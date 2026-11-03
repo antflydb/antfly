@@ -33,6 +33,7 @@ const Tensor = @import("../backends/tensor.zig").Tensor;
 const TensorInfo = @import("../backends/tensor.zig").TensorInfo;
 const BackendType = @import("../backends/backends.zig").BackendType;
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
+const incremental_observation = @import("invocation_observation.zig");
 const bert = @import("../models/bert.zig");
 const t5_mod = @import("../models/t5.zig");
 const gpt_mod = @import("../models/gpt.zig");
@@ -409,6 +410,7 @@ fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8
         },
     };
     errdefer archClose(impl);
+    try impl.model_lifetime.prepareFinalResources();
     // The final union member is in place before queues borrow its address.
     // Client ownership transfers directly to the session; all subsequent
     // failures close it together with the native weight inventory.
@@ -755,6 +757,8 @@ fn createCudaSessionWithRequiredProfile(
         .boundary_identity = prepared.boundary_identity,
         .budget_floor = prepared.budget_floor,
     };
+    errdefer archClose(impl);
+    try impl.model_lifetime.prepareFinalResources();
     return archSessionHandle(impl);
 }
 
@@ -999,6 +1003,7 @@ fn createGpuHostedSessionWithTaskOverride(
         .backend_data = .{ .metal = prepared.takeWeights() },
     };
     errdefer archClose(impl);
+    try impl.model_lifetime.prepareFinalResources();
     try device_weights.finalizeStableStorage(allocator, gpuBackendData(impl), prepared.boundary_identity, .{
         .config = kernel_jit_config,
         .scope = prepared.jit_scope,
@@ -2940,6 +2945,7 @@ fn archRunResidentWithControl(
 ) !?ResidentOutputs {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     if (self.task == .classifier or self.task == .extractor) return null;
+    if (self.arch_config == .whisper) return archRunIncrementalEncoderResident(self, inputs, allocator, control);
     const cfg = switch (self.arch_config) {
         .bert => |cfg| cfg,
         // Returning null forces the caller through runWithControl. Never
@@ -2974,7 +2980,49 @@ fn archRunResidentWithControl(
         .allocator = allocator,
         .backend_owner = cb,
         .deinit_backend_owner = &deinitResidentComputeBackend,
+        .backend_owner_cleanup_services = &resident_compute_cleanup_services,
     };
+}
+
+fn archRunIncrementalEncoderResident(self: *ArchSession, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !?ResidentOutputs {
+    if (self.arch_config != .whisper or inputs.len != 1) return null;
+    const first = inputs[0];
+    if (first.dtype != .f32 or !std.mem.eql(u8, first.name, "input_features")) return null;
+    const config = self.arch_config.whisper;
+    if (first.shape.len != 3 or first.shape[0] <= 0 or first.shape[1] != config.num_mel_bins or first.shape[2] <= 0 or !first.isAlignedFor(f32)) return error.InvalidInputShape;
+    const batch = std.math.cast(usize, first.shape[0]) orelse return error.ResourceLimitExceeded;
+    const frames = std.math.cast(usize, first.shape[2]) orelse return error.ResourceLimitExceeded;
+    const row_elements = std.math.mul(usize, config.num_mel_bins, frames) catch return error.ResourceLimitExceeded;
+    const elements = std.math.mul(usize, batch, row_elements) catch return error.ResourceLimitExceeded;
+    const bytes = std.math.mul(usize, elements, @sizeOf(f32)) catch return error.ResourceLimitExceeded;
+    if (first.data.len != bytes) return error.InvalidInputShape;
+    const mel_shape = [_]i32{ std.math.cast(i32, batch) orelse return error.ResourceLimitExceeded, std.math.cast(i32, config.num_mel_bins) orelse return error.ResourceLimitExceeded, std.math.cast(i32, frames) orelse return error.ResourceLimitExceeded };
+    const rows = (std.math.add(usize, frames, 1) catch return error.ResourceLimitExceeded) / 2;
+    const cb = try allocator.create(ops.ComputeBackend);
+    errdefer allocator.destroy(cb);
+    cb.* = try makeComputeBackend(self, allocator, null);
+    cb.execution_control = control;
+    errdefer cb.deinit();
+    if (control) |active| try active.check();
+    const mel = try cb.fromFloat32Shape(first.asFloat32(), &mel_shape);
+    defer cb.free(mel);
+    const encoded = try whisper_arch.encoderForwardTensor(cb, allocator, config, mel, batch, frames);
+    defer cb.free(encoded);
+    const hidden = try cb.primReshape(encoded, &.{ first.shape[0], std.math.cast(i64, rows) orelse return error.ResourceLimitExceeded, config.d_model });
+    errdefer cb.free(hidden);
+    const outputs = try allocator.alloc(ops.CT, 1);
+    outputs[0] = hidden;
+    return .{ .outputs = outputs, .backend = cb, .allocator = allocator, .backend_owner = cb, .deinit_backend_owner = deinitResidentComputeBackend, .backend_owner_cleanup_services = &resident_compute_cleanup_services };
+}
+
+fn acceptsResidentComputeCleanup(outputs: *const ResidentOutputs) bool {
+    return outputs.deinit_backend_owner == deinitResidentComputeBackend;
+}
+const resident_compute_cleanup_services = ResidentOutputs.BackendOwnerCleanupServices{ .accepts = acceptsResidentComputeCleanup, .deinit = deinitResidentComputeBackendWithCleanup };
+fn deinitResidentComputeBackendWithCleanup(owner: *anyopaque, allocator: std.mem.Allocator, current: @import("../execution/cleanup_context.zig").Context) void {
+    const cb: *ops.ComputeBackend = @ptrCast(@alignCast(owner));
+    cb.deinitWithCleanup(current);
+    allocator.destroy(cb);
 }
 
 fn deinitResidentComputeBackend(owner: *anyopaque, allocator: std.mem.Allocator) void {
@@ -3126,6 +3174,7 @@ test "GLiNER decision head declarations compile" {
 fn archRunResident(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) !?ResidentOutputs {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     if (self.task == .classifier or self.task == .extractor) return null;
+    if (self.arch_config == .whisper) return archRunIncrementalEncoderResident(self, inputs, allocator, null);
     switch (self.arch_config) {
         .bert, .modern_bert, .nomic_bert, .embedding_gemma2 => {},
         else => return null,
@@ -3181,6 +3230,7 @@ fn archRunResident(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.A
         .allocator = allocator,
         .backend_owner = cb,
         .deinit_backend_owner = &deinitResidentComputeBackend,
+        .backend_owner_cleanup_services = &resident_compute_cleanup_services,
     };
 }
 
@@ -3257,6 +3307,7 @@ fn archRunResidentTextEmbeddingImpl(
             .allocator = allocator,
             .backend_owner = cb,
             .deinit_backend_owner = &deinitResidentComputeBackend,
+            .backend_owner_cleanup_services = &resident_compute_cleanup_services,
         };
     }
     if (self.backend_type != .metal) return null;
@@ -3296,6 +3347,7 @@ fn archRunResidentTextEmbeddingImpl(
         .allocator = allocator,
         .backend_owner = cb,
         .deinit_backend_owner = &deinitResidentComputeBackend,
+        .backend_owner_cleanup_services = &resident_compute_cleanup_services,
     };
 }
 
@@ -3327,6 +3379,7 @@ fn makeComputeBackend(
     }
     return switch (self.backend_type) {
         .native => try @import("../backends/compute_factory.zig").createNative(allocator, &self.backend_data.native, run_budget, self.io, .{
+            .observe_allocations = self.diagnostics.enabled.load(.acquire),
             .quantized_activations = if (self.arch_config == .gliner_boundary or self.arch_config == .bert) .strict_f32 else .automatic,
             .borrow_bf16_linear_weights = self.arch_config == .gpt and self.arch_config.gpt.family == .qwen3,
             .cache_bf16_weight_mirrors = self.arch_config == .embedding_gemma2,
@@ -3336,7 +3389,7 @@ fn makeComputeBackend(
         // Non-partitioned ops (weight loads, sampling, etc.) run on native CPU.
         // Compiled partitions are executed via PjrtExecutor through the
         // multi_executor pipeline; see generation.zig attachPjrtExecutors.
-        .pjrt => try @import("../backends/compute_factory.zig").createNative(allocator, &self.backend_data.pjrt.native, run_budget, self.io, .{}),
+        .pjrt => try @import("../backends/compute_factory.zig").createNative(allocator, &self.backend_data.pjrt.native, run_budget, self.io, .{ .observe_allocations = self.diagnostics.enabled.load(.acquire) }),
         .cuda => if (comptime build_options.enable_cuda)
             try @import("../backends/compute_factory.zig").acquireCuda(self.backend_data.cuda.compute, run_budget)
         else
@@ -3824,10 +3877,44 @@ pub const WhisperNativeDecoder = struct {
     encoder_hidden: ops.CT,
     cache: whisper_arch.DecodeCache,
     gate: ?*std.atomic.Mutex,
+    encoder_owned: bool = true,
+    source_resources: ?Session.ModelLifetime.ResourcePin = null,
+    receiver_cleanup: ?ReceiverCleanup = null,
+    destination_model: ?*Session.ModelLifetime = null,
+    base_permit: ?@import("../backends/session.zig").RunPermit = null,
+    cache_permit: ?@import("../backends/session.zig").RunPermit = null,
+    diagnostics_binding: ?incremental_observation.Binding = null,
+    pending_observation: @import("pending_observation.zig").Span = .{},
+    fn ensurePendingObservation(self: *WhisperNativeDecoder) void {
+        if (self.pending_observation.source != null) return;
+        const binding = self.diagnostics_binding orelse return;
+        if (!binding.diagnostics.isEnabled()) return;
+        const model = self.destination_model orelse return;
+        self.pending_observation = @import("pending_observation.zig").Span.begin(.{ .publisher = binding.diagnostics, .model = model, .model_allocator = binding.model_allocator });
+    }
+    fn classifyPipelinedStep(result: whisper_arch.StepResult) incremental_observation.ResultClassification {
+        return .{ .unsupported = result != .encoded };
+    }
+    fn discardPending(backend: *const ops.ComputeBackend) !bool {
+        if (!backend.decoderRuntimeHasActiveFrame()) return false;
+        try backend.decoderRuntimeCancelFrame();
+        return true;
+    }
+
+    fn invocationBinding(self: *WhisperNativeDecoder) ?incremental_observation.Binding {
+        var binding = self.diagnostics_binding;
+        if (binding) |*value| value.* = value.forBackend(self.cb.backend);
+        return binding;
+    }
 
     /// Logits (`[vocab_size]` f32) for the last of `tokens`, which must be
     /// the tokens not yet decoded (`tokens.len >= 1`).
     pub fn step(self: *WhisperNativeDecoder, tokens: []const i64) ![]f32 {
+        const operation: @import("diagnostics.zig").Operation = if (self.cache.positions == 0 or tokens.len > 1) .prefill else .decode_step;
+        return incremental_observation.callOperation(self.invocationBinding(), operation, stepImpl, .{ self, tokens });
+    }
+
+    fn stepImpl(self: *WhisperNativeDecoder, tokens: []const i64) ![]f32 {
         if (self.cb.backend.execution_control) |control| try control.check();
         return whisper_arch.decoderStepCachedLogits(&self.cb.backend, self.allocator, self.config, tokens, &self.cache);
     }
@@ -3836,6 +3923,15 @@ pub const WhisperNativeDecoder = struct {
     /// the device-side token statistics (which fall back to logits when the
     /// backend cannot produce them).
     pub fn stepWith(self: *WhisperNativeDecoder, tokens: []const i64, output: whisper_arch.StepOutput) !whisper_arch.StepResult {
+        const operation: @import("diagnostics.zig").Operation = if (self.cache.positions == 0 or tokens.len > 1) .prefill else .decode_step;
+        if (output == .pipelined) {
+            self.ensurePendingObservation();
+            return self.pending_observation.callOperationClassified(&self.cb.backend, operation, .encode_next, .unavailable, classifyPipelinedStep, stepWithImpl, .{ self, tokens, output });
+        }
+        return incremental_observation.callOperation(self.invocationBinding(), operation, stepWithImpl, .{ self, tokens, output });
+    }
+
+    fn stepWithImpl(self: *WhisperNativeDecoder, tokens: []const i64, output: whisper_arch.StepOutput) !whisper_arch.StepResult {
         if (self.cb.backend.execution_control) |control| try control.check();
         return whisper_arch.decoderStepCached(&self.cb.backend, self.allocator, self.config, tokens, &self.cache, output);
     }
@@ -3853,24 +3949,33 @@ pub const WhisperNativeDecoder = struct {
 
     /// Submit the step the last `.pipelined` call encoded.
     pub fn submit(self: *WhisperNativeDecoder) !void {
-        return whisper_arch.decoderStepSubmit(&self.cb.backend);
+        self.ensurePendingObservation();
+        return self.pending_observation.call(&self.cb.backend, .submit, .unavailable, whisper_arch.decoderStepSubmit, .{&self.cb.backend});
     }
 
     /// Drop the step the last `.pipelined` call encoded without running it.
     pub fn discard(self: *WhisperNativeDecoder) void {
-        whisper_arch.decoderStepDiscard(&self.cb.backend);
+        self.ensurePendingObservation();
+        _ = self.pending_observation.call(&self.cb.backend, .cancel, .unavailable, discardPending, .{&self.cb.backend}) catch {};
     }
 
     /// Collect the statistics of the step in flight from `slot`.
     pub fn awaitStats(self: *WhisperNativeDecoder, slot: usize) !?ops.WhisperLogitsStatsRaw {
-        return whisper_arch.decoderStepAwait(&self.cb.backend, slot);
+        self.ensurePendingObservation();
+        return self.pending_observation.call(&self.cb.backend, .await_readback, .readback_returned, whisper_arch.decoderStepAwait, .{ &self.cb.backend, slot });
     }
 
     /// Wait for any step still in flight and drop any step still encoded;
     /// safe to call when there is neither.
+    fn retirePending(backend: *const ops.ComputeBackend) !void {
+        try backend.decoderRuntimeWaitSubmittedFrame();
+        if (backend.decoderRuntimeHasActiveFrame()) try backend.decoderRuntimeCancelFrame();
+    }
+
     pub fn drain(self: *WhisperNativeDecoder) void {
-        self.cb.backend.decoderRuntimeWaitSubmittedFrame() catch {};
-        whisper_arch.decoderStepDiscard(&self.cb.backend);
+        // A failed fence cannot authorize freeing cache/provider addresses.
+        // Preserve process fail-closed policy instead of unlocking/replaying.
+        self.pending_observation.call(&self.cb.backend, .drain, .unavailable, retirePending, .{&self.cb.backend}) catch platform.inference_process_supervisor.restartWorker();
     }
 
     pub fn positions(self: *const WhisperNativeDecoder) usize {
@@ -3878,18 +3983,337 @@ pub const WhisperNativeDecoder = struct {
     }
 
     pub fn deinit(self: *WhisperNativeDecoder) void {
+        var cleanup = self.receiver_cleanup;
+        self.receiver_cleanup = null;
+        // Published constructors always own a cold B. A manual raw decoder
+        // may use the historical raw destructor only with no tracked gate or
+        // retained source whose cleanup could run under another owner's lane.
+        if (cleanup == null and (self.gate != null or self.source_resources != null))
+            platform.inference_process_supervisor.restartWorker();
+        defer if (cleanup) |*owner| owner.finish();
+        const boundary = if (cleanup) |*owner| owner.boundary() else null;
+        const destination_model = self.destination_model;
+        const source = self.source_resources;
+        self.source_resources = null;
+        var scope = if (destination_model) |model| model.beginClose() else Session.CloseScope{};
+        defer scope.deinit();
+        self.drain();
         self.cache.deinit(&self.cb.backend);
-        self.cb.backend.free(self.encoder_hidden);
-        self.cb.deinit();
+        if (self.encoder_owned) self.cb.backend.freeWithBoundary(self.encoder_hidden, boundary);
+        if (cleanup != null) self.cb.deinitWithCleanup(.{ .boundary = boundary }) else self.cb.deinit();
+        self.pending_observation.deinit();
+        // Source SDK destruction remains protected while destination owns its
+        // gate; every source quota continuation receives this exact current B.
+        if (source) |resources| resources.releaseWithBoundary(boundary);
         if (self.gate) |gate| gate.unlock();
+        self.gate = null;
+        var cache_permit = self.cache_permit;
+        var base_permit = self.base_permit;
+        self.cache_permit = null;
+        self.base_permit = null;
+        scope.deinit();
+        self.* = undefined;
+        // Producers see all concrete SDK/provider/model and close scopes ended.
+        if (cache_permit) |*permit| permit.deinitWithCleanup(.{ .boundary = boundary });
+        if (base_permit) |*permit| permit.deinitWithCleanup(.{ .boundary = boundary });
+        if (destination_model) |model| model.releaseWithBoundary(boundary);
+    }
+};
+
+/// Compile-time native incremental implementation. Concrete config/weight
+/// semantics stay here; staged runtimes consume the operation contract only.
+pub const IncrementalDecoderAdapter = struct {
+    pub const State = WhisperNativeDecoder;
+    pub const StatsRequest = whisper_arch.StatsRequest;
+    pub const Source = RetainedEncoderSource;
+    pub const Receiver = struct {
+        source_ptr: *anyopaque,
+        source_vtable: *const Session.VTable,
+        destination_ptr: *anyopaque,
+        destination_vtable: *const Session.VTable,
+        backend: BackendType,
+        width: usize,
+        same_model_owner: bool,
+        /// Only the ModelLifetime-owned lane can outlive a model handle. The
+        /// complete RetainedEncoderSource.resources pins this exact lifetime.
+        source_owned_lane: ?*std.atomic.Mutex = null,
+    };
+
+    /// No driver/provider construction, cache allocation, or model submission.
+    pub fn qualify(source: Session, destination: Session) ?Receiver {
+        if (source.vtable != &arch_vtable or destination.vtable != &arch_vtable) return null;
+        const src: *ArchSession = @ptrCast(@alignCast(source.ptr));
+        const dst: *ArchSession = @ptrCast(@alignCast(destination.ptr));
+        if (src.arch_config != .whisper or dst.arch_config != .whisper or src.backend_type != dst.backend_type) return null;
+        if (src.task == .classifier or src.task == .extractor or dst.task == .classifier or dst.task == .extractor) return null;
+        if (src.arch_config.whisper.d_model != dst.arch_config.whisper.d_model) return null;
+        switch (src.backend_type) {
+            .native => {},
+            .metal => if (comptime build_options.enable_metal) {
+                // Native Metal architecture providers use the one system device.
+                // Distinct stores may not acquire the same already-leased provider.
+                const src_provider = gpuBackendData(src).shared_metal_native_provider;
+                const dst_provider = gpuBackendData(dst).shared_metal_native_provider;
+                if (src != dst and src_provider != null and src_provider == dst_provider) return null;
+            } else return null,
+            .cuda => if (comptime build_options.enable_cuda) {
+                const source_context = &src.backend_data.cuda.compute.ctx;
+                const target_context = &dst.backend_data.cuda.compute.ctx;
+                if (source_context.ctx == null or source_context.ctx != target_context.ctx or source_context.device != target_context.device) return null;
+            } else return null,
+            else => return null,
+        }
+        var source_owned_lane: ?*std.atomic.Mutex = null;
+        if (src != dst and src.backend_type == .cuda) if (source.execution_gate) |gate| {
+            const lifetime = source.model_lifetime orelse return null;
+            if (gate != &lifetime.execution_gate) return null;
+            source_owned_lane = gate;
+        };
+        return .{ .source_ptr = source.ptr, .source_vtable = source.vtable, .destination_ptr = destination.ptr, .destination_vtable = destination.vtable, .backend = src.backend_type, .width = dst.arch_config.whisper.d_model, .same_model_owner = src == dst, .source_owned_lane = source_owned_lane };
+    }
+
+    pub fn fromHost(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, hidden: []const f32, rows: usize) !?State {
+        return whisperNativeDecoder(session, allocator, control, hidden, rows);
+    }
+
+    /// Consumes the independent source capability on success and failure.
+    pub fn fromResident(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, source: Source) !State {
+        const held = if (session.model_lifetime) |model| model.retain() else null;
+        defer if (held) |model| model.release();
+        return createResidentIncrementalDecoder(session, allocator, control, source);
+    }
+};
+
+pub const RetainedEncoderSource = struct {
+    receiver: IncrementalDecoderAdapter.Receiver,
+    value: ops.CT,
+    backend: *const ops.ComputeBackend,
+    shape: [3]i64,
+    resources: Session.ModelLifetime.ResourcePin,
+    cleanup_root_qualified: bool = false,
+    cleanup_root_deadline_ns: ?u64 = null,
+    cleanup_root_background_supervised: bool = false,
+    pub fn payloadCharge(self: RetainedEncoderSource) ?@import("payload_charge.zig").Capability {
+        if (!self.cleanup_root_qualified) return null;
+        var capability = self.resources.payloadCharge() orelse return null;
+        capability.final_cleanup_qualified = true;
+        capability.root_cleanup_deadline_ns = self.cleanup_root_deadline_ns;
+        capability.background_supervised = self.cleanup_root_background_supervised;
+        return capability;
+    }
+
+    pub fn retained(self: RetainedEncoderSource) !RetainedEncoderSource {
+        var result = self;
+        result.resources = self.resources.retain() orelse return error.UnretainableResidentResources;
+        return result;
+    }
+    pub fn deinit(self: *RetainedEncoderSource) void {
+        // Historical raw destructor declares outside-execution cleanup.
+        // A caller under another lane must use the explicit boundary method.
+        self.resources.release();
+        self.* = undefined;
+    }
+    pub fn deinitWithBoundary(self: *RetainedEncoderSource, boundary: ?*const @import("retirement_sink.zig").Epoch) void {
+        self.resources.releaseWithBoundary(boundary);
         self.* = undefined;
     }
 };
+
+fn incrementalBasePermit(session: Session, config: whisper_mod.Config, geometry: whisper_arch.CacheGeometry, resident_input_held: bool, independent_device_copy: bool) !@import("../backends/session.zig").RunPermit {
+    const hidden_bytes = std.math.mul(usize, geometry.encoder_rows, std.math.mul(usize, geometry.width, @sizeOf(f32)) catch return error.ResourceLimitExceeded) catch return error.ResourceLimitExceeded;
+    const output_bytes = std.math.mul(usize, config.vocab_size, @sizeOf(f32)) catch return error.ResourceLimitExceeded;
+    // CUDA row statistics retain no device workspace after encode. Bound the
+    // actual supported maximum ids/partials/result before the model gate;
+    // existing CPU/Metal budgets and schedules remain unchanged.
+    const selection_workspace: usize = if (session.backend() == .cuda)
+        (try @import("../ops/row_selection_stats.zig").Geometry.init(config.vocab_size, config.vocab_size)).workspace_bytes
+    else
+        0;
+    const workspace = std.math.add(usize, try geometry.workspaceBytes(config), selection_workspace) catch return error.ResourceLimitExceeded;
+    return session.admit(.{
+        .batch = 1,
+        .sequence = 1,
+        .input_bytes = if (resident_input_held) 0 else hidden_bytes,
+        .backend_input_bytes = if (resident_input_held and !independent_device_copy) 0 else hidden_bytes,
+        .host_preprocess_bytes = if (resident_input_held) 0 else hidden_bytes,
+        .output_bytes = output_bytes,
+        .workspace_bytes = workspace,
+        // Preserve static/profile/source-route floors. Cache geometry does not
+        // pretend to prove opaque quantized or cached-panel staging coverage.
+        .workspace_planned = false,
+    });
+}
+
+fn incrementalCachePermit(session: Session, base: *const @import("../backends/session.zig").RunPermit, geometry: whisper_arch.CacheGeometry, cb: *const ops.ComputeBackend) !?@import("../backends/session.zig").RunPermit {
+    const lease = base.lease orelse return null;
+    const target = try lease.amounts.merge(try geometry.cacheAmounts(cb));
+    return try session.admitSupplement(base, target);
+}
+
+fn createResidentIncrementalDecoder(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, source: RetainedEncoderSource) !WhisperNativeDecoder {
+    var cleanup: ?ReceiverCleanup = null;
+    var transferred = false;
+    defer if (!transferred) if (cleanup) |*owner| owner.finish();
+    var destination_model: ?*Session.ModelLifetime = null;
+    defer if (!transferred) {
+        if (cleanup) |*owner| source.resources.releaseWithBoundary(owner.boundary()) else source.resources.release();
+        if (destination_model) |model| if (cleanup) |*owner| model.releaseWithBoundary(owner.boundary()) else model.release();
+    };
+    if (session.vtable != &arch_vtable or session.ptr != source.receiver.destination_ptr or session.vtable != source.receiver.destination_vtable) return error.InvalidIncrementalReceiver;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.arch_config != .whisper) return error.InvalidIncrementalReceiver;
+    const config = self.arch_config.whisper;
+    const expected_backend: ops.BackendKind = switch (self.backend_type) {
+        .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+        else => return error.InvalidIncrementalReceiverStorage,
+    };
+    if (source.backend.kind() != expected_backend or source.receiver.backend != self.backend_type or source.receiver.width != config.d_model) return error.InvalidIncrementalReceiverStorage;
+    const same_owner = source.receiver.source_ptr == session.ptr and source.receiver.source_vtable == session.vtable;
+    if (source.receiver.same_model_owner != same_owner) return error.InvalidIncrementalReceiver;
+    if (source.shape[0] != 1 or source.shape[1] <= 0 or source.shape[2] != config.d_model) return error.InvalidInputShape;
+    const rows = std.math.cast(usize, source.shape[1]) orelse return error.ResourceLimitExceeded;
+    destination_model = if (session.model_lifetime) |model| model.retain() else null;
+    const geometry = try whisper_arch.CacheGeometry.init(config, rows);
+    const foreign_cuda = source.receiver.backend == .cuda and !source.receiver.same_model_owner;
+    const foreign_async_eligible = foreign_cuda and ReceiverCleanup.permitsAsyncSource(session, source.payloadCharge());
+    cleanup = try ReceiverCleanup.beginForOwnedGate(session);
+    var base = try incrementalBasePermit(session, config, geometry, true, foreign_cuda);
+    errdefer base.deinit();
+    // Source authority precedes BOTH the destination lane and its older
+    // compute/provider acquisition path. Raw sessions with no published lane
+    // preserve their existing caller-guaranteed exclusive-use contract.
+    var funding: ?@import("payload_charge.zig").ReceiverFunding = null;
+    defer if (funding) |*owned| owned.abort();
+    if (foreign_async_eligible) {
+        const lease = if (base.lease) |*value| value else null;
+        const domain = if (destination_model) |model| if (lease) |owned| if (owned.controller) |controller| model.retainAdmissionDomain(controller) else null else null else null;
+        const bytes = std.math.mul(usize, geometry.encoder_rows, std.math.mul(usize, geometry.width, 4) catch return error.ResourceLimitExceeded) catch return error.ResourceLimitExceeded;
+        funding = try @import("payload_charge.zig").ReceiverFunding.prepare(source.payloadCharge(), source.value, lease, domain, bytes);
+    }
+    const ForeignCopy = if (build_options.enable_cuda) cuda_compute_mod.PreparedForeignTensorCopy else void;
+    var foreign_copy: ?ForeignCopy = null;
+    defer if (comptime build_options.enable_cuda) if (foreign_copy) |*copy| copy.deinitWithBoundary(if (cleanup) |*owner| owner.boundary() else null);
+    if (foreign_cuda) {
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+        const target_backend = self.backend_data.cuda.compute.computeBackend();
+        const target_identity = cuda_compute_mod.foreignTensorCopyTarget(&target_backend) orelse return error.InvalidIncrementalReceiverStorage;
+        const source_identity = cuda_compute_mod.foreignTensorCopyTarget(source.backend) orelse return error.InvalidIncrementalReceiverStorage;
+        if (!source_identity.matches(target_identity)) return error.InvalidIncrementalReceiverStorage;
+        var source_lane_guard = @import("source_lane.zig").Guard{};
+        if (source.receiver.source_owned_lane) |lane| {
+            try @import("source_lane.zig").Guard.acquireInto(lane, .{ .context = source.backend.ptr, .table = source.backend.vtable }, control, &source_lane_guard);
+        }
+        defer source_lane_guard.finish();
+        var source_sdk_guard: @import("../execution_control.zig").UninterruptibleGuard = if (control) |active| try active.enterUninterruptible(.uninterruptible) else .{};
+        defer source_sdk_guard.deinit();
+        var source_scope = @import("backend_operation.zig").Scope{};
+        try @import("backend_operation.zig").enterInto(source.backend, null, source.backend.operationToken(), .legacy_unknown_frame, &source_scope);
+        defer source_scope.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
+        if (control) |active| try active.check();
+        const cleanup_deadline = if (control) |active| if (active.deadline_ns) |deadline| deadline +| (active.cancellation_grace_ns orelse 0) else null else null;
+        const source_lane_proof = if (source.receiver.source_owned_lane != null) try source_lane_guard.borrow() else null;
+        if (source_lane_proof) |proof| try proof.validate(.{ .context = source.backend.ptr, .table = source.backend.vtable });
+        foreign_copy = (if (foreign_async_eligible and source_lane_proof != null and (if (control) |active| active.native_call_policy == .require_supervision and cleanup_deadline != null else false)) try cuda_compute_mod.prepareAsyncForeignTensorCopy(source.backend, source.value, target_identity, if (funding) |*owned| owned else null, if (cleanup) |*owner| owner.boundary() else null, cleanup_deadline) else null) orelse try cuda_compute_mod.prepareForeignTensorCopy(source.backend, source.value);
+        try source_scope.finish();
+    }
+    // Context-retain/release callbacks are metadata work, not source SDK work.
+    // Never abort an unused token plan under the destination's later gate.
+    if (funding) |*owned| owned.abort();
+    const gate = session.execution_gate;
+    if (gate) |mutex| {
+        if (control) |active| try active.lock(mutex) else while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+    errdefer if (gate) |mutex| mutex.unlock();
+    const binding = session.invocation_diagnostics;
+    const decoder = try incremental_observation.callOperation(binding, .decoder_init, finishResidentIncrementalDecoder, .{ session, allocator, control, source, config, rows, geometry, base, gate, destination_model, if (foreign_copy) |*copy| copy else null, if (cleanup) |*owner| owner else null });
+    transferred = true;
+    return decoder;
+}
+
+fn acquireIncrementalSourceProvider(session: Session, allocator: std.mem.Allocator, options: @import("../backends/session.zig").ComputeBackendOptions) !ops.ComputeBackend {
+    if (options.run_budget != null) return error.UnsupportedComputeProviderMode;
+    if (session.backend() == .cuda) {
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+        const owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
+        // The source already began this request. A second CUDA beginRequest
+        // resets capture/pinned-temp state while the encoder output is live.
+        return @import("../backends/compute_factory.zig").acquireCuda(owner.backend_data.cuda.compute, null);
+    }
+    return getComputeBackendBorrowingSharedProvider(session, allocator);
+}
+
+fn finishResidentIncrementalDecoder(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, source: RetainedEncoderSource, config: whisper_mod.Config, rows: usize, geometry: whisper_arch.CacheGeometry, base: @import("../backends/session.zig").RunPermit, gate: ?*std.atomic.Mutex, destination_model: ?*Session.ModelLifetime, foreign_copy: ?*const (if (build_options.enable_cuda) cuda_compute_mod.PreparedForeignTensorCopy else void), cleanup: ?*const ReceiverCleanup) !WhisperNativeDecoder {
+    // Own per-attempt compute caches while the complete source retains the
+    // outer provider lease. Native gets private compute; Metal borrows its
+    // already-leased provider without taking/releasing that lease twice.
+    // Establish/borrow the ACTUAL provider operation before even the private
+    // backend constructor reads SDK metadata. Raw source callers get a new
+    // managed scope; engine sources retain their original explicit outer one.
+    var source_operation = @import("backend_operation.zig").Scope{};
+    if (source.receiver.same_model_owner and source.backend.kind() == .metal) {
+        try @import("backend_operation.zig").enterInto(source.backend, null, source.backend.operationToken(), .managed, &source_operation);
+    }
+    defer source_operation.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+    var cb = if (source.receiver.same_model_owner)
+        try @import("../backends/compute_provider.zig").acquireWith(session, allocator, null, control, acquireIncrementalSourceProvider)
+    else
+        try getComputeBackendWithControl(session, allocator, control);
+    errdefer if (cleanup) |owner| cb.deinitWithCleanup(.{ .boundary = owner.boundary() }) else cb.deinit();
+    if (source.receiver.same_model_owner and source.backend.kind() == .metal) {
+        if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+        // Verify original numerical identity and actual shared provider before
+        // adopting authority. This does not wrap or replace the backend table.
+        const token = source_operation.token() orelse return error.BackendOperationUnavailable;
+        try token.validate(.{ .implementation = .{ .context = cb.backend.ptr, .table = cb.backend.vtable }, .program = null, .mode = .managed });
+        const target: *@import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(cb.backend.ptr));
+        if (source_operation.takeOwned()) |owned| {
+            target.adoptEngineOperation(owned) catch |err| {
+                var retired = owned;
+                retired.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+                return err;
+            };
+        } else try target.adoptEngineBorrowedOperation(token);
+    }
+    // B is a resource/source cleanup fence, not invented numerical authority.
+    // A same-provider Metal borrower must keep its source's original operation
+    // epoch. Only its actual owned Engine can bind a new numerical epoch.
+    if (cleanup) |owner| {
+        if (!(source.receiver.same_model_owner and cb.backend.kind() == .metal))
+            try bindOwnedDecoderCleanup(&cb.backend, owner.boundary());
+    }
+    var cache_permit = try incrementalCachePermit(session, &base, geometry, &cb.backend);
+    errdefer if (cache_permit) |*permit| permit.deinit();
+    var owns_encoder = false;
+    const encoder_ct = if (source.receiver.backend == .cuda and !source.receiver.same_model_owner) blk: {
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+        const ready = foreign_copy orelse return error.InvalidIncrementalReceiverStorage;
+        const copied = try cuda_compute_mod.importPreparedForeignTensorCopy(&cb.backend, ready);
+        owns_encoder = true;
+        break :blk copied;
+    } else source.value;
+    errdefer if (owns_encoder) cb.backend.freeWithBoundary(encoder_ct, if (cleanup) |owner| owner.boundary() else null);
+    const cache = try whisper_arch.DecodeCache.init(&cb.backend, allocator, config, encoder_ct, rows);
+    return .{ .allocator = allocator, .cb = cb, .config = config, .encoder_hidden = encoder_ct, .cache = cache, .gate = gate, .encoder_owned = owns_encoder, .source_resources = source.resources, .receiver_cleanup = if (cleanup) |owner| owner.* else null, .destination_model = destination_model, .base_permit = base, .cache_permit = cache_permit, .diagnostics_binding = session.invocation_diagnostics };
+}
 
 /// Open an incremental decoder over `encoder_hidden` (host f32,
 /// `[enc_seq, d_model]`). Returns null for sessions that are not native
 /// Whisper (ONNX bundles keep their own incremental path).
 pub fn whisperNativeDecoder(
+    session: Session,
+    allocator: std.mem.Allocator,
+    control: ?InferenceExecutionControl,
+    encoder_hidden: []const f32,
+    enc_seq: usize,
+) !?WhisperNativeDecoder {
+    const held = if (session.model_lifetime) |model| model.retain() else null;
+    defer if (held) |model| model.release();
+    return createHostIncrementalDecoder(session, allocator, control, encoder_hidden, enc_seq);
+}
+
+fn createHostIncrementalDecoder(
     session: Session,
     allocator: std.mem.Allocator,
     control: ?InferenceExecutionControl,
@@ -3902,23 +4326,46 @@ pub fn whisperNativeDecoder(
         .whisper => |cfg| cfg,
         else => return null,
     };
-    if (encoder_hidden.len != enc_seq * cfg.d_model) return error.InvalidInputShape;
+    const hidden_elements = std.math.mul(usize, enc_seq, cfg.d_model) catch return error.ResourceLimitExceeded;
+    if (encoder_hidden.len != hidden_elements) return error.InvalidInputShape;
+    var cleanup = try ReceiverCleanup.beginForOwnedGate(session);
+    var transferred = false;
+    defer if (!transferred) cleanup.finish();
+    const destination_model = if (session.model_lifetime) |model| model.retain() else null;
+    errdefer if (destination_model) |model| model.releaseWithBoundary(cleanup.boundary());
+    const geometry = try whisper_arch.CacheGeometry.init(cfg, enc_seq);
+    var base_permit = try incrementalBasePermit(session, cfg, geometry, false, false);
+    errdefer base_permit.deinit();
     const gate = session.execution_gate;
     if (gate) |mutex| {
         if (control) |active| try active.lock(mutex) else while (!mutex.tryLock()) std.atomic.spinLoopHint();
     }
     errdefer if (gate) |mutex| mutex.unlock();
+    const result = try incremental_observation.callOperation(session.invocation_diagnostics, .decoder_init, finishHostIncrementalDecoder, .{ session, allocator, control, encoder_hidden, enc_seq, cfg, geometry, base_permit, gate, destination_model, &cleanup });
+    transferred = true;
+    return result;
+}
+
+fn finishHostIncrementalDecoder(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, encoder_hidden: []const f32, enc_seq: usize, cfg: whisper_mod.Config, geometry: whisper_arch.CacheGeometry, base_permit: @import("../backends/session.zig").RunPermit, gate: ?*std.atomic.Mutex, destination_model: ?*Session.ModelLifetime, cleanup: *const ReceiverCleanup) !WhisperNativeDecoder {
     var cb = try getComputeBackendWithControl(session, allocator, control);
-    errdefer cb.deinit();
+    errdefer cb.deinitWithCleanup(.{ .boundary = cleanup.boundary() });
+    try bindOwnedDecoderCleanup(&cb.backend, cleanup.boundary());
     const shape = [_]i32{ 1, @intCast(enc_seq), @intCast(cfg.d_model) };
-    const encoder_host = try cb.backend.fromFloat32Shape(encoder_hidden, &shape);
     // Upload once so the cross-attention projections run on the device and
-    // their outputs are born resident.
-    const encoder_ct = if (try cb.backend.ensureDeviceResident(encoder_host)) |device| blk: {
-        cb.backend.free(encoder_host);
-        break :blk device;
-    } else encoder_host;
+    // their outputs are born resident. The host handle remains owned if the
+    // provider rejects/fails the upload before a resident handle exists.
+    const encoder_ct = blk: {
+        const host = try cb.backend.fromFloat32Shape(encoder_hidden, &shape);
+        errdefer cb.backend.free(host);
+        if (try cb.backend.ensureDeviceResident(host)) |device| {
+            cb.backend.free(host);
+            break :blk device;
+        }
+        break :blk host;
+    };
     errdefer cb.backend.free(encoder_ct);
+    var cache_permit = try incrementalCachePermit(session, &base_permit, geometry, &cb.backend);
+    errdefer if (cache_permit) |*permit| permit.deinit();
     const cache = try whisper_arch.DecodeCache.init(&cb.backend, allocator, cfg, encoder_ct, enc_seq);
     return .{
         .allocator = allocator,
@@ -3927,6 +4374,11 @@ pub fn whisperNativeDecoder(
         .encoder_hidden = encoder_ct,
         .cache = cache,
         .gate = gate,
+        .destination_model = destination_model,
+        .receiver_cleanup = cleanup.*,
+        .base_permit = base_permit,
+        .cache_permit = cache_permit,
+        .diagnostics_binding = session.invocation_diagnostics,
     };
 }
 
@@ -4653,6 +5105,38 @@ fn acquireArchComputeBackend(ctx: *anyopaque, session: Session, allocator: std.m
     return getComputeBackend(owner_session, allocator);
 }
 
+const archComputeServices = @import("../backends/session.zig").ComputeBackendProvider.VTable{
+    .acquire = acquireArchComputeBackend,
+    .cold_target_services = &.{ .accepts = acceptsArchComputeServices, .snapshot = coldArchComputeTarget },
+};
+fn acceptsArchComputeServices(actual: *const @import("../backends/session.zig").ComputeBackendProvider.VTable) bool {
+    return actual == &archComputeServices;
+}
+fn coldArchComputeTarget(raw: *anyopaque, _: Session, control: ?InferenceExecutionControl) !?@import("../backends/cold_compute_target.zig").Target {
+    if (control) |active| try active.check();
+    const self: *ArchSession = @ptrCast(@alignCast(raw));
+    switch (self.backend_type) {
+        .cuda => {
+            if (comptime !build_options.enable_cuda) return null;
+            const compute = self.backend_data.cuda.compute;
+            const primary = compute.ctx.ctx orelse return null;
+            const backend = compute.computeBackend();
+            return .{ .cuda = .{ .implementation_context = backend.ptr, .implementation_table = backend.vtable, .primary_context = @ptrCast(primary), .device = compute.ctx.device } };
+        },
+        .metal => {
+            if (comptime !build_options.enable_metal) return null;
+            const io = self.io orelse return null;
+            const data = gpuBackendData(self);
+            if (!data.shared_metal_native_provider_lock.tryLock()) return error.QueueFull;
+            defer data.shared_metal_native_provider_lock.unlock(io);
+            const provider = data.shared_metal_native_provider orelse return null;
+            const raw_runtime = provider.raw_decode_runtime orelse return null;
+            return .{ .metal = .{ .runtime = @ptrCast(raw_runtime), .exclusion = &provider.operations.gate } };
+        },
+        else => return null,
+    }
+}
+
 fn preparationRuntimeIdentity(raw: *anyopaque) !*anyopaque {
     if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
     const self: *ArchSession = @ptrCast(@alignCast(raw));
@@ -4698,7 +5182,7 @@ fn archSessionHandle(impl: *ArchSession) Session {
         },
         .ptr = impl,
         .vtable = &arch_vtable,
-        .compute_backend_provider = .{ .ptr = impl, .acquire = acquireArchComputeBackend },
+        .compute_backend_provider = .{ .ptr = impl, .services = &archComputeServices },
         .resident_preparation = .{ .ptr = impl, .prepare = prepareArchResident },
         .model_contract = .{
             .task = impl.task,
@@ -6512,6 +6996,7 @@ fn archQuiesce(ptr: *anyopaque) void {
 
 fn archClose(ptr: *anyopaque) void {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    self.model_lifetime.discardUnpublishedFinalResources();
     if (self.video_coefficients) |*cache| cache.deinit();
     if (self.video_coefficient_permit) |*permit| permit.deinit();
     if (self.video_coefficient_device_permit) |*permit| permit.deinit();
@@ -7638,4 +8123,1333 @@ test "device weight preparation and final session ownership unwind every allocat
     // Includes failure to allocate the final session after source preparation,
     // and failures after queue installation. Both must retire the same owner.
     try platform.allocator.checkAllAllocationFailures(a, Case.run, .{path});
+}
+
+const IncrementalFixture = struct {
+    fn session(a: std.mem.Allocator) !Session {
+        var store = NativeData{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+        errdefer store.deinitOwned();
+        try @import("testing/incremental_encoder_decoder.zig").populate(&store);
+        const owner = try a.create(ArchSession);
+        owner.* = .{ .allocator = a, .arch_config = .{ .whisper = @import("testing/incremental_encoder_decoder.zig").config }, .backend_type = .native, .backend_data = .{ .native = store } };
+        owner.model_lifetime.prepareFinalResources() catch |err| {
+            a.destroy(owner);
+            return err;
+        };
+        return archSessionHandle(owner);
+    }
+
+    fn features(a: std.mem.Allocator) !Tensor {
+        return Tensor.initFloat32(a, "input_features", &.{ 1, 2, 4 }, &.{ 0.2, 0.5, -0.1, 0.4, 0.3, -0.2, 0.7, 0.1 });
+    }
+
+    fn source(outputs: *@import("../backends/session.zig").ResidentOutputs, a: std.mem.Allocator, receiver: IncrementalDecoderAdapter.Receiver) !RetainedEncoderSource {
+        const shape = try outputs.backend.tensorShape(outputs.outputs[0], a);
+        defer a.free(shape);
+        if (shape.len != 3) return error.InvalidInputShape;
+        return .{ .receiver = receiver, .value = outputs.outputs[0], .backend = outputs.backend, .shape = .{ shape[0], shape[1], shape[2] }, .resources = try outputs.retainResources(a) };
+    }
+};
+
+test "native incremental resident source matches actual host encoder and KV steps after source and destination close" {
+    const a = std.testing.allocator;
+    const encoder = try IncrementalFixture.session(a);
+    var encoder_open = true;
+    defer if (encoder_open) encoder.close();
+    const destination = try IncrementalFixture.session(a);
+    var destination_open = true;
+    defer if (destination_open) destination.close();
+    var features = [_]Tensor{try IncrementalFixture.features(a)};
+    defer features[0].deinit();
+    const host = try encoder.run(&features, a);
+    defer {
+        for (host) |*value| value.deinit();
+        a.free(host);
+    }
+    var reference = (try whisperNativeDecoder(destination, a, null, host[0].asFloat32(), 2)).?;
+    var reference_open = true;
+    defer if (reference_open) reference.deinit();
+    const first = try reference.step(&.{ 0, 1 });
+    defer a.free(first);
+    const second = try reference.step(&.{2});
+    defer a.free(second);
+    reference.deinit();
+    reference_open = false;
+    var outputs = (try encoder.runResident(&features, a)).?;
+    var outputs_open = true;
+    defer if (outputs_open) outputs.deinit();
+    const resident_values = try outputs.backend.toFloat32(outputs.outputs[0], a);
+    defer a.free(resident_values);
+    try std.testing.expectEqualSlices(f32, host[0].asFloat32(), resident_values);
+    const receiver = IncrementalDecoderAdapter.qualify(encoder, destination).?;
+    try std.testing.expect(!receiver.same_model_owner);
+    var decoder = try IncrementalDecoderAdapter.fromResident(destination, a, null, try IncrementalFixture.source(&outputs, a, receiver));
+    defer decoder.deinit();
+    outputs.deinit();
+    outputs_open = false;
+    encoder.close();
+    encoder_open = false;
+    destination.close();
+    destination_open = false;
+    const actual_first = try decoder.step(&.{ 0, 1 });
+    defer a.free(actual_first);
+    const actual_second = try decoder.step(&.{2});
+    defer a.free(actual_second);
+    try std.testing.expectEqualSlices(f32, first, actual_first);
+    try std.testing.expectEqualSlices(f32, second, actual_second);
+    try std.testing.expectEqual(@as(usize, 3), decoder.positions());
+    try std.testing.expect(decoder.cache.layers[0].k_cross != decoder.encoder_hidden);
+}
+
+test "native incremental same-session receiver owns private compute and keeps zero-copy source alive" {
+    const a = std.testing.allocator;
+    const session = try IncrementalFixture.session(a);
+    var open = true;
+    defer if (open) session.close();
+    var features = [_]Tensor{try IncrementalFixture.features(a)};
+    defer features[0].deinit();
+    var outputs = (try session.runResident(&features, a)).?;
+    var outputs_open = true;
+    defer if (outputs_open) outputs.deinit();
+    const original_backend = outputs.backend.*;
+    const receiver = IncrementalDecoderAdapter.qualify(session, session).?;
+    try std.testing.expect(receiver.same_model_owner);
+    var decoder = try IncrementalDecoderAdapter.fromResident(session, a, null, try IncrementalFixture.source(&outputs, a, receiver));
+    defer decoder.deinit();
+    try std.testing.expect(original_backend.ptr != decoder.cb.backend.ptr);
+    try std.testing.expectEqual(original_backend.kind(), decoder.cb.backend.kind());
+    try std.testing.expect(decoder.cb.owns_backend);
+    try std.testing.expectEqual(outputs.outputs[0], decoder.encoder_hidden);
+    try std.testing.expect(!decoder.encoder_owned);
+    outputs.deinit();
+    outputs_open = false;
+    session.close();
+    open = false;
+    const logits = try decoder.step(&.{0});
+    defer a.free(logits);
+    try std.testing.expectEqual(@as(usize, 4), logits.len);
+}
+
+test "native incremental host receiver retains model through actual KV steps after Session close" {
+    const a = std.testing.allocator;
+    const session = try IncrementalFixture.session(a);
+    var open = true;
+    defer if (open) session.close();
+    const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+    var decoder = (try whisperNativeDecoder(session, a, null, &hidden, 2)).?;
+    defer decoder.deinit();
+    session.close();
+    open = false;
+    const logits = try decoder.step(&.{ 0, 1 });
+    defer a.free(logits);
+    try std.testing.expectEqual(@as(usize, 4), logits.len);
+    try std.testing.expectEqual(@as(usize, 2), decoder.positions());
+}
+
+test "native incremental constructor unwinds every allocation failure preserving complete resident source" {
+    const Probe = struct {
+        fn run(failing: std.mem.Allocator) !void {
+            const a = std.testing.allocator;
+            const session = try IncrementalFixture.session(a);
+            defer session.close();
+            const destination = try IncrementalFixture.session(a);
+            defer destination.close();
+            var features = [_]Tensor{try IncrementalFixture.features(a)};
+            defer features[0].deinit();
+            var outputs = (try session.runResident(&features, a)).?;
+            defer outputs.deinit();
+            const receiver = IncrementalDecoderAdapter.qualify(session, destination).?;
+            const source = try IncrementalFixture.source(&outputs, a, receiver);
+            var decoder = try IncrementalDecoderAdapter.fromResident(destination, failing, null, source);
+            defer decoder.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "native incremental actual cache tensors match canonical geometry and remain admitted through decoder destruction" {
+    const a = std.testing.allocator;
+    var controller = runtime.tier.memory.AdmissionController{};
+    defer controller.deinit();
+    var session = try IncrementalFixture.session(a);
+    var open = true;
+    defer if (open) session.close();
+    session.run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 16 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false };
+    const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+    var decoder = (try whisperNativeDecoder(session, a, null, &hidden, 2)).?;
+    var decoder_open = true;
+    defer if (decoder_open) decoder.deinit();
+    const geometry = try whisper_arch.CacheGeometry.init(decoder.config, 2);
+    const cache_amounts = try geometry.cacheAmounts(&decoder.cb.backend);
+    try std.testing.expectEqual(cache_amounts.host_kv_bytes, controller.snapshot().host_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_kv_bytes);
+    try std.testing.expectEqual(geometry.capacity, decoder.cache.capacity);
+    const cross = try decoder.cb.backend.toFloat32(decoder.cache.layers[0].k_cross, a);
+    defer a.free(cross);
+    const slab = try decoder.cb.backend.toFloat32(decoder.cache.layers[0].k_self.?, a);
+    defer a.free(slab);
+    try std.testing.expectEqual(geometry.cross_tensor_bytes, cross.len * @sizeOf(f32));
+    try std.testing.expectEqual(geometry.self_tensor_bytes, slab.len * @sizeOf(f32));
+    session.close();
+    open = false;
+    try std.testing.expectEqual(cache_amounts.host_kv_bytes, controller.snapshot().host_kv_bytes);
+    decoder.deinit();
+    decoder_open = false;
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+}
+
+test "native incremental private cache is denied before actual cache weight lookup and releases base request" {
+    const a = std.testing.allocator;
+    var controller = runtime.tier.memory.AdmissionController{};
+    defer controller.deinit();
+    const owner = try a.create(ArchSession);
+    owner.* = .{ .allocator = a, .arch_config = .{ .whisper = .{ .d_model = 4, .encoder_layers = 0, .decoder_layers = 1, .decoder_attention_heads = 2, .decoder_ffn_dim = 8, .vocab_size = 4, .max_target_positions = 8 } }, .backend_type = .native, .backend_data = .{ .native = .{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty } } };
+    var session = archSessionHandle(owner);
+    defer session.close();
+    session.run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
+    const geometry = try whisper_arch.CacheGeometry.init(owner.arch_config.whisper, 2);
+    var base = try incrementalBasePermit(session, owner.arch_config.whisper, geometry, false, false);
+    const base_amounts = base.lease.?.amounts;
+    base.deinit();
+    session.run_admission.?.limits.host_limit_bytes = base_amounts.hostTotalBytes();
+    var sizing_compute = native_mod.NativeCompute.init(a, &owner.backend_data.native, null);
+    defer sizing_compute.deinit();
+    const sizing_backend = sizing_compute.computeBackend();
+    const extra = try geometry.cacheAmounts(&sizing_backend);
+    // The incremental request fits alone. The live base reservation occupies
+    // the cap when the constructor requests its supplement, so ordinary
+    // admission classifies this as temporary capacity pressure.
+    try std.testing.expect(extra.hostTotalBytes() <= base_amounts.hostTotalBytes());
+    try std.testing.expect(extra.hostTotalBytes() > 0);
+
+    const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+    // This model deliberately has no decoder weights. Reaching Cache.init
+    // would produce MissingWeight rather than the expected admission failure.
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, whisperNativeDecoder(session, a, null, &hidden, 2));
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_kv_bytes);
+}
+
+test "native incremental stage receiver qualifies explicitly and keeps real source through task encoder retirement" {
+    const a = std.testing.allocator;
+    const stages = @import("encoder_decoder_runtime.zig");
+    const decoder_stage = @import("decoder_stage.zig");
+    const encoder = try IncrementalFixture.session(a);
+    defer encoder.close();
+    const destination = try IncrementalFixture.session(a);
+    defer destination.close();
+    var features = [_]Tensor{try IncrementalFixture.features(a)};
+    defer features[0].deinit();
+    var stateless = try stages.encodeWithPermit(a, encoder, destination, &features, null, null, null);
+    defer stateless.deinit(a);
+    try std.testing.expect(stateless == .host);
+    var reference = try decoder_stage.Decoder.init(a, destination, &stateless, 2, &.{ 1, 1 }, 4, null);
+    var reference_open = true;
+    defer if (reference_open) reference.deinit();
+    var first = try reference.step(&.{ 0, 1 }, null, null);
+    defer first.deinit();
+    var second = try reference.step(&.{ 0, 1, 2 }, null, null);
+    defer second.deinit();
+    reference.deinit();
+    reference_open = false;
+    var encoded = try stages.encodeForIncrementalWithPermit(a, encoder, destination, &features, null, null, null);
+    var encoded_open = true;
+    defer if (encoded_open) encoded.deinit(a);
+    try std.testing.expect(encoded == .resident);
+    var source = (try decoder_stage.retainIncrementalSource(a, &encoded, destination)).?;
+    var source_open = true;
+    defer if (source_open) source.deinit();
+    var runtime_decoder = try decoder_stage.Decoder.initWithSource(a, destination, &encoded, 2, &.{ 1, 1 }, 4, null, .{}, &source);
+    defer runtime_decoder.deinit();
+    source.deinit();
+    source_open = false;
+    encoded.deinit(a);
+    encoded_open = false;
+    var actual_first = try runtime_decoder.step(&.{ 0, 1 }, null, null);
+    defer actual_first.deinit();
+    var actual_second = try runtime_decoder.step(&.{ 0, 1, 2 }, null, null);
+    defer actual_second.deinit();
+    try std.testing.expectEqualSlices(f32, first.logits, actual_first.logits);
+    try std.testing.expectEqualSlices(f32, second.logits, actual_second.logits);
+}
+
+test "native incremental host constructor unwinds actual backend and cache allocation failures" {
+    const Probe = struct {
+        fn run(failing: std.mem.Allocator) !void {
+            const session = try IncrementalFixture.session(std.testing.allocator);
+            defer session.close();
+            const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+            var decoder = (try whisperNativeDecoder(session, failing, null, &hidden, 2)).?;
+            defer decoder.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "native incremental cancellation at actual destination gate preserves source owner and gate ownership" {
+    const a = std.testing.allocator;
+    const encoder = try IncrementalFixture.session(a);
+    defer encoder.close();
+    var destination = try IncrementalFixture.session(a);
+    defer destination.close();
+    var gate: std.atomic.Mutex = .unlocked;
+    try std.testing.expect(gate.tryLock());
+    var gate_locked = true;
+    defer if (gate_locked) gate.unlock();
+    destination.execution_gate = &gate;
+    var features = [_]Tensor{try IncrementalFixture.features(a)};
+    defer features[0].deinit();
+    var outputs = (try encoder.runResident(&features, a)).?;
+    defer outputs.deinit();
+    const receiver = IncrementalDecoderAdapter.qualify(encoder, destination).?;
+    var source = try IncrementalFixture.source(&outputs, a, receiver);
+    defer source.deinit();
+    const before = destination.model_lifetime.?.references.load(.acquire);
+    try std.testing.expectError(error.Timeout, IncrementalDecoderAdapter.fromResident(destination, a, .{ .deadline_ns = 0 }, try source.retained()));
+    try std.testing.expectEqual(before, destination.model_lifetime.?.references.load(.acquire));
+    try std.testing.expect(!gate.tryLock());
+    const values = try outputs.backend.toFloat32(outputs.outputs[0], a);
+    defer a.free(values);
+    try std.testing.expectEqual(@as(usize, 8), values.len);
+    gate.unlock();
+    gate_locked = false;
+    var decoder = try IncrementalDecoderAdapter.fromResident(destination, a, null, try source.retained());
+    defer decoder.deinit();
+    const logits = try decoder.step(&.{0});
+    defer a.free(logits);
+    try std.testing.expectEqual(@as(usize, 4), logits.len);
+}
+
+test "native incremental borrowed provider retires pending command callbacks before actual encoder and KV storage" {
+    const a = std.testing.allocator;
+    var cleanup = try ReceiverCleanup.beginStandalone();
+    var cleanup_moved = false;
+    defer if (!cleanup_moved) cleanup.finish();
+    const Probe = struct {
+        compute: native_mod.NativeCompute,
+        submitted: bool = false,
+        encoded: bool = false,
+        fail_wait: bool = false,
+        fail_cancel: bool = false,
+        frees: usize = 0,
+        waits: usize = 0,
+        cancels: usize = 0,
+        fn from(raw: *anyopaque) *@This() {
+            const compute: *native_mod.NativeCompute = @ptrCast(@alignCast(raw));
+            return @fieldParentPtr("compute", compute);
+        }
+        fn wait(raw: *anyopaque) !void {
+            const self = from(raw);
+            self.waits += 1;
+            if (self.fail_wait) return error.InjectedPendingRetirementFailure;
+            self.submitted = false;
+        }
+        fn active(raw: *anyopaque) bool {
+            return from(raw).encoded;
+        }
+        fn cancel(raw: *anyopaque) !void {
+            const self = from(raw);
+            std.debug.assert(!self.submitted);
+            self.cancels += 1;
+            if (self.fail_cancel) return error.InjectedPendingCancellationFailure;
+            self.encoded = false;
+        }
+        fn free(raw: *anyopaque, value: ops.CT) void {
+            const self = from(raw);
+            std.debug.assert(!self.submitted and !self.encoded);
+            self.frees += 1;
+            native_mod.vtable_impl.freeTensor(raw, value);
+        }
+    };
+    var weights = NativeData{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer weights.deinitOwned();
+    try @import("testing/incremental_encoder_decoder.zig").populate(&weights);
+    var probe = Probe{ .compute = native_mod.NativeCompute.init(a, &weights, null) };
+    defer probe.compute.deinit();
+    var table = native_mod.vtable_impl;
+    table.regions.commands.waitSubmittedFrame = Probe.wait;
+    table.regions.commands.hasActiveFrame = Probe.active;
+    table.regions.commands.cancelFrame = Probe.cancel;
+    table.freeTensor = Probe.free;
+    const cb = ops.ComputeBackend{ .ptr = &probe.compute, .vtable = &table };
+    const config = @import("testing/incremental_encoder_decoder.zig").config;
+    const mel = try cb.fromFloat32Shape(&.{ 0.2, 0.5, -0.1, 0.4, 0.3, -0.2, 0.7, 0.1 }, &.{ 1, 2, 4 });
+    defer cb.free(mel);
+    const encoded = try whisper_arch.encoderForwardTensor(&cb, a, config, mel, 1, 4);
+    const values = try a.alloc(ops.CT, 1);
+    values[0] = encoded;
+    var outputs = ResidentOutputs{ .outputs = values, .backend = &cb, .allocator = a };
+    var outputs_open = true;
+    defer if (outputs_open) outputs.deinit();
+    const source = try outputs.retainResources(a);
+    var source_open = true;
+    defer if (source_open) source.release();
+    const cache = try whisper_arch.DecodeCache.init(&cb, a, config, encoded, 2);
+    var decoder = WhisperNativeDecoder{ .allocator = a, .cb = .{ .backend = cb, .guard = .{}, .owns_backend = false }, .config = config, .encoder_hidden = encoded, .cache = cache, .gate = null, .encoder_owned = false, .source_resources = source, .receiver_cleanup = cleanup };
+    cleanup_moved = true;
+    source_open = false;
+    var decoder_open = true;
+    defer if (decoder_open) decoder.deinit();
+    outputs.deinit();
+    outputs_open = false;
+    const logits = try decoder.step(&.{0});
+    defer a.free(logits);
+    const before_frees = probe.frees;
+    probe.submitted = true;
+    probe.encoded = true;
+    probe.fail_wait = true;
+    try std.testing.expectError(error.InjectedPendingRetirementFailure, WhisperNativeDecoder.retirePending(&cb));
+    try std.testing.expect(probe.submitted and probe.encoded);
+    try std.testing.expectEqual(before_frees, probe.frees);
+    probe.fail_wait = false;
+    probe.fail_cancel = true;
+    try std.testing.expectError(error.InjectedPendingCancellationFailure, WhisperNativeDecoder.retirePending(&cb));
+    try std.testing.expect(!probe.submitted and probe.encoded);
+    try std.testing.expectEqual(before_frees, probe.frees);
+    probe.fail_cancel = false;
+    decoder.deinit();
+    decoder_open = false;
+    try std.testing.expect(!probe.submitted and !probe.encoded);
+    try std.testing.expectEqual(@as(usize, 3), probe.waits);
+    try std.testing.expectEqual(@as(usize, 2), probe.cancels);
+    try std.testing.expect(probe.frees > before_frees);
+}
+
+fn incrementalMetalFixtureSession(a: std.mem.Allocator) !Session {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    var native_weights = NativeData{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer native_weights.deinitOwned();
+    try @import("testing/incremental_encoder_decoder.zig").populate(&native_weights);
+    var hosted = GpuHostedData{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    errdefer @import("../backends/compute_factory.zig").closeMetalWeights(a, &hosted);
+    var iterator = native_weights.resident_weights.iterator();
+    while (iterator.next()) |entry| {
+        const key = try a.dupe(u8, entry.key_ptr.*);
+        errdefer a.free(key);
+        const reference_name = try a.dupe(u8, entry.key_ptr.*);
+        errdefer a.free(reference_name);
+        var value = try Tensor.initFloat32(a, key, entry.value_ptr.tensor.shape, entry.value_ptr.tensor.asFloat32());
+        errdefer value.deinit();
+        try hosted.lazy_weights.put(a, key, .{ .tensor_ref = .{ .name = reference_name }, .host_loaded = .{ .tensor = value } });
+    }
+    try @import("../backends/compute_factory.zig").initializeMetalWeightPrefetch(a, &hosted, false);
+    const owner = try a.create(ArchSession);
+    owner.* = .{ .allocator = a, .arch_config = .{ .whisper = @import("testing/incremental_encoder_decoder.zig").config }, .backend_type = .metal, .backend_data = .{ .metal = hosted } };
+    owner.model_lifetime.prepareFinalResources() catch |err| {
+        a.destroy(owner);
+        return err;
+    };
+    return archSessionHandle(owner);
+}
+
+test "native incremental actual Metal owned provider preserves source lease and two KV steps across retries" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const session = try incrementalMetalFixtureSession(a);
+    defer session.close();
+    const control = InferenceExecutionControl{ .native_call_policy = .in_process };
+    var features = [_]Tensor{try IncrementalFixture.features(a)};
+    defer features[0].deinit();
+    const host = try session.runWithControl(&features, a, control);
+    defer {
+        for (host) |*value| value.deinit();
+        a.free(host);
+    }
+    var reference = (try whisperNativeDecoder(session, a, control, host[0].asFloat32(), 2)).?;
+    var reference_open = true;
+    defer if (reference_open) reference.deinit();
+    const first = try reference.step(&.{ 0, 1 });
+    defer a.free(first);
+    const second = try reference.step(&.{2});
+    defer a.free(second);
+    reference.deinit();
+    reference_open = false;
+    var encoder_permit = try session.admitInputs(&features, a, control);
+    defer encoder_permit.deinit();
+    try encoder_permit.prepareResidentOutputRetirement();
+    var outputs = (try encoder_permit.runResidentWithControl(&features, a, control)).?;
+    if (outputs.resource_lease == null) {
+        outputs.resource_lease = encoder_permit.lease;
+        encoder_permit.lease = null;
+    }
+    var outputs_open = true;
+    defer if (outputs_open) outputs.deinit();
+    const source_cb = outputs.backend.*;
+    const source_compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(source_cb.ptr));
+    const receiver = IncrementalDecoderAdapter.qualify(session, session).?;
+    try std.testing.expect(receiver.same_model_owner);
+    var source = try IncrementalFixture.source(&outputs, a, receiver);
+    defer source.deinit();
+    outputs.deinit();
+    outputs_open = false;
+    for (0..2) |_| {
+        const before = @import("../ops/media_residency_test.zig").Transfers.snapshot(source_cb);
+        var decoder = try IncrementalDecoderAdapter.fromResident(session, a, control, try source.retained());
+        var decoder_open = true;
+        defer if (decoder_open) decoder.deinit();
+        const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(decoder.cb.backend.ptr));
+        try std.testing.expect(source_cb.ptr != decoder.cb.backend.ptr);
+        try std.testing.expectEqual(source_compute.provider_impl, compute.provider_impl);
+        try std.testing.expect(compute.shared_provider_lease_io == null);
+        try std.testing.expect(source_compute.shared_provider_lease_io != null);
+        try std.testing.expect(decoder.cb.owns_backend and !decoder.encoder_owned);
+        try std.testing.expectEqual(source.value, decoder.encoder_hidden);
+        try before.expectUnchanged(source_cb);
+        const actual_first = try decoder.step(&.{ 0, 1 });
+        defer a.free(actual_first);
+        const actual_second = try decoder.step(&.{2});
+        defer a.free(actual_second);
+        for (first, actual_first) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0001);
+        for (second, actual_second) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0001);
+        try std.testing.expectEqual(@as(usize, 3), decoder.positions());
+        decoder.deinit();
+        decoder_open = false;
+        // Nested compute retirement must leave the real source lease held;
+        // acquiring an unrelated numerical owner still fails immediately.
+        const owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
+        try std.testing.expectError(error.QueueFull, metal_compute_mod.MetalCompute.init(a, gpuBackendData(owner), null));
+        try std.testing.expect(source_compute.shared_provider_lease_io != null);
+    }
+}
+
+const IncrementalAggregateGateFixture = struct {
+    const tokenizer_json = "{\"version\":\"1.0\",\"added_tokens\":[{\"id\":0,\"content\":\"<unk>\"},{\"id\":10,\"content\":\"<|en|>\"},{\"id\":11,\"content\":\"<|es|>\"},{\"id\":12,\"content\":\"<|transcribe|>\"},{\"id\":13,\"content\":\"<|notimestamps|>\"}],\"model\":{\"type\":\"BPE\",\"vocab\":{\"<unk>\":0,\"<|en|>\":10,\"<|es|>\":11,\"<|transcribe|>\":12,\"<|notimestamps|>\":13},\"merges\":[]}}";
+    fn write(dir: std.Io.Dir) !void {
+        try dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"t5\",\"d_model\":4,\"num_heads\":2,\"num_layers\":1,\"vocab_size\":4}" });
+        try dir.writeFile(std.testing.io, .{ .sub_path = "tokenizer.json", .data = tokenizer_json });
+    }
+    fn inside(gate: ?*std.atomic.Mutex, aggregate: *anyopaque, size: usize) bool {
+        const address = @intFromPtr(gate orelse return false);
+        const start = @intFromPtr(aggregate);
+        return address >= start and address - start < size;
+    }
+    fn tokenizer(_: *anyopaque, _: []const u8) !@import("../models/managed_tokenizer.zig").Managed {
+        return .{ .tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(std.testing.allocator, tokenizer_json) };
+    }
+    fn session(_: *anyopaque, _: []const u8, _: []const BackendType, _: ?*@import("../backends/imported_onnx_session.zig").SharedBackendContext, control: ?InferenceExecutionControl) !@import("../models/session_loader.zig").ManagedSession {
+        if (control) |active| try active.check();
+        return .{ .session = try IncrementalFixture.session(std.testing.allocator) };
+    }
+    fn plan(raw: *anyopaque, _: []const u8, _: []const BackendType, paths: []const []const u8) !@import("../models/component_loader.zig").ComponentLoader {
+        var loader = @import("../models/component_loader.zig").ComponentLoader{ .services = .{ .allocator = std.testing.allocator, .context = raw, .load_session_fn = session, .load_tokenizer_fn = tokenizer } };
+        loader.allowed_backends[0] = .native;
+        loader.allowed_backend_count = 1;
+        for (paths) |path| try loader.addComponentPath(path);
+        return loader;
+    }
+    fn identity(_: *anyopaque, _: @import("../models/composite_runtime.zig").Request) ![32]u8 {
+        return @splat(7);
+    }
+    fn loaded(path: []const u8, sessions: *@import("../backends/backends.zig").SessionManager) !*@import("../models/loaded_runtime.zig").Runtime {
+        const a = std.testing.allocator;
+        const owner = @import("../models/loaded_runtime.zig");
+        var manifest = try manifest_mod.loadFromDir(a, path);
+        var manifest_open = true;
+        defer if (manifest_open) manifest.deinit();
+        const native_session = try IncrementalFixture.session(a);
+        var session_open = true;
+        defer if (session_open) native_session.close();
+        const tok = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_json);
+        var tokenizer_open = true;
+        defer if (tokenizer_open) tok.deinitSelf();
+        const revision = try owner.resolutionModelRevision(a, std.testing.io, manifest);
+        const assets = owner.Assets{ .manifest = manifest, .hf_tok = tok, .sp_tok = null, .session = .{ .session = native_session }, .session_manager = sessions, .host = owner.Host.unmanaged(), .model_dir = path, .preparation_io = std.testing.io, .executor_io = std.testing.io, .resolution_revision = revision, .resolution_file_revision = revision, .native_kv_asset_generation = null, .tokenizer_type = .huggingface, .embedding_signature = null, .tokenizer_resource_lease = null, .kernel_jit_profile_bundle = null };
+        manifest_open = false;
+        session_open = false;
+        tokenizer_open = false;
+        return owner.Runtime.fromOwnedAssets(a, assets, null);
+    }
+};
+
+test "native incremental real LoadedModel destruction cannot retire retained decoder execution gate" {
+    const a = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try IncrementalAggregateGateFixture.write(temporary.dir);
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temporary.sub_path[0..] });
+    defer a.free(path);
+    var sessions = @import("../backends/backends.zig").SessionManager.init(a);
+    const model = try IncrementalAggregateGateFixture.loaded(path, &sessions);
+    var model_open = true;
+    defer if (model_open) {
+        model.deinit();
+        a.destroy(model);
+    };
+    const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+    var decoder = (try whisperNativeDecoder(model.session, a, null, &hidden, 2)).?;
+    var decoder_open = true;
+    defer if (decoder_open) decoder.deinit();
+    try std.testing.expect(decoder.gate != null);
+    try std.testing.expectEqual(model.session.execution_gate, decoder.gate);
+    const gate_in_aggregate = IncrementalAggregateGateFixture.inside(decoder.gate, model, @sizeOf(@import("../models/loaded_runtime.zig").Runtime));
+    // Bounded old-route canary: record the invalid lifetime before destroying
+    // the real aggregate. Detach only that already-proven stale cleanup pointer
+    // so the failure is an assertion instead of touching freed mutex storage.
+    if (gate_in_aggregate) decoder.gate = null;
+    model.deinit();
+    a.destroy(model);
+    model_open = false;
+    const logits = try decoder.step(&.{0});
+    defer a.free(logits);
+    try std.testing.expectEqual(@as(usize, 4), logits.len);
+    decoder.deinit();
+    decoder_open = false;
+    try std.testing.expect(!gate_in_aggregate);
+}
+
+test "native incremental real CompositeAssets destruction cannot retire retained decoder execution gate" {
+    const a = std.testing.allocator;
+    const composites = @import("../models/composite_runtime.zig");
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try IncrementalAggregateGateFixture.write(temporary.dir);
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temporary.sub_path[0..] });
+    defer a.free(path);
+    var token: u8 = 0;
+    const assets = try composites.load(a, .{ .context = &token, .io = std.testing.io, .load_tokenizer_fn = IncrementalAggregateGateFixture.tokenizer, .plan_components_fn = IncrementalAggregateGateFixture.plan, .identity_fn = IncrementalAggregateGateFixture.identity }, .{ .model_dir = path, .component_paths = &.{ "encoder.onnx", "decoder.onnx" }, .preferred_backends = &.{.native}, .asset_generation = @splat(7), .runtime_id = 19, .model_type = .rewriter, .kind = .seq2seq }, null);
+    var assets_open = true;
+    defer if (assets_open) {
+        assets.deinit();
+        a.destroy(assets);
+    };
+    const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+    var decoder = (try whisperNativeDecoder(assets.decoder.?.session, a, null, &hidden, 2)).?;
+    var decoder_open = true;
+    defer if (decoder_open) decoder.deinit();
+    try std.testing.expect(decoder.gate != null);
+    try std.testing.expectEqual(assets.decoder.?.session.execution_gate, decoder.gate);
+    const gate_in_aggregate = IncrementalAggregateGateFixture.inside(decoder.gate, assets, @sizeOf(composites.CompositeAssets));
+    if (gate_in_aggregate) decoder.gate = null;
+    assets.deinit();
+    a.destroy(assets);
+    assets_open = false;
+    const logits = try decoder.step(&.{0});
+    defer a.free(logits);
+    try std.testing.expectEqual(@as(usize, 4), logits.len);
+    decoder.deinit();
+    decoder_open = false;
+    try std.testing.expect(!gate_in_aggregate);
+}
+
+fn retainedDecoderFixtureSession(allocator: std.mem.Allocator) !Session {
+    var store = NativeData{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty };
+    errdefer store.deinitOwned();
+    try @import("testing/decoder.zig").populate(&store);
+    const owner = try allocator.create(ArchSession);
+    owner.* = .{ .allocator = allocator, .arch_config = .{ .gpt = @import("testing/decoder.zig").config() }, .backend_type = .native, .backend_data = .{ .native = store } };
+    owner.model_lifetime.prepareFinalResources() catch |err| {
+        allocator.destroy(owner);
+        return err;
+    };
+    return archSessionHandle(owner);
+}
+
+fn retainedDecoderFixtureModel(path: []const u8, sessions: *@import("../backends/backends.zig").SessionManager, source: Session) !*@import("../models/loaded_runtime.zig").Runtime {
+    const a = std.testing.allocator;
+    const owner = @import("../models/loaded_runtime.zig");
+    var source_open = true;
+    defer if (source_open) source.close();
+    var manifest = try manifest_mod.loadFromDir(a, path);
+    var manifest_open = true;
+    defer if (manifest_open) manifest.deinit();
+    const revision = try owner.resolutionModelRevision(a, std.testing.io, manifest);
+    const assets = owner.Assets{ .manifest = manifest, .hf_tok = null, .sp_tok = null, .session = .{ .session = source }, .session_manager = sessions, .host = owner.Host.unmanaged(), .model_dir = path, .preparation_io = std.testing.io, .executor_io = std.testing.io, .resolution_revision = revision, .resolution_file_revision = revision, .native_kv_asset_generation = null, .tokenizer_type = .huggingface, .embedding_signature = null, .tokenizer_resource_lease = null, .kernel_jit_profile_bundle = null };
+    source_open = false;
+    manifest_open = false;
+    return owner.Runtime.fromOwnedAssets(a, assets, null);
+}
+
+fn writeRetainedDecoderConfig(dir: std.Io.Dir) !void {
+    try dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"llama\",\"hidden_size\":64,\"num_hidden_layers\":1,\"num_attention_heads\":1,\"intermediate_size\":128,\"vocab_size\":2,\"max_position_embeddings\":64,\"tie_word_embeddings\":true}" });
+}
+
+test "owned decoder runtime retains actual Native model across executor and LoadedModel destruction" {
+    const a = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try writeRetainedDecoderConfig(temporary.dir);
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temporary.sub_path[0..] });
+    defer a.free(path);
+    var sessions = @import("../backends/backends.zig").SessionManager.init(a);
+    const model = try retainedDecoderFixtureModel(path, &sessions, try retainedDecoderFixtureSession(a));
+    var model_open = true;
+    defer if (model_open) {
+        model.deinit();
+        a.destroy(model);
+    };
+    const lifetime = model.session.model_lifetime.?;
+    const before = lifetime.references.load(.acquire);
+    var executor = (try @import("model_candidate.zig").createSessionExecutor(a, model.session, .{ .kv_dtype = .f32 })).?;
+    var executor_open = true;
+    defer if (executor_open) executor.deinit();
+    var physical = try executor.createRuntime(a);
+    var physical_open = true;
+    defer if (physical_open) physical.deinit();
+    executor.deinit();
+    executor_open = false;
+    const model_retained = lifetime.references.load(.acquire) > before;
+    // Real aggregate destruction follows below. The old implementation has no
+    // pin: hold one explicit bounded safety reference solely so the canary can
+    // report the missing owner without dereferencing destroyed weight storage.
+    const safety = lifetime.retain();
+    var safety_open = true;
+    defer {
+        if (physical_open) {
+            physical.deinit();
+            physical_open = false;
+        }
+        if (safety_open) safety.release();
+    }
+    model.deinit();
+    a.destroy(model);
+    model_open = false;
+    if (model_retained) {
+        safety.release();
+        safety_open = false;
+    }
+    var output = try physical.prefill(a, .{ .input_ids = &.{ 0, 1 }, .seq_len = 2, .query_seq_len = 2, .attention_mode = .full_recompute });
+    var output_open = true;
+    defer if (output_open) output.deinit(a);
+    const logits = try output.takeHostLogits(a);
+    defer a.free(logits);
+    try std.testing.expectEqual(@as(usize, 2), logits.len);
+    output.deinit(a);
+    output_open = false;
+    physical.deinit();
+    physical_open = false;
+    if (safety_open) {
+        safety.release();
+        safety_open = false;
+    }
+    try std.testing.expect(model_retained);
+}
+
+fn retainedDecoderMetalFixtureSession(a: std.mem.Allocator) !Session {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    var native_weights = NativeData{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer native_weights.deinitOwned();
+    try @import("testing/decoder.zig").populate(&native_weights);
+    var hosted = GpuHostedData{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    errdefer @import("../backends/compute_factory.zig").closeMetalWeights(a, &hosted);
+    var iterator = native_weights.resident_weights.iterator();
+    while (iterator.next()) |entry| {
+        const key = try a.dupe(u8, entry.key_ptr.*);
+        errdefer a.free(key);
+        const reference_name = try a.dupe(u8, entry.key_ptr.*);
+        errdefer a.free(reference_name);
+        var value = try Tensor.initFloat32(a, key, entry.value_ptr.tensor.shape, entry.value_ptr.tensor.asFloat32());
+        errdefer value.deinit();
+        try hosted.lazy_weights.put(a, key, .{ .tensor_ref = .{ .name = reference_name }, .host_loaded = .{ .tensor = value } });
+    }
+    try @import("../backends/compute_factory.zig").initializeMetalWeightPrefetch(a, &hosted, false);
+    const owner = try a.create(ArchSession);
+    owner.* = .{ .allocator = a, .arch_config = .{ .gpt = @import("testing/decoder.zig").config() }, .backend_type = .metal, .backend_data = .{ .metal = hosted } };
+    owner.model_lifetime.prepareFinalResources() catch |err| {
+        a.destroy(owner);
+        return err;
+    };
+    return archSessionHandle(owner);
+}
+
+test "owned decoder ModelOutput retains actual Metal model after runtime and LoadedModel destruction" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try writeRetainedDecoderConfig(temporary.dir);
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temporary.sub_path[0..] });
+    defer a.free(path);
+    var sessions = @import("../backends/backends.zig").SessionManager.init(a);
+    const model = try retainedDecoderFixtureModel(path, &sessions, try retainedDecoderMetalFixtureSession(a));
+    var model_open = true;
+    defer if (model_open) {
+        model.deinit();
+        a.destroy(model);
+    };
+    const lifetime = model.session.model_lifetime.?;
+    var source_compute = try getComputeBackendWithControl(model.session, a, .{ .native_call_policy = .in_process });
+    var source_compute_open = true;
+    defer if (source_compute_open) source_compute.deinit();
+    const before = lifetime.references.load(.acquire);
+    var executor = (try @import("model_candidate.zig").createSessionExecutor(a, model.session, .{ .kv_dtype = .f16 })).?;
+    var executor_open = true;
+    defer if (executor_open) executor.deinit();
+    var physical = try executor.createRuntime(a);
+    var physical_open = true;
+    defer if (physical_open) physical.deinit();
+    executor.deinit();
+    executor_open = false;
+    const safety = lifetime.retain();
+    var safety_open = true;
+    defer {
+        if (physical_open) {
+            physical.deinit();
+            physical_open = false;
+        }
+        if (safety_open) safety.release();
+    }
+    // The private cached runtime deliberately stores no request token. This
+    // fixture owns the actual Engine, so route its live capability explicitly
+    // through the request rather than trying to reacquire its provider gate.
+    var output = try physical.prefill(a, .{ .execution_control = .{ .native_call_policy = .in_process }, .backend_operation = source_compute.backend.operationToken(), .input_ids = &.{1}, .seq_len = 1, .query_seq_len = 1, .attention_mode = .paged_prefill });
+    var output_open = true;
+    defer if (output_open) output.deinit(a);
+    // Only a published resident output can prove the output-owner contract.
+    // A host fallback cannot substitute for retained device storage here.
+    if (output.device_logits == null and output.prepared_tail == null) return error.MetalRetainedOutputUnexpectedHostFallback;
+    if (output.owner == null) return error.MetalRetainedOutputMissingRuntimeOwner;
+    const retained_model = lifetime.references.load(.acquire) > before + 1;
+    physical.deinit();
+    physical_open = false;
+    source_compute.deinit();
+    source_compute_open = false;
+    model.deinit();
+    a.destroy(model);
+    model_open = false;
+    if (retained_model) {
+        safety.release();
+        safety_open = false;
+    }
+    const owner_before_failed_materialization = output.owner.?.ptr;
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, output.hostLogits(failing.allocator()));
+    if (output.owner == null) return error.MetalRetainedOutputLostOwnerOnFailedMaterialization;
+    if (output.owner.?.ptr != owner_before_failed_materialization) return error.MetalRetainedOutputChangedOwnerOnFailedMaterialization;
+    const logits = try output.takeHostLogits(a);
+    defer a.free(logits);
+    try std.testing.expectEqual(@as(usize, 2), logits.len);
+    for (logits) |value| try std.testing.expect(std.math.isFinite(value));
+    output.deinit(a);
+    output_open = false;
+    if (safety_open) {
+        safety.release();
+        safety_open = false;
+    }
+    if (!retained_model) return error.MetalRetainedOutputMissingModelPin;
+}
+
+const WhisperPendingObservationFixture = struct {
+    const Probe = struct {
+        observed: bool,
+        active: bool = false,
+        submitted: bool = false,
+        fail_submit: bool = false,
+        fail_wait: bool = false,
+        fail_cancel: bool = false,
+        destroyed: bool = false,
+        submits: usize = 0,
+        waits: usize = 0,
+        reads: usize = 0,
+        cancels: usize = 0,
+        fn get(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn check(self: *@This()) !void {
+            if (self.destroyed) return error.WhisperPendingOwnerRetired;
+            if (@import("allocation_registry.zig").enabled() != self.observed) return error.WhisperPendingDisabledPathChanged;
+        }
+        fn kind(_: *anyopaque) ops.BackendKind {
+            return .native;
+        }
+        fn submit(raw: *anyopaque) !void {
+            const self = get(raw);
+            try self.check();
+            self.submits += 1;
+            if (self.fail_submit) return error.WhisperSubmitFailure;
+            self.submitted = true;
+        }
+        fn wait(raw: *anyopaque) !void {
+            const self = get(raw);
+            try self.check();
+            self.waits += 1;
+            if (self.fail_wait) return error.WhisperAwaitFailure;
+            self.submitted = false;
+        }
+        fn activeFrame(raw: *anyopaque) bool {
+            return get(raw).active;
+        }
+        fn cancel(raw: *anyopaque) !void {
+            const self = get(raw);
+            try self.check();
+            self.cancels += 1;
+            if (self.fail_cancel) return error.WhisperCancelFailure;
+            self.active = false;
+        }
+        fn stats(raw: *anyopaque, slot: usize, values: *ops.WhisperLogitsStatsRaw) bool {
+            const self = get(raw);
+            std.debug.assert(!self.destroyed and slot == 0 and !self.submitted);
+            self.reads += 1;
+            values.* = @splat(0);
+            return true;
+        }
+        fn destroy(raw: *anyopaque) void {
+            get(raw).destroyed = true;
+        }
+    };
+};
+
+test "Whisper pending owner observes submit await cancel failures and disabled parity without claiming interval GPU completion" {
+    const F = WhisperPendingObservationFixture;
+    for (0..5) |mode| {
+        const enabled = mode != 0;
+        var probe = F.Probe{ .observed = enabled, .fail_submit = mode == 2, .fail_wait = mode == 3, .fail_cancel = mode == 4 };
+        var lifetime = Session.ModelLifetime{ .owner = &probe, .destroy_fn = F.Probe.destroy };
+        var original_model = true;
+        defer if (original_model) lifetime.release();
+        var diagnostics = @import("diagnostics.zig").Diagnostics{};
+        diagnostics.configure(enabled);
+        var table = @import("../ops/native_compute.zig").vtable_impl;
+        table.backendKind = F.Probe.kind;
+        table.registerRuntimeObservation = null;
+        table.debugTimingSnapshot = null;
+        table.regions.commands.submitFrame = F.Probe.submit;
+        table.regions.commands.waitSubmittedFrame = F.Probe.wait;
+        table.regions.commands.hasActiveFrame = F.Probe.activeFrame;
+        table.regions.commands.cancelFrame = F.Probe.cancel;
+        table.regions.token_selection.readLogitsStats = F.Probe.stats;
+        const backend = ops.ComputeBackend{ .ptr = &probe, .vtable = &table };
+        var decoder = WhisperNativeDecoder{ .allocator = std.testing.allocator, .cb = .{ .backend = backend, .guard = undefined, .owns_backend = false }, .config = undefined, .encoder_hidden = undefined, .cache = undefined, .gate = null, .destination_model = &lifetime, .diagnostics_binding = .{ .diagnostics = &diagnostics } };
+        // This phase fixture has no numerical cache/encoder allocation. Its
+        // exact backend and publication owner remain live until every callback.
+        defer decoder.pending_observation.deinit();
+        if (mode == 2) {
+            try std.testing.expectError(error.WhisperSubmitFailure, decoder.submit());
+        } else try decoder.submit();
+        var identity: u64 = 0;
+        if (enabled) {
+            const submitted = diagnostics.snapshot().?;
+            identity = submitted.pending_interval.?.identity;
+            try std.testing.expect(submitted.pending_interval.?.phase == .submit and submitted.pending_interval.?.completion == .unavailable);
+            try std.testing.expectEqual(mode == 2, submitted.outcome == .failed);
+            lifetime.release();
+            original_model = false;
+            try std.testing.expect(!probe.destroyed);
+        } else try std.testing.expect(diagnostics.snapshot() == null);
+        if (mode != 2) {
+            if (mode == 3) {
+                try std.testing.expectError(error.WhisperAwaitFailure, decoder.awaitStats(0));
+                const failed = diagnostics.snapshot().?;
+                try std.testing.expect(failed.outcome == .failed and failed.pending_interval.?.completion == .unavailable);
+            } else {
+                try std.testing.expect((try decoder.awaitStats(0)) != null);
+                if (enabled) try std.testing.expect(diagnostics.snapshot().?.pending_interval.?.completion == .readback_returned);
+            }
+            if (mode != 3) {
+                probe.active = true;
+                decoder.discard();
+                if (enabled) {
+                    const cancelled = diagnostics.snapshot().?;
+                    try std.testing.expect(cancelled.pending_interval.?.phase == .cancel and cancelled.pending_interval.?.completion == .unavailable);
+                    try std.testing.expectEqual(mode == 4, cancelled.outcome == .failed);
+                }
+            }
+        }
+        probe.fail_submit = false;
+        probe.fail_wait = false;
+        probe.fail_cancel = false;
+        if (mode <= 1) {
+            diagnostics.configure(false);
+            probe.observed = false;
+            probe.active = true;
+            decoder.discard();
+        }
+        decoder.drain();
+        if (mode <= 1) {
+            try std.testing.expect(diagnostics.snapshot() == null);
+            try std.testing.expectEqual(@as(usize, 1), probe.submits);
+            try std.testing.expectEqual(@as(usize, 2), probe.waits);
+            try std.testing.expectEqual(@as(usize, 1), probe.reads);
+            try std.testing.expectEqual(@as(usize, 2), probe.cancels);
+        } else {
+            const drained = diagnostics.snapshot().?;
+            try std.testing.expectEqual(identity, drained.pending_interval.?.identity);
+            try std.testing.expect(drained.pending_interval.?.phase == .drain and drained.pending_interval.?.completion == .unavailable);
+            const failure: []const u8 = if (mode == 2) "WhisperSubmitFailure" else if (mode == 3) "WhisperAwaitFailure" else "WhisperCancelFailure";
+            try std.testing.expectEqualStrings(failure, drained.pending_interval.?.prior_failure.?.view());
+            try std.testing.expect(drained.pending_interval.?.whole_interval_counters == .unavailable);
+        }
+        decoder.pending_observation.deinit();
+        try std.testing.expectEqual(enabled, probe.destroyed);
+        try std.testing.expect(!@import("allocation_registry.zig").enabled());
+    }
+}
+
+test "actual Native Whisper numerical decoder publishes rejected pending operations through its retained model owner" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const session = try IncrementalFixture.session(a);
+    var session_open = true;
+    defer if (session_open) session.close();
+    try std.testing.expect(session.configureExecutionDiagnostics(true));
+    const diagnostics = session.invocation_diagnostics.?.diagnostics;
+    var features = [_]Tensor{try IncrementalFixture.features(a)};
+    defer features[0].deinit();
+    const encoded = try session.run(&features, a);
+    defer {
+        for (encoded) |*value| value.deinit();
+        a.free(encoded);
+    }
+    var decoder = (try whisperNativeDecoder(session, a, null, encoded[0].asFloat32(), 2)).?;
+    defer decoder.deinit();
+    const logits = try decoder.step(&.{ 0, 1 });
+    defer a.free(logits);
+    try std.testing.expectEqual(@as(usize, @import("testing/incremental_encoder_decoder.zig").config.vocab_size), logits.len);
+    try std.testing.expect(diagnostics.snapshot().?.outcome == .success);
+    session.close();
+    session_open = false;
+    try std.testing.expectError(error.UnsupportedOperation, decoder.submit());
+    const rejected = diagnostics.snapshot().?;
+    try std.testing.expect(rejected.outcome == .failed and rejected.pending_interval.?.phase == .submit);
+    try std.testing.expectEqualStrings("UnsupportedOperation", rejected.error_name.?.view());
+    try std.testing.expect((try decoder.awaitStats(0)) == null);
+    const unavailable = diagnostics.snapshot().?;
+    try std.testing.expect(unavailable.outcome == .unsupported and unavailable.pending_interval.?.completion == .unavailable);
+    try std.testing.expectEqual(@as(usize, 2), decoder.positions());
+}
+
+test "actual opt-in Metal Whisper pipelined numerical step preserves encoded submit await observation phases" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const session = try incrementalMetalFixtureSession(a);
+    defer session.close();
+    try std.testing.expect(session.configureExecutionDiagnostics(true));
+    const diagnostics = session.invocation_diagnostics.?.diagnostics;
+    const control = InferenceExecutionControl{ .native_call_policy = .in_process };
+    var features = [_]Tensor{try IncrementalFixture.features(a)};
+    defer features[0].deinit();
+    const encoded = try session.runWithControl(&features, a, control);
+    defer {
+        for (encoded) |*value| value.deinit();
+        a.free(encoded);
+    }
+    var decoder = (try whisperNativeDecoder(session, a, control, encoded[0].asFloat32(), 2)).?;
+    defer decoder.deinit();
+    const prefix = try decoder.step(&.{ 0, 1 });
+    defer a.free(prefix);
+    // The numerical profile is explicitly opt-in. Absence of support is not
+    // replaced by an eager replay or a fabricated completion observation.
+    if (!decoder.setPipelined(true)) return error.SkipZigTest;
+    defer {
+        decoder.drain();
+        _ = decoder.setPipelined(false);
+    }
+    const params = ops.WhisperLogitsParams{ .out_dim = 4, .suppress_count = 0, .ts_begin = 4, .text_allowed = 1, .ts_min = 4, .ts_max = 4, .eot = 3, .probe_id = 4, .mode = ops.whisper_logits_mode_choose };
+    const result = decoder.stepWith(&.{2}, .{ .pipelined = .{ .params = params, .suppress = &.{} } }) catch |err| switch (err) {
+        error.UnsupportedOperation => return error.SkipZigTest,
+        else => return err,
+    };
+    try std.testing.expect(result == .encoded);
+    const encoded_phase = diagnostics.snapshot().?;
+    try std.testing.expect(encoded_phase.pending_interval.?.phase == .encode_next and encoded_phase.pending_interval.?.completion == .unavailable);
+    try decoder.submit();
+    const submitted = diagnostics.snapshot().?;
+    try std.testing.expectEqual(encoded_phase.pending_interval.?.identity, submitted.pending_interval.?.identity);
+    try std.testing.expect(submitted.pending_interval.?.phase == .submit and submitted.pending_interval.?.completion == .unavailable);
+    try std.testing.expect((try decoder.awaitStats(0)) != null);
+    const ready = diagnostics.snapshot().?;
+    try std.testing.expect(ready.pending_interval.?.phase == .await_readback and ready.pending_interval.?.completion == .readback_returned);
+    try std.testing.expect(ready.pending_interval.?.whole_interval_counters == .unavailable);
+    try std.testing.expectEqual(@as(usize, 3), decoder.positions());
+}
+
+test "CUDA incremental receiver qualification requires exact live primary context and device before submission" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    var source_compute: cuda_compute_mod.CudaCompute = undefined;
+    var target_compute: cuda_compute_mod.CudaCompute = undefined;
+    source_compute.ctx.ctx = @ptrFromInt(8);
+    source_compute.ctx.device = 0;
+    source_compute.ctx.info.selected_device = 0;
+    target_compute.ctx.ctx = @ptrFromInt(8);
+    target_compute.ctx.device = 0;
+    target_compute.ctx.info.selected_device = 0;
+    var source_owner = ArchSession{ .allocator = std.testing.allocator, .arch_config = .{ .whisper = .{ .d_model = 4 } }, .backend_type = .cuda, .backend_data = .{ .cuda = .{ .compute = &source_compute } } };
+    var target_owner = ArchSession{ .allocator = std.testing.allocator, .arch_config = .{ .whisper = .{ .d_model = 4 } }, .backend_type = .cuda, .backend_data = .{ .cuda = .{ .compute = &target_compute } } };
+    const source = Session{ .ptr = &source_owner, .vtable = &arch_vtable };
+    const target = Session{ .ptr = &target_owner, .vtable = &arch_vtable };
+    // Everything except the immutable metadata above remains undefined: any
+    // driver, allocator, budget, or queue access would make this test invalid.
+    try std.testing.expect(IncrementalDecoderAdapter.qualify(source, target) != null);
+    target_compute.ctx.ctx = @ptrFromInt(16);
+    try std.testing.expect(IncrementalDecoderAdapter.qualify(source, target) == null);
+    target_compute.ctx.ctx = source_compute.ctx.ctx;
+    target_compute.ctx.device = 1;
+    try std.testing.expect(IncrementalDecoderAdapter.qualify(source, target) == null);
+    target_compute.ctx.device = 0;
+    source_compute.ctx.ctx = null;
+    target_compute.ctx.ctx = null;
+    try std.testing.expect(IncrementalDecoderAdapter.qualify(source, target) == null);
+}
+
+/// Lives in the actual incremental decoder owner, never in a borrowed request
+/// pointer. The guard starts before source preparation/destination acquisition;
+/// finish runs only after destination gate, provider and model CloseScopes end.
+fn bindOwnedDecoderCleanup(backend: *const ops.ComputeBackend, boundary: *const @import("retirement_sink.zig").Epoch) !void {
+    if (try backend.bindCleanupEpoch(boundary)) return;
+    const services = backend.vtable.operation_services orelse return error.IncrementalCleanupAuthorityUnavailable;
+    if (!services.accepts(backend.vtable)) return error.IncrementalCleanupAuthorityUnavailable;
+    switch (backend.kind()) {
+        .native, .cuda => {}, // Metadata fence only; no numerical capability is created.
+        else => return error.IncrementalCleanupAuthorityUnavailable,
+    }
+}
+
+const ReceiverCleanup = struct {
+    sink: @import("retirement_sink.zig").Ref,
+    guard: @import("retirement_sink.zig").Guard,
+    epoch: @import("retirement_sink.zig").Epoch,
+
+    fn permitsAsyncSource(destination: Session, capability: ?@import("payload_charge.zig").Capability) bool {
+        const source = capability orelse return false;
+        if (!source.final_cleanup_qualified or !source.background_supervised or source.root_cleanup_deadline_ns == null) return false;
+        const model = destination.model_lifetime orelse return false;
+        return destination.execution_gate == &model.execution_gate;
+    }
+    // Compatibility qualification query for the separately certified foreign
+    // async CUDA route. This does not decide whether an owned gate needs B.
+    fn begin(destination: Session, capability: ?@import("payload_charge.zig").Capability) !?ReceiverCleanup {
+        if (!permitsAsyncSource(destination, capability)) return null;
+        return beginForOwnedGate(destination) catch |err| switch (err) {
+            error.RetirementEpochCapacityExceeded, error.ResourceTemporarilyUnavailable => null,
+            else => return err,
+        };
+    }
+    fn beginForOwnedGate(destination: Session) !ReceiverCleanup {
+        const stable = if (destination.model_lifetime != null)
+            (try destination.retainRetirementSink()) orelse return error.IncrementalCleanupAuthorityUnavailable
+        else
+            try @import("retirement_sink.zig").Ref.create();
+        return beginWithOwnedSink(stable);
+    }
+    /// Explicit raw owner reserves its pure cleanup lifetime before any lane,
+    /// SDK construction, or source-root transfer. No fake Session is required.
+    fn beginStandalone() !ReceiverCleanup {
+        return beginWithOwnedSink(try @import("retirement_sink.zig").Ref.create());
+    }
+    fn beginWithOwnedSink(owned: @import("retirement_sink.zig").Ref) !ReceiverCleanup {
+        var stable = owned;
+        errdefer stable.release();
+        var guard = stable.enter() catch |err| switch (err) {
+            error.RetirementEpochCapacityExceeded => return error.ResourceTemporarilyUnavailable,
+            else => return err,
+        };
+        errdefer guard.finish();
+        const epoch = try guard.retainEpoch();
+        return .{ .sink = stable, .guard = guard, .epoch = epoch };
+    }
+    fn boundary(self: *const ReceiverCleanup) *const @import("retirement_sink.zig").Epoch {
+        return &self.epoch;
+    }
+    fn finish(self: *ReceiverCleanup) void {
+        var guard = self.guard;
+        var epoch = self.epoch;
+        var stable = self.sink;
+        self.* = undefined;
+        guard.finish();
+        epoch.release();
+        stable.release();
+    }
+};
+
+test "owned incremental input keeps both real encoder roots across cancelled and repeated decoder attempts" {
+    const a = std.testing.allocator;
+    const Root = @import("owned_incremental_input.zig");
+    const stages = @import("encoder_decoder_runtime.zig");
+    const decoder_stage = @import("decoder_stage.zig");
+    const encoder = try IncrementalFixture.session(a);
+    defer encoder.close();
+    const destination = try IncrementalFixture.session(a);
+    defer destination.close();
+    var features = [_]Tensor{try IncrementalFixture.features(a)};
+    defer features[0].deinit();
+    var host = try stages.encodeWithPermit(a, encoder, destination, &features, null, null, null);
+    defer host.deinit(a);
+    var reference = try decoder_stage.Decoder.init(a, destination, &host, 2, &.{ 1, 1 }, 4, null);
+    var reference_open = true;
+    defer if (reference_open) reference.deinit();
+    var expected = try reference.step(&.{ 0, 1 }, null, null);
+    defer expected.deinit();
+    reference.deinit();
+    reference_open = false;
+    var cleanup = try Root.Cleanup.beginTaskWithoutEnclosingLanes(null);
+    defer cleanup.finish();
+    var root_epoch = (try cleanup.borrowedEpoch()).?;
+    defer root_epoch.release();
+    var encoded = try stages.encodeForIncrementalWithPermit(a, encoder, destination, &features, null, null, null);
+    var encoded_open = true;
+    defer if (encoded_open) encoded.deinit(a);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, Root.OwnedIncrementalInput.take(failing.allocator(), &encoded, destination, &cleanup));
+    try std.testing.expect(encoded == .resident);
+    try std.testing.expectEqual(@as(usize, 1), encoded.resident.values.outputs.len);
+    var owned = try Root.OwnedIncrementalInput.take(a, &encoded, destination, &cleanup);
+    encoded_open = false;
+    var owned_open = true;
+    defer if (owned_open) owned.deinit();
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.InferenceCancelled;
+        }
+    };
+    try std.testing.expectError(error.InferenceCancelled, decoder_stage.Decoder.initWithSource(a, destination, &owned.encoder, 2, &.{ 1, 1 }, 4, .{ .check_fn = Cancel.check }, .{}, &owned.source.?));
+    try std.testing.expect(!(try root_epoch.isSealed()));
+    for (0..3) |_| {
+        var actual = try decoder_stage.Decoder.initWithSource(a, destination, &owned.encoder, 2, &.{ 1, 1 }, 4, null, .{}, &owned.source.?);
+        defer actual.deinit();
+        var row = try actual.step(&.{ 0, 1 }, null, null);
+        defer row.deinit();
+        try std.testing.expectEqualSlices(f32, expected.logits, row.logits);
+        try std.testing.expect(!(try root_epoch.isSealed()));
+    }
+    owned.deinit();
+    owned_open = false;
+    try std.testing.expect(try root_epoch.isSealed());
+}
+
+test "optional receiver cleanup capacity declines before work and releases its retained model sink" {
+    const Sink = @import("retirement_sink.zig");
+    const Probe = struct {
+        destroyed: bool = false,
+        fn destroy(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.destroyed = true;
+        }
+        fn reserve(_: *anyopaque, _: usize, _: ?u64) !bool {
+            return error.UnexpectedPayloadReservation;
+        }
+        fn take(_: *anyopaque) @import("payload_charge.zig").Owned {
+            unreachable;
+        }
+        fn noop(_: *anyopaque) void {}
+    };
+    var probe = Probe{};
+    var model = Session.ModelLifetime{ .owner = &probe, .destroy_fn = Probe.destroy };
+    defer model.release();
+    const destination = Session{ .ptr = &probe, .vtable = undefined, .model_lifetime = &model, .execution_gate = &model.execution_gate };
+    var sink = try model.retainRetirementSink();
+    defer sink.release();
+    var guards: [64]Sink.Guard = undefined;
+    var initialized: usize = 0;
+    defer while (initialized != 0) {
+        initialized -= 1;
+        guards[initialized].finish();
+    };
+    for (&guards) |*guard| {
+        guard.* = try sink.enter();
+        initialized += 1;
+    }
+    const source = @import("payload_charge.zig").Capability{ .context = &probe, .prepare_fn = Probe.reserve, .commit_fn = Probe.noop, .abort_fn = Probe.noop, .take_fn = Probe.take, .final_cleanup_qualified = true, .background_supervised = true, .root_cleanup_deadline_ns = @import("antfly_platform").time.monotonicNs() + 30 * std.time.ns_per_s };
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, ReceiverCleanup.beginForOwnedGate(destination));
+    try std.testing.expect((try ReceiverCleanup.begin(destination, source)) == null);
+    initialized -= 1;
+    guards[initialized].finish();
+    var admitted = (try ReceiverCleanup.begin(destination, source)).?;
+    admitted.finish();
+    try std.testing.expect(!probe.destroyed);
+}
+
+test "decoder owned current B retires real foreign Metal source before two provider and model reentry" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var encoder = try incrementalMetalFixtureSession(a);
+    defer encoder.close();
+    var destination = try incrementalMetalFixtureSession(a);
+    defer destination.close();
+    encoder.execution_gate = &encoder.model_lifetime.?.execution_gate;
+    destination.execution_gate = &destination.model_lifetime.?.execution_gate;
+    var features = [_]Tensor{try IncrementalFixture.features(a)};
+    defer features[0].deinit();
+    const source_gate = encoder.execution_gate.?;
+    try std.testing.expect(source_gate.tryLock());
+    var source_locked = true;
+    defer if (source_locked) source_gate.unlock();
+    var outputs = (try encoder.runResident(&features, a)) orelse return error.MissingResidentEncoder;
+    var outputs_open = true;
+    defer if (outputs_open) outputs.deinit();
+    const receiver = IncrementalDecoderAdapter.qualify(encoder, destination) orelse return error.MissingIncrementalReceiver;
+    const retained_source = try IncrementalFixture.source(&outputs, a, receiver);
+    source_gate.unlock();
+    source_locked = false;
+    var decoder = try IncrementalDecoderAdapter.fromResident(destination, a, .{ .native_call_policy = .in_process }, retained_source);
+    var decoder_open = true;
+    defer if (decoder_open) decoder.deinit();
+    outputs.deinit();
+    outputs_open = false;
+    var expected = try decoder.receiver_cleanup.?.epoch.retain();
+    defer expected.release();
+    const Pin = Session.ModelLifetime.ResourcePin;
+    const Probe = struct {
+        source: Session,
+        destination: Session,
+        original: ?Pin,
+        expected: *const @import("retirement_sink.zig").Epoch,
+        node: @import("resource_retirement.zig").Node = undefined,
+        queued: usize = 0,
+        calls: usize = 0,
+        failure: ?anyerror = null,
+        fn rawRelease(_: *anyopaque) void {
+            @panic("decoder selected unqualified raw source release under its owned gate");
+        }
+        fn releaseWithBoundary(raw: *anyopaque, boundary: ?*const @import("retirement_sink.zig").Epoch) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const current = boundary orelse @panic("decoder omitted current B");
+            std.debug.assert(current.record == self.expected.record and current.nonce == self.expected.nonce);
+            self.node = .{ .context = self, .release_fn = retire };
+            const deferred = current.boundary() catch @panic("invalid decoder B");
+            deferred.register(deferred.context, deferred.nonce, &self.node) catch @panic("decoder B registration failed");
+            self.queued += 1;
+            const original = self.original.?;
+            self.original = null;
+            // Complete actual source SDK/backend destruction while destination
+            // still owns its lane. The producer callback must remain queued.
+            original.releaseWithBoundary(current);
+            std.debug.assert(self.calls == 0);
+        }
+        fn retire(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.check() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn check(self: *@This()) !void {
+            const source_model_gate = self.source.execution_gate.?;
+            const destination_model_gate = self.destination.execution_gate.?;
+            if (!source_model_gate.tryLock()) return error.SourceModelGateStillHeld;
+            defer source_model_gate.unlock();
+            if (!destination_model_gate.tryLock()) return error.DestinationModelGateStillHeld;
+            defer destination_model_gate.unlock();
+            // These concrete model constructors acquire the actual distinct
+            // shared-provider leases and operation gates; QueueFull is a
+            // meaningful failure rather than a synthetic mutex substitute.
+            var source_compute = try getComputeBackendWithControl(self.source, std.testing.allocator, .{ .native_call_policy = .in_process });
+            defer source_compute.deinit();
+            var destination_compute = try getComputeBackendWithControl(self.destination, std.testing.allocator, .{ .native_call_policy = .in_process });
+            defer destination_compute.deinit();
+            for ([_]*const ops.ComputeBackend{ &source_compute.backend, &destination_compute.backend }) |backend| {
+                const token = backend.operationToken() orelse return error.MissingActualProviderOperation;
+                try token.validate(.{ .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .program = null, .mode = .managed });
+                const input = try backend.fromFloat32(&.{ 2, 5 });
+                defer backend.free(input);
+                const result = try backend.add(input, input);
+                defer backend.free(result);
+                const values = try backend.toFloat32(result, std.testing.allocator);
+                defer std.testing.allocator.free(values);
+                try std.testing.expectEqualSlices(f32, &.{ 4, 10 }, values);
+            }
+        }
+    };
+    var probe = Probe{ .source = encoder, .destination = destination, .original = decoder.source_resources, .expected = &expected };
+    decoder.source_resources = .{ .ptr = &probe, .release_fn = Probe.rawRelease, .release_with_boundary_fn = Probe.releaseWithBoundary };
+    decoder.deinit();
+    decoder_open = false;
+    try std.testing.expectEqual(@as(usize, 1), probe.queued);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(probe.original == null);
+    try std.testing.expect(try expected.isSealed());
+    if (probe.failure) |err| return err;
 }

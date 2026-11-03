@@ -223,8 +223,8 @@ test "embeddinggemma2 resize cache reuses uploads and fences only reused source 
     Mock.host_next = 0;
     var controller = memory.AdmissionController{};
     var ctx: Context = undefined;
-    ctx.observation = null;
-    ctx.observation_enable_failed = false;
+    ctx.observation.store(null, .release);
+    ctx.observation_enable_failed.store(false, .release);
     ctx.ctx = @ptrFromInt(1);
     ctx.stream = @ptrFromInt(2);
     ctx.stats = .{};

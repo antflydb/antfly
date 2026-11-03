@@ -133,8 +133,8 @@ test "LightOnOCR3 CUDA burst readback failed physical free retains ownership and
     var controller = memory.AdmissionController{};
     var slot = Slot{ .generation = 7, .host = .{ .ptr = @ptrFromInt(1), .len = capacity }, .lease = try controller.tryAcquire(.gpu, .{ .host_limit_bytes = capacity }, .{ .host_scratch_bytes = capacity }, false) };
     var ctx: context.CudaContext = undefined;
-    ctx.observation = null;
-    ctx.observation_enable_failed = false;
+    ctx.observation.store(null, .release);
+    ctx.observation_enable_failed.store(false, .release);
     ctx.ctx = @ptrFromInt(1);
     ctx.driver.fns.cuCtxSetCurrent = Fake.current;
     ctx.driver.fns.cuMemFreeHost = Fake.free;

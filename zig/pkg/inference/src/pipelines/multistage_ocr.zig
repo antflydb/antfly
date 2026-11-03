@@ -291,6 +291,25 @@ pub const CTCRecognizer = struct {
         self.session.close();
     }
 
+    // Keep synchronous provider work inside one short opaque scope. The
+    // caller retires the complete output/quota owner after this returns.
+    fn finishResidentRecognition(self: *CTCRecognizer, resident: *@import("../backends/session.zig").ResidentOutputs) !RecognitionResult {
+        if (resident.outputs.len == 0) return error.NoRecognitionOutput;
+        if (try ctc_decode.decodeResident(self.allocator, resident.backend, resident.outputs[0], self.char_dict)) |decoded| {
+            return .{ .text = decoded.text, .confidence = decoded.confidence };
+        }
+        // Reuse this forward if reduction is unsupported; exporting its
+        // logits is cheaper than executing the entire recognizer again.
+        const output_shape = try resident.backend.tensorShape(resident.outputs[0], self.allocator);
+        defer self.allocator.free(output_shape);
+        const output_values = try resident.backend.toFloat32(resident.outputs[0], self.allocator);
+        defer self.allocator.free(output_values);
+        var host_output = try backends.Tensor.initFloat32(self.allocator, "ctc_logits", output_shape, output_values);
+        defer host_output.deinit();
+        const decoded = try ctc_decode.decodeFromTensor(self.allocator, &host_output, self.char_dict);
+        return .{ .text = decoded.text, .confidence = decoded.confidence };
+    }
+
     pub fn recognize(self: *CTCRecognizer, img: image.Image, control: ?InferenceExecutionControl) !RecognitionResult {
         var input_width = self.preprocess.width;
         const pixel_values = if (self.preprocess.keep_aspect_ratio) blk: {
@@ -333,23 +352,11 @@ pub const CTCRecognizer = struct {
 
         var permit = try self.session.admitInputs(&.{input_tensor}, self.allocator, control);
         defer permit.deinit();
+        try permit.prepareResidentOutputRetirement();
         if (try permit.runResidentWithControl(&.{input_tensor}, self.allocator, control)) |resident_outputs| {
             var resident = resident_outputs;
             defer resident.deinit();
-            if (resident.outputs.len == 0) return error.NoRecognitionOutput;
-            if (try ctc_decode.decodeResident(self.allocator, resident.backend, resident.outputs[0], self.char_dict)) |decoded| {
-                return .{ .text = decoded.text, .confidence = decoded.confidence };
-            }
-            // Reuse this forward if reduction is unsupported; exporting its
-            // logits is cheaper than executing the entire recognizer again.
-            const output_shape = try resident.backend.tensorShape(resident.outputs[0], self.allocator);
-            defer self.allocator.free(output_shape);
-            const output_values = try resident.backend.toFloat32(resident.outputs[0], self.allocator);
-            defer self.allocator.free(output_values);
-            var host_output = try backends.Tensor.initFloat32(self.allocator, "ctc_logits", output_shape, output_values);
-            defer host_output.deinit();
-            const decoded = try ctc_decode.decodeFromTensor(self.allocator, &host_output, self.char_dict);
-            return .{ .text = decoded.text, .confidence = decoded.confidence };
+            return @import("../execution/backend_operation.zig").callOpaque(resident.backend.*, resident.backend.operationToken(), finishResidentRecognition, .{ self, &resident });
         }
         const outputs = try permit.runWithControl(&.{input_tensor}, self.allocator, control);
         defer freeTensorSlice(self.allocator, outputs);

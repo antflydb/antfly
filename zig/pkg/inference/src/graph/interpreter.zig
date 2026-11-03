@@ -203,6 +203,9 @@ pub const ExecuteOptions = struct {
 
     /// Per-node CT overrides (e.g. pre-computed tensors).
     runtime_inputs: ?[]const RuntimeInput = null,
+    /// Borrowed host payloads for a prepared frame's declared input uploads.
+    /// Sources are copied into owned staging before graph capture/submission.
+    host_inputs: ?[]const @import("../execution/host_ingress.zig").Input = null,
 
     /// Buffer donation flags, parallel to runtime_inputs. When
     /// donate[i] is true the interpreter transfers ownership of
@@ -248,7 +251,11 @@ pub const ExecuteOptions = struct {
     cached_buffer_plan_validated: bool = false,
     physical_frame: ?*@import("../execution/physical_buffers.zig").Frame = null,
     storage_admission: ?@import("../execution/storage_admission.zig").Capability = null,
+    prepared_routes: ?*@import("../execution/prepared_routes.zig").PreparedRoutes = null,
     physical_frame_claim: ?*@import("../execution/physical_buffers.zig").FrameClaim = null,
+    region_claims: ?*@import("../execution/region_claims.zig").Set = null,
+    region_execution_profile: ?*@import("../execution/region_execution_profile.zig").Claim = null,
+    backend_operation: ?@import("../execution/backend_operation.zig").Borrowed = null,
 
     /// Skip Metal graph-fusion probes for graphs whose hot path is already
     /// covered by backend primitive/runtime commands.
@@ -686,6 +693,7 @@ pub fn execute(
     cb: *const ComputeBackend,
     options: ExecuteOptions,
 ) !ExecutionResult {
+    if (options.host_inputs != null) return error.PreparedHostIngressUnavailable;
     if (options.execution_control) |control| try control.check();
     const count = graph.nodeCount();
     if (options.runtime_inputs) |inputs| for (inputs) |input| {

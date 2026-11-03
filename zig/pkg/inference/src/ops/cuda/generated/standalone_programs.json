@@ -335,5 +335,25 @@
     "hidden": 0,
     "wide": 0,
     "bf16": false
+  },
+  {
+    "family": "row_selection_stats_f32",
+    "file": "row_selection_stats_f32.ptx",
+    "entry": "antfly_tile_whisper_logits_partials",
+    "producer": "../generated/tile_whisper_logits.cu",
+    "exports": [
+      "antfly_tile_whisper_logits_partials",
+      "antfly_tile_whisper_logits_partials_combine"
+    ],
+    "nvcc_flags": [
+      "--fmad=false",
+      "-std=c++17"
+    ],
+    "target": 75,
+    "threads": 0,
+    "shared": 0,
+    "hidden": 0,
+    "wide": 0,
+    "bf16": false
   }
 ]

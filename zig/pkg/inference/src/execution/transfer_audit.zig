@@ -16,7 +16,25 @@
 //! Request-local physical transfer accounting and strict readback policy.
 //! Scopes nest on the submitting thread; unrelated contexts/threads cannot
 //! contaminate a request with process-global provider counters.
+pub const Measurements = struct {
+    unit: enum { successful_project_wrapper_calls } = .successful_project_wrapper_calls,
+    completion: enum { not_gpu_completion } = .not_gpu_completion,
+    copy_coverage: enum { instrumented_buffer_wrappers_only } = .instrumented_buffer_wrappers_only,
+    upload_calls: u64 = 0,
+    upload_bytes: u64 = 0,
+    download_calls: u64 = 0,
+    download_bytes: u64 = 0,
+    device_copy_calls: ?u64 = null,
+    device_copy_bytes: ?u64 = null,
+    host_accesses: u64 = 0,
+    host_access_bytes: u64 = 0,
+    index_metadata_host_accesses: u64 = 0,
+    index_metadata_host_access_bytes: u64 = 0,
+};
 pub const Audit = struct {
+    device_copy_calls: u64 = 0,
+    device_copy_bytes: u64 = 0,
+
     upload_bytes: u64 = 0,
     download_bytes: u64 = 0,
     host_access_bytes: u64 = 0,
@@ -30,6 +48,10 @@ pub const Audit = struct {
     index_metadata_host_accesses: u64 = 0,
     index_metadata_host_access_bytes: u64 = 0,
     parent: ?*Audit = null,
+
+    pub fn measurements(self: *const Audit) Measurements {
+        return .{ .upload_calls = self.upload_calls, .upload_bytes = self.upload_bytes, .download_calls = self.download_calls, .download_bytes = self.download_bytes, .device_copy_calls = self.device_copy_calls, .device_copy_bytes = self.device_copy_bytes, .host_accesses = self.host_accesses, .host_access_bytes = self.host_access_bytes, .index_metadata_host_accesses = self.index_metadata_host_accesses, .index_metadata_host_access_bytes = self.index_metadata_host_access_bytes };
+    }
 
     pub fn recordStats(self: *const Audit, stats: *@import("stats.zig").ExecutionStats) void {
         stats.actual_upload_calls = self.upload_calls;
@@ -140,4 +162,13 @@ test "activation residency permits counted index metadata without weakening all-
     defer end();
     try std.testing.expectError(error.DeviceReadbackForbidden, indexMetadataHostAccess(8));
     try std.testing.expectEqual(@as(u64, 0), strict.index_metadata_host_accesses);
+}
+
+/// Successful explicit buffer-copy submission; not a completed-copy claim.
+pub fn deviceCopy(bytes: usize) void {
+    var ancestor = current;
+    while (ancestor) |audit| : (ancestor = audit.parent) {
+        audit.device_copy_calls += 1;
+        audit.device_copy_bytes += bytes;
+    }
 }

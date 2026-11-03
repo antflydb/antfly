@@ -34,8 +34,10 @@ const QuantizedStorage = weight_source_mod.QuantizedStorage;
 const RawMetalProvider = metal_runtime.RawMetalProvider;
 const RawMetalDecodeRuntime = metal_runtime.RawMetalDecodeRuntime;
 const tier_cache_mod = @import("../runtime/tier/cache.zig");
+const prepared_slot = @import("prepared_slot_owner.zig");
 pub const PreparedConstant = struct { tensor: MetalTensor, bytes: usize };
 pub const EmbeddingGemma2LinearCacheEntry = struct {
+    owner: ?*prepared_slot.Owner = null,
     projection_widths: [3]usize = @splat(0),
     slot: usize,
     in_dim: usize,
@@ -104,6 +106,16 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     embeddinggemma2_constant_cache: std.StringHashMapUnmanaged(PreparedConstant) = .empty,
     embeddinggemma2_constant_bytes: usize = 0,
     embeddinggemma2_linear_cache_bytes: usize = 0,
+    linear_slot_owner_epoch: u64 = 1,
+    linear_slot_index_mutex: std.atomic.Mutex = .unlocked,
+    operations: @import("../execution/operation_owner.zig").Owner = .{},
+    // Atomic marks own no caller metadata. The provider already owns the
+    // corresponding SDK payload and fallback clones until actual retirement.
+    private_retirement_dirty: std.atomic.Value(bool) = .init(false),
+    private_linear_retirements: [decoder_runtime_linear_slot_capacity]std.atomic.Value(u64) = @splat(.init(0)),
+    private_layer_norm_retirements: [decoder_runtime_layer_norm_slot_capacity]std.atomic.Value(u64) = @splat(.init(0)),
+    private_rms_norm_retirements: [decoder_runtime_rms_norm_slot_capacity]std.atomic.Value(u64) = @splat(.init(0)),
+
     embeddinggemma2_vision_linear_cache_bytes: usize = 0,
     embeddinggemma2_audio_linear_cache_bytes: usize = 0,
     embedding_vision_coefficients: ?*@import("../ops/metal_embedding_bindings.zig").VisionCoefficients = null,
@@ -177,6 +189,73 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     deberta_relative_projection_cache: [decoder_runtime_linear_slot_capacity]DebertaRelativeProjectionCacheEntry =
         @as([decoder_runtime_linear_slot_capacity]DebertaRelativeProjectionCacheEntry, @splat(.{})),
     deberta_relative_embedding_cache: DebertaRelativeEmbeddingCacheEntry = .{},
+
+    // Declaration ownership is independent of lazy SDK materialization.
+    pub fn privateSlotDeclaration(self: *MetalNativeProvider, kind: metal_runtime.PreparedBindingKind, slot: usize) u64 {
+        return metal_runtime.antfly_metal_prepared_declaration(self.raw_decode_runtime, kind, slot);
+    }
+    pub fn replacePrivateSlotDeclaration(self: *MetalNativeProvider, kind: metal_runtime.PreparedBindingKind, slot: usize) void {
+        metal_runtime.antfly_metal_replace_prepared_declaration(self.raw_decode_runtime, kind, slot);
+    }
+
+    fn privateRetirementMarks(self: *MetalNativeProvider, kind: metal_runtime.PreparedBindingKind) []std.atomic.Value(u64) {
+        return switch (kind) {
+            .linear => &self.private_linear_retirements,
+            .layer_norm => &self.private_layer_norm_retirements,
+            .rms_norm => &self.private_rms_norm_retirements,
+        };
+    }
+
+    /// Metadata-only, including concurrent last-output retirement. Nonwrapping
+    /// binding generations ensure a late old mark cannot overwrite a newer one.
+    pub fn requestPrivateSlotRetirement(self: *MetalNativeProvider, kind: metal_runtime.PreparedBindingKind, slot: usize, generation: u64) void {
+        const marks = self.privateRetirementMarks(kind);
+        std.debug.assert(slot < marks.len and generation != 0);
+        const retired_generation = metal_runtime.antfly_metal_retire_prepared_binding(self.raw_decode_runtime, kind, slot, generation);
+        if (retired_generation == 0) return;
+        var previous = marks[slot].load(.acquire);
+        while (previous < retired_generation) {
+            previous = marks[slot].cmpxchgWeak(previous, retired_generation, .release, .acquire) orelse break;
+        }
+        // Publish AFTER the mark. Racing terminal cleanup may leave one benign
+        // extra scan, but can never erase the last unseen retirement request.
+        self.private_retirement_dirty.store(true, .release);
+    }
+
+    /// Actual host provider ownership is supplied explicitly by its terminal
+    /// finalizer. No callback waits for GPU work or acquires numerical authority.
+    pub inline fn retirePrivateSlotsAtTerminal(self: *MetalNativeProvider, current: *const @import("../execution/operation_owner.zig").Owner.Record.Snapshot) !usize {
+        if (!self.private_retirement_dirty.load(.acquire)) return 0;
+        return self.retirePrivateSlotsAtTerminalCold(current);
+    }
+    noinline fn retirePrivateSlotsAtTerminalCold(self: *MetalNativeProvider, current: *const @import("../execution/operation_owner.zig").Owner.Record.Snapshot) !usize {
+        if (current.provider != @as(*anyopaque, @ptrCast(self)) or !current.entered or current.mode == .metadata or !try current.ticket.ownsGate()) return error.BackendCleanupAuthorityRequired;
+        if (metal_runtime.hasActiveFrame(self.raw_decode_runtime) or metal_runtime.hasSubmittedFrame(self.raw_decode_runtime)) return 0;
+        if (!self.private_retirement_dirty.swap(false, .acq_rel)) return 0;
+        while (!self.linear_slot_index_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.linear_slot_index_mutex.unlock();
+        var retired: usize = 0;
+        inline for ([_]metal_runtime.PreparedBindingKind{ .linear, .layer_norm, .rms_norm }) |kind| {
+            const marks = self.privateRetirementMarks(kind);
+            for (marks, 0..) |*mark, slot| {
+                const expected = mark.swap(0, .acq_rel);
+                if (expected == 0 or expected != self.privateSlotDeclaration(kind, slot)) continue;
+                switch (kind) {
+                    .linear => {
+                        // A shared admitted cache entry owns its own payload,
+                        // charge and retirement protocol. Private teardown must
+                        // never evict it or refund its charge through this path.
+                        if (!self.allowsOwnedSlotMutation(slot)) continue;
+                        metal_runtime.clearRawLinearSlot(self, slot);
+                    },
+                    .layer_norm => metal_runtime.clearRawLayerNormSlot(self, slot),
+                    .rms_norm => metal_runtime.clearRawRmsNormSlot(self, slot),
+                }
+                retired += 1;
+            }
+        }
+        return retired;
+    }
 
     pub fn create() !MetalNativeProvider {
         return createWithKernelJit(.{});
@@ -302,6 +381,8 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     /// Optional immutable constants yield to admission by class. Retained
     /// execution workspaces keep their existing ownership. No allocation occurs.
     pub fn reclaimEmbeddingGemma2Weights(self: *MetalNativeProvider, cache_class: @import("../models/embedding_gemma2_weight_cache.zig").MetalClass) !usize {
+        while (!self.linear_slot_index_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.linear_slot_index_mutex.unlock();
         if (metal_runtime.hasActiveFrame(self.raw_decode_runtime) or
             metal_runtime.hasSubmittedFrame(self.raw_decode_runtime)) return error.MetalWorkspaceBusy;
         const cache = self.embeddinggemma2_cache_admission orelse return 0;
@@ -338,21 +419,31 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
             var it = self.embeddinggemma2_linear_cache.iterator();
             const name = blk: {
                 while (it.next()) |entry| {
-                    if (policy.metalClass(entry.key_ptr.*) == cache_class) break :blk entry.key_ptr.*;
+                    if (policy.metalClass(entry.key_ptr.*) != cache_class) continue;
+                    if (entry.value_ptr.owner) |owner| {
+                        if (owner.beginRetirement() == null) continue;
+                    }
+                    break :blk entry.key_ptr.*;
                 }
                 break :blk null;
             } orelse break;
             const candidate = self.embeddinggemma2_linear_cache.get(name).?;
             // These slots were published only from owned F32 snapshots. The
             // original checkpoint and shared canonical zero bias stay intact.
-            if (metal_runtime.termite_metal_decode_runtime_discard_owned_linear_slot(self.raw_decode_runtime, candidate.slot) != 0)
+            if (metal_runtime.termite_metal_decode_runtime_discard_owned_linear_slot(self.raw_decode_runtime, candidate.slot) != 0) {
+                // Every nonzero bridge status is explicitly before teardown.
+                if (candidate.owner) |owner| (prepared_slot.Owner.Retirement{ .owner = owner }).abortBeforeTeardown();
                 return error.MetalWorkspaceBusy;
+            }
+            metal_runtime.clearRawLinearSlot(self, candidate.slot);
             const removed = self.embeddinggemma2_linear_cache.fetchRemove(name).?;
-            metal_runtime.clearRawLinearSlot(self, removed.value.slot);
             self.embeddinggemma2_linear_cache_bytes -= removed.value.bytes;
             if (cache_class == .vision) self.embeddinggemma2_vision_linear_cache_bytes -= removed.value.bytes;
             if (cache_class == .audio) self.embeddinggemma2_audio_linear_cache_bytes -= removed.value.bytes;
-            cache.noteRelease(.backend, removed.value.bytes);
+            if (removed.value.owner) |owner|
+                (prepared_slot.Owner.Retirement{ .owner = owner }).commitRetiredPayload()
+            else
+                cache.noteRelease(.backend, removed.value.bytes);
             reclaimed += removed.value.bytes;
             std.heap.c_allocator.free(removed.key);
         }
@@ -427,16 +518,153 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         self.jit_exact_pipeline_owner_count += 1;
     }
 
-    /// Releases every owned resource. The provider is consumed and must not be
-    /// used or deinitialized again.
+    /// Allocate metadata before driver preparation; existing reservation guards own
+    /// error cleanup until the fully initialized slot is published to the cache.
+    pub fn createLinearSlotOwner(self: *MetalNativeProvider, slot: usize, bytes: usize) !*prepared_slot.Owner {
+        const epoch = self.linear_slot_owner_epoch;
+        const next = try std.math.add(u64, epoch, 1);
+        const owner = try prepared_slot.Owner.create(std.heap.c_allocator, slot, epoch, .{ .context = self, .bytes = bytes, .release_retired = releaseRetiredLinearCharge });
+        self.linear_slot_owner_epoch = next;
+        return owner;
+    }
+
+    fn releaseRetiredLinearCharge(owner: *const prepared_slot.Owner) void {
+        const self: *MetalNativeProvider = @ptrCast(@alignCast(owner.resource.context));
+        const cache = self.embeddinggemma2_cache_admission orelse unreachable;
+        cache.noteRelease(.backend, owner.resource.bytes);
+    }
+
+    /// Call under the existing provider/residency mutation domain. The returned pin
+    /// owns the actual cache member and unchanged charge, not a source tensor key.
+    pub fn pinLinearSlot(self: *MetalNativeProvider, slot: usize) ?prepared_slot.Owner.Pin {
+        if (!self.linear_slot_index_mutex.tryLock()) return null;
+        defer self.linear_slot_index_mutex.unlock();
+        var iterator = self.embeddinggemma2_linear_cache.valueIterator();
+        while (iterator.next()) |entry| {
+            if (entry.slot != slot) continue;
+            const owner = entry.owner orelse return null;
+            return owner.tryPin(owner.epoch);
+        }
+        return null;
+    }
+
+    /// A cached payload cannot be cleared/reassigned behind a frozen selector.
+    /// Only its marked retirement (or a noncached legacy slot) permits mutation.
+    pub fn allowsOwnedSlotMutation(self: *MetalNativeProvider, slot: usize) bool {
+        var iterator = self.embeddinggemma2_linear_cache.valueIterator();
+        while (iterator.next()) |entry| {
+            if (entry.slot != slot) continue;
+            const owner = entry.owner orelse return true;
+            return owner.retirementInProgress();
+        }
+        return true;
+    }
+
+    /// Idle selectors borrow metadata only. Cache publication/lookup is already
+    /// serialized by the shared provider execution+residency mutation domain.
+    pub fn profileLinearSlot(self: *MetalNativeProvider, slot: usize) ?prepared_slot.Owner.Profile {
+        if (!self.linear_slot_index_mutex.tryLock()) return null;
+        defer self.linear_slot_index_mutex.unlock();
+        return self.profileLinearSlotLocked(slot);
+    }
+
+    /// Caller already owns the narrow index mutex; this never reenters it.
+    pub fn profileLinearSlotLocked(self: *MetalNativeProvider, slot: usize) ?prepared_slot.Owner.Profile {
+        var iterator = self.embeddinggemma2_linear_cache.valueIterator();
+        while (iterator.next()) |entry| {
+            if (entry.slot != slot) continue;
+            const owner = entry.owner orelse return null;
+            return owner.profile();
+        }
+        return null;
+    }
+
+    fn preparedUseUncertain(_: *anyopaque) callconv(.c) void {
+        std.log.err("Metal prepared submission lost terminal completion proof", .{});
+        @import("antfly_platform").inference_process_supervisor.restartWorker();
+    }
+
+    /// Registration owns an independent pin through the real command buffer's
+    /// completed handler. Caller still owns its root claim across later CB chunks.
+    pub fn retainLinearSlotForActiveSubmission(self: *MetalNativeProvider, pin: prepared_slot.Owner.Pin) !void {
+        while (!self.linear_slot_index_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.linear_slot_index_mutex.unlock();
+        if (!pin.valid()) return error.PreparedLinearSlotChanged;
+        var iterator = self.embeddinggemma2_linear_cache.valueIterator();
+        const found = while (iterator.next()) |entry| {
+            if (entry.owner == pin.owner) break true;
+        } else false;
+        if (!found) return error.PreparedLinearSlotChanged;
+        if (metal_runtime.antfly_metal_frame_retain_prepared_use(self.raw_decode_runtime, pin.owner, prepared_slot.Owner.retainSubmittedUse, prepared_slot.Owner.releaseSubmittedUse, preparedUseUncertain) != 0)
+            return error.PreparedLinearSubmissionRetentionFailed;
+    }
+
+    /// Ordinary numerical callers already own the provider execution domain. Return
+    /// by value so HashMap internals never escape its index mutation guard. This is
+    /// NOT an independently retained claim; cold selectors must acquire a Profile
+    /// under the same lock instead of keeping this owner pointer.
+    pub fn lookupLinearCache(self: *MetalNativeProvider, name: []const u8) ?EmbeddingGemma2LinearCacheEntry {
+        while (!self.linear_slot_index_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.linear_slot_index_mutex.unlock();
+        return self.embeddinggemma2_linear_cache.get(name);
+    }
+
+    /// Complete all submitted work, then close flush's freshly reopened empty
+    /// frame. Do not wait for a frame that has never been submitted.
+    pub fn quiesceOwnedRuntimeChecked(self: *MetalNativeProvider) !void {
+        return self.quiesceOwnedRuntimeWith(OwnedDriver);
+    }
+
+    const OwnedDriver = struct {
+        fn flush(runtime: ?*RawMetalDecodeRuntime) !void {
+            try metal_runtime.flushActiveFrame(runtime);
+        }
+        fn cancel(runtime: ?*RawMetalDecodeRuntime) !void {
+            try metal_runtime.cancelFrame(runtime);
+        }
+        fn active(runtime: ?*RawMetalDecodeRuntime) bool {
+            return metal_runtime.hasActiveFrame(runtime);
+        }
+        fn submitted(runtime: ?*RawMetalDecodeRuntime) bool {
+            return metal_runtime.hasSubmittedFrame(runtime);
+        }
+    };
+
+    fn quiesceOwnedRuntimeWith(self: *MetalNativeProvider, comptime Driver: type) !void {
+        // Creation error cleanup may own a provider before a decoder exists.
+        const runtime = self.raw_decode_runtime orelse return;
+        try Driver.flush(runtime);
+        if (Driver.active(runtime)) try Driver.cancel(runtime);
+        if (Driver.active(runtime) or Driver.submitted(runtime)) return error.MetalProviderDrainIncomplete;
+    }
+
+    /// Releases every owned resource after checked completion. The provider
+    /// is consumed and must not be used or deinitialized again.
     pub fn deinitOwned(self: *MetalNativeProvider) void {
         // Release the synchronous JIT session before provider, cache, or
         // pipeline dependencies are released.
+        while (!self.linear_slot_index_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.linear_slot_index_mutex.unlock();
+        self.quiesceOwnedRuntimeChecked() catch |err| {
+            std.log.err("Metal provider checked teardown failed: {s}", .{@errorName(err)});
+            @import("antfly_platform").inference_process_supervisor.restartWorker();
+        };
+        self.operations.assertIdle();
+        // Completed handlers have retired submitted pins before quiesce returns.
+        // Idle profile metadata may survive; live captured/armed pins may not.
+        var owned_slots = self.embeddinggemma2_linear_cache.valueIterator();
+        while (owned_slots.next()) |entry| if (entry.owner) |owner| {
+            if (owner.beginRetirement() == null) {
+                while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
+                const pins = owner.payload_pins;
+                const references = owner.metadata_references;
+                const retiring = owner.retiring;
+                owner.mutex.unlock();
+                std.log.err("Metal provider still owns prepared slot {d}: pins={d} refs={d} retiring={}", .{ owner.slot, pins, references, retiring });
+                @import("antfly_platform").inference_process_supervisor.restartWorker();
+            }
+        };
         metal_runtime.destroyMetalJitSession(self.jit_session);
-        metal_runtime.flushActiveFrame(self.raw_decode_runtime) catch {};
-        if (metal_runtime.hasActiveFrame(self.raw_decode_runtime)) {
-            metal_runtime.waitFrame(self.raw_decode_runtime) catch {};
-        }
         metal_runtime.resetGatheredSpans(self);
         _ = self.clearRotary(null);
         _ = self.clearEmbeddingBindings();
@@ -463,7 +691,10 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         var embeddinggemma2_it = self.embeddinggemma2_linear_cache.iterator();
         while (embeddinggemma2_it.next()) |entry| {
             std.heap.c_allocator.free(entry.key_ptr.*);
-            if (self.embeddinggemma2_cache_admission) |cache| cache.noteRelease(.backend, entry.value_ptr.bytes);
+            if (entry.value_ptr.owner) |owner|
+                (prepared_slot.Owner.Retirement{ .owner = owner }).commitRetiredPayload()
+            else if (self.embeddinggemma2_cache_admission) |cache|
+                cache.noteRelease(.backend, entry.value_ptr.bytes);
         }
         self.embeddinggemma2_linear_cache.deinit(std.heap.c_allocator);
         self.embeddinggemma2_linear_cache = .empty;

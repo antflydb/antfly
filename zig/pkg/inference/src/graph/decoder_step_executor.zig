@@ -99,6 +99,18 @@ pub fn forwardAll(
     decode_context: *const gpt_arch.DecodeContext,
     replay_fallbacks: *u64,
 ) ![]f32 {
+    return @import("../execution/invocation_observation.zig").callContextOperation(context, .forward, forwardAllUnobserved, .{ context, graph_cache, input_ids, batch_size, seq_len, decode_context, replay_fallbacks });
+}
+
+fn forwardAllUnobserved(
+    context: *const execution.Context,
+    graph_cache: ?*@import("cache.zig").GraphCache,
+    input_ids: []const i64,
+    batch_size: usize,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+    replay_fallbacks: *u64,
+) ![]f32 {
     if (NativeDecodeState.requiresDeepSeekV4CompressedCache(context.gpt_config.*) and
         (graph_cache != null or context.compiled_partition_backend != null)) return error.DeepSeekV4CompressedGraphModeNotSupported;
     if (graph_cache) |cache| return execution.graphForwardAll(context, cache, input_ids, batch_size, seq_len, decode_context);
@@ -126,6 +138,9 @@ pub fn endDecodeEpoch(cb: *const ComputeBackend, execution_id: u64, attempts: u6
 }
 
 pub const Executor = struct {
+    /// Borrowed model sink, independent of context so pre-acquisition errors
+    /// never dereference the backend, work or borrowed numerical context.
+    batch_diagnostics: ?@import("../execution/invocation_observation.zig").Binding = null,
     context: execution.Context,
     graph_cache: ?*@import("cache.zig").GraphCache = null,
     pad_token: i64 = 0,
@@ -160,6 +175,7 @@ pub const Executor = struct {
         if (self.access.mutex) |mutex| {
             if (step_events or self.access.gate != null) {
                 self.access.acquire() catch |err| {
+                    @import("../execution/shared_batch_observation.zig").acquisitionFailure(self.batchBinding(), .scheduled_step, claimed, describeParticipant, err);
                     publication.publish(claimed, err);
                     return;
                 };
@@ -188,17 +204,31 @@ pub const Executor = struct {
     }
 
     fn executePooled(self: *Executor, claimed: []const runtime.scheduler.native_generate.StepItem, publication: Publication) void {
-        self.context.cb.drainPrefetchBudget(4);
-        for (claimed) |item| if (item.phase == .decode) {
-            const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
-            if (work.continuation_context != null) self.tail_steps += 1;
-        };
-        var result = self.forward(claimed) catch |err| {
+        var result = @import("../execution/shared_batch_observation.zig").call(self.batchBinding(), self.context.cb.*, .scheduled_step, claimed, describeParticipant, @This().forwardOwnedCohort, .{ self, claimed }) catch |err| {
             publication.publish(claimed, err);
             return;
         };
         defer result.deinit(self.context.allocator);
         publication.publish(claimed, result);
+    }
+
+    fn batchBinding(self: *const Executor) ?@import("../execution/invocation_observation.zig").Binding {
+        return self.batch_diagnostics;
+    }
+    fn describeParticipant(item: runtime.scheduler.native_generate.StepItem) @import("../execution/diagnostics.zig").Batch.Participant {
+        return .{ .request_id = item.request_id, .phase = switch (item.phase) {
+            .prefill => .prefill,
+            .decode => .decode,
+            .waiting => .unknown,
+        }, .query_rows = item.query_sequence_len, .total_rows = item.total_sequence_len };
+    }
+    fn forwardOwnedCohort(self: *Executor, claimed: []const runtime.scheduler.native_generate.StepItem) !Result {
+        self.context.cb.drainPrefetchBudget(4);
+        for (claimed) |item| if (item.phase == .decode) {
+            const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
+            if (work.continuation_context != null) self.tail_steps += 1;
+        };
+        return self.forward(claimed);
     }
 
     pub fn endEpoch(self: *Executor) void {
@@ -1481,4 +1511,78 @@ test "physical decoder step cancellation publishes once before borrowing backend
         try std.testing.expectEqual(@as(usize, 0), waiters.load(.acquire));
         try std.testing.expect(!gate.owned and gate.head == null and gate.tail == null);
     }
+}
+
+fn checkSharedNativeCohort(actual: ComputeBackend, reference: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const fixture = @import("../execution/testing/decoder.zig");
+    const diagnostics_mod = @import("../execution/diagnostics.zig");
+    const cfg = fixture.config();
+    const ids = [_]i64{ 0, 1 };
+    const expected = try fixture.eager(reference, cfg, &ids);
+    defer a.free(expected);
+    const Publisher = struct {
+        owner: *diagnostics_mod.Diagnostics,
+        expected: []const f32,
+        mutex: *std.atomic.Mutex,
+        observed: bool,
+        failure: ?anyerror = null,
+        calls: usize = 0,
+        fn validate(self: *@This(), peers: []const runtime.scheduler.native_generate.StepItem, outcome: anyerror!Result) !void {
+            const values = try outcome;
+            const unlocked = self.mutex.tryLock();
+            if (unlocked) self.mutex.unlock();
+            try std.testing.expect(!unlocked);
+            if (self.observed) {
+                const sampled = self.owner.snapshot() orelse return error.MissingSharedNativeCohort;
+                try std.testing.expect(sampled.scope == .shared_batch_numerical_dispatch and sampled.outcome == .success);
+                try std.testing.expectEqual(@as(usize, 2), sampled.batch.?.participant_count);
+                for (peers, 0..) |peer, index| try std.testing.expectEqual(peer.request_id, sampled.batch.?.participants[index].request_id);
+            } else try std.testing.expect(self.owner.snapshot() == null);
+            try std.testing.expect(!@import("../execution/allocation_registry.zig").enabled());
+            const logits = values.logits orelse return error.MissingSharedNativeLogits;
+            for (peers, 0..) |_, index| {
+                const last = logits[(index * values.max_query_seq_len + values.max_query_seq_len - 1) * self.expected.len ..][0..self.expected.len];
+                for (self.expected, last) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.01);
+            }
+        }
+        fn publish(raw: *anyopaque, peers: []const runtime.scheduler.native_generate.StepItem, outcome: anyerror!Result) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.validate(peers, outcome) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    for ([_]bool{ false, true }) |enabled| {
+        var owner = diagnostics_mod.Diagnostics{};
+        if (enabled) owner.configureBackend(true, &actual);
+        var manager = runtime.kv.manager.KvManager.init(a);
+        defer manager.deinit();
+        const pool = try manager.addPool(.{ .backend = .native, .dtype = .f16, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 64 });
+        var states = [_]NativeDecodeState{ NativeDecodeState.initPaged(a, &manager, pool, null), NativeDecodeState.initPaged(a, &manager, pool, null) };
+        defer for (&states) |*state| state.deinit();
+        var work = [_]PendingPrefillBatchWork{
+            .{ .allocator = a, .decode_state = &states[0], .token_ids = &ids, .seq_len = ids.len, .query_seq_len = ids.len, .wants_last_logits = true },
+            .{ .allocator = a, .decode_state = &states[1], .token_ids = &ids, .seq_len = ids.len, .query_seq_len = ids.len, .wants_last_logits = true },
+        };
+        const claimed = [_]runtime.scheduler.native_generate.StepItem{
+            .{ .request_id = 101, .work_ptr = &work[0], .phase = .prefill, .query_sequence_len = ids.len, .total_sequence_len = ids.len, .kv_sequence_len = 0, .kv_position_offset = 0 },
+            .{ .request_id = 202, .work_ptr = &work[1], .phase = .prefill, .query_sequence_len = ids.len, .total_sequence_len = ids.len, .kv_sequence_len = 0, .kv_position_offset = 0 },
+        };
+        var mutex: std.atomic.Mutex = .unlocked;
+        var executor = Executor{ .context = .{ .allocator = a, .cb = &actual, .gpt_config = &cfg, .weight_semantics = .traced_decoder }, .batch_diagnostics = .{ .diagnostics = &owner }, .access = .{ .mutex = &mutex } };
+        var publication = Publisher{ .owner = &owner, .expected = expected, .mutex = &mutex, .observed = enabled };
+        executor.execute(&claimed, true, .{ .ptr = &publication, .publish_fn = Publisher.publish });
+        try std.testing.expectEqual(@as(usize, 1), publication.calls);
+        if (publication.failure) |err| return err;
+        for (&states) |*state| try std.testing.expectEqual(ids.len, state.total_tokens);
+        try std.testing.expect(mutex.tryLock());
+        mutex.unlock();
+    }
+}
+
+test "actual Native shared prefill cohort publishes exact model-owned participants before task publication" {
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onNative(@import("../execution/testing/decoder.zig").populate, checkSharedNativeCohort);
 }

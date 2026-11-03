@@ -175,6 +175,11 @@ pub const AuxiliaryRequirements = struct {
 };
 pub const AuxiliaryBinding = struct { role: AuxiliaryRole, tensor: CT };
 pub const Invocation = struct {
+    input_generation: u64 = 0,
+    assigned_inputs: ?*const [3]?@import("../execution/kernel_route.zig").AssignedInput = null,
+    prepared_route: ?*const @import("../execution/kernel_route.zig").Owned = null,
+    prepared_resources: ?*const @import("../execution/kernel_route.zig").Assigned = null,
+    assigned_output: ?*const @import("../execution/kernel_route.zig").AssignedOutput = null,
     descriptor: *const Descriptor,
     /// Selected implementation policy stays separate from mathematical identity.
     operator_plan: ?*const @import("../graph/operator_plan.zig").OperatorPlan = null,
@@ -219,7 +224,8 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
     const node = graph.node(id);
     const shape = node.output_shape;
     const count = shape.numElements() orelse return null;
-    if (shape.dtype != .f32 or count <= 0 or count > std.math.maxInt(i32)) return null;
+    const typed_slice = node.op == .slice and (shape.dtype == .i32 or shape.dtype == .i64);
+    if ((shape.dtype != .f32 and !typed_slice) or count <= 0 or count > std.math.maxInt(i32)) return null;
     const operation: Operation = switch (node.op) {
         .transpose, .broadcast_in_dim => blk: {
             if (node.num_inputs != 1 or node.inputs[0] == ml.graph.null_node or node.inputs[0] >= graph.nodeCount()) return null;
@@ -255,7 +261,7 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
         .slice => |attrs| blk: {
             if (node.num_inputs != 1 or attrs.runtime_starts or attrs.runtime_limits) return null;
             const input = inputShape(graph, id, 0) orelse return null;
-            if (attrs.num_axes != input.rank()) return null;
+            if (attrs.num_axes != input.rank() or input.dtype != shape.dtype) return null;
             break :blk .{ .slice = Slice.init(input.dims[0..input.rank()], shape.dims[0..shape.rank()], attrs.starts[0..attrs.num_axes], attrs.limits[0..attrs.num_axes], attrs.strides[0..attrs.num_axes]) catch return null };
         },
         .gather => |attrs| blk: {
@@ -321,7 +327,7 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
         .linear => |linear| if (linear.bias) 3 else 2,
     };
     if (node.num_inputs != inputs) return null;
-    var result = Descriptor{ .operation = operation, .output_shape = shape, .input_count = inputs, .input_shapes = undefined };
+    var result = Descriptor{ .alignment = @intCast(@max(@as(usize, @alignOf(f32)), shape.dtype.byteSize())), .operation = operation, .output_shape = shape, .input_count = inputs, .input_shapes = undefined };
     for (node.getInputs(), 0..) |input, index| {
         if (input == ml.graph.null_node or input >= graph.nodeCount()) return null;
         const input_shape = graph.node(input).output_shape;
@@ -330,7 +336,8 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
             (input_shape.dtype == .f16 or input_shape.dtype == .bf16);
         const integer_indices = index == 1 and operation == .gather and
             (input_shape.dtype == .i32 or input_shape.dtype == .i64);
-        if ((input_shape.dtype != .f32 and !reduced_weight and !integer_indices) or input_count <= 0 or input_count > std.math.maxInt(i32)) return null;
+        const typed_slice_input = typed_slice and index == 0 and input_shape.dtype == shape.dtype;
+        if ((input_shape.dtype != .f32 and !reduced_weight and !integer_indices and !typed_slice_input) or input_count <= 0 or input_count > std.math.maxInt(i32)) return null;
         if ((operation == .unary or operation == .binary or operation == .softmax or operation == .rope) and input_count != 1 and !std.mem.eql(i64, input_shape.dims[0..input_shape.rank()], shape.dims[0..shape.rank()])) return null;
         if ((operation == .unary or operation == .softmax or operation == .rope) and input_count != count) return null;
         result.input_shapes[index] = input_shape;

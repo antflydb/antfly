@@ -28,6 +28,25 @@ pub const Budget = struct {
     allocations: u64 = 0,
     frees: u64 = 0,
 
+    /// Move existing physical ownership without inventing SDK allocation/free
+    /// events. A cleanup-only provider can outlive the original compute owner.
+    pub fn handoffTo(self: *Budget, destination: *Budget, bytes: usize) !void {
+        if (self == destination or bytes == 0) return;
+        const first = if (@intFromPtr(self) < @intFromPtr(destination)) self else destination;
+        const second = if (first == self) destination else self;
+        while (!first.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer first.mutex.unlock();
+        while (!second.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer second.mutex.unlock();
+        if (bytes > self.physical_live or bytes > self.live or bytes > destination.limit - destination.live) return error.InvalidCudaPhysicalHandoff;
+        self.physical_live -= bytes;
+        self.live -= bytes;
+        destination.physical_live += bytes;
+        destination.live += bytes;
+        destination.peak = @max(destination.peak, destination.live);
+        destination.physical_peak = @max(destination.physical_peak, destination.physical_live);
+    }
+
     pub const Snapshot = struct { limit: usize, live: usize, peak: usize, physical_live: usize, physical_peak: usize, allocations: u64, frees: u64 };
 
     pub fn snapshot(self: *Budget) Snapshot {
@@ -115,4 +134,28 @@ test "CUDA physical counters exclude rolled-back reservations and keep failed fr
     try std.testing.expectEqual(@as(usize, 32), final.physical_peak);
     try std.testing.expectEqual(@as(u64, 1), final.allocations);
     try std.testing.expectEqual(@as(u64, 1), final.frees);
+}
+
+test "CUDA retirement accounting handoff is exact and failure atomic" {
+    var source: Budget = .{};
+    var target: Budget = .{};
+    try source.reserve(64);
+    source.allocated(64);
+    try target.setLimit(32);
+    const before = source.snapshot();
+    try std.testing.expectError(error.InvalidCudaPhysicalHandoff, source.handoffTo(&target, 33));
+    try std.testing.expectEqualDeep(before, source.snapshot());
+    try std.testing.expectEqual(@as(usize, 0), target.snapshot().live);
+    try std.testing.expectError(error.InvalidCudaPhysicalHandoff, source.handoffTo(&target, 65));
+    try std.testing.expectEqualDeep(before, source.snapshot());
+    try source.handoffTo(&target, 16);
+    try std.testing.expectEqual(@as(usize, 48), source.snapshot().physical_live);
+    try std.testing.expectEqual(@as(usize, 16), target.snapshot().physical_live);
+    try std.testing.expectEqual(@as(u64, 1), source.snapshot().allocations);
+    try std.testing.expectEqual(@as(u64, 0), target.snapshot().allocations);
+    try std.testing.expectEqual(@as(u64, 0), source.snapshot().frees);
+    target.freed(16);
+    source.freed(48);
+    try std.testing.expectEqual(@as(usize, 0), target.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 0), source.snapshot().live);
 }

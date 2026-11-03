@@ -816,7 +816,8 @@ const SharedExternalAdmission = struct {
     references: usize = 1,
     mutex: std.atomic.Mutex = .unlocked,
 
-    fn create(allocator: std.mem.Allocator, controller: *AdmissionController, token: usize, amounts: AdmissionAmounts) !*@This() {
+    fn create(requested_allocator: std.mem.Allocator, controller: *AdmissionController, token: usize, amounts: AdmissionAmounts) !*@This() {
+        const allocator = controller.metadata_allocator orelse requested_allocator;
         const owner = try allocator.create(@This());
         errdefer allocator.destroy(owner);
         // A nonempty original reservation prevents reconfiguration between
@@ -838,6 +839,28 @@ const SharedExternalAdmission = struct {
         controller.mutex.unlock();
         owner.* = .{ .allocator = allocator, .controller = controller, .budget = budget, .token = token, .amounts = amounts };
         return owner;
+    }
+
+    fn dropPreparedReference(self: *@This()) void {
+        spinLockAdmission(&self.mutex);
+        std.debug.assert(self.references > 1);
+        self.references -= 1;
+        self.mutex.unlock();
+    }
+
+    /// The original lease still owns its unchanged external token. Discard
+    /// unpublished split metadata WITHOUT reducing or releasing that token.
+    fn destroyUnpublished(self: *@This()) void {
+        std.debug.assert(self.references == 2);
+        const controller = self.controller;
+        const budget = self.budget;
+        const allocator = self.allocator;
+        spinLockAdmission(&controller.mutex);
+        std.debug.assert(controller.shared_external_owners != 0);
+        controller.shared_external_owners -= 1;
+        controller.mutex.unlock();
+        allocator.destroy(self);
+        budget.releaseContext();
     }
 
     fn addReference(self: *@This()) !void {
@@ -905,12 +928,45 @@ pub const AdmissionLease = struct {
     live_settled_bytes: usize = 0,
     live_settled_epoch: u64 = 0,
 
-    /// Transfer an owned subset without acquiring another reservation or
-    /// publishing a release/reacquire gap. The caller owns both results and
-    /// keeps the controller alive until both retire. An external process token
-    /// is shared through one retained producer, never copied or reconstructed.
-    /// The first external split allocates one owner; unsplit leases do not.
-    pub fn partition(self: *AdmissionLease, allocator: std.mem.Allocator, amounts: AdmissionAmounts) !AdmissionLease {
+    /// Exclusively borrows the source until commit/abort. Preparation can
+    /// allocate shared-token metadata but changes no owned amounts or quota.
+    /// Several DIFFERENT lease members can prepare before an atomic commit.
+    pub const PreparedPartition = struct {
+        source: *AdmissionLease,
+        child: AdmissionLease,
+        remaining: AdmissionAmounts,
+        domain_remaining: AdmissionAmounts,
+        original_amounts: AdmissionAmounts,
+        original_external: ?usize,
+        original_shared: ?*SharedExternalAdmission,
+        index: usize,
+        created_shared: bool,
+        held: bool = true,
+
+        pub fn commit(self: *PreparedPartition) AdmissionLease {
+            std.debug.assert(self.held);
+            std.debug.assert(self.source.controller == self.child.controller);
+            std.debug.assert(std.meta.eql(self.source.amounts, self.original_amounts));
+            std.debug.assert(self.source.external_lease == self.original_external and self.source.shared_external == self.original_shared);
+            self.source.amounts = self.remaining;
+            self.source.amounts_by_backend[self.index] = self.domain_remaining;
+            self.source.live_reserved_bytes -= self.child.live_reserved_bytes;
+            self.source.live_settled_bytes -= self.child.live_settled_bytes;
+            self.source.external_lease = null;
+            self.source.shared_external = self.child.shared_external;
+            self.held = false;
+            return self.child;
+        }
+        pub fn abort(self: *PreparedPartition) void {
+            if (!self.held) return;
+            self.held = false;
+            if (self.child.shared_external) |owner| {
+                if (self.created_shared) owner.destroyUnpublished() else owner.dropPreparedReference();
+            }
+        }
+    };
+
+    pub fn preparePartition(self: *AdmissionLease, allocator: std.mem.Allocator, amounts: AdmissionAmounts) !PreparedPartition {
         const controller = self.controller orelse return error.AdmissionLeaseReleased;
         const backend = self.retain_backend_class orelse return error.InvalidAdmissionLeasePartition;
         if (std.meta.eql(amounts, AdmissionAmounts{})) return error.InvalidAdmissionLeasePartition;
@@ -921,35 +977,36 @@ pub const AdmissionLease = struct {
         const live_bytes = liveHostBytes(amounts) catch return error.InvalidAdmissionLeasePartition;
         const pending = @min(self.live_reserved_bytes, live_bytes);
         const settled = @min(self.live_settled_bytes, live_bytes - pending);
-        // Every fallible operation precedes ownership mutation. Allocation or
-        // capability failure leaves the original exactly-once token untouched.
         var shared = self.shared_external;
+        var created_shared = false;
         if (shared) |owner| {
             try owner.addReference();
         } else if (self.external_lease) |token| {
             shared = try SharedExternalAdmission.create(allocator, controller, token, self.amounts);
-            // create owns the original member; the child is the second.
-            shared.?.references = 2;
+            shared.?.references = 2; // original member + prepared child
+            created_shared = true;
         }
         var domains = emptyAdmissionAmountsByBackend();
         domains[index] = amounts;
-        const child = AdmissionLease{
-            .controller = controller,
-            .amounts = amounts,
-            .amounts_by_backend = domains,
-            .retain_backend_class = backend,
-            .live_reserved_bytes = pending,
-            .live_settled_bytes = settled,
-            .live_settled_epoch = self.live_settled_epoch,
-            .shared_external = shared,
+        return .{
+            .source = self,
+            .child = .{ .controller = controller, .amounts = amounts, .amounts_by_backend = domains, .retain_backend_class = backend, .live_reserved_bytes = pending, .live_settled_bytes = settled, .live_settled_epoch = self.live_settled_epoch, .shared_external = shared },
+            .remaining = remaining,
+            .domain_remaining = domain_remaining,
+            .original_amounts = self.amounts,
+            .original_external = self.external_lease,
+            .original_shared = self.shared_external,
+            .index = index,
+            .created_shared = created_shared,
         };
-        self.amounts = remaining;
-        self.amounts_by_backend[index] = domain_remaining;
-        self.live_reserved_bytes -= pending;
-        self.live_settled_bytes -= settled;
-        self.external_lease = null;
-        self.shared_external = shared;
-        return child;
+    }
+
+    /// Transfer an owned subset without another reservation or refund/reacquire
+    /// gap. All fallible work precedes ownership mutation; direct callers retain
+    /// the original API while transactions can prepare multiple members first.
+    pub fn partition(self: *AdmissionLease, allocator: std.mem.Allocator, amounts: AdmissionAmounts) !AdmissionLease {
+        var prepared = try self.preparePartition(allocator, amounts);
+        return prepared.commit();
     }
 
     /// Reduce a peak reservation to the bytes that remain resident after a
@@ -1001,6 +1058,10 @@ pub const AdmissionLease = struct {
 };
 
 pub const AdmissionController = struct {
+    /// Optional stable allocator for controller-owned shared-token metadata.
+    /// Initialize before publication and keep immutable for this controller's
+    /// complete lifetime. Raw controllers preserve requested allocation.
+    metadata_allocator: ?std.mem.Allocator = null,
     mutex: std.atomic.Mutex = .unlocked,
     /// Serializes reservations against one sampled live-memory capacity. While
     /// any lease is pending, every concurrent admission consumes the same
@@ -5065,4 +5126,63 @@ test "admission partition external promotion unwinds every allocation failure" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "external partition metadata uses stable controller allocator and raw controllers preserve requested OOM" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |stable_owner| {
+        var recorder = PartitionBudgetRecorder{};
+        var controller = AdmissionController{ .metadata_allocator = if (stable_owner) a else null };
+        defer controller.deinit();
+        try controller.configureResourceBudget(recorder.capability());
+        var source = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 32 }, false);
+        defer source.release();
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        if (stable_owner) {
+            var child = try source.partition(failing.allocator(), .{ .host_scratch_bytes = 16 });
+            defer child.release();
+            try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+            try std.testing.expect(!failing.has_induced_failure);
+            const owner = child.shared_external.?;
+            try std.testing.expect(owner.allocator.ptr == a.ptr and owner.allocator.vtable == a.vtable);
+            source.release();
+            child.release();
+            try std.testing.expectEqual(@as(usize, 1), recorder.releases);
+        } else {
+            try std.testing.expectError(error.OutOfMemory, source.partition(failing.allocator(), .{ .host_scratch_bytes = 16 }));
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(AdmissionAmounts{ .host_scratch_bytes = 32 }, source.amounts);
+            try std.testing.expect(source.shared_external == null and source.external_lease != null);
+            source.release();
+            try std.testing.expectEqual(@as(usize, 1), recorder.releases);
+        }
+        try std.testing.expectEqual(AdmissionAmounts{}, controller.snapshot());
+    }
+}
+
+test "admission prepared partition abort preserves exact external token and original amounts" {
+    var controller = AdmissionController{};
+    defer controller.deinit();
+    var budget = PartitionBudgetRecorder{};
+    try controller.configureResourceBudget(budget.capability());
+    var original = try controller.tryAcquire(.gpu, .{}, .{ .backend_kv_bytes = 96 }, false);
+    defer original.release();
+    const before = controller.snapshot();
+    var pending = try original.preparePartition(std.testing.allocator, .{ .backend_kv_bytes = 32 });
+    try std.testing.expectEqual(@as(usize, 96), original.amounts.backend_kv_bytes);
+    try std.testing.expect(original.external_lease != null and original.shared_external == null);
+    try std.testing.expectEqual(@as(usize, 1), controller.shared_external_owners);
+    pending.abort();
+    try std.testing.expectEqual(@as(usize, 0), controller.shared_external_owners);
+    try std.testing.expectEqual(before.backend_kv_bytes, controller.snapshot().backend_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 1), budget.reserves);
+    try std.testing.expectEqual(@as(usize, 0), budget.releases);
+    try std.testing.expectEqual(@as(usize, 2), budget.references); // controller + fixture
+    var child = try original.partition(std.testing.allocator, .{ .backend_kv_bytes = 32 });
+    defer child.release();
+    var second = try original.preparePartition(std.testing.allocator, .{ .backend_kv_bytes = 16 });
+    second.abort();
+    try std.testing.expectEqual(@as(usize, 64), original.amounts.backend_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 96), budget.current.backend_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 1), budget.reserves);
 }

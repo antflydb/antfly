@@ -120,6 +120,13 @@ const metal_tensor_bridge = struct {
 
 pub const RawMetalProvider = opaque {};
 pub const RawMetalDecodeRuntime = opaque {};
+pub const PreparedBindingKind = @import("prepared_binding.zig").Kind;
+pub const PreparedBindingStamp = @import("prepared_binding.zig").Stamp;
+pub extern fn antfly_metal_prepared_binding_generation(runtime: ?*RawMetalDecodeRuntime, kind: PreparedBindingKind, slot: usize) u64;
+pub extern fn antfly_metal_validate_prepared_bindings(runtime: ?*RawMetalDecodeRuntime, checked: *u64, stamps: [*]const PreparedBindingStamp, count: usize) c_int;
+pub extern fn antfly_metal_slot_mutation_needs_drain(runtime: ?*RawMetalDecodeRuntime) c_int;
+
+pub extern fn antfly_metal_frame_retain_prepared_use(runtime: ?*RawMetalDecodeRuntime, context: *anyopaque, retain_use: *const fn (*anyopaque) callconv(.c) void, release_use: *const fn (*anyopaque) callconv(.c) void, uncertain_use: *const fn (*anyopaque) callconv(.c) void) c_int;
 
 /// Diagnostic-only A4B operation identities for the versioned Metal roofline
 /// ledger. Keep the numeric values synchronized with metal_kernels.m.
@@ -1617,17 +1624,17 @@ pub fn decoderRuntimeAbsoluteEmbeddingsPrepared(self: anytype) bool {
 
 pub fn decoderRuntimeRmsNormSlotPrepared(self: anytype, slot: usize, hidden_size: usize) bool {
     if (slot >= decoder_runtime_rms_norm_slot_capacity) return false;
-    return self.raw_rms_norm_slots_prepared[slot] and self.raw_rms_norm_slot_hidden_sizes[slot] == hidden_size;
+    return rawRmsNormSlotPrepared(self, slot) and self.raw_rms_norm_slot_hidden_sizes[slot] == hidden_size;
 }
 
 pub fn decoderRuntimeLayerNormSlotPrepared(self: anytype, slot: usize, hidden_size: usize) bool {
     if (slot >= decoder_runtime_layer_norm_slot_capacity) return false;
-    return self.raw_layer_norm_slots_prepared[slot] and self.raw_layer_norm_slot_hidden_sizes[slot] == hidden_size;
+    return rawLayerNormSlotPrepared(self, slot) and self.raw_layer_norm_slot_hidden_sizes[slot] == hidden_size;
 }
 
 pub fn decoderRuntimeLinearSlotPrepared(self: anytype, slot: usize, in_dim: usize, out_dim: usize) bool {
     if (slot >= decoder_runtime_linear_slot_capacity) return false;
-    return self.raw_linear_slots_prepared[slot] and
+    return rawLinearSlotPrepared(self, slot) and
         self.raw_linear_slot_in_dims[slot] == in_dim and
         self.raw_linear_slot_out_dims[slot] == out_dim;
 }
@@ -3466,7 +3473,7 @@ pub fn decoderRuntimeApplyRmsNormScratch(self: anytype, request: anytype, output
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (request.slot >= decoder_runtime_layer_norm_slot_capacity) return null;
-    if (!self.raw_rms_norm_slots_prepared[request.slot]) return null;
+    if (!rawRmsNormSlotPrepared(self, request.slot)) return null;
     if (self.raw_rms_norm_slot_hidden_sizes[request.slot] != request.hidden_size) return null;
     if (request.hidden_size == 0 or request.input.ndim() != 2 or output_index >= 6) return null;
     if (@as(usize, @intCast(request.input.dim(0))) != 1) return null;
@@ -4348,10 +4355,11 @@ pub fn encodeArgmaxLogitsDevice(self: anytype, input: MetalTensor, out_dim: usiz
 }
 
 pub fn decoderRuntimePrepareLayerNorm(self: anytype, request: anytype) !bool {
+    if (preparedBindingRetired(self, .layer_norm, request.slot)) return false;
     const runtime = self.raw_decode_runtime orelse return false;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
     if (request.hidden_size == 0 or request.slot >= decoder_runtime_layer_norm_slot_capacity) return false;
-    if (self.raw_layer_norm_slots_prepared[request.slot] and
+    if (rawLayerNormSlotPrepared(self, request.slot) and
         self.raw_layer_norm_slot_hidden_sizes[request.slot] == request.hidden_size)
     {
         return true;
@@ -4389,16 +4397,18 @@ pub fn decoderRuntimePrepareLayerNorm(self: anytype, request: anytype) !bool {
     self.raw_layer_norm_slot_weights[request.slot] = weight_copy;
     self.raw_layer_norm_slot_biases[request.slot] = bias_copy;
     self.raw_layer_norm_slots_prepared[request.slot] = true;
+    if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.layer_norm, request.slot);
     self.raw_layer_norm_slot_hidden_sizes[request.slot] = request.hidden_size;
     published = true;
     return true;
 }
 
 pub fn decoderRuntimePrepareRmsNorm(self: anytype, request: anytype) !bool {
+    if (preparedBindingRetired(self, .rms_norm, request.slot)) return false;
     const runtime = self.raw_decode_runtime orelse return false;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
     if (request.hidden_size == 0 or request.slot >= decoder_runtime_rms_norm_slot_capacity) return false;
-    if (self.raw_rms_norm_slots_prepared[request.slot] and
+    if (rawRmsNormSlotPrepared(self, request.slot) and
         self.raw_rms_norm_slot_hidden_sizes[request.slot] == request.hidden_size)
     {
         return true;
@@ -4423,6 +4433,7 @@ pub fn decoderRuntimePrepareRmsNorm(self: anytype, request: anytype) !bool {
                     self.raw_rms_norm_slot_weights[request.slot] = null;
                 }
                 self.raw_rms_norm_slots_prepared[request.slot] = true;
+                if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.rms_norm, request.slot);
                 self.raw_rms_norm_slot_hidden_sizes[request.slot] = request.hidden_size;
                 return true;
             }
@@ -4448,6 +4459,7 @@ pub fn decoderRuntimePrepareRmsNorm(self: anytype, request: anytype) !bool {
     if (self.raw_rms_norm_slot_weights[request.slot]) |*old| old.deinit();
     self.raw_rms_norm_slot_weights[request.slot] = weight_copy;
     self.raw_rms_norm_slots_prepared[request.slot] = true;
+    if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.rms_norm, request.slot);
     self.raw_rms_norm_slot_hidden_sizes[request.slot] = request.hidden_size;
     published = true;
     return true;
@@ -4466,7 +4478,7 @@ pub fn decoderRuntimeApplyLayerNorm(self: anytype, request: anytype, stats: anyt
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (request.hidden_size == 0 or request.slot >= decoder_runtime_layer_norm_slot_capacity) return null;
-    if (!self.raw_layer_norm_slots_prepared[request.slot]) return null;
+    if (!rawLayerNormSlotPrepared(self, request.slot)) return null;
     if (self.raw_layer_norm_slot_hidden_sizes[request.slot] != request.hidden_size) return null;
     if (request.input.ndim() != 2) return null;
     const rows = @as(usize, @intCast(request.input.dim(0)));
@@ -4501,7 +4513,7 @@ pub fn decoderRuntimeApplyAddLayerNorm(self: anytype, request: anytype, stats: a
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (request.hidden_size == 0 or request.slot >= decoder_runtime_layer_norm_slot_capacity) return null;
-    if (!self.raw_layer_norm_slots_prepared[request.slot]) return null;
+    if (!rawLayerNormSlotPrepared(self, request.slot)) return null;
     if (self.raw_layer_norm_slot_hidden_sizes[request.slot] != request.hidden_size) return null;
     if (!request.a.isDevice() or !request.b.isDevice()) return null;
     if (request.a.ndim() != 2 or request.b.ndim() != 2) return null;
@@ -4579,7 +4591,7 @@ pub fn decoderRuntimeApplyAddLayerNormSum(self: anytype, request: anytype, stats
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (request.hidden_size == 0 or request.slot >= decoder_runtime_layer_norm_slot_capacity) return null;
-    if (!self.raw_layer_norm_slots_prepared[request.slot]) return null;
+    if (!rawLayerNormSlotPrepared(self, request.slot)) return null;
     if (self.raw_layer_norm_slot_hidden_sizes[request.slot] != request.hidden_size) return null;
     if (!request.a.isDevice() or !request.b.isDevice()) return null;
     if (request.a.ndim() != 2 or request.b.ndim() != 2) return null;
@@ -4708,7 +4720,7 @@ pub fn decoderRuntimeApplyAddLayerNormInto(
     const runtime = self.raw_decode_runtime orelse return false;
     if (termite_metal_decode_runtime_ready(runtime) == 0 or !hasActiveFrame(runtime)) return false;
     if (request.hidden_size == 0 or request.slot >= decoder_runtime_layer_norm_slot_capacity or
-        !self.raw_layer_norm_slots_prepared[request.slot] or
+        !rawLayerNormSlotPrepared(self, request.slot) or
         self.raw_layer_norm_slot_hidden_sizes[request.slot] != request.hidden_size)
     {
         return false;
@@ -4745,7 +4757,7 @@ pub fn decoderRuntimeApplyRmsNorm(self: anytype, request: anytype, stats: anytyp
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (request.hidden_size == 0 or request.slot >= decoder_runtime_rms_norm_slot_capacity) return null;
-    if (!self.raw_rms_norm_slots_prepared[request.slot]) return null;
+    if (!rawRmsNormSlotPrepared(self, request.slot)) return null;
     if (self.raw_rms_norm_slot_hidden_sizes[request.slot] != request.hidden_size) return null;
     if (request.input.ndim() != 2) return null;
     const rows = @as(usize, @intCast(request.input.dim(0)));
@@ -5027,9 +5039,9 @@ pub fn decoderRuntimeApplyLayerNormLinearArgmax(self: anytype, request: anytype)
     const frame_active = hasActiveFrame(self.raw_decode_runtime);
     if (request.hidden_size == 0 or request.out_dim == 0) return null;
     if (request.norm_slot >= decoder_runtime_layer_norm_slot_capacity or request.linear_slot >= decoder_runtime_linear_slot_capacity) return null;
-    if (!self.raw_layer_norm_slots_prepared[request.norm_slot]) return null;
+    if (!rawLayerNormSlotPrepared(self, request.norm_slot)) return null;
     if (self.raw_layer_norm_slot_hidden_sizes[request.norm_slot] != request.hidden_size) return null;
-    if (!self.raw_linear_slots_prepared[request.linear_slot]) return null;
+    if (!rawLinearSlotPrepared(self, request.linear_slot)) return null;
     if (self.raw_linear_slot_kinds[request.linear_slot] != .dense) return null;
     if (self.raw_linear_slot_in_dims[request.linear_slot] != request.hidden_size) return null;
     if (self.raw_linear_slot_out_dims[request.linear_slot] != request.out_dim) return null;
@@ -5086,9 +5098,9 @@ pub fn decoderRuntimeApplyLayerNormLinear(self: anytype, request: anytype) !?Met
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (request.hidden_size == 0 or request.out_dim == 0) return null;
     if (request.norm_slot >= decoder_runtime_layer_norm_slot_capacity or request.linear_slot >= decoder_runtime_linear_slot_capacity) return null;
-    if (!self.raw_layer_norm_slots_prepared[request.norm_slot]) return null;
+    if (!rawLayerNormSlotPrepared(self, request.norm_slot)) return null;
     if (self.raw_layer_norm_slot_hidden_sizes[request.norm_slot] != request.hidden_size) return null;
-    if (!self.raw_linear_slots_prepared[request.linear_slot]) return null;
+    if (!rawLinearSlotPrepared(self, request.linear_slot)) return null;
     if (self.raw_linear_slot_kinds[request.linear_slot] != .dense) return null;
     if (self.raw_linear_slot_in_dims[request.linear_slot] != request.hidden_size) return null;
     if (self.raw_linear_slot_out_dims[request.linear_slot] != request.out_dim) return null;
@@ -5153,7 +5165,7 @@ fn decoderRuntimeApplyNormLinearSample(comptime rms: bool, self: anytype, reques
     if (request.norm_slot >= norm_capacity or request.linear_slot >= decoder_runtime_linear_slot_capacity) return null;
     if (!norm_prepared[request.norm_slot]) return null;
     if (norm_hidden_sizes[request.norm_slot] != request.hidden_size) return null;
-    if (!self.raw_linear_slots_prepared[request.linear_slot]) return null;
+    if (!rawLinearSlotPrepared(self, request.linear_slot)) return null;
     if (self.raw_linear_slot_kinds[request.linear_slot] != .dense) return null;
     if (self.raw_linear_slot_in_dims[request.linear_slot] != request.hidden_size) return null;
     if (self.raw_linear_slot_out_dims[request.linear_slot] != request.out_dim) return null;
@@ -5233,9 +5245,9 @@ pub fn decoderRuntimeApplyRmsNormLinearArgmax(self: anytype, request: anytype) !
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (request.hidden_size == 0 or request.out_dim == 0) return null;
     if (request.norm_slot >= decoder_runtime_rms_norm_slot_capacity or request.linear_slot >= decoder_runtime_linear_slot_capacity) return null;
-    if (!self.raw_rms_norm_slots_prepared[request.norm_slot]) return null;
+    if (!rawRmsNormSlotPrepared(self, request.norm_slot)) return null;
     if (self.raw_rms_norm_slot_hidden_sizes[request.norm_slot] != request.hidden_size) return null;
-    if (!self.raw_linear_slots_prepared[request.linear_slot]) return null;
+    if (!rawLinearSlotPrepared(self, request.linear_slot)) return null;
     const linear_kind = self.raw_linear_slot_kinds[request.linear_slot];
     if (linear_kind != .dense and linear_kind != .quantized) return null;
     if (self.raw_linear_slot_in_dims[request.linear_slot] != request.hidden_size) return null;
@@ -5350,9 +5362,9 @@ pub fn decoderRuntimeEncodeRmsNormLinearArgmaxDevice(self: anytype, request: any
     if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
     if (request.hidden_size == 0 or request.out_dim == 0) return false;
     if (request.norm_slot >= decoder_runtime_rms_norm_slot_capacity or request.linear_slot >= decoder_runtime_linear_slot_capacity) return false;
-    if (!self.raw_rms_norm_slots_prepared[request.norm_slot]) return false;
+    if (!rawRmsNormSlotPrepared(self, request.norm_slot)) return false;
     if (self.raw_rms_norm_slot_hidden_sizes[request.norm_slot] != request.hidden_size) return false;
-    if (!self.raw_linear_slots_prepared[request.linear_slot]) return false;
+    if (!rawLinearSlotPrepared(self, request.linear_slot)) return false;
     const linear_kind = self.raw_linear_slot_kinds[request.linear_slot];
     if (linear_kind != .dense and linear_kind != .quantized) return false;
     if (self.raw_linear_slot_in_dims[request.linear_slot] != request.hidden_size) return false;
@@ -5423,9 +5435,9 @@ pub fn decoderRuntimeEncodeRmsNormLinearLogitsDevice(self: anytype, request: any
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (request.hidden_size == 0 or request.out_dim == 0) return null;
     if (request.norm_slot >= decoder_runtime_rms_norm_slot_capacity or request.linear_slot >= decoder_runtime_linear_slot_capacity) return null;
-    if (!self.raw_rms_norm_slots_prepared[request.norm_slot]) return null;
+    if (!rawRmsNormSlotPrepared(self, request.norm_slot)) return null;
     if (self.raw_rms_norm_slot_hidden_sizes[request.norm_slot] != request.hidden_size) return null;
-    if (!self.raw_linear_slots_prepared[request.linear_slot]) return null;
+    if (!rawLinearSlotPrepared(self, request.linear_slot)) return null;
     if (self.raw_linear_slot_kinds[request.linear_slot] != .quantized) return null;
     if (self.raw_linear_slot_in_dims[request.linear_slot] != request.hidden_size) return null;
     if (self.raw_linear_slot_out_dims[request.linear_slot] != request.out_dim) return null;
@@ -5482,7 +5494,7 @@ pub fn decoderRuntimeEncodeRmsNormLinearLogitsDevice(self: anytype, request: any
 
 fn runtimeLinearSlotSupportsDeviceApply(self: anytype, slot: usize, in_dim: usize, out_dim: usize) bool {
     if (slot >= decoder_runtime_linear_slot_capacity) return false;
-    if (!self.raw_linear_slots_prepared[slot]) return false;
+    if (!rawLinearSlotPrepared(self, slot)) return false;
     if (self.raw_linear_slot_in_dims[slot] != in_dim or self.raw_linear_slot_out_dims[slot] != out_dim) return false;
     return switch (self.raw_linear_slot_kinds[slot]) {
         .dense => true,
@@ -5507,8 +5519,8 @@ fn tracePleResidualRuntimeEnabled() bool {
 }
 
 fn tracePleResidualRuntimeSlot(self: anytype, label: []const u8, slot: usize, in_dim: usize, out_dim: usize) void {
-    if (!tracePleResidualRuntimeEnabled()) return;
-    const prepared = slot < decoder_runtime_linear_slot_capacity and self.raw_linear_slots_prepared[slot];
+    if (!tracePleResidualRuntimeEnabled() or preparedBindingRetired(self, .linear, slot)) return;
+    const prepared = slot < decoder_runtime_linear_slot_capacity and rawLinearSlotPrepared(self, slot);
     const kind = if (slot < decoder_runtime_linear_slot_capacity) self.raw_linear_slot_kinds[slot] else .none;
     const runtime_kind = if (slot < decoder_runtime_linear_slot_capacity) self.raw_linear_slot_runtime_prepared_kind[slot] else .none;
     const raw_in = if (slot < decoder_runtime_linear_slot_capacity) self.raw_linear_slot_in_dims[slot] else 0;
@@ -5568,7 +5580,7 @@ pub fn decoderRuntimeApplyPleResidualDevice(self: anytype, request: anytype) !?M
         if (tracePleResidualRuntimeEnabled()) std.debug.print("metal_graph_fusion_trace: ple_residual runtime_early reason=post_norm_range slot={d}\n", .{request.post_norm_slot});
         return null;
     }
-    if (!self.raw_rms_norm_slots_prepared[request.post_norm_slot]) {
+    if (!rawRmsNormSlotPrepared(self, request.post_norm_slot)) {
         if (tracePleResidualRuntimeEnabled()) std.debug.print("metal_graph_fusion_trace: ple_residual runtime_early reason=post_norm_unprepared slot={d}\n", .{request.post_norm_slot});
         return null;
     }
@@ -5743,12 +5755,12 @@ pub fn decoderRuntimeApplyAttentionOutputResidualDevice(self: anytype, request: 
     if (linear_format == .unsupported) return null;
     if (request.pre_linear_rms_norm_slot) |slot| {
         if (slot >= decoder_runtime_rms_norm_slot_capacity) return null;
-        if (!self.raw_rms_norm_slots_prepared[slot]) return null;
+        if (!rawRmsNormSlotPrepared(self, slot)) return null;
         if (self.raw_rms_norm_slot_hidden_sizes[slot] != request.attention_input_size) return null;
     }
     if (request.post_linear_rms_norm_slot) |slot| {
         if (slot >= decoder_runtime_rms_norm_slot_capacity) return null;
-        if (!self.raw_rms_norm_slots_prepared[slot]) return null;
+        if (!rawRmsNormSlotPrepared(self, slot)) return null;
         if (self.raw_rms_norm_slot_hidden_sizes[slot] != request.hidden_size) return null;
     }
 
@@ -5822,7 +5834,7 @@ pub fn decoderRuntimeApplyLinearArgmax(self: anytype, request: anytype) !?usize 
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (request.in_dim == 0 or request.out_dim == 0) return null;
     if (request.slot >= decoder_runtime_linear_slot_capacity) return null;
-    if (!self.raw_linear_slots_prepared[request.slot]) return null;
+    if (!rawLinearSlotPrepared(self, request.slot)) return null;
     if (self.raw_linear_slot_kinds[request.slot] != .dense) return null;
     if (self.raw_linear_slot_in_dims[request.slot] != request.in_dim) return null;
     if (self.raw_linear_slot_out_dims[request.slot] != request.out_dim) return null;
@@ -5870,7 +5882,7 @@ pub fn decoderRuntimeApplyLinearArgmaxFrameEncode(self: anytype, request: anytyp
     if (termite_metal_decode_runtime_has_active_frame(runtime) == 0) return false;
     if (request.in_dim == 0 or request.out_dim == 0) return false;
     if (request.slot >= decoder_runtime_linear_slot_capacity) return false;
-    if (!self.raw_linear_slots_prepared[request.slot]) return false;
+    if (!rawLinearSlotPrepared(self, request.slot)) return false;
     if (self.raw_linear_slot_kinds[request.slot] != .dense) return false;
     if (self.raw_linear_slot_in_dims[request.slot] != request.in_dim) return false;
     if (self.raw_linear_slot_out_dims[request.slot] != request.out_dim) return false;
@@ -9317,6 +9329,7 @@ pub fn decoderRuntimeApplyAddRhsRepeat(self: anytype, lhs: MetalTensor, rhs: Met
 /// Metadata-only proof for explicit decoder targets. No upload, readback or
 /// command encoding is allowed while checking these borrowed device views.
 pub fn decoderRuntimeOutputCompatible(runtime: *RawMetalDecodeRuntime, output: MetalTensor, inputs: []const MetalTensor, dim: usize) bool {
+    if (output.isReadOnlyPhysical()) return false;
     if (dim == 0 or dim > std.math.maxInt(u32) or inputs.len == 0 or !output.isDevice() or output.dtype != .f32 or output.elemCount() != dim) return false;
     const owner: *anyopaque = @ptrCast(runtime);
     const target = output.device orelse return false;
@@ -9555,7 +9568,7 @@ pub fn decoderRuntimeApplyRmsNormAdd(self: anytype, request: anytype, stats: any
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (request.rows == 0 or request.hidden_size == 0) return null;
     if (request.norm_slot >= decoder_runtime_rms_norm_slot_capacity) return null;
-    if (!self.raw_rms_norm_slots_prepared[request.norm_slot]) return null;
+    if (!rawRmsNormSlotPrepared(self, request.norm_slot)) return null;
     if (self.raw_rms_norm_slot_hidden_sizes[request.norm_slot] != request.hidden_size) return null;
     if (request.input.ndim() != 2 or request.residual.ndim() != 2) return null;
     if (@as(usize, @intCast(request.input.dim(0))) != request.rows or
@@ -9774,7 +9787,7 @@ pub fn decoderRuntimeApplyDenseGatedFfnLayerNorm(
     if (self.raw_linear_slot_kinds[request.fc11_slot] != .dense or
         self.raw_linear_slot_kinds[request.fc12_slot] != .dense or
         self.raw_linear_slot_kinds[request.fc2_slot] != .dense or
-        !self.raw_layer_norm_slots_prepared[request.layer_norm_slot]) return null;
+        !rawLayerNormSlotPrepared(self, request.layer_norm_slot)) return null;
     if (self.raw_linear_slot_in_dims[request.fc11_slot] != request.hidden_size or
         self.raw_linear_slot_out_dims[request.fc11_slot] != request.intermediate_size or
         self.raw_linear_slot_in_dims[request.fc12_slot] != request.hidden_size or
@@ -10661,8 +10674,8 @@ pub fn decoderRuntimeApplyLinearActivationLinearResidual(self: anytype, request:
     if (request.hidden_size == 0 or request.intermediate_size == 0) return null;
     if (request.first_linear_slot >= decoder_runtime_linear_slot_capacity or
         request.second_linear_slot >= decoder_runtime_linear_slot_capacity) return null;
-    if (!self.raw_linear_slots_prepared[request.first_linear_slot] or
-        !self.raw_linear_slots_prepared[request.second_linear_slot]) return null;
+    if (!rawLinearSlotPrepared(self, request.first_linear_slot) or
+        !rawLinearSlotPrepared(self, request.second_linear_slot)) return null;
     if (self.raw_linear_slot_kinds[request.first_linear_slot] != .dense or
         self.raw_linear_slot_kinds[request.second_linear_slot] != .dense) return null;
     if (self.raw_linear_slot_in_dims[request.first_linear_slot] != request.hidden_size or
@@ -10932,7 +10945,7 @@ pub fn tryRawLinearHost(
     output: [*c]f32,
 ) !bool {
     if (slot >= decoder_runtime_linear_slot_capacity) return false;
-    if (!self.raw_linear_slots_prepared[slot]) return false;
+    if (!rawLinearSlotPrepared(self, slot)) return false;
     if (self.raw_linear_slot_in_dims[slot] != in_dim or self.raw_linear_slot_out_dims[slot] != out_dim) return false;
     switch (self.raw_linear_slot_kinds[slot]) {
         .dense => {
@@ -11015,7 +11028,7 @@ pub fn decoderRuntimeTryApplyBf16GateUp(self: anytype, request: anytype) !?Metal
 extern fn termite_metal_decode_runtime_apply_linear_rows_device(runtime: ?*RawMetalDecodeRuntime, slot: usize, input: ?*anyopaque, input_offset: usize, rows: usize, first: usize, width: usize, output: ?*anyopaque, output_offset: usize) c_int;
 pub fn decoderRuntimeApplyLinearRows(self: anytype, slot: usize, input: MetalTensor, first: usize, width: usize) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
-    if (slot >= decoder_runtime_linear_slot_capacity or !self.raw_linear_slots_prepared[slot] or !input.isDevice() or input.ndim() != 2 or input.dim(0) <= 0 or input.dim(1) <= 0) return null;
+    if (slot >= decoder_runtime_linear_slot_capacity or !rawLinearSlotPrepared(self, slot) or !input.isDevice() or input.ndim() != 2 or input.dim(0) <= 0 or input.dim(1) <= 0) return null;
     const rows: usize = @intCast(input.dim(0));
     if (self.raw_linear_slot_in_dims[slot] != @as(usize, @intCast(input.dim(1))) or width == 0 or first > self.raw_linear_slot_out_dims[slot] or width > self.raw_linear_slot_out_dims[slot] - first) return error.InvalidTensorShape;
     const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32));
@@ -11028,7 +11041,7 @@ pub fn decoderRuntimeApplyLinearRows(self: anytype, slot: usize, input: MetalTen
 pub fn decoderRuntimeApplyLinear(self: anytype, request: anytype) !?MetalTensor {
     if (request.in_dim == 0 or request.out_dim == 0) return null;
     if (request.slot >= decoder_runtime_linear_slot_capacity) return null;
-    if (!self.raw_linear_slots_prepared[request.slot]) return null;
+    if (!rawLinearSlotPrepared(self, request.slot)) return null;
     if (self.raw_linear_slot_in_dims[request.slot] != request.in_dim or
         self.raw_linear_slot_out_dims[request.slot] != request.out_dim) return null;
     if (request.input.ndim() != 2) return null;
@@ -11084,7 +11097,7 @@ pub fn decoderRuntimeApplyLinear(self: anytype, request: anytype) !?MetalTensor 
 pub fn decoderRuntimeApplyLinearPair(self: anytype, request: anytype) !?RuntimeLinearPairResult {
     if (request.in_dim == 0 or request.out_dim == 0) return null;
     if (request.slot_a >= decoder_runtime_linear_slot_capacity or request.slot_b >= decoder_runtime_linear_slot_capacity) return null;
-    if (!self.raw_linear_slots_prepared[request.slot_a] or !self.raw_linear_slots_prepared[request.slot_b]) return null;
+    if (!rawLinearSlotPrepared(self, request.slot_a) or !rawLinearSlotPrepared(self, request.slot_b)) return null;
     if (self.raw_linear_slot_in_dims[request.slot_a] != request.in_dim or
         self.raw_linear_slot_out_dims[request.slot_a] != request.out_dim or
         self.raw_linear_slot_in_dims[request.slot_b] != request.in_dim or
@@ -11120,9 +11133,9 @@ pub fn decoderRuntimeApplyRmsNormLinear(self: anytype, request: anytype) !?Metal
     const frame_active = hasActiveFrame(self.raw_decode_runtime);
     if (request.hidden_size == 0 or request.out_dim == 0) return null;
     if (request.norm_slot >= decoder_runtime_rms_norm_slot_capacity or request.linear_slot >= decoder_runtime_linear_slot_capacity) return null;
-    if (!self.raw_rms_norm_slots_prepared[request.norm_slot]) return null;
+    if (!rawRmsNormSlotPrepared(self, request.norm_slot)) return null;
     if (self.raw_rms_norm_slot_hidden_sizes[request.norm_slot] != request.hidden_size) return null;
-    if (!self.raw_linear_slots_prepared[request.linear_slot]) return null;
+    if (!rawLinearSlotPrepared(self, request.linear_slot)) return null;
     if (self.raw_linear_slot_in_dims[request.linear_slot] != request.hidden_size) return null;
     if (self.raw_linear_slot_out_dims[request.linear_slot] != request.out_dim) return null;
     if (request.input.ndim() != 2) return null;
@@ -11251,6 +11264,8 @@ pub extern fn termite_metal_decode_runtime_prepare_linear_generated_f32(runtime:
 pub const OwnedF32SlotStorage = enum { private, owned_shared_if_unified };
 
 pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anytype) !bool {
+    if (preparedBindingRetired(self, .linear, request.slot)) return false;
+    if (!ownedLinearSlotMutationAllowed(self, request.slot)) return false;
     const runtime = self.raw_decode_runtime orelse return false;
     if (termite_metal_decode_runtime_ready(runtime) == 0) {
         stats.decoder_runtime_prepare_linear_runtime_not_ready += 1;
@@ -11277,7 +11292,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         request.prefer_f32_mps_fallback
     else
         false;
-    if (self.raw_linear_slots_prepared[request.slot] and
+    if (rawLinearSlotPrepared(self, request.slot) and
         self.raw_linear_slot_in_dims[request.slot] == request.in_dim and
         self.raw_linear_slot_out_dims[request.slot] == request.out_dim and
         ((request.quantized_storage != null and
@@ -11361,6 +11376,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
                         stats.decoder_runtime_prepare_linear_calls += 1;
                         self.raw_linear_slot_kinds[request.slot] = .dense;
                         self.raw_linear_slots_prepared[request.slot] = true;
+                        if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.linear, request.slot);
                         self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
                         self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
                         return true;
@@ -11383,6 +11399,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
                         stats.decoder_runtime_prepare_linear_calls += 1;
                         self.raw_linear_slot_kinds[request.slot] = .dense;
                         self.raw_linear_slots_prepared[request.slot] = true;
+                        if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.linear, request.slot);
                         self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
                         self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
                         return true;
@@ -11412,6 +11429,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
                         stats.decoder_runtime_prepare_linear_calls += 1;
                         self.raw_linear_slot_kinds[request.slot] = .dense;
                         self.raw_linear_slots_prepared[request.slot] = true;
+                        if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.linear, request.slot);
                         self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
                         self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
                         return true;
@@ -11428,6 +11446,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
                 setRuntimeQuantMappedDisabled(self, request.slot, disable_mapped_quant_weight);
                 self.raw_linear_slot_kinds[request.slot] = .quantized;
                 self.raw_linear_slots_prepared[request.slot] = true;
+                if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.linear, request.slot);
                 self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
                 self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
                 return true;
@@ -11447,6 +11466,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
                     stats.decoder_runtime_prepare_linear_calls += 1;
                     self.raw_linear_slot_kinds[request.slot] = .dense;
                     self.raw_linear_slots_prepared[request.slot] = true;
+                    if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.linear, request.slot);
                     self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
                     self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
                     return true;
@@ -11468,7 +11488,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
                     refine_slot == null or
                     refine_slot.? >= decoder_runtime_linear_slot_capacity or
                     refine_slot.? == request.slot or
-                    self.raw_linear_slots_prepared[refine_slot.?]) break :repack;
+                    rawLinearSlotPrepared(self, refine_slot.?)) break :repack;
                 if (termite_metal_decode_runtime_lm_head_q4_q6_refine_ready(runtime) == 0) {
                     std.log.warn("lm_head Q4_K repack requested but refine pipelines are unavailable; preserving checkpoint Q6_K head", .{});
                     break :repack;
@@ -11508,6 +11528,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
                     setRuntimeQuantMappedDisabled(self, exact_slot, disable_mapped_quant_weight);
                     self.raw_linear_slot_kinds[exact_slot] = .quantized;
                     self.raw_linear_slots_prepared[exact_slot] = true;
+                    if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.linear, exact_slot);
                     self.raw_linear_slot_in_dims[exact_slot] = request.in_dim;
                     self.raw_linear_slot_out_dims[exact_slot] = request.out_dim;
                     setLmHeadRefineSlot(self, request.slot, exact_slot);
@@ -11522,6 +11543,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
                 setRuntimeQuantMappedDisabled(self, request.slot, disable_mapped_quant_weight);
                 self.raw_linear_slot_kinds[request.slot] = .quantized;
                 self.raw_linear_slots_prepared[request.slot] = true;
+                if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.linear, request.slot);
                 self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
                 self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
                 return true;
@@ -11533,6 +11555,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         setRuntimeQuantMappedDisabled(self, request.slot, disable_mapped_quant_weight);
         self.raw_linear_slot_kinds[request.slot] = .quantized;
         self.raw_linear_slots_prepared[request.slot] = true;
+        if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.linear, request.slot);
         self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
         self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
         return true;
@@ -11561,6 +11584,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         ) != 0) return false;
         stats.decoder_runtime_prepare_linear_calls += 1;
         self.raw_linear_slots_prepared[request.slot] = true;
+        if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.linear, request.slot);
         self.raw_linear_slot_kinds[request.slot] = .dense;
         self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
         self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
@@ -11586,6 +11610,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
                 stats.decoder_runtime_prepare_linear_calls += 1;
                 self.raw_linear_slot_kinds[request.slot] = .dense;
                 self.raw_linear_slots_prepared[request.slot] = true;
+                if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.linear, request.slot);
                 self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
                 self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
                 return true;
@@ -11602,6 +11627,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
             stats.decoder_runtime_prepare_linear_calls += 1;
             self.raw_linear_slot_kinds[request.slot] = .dense;
             self.raw_linear_slots_prepared[request.slot] = true;
+            if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.linear, request.slot);
             self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
             self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
             return true;
@@ -11649,6 +11675,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
             self.raw_linear_slot_quantized_storage[request.slot] = q8_storage;
             self.raw_linear_slot_kinds[request.slot] = .quantized;
             self.raw_linear_slots_prepared[request.slot] = true;
+            if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.linear, request.slot);
             self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
             self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
             return true;
@@ -11683,6 +11710,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         }
         if (rc != 0) return false;
         self.raw_linear_slots_prepared[request.slot] = true;
+        if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.linear, request.slot);
         self.raw_linear_slot_kinds[request.slot] = .dense;
         self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
         self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
@@ -11747,6 +11775,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
             stats.decoder_runtime_prepare_linear_calls += 1;
             self.raw_linear_slot_kinds[request.slot] = .dense;
             self.raw_linear_slots_prepared[request.slot] = true;
+            if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.linear, request.slot);
             self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
             self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
             return true;
@@ -11784,6 +11813,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
             self.raw_linear_slot_quantized_storage[request.slot] = q8_storage;
             self.raw_linear_slot_kinds[request.slot] = .quantized;
             self.raw_linear_slots_prepared[request.slot] = true;
+            if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.linear, request.slot);
             self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
             self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
             return true;
@@ -11816,6 +11846,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
     // keeping their checkpoint weights in F32.
     if (prefer_f32_mps_fallback and termite_metal_decode_runtime_prefer_linear_mps(runtime, request.slot) != 0) return false;
     self.raw_linear_slots_prepared[request.slot] = true;
+    if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.linear, request.slot);
     self.raw_linear_slot_kinds[request.slot] = .dense;
     self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
     self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
@@ -19410,6 +19441,7 @@ pub extern fn termite_metal_video_preparation_device() ?*anyopaque;
 pub extern fn termite_metal_decode_runtime_device(runtime: ?*RawMetalDecodeRuntime) ?*anyopaque;
 pub extern fn termite_metal_buffer_retain_external(runtime: ?*RawMetalDecodeRuntime, handle: *anyopaque, length: usize) ?*anyopaque;
 pub extern fn termite_metal_buffer_alloc(runtime: ?*RawMetalDecodeRuntime, length: usize, storage_mode: c_int) ?*anyopaque;
+pub extern fn termite_metal_buffer_alloc_fresh(runtime: ?*RawMetalDecodeRuntime, length: usize, storage_mode: c_int) ?*anyopaque;
 pub extern fn termite_metal_buffer_release(handle: ?*anyopaque) void;
 extern fn termite_metal_decode_runtime_release_buffer(runtime: ?*RawMetalDecodeRuntime, handle: ?*anyopaque) void;
 pub extern fn termite_metal_buffer_contents(handle: ?*anyopaque) ?*anyopaque;
@@ -19426,6 +19458,44 @@ pub extern fn termite_metal_buffer_download(
     offset: usize,
     dst: ?*anyopaque,
     length: usize,
+) c_int;
+pub const RawKvGrowthPlane = extern struct {
+    slot: usize,
+    old_keys: *anyopaque,
+    old_values: *anyopaque,
+    old_key_length: usize,
+    old_value_length: usize,
+    old_key_allocated: usize,
+    old_value_allocated: usize,
+    new_key_length: usize,
+    new_value_length: usize,
+    key_bound: usize,
+    value_bound: usize,
+};
+pub extern fn antfly_metal_kv_growth_prepare(runtime: *RawMetalDecodeRuntime, planes: [*]const RawKvGrowthPlane, count: usize, stage: *?*anyopaque) c_int;
+pub const RawKvGrowthAllocate = *const fn (?*anyopaque, *RawMetalDecodeRuntime, usize) callconv(.c) ?*anyopaque;
+pub extern fn antfly_metal_kv_growth_prepare_with_allocator(runtime: *RawMetalDecodeRuntime, planes: [*]const RawKvGrowthPlane, count: usize, stage: *?*anyopaque, allocate: RawKvGrowthAllocate, context: ?*anyopaque) c_int;
+
+pub extern fn antfly_metal_buffer_retirement_attach(witnesses: *anyopaque) c_int;
+pub extern fn antfly_metal_kv_growth_discard(stage: ?*anyopaque) void;
+pub extern fn antfly_metal_kv_growth_buffer(stage: *anyopaque, layer: usize, which: usize) ?*anyopaque;
+pub extern fn antfly_metal_kv_growth_copy_checked(stage: ?*anyopaque) c_int;
+pub extern fn antfly_metal_kv_growth_publish(stage: ?*anyopaque) void;
+pub const RawPagedCopyPlane = extern struct {
+    keys: *anyopaque,
+    values: *anyopaque,
+    key_row_bytes: usize,
+    value_row_bytes: usize,
+    key_capacity: usize,
+    value_capacity: usize,
+};
+pub extern fn antfly_metal_copy_paged_rows_checked(
+    runtime: ?*RawMetalDecodeRuntime,
+    planes: [*]const RawPagedCopyPlane,
+    plane_count: usize,
+    items: [*]const @import("../runtime/kv/block_copy.zig").Item,
+    count: usize,
+    page_size: u16,
 ) c_int;
 pub extern fn termite_metal_buffer_copy(
     runtime: ?*RawMetalDecodeRuntime,
@@ -24785,7 +24855,7 @@ fn runtimeQuantSlotDescriptor(
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (slot >= decoder_runtime_linear_slot_capacity) return null;
-    if (!self.raw_linear_slots_prepared[slot]) return null;
+    if (!rawLinearSlotPrepared(self, slot)) return null;
     if (self.raw_linear_slot_kinds[slot] != .quantized) return null;
     if (self.raw_linear_slot_in_dims[slot] != in_dim or self.raw_linear_slot_out_dims[slot] != out_dim) return null;
     const storage = self.raw_linear_slot_quantized_storage[slot] orelse return null;
@@ -24839,8 +24909,8 @@ pub fn exactLmHeadLinearSlot(self: anytype, main_slot: usize, in_dim: usize, out
     if (main_slot >= decoder_runtime_linear_slot_capacity or
         refine_slot >= decoder_runtime_linear_slot_capacity or
         refine_slot == main_slot) return null;
-    if (!self.raw_linear_slots_prepared[main_slot] or
-        !self.raw_linear_slots_prepared[refine_slot]) return null;
+    if (!rawLinearSlotPrepared(self, main_slot) or
+        !rawLinearSlotPrepared(self, refine_slot)) return null;
     if (self.raw_linear_slot_kinds[main_slot] != .quantized or
         self.raw_linear_slot_kinds[refine_slot] != .quantized) return null;
     if (self.raw_linear_slot_in_dims[main_slot] != in_dim or
@@ -24887,7 +24957,7 @@ fn residentLmHeadMainSlotSupportsLogits(
     out_dim: usize,
 ) bool {
     if (main_slot >= decoder_runtime_linear_slot_capacity) return false;
-    if (!self.raw_linear_slots_prepared[main_slot]) return false;
+    if (!rawLinearSlotPrepared(self, main_slot)) return false;
     if (self.raw_linear_slot_kinds[main_slot] != .quantized) return false;
     if (self.raw_linear_slot_in_dims[main_slot] != in_dim or
         self.raw_linear_slot_out_dims[main_slot] != out_dim) return false;
@@ -25361,7 +25431,7 @@ pub fn ensureTl1RuntimeLinearSlotPrepared(self: anytype, slot: usize, in_dim: us
     const runtime = self.raw_decode_runtime orelse return false;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
     if (slot >= decoder_runtime_linear_slot_capacity) return false;
-    if (!self.raw_linear_slots_prepared[slot]) return false;
+    if (!rawLinearSlotPrepared(self, slot)) return false;
     if (self.raw_linear_slot_kinds[slot] != .quantized) return false;
     if (self.raw_linear_slot_in_dims[slot] != in_dim or self.raw_linear_slot_out_dims[slot] != out_dim) return false;
     const storage = self.raw_linear_slot_quantized_storage[slot] orelse return false;
@@ -25396,7 +25466,7 @@ pub fn ensureTl2RuntimeLinearSlotPrepared(self: anytype, slot: usize, in_dim: us
     const runtime = self.raw_decode_runtime orelse return false;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
     if (slot >= decoder_runtime_linear_slot_capacity) return false;
-    if (!self.raw_linear_slots_prepared[slot]) return false;
+    if (!rawLinearSlotPrepared(self, slot)) return false;
     if (self.raw_linear_slot_kinds[slot] != .quantized) return false;
     if (self.raw_linear_slot_in_dims[slot] != in_dim or self.raw_linear_slot_out_dims[slot] != out_dim) return false;
     const storage = self.raw_linear_slot_quantized_storage[slot] orelse return false;
@@ -25439,7 +25509,7 @@ pub fn ensureTl2RuntimeLinearSlotPrepared(self: anytype, slot: usize, in_dim: us
 
 pub fn ensureQuantizedRuntimeLinearSlotPrepared(self: anytype, slot: usize, in_dim: usize, out_dim: usize) RawQuantizedRuntimeLinearKind {
     if (slot >= decoder_runtime_linear_slot_capacity) return .none;
-    if (!self.raw_linear_slots_prepared[slot]) return .none;
+    if (!rawLinearSlotPrepared(self, slot)) return .none;
     if (self.raw_linear_slot_kinds[slot] != .quantized) return .none;
     if (self.raw_linear_slot_in_dims[slot] != in_dim or self.raw_linear_slot_out_dims[slot] != out_dim) return .none;
     const storage = self.raw_linear_slot_quantized_storage[slot] orelse return .none;
@@ -25481,7 +25551,7 @@ pub fn ensureQuantizedRuntimeLinearSlotPrepared(self: anytype, slot: usize, in_d
 
 fn ensureQuantizedRuntimeLinearSlotPreparedWritable(self: anytype, slot: usize, in_dim: usize, out_dim: usize) RawQuantizedRuntimeLinearKind {
     if (slot >= decoder_runtime_linear_slot_capacity) return .none;
-    if (!self.raw_linear_slots_prepared[slot]) return .none;
+    if (!rawLinearSlotPrepared(self, slot)) return .none;
     if (self.raw_linear_slot_kinds[slot] != .quantized) return .none;
     if (self.raw_linear_slot_in_dims[slot] != in_dim or self.raw_linear_slot_out_dims[slot] != out_dim) return .none;
     const storage = self.raw_linear_slot_quantized_storage[slot] orelse return .none;
@@ -25642,7 +25712,25 @@ pub fn decoderRuntimeGetRowsQuantLinearSlot(
     return finishDeviceOutput(&output, rc);
 }
 
+fn ownedLinearSlotMutationAllowed(self: anytype, slot: usize) bool {
+    if (comptime @hasDecl(@TypeOf(self.*), "allowsOwnedSlotMutation")) return self.allowsOwnedSlotMutation(slot);
+    return true;
+}
+fn ownedLinearSlotGroupMutationAllowed(self: anytype, slot: usize) bool {
+    if (!ownedLinearSlotMutationAllowed(self, slot)) return false;
+    if (comptime typeHasField(@TypeOf(self), "raw_linear_slot_lm_head_refine_slots")) {
+        for (@field(self, "raw_linear_slot_lm_head_refine_slots"), 0..) |mapped, main| {
+            if (main == slot) {
+                if (mapped) |companion| if (!ownedLinearSlotMutationAllowed(self, companion)) return false;
+            } else if (mapped == slot and !ownedLinearSlotMutationAllowed(self, main)) return false;
+        }
+    }
+    return true;
+}
+
 pub fn releaseRawLinearSlot(self: anytype, slot: usize) void {
+    if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.linear, slot);
+    if (!ownedLinearSlotMutationAllowed(self, slot)) return;
     if (self.raw_decode_runtime) |runtime| {
         _ = termite_metal_decode_runtime_clear_linear_slot(runtime, slot);
     }
@@ -25686,6 +25774,7 @@ fn clearRawLinearSlotStorage(self: anytype, slot: usize) void {
 }
 
 pub fn clearRawLinearSlot(self: anytype, slot: usize) void {
+    if (!ownedLinearSlotGroupMutationAllowed(self, slot)) return;
     const refine_slot = clearLmHeadRefineSlotMapping(self, slot);
     if (comptime typeHasField(@TypeOf(self), "raw_linear_slot_lm_head_refine_slots")) {
         for (&@field(self, "raw_linear_slot_lm_head_refine_slots"), 0..) |*mapped_slot, main_slot| {
@@ -25709,6 +25798,7 @@ pub fn clearRawLinearSlot(self: anytype, slot: usize) void {
 }
 
 pub fn releaseRawLayerNormSlot(self: anytype, slot: usize) void {
+    if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.layer_norm, slot);
     if (self.raw_decode_runtime) |runtime| {
         _ = termite_metal_decode_runtime_clear_layer_norm_slot(runtime, slot);
     }
@@ -25725,6 +25815,7 @@ pub fn clearRawLayerNormSlot(self: anytype, slot: usize) void {
 }
 
 pub fn releaseRawRmsNormSlot(self: anytype, slot: usize) void {
+    if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.rms_norm, slot);
     if (self.raw_decode_runtime) |runtime| {
         _ = termite_metal_decode_runtime_clear_rms_norm_slot(runtime, slot);
     }
@@ -25970,6 +26061,7 @@ pub fn decoderRuntimePreparePackedMoeLinear(
     in_dim: usize,
     out_dim: usize,
 ) !?PackedMoeLinearDescriptor {
+    if (preparedBindingRetired(self, .linear, slot)) return null;
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0 or slot >= decoder_runtime_linear_slot_capacity) return null;
     const packed_meta = storage.packed_expert orelse return null;
@@ -26007,7 +26099,7 @@ pub fn decoderRuntimePreparePackedMoeLinear(
         self.raw_model_mapped_buffer_prepared = true;
     }
 
-    if (self.raw_linear_slots_prepared[slot]) {
+    if (rawLinearSlotPrepared(self, slot)) {
         if (self.raw_linear_slot_kinds[slot] != .quantized or
             self.raw_linear_slot_in_dims[slot] != in_dim or
             self.raw_linear_slot_out_dims[slot] != flat_out_dim or
@@ -26059,6 +26151,7 @@ pub fn decoderRuntimePreparePackedMoeLinear(
         return null;
     }
     self.raw_linear_slots_prepared[slot] = true;
+    if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.linear, slot);
     self.raw_linear_slot_kinds[slot] = .quantized;
     self.raw_linear_slot_in_dims[slot] = in_dim;
     self.raw_linear_slot_out_dims[slot] = flat_out_dim;
@@ -26519,7 +26612,7 @@ pub fn decoderRuntimeGlinerBoundaryLinearDevice(
     const output_elements = try std.math.mul(usize, rows, out_dim);
     if (input_elements > std.math.maxInt(i32) or output_elements > std.math.maxInt(i32) or
         input.elemCount() != input_elements or input.deviceByteLen() != try std.math.mul(usize, input_elements, 4)) return null;
-    if (!self.raw_linear_slots_prepared[slot] or self.raw_linear_slot_in_dims[slot] != in_dim or self.raw_linear_slot_out_dims[slot] != out_dim) return null;
+    if (!rawLinearSlotPrepared(self, slot) or self.raw_linear_slot_in_dims[slot] != in_dim or self.raw_linear_slot_out_dims[slot] != out_dim) return null;
     const format: MetalQuantFormat = if (precision == .f16) blk: {
         if (self.raw_linear_slot_kinds[slot] != .dense) return null;
         break :blk .unsupported;
@@ -26814,12 +26907,12 @@ pub fn decoderRuntimeApplyPrefillSetupDevice(
     if (!quantizedRuntimeLinearKindHasSingleStageDeviceKernel(q_kind) or q_format == .unsupported) {
         if (trace) {
             const slot = request.q_slot;
-            const raw_prepared = if (slot < decoder_runtime_linear_slot_capacity) self.raw_linear_slots_prepared[slot] else false;
+            const raw_prepared = if (slot < decoder_runtime_linear_slot_capacity) rawLinearSlotPrepared(self, slot) else false;
             const raw_kind = if (slot < decoder_runtime_linear_slot_capacity) self.raw_linear_slot_kinds[slot] else .none;
             const raw_in = if (slot < decoder_runtime_linear_slot_capacity) self.raw_linear_slot_in_dims[slot] else 0;
             const raw_out = if (slot < decoder_runtime_linear_slot_capacity) self.raw_linear_slot_out_dims[slot] else 0;
             const runtime_kind = if (slot < decoder_runtime_linear_slot_capacity) self.raw_linear_slot_runtime_prepared_kind[slot] else .none;
-            const storage = if (slot < decoder_runtime_linear_slot_capacity) self.raw_linear_slot_quantized_storage[slot] else null;
+            const storage = if (slot < decoder_runtime_linear_slot_capacity and !preparedBindingRetired(self, .linear, slot)) self.raw_linear_slot_quantized_storage[slot] else null;
             const storage_kind = if (storage) |quant| quantizedRuntimeLinearKind(quant) else .none;
             const descriptor = if (storage) |quant| packedWeightDescriptor(quant, request.hidden_size) else null;
             if (descriptor) |desc| {
@@ -26860,8 +26953,8 @@ pub fn decoderRuntimeApplyPrefillSetupDevice(
         if (trace) std.debug.print("metal-prefill-quant-setup-zig-null rows={d} shares_kv={} reason=q-norm-slot-range slot={d}\n", .{ request.rows, request.shares_kv, request.q_norm_slot });
         return null;
     }
-    if (!self.raw_rms_norm_slots_prepared[request.q_norm_slot] or self.raw_rms_norm_slot_hidden_sizes[request.q_norm_slot] != request.head_dim) {
-        if (trace) std.debug.print("metal-prefill-quant-setup-zig-null rows={d} shares_kv={} reason=q-norm-slot slot={d} prepared={} slot_hidden={d} head_dim={d}\n", .{ request.rows, request.shares_kv, request.q_norm_slot, self.raw_rms_norm_slots_prepared[request.q_norm_slot], self.raw_rms_norm_slot_hidden_sizes[request.q_norm_slot], request.head_dim });
+    if (!rawRmsNormSlotPrepared(self, request.q_norm_slot) or self.raw_rms_norm_slot_hidden_sizes[request.q_norm_slot] != request.head_dim) {
+        if (trace) std.debug.print("metal-prefill-quant-setup-zig-null rows={d} shares_kv={} reason=q-norm-slot slot={d} prepared={} slot_hidden={d} head_dim={d}\n", .{ request.rows, request.shares_kv, request.q_norm_slot, rawRmsNormSlotPrepared(self, request.q_norm_slot), self.raw_rms_norm_slot_hidden_sizes[request.q_norm_slot], request.head_dim });
         return null;
     }
     if (!request.shares_kv) {
@@ -26869,8 +26962,8 @@ pub fn decoderRuntimeApplyPrefillSetupDevice(
             if (trace) std.debug.print("metal-prefill-quant-setup-zig-null rows={d} shares_kv=false reason=k-norm-slot-range slot={d}\n", .{ request.rows, request.k_norm_slot });
             return null;
         }
-        if (!self.raw_rms_norm_slots_prepared[request.k_norm_slot] or self.raw_rms_norm_slot_hidden_sizes[request.k_norm_slot] != request.head_dim) {
-            if (trace) std.debug.print("metal-prefill-quant-setup-zig-null rows={d} shares_kv=false reason=k-norm-slot slot={d} prepared={} slot_hidden={d} head_dim={d}\n", .{ request.rows, request.k_norm_slot, self.raw_rms_norm_slots_prepared[request.k_norm_slot], self.raw_rms_norm_slot_hidden_sizes[request.k_norm_slot], request.head_dim });
+        if (!rawRmsNormSlotPrepared(self, request.k_norm_slot) or self.raw_rms_norm_slot_hidden_sizes[request.k_norm_slot] != request.head_dim) {
+            if (trace) std.debug.print("metal-prefill-quant-setup-zig-null rows={d} shares_kv=false reason=k-norm-slot slot={d} prepared={} slot_hidden={d} head_dim={d}\n", .{ request.rows, request.k_norm_slot, rawRmsNormSlotPrepared(self, request.k_norm_slot), self.raw_rms_norm_slot_hidden_sizes[request.k_norm_slot], request.head_dim });
             return null;
         }
     }
@@ -27037,7 +27130,7 @@ pub fn runPrefillPagedGatedFrameLayerDevice(
             return null;
         }
         if (ple_post_norm_slot >= decoder_runtime_rms_norm_slot_capacity) return null;
-        if (!self.raw_rms_norm_slots_prepared[ple_post_norm_slot]) return null;
+        if (!rawRmsNormSlotPrepared(self, ple_post_norm_slot)) return null;
         if (self.raw_rms_norm_slot_hidden_sizes[ple_post_norm_slot] != request.hidden_size) return null;
     }
 
@@ -27206,14 +27299,50 @@ pub fn tryApplyQuantizedRuntimeLinearPair(
     in_dim: usize,
     out_dim: usize,
 ) !?RuntimeLinearPairResult {
+    return tryApplyQuantizedRuntimeLinearPairWithOutputs(self, slot_a, slot_b, input, rows, in_dim, out_dim, null);
+}
+
+pub fn tryApplyQuantizedRuntimeLinearPairAssigned(
+    self: anytype,
+    slot_a: usize,
+    slot_b: usize,
+    input: MetalTensor,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    destinations: RuntimeLinearPairResult,
+) !bool {
+    if (!input.isDevice() or rows == 0 or in_dim == 0) return false;
+    if (slot_a >= decoder_runtime_linear_slot_capacity or !rawLinearSlotPrepared(self, slot_a) or self.raw_linear_slot_kinds[slot_a] != .quantized or self.raw_linear_slot_in_dims[slot_a] != in_dim or self.raw_linear_slot_out_dims[slot_a] != out_dim or self.raw_linear_slot_runtime_prepared_kind[slot_a] == .none) return false;
+    if (slot_b >= decoder_runtime_linear_slot_capacity or !rawLinearSlotPrepared(self, slot_b) or self.raw_linear_slot_kinds[slot_b] != .quantized or self.raw_linear_slot_in_dims[slot_b] != in_dim or self.raw_linear_slot_out_dims[slot_b] != out_dim or self.raw_linear_slot_runtime_prepared_kind[slot_b] == .none) return false;
+    if (!destinations.first.isDevice() or !denseRegionShape(destinations.first, rows, out_dim)) return false;
+    if (!destinations.second.isDevice() or !denseRegionShape(destinations.second, rows, out_dim)) return false;
+    var result = (try tryApplyQuantizedRuntimeLinearPairWithOutputs(self, slot_a, slot_b, input, rows, in_dim, out_dim, destinations)) orelse return false;
+    defer result.first.deinit();
+    defer result.second.deinit();
+    return true;
+}
+
+fn tryApplyQuantizedRuntimeLinearPairWithOutputs(
+    self: anytype,
+    slot_a: usize,
+    slot_b: usize,
+    input: MetalTensor,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    assigned: ?RuntimeLinearPairResult,
+) !?RuntimeLinearPairResult {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     const frame_active = hasActiveFrame(self.raw_decode_runtime);
-    const kind_a = ensureQuantizedRuntimeLinearSlotPrepared(self, slot_a, in_dim, out_dim);
-    const kind_b = ensureQuantizedRuntimeLinearSlotPrepared(self, slot_b, in_dim, out_dim);
+    const kind_a = if (assigned != null) self.raw_linear_slot_runtime_prepared_kind[slot_a] else ensureQuantizedRuntimeLinearSlotPrepared(self, slot_a, in_dim, out_dim);
+    const kind_b = if (assigned != null) self.raw_linear_slot_runtime_prepared_kind[slot_b] else ensureQuantizedRuntimeLinearSlotPrepared(self, slot_b, in_dim, out_dim);
     if (kind_a == .none or kind_b == .none or kind_a != kind_b) return null;
     const pair_format = metalQuantFormatForKind(kind_a);
     const has_direct_pair = quantizedRuntimeLinearKindHasPairDeviceKernel(kind_a) and pair_format != .unsupported;
+
+    if (assigned != null and (!input.isDevice() or !has_direct_pair or referenceQuantizedRuntimeLinearDebug() or (kind_a == .q4_0 and rows == 1 and !q4_0SingleRowDeviceLinearEnabled()))) return null;
 
     if (referenceQuantizedRuntimeLinearDebug() or
         (kind_a == .q4_0 and rows == 1 and !q4_0SingleRowDeviceLinearEnabled()))
@@ -27232,9 +27361,9 @@ pub fn tryApplyQuantizedRuntimeLinearPair(
 
     if (input.isDevice() and has_direct_pair) {
         const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
-        var first_device = try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &shape);
+        var first_device = if (assigned) |destinations| try destinations.first.retainedCopy() else try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &shape);
         errdefer first_device.deinit();
-        var second_device = try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &shape);
+        var second_device = if (assigned) |destinations| try destinations.second.retainedCopy() else try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &shape);
         errdefer second_device.deinit();
         const device_rc = termite_metal_decode_runtime_apply_quantized_linear_pair_slots_device(
             runtime,
@@ -27251,10 +27380,12 @@ pub fn tryApplyQuantizedRuntimeLinearPair(
             second_device.deviceHandle(),
             second_device.deviceByteOffset(),
         );
+        if (device_rc != 0 and assigned != null) return error.AssignedQuantRegionDispatchFailed;
         if (device_rc == 0) {
             if (!applyRuntimeLinearBiasDevice(self, slot_a, &first_device, rows, out_dim) or
                 !applyRuntimeLinearBiasDevice(self, slot_b, &second_device, rows, out_dim))
             {
+                if (assigned != null) return error.AssignedQuantRegionDispatchFailed;
                 second_device.deinit();
                 first_device.deinit();
                 return null;
@@ -27267,6 +27398,8 @@ pub fn tryApplyQuantizedRuntimeLinearPair(
         second_device.deinit();
         first_device.deinit();
     }
+
+    if (assigned != null) return null;
 
     if (input.isDevice() and quantizedRuntimeLinearKindHasSingleStageDeviceKernel(kind_a)) {
         var first = (try tryApplyQuantizedRuntimeLinear(self, slot_a, input, rows, in_dim, out_dim)) orelse return null;
@@ -27569,7 +27702,7 @@ pub fn tryApplyDenseRuntimeFfnLayerNorm(
         second_slot >= decoder_runtime_linear_slot_capacity or
         layer_norm_slot >= decoder_runtime_layer_norm_slot_capacity) return null;
     if (self.raw_linear_slot_kinds[first_slot] != .dense or self.raw_linear_slot_kinds[second_slot] != .dense) return null;
-    if (!self.raw_layer_norm_slots_prepared[layer_norm_slot]) return null;
+    if (!rawLayerNormSlotPrepared(self, layer_norm_slot)) return null;
     if (self.raw_linear_slot_in_dims[first_slot] != hidden_size or self.raw_linear_slot_out_dims[first_slot] != intermediate_size) return null;
     if (self.raw_linear_slot_in_dims[second_slot] != intermediate_size or self.raw_linear_slot_out_dims[second_slot] != hidden_size) return null;
     if (self.raw_layer_norm_slot_hidden_sizes[layer_norm_slot] != hidden_size) return null;
@@ -27621,7 +27754,7 @@ pub fn tryApplyDenseRuntimeLinearLayerNorm(
     _ = std.math.mul(usize, rows, in_dim) catch return null;
     if (linear_slot >= decoder_runtime_linear_slot_capacity or layer_norm_slot >= decoder_runtime_layer_norm_slot_capacity) return null;
     if (self.raw_linear_slot_kinds[linear_slot] != .dense) return null;
-    if (!self.raw_layer_norm_slots_prepared[layer_norm_slot]) return null;
+    if (!rawLayerNormSlotPrepared(self, layer_norm_slot)) return null;
     if (self.raw_linear_slot_in_dims[linear_slot] != in_dim or self.raw_linear_slot_out_dims[linear_slot] != hidden_size) return null;
     if (self.raw_layer_norm_slot_hidden_sizes[layer_norm_slot] != hidden_size) return null;
     if (input.ndim() != 2 or residual.ndim() != 2 or input.dim(0) <= 0 or input.dim(1) <= 0 or residual.dim(0) <= 0 or residual.dim(1) <= 0) return null;
@@ -27672,7 +27805,7 @@ pub fn decoderRuntimeApplyDenseLinearLayerNormInto(
         return false;
     }
     if (self.raw_linear_slot_kinds[linear_slot] != .dense or
-        !self.raw_layer_norm_slots_prepared[layer_norm_slot] or
+        !rawLayerNormSlotPrepared(self, layer_norm_slot) or
         self.raw_linear_slot_in_dims[linear_slot] != in_dim or self.raw_linear_slot_out_dims[linear_slot] != hidden_size or
         self.raw_layer_norm_slot_hidden_sizes[layer_norm_slot] != hidden_size)
     {
@@ -27722,7 +27855,7 @@ pub fn tryApplyQuantizedRuntimeLinearLayerNorm(
     if (!input.isDevice() or !residual.isDevice()) return null;
     if (linear_slot >= decoder_runtime_linear_slot_capacity or layer_norm_slot >= decoder_runtime_layer_norm_slot_capacity) return null;
     if (self.raw_linear_slot_kinds[linear_slot] != .quantized) return null;
-    if (!self.raw_layer_norm_slots_prepared[layer_norm_slot]) return null;
+    if (!rawLayerNormSlotPrepared(self, layer_norm_slot)) return null;
     if (self.raw_linear_slot_in_dims[linear_slot] != in_dim or self.raw_linear_slot_out_dims[linear_slot] != hidden_size) return null;
     if (self.raw_layer_norm_slot_hidden_sizes[layer_norm_slot] != hidden_size) return null;
     if (input.ndim() != 2 or residual.ndim() != 2) return null;
@@ -27780,7 +27913,7 @@ pub fn tryApplyQuantizedRuntimeFfnLayerNorm(
         second_slot >= decoder_runtime_linear_slot_capacity or
         layer_norm_slot >= decoder_runtime_layer_norm_slot_capacity) return null;
     if (self.raw_linear_slot_kinds[first_slot] != .quantized or self.raw_linear_slot_kinds[second_slot] != .quantized) return null;
-    if (!self.raw_layer_norm_slots_prepared[layer_norm_slot]) return null;
+    if (!rawLayerNormSlotPrepared(self, layer_norm_slot)) return null;
     if (self.raw_linear_slot_in_dims[first_slot] != hidden_size or self.raw_linear_slot_out_dims[first_slot] != intermediate_size) return null;
     if (self.raw_linear_slot_in_dims[second_slot] != intermediate_size or self.raw_linear_slot_out_dims[second_slot] != hidden_size) return null;
     if (self.raw_layer_norm_slot_hidden_sizes[layer_norm_slot] != hidden_size) return null;
@@ -27957,7 +28090,7 @@ pub fn tryApplyDenseRuntimeLinearInto(
     if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
     if (slot >= decoder_runtime_linear_slot_capacity or rows == 0 or in_dim == 0 or out_dim == 0) return false;
     if (rows > std.math.maxInt(i32) or in_dim > std.math.maxInt(i32) or out_dim > std.math.maxInt(i32)) return false;
-    if (!self.raw_linear_slots_prepared[slot] or self.raw_linear_slot_kinds[slot] != .dense) return false;
+    if (!rawLinearSlotPrepared(self, slot) or self.raw_linear_slot_kinds[slot] != .dense) return false;
     if (self.raw_linear_slot_in_dims[slot] != in_dim or self.raw_linear_slot_out_dims[slot] != out_dim) return false;
     if (!input.isDevice() or !out.isDevice()) return false;
     if (input.ndim() != 2 or @as(usize, @intCast(input.dim(0))) != rows or @as(usize, @intCast(input.dim(1))) != in_dim) return false;
@@ -28008,7 +28141,7 @@ pub fn tryApplyDenseRuntimeLinearQkvInto(
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (q_slot >= decoder_runtime_linear_slot_capacity or k_slot >= decoder_runtime_linear_slot_capacity or v_slot >= decoder_runtime_linear_slot_capacity) return null;
     if (in_dim == 0 or q_out_dim == 0 or kv_out_dim == 0 or in_dim > std.math.maxInt(i32) or q_out_dim > std.math.maxInt(i32) or kv_out_dim > std.math.maxInt(i32)) return null;
-    if (!self.raw_linear_slots_prepared[q_slot] or !self.raw_linear_slots_prepared[k_slot] or !self.raw_linear_slots_prepared[v_slot]) return null;
+    if (!rawLinearSlotPrepared(self, q_slot) or !rawLinearSlotPrepared(self, k_slot) or !rawLinearSlotPrepared(self, v_slot)) return null;
     if (self.raw_linear_slot_kinds[q_slot] != .dense or self.raw_linear_slot_kinds[k_slot] != .dense or self.raw_linear_slot_kinds[v_slot] != .dense) return null;
     if (self.raw_linear_slot_in_dims[q_slot] != in_dim or self.raw_linear_slot_in_dims[k_slot] != in_dim or self.raw_linear_slot_in_dims[v_slot] != in_dim or
         self.raw_linear_slot_out_dims[q_slot] != q_out_dim or self.raw_linear_slot_out_dims[k_slot] != kv_out_dim or self.raw_linear_slot_out_dims[v_slot] != kv_out_dim) return null;
@@ -28360,6 +28493,47 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
     q_out_dim: usize,
     kv_out_dim: usize,
 ) !?RuntimeLinearTripleResult {
+    return tryApplyQuantizedRuntimeLinearQkvWithOutputs(self, q_slot, k_slot, v_slot, input, rows, in_dim, q_out_dim, kv_out_dim, null);
+}
+
+pub fn tryApplyQuantizedRuntimeLinearQkvAssigned(
+    self: anytype,
+    q_slot: usize,
+    k_slot: usize,
+    v_slot: usize,
+    input: MetalTensor,
+    rows: usize,
+    in_dim: usize,
+    q_out_dim: usize,
+    kv_out_dim: usize,
+    destinations: RuntimeLinearTripleResult,
+) !bool {
+    if (!input.isDevice() or rows == 0 or in_dim == 0) return false;
+    if (q_slot >= decoder_runtime_linear_slot_capacity or !rawLinearSlotPrepared(self, q_slot) or self.raw_linear_slot_kinds[q_slot] != .quantized or self.raw_linear_slot_in_dims[q_slot] != in_dim or self.raw_linear_slot_out_dims[q_slot] != q_out_dim or self.raw_linear_slot_runtime_prepared_kind[q_slot] == .none) return false;
+    if (k_slot >= decoder_runtime_linear_slot_capacity or !rawLinearSlotPrepared(self, k_slot) or self.raw_linear_slot_kinds[k_slot] != .quantized or self.raw_linear_slot_in_dims[k_slot] != in_dim or self.raw_linear_slot_out_dims[k_slot] != kv_out_dim or self.raw_linear_slot_runtime_prepared_kind[k_slot] == .none) return false;
+    if (v_slot >= decoder_runtime_linear_slot_capacity or !rawLinearSlotPrepared(self, v_slot) or self.raw_linear_slot_kinds[v_slot] != .quantized or self.raw_linear_slot_in_dims[v_slot] != in_dim or self.raw_linear_slot_out_dims[v_slot] != kv_out_dim or self.raw_linear_slot_runtime_prepared_kind[v_slot] == .none) return false;
+    if (!destinations.first.isDevice() or !denseRegionShape(destinations.first, rows, q_out_dim)) return false;
+    if (!destinations.second.isDevice() or !denseRegionShape(destinations.second, rows, kv_out_dim)) return false;
+    if (!destinations.third.isDevice() or !denseRegionShape(destinations.third, rows, kv_out_dim)) return false;
+    var result = (try tryApplyQuantizedRuntimeLinearQkvWithOutputs(self, q_slot, k_slot, v_slot, input, rows, in_dim, q_out_dim, kv_out_dim, destinations)) orelse return false;
+    defer result.first.deinit();
+    defer result.second.deinit();
+    defer result.third.deinit();
+    return true;
+}
+
+fn tryApplyQuantizedRuntimeLinearQkvWithOutputs(
+    self: anytype,
+    q_slot: usize,
+    k_slot: usize,
+    v_slot: usize,
+    input: MetalTensor,
+    rows: usize,
+    in_dim: usize,
+    q_out_dim: usize,
+    kv_out_dim: usize,
+    assigned: ?RuntimeLinearTripleResult,
+) !?RuntimeLinearTripleResult {
     const DirectCase = enum {
         q4_0,
         q4_q4,
@@ -28369,9 +28543,9 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     const frame_active = hasActiveFrame(self.raw_decode_runtime);
-    const q_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, q_slot, in_dim, q_out_dim);
-    const k_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, k_slot, in_dim, kv_out_dim);
-    const v_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, v_slot, in_dim, kv_out_dim);
+    const q_kind = if (assigned != null) self.raw_linear_slot_runtime_prepared_kind[q_slot] else ensureQuantizedRuntimeLinearSlotPrepared(self, q_slot, in_dim, q_out_dim);
+    const k_kind = if (assigned != null) self.raw_linear_slot_runtime_prepared_kind[k_slot] else ensureQuantizedRuntimeLinearSlotPrepared(self, k_slot, in_dim, kv_out_dim);
+    const v_kind = if (assigned != null) self.raw_linear_slot_runtime_prepared_kind[v_slot] else ensureQuantizedRuntimeLinearSlotPrepared(self, v_slot, in_dim, kv_out_dim);
     if (q_kind == .none or k_kind == .none or v_kind == .none) return null;
     const direct_case: ?DirectCase = if (q_kind == .q4_0 and k_kind == .q4_0 and v_kind == .q4_0)
         .q4_0
@@ -28383,6 +28557,8 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
         .q8_0
     else
         null;
+
+    if (assigned != null and (!input.isDevice() or direct_case == null or referenceQuantizedRuntimeLinearDebug())) return null;
 
     if (referenceQuantizedRuntimeLinearDebug()) {
         var q_out = (try tryApplyQuantizedRuntimeLinear(self, q_slot, input, rows, in_dim, q_out_dim)) orelse return null;
@@ -28408,11 +28584,11 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
         const device_case = direct_case.?;
         const q_shape = [_]i32{ @intCast(rows), @intCast(q_out_dim) };
         const kv_shape = [_]i32{ @intCast(rows), @intCast(kv_out_dim) };
-        var q_device = try MetalTensor.deviceAllocate(runtime, rows * q_out_dim * @sizeOf(f32), .private, &q_shape);
+        var q_device = if (assigned) |destinations| try destinations.first.retainedCopy() else try MetalTensor.deviceAllocate(runtime, rows * q_out_dim * @sizeOf(f32), .private, &q_shape);
         errdefer q_device.deinit();
-        var k_device = try MetalTensor.deviceAllocate(runtime, rows * kv_out_dim * @sizeOf(f32), .private, &kv_shape);
+        var k_device = if (assigned) |destinations| try destinations.second.retainedCopy() else try MetalTensor.deviceAllocate(runtime, rows * kv_out_dim * @sizeOf(f32), .private, &kv_shape);
         errdefer k_device.deinit();
-        var v_device = try MetalTensor.deviceAllocate(runtime, rows * kv_out_dim * @sizeOf(f32), .private, &kv_shape);
+        var v_device = if (assigned) |destinations| try destinations.third.retainedCopy() else try MetalTensor.deviceAllocate(runtime, rows * kv_out_dim * @sizeOf(f32), .private, &kv_shape);
         errdefer v_device.deinit();
         const device_rc = switch (device_case) {
             .q4_0 => termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_device(
@@ -28500,11 +28676,13 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
                 v_device.deviceByteOffset(),
             ),
         };
+        if (device_rc != 0 and assigned != null) return error.AssignedQuantRegionDispatchFailed;
         if (device_rc == 0) {
             if (!applyRuntimeLinearBiasDevice(self, q_slot, &q_device, rows, q_out_dim) or
                 !applyRuntimeLinearBiasDevice(self, k_slot, &k_device, rows, kv_out_dim) or
                 !applyRuntimeLinearBiasDevice(self, v_slot, &v_device, rows, kv_out_dim))
             {
+                if (assigned != null) return error.AssignedQuantRegionDispatchFailed;
                 v_device.deinit();
                 k_device.deinit();
                 q_device.deinit();
@@ -28520,6 +28698,8 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
         k_device.deinit();
         q_device.deinit();
     }
+
+    if (assigned != null) return null;
 
     if (input.isDevice() and
         quantizedRuntimeLinearKindHasSingleStageDeviceKernel(q_kind) and
@@ -28776,9 +28956,9 @@ pub fn tryRawQuantizedGatedFfnResidualHost(
     {
         return false;
     }
-    if (!self.raw_linear_slots_prepared[request.gate_linear_slot] or
-        !self.raw_linear_slots_prepared[request.up_linear_slot] or
-        !self.raw_linear_slots_prepared[request.down_linear_slot])
+    if (!rawLinearSlotPrepared(self, request.gate_linear_slot) or
+        !rawLinearSlotPrepared(self, request.up_linear_slot) or
+        !rawLinearSlotPrepared(self, request.down_linear_slot))
     {
         return false;
     }
@@ -29135,9 +29315,9 @@ pub fn tryDeviceQuantizedGatedFfnResidual(
     {
         return null;
     }
-    if (!self.raw_linear_slots_prepared[request.gate_linear_slot] or
-        !self.raw_linear_slots_prepared[request.up_linear_slot] or
-        !self.raw_linear_slots_prepared[request.down_linear_slot])
+    if (!rawLinearSlotPrepared(self, request.gate_linear_slot) or
+        !rawLinearSlotPrepared(self, request.up_linear_slot) or
+        !rawLinearSlotPrepared(self, request.down_linear_slot))
     {
         return null;
     }
@@ -29459,9 +29639,9 @@ pub fn tryDeviceQuantizedGatedFfn(
     {
         return null;
     }
-    if (!self.raw_linear_slots_prepared[request.gate_linear_slot] or
-        !self.raw_linear_slots_prepared[request.up_linear_slot] or
-        !self.raw_linear_slots_prepared[request.down_linear_slot])
+    if (!rawLinearSlotPrepared(self, request.gate_linear_slot) or
+        !rawLinearSlotPrepared(self, request.up_linear_slot) or
+        !rawLinearSlotPrepared(self, request.down_linear_slot))
     {
         return null;
     }
@@ -29534,8 +29714,8 @@ pub fn tryDeviceQuantizedGatedFfnGateUp(
     {
         return null;
     }
-    if (!self.raw_linear_slots_prepared[request.gate_linear_slot] or
-        !self.raw_linear_slots_prepared[request.up_linear_slot])
+    if (!rawLinearSlotPrepared(self, request.gate_linear_slot) or
+        !rawLinearSlotPrepared(self, request.up_linear_slot))
     {
         return null;
     }
@@ -29599,7 +29779,7 @@ pub fn tryDeviceQuantizedGatedFfnDown(
     {
         return null;
     }
-    if (!self.raw_linear_slots_prepared[request.down_linear_slot] or
+    if (!rawLinearSlotPrepared(self, request.down_linear_slot) or
         self.raw_linear_slot_kinds[request.down_linear_slot] != .quantized)
     {
         return null;
@@ -29644,6 +29824,7 @@ pub fn shouldAttemptDirectQuantizedGatedFfn(
     logged_mixed_kind: *bool,
     logged_unsupported_kind: *bool,
 ) bool {
+    if (preparedBindingRetired(self, .linear, gate_linear_slot) or preparedBindingRetired(self, .linear, up_linear_slot) or preparedBindingRetired(self, .linear, down_linear_slot)) return false;
     const gate_storage = self.raw_linear_slot_quantized_storage[gate_linear_slot] orelse return false;
     const up_storage = self.raw_linear_slot_quantized_storage[up_linear_slot] orelse return false;
     const down_storage = self.raw_linear_slot_quantized_storage[down_linear_slot] orelse return false;
@@ -30046,7 +30227,7 @@ fn directQuantizedBlockFormatForSlot(
         if (trace) std.debug.print("metal-quant-block-slot-skip layer={d} slot={s} id={d} reason=slot-range\n", .{ layer_index, label, slot });
         return null;
     }
-    if (!self.raw_linear_slots_prepared[slot]) {
+    if (!rawLinearSlotPrepared(self, slot)) {
         if (trace) std.debug.print("metal-quant-block-slot-skip layer={d} slot={s} id={d} reason=slot-unprepared\n", .{ layer_index, label, slot });
         return null;
     }
@@ -30104,7 +30285,7 @@ fn directQuantizedBlockFormatForRequest(self: anytype, request: anytype) ?Direct
         if (ple_gate_format != ple_proj_format) return null;
         formats.ple = ple_gate_format;
         if (ple_post_norm_slot >= decoder_runtime_rms_norm_slot_capacity) return null;
-        if (!self.raw_rms_norm_slots_prepared[ple_post_norm_slot]) return null;
+        if (!rawRmsNormSlotPrepared(self, ple_post_norm_slot)) return null;
         if (self.raw_rms_norm_slot_hidden_sizes[ple_post_norm_slot] != request.hidden_size) return null;
     }
     return formats;
@@ -30133,7 +30314,7 @@ pub fn supportsDirectPagedGatedDecoderBlockSlots(self: anytype, request: anytype
         const ple_proj_format = directQuantizedBlockFormatForSlot(self, layer_index, "ple-proj", ple_proj_slot, request.ple_hidden_size, request.hidden_size) orelse return false;
         if (ple_gate_format != ple_proj_format) return false;
         if (ple_post_norm_slot >= decoder_runtime_rms_norm_slot_capacity) return false;
-        if (!self.raw_rms_norm_slots_prepared[ple_post_norm_slot]) return false;
+        if (!rawRmsNormSlotPrepared(self, ple_post_norm_slot)) return false;
         if (self.raw_rms_norm_slot_hidden_sizes[ple_post_norm_slot] != request.hidden_size) return false;
     }
     return true;
@@ -30305,7 +30486,7 @@ fn runAttentionF32QuantizedBlock(
         if (ple_mt.ndim() != 2 or @as(usize, @intCast(ple_mt.dim(0))) != rows or @as(usize, @intCast(ple_mt.dim(1))) != request.ple_hidden_size) return if (allocating) null else false;
         if (!ple_mt.isDevice()) return if (allocating) null else false;
         if (ple_post_norm_slot >= decoder_runtime_rms_norm_slot_capacity) return if (allocating) null else false;
-        if (!self.raw_rms_norm_slots_prepared[ple_post_norm_slot]) return if (allocating) null else false;
+        if (!rawRmsNormSlotPrepared(self, ple_post_norm_slot)) return if (allocating) null else false;
         if (self.raw_rms_norm_slot_hidden_sizes[ple_post_norm_slot] != request.hidden_size) return if (allocating) null else false;
     }
     const output_scale_value_opt: ?f32 = if (@hasField(@TypeOf(request), "output_scale_value")) request.output_scale_value else null;
@@ -30484,7 +30665,7 @@ fn runAttentionPagedGatedDecoderBlockQuantizedDeviceInto(
         if (ple_mt.ndim() != 2 or @as(usize, @intCast(ple_mt.dim(0))) != rows or @as(usize, @intCast(ple_mt.dim(1))) != request.ple_hidden_size) return false;
         if (!ple_mt.isDevice()) return false;
         if (ple_post_norm_slot >= decoder_runtime_rms_norm_slot_capacity) return false;
-        if (!self.raw_rms_norm_slots_prepared[ple_post_norm_slot]) return false;
+        if (!rawRmsNormSlotPrepared(self, ple_post_norm_slot)) return false;
         if (self.raw_rms_norm_slot_hidden_sizes[ple_post_norm_slot] != request.hidden_size) return false;
     }
     const output_scale_value_opt: ?f32 = if (@hasField(@TypeOf(request), "output_scale_value")) request.output_scale_value else null;
@@ -32046,7 +32227,7 @@ pub fn runCompressedAttentionResidual(self: anytype, request: anytype, stats: an
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (request.attention_linear_slot >= decoder_runtime_linear_slot_capacity) return null;
-    if (!self.raw_linear_slots_prepared[request.attention_linear_slot]) return null;
+    if (!rawLinearSlotPrepared(self, request.attention_linear_slot)) return null;
     if (self.raw_linear_slot_in_dims[request.attention_linear_slot] != attention_input_size or
         self.raw_linear_slot_out_dims[request.attention_linear_slot] != request.hidden_size) return null;
     if (request.q.ndim() != 2 or
@@ -33279,7 +33460,7 @@ pub fn tryRawAttentionResidualHost(
     const runtime = self.raw_decode_runtime orelse return false;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
     if (attention_linear_slot >= decoder_runtime_linear_slot_capacity) return false;
-    if (!self.raw_linear_slots_prepared[attention_linear_slot]) return false;
+    if (!rawLinearSlotPrepared(self, attention_linear_slot)) return false;
     if (self.raw_linear_slot_in_dims[attention_linear_slot] != attention_input_size or self.raw_linear_slot_out_dims[attention_linear_slot] != hidden_size) return false;
     const kind = self.raw_linear_slot_kinds[attention_linear_slot];
     if (kind == .none) return false;
@@ -33378,7 +33559,7 @@ pub fn tryRawAttentionResidualHost(
     var pre_normed_storage: ?[]f32 = null;
     defer if (pre_normed_storage) |buf| std.heap.c_allocator.free(buf);
     const linear_input: [*c]const f32 = if (attention_pre_linear_rms_norm_slot) |norm_slot| blk: {
-        if (!self.raw_rms_norm_slots_prepared[norm_slot] or self.raw_rms_norm_slot_hidden_sizes[norm_slot] != attention_input_size) return false;
+        if (!rawRmsNormSlotPrepared(self, norm_slot) or self.raw_rms_norm_slot_hidden_sizes[norm_slot] != attention_input_size) return false;
         var weight_tensor = try (self.raw_rms_norm_slot_weights[norm_slot] orelse return false).readView();
         defer weight_tensor.deinit();
         const normed = try std.heap.c_allocator.alloc(f32, attention_input_size);
@@ -33413,7 +33594,7 @@ pub fn tryRawAttentionResidualHost(
     if (!linear_ok) return false;
 
     if (attention_post_linear_rms_norm_slot) |norm_slot| {
-        if (!self.raw_rms_norm_slots_prepared[norm_slot] or self.raw_rms_norm_slot_hidden_sizes[norm_slot] != hidden_size) return false;
+        if (!rawRmsNormSlotPrepared(self, norm_slot) or self.raw_rms_norm_slot_hidden_sizes[norm_slot] != hidden_size) return false;
         var weight_tensor = try (self.raw_rms_norm_slot_weights[norm_slot] orelse return false).readView();
         defer weight_tensor.deinit();
         activations.rmsNorm(projected, (try tensorHostSlice(&weight_tensor))[0..hidden_size], hidden_size, eps);
@@ -33432,7 +33613,7 @@ pub fn canTryRawAttentionResidualHost(
     hidden_size: usize,
 ) bool {
     if (attention_linear_slot >= decoder_runtime_linear_slot_capacity) return false;
-    if (!self.raw_linear_slots_prepared[attention_linear_slot]) return false;
+    if (!rawLinearSlotPrepared(self, attention_linear_slot)) return false;
     if (self.raw_linear_slot_in_dims[attention_linear_slot] != attention_input_size or
         self.raw_linear_slot_out_dims[attention_linear_slot] != hidden_size)
     {
@@ -33471,7 +33652,7 @@ pub fn tryRawCompressedAttentionResidualHost(
     const runtime = self.raw_decode_runtime orelse return false;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
     if (attention_linear_slot >= decoder_runtime_linear_slot_capacity) return false;
-    if (!self.raw_linear_slots_prepared[attention_linear_slot]) return false;
+    if (!rawLinearSlotPrepared(self, attention_linear_slot)) return false;
     if (self.raw_linear_slot_in_dims[attention_linear_slot] != attention_input_size or self.raw_linear_slot_out_dims[attention_linear_slot] != hidden_size) return false;
     if (self.raw_linear_slot_kinds[attention_linear_slot] != .quantized) return false;
     const storage = self.raw_linear_slot_quantized_storage[attention_linear_slot] orelse return false;
@@ -49865,6 +50046,11 @@ pub extern fn termite_metal_decode_runtime_lighton_wide_mpp_stats(runtime: ?*Raw
 pub extern fn termite_metal_decode_runtime_lighton_standalone_wide_head_calls(runtime: ?*RawMetalDecodeRuntime) u64;
 
 pub extern fn termite_metal_buffer_allocated_size(handle: ?*anyopaque) usize;
+/// Independent cold bank allocation, without mutable request/runtime state.
+pub extern fn antfly_metal_standalone_device_retain(runtime: *RawMetalDecodeRuntime) ?*anyopaque;
+pub extern fn antfly_metal_standalone_device_release(device: ?*anyopaque) void;
+pub extern fn antfly_metal_standalone_allocation_bytes(device: ?*anyopaque, bytes: usize) usize;
+pub extern fn antfly_metal_standalone_buffer_alloc(device: ?*anyopaque, bytes: usize) ?*anyopaque;
 
 pub extern fn termite_metal_decode_runtime_stream_frames_available(runtime: ?*RawMetalDecodeRuntime) c_int;
 
@@ -50007,4 +50193,120 @@ test "metal native ternary attention prepared slots preserve the Zig C boundary"
             for (output) |value| try std.testing.expectApproxEqAbs(@as(f32, 0.4375), value, 1e-5);
         }
     }
+}
+
+pub fn tryApplyDenseRuntimeLinearAssigned(self: anytype, slot: usize, input: MetalTensor, rows: usize, in_dim: usize, out_dim: usize, output: MetalTensor) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (slot >= decoder_runtime_linear_slot_capacity or !rawLinearSlotPrepared(self, slot) or self.raw_linear_slot_kinds[slot] != .dense or self.raw_linear_slot_in_dims[slot] != in_dim or self.raw_linear_slot_out_dims[slot] != out_dim) return false;
+    if (!denseRegionShape(input, rows, in_dim) or !denseRegionShape(output, rows, out_dim)) return false;
+    const status = if (rows == 1) termite_metal_decode_runtime_apply_linear_device(runtime, slot, input.deviceHandle(), input.deviceByteOffset(), in_dim, out_dim, output.deviceHandle(), output.deviceByteOffset()) else termite_metal_decode_runtime_apply_linear_multi_row_device(runtime, slot, input.deviceHandle(), input.deviceByteOffset(), rows, in_dim, out_dim, output.deviceHandle(), output.deviceByteOffset());
+    return assignedDenseDispatch(status);
+}
+
+/// Packed region outputs and intermediate are the caller's admitted ranges.
+/// This shares the allocating bridge's exact packed matmul/split body.
+pub fn tryApplyDenseRuntimeLinearPairAssigned(self: anytype, slot_a: usize, slot_b: usize, input: MetalTensor, rows: usize, in_dim: usize, out_dim: usize, first: MetalTensor, second: MetalTensor, workspace: ?MetalTensor) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (!input.isDevice() or !first.isDevice() or !second.isDevice() or rows == 0 or in_dim == 0 or out_dim == 0 or slot_a >= decoder_runtime_linear_slot_capacity or slot_b >= decoder_runtime_linear_slot_capacity) return false;
+    if (!rawLinearSlotPrepared(self, slot_a) or !rawLinearSlotPrepared(self, slot_b) or self.raw_linear_slot_kinds[slot_a] != .dense or self.raw_linear_slot_kinds[slot_b] != .dense or self.raw_linear_slot_in_dims[slot_a] != in_dim or self.raw_linear_slot_in_dims[slot_b] != in_dim or self.raw_linear_slot_out_dims[slot_a] != out_dim or self.raw_linear_slot_out_dims[slot_b] != out_dim) return false;
+    if (!denseRegionShape(input, rows, in_dim) or !denseRegionShape(first, rows, out_dim) or !denseRegionShape(second, rows, out_dim)) return false;
+    if (hasActiveFrame(runtime) and rows != 1) {
+        const packed_workspace = workspace orelse return false;
+        const packed_columns = std.math.mul(usize, out_dim, 2) catch return false;
+        if (!assignedWorkspaceFits(packed_workspace, rows, packed_columns)) return false;
+        return assignedDenseDispatch(termite_metal_decode_runtime_apply_dense_linear_pair_slots_assigned_device(runtime, slot_a, slot_b, input.deviceHandle(), input.deviceByteOffset(), rows, in_dim, out_dim, first.deviceHandle(), first.deviceByteOffset(), second.deviceHandle(), second.deviceByteOffset(), packed_workspace.deviceHandle(), packed_workspace.deviceByteOffset()));
+    }
+    return assignedDenseDispatch(termite_metal_decode_runtime_apply_linear_pair_slots_device(runtime, slot_a, slot_b, input.deviceHandle(), input.deviceByteOffset(), rows, in_dim, out_dim, first.deviceHandle(), first.deviceByteOffset(), second.deviceHandle(), second.deviceByteOffset()));
+}
+
+pub fn tryApplyDenseRuntimeLinearQkvAssigned(self: anytype, q_slot: usize, k_slot: usize, v_slot: usize, input: MetalTensor, rows: usize, in_dim: usize, q_dim: usize, kv_dim: usize, q: MetalTensor, k: MetalTensor, v: MetalTensor, workspace: ?MetalTensor) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (!input.isDevice() or !q.isDevice() or !k.isDevice() or !v.isDevice() or rows == 0 or in_dim == 0 or q_dim == 0 or kv_dim == 0 or q_slot >= decoder_runtime_linear_slot_capacity or k_slot >= decoder_runtime_linear_slot_capacity or v_slot >= decoder_runtime_linear_slot_capacity) return false;
+    for ([_]usize{ q_slot, k_slot, v_slot }, 0..) |slot, index| {
+        if (!rawLinearSlotPrepared(self, slot) or self.raw_linear_slot_kinds[slot] != .dense or self.raw_linear_slot_in_dims[slot] != in_dim or self.raw_linear_slot_out_dims[slot] != (if (index == 0) q_dim else kv_dim)) return false;
+    }
+    if (!denseRegionShape(input, rows, in_dim) or !denseRegionShape(q, rows, q_dim) or !denseRegionShape(k, rows, kv_dim) or !denseRegionShape(v, rows, kv_dim)) return false;
+    if (rows == 1) return assignedDenseDispatch(termite_metal_decode_runtime_apply_linear_qkv_slots_device(runtime, q_slot, k_slot, v_slot, input.deviceHandle(), input.deviceByteOffset(), rows, in_dim, q_dim, kv_dim, q.deviceHandle(), q.deviceByteOffset(), k.deviceHandle(), k.deviceByteOffset(), v.deviceHandle(), v.deviceByteOffset()));
+    if (!hasActiveFrame(runtime) or getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED")) return false;
+    const packed_workspace = workspace orelse return false;
+    const twice_kv = std.math.mul(usize, kv_dim, 2) catch return false;
+    const packed_columns = std.math.add(usize, q_dim, twice_kv) catch return false;
+    if (!assignedWorkspaceFits(packed_workspace, rows, packed_columns)) return false;
+    return assignedDenseDispatch(termite_metal_decode_runtime_apply_dense_linear_qkv_slots_assigned_device(runtime, q_slot, k_slot, v_slot, input.deviceHandle(), input.deviceByteOffset(), rows, in_dim, q_dim, kv_dim, q.deviceHandle(), q.deviceByteOffset(), k.deviceHandle(), k.deviceByteOffset(), v.deviceHandle(), v.deviceByteOffset(), packed_workspace.deviceHandle(), packed_workspace.deviceByteOffset()));
+}
+
+fn denseRegionShape(value: MetalTensor, rows: usize, columns: usize) bool {
+    if (value.dtype != .f32 or value.ndim() != 2 or value.dim(0) <= 0 or value.dim(1) <= 0 or @as(usize, @intCast(value.dim(0))) != rows or @as(usize, @intCast(value.dim(1))) != columns) return false;
+    return assignedWorkspaceFits(value, rows, columns);
+}
+
+fn assignedWorkspaceFits(value: MetalTensor, rows: usize, columns: usize) bool {
+    if (!value.isDevice() or value.dtype != .f32 or value.deviceByteOffset() % @sizeOf(f32) != 0) return false;
+    const count = std.math.mul(usize, rows, columns) catch return false;
+    const bytes = std.math.mul(usize, count, @sizeOf(f32)) catch return false;
+    return value.deviceByteLen() >= bytes;
+}
+
+/// Metadata-only rejection happens before this call. Once the bridge has been
+/// entered, a failure may follow encoding/submission and can never mean decline.
+fn assignedDenseDispatch(status: c_int) !bool {
+    if (status != 0) return error.AssignedDenseRegionDispatchFailed;
+    return true;
+}
+
+pub extern fn termite_metal_decode_runtime_apply_dense_linear_pair_slots_assigned_device(runtime: ?*RawMetalDecodeRuntime, slot_a: usize, slot_b: usize, input: ?*anyopaque, input_offset: usize, rows: usize, in_dim: usize, out_dim: usize, output_a: ?*anyopaque, output_a_offset: usize, output_b: ?*anyopaque, output_b_offset: usize, packed_workspace: ?*anyopaque, packed_offset: usize) c_int;
+pub extern fn termite_metal_decode_runtime_apply_dense_linear_qkv_slots_assigned_device(runtime: ?*RawMetalDecodeRuntime, q_slot: usize, k_slot: usize, v_slot: usize, input: ?*anyopaque, input_offset: usize, rows: usize, in_dim: usize, q_dim: usize, kv_dim: usize, q: ?*anyopaque, q_offset: usize, k: ?*anyopaque, k_offset: usize, v: ?*anyopaque, v_offset: usize, packed_workspace: ?*anyopaque, packed_offset: usize) c_int;
+
+pub extern fn antfly_metal_output_retirement_begin(runtime: *RawMetalDecodeRuntime, origin: *u64, next_identity: *const fn () callconv(.c) u64) c_int;
+pub extern fn antfly_metal_output_retirement_attach(runtime: *RawMetalDecodeRuntime, nodes: [*]@import("../execution/resource_retirement.zig").Node, count: usize, witnesses: *anyopaque) c_int;
+pub extern fn antfly_metal_output_retirement_end(runtime: *RawMetalDecodeRuntime) void;
+pub extern fn antfly_metal_retirement_arena_test_partial_failure() c_int;
+pub extern fn antfly_metal_retirement_arena_prepare(output_capacity: usize, origin_capacity: usize) ?*anyopaque;
+pub extern fn antfly_metal_retirement_arena_destroy(arena: *anyopaque) void;
+pub extern fn antfly_metal_retirement_arena_handles(arena: *anyopaque, needed: usize) ?[*]*anyopaque;
+pub extern fn antfly_metal_retirement_arena_arm(arena: *anyopaque, runtime: ?*RawMetalDecodeRuntime, buffers: [*]const *anyopaque, count: usize, payload: @import("../execution/resource_retirement.zig").Payload) ?*anyopaque;
+pub extern fn antfly_metal_prepare_retirement_witnesses(buffers: [*]const *anyopaque, count: usize, payload: @import("../execution/resource_retirement.zig").Payload) ?*anyopaque;
+pub extern fn antfly_metal_discard_retirement_witnesses(witnesses: *anyopaque) void;
+pub extern fn antfly_metal_set_retirement_poll(callback: *const fn () callconv(.c) void) c_int;
+pub extern fn antfly_metal_request_retirement_poll() callconv(.c) void;
+pub extern fn antfly_metal_prepare_retirement_witnesses_with_frames(runtime: *RawMetalDecodeRuntime, buffers: [*]const *anyopaque, count: usize, payload: @import("../execution/resource_retirement.zig").Payload) ?*anyopaque;
+
+pub const RawInitialKvSlot = extern struct {
+    slot: usize,
+    old_keys: ?*anyopaque,
+    old_values: ?*anyopaque,
+    old_key_capacity: usize,
+    old_value_capacity: usize,
+    old_key_allocated: usize,
+    old_value_allocated: usize,
+    keys: *anyopaque,
+    values: *anyopaque,
+    key_length: usize,
+    value_length: usize,
+    key_bound: usize,
+    value_bound: usize,
+};
+pub extern fn antfly_metal_standalone_buffer_length(buffer: ?*anyopaque) usize;
+pub extern fn antfly_metal_initialize_leased_kv_slots(runtime: *RawMetalDecodeRuntime, slots: [*]const RawInitialKvSlot, count: usize) c_int;
+
+pub extern fn antfly_metal_retirement_frame_holds(runtime: ?*RawMetalDecodeRuntime, handle: *anyopaque, active: *c_int, submitted: *c_int) c_int;
+
+pub extern fn antfly_metal_retire_prepared_binding(runtime: ?*RawMetalDecodeRuntime, kind: PreparedBindingKind, slot: usize, expected: u64) u64;
+
+pub extern fn antfly_metal_prepared_declaration(runtime: ?*RawMetalDecodeRuntime, kind: PreparedBindingKind, slot: usize) u64;
+pub extern fn antfly_metal_replace_prepared_declaration(runtime: ?*RawMetalDecodeRuntime, kind: PreparedBindingKind, slot: usize) void;
+
+pub fn preparedBindingRetired(self: anytype, kind: PreparedBindingKind, slot: usize) bool {
+    if (comptime !@hasField(@TypeOf(self.*), "raw_decode_runtime")) return false;
+    const frame_runtime = self.raw_decode_runtime orelse return false;
+    return (antfly_metal_prepared_declaration(frame_runtime, kind, slot) & 1) != 0;
+}
+fn rawLinearSlotPrepared(self: anytype, slot: usize) bool {
+    return slot < decoder_runtime_linear_slot_capacity and self.raw_linear_slots_prepared[slot] and !preparedBindingRetired(self, .linear, slot);
+}
+fn rawLayerNormSlotPrepared(self: anytype, slot: usize) bool {
+    return slot < decoder_runtime_layer_norm_slot_capacity and self.raw_layer_norm_slots_prepared[slot] and !preparedBindingRetired(self, .layer_norm, slot);
+}
+fn rawRmsNormSlotPrepared(self: anytype, slot: usize) bool {
+    return slot < decoder_runtime_rms_norm_slot_capacity and self.raw_rms_norm_slots_prepared[slot] and !preparedBindingRetired(self, .rms_norm, slot);
 }

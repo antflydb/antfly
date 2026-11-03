@@ -957,6 +957,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .scheduler = if (use_scheduler) model.native_generate_coordinator else null,
         .scheduler_lease = if (use_scheduler) if (native_generate_lease) |*lease| lease else null else null,
         .draft_cb = if (draft_cb) |draft_backend| draft_backend else null,
+        .draft_diagnostics_binding = if (draft_model) |loaded| loaded.session.invocation_diagnostics else null,
         .draft_gpt_config = draft_gpt_config,
         .draft_decode_state = if (draft_decode_state) |*state| state else null,
         .graph_cache = if (graph_mode) &graph_cache else null,

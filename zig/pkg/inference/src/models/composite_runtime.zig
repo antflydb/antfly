@@ -60,8 +60,6 @@ pub const CompositeAssets = struct {
     preferred_backends_owned: bool = false,
     startup_managed: bool = false,
     model_type: manifest_mod.ModelType = .transcriber,
-    encoder_gate: std.atomic.Mutex = .unlocked,
-    decoder_gate: std.atomic.Mutex = .unlocked,
     managed_tokenizer: ManagedHfTokenizer,
     prompt_cache: ?whisper_prompt.PromptCache,
     encoder: ?ManagedSession = null,
@@ -235,6 +233,8 @@ pub fn load(allocator: std.mem.Allocator, host: Host, request: Request, control:
     if (!std.mem.eql(u8, asset_generation[0..], verified_generation[0..]))
         return error.ModelArtifactsChanging;
 
+    if (encoder) |*managed| try managed.session.installOwnedExecutionGate(allocator);
+    if (decoder) |*managed| try managed.session.installOwnedExecutionGate(allocator);
     const assets = try allocator.create(CompositeAssets);
     errdefer allocator.destroy(assets);
     const owned_model_dir = try allocator.dupe(u8, model_dir);
@@ -260,7 +260,6 @@ pub fn load(allocator: std.mem.Allocator, host: Host, request: Request, control:
         .generation = asset_generation,
     };
     if (assets.encoder) |*managed| {
-        managed.session.execution_gate = &assets.encoder_gate;
         const info = managed.session.outputInfo();
         if (info.len == 1 and info[0].shape.len == 3 and info[0].dtype == .f32) {
             // Exported hidden width is authoritative; the validated model
@@ -270,7 +269,6 @@ pub fn load(allocator: std.mem.Allocator, host: Host, request: Request, control:
         }
     }
     if (assets.decoder) |*managed| {
-        managed.session.execution_gate = &assets.decoder_gate;
         const info = managed.session.outputInfo();
         if (info.len == 1 and info[0].shape.len == 3 and info[0].dtype == .f32)
             managed.session.output_geometry = .{ .input_name = "input_ids", .width = if (info[0].shape[2] > 0) @intCast(info[0].shape[2]) else decoder_config.vocab_size };
@@ -352,8 +350,8 @@ test "model composite construction releases admitted peers on every allocation f
             try std.testing.expectEqual(@as(usize, 32), self.admission.snapshot().host_weight_bytes);
             try std.testing.expect(result.reclaimableAdmissions()[1] != null and result.reclaimableAdmissions()[2] != null);
             try std.testing.expectEqual(@as(u128, 123), result.runtime_id);
-            try std.testing.expectEqual(&result.encoder_gate, result.encoder.?.session.execution_gate.?);
-            try std.testing.expectEqual(&result.decoder_gate, result.decoder.?.session.execution_gate.?);
+            try std.testing.expectEqual(&result.encoder.?.session.model_lifetime.?.execution_gate, result.encoder.?.session.execution_gate.?);
+            try std.testing.expectEqual(&result.decoder.?.session.model_lifetime.?.execution_gate, result.decoder.?.session.execution_gate.?);
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Probe.run, .{directory});

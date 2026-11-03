@@ -17,7 +17,10 @@
 """Retained baseline/candidate model and CUDA-code qualification receipts.
 
 Model configs contain cases [{name, args, timing_prefix?}], arm_order and
-optional environment/cpu_affinity. Args are literal argv (no shell); --output
+optional environment/cpu_affinity and arm_extra_args {A: [...], B: [...]}
+(default empty). Arm extras append after shared case args for same-binary policy
+comparisons; exact argv and normalized extras are retained. Args are literal
+argv (no shell); --output
 is supplied by this runner. All arms must produce finite, byte-identical F32
 outputs by default. A case may explicitly pin an independent F32 reference and
 absolute tolerance instead. Independent operator references remain required gates.
@@ -46,18 +49,34 @@ def save(path, value):
     temporary.replace(path)
 
 
+def arm_extra_args(config):
+    extras = config.get('arm_extra_args', {})
+    if not isinstance(extras, dict) or set(extras) - {'A', 'B'}:
+        raise ValueError('arm_extra_args accepts only A/B literal argv lists')
+    result = {}
+    for arm in 'AB':
+        values = extras.get(arm, [])
+        if not isinstance(values, list) or any(not isinstance(x, str) or not x or '\0' in x for x in values):
+            raise ValueError('arm_extra_args values must be nonempty literal argv strings')
+        if any(x == '--output' or x.startswith('--output=') for x in values):
+            raise ValueError('--output is owned by the qualification runner')
+        result[arm] = values
+    return result
+
+
 def models(args):
     config = json.loads(args.config.read_text())
     order = config.get('arm_order', 'ABBABAABABBAABBA')
     if set(order) != {'A', 'B'} or order.count('A') != order.count('B'):
         raise ValueError('arm_order must have balanced A/B arms')
     binaries = {'A': args.baseline.resolve(), 'B': args.candidate.resolve()}
+    extras = arm_extra_args(config)
     env = dict(os.environ, **config.get('environment', {}))
     affinity = config.get('cpu_affinity')
     if affinity and not hasattr(os, 'sched_setaffinity'):
         raise ValueError('CPU affinity requires a supported host')
     receipt = {'config': config, 'binaries': {k: {'path': str(v), 'sha256': digest(v.read_bytes())}
-               for k, v in binaries.items()}, 'cases': []}
+               for k, v in binaries.items()}, 'arm_extra_args': extras, 'cases': []}
     passed = True
     for case in config['cases']:
         if not re.fullmatch(r'[\w.-]+', case['name']):
@@ -86,7 +105,7 @@ def models(args):
             log = Path(str(stem) + '.log')
             if output.exists():
                 output.unlink()
-            command = [str(binaries[arm])] + case['args'] + ['--output', str(output)]
+            command = [str(binaries[arm])] + case['args'] + extras[arm] + ['--output', str(output)]
             prepare = (lambda: os.sched_setaffinity(0, affinity)) if affinity else None
             run = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  env=env, preexec_fn=prepare)

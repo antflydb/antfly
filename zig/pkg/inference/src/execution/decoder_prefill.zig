@@ -48,7 +48,180 @@ pub const ChunkRequest = struct {
 };
 pub const ChunkOutcome = union(enum) { complete: Output, retry_chunk_size: usize };
 
+/// Physical chunk progression. Task adapters supply scheduler fairness limits
+/// and publish progress; they cannot mutate admitted shapes or advance a failed
+/// numerical attempt. The plan's immutable storage must outlive this cursor.
+pub const ChunkCursor = struct {
+    const Plan = runtime.scheduler.native_generate.PrefillChunkPlan;
+    const Chunk = runtime.scheduler.native_generate.PrefillChunk;
+    pub const Options = struct {
+        query_tokens: usize,
+        prefilled_tokens: usize,
+        prompt_tokens: usize,
+        initial_chunk_rows: usize = 1,
+        admitted_plan: ?Plan = null,
+        first_token_coalesced: bool = false,
+        greedy_output: bool = false,
+        capture_hidden: bool = false,
+        execution_control: ?control.InferenceExecutionControl = null,
+    };
+    pub const Attempt = struct {
+        nonce: u64,
+        start: usize,
+        end: usize,
+        total_end: usize,
+        chunk: Chunk,
+        output_intent: decoder_routes.PrefillOutputIntent,
+    };
+    options: Options,
+    current_chunk_size: usize,
+    processed: usize = 0,
+    plan_index: usize = 0,
+    nonce: u64 = 0,
+    pending: ?Attempt = null,
+    plan_decision: PlanDecision = .none,
+    uncoalesced_chunk_size: usize = 0,
+
+    pub const Selection = struct {
+        configured_plan: ?Plan = null,
+        leased_plan: ?Plan = null,
+        configured_chunk_rows: usize = 0,
+        scheduler_chunk_rows: usize = 0,
+        selected_kv: bool = false,
+        checkpoint_resume: bool = false,
+        backend: ops.BackendKind,
+        pure_greedy: bool,
+        resident_greedy_allowed: bool,
+        first_token_enabled: bool,
+        coalesce_token_limit: usize,
+    };
+    pub const PlanDecision = union(enum) {
+        none,
+        execute: Plan,
+        bypassed_prompt_cache: Plan,
+        bypassed_geometry: Plan,
+    };
+
+    /// Resolve the physical plan once before any chunk/KV mutation. Scheduler
+    /// and task configuration become primitive request facts at this boundary.
+    pub fn select(request: Options, selection: Selection) !ChunkCursor {
+        if (selection.configured_plan != null and selection.leased_plan != null and selection.configured_plan.?.fingerprint != selection.leased_plan.?.fingerprint) return error.InvalidPrefillChunkPlan;
+        const borrowed = if (selection.selected_kv) null else selection.configured_plan orelse selection.leased_plan;
+        var decision: PlanDecision = .none;
+        var admitted: ?Plan = null;
+        if (borrowed) |plan| {
+            try plan.validate();
+            if (request.prefilled_tokens != 0 and !selection.checkpoint_resume) {
+                decision = .{ .bypassed_prompt_cache = plan };
+            } else if (plan.prompt_tokens != request.query_tokens) {
+                if (selection.checkpoint_resume) return error.InvalidPrefillChunkPlan;
+                decision = .{ .bypassed_geometry = plan };
+            } else {
+                decision = .{ .execute = plan };
+                admitted = plan;
+            }
+        }
+        var rows = if (admitted) |plan| plan.max_chunk_rows else blk: {
+            if (selection.configured_chunk_rows > 0 and selection.scheduler_chunk_rows > 0) break :blk @min(selection.configured_chunk_rows, selection.scheduler_chunk_rows);
+            if (selection.configured_chunk_rows > 0) break :blk selection.configured_chunk_rows;
+            if (selection.scheduler_chunk_rows > 0) break :blk selection.scheduler_chunk_rows;
+            break :blk request.query_tokens;
+        };
+        rows = @max(@min(rows, request.query_tokens), 1);
+        if (selection.selected_kv) rows = @min(rows, runtime.kv.selection.defaults.prefill_chunk_rows);
+        const uncoalesced = rows;
+        if (borrowed == null and !selection.selected_kv) rows = decoder_routes.coalescedPrefillChunkSizeForFirstToken(selection.backend, selection.pure_greedy, !selection.resident_greedy_allowed, selection.first_token_enabled, request.query_tokens, rows, selection.coalesce_token_limit);
+        var options = request;
+        options.admitted_plan = admitted;
+        options.initial_chunk_rows = rows;
+        options.first_token_coalesced = rows > uncoalesced;
+        // admitted was fully validated above; do not scan its chunks twice.
+        var result = initValidated(options);
+        result.plan_decision = decision;
+        result.uncoalesced_chunk_size = uncoalesced;
+        return result;
+    }
+
+    pub fn init(options: Options) !ChunkCursor {
+        if (options.admitted_plan) |plan| {
+            try plan.validate();
+            if (plan.prompt_tokens != options.query_tokens) return error.InvalidPrefillChunkPlan;
+        }
+        return initValidated(options);
+    }
+    fn initValidated(options: Options) ChunkCursor {
+        return .{ .options = options, .current_chunk_size = @max(options.initial_chunk_rows, 1) };
+    }
+    pub fn next(self: *ChunkCursor, scheduler_chunk: usize) !?Attempt {
+        if (self.pending != null) return error.PrefillChunkInFlight;
+        if (self.processed == self.options.query_tokens) return null;
+        if (self.options.execution_control) |active| try active.check();
+        if (self.processed > self.options.query_tokens) return error.InvalidPrefillChunkState;
+        const chunk = if (self.options.admitted_plan) |plan| blk: {
+            if (self.plan_index >= plan.chunks.len) return error.InvalidPrefillChunkPlan;
+            break :blk plan.chunks[self.plan_index];
+        } else Chunk{ .rows = @max(@min(self.current_chunk_size, decoder_routes.schedulerChunkForPrefillIteration(scheduler_chunk, self.current_chunk_size, self.options.first_token_coalesced)), 1) };
+        const proposed = std.math.add(usize, self.processed, chunk.rows) catch return error.InvalidPrefillChunkState;
+        const end = @min(self.options.query_tokens, proposed);
+        if (self.options.admitted_plan != null and end - self.processed != chunk.rows) return error.InvalidPrefillChunkPlan;
+        const total_end = std.math.add(usize, self.options.prefilled_tokens, end) catch return error.InvalidPrefillChunkState;
+        const nonce = std.math.add(u64, self.nonce, 1) catch return error.InvalidPrefillChunkState;
+        const attempt = Attempt{ .nonce = nonce, .start = self.processed, .end = end, .total_end = total_end, .chunk = chunk, .output_intent = decoder_routes.prefillOutputIntent(total_end == self.options.prompt_tokens, self.options.greedy_output, self.options.capture_hidden) };
+        self.pending = attempt;
+        self.nonce = nonce;
+        return attempt;
+    }
+    fn validateAttempt(self: *const ChunkCursor, attempt: Attempt) !void {
+        const pending = self.pending orelse return error.PrefillChunkAlreadyConsumed;
+        if (!std.meta.eql(pending, attempt) or attempt.start != self.processed) return error.InvalidPrefillChunkState;
+    }
+    pub fn commit(self: *ChunkCursor, attempt: Attempt) !void {
+        try self.validateAttempt(attempt);
+        self.processed = attempt.end;
+        if (self.options.admitted_plan != null) self.plan_index += 1;
+        self.pending = null;
+    }
+    pub fn retry(self: *ChunkCursor, attempt: Attempt, smaller: usize) !void {
+        try self.validateAttempt(attempt);
+        if (self.options.admitted_plan != null) return error.InvalidPrefillChunkPlan;
+        if (smaller == 0 or smaller >= attempt.chunk.rows) return error.InvalidPrefillChunkRetry;
+        self.current_chunk_size = smaller;
+        self.pending = null;
+    }
+    pub fn retryMemoryBudgetExceeded(self: *ChunkCursor, attempt: Attempt, err: anyerror) !bool {
+        try self.validateAttempt(attempt);
+        if (self.options.admitted_plan != null or err != error.MemoryBudgetExceeded or attempt.chunk.rows <= 1) return false;
+        try self.retry(attempt, @max(attempt.chunk.rows / 2, 1));
+        return true;
+    }
+    /// Cancelling numerical work does not publish progress or resize an
+    /// admitted plan. The numerical owner separately owns its KV rollback.
+    pub fn cancel(self: *ChunkCursor, attempt: Attempt) !void {
+        if (self.pending == null) return;
+        try self.validateAttempt(attempt);
+        self.pending = null;
+    }
+    pub fn finish(self: *const ChunkCursor) !void {
+        if (self.pending != null or self.processed != self.options.query_tokens) return error.InvalidPrefillChunkState;
+        if (self.options.admitted_plan) |plan| if (self.plan_index != plan.chunks.len) return error.InvalidPrefillChunkPlan;
+    }
+};
+
+fn classifyChunkOutcome(result: ChunkOutcome) @import("invocation_observation.zig").ResultClassification {
+    return switch (result) {
+        .complete => .{},
+        .retry_chunk_size => .{ .error_name = "MemoryBudgetExceeded" },
+    };
+}
+
 pub const Runtime = struct {
+    inline fn acquireForObservation(self: *Runtime) !void {
+        self.execution.acquire() catch |err| {
+            @import("invocation_observation.zig").recordContextAcquisitionFailure(&self.forward.context, .prefill, err);
+            return err;
+        };
+    }
+
     forward: decoder_forward.Runtime,
     state: *graph_mod.decode_state_runtime.NativeDecodeState,
     execution: control.ExecutionAccess = .{},
@@ -60,8 +233,12 @@ pub const Runtime = struct {
     }
 
     pub fn runChunk(self: *Runtime, request: ChunkRequest) !ChunkOutcome {
-        try self.execution.acquire();
+        try self.acquireForObservation();
         defer self.execution.release();
+        return @import("invocation_observation.zig").callContextOperationClassified(&self.forward.context, .prefill, classifyChunkOutcome, @This().runChunkUnobserved, .{ self, request });
+    }
+
+    fn runChunkUnobserved(self: *Runtime, request: ChunkRequest) !ChunkOutcome {
         var repeat: if (build_options.enable_cuda) ?cuda_compute.CudaCompute.AttentionMatchRepeatScope else ?void = null;
         if (comptime build_options.enable_cuda) {
             if (request.exact_repeat_probe and request.token_ids.len > 1) {
@@ -267,6 +444,51 @@ pub const Runtime = struct {
         return .{ .complete = .{ .last_logits = prefill_last_logits, .greedy_token = prefill_greedy_token, .last_hidden = prefill_last_hidden, .last_hidden_rows = prefill_last_hidden_rows } };
     }
 
+    pub const CompiledChunk = struct {
+        token_ids: []const i64,
+        total_sequence_length: usize,
+        output: enum { kv_only, last_logits, greedy_token },
+    };
+
+    /// The whole-model runtime owns physical KV/cache storage. This owner
+    /// advances matching logical coordination state and retires ModelOutput
+    /// under the caller's existing execution/provider capability. An error
+    /// after the runtime call propagates; no eager/serial replay is attempted.
+    pub fn runCompiledChunk(self: *Runtime, request: CompiledChunk) !Output {
+        return self.runCompiledChunkWith(request, graph_mod.execution.graphForwardCompiledModelOutput);
+    }
+
+    fn runCompiledChunkWith(self: *Runtime, request: CompiledChunk, comptime forward_fn: anytype) !Output {
+        const cache = self.forward.graph_cache orelse {
+            @import("invocation_observation.zig").recordContextAcquisitionFailure(&self.forward.context, .prefill, error.MissingCompiledModelRuntime);
+            return error.MissingCompiledModelRuntime;
+        };
+        try self.acquireForObservation();
+        defer self.execution.release();
+        return @import("invocation_observation.zig").callContextOperation(&self.forward.context, .prefill, @This().runCompiledChunkWithOwnedLane, .{ self, request, cache, forward_fn });
+    }
+
+    fn runCompiledChunkWithOwnedLane(self: *Runtime, request: CompiledChunk, cache: *graph_mod.cache.GraphCache, comptime forward_fn: anytype) !Output {
+        const allocator = self.forward.context.allocator;
+        var logical = BorrowedDecodeStateRuntime.init(self.state);
+        const context = try logical.preparePrefill(request.total_sequence_length, request.token_ids.len);
+        const cleanup_operation = self.forward.context.cb.operationToken();
+        var inherited = if (self.forward.context.cleanup_epoch == null and cleanup_operation != null) try cleanup_operation.?.retainCleanupEpoch() else null;
+        defer if (inherited) |*epoch| epoch.release();
+        const cleanup = @import("cleanup_context.zig").Context{ .boundary = self.forward.context.cleanup_epoch orelse if (inherited) |*epoch| epoch else null, .operation = cleanup_operation };
+        var output = (try forward_fn(&self.forward.context, cache, request.token_ids, 1, request.total_sequence_length, &context)) orelse return error.MissingCompiledModelRuntime;
+        defer output.deinitWithCleanup(allocator, cleanup);
+        return switch (request.output) {
+            .kv_only => .{},
+            .last_logits => .{ .last_logits = try output.takeHostLogitsWithCleanup(allocator, cleanup) },
+            .greedy_token => blk: {
+                const token = try output.greedyTokenWithCleanup(allocator, self.forward.context.gpt_config.vocab_size, cleanup);
+                if (token < 0) return error.InvalidModelOutput;
+                break :blk .{ .greedy_token = @intCast(token) };
+            },
+        };
+    }
+
     fn forwardAllLogits(self: *Runtime, ids: []const i64, batch: usize, total: usize, decode: *const gpt_arch.DecodeContext) ![]f32 {
         var fallback_count: u64 = 0;
         return graph_mod.decoder_step_executor.forwardAll(&self.forward.context, self.forward.graph_cache, ids, batch, total, decode, self.forward.replay_fallbacks orelse &fallback_count);
@@ -335,8 +557,12 @@ pub const Runtime = struct {
     /// The caller owns its admitted scheduler turn. Physical state was prepared
     /// before acquiring the model lane, preserving prepared-prefix lock order.
     pub fn runEmbeddingsOwned(self: *Runtime, request: EmbeddingRequest) !Output {
-        try self.execution.acquire();
+        try self.acquireForObservation();
         defer self.execution.release();
+        return @import("invocation_observation.zig").callContextOperation(&self.forward.context, .prefill, @This().runEmbeddingsOwnedUnobserved, .{ self, request });
+    }
+
+    fn runEmbeddingsOwnedUnobserved(self: *Runtime, request: EmbeddingRequest) !Output {
         const original = request.owner.* orelse return error.InvalidPreparedPrompt;
         request.owner.* = null;
         const cb = self.forward.context.cb;
@@ -359,6 +585,8 @@ pub const Runtime = struct {
     }
 };
 pub const PositionedEmbeddingBatchItem = struct {
+    diagnostics_binding: ?@import("invocation_observation.zig").Binding = null,
+    request_id: ?u64 = null,
     allocator: std.mem.Allocator,
     backend: *const ComputeBackend,
     model: *const @import("../models/gpt.zig").Config,
@@ -371,6 +599,14 @@ pub const PositionedEmbeddingBatchItem = struct {
 };
 
 pub fn forwardPositionedEmbeddingBatch(items: []const PositionedEmbeddingBatchItem) ![][]f32 {
+    if (items.len == 0) return forwardPositionedEmbeddingBatchUnobserved(items);
+    const observation = @import("shared_batch_observation.zig");
+    return observation.call(observation.positionedBinding(items), items[0].backend.*, .positioned_prefill, items, describePositionedParticipant, forwardPositionedEmbeddingBatchUnobserved, .{items});
+}
+fn describePositionedParticipant(item: PositionedEmbeddingBatchItem) @import("diagnostics.zig").Batch.Participant {
+    return .{ .request_id = item.request_id, .phase = .prefill, .query_rows = item.sequence_length, .total_rows = item.sequence_length };
+}
+fn forwardPositionedEmbeddingBatchUnobserved(items: []const PositionedEmbeddingBatchItem) ![][]f32 {
     const capacity = if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES")) decoder_routes.max_positioned_prefill_items else decoder_routes.default_positioned_prefill_items;
     if (items.len == 0 or items.len > capacity) return error.InvalidBatchDecodeState;
     const first = items[0];
@@ -467,6 +703,16 @@ pub const Forward = struct {
         decode_context: *const gpt_arch.DecodeContext,
         capture_last_hidden: bool,
     ) !?Output {
+        return @import("invocation_observation.zig").callContextOperation(&self.forward.context, .prefill, @This().tryCudaPreparedTailPrefillGreedyUnobserved, .{ self, input_ids, seq_len, decode_context, capture_last_hidden });
+    }
+
+    fn tryCudaPreparedTailPrefillGreedyUnobserved(
+        self: *Forward,
+        input_ids: []const i64,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        capture_last_hidden: bool,
+    ) !?Output {
         if (!decoder_routes.cudaPreparedPrefillGreedyEnabled()) return null;
         if (self.forward.context.cb.kind() != .cuda) return null;
         if (decode_context.attention_mode != .paged_prefill or decode_context.query_sequence_len != input_ids.len) return null;
@@ -546,6 +792,16 @@ pub const Forward = struct {
     /// prompt-length forward that scales with prompt size). Returns null on
     /// any miss so the caller falls back to the plain logits prefill.
     pub fn tryMetalPreparedTailPrefillGreedy(
+        self: *Forward,
+        input_ids: []const i64,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        capture_last_hidden: bool,
+    ) !?Output {
+        return @import("invocation_observation.zig").callContextOperation(&self.forward.context, .prefill, @This().tryMetalPreparedTailPrefillGreedyUnobserved, .{ self, input_ids, seq_len, decode_context, capture_last_hidden });
+    }
+
+    fn tryMetalPreparedTailPrefillGreedyUnobserved(
         self: *Forward,
         input_ids: []const i64,
         seq_len: usize,
@@ -641,6 +897,17 @@ pub const Forward = struct {
         decode_context: *const gpt_arch.DecodeContext,
         capture_last_hidden: bool,
     ) !Output {
+        return @import("invocation_observation.zig").callContextOperation(&self.forward.context, .prefill, @This().forwardPreparedEmbeddingsLastLogitsUnobserved, .{ self, input_embeddings, ple_token_ids, seq_len, decode_context, capture_last_hidden });
+    }
+
+    fn forwardPreparedEmbeddingsLastLogitsUnobserved(
+        self: *Forward,
+        input_embeddings: ops.CT,
+        ple_token_ids: []const i64,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        capture_last_hidden: bool,
+    ) !Output {
         var owns_input = true;
         defer if (owns_input) self.forward.context.cb.free(input_embeddings);
         if (try self.tryMetalPreparedMultimodalPrefill(input_embeddings, ple_token_ids, seq_len, decode_context, capture_last_hidden)) |logits| {
@@ -669,6 +936,17 @@ pub const Forward = struct {
     /// submission per op. Null leaves the embeddings untouched for the
     /// generic forward.
     pub fn tryMetalPreparedMultimodalPrefill(
+        self: *Forward,
+        input_embeddings: ops.CT,
+        ple_token_ids: []const i64,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        capture_last_hidden: bool,
+    ) !?Output {
+        return @import("invocation_observation.zig").callContextOperation(&self.forward.context, .prefill, @This().tryMetalPreparedMultimodalPrefillUnobserved, .{ self, input_embeddings, ple_token_ids, seq_len, decode_context, capture_last_hidden });
+    }
+
+    fn tryMetalPreparedMultimodalPrefillUnobserved(
         self: *Forward,
         input_embeddings: ops.CT,
         ple_token_ids: []const i64,
@@ -730,4 +1008,341 @@ const cudaReplayLastLogitsEnabled = decoder_forward.cudaReplayLastLogitsEnabled;
 fn debugGenerationStage(comptime fmt: []const u8, args: anytype) void {
     if (!platform.env.getenvBool("TERMITE_GEN_STAGE_DEBUG")) return;
     std.debug.print("gen_debug: " ++ fmt ++ "\n", args);
+}
+
+const CompiledPrefillFixture = @import("testing/decoder.zig");
+
+fn checkNativeCompiledChunkCore(cb: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const model = CompiledPrefillFixture.config();
+    const ids = [_]i64{ 0, 1 };
+    const expected = try CompiledPrefillFixture.eager(cb, model, &ids);
+    defer a.free(expected);
+    const Probe = struct {
+        backend: ComputeBackend,
+        config: *const CompiledPrefillFixture.Config,
+        mutex: *std.atomic.Mutex,
+        lane: *control.ExecutionLane,
+        calls: usize = 0,
+        numerical_calls: usize = 0,
+        decline: bool = false,
+        fail_after: bool = false,
+        fn get(raw: *anyopaque, name: []const u8) !ops.CT {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return gpt_arch.getTracedWeight(std.testing.allocator, &self.backend, self.config, name);
+        }
+        fn forward(ctx: *const graph_mod.execution.Context, _: *graph_mod.cache.GraphCache, tokens: []const i64, batch: usize, sequence: usize, decode: *const gpt_arch.DecodeContext) !?graph_mod.model_runtime.ModelOutput {
+            const self: *@This() = @ptrCast(@alignCast(ctx.weights.?.ptr));
+            self.calls += 1;
+            try std.testing.expect(@import("allocation_registry.zig").enabled());
+            if (!self.lane.owned) return error.CompiledPrefillMissingExecutionLane;
+            if (self.mutex.tryLock()) {
+                self.mutex.unlock();
+                return error.CompiledPrefillMissingExecutionMutex;
+            }
+            if (self.decline) return null;
+            self.numerical_calls += 1;
+            const values = try gpt_arch.forward(&self.backend, ctx.allocator, self.config.*, tokens, batch, sequence, decode);
+            defer ctx.allocator.free(values);
+            var output = graph_mod.model_runtime.ModelOutput{ .logits = try ctx.allocator.dupe(f32, values[(tokens.len - 1) * self.config.vocab_size ..][0..self.config.vocab_size]) };
+            errdefer output.deinit(ctx.allocator);
+            if (self.fail_after) return error.InjectedCommittedCompiledPrefill;
+            return output;
+        }
+    };
+    for (0..6) |scenario| {
+        var mutex: std.atomic.Mutex = .unlocked;
+        var lane = control.ExecutionLane{};
+        var probe = Probe{ .backend = cb, .config = &model, .mutex = &mutex, .lane = &lane, .decline = scenario == 3, .fail_after = scenario == 4 };
+        var cache = graph_mod.cache.GraphCache.init(a);
+        defer cache.deinit();
+        var state = graph_mod.decode_state_runtime.NativeDecodeState.initContiguous(a);
+        defer state.deinit();
+        var diagnostics = @import("diagnostics.zig").Diagnostics{};
+        diagnostics.configureBackend(true, &cb);
+        const session = @import("../backends/session.zig").Session{ .ptr = &probe, .vtable = undefined, .invocation_diagnostics = .{ .diagnostics = &diagnostics } };
+        var physical = Runtime{ .forward = .{ .context = .{ .session = session, .allocator = a, .cb = &cb, .gpt_config = &model, .weights = .{ .ptr = &probe, .get_fn = Probe.get } }, .graph_cache = &cache }, .state = &state, .execution = .{ .mutex = &mutex, .gate = &lane, .control = if (scenario == 5) .{ .deadline_ns = 0 } else null } };
+        const request = Runtime.CompiledChunk{ .token_ids = &ids, .total_sequence_length = ids.len, .output = if (scenario == 0) .kv_only else if (scenario == 2) .greedy_token else .last_logits };
+        if (scenario == 5) {
+            try std.testing.expectError(error.Timeout, physical.runCompiledChunkWith(request, Probe.forward));
+        } else if (scenario == 3) {
+            try std.testing.expectError(error.MissingCompiledModelRuntime, physical.runCompiledChunkWith(request, Probe.forward));
+        } else if (scenario == 4) {
+            try std.testing.expectError(error.InjectedCommittedCompiledPrefill, physical.runCompiledChunkWith(request, Probe.forward));
+        } else {
+            const result = try physical.runCompiledChunkWith(request, Probe.forward);
+            defer if (result.last_logits) |values| a.free(values);
+            if (scenario == 0) try std.testing.expect(result.last_logits == null and result.greedy_token == null);
+            if (scenario == 1) try std.testing.expectEqualSlices(f32, expected, result.last_logits.?);
+            if (scenario == 2) try std.testing.expectEqual(@as(usize, if (expected[1] > expected[0]) 1 else 0), result.greedy_token.?);
+        }
+        try std.testing.expectEqual(@as(usize, if (scenario == 5) 0 else 1), probe.calls);
+        try std.testing.expectEqual(@as(usize, if (scenario == 3 or scenario == 5) 0 else 1), probe.numerical_calls);
+        try std.testing.expectEqual(@as(usize, if (scenario == 5) 0 else 2), state.total_tokens);
+        try CompiledPrefillFixture.checkUnlocked(&mutex, &lane);
+        try std.testing.expect(!@import("allocation_registry.zig").enabled());
+        const observed = diagnostics.snapshot() orelse return error.MissingCompiledPrefillObservation;
+        try std.testing.expect(observed.operation == .prefill);
+        if (scenario >= 3) {
+            try std.testing.expect(observed.outcome == .failed);
+            const name: []const u8 = if (scenario == 3) "MissingCompiledModelRuntime" else if (scenario == 4) "InjectedCommittedCompiledPrefill" else "Timeout";
+            try std.testing.expectEqualStrings(name, observed.error_name.?.view());
+        } else try std.testing.expect(observed.outcome == .success);
+        if (scenario == 5) {
+            try std.testing.expect(observed.context_runtime_scope == .unavailable);
+            try std.testing.expect(observed.runtime.submission == null);
+        } else {
+            try std.testing.expect(observed.context_runtime_scope == .borrowed_execution_backend_context);
+            try std.testing.expect(observed.runtime.submission != null);
+        }
+    }
+}
+
+test "compiled prefill transaction actual Native parity output intents decline and post-forward faults release lane without replay" {
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onNative(CompiledPrefillFixture.populate, checkNativeCompiledChunkCore);
+}
+
+fn checkMetalCompiledChunk(cb: ComputeBackend, native_reference: ComputeBackend) !void {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const backend_session = @import("../backends/session.zig");
+    const model = CompiledPrefillFixture.config();
+    const ids = [_]i64{ 0, 1 };
+    const expected = try CompiledPrefillFixture.eager(native_reference, model, &ids);
+    defer a.free(expected);
+    const Source = struct {
+        compute: *@import("../ops/metal_compute.zig").MetalCompute,
+        fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
+            return .metal;
+        }
+        fn info(_: *anyopaque) []const @import("../backends/tensor.zig").TensorInfo {
+            return &.{};
+        }
+        fn close(_: *anyopaque) void {}
+        const table = backend_session.Session.VTable{ .run = undefined, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
+        fn acquire(raw: *anyopaque, _: backend_session.Session, allocator: std.mem.Allocator, options: backend_session.ComputeBackendOptions) !ComputeBackend {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!options.borrow_shared_provider or options.run_budget != null) return error.InvalidCompiledPrefillTestProvider;
+            return @import("../backends/compute_factory.zig").borrowMetalProvider(allocator, self.compute.data, self.compute.io, .{}, false);
+        }
+    };
+    var source = Source{ .compute = @ptrCast(@alignCast(cb.ptr)) };
+    const session = backend_session.Session{ .ptr = &source, .vtable = &Source.table, .model_contract = .{ .decoder_config = &model }, .compute_backend_provider = .{ .ptr = &source, .services = &.{ .acquire = Source.acquire } } };
+    const Fault = struct {
+        calls: usize = 0,
+        fn get(_: *anyopaque, _: []const u8) anyerror!ops.CT {
+            return error.UnexpectedCompiledPrefillWeightOverride;
+        }
+        fn forward(ctx: *const graph_mod.execution.Context, cache_arg: *graph_mod.cache.GraphCache, tokens: []const i64, batch: usize, sequence: usize, decode: *const gpt_arch.DecodeContext) !?graph_mod.model_runtime.ModelOutput {
+            const self: *@This() = @ptrCast(@alignCast(ctx.weights.?.ptr));
+            self.calls += 1;
+            var result = (try graph_mod.execution.graphForwardCompiledModelOutput(ctx, cache_arg, tokens, batch, sequence, decode)) orelse return error.MissingCompiledModelRuntime;
+            defer result.deinit(ctx.allocator);
+            return error.InjectedCommittedCompiledPrefill;
+        }
+    };
+    const request_control = control.InferenceExecutionControl{ .native_call_policy = .in_process };
+    var cache = graph_mod.cache.GraphCache.init(a);
+    defer cache.deinit();
+    for (0..4) |scenario| {
+        var state = graph_mod.decode_state_runtime.NativeDecodeState.initContiguous(a);
+        defer state.deinit();
+        var physical = Runtime{ .forward = .{ .context = .{ .allocator = a, .cb = &cb, .gpt_config = &model, .weight_semantics = .traced_decoder, .session = session, .compiled_partition_backend = .metal, .compiled_attachment_target = .whole_model, .kv_dtype = .f16, .execution_control = request_control }, .graph_cache = &cache }, .state = &state };
+        const request = Runtime.CompiledChunk{ .token_ids = &ids, .total_sequence_length = ids.len, .output = if (scenario == 0) .kv_only else if (scenario == 2) .greedy_token else .last_logits };
+        if (scenario == 3) {
+            var fault = Fault{};
+            physical.forward.context.weights = .{ .ptr = &fault, .get_fn = Fault.get };
+            try std.testing.expectError(error.InjectedCommittedCompiledPrefill, physical.runCompiledChunkWith(request, Fault.forward));
+            try std.testing.expectEqual(@as(usize, 1), fault.calls);
+            try std.testing.expectEqual(@as(usize, 2), state.total_tokens);
+            continue;
+        }
+        const result = try physical.runCompiledChunk(request);
+        defer if (result.last_logits) |values| a.free(values);
+        if (scenario == 0) try std.testing.expect(result.last_logits == null and result.greedy_token == null);
+        if (scenario == 1) for (expected, result.last_logits.?) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.001);
+        if (scenario == 2) try std.testing.expectEqual(@as(usize, if (expected[1] > expected[0]) 1 else 0), result.greedy_token.?);
+        try std.testing.expectEqual(@as(usize, 2), state.total_tokens);
+    }
+}
+
+test "compiled prefill transaction actual Metal whole-model runtime matches independent Native final row and greedy token" {
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onMetal(CompiledPrefillFixture.populate, checkMetalCompiledChunk);
+}
+
+test "prefill cursor preserves admitted shapes scratch envelope hints and exactly once progression" {
+    const a = std.testing.allocator;
+    var plan = try runtime.scheduler.native_generate.PrefillChunkPlan.init(a, 19, 8, 4096, .shared, .fixed_ceiling);
+    defer plan.deinit(a);
+    const fingerprint = plan.fingerprint;
+    var cursor = try ChunkCursor.init(.{ .query_tokens = 19, .prefilled_tokens = 3, .prompt_tokens = 22, .initial_chunk_rows = 1, .admitted_plan = plan, .greedy_output = true, .capture_hidden = true });
+    const first = (try cursor.next(1)).?;
+    try std.testing.expectEqual(@as(usize, 8), first.chunk.rows);
+    try std.testing.expectEqual(@as(usize, 11), first.total_end);
+    try std.testing.expectEqual(decoder_routes.PrefillOutputIntent.kv_only, first.output_intent);
+    try std.testing.expectError(error.PrefillChunkInFlight, cursor.next(1));
+    try std.testing.expectError(error.InvalidPrefillChunkPlan, cursor.retry(first, 4));
+    try std.testing.expect(!try cursor.retryMemoryBudgetExceeded(first, error.MemoryBudgetExceeded));
+    try std.testing.expectEqual(@as(usize, 0), cursor.processed);
+    try cursor.commit(first);
+    try std.testing.expectError(error.PrefillChunkAlreadyConsumed, cursor.commit(first));
+    const second = (try cursor.next(1)).?;
+    try std.testing.expectEqual(@as(usize, 8), second.chunk.rows);
+    try cursor.commit(second);
+    const tail = (try cursor.next(1)).?;
+    try std.testing.expectEqual(@as(usize, 3), tail.chunk.rows);
+    try std.testing.expectEqual(plan.tail().weight_route_hint, tail.chunk.weight_route_hint);
+    try std.testing.expectEqual(decoder_routes.PrefillOutputIntent.greedy_token_and_hidden, tail.output_intent);
+    try cursor.commit(tail);
+    try std.testing.expect((try cursor.next(1)) == null);
+    try cursor.finish();
+    try plan.validate();
+    try std.testing.expectEqual(fingerprint, plan.fingerprint);
+    try std.testing.expectEqual(@as(usize, 4096), plan.max_scratch_bytes);
+}
+
+test "prefill cursor retry cancellation and stale attempts preserve actual paged KV and unpublished progress" {
+    const Case = struct {
+        const Cancel = struct {
+            cancelled: bool = false,
+            fn check(raw: ?*anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                if (self.cancelled) return error.Cancelled;
+            }
+        };
+        fn run(a: std.mem.Allocator) !void {
+            var manager = runtime.kv.manager.KvManager.init(a);
+            defer manager.deinit();
+            // The recycler append on deinit is intentionally best effort and
+            // has a scan fallback. Exercise its allocation as fallible setup,
+            // so every injected fault here belongs to required forward work.
+            try manager.free_sequence_indices.ensureTotalCapacity(a, 1);
+            const pool = try manager.addPool(.{ .backend = .native, .dtype = .f16, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 8 });
+            var state = graph_mod.decode_state_runtime.NativeDecodeState.initPaged(a, &manager, pool, null);
+            defer state.deinit();
+            var decode = BorrowedDecodeStateRuntime.init(&state);
+            try decode.appendPrefillChunk(3);
+            var cancel = Cancel{};
+            var cursor = try ChunkCursor.init(.{ .query_tokens = 6, .prefilled_tokens = 3, .prompt_tokens = 9, .initial_chunk_rows = 8, .execution_control = .{ .ptr = &cancel, .check_fn = Cancel.check } });
+            const first = (try cursor.next(8)).?;
+            const reserved = try decode.reservePrefillTo(first.total_end);
+            var resized = cursor.current_chunk_size;
+            try std.testing.expect(try retryAfterMemoryBudgetExceeded(&decode, reserved, first.chunk.rows, &resized, true, error.MemoryBudgetExceeded));
+            try cursor.retry(first, resized);
+            try std.testing.expectEqual(@as(usize, 3), state.total_tokens);
+            try std.testing.expectEqual(@as(usize, 3), manager.tokenCount(state.sequence_id.?).?);
+            try std.testing.expectEqual(@as(usize, 0), cursor.processed);
+            const pending = (try cursor.next(8)).?;
+            const pending_reserved = try decode.reservePrefillTo(pending.total_end);
+            cancel.cancelled = true;
+            // Numerical cancellation retires its exact physical reservation;
+            // cursor cancellation only discards unpublished scheduling state.
+            try decode.rollbackReservedPrefill(pending_reserved);
+            try cursor.cancel(pending);
+            try std.testing.expectError(error.Cancelled, cursor.next(8));
+            try std.testing.expectEqual(@as(usize, 0), cursor.processed);
+            try std.testing.expectEqual(@as(usize, 3), state.total_tokens);
+            cancel.cancelled = false;
+            const resumed = (try cursor.next(8)).?;
+            try std.testing.expectError(error.InvalidPrefillChunkState, cursor.commit(pending));
+            _ = try decode.reservePrefillTo(resumed.total_end);
+            try cursor.commit(resumed);
+            try std.testing.expectEqual(@as(usize, 4), cursor.processed);
+            const tail = (try cursor.next(8)).?;
+            try std.testing.expectEqual(decoder_routes.PrefillOutputIntent.last_logits, tail.output_intent);
+            _ = try decode.reservePrefillTo(tail.total_end);
+            try cursor.commit(tail);
+            try cursor.finish();
+            try std.testing.expectEqual(@as(usize, 9), state.total_tokens);
+            try std.testing.expectEqual(@as(usize, 9), manager.tokenCount(state.sequence_id.?).?);
+        }
+    };
+    try Case.run(std.testing.allocator);
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "prefill cursor preserves scalar coalescing and rejects invalid retry without consuming attempt" {
+    var ordinary = try ChunkCursor.init(.{ .query_tokens = 10, .prefilled_tokens = 0, .prompt_tokens = 10, .initial_chunk_rows = 8 });
+    const first = (try ordinary.next(4)).?;
+    try std.testing.expectEqual(@as(usize, 4), first.chunk.rows);
+    try std.testing.expectError(error.InvalidPrefillChunkRetry, ordinary.retry(first, 0));
+    try std.testing.expectError(error.InvalidPrefillChunkRetry, ordinary.retry(first, 4));
+    try std.testing.expect(!try ordinary.retryMemoryBudgetExceeded(first, error.Cancelled));
+    try std.testing.expectError(error.InvalidPrefillChunkState, ordinary.finish());
+    try ordinary.cancel(first);
+    var coalesced = try ChunkCursor.init(.{ .query_tokens = 10, .prefilled_tokens = 0, .prompt_tokens = 10, .initial_chunk_rows = 8, .first_token_coalesced = true });
+    const large = (try coalesced.next(4)).?;
+    try std.testing.expectEqual(@as(usize, 8), large.chunk.rows);
+    try coalesced.cancel(large);
+}
+
+test "prefill selection reconciles actual admitted plans cache bypass and checkpoint geometry" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var plan = try runtime.scheduler.native_generate.PrefillChunkPlan.init(a, 19, 8, 4096, .shared, .fixed_ceiling);
+            defer plan.deinit(a);
+            var other = try runtime.scheduler.native_generate.PrefillChunkPlan.init(a, 19, 6, 8192, .shared, .fixed_ceiling);
+            defer other.deinit(a);
+            var selection = ChunkCursor.Selection{ .configured_plan = plan, .leased_plan = plan, .configured_chunk_rows = 12, .scheduler_chunk_rows = 5, .backend = .cuda, .pure_greedy = true, .resident_greedy_allowed = true, .first_token_enabled = true, .coalesce_token_limit = 512 };
+            const request = ChunkCursor.Options{ .query_tokens = 19, .prefilled_tokens = 3, .prompt_tokens = 22 };
+            var cursor = try ChunkCursor.select(request, selection);
+            try std.testing.expect(cursor.plan_decision == .bypassed_prompt_cache);
+            try std.testing.expect(cursor.options.admitted_plan == null);
+            try std.testing.expectEqual(@as(usize, 5), cursor.current_chunk_size);
+            try std.testing.expect(!cursor.options.first_token_coalesced); // borrowed plans never coalesce
+            selection.checkpoint_resume = true;
+            cursor = try ChunkCursor.select(request, selection);
+            try std.testing.expect(cursor.plan_decision == .execute);
+            try std.testing.expect(cursor.options.admitted_plan.?.chunks.ptr == plan.chunks.ptr);
+            try std.testing.expectEqual(@as(usize, 8), cursor.current_chunk_size);
+            const wrong_geometry = ChunkCursor.Options{ .query_tokens = 7, .prefilled_tokens = 3, .prompt_tokens = 10 };
+            try std.testing.expectError(error.InvalidPrefillChunkPlan, ChunkCursor.select(wrong_geometry, selection));
+            selection.checkpoint_resume = false;
+            cursor = try ChunkCursor.select(.{ .query_tokens = 7, .prefilled_tokens = 0, .prompt_tokens = 7 }, selection);
+            try std.testing.expect(cursor.plan_decision == .bypassed_geometry);
+            try std.testing.expectEqual(@as(usize, 5), cursor.current_chunk_size);
+            selection.leased_plan = other;
+            try std.testing.expectError(error.InvalidPrefillChunkPlan, ChunkCursor.select(request, selection));
+            selection.selected_kv = true;
+            try std.testing.expectError(error.InvalidPrefillChunkPlan, ChunkCursor.select(request, selection));
+            selection.leased_plan = plan;
+            selection.configured_chunk_rows = 2048;
+            selection.scheduler_chunk_rows = 4096;
+            cursor = try ChunkCursor.select(.{ .query_tokens = 8192, .prefilled_tokens = 0, .prompt_tokens = 8192 }, selection);
+            try std.testing.expect(cursor.plan_decision == .none and cursor.options.admitted_plan == null);
+            try std.testing.expectEqual(@min(@as(usize, 2048), runtime.kv.selection.defaults.prefill_chunk_rows), cursor.current_chunk_size);
+            try std.testing.expect(!cursor.options.first_token_coalesced);
+        }
+    };
+    try Case.run(std.testing.allocator);
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "prefill selection preserves measured CUDA coalescing eligibility and scheduler ceiling" {
+    const request = ChunkCursor.Options{ .query_tokens = 100, .prefilled_tokens = 0, .prompt_tokens = 100 };
+    var policy = ChunkCursor.Selection{ .configured_chunk_rows = 64, .scheduler_chunk_rows = 32, .backend = .cuda, .pure_greedy = true, .resident_greedy_allowed = true, .first_token_enabled = true, .coalesce_token_limit = 512 };
+    var cursor = try ChunkCursor.select(request, policy);
+    try std.testing.expectEqual(@as(usize, 32), cursor.uncoalesced_chunk_size);
+    try std.testing.expectEqual(@as(usize, 100), cursor.current_chunk_size);
+    try std.testing.expect(cursor.options.first_token_coalesced);
+    const attempt = (try cursor.next(16)).?;
+    try std.testing.expectEqual(@as(usize, 100), attempt.chunk.rows);
+    try cursor.cancel(attempt);
+    policy.backend = .metal;
+    cursor = try ChunkCursor.select(request, policy);
+    try std.testing.expectEqual(@as(usize, 32), cursor.current_chunk_size);
+    policy.backend = .cuda;
+    policy.pure_greedy = false;
+    cursor = try ChunkCursor.select(request, policy);
+    try std.testing.expectEqual(@as(usize, 32), cursor.current_chunk_size);
+    policy.pure_greedy = true;
+    policy.resident_greedy_allowed = false;
+    cursor = try ChunkCursor.select(request, policy);
+    try std.testing.expectEqual(@as(usize, 32), cursor.current_chunk_size);
+    policy.resident_greedy_allowed = true;
+    policy.coalesce_token_limit = 99;
+    cursor = try ChunkCursor.select(request, policy);
+    try std.testing.expectEqual(@as(usize, 32), cursor.current_chunk_size);
 }

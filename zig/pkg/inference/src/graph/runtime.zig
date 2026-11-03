@@ -72,6 +72,9 @@ pub const Result = struct {
     }
 
     pub fn deinit(self: *Result, runtime: *const Runtime) void {
+        self.deinitWithCleanup(runtime, .{});
+    }
+    pub fn deinitWithCleanup(self: *Result, runtime: *const Runtime, cleanup: @import("../execution/cleanup_context.zig").Context) void {
         for (self.outputs, 0..) |ct, i| {
             const backend = self.backendFor(runtime, i);
             var duplicate = false;
@@ -82,7 +85,7 @@ pub const Result = struct {
                     break;
                 }
             }
-            if (!duplicate) backend.free(ct);
+            if (!duplicate) backend.freeWithCleanup(ct, cleanup);
         }
         if (self.output_devices) |devices| self.allocator.free(devices);
         if (self.output_backends) |backends| self.allocator.free(backends);
@@ -144,9 +147,12 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) void {
+        self.deinitWithCleanup(.{});
+    }
+    pub fn deinitWithCleanup(self: *Runtime, cleanup: @import("../execution/cleanup_context.zig").Context) void {
         if (self.partition_last_use) |uses| self.allocator.free(uses);
         self.partition_last_use = null;
-        if (self.physical_pool) |pool| pool.deinit();
+        if (self.physical_pool) |pool| pool.deinitWithCleanup(cleanup);
         self.physical_pool = null;
         if (self.buffer_plan) |*plan| plan.deinit();
         self.buffer_plan = null;
@@ -179,15 +185,43 @@ pub const Runtime = struct {
         graph: *const Graph,
         options: interpreter.ExecuteOptions,
     ) !Result {
+        var result: Result = undefined;
+        try self.executeInto(allocator, graph, &options, &result);
+        return result;
+    }
+
+    /// Synchronous borrowed submission into fresh caller-owned result storage.
+    /// On failure no output ownership is transferred; the result is valid only
+    /// after success. There is no shared mutable result/options buffer.
+    pub fn executeInto(
+        self: *Runtime,
+        allocator: std.mem.Allocator,
+        graph: *const Graph,
+        options: *const interpreter.ExecuteOptions,
+        output: *Result,
+    ) !void {
+        const profile_owned = if (options.region_execution_profile) |profile| try profile.ensureScope(.{ .operation = .graph_execution, .implementation = .{ .context = self.default_backend.ptr, .table = self.default_backend.vtable }, .program = graph }) else false;
+        errdefer if (profile_owned) options.region_execution_profile.?.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        const operation = @import("../execution/backend_operation.zig");
+        const borrowed_operation = options.backend_operation orelse self.default_backend.operationToken() orelse if (options.region_execution_profile) |profile| profile.operation_lease else null;
+        var operation_scope: operation.Scope = undefined;
+        try operation.enterInto(self.default_backend, graph, borrowed_operation, if (options.region_execution_profile != null) .managed else .legacy_unknown_frame, &operation_scope);
+        errdefer operation_scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         const transfer_audit = @import("../execution/transfer_audit.zig");
         var audit = transfer_audit.Audit{ .forbid_activation_readbacks = options.activation_readbacks == .forbidden };
         const auditing = options.collect_partition_stats or audit.forbid_activation_readbacks;
         if (audit.forbid_activation_readbacks) try transfer_audit.validateBackend(self.default_backend.kind());
         if (auditing) try transfer_audit.begin(&audit);
         defer if (auditing) transfer_audit.end();
-        var result = try self.executeImpl(allocator, graph, options);
-        audit.recordStats(&result.stats);
-        return result;
+        try self.executeImplInto(allocator, graph, options, operation_scope.token(), output);
+        errdefer output.deinit(self);
+        audit.recordStats(&output.stats);
+        operation_scope.finish() catch |err| {
+            operation_scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            return err;
+        };
+        if (profile_owned) try options.region_execution_profile.?.finishSubmission();
+        return;
     }
 
     fn addPhysicalStats(stats: *partition_mod.PartitionExecutor.ExecutionStats, physical: @import("../execution/physical_buffers.zig").Stats) void {
@@ -203,6 +237,7 @@ pub const Runtime = struct {
         stats.physical_capture_failures += physical.capture_failures;
         stats.physical_replay_error = physical.capture_failure;
         stats.physical_graph_replays += physical.graph_replays;
+        stats.graph_output_owned_copies += physical.output_copies;
         stats.physical_input_copies += physical.input_copies;
         stats.physical_input_copy_bytes += physical.input_copy_bytes;
     }
@@ -212,16 +247,17 @@ pub const Runtime = struct {
         graph: *const Graph,
         plan: *const multi_executor.DevicePartitionPlan,
         mesh: *const device_mesh_mod.DeviceMesh,
-        options: interpreter.ExecuteOptions,
+        options: *const interpreter.ExecuteOptions,
+        stats: *partition_mod.PartitionExecutor.ExecutionStats,
         frame: ?*@import("../execution/physical_buffers.zig").Frame,
         capturing: *bool,
-    ) !multi_executor.MultiExecutionResult {
-        var result = multi_executor.executeMultiDevice(allocator, graph, plan, mesh, options) catch |err| recover: {
+    ) !multi_executor.DeviceOutputs {
+        var result = multi_executor.executeDeviceOutputs(allocator, graph, plan, mesh, options, stats) catch |err| recover: {
             if (!capturing.*) return err;
             frame.?.abortReplayCapture(err);
             capturing.* = false;
             if (frame.?.storage_admission_failed) return err;
-            break :recover try multi_executor.executeMultiDevice(allocator, graph, plan, mesh, options);
+            break :recover try multi_executor.executeDeviceOutputs(allocator, graph, plan, mesh, options, stats);
         };
         if (!capturing.*) return result;
         const active = frame.?;
@@ -231,7 +267,7 @@ pub const Runtime = struct {
             active.abortReplayCapture(err);
             capturing.* = false;
             result.deinit(mesh);
-            return multi_executor.executeMultiDevice(allocator, graph, plan, mesh, options);
+            return multi_executor.executeDeviceOutputs(allocator, graph, plan, mesh, options, stats);
         };
         capturing.* = false;
         errdefer result.deinit(mesh);
@@ -240,48 +276,115 @@ pub const Runtime = struct {
         return result;
     }
 
-    fn executeImpl(self: *Runtime, allocator: std.mem.Allocator, graph: *const Graph, options: interpreter.ExecuteOptions) !Result {
+    noinline fn retainPhysicalCleanupEpoch(cap: @import("../execution/storage_admission.zig").Capability, operation: ?@import("../execution/backend_operation.zig").Borrowed) !@import("../execution/retirement_sink.zig").Epoch {
+        if (operation) |active| if (try active.retainCleanupEpoch()) |epoch| return epoch;
+        // Explicit construction B comes from this invocation's prebound Set;
+        // it grants no numerical authority and is never used for future drops.
+        if (cap.constructionEpoch()) |epoch| return epoch.retain();
+        return error.MissingCurrentCleanupEpoch;
+    }
+
+    fn executeImplInto(self: *Runtime, allocator: std.mem.Allocator, graph: *const Graph, options: *const interpreter.ExecuteOptions, backend_operation: ?@import("../execution/backend_operation.zig").Borrowed, output: *Result) !void {
+        // Initialize only the small ownership payload here. The selected
+        // submission branch initializes/writes stats once at its final address.
+        output.outputs = &.{};
+        output.output_devices = null;
+        output.owner_backend = null;
+        output.output_backends = null;
+        output.fallback_owner = null;
+        output.allocator = allocator;
         switch (self.strategy) {
             .interpreter => {
-                var result = try interpreter.execute(allocator, graph, self.default_backend, options);
+                if (options.host_inputs != null) return error.PreparedHostIngressUnavailable;
+                // This branch already passes options by value to the public
+                // interpreter API. The hot planned branch keeps its borrowed
+                // options pointer and uses its existing submission copy below.
+                var interpreter_options = options.*;
+                interpreter_options.backend_operation = backend_operation;
+                var result = try interpreter.execute(allocator, graph, self.default_backend, interpreter_options);
                 errdefer result.deinit(self.default_backend);
                 const outputs = result.outputs;
                 result.outputs = &.{};
-                return .{
-                    .outputs = outputs,
-                    .owner_backend = durableBackend(self.default_backend.*),
-                    .allocator = result.allocator,
-                };
+                output.stats = .{};
+                output.outputs = outputs;
+                output.owner_backend = durableBackend(self.default_backend.*);
+                output.allocator = result.allocator;
+                return;
             },
             .partitioned, .compiled_preferred, .compiled_required => {
                 const plan = self.plan orelse return error.MissingGraphRuntimePlan;
                 const mesh = self.mesh orelse return error.MissingGraphRuntimeMesh;
-                const frame = if (self.physical_pool) |pool| try pool.acquirePrepared(options.storage_admission, options.physical_frame_claim) else null;
+                const selected_pool = if (options.prepared_routes) |routes| selected: {
+                    const root = self.physical_pool orelse return error.InvalidPreparedKernelRoute;
+                    if (routes.pool.root_pool != root) return error.InvalidPreparedKernelRoute;
+                    try routes.validateRuntimeInputs(options.runtime_inputs orelse &.{}, self.default_backend);
+                    if (routes.pool.regions.len != 0) {
+                        const profile = options.region_execution_profile orelse return error.RegionExecutionProfileChanged;
+                        if (!profile.held or profile.profile != routes.pool.region_execution_profile or profile.phase != .active) return error.RegionExecutionProfileChanged;
+                    }
+                    break :selected routes.pool;
+                } else self.physical_pool;
+                if (options.host_inputs) |inputs| {
+                    const pool = selected_pool orelse return error.PreparedHostIngressUnavailable;
+                    if (options.donate != null) return error.InvalidHostIngressBinding;
+                    try pool.validateBorrowedHostOptions(options);
+                    try pool.validateHostInputs(inputs);
+                    // A single authoritative value must supply each node.
+                    for (inputs) |host| for (options.runtime_inputs orelse &.{}) |existing| {
+                        if (host.node_id == existing.node_id) return error.DuplicateRuntimeInput;
+                    };
+                } else if (selected_pool) |pool| {
+                    if (pool.host_input_plans.len != 0) return error.MissingPreparedHostInputs;
+                }
+                var physical_epoch = if (options.storage_admission) |cap| if (cap.services.takeBacking != null) try retainPhysicalCleanupEpoch(cap, backend_operation) else null else null;
+                defer if (physical_epoch) |*epoch| epoch.release();
+                const physical_cleanup = @import("../execution/cleanup_context.zig").Context{ .operation = backend_operation, .boundary = if (physical_epoch) |*epoch| epoch else null };
+                const frame = if (selected_pool) |pool| try pool.acquirePreparedWithRegions(options.storage_admission, options.physical_frame_claim, options.region_claims) else null;
+                if (options.prepared_routes != null and frame == null) return error.PreparedPhysicalFrameUnavailable;
                 var frame_finished = false;
                 defer if (frame) |active| {
                     if (!frame_finished) {
-                        if (active.finish()) |_| {} else |err| std.log.warn("physical frame completion failed during cleanup: {s}", .{@errorName(err)});
+                        if (active.finishWithCleanup(physical_cleanup)) |_| {} else |err| std.log.warn("physical frame completion failed during cleanup: {s}", .{@errorName(err)});
                     }
                 };
                 if (frame) |active| {
                     active.collect_storage_stats = options.collect_partition_stats;
                     try active.begin();
                 }
-                var planned_options = options;
+                var planned_options = options.*;
+                planned_options.backend_operation = backend_operation;
                 planned_options.physical_frame = frame;
-                const replay_inputs = if (frame) |active| try active.bindReplayInputs(options) else null;
+                var input_storage: [16]interpreter.RuntimeInput = undefined;
+                var allocated_inputs: ?[]interpreter.RuntimeInput = null;
+                defer if (allocated_inputs) |inputs| allocator.free(inputs);
+                defer if (options.host_inputs != null and !frame_finished) {
+                    if (frame) |active| active.releaseHostInputs();
+                };
+                if (options.host_inputs) |inputs| {
+                    const active = frame orelse return error.PreparedHostIngressUnavailable;
+                    const uploaded = try active.bindHostInputsWithControl(inputs, options.execution_control);
+                    const existing = options.runtime_inputs orelse &.{};
+                    const count = try std.math.add(usize, existing.len, uploaded.len);
+                    const merged = if (count <= input_storage.len) input_storage[0..count] else blk: {
+                        allocated_inputs = try allocator.alloc(interpreter.RuntimeInput, count);
+                        break :blk allocated_inputs.?;
+                    };
+                    @memcpy(merged[0..existing.len], existing);
+                    @memcpy(merged[existing.len..], uploaded);
+                    planned_options.runtime_inputs = merged;
+                    planned_options.host_inputs = null;
+                }
+                const replay_inputs = if (frame) |active| try active.bindReplayInputs(&planned_options) else null;
                 defer if (replay_inputs != null) frame.?.releaseReplayInputs();
                 if (replay_inputs) |inputs| planned_options.runtime_inputs = inputs;
                 if (frame) |active| if (replay_inputs != null and active.replay_ready) {
-                    var replayed = Result{
-                        .outputs = try active.replayOutputs(allocator),
-                        .owner_backend = durableBackend(self.default_backend.*),
-                        .allocator = allocator,
-                    };
-                    errdefer replayed.deinit(self);
+                    output.stats = .{};
+                    output.outputs = try active.replayOutputs(allocator);
+                    output.owner_backend = durableBackend(self.default_backend.*);
+                    errdefer output.deinitWithCleanup(self, physical_cleanup);
                     frame_finished = true;
-                    addPhysicalStats(&replayed.stats, try active.finish());
-                    return replayed;
+                    addPhysicalStats(&output.stats, try active.finishWithCleanup(physical_cleanup));
+                    return;
                 };
                 var capturing = if (frame) |active| if (replay_inputs != null) active.beginReplayCapture() catch |err| recover: {
                     active.abortReplayCapture(err);
@@ -289,6 +392,9 @@ pub const Runtime = struct {
                 } else false else false;
                 defer if (capturing) frame.?.replay.?.abort();
 
+                if (frame) |active| if (active.pool.region_runtime_last_use.len != 0) {
+                    planned_options.cached_partition_last_use = active.pool.region_runtime_last_use;
+                };
                 if (planned_options.cached_partition_last_use == null) planned_options.cached_partition_last_use = self.partition_last_use;
                 if (planned_options.cached_buffer_plan == null) {
                     if (self.buffer_plan) |*buffers| {
@@ -296,7 +402,7 @@ pub const Runtime = struct {
                         planned_options.cached_buffer_plan_validated = true;
                     }
                 }
-                var result = try submitPreparedFrame(allocator, graph, &plan, &mesh, planned_options, frame, &capturing);
+                var result = try submitPreparedFrame(allocator, graph, &plan, &mesh, &planned_options, &output.stats, frame, &capturing);
                 errdefer result.deinit(&mesh);
                 if (frame) |active| if (replay_inputs != null) {
                     active.warmed = active.stats.dispatches == active.pool.replay_kernel_count;
@@ -304,11 +410,11 @@ pub const Runtime = struct {
                 if (options.output_placement == .default_backend) try self.normalizeOutputsToDefaultDevice(allocator, &result);
                 if (frame) |active| {
                     frame_finished = true;
-                    const physical_stats = try active.finish();
-                    addPhysicalStats(&result.stats, physical_stats);
+                    const physical_stats = try active.finishWithCleanup(physical_cleanup);
+                    addPhysicalStats(&output.stats, physical_stats);
                 } else if (self.physical_pool != null) {
-                    result.stats.physical_frame_busy_fallbacks += 1;
-                    result.stats.physical_replay = .busy_frame;
+                    output.stats.physical_frame_busy_fallbacks += 1;
+                    output.stats.physical_replay = .busy_frame;
                 }
                 // Copy representation owners before detaching outputs. Result
                 // cleanup must not depend on an evicted executable's mesh.
@@ -338,15 +444,13 @@ pub const Runtime = struct {
                 result.outputs = &.{};
                 if (devices == null) allocator.free(result.output_devices);
                 result.output_devices = &.{};
-                return .{
-                    .outputs = outputs,
-                    .output_devices = devices,
-                    .owner_backend = durableBackend(self.default_backend.*),
-                    .output_backends = output_backends,
-                    .fallback_owner = fallback_owner,
-                    .stats = result.stats,
-                    .allocator = result.allocator,
-                };
+                output.outputs = outputs;
+                output.output_devices = devices;
+                output.owner_backend = durableBackend(self.default_backend.*);
+                output.output_backends = output_backends;
+                output.fallback_owner = fallback_owner;
+                output.allocator = result.allocator;
+                return;
             },
         }
     }
@@ -465,9 +569,12 @@ pub const Runtime = struct {
         };
         plan_installed = true;
         try self.attachCompiledPartitionExecutors(graph, backend, target_kind);
-        self.buffer_plan = try buffer_plan_mod.build(self.allocator, graph, &self.plan.?.base, .{});
         var physical_backends: [2]*const ComputeBackend = undefined;
         for (devices_buf[0..device_count], 0..) |device, i| physical_backends[i] = device.backend;
+        var output_layout = PhysicalOutputLayout{ .graph = graph, .backends = physical_backends[0..device_count] };
+        self.buffer_plan = try buffer_plan_mod.build(self.allocator, graph, &self.plan.?.base, .{
+            .output_layout = .{ .context = &output_layout, .resolve = &PhysicalOutputLayout.resolve },
+        });
         self.physical_pool = try @import("../execution/physical_buffers.zig").Pool.create(self.allocator, graph, &self.buffer_plan.?, physical_backends[0..device_count], self.plan.?.base.node_operator_plans);
         try self.buffer_plan.?.validate(graph, &self.plan.?.base);
     }
@@ -579,7 +686,7 @@ pub const Runtime = struct {
     fn normalizeOutputsToDefaultDevice(
         self: *Runtime,
         allocator: std.mem.Allocator,
-        result: *multi_executor.MultiExecutionResult,
+        result: *multi_executor.DeviceOutputs,
     ) !void {
         const mesh = self.mesh orelse return;
         const default_entry = mesh.device(0) orelse return error.DeviceNotFound;
@@ -604,6 +711,9 @@ fn durableBackend(backend: ComputeBackend) ComputeBackend {
     var retained = backend;
     retained.execution_control = null;
     retained.embedding_stage = null;
+    // Scope capabilities remain on their explicit target owner and are never
+    // copied into this durable backend value. currentToken validates activity.
+
     return retained;
 }
 
@@ -1261,4 +1371,89 @@ test "graph runtime producer outputs retain fallback ownership and repeated bind
     const after_eviction = try resident.backendFor(&runtime, 0).toFloat32(resident.outputs[0], a);
     defer a.free(after_eviction);
     try std.testing.expectEqualSlices(f32, expected, after_eviction);
+}
+
+/// Uses the selected implementation's shape policy, before BufferPlan assigns
+/// storage identities. Copied callback tables cannot inherit these promises.
+const PhysicalOutputLayout = struct {
+    graph: *const Graph,
+    backends: []const *const ComputeBackend,
+
+    fn resolve(ctx: *anyopaque, kind: BackendKind, id: NodeId, inferred: contracts.TensorDesc) contracts.TensorDesc {
+        const self: *const PhysicalOutputLayout = @ptrCast(@alignCast(ctx));
+        for (self.backends) |backend| {
+            if (backend.kind() != kind) continue;
+            const functions = backend.vtable.kernels orelse continue;
+            if (!functions.accepts(backend.vtable)) continue;
+            const node = self.graph.node(id);
+            // CUDA's dense materializations make following reshape aliases
+            // dense as well. Native lazy-view strides remain untouched.
+            if (kind == .cuda and node.op == .reshape and functions.physicalReplayReshapeViews)
+                return contracts.TensorDesc.view(node.output_shape, node.inputs[0], contracts.TensorStrides.dense(node.output_shape), kind, 0);
+            const materializes = functions.materializesOutput orelse continue;
+            const descriptor = ops_mod.kernel_descriptor.lower(self.graph, id) orelse return inferred;
+            if (materializes(backend.ptr, &descriptor)) {
+                var desc = contracts.TensorDesc.init(node.output_shape, if (kind == .native and node.output_shape.dtype != .f32) .host_dense else partition_mod.tensorStorageForBackend(kind));
+                desc.resident_backend = kind;
+                return desc;
+            }
+            return inferred;
+        }
+        return inferred;
+    }
+};
+
+test "backend output layouts materialize partial Native slices before allocation IDs and retain lazy aliases" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = Builder.init(&graph);
+    const input = try b.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    const partial = try b.sliceLastDim(input, 1, 3);
+    const full = try b.sliceLastDim(input, 0, 4);
+    const transposed = try b.transpose(input, &.{ 1, 0 });
+    const broadcast_shape = Shape.init(.f32, &.{ 3, 2, 4 });
+    var attrs = ml.graph.node.BroadcastAttrs{ .target_shape = broadcast_shape, .num_axes = 2 };
+    attrs.broadcast_axes[0] = 1;
+    attrs.broadcast_axes[1] = 2;
+    const broadcast = try graph.addNode(.{ .op = .{ .broadcast_in_dim = attrs }, .output_shape = broadcast_shape, .inputs = .{ input, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node }, .num_inputs = 1 });
+    try graph.markOutput(partial);
+    try graph.markOutput(full);
+    try graph.markOutput(transposed);
+    try graph.markOutput(broadcast);
+    const capabilities = [_]partition_mod.Capability{.{ .backend = .native, .priority = 0, .supports = &partition_mod.supportsAll }};
+    var placement = try partition_mod.partition(a, &graph, &capabilities);
+    defer placement.deinit();
+    const backends = [_]*const ComputeBackend{&backend};
+    var layout = PhysicalOutputLayout{ .graph = &graph, .backends = &backends };
+    var plan = try buffer_plan_mod.build(a, &graph, &placement, .{ .output_layout = .{ .context = &layout, .resolve = PhysicalOutputLayout.resolve } });
+    defer plan.deinit();
+    try plan.validate(&graph, &placement);
+    const materialized = plan.slotForNode(partial).?;
+    try std.testing.expectEqual(buffer_plan_mod.SlotKind.allocation, materialized.kind);
+    try std.testing.expectEqual(@as(u64, 16), plan.allocations[materialized.allocation].byte_size);
+    try std.testing.expect(materialized.source_slot == null);
+    for ([_]NodeId{ full, transposed, broadcast }) |id| {
+        const alias = plan.slotForNode(id).?;
+        try std.testing.expectEqual(buffer_plan_mod.SlotKind.view, alias.kind);
+        try std.testing.expectEqual(input, alias.source_slot.?);
+        try std.testing.expectEqual(plan.slotForNode(input).?.allocation, alias.allocation);
+    }
+    // A copied callback table cannot promote layout facts even if it inherited
+    // the canonical backend's physical callbacks unchanged.
+    const copied_table = backend.vtable.*;
+    const custom = ComputeBackend{ .ptr = backend.ptr, .vtable = &copied_table };
+    const custom_backends = [_]*const ComputeBackend{&custom};
+    var custom_layout = PhysicalOutputLayout{ .graph = &graph, .backends = &custom_backends };
+    const inferred = contracts.TensorDesc.view(graph.node(partial).output_shape, input, contracts.TensorStrides.none(), .native, 0);
+    try std.testing.expect(PhysicalOutputLayout.resolve(&custom_layout, .native, partial, inferred).isView());
+    // Invalid slice geometry must not acquire a materialization declaration.
+    graph.nodeMut(partial).output_shape = Shape.init(.f32, &.{ 2, 3 });
+    var invalid = inferred;
+    invalid.shape = graph.node(partial).output_shape;
+    try std.testing.expect(PhysicalOutputLayout.resolve(&layout, .native, partial, invalid).isView());
 }

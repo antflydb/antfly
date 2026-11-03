@@ -69,8 +69,6 @@ pub const BackendContext = union(enum) {
             },
             .native => blk: {
                 if (comptime !build_options.enable_native) return error.NativeNotEnabled;
-                const compute = try allocator.create(NativeCompute);
-                errdefer allocator.destroy(compute);
                 const weight_store = try allocator.create(WeightStore);
                 errdefer allocator.destroy(weight_store);
                 weight_store.* = .{
@@ -78,10 +76,8 @@ pub const BackendContext = union(enum) {
                     .resident_weights = .empty,
                     .lazy_weights = .empty,
                 };
-                compute.* = if (io) |runtime|
-                    NativeCompute.initWithIo(allocator, weight_store, null, runtime)
-                else
-                    NativeCompute.init(allocator, weight_store, null);
+                const backend = try @import("compute_factory.zig").createNative(allocator, weight_store, null, io, .{});
+                const compute: *NativeCompute = @ptrCast(@alignCast(backend.ptr));
                 break :blk .{
                     .native = .{
                         .compute = compute,
@@ -276,6 +272,8 @@ pub const BackendContext = union(enum) {
 };
 
 pub const SharedBackendContext = struct {
+    /// Stable cold provider metadata; no per-request/native-kernel heap owner.
+    operations: @import("../execution/operation_owner.zig").Owner = .{},
     allocator: std.mem.Allocator,
     ctx: BackendContext,
     backend: ops_mod.ComputeBackend,
@@ -298,6 +296,11 @@ pub const SharedBackendContext = struct {
         errdefer allocator.destroy(shared);
         var context = try BackendContext.init(allocator, requested, io);
         shared.* = .{ .allocator = allocator, .backend = context.computeBackend(), .ctx = context };
+        if (requested == .native) {
+            if (comptime build_options.enable_native) shared.ctx.native.compute.shared_operation_owner = &shared.operations;
+        } else if (requested == .cuda) {
+            if (comptime build_options.enable_cuda) shared.ctx.cuda.shared_operation_owner = &shared.operations;
+        }
         return shared;
     }
 
@@ -308,6 +311,7 @@ pub const SharedBackendContext = struct {
 
     pub fn release(self: *SharedBackendContext) void {
         if (self.ref_count.fetchSub(1, .acq_rel) != 1) return;
+        self.operations.assertIdle();
         self.ctx.deinit(self.allocator);
         self.allocator.destroy(self);
     }
@@ -323,22 +327,56 @@ pub const SharedBackendContext = struct {
         return self.ctx.backendType();
     }
 
-    pub fn importHostTensor(self: *SharedBackendContext, allocator: std.mem.Allocator, tensor: *const Tensor) !ops_mod.CT {
-        return self.ctx.importHostTensor(allocator, tensor);
+    pub fn importHostTensor(self: *SharedBackendContext, allocator: std.mem.Allocator, tensor: *const Tensor) anyerror!ops_mod.CT {
+        return self.importHostTensorWithOperation(allocator, tensor, null);
+    }
+    pub fn importHostTensorWithOperation(self: *SharedBackendContext, allocator: std.mem.Allocator, tensor: *const Tensor, token: ?@import("../execution/backend_operation.zig").Borrowed) anyerror!ops_mod.CT {
+        var scope: @import("../execution/backend_operation.zig").Scope = undefined;
+        try @import("../execution/backend_operation.zig").enterInto(&self.backend, null, token, .legacy_unknown_frame, &scope);
+        var succeeded = false;
+        defer {
+            if (succeeded) scope.finish() catch @import("antfly_platform").inference_process_supervisor.restartWorker() else scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        }
+        const result = try self.ctx.importHostTensor(allocator, tensor);
+        succeeded = true;
+        return result;
     }
 
-    pub fn importStaticTensor(self: *SharedBackendContext, allocator: std.mem.Allocator, tensor: Tensor) !ops_mod.CT {
-        return self.ctx.importStaticTensor(allocator, tensor);
+    pub fn importStaticTensor(self: *SharedBackendContext, allocator: std.mem.Allocator, tensor: Tensor) anyerror!ops_mod.CT {
+        return self.importStaticTensorWithOperation(allocator, tensor, null);
+    }
+    pub fn importStaticTensorWithOperation(self: *SharedBackendContext, allocator: std.mem.Allocator, tensor: Tensor, token: ?@import("../execution/backend_operation.zig").Borrowed) anyerror!ops_mod.CT {
+        var scope: @import("../execution/backend_operation.zig").Scope = undefined;
+        @import("../execution/backend_operation.zig").enterInto(&self.backend, null, token, .legacy_unknown_frame, &scope) catch |err| {
+            var rejected = tensor;
+            rejected.deinit();
+            return err;
+        };
+        var succeeded = false;
+        defer {
+            if (succeeded) scope.finish() catch @import("antfly_platform").inference_process_supervisor.restartWorker() else scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        }
+        const result = try self.ctx.importStaticTensor(allocator, tensor);
+        succeeded = true;
+        return result;
     }
 
-    pub fn importDenseStaticF32(
-        self: *SharedBackendContext,
-        allocator: std.mem.Allocator,
-        dtype: DType,
-        shape: []const i64,
-        values: []f32,
-    ) !ops_mod.CT {
-        return self.ctx.importDenseStaticF32(allocator, dtype, shape, values);
+    pub fn importDenseStaticF32(self: *SharedBackendContext, allocator: std.mem.Allocator, dtype: DType, shape: []const i64, values: []f32) anyerror!ops_mod.CT {
+        return self.importDenseStaticF32WithOperation(allocator, dtype, shape, values, null);
+    }
+    pub fn importDenseStaticF32WithOperation(self: *SharedBackendContext, allocator: std.mem.Allocator, dtype: DType, shape: []const i64, values: []f32, token: ?@import("../execution/backend_operation.zig").Borrowed) anyerror!ops_mod.CT {
+        var scope: @import("../execution/backend_operation.zig").Scope = undefined;
+        @import("../execution/backend_operation.zig").enterInto(&self.backend, null, token, .legacy_unknown_frame, &scope) catch |err| {
+            allocator.free(values);
+            return err;
+        };
+        var succeeded = false;
+        defer {
+            if (succeeded) scope.finish() catch @import("antfly_platform").inference_process_supervisor.restartWorker() else scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        }
+        const result = try self.ctx.importDenseStaticF32(allocator, dtype, shape, values);
+        succeeded = true;
+        return result;
     }
 };
 
@@ -707,4 +745,193 @@ test "early native observed context construction unwinds every allocation failur
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+const ObservedNativeContextFixture = struct {
+    fn run(a: std.mem.Allocator) !void {
+        var context = try BackendContext.init(a, .native, null);
+        defer context.deinit(a);
+        try std.testing.expect(context.native.compute.data == context.native.weight_store);
+        try std.testing.expectEqual(@import("../execution/allocation_registry.zig").enabled(), @import("../execution/allocation_observer.zig").State.forAllocator(context.native.compute.allocator) != null);
+        try expectSimpleAddRoundTrip(&context, a);
+    }
+    fn observed(a: std.mem.Allocator) !void {
+        var registry: @import("../execution/allocation_registry.zig").Registry = undefined;
+        registry.begin(std.testing.allocator);
+        defer _ = registry.finish();
+        try run(a);
+    }
+};
+
+test "generic Native backend context uses canonical factory with unchanged disabled allocations and observed numerics" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    try std.testing.expect(!@import("../execution/allocation_registry.zig").enabled());
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var context = try BackendContext.init(backing.allocator(), .native, null);
+    defer context.deinit(backing.allocator());
+    try std.testing.expectEqual(@as(usize, 2), backing.alloc_index);
+    try ObservedNativeContextFixture.run(std.testing.allocator);
+    try ObservedNativeContextFixture.observed(std.testing.allocator);
+}
+
+test "generic Native backend context observed and unobserved required allocations unwind all faults" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), ObservedNativeContextFixture.run, .{});
+    try std.testing.checkAllAllocationFailures(backing.allocator(), ObservedNativeContextFixture.observed, .{});
+}
+
+const SharedNativeObservationFixture = struct {
+    const operation = @import("../execution/backend_operation.zig");
+    const invocation = @import("../execution/invocation_observation.zig");
+    const Diagnostics = @import("../execution/diagnostics.zig").Diagnostics;
+    const Session = @import("session.zig").Session;
+    const Worker = struct {
+        session: Session,
+        binding: invocation.Binding,
+        failed: bool = false,
+        fn noop() !usize {
+            return 7;
+        }
+        fn run(self: *@This()) void {
+            for (0..128) |_| {
+                // This model has a DIFFERENT Session gate. The shared provider
+                // gate must still reject cold allocator installation/sampling.
+                if (self.session.configureExecutionDiagnostics(true)) {
+                    self.failed = true;
+                    return;
+                }
+                const value = invocation.call(self.binding, noop, .{}) catch {
+                    self.failed = true;
+                    return;
+                };
+                if (value != 7) {
+                    self.failed = true;
+                    return;
+                }
+                const observed = self.binding.diagnostics.snapshot() orelse {
+                    self.failed = true;
+                    return;
+                };
+                if (observed.context_runtime_scope != .unavailable or observed.runtime.native_allocations != null or observed.runtime.submission == null) {
+                    self.failed = true;
+                    return;
+                }
+            }
+        }
+    };
+};
+
+test "actual shared Native provider excludes foreign model cold enable and snapshots until its real lane is free" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const F = SharedNativeObservationFixture;
+    const shared = try SharedBackendContext.init(std.testing.allocator, .native, null);
+    defer shared.release();
+    const backend = shared.computeBackend();
+    const original_allocator = shared.ctx.native.compute.allocator;
+    var numeric = try F.operation.enter(backend, null, null, .managed);
+    defer numeric.deinitChecked() catch unreachable;
+    const token = numeric.token() orelse return error.MissingSharedNativeOperation;
+    var cold = F.Diagnostics{};
+    var sampled = F.Diagnostics{};
+    sampled.configure(true); // observation only; deliberately no backend mutation
+    var foreign_gate: std.atomic.Mutex = .unlocked;
+    const session = F.Session{ .ptr = shared, .vtable = undefined, .execution_gate = &foreign_gate, .invocation_diagnostics = .{ .diagnostics = &cold, .stable_backend = backend, .context_sampling = .provider_metadata } };
+    var worker = F.Worker{ .session = session, .binding = .{ .diagnostics = &sampled, .stable_backend = backend, .context_sampling = .provider_metadata } };
+    const thread = try std.Thread.spawn(.{}, F.Worker.run, .{&worker});
+    thread.join();
+    try std.testing.expect(!worker.failed and !cold.enabled.load(.acquire));
+    try std.testing.expect(shared.ctx.native.compute.allocator.ptr == original_allocator.ptr and shared.ctx.native.compute.allocator.vtable == original_allocator.vtable);
+    try std.testing.expectError(error.QueueFull, F.operation.enter(backend, null, null, .legacy_unknown_frame));
+    // Numerical exclusion does not also own the distinct metadata/index
+    // capability. Nest only the actual managed operation; reject promotion.
+    try std.testing.expectError(error.BackendOperationChanged, F.operation.enter(backend, null, token, .metadata));
+    var nested = try F.operation.enter(backend, null, token, .managed);
+    try nested.finish();
+    try numeric.finish();
+    try std.testing.expectError(error.BackendOperationConsumed, token.validate(.{ .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .program = null, .mode = .managed }));
+    try std.testing.expect(session.configureExecutionDiagnostics(true));
+    try std.testing.expect(@import("../execution/allocation_observer.zig").State.forAllocator(shared.ctx.native.compute.allocator) != null);
+    try std.testing.expectEqual(@as(usize, 7), try F.invocation.call(session.invocation_diagnostics, F.Worker.noop, .{}));
+    const observed = cold.snapshot().?;
+    try std.testing.expect(observed.context_runtime_scope == .shared_backend_context_interval);
+    try std.testing.expect(observed.runtime.native_allocations.?.compute != null);
+    var metadata = try F.operation.enter(backend, null, null, .metadata);
+    defer metadata.deinitChecked() catch unreachable;
+    try std.testing.expectError(error.BackendOperationChanged, F.operation.enter(backend, null, metadata.token(), .managed));
+    try metadata.finish();
+}
+
+test "private Native computes keep no operation owner and cannot inherit shared scope through altered callbacks" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const operation = @import("../execution/backend_operation.zig");
+    var context = try BackendContext.init(std.testing.allocator, .native, null);
+    defer context.deinit(std.testing.allocator);
+    const backend = context.computeBackend();
+    var raw = try operation.enter(backend, null, null, .metadata);
+    try std.testing.expect(raw.token() == null);
+    try raw.finish();
+    try std.testing.expect(context.native.compute.shared_operation_owner == null);
+    const shared = try SharedBackendContext.init(std.testing.allocator, .native, null);
+    defer shared.release();
+    var copied = shared.computeBackend();
+    var table = copied.vtable.*;
+    copied.vtable = &table;
+    var declined = try operation.enter(copied, null, null, .metadata);
+    try std.testing.expect(declined.token() == null);
+    try declined.finish();
+}
+
+test "actual shared CUDA provider operation accepts canonical scoped budget view with no success path wait" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const operation = @import("../execution/backend_operation.zig");
+    const shared = SharedBackendContext.init(std.testing.allocator, .cuda, null) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer shared.release();
+    const backend = shared.computeBackend();
+    var scope = try operation.enter(backend, null, null, .managed);
+    defer scope.deinitChecked() catch unreachable;
+    const token = scope.token() orelse return error.MissingSharedCudaOperation;
+    var budget = @import("../runtime/tier/memory.zig").RunBudget.init(.{});
+    const scoped = shared.ctx.cuda.computeBackendWithScopedRunBudget(&budget);
+    var scoped_live = true;
+    defer if (scoped_live) scoped.deinit();
+    try std.testing.expect(scoped.ptr == backend.ptr);
+    try std.testing.expectError(error.BackendOperationChanged, operation.enter(scoped, null, token, .metadata));
+    var nested = try operation.enter(scoped, null, token, .managed);
+    try nested.finish();
+    const input = try scoped.fromFloat32Shape(&.{ 1, 2 }, &.{2});
+    defer backend.free(input);
+    const output = try scoped.add(input, input);
+    defer backend.free(output);
+    const values = try scoped.toFloat32(output, std.testing.allocator);
+    defer std.testing.allocator.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 4 }, values);
+    const waits = shared.ctx.cuda.ctx.stats.stream_syncs;
+    scoped.deinit();
+    scoped_live = false;
+    try scope.finish();
+    try std.testing.expectEqual(waits, shared.ctx.cuda.ctx.stats.stream_syncs);
+    var metadata = try operation.enter(backend, null, null, .metadata);
+    const before_metadata = shared.ctx.cuda.ctx.stats.stream_syncs;
+    try metadata.deinitChecked();
+    try std.testing.expectEqual(before_metadata, shared.ctx.cuda.ctx.stats.stream_syncs);
+    var unknown = try operation.enter(backend, null, null, .legacy_unknown_frame);
+    try unknown.deinitChecked();
+    try std.testing.expectEqual(before_metadata, shared.ctx.cuda.ctx.stats.stream_syncs);
+    shared.ctx.cuda.debug_cuda_graph_capture_active = true;
+    const rejected = operation.enter(backend, null, null, .managed);
+    shared.ctx.cuda.debug_cuda_graph_capture_active = false;
+    if (rejected) |unexpected_value| {
+        var unexpected = unexpected_value;
+        try unexpected.finish();
+        return error.ExpectedForeignCaptureRejection;
+    } else |err| try std.testing.expectEqual(error.UnknownExternalOperationFrame, err);
+    try std.testing.expectEqual(before_metadata, shared.ctx.cuda.ctx.stats.stream_syncs);
+    var uncertain = try operation.enter(backend, null, null, .managed);
+    const before_cleanup = shared.ctx.cuda.ctx.stats.stream_syncs;
+    try uncertain.deinitChecked();
+    try std.testing.expectEqual(before_cleanup + 1, shared.ctx.cuda.ctx.stats.stream_syncs);
 }

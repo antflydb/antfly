@@ -51,6 +51,7 @@ pub const server = struct {
     pub const model_manager = @import("server/model_manager.zig");
 };
 pub const pipelines = struct {
+    pub const transcription = @import("pipelines/transcription.zig");
     pub const generation = @import("pipelines/generation.zig");
     pub const image = @import("pipelines/image.zig");
     pub const media_chunking = @import("pipelines/media_chunking.zig");

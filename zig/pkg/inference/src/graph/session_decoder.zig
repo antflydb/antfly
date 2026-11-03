@@ -14,7 +14,8 @@
 // limitations under the License.
 
 //! Immutable session-bound decoder metadata shared by executor/runtime owners.
-//! The loaded session and shared expert cache outlive every derived runtime.
+//! Published sessions and owned expert statistics retain their physical owners.
+//! Custom unprotected sessions and stack-initialized caches remain explicit borrows.
 const std = @import("std");
 const Session = @import("../backends/session.zig").Session;
 const gpt = @import("../models/gpt.zig");
@@ -31,12 +32,14 @@ pub const Definition = struct {
     kv_dtype: ?runtime.kv.pool.KvDType,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
     create_runtime_fn: CreateRuntime,
+    model_retention: ?*Session.ModelLifetime,
+    shared_cache_retention: ?runtime.moe.shared.SharedExpertCache.Retention,
 
     fn init(allocator: std.mem.Allocator, session: Session, configuration: *const gpt.Config, kv_dtype: ?runtime.kv.pool.KvDType, shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache, create_runtime: CreateRuntime) !*Definition {
         var owned = try gpt.OwnedConfig.init(allocator, configuration);
         errdefer owned.deinit(allocator);
         const self = try allocator.create(Definition);
-        self.* = .{ .allocator = allocator, .session = session, .configuration = owned, .kv_dtype = kv_dtype, .shared_moe_cache = shared_moe_cache, .create_runtime_fn = create_runtime };
+        self.* = .{ .allocator = allocator, .session = session, .configuration = owned, .kv_dtype = kv_dtype, .shared_moe_cache = shared_moe_cache, .create_runtime_fn = create_runtime, .model_retention = if (session.model_lifetime) |lifetime| lifetime.retain() else null, .shared_cache_retention = if (shared_moe_cache) |cache| cache.retainOwned() else null };
         return self;
     }
 
@@ -52,12 +55,25 @@ pub const Definition = struct {
         return init(allocator, self.session, &self.configuration.value, self.kv_dtype, self.shared_moe_cache, self.create_runtime_fn);
     }
 
+    pub fn beginCleanup(self: *const Definition) Session.CloseScope {
+        return if (self.model_retention) |held| held.beginClose() else .{};
+    }
+
     pub fn release(self: *Definition) void {
+        self.releaseWithCleanup(.{ .outside_execution = true });
+    }
+    pub fn releaseWithCleanup(self: *Definition, current: @import("../execution/cleanup_context.zig").Context) void {
         const previous = self.references.fetchSub(1, .acq_rel);
         std.debug.assert(previous != 0);
         if (previous != 1) return;
+        const model_retention = self.model_retention;
+        const cache_retention = self.shared_cache_retention;
         self.configuration.deinit(self.allocator);
         self.allocator.destroy(self);
+        if (cache_retention) |held| held.release();
+        // Runtime/cache/backend destruction has completed before weights,
+        // provider, admission and serving resource-domain pins can retire.
+        if (model_retention) |held| held.releaseWithCleanup(current);
     }
 };
 
@@ -75,7 +91,15 @@ fn deinitExecutor(raw: *anyopaque) void {
     self.release();
 }
 
-const executor_vtable = model.ModelExecutor.VTable{ .create_runtime = createRuntime, .deinit = deinitExecutor };
+fn acceptsExecutorCleanup(table: *const model.ModelExecutor.VTable) bool {
+    return table == &executor_vtable;
+}
+fn deinitExecutorWithCleanup(raw: *anyopaque, current: @import("../execution/cleanup_context.zig").Context) void {
+    const self: *Definition = @ptrCast(@alignCast(raw));
+    self.releaseWithCleanup(current);
+}
+const executor_cleanup_services = model.ModelExecutor.ColdCleanupServices{ .accepts = acceptsExecutorCleanup, .deinit = deinitExecutorWithCleanup };
+const executor_vtable = model.ModelExecutor.VTable{ .create_runtime = createRuntime, .deinit = deinitExecutor, .cold_cleanup_services = &executor_cleanup_services };
 
 const TestRuntime = struct {
     fn create(definition: *Definition, allocator: std.mem.Allocator) !model.ModelRuntime {
@@ -153,4 +177,53 @@ test "session decoder definition migration is failure atomic at every allocation
     defer executor.deinit();
     try std.testing.checkAllAllocationFailures(a, checkRuntimeMigration, .{&executor});
     try checkRuntimeMigration(a, &executor);
+}
+
+test "session decoder definition retains independent model and expert-cache owners across allocator migration" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        destroyed: bool = false,
+        fn destroy(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.destroyed);
+            self.destroyed = true;
+        }
+    };
+    var probe = Probe{};
+    var lifetime = Session.ModelLifetime{ .owner = &probe, .destroy_fn = Probe.destroy };
+    var model_open = true;
+    defer if (model_open) lifetime.release();
+    const cache = try runtime.moe.shared.SharedExpertCache.createOwned(a);
+    var cache_open = true;
+    defer if (cache_open) cache.releaseOwned();
+    try cache.noteActiveExperts(0, 4, &.{ 1, 2 });
+    var arena = std.heap.ArenaAllocator.init(a);
+    var arena_open = true;
+    defer if (arena_open) arena.deinit();
+    const table: Session.VTable = undefined;
+    const session = Session{ .ptr = &probe, .vtable = &table, .model_lifetime = &lifetime };
+    const config = gpt.Config{ .weight_prefix = "model." };
+    var executor = try createExecutor(arena.allocator(), session, &config, null, cache, TestRuntime.create);
+    var executor_open = true;
+    defer if (executor_open) executor.deinit();
+    // Failure during allocator migration must not consume either original pin.
+    try std.testing.checkAllAllocationFailures(a, checkRuntimeMigration, .{&executor});
+    try std.testing.expectEqual(@as(usize, 2), lifetime.references.load(.acquire));
+    var physical = try executor.createRuntime(a);
+    var physical_open = true;
+    defer if (physical_open) physical.deinit();
+    executor.deinit();
+    executor_open = false;
+    arena.deinit();
+    arena_open = false;
+    cache.releaseOwned();
+    cache_open = false;
+    lifetime.release();
+    model_open = false;
+    try std.testing.expect(!probe.destroyed);
+    const definition: *Definition = @ptrCast(@alignCast(physical.ptr));
+    try std.testing.expectEqual(@as(usize, 4), definition.shared_moe_cache.?.layers.items[0].num_experts);
+    physical.deinit();
+    physical_open = false;
+    try std.testing.expect(probe.destroyed);
 }

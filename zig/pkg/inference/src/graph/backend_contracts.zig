@@ -568,6 +568,9 @@ pub const DecoderRuntimePrepareLayerNormRequest = struct {
 };
 
 pub const DecoderRuntimeEnsureLayerNormSlotRequest = struct {
+    /// Explicit invocation scope. Zero never authorizes reuse of an unknown
+    /// source across independent calls. No ambient/TLS preparation state.
+    preparation_scope: u64 = 0,
     weight: CT,
     bias: CT,
     hidden_size: usize,
@@ -587,6 +590,9 @@ pub const DecoderRuntimePrepareRmsNormRequest = struct {
 };
 
 pub const DecoderRuntimeEnsureRmsNormSlotRequest = struct {
+    /// Explicit invocation scope. Zero never authorizes reuse of an unknown
+    /// source across independent calls. No ambient/TLS preparation state.
+    preparation_scope: u64 = 0,
     weight: CT,
     hidden_size: usize,
 };
@@ -722,6 +728,9 @@ pub const DecoderRuntimePrepareLinearRequest = struct {
 };
 
 pub const DecoderRuntimeEnsureLinearSlotRequest = struct {
+    /// Explicit invocation scope. Zero never authorizes reuse of an unknown
+    /// source across independent calls. No ambient/TLS preparation state.
+    preparation_scope: u64 = 0,
     weight: CT,
     bias: ?CT,
     in_dim: usize,

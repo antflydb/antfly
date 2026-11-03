@@ -81,6 +81,53 @@ class QualificationTests(unittest.TestCase):
         self.executable('candidate', '1.0', output=False)
         self.assertFalse(self.run_models())
 
+    def test_same_binary_policy_args_are_literal_and_select_full_task_metric(self):
+        import sys
+        binary = self.root / 'same-binary'
+        binary.write_text('#!' + sys.executable + '\n'
+                          'import sys, struct\n'
+                          'assert sys.argv[1:3] == ["--shared-shape", "3000"]\n'
+                          'policy = sys.argv[sys.argv.index("--source-policy") + 1]\n'
+                          'assert policy in ("cold", "qualified")\n'
+                          'open(sys.argv[sys.argv.index("--output") + 1], "wb").write(struct.pack("f", 1.0))\n'
+                          'print("source_receiver_metric name=constructor p50_ns=9999 p95_ns=9999")\n'
+                          'print("source_receiver_metric name=complete_task_lifecycle p50_ns=100 p95_ns=110")\n')
+        binary.chmod(0o755)
+        self.args.baseline = self.args.candidate = binary
+        config = json.loads(self.config.read_text())
+        config['arm_extra_args'] = {'A': ['--source-policy', 'cold'], 'B': ['--source-policy', 'qualified']}
+        config['cases'][0].update(args=['--shared-shape', '3000'], timing_prefix='source_receiver_metric name=complete_task_lifecycle')
+        self.config.write_text(json.dumps(config))
+        self.assertTrue(self.run_models())
+        receipt = json.loads((self.root / 'receipt.json').read_text())
+        self.assertEqual(receipt['binaries']['A'], receipt['binaries']['B'])
+        self.assertEqual(receipt['arm_extra_args'], config['arm_extra_args'])
+        for row in receipt['cases'][0]['arms']:
+            self.assertEqual(row['timing']['name'], 'complete_task_lifecycle')
+            self.assertEqual(row['timing']['p50_ns'], '100')
+            expected = [str(binary.resolve()), '--shared-shape', '3000', '--source-policy',
+                        'cold' if row['arm'] == 'A' else 'qualified']
+            self.assertEqual(row['command'][:-2], expected)
+            self.assertTrue(row['finite'] and row['byte_identical'])
+
+    def test_default_arm_args_preserve_existing_exact_commands(self):
+        self.assertTrue(self.run_models())
+        receipt = json.loads((self.root / 'receipt.json').read_text())
+        self.assertEqual(receipt['arm_extra_args'], {'A': [], 'B': []})
+        for row in receipt['cases'][0]['arms']:
+            self.assertEqual(row['command'][1:-2], [])
+
+    def test_arm_args_reject_nonliteral_or_unknown_arms_and_output_override(self):
+        invalid = ['--source-policy cold', [], {'C': []}, {'A': 'cold'}, {'A': [7]},
+                   {'A': ['']}, {'B': ['bad\0arg']}, {'A': ['--output', '/tmp/override']},
+                   {'B': ['--output=/tmp/override']}]
+        for extras in invalid:
+            config = json.loads(self.config.read_text())
+            config['arm_extra_args'] = extras
+            self.config.write_text(json.dumps(config))
+            with self.subTest(extras=repr(extras)), self.assertRaises(ValueError):
+                self.run_models()
+
     def test_unbalanced_protocol_is_rejected(self):
         config = json.loads(self.config.read_text())
         config['arm_order'] = 'AAB'

@@ -44,6 +44,7 @@ pub const architecture_session = @import("architecture_session.zig");
 pub const decoder_routes = @import("decoder_routes.zig");
 
 pub const encoder_decoder_runtime = @import("encoder_decoder_runtime.zig");
+pub const owned_incremental_input = @import("owned_incremental_input.zig");
 pub const seq2seq_runtime = @import("seq2seq_runtime.zig");
 
 pub const decoder_checkpoint = @import("decoder_checkpoint.zig");
@@ -55,3 +56,81 @@ pub const cached_decoder = @import("cached_decoder.zig");
 pub const decoder_stage = @import("decoder_stage.zig");
 
 pub const speculative_activation = @import("speculative_activation.zig");
+
+test {
+    _ = @import("../backends/compute_factory.zig");
+    _ = @import("decoder_forward.zig");
+    _ = @import("invocation_observation.zig");
+    _ = @import("pending_observation.zig");
+    _ = @import("shared_batch_observation.zig");
+    _ = @import("assigned_kernel_route.zig");
+    _ = @import("host_ingress.zig");
+    _ = @import("../ops/physical_storage.zig");
+    _ = @import("route_selection.zig");
+}
+
+test {
+    _ = @import("region_route.zig");
+    _ = @import("region_binding.zig");
+    _ = @import("region_schedule.zig");
+    _ = @import("region_recolor.zig");
+    _ = @import("region_preparation.zig");
+    _ = @import("region_claims.zig");
+}
+
+test {
+    _ = @import("region_execution_profile.zig");
+}
+
+test {
+    _ = @import("region_lifetimes.zig");
+}
+
+pub const resource_retirement = @import("resource_retirement.zig");
+test {
+    _ = resource_retirement;
+}
+
+test {
+    _ = @import("diagnostic_export.zig");
+    _ = @import("metadata_sample.zig");
+}
+
+pub const backend_operation = @import("backend_operation.zig");
+test {
+    _ = backend_operation;
+}
+
+pub const operation_gate = @import("operation_gate.zig");
+test {
+    _ = operation_gate;
+}
+
+pub const operation_owner = @import("operation_owner.zig");
+test {
+    _ = operation_owner;
+}
+
+pub const retirement_sink = @import("retirement_sink.zig");
+test {
+    _ = retirement_sink;
+}
+
+test {
+    _ = @import("operation_cleanup_epoch_test.zig");
+}
+
+test {
+    _ = @import("completion_retirement.zig");
+    _ = @import("payload_charge.zig");
+}
+
+test {
+    _ = @import("retirement_sink.zig");
+    _ = @import("owned_incremental_input.zig");
+    _ = @import("source_lane.zig");
+}
+
+test {
+    _ = @import("cleanup_owner.zig");
+}

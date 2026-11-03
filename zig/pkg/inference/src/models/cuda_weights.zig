@@ -107,6 +107,18 @@ pub fn cudaProfileForArch(
     model_manifest: *const manifest_mod.ModelManifest,
 ) ?CudaCapabilityProfile {
     return switch (arch_config) {
+        .whisper => |cfg| blk: {
+            // Initial public dense-F32 bundle contract. Actual adapter/kernel
+            // names remain generic; checkpoint configuration stays here.
+            if (task != .generic or model_manifest.usesGgufWeights() or
+                cfg.d_model == 0 or cfg.encoder_layers == 0 or cfg.decoder_layers == 0 or
+                cfg.encoder_attention_heads == 0 or cfg.decoder_attention_heads == 0 or
+                cfg.d_model % cfg.encoder_attention_heads != 0 or cfg.d_model % cfg.decoder_attention_heads != 0 or
+                cfg.d_model / cfg.encoder_attention_heads != 64 or cfg.d_model / cfg.decoder_attention_heads != 64 or
+                cfg.encoder_ffn_dim == 0 or cfg.decoder_ffn_dim == 0 or cfg.num_mel_bins == 0 or
+                cfg.vocab_size == 0 or cfg.max_source_positions == 0 or cfg.max_source_positions > 4096 or cfg.max_target_positions == 0) break :blk null;
+            break :blk .transformer_seq2seq;
+        },
         .clip, .clap => .clipclap,
         .bert => .bert_encoder,
         .modern_bert => |cfg| blk: {
@@ -355,6 +367,7 @@ test "GLiNER Decide CUDA mixed precision rejects packed-only weights before uplo
 }
 
 pub const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.CapabilityProfile else enum {
+    transformer_seq2seq,
     clipclap,
     bert_encoder,
     laya,
@@ -661,4 +674,24 @@ pub fn prepare(
         .boundary_identity = host_weights_owner.boundary_identity,
         .budget_floor = gliner_budget,
     };
+}
+
+test "CUDA dense seq2seq bundle profile checks actual encoder decoder geometry" {
+    const manifest = manifest_mod.ModelManifest{ .allocator = std.testing.allocator, .model_type = .generator };
+    const Config = @import("whisper.zig").Config;
+    for ([_]u32{ 384, 768 }) |width| {
+        const layers: u32 = if (width == 384) 4 else 12;
+        const cfg = Config{ .d_model = width, .encoder_layers = layers, .decoder_layers = layers, .encoder_attention_heads = width / 64, .decoder_attention_heads = width / 64, .encoder_ffn_dim = width * 4, .decoder_ffn_dim = width * 4 };
+        try std.testing.expectEqual(CudaCapabilityProfile.transformer_seq2seq, cudaProfileForArch(.{ .whisper = cfg }, .generic, &manifest).?);
+        try std.testing.expect(cudaProfileForArch(.{ .whisper = cfg }, .classifier, &manifest) == null);
+        var invalid = cfg;
+        invalid.encoder_attention_heads = 0;
+        try std.testing.expect(cudaProfileForArch(.{ .whisper = invalid }, .generic, &manifest) == null);
+        invalid = cfg;
+        invalid.decoder_attention_heads = 3;
+        if (width / 3 != 64) try std.testing.expect(cudaProfileForArch(.{ .whisper = invalid }, .generic, &manifest) == null);
+        invalid = cfg;
+        invalid.max_source_positions = 4097;
+        try std.testing.expect(cudaProfileForArch(.{ .whisper = invalid }, .generic, &manifest) == null);
+    }
 }

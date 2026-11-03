@@ -28,7 +28,11 @@ pub const Scheduler = struct {
         owner: ?*Scheduler = null,
         gate: ?*std.atomic.Mutex = null,
         acquired: bool = false,
+        ready: bool = false,
     };
+    fn lock(self: *Scheduler) void {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+    }
     fn append(self: *Scheduler, waiter: *Waiter, gate: *std.atomic.Mutex) void {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
@@ -43,6 +47,53 @@ pub const Scheduler = struct {
         if (self.head != waiter or !waiter.gate.?.tryLock()) return false;
         waiter.acquired = true;
         return true;
+    }
+    /// Reserve only the existing FIFO ready turn. No model/provider gate is
+    /// held while the selected caller prepares exact resource admission.
+    pub fn selectReady(self: *Scheduler, waiter: *Waiter, gate: *std.atomic.Mutex, control: Control) !void {
+        try control.check();
+        self.append(waiter, gate);
+        errdefer leave(waiter);
+        while (true) {
+            self.lock();
+            const ready = self.head == waiter;
+            if (ready) waiter.ready = true;
+            self.mutex.unlock();
+            if (ready) break;
+            try control.check();
+            if (control.io) |io| try std.Io.sleep(io, .fromMilliseconds(1), .awake) else @import("antfly_platform").time.yieldNow();
+        }
+        try control.check();
+    }
+    /// Admission/preparation has finished. Acquire the same original model
+    /// gate without holding scheduler metadata exclusion or changing FIFO turn.
+    pub fn acquireSelected(waiter: *Waiter, control: Control) !void {
+        const self = waiter.owner orelse return error.UnselectedExecutionCohort;
+        self.lock();
+        const valid = self.head == waiter and waiter.ready and !waiter.acquired;
+        const gate = waiter.gate;
+        self.mutex.unlock();
+        if (!valid or gate == null) return error.UnselectedExecutionCohort;
+        errdefer releaseGate(waiter); // Caller retains FIFO ownership through cleanup.
+        try control.lock(gate.?);
+        self.lock();
+        // This caller alone owns its selected stack waiter until leave().
+        std.debug.assert(self.head == waiter and waiter.ready and !waiter.acquired);
+        waiter.acquired = true;
+        self.mutex.unlock();
+        try control.check();
+    }
+    /// End numerical ownership but retain this ready turn while its actual
+    /// cleanup epoch seals and supplier refunds finish. A successor cannot
+    /// spuriously fail admission against this cohort's just-dead workspace.
+    pub fn releaseGate(waiter: *Waiter) void {
+        const self = waiter.owner orelse return;
+        self.lock();
+        defer self.mutex.unlock();
+        if (!waiter.acquired) return;
+        std.debug.assert(self.head == waiter and waiter.ready);
+        waiter.gate.?.unlock();
+        waiter.acquired = false;
     }
     pub fn enter(self: *Scheduler, waiter: *Waiter, gate: *std.atomic.Mutex, control: Control) !void {
         try control.check();
@@ -177,4 +228,54 @@ test "embeddinggemma2 ready cohort scheduler hands off across threads and remove
     try std.testing.expectEqual(@as(usize, 1), workers[2].order);
     try std.testing.expectEqual(@as(usize, 2), counter.load(.monotonic));
     try std.testing.expect(scheduler.head == null and scheduler.tail == null);
+}
+
+test "ready cohort retains FIFO workspace turn with model gate free throughout producer phase" {
+    var scheduler = Scheduler{};
+    var gate: std.atomic.Mutex = .unlocked;
+    var selected = Scheduler.Waiter{};
+    try scheduler.selectReady(&selected, &gate, .{});
+    defer Scheduler.leave(&selected);
+    try std.testing.expect(selected.ready and !selected.acquired);
+    // A real resource supplier can reenter model metadata/gate probes while
+    // this one ready cohort owns preparation; no other queued workspace wins.
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    try std.testing.expect(scheduler.mutex.tryLock());
+    scheduler.mutex.unlock();
+    var peer = Scheduler.Waiter{};
+    scheduler.append(&peer, &gate);
+    defer Scheduler.leave(&peer);
+    try std.testing.expect(!scheduler.take(&peer));
+    try Scheduler.acquireSelected(&selected, .{});
+    try std.testing.expect(selected.acquired);
+    try std.testing.expect(!gate.tryLock());
+    Scheduler.leave(&selected);
+    try std.testing.expect(scheduler.take(&peer));
+    try std.testing.expect(peer.acquired);
+}
+
+test "cancelled ready execution retains cleanup turn before successor admission" {
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    var scheduler = Scheduler{};
+    var gate: std.atomic.Mutex = .unlocked;
+    var selected = Scheduler.Waiter{};
+    try scheduler.selectReady(&selected, &gate, .{});
+    defer Scheduler.leave(&selected);
+    var peer = Scheduler.Waiter{};
+    scheduler.append(&peer, &gate);
+    defer Scheduler.leave(&peer);
+    try std.testing.expectError(error.Cancelled, Scheduler.acquireSelected(&selected, .{ .check_fn = Cancel.check }));
+    try std.testing.expect(selected.owner == &scheduler and selected.ready and !selected.acquired);
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    // Real caller cleanup/epoch sealing occurs before leave. A successor must
+    // not acquire against quota still owned by the canceled preparation.
+    try std.testing.expect(!scheduler.take(&peer));
+    Scheduler.leave(&selected);
+    try std.testing.expect(scheduler.take(&peer));
 }

@@ -1354,7 +1354,8 @@ pub const ModelManager = struct {
     /// remains charged until the last escaped tokenizer is destroyed.
     const ResourceDomain = struct {
         allocator: std.mem.Allocator,
-        admission: runtime.tier.memory.AdmissionController = .{},
+        admission_owner: *runtime.tier.admission_domain.Domain,
+        admission: *runtime.tier.memory.AdmissionController,
         admission_limits: runtime.tier.memory.Limits = .{},
         tokenizer_cache_budget_source: TokenizerCacheBudgetSource = .none,
         external_tokenizer_cache_budget: ?hf_tokenizer.HfTokenizer.BpeCacheResourceBudget = null,
@@ -1367,8 +1368,12 @@ pub const ModelManager = struct {
 
         fn create(allocator: std.mem.Allocator) !*@This() {
             const lifetime = try allocator.create(@This());
+            errdefer allocator.destroy(lifetime);
+            const admission = try runtime.tier.admission_domain.Domain.create();
             lifetime.* = .{
                 .allocator = allocator,
+                .admission_owner = admission,
+                .admission = &admission.controller,
             };
             return lifetime;
         }
@@ -1409,11 +1414,9 @@ pub const ModelManager = struct {
                         @panic("inference resource domain closed with tokenizer observers");
                     shard.records.deinit(self.allocator);
                 }
-                if (!std.meta.eql(
-                    self.admission.snapshot(),
-                    runtime.tier.memory.AdmissionAmounts{},
-                )) @panic("inference resource domain closed with admission leases");
-                self.admission.deinit();
+                // Ordinary owners and IO may disappear while independently
+                // pinned SDK retirement still owns its exact admission lease.
+                self.admission_owner.release();
                 if (self.external_tokenizer_cache_budget) |budget| budget.releaseContext();
                 self.allocator.destroy(self);
             }
@@ -1729,7 +1732,7 @@ pub const ModelManager = struct {
     fn admissionController(
         self: *const ModelManager,
     ) *runtime.tier.memory.AdmissionController {
-        return &self.resource_domain.?.admission;
+        return self.resource_domain.?.admission;
     }
 
     /// Read the physical admission ledger without holding model/catalog locks.
@@ -3558,7 +3561,13 @@ pub const ModelManager = struct {
         self.tokenizer_parallel_bpe_config = config;
     }
 
+    /// External export is allowed only after numerical/resource lanes retire.
+    pub fn flushExecutionDiagnostics(self: *const ModelManager) void {
+        if (self.session_manager.execution_diagnostics.enabled) @import("../execution/diagnostic_export.zig").flush();
+    }
+
     pub fn deinit(self: *ModelManager) void {
+        defer self.flushExecutionDiagnostics();
         // Sessions can retain the load runtime. Join work and destroy all
         // resident resources before tearing down the manager-owned fallback.
         defer if (self.owned_load_io_owner) |owner| owner.release();
@@ -4860,10 +4869,17 @@ pub const ModelManager = struct {
         self.unlockLoadedModels();
         errdefer domain.release();
         errdefer if (io_owner) |owner| owner.release();
+        if (session.model_lifetime) |lifetime| if (lifetime.admission_domain) |pin| {
+            if (pin.controller() != domain.admission) return error.ForeignAdmissionDomain;
+        };
         const holder = try self.allocator.create(RetainedSessionResources);
         errdefer self.allocator.destroy(holder);
         holder.* = .{ .allocator = self.allocator, .domain = domain, .io_owner = io_owner };
         try session.attachResourcePin(self.allocator, .{ .ptr = holder, .release_fn = RetainedSessionResources.release, .retain_fn = RetainedSessionResources.retain });
+        // attachResourcePin has published a stable lifetime; nothing fallible
+        // follows, and matching preinstalled domain ownership is preserved.
+        if (session.model_lifetime.?.admission_domain == null)
+            session.model_lifetime.?.admission_domain = domain.admission_owner.pin();
     }
 
     fn primaryPreparation(self: *ModelManager) loaded_runtime.PrimaryPreparation {
@@ -9669,7 +9685,7 @@ const TeardownStderrBlocker = struct {
     }
 
     fn start(self: *@This()) !void {
-        self.thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, hold, .{self});
+        self.thread = try std.Thread.spawn(.{}, hold, .{self});
         const deadline = platform.time.monotonicNs() + std.time.ns_per_s;
         while (!self.ready.load(.acquire)) {
             if (platform.time.monotonicNs() >= deadline) return error.StderrLockFixtureNotReady;
@@ -11138,4 +11154,252 @@ test "explicit load policy resolves global model and call precedence before any 
     try std.testing.expectEqual(@as(u32, 20480), explicit.cache_policy.a4b_request.?.memory_budget_mb);
     const override = manager.resolveModelLoadPolicy("model", .{ .a4b_request = .{ .memory_budget_mb = 24576 } });
     try std.testing.expectEqual(@as(u32, 24576), override.cache_policy.a4b_request.?.memory_budget_mb);
+}
+
+test "model manager resident child views retain actual Native source and quota after manager shutdown" {
+    const a = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    const ops = @import("../ops/ops.zig");
+    const Resident = @import("../backends/session.zig").ResidentOutputs;
+    const Tensor = backends.Tensor;
+    var manager = ModelManager.init(a, .{ .allocator = a, .preferred_backends = &.{.native} });
+    var manager_open = true;
+    defer if (manager_open) manager.deinit();
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 1024 * 1024 });
+    try manager.ensureResourceOwnerReady();
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer weights.deinitOwned();
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const Probe = struct {
+        close: TeardownTestProbe = .{},
+        cb: ops.ComputeBackend,
+        charged_at_cleanup: bool = false,
+        controller: *runtime.tier.memory.AdmissionController,
+        fn kind(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn info(_: *anyopaque) []const backends.TensorInfo {
+            return &.{.{ .name = "values", .dtype = .f32, .shape = &.{ -1, 2 } }};
+        }
+        fn forward(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) !?Resident {
+            const close: *TeardownTestProbe = @ptrCast(@alignCast(raw));
+            const self: *@This() = @fieldParentPtr("close", close);
+            const source = try self.cb.fromFloat32Shape(inputs[0].asFloat32(), &.{ 2, 2 });
+            errdefer self.cb.free(source);
+            const vector = try allocator.alloc(ops.CT, 1);
+            vector[0] = source;
+            return .{ .outputs = vector, .backend = &self.cb, .allocator = allocator, .backend_owner = self, .deinit_backend_owner = cleanup };
+        }
+        fn cleanup(raw: *anyopaque, _: std.mem.Allocator) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.charged_at_cleanup = self.controller.snapshot().host_scratch_bytes > 0;
+            std.debug.assert(self.close.ticket.?.deadline_ns.load(.acquire) != 0);
+        }
+    };
+    var probe = Probe{ .cb = compute.computeBackend(), .controller = manager.admissionController() };
+    var session = try probe.close.session(&manager);
+    var session_open = true;
+    defer if (session_open) session.close();
+    var table = TeardownTestProbe.vtable;
+    table.runResident = Probe.forward;
+    table.inputInfo = Probe.info;
+    table.outputInfo = Probe.info;
+    table.backend = Probe.kind;
+    session.vtable = &table;
+    session.run_admission = .{ .controller = manager.admissionController(), .backend_class = .cpu, .limits = .{ .host_limit_bytes = 1024 * 1024 }, .static_workspace_bytes = 1, .check_live_memory = false };
+    session.installBorrowedCloseProtection(session.close_protection);
+    try manager.attachSessionResourcePin(&session);
+    const domain = manager.resource_domain.?;
+    var input = try Tensor.initFloat32(a, "values", &.{ 2, 2 }, &.{ 1, 2, 3, 4 });
+    defer input.deinit();
+    var output = (try session.runResident(&.{input}, a)).?;
+    var output_open = true;
+    defer if (output_open) output.deinit();
+    const first_vector = try a.alloc(ops.CT, 1);
+    var first_vector_open = true;
+    defer if (first_vector_open) a.free(first_vector);
+    first_vector[0] = try probe.cb.sliceRows2D(a, output.outputs[0], 0, 1, 2);
+    var first_ct_open = true;
+    defer if (first_ct_open) probe.cb.free(first_vector[0]);
+    var first = try output.ownViewsOf(a, first_vector);
+    first_vector_open = false;
+    first_ct_open = false;
+    var first_open = true;
+    defer if (first_open) first.deinit();
+    const second_vector = try a.alloc(ops.CT, 1);
+    var second_vector_open = true;
+    defer if (second_vector_open) a.free(second_vector);
+    second_vector[0] = try probe.cb.sliceRows2D(a, output.outputs[0], 1, 1, 2);
+    var second_ct_open = true;
+    defer if (second_ct_open) probe.cb.free(second_vector[0]);
+    var second = try output.ownViewsOf(a, second_vector);
+    second_vector_open = false;
+    second_ct_open = false;
+    var second_open = true;
+    defer if (second_open) second.deinit();
+    output.deinit();
+    output_open = false;
+    session.close();
+    session_open = false;
+    manager.deinit();
+    manager_open = false;
+    try std.testing.expect(domain.closing.load(.acquire));
+    try std.testing.expect(!probe.close.closed);
+    try std.testing.expect(domain.admission.snapshot().host_scratch_bytes > 0);
+    first.deinit();
+    first_open = false;
+    try std.testing.expect(!probe.close.closed);
+    const values = try second.backend.toFloat32(second.outputs[0], a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, values);
+    second.deinit();
+    second_open = false;
+    try std.testing.expect(probe.close.closed and probe.charged_at_cleanup);
+}
+
+test "pure admission pin preserves external partition token after actual session manager IO and arena teardown" {
+    const a = std.testing.allocator;
+    const Recorder = struct { retained: usize = 0, contexts_released: usize = 0, contexts_destroyed: usize = 0, reserves: usize = 0, shrinks: usize = 0, releases: usize = 0 };
+    const Budget = struct {
+        allocator: std.mem.Allocator,
+        recorder: *Recorder,
+        references: std.atomic.Value(usize) = .init(1),
+        amounts: runtime.tier.memory.AdmissionAmounts = .{},
+        fn capability(self: *@This()) runtime.tier.memory.AdmissionResourceBudget {
+            return .{ .context = self, .retain_context = retainContext, .release_context = releaseContext, .try_reserve = reserve, .retain = shrink, .release = release };
+        }
+        fn retainContext(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const old = self.references.fetchAdd(1, .monotonic);
+            std.debug.assert(old > 0);
+            self.recorder.retained += 1;
+            return true;
+        }
+        fn releaseContext(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.recorder.contexts_released += 1;
+            const old = self.references.fetchSub(1, .acq_rel);
+            std.debug.assert(old > 0);
+            if (old == 1) {
+                self.recorder.contexts_destroyed += 1;
+                const allocator = self.allocator;
+                allocator.destroy(self);
+            }
+        }
+        fn reserve(raw: *anyopaque, amounts: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.recorder.reserves != 0) return error.ResourceLimitExceeded;
+            self.recorder.reserves += 1;
+            self.amounts = amounts;
+            return 0x1166;
+        }
+        fn shrink(raw: *anyopaque, token: usize, amounts: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (token != 0x1166 or amounts.host_scratch_bytes > self.amounts.host_scratch_bytes) return error.ResourceLimitExceeded;
+            self.recorder.shrinks += 1;
+            self.amounts = amounts;
+        }
+        fn release(raw: *anyopaque, token: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(token == 0x1166);
+            self.recorder.releases += 1;
+            self.amounts = .{};
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    var arena_live = true;
+    defer if (arena_live) arena.deinit();
+    var synchronized = @import("executor_microbatch.zig").SynchronizedAllocator{ .child = arena.allocator() };
+    const alloc = synchronized.allocator();
+    var manager = ModelManager.init(alloc, .{ .allocator = alloc, .preferred_backends = &.{.native} });
+    var manager_live = true;
+    defer if (manager_live) manager.deinit();
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 64 });
+    try manager.ensureResourceOwnerReady();
+    {
+        spinLock(&manager.load_lock);
+        defer manager.load_lock.unlock();
+        _ = try manager.loadCoordinationIoLocked();
+    }
+    try std.testing.expect(manager.owned_load_io_owner != null);
+    var probe = TeardownTestProbe{};
+    var session = try probe.session(&manager);
+    var session_live = true;
+    defer if (session_live) session.close();
+    try manager.attachSessionResourcePin(&session);
+    const controller = manager.admissionController();
+    const pin = session.model_lifetime.?.retainAdmissionDomain(controller) orelse return error.MissingAdmissionDomain;
+    var pin_live = true;
+    defer if (pin_live) pin.release();
+    var unrelated = runtime.tier.memory.AdmissionController{};
+    defer unrelated.deinit();
+    try std.testing.expect(session.model_lifetime.?.retainAdmissionDomain(&unrelated) == null);
+    var recorder = Recorder{};
+    const external = try a.create(Budget);
+    external.* = .{ .allocator = a, .recorder = &recorder };
+    var external_live = true;
+    defer if (external_live) Budget.releaseContext(external);
+    try controller.configureResourceBudget(external.capability());
+    var lease = try controller.tryAcquire(.cpu, .{ .host_limit_bytes = 64 }, .{ .host_scratch_bytes = 32 }, false);
+    defer lease.release();
+    // The requested metadata allocator deliberately belongs to the Arena.
+    // Domain controllers must place the shared token in their stable owner.
+    var child = try lease.partition(alloc, .{ .host_scratch_bytes = 16 });
+    defer child.release();
+    lease.release();
+    Budget.releaseContext(external);
+    external_live = false;
+    try std.testing.expectEqual(@as(usize, 2), recorder.retained);
+    try std.testing.expectEqual(@as(usize, 1), recorder.shrinks);
+    session.close();
+    session_live = false;
+    try std.testing.expect(probe.closed);
+    manager.deinit();
+    manager_live = false;
+    arena.deinit();
+    arena_live = false;
+    try std.testing.expectEqual(@as(usize, 16), pin.controller().snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), recorder.contexts_destroyed);
+    try std.testing.expectEqual(@as(usize, 0), recorder.releases);
+    child.release();
+    try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, pin.controller().snapshot());
+    try std.testing.expectEqual(@as(usize, 1), recorder.reserves);
+    try std.testing.expectEqual(@as(usize, 1), recorder.releases);
+    try std.testing.expectEqual(@as(usize, 2), recorder.contexts_released);
+    pin.release();
+    pin_live = false;
+    try std.testing.expectEqual(@as(usize, 3), recorder.contexts_released);
+    try std.testing.expectEqual(@as(usize, 1), recorder.contexts_destroyed);
+}
+
+test "managed cold diagnostics policy observes constructor ownership and rejects allocation failure cleanly" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, a);
+    const root = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer a.free(root);
+    var sessions = backends.SessionManager{ .allocator = a, .preferred_backends = &.{.native}, .execution_diagnostics = .{ .enabled = true } };
+    var manager = ModelManager.init(a, sessions);
+    defer manager.deinit();
+    var man = try manifest_mod.loadFromDir(a, root);
+    defer man.deinit();
+    var loaded = try loadSessionForPreferredBackends(&manager, &.{.native}, root, man, &manager.session_manager, null);
+    defer loaded.deinit();
+    const binding = loaded.session.invocation_diagnostics orelse return error.MissingManagedDiagnostics;
+    try std.testing.expect(binding.diagnostics.isEnabled());
+    try std.testing.expect(binding.diagnostics.export_owner != 0);
+    const observer = @import("../execution/allocation_observer.zig").State.forAllocator(binding.model_allocator orelse return error.MissingModelAllocator) orelse return error.MissingColdModelObserver;
+    try std.testing.expectEqual(.from_owner_creation, observer.coverage);
+    // No numerical event occurred: exporting cannot reuse another request's
+    // previous success or manufacture a model-construction success snapshot.
+    try std.testing.expect(loaded.session.executionDiagnostics() == null);
+    var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    sessions.allocator = fail.allocator();
+    try std.testing.expectError(error.OutOfMemory, sessions.loadModel(root));
+    const quiet = backends.SessionManager{ .allocator = a, .preferred_backends = &.{.native} };
+    try std.testing.expect(!quiet.execution_diagnostics.enabled);
+    try std.testing.expectEqual(@intFromPtr(a.ptr), @intFromPtr(quiet.allocator.ptr));
 }

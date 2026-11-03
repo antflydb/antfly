@@ -87,6 +87,10 @@ fn timeMajorHidden(
         else => {},
     }
 
+    // CUDA's dense seq2seq contract requires a device layout transform.
+    // Missing kernels/errors must fail rather than silently running transpose
+    // on the CPU and reuploading an intermediate during encoder execution.
+    if (cb.kind() == .cuda) return error.CudaResidentLayoutRequired;
     const conv_data = try cb.toFloat32(conv_out, allocator);
     defer allocator.free(conv_data);
     const transposed = try allocator.alloc(f32, total * d_model);
@@ -116,6 +120,33 @@ pub fn encoderForward(
     batch: usize,
     time_steps: usize,
 ) ![]f32 {
+    return encoderForwardOutput(false, cb, allocator, config, mel_features, batch, time_steps);
+}
+
+pub fn encoderForwardTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    mel_features: CT,
+    batch: usize,
+    time_steps: usize,
+) !CT {
+    return encoderForwardOutput(true, cb, allocator, config, mel_features, batch, time_steps);
+}
+
+fn EncoderOutput(comptime resident: bool) type {
+    return if (resident) CT else []f32;
+}
+
+fn encoderForwardOutput(
+    comptime resident: bool,
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    mel_features: CT,
+    batch: usize,
+    time_steps: usize,
+) !EncoderOutput(resident) {
     const d_model = config.d_model;
     const num_heads = config.encoder_attention_heads;
     const head_dim = config.encoderHeadDim();
@@ -260,12 +291,14 @@ pub fn encoderForward(
         .b = try fetcher.fetch("model.encoder.layer_norm.bias"),
     };
     const normed = try stream.normalize(cb, final_ln, d_model, null);
-    defer cb.free(normed);
+    defer if (comptime !resident) cb.free(normed);
+    errdefer if (comptime resident) cb.free(normed);
     profile.mark(cb, "final_norm");
     if (frame_active) {
         try cb.decoderRuntimeSubmitAndWaitFrame();
         frame_active = false;
     }
+    if (comptime resident) return normed;
     const result = try cb.toFloat32(normed, allocator);
     profile.mark(cb, "readback");
     return result;
@@ -742,6 +775,70 @@ const WeightFetcher = struct {
 /// token is blitted into place, so the cache never reallocates and the
 /// attention kernel reads a zero-copy view of the live prefix. Elsewhere the
 /// cache grows by concatenation.
+/// Canonical allocation geometry shared by cache construction and admission.
+/// KV values are F32 on every current backend; opaque source preparation keeps
+/// the existing model/static workspace floor until its selected-route bound is
+/// available. No private cache is mislabeled as a published output tensor.
+pub const CacheGeometry = struct {
+    layers: usize,
+    width: usize,
+    encoder_rows: usize,
+    capacity: usize,
+    encoder_mask_elements: usize,
+    self_mask_elements: usize,
+    cross_tensor_bytes: usize,
+    self_tensor_bytes: usize,
+    known_metadata_bytes: usize,
+
+    pub fn init(config: Config, encoder_rows: usize) !CacheGeometry {
+        const mul = cacheMul;
+        const add = cacheAdd;
+        const width: usize = config.d_model;
+        const capacity = @max(@as(usize, 1), config.max_target_positions);
+        if (encoder_rows == 0 or width == 0) return error.InvalidInputShape;
+        const cross_bytes = try mul(usize, try mul(usize, encoder_rows, width), @sizeOf(f32));
+        const self_bytes = try mul(usize, try mul(usize, capacity, width), @sizeOf(f32));
+        const masks = try mul(usize, try add(usize, encoder_rows, capacity), @sizeOf(i64));
+        const vectors = try mul(usize, config.decoder_layers, @sizeOf(DecodeCache.LayerCache) + @sizeOf(LayerWeights));
+        return .{ .layers = config.decoder_layers, .width = width, .encoder_rows = encoder_rows, .capacity = capacity, .encoder_mask_elements = encoder_rows, .self_mask_elements = capacity, .cross_tensor_bytes = cross_bytes, .self_tensor_bytes = self_bytes, .known_metadata_bytes = try add(usize, masks, vectors) };
+    }
+
+    pub fn cacheAmounts(self: CacheGeometry, cb: *const ComputeBackend) !@import("../runtime/tier/memory.zig").AdmissionAmounts {
+        if (self.layers == 0) return .{ .host_scratch_bytes = self.known_metadata_bytes };
+        const functions = cb.vtable.kernels;
+        const cross = if (functions) |table| if (table.physicalStorageReservationBytes) |bound| try bound(cb.ptr, self.cross_tensor_bytes) else self.cross_tensor_bytes else self.cross_tensor_bytes;
+        const slab = if (functions) |table| if (table.physicalStorageReservationBytes) |bound| try bound(cb.ptr, self.self_tensor_bytes) else self.self_tensor_bytes else self.self_tensor_bytes;
+        if (cross < self.cross_tensor_bytes or slab < self.self_tensor_bytes) return error.InvalidPhysicalStorageReservation;
+        const bytes = try cacheMul(usize, try cacheMul(usize, self.layers, 2), try cacheAdd(usize, cross, slab));
+        var result = @import("../runtime/tier/memory.zig").AdmissionAmounts{ .host_scratch_bytes = self.known_metadata_bytes };
+        switch (cb.kind()) {
+            .native => result.host_kv_bytes = bytes,
+            .metal, .cuda => result.backend_kv_bytes = bytes,
+            .pjrt, .wasm, .webgpu, .graph => return error.UnsupportedIncrementalDecoderBackend,
+        }
+        return result;
+    }
+
+    pub fn workspaceBytes(self: CacheGeometry, config: Config) !usize {
+        const mul = cacheMul;
+        const add = cacheAdd;
+        const keys = @max(self.encoder_rows, self.capacity);
+        const attention = try mul(usize, try mul(usize, keys, config.decoder_attention_heads), 3);
+        const activations = try add(usize, try mul(usize, self.width, 6), try mul(usize, config.decoder_ffn_dim, 3));
+        const context = try mul(usize, try mul(usize, keys, self.width), 6);
+        const constructor = try mul(usize, try mul(usize, self.encoder_rows, self.width), 6);
+        const head = try add(usize, self.width, config.vocab_size);
+        return mul(usize, @max(constructor, @max(head, @max(attention, @max(activations, context)))), @sizeOf(f32));
+    }
+};
+
+fn cacheMul(comptime T: type, left: T, right: T) !T {
+    return std.math.mul(T, left, right) catch error.ResourceLimitExceeded;
+}
+fn cacheAdd(comptime T: type, left: T, right: T) !T {
+    return std.math.add(T, left, right) catch error.ResourceLimitExceeded;
+}
+
 pub const DecodeCache = struct {
     allocator: std.mem.Allocator,
     layers: []LayerCache,
@@ -771,6 +868,7 @@ pub const DecodeCache = struct {
         encoder_hidden: CT,
         enc_seq: usize,
     ) !DecodeCache {
+        const geometry = try CacheGeometry.init(config, enc_seq);
         const d_model = config.d_model;
         var fetcher = WeightFetcher{ .cb = cb, .allocator = allocator };
         errdefer fetcher.release(cb);
@@ -853,7 +951,7 @@ pub const DecodeCache = struct {
 
         // Preallocated self-cache slabs, when the backend supports them.
         var capacity: usize = 0;
-        const slab_rows = @max(@as(usize, 1), config.max_target_positions);
+        const slab_rows = geometry.capacity;
         if (slab_rows <= std.math.maxInt(i32) and d_model <= std.math.maxInt(i32)) {
             const shape = [_]i32{ @intCast(slab_rows), @intCast(d_model) };
             var all_allocated = true;
@@ -881,10 +979,10 @@ pub const DecodeCache = struct {
             }
         }
 
-        const encoder_mask = try allocator.alloc(i64, enc_seq);
+        const encoder_mask = try allocator.alloc(i64, geometry.encoder_mask_elements);
         errdefer allocator.free(encoder_mask);
         @memset(encoder_mask, 1);
-        const self_mask = try allocator.alloc(i64, slab_rows);
+        const self_mask = try allocator.alloc(i64, geometry.self_mask_elements);
         @memset(self_mask, 1);
         fetcher.cb = undefined;
         return .{
@@ -1425,4 +1523,75 @@ fn decoderBlockCached(
     stream.sum = after_cross.sum;
     after_cross_sum_live = false;
     stream.pending = fc2_out;
+}
+
+fn checkIncrementalResidentEncoder(cb: ComputeBackend, reference: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const fixture = @import("../execution/testing/incremental_encoder_decoder.zig");
+    const config = fixture.config;
+    const features = [_]f32{ 0.2, 0.5, -0.1, 0.4, 0.3, -0.2, 0.7, 0.1 };
+    const mel = try cb.fromFloat32Shape(&features, &.{ 1, 2, 4 });
+    defer cb.free(mel);
+    const mel_reference = try reference.fromFloat32Shape(&features, &.{ 1, 2, 4 });
+    defer reference.free(mel_reference);
+    const host = try encoderForward(&reference, a, config, mel_reference, 1, 4);
+    defer a.free(host);
+    const held = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+    const encoded = try encoderForwardTensor(&cb, a, config, mel, 1, 4);
+    defer cb.free(encoded);
+    try held.expectUnchanged(cb);
+    var cache = try DecodeCache.init(&cb, a, config, encoded, 2);
+    defer cache.deinit(&cb);
+    try held.expectUnchanged(cb);
+    const reference_ct = try reference.fromFloat32Shape(host, &.{ 2, 4 });
+    defer reference.free(reference_ct);
+    var expected_cache = try DecodeCache.init(&reference, a, config, reference_ct, 2);
+    defer expected_cache.deinit(&reference);
+    const actual_first = try decoderStepCachedLogits(&cb, a, config, &.{ 0, 1 }, &cache);
+    defer a.free(actual_first);
+    const expected_first = try decoderStepCachedLogits(&reference, a, config, &.{ 0, 1 }, &expected_cache);
+    defer a.free(expected_first);
+    const actual_second = try decoderStepCachedLogits(&cb, a, config, &.{2}, &cache);
+    defer a.free(actual_second);
+    const expected_second = try decoderStepCachedLogits(&reference, a, config, &.{2}, &expected_cache);
+    defer a.free(expected_second);
+    try std.testing.expectEqual(expected_first.len, actual_first.len);
+    try std.testing.expectEqual(expected_second.len, actual_second.len);
+    for (expected_first, actual_first) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0001);
+    for (expected_second, actual_second) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0001);
+    try std.testing.expectEqual(@as(usize, 3), cache.positions);
+    const geometry = try CacheGeometry.init(config, 2);
+    const amounts = try geometry.cacheAmounts(&cb);
+    const logical = 2 * config.decoder_layers * (geometry.cross_tensor_bytes + geometry.self_tensor_bytes);
+    if (cb.kind() == .native) {
+        try std.testing.expectEqual(logical, amounts.host_kv_bytes);
+        try std.testing.expectEqual(@as(usize, 0), amounts.backend_kv_bytes);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), amounts.host_kv_bytes);
+        try std.testing.expect(amounts.backend_kv_bytes >= logical);
+        if (cb.vtable.kernels) |table| if (table.physicalStorageReservationBytes) |bound| {
+            const actual_bound = 2 * config.decoder_layers * (try bound(cb.ptr, geometry.cross_tensor_bytes) + try bound(cb.ptr, geometry.self_tensor_bytes));
+            try std.testing.expectEqual(actual_bound, amounts.backend_kv_bytes);
+        };
+    }
+}
+
+test "incremental resident encoder and real Native KV steps match host reference without hidden roundtrip" {
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onNative(@import("../execution/testing/incremental_encoder_decoder.zig").populate, checkIncrementalResidentEncoder);
+}
+
+test "incremental resident encoder and real Metal KV steps match Native reference without hidden roundtrip" {
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onMetal(@import("../execution/testing/incremental_encoder_decoder.zig").populate, checkIncrementalResidentEncoder);
+}
+
+test "incremental canonical cache geometry bounds full encoder constructor and rejects overflow" {
+    const config: Config = .{ .d_model = 64, .decoder_layers = 2, .decoder_attention_heads = 2, .decoder_ffn_dim = 128, .max_target_positions = 8, .vocab_size = 4 };
+    const geometry = try CacheGeometry.init(config, 1024);
+    try std.testing.expect(try geometry.workspaceBytes(config) >= 6 * 1024 * 64 * @sizeOf(f32));
+    try std.testing.expectEqual(@as(usize, 1024), geometry.encoder_mask_elements);
+    try std.testing.expectEqual(@as(usize, 8), geometry.self_mask_elements);
+    try std.testing.expectError(error.ResourceLimitExceeded, CacheGeometry.init(config, std.math.maxInt(usize)));
+    try std.testing.expectError(error.InvalidInputShape, CacheGeometry.init(config, 0));
 }

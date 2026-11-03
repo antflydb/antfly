@@ -20,6 +20,7 @@ const pool = @import("../runtime/kv/pool.zig");
 const CapacityPolicy = @import("../runtime/tier/memory.zig").GenerationKvCapacityPolicy;
 
 pub const Options = struct {
+    shared_kv: bool = true,
     /// Existing whole-model runtimes address every architectural layer. The
     /// compact recurrent route instead assigns slots only to stored KV layers.
     layer_layout: enum { architectural, stored } = .stored,
@@ -190,4 +191,56 @@ pub fn selectedPeakBytes(config: Config, dtype: pool.KvDType, gpu_oracle: bool) 
     total = try std.math.add(usize, total, host_selection);
     total = try std.math.add(usize, total, scorer);
     return std.math.add(usize, total, oracle);
+}
+
+/// Enumerate only actual KV owners. Recurrent layers and shared-tail consumers
+/// do not acquire duplicate physical planes; the existing model metadata maps
+/// donors into architectural or compact stored indices. Backend code sees only
+/// typed IDs/head rows, never model family names or inferred dense numbering.
+pub fn requiredKvGeometry(config: *const Config, options: Options) !@import("../runtime/kv/device_capacity.zig").Geometry {
+    var result = @import("../runtime/kv/device_capacity.zig").Geometry{};
+    for (0..config.num_hidden_layers) |layer| {
+        if (config.layerUsesQwen35LinearAttention(layer)) continue;
+        const donor = if (options.shared_kv) try config.kvStorageLayerIndex(layer) else layer;
+        if (donor != layer) continue;
+        const geometry = if (options.shared_kv) try config.kvDonorGeometry(layer) else Config.KvDonorGeometry{
+            .donor_layer = layer,
+            .sliding = config.layerUsesSlidingAttention(layer),
+            .num_kv_heads = config.effectiveKVHeadsForLayer(layer),
+            .head_dim = config.effectiveHeadDimForLayer(layer),
+        };
+        // Ring/selected/private layouts need their separate actual ownership
+        // contract. Full-history storage may still have a sliding model mask.
+        const storage_index = switch (options.layer_layout) {
+            .architectural => donor,
+            .stored => config.compactQwen35KvStorageLayerIndex(donor) orelse return error.InvalidDeviceCapacityLayout,
+        };
+        try result.append(.{ .index = std.math.cast(u16, storage_index) orelse return error.InvalidDeviceCapacityLayout, .num_kv_heads = geometry.num_kv_heads, .head_dim = geometry.head_dim });
+    }
+    return result;
+}
+
+test "decoder KV capacity geometry preserves sparse architectural layers and compact stored owners" {
+    var model = Config{ .family = .qwen3_5, .num_hidden_layers = 8, .num_attention_heads = 4, .num_key_value_heads = 2, .attention_head_dim = 32, .qwen35_full_attention_interval = 4, .qwen35_has_linear_attention = true };
+    const architectural = try requiredKvGeometry(&model, .{ .layer_layout = .architectural });
+    try std.testing.expectEqual(@as(u16, 2), architectural.count);
+    try std.testing.expectEqual(@as(u16, 3), architectural.layers[0].index);
+    try std.testing.expectEqual(@as(u16, 7), architectural.layers[1].index);
+    try std.testing.expectEqual(@as(usize, 64), try architectural.layers[0].width());
+    model.compact_qwen35_kv = true;
+    // A compact flag alone cannot change the validated architecture contract.
+    const unsupported_compact = try requiredKvGeometry(&model, .{});
+    try std.testing.expectEqual(@as(u16, 3), unsupported_compact.layers[0].index);
+    var compact = try @import("../models/gpt.zig").parseConfig(std.testing.allocator, @embedFile("../models/testdata/lightonocr3/config.json"));
+    compact.num_hidden_layers = 8;
+    compact.compact_qwen35_kv = true;
+    try std.testing.expect(compact.usesCompactQwen35Kv());
+    const stored = try requiredKvGeometry(&compact, .{});
+    try std.testing.expectEqual(@as(u16, 2), stored.count);
+    try std.testing.expectEqual(@as(u16, 0), stored.layers[0].index);
+    try std.testing.expectEqual(@as(u16, 1), stored.layers[1].index);
+    const ordinary = Config{ .num_hidden_layers = 3, .num_attention_heads = 4, .num_key_value_heads = 2, .attention_head_dim = 32 };
+    const dense = try requiredKvGeometry(&ordinary, .{});
+    try std.testing.expectEqual(@as(u16, 3), dense.count);
+    for (dense.items(), 0..) |layer, index| try std.testing.expectEqual(index, layer.index);
 }

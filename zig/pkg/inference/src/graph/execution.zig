@@ -57,12 +57,24 @@ pub const Context = struct {
     artifact_dir: ?[]const u8 = null,
     pjrt_client: ?*anyopaque = null,
     session: ?@import("../backends/session.zig").Session = null,
+    /// Borrowed exact outer owner; reader stores it in stable epoch allocation.
+    cleanup_epoch: ?*const @import("../execution/retirement_sink.zig").Epoch = null,
+    /// Borrowed from the actual retaining model owner. A standalone/draft
+    /// execution need not acquire Session numerical/provider capabilities just
+    /// to publish its physical observations. The model outlives this context.
+    diagnostics_binding: ?@import("../execution/invocation_observation.zig").Binding = null,
     kv_dtype: ?@import("../runtime/root.zig").kv.pool.KvDType = null,
     shared_moe_cache: ?*@import("../runtime/root.zig").moe.shared.SharedExpertCache = null,
     device_mesh: ?*device_mesh.DeviceMesh = null,
     parallel_config: ?parallel_strategy.ParallelConfig = null,
     compiled_partition_backend: ?contracts.BackendKind = null,
     compiled_attachment_target: compiled_backend.AttachmentTarget = .partitioned,
+
+    pub fn diagnosticsBinding(self: *const Context) ?@import("../execution/invocation_observation.zig").Binding {
+        if (self.diagnostics_binding) |binding| return binding;
+        const owner = self.session orelse return null;
+        return owner.invocation_diagnostics;
+    }
 
     pub fn graphWeight(self: *const Context, name: []const u8) !ops.CT {
         if (self.weights) |source| return source.get_fn(source.ptr, name);
@@ -335,14 +347,13 @@ const FallbackNativeBackend = struct {
             .lazy_weights = .empty,
         };
 
-        const compute = try allocator.create(native_compute.NativeCompute);
-        errdefer allocator.destroy(compute);
-        compute.* = native_compute.NativeCompute.init(allocator, weight_store, null);
+        const backend = try @import("../backends/compute_factory.zig").createNative(allocator, weight_store, null, null, .{});
+        const compute: *native_compute.NativeCompute = @ptrCast(@alignCast(backend.ptr));
 
         return .{
             .weight_store = weight_store,
             .compute = compute,
-            .backend = compute.computeBackend(),
+            .backend = backend,
         };
     }
 
@@ -559,6 +570,29 @@ pub fn executeExplicitCompiledPartitionBackend(
     return try multiResultLastOutputToFloat32(allocator, &mesh, &multi_result);
 }
 
+// Borrows an explicitly supplied outer owner, or retains only the epoch
+// bound to THIS validated backend operation. It never creates an epoch or
+// infers authority from an unrelated currently active task/provider.
+const RequestCleanupEpoch = struct {
+    supplied: ?*const @import("../execution/retirement_sink.zig").Epoch = null,
+    inherited: ?@import("../execution/retirement_sink.zig").Epoch = null,
+    fn init(context: *const Context) !@This() {
+        if (context.cleanup_epoch) |epoch| {
+            if (try epoch.isSealed()) return error.RetirementEpochSealed;
+            return .{ .supplied = epoch };
+        }
+        const token = context.cb.operationToken() orelse return .{};
+        return .{ .inherited = try token.retainCleanupEpoch() };
+    }
+    fn current(self: *const @This()) ?*const @import("../execution/retirement_sink.zig").Epoch {
+        return self.supplied orelse if (self.inherited) |*value| value else null;
+    }
+    fn deinit(self: *@This()) void {
+        if (self.inherited) |*value| value.release();
+        self.* = .{};
+    }
+};
+
 pub fn graphForwardCompiledModelLast(
     pipeline: *const Context,
     cache: *cache_mod.GraphCache,
@@ -583,10 +617,18 @@ pub fn graphForwardCompiledModelLast(
         );
         return null;
     }
+    var cleanup = try RequestCleanupEpoch.init(pipeline);
+    defer cleanup.deinit();
     const allocator = pipeline.allocator;
     const attention_mode = cacheAttentionMode(decode_context);
     const attach_context = compiledBackendAttachContext(pipeline, backend, attention_mode);
-    const request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode, pipeline.execution_control);
+    var request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode, pipeline.execution_control);
+    switch (request) {
+        inline else => |*value| {
+            value.backend_operation = pipeline.cb.operationToken();
+            value.cleanup_epoch = cleanup.current();
+        },
+    }
     if (try backend_def.candidate(allocator, cache, attach_context, .single_device)) |candidate| {
         if (try candidate.forward(allocator, request)) |last_logits| return last_logits;
     }
@@ -675,9 +717,11 @@ pub fn prepareCompiledModelRuntime(
     const backend_def = compiledBackendDefinition(backend) orelse return false;
     if (backend_def.model_runtime_strategy == .none) return false;
 
+    var cleanup = try RequestCleanupEpoch.init(pipeline);
+    defer cleanup.deinit();
     const attach_context = compiledBackendAttachContext(pipeline, backend, null);
     const candidate = (try backend_def.candidate(pipeline.allocator, cache, attach_context, .single_device)) orelse return false;
-    return candidate.prepare(pipeline.allocator, .{ .execution_control = pipeline.execution_control, .kv_tokens_hint = kv_tokens_hint });
+    return candidate.prepare(pipeline.allocator, .{ .execution_control = pipeline.execution_control, .kv_tokens_hint = kv_tokens_hint, .backend_operation = pipeline.cb.operationToken(), .cleanup_epoch = cleanup.current() });
 }
 
 pub fn graphForwardCompiledModelOutput(
@@ -695,8 +739,16 @@ pub fn graphForwardCompiledModelOutput(
     if (backend_def.model_runtime_strategy == .none) return null;
 
     const attention_mode = cacheAttentionMode(decode_context);
+    var cleanup = try RequestCleanupEpoch.init(pipeline);
+    defer cleanup.deinit();
     const attach_context = compiledBackendAttachContext(pipeline, backend, attention_mode);
-    const request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode, pipeline.execution_control);
+    var request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode, pipeline.execution_control);
+    switch (request) {
+        inline else => |*value| {
+            value.backend_operation = pipeline.cb.operationToken();
+            value.cleanup_epoch = cleanup.current();
+        },
+    }
     const candidate = (try backend_def.candidate(pipeline.allocator, cache, attach_context, .single_device)) orelse return null;
     return candidate.output(pipeline.allocator, request);
 }
@@ -717,8 +769,16 @@ pub fn graphForwardCompiledModelGreedyToken(
     if (backend_def.model_runtime_strategy == .none) return null;
 
     const attention_mode = cacheAttentionMode(decode_context);
+    var cleanup = try RequestCleanupEpoch.init(pipeline);
+    defer cleanup.deinit();
     const attach_context = compiledBackendAttachContext(pipeline, backend, attention_mode);
-    const request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode, pipeline.execution_control);
+    var request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode, pipeline.execution_control);
+    switch (request) {
+        inline else => |*value| {
+            value.backend_operation = pipeline.cb.operationToken();
+            value.cleanup_epoch = cleanup.current();
+        },
+    }
     const candidate = (try backend_def.candidate(pipeline.allocator, cache, attach_context, .single_device)) orelse return null;
     return candidate.greedy(pipeline.allocator, request, vocab_size);
 }
@@ -737,13 +797,18 @@ pub fn graphForwardCompiledModelSampledToken(
     const backend_def = compiledBackendDefinition(backend) orelse return null;
     if (backend_def.model_runtime_strategy == .none) return null;
 
+    var cleanup = try RequestCleanupEpoch.init(pipeline);
+    defer cleanup.deinit();
     const attach_context = compiledBackendAttachContext(
         pipeline,
         backend,
         request.decode.attention_mode,
     );
     const candidate = (try backend_def.candidate(pipeline.allocator, cache, attach_context, .single_device)) orelse return null;
-    return candidate.sample(pipeline.allocator, request);
+    var scoped = request;
+    scoped.decode.backend_operation = pipeline.cb.operationToken();
+    scoped.decode.cleanup_epoch = cleanup.current();
+    return candidate.sample(pipeline.allocator, scoped);
 }
 
 test "shouldUsePartitionedGraphExecution requires explicit sharding config" {
@@ -981,4 +1046,45 @@ test "decoder graph cache owns tracing allocations and failed traces remain retr
         // Total KV length changes each step; the physical query remains one row.
         try std.testing.expect(decode_entry == try ensureGraphEntry(&pipeline, &cache, &.{0}, 1, 15, &decode));
     }
+}
+
+const ObservedGraphFallbackFixture = struct {
+    fn run(a: std.mem.Allocator) !void {
+        var fallback = try FallbackNativeBackend.init(a);
+        defer fallback.deinit(a);
+        try std.testing.expect(fallback.compute.data == fallback.weight_store);
+        try std.testing.expectEqual(@import("../execution/allocation_registry.zig").enabled(), @import("../execution/allocation_observer.zig").State.forAllocator(fallback.compute.allocator) != null);
+        const input = try fallback.backend.fromFloat32Shape(&.{ 1, 2, 3 }, &.{3});
+        defer fallback.backend.free(input);
+        const output = try fallback.backend.add(input, input);
+        defer fallback.backend.free(output);
+        const values = try fallback.backend.toFloat32(output, a);
+        defer a.free(values);
+        try std.testing.expectEqualSlices(f32, &.{ 2, 4, 6 }, values);
+    }
+    fn observed(a: std.mem.Allocator) !void {
+        var registry: @import("../execution/allocation_registry.zig").Registry = undefined;
+        registry.begin(std.testing.allocator);
+        defer _ = registry.finish();
+        try run(a);
+    }
+};
+
+test "graph fallback Native factory preserves numerical owner identity and disabled constructor allocations" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    try std.testing.expect(!@import("../execution/allocation_registry.zig").enabled());
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var fallback = try FallbackNativeBackend.init(backing.allocator());
+    defer fallback.deinit(backing.allocator());
+    try std.testing.expectEqual(@as(usize, 2), backing.alloc_index);
+    try std.testing.expect(fallback.compute.allocator.vtable == backing.allocator().vtable and fallback.compute.allocator.ptr == backing.allocator().ptr);
+    try ObservedGraphFallbackFixture.run(std.testing.allocator);
+    try ObservedGraphFallbackFixture.observed(std.testing.allocator);
+}
+
+test "graph fallback Native factory required allocations and observed numerics unwind all faults" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), ObservedGraphFallbackFixture.run, .{});
+    try std.testing.checkAllAllocationFailures(backing.allocator(), ObservedGraphFallbackFixture.observed, .{});
 }

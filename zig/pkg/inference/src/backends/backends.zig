@@ -245,6 +245,7 @@ const RequiredBackendConfig = struct {
 /// SessionManager selects the best available backend and creates sessions.
 pub const SessionManager = struct {
     allocator: std.mem.Allocator,
+    execution_diagnostics: @import("../execution/diagnostic_policy.zig").Policy = .{},
     preferred_backends: []const BackendType,
     required_backend: ?BackendType = null,
     required_backend_invalid: bool = false,
@@ -279,6 +280,7 @@ pub const SessionManager = struct {
         return .{
             .allocator = allocator,
             .preferred_backends = configuredPreferredBackends(),
+            .execution_diagnostics = @import("../execution/diagnostic_policy.zig").Policy.fromEnvironment(),
             .required_backend = required.backend,
             .required_backend_invalid = required.invalid,
         };
@@ -289,6 +291,7 @@ pub const SessionManager = struct {
         return .{
             .allocator = allocator,
             .preferred_backends = configuredPreferredBackends(),
+            .execution_diagnostics = @import("../execution/diagnostic_policy.zig").Policy.fromEnvironment(),
             .required_backend = required.backend,
             .required_backend_invalid = required.invalid,
             .io = io,
@@ -331,6 +334,19 @@ pub const SessionManager = struct {
         model_path: []const u8,
         shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext,
     ) !Session {
+        if (!self.execution_diagnostics.enabled) return self.loadModelConfigured(model_path, shared_backend_ctx);
+        const observer = try @import("../execution/allocation_observer.zig").State.create(self.allocator, .from_owner_creation);
+        defer observer.release();
+        var observed = self.*;
+        observed.allocator = observer.allocator();
+        const session = try observed.loadModelConfigured(model_path, shared_backend_ctx);
+        errdefer session.close();
+        if (!session.configureExecutionDiagnostics(true)) return error.ExecutionDiagnosticsUnavailable;
+        if (session.invocation_diagnostics) |binding| binding.diagnostics.configureExport();
+        return session;
+    }
+
+    fn loadModelConfigured(self: *SessionManager, model_path: []const u8, shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext) !Session {
         var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch null;
         defer if (manifest) |*m| m.deinit();
         var effective_buf: [backend_order_capacity]BackendType = undefined;
@@ -476,12 +492,14 @@ pub const SessionManager = struct {
                     continue,
                 .native => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx) catch |err| {
+                        if (err == error.OutOfMemory) return err;
                         std.log.err("imported onnx native session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;
                     }
                 else
                     session_factory.createNativeSession(self.allocator, model_path) catch |err| {
+                        if (err == error.OutOfMemory) return err;
                         std.log.err("native session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;

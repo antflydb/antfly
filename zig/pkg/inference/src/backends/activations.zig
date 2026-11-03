@@ -67,6 +67,9 @@ fn applyActivation(comptime kind: kernel_math.Activation, data: []f32) void {
         data[i..][0..VEC_LEN].* = kernel_math.evaluate(vector_recipe, VectorMath, v);
     }
     while (i < data.len) : (i += 1) data[i] = kernel_math.evaluate(scalar_recipe, kernel_math.ScalarMath, data[i]);
+    // Observe only after this actual terminal body completed. Independent
+    // worker threads stay outside the submitting-thread observation scope.
+    @import("../execution/runtime_observation.zig").nativeActivationBody(@tagName(kind), VEC_LEN, data.len / VEC_LEN, data.len % VEC_LEN);
 }
 
 /// GELU and gate multiplication stream through cache-sized tiles. Workers

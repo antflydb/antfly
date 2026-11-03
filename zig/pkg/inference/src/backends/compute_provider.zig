@@ -45,10 +45,13 @@ pub const ManagedComputeBackend = struct {
     completion: ?Completion = null,
 
     pub fn deinit(self: *ManagedComputeBackend) void {
+        self.deinitWithCleanup(.{ .outside_execution = true });
+    }
+    pub fn deinitWithCleanup(self: *ManagedComputeBackend, current: @import("../execution/cleanup_context.zig").Context) void {
         if (!self.owns_backend) return;
         self.owns_backend = false;
         defer self.guard.deinit();
-        self.backend.deinit();
+        self.backend.deinitWithCleanup(current);
         if (self.completion) |completion| {
             // An incomplete drain cannot safely permit arena reuse or unload.
             completion.finish() catch platform.inference_process_supervisor.restartWorker();
@@ -140,7 +143,7 @@ test "published compute provider protects construction rollback and generation c
     var vtable: Session.VTable = undefined;
     vtable.backend = Probe.backend;
     vtable.interruption = null;
-    const session = Session{ .ptr = &probe, .vtable = &vtable, .compute_backend_provider = .{ .ptr = &probe, .acquire = Probe.create } };
+    const session = Session{ .ptr = &probe, .vtable = &vtable, .compute_backend_provider = .{ .ptr = &probe, .services = &.{ .acquire = Probe.create } } };
     const control = Control{
         .hard_cancellation = .{ .ptr = &probe, .arm_fn = Probe.arm, .disarm_fn = Probe.disarm },
         .cancellation = .{ .ptr = &probe, .is_cancelled_fn = Probe.isCancelled },

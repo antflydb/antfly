@@ -95,8 +95,8 @@ pub const CudaContext = struct {
     video_decoder_release: ?*const fn (*anyopaque) callconv(.c) void = null,
     video_cache_budget: @import("video_cache_budget.zig").CacheBudget = .{},
     stats: RuntimeStats = .{},
-    observation: ?*@import("graph_observation.zig").State = null,
-    observation_enable_failed: bool = false,
+    observation: std.atomic.Value(?*@import("graph_observation.zig").State) = .init(null),
+    observation_enable_failed: std.atomic.Value(bool) = .init(false),
     device_allocations: @import("allocation_budget.zig").Budget = .{},
     debug_graph_capture_active: bool = false,
     debug_graph_capture_id: usize = 0,
@@ -104,16 +104,20 @@ pub const CudaContext = struct {
     debug_graph_capture_tensor_trace_count: usize = 0,
 
     pub fn enableRuntimeObservation(self: *CudaContext) void {
-        if (self.observation != null) return;
-        self.observation = @import("graph_observation.zig").State.create(std.heap.page_allocator) catch {
-            self.observation_enable_failed = true;
+        self.enableRuntimeObservationWithAllocator(std.heap.page_allocator);
+    }
+    fn enableRuntimeObservationWithAllocator(self: *CudaContext, allocator: std.mem.Allocator) void {
+        if (self.observation.load(.acquire) != null) return;
+        const candidate = @import("graph_observation.zig").State.create(allocator) catch {
+            self.observation_enable_failed.store(true, .release);
             return;
         };
-        self.observation_enable_failed = false;
+        if (self.observation.cmpxchgStrong(null, candidate, .acq_rel, .acquire)) |_| candidate.deinit();
+        self.observation_enable_failed.store(false, .release);
     }
     pub fn runtimeObservation(self: *const CudaContext) ?@import("../../execution/runtime_telemetry.zig").Cuda {
-        if (self.observation) |state| return state.snapshot();
-        return if (self.observation_enable_failed) .{ .state = .allocation_failed } else null;
+        if (self.observation.load(.acquire)) |state| return state.snapshot();
+        return if (self.observation_enable_failed.load(.acquire)) .{ .state = .allocation_failed } else null;
     }
     fn graphObservationApi(self: *const CudaContext) @import("graph_observation.zig").Api {
         return .{ .get_nodes = self.driver.fns.cuGraphGetNodes, .get_type = self.driver.fns.cuGraphNodeGetType, .get_child = self.driver.fns.cuGraphChildGraphNodeGetGraph };
@@ -168,13 +172,17 @@ pub const CudaContext = struct {
         checkStep(&driver, "cuStreamCreate", driver.fns.cuStreamCreate(&stream, 0)) catch |err| return err;
         errdefer _ = driver.fns.cuStreamDestroy(stream);
 
-        return .{
+        var result = CudaContext{
             .driver = driver,
             .device = device,
             .ctx = ctx,
             .stream = stream,
             .info = info,
         };
+        // New temporary contexts are not yet shared. Observe them before
+        // constructor work can submit numerical commands in an active scope.
+        if (@import("../../execution/allocation_registry.zig").enabled()) result.enableRuntimeObservation();
+        return result;
     }
 
     /// Called under the session execution lock. Keep cache admission attached
@@ -204,8 +212,7 @@ pub const CudaContext = struct {
     /// Leave driver entry points loaded for host-only cleanup after a lost
     /// context has relinquished all in-flight device references.
     pub fn releaseResources(self: *CudaContext) void {
-        if (self.observation) |state| state.deinit();
-        self.observation = null;
+        if (self.observation.swap(null, .acq_rel)) |state| state.deinit();
         if (self.ctx != null) {
             _ = self.driver.fns.cuCtxSetCurrent(self.ctx);
         }
@@ -234,19 +241,19 @@ pub const CudaContext = struct {
     /// inside a vendor operation/free or measured CPU blocking time.
     pub inline fn synchronizeStreamResult(self: *CudaContext, stream: CUstream) driver_mod.CUresult {
         const result = self.driver.fns.cuStreamSynchronize(stream);
-        if (self.observation) |state| state.hostSynchronization(false, result);
+        if (self.observation.load(.acquire)) |state| state.hostSynchronization(false, result);
         return result;
     }
     pub inline fn synchronizeEventResult(self: *CudaContext, event: CUevent) driver_mod.CUresult {
         const result = self.driver.fns.cuEventSynchronize(event);
-        if (self.observation) |state| state.hostSynchronization(true, result);
+        if (self.observation.load(.acquire)) |state| state.hostSynchronization(true, result);
         return result;
     }
     /// A GPU dependency is distinct from a host wait. Owned-stream recording
     /// is separate; another stream's capture state is deliberately unknown.
     pub inline fn waitStreamEventResult(self: *CudaContext, stream: CUstream, event: CUevent, flags: c_uint) driver_mod.CUresult {
         const result = self.driver.fns.cuStreamWaitEvent(stream, event, flags);
-        if (self.observation) |state| state.streamDependency(stream == self.stream, self.debug_graph_capture_active, result);
+        if (self.observation.load(.acquire)) |state| state.streamDependency(stream == self.stream, self.debug_graph_capture_active, result);
         return result;
     }
 
@@ -325,7 +332,7 @@ pub const CudaContext = struct {
             try self.driver.check(self.driver.fns.cuGraphInstantiate(&exec, graph, 0));
         }
         if (exec == null) return error.InvalidCudaState;
-        if (self.observation) |state| state.register(self.graphObservationApi(), graph, exec);
+        if (self.observation.load(.acquire)) |state| state.register(self.graphObservationApi(), graph, exec);
         return exec;
     }
 
@@ -338,7 +345,7 @@ pub const CudaContext = struct {
         outcome.update_result = result_info.result;
         outcome.error_node = result_info.errorNode;
         outcome.error_from_node = result_info.errorFromNode;
-        if (outcome.success()) if (self.observation) |state| {
+        if (outcome.success()) if (self.observation.load(.acquire)) |state| {
             state.register(self.graphObservationApi(), graph, exec);
         };
         return outcome;
@@ -350,7 +357,7 @@ pub const CudaContext = struct {
         // Preserve legacy API-event counters without calling this an eager kernel.
         self.stats.kernel_launches += 1;
         self.stats.graph_submissions += 1;
-        if (self.observation) |state| state.graphCall(exec, self.debug_graph_capture_active);
+        if (self.observation.load(.acquire)) |state| state.graphCall(exec, self.debug_graph_capture_active);
     }
 
     /// Return the driver's authoritative stream-capture state when the
@@ -421,7 +428,7 @@ pub const CudaContext = struct {
     pub fn destroyGraphExec(self: *CudaContext, exec: CUgraphExec) void {
         if (exec == null) return;
         self.makeCurrent() catch {};
-        if (self.observation) |state| state.retire(exec);
+        if (self.observation.load(.acquire)) |state| state.retire(exec);
         _ = self.driver.fns.cuGraphExecDestroy(exec);
     }
 
@@ -451,13 +458,15 @@ pub const CudaContext = struct {
     pub inline fn launchKernel(self: *CudaContext, function: driver_mod.CUfunction, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, by: c_uint, bz: c_uint, shared_bytes: c_uint, stream: CUstream, params: ?[*]?*anyopaque, extra: ?[*]?*anyopaque) driver_mod.Error!void {
         try self.driver.check(self.driver.fns.cuLaunchKernel(function, gx, gy, gz, bx, by, bz, shared_bytes, stream, params, extra));
         self.noteObservedKernel(stream);
+        @import("../../execution/runtime_observation.zig").cudaKernel(@intFromPtr(self), @intFromPtr(function), @intFromPtr(stream), false, .{ gx, gy, gz }, .{ bx, by, bz }, shared_bytes, self.debug_graph_capture_active, stream != self.stream);
     }
     pub inline fn launchCooperativeKernel(self: *CudaContext, launch: anytype, function: driver_mod.CUfunction, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, by: c_uint, bz: c_uint, shared_bytes: c_uint, stream: CUstream, params: ?[*]?*anyopaque) driver_mod.Error!void {
         try self.driver.check(launch(function, gx, gy, gz, bx, by, bz, shared_bytes, stream, params));
         self.noteObservedKernel(stream);
+        @import("../../execution/runtime_observation.zig").cudaKernel(@intFromPtr(self), @intFromPtr(function), @intFromPtr(stream), true, .{ gx, gy, gz }, .{ bx, by, bz }, shared_bytes, self.debug_graph_capture_active, stream != self.stream);
     }
     inline fn noteObservedKernel(self: *CudaContext, stream: CUstream) void {
-        if (self.observation) |state| {
+        if (self.observation.load(.acquire)) |state| {
             if (stream == self.stream) state.kernelCall(self.debug_graph_capture_active) else state.foreignKernelCall();
         }
     }
@@ -501,13 +510,13 @@ test "CUDA explicit wait helpers preserve arguments statuses and host dependency
     const state = try @import("graph_observation.zig").State.create(std.testing.allocator);
     defer state.deinit();
     var context: CudaContext = undefined;
-    context.observation = null;
-    context.observation_enable_failed = false;
+    context.observation.store(null, .release);
+    context.observation_enable_failed.store(false, .release);
     context.driver = undefined;
     context.driver.fns.cuStreamSynchronize = Fake.stream;
     context.driver.fns.cuEventSynchronize = Fake.event;
     context.driver.fns.cuStreamWaitEvent = Fake.depend;
-    context.observation = state;
+    context.observation.store(state, .release);
     context.stream = @ptrFromInt(1);
     context.debug_graph_capture_active = false;
     context.stats = .{};
@@ -536,6 +545,51 @@ test "CUDA explicit wait helpers preserve arguments statuses and host dependency
     try std.testing.expectEqual(@as(usize, 0), context.stats.stream_syncs);
     // The optional observer does not alter a silent cleanup caller's driver
     // status handling, even when no observation owner has been installed.
-    context.observation = null;
+    context.observation.store(null, .release);
     try std.testing.expectEqual(@as(driver_mod.CUresult, 1), context.synchronizeStreamResult(Fake.expected_stream));
+}
+
+test "CUDA observation cold installation publishes one complete state and retires racing candidates" {
+    const BarrierAllocator = struct {
+        arrivals: std.atomic.Value(usize) = .init(0),
+        frees: std.atomic.Value(usize) = .init(0),
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const result = std.heap.page_allocator.rawAlloc(len, alignment, ret_addr) orelse return null;
+            _ = self.arrivals.fetchAdd(1, .acq_rel);
+            while (self.arrivals.load(.acquire) < 2) std.atomic.spinLoopHint();
+            return result;
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.frees.fetchAdd(1, .monotonic);
+            std.heap.page_allocator.rawFree(bytes, alignment, ret_addr);
+        }
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+        }
+    };
+    const Worker = struct {
+        fn run(context: *CudaContext, allocator: std.mem.Allocator) void {
+            context.enableRuntimeObservationWithAllocator(allocator);
+        }
+    };
+    var allocator = BarrierAllocator{};
+    var context: CudaContext = undefined;
+    context.observation = .init(null);
+    context.observation_enable_failed = .init(false);
+    defer if (context.observation.swap(null, .acq_rel)) |state| state.deinit();
+    var future = try std.testing.io.concurrent(Worker.run, .{ &context, allocator.allocator() });
+    defer future.await(std.testing.io);
+    Worker.run(&context, allocator.allocator());
+    future.await(std.testing.io);
+    const installed = context.observation.load(.acquire) orelse return error.MissingObservationState;
+    try std.testing.expectEqual(@as(usize, 2), allocator.arrivals.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), allocator.frees.load(.monotonic));
+    context.enableRuntimeObservation();
+    try std.testing.expect(context.observation.load(.acquire) == installed);
+    try std.testing.expect(context.runtimeObservation().?.counters != null);
+    context.observation.store(null, .release);
+    installed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), allocator.frees.load(.monotonic));
 }

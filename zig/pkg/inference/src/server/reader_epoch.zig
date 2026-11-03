@@ -29,6 +29,12 @@ const metal_runtime = @import("../backends/metal_runtime.zig");
 const qwen3vl_projector = @import("../architectures/qwen3vl_projector.zig");
 
 const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
+const banks = @import("../execution/prepared_kv_banks.zig");
+const cold_target = @import("../backends/cold_compute_target.zig");
+const compute_factory = @import("../backends/compute_factory.zig");
+const capacity = @import("../runtime/kv/device_capacity.zig");
+const storage_admission = @import("../execution/storage_admission.zig");
+const cleanup_owner = @import("../execution/cleanup_owner.zig");
 var lighton_stream_execution_id: std.atomic.Value(u64) = .init(1);
 
 /// Owns a reader epoch, its worker, page controls and all shared leases.
@@ -44,11 +50,16 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
         auxiliary_acquisitions: usize = 0,
         budget: runtime.tier.memory.RunBudget,
         lane: execution_control_mod.ExecutionLane.Lease,
+        cleanup_owner: @import("../execution/cleanup_owner.zig").Owner = .{},
         coordinator: runtime.scheduler.native_generate.NativeGenerateCoordinator,
         manager: runtime.kv.manager.KvManager,
         storage: runtime.kv.storage_runtime.KvStorageRuntime = undefined,
         pool: runtime.kv.block.KvPoolId = undefined,
         cb: ?ops.ComputeBackend = null,
+        kv_bank: ?banks.Owned = null,
+        // Frozen outside Poolmutex, points into the actual bank retained here.
+        bank_coverage: ?banks.Coverage = null,
+        bank_adopted: bool = false,
         execution_gate_wait_ns: u64 = 0,
         phase_wait_ns: u64 = 0,
         phase_fair: bool = false,
@@ -114,16 +125,101 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             dynamic_vision_batch_items: usize = 0,
             features: ExecutionFeatures = .{},
             control: InferenceExecutionControl,
+            kv_target: ?cold_target.Retained = null,
+            kv_descriptor: ?banks.Descriptor = null,
+            kv_geometry: capacity.Geometry = .{},
+            kv_domain: ?runtime.tier.admission_domain.Pin = null,
+
+            pub fn describeKv(self: *Factory, prefix: usize, max_new: usize, live: usize, dtype: runtime.kv.pool.KvDType) !void {
+                const session = self.model.session;
+                const policy = session.run_admission orelse return;
+                const model = session.model_lifetime orelse return;
+                if (self.control.native_call_policy == .require_supervision and model.close_protection == null) return;
+                const config = generation.requestKvManagerPoolConfig(generation.kvPoolConfig(if (session.backend() == .cuda) .cuda else .metal, dtype, self.cfg, Hooks.generationKvSlidingTrimForced()));
+                // Cyclic/selected stores require separate proven owners. This
+                // path describes only full-history ordinary request storage.
+                if (config.sliding_window_size != null) return;
+                self.kv_geometry = try @import("../execution/decoder_storage.zig").requiredKvGeometry(&self.cfg, .{});
+                if (self.kv_geometry.count == 0) return;
+                var target = (try cold_target.Retained.acquire(session, self.control)) orelse return; // lazy Metal honestly falls back
+                defer target.deinit();
+                const mode: banks.Mode = if (session.backend() == .cuda and dtype == .f32) .sequence_private else .shared_physical_pages;
+                // Scheduler withholds one spare physical page from a global
+                // pool; private planes have no shared-COW/spare-page contract.
+                const window = try capacity.Window.fromRequest(prefix, max_new, live, config.page_size_tokens, if (mode == .shared_physical_pages) 1 else 0);
+                const descriptor = (try compute_factory.describeKvCoverage(target.target, dtype, window, mode, self.kv_geometry.items())) orelse return;
+                const domain = model.retainAdmissionDomain(policy.controller) orelse return;
+                self.kv_domain = domain;
+                self.kv_descriptor = descriptor;
+                self.kv_target = target;
+                target.model = null;
+            }
+            pub fn deinitKv(self: *Factory) void {
+                if (self.kv_target) |*target| target.deinit();
+                self.kv_target = null;
+                if (self.kv_domain) |pin| pin.release();
+                self.kv_domain = null;
+            }
+            fn reserveKv(raw: *anyopaque, _: std.mem.Allocator, bytes: usize) !storage_admission.Reservation {
+                const self: *Factory = @ptrCast(@alignCast(raw));
+                const policy = self.model.session.run_admission orelse return error.InvalidDeviceCapacityAdmission;
+                const pin = self.kv_domain orelse return error.InvalidDeviceCapacityAdmission;
+                const lifetime = storage_admission.Lifetime.forAdmissionDomain(pin);
+                if (!lifetime.acquire()) return error.InvalidDeviceCapacityAdmission;
+                errdefer lifetime.release(lifetime.context);
+                const lease = try policy.controller.tryAcquire(policy.backend_class, self.limits, .{ .backend_kv_bytes = bytes }, policy.check_live_memory);
+                return .{ .identity = .{ .controller = policy.controller, .backend_class = policy.backend_class }, .leases = .{ lease, null }, .lifetime = lifetime, .domain = .backend_kv };
+            }
+            fn prepareKv(self: *Factory) !?banks.Owned {
+                const descriptor = if (self.kv_descriptor) |*value| value else return null;
+                const target = if (self.kv_target) |*value| value else return null;
+                const policy = self.model.session.run_admission orelse return null;
+                var preparation = try cleanup_owner.Owner.beginAdmitted(self.model.session);
+                defer preparation.finishAfterUnlock();
+                const epoch = preparation.epoch() orelse return null;
+                // The Pool invokes create only for an empty epoch, outside its
+                // mutex. Neither real model nor reader lane has been acquired.
+                return compute_factory.prepareKvBanks(target, descriptor.dtype, descriptor.window, descriptor.mode, self.kv_geometry.items(), .{ .identity = .{ .controller = policy.controller, .backend_class = policy.backend_class }, .context = self, .reserve = reserveKv, .domain = self.kv_domain }, self.control, epoch);
+            }
         };
+        pub fn compatible(existing: *const anyopaque, requested: *const anyopaque) bool {
+            const ctx: *const LightOnStreamContext = @ptrCast(@alignCast(existing));
+            const factory: *const Factory = @ptrCast(@alignCast(requested));
+            if (!std.meta.eql(ctx.features, factory.features) or ctx.cfg.compact_qwen35_kv != factory.cfg.compact_qwen35_kv or ctx.cfg.qwen35_device_only_state != factory.cfg.qwen35_device_only_state) return false;
+            if (ctx.bank_coverage) |available| return if (factory.kv_descriptor) |*request| available.covers(request.coverage()) else false;
+            return factory.kv_descriptor == null;
+        }
+        pub fn pageAmounts(ctx: *const LightOnStreamContext, factory: *const Factory, original: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionAmounts {
+            var result = original;
+            if (ctx.bank_coverage) |available| if (factory.kv_descriptor) |*request| if (available.covers(request.coverage())) {
+                result.backend_kv_bytes = 0;
+            };
+            return result;
+        }
         pub fn create(raw: *anyopaque) !*anyopaque {
             const factory: *Factory = @ptrCast(@alignCast(raw));
+            // Reserve the exact epoch BEFORE either real outer execution lane.
+            // The model's generation mutex remains owned until destroy, so a
+            // per-step boundary would be too short for provider/cache cleanup.
+            // Reserve lifetime metadata first so every successful cold bank
+            // has a guaranteed current cleanup epoch on later create failure.
+            // Each Owner has a distinct epoch, even on the same model sink.
+            var cleanup = try cleanup_owner.Owner.beginAdmitted(factory.model.session);
+            errdefer cleanup.finishAfterUnlock();
+            var bank = if (cleanup.epoch() != null) try factory.prepareKv() else null;
+            errdefer if (bank) |*value| value.abortOutsideLanes(cleanup.epoch().?);
+            const coverage = if (bank) |value| try value.snapshotCoverage() else null;
             const lane = try factory.model.native_reader_execution_lane.acquire(factory.control);
             errdefer lane.release();
             try factory.control.lock(factory.model.nativeGenerationMutex());
             errdefer factory.model.unlockNativeGeneration();
             const a = std.heap.smp_allocator;
             const ctx = try a.create(LightOnStreamContext);
-            ctx.* = .{ .allocator = a, .model = factory.model, .cfg = factory.cfg, .features = factory.features, .auxiliary_ready = .init(!factory.features.needsAuxiliary()), .budget = runtime.tier.memory.RunBudget.init(factory.limits), .lane = lane, .coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(a), .manager = runtime.kv.manager.KvManager.init(a), .vision_peak = .{ .max_increments = factory.epoch_page_limit }, .vision_host_peak = .{ .max_increments = factory.epoch_page_limit }, .decoder_peak = .{ .max_increments = factory.epoch_page_limit }, .vision_broker = executor_microbatch.Broker.init(a), .prefill_broker = executor_microbatch.Broker.init(a), .execution_id = lighton_stream_execution_id.fetchAdd(1, .monotonic) };
+            ctx.* = .{ .allocator = a, .model = factory.model, .cfg = factory.cfg, .features = factory.features, .auxiliary_ready = .init(!factory.features.needsAuxiliary()), .budget = runtime.tier.memory.RunBudget.init(factory.limits), .lane = lane, .cleanup_owner = cleanup, .coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(a), .manager = runtime.kv.manager.KvManager.init(a), .vision_peak = .{ .max_increments = factory.epoch_page_limit }, .vision_host_peak = .{ .max_increments = factory.epoch_page_limit }, .decoder_peak = .{ .max_increments = factory.epoch_page_limit }, .vision_broker = executor_microbatch.Broker.init(a), .prefill_broker = executor_microbatch.Broker.init(a), .execution_id = lighton_stream_execution_id.fetchAdd(1, .monotonic) };
+            ctx.kv_bank = bank;
+            bank = null;
+            ctx.bank_coverage = coverage;
+            cleanup = .{}; // ownership moved into the stable epoch allocation
             if (factory.features.vision_late_seal) ctx.vision_broker.execution_mutex = &ctx.vision_seal_mutex;
             if (factory.features.prefill_late_seal) ctx.prefill_broker.execution_mutex = &ctx.prefill_seal_mutex;
             ctx.coordinator.setPolicy(factory.node.lightOnOcrPolicy(factory.physical_rows_limit));
@@ -143,6 +239,10 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
         pub fn destroy(raw: *anyopaque) void {
             const ctx: *LightOnStreamContext = @ptrCast(@alignCast(raw));
             std.debug.assert(ctx.registered_pages == 0);
+            var cleanup = ctx.cleanup_owner;
+            ctx.cleanup_owner = .{};
+            const cleanup_epoch = cleanup.epoch();
+            defer cleanup.finishAfterUnlock();
             // Published results can let the last caller retire while the
             // executor is still freeing its own output. Join before the CB,
             // coordinator, model lane, or worker-owned Io can be destroyed.
@@ -244,31 +344,39 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             }
             ctx.vision_broker.deinit();
             ctx.prefill_broker.deinit();
-            if (ctx.cb != null) ctx.storage.deinit();
+            if (ctx.cb != null) ctx.storage.deinitWithBoundary(cleanup_epoch);
             ctx.manager.deinit();
             if (ctx.cb) |*cb| cb.deinit();
             // The worker has joined and the backend has released plans and
             // cached activations. Admission waiters may have kept this epoch
             // alive after its last admitted page retired; retain its own lease
             // through that interval, independently of every page's lease.
+            ctx.coordinator.deinit();
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 shared_vision_peak_bytes={d} peak_segments={d}\n", .{ ctx.vision_peak.bytes, ctx.vision_peak.count });
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 shared_vision_host_peak_bytes={d} peak_segments={d}\n", .{ ctx.vision_host_peak.bytes, ctx.vision_host_peak.count });
+            const decoder_bytes = ctx.decoder_peak.bytes;
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 shared_decoder_scratch={d} shared_decoder_peak_bytes={d} peak_segments={d}\n", .{ @intFromBool(ctx.features.shared_decoder_scratch), decoder_bytes, ctx.decoder_peak.count });
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 prefill_host_scratch_acquisitions={d} prefill_host_scratch_releases={d} prefill_host_scratch_peak_bytes={d}\n", .{ ctx.prefill_host_scratch_acquisitions, ctx.prefill_host_scratch_releases, ctx.prefill_host_scratch_peak_bytes });
+            // SDK/cache cleanup is complete. Release BOTH actual outer lanes
+            // before external admission callbacks or current-epoch retirement.
+            ctx.model.unlockNativeGeneration();
+            ctx.lane.release();
+            // Physical storage was destroyed under the CURRENT lifetime epoch;
+            // the target pin/quota wrapper retires only after both real lanes.
+            if (ctx.kv_bank) |*bank| {
+                if (ctx.bank_adopted) bank.finishAfterUnlock(cleanup_epoch.?) else bank.abortOutsideLanes(cleanup_epoch.?);
+                ctx.kv_bank = null;
+            }
             if (ctx.auxiliary_lease) |*auxiliary| {
                 auxiliary.release();
                 ctx.auxiliary_lease = null;
                 if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 auxiliary_release_after_backend=1\n", .{});
             }
-            ctx.coordinator.deinit();
-            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 shared_vision_peak_bytes={d} peak_segments={d}\n", .{ ctx.vision_peak.bytes, ctx.vision_peak.count });
-            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 shared_vision_host_peak_bytes={d} peak_segments={d}\n", .{ ctx.vision_host_peak.bytes, ctx.vision_host_peak.count });
             ctx.vision_peak.deinit();
             ctx.vision_host_peak.deinit();
-            const decoder_bytes = ctx.decoder_peak.bytes;
-            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 shared_decoder_scratch={d} shared_decoder_peak_bytes={d} peak_segments={d}\n", .{ @intFromBool(ctx.features.shared_decoder_scratch), decoder_bytes, ctx.decoder_peak.count });
-            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 prefill_host_scratch_acquisitions={d} prefill_host_scratch_releases={d} prefill_host_scratch_peak_bytes={d}\n", .{ ctx.prefill_host_scratch_acquisitions, ctx.prefill_host_scratch_releases, ctx.prefill_host_scratch_peak_bytes });
-            // The worker joined, frames drained and backend caches retired above.
             ctx.decoder_peak.deinit();
             if (decoder_bytes != 0 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 decoder_scratch_release_after_backend=1\n", .{});
-            ctx.model.unlockNativeGeneration();
-            ctx.lane.release();
+            cleanup.finishAfterUnlock();
             ctx.allocator.destroy(ctx);
         }
         pub fn acquireVisionPeak(factory: *Factory, bytes: usize) !model_manager_mod.GenerationAdmissionLease {
@@ -520,6 +628,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                     .session = ctx.model.session,
                     .kv_dtype = ctx.worker_kv_dtype,
                     .execution_control = ctx.worker_control,
+                    .cleanup_epoch = ctx.cleanup_owner.epoch(),
                 },
                 .pad_token = ctx.model.getTokenizer().specialTokens().pad_id,
                 .continuation = ctx.worker_control,
@@ -585,13 +694,20 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             if (ctx.cb != null) return;
             var cb = try session_factory.getComputeBackendWithBudget(ctx.model.session, ctx.allocator, &ctx.budget);
             errdefer cb.deinit();
+            if (ctx.cleanup_owner.epoch() != null) {
+                const bound = try ctx.cleanup_owner.bindBackend(&cb);
+                // An acquired engine token must bind its exact owned record.
+                // Canonical model-owned/private targets without an engine token
+                // remain under this epoch's actual generation lane.
+                if (!bound and cb.operationToken() != null) return error.BackendOperationCleanupUnavailable;
+            }
             // The device hook owns CUDA KV bytes. Both epoch pools retain
             // logical pages without allocating a second pair of host mirrors.
             const config = generation.requestKvManagerPoolConfig(generation.kvPoolConfig(if (ctx.model.session.backend() == .cuda) .cuda else .metal, kv_dtype, ctx.cfg, Hooks.generationKvSlidingTrimForced()));
             ctx.pool = try ctx.manager.addPool(config);
             ctx.storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, config);
-            errdefer ctx.storage.deinit();
-            try cb.provisionKvDeviceWriteHook(&ctx.storage);
+            errdefer ctx.storage.deinitWithBoundary(ctx.cleanup_owner.epoch());
+            if (ctx.kv_bank == null) try cb.provisionKvDeviceWriteHook(&ctx.storage);
             if (comptime build_options.enable_metal) {
                 if (cb.kind() == .metal) {
                     const M = @import("../ops/metal_compute.zig").MetalCompute;
@@ -607,6 +723,15 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                     // It outlives cb.deinit and its explicit workspace clear.
                     try M.setLightOnVisionWorkspaceCache(&cb, ctx.features.vision_workspace_cache);
                 }
+            }
+            // LAST fallible validation/transfer. Leaf adoption publishes its
+            // already-owned hook only after all checks and ledger handoff.
+            if (ctx.kv_bank) |*bank| {
+                const blocks = try ctx.bank_coverage.?.window.sharedBlocks();
+                try bank.adopt(&cb, &ctx.storage);
+                ctx.bank_adopted = true;
+                ctx.manager.setPoolTargetMaxBlocks(ctx.pool, blocks);
+                ctx.storage.storage.setTargetMaxBlocks(blocks);
             }
             ctx.cb = cb;
         }

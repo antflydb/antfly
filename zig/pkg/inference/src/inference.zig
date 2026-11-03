@@ -126,6 +126,7 @@ pub const native_compute = struct {
 };
 
 test {
+    _ = @import("pipelines/moondream.zig");
     _ = @import("execution/testing/model_formats.zig");
     _ = @import("tile/q4_q8_schedule.zig");
     // Keep host-only ownership/descriptor tests reachable under narrow filters.

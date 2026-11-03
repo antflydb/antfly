@@ -273,7 +273,7 @@ fn serverA4bTelemetrySnapshot(cb: ?*const ops.ComputeBackend) ?ops.NativeQuantTi
     if (!serverA4bTelemetryEnabled()) return null;
     const backend = cb orelse return null;
     if (backend.kind() != .metal and backend.kind() != .cuda) return null;
-    return backend.debugTimingSnapshot().provider;
+    return (if (@import("../execution/metadata_sample.zig").snapshot(backend)) |sample| sample.provider else null);
 }
 
 fn serverA4bTelemetryDelta(
@@ -338,7 +338,8 @@ fn logServerA4bTelemetry(
 ) void {
     const start = before orelse return;
     const backend = cb orelse return;
-    const delta = serverA4bTelemetryDelta(backend.debugTimingSnapshot().provider, start);
+    const after = @import("../execution/metadata_sample.zig").snapshot(backend) orelse return;
+    const delta = serverA4bTelemetryDelta(after.provider, start);
     if (backend.kind() == .cuda) {
         std.log.info(
             "cuda_a4b_server_request: scope=process_delta model={s} resident_source_bytes={d} resident_source_count={d} route_calls={d} decode_calls={d} prefill_calls={d} route_fallbacks={d}",
@@ -4392,17 +4393,33 @@ pub const Node = struct {
     }
 
     fn tensorBatchDispatch(self: *Node, task: executor_microbatch.Task) @import("tensor_microbatch.zig").Dispatch {
-        return .{ .ptr = self, .task = task, .run_fn = runTensorBatch };
+        return .{ .ptr = self, .task = task, .run_fn = runTensorBatch, .run_resident_fn = runResidentTensorBatch };
+    }
+
+    fn TensorBatchOutput(comptime resident: bool) type {
+        return if (resident) @import("../backends/session.zig").ResidentOutputs else []backends_mod.Tensor;
     }
 
     fn runTensorBatch(raw: *anyopaque, task: executor_microbatch.Task, allocator: std.mem.Allocator, session: backends_mod.Session, permit: ?*@import("../backends/session.zig").RunPermit, gate: ?*std.atomic.Mutex, inputs: []const backends_mod.Tensor, supplied: ?InferenceExecutionControl) anyerror![]backends_mod.Tensor {
+        return runTensorBatchWithPlacement(false, raw, task, allocator, session, permit, gate, inputs, supplied);
+    }
+
+    fn runResidentTensorBatch(raw: *anyopaque, task: executor_microbatch.Task, allocator: std.mem.Allocator, session: backends_mod.Session, permit: ?*@import("../backends/session.zig").RunPermit, gate: ?*std.atomic.Mutex, inputs: []const backends_mod.Tensor, supplied: ?InferenceExecutionControl) anyerror!?@import("../backends/session.zig").ResidentOutputs {
+        return try runTensorBatchWithPlacement(true, raw, task, allocator, session, permit, gate, inputs, supplied);
+    }
+
+    fn runTensorBatchWithPlacement(comptime resident: bool, raw: *anyopaque, task: executor_microbatch.Task, allocator: std.mem.Allocator, session: backends_mod.Session, permit: ?*@import("../backends/session.zig").RunPermit, gate: ?*std.atomic.Mutex, inputs: []const backends_mod.Tensor, supplied: ?InferenceExecutionControl) anyerror!TensorBatchOutput(resident) {
         const self: *Node = @ptrCast(@alignCast(raw));
         const control = self.bindExecutionControl(null, supplied orelse .{});
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*value| value.deinit();
         const io = self.inferenceIo(allocator, control.io, &owned_io);
         const selected_gate = gate orelse session.execution_gate orelse return error.MissingExecutionGate;
-        return @import("tensor_microbatch.zig").run(self.executorMicrobatchBroker(), allocator, io, task, session, permit, selected_gate, inputs, control, try directExecutorDeadline(io, control.deadline_ns), self.config.executor_microbatch_max_wait_us);
+        if (comptime resident) {
+            return @import("tensor_microbatch.zig").runResident(self.executorMicrobatchBroker(), allocator, io, task, session, permit, selected_gate, inputs, control, try directExecutorDeadline(io, control.deadline_ns), self.config.executor_microbatch_max_wait_us);
+        } else {
+            return @import("tensor_microbatch.zig").run(self.executorMicrobatchBroker(), allocator, io, task, session, permit, selected_gate, inputs, control, try directExecutorDeadline(io, control.deadline_ns), self.config.executor_microbatch_max_wait_us);
+        }
     }
 
     fn createRerankingPipeline(self: *Node, allocator: std.mem.Allocator, model: *model_manager_mod.LoadedModel) @import("../pipelines/reranking.zig").RerankingPipeline {
@@ -8681,15 +8698,18 @@ pub const Node = struct {
         // window and every GPU forward retain their existing independent caps.
         const epoch_page_limit: usize = if (extended_epoch) 256 else 64;
         var factory = LightOnStreamContext.Factory{ .node = self, .model = model, .cfg = cfg, .limits = limits, .physical_rows_limit = try lightOnCohortRowLimit(self.lightOnReaderRows(), contract.batch.max_items, model.manifest.capabilities), .epoch_page_limit = epoch_page_limit, .cuda_batch_enabled = self.lightOnCudaBatchEnabled(), .decoder_peak = memory.decoder_backend_peak, .decoder_workspace = decoder_workspace, .dynamic_vision_batch_items = if (backend == .cuda) features.vision_batch_items else 0, .features = features, .control = control };
+        try factory.describeKv(estimate.token_count, @intCast(max_tokens), self.lightOnReaderWindow(), kv_dtype);
+        defer factory.deinitKv();
         // Queue before admission and GPU allocation. Only active slots reserve
         // live resources; independently completed pages immediately free slots.
         // Logical occupancy can exceed the physical per-step contract. Every
         // page still acquires its own admission lease; the coordinator caps
         // each GPU forward at the contract's physical row limit.
-        var pool_lease = try model.native_reader_stream.joinBounded(control, self.lightOnReaderWindow(), epoch_page_limit, &factory, LightOnStreamContext.create, LightOnStreamContext.destroy);
+        var pool_lease = try model.native_reader_stream.joinBoundedMatching(control, self.lightOnReaderWindow(), epoch_page_limit, &factory, LightOnStreamContext.create, LightOnStreamContext.destroy, LightOnStreamContext.compatible);
         var pool_owned = true;
         defer if (pool_owned) pool_lease.release();
         const ctx: *LightOnStreamContext = @ptrCast(@alignCast(pool_lease.context));
+        const page_amounts = ctx.pageAmounts(&factory, amounts);
         const index = ctx.register(control);
         var registered = true;
         defer if (registered) ctx.unregister(index);
@@ -8703,7 +8723,7 @@ pub const Node = struct {
         var logged_wait = false;
         var admission = while (true) {
             try control.check();
-            const admitted = ctx.admitRegisteredPage(&factory, index, if (share_vision_peak) shared_vision_bytes else null, if (share_vision_peak) shared_vision_host_bytes else 0, amounts) catch |err| {
+            const admitted = ctx.admitRegisteredPage(&factory, index, if (share_vision_peak) shared_vision_bytes else null, if (share_vision_peak) shared_vision_host_bytes else 0, page_amounts) catch |err| {
                 // Live-memory pressure is transient as peers retire. Keep the
                 // page queued without its per-page lease; never bypass a cap.
                 if (err != error.ResourceTemporarilyUnavailable) return err;
@@ -10847,6 +10867,9 @@ pub const Node = struct {
                 .timestamps = timestamps,
             },
         );
+        // This private Node factory holds only ModelHandle lifetime pins; its
+        // callers hold no provider/model execution lane around transcription.
+        pipeline.incremental_cleanup_contract = .no_enclosing_lanes;
         pipeline.execution_control = control;
 
         pipeline.batch_dispatch = self.tensorBatchDispatch(.transcribe);
@@ -15430,7 +15453,7 @@ pub const Node = struct {
                     .message = "Moondream generation does not support tool calls",
                 });
             }
-            var pipeline = moondream_pipeline.Pipeline.loadWithControl(ctx.allocator, model_path, execution_control, ctx.io) catch |err|
+            var pipeline = moondream_pipeline.Pipeline.loadWithOptions(ctx.allocator, model_path, execution_control, ctx.io, .{ .execution_diagnostics = self.model_manager.session_manager.execution_diagnostics }) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             defer pipeline.deinit();
             pipeline.execution_control = execution_control;
@@ -16439,6 +16462,7 @@ pub const Node = struct {
             .scheduler_lease = if (use_scheduler) if (native_generate_lease) |*lease| lease else null else null,
             .execution_lock = if (isolated_generation) model.nativeGenerationMutex() else null,
             .draft_cb = if (draft_cb) |cb_value| cb_value else null,
+            .draft_diagnostics_binding = if (draft_model_for_generation) |draft| draft.session.invocation_diagnostics else null,
             .draft_gpt_config = draft_gpt_config,
             .draft_decode_state = if (draft_decode_state) |*state| state else null,
             .prompt_cache = prompt_cache,
@@ -21609,6 +21633,9 @@ pub const Node = struct {
                     .audio_context = audio_context,
                 },
             );
+            // Reviewed HTTP, dictation and session callers retain lifetime/
+            // task-busy pins, not provider/model execution lanes.
+            result.incremental_cleanup_contract = .no_enclosing_lanes;
             result.execution_control = control;
             result.batch_dispatch = self.node.tensorBatchDispatch(.transcribe);
             return result;
@@ -29834,6 +29861,9 @@ fn inferenceRouteSupportsFramedAttachments(comptime path: []const u8) bool {
 }
 
 fn admittedInferenceHandler(node: *Node, handler: httpx.Handler, ctx: *httpx.Context) anyerror!httpx.Response {
+    // The invoked handler unwinds all numerical/model lanes before returning.
+    // Export copies only values and never holds a provider gate during IO.
+    defer node.model_manager.flushExecutionDiagnostics();
     const now = platform.time.monotonicNs();
     ctx.application_deadline_ns = @import("inference_deadline.zig").establish(ctx.application_deadline_ns, ctx.request.headers.iterator(), now) catch {
         ctx.application_deadline_invalid = true;
@@ -44963,7 +44993,7 @@ test "LightOnOCR3 decoder peak ownership preserves caps across failed growth and
     defer node.model_manager.deinit();
     var bootstrap = try node.model_manager.acquireRunResourceAmounts(.cpu, .{}, .{});
     bootstrap.release();
-    const controller = &node.model_manager.resource_domain.?.admission;
+    const controller = node.model_manager.resource_domain.?.admission;
     controller.configureSharedLimits(.{});
     controller.live_capacity_bytes = 1024 * 1024 * 1024;
     controller.live_pending_bytes = 1;
@@ -45106,7 +45136,7 @@ test "LightOnOCR3 epoch admission owns shared scratch across page retirement and
     // Initialize the real resource owner without allocating any model or GPU.
     var bootstrap = try node.model_manager.acquireRunResourceAmounts(.cpu, .{}, .{});
     bootstrap.release();
-    const controller = &node.model_manager.resource_domain.?.admission;
+    const controller = node.model_manager.resource_domain.?.admission;
     controller.configureSharedLimits(.{});
     // Model an existing live-memory epoch to keep this test independent of
     // the machine's free memory. The anchor releases this one-byte reservation.
@@ -47723,7 +47753,7 @@ test "dynamic CUDA admission counts admitted pages and rolls back failed batch g
     defer node.model_manager.deinit();
     var bootstrap = try node.model_manager.acquireRunResourceAmounts(.cpu, .{}, .{});
     bootstrap.release();
-    const controller = &node.model_manager.resource_domain.?.admission;
+    const controller = node.model_manager.resource_domain.?.admission;
     controller.configureSharedLimits(.{});
     controller.live_capacity_bytes = 1024 * mib;
     controller.live_pending_bytes = 1;
@@ -47788,4 +47818,224 @@ test "dynamic CUDA admission counts admitted pages and rolls back failed batch g
     defer next.release();
     ctx.unregister(pending_index);
     try std.testing.expectEqual(@as(usize, 0), ctx.admitted_pages);
+}
+
+test "installed Node typed resident dispatch preserves encoder ownership past Node and session close" {
+    const a = std.testing.allocator;
+    const imported = @import("../backends/imported_onnx_session.zig");
+    const stages = @import("../execution/encoder_decoder_runtime.zig");
+    const transfer = @import("../execution/transfer_audit.zig");
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try @import("../execution/testing/encoder_decoder.zig").write(a, temp.dir, "encoder.onnx", true);
+    try @import("../execution/testing/encoder_decoder.zig").write(a, temp.dir, "decoder.onnx", false);
+    const encoder_path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temp.sub_path[0..], "encoder.onnx" });
+    defer a.free(encoder_path);
+    const decoder_path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temp.sub_path[0..], "decoder.onnx" });
+    defer a.free(decoder_path);
+    const encoder = try imported.createSessionWithOptions(a, encoder_path, .native, .{ .graph_runtime_strategy = .compiled_preferred });
+    var encoder_open = true;
+    defer if (encoder_open) encoder.close();
+    const decoder = try imported.createSessionWithOptions(a, decoder_path, .native, .{ .graph_runtime_strategy = .compiled_preferred, .shared_backend_ctx = encoder.shared_compute_context });
+    var decoder_open = true;
+    defer if (decoder_open) decoder.close();
+    var input = try backends_mod.Tensor.initFloat32(a, "features", &.{ 1, 2, 4 }, &.{ -2, 1, 2, -1, 3, -1, 1, 0 });
+    defer input.deinit();
+    var node = try Node.init(a, .{});
+    var node_open = true;
+    defer if (node_open) node.deinit();
+    var gate: std.atomic.Mutex = .unlocked;
+    // Mirror the real LoadedModel cold publication: every installed model
+    // gate shares one FIFO whose stable owner outlives both dispatched calls.
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    var serving_encoder = encoder;
+    serving_encoder.execution_gate = &gate;
+    serving_encoder.cohort_scheduler = &scheduler;
+    const dispatch = node.tensorBatchDispatch(.transcribe);
+    try std.testing.expect(dispatch.supportsResident());
+    var encoded = blk: {
+        var audit = transfer.Audit{ .forbid_activation_readbacks = true };
+        try transfer.begin(&audit);
+        defer transfer.end();
+        break :blk try stages.encode(a, serving_encoder, decoder, &.{input}, dispatch, .{ .io = std.testing.io, .native_call_policy = .in_process });
+    };
+    defer encoded.deinit(a);
+    try std.testing.expect(encoded == .resident);
+    // Existing custom dispatchers retain their exact host scheduling policy.
+    var host_only = dispatch;
+    host_only.run_resident_fn = null;
+    var hosted = try stages.encode(a, serving_encoder, decoder, &.{input}, host_only, .{ .io = std.testing.io, .native_call_policy = .in_process });
+    defer hosted.deinit(a);
+    try std.testing.expect(hosted == .host);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1, 2, 0, 3, 0, 1, 0 }, hosted.host[0].asFloat32());
+    try std.testing.expect(scheduler.head == null);
+    node.deinit();
+    node_open = false;
+    encoder.close();
+    encoder_open = false;
+    decoder.close();
+    decoder_open = false;
+    const values = try encoded.resident.values.backend.toFloat32(encoded.resident.values.outputs[0], a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1, 2, 0, 3, 0, 1, 0 }, values);
+}
+
+test "reader cold bank eligibility and page credit require exact immutable actual coverage" {
+    const Context = Node.LightOnStreamContext;
+    const Banks = @import("../execution/prepared_kv_banks.zig");
+    var node: Node = undefined;
+    var model: model_manager_mod.LoadedModel = undefined;
+    var factory = Context.Factory{ .node = &node, .model = &model, .cfg = .{}, .limits = .{}, .physical_rows_limit = 8, .control = .{} };
+    var ctx: Context = undefined;
+    ctx.features = .{};
+    ctx.cfg = .{};
+    ctx.bank_coverage = null;
+    const original = runtime.tier.memory.AdmissionAmounts{ .host_kv_bytes = 13, .backend_kv_bytes = 17, .host_scratch_bytes = 19, .backend_scratch_bytes = 23 };
+    try std.testing.expect(Context.compatible(&ctx, &factory));
+    try std.testing.expectEqualDeep(original, ctx.pageAmounts(&factory, original));
+    const target = @import("../backends/cold_compute_target.zig").Target{ .cuda = .{ .implementation_context = @ptrFromInt(16), .implementation_table = @ptrFromInt(32), .primary_context = @ptrFromInt(48), .device = 0 } };
+    var descriptor = Banks.Descriptor{ .target = target, .window = try runtime.kv.storage_runtime.device_capacity.Window.fromRequest(17, 15, 3, 16, 1), .dtype = .f16, .mode = .shared_physical_pages };
+    try descriptor.append(.{ .geometry = .{ .index = 3, .num_kv_heads = 2, .head_dim = 64 }, .key_row_bytes = 256, .base_key_row_bytes = 256, .value_row_bytes = 256 });
+    factory.kv_descriptor = descriptor;
+    // Describing a request never creates physical credit.
+    try std.testing.expect(!Context.compatible(&ctx, &factory));
+    try std.testing.expectEqualDeep(original, ctx.pageAmounts(&factory, original));
+    ctx.bank_coverage = descriptor.coverage();
+    try std.testing.expect(Context.compatible(&ctx, &factory));
+    var expected = original;
+    expected.backend_kv_bytes = 0;
+    try std.testing.expectEqualDeep(expected, ctx.pageAmounts(&factory, original));
+    factory.kv_descriptor.?.window = try runtime.kv.storage_runtime.device_capacity.Window.fromRequest(33, 0, 3, 16, 1);
+    try std.testing.expect(!Context.compatible(&ctx, &factory));
+    try std.testing.expectEqualDeep(original, ctx.pageAmounts(&factory, original));
+    factory.kv_descriptor = descriptor;
+    factory.kv_descriptor.?.inline_rows[0].codec_words[1] = 9;
+    try std.testing.expect(!Context.compatible(&ctx, &factory));
+    try std.testing.expectEqualDeep(original, ctx.pageAmounts(&factory, original));
+    factory.kv_descriptor = null;
+    try std.testing.expect(!Context.compatible(&ctx, &factory));
+    try std.testing.expectEqualDeep(original, ctx.pageAmounts(&factory, original));
+}
+
+test "reader cold bank actual destroy retires failed and adopted hooks under currentB after both lanes" {
+    const Context = Node.LightOnStreamContext;
+    const Banks = @import("../execution/prepared_kv_banks.zig");
+    const Sink = @import("../execution/retirement_sink.zig");
+    const Resource = @import("../execution/resource_retirement.zig");
+    const Probe = struct {
+        model: *model_manager_mod.LoadedModel,
+        expected: u64,
+        lease: runtime.tier.memory.AdmissionLease,
+        node: Resource.Node = undefined,
+        hook_retired: bool = false,
+        cb_retired: bool = false,
+        bank_retired: bool = false,
+        releases: usize = 0,
+        failure: ?anyerror = null,
+        fn release(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checkUnlocked() catch |err| {
+                self.failure = err;
+            };
+            self.lease.release();
+            self.releases += 1;
+        }
+        fn checkUnlocked(self: *@This()) !void {
+            if (self.model.native_reader_execution_lane.owned) return error.ReaderLaneStillHeld;
+            if (!self.model.nativeGenerationMutex().tryLock()) return error.ModelLaneStillHeld;
+            self.model.nativeGenerationMutex().unlock();
+        }
+        fn queue(self: *@This(), epoch: *const Sink.Epoch) !void {
+            if (epoch.nonce != self.expected or try epoch.isSealed()) return error.WrongCurrentEpoch;
+            self.node = .{ .context = self, .release_fn = release };
+            const boundary = try epoch.boundary();
+            try boundary.register(boundary.context, boundary.nonce, &self.node);
+        }
+        fn write(_: *anyopaque, _: runtime.kv.storage_runtime.KvSuffixWrite, _: runtime.kv.storage_runtime.DeviceKvRef, _: runtime.kv.storage_runtime.DeviceKvRef) !void {
+            return error.UnexpectedWrite;
+        }
+        fn unscopedHookClose(_: *anyopaque, _: std.mem.Allocator) void {
+            @panic("reader hook lost its current cleanup epoch");
+        }
+        fn hookClose(raw: *anyopaque, _: std.mem.Allocator, epoch: ?*const Sink.Epoch) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checkHook(epoch) catch |err| {
+                self.failure = err;
+            };
+        }
+        fn checkHook(self: *@This(), epoch: ?*const Sink.Epoch) !void {
+            if (!self.model.native_reader_execution_lane.owned) return error.ReaderLaneMissingDuringHookCleanup;
+            if (self.model.nativeGenerationMutex().tryLock()) {
+                self.model.nativeGenerationMutex().unlock();
+                return error.ModelLaneMissingDuringHookCleanup;
+            }
+            try self.queue(epoch orelse return error.MissingCurrentEpoch);
+            self.hook_retired = true;
+        }
+        fn cbClose(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.hook_retired) self.failure = error.BackendRetiredBeforeStorage;
+            self.cb_retired = true;
+        }
+        pub fn snapshotCoverage(_: *const @This()) Banks.Coverage {
+            unreachable;
+        }
+        pub fn adopt(_: *@This(), _: *const @import("../ops/ops.zig").ComputeBackend, _: *runtime.kv.storage_runtime.KvStorageRuntime) !void {
+            return error.UnexpectedAdopt;
+        }
+        pub fn abortOutsideLanes(self: *@This(), epoch: *const Sink.Epoch) void {
+            self.checkUnlocked() catch |err| {
+                self.failure = err;
+            };
+            self.queue(epoch) catch |err| {
+                self.failure = err;
+            };
+            self.bank_retired = true;
+        }
+        pub fn finishAfterUnlock(self: *@This(), epoch: *const Sink.Epoch) void {
+            self.checkUnlocked() catch |err| {
+                self.failure = err;
+            };
+            if (epoch.nonce != self.expected or !self.hook_retired or !self.cb_retired or self.releases != 0) self.failure = error.IncorrectBankFinishOrder;
+            self.bank_retired = true;
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |adopted| {
+        var controller = runtime.tier.memory.AdmissionController{};
+        defer controller.deinit();
+        var model: model_manager_mod.LoadedModel = undefined;
+        model.native_generate_lock = .unlocked;
+        model.native_reader_execution_lane = .{};
+        var sink = try Sink.Ref.create();
+        defer sink.release();
+        var prep = try sink.enter();
+        var prep_epoch = try prep.retainEpoch();
+        defer prep_epoch.release();
+        prep.finish();
+        try std.testing.expect(try prep_epoch.isSealed());
+        const current = try sink.enter();
+        var current_epoch = try current.retainEpoch();
+        defer current_epoch.release();
+        const lane = try model.native_reader_execution_lane.acquire(.{});
+        try std.testing.expect(model.nativeGenerationMutex().tryLock());
+        var probe = Probe{ .model = &model, .expected = current_epoch.nonce, .lease = try controller.tryAcquire(.gpu, .{}, .{ .backend_kv_bytes = 8 }, false) };
+        const ctx = try a.create(Context);
+        ctx.* = .{ .allocator = a, .model = &model, .cfg = .{}, .budget = runtime.tier.memory.RunBudget.init(.{}), .lane = lane, .cleanup_owner = .{ .guard = current, .owned_epoch = try current_epoch.retain() }, .coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(a), .manager = runtime.kv.manager.KvManager.init(a), .vision_broker = executor_microbatch.Broker.init(a), .prefill_broker = executor_microbatch.Broker.init(a), .execution_id = 1, .kv_bank = Banks.Owned.fromLeaf(Probe, &probe), .bank_adopted = adopted };
+        var table: @import("../ops/ops.zig").ComputeBackend.VTable = undefined;
+        table.deinitBackend = Probe.cbClose;
+        if (adopted) {
+            ctx.storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, .{ .backend = .cuda, .dtype = .f16, .page_size_tokens = 16, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 64, .store_cpu_bytes = false });
+            ctx.storage.setDeviceWriteHook(.{ .ctx = &probe, .vtable = &.{ .writeLayerKvSuffix = Probe.write, .deinit = Probe.unscopedHookClose, .deinitWithBoundary = Probe.hookClose } });
+            ctx.cb = .{ .ptr = &probe, .vtable = &table };
+        }
+        // Releasing the old preparation epoch cannot release current storage.
+        try std.testing.expectEqual(@as(usize, 8), controller.snapshot().backend_kv_bytes);
+        Context.destroy(ctx);
+        try std.testing.expect(probe.bank_retired);
+        try std.testing.expectEqual(@as(?anyerror, null), probe.failure);
+        try std.testing.expectEqual(@as(usize, 1), probe.releases);
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_kv_bytes);
+        try std.testing.expect(try current_epoch.isSealed());
+    }
 }

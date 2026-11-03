@@ -40,6 +40,21 @@ const Options = struct {
     decoder_request_contexts: bool = false,
     decoder_scheduled: bool = false,
     diagnostics: bool = false,
+    resident: bool = false,
+    incremental_source: bool = false,
+    transcribe_audio: []const u8 = "",
+    transcribe_timestamps: bool = false,
+    transcribe_require_eos: bool = false,
+    transcribe_output_format: enum { json, parity_f32 } = .json,
+    decoder_model_dir: []const u8 = "",
+    source_pipelined_steps: usize = 0,
+    source_attempts: usize = 3,
+    source_trace_constructor: bool = false,
+    source_policy: enum { qualified, cold } = .qualified,
+    source_proof: enum { off, legacy, detached } = .off,
+    source_fixture_label: enum { model, synthetic } = .model,
+    admission: bool = false,
+    graph_runtime: ?inference.graph.runtime.Strategy = null,
     soak_seconds: u64 = 0,
     soak_pause_ms: u64 = 1000,
     soak_allocator: enum { smp, c } = .smp,
@@ -51,8 +66,17 @@ pub fn main(init: std.process.Init) !void {
     var options = Options{};
     while (args.next()) |arg| {
         const value = args.next() orelse return error.MissingArgument;
-        if (std.mem.eql(u8, arg, "--primitive")) options.primitive = std.meta.stringToEnum(Primitive, value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--embedding-pool")) options.embedding_pool = std.meta.stringToEnum(inference.pipelines.embedding.PoolingStrategy, value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--embedding-resident")) options.embedding_resident = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--embedding-normalize")) options.embedding_normalize = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--rows")) options.rows = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--dim")) options.dim = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--model-dir")) options.model_dir = value else if (std.mem.eql(u8, arg, "--backend")) options.backend = backend_choice.parse(value) orelse return error.InvalidBackend else if (std.mem.eql(u8, arg, "--batch")) options.batch = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--seq-len")) options.seq_len = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--warmup-iters")) options.warmup = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--measure-iters")) options.iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--output")) options.output = value else if (std.mem.eql(u8, arg, "--diagnostics")) options.diagnostics = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-request-contexts")) options.decoder_request_contexts = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-scheduled")) options.decoder_scheduled = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-steps")) options.decoder_steps = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--soak-seconds")) options.soak_seconds = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-pause-ms")) options.soak_pause_ms = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-allocator")) options.soak_allocator = std.meta.stringToEnum(@TypeOf(options.soak_allocator), value) orelse return error.InvalidArgument else return error.InvalidArgument;
+        if (std.mem.eql(u8, arg, "--transcribe-require-eos")) options.transcribe_require_eos = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--transcribe-timestamps")) options.transcribe_timestamps = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--transcribe-output-format")) options.transcribe_output_format = if (std.mem.eql(u8, value, "json")) .json else if (std.mem.eql(u8, value, "parity-f32")) .parity_f32 else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--transcribe-audio")) options.transcribe_audio = value else if (std.mem.eql(u8, arg, "--source-trace-constructor")) options.source_trace_constructor = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--source-pipelined-steps")) options.source_pipelined_steps = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--incremental-source")) options.incremental_source = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-model-dir")) options.decoder_model_dir = value else if (std.mem.eql(u8, arg, "--source-attempts")) options.source_attempts = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--source-policy")) options.source_policy = std.meta.stringToEnum(@FieldType(Options, "source_policy"), value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--source-proof")) options.source_proof = std.meta.stringToEnum(@FieldType(Options, "source_proof"), value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--source-fixture-label")) options.source_fixture_label = std.meta.stringToEnum(@FieldType(Options, "source_fixture_label"), value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--admission")) options.admission = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--resident")) options.resident = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--graph-runtime")) options.graph_runtime = inference.graph.runtime.parseStrategy(value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--primitive")) options.primitive = std.meta.stringToEnum(Primitive, value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--embedding-pool")) options.embedding_pool = std.meta.stringToEnum(inference.pipelines.embedding.PoolingStrategy, value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--embedding-resident")) options.embedding_resident = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--embedding-normalize")) options.embedding_normalize = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--rows")) options.rows = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--dim")) options.dim = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--model-dir")) options.model_dir = value else if (std.mem.eql(u8, arg, "--backend")) options.backend = backend_choice.parse(value) orelse return error.InvalidBackend else if (std.mem.eql(u8, arg, "--batch")) options.batch = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--seq-len")) options.seq_len = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--warmup-iters")) options.warmup = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--measure-iters")) options.iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--output")) options.output = value else if (std.mem.eql(u8, arg, "--diagnostics")) options.diagnostics = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-request-contexts")) options.decoder_request_contexts = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-scheduled")) options.decoder_scheduled = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-steps")) options.decoder_steps = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--soak-seconds")) options.soak_seconds = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-pause-ms")) options.soak_pause_ms = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-allocator")) options.soak_allocator = std.meta.stringToEnum(@TypeOf(options.soak_allocator), value) orelse return error.InvalidArgument else return error.InvalidArgument;
     }
+    if (options.transcribe_audio.len == 0 and (options.transcribe_timestamps or options.transcribe_require_eos or options.transcribe_output_format != .json)) return error.InvalidTranscriptionGeometry;
+    if (options.transcribe_audio.len != 0 and (options.incremental_source or (options.backend != .native and options.backend != .metal and options.backend != .cuda) or options.batch != 1 or options.resident or options.primitive != null or options.embedding_pool != null or options.decoder_steps != 0 or options.decoder_request_contexts or options.decoder_scheduled or options.soak_seconds != 0 or options.source_proof != .off or options.source_trace_constructor or options.source_pipelined_steps != 0 or options.decoder_model_dir.len != 0)) return error.InvalidTranscriptionGeometry;
+    if (options.incremental_source and ((options.backend != .cuda and options.backend != .metal and options.backend != .native) or options.batch != 1 or options.source_attempts == 0 or options.resident or options.primitive != null or options.embedding_pool != null or options.decoder_steps != 0 or options.decoder_request_contexts or options.decoder_scheduled or options.soak_seconds != 0)) return error.InvalidGeometry;
+    if (options.source_trace_constructor and (!options.incremental_source or options.backend != .cuda or options.source_proof == .off or !options.diagnostics)) return error.ConstructorTraceRequiresCudaProof;
+    if (options.incremental_source and options.backend != .cuda and options.source_proof != .off) return error.CudaSourceProofRequired;
+    if (options.source_pipelined_steps > 64 or (options.source_pipelined_steps != 0 and (!options.incremental_source or options.backend != .metal or options.source_proof != .off))) return error.InvalidGeometry;
+    if (!options.incremental_source and (options.decoder_model_dir.len != 0 or options.source_proof != .off)) return error.InvalidGeometry;
+    if (options.resident and (options.primitive != null or options.embedding_pool != null or options.decoder_steps != 0 or options.decoder_request_contexts or options.decoder_scheduled or options.soak_seconds != 0)) return error.InvalidGeometry;
+    if (options.admission and options.primitive != null) return error.InvalidGeometry;
     if (options.primitive) |primitive| {
         if (options.backend != .native or options.rows == 0 or options.dim == 0 or options.iterations == 0 or options.soak_seconds != 0) return error.InvalidGeometry;
         switch (primitive) {
@@ -75,11 +99,17 @@ pub fn main(init: std.process.Init) !void {
     try backend_choice.validate(options.backend);
     var sessions = inference.backends.SessionManager.initWithIo(a, init.io);
     backend_choice.configureSessionPreference(&sessions, options.backend);
+    if (options.graph_runtime) |strategy| sessions.graph_runtime_strategy = strategy;
     var manager = inference.server.model_manager.ModelManager.init(a, sessions);
     defer manager.deinit();
+    // The public serving policy installs model/run admission before loading.
+    // Keep ordinary offline benchmark defaults unchanged.
+    if (options.resident or options.admission or options.incremental_source or options.transcribe_audio.len != 0) manager.configureServingPolicy(.{ .allow_unknown = true });
     const model = try manager.loadFromDir(options.model_dir);
     const model_loaded = inference.platform.time.awakeNs(init.io);
     const session = model.session;
+    if (options.incremental_source) return @import("incremental_source.zig").run(init, model, a, options);
+    if (options.transcribe_audio.len != 0) return @import("transcribe_task.zig").run(init, model, a, options);
     if (options.embedding_pool != null) {
         if (options.decoder_steps != 0 or options.soak_seconds != 0) return error.InvalidGeometry;
         try runEmbeddingStages(init, model, a, options);
@@ -133,6 +163,7 @@ pub fn main(init: std.process.Init) !void {
         } else return error.UnsupportedInputType;
     }
     const inputs_ready = inference.platform.time.awakeNs(init.io);
+    if (options.resident) return runResidentEncoder(init, session, inputs.items, a, options);
     var first_warmup_ns: u64 = 0;
     for (0..options.warmup) |warmup_index| {
         const outputs = try session.run(inputs.items, a);
@@ -520,9 +551,12 @@ fn runDecoder(init: std.process.Init, model: *inference.server.model_manager.Loa
     if (options.batch != 1) return error.UnsupportedDecoderBatch;
     var executor = (try model.wholeModelExecutor(a, null)) orelse return error.UnsupportedModelRuntime;
     defer executor.deinit();
-    // The serving request owns the provider lane while its runtime borrows it.
-    var request_backend = try inference.architectures.session_factory.getComputeBackend(model.session, a);
-    defer request_backend.deinit();
+    // Initialize provider state before the independent runtime owns each
+    // numerical operation. Snapshot handles remain confined between calls.
+    {
+        var initial_backend = try inference.architectures.session_factory.getComputeBackend(model.session, a);
+        defer initial_backend.deinit();
+    }
     var runtime = try executor.createRuntime(a);
     var runtime_live = true;
     defer if (runtime_live) runtime.deinit();
@@ -581,7 +615,7 @@ fn runDecoder(init: std.process.Init, model: *inference.server.model_manager.Loa
                 const host_live = bounded.live;
                 const host_peak = bounded.peak;
                 bounded.mutex.unlock();
-                const provider = request_backend.debugTimingSnapshot().provider;
+                const provider = providerSnapshot(model.session, a);
                 if (iteration + 1 == 128) {
                     steady_host = host_live;
                     steady_device = provider.metal_tensor_device_owned_live_bytes;
@@ -769,3 +803,98 @@ fn runEmbeddingStages(init: std.process.Init, model: *inference.server.model_man
     const resident = if (comptime @hasDecl(@TypeOf(pipeline), "residentTextEncoderEnabled")) pipeline.residentTextEncoderEnabled() else pipeline.config.resident_text_encoder;
     std.debug.print("unified_embedding_stages backend={s} pooling={s} resident={} batch={d} seq={d} iterations={d} output_elements={d} checksum={d:.9} p50_ns={d} p95_ns={d} min_ns={d} upload_calls={d} download_calls={d} download_bytes={d} host_access_bytes={d} reset_parity=exact\n", .{ @tagName(model.session.backend()), @tagName(options.embedding_pool.?), resident, options.batch, options.seq_len, options.iterations, reference.items.len, checksum, samples[samples.len / 2], samples[@min(samples.len - 1, samples.len * 95 / 100)], samples[0], uploads, downloads, download_bytes, host_bytes });
 }
+
+/// Public resident encoder acceptance: includes requested host materialization
+/// and every output/backend-owner retirement in the measured interval.
+fn runResidentEncoder(init: std.process.Init, session: inference.backends.Session, inputs: []const Tensor, a: std.mem.Allocator, options: Options) !void {
+    if (options.soak_seconds != 0 or options.iterations == 0) return error.InvalidGeometry;
+    const reference = try session.run(inputs, a);
+    defer {
+        for (reference) |*value| value.deinit();
+        a.free(reference);
+    }
+    var checksum: f64 = 0;
+    var elements: usize = 0;
+    const proof_started = inference.platform.time.awakeNs(init.io);
+    {
+        var outputs = (try session.runResident(inputs, a)) orelse return error.ResidentExecutionUnavailable;
+        defer outputs.deinit();
+        if (outputs.resource_lease == null) return error.ResidentAdmissionMissing;
+        if (outputs.outputs.len != reference.len) return error.ResidentOutputCountChanged;
+        var proof = ResidentBackingProof{};
+        const functions = outputs.backend.vtable.kernels orelse return error.ResidentOwnershipUnavailable;
+        if (!functions.accepts(outputs.backend.vtable)) return error.ResidentOwnershipUnavailable;
+        const query = functions.storageOwnership orelse return error.ResidentOwnershipUnavailable;
+        for (outputs.outputs, reference) |value, expected| {
+            if (try query(outputs.backend.ptr, value, .{ .context = &proof, .visit = ResidentBackingProof.visit }) != .complete) return error.ResidentOwnershipUnavailable;
+            const actual = try outputs.backend.toFloat32(value, a);
+            defer a.free(actual);
+            const oracle = expected.asFloat32();
+            if (actual.len != oracle.len) return error.ResidentOutputCountChanged;
+            for (actual, oracle) |got, want| {
+                if (!std.math.isFinite(got) or !std.math.isFinite(want)) return error.NonFiniteOutput;
+                if (@abs(got - want) > 0.0002 * @max(@as(f32, 1), @abs(want))) return error.ResidentOutputChanged;
+                checksum += got;
+                elements += 1;
+            }
+            if (options.output) |path| {
+                if (outputs.outputs.len != 1) return error.MultipleOutputs;
+                try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = std.mem.sliceAsBytes(actual) });
+            }
+        }
+        if (proof.legacy_spans == 0) return error.ResidentLegacyBackingMissing;
+        std.debug.print("resident_proof admitted=true legacy_owned_backend_spans={d} legacy_requested_bytes={d} oracle_pass=true strategy={s}\n", .{ proof.legacy_spans, proof.legacy_bytes, if (options.graph_runtime) |strategy| @tagName(strategy) else "default" });
+    }
+    const proof_ns = inference.platform.time.awakeNs(init.io) - proof_started;
+    var first_warmup_ns: u64 = 0;
+    for (0..options.warmup) |index| {
+        const start = inference.platform.time.awakeNs(init.io);
+        try residentEncoderSample(session, inputs, a);
+        if (index == 0) first_warmup_ns = inference.platform.time.awakeNs(init.io) - start;
+    }
+    const samples = try a.alloc(u64, options.iterations);
+    defer a.free(samples);
+    for (samples) |*sample| {
+        const start = inference.platform.time.awakeNs(init.io);
+        try residentEncoderSample(session, inputs, a);
+        sample.* = inference.platform.time.awakeNs(init.io) - start;
+    }
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    std.debug.print("unified_resident_setup oracle_proof_ns={d} first_warmup_ns={d}\n", .{ proof_ns, first_warmup_ns });
+    std.debug.print("unified_execution backend={s} resident=true batch={d} seq={d} iterations={d} output_elements={d} checksum={d:.9} p50_ns={d} p95_ns={d} min_ns={d}\n", .{ @tagName(session.backend()), options.batch, options.seq_len, options.iterations, elements, checksum, samples[samples.len / 2], samples[@min(samples.len - 1, samples.len * 95 / 100)], samples[0] });
+}
+
+fn residentEncoderSample(session: inference.backends.Session, inputs: []const Tensor, allocator: std.mem.Allocator) !void {
+    var outputs = (try session.runResident(inputs, allocator)) orelse return error.ResidentExecutionUnavailable;
+    defer outputs.deinit();
+    if (outputs.resource_lease == null) return error.ResidentAdmissionMissing;
+    for (outputs.outputs) |value| {
+        const host = try outputs.backend.toFloat32(value, allocator);
+        allocator.free(host);
+    }
+}
+
+const OwnershipPointer = @typeInfo(@FieldType(inference.ops.KernelBackend, "storageOwnership")).optional.child;
+const OwnershipQuery = @typeInfo(OwnershipPointer).pointer.child;
+const OwnershipVisitor = @typeInfo(OwnershipQuery).@"fn".param_types[2].?;
+const OwnershipCallback = @typeInfo(@FieldType(OwnershipVisitor, "visit")).pointer.child;
+const OwnershipReport = @typeInfo(OwnershipCallback).@"fn".param_types[1].?;
+
+const ResidentBackingProof = struct {
+    legacy_spans: usize = 0,
+    legacy_bytes: usize = 0,
+    fn visit(raw: *anyopaque, report: OwnershipReport) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const span = switch (report) {
+            .backing => |span| span,
+            .plane => return,
+        };
+        // Owned unreserved backend payload is the generic legacy allocation
+        // fact. Assigned banks carry independent span.charged reservations.
+        if (span.domain != .backend or span.ownership != .allocation or span.access != .writable or span.charged != null) return;
+        const bytes = span.requested_bytes orelse return;
+        if (bytes == 0) return;
+        self.legacy_spans += 1;
+        self.legacy_bytes = try std.math.add(usize, self.legacy_bytes, bytes);
+    }
+};

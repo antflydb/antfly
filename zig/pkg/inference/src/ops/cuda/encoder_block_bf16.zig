@@ -47,8 +47,8 @@ test "LightOnOCR3 BF16 vision device contract includes Ampere and Blackwell" {
     try std.testing.expect(!validRowGeometry(1, 0));
     // Direct module users must obey the same contract as the selector.
     var ctx: context.CudaContext = undefined;
-    ctx.observation = null;
-    ctx.observation_enable_failed = false;
+    ctx.observation.store(null, .release);
+    ctx.observation_enable_failed.store(false, .release);
     ctx.info.compute_major = 8;
     ctx.info.compute_minor = 0;
     ctx.info.driver_version = 12090;

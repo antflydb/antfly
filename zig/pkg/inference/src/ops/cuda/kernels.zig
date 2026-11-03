@@ -20327,8 +20327,8 @@ test "generated CUDA Q4_0 Q8_1 E2B argmax launch contract is exact" {
 
     var module: KernelModule = .{};
     var ctx: context_mod.CudaContext = undefined;
-    ctx.observation = null;
-    ctx.observation_enable_failed = false;
+    ctx.observation.store(null, .release);
+    ctx.observation_enable_failed.store(false, .release);
     const empty_buffer: buffer_mod.DeviceBuffer = .{};
     try std.testing.expect(!module.hasLinearQ4_0Q8_1ArgmaxE2BPrimitives());
     try std.testing.expectError(
@@ -20375,8 +20375,8 @@ test "generated CUDA llama Q8_1 E2B launch contract is typed and narrow" {
 
     var module: KernelModule = .{};
     var ctx: context_mod.CudaContext = undefined;
-    ctx.observation = null;
-    ctx.observation_enable_failed = false;
+    ctx.observation.store(null, .release);
+    ctx.observation_enable_failed.store(false, .release);
     const empty: buffer_mod.DeviceBuffer = .{};
     const typed_empty = GgmlQ8_1Buffer.init(empty);
     try std.testing.expectError(
@@ -20449,8 +20449,8 @@ test "generated CUDA Q6_K Q8_1 argmax launch contracts are exact" {
 
     var module: KernelModule = .{};
     var ctx: context_mod.CudaContext = undefined;
-    ctx.observation = null;
-    ctx.observation_enable_failed = false;
+    ctx.observation.store(null, .release);
+    ctx.observation_enable_failed.store(false, .release);
     const empty_buffer: buffer_mod.DeviceBuffer = .{};
     try std.testing.expectError(
         error.InvalidCudaState,
@@ -20516,8 +20516,8 @@ test "generated CUDA Q4_0 Q8_1 E2B launch contracts are exact" {
 
     var module: KernelModule = .{};
     var ctx: context_mod.CudaContext = undefined;
-    ctx.observation = null;
-    ctx.observation_enable_failed = false;
+    ctx.observation.store(null, .release);
+    ctx.observation_enable_failed.store(false, .release);
     const empty_buffer: buffer_mod.DeviceBuffer = .{};
     try std.testing.expectError(
         error.CudaKernelUnavailable,
@@ -20574,8 +20574,8 @@ test "generated CUDA exact F32 E2B FFN launch contracts preserve the activation 
 
     var module: KernelModule = .{};
     var ctx: context_mod.CudaContext = undefined;
-    ctx.observation = null;
-    ctx.observation_enable_failed = false;
+    ctx.observation.store(null, .release);
+    ctx.observation_enable_failed.store(false, .release);
     const empty_buffer: buffer_mod.DeviceBuffer = .{};
     try std.testing.expectError(
         error.CudaKernelUnavailable,
@@ -20635,8 +20635,8 @@ test "generated CUDA Q4_0 Q8_1 E4B plans reject other model shapes" {
 
     var module: KernelModule = .{};
     var ctx: context_mod.CudaContext = undefined;
-    ctx.observation = null;
-    ctx.observation_enable_failed = false;
+    ctx.observation.store(null, .release);
+    ctx.observation_enable_failed.store(false, .release);
     const empty_buffer: buffer_mod.DeviceBuffer = .{};
     try std.testing.expectError(
         error.InvalidCudaState,
@@ -21609,8 +21609,8 @@ test "CUDA primitive index traversal rejects overflowing legacy coordinates befo
         .primitive_scatter_add_axis0_f32_i64 = function,
     };
     var ctx: context_mod.CudaContext = undefined;
-    ctx.observation = null;
-    ctx.observation_enable_failed = false;
+    ctx.observation.store(null, .release);
+    ctx.observation_enable_failed.store(false, .release);
     const large = buffer_mod.DeviceBuffer{ .ptr = 8, .len = @as(usize, 1) << 35 };
     inline for (.{ TensorDType.f32, TensorDType.i32, TensorDType.i64 }) |dtype| {
         try std.testing.expectError(error.InvalidCudaState, module.launchPrimitiveScatterAddAxis0(dtype, &ctx, large, large, large, 65536, 65536, 65536));

@@ -488,6 +488,7 @@ pub const Runtime = struct {
         var assets_owned = true;
         defer if (assets_owned) assets.deinit(allocator);
         const man = assets.manifest;
+        try assets.session.session.installOwnedExecutionGate(allocator);
         const session = assets.session.session;
         const model_dir = assets.model_dir;
         const hf_tok = assets.hf_tok;
@@ -556,17 +557,12 @@ pub const Runtime = struct {
         var shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = blk: {
             if (session_factory.getGptConfig(session)) |cfg| {
                 if (cfg.usesMoe()) {
-                    const cache = try allocator.create(runtime.moe.shared.SharedExpertCache);
-                    cache.* = runtime.moe.shared.SharedExpertCache.init(allocator);
-                    break :blk cache;
+                    break :blk try runtime.moe.shared.SharedExpertCache.createOwned(allocator);
                 }
             }
             break :blk null;
         };
-        errdefer if (shared_moe_cache) |cache| {
-            cache.deinit();
-            allocator.destroy(cache);
-        };
+        errdefer if (shared_moe_cache) |cache| cache.releaseOwned();
         var shared_prefetch: ?*runtime.tier.shared.SharedPrefetchState = if (session_factory.getGptConfig(session)) |_| blk: {
             const state = try allocator.create(runtime.tier.shared.SharedPrefetchState);
             errdefer allocator.destroy(state);
@@ -662,8 +658,9 @@ pub const Runtime = struct {
             .tokenizer_resource_lease = tokenizer_resource_lease,
             .resource_lease = assets.session.resource_lease,
         };
-        model.session.execution_gate = &model.target_inference_run_lock;
-        if (session_factory.getEmbeddingGemma2Config(model.session) != null) model.session.cohort_scheduler = &model.embedding_cohort_scheduler;
+        // The same ready FIFO bounds admitted work before every model's
+        // actual execution gate; no resource supplier runs under that gate.
+        model.session.cohort_scheduler = &model.embedding_cohort_scheduler;
 
         // One final owner is installed before borrowing shared state. Every
         // subsequent failure closes the session/worker before freeing it.
@@ -767,7 +764,6 @@ pub const Runtime = struct {
     /// Stateful GPU pipelines share mutable command-frame and resident-slot
     /// state within a loaded model. Keep one model-local lane while allowing
     /// independent models to overlap.
-    target_inference_run_lock: std.atomic.Mutex = .unlocked,
     embedding_cohort_scheduler: @import("../runtime/embedding_scheduler.zig").Scheduler = .{},
     /// CUDA boundary requests execute serially on this session. Queue before
     /// reserving their full device scratch ceiling, without holding a provider
@@ -1414,7 +1410,7 @@ pub const Runtime = struct {
     }
 
     pub fn targetInferenceExecutionMutex(self: *LoadedModel) ?*std.atomic.Mutex {
-        return targetInferenceExecutionMutexForBackend(self.session.backend(), &self.target_inference_run_lock);
+        return targetInferenceExecutionMutexForBackend(self.session.backend(), self.session.execution_gate orelse return null);
     }
 
     pub fn rerankingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) RerankingPipeline {
@@ -1594,10 +1590,7 @@ pub const Runtime = struct {
         if (self.visual_projection_resource_lease) |*lease| lease.release();
         if (self.audio_projection_resource_lease) |*lease| lease.release();
         if (self.whisper_prompt_cache) |*cache| cache.deinit();
-        if (self.shared_moe_cache) |cache| {
-            cache.deinit();
-            self.allocator.destroy(cache);
-        }
+        if (self.shared_moe_cache) |cache| cache.releaseOwned();
         if (self.shared_prefetch) |state| {
             state.deinit();
             self.allocator.destroy(state);
@@ -1790,7 +1783,8 @@ test "loaded runtime owned asset construction unwinds model and shared state at 
             defer model.deinit();
             try std.testing.expect(model.shared_prefetch != null);
             try std.testing.expect(model.native_generate_coordinator != null);
-            try std.testing.expectEqual(&model.target_inference_run_lock, model.session.execution_gate.?);
+            try std.testing.expectEqual(&model.session.model_lifetime.?.execution_gate, model.session.execution_gate.?);
+            try std.testing.expectEqual(&model.embedding_cohort_scheduler, model.session.cohort_scheduler.?);
         }
     };
     try std.testing.checkAllAllocationFailures(a, Case.run, .{directory});
@@ -2024,7 +2018,8 @@ test "primary model preparation loads without a serving registry and preserves i
     defer a.destroy(model);
     defer model.deinit();
     try std.testing.expectEqual(backends.BackendType.native, model.session.backend());
-    try std.testing.expectEqual(&model.target_inference_run_lock, model.session.execution_gate.?);
+    try std.testing.expectEqual(&model.session.model_lifetime.?.execution_gate, model.session.execution_gate.?);
+    try std.testing.expectEqual(&model.embedding_cohort_scheduler, model.session.cohort_scheduler.?);
     try std.testing.expect(model.hf_tok != null);
     const ids = try model.hf_tok.?.tokenizer().encode(a, "hello");
     defer a.free(ids);

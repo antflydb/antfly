@@ -13,12 +13,26 @@ const Class = @import("storage_accounting.zig").Class;
 /// storage reservation retains it once; its release follows all token releases.
 pub const Lifetime = struct {
     context: *anyopaque,
+    admission_domain: ?*@import("../runtime/tier/admission_domain.zig").Domain = null,
     retain: ?*const fn (*anyopaque) bool = null,
     /// A pin already held by the caller may expose an infallible clone. Store
     /// its real owner pointer/callbacks, never the address of a stack wrapper.
     retain_infallible: ?*const fn (*anyopaque) void = null,
     release: *const fn (*anyopaque) void,
 
+    /// Borrows this pin only during synchronous reservation preparation. Each
+    /// successful Reservation owns an independent pure-controller reference.
+    pub fn forAdmissionDomain(pin: @import("../runtime/tier/admission_domain.zig").Pin) Lifetime {
+        return .{ .context = pin.owner, .admission_domain = pin.owner, .retain_infallible = retainDomain, .release = releaseDomain };
+    }
+    fn retainDomain(raw: *anyopaque) void {
+        const owner: *@import("../runtime/tier/admission_domain.zig").Domain = @ptrCast(@alignCast(raw));
+        _ = owner.retain();
+    }
+    fn releaseDomain(raw: *anyopaque) void {
+        const owner: *@import("../runtime/tier/admission_domain.zig").Domain = @ptrCast(@alignCast(raw));
+        owner.release();
+    }
     pub fn isValid(self: Lifetime) bool {
         return (self.retain != null) != (self.retain_infallible != null);
     }
@@ -52,17 +66,81 @@ pub const Identity = struct {
     }
 };
 
-pub const Capability = struct {
-    identity: Identity,
-    context: *anyopaque,
-    reserve_fn: *const fn (*anyopaque, std.mem.Allocator, BackendKind, Class, usize) anyerror!Reservation,
+/// Returned metadata is already funded and process-stable. Construction epoch
+/// is borrowed only through this synchronous invocation/rollback; final physical
+/// release receives a NEW current cleanup Epoch rather than storing this one.
+pub const BackingReservation = struct {
+    owner: *@import("backing_retirement.zig").BackingOwner,
+    construction_epoch: *const @import("retirement_sink.zig").Epoch,
+    attachment: ?*@import("resource_retirement.zig").Charge.PreparedAttachment = null,
+};
 
-    pub fn reserve(self: Capability, allocator: std.mem.Allocator, backend: BackendKind, class: Class, bytes: usize) !Reservation {
-        return self.reserve_fn(self.context, allocator, backend, class, bytes);
+/// One actual storage owner. Published dispatch moves only a preadmitted
+/// backing; the ordinary Reservation variant preserves low-level compatibility.
+/// The construction epoch is borrowed solely for synchronous rollback.
+pub const Binding = struct {
+    reservation: ?*Reservation = null,
+    backing: ?BackingReservation = null,
+    pub fn rollback(self: Binding, allocator: std.mem.Allocator) void {
+        if (self.backing) |value| value.owner.release(value.construction_epoch) else if (self.reservation) |value| {
+            value.release();
+            allocator.destroy(value);
+        }
     }
 };
 
-const Domain = enum { host, backend };
+pub const Capability = struct {
+    identity: Identity,
+    context: *anyopaque,
+    /// One static descriptor replaces the previous one function pointer;
+    /// Capability and optional dispatch-capability width remain unchanged.
+    services: *const VTable,
+    pub const VTable = struct {
+        reserve: *const fn (*anyopaque, std.mem.Allocator, BackendKind, Class, usize) anyerror!Reservation,
+        takeBacking: ?*const fn (*anyopaque, std.mem.Allocator, BackendKind, Class, usize) anyerror!BackingReservation = null,
+        /// Borrows the Set's explicitly retained construction pin only until
+        /// this synchronous dispatch ends. Cached owners never save this pin.
+        constructionEpoch: ?*const fn (*anyopaque) ?*const @import("retirement_sink.zig").Epoch = null,
+        /// Explicit current outer invocation owner, independently forwarded by
+        /// RunPermit even for an empty/warm Set. Construction metadata never
+        /// supplies numerical authority through this service.
+        currentCleanupEpoch: ?*const fn (*anyopaque) ?*const @import("retirement_sink.zig").Epoch = null,
+    };
+
+    /// Called only with the frozen actual backing bound. Typed serving
+    /// capabilities cannot fall back to an allocator or supplier callback.
+    pub fn reserveOwned(self: Capability, allocator: std.mem.Allocator, backend: BackendKind, class: Class, bytes: usize) !Binding {
+        if (try self.reserveBacking(allocator, backend, class, bytes)) |backing| {
+            const reservation = backing.owner.charge.storageReservation() orelse @panic("prepared physical owner lacks exact storage reservation");
+            if (!reservation.identity.eql(self.identity) or backing.owner.admittedBytes() != bytes) {
+                backing.owner.release(backing.construction_epoch);
+                return error.InvalidPhysicalStorageReservation;
+            }
+            return .{ .reservation = reservation, .backing = backing };
+        }
+        const reservation = try allocator.create(Reservation);
+        errdefer allocator.destroy(reservation);
+        reservation.* = try self.reserve(allocator, backend, class, bytes);
+        return .{ .reservation = reservation };
+    }
+    pub fn reserveBacking(self: Capability, allocator: std.mem.Allocator, backend: BackendKind, class: Class, bytes: usize) !?BackingReservation {
+        const take = self.services.takeBacking orelse return null;
+        return try take(self.context, allocator, backend, class, bytes);
+    }
+    pub fn constructionEpoch(self: Capability) ?*const @import("retirement_sink.zig").Epoch {
+        const query = self.services.constructionEpoch orelse return null;
+        return query(self.context);
+    }
+    pub fn currentCleanupEpoch(self: Capability) ?*const @import("retirement_sink.zig").Epoch {
+        const query = self.services.currentCleanupEpoch orelse return null;
+        return query(self.context);
+    }
+    pub fn reserve(self: Capability, allocator: std.mem.Allocator, backend: BackendKind, class: Class, bytes: usize) !Reservation {
+        return self.services.reserve(self.context, allocator, backend, class, bytes);
+    }
+};
+
+const Domain = enum { host, backend, backend_kv };
 
 pub const Reservation = struct {
     /// Credit from the current request and an independently admitted deficit
@@ -83,6 +161,39 @@ pub const Reservation = struct {
         if (lifetime) |owner| owner.release(owner.context);
     }
 
+    /// Prepares every underlying exactly-once member before publishing any
+    /// amount transfer. Denied lifetime/metadata leaves parent quota intact.
+    /// Used BEFORE SDK allocation to turn one full transaction into independent
+    /// physical-backing owners without external reserve/reacquire calls.
+    pub fn partition(self: *Reservation, allocator: std.mem.Allocator, bytes: usize) !Reservation {
+        if (bytes == 0 or bytes > self.reservedBytes()) return error.InvalidStorageAdmission;
+        if (self.lifetime) |owner| if (!owner.acquire()) return error.ResourceOwnerShuttingDown;
+        errdefer if (self.lifetime) |owner| owner.release(owner.context);
+        var prepared: [2]?memory.AdmissionLease.PreparedPartition = @splat(null);
+        defer for (&prepared) |*item| if (item.*) |*split| split.abort();
+        var remaining = bytes;
+        for (&self.leases, 0..) |*member, index| {
+            const source = if (member.*) |*value| value else continue;
+            const amount = @min(remaining, domainBytes(source.amounts, self.domain));
+            if (amount == 0) continue;
+            prepared[index] = try source.preparePartition(allocator, amountsForDomain(self.domain, amount));
+            remaining -= amount;
+        }
+        std.debug.assert(remaining == 0);
+        var children: [2]?memory.AdmissionLease = @splat(null);
+        for (&prepared, 0..) |*item, index| {
+            if (item.*) |*split| children[index] = split.commit();
+        }
+        return .{ .identity = self.identity, .leases = children, .lifetime = self.lifetime, .domain = self.domain };
+    }
+
+    pub fn retainAdmissionDomain(self: *const Reservation) !?@import("../runtime/tier/admission_domain.zig").Pin {
+        const lifetime = self.lifetime orelse return null;
+        const owner = lifetime.admission_domain orelse return null;
+        if (&owner.controller != self.identity.controller or lifetime.context != @as(*anyopaque, @ptrCast(owner)) or lifetime.retain_infallible != Lifetime.retainDomain or lifetime.release != Lifetime.releaseDomain) return error.ForeignAdmissionDomain;
+        return owner.pin();
+    }
+
     /// Shrink conservative padding after measuring the actual owned span.
     /// A provider refusing a shrink retains the larger reservation safely.
     pub fn retainBytes(self: *Reservation, bytes: usize) void {
@@ -95,6 +206,12 @@ pub const Reservation = struct {
             remaining -= wanted;
         }
         std.debug.assert(remaining == 0);
+    }
+
+    /// Project a separately synchronized held-byte snapshot using only this
+    /// reservation's immutable domain. Never inspect mutable lease amounts.
+    pub fn amountsForBytes(self: *const Reservation, bytes: usize) memory.AdmissionAmounts {
+        return amountsForDomain(self.domain, bytes);
     }
 
     pub fn amounts(self: *const Reservation) memory.AdmissionAmounts {
@@ -123,6 +240,7 @@ fn domainBytes(amounts: memory.AdmissionAmounts, domain: Domain) usize {
     return switch (domain) {
         .host => amounts.host_scratch_bytes,
         .backend => amounts.backend_scratch_bytes,
+        .backend_kv => amounts.backend_kv_bytes,
     };
 }
 
@@ -130,6 +248,7 @@ fn amountsForDomain(domain: Domain, bytes: usize) memory.AdmissionAmounts {
     return switch (domain) {
         .host => .{ .host_scratch_bytes = bytes },
         .backend => .{ .backend_scratch_bytes = bytes },
+        .backend_kv => .{ .backend_kv_bytes = bytes },
     };
 }
 
@@ -138,9 +257,20 @@ fn amountsForDomain(domain: Domain, bytes: usize) memory.AdmissionAmounts {
 /// The backend must allocate only after success, and abort rather than retry
 /// an execution whose subsequent allocation fails under its reduced permit.
 pub fn fromRunLease(allocator: std.mem.Allocator, source: *memory.AdmissionLease, policy: Policy, backend: BackendKind, class: Class, bytes: usize) !Reservation {
+    return fromRunDomain(allocator, source, policy, try domainFor(backend, class), bytes);
+}
+
+/// Persistent device KV owns a distinct quota class. Only an explicitly declared
+/// KV allowance can be partitioned; scratch/IO protection never supplies credit.
+/// The owner must retain the returned reservation through actual backing death.
+pub fn fromRunKvLease(allocator: std.mem.Allocator, source: *memory.AdmissionLease, policy: Policy, bytes: usize) !Reservation {
+    if (policy.backend_class != .gpu) return error.InvalidStorageAdmission;
+    return fromRunDomain(allocator, source, policy, .backend_kv, bytes);
+}
+
+fn fromRunDomain(allocator: std.mem.Allocator, source: *memory.AdmissionLease, policy: Policy, domain: Domain, bytes: usize) !Reservation {
     if (bytes == 0) return error.InvalidStorageAdmission;
     if (source.controller != policy.controller or source.retain_backend_class != policy.backend_class) return error.InvalidStorageAdmission;
-    const domain = try domainFor(backend, class);
     if (policy.lifetime) |owner| {
         if (!owner.isValid()) return error.InvalidStorageLifetime;
         if (!owner.acquire()) return error.ResourceOwnerShuttingDown;
@@ -160,6 +290,7 @@ pub fn fromRunLease(allocator: std.mem.Allocator, source: *memory.AdmissionLease
     if (policy.credit) |remaining| switch (domain) {
         .host => remaining.host_scratch_bytes -= credit,
         .backend => remaining.backend_scratch_bytes -= credit,
+        .backend_kv => remaining.backend_kv_bytes -= credit,
     };
     return .{ .identity = .{ .controller = policy.controller, .backend_class = policy.backend_class }, .leases = .{ partitioned, supplemental }, .lifetime = policy.lifetime, .domain = domain };
 }
@@ -381,4 +512,137 @@ test "physical storage admission clones infallible owner pins without stack adap
     reservation.release();
     try std.testing.expectEqual(@as(usize, 1), owner.refs);
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "persistent KV growth admits full replacement overlap without spending unrelated scratch" {
+    const a = std.testing.allocator;
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var source = try controller.tryAcquire(.gpu, .{}, .{ .backend_kv_bytes = 64, .backend_scratch_bytes = 32 }, false);
+    defer source.release();
+    const original = source.amounts;
+    var policy = Policy{ .controller = &controller, .backend_class = .gpu, .limits = .{ .backend_limit_bytes = 191 }, .check_live_memory = false };
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, fromRunKvLease(a, &source, policy, 96));
+    try std.testing.expectEqualDeep(original, source.amounts);
+    try std.testing.expectEqualDeep(original, controller.snapshot());
+    policy.limits.backend_limit_bytes = 192;
+    var replacement = try fromRunKvLease(a, &source, policy, 96);
+    defer replacement.release();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .backend_kv_bytes = 160, .backend_scratch_bytes = 32 }, controller.snapshot());
+    try std.testing.expectEqualDeep(original, source.amounts);
+    source.release();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .backend_kv_bytes = 96 }, controller.snapshot());
+    replacement.release();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "persistent KV partition consumes only declared KV credit and leaves IO scratch protected" {
+    const a = std.testing.allocator;
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var source = try controller.tryAcquire(.gpu, .{}, .{ .backend_kv_bytes = 96, .backend_scratch_bytes = 32 }, false);
+    defer source.release();
+    var credit = memory.AdmissionAmounts{ .backend_kv_bytes = 96 };
+    var reservation = try fromRunKvLease(a, &source, .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .backend_limit_bytes = 128 }, .check_live_memory = false, .credit = &credit }, 96);
+    defer reservation.release();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .backend_scratch_bytes = 32 }, source.amounts);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, credit);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .backend_kv_bytes = 96 }, reservation.amounts());
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .backend_kv_bytes = 96, .backend_scratch_bytes = 32 }, controller.snapshot());
+}
+
+test "physical storage reservation partitions every member before failure atomic publication" {
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var first = try controller.tryAcquire(.gpu, .{}, .{ .backend_kv_bytes = 32 }, false);
+    var second = try controller.tryAcquire(.gpu, .{}, .{ .backend_kv_bytes = 64 }, false);
+    var parent = Reservation{ .identity = .{ .controller = &controller, .backend_class = .gpu }, .domain = .backend_kv, .leases = .{ first, second } };
+    first.controller = null;
+    second.controller = null;
+    defer parent.release();
+    var child = try parent.partition(std.testing.allocator, 48);
+    defer child.release();
+    try std.testing.expectEqual(@as(usize, 48), parent.reservedBytes());
+    try std.testing.expectEqual(@as(usize, 48), child.reservedBytes());
+    try std.testing.expectEqual(@as(usize, 96), controller.snapshot().backend_kv_bytes);
+    child.release();
+    try std.testing.expectEqual(@as(usize, 48), controller.snapshot().backend_kv_bytes);
+    try std.testing.expectError(error.InvalidStorageAdmission, parent.partition(std.testing.allocator, 49));
+    try std.testing.expectEqual(@as(usize, 48), parent.reservedBytes());
+    parent.release();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_kv_bytes);
+}
+
+test "physical storage partition second member metadata failure leaves both opaque tokens untouched" {
+    const Budget = struct {
+        amounts: [2]memory.AdmissionAmounts = @splat(.{}),
+        tokens: usize = 0,
+        references: usize = 1,
+        releases: usize = 0,
+        fn retainContext(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references += 1;
+            return true;
+        }
+        fn releaseContext(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references -= 1;
+        }
+        fn reserve(raw: *anyopaque, amounts: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.tokens >= self.amounts.len) return error.ResourceLimitExceeded;
+            self.amounts[self.tokens] = amounts;
+            self.tokens += 1;
+            return self.tokens;
+        }
+        fn retain(raw: *anyopaque, token: usize, amounts: memory.AdmissionAmounts) memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (token == 0 or token > self.tokens) return error.ResourceLimitExceeded;
+            self.amounts[token - 1] = amounts;
+        }
+        fn release(raw: *anyopaque, token: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.amounts[token - 1] = .{};
+            self.releases += 1;
+        }
+    };
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var budget = Budget{};
+    try controller.configureResourceBudget(.{ .context = &budget, .try_reserve = Budget.reserve, .retain = Budget.retain, .release = Budget.release, .retain_context = Budget.retainContext, .release_context = Budget.releaseContext });
+    var parent = Reservation{ .identity = .{ .controller = &controller, .backend_class = .gpu }, .domain = .backend_kv };
+    defer parent.release();
+    parent.leases[0] = try controller.tryAcquire(.gpu, .{}, .{ .backend_kv_bytes = 32 }, false);
+    parent.leases[1] = try controller.tryAcquire(.gpu, .{}, .{ .backend_kv_bytes = 64 }, false);
+    const before = parent;
+    var fail_second = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, parent.partition(fail_second.allocator(), 48));
+    try std.testing.expectEqualDeep(before, parent);
+    try std.testing.expectEqual(@as(usize, 0), controller.shared_external_owners);
+    try std.testing.expectEqual(@as(usize, 2), budget.references);
+    try std.testing.expectEqual(@as(usize, 0), budget.releases);
+    try std.testing.expectEqual(@as(usize, 2), budget.tokens);
+    try std.testing.expectEqual(@as(usize, 32), budget.amounts[0].backend_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 64), budget.amounts[1].backend_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 96), controller.snapshot().backend_kv_bytes);
+    var child = try parent.partition(std.testing.allocator, 48);
+    defer child.release();
+    parent.release();
+    try std.testing.expectEqual(@as(usize, 48), controller.snapshot().backend_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 2), budget.tokens);
+    child.release();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 2), budget.releases);
+    try std.testing.expectEqual(@as(usize, 2), budget.references);
+}
+
+test "prepared physical services preserve original capability and optional dispatch widths" {
+    const Previous = struct {
+        identity: Identity,
+        context: *anyopaque,
+        reserve_fn: *const fn (*anyopaque, std.mem.Allocator, BackendKind, Class, usize) anyerror!Reservation,
+    };
+    try std.testing.expectEqual(@sizeOf(Previous), @sizeOf(Capability));
+    try std.testing.expectEqual(@alignOf(Previous), @alignOf(Capability));
+    try std.testing.expectEqual(@sizeOf(?Previous), @sizeOf(?Capability));
 }

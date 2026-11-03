@@ -56,12 +56,39 @@ const metal_runtime = @import("metal_runtime.zig");
 /// into a (f32_scale + int8[head_dim]) per-head layout via the threadgroup
 /// reduction kernel while values stay raw f32 (parallel to polar4/turbo3).
 /// Other KV dtypes (int4, bf16) still fall through to the host write path.
+pub const RowLayout = struct { token_values: usize, key_row_bytes: usize, base_key_row_bytes: usize, v_row_stride: usize };
+
 pub const KeyFormat = enum(u32) {
     polar4 = 0,
     turbo3 = 1,
     raw_f32 = 2,
     f16 = 3,
     int8_per_head = 4,
+
+    pub fn rowLayout(self: KeyFormat, num_kv_heads: u32, head_dim: u32) RowLayout {
+        const token_values: usize = @as(usize, num_kv_heads) * @as(usize, head_dim);
+        const int8_row_bytes: usize = @as(usize, num_kv_heads) * (@as(usize, head_dim) + @sizeOf(f32));
+        const key_row_bytes: usize = switch (self) {
+            .polar4 => turboquant.polar4KeyBytes(num_kv_heads, head_dim),
+            .turbo3 => turboquant.turbo3KeyBytes(num_kv_heads, head_dim) + turboquant.turbo3ResidualBytes(num_kv_heads, head_dim),
+            .raw_f32 => token_values * @sizeOf(f32),
+            .f16 => token_values * @sizeOf(u16),
+            .int8_per_head => int8_row_bytes,
+        };
+        const base_key_row_bytes: usize = switch (self) {
+            .polar4 => turboquant.polar4KeyBytes(num_kv_heads, head_dim),
+            .turbo3 => turboquant.turbo3KeyBytes(num_kv_heads, head_dim),
+            .raw_f32 => token_values * @sizeOf(f32),
+            .f16 => token_values * @sizeOf(u16),
+            .int8_per_head => int8_row_bytes,
+        };
+        return .{
+            .token_values = token_values,
+            .key_row_bytes = key_row_bytes,
+            .base_key_row_bytes = base_key_row_bytes,
+            .v_row_stride = token_values,
+        };
+    }
 
     pub fn fromKvDType(dtype: pool_mod.KvDType) ?KeyFormat {
         return switch (dtype) {
@@ -152,7 +179,10 @@ pub const MetalKvStorage = struct {
     slot_ring_page_count: [metal_runtime.attention_span_slot_capacity]usize = @as([metal_runtime.attention_span_slot_capacity]usize, @splat(0)),
     slot_ring_policy_initialized: [metal_runtime.attention_span_slot_capacity]bool = @as([metal_runtime.attention_span_slot_capacity]bool, @splat(false)),
     slot_buffer_capacity_tokens: [metal_runtime.attention_span_slot_capacity]usize = @as([metal_runtime.attention_span_slot_capacity]usize, @splat(0)),
-    cyclic_page_table_cache: storage_runtime.CyclicPageTableCache = .{},
+    cyclic_page_table_cache: storage_runtime.PageTokenOffsetCache = .{},
+    capacity_epoch: u64 = 1,
+    cold_bank: ?*ColdKvBank = null,
+    capacity_owners: [metal_runtime.attention_span_slot_capacity][2]?*storage_runtime.device_capacity.BackingOwner = @splat(@splat(null)),
 
     /// Allocate a MetalKvStorage keyed to `runtime`. The storage does not own
     /// the runtime — callers are responsible for its lifetime. `dtype` must
@@ -225,6 +255,19 @@ pub const MetalKvStorage = struct {
         share_global: bool,
         compactable_global: bool,
     ) !*SlotBinding {
+        var cold_sequence_slot: ?usize = null;
+        if (self.cold_bank) |bank| {
+            if (!bank.adopted or ring_page_count != 0 or !share_global or compactable_global or self.global_layer_slots.get(key.layer_index) == null) return error.DeviceWriteFallback;
+            var found = false;
+            for (bank.active_sequences, 0..) |sequence, index| {
+                if (sequence == key.sequence_id) {
+                    found = true;
+                    break;
+                }
+                if (sequence == null and cold_sequence_slot == null) cold_sequence_slot = index;
+            }
+            if (found) cold_sequence_slot = null else if (cold_sequence_slot == null) return error.KvCapacityTooSmall;
+        }
         if (self.slot_map.getPtr(key)) |binding| {
             if (binding.ring_page_count != ring_page_count) return error.DeviceWriteFallback;
             if (compactable_global and !binding.compactable_global) return error.DeviceWriteFallback;
@@ -255,12 +298,11 @@ pub const MetalKvStorage = struct {
             _ = try self.configureSlotRingPolicy(slot, ring_page_count);
         }
 
-        try self.slot_map.put(self.allocator, key, .{
-            .slot = slot,
-            .ring_page_count = ring_page_count,
-            .sequence_owned = owns_slot,
-            .compactable_global = compactable_global,
-        });
+        const value = SlotBinding{ .slot = slot, .ring_page_count = ring_page_count, .sequence_owned = owns_slot, .compactable_global = compactable_global };
+        if (self.cold_bank) |bank| {
+            self.slot_map.putAssumeCapacity(key, value);
+            if (cold_sequence_slot) |index| bank.active_sequences[index] = key.sequence_id;
+        } else try self.slot_map.put(self.allocator, key, value);
         return self.slot_map.getPtr(key).?;
     }
 
@@ -322,15 +364,7 @@ pub const MetalKvStorage = struct {
                 !envFlagEnabled("TERMITE_METAL_DISABLE_CYCLIC_PAGE_TABLE_CACHE"),
             );
         }
-        if (logical_blocks.len < needed_blocks) return error.KvCapacityTooSmall;
-        const offsets = try self.allocator.alloc(u32, needed_blocks);
-        errdefer self.allocator.free(offsets);
-        for (offsets, logical_blocks[0..needed_blocks]) |*offset, block_id| {
-            const token_offset = std.math.mul(usize, @as(usize, block_id), page_size_tokens) catch return error.KvCapacityTooSmall;
-            if (token_offset > std.math.maxInt(u32)) return error.KvCapacityTooSmall;
-            offset.* = @intCast(token_offset);
-        }
-        return .{ .owned = offsets };
+        return self.cyclic_page_table_cache.getMapped(self.allocator, logical_blocks, needed_blocks, page_size_tokens);
     }
 
     fn identityPageTokenOffsets(
@@ -338,14 +372,18 @@ pub const MetalKvStorage = struct {
         needed_blocks: usize,
         page_size_tokens: usize,
     ) !storage_runtime.PageTokenOffsets {
-        if (needed_blocks == 0 or page_size_tokens == 0) return error.KvCapacityTooSmall;
-        const offsets = try self.allocator.alloc(u32, needed_blocks);
-        errdefer self.allocator.free(offsets);
-        for (offsets, 0..) |*offset, block_index| {
-            const token_offset = std.math.mul(usize, block_index, page_size_tokens) catch return error.KvCapacityTooSmall;
-            offset.* = std.math.cast(u32, token_offset) orelse return error.KvCapacityTooSmall;
+        return self.cyclic_page_table_cache.getIdentity(self.allocator, needed_blocks, page_size_tokens);
+    }
+
+    fn requirePreparedLayout(self: *const MetalKvStorage, index: usize, heads: u32, dimension: u32) !void {
+        const bank = self.cold_bank orelse return;
+        if (!bank.adopted) return error.PreparedKvBankConsumed;
+        for (bank.rows[0..bank.count]) |row| {
+            if (row.geometry.index != index) continue;
+            if (row.geometry.num_kv_heads != heads or row.geometry.head_dim != dimension) return error.DeviceKvCapacityLayoutChanged;
+            return;
         }
-        return .{ .owned = offsets };
+        return error.DeviceKvCapacityLayoutChanged;
     }
 
     fn reserveSlotCapacity(
@@ -357,8 +395,20 @@ pub const MetalKvStorage = struct {
         key_row_bytes: usize,
         v_row_stride: usize,
     ) !void {
+        if (self.cold_bank) |bank| {
+            if (!bank.adopted or ring_page_count != 0 or page_size_tokens != bank.window.page_size) return error.DeviceWriteFallback;
+            var matches = false;
+            for (bank.rows[0..bank.count]) |row| {
+                if (self.global_layer_slots.get(row.geometry.index) != slot) continue;
+                matches = row.key_row_bytes == key_row_bytes and row.value_row_bytes == v_row_stride * (if (self.format == .f16) @as(usize, 2) else 4);
+                break;
+            }
+            if (!matches) return error.DeviceKvCapacityLayoutChanged;
+        }
         const current = self.slot_buffer_capacity_tokens[slot];
         if (required_tokens <= current) return;
+        if (self.capacity_owners[slot][0] != null or self.capacity_owners[slot][1] != null) return error.DeviceKvCapacityAdmissionRequired;
+        self.capacity_epoch = try std.math.add(u64, self.capacity_epoch, 1);
         const target = if (ring_page_count > 0 or envFlagEnabled("TERMITE_METAL_DISABLE_GEOMETRIC_KV_GROWTH"))
             required_tokens
         else
@@ -398,7 +448,12 @@ pub const MetalKvStorage = struct {
                 key_count += 1;
                 if (key_count == keys.len) break;
             }
-            if (key_count == 0) return;
+            if (key_count == 0) {
+                if (self.cold_bank) |bank| for (&bank.active_sequences) |*id| {
+                    if (id.* == sequence_id) id.* = null;
+                };
+                return;
+            }
             for (keys[0..key_count]) |key| {
                 if (self.slot_map.fetchRemove(key)) |removed| {
                     if (removed.value.selected_positions) |positions| self.allocator.free(positions);
@@ -412,38 +467,8 @@ pub const MetalKvStorage = struct {
         }
     }
 
-    fn rowLayout(
-        self: *const MetalKvStorage,
-        num_kv_heads: u32,
-        head_dim: u32,
-    ) struct {
-        token_values: usize,
-        key_row_bytes: usize,
-        base_key_row_bytes: usize,
-        v_row_stride: usize,
-    } {
-        const token_values: usize = @as(usize, num_kv_heads) * @as(usize, head_dim);
-        const int8_row_bytes: usize = @as(usize, num_kv_heads) * (@as(usize, head_dim) + @sizeOf(f32));
-        const key_row_bytes: usize = switch (self.format) {
-            .polar4 => turboquant.polar4KeyBytes(num_kv_heads, head_dim),
-            .turbo3 => turboquant.turbo3KeyBytes(num_kv_heads, head_dim) + turboquant.turbo3ResidualBytes(num_kv_heads, head_dim),
-            .raw_f32 => token_values * @sizeOf(f32),
-            .f16 => token_values * @sizeOf(u16),
-            .int8_per_head => int8_row_bytes,
-        };
-        const base_key_row_bytes: usize = switch (self.format) {
-            .polar4 => turboquant.polar4KeyBytes(num_kv_heads, head_dim),
-            .turbo3 => turboquant.turbo3KeyBytes(num_kv_heads, head_dim),
-            .raw_f32 => token_values * @sizeOf(f32),
-            .f16 => token_values * @sizeOf(u16),
-            .int8_per_head => int8_row_bytes,
-        };
-        return .{
-            .token_values = token_values,
-            .key_row_bytes = key_row_bytes,
-            .base_key_row_bytes = base_key_row_bytes,
-            .v_row_stride = token_values,
-        };
+    fn rowLayout(self: *const MetalKvStorage, num_kv_heads: u32, head_dim: u32) RowLayout {
+        return self.format.rowLayout(num_kv_heads, head_dim);
     }
 
     pub fn deviceWriteHook(self: *MetalKvStorage) storage_runtime.DeviceWriteHook {
@@ -475,6 +500,7 @@ pub const MetalKvStorage = struct {
         v: storage_runtime.DeviceKvRef,
     ) anyerror!void {
         const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        try self.requirePreparedLayout(write.layer_index, write.num_kv_heads, write.head_dim);
         const num_kv_heads: u32 = write.num_kv_heads;
         const head_dim: u32 = write.head_dim;
 
@@ -672,6 +698,7 @@ pub const MetalKvStorage = struct {
         reserve: storage_runtime.DeviceKvLayerReserve,
     ) anyerror!void {
         const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        try self.requirePreparedLayout(reserve.layer_index, reserve.num_kv_heads, reserve.head_dim);
         if (reserve.token_capacity == 0) return;
         const layout = self.rowLayout(reserve.num_kv_heads, reserve.head_dim);
         if (layout.key_row_bytes == 0 or layout.v_row_stride == 0) return error.InvalidKvShape;
@@ -778,6 +805,183 @@ pub const MetalKvStorage = struct {
         if (!binding.commitWrite(commit.total_token_count, commit.position_offset)) return error.DeviceWriteFallback;
     }
 
+    fn copySharedBlockPrefixes(ctx: *anyopaque, implementation: *const anyopaque, request: storage_runtime.block_copy.Request) !void {
+        if (implementation != @as(*const anyopaque, @ptrCast(&hook_vtable))) return error.SharedKvWriteUnsupported;
+        const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        try request.validate();
+        if (request.page_size != self.page_size_tokens or self.global_layer_slots.count() != request.layers) return error.SharedKvCopyLayoutChanged;
+        if (metal_runtime.termite_metal_decode_runtime_has_active_frame(self.runtime) != 0 or metal_runtime.termite_metal_decode_runtime_has_submitted_frame(self.runtime) != 0) return error.SharedKvCopyDuringFrame;
+        var planes: [256]metal_runtime.RawPagedCopyPlane = undefined;
+        for (0..request.layers) |index| {
+            const slot = self.global_layer_slots.get(@intCast(index)) orelse return error.SharedKvWriteUnsupported;
+            if (slot >= self.leased_slots.len or !self.leased_slots[slot] or self.slot_ring_page_count[slot] != 0) return error.SharedKvCopyLayoutChanged;
+            if (self.slot_map.get(.{ .sequence_id = request.sequence, .layer_index = @intCast(index) })) |binding| if (binding.slot != slot or binding.sequence_owned or binding.ring_page_count != 0 or binding.selected_positions != null or binding.compactable_global) return error.SharedKvWriteUnsupported;
+            const info = try self.slotInfo(slot);
+            if (info.encoded_key_handle == null or info.v_handle == null or info.key_row_bytes == 0 or info.v_row_stride == 0) return error.SharedKvCopyLayoutChanged;
+            const value_bytes = try std.math.mul(usize, info.v_row_stride, if (self.format == .f16) @as(usize, 2) else @as(usize, 4));
+            const key_capacity = try std.math.mul(usize, self.slot_buffer_capacity_tokens[slot], info.key_row_bytes);
+            const value_capacity = try std.math.mul(usize, self.slot_buffer_capacity_tokens[slot], value_bytes);
+            if (key_capacity == 0 or value_capacity == 0 or key_capacity > info.encoded_key_capacity or value_capacity > info.v_capacity) return error.SharedKvCopyLayoutChanged;
+            for (request.items) |item| {
+                const keys = try request.byteRange(item, info.key_row_bytes);
+                const values = try request.byteRange(item, value_bytes);
+                if (keys.source > key_capacity or keys.bytes > key_capacity - keys.source or keys.destination > key_capacity or keys.bytes > key_capacity - keys.destination or values.source > value_capacity or values.bytes > value_capacity - values.source or values.destination > value_capacity or values.bytes > value_capacity - values.destination) return error.SharedKvCopyCapacityRequired;
+            }
+            planes[index] = .{ .keys = info.encoded_key_handle.?, .values = info.v_handle.?, .key_row_bytes = info.key_row_bytes, .value_row_bytes = value_bytes, .key_capacity = key_capacity, .value_capacity = value_capacity };
+        }
+        const rc = metal_runtime.antfly_metal_copy_paged_rows_checked(self.runtime, &planes, request.layers, request.items.ptr, request.items.len, request.page_size);
+        if (rc == -100) @import("antfly_platform").inference_process_supervisor.restartWorker();
+        if (rc != 0) return error.SharedKvCopyFailed;
+    }
+
+    fn planCapacity(ctx: *anyopaque, implementation: *const anyopaque, minimum_tokens: usize, page: u16, layers: []const storage_runtime.device_capacity.LayerGeometry, out: *storage_runtime.device_capacity.Plan) !void {
+        if (implementation != @as(*const anyopaque, @ptrCast(&hook_vtable))) return error.DeviceKvCapacityUnsupported;
+        const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        if (minimum_tokens == 0 or page != self.page_size_tokens or layers.len == 0 or layers.len > 256 or self.global_layer_slots.count() != layers.len) return error.DeviceKvCapacityUnsupported;
+        if (metal_runtime.hasActiveFrame(self.runtime) or metal_runtime.hasSubmittedFrame(self.runtime)) return error.SharedKvCopyDuringFrame;
+        var plan = storage_runtime.device_capacity.Plan{ .backend = .metal, .owner = @intFromPtr(self), .implementation = @intFromPtr(&hook_vtable), .epoch = self.capacity_epoch, .minimum_tokens = minimum_tokens, .page_size = page };
+        for (layers) |layout| {
+            const index = layout.index;
+            const slot = self.global_layer_slots.get(@intCast(index)) orelse return error.DeviceKvCapacityUnsupported;
+            if (slot >= self.leased_slots.len or !self.leased_slots[slot] or self.slot_ring_page_count[slot] != 0) return error.DeviceKvCapacityLayoutChanged;
+            var bindings = self.slot_map.valueIterator();
+            while (bindings.next()) |binding| if (binding.slot == slot and (binding.sequence_owned or binding.ring_page_count != 0 or binding.selected_positions != null or binding.compactable_global)) return error.DeviceKvCapacityUnsupported;
+            const info = try self.slotInfo(slot);
+            const expected = self.rowLayout(layout.num_kv_heads, layout.head_dim);
+            if (info.key_row_bytes != expected.key_row_bytes or info.v_row_stride != expected.v_row_stride) return error.DeviceKvCapacityLayoutChanged;
+            const keys = info.encoded_key_handle orelse return error.DeviceKvCapacityLayoutChanged;
+            const values = info.v_handle orelse return error.DeviceKvCapacityLayoutChanged;
+            const current = self.slot_buffer_capacity_tokens[slot];
+            const target = if (minimum_tokens <= current) current else if (envFlagEnabled("TERMITE_METAL_DISABLE_GEOMETRIC_KV_GROWTH")) minimum_tokens else try storage_runtime.geometricKvTokenCapacity(current, minimum_tokens, page);
+            const value_row = try std.math.mul(usize, info.v_row_stride, if (self.format == .f16) @as(usize, 2) else @as(usize, 4));
+            // Reused slots can retain unequal K/V spans. Admit and replace
+            // only a plane whose actual visible capacity cannot cover target.
+            const required_keys = try std.math.mul(usize, target, info.key_row_bytes);
+            const required_values = try std.math.mul(usize, target, value_row);
+            const new_keys = if (required_keys > info.encoded_key_capacity) required_keys else 0;
+            const new_values = if (required_values > info.v_capacity) required_values else 0;
+            const key_bound = if (new_keys != 0) metal_runtime.antfly_metal_physical_allocation_bytes(self.runtime, new_keys) else 0;
+            const value_bound = if (new_values != 0) metal_runtime.antfly_metal_physical_allocation_bytes(self.runtime, new_values) else 0;
+            try plan.append(.{ .index = @intCast(index), .geometry = layout, .slot = @intCast(slot), .current_tokens = current, .target_tokens = target, .keys = .{ .handle = @intFromPtr(keys), .length = info.encoded_key_capacity, .allocated = metal_runtime.termite_metal_buffer_allocated_size(keys), .row_bytes = info.key_row_bytes, .new_length = new_keys, .new_bound = key_bound }, .values = .{ .handle = @intFromPtr(values), .length = info.v_capacity, .allocated = metal_runtime.termite_metal_buffer_allocated_size(values), .row_bytes = value_row, .new_length = new_values, .new_bound = value_bound } });
+        }
+        out.* = plan;
+    }
+
+    fn growCapacity(ctx: *anyopaque, implementation: *const anyopaque, plan: *const storage_runtime.device_capacity.Plan, claim: *storage_runtime.device_capacity.Claim, cleanup: *const @import("../execution/retirement_sink.zig").Epoch) !void {
+        const Allocation = struct {
+            fn prepare(runtime: *metal_runtime.RawMetalDecodeRuntime, planes: [*]const metal_runtime.RawKvGrowthPlane, count: usize, stage: *?*anyopaque) c_int {
+                return metal_runtime.antfly_metal_kv_growth_prepare(runtime, planes, count, stage);
+            }
+        };
+        return growCapacityUsing(ctx, implementation, plan, claim, cleanup, Allocation);
+    }
+    fn growCapacityUsing(ctx: *anyopaque, implementation: *const anyopaque, plan: *const storage_runtime.device_capacity.Plan, claim: *storage_runtime.device_capacity.Claim, cleanup: *const @import("../execution/retirement_sink.zig").Epoch, comptime Allocation: type) !void {
+        if (implementation != @as(*const anyopaque, @ptrCast(&hook_vtable))) return error.DeviceKvCapacityUnsupported;
+        const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        var current: storage_runtime.device_capacity.Plan = undefined;
+        const geometry = try plan.requiredGeometry();
+        try planCapacity(ctx, implementation, plan.minimum_tokens, plan.page_size, geometry.items(), &current);
+        if (!plan.eql(&current)) return error.DeviceKvCapacityPlanChanged;
+        if (plan.new_bytes == 0) {
+            var changed = false;
+            for (plan.layers[0..plan.count]) |layer| changed = changed or layer.target_tokens != layer.current_tokens;
+            if (!changed) return;
+            if (try cleanup.isSealed()) return error.DeviceKvCapacityRequiresActiveCleanupEpoch;
+            const next_epoch = try std.math.add(u64, self.capacity_epoch, 1);
+            for (plan.layers[0..plan.count]) |layer| self.slot_buffer_capacity_tokens[layer.slot] = layer.target_tokens;
+            self.capacity_epoch = next_epoch;
+            return; // Actual buffers already cover every row: no SDK or quota work.
+        }
+        if (try cleanup.isSealed()) return error.DeviceKvCapacityRequiresActiveCleanupEpoch;
+        try claim.require(plan);
+        const next_epoch = try std.math.add(u64, self.capacity_epoch, 1);
+        const retirement = @import("../execution/resource_retirement.zig");
+        const initialized = metal_runtime.antfly_metal_set_retirement_poll(@import("../ops/metal_compute.zig").MetalCompute.pollRetirementChargesCPU);
+        if (initialized == -1) return error.OutOfMemory;
+        if (initialized != 0) return error.InvalidResourceRetirement;
+        var planes: [256]metal_runtime.RawKvGrowthPlane = undefined;
+        for (plan.layers[0..plan.count], 0..) |layer, index| planes[index] = .{
+            .slot = layer.slot,
+            .old_keys = @ptrFromInt(layer.keys.handle),
+            .old_values = @ptrFromInt(layer.values.handle),
+            .old_key_length = layer.keys.length,
+            .old_value_length = layer.values.length,
+            .old_key_allocated = layer.keys.allocated,
+            .old_value_allocated = layer.values.allocated,
+            .new_key_length = layer.keys.new_length,
+            .new_value_length = layer.values.new_length,
+            .key_bound = layer.keys.new_bound,
+            .value_bound = layer.values.new_bound,
+        };
+        var stage: ?*anyopaque = null;
+        claim.attempted = true;
+        const prepared = Allocation.prepare(self.runtime, &planes, plan.count, &stage);
+        if (prepared == -5) return error.OutOfMemory;
+        if (prepared != 0) return error.DeviceKvCapacityPreparationFailed;
+        defer metal_runtime.antfly_metal_kv_growth_discard(stage);
+
+        const Attachment = struct {
+            runtime: *metal_runtime.RawMetalDecodeRuntime,
+            buffer: *anyopaque,
+            fn beginScope(raw: *anyopaque, _: []const @import("../ops/ops.zig").CT) !retirement.Scope.Begun {
+                const value: *@This() = @ptrCast(@alignCast(raw));
+                var origin: u64 = 0;
+                const pending = metal_runtime.antfly_metal_output_retirement_begin(value.runtime, &origin, retirement.Queue.createIdentity);
+                if (pending < 0) return error.InvalidResourceRetirement;
+                metal_runtime.antfly_metal_output_retirement_end(value.runtime);
+                // These freshly allocated buffers have not been encoded yet.
+                // Unrelated frame/reuse-pool batches do not own this claim.
+                return .{ .origin = .{ .identity = origin }, .pending_batches = 0 };
+            }
+            fn end(_: *anyopaque) void {}
+            fn attach(raw: *anyopaque, _: []const @import("../ops/ops.zig").CT, nodes: []retirement.Node, payload: retirement.Payload) !void {
+                const value: *@This() = @ptrCast(@alignCast(raw));
+                if (nodes.len != 0) return error.InvalidResourceRetirement;
+                const buffers = [_]*anyopaque{value.buffer};
+                const witnesses = metal_runtime.antfly_metal_prepare_retirement_witnesses(&buffers, buffers.len, payload) orelse return error.OutOfMemory;
+                defer metal_runtime.antfly_metal_discard_retirement_witnesses(witnesses);
+                if (metal_runtime.antfly_metal_buffer_retirement_attach(witnesses) != 0) return error.InvalidResourceRetirement;
+            }
+            fn attachPrepared(raw: *anyopaque, _: []const @import("../ops/ops.zig").CT, nodes: []retirement.Node, payload: retirement.Payload, metadata: *retirement.BackendPreparation) !void {
+                const value: *@This() = @ptrCast(@alignCast(raw));
+                if (nodes.len != 0) return error.InvalidResourceRetirement;
+                const buffers = [_]*anyopaque{value.buffer};
+                const witnesses = try metadata.armMetal(null, &buffers, payload);
+                defer metal_runtime.antfly_metal_discard_retirement_witnesses(witnesses);
+                if (metal_runtime.antfly_metal_buffer_retirement_attach(witnesses) != 0) return error.InvalidResourceRetirement;
+            }
+            const table = retirement.Scope.VTable{ .begin = beginScope, .attach = attach, .attach_prepared = attachPrepared, .end = end, .notify = metal_runtime.antfly_metal_request_retirement_poll };
+        };
+        for (plan.layers[0..plan.count], 0..) |layer, index| {
+            const planned_planes = [_]storage_runtime.device_capacity.Plane{ layer.keys, layer.values };
+            for (planned_planes, 0..) |plane, which| if (plane.new_length != 0) {
+                const buffer = metal_runtime.antfly_metal_kv_growth_buffer(stage.?, index, which) orelse return error.InvalidResourceRetirement;
+                const owner = claim.ownerAt(index, which);
+                owner.measure(cleanup, metal_runtime.termite_metal_buffer_allocated_size(buffer));
+                var attachment = Attachment{ .runtime = self.runtime, .buffer = buffer };
+                const begun = try Attachment.beginScope(&attachment, &.{});
+                var scope = retirement.Scope{ .context = &attachment, .origin = begun.origin, .pending_batches = begun.pending_batches, .outputs = &.{}, .active = true, .vtable = &Attachment.table };
+                defer scope.end();
+                if (begun.pending_batches != 0) return error.SharedKvCopyDuringFrame;
+                try owner.charge.attach(&scope);
+                scope.end();
+            };
+        }
+        const copied = metal_runtime.antfly_metal_kv_growth_copy_checked(stage);
+        if (copied == -100) @import("antfly_platform").inference_process_supervisor.restartWorker();
+        if (copied != 0) return error.DeviceKvCapacityCopyFailed;
+        metal_runtime.antfly_metal_kv_growth_publish(stage);
+        for (plan.layers[0..plan.count], 0..) |layer, index| {
+            const planned_planes = [_]storage_runtime.device_capacity.Plane{ layer.keys, layer.values };
+            for (planned_planes, 0..) |plane, which| if (plane.new_length != 0) {
+                if (self.capacity_owners[layer.slot][which]) |previous| previous.release(cleanup);
+                self.capacity_owners[layer.slot][which] = claim.takeOwner(index, which);
+            };
+            self.slot_buffer_capacity_tokens[layer.slot] = layer.target_tokens;
+        }
+        self.capacity_epoch = next_epoch;
+        claim.deinit(cleanup);
+    }
     fn repackSelectedGlobalKv(
         ctx: *anyopaque,
         repack: storage_runtime.SelectedGlobalKvRepack,
@@ -930,7 +1134,20 @@ pub const MetalKvStorage = struct {
     }
 
     fn hookDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+        hookDeinitWithBoundary(ctx, allocator, null);
+    }
+    fn hookDeinitWithBoundary(ctx: *anyopaque, _: std.mem.Allocator, cleanup: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
         const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        const allocator = self.allocator;
+        const cold_owner = self.cold_bank;
+        defer if (cold_owner) |bank| {
+            bank.store = null;
+        };
+        for (self.capacity_owners) |pair| for (pair) |owner| if (owner != null) {
+            const epoch = cleanup orelse @import("antfly_platform").inference_process_supervisor.restartWorker();
+            if (epoch.isSealed() catch true) @import("antfly_platform").inference_process_supervisor.restartWorker();
+            if (metal_runtime.hasActiveFrame(self.runtime) or metal_runtime.hasSubmittedFrame(self.runtime)) @import("antfly_platform").inference_process_supervisor.restartWorker();
+        };
         var binding_it = self.slot_map.valueIterator();
         while (binding_it.next()) |binding| {
             if (binding.selected_positions) |positions| allocator.free(positions);
@@ -938,7 +1155,18 @@ pub const MetalKvStorage = struct {
         }
         for (&self.leased_slots, 0..) |*leased, slot| {
             if (!leased.*) continue;
-            _ = metal_runtime.termite_metal_decode_runtime_release_paged_kv_slot(self.runtime, slot);
+            // Independently charged backings must reach actual SDK death;
+            // ordinary uncharged slots retain their existing capacity cache.
+            const charged = self.capacity_owners[slot][0] != null or self.capacity_owners[slot][1] != null;
+            const released = if (charged)
+                metal_runtime.termite_metal_decode_runtime_discard_paged_kv_slot(self.runtime, slot)
+            else
+                metal_runtime.termite_metal_decode_runtime_release_paged_kv_slot(self.runtime, slot);
+            for (&self.capacity_owners[slot]) |*owner| if (owner.*) |value| {
+                if (released != 0) @import("antfly_platform").inference_process_supervisor.restartWorker();
+                value.release(cleanup.?);
+                owner.* = null;
+            };
             leased.* = false;
         }
         self.slot_map.deinit(allocator);
@@ -1255,6 +1483,297 @@ pub const MetalKvStorage = struct {
         return binding.slot;
     }
 
+    /// Initial full-history bank. All numerical work retains the existing
+    /// device hook and codec schedules. Preparation owns only atomically leased
+    /// slots and an independent MTLDevice; publication uses the actual Gate.
+    pub const ColdKvBank = struct {
+        const capacity = storage_runtime.device_capacity;
+        const banks = @import("../execution/prepared_kv_banks.zig");
+        const cold = @import("cold_compute_target.zig");
+        const sink = @import("../execution/retirement_sink.zig");
+        const storage_admission = @import("../execution/storage_admission.zig");
+        const retirement = @import("../execution/resource_retirement.zig");
+        const platform = @import("antfly_platform");
+        const Control = @import("../execution_control.zig").InferenceExecutionControl;
+        allocator: std.mem.Allocator,
+        retained: cold.Retained,
+        ticket: @import("../execution/operation_gate.zig").Gate.Ticket,
+        store: ?*MetalKvStorage = null,
+        window: capacity.Window,
+        dtype: pool_mod.KvDType,
+        rows: [256]banks.EncodedLayer = undefined,
+        count: usize = 0,
+        adopted: bool = false,
+        published: bool = false,
+        active_sequences: [128]?storage_runtime.SequenceId = @splat(null),
+
+        const Budget = struct {
+            reservation: ?storage_admission.Reservation,
+            fn take(raw: *anyopaque, allocator: std.mem.Allocator, bytes: usize) !storage_admission.Reservation {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return self.reservation.?.partition(allocator, bytes);
+            }
+        };
+        const Attachment = struct {
+            buffer: *anyopaque,
+            origin: retirement.Queue,
+            fn begin(raw: *anyopaque, _: []const @import("../ops/ops.zig").CT) !retirement.Scope.Begun {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return .{ .origin = self.origin, .pending_batches = 0 };
+            }
+            fn attach(raw: *anyopaque, _: []const @import("../ops/ops.zig").CT, nodes: []retirement.Node, payload: retirement.Payload) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (nodes.len != 0) return error.InvalidResourceRetirement;
+                const handles = [_]*anyopaque{self.buffer};
+                const prepared = metal_runtime.antfly_metal_prepare_retirement_witnesses(&handles, 1, payload) orelse return error.OutOfMemory;
+                defer metal_runtime.antfly_metal_discard_retirement_witnesses(prepared);
+                if (metal_runtime.antfly_metal_buffer_retirement_attach(prepared) != 0) return error.InvalidResourceRetirement;
+            }
+            fn attachPrepared(raw: *anyopaque, _: []const @import("../ops/ops.zig").CT, nodes: []retirement.Node, payload: retirement.Payload, metadata: *retirement.BackendPreparation) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (nodes.len != 0) return error.InvalidResourceRetirement;
+                const handles = [_]*anyopaque{self.buffer};
+                const witnesses = try metadata.armMetal(null, &handles, payload);
+                defer metal_runtime.antfly_metal_discard_retirement_witnesses(witnesses);
+                if (metal_runtime.antfly_metal_buffer_retirement_attach(witnesses) != 0) return error.InvalidResourceRetirement;
+            }
+            fn end(_: *anyopaque) void {}
+            const table = retirement.Scope.VTable{ .begin = begin, .attach = attach, .attach_prepared = attachPrepared, .end = end, .notify = metal_runtime.antfly_metal_request_retirement_poll };
+            fn bind(self: *@This(), owner: *capacity.BackingOwner) !void {
+                var scope = retirement.Scope{ .context = self, .origin = self.origin, .pending_batches = 0, .outputs = &.{}, .active = true, .vtable = &table };
+                defer scope.end();
+                try owner.charge.attach(&scope);
+            }
+        };
+
+        /// Pure pre-join description: no SDK handles, allocation or lane access.
+        pub fn describeCoverage(target: cold.Target, dtype: pool_mod.KvDType, window: capacity.Window, mode: banks.Mode, geometry: []const capacity.LayerGeometry) !?banks.Descriptor {
+            switch (target) {
+                .metal => {},
+                else => return null,
+            }
+            if (mode != .shared_physical_pages) return null;
+            const format = KeyFormat.fromKvDType(dtype) orelse return null;
+            if (geometry.len == 0 or geometry.len > 256 or window.live_sequences > 128) return null;
+            _ = try window.sharedTokens();
+            var result = banks.Descriptor{ .target = target, .dtype = dtype, .window = window, .mode = .shared_physical_pages };
+            for (geometry) |layer| {
+                _ = try std.math.mul(usize, try layer.width(), @sizeOf(f32));
+                const layout = format.rowLayout(layer.num_kv_heads, layer.head_dim);
+                const values = try std.math.mul(usize, layout.v_row_stride, if (format == .f16) @as(usize, 2) else 4);
+                try result.append(.{ .geometry = layer, .key_row_bytes = layout.key_row_bytes, .base_key_row_bytes = layout.base_key_row_bytes, .value_row_bytes = values, .codec_words = .{ @backingInt(format), if (format == .f16) 1 else 0, 0, 0 } });
+            }
+            return result;
+        }
+
+        pub fn prepare(retained: *cold.Retained, dtype: pool_mod.KvDType, window: capacity.Window, mode: banks.Mode, geometry: []const capacity.LayerGeometry, admission: capacity.Admission, control: Control, epoch: *const sink.Epoch) !?*ColdKvBank {
+            const Physical = struct {
+                fn alloc(device: *anyopaque, bytes: usize) ?*anyopaque {
+                    return metal_runtime.antfly_metal_standalone_buffer_alloc(device, bytes);
+                }
+                fn free(buffer: *anyopaque) void {
+                    metal_runtime.termite_metal_buffer_release(buffer);
+                }
+                fn releaseDevice(device: *anyopaque) void {
+                    metal_runtime.antfly_metal_standalone_device_release(device);
+                }
+            };
+            return prepareUsing(retained, dtype, window, mode, geometry, admission, control, epoch, Physical);
+        }
+        fn prepareUsing(retained: *cold.Retained, dtype: pool_mod.KvDType, window: capacity.Window, mode: banks.Mode, geometry: []const capacity.LayerGeometry, admission: capacity.Admission, control: Control, epoch: *const sink.Epoch, comptime Allocation: type) !?*ColdKvBank {
+            const target = switch (retained.target) {
+                .metal => |value| value,
+                else => return null,
+            };
+            if (geometry.len == 0 or geometry.len > 256 or admission.domain == null or window.live_sequences > 128) return null;
+            const descriptor = (try describeCoverage(retained.target, dtype, window, mode, geometry)) orelse return null;
+            const model = retained.model orelse return error.PreparedKvBankConsumed;
+            if (control.native_call_policy == .require_supervision and model.close_protection == null) return null;
+            try control.check();
+            if (try epoch.isSealed()) return error.DeviceKvCapacityRequiresActiveCleanupEpoch;
+            const tokens = try window.sharedTokens();
+            const a = platform.allocator.processAllocator(platform.allocator.concurrentFallback());
+            var ticket = try target.exclusion.prepare();
+            var ticket_owned = true;
+            errdefer if (ticket_owned) ticket.release() catch platform.inference_process_supervisor.restartWorker();
+            const self = try a.create(ColdKvBank);
+            self.* = .{ .allocator = a, .retained = retained.*, .ticket = ticket, .window = window, .dtype = dtype, .rows = descriptor.inline_rows, .count = descriptor.row_count };
+            _ = model.retain(); // Independent construction pin; errors preserve caller ownership.
+            ticket_owned = false;
+            errdefer self.abortOutsideLanes(epoch);
+            const runtime: *metal_runtime.RawMetalDecodeRuntime = @ptrCast(@alignCast(target.runtime));
+            const store = try MetalKvStorage.create(a, runtime, dtype, geometry[0].num_kv_heads, geometry[0].head_dim, window.page_size);
+            self.store = store;
+            try store.global_layer_slots.ensureTotalCapacity(a, @intCast(geometry.len));
+            try store.slot_map.ensureTotalCapacity(a, std.math.cast(u32, try std.math.mul(usize, geometry.len, window.live_sequences)) orelse return error.Overflow);
+            try store.cyclic_page_table_cache.reserveMapped(a, try window.blocksPerSequence());
+            var metadata_guard = try control.enterUninterruptible(.uninterruptible);
+            defer metadata_guard.deinit();
+            var plan = capacity.Plan{ .backend = .metal, .owner = @intFromPtr(store), .implementation = @intFromPtr(&hook_vtable), .epoch = store.capacity_epoch, .minimum_tokens = tokens, .page_size = window.page_size };
+            var slots: [256]metal_runtime.RawInitialKvSlot = undefined;
+            var fresh: [256][2]?*anyopaque = @splat(@splat(null));
+            var old_spans: [512]usize = undefined;
+            var old_handles: [512]*anyopaque = undefined;
+            var old_count: usize = 0;
+            var old_bytes: usize = 0;
+            for (geometry, 0..) |layer, index| {
+                try control.check();
+                const slot = try store.allocateSlot();
+                store.global_layer_slots.putAssumeCapacity(layer.index, slot);
+                store.slot_ring_policy_initialized[slot] = true;
+                const before = try store.slotInfo(slot);
+                if (before.tokens != 0) return error.DeviceKvCapacityLayoutChanged;
+                const layout = store.rowLayout(layer.num_kv_heads, layer.head_dim);
+                const value_row = try std.math.mul(usize, layout.v_row_stride, if (store.format == .f16) @as(usize, 2) else 4);
+                const required = [2]usize{ try std.math.mul(usize, tokens, layout.key_row_bytes), try std.math.mul(usize, tokens, value_row) };
+                const old = [2]?*anyopaque{ before.encoded_key_handle, before.v_handle };
+                var planes: [2]capacity.Plane = undefined;
+                for (old, 0..) |handle, which| {
+                    const bytes = if (handle) |h| metal_runtime.antfly_metal_standalone_buffer_length(h) else 0;
+                    const allocated = if (handle) |h| metal_runtime.termite_metal_buffer_allocated_size(h) else 0;
+                    const reuse = handle != null and bytes >= required[which];
+                    const length = if (reuse) bytes else required[which];
+                    const bound = if (reuse) allocated else metal_runtime.antfly_metal_physical_allocation_bytes(runtime, length);
+                    if (bound < length or length == 0) return error.InvalidDeviceCapacityLayout;
+                    planes[which] = .{ .handle = if (handle) |h| @intFromPtr(h) else 0, .length = 0, .allocated = 0, .row_bytes = if (which == 0) layout.key_row_bytes else value_row, .new_length = length, .new_bound = bound };
+                    if (!reuse and handle != null) {
+                        old_spans[old_count] = allocated;
+                        old_handles[old_count] = handle.?;
+                        old_count += 1;
+                        old_bytes = try std.math.add(usize, old_bytes, allocated);
+                    }
+                }
+                try plan.appendCold(.{ .index = layer.index, .geometry = layer, .slot = @intCast(slot), .current_tokens = 0, .target_tokens = tokens, .keys = planes[0], .values = planes[1] });
+                slots[index] = .{ .slot = slot, .old_keys = old[0], .old_values = old[1], .old_key_capacity = before.encoded_key_capacity, .old_value_capacity = before.v_capacity, .old_key_allocated = if (old[0]) |h| metal_runtime.termite_metal_buffer_allocated_size(h) else 0, .old_value_allocated = if (old[1]) |h| metal_runtime.termite_metal_buffer_allocated_size(h) else 0, .keys = undefined, .values = undefined, .key_length = planes[0].new_length, .value_length = planes[1].new_length, .key_bound = planes[0].new_bound, .value_bound = planes[1].new_bound };
+            }
+            metadata_guard.deinit(); // External admission callbacks own no SDK interval.
+            // Old cached buffers are unadmitted: grant ZERO old-capacity credit.
+            // Reserve full new/reused ownership plus actual replacement overlap.
+            const total = try std.math.add(usize, plan.new_bytes, old_bytes);
+            var budget = Budget{ .reservation = try admission.reserve(admission.context, a, total) };
+            defer if (budget.reservation) |*r| r.release();
+            if (!budget.reservation.?.identity.eql(admission.identity) or !std.meta.eql(budget.reservation.?.amounts(), @import("../runtime/tier/memory.zig").AdmissionAmounts{ .backend_kv_bytes = total })) return error.InvalidDeviceCapacityAdmission;
+            var claim = try capacity.Claim.prepare(&plan, .{ .identity = admission.identity, .context = &budget, .reserve = Budget.take, .domain = admission.domain });
+            defer claim.deinit(epoch);
+            var retiring: ?*ColdRetiringBackings = null;
+            if (old_count != 0) {
+                var old_part: ?storage_admission.Reservation = try budget.reservation.?.partition(a, old_bytes);
+                defer if (old_part) |*r| r.release();
+                retiring = try ColdRetiringBackings.create(a, &old_part, old_spans[0..old_count], admission.domain.?);
+            }
+            defer if (retiring) |r| r.finish(epoch);
+            if (budget.reservation.?.reservedBytes() != 0) return error.InvalidDeviceCapacityAdmission;
+            var sdk_guard = try control.enterUninterruptible(.uninterruptible);
+            defer sdk_guard.deinit();
+            const device = metal_runtime.antfly_metal_standalone_device_retain(runtime) orelse return error.RuntimeUnavailable;
+            defer Allocation.releaseDevice(device);
+            defer for (fresh[0..geometry.len]) |pair| for (pair) |handle| if (handle) |buffer| Allocation.free(buffer);
+            const poll = metal_runtime.antfly_metal_set_retirement_poll(@import("../ops/metal_compute.zig").MetalCompute.pollRetirementChargesCPU);
+            if (poll != 0) return error.InvalidResourceRetirement;
+            // Independent SDK allocation does not touch mutable runtime/frame,
+            // reuse pools, numerical gates or callbacks into the quota producer.
+            for (plan.layers[0..plan.count], 0..) |layer, index| {
+                const previous = [2]?*anyopaque{ slots[index].old_keys, slots[index].old_values };
+                const planes = [2]capacity.Plane{ layer.keys, layer.values };
+                var chosen: [2]*anyopaque = undefined;
+                for (planes, previous, 0..) |plane, old, which| {
+                    try control.check();
+                    const reuse = old != null and metal_runtime.antfly_metal_standalone_buffer_length(old.?) >= plane.new_length;
+                    const buffer = if (reuse) old.? else Allocation.alloc(device, plane.new_length) orelse return error.OutOfMemory;
+                    if (!reuse) fresh[index][which] = buffer;
+                    chosen[which] = buffer;
+                    claim.ownerAt(index, which).measure(epoch, metal_runtime.termite_metal_buffer_allocated_size(buffer));
+                }
+                slots[index].keys = chosen[0];
+                slots[index].values = chosen[1];
+            }
+            // Publication alone takes the actual provider Gate, before either
+            // long-lived reader lane. Every failure before publication discards
+            // the leased cache slots before any charge root can retire.
+            try self.ticket.begin();
+            defer self.ticket.end() catch platform.inference_process_supervisor.restartWorker();
+            if (metal_runtime.hasActiveFrame(runtime) or metal_runtime.hasSubmittedFrame(runtime)) return error.SharedKvCopyDuringFrame;
+            const origin = retirement.Queue.init();
+            // Roots in claim/retiring remain live until after this Gate unwinds.
+            if (retiring) |r| for (r.owners, old_handles[0..old_count]) |*owner, buffer| {
+                var attachment = Attachment{ .buffer = buffer, .origin = origin };
+                try attachment.bind(owner);
+            };
+            for (slots[0..self.count], 0..) |slot, index| {
+                const buffers = [2]*anyopaque{ slot.keys, slot.values };
+                for (buffers, 0..) |buffer, which| {
+                    var attachment = Attachment{ .buffer = buffer, .origin = origin };
+                    try attachment.bind(claim.ownerAt(index, which));
+                }
+            }
+            if (metal_runtime.antfly_metal_initialize_leased_kv_slots(runtime, &slots, self.count) != 0) return error.DeviceKvCapacityPreparationFailed;
+            self.published = true;
+            for (plan.layers[0..plan.count], 0..) |layer, index| {
+                store.capacity_owners[layer.slot] = .{ claim.takeOwner(index, 0), claim.takeOwner(index, 1) };
+                store.slot_buffer_capacity_tokens[layer.slot] = tokens;
+            }
+            store.cold_bank = self;
+            // The bank's separate pin makes this guaranteed nonfinal/atomic.
+            // Consume the original only after every fallible step succeeded.
+            retained.deinitWithBoundary(epoch);
+            return self;
+        }
+
+        pub fn snapshotCoverage(self: *const ColdKvBank) banks.Coverage {
+            return .{ .target = self.retained.target, .window = self.window, .dtype = self.dtype, .mode = .shared_physical_pages, .rows = self.rows[0..self.count] };
+        }
+        pub fn adopt(self: *ColdKvBank, backend: *const @import("../ops/ops.zig").ComputeBackend, runtime: *storage_runtime.KvStorageRuntime) !void {
+            if (self.adopted or !self.published) return error.PreparedKvBankConsumed;
+            const target = self.retained.target.metal;
+            const MetalCompute = @import("../ops/metal_compute.zig").MetalCompute;
+            const identity = MetalCompute.preparedBackendIdentity(backend) orelse return error.DeviceKvCapacityLayoutChanged;
+            const compute: *MetalCompute = @ptrCast(@alignCast(identity.context));
+            if (compute.provider_impl.raw_decode_runtime != @as(?*metal_runtime.RawMetalDecodeRuntime, @ptrCast(@alignCast(target.runtime))) or &compute.provider_impl.operations.gate != target.exclusion) return error.DeviceKvCapacityLayoutChanged;
+            const operation = backend.operationToken() orelse return error.BackendOperationNotActive;
+            try operation.validate(.{ .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .program = null, .mode = .managed });
+            // Caller must install only into an empty, already-built runtime.
+            if (runtime.device_write_hook != null or runtime.sequences.items.len != 0 or runtime.storage.config.dtype != self.dtype or runtime.storage.config.page_size_tokens != self.window.page_size) return error.PreparedKvBankTargetNotEmpty;
+            runtime.setDeviceWriteHook(self.store.?.deviceWriteHook());
+            self.adopted = true;
+        }
+        pub fn abortOutsideLanes(self: *ColdKvBank, epoch: *const sink.Epoch) void {
+            const model = self.retained.model orelse platform.inference_process_supervisor.restartWorker();
+            var close = model.beginClose();
+            defer close.deinit();
+            if (self.adopted) platform.inference_process_supervisor.restartWorker();
+            while (true) {
+                self.ticket.begin() catch |err| switch (err) {
+                    error.QueueFull => {
+                        platform.time.sleepNs(100 * std.time.ns_per_us);
+                        continue;
+                    },
+                    else => platform.inference_process_supervisor.restartWorker(),
+                };
+                break;
+            }
+            if (self.store) |store| {
+                // Preparation failures may have attached witnesses to cached
+                // uncharged planes. Force actual SDK death under exclusion.
+                if (!self.published) for (store.leased_slots, 0..) |leased, slot| if (leased) {
+                    if (metal_runtime.termite_metal_decode_runtime_discard_paged_kv_slot(store.runtime, slot) != 0) platform.inference_process_supervisor.restartWorker();
+                    store.leased_slots[slot] = false;
+                };
+                hookDeinitWithBoundary(store, store.allocator, epoch);
+                self.store = null;
+            }
+            self.ticket.end() catch platform.inference_process_supervisor.restartWorker();
+            self.ticket.release() catch platform.inference_process_supervisor.restartWorker();
+            self.retained.deinitWithBoundary(epoch);
+            self.allocator.destroy(self);
+        }
+        pub fn finishAfterUnlock(self: *ColdKvBank, epoch: *const sink.Epoch) void {
+            if (!self.adopted or self.store != null) platform.inference_process_supervisor.restartWorker();
+            self.ticket.release() catch platform.inference_process_supervisor.restartWorker();
+            self.retained.deinitWithBoundary(epoch);
+            self.allocator.destroy(self);
+        }
+    };
+
     pub const SlotInfo = struct {
         encoded_key_handle: ?*anyopaque = null,
         encoded_key_capacity: usize = 0,
@@ -1312,6 +1831,10 @@ const hook_vtable: storage_runtime.DeviceWriteHook.VTable = .{
     .reserveLayerKvDevice = MetalKvStorage.reserveLayerKvDevice,
     .commitLayerKvDeviceWrite = MetalKvStorage.commitLayerKvDeviceWrite,
     .repackSelectedGlobalKv = MetalKvStorage.repackSelectedGlobalKv,
+    .copySharedBlockPrefixes = MetalKvStorage.copySharedBlockPrefixes,
+    .planCapacity = MetalKvStorage.planCapacity,
+    .growCapacity = MetalKvStorage.growCapacity,
+    .deinitWithBoundary = MetalKvStorage.hookDeinitWithBoundary,
     .scoreSelectedAttention = MetalKvStorage.scoreSelectedAttention,
     .truncateSequence = MetalKvStorage.truncateSequenceOp,
     .releaseSequence = MetalKvStorage.releaseSequenceOp,
@@ -1744,4 +2267,670 @@ test "Metal paged KV keeps layer-global pages across source sequence release" {
         try std.testing.expectEqualSlices(f32, &expected_v, gathered.v);
     }
     try storage.releaseSequence(derived_id);
+}
+
+test "Metal zero-growth encoded KV COW fences all planes once and preserves exact source pages" {
+    if (!build_options.enable_metal or builtin.os.tag != .macos) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const raw = metal_runtime.termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_decode_runtime_destroy(raw);
+    if (metal_runtime.termite_metal_decode_runtime_ready(raw) == 0) return error.SkipZigTest;
+    for ([_]pool_mod.KvDType{ .f32, .f16, .polar4, .turbo3, .int8 }) |dtype| {
+        var storage = try storage_runtime.KvStorageRuntime.init(a, .{ .backend = .metal, .dtype = dtype, .page_size_tokens = 2, .num_layers_packed = 2, .num_kv_heads = 1, .head_dim = 64, .store_cpu_bytes = false });
+        defer storage.deinit();
+        const owner = try MetalKvStorage.create(a, raw, dtype, 1, 64, 2);
+        storage.setDeviceWriteHook(owner.deviceWriteHook());
+        const source = try storage.attachSequence(storage.poolId());
+        try storage.appendTokens(source, 4);
+        var values: [4 * 64]f32 = undefined;
+        for (&values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 31)) * 0.125 - 1;
+        const bytes = @sizeOf(@TypeOf(values));
+        const keys = metal_runtime.termite_metal_buffer_alloc(raw, bytes, 0) orelse return error.MetalBufferAllocFailed;
+        defer metal_runtime.termite_metal_buffer_release(keys);
+        const vals = metal_runtime.termite_metal_buffer_alloc(raw, bytes, 0) orelse return error.MetalBufferAllocFailed;
+        defer metal_runtime.termite_metal_buffer_release(vals);
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(raw, keys, 0, &values, bytes));
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(raw, vals, 0, &values, bytes));
+        const key_ref = storage_runtime.DeviceKvRef{ .handle = keys, .byte_offset = 0, .byte_len = bytes };
+        const value_ref = storage_runtime.DeviceKvRef{ .handle = vals, .byte_offset = 0, .byte_len = bytes };
+        for (0..2) |index| try storage.writeLayerKvSuffixDevice(.{ .sequence_id = source, .layer_index = index, .total_token_count = 4, .suffix_token_count = 4, .position_offset = 0, .num_kv_heads = 1, .head_dim = 64 }, key_ref, value_ref);
+        var original_keys: [2]?[]u8 = @splat(null);
+        defer for (original_keys) |data| if (data) |owned| a.free(owned);
+        var original_values: [2]?[]u8 = @splat(null);
+        defer for (original_values) |data| if (data) |owned| a.free(owned);
+        for (0..2) |index| {
+            const slot = owner.global_layer_slots.get(@intCast(index)).?;
+            const info = try owner.slotInfo(slot);
+            const value_bytes = info.v_row_stride * (if (owner.format == .f16) @as(usize, 2) else @as(usize, 4));
+            original_keys[index] = try a.alloc(u8, 4 * info.key_row_bytes);
+            original_values[index] = try a.alloc(u8, 4 * value_bytes);
+            try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(raw, info.encoded_key_handle, 0, original_keys[index].?.ptr, original_keys[index].?.len));
+            try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(raw, info.v_handle, 0, original_values[index].?.ptr, original_values[index].?.len));
+        }
+        const derived = try storage.attachSequenceWithRetainedBlocks(storage.poolId(), storage.blockTable(source).?.blocks.items, 4);
+        _ = try storage.truncateSequence(derived, 1);
+        try storage.reserveTokenCapacity(derived, 4);
+        const old_tail = storage.blockTable(derived).?.last().?;
+        const target = (try storage.sequenceMut(derived)).reserved_tail_blocks.items[0];
+        const metadata = storage.storage.hostPool().?.storageMut(old_tail).?;
+        metadata.meta.tokens_written = 2;
+        metadata.meta.model_tag = 42;
+        metadata.meta.priority = 7;
+        metadata.meta.prefix_cacheable = true;
+        // Initial exact slot capacity cannot authorize writes to an SDK tail.
+        try std.testing.expectError(error.SharedKvCopyCapacityRequired, storage.appendTokens(derived, 1));
+        try std.testing.expectEqual(old_tail, storage.blockTable(derived).?.last().?);
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_begin_frame(raw));
+        try std.testing.expectError(error.SharedKvCopyDuringFrame, storage.appendTokens(derived, 1));
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_cancel_frame(raw));
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_begin_frame(raw));
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_copy(raw, keys, 0, vals, 0, bytes));
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_submit_frame(raw));
+        try std.testing.expectError(error.SharedKvCopyDuringFrame, storage.appendTokens(derived, 1));
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_wait_frame(raw));
+        // Explicit preparation owns any growth. The COW callback itself must
+        // use only these declared, preexisting plane capacities and handles.
+        var handles: [2][2]*anyopaque = undefined;
+        for (0..2) |index| {
+            const slot = owner.global_layer_slots.get(@intCast(index)).?;
+            const before = try owner.slotInfo(slot);
+            try owner.reserveSlotCapacity(slot, 8, 2, 0, before.key_row_bytes, before.v_row_stride);
+            const prepared = try owner.slotInfo(slot);
+            handles[index] = .{ prepared.encoded_key_handle.?, prepared.v_handle.? };
+        }
+        const plane_bytes = metal_runtime.runtimeMemorySnapshot(raw).attention_span_bytes;
+        var audit = @import("../execution/transfer_audit.zig").Audit{ .forbid_device_host_access = true };
+        try @import("../execution/transfer_audit.zig").begin(&audit);
+        storage.appendTokens(derived, 1) catch |err| {
+            @import("../execution/transfer_audit.zig").end();
+            return err;
+        };
+        @import("../execution/transfer_audit.zig").end();
+        try std.testing.expectEqual(@as(u64, 0), audit.upload_calls);
+        try std.testing.expectEqual(@as(u64, 0), audit.download_calls);
+        try std.testing.expectEqual(plane_bytes, metal_runtime.runtimeMemorySnapshot(raw).attention_span_bytes);
+        try std.testing.expectEqual(target, storage.blockTable(derived).?.last().?);
+        const target_meta = storage.storage.hostPool().?.storage(target).?.meta;
+        try std.testing.expectEqual(@as(u16, 1), target_meta.tokens_written);
+        try std.testing.expectEqual(@as(u64, 42), target_meta.model_tag);
+        try std.testing.expectEqual(@as(i32, 7), target_meta.priority);
+        try std.testing.expect(!target_meta.prefix_cacheable);
+        for (0..2) |index| {
+            const info = try owner.slotInfo(owner.global_layer_slots.get(@intCast(index)).?);
+            try std.testing.expect(handles[index][0] == info.encoded_key_handle.? and handles[index][1] == info.v_handle.?);
+            const value_bytes = info.v_row_stride * (if (owner.format == .f16) @as(usize, 2) else @as(usize, 4));
+            const copied_key = try a.alloc(u8, info.key_row_bytes);
+            defer a.free(copied_key);
+            const copied_value = try a.alloc(u8, value_bytes);
+            defer a.free(copied_value);
+            try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(raw, info.encoded_key_handle, target * 2 * info.key_row_bytes, copied_key.ptr, copied_key.len));
+            try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(raw, info.v_handle, target * 2 * value_bytes, copied_value.ptr, copied_value.len));
+            try std.testing.expectEqualSlices(u8, original_keys[index].?[old_tail * 2 * info.key_row_bytes ..][0..copied_key.len], copied_key);
+            try std.testing.expectEqualSlices(u8, original_values[index].?[old_tail * 2 * value_bytes ..][0..copied_value.len], copied_value);
+            const unchanged = try a.alloc(u8, original_keys[index].?.len);
+            defer a.free(unchanged);
+            try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(raw, info.encoded_key_handle, 0, unchanged.ptr, unchanged.len));
+            try std.testing.expectEqualSlices(u8, original_keys[index].?, unchanged);
+        }
+    }
+}
+
+test "Metal admitted KV growth is atomic across SDK allocation faults and preserves encoded held backings beyond epoch reuse" {
+    if (comptime !build_options.enable_metal or builtin.os.tag != .macos) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const capacity = storage_runtime.device_capacity;
+    const sink_mod = @import("../execution/retirement_sink.zig");
+    const retirement = @import("../execution/resource_retirement.zig");
+    const operation = @import("../execution/backend_operation.zig");
+    var context = try @import("compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    const compute: *@import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    const raw = compute.provider_impl.raw_decode_runtime.?;
+    var receiver = try sink_mod.Ref.create();
+    defer receiver.release();
+    const Scenario = enum { all_layers, heterogeneous, sparse };
+    for ([_]Scenario{ .all_layers, .heterogeneous, .sparse }) |scenario| for ([_]pool_mod.KvDType{ .f32, .f16, .polar4, .turbo3, .int8 }) |dtype| {
+        const sparse = scenario == .sparse;
+        const layer_ids: [2]u16 = if (sparse) .{ 1, 3 } else .{ 0, 1 };
+        var geometry = capacity.Geometry{};
+        for (layer_ids) |index| try geometry.append(.{ .index = index, .num_kv_heads = 1, .head_dim = 64 });
+        var runtime = try storage_runtime.KvStorageRuntime.init(a, .{ .backend = .metal, .dtype = dtype, .page_size_tokens = 2, .num_layers_packed = if (sparse) 4 else 2, .num_kv_heads = 1, .head_dim = 64, .store_cpu_bytes = false });
+        var runtime_live = true;
+        defer if (runtime_live) {
+            var final = receiver.enter() catch @panic("cleanup epoch unavailable");
+            var epoch = final.retainEpoch() catch @panic("cleanup epoch pin failed");
+            runtime.deinitWithBoundary(&epoch);
+            final.finish();
+            epoch.release();
+            _ = retirement.poll();
+        };
+        const owner = try MetalKvStorage.create(a, raw, dtype, 1, 64, 2);
+        runtime.setDeviceWriteHook(owner.deviceWriteHook());
+        const sequence = try runtime.attachSequence(runtime.poolId());
+        try runtime.appendTokens(sequence, 16);
+        var values: [16 * 64]f32 = undefined;
+        for (&values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 29)) * 0.125 - 1;
+        const input = metal_runtime.termite_metal_buffer_alloc(raw, @sizeOf(@TypeOf(values)), 0) orelse return error.MetalBufferAllocFailed;
+        defer metal_runtime.termite_metal_buffer_release(input);
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(raw, input, 0, &values, @sizeOf(@TypeOf(values))));
+        const input_ref = storage_runtime.DeviceKvRef{ .handle = input, .byte_offset = 0, .byte_len = @sizeOf(@TypeOf(values)) };
+        for (layer_ids) |index| try runtime.writeLayerKvSuffixDevice(.{ .sequence_id = sequence, .layer_index = index, .total_token_count = 16, .suffix_token_count = 16, .position_offset = 0, .num_kv_heads = 1, .head_dim = 64 }, input_ref, input_ref);
+        if (scenario == .heterogeneous) {
+            // Real public reserve keeps layer1's independently larger bank.
+            try runtime.reserveLayerKvDeviceCapacity(sequence, 1, 64, 0, 1, 64, 0, 0, false);
+        }
+        var requested: usize = 18;
+        if (sparse) {
+            const cached = try runtime.planDeviceCapacityFor(requested, &geometry);
+            if (cached.new_bytes == 0) {
+                // Reuse can cover both planes beyond the old token hint.
+                // Publish only the validated hint, without SDK or quota work.
+                var metadata_guard = try receiver.enter();
+                defer metadata_guard.finish();
+                var metadata_epoch = try metadata_guard.retainEpoch();
+                defer metadata_epoch.release();
+                var no_claim = capacity.Claim{ .batch = null };
+                var metadata_scope = try operation.enter(cb, null, null, .managed);
+                defer metadata_scope.deinitChecked() catch @panic("capacity metadata cleanup failed");
+                var metadata_audit = @import("../execution/transfer_audit.zig").Audit{ .forbid_device_host_access = true };
+                try @import("../execution/transfer_audit.zig").begin(&metadata_audit);
+                runtime.growDeviceCapacity(&cached, &no_claim, &metadata_epoch) catch |err| {
+                    @import("../execution/transfer_audit.zig").end();
+                    return err;
+                };
+                @import("../execution/transfer_audit.zig").end();
+                try metadata_scope.finish();
+                metadata_guard.finish();
+                try std.testing.expectEqual(@as(u64, 0), metadata_audit.upload_calls);
+                try std.testing.expectEqual(@as(u64, 0), metadata_audit.download_calls);
+                const reused = try runtime.planDeviceCapacityFor(requested, &geometry);
+                for (cached.layers[0..cached.count], reused.layers[0..reused.count]) |before, after| {
+                    try std.testing.expectEqual(before.keys.handle, after.keys.handle);
+                    try std.testing.expectEqual(before.values.handle, after.values.handle);
+                    try std.testing.expectEqual(before.target_tokens, after.current_tokens);
+                }
+            }
+            // Independently exercise actual replacement even when the runtime
+            // retained larger SDK buffers from a previous format or slot user.
+            for (cached.layers[0..cached.count]) |layer| {
+                requested = @max(requested, try std.math.add(usize, layer.keys.length / layer.keys.row_bytes, 2));
+                requested = @max(requested, try std.math.add(usize, layer.values.length / layer.values.row_bytes, 2));
+            }
+        }
+        const plan = (if (sparse) try runtime.planDeviceCapacityFor(requested, &geometry) else try runtime.planDeviceCapacity(requested));
+        if (scenario == .heterogeneous) {
+            try std.testing.expect(plan.layers[0].keys.new_length != 0);
+            try std.testing.expectEqual(@as(usize, 0), plan.layers[1].keys.new_length);
+            try std.testing.expectEqual(@as(usize, 0), plan.layers[1].values.new_length);
+        }
+        if (sparse) {
+            try std.testing.expectEqual(@as(u16, 1), plan.layers[0].index);
+            try std.testing.expectEqual(@as(u16, 3), plan.layers[1].index);
+            var wrong = geometry;
+            wrong.layers[0].head_dim = 32;
+            try std.testing.expectError(error.DeviceKvCapacityLayoutChanged, runtime.planDeviceCapacityFor(plan.minimum_tokens, &wrong));
+            var missing = capacity.Geometry{};
+            try missing.append(geometry.layers[0]);
+            try std.testing.expectError(error.DeviceKvCapacityUnsupported, runtime.planDeviceCapacityFor(plan.minimum_tokens, &missing));
+            try std.testing.expectError(error.InvalidDeviceCapacityLayout, geometry.append(geometry.layers[1]));
+        }
+        const budget = try capacity.TestAdmission.create(a, plan.old_bytes, (try plan.peakBytes()) - 1);
+        defer {
+            if (runtime_live) {
+                var final = receiver.enter() catch @panic("cleanup epoch unavailable");
+                var epoch = final.retainEpoch() catch @panic("cleanup epoch pin failed");
+                runtime.deinitWithBoundary(&epoch);
+                runtime_live = false;
+                final.finish();
+                epoch.release();
+            }
+            _ = retirement.poll();
+            budget.deinit();
+        }
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, capacity.Claim.prepare(&plan, budget.admission()));
+        budget.limit = try plan.peakBytes();
+        var saved: [2][2]?[]u8 = @splat(@splat(null));
+        defer for (saved) |layer| for (layer) |bytes| if (bytes) |owned| a.free(owned);
+        for (plan.layers[0..plan.count], 0..) |layer, index| {
+            const planes = [_]capacity.Plane{ layer.keys, layer.values };
+            for (planes, 0..) |plane, which| {
+                saved[index][which] = try a.alloc(u8, plane.length);
+                try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(raw, @ptrFromInt(plane.handle), 0, saved[index][which].?.ptr, plane.length));
+            }
+        }
+        const Fault = struct {
+            var calls: usize = 0;
+            var fail_at: usize = 0;
+            var hook: storage_runtime.DeviceWriteHook.VTable = undefined;
+            fn allocate(_: ?*anyopaque, runtime_value: *metal_runtime.RawMetalDecodeRuntime, bytes: usize) callconv(.c) ?*anyopaque {
+                calls += 1;
+                if (calls == fail_at) return null;
+                return metal_runtime.termite_metal_buffer_alloc_fresh(runtime_value, bytes, 1);
+            }
+            fn prepare(runtime_value: *metal_runtime.RawMetalDecodeRuntime, planes: [*]const metal_runtime.RawKvGrowthPlane, count: usize, stage: *?*anyopaque) c_int {
+                return metal_runtime.antfly_metal_kv_growth_prepare_with_allocator(runtime_value, planes, count, stage, allocate, null);
+            }
+            fn grow(raw_value: *anyopaque, implementation: *const anyopaque, prepared: *const capacity.Plan, claim: *capacity.Claim, epoch: *const sink_mod.Epoch) !void {
+                if (implementation != @as(*const anyopaque, @ptrCast(&hook))) return error.WrongKvFaultProvider;
+                return MetalKvStorage.growCapacityUsing(raw_value, &hook_vtable, prepared, claim, epoch, @This());
+            }
+        };
+        const failure_indices: [2]usize = if (scenario == .heterogeneous) .{ 1, 2 } else .{ 2, 3 };
+        for (failure_indices) |failure| {
+            var guard = try receiver.enter();
+            defer guard.finish();
+            var epoch = try guard.retainEpoch();
+            defer epoch.release();
+            var claim = try capacity.Claim.prepare(&plan, budget.admission());
+            defer claim.deinit(&epoch);
+            Fault.calls = 0;
+            Fault.fail_at = failure;
+            Fault.hook = hook_vtable;
+            Fault.hook.growCapacity = Fault.grow;
+            const original = runtime.device_write_hook;
+            runtime.device_write_hook = .{ .ctx = owner, .vtable = &Fault.hook };
+            defer runtime.device_write_hook = original;
+            try std.testing.expect(budget.provider_gate.tryLock());
+            var outer_held = true;
+            defer if (outer_held) budget.provider_gate.unlock();
+            var operation_scope = try operation.enter(cb, null, null, .managed);
+            defer operation_scope.deinitChecked() catch @panic("capacity failure drain failed");
+            try std.testing.expectError(error.OutOfMemory, runtime.growDeviceCapacity(&plan, &claim, &epoch));
+            try operation_scope.finish();
+            claim.deinit(&epoch);
+            try std.testing.expectEqual(try plan.peakBytes(), budget.domain.controller.snapshot().backend_kv_bytes);
+            runtime.device_write_hook = original;
+            const unchanged = (if (sparse) try runtime.planDeviceCapacityFor(requested, &geometry) else try runtime.planDeviceCapacity(requested));
+            try std.testing.expect(plan.eql(&unchanged));
+            budget.provider_gate.unlock();
+            outer_held = false;
+            guard.finish();
+            try std.testing.expectEqual(plan.old_bytes, budget.domain.controller.snapshot().backend_kv_bytes);
+        }
+        var held: ?*anyopaque = null;
+        defer if (held) |buffer| metal_runtime.termite_metal_buffer_release(buffer);
+        var first_actual: usize = 0;
+        for (0..2) |round| {
+            const current = if (round == 0) plan else (if (sparse) try runtime.planDeviceCapacityFor(owner.slot_buffer_capacity_tokens[plan.layers[0].slot] + 2, &geometry) else try runtime.planDeviceCapacity(owner.slot_buffer_capacity_tokens[plan.layers[0].slot] + 2));
+            budget.limit = try std.math.add(usize, budget.domain.controller.snapshot().backend_kv_bytes, current.new_bytes);
+            var guard = try receiver.enter();
+            defer guard.finish();
+            var epoch = try guard.retainEpoch();
+            defer epoch.release();
+            var claim = try capacity.Claim.prepare(&current, budget.admission());
+            defer claim.deinit(&epoch);
+            // Owned frames are rejected before any allocation/publication.
+            try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_begin_frame(raw));
+            try std.testing.expectError(error.SharedKvCopyDuringFrame, runtime.growDeviceCapacity(&current, &claim, &epoch));
+            try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_cancel_frame(raw));
+            try std.testing.expect(budget.provider_gate.tryLock());
+            var outer_held = true;
+            defer if (outer_held) budget.provider_gate.unlock();
+            var operation_scope = try operation.enter(cb, null, null, .managed);
+            defer operation_scope.deinitChecked() catch @panic("capacity success drain failed");
+            var audit = @import("../execution/transfer_audit.zig").Audit{ .forbid_device_host_access = true };
+            try @import("../execution/transfer_audit.zig").begin(&audit);
+            runtime.growDeviceCapacity(&current, &claim, &epoch) catch |err| {
+                @import("../execution/transfer_audit.zig").end();
+                return err;
+            };
+            @import("../execution/transfer_audit.zig").end();
+            try operation_scope.finish();
+            budget.provider_gate.unlock();
+            outer_held = false;
+            guard.finish();
+            const retired_boundary = try epoch.boundary();
+            epoch.release(); // Do not let the test itself pin the retired record.
+            try std.testing.expectEqual(@as(u64, 0), audit.upload_calls);
+            try std.testing.expectEqual(@as(u64, 0), audit.download_calls);
+            try std.testing.expect(claim.batch == null);
+            const completed = (if (sparse) try runtime.planDeviceCapacityFor(current.minimum_tokens, &geometry) else try runtime.planDeviceCapacity(current.minimum_tokens));
+            try std.testing.expectEqual(@as(usize, 0), completed.new_bytes);
+            var completed_charged: usize = 0;
+            for (completed.layers[0..completed.count]) |layer| {
+                const planes = [_]capacity.Plane{ layer.keys, layer.values };
+                for (planes, 0..) |plane, which| if (owner.capacity_owners[layer.slot][which] != null) {
+                    completed_charged = try std.math.add(usize, completed_charged, plane.allocated);
+                };
+            }
+            if (scenario == .heterogeneous) {
+                try std.testing.expectEqual(plan.layers[1].keys.handle, completed.layers[1].keys.handle);
+                try std.testing.expectEqual(plan.layers[1].values.handle, completed.layers[1].values.handle);
+                try std.testing.expect(owner.capacity_owners[completed.layers[1].slot][0] == null);
+                try std.testing.expect(owner.capacity_owners[completed.layers[1].slot][1] == null);
+            }
+            for (completed.layers[0..completed.count], 0..) |layer, index| {
+                const planes = [_]capacity.Plane{ layer.keys, layer.values };
+                for (planes, 0..) |plane, which| {
+                    const actual = try a.alloc(u8, saved[index][which].?.len);
+                    defer a.free(actual);
+                    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(raw, @ptrFromInt(plane.handle), 0, actual.ptr, actual.len));
+                    try std.testing.expectEqualSlices(u8, saved[index][which].?, actual);
+                }
+            }
+            if (round == 0) {
+                first_actual = completed.layers[0].keys.allocated;
+                const plane = completed.layers[0].keys;
+                held = metal_runtime.termite_metal_buffer_retain_external(raw, @ptrFromInt(plane.handle), plane.length) orelse return error.ExpectedRetainedKvBacking;
+            } else {
+                // The original growth epoch is over. Reuse bounded records
+                // repeatedly BEFORE actual held SDK backing finally dies.
+                for (0..64) |reuse| {
+                    var next = try receiver.enter();
+                    defer next.finish();
+                    const fresh = try next.boundary();
+                    if (reuse == 0) try std.testing.expect(fresh.context == retired_boundary.context and fresh.nonce != retired_boundary.nonce);
+                    next.finish();
+                }
+                for (0..1_000_000) |_| {
+                    _ = retirement.poll();
+                    if (budget.domain.controller.snapshot().backend_kv_bytes == plan.old_bytes + first_actual + completed_charged) break;
+                    std.atomic.spinLoopHint();
+                }
+                try std.testing.expectEqual(plan.old_bytes + first_actual + completed_charged, budget.domain.controller.snapshot().backend_kv_bytes);
+                metal_runtime.termite_metal_buffer_release(held.?);
+                held = null;
+                for (0..1_000_000) |_| {
+                    _ = retirement.poll();
+                    if (budget.domain.controller.snapshot().backend_kv_bytes == plan.old_bytes + completed_charged) break;
+                    std.atomic.spinLoopHint();
+                }
+                try std.testing.expectEqual(plan.old_bytes + completed_charged, budget.domain.controller.snapshot().backend_kv_bytes);
+            }
+        }
+        var final_guard = try receiver.enter();
+        defer final_guard.finish();
+        var final_epoch = try final_guard.retainEpoch();
+        defer final_epoch.release();
+        try std.testing.expect(budget.provider_gate.tryLock());
+        var final_gate_held = true;
+        defer if (final_gate_held) budget.provider_gate.unlock();
+        runtime.deinitWithBoundary(&final_epoch);
+        runtime_live = false;
+        budget.provider_gate.unlock();
+        final_gate_held = false;
+        final_guard.finish();
+        for (0..1_000_000) |_| {
+            _ = retirement.poll();
+            if (budget.domain.controller.snapshot().backend_kv_bytes == plan.old_bytes) break;
+            std.atomic.spinLoopHint();
+        }
+        try std.testing.expectEqual(plan.old_bytes, budget.domain.controller.snapshot().backend_kv_bytes);
+    };
+}
+
+// Pure quota metadata for cached unadmitted buffers that will be replaced.
+// The SDK/runtime and caller model never enter these delayed owner records.
+const ColdRetiringBackings = struct {
+    const capacity = storage_runtime.device_capacity;
+    const storage = @import("../execution/storage_admission.zig");
+    const retirement = @import("../execution/resource_retirement.zig");
+    const sink = @import("../execution/retirement_sink.zig");
+    allocator: std.mem.Allocator,
+    references: std.atomic.Value(usize) = .init(1),
+    owners: []capacity.BackingOwner,
+
+    fn releaseMetadata(self: *ColdRetiringBackings) void {
+        const previous = self.references.fetchSub(1, .acq_rel);
+        std.debug.assert(previous != 0);
+        if (previous != 1) return;
+        const allocator = self.allocator;
+        allocator.free(self.owners);
+        allocator.destroy(self);
+    }
+    fn releaseCell(raw: *anyopaque) void {
+        const self: *ColdRetiringBackings = @ptrCast(@alignCast(raw));
+        self.releaseMetadata();
+    }
+    /// Consumes the complete separately partitioned old-cache reservation.
+    /// This synchronous cold constructor runs before any actual gate/SDK use.
+    fn create(allocator: std.mem.Allocator, reservation: *?storage.Reservation, spans: []const usize, domain: @import("../runtime/tier/admission_domain.zig").Pin) !*ColdRetiringBackings {
+        var source = reservation.* orelse return error.MissingResourceRetirementLease;
+        reservation.* = null;
+        defer source.release();
+        var total: usize = 0;
+        for (spans) |bytes| {
+            if (bytes == 0) return error.InvalidDeviceCapacityAdmission;
+            total = try std.math.add(usize, total, bytes);
+        }
+        if (spans.len == 0 or source.reservedBytes() != total or source.identity.controller != domain.controller()) return error.InvalidDeviceCapacityAdmission;
+        const self = try allocator.create(ColdRetiringBackings);
+        errdefer allocator.destroy(self);
+        const owners = try allocator.alloc(capacity.BackingOwner, spans.len);
+        errdefer allocator.free(owners);
+        self.* = .{ .allocator = allocator, .owners = owners };
+        var initialized: usize = 0;
+        errdefer for (owners[0..initialized]) |*owner| owner.charge.release();
+        for (owners, spans) |*owner, bytes| {
+            var part: ?storage.Reservation = try source.partition(allocator, bytes);
+            errdefer if (part) |*value| value.release();
+            var held: ?@import("../runtime/tier/admission_domain.zig").Pin = domain.retain();
+            errdefer if (held) |pin| pin.release();
+            const charge = try retirement.Charge.createReservation(&part, &held);
+            owner.init(charge, .{ .context = self, .release = releaseCell });
+            _ = self.references.fetchAdd(1, .monotonic);
+            initialized += 1;
+        }
+        return self;
+    }
+    fn finish(self: *ColdRetiringBackings, epoch: *const sink.Epoch) void {
+        // The root reference keeps the owner slab valid if a sealed boundary
+        // executes any of these metadata callbacks immediately.
+        for (self.owners) |*owner| owner.release(epoch);
+        self.releaseMetadata();
+    }
+};
+
+test "Metal cold KV bank prefunds sparse planes failure atomically and reuses actual buffers through sixty four refills" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const platform = @import("antfly_platform");
+    const path = platform.env.getenv("ANTFLY_UNIFIED_DECODER_FIXTURE") orelse return error.SkipZigTest;
+    const factory = @import("../architectures/session_factory.zig");
+    const cold = @import("cold_compute_target.zig");
+    const capacity = storage_runtime.device_capacity;
+    const retirement = @import("../execution/resource_retirement.zig");
+    const a = std.testing.allocator;
+    const Monitor = struct {
+        active: std.atomic.Value(bool) = .init(false),
+        arms: usize = 0,
+        fn arm(raw: *anyopaque, _: @import("../execution_control.zig").MonitorControl) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.active.swap(true, .acq_rel)) return error.UnexpectedNestedSdkScope;
+            self.arms += 1;
+            return 1;
+        }
+        fn disarm(raw: *anyopaque, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.active.swap(false, .acq_rel));
+        }
+    };
+    var monitor = Monitor{};
+    const control = @import("../execution_control.zig").InferenceExecutionControl{ .native_call_policy = .in_process, .hard_cancellation = .{ .ptr = &monitor, .arm_fn = Monitor.arm, .disarm_fn = Monitor.disarm } };
+    var session = try factory.createMetalSession(a, path);
+    defer session.close();
+    factory.attachIo(session, std.testing.io);
+    try session.installOwnedExecutionGate(a);
+    var provider_gate: *@import("../execution/operation_gate.zig").Gate = undefined;
+    var raw: *metal_runtime.RawMetalDecodeRuntime = undefined;
+    var input: ?*anyopaque = null;
+    defer if (input) |handle| metal_runtime.termite_metal_buffer_release(handle);
+    var values: [8 * 64]f32 = undefined;
+    for (&values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 13)) * 0.125 - 0.5;
+    {
+        const backend = try factory.getComputeBackend(session, a);
+        defer backend.deinit();
+        const compute: *@import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(backend.ptr));
+        raw = compute.provider_impl.raw_decode_runtime.?;
+        provider_gate = &compute.provider_impl.operations.gate;
+        input = metal_runtime.termite_metal_buffer_alloc(raw, @sizeOf(@TypeOf(values)), 0) orelse return error.OutOfMemory;
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(raw, input, 0, &values, @sizeOf(@TypeOf(values))));
+    }
+    const budget = try capacity.TestAdmission.create(a, 0, 1024 * 1024);
+    budget.actual_provider_gate = &provider_gate.mutex;
+    budget.actual_model_gate = session.execution_gate;
+    budget.actual_sdk_active = &monitor.active;
+    defer {
+        const end = platform.time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (budget.domain.controller.snapshot().backend_kv_bytes != 0) {
+            _ = retirement.poll();
+            if (platform.time.monotonicNs() >= end) @panic("cold KV backing failed to retire");
+            std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+        budget.deinit();
+    }
+    var receiver = try session.model_lifetime.?.retainRetirementSink();
+    defer receiver.release();
+    const geometry = [_]capacity.LayerGeometry{ .{ .index = 1, .num_kv_heads = 1, .head_dim = 64 }, .{ .index = 3, .num_kv_heads = 1, .head_dim = 64 } };
+    const window = try capacity.Window.fromRequest(8, 0, 2, 2, 0);
+    const Fault = struct {
+        var calls: usize = 0;
+        var fail_at: usize = 0;
+        var sdk_monitor: *Monitor = undefined;
+        fn free(buffer: *anyopaque) void {
+            std.debug.assert(sdk_monitor.active.load(.acquire));
+            metal_runtime.termite_metal_buffer_release(buffer);
+            std.debug.assert(sdk_monitor.active.load(.acquire));
+        }
+        fn releaseDevice(device: *anyopaque) void {
+            std.debug.assert(sdk_monitor.active.load(.acquire));
+            metal_runtime.antfly_metal_standalone_device_release(device);
+            std.debug.assert(sdk_monitor.active.load(.acquire));
+        }
+        fn alloc(device: *anyopaque, bytes: usize) ?*anyopaque {
+            std.debug.assert(sdk_monitor.active.load(.acquire));
+            calls += 1;
+            if (calls == fail_at) return null;
+            return metal_runtime.antfly_metal_standalone_buffer_alloc(device, bytes);
+        }
+    };
+    Fault.sdk_monitor = &monitor;
+    // Fresh slots have no SDK buffers. Every partial allocation must unwind
+    // actual objects, quota and the retained model without a caller Arena.
+    for (1..5) |failure| {
+        var guard = try receiver.enter();
+        defer guard.finish();
+        var epoch = try guard.retainEpoch();
+        defer epoch.release();
+        var target = (try cold.Retained.acquire(session, control)).?;
+        defer target.deinitWithBoundary(&epoch);
+        Fault.calls = 0;
+        Fault.fail_at = failure;
+        try std.testing.expectError(error.OutOfMemory, MetalKvStorage.ColdKvBank.prepareUsing(&target, .f32, window, .shared_physical_pages, &geometry, budget.admission(), control, &epoch, Fault));
+        try std.testing.expectEqual(failure, Fault.calls);
+        try std.testing.expect(target.model != null); // Failed construction never consumes caller pin.
+        try std.testing.expectEqual(@as(usize, 2), session.model_lifetime.?.references.load(.acquire));
+        try std.testing.expect(!monitor.active.load(.acquire));
+        guard.finish();
+        _ = retirement.poll();
+        try std.testing.expectEqual(@as(usize, 0), budget.domain.controller.snapshot().backend_kv_bytes);
+    }
+    const config = pool_mod.KvPoolConfig{ .backend = .metal, .dtype = .f32, .page_size_tokens = 2, .num_layers_packed = 4, .num_kv_heads = 1, .head_dim = 64, .store_cpu_bytes = false };
+    var prepare_guard = try receiver.enter();
+    defer prepare_guard.finish();
+    var prepare_epoch = try prepare_guard.retainEpoch();
+    defer prepare_epoch.release();
+    var target = (try cold.Retained.acquire(session, control)).?;
+    defer target.deinitWithBoundary(&prepare_epoch);
+    for ([_]@import("../execution/prepared_kv_banks.zig").Mode{ .sequence_private, .ring, .fitted_match }) |mode| {
+        try std.testing.expect((try MetalKvStorage.ColdKvBank.prepare(&target, .f32, window, mode, &geometry, budget.admission(), control, &prepare_epoch)) == null);
+        try std.testing.expect(target.model != null);
+    }
+    Fault.calls = 0;
+    Fault.fail_at = 0;
+    const bank = (try MetalKvStorage.ColdKvBank.prepareUsing(&target, .f32, window, .shared_physical_pages, &geometry, budget.admission(), control, &prepare_epoch, Fault)).?;
+    var adopted = false;
+    var bank_live = true;
+    defer if (bank_live) {
+        // Error cleanup runs outside the nested real model/provider scopes.
+        // It owns a fresh teardown boundary, never the old preparation A.
+        var close_guard = receiver.enter() catch @panic("test cleanup owner unavailable");
+        var close_epoch = close_guard.retainEpoch() catch @panic("test cleanup epoch unavailable");
+        if (adopted) bank.finishAfterUnlock(&close_epoch) else bank.abortOutsideLanes(&close_epoch);
+        close_guard.finish();
+        close_epoch.release();
+    };
+    try std.testing.expect(target.model == null);
+    try std.testing.expectEqual(@as(usize, 4), Fault.calls);
+    const descriptor = (try MetalKvStorage.ColdKvBank.describeCoverage(bank.retained.target, .f32, window, .shared_physical_pages, &geometry)).?;
+    try std.testing.expect(bank.snapshotCoverage().covers(descriptor.coverage()));
+    prepare_guard.finish();
+    // Cycle beyond bounded epoch capacity before real physical destruction.
+    for (0..70) |_| {
+        var unrelated = try receiver.enter();
+        unrelated.finish();
+    }
+    const held = budget.domain.controller.snapshot().backend_kv_bytes;
+    try std.testing.expect(held > 0);
+    var current = try receiver.enter();
+    defer current.finish();
+    var epoch = try current.retainEpoch();
+    defer epoch.release();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var runtime = try storage_runtime.KvStorageRuntime.init(arena.allocator(), config);
+    {
+        try control.lock(session.execution_gate.?);
+        defer session.execution_gate.?.unlock();
+        const backend = try factory.getComputeBackend(session, a);
+        defer backend.deinit();
+        try std.testing.expect(try backend.bindCleanupEpoch(&epoch));
+        try bank.adopt(&backend, &runtime);
+        adopted = true;
+        var runtime_live = true;
+        defer if (runtime_live) runtime.deinitWithBoundary(&epoch);
+        var original: [2][2]*anyopaque = undefined;
+        for (geometry, 0..) |layer, index| {
+            const info = try bank.store.?.slotInfo(bank.store.?.global_layer_slots.get(layer.index).?);
+            original[index] = .{ info.encoded_key_handle.?, info.v_handle.? };
+        }
+        // One long-lived page stays resident while a second slot refills.
+        const longest = try runtime.attachSequence(runtime.poolId());
+        try runtime.appendTokens(longest, 8);
+        const retained_source = storage_runtime.DeviceKvRef{ .handle = input.?, .byte_offset = 0, .byte_len = @sizeOf(@TypeOf(values)) };
+        for (geometry) |layer| try runtime.writeLayerKvSuffixDevice(.{ .sequence_id = longest, .layer_index = layer.index, .total_token_count = 8, .suffix_token_count = 8, .position_offset = 0, .num_kv_heads = 1, .head_dim = 64 }, retained_source, retained_source);
+        for (0..64) |_| {
+            const sequence = try runtime.attachSequence(runtime.poolId());
+            try runtime.appendTokens(sequence, 8);
+            const source = storage_runtime.DeviceKvRef{ .handle = input.?, .byte_offset = 0, .byte_len = @sizeOf(@TypeOf(values)) };
+            for (geometry, 0..) |layer, index| {
+                try runtime.writeLayerKvSuffixDevice(.{ .sequence_id = sequence, .layer_index = layer.index, .total_token_count = 8, .suffix_token_count = 8, .position_offset = 0, .num_kv_heads = 1, .head_dim = 64 }, source, source);
+                const info = try bank.store.?.slotInfo(bank.store.?.global_layer_slots.get(layer.index).?);
+                // Recycled global blocks need not be contiguous. Read their
+                // actual SDK rows using the logical table as an independent
+                // scalar oracle; ordinary gather intentionally declines that
+                // layout when no CPU mirror is present.
+                const ids = runtime.blockTable(sequence).?.blocks.items;
+                var actual_k: [8 * 64]f32 = undefined;
+                var actual_v: [8 * 64]f32 = undefined;
+                for (0..8) |token| {
+                    const physical = (@as(usize, ids[token / 2]) * 2 + token % 2) * 64 * @sizeOf(f32);
+                    const first = token * 64;
+                    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(raw, info.encoded_key_handle, physical, @ptrCast(actual_k[first..].ptr), 64 * @sizeOf(f32)));
+                    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(raw, info.v_handle, physical, @ptrCast(actual_v[first..].ptr), 64 * @sizeOf(f32)));
+                }
+                try std.testing.expectEqualSlices(f32, &values, &actual_k);
+                try std.testing.expectEqualSlices(f32, &values, &actual_v);
+                try std.testing.expectEqual(original[index][0], info.encoded_key_handle.?);
+                try std.testing.expectEqual(original[index][1], info.v_handle.?);
+            }
+            try runtime.releaseSequence(sequence);
+            try std.testing.expectEqual(held, budget.domain.controller.snapshot().backend_kv_bytes);
+        }
+        try runtime.releaseSequence(longest);
+        try std.testing.expectEqual(@as(usize, 4), Fault.calls);
+        runtime.deinitWithBoundary(&epoch);
+        runtime_live = false;
+        try std.testing.expect(bank.store == null);
+        try std.testing.expect(budget.domain.controller.snapshot().backend_kv_bytes > 0);
+    }
+    arena.deinit();
+    arena = .init(a);
+    bank.finishAfterUnlock(&epoch);
+    bank_live = false;
+    current.finish();
+    _ = retirement.poll();
 }

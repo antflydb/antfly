@@ -482,6 +482,7 @@ pub fn attachSessionRunAdmission(
         .backend_class = backend_class,
         .limits = limits,
         .static_workspace_bytes = modelRunWorkspaceAllowance(weight_bytes),
+        .static_workspace_kind = .estimate,
         .model_profile = sessionRunAdmissionModelProfile(backend_runtime, man, qwen_cfg),
     };
 }

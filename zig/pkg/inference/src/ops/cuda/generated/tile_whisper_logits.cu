@@ -134,7 +134,7 @@ extern "C" __global__ void __launch_bounds__(256) antfly_tile_whisper_logits_par
     partials[q + 15u] = 0.0f;
 }
 
-extern "C" __global__ void antfly_tile_whisper_logits_partials_combine(const float *__restrict__ partials, float *__restrict__ out, const unsigned int partial_count) {
+extern "C" __global__ void antfly_tile_whisper_logits_partials_combine(const float *__restrict__ partials, float *__restrict__ out, const unsigned int partial_count, const float *__restrict__ values, const antfly_tile_whisper_logits_params p) {
     if (blockIdx.x != 0u || threadIdx.x != 0u) return;
     float c0_a = (__int_as_float(0xff800000)); unsigned int c0_i = 0xffffffffu; // best
     float c1_a = (__int_as_float(0xff800000)); unsigned int c1_i = 0xffffffffu; // text
@@ -162,4 +162,6 @@ extern "C" __global__ void antfly_tile_whisper_logits_partials_combine(const flo
     out[12] = c6_a; out[13] = c6_b;
     out[14] = 0.0f;
     out[15] = 0.0f;
+    out[14] = (p.probe_id < p.out_dim) ? values[p.probe_id] : 0.0f;
+    out[15] = (p.eot < p.out_dim) ? values[p.eot] : (__int_as_float(0xff800000));
 }

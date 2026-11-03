@@ -328,6 +328,220 @@ fn hashNodeIds(node_ids: []const NodeId) u64 {
     return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(node_ids));
 }
 
+/// Typed, stack-only forwarding of an actual invocation's preparation nonce.
+/// Every callback still uses the original backend pointer/table and policy.
+const PreparationBackend = struct {
+    backend: *const ComputeBackend,
+    nonce: u64,
+    fn decoderRuntimeEnsureLinearSlot(self: *const PreparationBackend, request: *const ops_mod.DecoderRuntimeEnsureLinearSlotRequest) !?usize {
+        var scoped = request.*;
+        scoped.preparation_scope = self.nonce;
+        return self.backend.decoderRuntimeEnsureLinearSlot(&scoped);
+    }
+    fn decoderRuntimeEnsureRmsNormSlot(self: *const PreparationBackend, request: *const ops_mod.DecoderRuntimeEnsureRmsNormSlotRequest) !?usize {
+        var scoped = request.*;
+        scoped.preparation_scope = self.nonce;
+        return self.backend.decoderRuntimeEnsureRmsNormSlot(&scoped);
+    }
+    fn sliceRows2D(self: *const PreparationBackend, allocator: std.mem.Allocator, tensor: CT, start: usize, rows: usize, cols: usize) !CT {
+        return self.backend.sliceRows2D(allocator, tensor, start, rows, cols);
+    }
+    fn primSlice(self: *const PreparationBackend, tensor: CT, starts: []const i64, limits: []const i64, strides: []const i64, shape: []const i64) !CT {
+        return self.backend.primSlice(tensor, starts, limits, strides, shape);
+    }
+    fn free(self: *const PreparationBackend, tensor: CT) void {
+        self.backend.free(tensor);
+    }
+};
+
+const PreparedSourceState = struct {
+    const max_sources = 6;
+    nodes: [max_sources]NodeId = undefined,
+    identities: [max_sources]metal_compute_mod.ParameterIdentity = undefined,
+    count: usize = 0,
+    backend: ?metal_compute_mod.PreparedBackendIdentity = null,
+    valid: bool = false,
+    reusable: bool = false,
+    bindings: [6]@import("../backends/prepared_binding.zig").Stamp = undefined,
+    binding_count: usize = 0,
+    checked_binding_generation: u64 = 0,
+    fn addBinding(self: *PreparedSourceState, cb: *const ComputeBackend, kind: @import("../backends/prepared_binding.zig").Kind, slot: usize) void {
+        for (self.bindings[0..self.binding_count]) |prior| if (prior.kind == kind and prior.slot == slot) return;
+        if (self.binding_count == self.bindings.len) {
+            self.valid = false;
+            return;
+        }
+        self.bindings[self.binding_count] = metal_compute_mod.MetalCompute.preparedBindingStamp(cb, kind, slot) orelse {
+            self.valid = false;
+            return;
+        };
+        self.binding_count += 1;
+    }
+    fn ffnBindings(self: *PreparedSourceState, cb: *const ComputeBackend, slots: PreparedGatedFfnResidualRegion) void {
+        self.addBinding(cb, .linear, slots.gate_slot);
+        self.addBinding(cb, .linear, slots.up_slot);
+        self.addBinding(cb, .linear, slots.down_slot);
+        if (slots.post_down_rms_norm_slot) |slot| self.addBinding(cb, .rms_norm, slot);
+    }
+    fn qkvBindings(self: *PreparedSourceState, cb: *const ComputeBackend, slots: PreparedQkvRegion) void {
+        self.addBinding(cb, .linear, slots.q_slot);
+        self.addBinding(cb, .linear, slots.k_slot);
+        self.addBinding(cb, .linear, slots.v_slot);
+    }
+    fn captureBindings(self: *PreparedSourceState, cb: *const ComputeBackend, prepared: PreparedRuntimeRegion) void {
+        self.binding_count = 0;
+        self.checked_binding_generation = 0;
+        switch (prepared) {
+            .raw_linear_dot, .raw_linear_bias, .q_linear => |slots| self.addBinding(cb, .linear, slots.linear_slot),
+            .raw_linear_pair, .raw_linear_bias_pair => |slots| {
+                self.addBinding(cb, .linear, slots.first_slot);
+                self.addBinding(cb, .linear, slots.second_slot);
+            },
+            .linear_qkv, .grouped_linear_qkv_slice, .packed_linear_qkv_slice => |slots| self.qkvBindings(cb, slots),
+            .rms_norm_grouped_linear_qkv_slice => |slots| {
+                self.addBinding(cb, .rms_norm, slots.norm_slot);
+                self.qkvBindings(cb, slots.qkv);
+            },
+            .attention_output_residual => |slots| {
+                self.addBinding(cb, .linear, slots.linear_slot);
+                if (slots.pre_linear_rms_norm_slot) |slot| self.addBinding(cb, .rms_norm, slot);
+                if (slots.post_linear_rms_norm_slot) |slot| self.addBinding(cb, .rms_norm, slot);
+            },
+            .gated_ffn_residual => |slots| self.ffnBindings(cb, slots),
+            .rms_norm_gated_ffn_residual => |slots| {
+                self.addBinding(cb, .rms_norm, slots.norm_slot);
+                self.ffnBindings(cb, slots.ffn);
+            },
+            .ple_residual => |slots| {
+                self.addBinding(cb, .linear, slots.gate_slot);
+                self.addBinding(cb, .linear, slots.projection_slot);
+                self.addBinding(cb, .rms_norm, slots.post_norm_slot);
+            },
+            .deberta_ffn_forward, .deberta_encoder_lora_layer => |slots| {
+                self.addBinding(cb, .linear, slots.first_slot);
+                self.addBinding(cb, .linear, slots.second_slot);
+            },
+            else => {},
+        }
+    }
+
+    fn add(self: *PreparedSourceState, node: NodeId) !void {
+        if (node == null_node) return error.InvalidPreparedParameterSource;
+        for (self.nodes[0..self.count]) |prior| if (prior == node) return;
+        if (self.count == max_sources) return error.TooManyPreparedParameterSources;
+        self.nodes[self.count] = node;
+        self.count += 1;
+    }
+    fn linear(self: *PreparedSourceState, graph: *const Graph, node: NodeId) !void {
+        const inputs = graph.node(node).getInputs();
+        if (inputs.len < 2) return error.InvalidPreparedParameterSource;
+        try self.add(inputs[1]);
+    }
+    fn ffn(self: *PreparedSourceState, graph: *const Graph, pattern: GatedFfnResidualPattern) !void {
+        const pair = graph.node(pattern.pair_id).getInputs();
+        if (pair.len < 3) return error.InvalidPreparedParameterSource;
+        try self.add(pair[1]);
+        try self.add(pair[2]);
+        try self.linear(graph, pattern.down_id);
+        if (pattern.post_down_norm_id) |node| try self.linear(graph, node);
+    }
+    fn sources(self: *PreparedSourceState, graph: *const Graph, region: RuntimeRegion) !void {
+        self.count = 0;
+        switch (region) {
+            .raw_linear_dot => |p| try self.add(p.weight_id),
+            .raw_linear_pair => |p| {
+                try self.add(p.first.weight_id);
+                try self.add(p.second.weight_id);
+            },
+            .raw_linear_bias => |p| {
+                try self.add(p.dot.weight_id);
+                try self.add(p.bias_id);
+            },
+            .raw_linear_bias_pair => |p| {
+                try self.add(p.first.dot.weight_id);
+                try self.add(p.first.bias_id);
+                try self.add(p.second.dot.weight_id);
+                try self.add(p.second.bias_id);
+            },
+            .q_linear => |p| try self.add(p.weight_id),
+            .linear_qkv => |p| {
+                try self.add(p.q_weight_id);
+                try self.add(p.k_weight_id);
+                try self.add(p.v_weight_id);
+            },
+            .grouped_linear_qkv_slice => |p| {
+                try self.add(p.q_weight_id);
+                try self.add(p.k_weight_id);
+                try self.add(p.v_weight_id);
+            },
+            .packed_linear_qkv_slice => |p| {
+                try self.add(p.weight_id);
+                try self.add(p.bias_id);
+            },
+            .rms_norm_grouped_linear_qkv_slice => |p| {
+                try self.add(p.norm_weight_id);
+                try self.add(p.qkv.q_weight_id);
+                try self.add(p.qkv.k_weight_id);
+                try self.add(p.qkv.v_weight_id);
+            },
+            .attention_output_residual => |p| {
+                try self.linear(graph, p.linear_id);
+                if (p.pre_linear_norm_id) |node| try self.linear(graph, node);
+                if (p.post_linear_norm_id) |node| try self.linear(graph, node);
+            },
+            .gated_ffn_residual => |p| try self.ffn(graph, p),
+            .rms_norm_gated_ffn_residual => |p| {
+                try self.add(p.norm_weight_id);
+                try self.ffn(graph, p.ffn);
+            },
+            .ple_residual => |p| {
+                try self.add(p.gate_weight_id);
+                try self.add(p.projection_weight_id);
+                try self.add(p.post_norm_weight_id);
+            },
+            .deberta_ffn_forward => |p| {
+                try self.add(p.first_weight_id);
+                try self.add(p.first_bias_id);
+                try self.add(p.second_weight_id);
+                try self.add(p.second_bias_id);
+            },
+            .deberta_encoder_lora_layer => |p| {
+                try self.add(p.ffn.first_weight_id);
+                try self.add(p.ffn.first_bias_id);
+                try self.add(p.ffn.second_weight_id);
+                try self.add(p.ffn.second_bias_id);
+            },
+            else => {}, // No prepared slots: these paths read current values.
+        }
+    }
+    fn capture(self: *PreparedSourceState, graph: *const Graph, cb: *const ComputeBackend, values: []?CT, value_device: []const DeviceId, device_id: DeviceId, region: RuntimeRegion) !void {
+        self.valid = false;
+        self.reusable = true;
+        self.backend = metal_compute_mod.MetalCompute.preparedBackendIdentity(cb) orelse return;
+        try self.sources(graph, region);
+        for (self.nodes[0..self.count], self.identities[0..self.count]) |node, *identity| {
+            if (node >= value_device.len or value_device[node] != device_id) return;
+            const value = valueFor(values, node) orelse return;
+            identity.* = metal_compute_mod.MetalCompute.preparedParameterIdentity(cb, value) orelse return;
+            if (identity.version == null or identity.secondary_version == null) self.reusable = false;
+        }
+        self.valid = true;
+    }
+    fn matches(self: *PreparedSourceState, cb: *const ComputeBackend, values: []?CT, value_device: []const DeviceId, device_id: DeviceId) bool {
+        if (!self.valid) return false;
+        const current = metal_compute_mod.MetalCompute.preparedBackendIdentity(cb) orelse return false;
+        if (!std.meta.eql(current, self.backend orelse return false)) return false;
+        if (self.binding_count != 0 and !metal_compute_mod.MetalCompute.preparedBindingsMatch(cb, &self.checked_binding_generation, self.bindings[0..self.binding_count])) return false;
+        for (self.nodes[0..self.count], self.identities[0..self.count]) |node, saved| {
+            if (node >= value_device.len or value_device[node] != device_id) return false;
+            const value = valueFor(values, node) orelse return false;
+            const identity = metal_compute_mod.MetalCompute.preparedParameterIdentity(cb, value) orelse return false;
+            if (!std.meta.eql(identity, saved)) return false;
+        }
+        return true;
+    }
+};
+
 const RuntimeRegionPlan = struct {
     node_count: usize = 0,
     value_count: usize = 0,
@@ -341,6 +555,8 @@ const RuntimeRegionPlan = struct {
     descriptors: []ops_mod.kernel_descriptor.Descriptor = &.{},
     regions_by_pos: []RuntimeRegion = &.{},
     prepared_by_pos: []PreparedRuntimeRegion = &.{},
+    prepared_source_indices: []u32 = &.{},
+    prepared_sources: []PreparedSourceState = &.{},
     attention_input_max_first_node: []NodeId = &.{},
     pre_skipped_by_region: []bool = &.{},
     region_count: usize = 0,
@@ -355,6 +571,8 @@ const RuntimeRegionPlan = struct {
         allocator.free(self.descriptors);
         allocator.free(self.regions_by_pos);
         allocator.free(self.prepared_by_pos);
+        allocator.free(self.prepared_source_indices);
+        allocator.free(self.prepared_sources);
         allocator.free(self.attention_input_max_first_node);
         allocator.free(self.pre_skipped_by_region);
         self.* = .{};
@@ -387,6 +605,12 @@ const RuntimeRegionPlan = struct {
         if (node_pos >= self.prepared_by_pos.len or node_pos >= node_ids.len) return null;
         if (node_ids[node_pos] != node_id) return null;
         return &self.prepared_by_pos[node_pos];
+    }
+
+    fn sourceStateAt(self: RuntimeRegionPlan, position: usize) ?*PreparedSourceState {
+        if (position >= self.prepared_source_indices.len) return null;
+        const index = self.prepared_source_indices[position];
+        return if (index < self.prepared_sources.len) &self.prepared_sources[index] else null;
     }
 
     fn needsAttentionInputAfterNode(self: RuntimeRegionPlan, input_id: NodeId, node_id: NodeId) bool {
@@ -1518,6 +1742,7 @@ pub const MetalPartitionExecutor = struct {
         const allocator = exec_ctx.allocator orelse self.allocator;
         const graph = exec_ctx.graph orelse self.graph;
         const cb = exec_ctx.backend orelse self.backend;
+        const preparation_scope = metal_compute_mod.nextPreparationNonce();
         const reachable = exec_ctx.reachable orelse return error.MissingPartitionExecutionContext;
         const last_use = exec_ctx.last_use orelse return error.MissingPartitionExecutionContext;
         const buffer_plan = exec_ctx.buffer_plan orelse return error.MissingPartitionExecutionContext;
@@ -1618,18 +1843,10 @@ pub const MetalPartitionExecutor = struct {
             effective_exec_ctx.owned_runtime_transfers = &local_owned_runtime_transfers;
         }
 
-        var rt_map = std.AutoHashMapUnmanaged(NodeId, CT).empty;
-        defer rt_map.deinit(allocator);
-        var donated = std.AutoHashMapUnmanaged(NodeId, void).empty;
-        defer donated.deinit(allocator);
-        if (options.runtime_inputs) |inputs| {
-            for (inputs, 0..) |ri, idx| {
-                try rt_map.put(allocator, ri.node_id, ri.value);
-                if (options.donate) |donate| {
-                    if (idx < donate.len and donate[idx]) try donated.put(allocator, ri.node_id, {});
-                }
-            }
-        }
+        var runtime_input_index = try exec_ctx.runtimeInputIndex(allocator, options);
+        defer runtime_input_index.deinit(allocator);
+        const rt_map = runtime_input_index.values;
+        const donated = runtime_input_index.donated;
 
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_runtime_inputs_begin partition={d}\n", .{partition_index});
         if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_runtime_inputs_begin partition={d}\n", .{partition_index});
@@ -1678,6 +1895,7 @@ pub const MetalPartitionExecutor = struct {
             node_ids,
             reachable,
             device_id,
+            options.physical_frame,
         );
         if (collect_loop_profile) loop_profile.materialize_constants_ns += metalPartitionElapsedNs(constants_start_ns, metalPartitionNowNs());
         if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_constants_end partition={d}\n", .{partition_index});
@@ -1817,6 +2035,7 @@ pub const MetalPartitionExecutor = struct {
             value_device,
             device_id,
             runtime_region_plan,
+            preparation_scope,
             exec_ctx.stats,
         );
 
@@ -2008,6 +2227,8 @@ pub const MetalPartitionExecutor = struct {
             if (try tryExecutePlannedRuntimeRegion(
                 runtime_region,
                 runtime_region_plan.preparedPtrAt(node_pos, node_id, node_ids),
+                runtime_region_plan.sourceStateAt(node_pos),
+                preparation_scope,
                 allocator,
                 graph,
                 cb,
@@ -4345,7 +4566,21 @@ fn buildRuntimeRegionPlan(
         }
     }
 
+    const source_indices = try allocator.alloc(u32, node_ids.len);
+    errdefer allocator.free(source_indices);
+    @memset(source_indices, std.math.maxInt(u32));
+    const source_states = try allocator.alloc(PreparedSourceState, region_count);
+    errdefer allocator.free(source_states);
+    @memset(source_states, .{});
+    var source_count: usize = 0;
+    for (regions, 0..) |region, position| if (std.meta.activeTag(region) != .none) {
+        source_indices[position] = @intCast(source_count);
+        source_count += 1;
+    };
+    std.debug.assert(source_count == region_count);
     return .{
+        .prepared_source_indices = source_indices,
+        .prepared_sources = source_states,
         .node_count = node_ids.len,
         .value_count = value_count,
         .first_node = if (node_ids.len == 0) null_node else node_ids[0],
@@ -5560,8 +5795,12 @@ fn prepareRuntimeRegionPlan(
     value_device: []DeviceId,
     device_id: DeviceId,
     plan: RuntimeRegionPlan,
+    preparation_scope: u64,
     stats: ?*PartitionExecutor.ExecutionStats,
 ) !void {
+    for (plan.prepared_sources) |*source| if (!source.reusable) {
+        source.valid = false;
+    };
     for (plan.regions_by_pos, 0..) |region, node_pos| {
         if (std.meta.activeTag(region) == .none) continue;
         if (node_pos >= plan.prepared_by_pos.len) continue;
@@ -5573,13 +5812,15 @@ fn prepareRuntimeRegionPlan(
             device_id,
             region,
             &plan.prepared_by_pos[node_pos],
+            plan.sourceStateAt(node_pos),
+            preparation_scope,
             stats,
         );
     }
 }
 
 fn ensurePreparedLinearSlot(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     weight_id: NodeId,
     in_dim: usize,
@@ -5597,7 +5838,7 @@ fn ensurePreparedLinearSlot(
 }
 
 fn ensurePreparedLinearSlotWithOptionalBias(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     weight_id: NodeId,
     bias_id: ?NodeId,
@@ -5617,7 +5858,7 @@ fn ensurePreparedLinearSlotWithOptionalBias(
 }
 
 fn ensurePreparedRmsNormSlot(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     weight_id: NodeId,
     hidden_size: usize,
@@ -5632,7 +5873,7 @@ fn ensurePreparedRmsNormSlot(
 }
 
 fn prepareQLinearRegion(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: QLinearPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -5649,7 +5890,7 @@ fn prepareQLinearRegion(
 }
 
 fn prepareQkvRegion(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     q_weight_id: NodeId,
     k_weight_id: NodeId,
@@ -5670,7 +5911,7 @@ fn prepareQkvRegion(
 }
 
 fn prepareLinearNoBiasQkvRegion(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: LinearNoBiasQkvPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -5689,7 +5930,7 @@ fn prepareLinearNoBiasQkvRegion(
 }
 
 fn prepareGroupedLinearQkvSliceRegion(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: GroupedLinearQkvSlicePattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -5708,7 +5949,7 @@ fn prepareGroupedLinearQkvSliceRegion(
 }
 
 fn ensurePreparedLinearSlotFromTensor(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     weight: CT,
     bias: CT,
     in_dim: usize,
@@ -5726,7 +5967,7 @@ fn ensurePreparedLinearSlotFromTensor(
 
 fn preparePackedLinearQkvSliceRegion(
     allocator: std.mem.Allocator,
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: PackedLinearQkvSlicePattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -5758,7 +5999,7 @@ fn preparePackedLinearQkvSliceRegion(
     };
 }
 
-fn slicePackedBias(cb: *const ComputeBackend, bias: CT, start: usize, limit: usize, total: usize) !CT {
+fn slicePackedBias(cb: *const PreparationBackend, bias: CT, start: usize, limit: usize, total: usize) !CT {
     const starts = [_]i64{@intCast(start)};
     const limits = [_]i64{@intCast(limit)};
     const strides = [_]i64{1};
@@ -5767,7 +6008,7 @@ fn slicePackedBias(cb: *const ComputeBackend, bias: CT, start: usize, limit: usi
 }
 
 fn prepareRmsNormGroupedLinearQkvSliceRegion(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: RmsNormGroupedLinearQkvSlicePattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -5782,7 +6023,7 @@ fn prepareRmsNormGroupedLinearQkvSliceRegion(
 
 fn prepareAttentionOutputResidualRegion(
     graph: *const Graph,
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: AttentionOutputResidualPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -5833,7 +6074,7 @@ fn prepareAttentionOutputResidualRegion(
 
 fn prepareGatedFfnResidualRegion(
     graph: *const Graph,
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: GatedFfnResidualPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -5891,7 +6132,7 @@ fn prepareGatedFfnResidualRegion(
 
 fn prepareRmsNormGatedFfnResidualRegion(
     graph: *const Graph,
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: RmsNormGatedFfnResidualPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -5908,7 +6149,7 @@ fn prepareRmsNormGatedFfnResidualRegion(
 }
 
 fn preparePleResidualRegion(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: PleResidualPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -5945,17 +6186,17 @@ fn preparePleResidualRegion(
 
 fn prepareDebertaFfnForwardRegion(
     graph: *const Graph,
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     value_device: []DeviceId,
     device_id: DeviceId,
     pattern: DebertaFfnForwardPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
 ) !?PreparedDebertaFfnForwardRegion {
-    _ = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, pattern.first_weight_id)) orelse return null;
-    _ = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, pattern.first_bias_id)) orelse return null;
-    _ = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, pattern.second_weight_id)) orelse return null;
-    _ = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, pattern.second_bias_id)) orelse return null;
+    _ = (try valueForOrMaterializeParameter(graph, cb.backend, values, value_device, device_id, pattern.first_weight_id)) orelse return null;
+    _ = (try valueForOrMaterializeParameter(graph, cb.backend, values, value_device, device_id, pattern.first_bias_id)) orelse return null;
+    _ = (try valueForOrMaterializeParameter(graph, cb.backend, values, value_device, device_id, pattern.second_weight_id)) orelse return null;
+    _ = (try valueForOrMaterializeParameter(graph, cb.backend, values, value_device, device_id, pattern.second_bias_id)) orelse return null;
     const first_slot = (try ensurePreparedLinearSlotWithOptionalBias(
         cb,
         values,
@@ -5979,7 +6220,7 @@ fn prepareDebertaFfnForwardRegion(
 
 fn prepareDebertaEncoderLoraLayerRegion(
     graph: *const Graph,
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     value_device: []DeviceId,
     device_id: DeviceId,
@@ -5988,8 +6229,8 @@ fn prepareDebertaEncoderLoraLayerRegion(
 ) !?PreparedDebertaFfnForwardRegion {
     const ffn = (try prepareDebertaFfnForwardRegion(graph, cb, values, value_device, device_id, pattern.ffn, stats)) orelse return null;
     if (pattern.layer_norm_id != null_node) {
-        _ = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, pattern.layer_norm_weight_id)) orelse return null;
-        _ = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, pattern.layer_norm_bias_id)) orelse return null;
+        _ = (try valueForOrMaterializeParameter(graph, cb.backend, values, value_device, device_id, pattern.layer_norm_weight_id)) orelse return null;
+        _ = (try valueForOrMaterializeParameter(graph, cb.backend, values, value_device, device_id, pattern.layer_norm_bias_id)) orelse return null;
     }
     return ffn;
 }
@@ -6002,77 +6243,89 @@ fn prepareRuntimeRegion(
     device_id: DeviceId,
     region: RuntimeRegion,
     prepared_region: ?*PreparedRuntimeRegion,
+    source_state: ?*PreparedSourceState,
+    preparation_scope: u64,
     stats: ?*PartitionExecutor.ExecutionStats,
 ) !?PreparedRuntimeRegion {
     if (prepared_region) |prepared_ptr| {
-        if (preparedRuntimeRegionMatches(region, prepared_ptr.*)) {
+        if (preparedRuntimeRegionMatches(region, prepared_ptr.*) and (if (source_state) |source| source.matches(cb, values, value_device, device_id) else false)) {
             if (stats) |s| s.runtime_prepare_slot_cache_hits += preparedRuntimeRegionSlotCount(prepared_ptr.*);
             return prepared_ptr.*;
         }
     }
 
+    // A failed reprepare must never leave the previous source's slot armed.
+    if (prepared_region) |prepared_ptr| prepared_ptr.* = .{ .none = {} };
+    if (source_state) |source| source.valid = false;
+    const scoped_cb = &PreparationBackend{ .backend = cb, .nonce = preparation_scope };
     const prepared: PreparedRuntimeRegion = switch (region) {
         .none => return null,
         .raw_linear_dot => |pattern| .{
-            .raw_linear_dot = (try prepareRawLinearDotRegion(cb, values, pattern, stats)) orelse return null,
+            .raw_linear_dot = (try prepareRawLinearDotRegion(scoped_cb, values, pattern, stats)) orelse return null,
         },
         .raw_linear_pair => |pattern| .{
-            .raw_linear_pair = (try prepareRawLinearPairRegion(cb, values, pattern, stats)) orelse return null,
+            .raw_linear_pair = (try prepareRawLinearPairRegion(scoped_cb, values, pattern, stats)) orelse return null,
         },
         .raw_linear_bias => |pattern| .{
-            .raw_linear_bias = (try prepareRawLinearBiasRegion(cb, values, pattern, stats)) orelse return null,
+            .raw_linear_bias = (try prepareRawLinearBiasRegion(scoped_cb, values, pattern, stats)) orelse return null,
         },
         .raw_linear_bias_pair => |pattern| .{
-            .raw_linear_bias_pair = (try prepareRawLinearBiasPairRegion(cb, values, pattern, stats)) orelse return null,
+            .raw_linear_bias_pair = (try prepareRawLinearBiasPairRegion(scoped_cb, values, pattern, stats)) orelse return null,
         },
         .lora_linear => .{ .lora_linear = {} },
         .lora_linear_qkv => .{ .lora_linear_qkv = {} },
         .deberta_attention => .{ .deberta_attention = {} },
         .deberta_ffn_forward => |pattern| .{
-            .deberta_ffn_forward = (try prepareDebertaFfnForwardRegion(graph, cb, values, value_device, device_id, pattern, stats)) orelse return null,
+            .deberta_ffn_forward = (try prepareDebertaFfnForwardRegion(graph, scoped_cb, values, value_device, device_id, pattern, stats)) orelse return null,
         },
         .deberta_encoder_lora_layer => |pattern| .{
-            .deberta_encoder_lora_layer = (try prepareDebertaEncoderLoraLayerRegion(graph, cb, values, value_device, device_id, pattern, stats)) orelse return null,
+            .deberta_encoder_lora_layer = (try prepareDebertaEncoderLoraLayerRegion(graph, scoped_cb, values, value_device, device_id, pattern, stats)) orelse return null,
         },
         .lora_backward => .{ .lora_backward = {} },
         .low_rank_lora_backward => .{ .low_rank_lora_backward = {} },
         .rank_adapter_backward => .{ .rank_adapter_backward = {} },
         .ffn_gelu_backward => .{ .ffn_gelu_backward = {} },
         .q_linear => |pattern| .{
-            .q_linear = (try prepareQLinearRegion(cb, values, pattern, stats)) orelse return null,
+            .q_linear = (try prepareQLinearRegion(scoped_cb, values, pattern, stats)) orelse return null,
         },
         .linear_qkv => |pattern| .{
-            .linear_qkv = (try prepareLinearNoBiasQkvRegion(cb, values, pattern, stats)) orelse return null,
+            .linear_qkv = (try prepareLinearNoBiasQkvRegion(scoped_cb, values, pattern, stats)) orelse return null,
         },
         .grouped_linear_qkv_slice => |pattern| .{
-            .grouped_linear_qkv_slice = (try prepareGroupedLinearQkvSliceRegion(cb, values, pattern, stats)) orelse return null,
+            .grouped_linear_qkv_slice = (try prepareGroupedLinearQkvSliceRegion(scoped_cb, values, pattern, stats)) orelse return null,
         },
         .packed_linear_qkv_slice => |pattern| .{
-            .packed_linear_qkv_slice = (try preparePackedLinearQkvSliceRegion(graph.allocator, cb, values, pattern, stats)) orelse return null,
+            .packed_linear_qkv_slice = (try preparePackedLinearQkvSliceRegion(graph.allocator, scoped_cb, values, pattern, stats)) orelse return null,
         },
         .rms_norm_grouped_linear_qkv_slice => |pattern| .{
-            .rms_norm_grouped_linear_qkv_slice = (try prepareRmsNormGroupedLinearQkvSliceRegion(cb, values, pattern, stats)) orelse return null,
+            .rms_norm_grouped_linear_qkv_slice = (try prepareRmsNormGroupedLinearQkvSliceRegion(scoped_cb, values, pattern, stats)) orelse return null,
         },
         .attention_output_residual => |pattern| .{
-            .attention_output_residual = (try prepareAttentionOutputResidualRegion(graph, cb, values, pattern, stats)) orelse return null,
+            .attention_output_residual = (try prepareAttentionOutputResidualRegion(graph, scoped_cb, values, pattern, stats)) orelse return null,
         },
         .rms_norm_gated_ffn_residual => |pattern| .{
-            .rms_norm_gated_ffn_residual = (try prepareRmsNormGatedFfnResidualRegion(graph, cb, values, pattern, stats)) orelse return null,
+            .rms_norm_gated_ffn_residual = (try prepareRmsNormGatedFfnResidualRegion(graph, scoped_cb, values, pattern, stats)) orelse return null,
         },
         .gated_ffn_residual => |pattern| .{
-            .gated_ffn_residual = (try prepareGatedFfnResidualRegion(graph, cb, values, pattern, stats)) orelse return null,
+            .gated_ffn_residual = (try prepareGatedFfnResidualRegion(graph, scoped_cb, values, pattern, stats)) orelse return null,
         },
         .ple_residual => |pattern| .{
-            .ple_residual = (try preparePleResidualRegion(cb, values, pattern, stats)) orelse return null,
+            .ple_residual = (try preparePleResidualRegion(scoped_cb, values, pattern, stats)) orelse return null,
         },
     };
     if (prepared_region) |prepared_ptr| prepared_ptr.* = prepared;
+    if (source_state) |source| {
+        try source.capture(graph, cb, values, value_device, device_id, region);
+        if (source.valid) source.captureBindings(cb, prepared);
+    }
     return prepared;
 }
 
 fn tryExecutePlannedRuntimeRegion(
     region: RuntimeRegion,
     prepared_region: ?*PreparedRuntimeRegion,
+    source_state: ?*PreparedSourceState,
+    preparation_scope: u64,
     allocator: std.mem.Allocator,
     graph: *const Graph,
     cb: *const ComputeBackend,
@@ -6092,7 +6345,7 @@ fn tryExecutePlannedRuntimeRegion(
     _ = node_ids;
     _ = node_pos;
     _ = reachable;
-    const prepared = (try prepareRuntimeRegion(graph, cb, values, value_device, device_id, region, prepared_region, exec_ctx.stats)) orelse {
+    const prepared = (try prepareRuntimeRegion(graph, cb, values, value_device, device_id, region, prepared_region, source_state, preparation_scope, exec_ctx.stats)) orelse {
         if (std.meta.activeTag(region) != .none) {
             if (exec_ctx.stats) |stats| stats.runtime_region_fallbacks += 1;
         }
@@ -6441,7 +6694,7 @@ fn tryExecuteAttentionOutputResidualPattern(
 ) !bool {
     if (!attentionOutputResidualGraphFusionEnabled()) return false;
     const pattern = matchAttentionOutputResidualPattern(graph, node_ids, node_pos, reachable, skipped_nodes, last_use) orelse return false;
-    const prepared = (try prepareAttentionOutputResidualRegion(graph, cb, values, pattern, exec_ctx.stats)) orelse return false;
+    const prepared = (try prepareAttentionOutputResidualRegion(graph, &PreparationBackend{ .backend = cb, .nonce = metal_compute_mod.nextPreparationNonce() }, values, pattern, exec_ctx.stats)) orelse return false;
     return executeAttentionOutputResidualPattern(
         graph,
         cb,
@@ -6682,7 +6935,7 @@ fn tryExecuteRmsNormGatedFfnResidualPattern(
 ) !bool {
     if (!gatedFfnGraphFusionEnabled()) return false;
     const pattern = matchRmsNormGatedFfnResidualPattern(graph, node_ids, node_pos, reachable, skipped_nodes, last_use) orelse return false;
-    const prepared = (try prepareRmsNormGatedFfnResidualRegion(graph, cb, values, pattern, stats)) orelse return false;
+    const prepared = (try prepareRmsNormGatedFfnResidualRegion(graph, &PreparationBackend{ .backend = cb, .nonce = metal_compute_mod.nextPreparationNonce() }, values, pattern, stats)) orelse return false;
     return executeRmsNormGatedFfnResidualPattern(
         graph,
         cb,
@@ -6795,7 +7048,7 @@ fn tryExecuteGatedFfnResidualPattern(
         if (traceMetalGraphFusionsEnabled()) traceGatedFfnResidualCandidate(graph, node_ids, node_pos, reachable, skipped_nodes, last_use);
         return false;
     };
-    const prepared = (try prepareGatedFfnResidualRegion(graph, cb, values, pattern, stats)) orelse return false;
+    const prepared = (try prepareGatedFfnResidualRegion(graph, &PreparationBackend{ .backend = cb, .nonce = metal_compute_mod.nextPreparationNonce() }, values, pattern, stats)) orelse return false;
     return executeMatchedGatedFfnResidualPattern(
         graph,
         cb,
@@ -6973,7 +7226,7 @@ fn tryExecutePleResidualPattern(
     stats: ?*PartitionExecutor.ExecutionStats,
 ) !bool {
     const pattern = matchPleResidualPattern(graph, node_ids, node_pos, reachable, skipped_nodes) orelse return false;
-    const prepared = (try preparePleResidualRegion(cb, values, pattern, stats)) orelse return false;
+    const prepared = (try preparePleResidualRegion(&PreparationBackend{ .backend = cb, .nonce = metal_compute_mod.nextPreparationNonce() }, values, pattern, stats)) orelse return false;
     return executePleResidualPattern(
         graph,
         cb,
@@ -12239,7 +12492,7 @@ fn isLoRAAdapterParameterName(name: []const u8) bool {
 }
 
 fn prepareRawLinearDotRegion(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: RawLinearDotPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -12256,7 +12509,7 @@ fn prepareRawLinearDotRegion(
 }
 
 fn prepareRawLinearPairRegion(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: RawLinearPairPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -12284,7 +12537,7 @@ fn prepareRawLinearPairRegion(
 }
 
 fn prepareRawLinearBiasRegion(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: RawLinearBiasPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -12302,7 +12555,7 @@ fn prepareRawLinearBiasRegion(
 }
 
 fn prepareRawLinearBiasPairRegion(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: RawLinearBiasPairPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -12521,7 +12774,7 @@ fn tryExecuteRmsNormGroupedLinearQkvSlicePattern(
     donated: std.AutoHashMapUnmanaged(NodeId, void),
 ) !bool {
     const pattern = matchRmsNormGroupedLinearQkvSlicePattern(graph, values, node_ids, node_pos, reachable, skipped_nodes) orelse return false;
-    const prepared = (try prepareRmsNormGroupedLinearQkvSliceRegion(cb, values, pattern, exec_ctx.stats)) orelse return false;
+    const prepared = (try prepareRmsNormGroupedLinearQkvSliceRegion(&PreparationBackend{ .backend = cb, .nonce = metal_compute_mod.nextPreparationNonce() }, values, pattern, exec_ctx.stats)) orelse return false;
     return executeRmsNormGroupedLinearQkvSlicePattern(
         allocator,
         graph,
@@ -12717,7 +12970,7 @@ fn tryExecuteGroupedLinearQkvSlicePattern(
     donated: std.AutoHashMapUnmanaged(NodeId, void),
 ) !bool {
     const pattern = matchGroupedLinearQkvSlicePattern(graph, values, node_ids, node_pos, reachable, skipped_nodes) orelse return false;
-    const prepared = (try prepareGroupedLinearQkvSliceRegion(cb, values, pattern, exec_ctx.stats)) orelse return false;
+    const prepared = (try prepareGroupedLinearQkvSliceRegion(&PreparationBackend{ .backend = cb, .nonce = metal_compute_mod.nextPreparationNonce() }, values, pattern, exec_ctx.stats)) orelse return false;
     return executeGroupedLinearQkvSlicePattern(
         allocator,
         graph,
@@ -13119,7 +13372,7 @@ fn tryExecuteLinearNoBiasQkvPattern(
     donated: std.AutoHashMapUnmanaged(NodeId, void),
 ) !bool {
     const pattern = matchLinearNoBiasQkvPattern(graph, values, node_ids, node_pos, reachable, skipped_nodes) orelse return false;
-    const prepared = (try prepareLinearNoBiasQkvRegion(cb, values, pattern, exec_ctx.stats)) orelse return false;
+    const prepared = (try prepareLinearNoBiasQkvRegion(&PreparationBackend{ .backend = cb, .nonce = metal_compute_mod.nextPreparationNonce() }, values, pattern, exec_ctx.stats)) orelse return false;
     return executeLinearNoBiasQkvPattern(
         allocator,
         graph,
@@ -16548,6 +16801,7 @@ fn materializePartitionConstants(
     node_ids: []const NodeId,
     reachable: []const bool,
     device_id: DeviceId,
+    physical_frame: ?*@import("../execution/physical_buffers.zig").Frame,
 ) !void {
     for (node_ids) |node_id| {
         const i: usize = @intCast(node_id);
@@ -16555,7 +16809,10 @@ fn materializePartitionConstants(
         if (values[i] != null) continue;
         const node = graph.node(node_id);
         const materialized = switch (node.op) {
-            .constant => |attrs| try executeRuntimeConstant(graph, cb, node.output_shape, attrs),
+            .constant => |attrs| if (physical_frame) |frame|
+                (try frame.materializeLiteral(cb, node_id)) orelse try executeRuntimeConstant(graph, cb, node.output_shape, attrs)
+            else
+                try executeRuntimeConstant(graph, cb, node.output_shape, attrs),
             .fused_zero_tensor => |attrs| try executeRuntimeZeroTensor(cb, attrs.rows, attrs.out_dim),
             else => null,
         } orelse continue;
@@ -22410,4 +22667,118 @@ test "metal partition lifetime sweep preserves inputs to later native partitions
     const final = try sweepExpiredValuesThroughNode(a, &g, &cb, &values, &devices, &.{late}, 0, late, 0, last_use, null, .empty, .empty, .{});
     try std.testing.expectEqual(@as(usize, 1), final);
     try std.testing.expect(values[input] == null);
+}
+
+fn expectCachedPreparedParameters(comptime rebind_slot: bool) !void {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const dim = 64;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input_node = try builder.parameter("input", ml.graph.Shape.init(.f32, &.{ 1, dim }));
+    const weight_node = try builder.parameter("encoder.layer.0.attention.self.query_proj.weight", ml.graph.Shape.init(.f32, &.{ dim, dim }));
+    const transpose = try builder.transpose(weight_node, &.{ 1, 0 });
+    const output_node = try graph.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 0,
+        } },
+        .output_shape = ml.graph.Shape.init(.f32, &.{ 1, dim }),
+        .inputs = .{ input_node, transpose, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try graph.markOutput(output_node);
+    const seeds = try partition_mod.allocTensorDescriptorSeeds(a, &graph);
+    defer a.free(seeds);
+    try partition_mod.seedAllParameterResidency(seeds, &graph, .metal, 0);
+    var store = initEmptyMetalWeightStore(a);
+    defer deinitEmptyMetalWeightStore(&store, a);
+    var compute = try metal_compute_mod.MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    var backend = compute.computeBackend();
+    if (!backend.decoderRuntimeReady()) return error.ExpectedMetalDecoderRuntime;
+    var runtime = try @import("runtime.zig").Runtime.initWithOptions(a, &graph, &backend, .partitioned, .{ .tensor_descs = seeds });
+    defer runtime.deinit();
+    var input_data: [dim]f32 = @splat(0.125);
+    var first_data: [dim * dim]f32 = @splat(0.125);
+    var second_data: [dim * dim]f32 = @splat(0.25);
+    const input = try backend.ensureDeviceResidentOwned(try backend.fromFloat32Shape(&input_data, &.{ 1, dim }));
+    defer backend.free(input);
+    const first_weight = try backend.ensureDeviceResidentOwned(try backend.fromFloat32Shape(&first_data, &.{ dim, dim }));
+    defer backend.free(first_weight);
+    const second_weight = try backend.ensureDeviceResidentOwned(try backend.fromFloat32Shape(&second_data, &.{ dim, dim }));
+    defer backend.free(second_weight);
+    try std.testing.expect(first_weight != second_weight);
+    var native_store = native_compute.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitEmptyNativeWeightStore(&native_store, a);
+    var native = native_compute.NativeCompute.init(a, &native_store, null);
+    defer native.deinit();
+    const reference = native.computeBackend();
+    const reference_input = try reference.fromFloat32Shape(&input_data, &.{ 1, dim });
+    defer reference.free(reference_input);
+    const reference_weight = try reference.fromFloat32Shape(&second_data, &.{ dim, dim });
+    defer reference.free(reference_weight);
+    const reference_product = try reference.linearNoBias(reference_input, reference_weight, 1, dim, dim);
+    defer reference.free(reference_product);
+    const expected = try reference.toFloat32(reference_product, a);
+    defer a.free(expected);
+    for (if (rebind_slot) [_]CT{ second_weight, second_weight, second_weight } else [_]CT{ first_weight, second_weight, second_weight }, 0..) |weight, step| {
+        var result = try runtime.execute(a, &graph, .{
+            .runtime_inputs = &.{ .{ .node_id = input_node, .value = input }, .{ .node_id = weight_node, .value = weight } },
+            .collect_partition_stats = true,
+            .planned_device_execution = true,
+        });
+        defer result.deinit(&runtime);
+        if (result.stats.runtime_region_plan_dispatches == 0) return error.ExpectedActualPreparedMetalRegion;
+        try std.testing.expectEqual(@as(usize, 1), result.outputs.len);
+        if (result.backendFor(&runtime, 0).kind() != .metal) return error.ExpectedActualMetalOutput;
+        const actual = try result.backendFor(&runtime, 0).toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        if (step == 0) {
+            for (actual) |value| try std.testing.expectApproxEqAbs(@as(f32, if (rebind_slot) 2 else 1), value, 0.00001);
+            if (result.stats.runtime_prepare_slot_calls == 0) return error.ExpectedColdMetalSlotPreparation;
+            if (rebind_slot) {
+                const slot = (try backend.decoderRuntimeEnsureLinearSlot(&.{ .weight = second_weight, .bias = null, .in_dim = dim, .out_dim = dim })) orelse return error.ExpectedCachedMetalSlot;
+                var zero_data: [dim]f32 = @splat(0);
+                const zero_bias = try backend.fromFloat32Shape(&zero_data, &.{dim});
+                defer backend.free(zero_bias);
+                metal_runtime_mod.clearRawLinearSlot(compute.provider_impl, slot);
+                if (!try backend.decoderRuntimePrepareLinear(&.{ .slot = slot, .weight = first_weight, .bias = zero_bias, .in_dim = dim, .out_dim = dim })) return error.ExpectedReboundMetalSlot;
+                // Prove the real slot now contains A, while the graph's public
+                // parameter remains B. Shape checks alone cannot distinguish it.
+                const rebound = (try backend.decoderRuntimeApplyLinear(&.{ .slot = slot, .input = input, .in_dim = dim, .out_dim = dim })) orelse return error.ExpectedReboundMetalProjection;
+                defer backend.free(rebound);
+                const rebound_values = try backend.toFloat32(rebound, a);
+                defer a.free(rebound_values);
+                // This private raw preparation may select its reduced-weight
+                // schedule (observed A=0.99993896). This is a binding oracle,
+                // not precision parity: discriminate A from the independently
+                // computed B. The final Runtime=2 precision gate is unchanged.
+                for (rebound_values, expected) |value, second| {
+                    try std.testing.expect(std.math.isFinite(value));
+                    const first = second * 0.5; // first_data is exactly B/2
+                    try std.testing.expect(@abs(value - first) < @abs(value - second));
+                }
+            }
+        } else {
+            // Both shape and graph remain identical. Only a legitimate public
+            // runtime parameter value changes; cached slot IDs cannot replace it.
+            for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00001);
+            if (step == 2 and result.stats.runtime_prepare_slot_cache_hits == 0) return error.ExpectedUnchangedPreparedMetalSlotReuse;
+        }
+    }
+}
+
+test "Metal public cached graph runtime refreshes same-shaped weight bindings and reuses unchanged preparation" {
+    try expectCachedPreparedParameters(false);
+}
+
+test "Metal public cached graph runtime rejects rebound same-shaped prepared slots" {
+    try expectCachedPreparedParameters(true);
 }

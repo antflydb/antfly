@@ -236,7 +236,7 @@ pub fn loadPreferred(
         if (backend_session_manager.loadModel(candidate_path)) |loaded_session| {
             var loaded = ManagedSession{ .session = loaded_session, .resource_lease = resource_lease };
             std.debug.assert(loaded.session.close_protection == null);
-            loaded.session.close_protection = close_protection;
+            loaded.session.installBorrowedCloseProtection(close_protection);
             close_protection = null;
             resource_lease = null;
             defer loaded.deinit();
@@ -374,7 +374,7 @@ pub fn loadComponent(
         )) |loaded_session| {
             var loaded = ManagedSession{ .session = loaded_session, .resource_lease = resource_lease };
             std.debug.assert(loaded.session.close_protection == null);
-            loaded.session.close_protection = close_protection;
+            loaded.session.installBorrowedCloseProtection(close_protection);
             close_protection = null;
             resource_lease = null;
             defer loaded.deinit();

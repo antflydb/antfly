@@ -543,6 +543,7 @@ fn nativeResidentCloseCase(mode: NativeResidentLifetimeCase) !void {
     var resident = if (mode == .control) blk: {
         var permit = try session.admit(try session.planRun(&inputs, null));
         defer permit.deinit();
+        try permit.prepareResidentOutputRetirement();
         const outputs = (try permit.runResidentWithControl(&inputs, a, .{ .ptr = &probe, .check_fn = Probe.check })) orelse return error.MissingResidentOutput;
         try std.testing.expect(probe.calls > 0);
         break :blk outputs;

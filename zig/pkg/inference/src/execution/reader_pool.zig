@@ -23,6 +23,11 @@ pub const Pool = struct {
     pub const max_capacity: usize = 128;
     mutex: std.atomic.Mutex = .unlocked,
     context: ?*anyopaque = null,
+    /// Only construction owns this reservation. SDK and factory callbacks
+    /// execute unlocked; no second caller can publish the same empty epoch.
+    creating: bool = false,
+    /// An incompatible head request closes this epoch to further refills.
+    draining: bool = false,
     users: usize = 0,
     joins: usize = 0,
     max_epoch_joins: usize = 64,
@@ -62,19 +67,23 @@ pub const Pool = struct {
         context: *anyopaque,
         pub fn release(self: *Lease) void {
             platform.sync.lockYielding(&self.owner.mutex);
-            defer self.owner.mutex.unlock();
             std.debug.assert(self.owner.context == self.context and self.owner.users > 0);
             self.owner.users -= 1;
-            if (self.owner.users == 0) {
-                self.owner.destroy_fn.?(self.context);
+            const destroy = if (self.owner.users == 0) self.owner.destroy_fn else null;
+            if (destroy != null) {
                 self.owner.context = null;
                 self.owner.destroy_fn = null;
                 self.owner.joins = 0;
+                self.owner.draining = false;
                 self.owner.max_epoch_joins = 64;
             }
-            // A release makes room or finishes a bounded epoch. Wake queued
-            // joins under the same mutex that protects their event reset.
+            // Publish retirement before callback reentry. A replacement epoch
+            // can wait for its actual model/provider gate without holding this
+            // pool's metadata lock. Each factory owns its resource exclusion.
             self.owner.wakeWaiters();
+            self.owner.mutex.unlock();
+            if (destroy) |finish| finish(self.context);
+            // The callback can destroy an embedded pool; never access it again.
         }
     };
 
@@ -83,12 +92,25 @@ pub const Pool = struct {
     }
 
     pub fn joinBounded(self: *Pool, control: Control, capacity: usize, max_epoch_joins: usize, factory: *anyopaque, create: *const fn (*anyopaque) anyerror!*anyopaque, destroy: *const fn (*anyopaque) void) !Lease {
+        return self.joinBoundedMatching(control, capacity, max_epoch_joins, factory, create, destroy, alwaysCompatible);
+    }
+
+    fn alwaysCompatible(_: *const anyopaque, _: *const anyopaque) bool {
+        return true;
+    }
+
+    /// compatible examines immutable values pinned by the context/factory.
+    /// It must not allocate, call SDK/quota providers, or acquire other locks.
+    /// Incompatible requests wait for a new epoch rather than growing a live
+    /// bank. FIFO admission prevents compatible refills from starving them.
+    pub fn joinBoundedMatching(self: *Pool, control: Control, capacity: usize, max_epoch_joins: usize, factory: *anyopaque, create: *const fn (*anyopaque) anyerror!*anyopaque, destroy: *const fn (*anyopaque) void, comptime compatible: fn (*const anyopaque, *const anyopaque) bool) !Lease {
         if (capacity == 0 or capacity > max_capacity or max_epoch_joins < capacity or max_epoch_joins > 256) return error.InvalidReaderCapacity;
         var waiter = Waiter{ .io = control.io };
         var attached = false;
         defer if (attached) {
             platform.sync.lockYielding(&self.mutex);
             self.detach(&waiter);
+            self.wakeWaiters();
             self.mutex.unlock();
         };
         while (true) {
@@ -97,33 +119,48 @@ pub const Pool = struct {
                 self.mutex.unlock();
                 return error.InvalidReaderCapacity;
             }
+            const first = self.waiters == null or (attached and self.waiters == &waiter);
+            if (first and self.context != null and !compatible(self.context.?, factory)) self.draining = true;
             // Bound each epoch as well as its instantaneous occupancy so a
             // permanent stream cannot monopolize the model execution lane.
-            if (self.users < capacity and (self.context == null or self.joins < self.max_epoch_joins)) {
-                if (self.context == null) {
-                    self.context = create(factory) catch |err| {
+            if (first and !self.creating and !self.draining and self.users < capacity and (self.context == null or self.joins < self.max_epoch_joins)) {
+                const new_epoch = self.context == null;
+                if (new_epoch) {
+                    self.creating = true;
+                    self.mutex.unlock();
+                    const created = create(factory) catch |err| {
+                        platform.sync.lockYielding(&self.mutex);
+                        self.creating = false;
+                        self.wakeWaiters();
                         self.mutex.unlock();
                         return err;
                     };
+                    platform.sync.lockYielding(&self.mutex);
+                    std.debug.assert(self.creating and self.context == null and self.users == 0);
+                    self.context = created;
                     self.destroy_fn = destroy;
                     self.max_epoch_joins = max_epoch_joins;
+                    self.creating = false;
                 }
                 self.users += 1;
                 self.joins += 1;
+                if (new_epoch) self.wakeWaiters();
                 if (attached) {
                     self.detach(&waiter);
                     attached = false;
+                    self.wakeWaiters();
                 }
                 const result = Lease{ .owner = self, .context = self.context.? };
                 self.mutex.unlock();
                 return result;
             }
+            if (!attached) {
+                var tail = &self.waiters;
+                while (tail.*) |current| tail = &current.next;
+                tail.* = &waiter;
+                attached = true;
+            }
             if (control.io != null) {
-                if (!attached) {
-                    waiter.next = self.waiters;
-                    self.waiters = &waiter;
-                    attached = true;
-                }
                 waiter.ready.reset();
                 _ = self.event_waits.fetchAdd(1, .monotonic);
             }
@@ -150,16 +187,16 @@ pub const Pool = struct {
 
 test "LightOnOCR3 shared reader pool refills before the longest page retires" {
     const Fake = struct {
-        created: usize = 0,
-        destroyed: usize = 0,
+        created: std.atomic.Value(usize) = .init(0),
+        destroyed: std.atomic.Value(usize) = .init(0),
         fn create(raw: *anyopaque) !*anyopaque {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.created += 1;
+            _ = self.created.fetchAdd(1, .monotonic);
             return raw;
         }
         fn destroy(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.destroyed += 1;
+            _ = self.destroyed.fetchAdd(1, .monotonic);
         }
     };
     var fake = Fake{};
@@ -172,15 +209,15 @@ test "LightOnOCR3 shared reader pool refills before the longest page retires" {
         try std.testing.expectEqual(long.context, refill.context);
         refill.release();
     }
-    try std.testing.expectEqual(@as(usize, 1), fake.created);
-    try std.testing.expectEqual(@as(usize, 0), fake.destroyed);
+    try std.testing.expectEqual(@as(usize, 1), fake.created.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), fake.destroyed.load(.acquire));
     long.release();
-    try std.testing.expectEqual(@as(usize, 1), fake.destroyed);
+    try std.testing.expectEqual(@as(usize, 1), fake.destroyed.load(.acquire));
     try std.testing.expect(pool.context == null);
     var next = try pool.join(.{}, 2, &fake, Fake.create, Fake.destroy);
     next.release();
-    try std.testing.expectEqual(@as(usize, 2), fake.created);
-    try std.testing.expectEqual(@as(usize, 2), fake.destroyed);
+    try std.testing.expectEqual(@as(usize, 2), fake.created.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), fake.destroyed.load(.acquire));
 }
 
 test "LightOnOCR3 shared reader pool rejects canceled joins and unwinds failed creation" {
@@ -201,16 +238,16 @@ test "LightOnOCR3 shared reader pool rejects canceled joins and unwinds failed c
 
 test "LightOnOCR3 shared reader pool parks joins and wakes on slot or epoch retirement" {
     const Fake = struct {
-        created: usize = 0,
-        destroyed: usize = 0,
+        created: std.atomic.Value(usize) = .init(0),
+        destroyed: std.atomic.Value(usize) = .init(0),
         fn create(raw: *anyopaque) !*anyopaque {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.created += 1;
+            _ = self.created.fetchAdd(1, .monotonic);
             return raw;
         }
         fn destroy(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.destroyed += 1;
+            _ = self.destroyed.fetchAdd(1, .monotonic);
         }
         fn join(pool: *Pool, fake: *@This(), capacity: usize, limit: usize) !void {
             var lease = try pool.joinBounded(.{ .io = std.testing.io }, capacity, limit, fake, create, destroy);
@@ -254,12 +291,12 @@ test "LightOnOCR3 shared reader pool parks joins and wakes on slot or epoch reti
         try std.testing.expect(pool.waiters == null);
         try std.testing.expect(pool.event_waits.load(.monotonic) > 0);
         try std.testing.expectEqual(@as(usize, 0), pool.poll_waits.load(.monotonic));
-        try std.testing.expectEqual(@as(usize, if (retire_epoch) 2 else 1), fake.created);
+        try std.testing.expectEqual(@as(usize, if (retire_epoch) 2 else 1), fake.created.load(.acquire));
         if (held_live) {
             held.release();
             held_live = false;
         }
-        try std.testing.expectEqual(fake.created, fake.destroyed);
+        try std.testing.expectEqual(fake.created.load(.acquire), fake.destroyed.load(.acquire));
         try std.testing.expect(pool.context == null and pool.users == 0);
     }
 }
@@ -365,16 +402,16 @@ test "LightOnOCR3 shared vision peak preserves caps and reservations across page
 
 test "LightOnOCR3 logical window keeps thirty-two independent leases bounded" {
     const Fake = struct {
-        created: usize = 0,
-        destroyed: usize = 0,
+        created: std.atomic.Value(usize) = .init(0),
+        destroyed: std.atomic.Value(usize) = .init(0),
         fn create(raw: *anyopaque) !*anyopaque {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.created += 1;
+            _ = self.created.fetchAdd(1, .monotonic);
             return raw;
         }
         fn destroy(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.destroyed += 1;
+            _ = self.destroyed.fetchAdd(1, .monotonic);
         }
     };
     var fake = Fake{};
@@ -383,30 +420,30 @@ test "LightOnOCR3 logical window keeps thirty-two independent leases bounded" {
     var leases: [32]Pool.Lease = undefined;
     for (&leases) |*lease| lease.* = try pool.join(.{}, 32, &fake, Fake.create, Fake.destroy);
     try std.testing.expectEqual(@as(usize, 32), pool.users);
-    try std.testing.expectEqual(@as(usize, 1), fake.created);
+    try std.testing.expectEqual(@as(usize, 1), fake.created.load(.acquire));
     for (1..32) |i| {
         leases[i].release();
         leases[i] = try pool.join(.{}, 32, &fake, Fake.create, Fake.destroy);
         try std.testing.expectEqual(leases[0].context, leases[i].context);
     }
-    try std.testing.expectEqual(@as(usize, 0), fake.destroyed);
+    try std.testing.expectEqual(@as(usize, 0), fake.destroyed.load(.acquire));
     for (&leases) |*lease| lease.release();
-    try std.testing.expectEqual(@as(usize, 1), fake.destroyed);
+    try std.testing.expectEqual(@as(usize, 1), fake.destroyed.load(.acquire));
     try std.testing.expect(pool.context == null and pool.users == 0);
 }
 
 test "LightOnOCR3 logical window keeps sixty-four independent leases bounded" {
     const Fake = struct {
-        created: usize = 0,
-        destroyed: usize = 0,
+        created: std.atomic.Value(usize) = .init(0),
+        destroyed: std.atomic.Value(usize) = .init(0),
         fn create(raw: *anyopaque) !*anyopaque {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.created += 1;
+            _ = self.created.fetchAdd(1, .monotonic);
             return raw;
         }
         fn destroy(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.destroyed += 1;
+            _ = self.destroyed.fetchAdd(1, .monotonic);
         }
     };
     var fake = Fake{};
@@ -415,30 +452,30 @@ test "LightOnOCR3 logical window keeps sixty-four independent leases bounded" {
     var leases: [64]Pool.Lease = undefined;
     for (&leases) |*lease| lease.* = try pool.joinBounded(.{}, 64, 256, &fake, Fake.create, Fake.destroy);
     try std.testing.expectEqual(@as(usize, 64), pool.users);
-    try std.testing.expectEqual(@as(usize, 1), fake.created);
+    try std.testing.expectEqual(@as(usize, 1), fake.created.load(.acquire));
     for (1..64) |i| {
         leases[i].release();
         leases[i] = try pool.joinBounded(.{}, 64, 256, &fake, Fake.create, Fake.destroy);
         try std.testing.expectEqual(leases[0].context, leases[i].context);
     }
-    try std.testing.expectEqual(@as(usize, 0), fake.destroyed);
+    try std.testing.expectEqual(@as(usize, 0), fake.destroyed.load(.acquire));
     for (&leases) |*lease| lease.release();
-    try std.testing.expectEqual(@as(usize, 1), fake.destroyed);
+    try std.testing.expectEqual(@as(usize, 1), fake.destroyed.load(.acquire));
     try std.testing.expect(pool.context == null and pool.users == 0);
 }
 
 test "LightOnOCR3 extended epoch refills beyond sixty-four pages without changing its bound" {
     const Fake = struct {
-        created: usize = 0,
-        destroyed: usize = 0,
+        created: std.atomic.Value(usize) = .init(0),
+        destroyed: std.atomic.Value(usize) = .init(0),
         fn create(raw: *anyopaque) !*anyopaque {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.created += 1;
+            _ = self.created.fetchAdd(1, .monotonic);
             return raw;
         }
         fn destroy(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.destroyed += 1;
+            _ = self.destroyed.fetchAdd(1, .monotonic);
         }
     };
     var fake = Fake{};
@@ -451,11 +488,11 @@ test "LightOnOCR3 extended epoch refills beyond sixty-four pages without changin
         page.release();
     }
     try std.testing.expectEqual(@as(usize, 201), pool.joins);
-    try std.testing.expectEqual(@as(usize, 1), fake.created);
-    try std.testing.expectEqual(@as(usize, 0), fake.destroyed);
+    try std.testing.expectEqual(@as(usize, 1), fake.created.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), fake.destroyed.load(.acquire));
     try std.testing.expectError(error.InvalidReaderCapacity, pool.join(.{}, 2, &fake, Fake.create, Fake.destroy));
     long.release();
-    try std.testing.expectEqual(@as(usize, 1), fake.destroyed);
+    try std.testing.expectEqual(@as(usize, 1), fake.destroyed.load(.acquire));
     var ordinary = try pool.join(.{}, 2, &fake, Fake.create, Fake.destroy);
     try std.testing.expectEqual(@as(usize, 64), pool.max_epoch_joins);
     ordinary.release();
@@ -522,16 +559,16 @@ test "LightOnOCR3 shared host and device vision peaks preserve the combined scra
 
 test "LightOnOCR3 128 page reader pool refills within the existing 256 join epoch" {
     const Fake = struct {
-        created: usize = 0,
-        destroyed: usize = 0,
+        created: std.atomic.Value(usize) = .init(0),
+        destroyed: std.atomic.Value(usize) = .init(0),
         fn create(raw: *anyopaque) !*anyopaque {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.created += 1;
+            _ = self.created.fetchAdd(1, .monotonic);
             return raw;
         }
         fn destroy(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.destroyed += 1;
+            _ = self.destroyed.fetchAdd(1, .monotonic);
         }
     };
     var fake = Fake{};
@@ -544,8 +581,8 @@ test "LightOnOCR3 128 page reader pool refills within the existing 256 join epoc
     try std.testing.expectEqual(@as(usize, 129), pool.joins);
     for (&leases) |*lease| lease.release();
     try std.testing.expectEqual(@as(usize, 0), pool.users);
-    try std.testing.expectEqual(@as(usize, 1), fake.created);
-    try std.testing.expectEqual(@as(usize, 1), fake.destroyed);
+    try std.testing.expectEqual(@as(usize, 1), fake.created.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), fake.destroyed.load(.acquire));
 }
 
 test "shared peak admission rollback releases only unconsumed growth" {
@@ -572,4 +609,247 @@ test "shared peak admission rollback releases only unconsumed growth" {
     try std.testing.expectEqual(@as(usize, 1), owner.released);
     peak.deinit();
     try std.testing.expectEqual(@as(usize, 2), owner.released);
+}
+
+test "reader pool factories and retired cleanup reenter outside metadata exclusion" {
+    const Probe = struct {
+        pool: *Pool,
+        created: usize = 0,
+        destroyed: usize = 0,
+        reentered: bool = false,
+        fail_next: bool = false,
+        fn create(raw: *anyopaque) !*anyopaque {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            {
+                try std.testing.expect(self.pool.mutex.tryLock());
+                defer self.pool.mutex.unlock();
+                try std.testing.expect(self.pool.creating and self.pool.context == null and self.pool.users == 0);
+            }
+            // A producer can perform a bounded join during creation without
+            // recursively waiting on the callback that is constructing it.
+            try std.testing.expectError(error.Timeout, self.pool.join(.{ .deadline_ns = 0 }, 2, raw, create, destroy));
+            if (self.fail_next) {
+                self.fail_next = false;
+                return error.OutOfMemory;
+            }
+            self.created += 1;
+            return raw;
+        }
+        fn destroy(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.pool.mutex.tryLock()) @panic("reader cleanup held pool metadata lock");
+            std.debug.assert(self.pool.context == null and self.pool.users == 0);
+            self.pool.mutex.unlock();
+            self.destroyed += 1;
+            if (!self.reentered) {
+                self.reentered = true;
+                var nested = self.pool.join(.{}, 2, raw, create, destroy) catch @panic("reader cleanup cannot reenter");
+                nested.release();
+            }
+        }
+    };
+    var pool = Pool{};
+    var probe = Probe{ .pool = &pool };
+    var first = try pool.join(.{}, 2, &probe, Probe.create, Probe.destroy);
+    first.release();
+    try std.testing.expectEqual(@as(usize, 2), probe.created);
+    try std.testing.expectEqual(probe.created, probe.destroyed);
+    try std.testing.expect(pool.context == null and !pool.creating and pool.users == 0);
+    probe.fail_next = true;
+    try std.testing.expectError(error.OutOfMemory, pool.join(.{}, 2, &probe, Probe.create, Probe.destroy));
+    try std.testing.expect(pool.context == null and !pool.creating and pool.users == 0);
+    var recovered = try pool.join(.{}, 2, &probe, Probe.create, Probe.destroy);
+    recovered.release();
+    try std.testing.expectEqual(@as(usize, 3), probe.created);
+    try std.testing.expectEqual(probe.created, probe.destroyed);
+}
+
+test "reader pool failed unlocked construction notifies a queued join and retries exactly once" {
+    const Probe = struct {
+        pool: *Pool,
+        deadline_ns: u64,
+        entered: std.atomic.Value(bool) = .init(false),
+        allow_failure: std.atomic.Value(bool) = .init(false),
+        calls: std.atomic.Value(usize) = .init(0),
+        destroyed: std.atomic.Value(usize) = .init(0),
+        notified: std.atomic.Value(bool) = .init(false),
+        // Borrowed only while the second join is inside create: its Waiter
+        // remains in that join's stack even if detached before publication.
+        queued_event: ?*const std.Io.Event = null,
+
+        fn create(raw: *anyopaque) !*anyopaque {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const call = self.calls.fetchAdd(1, .acq_rel);
+            if (call == 0) {
+                self.entered.store(true, .release);
+                while (!self.allow_failure.load(.acquire)) {
+                    if (platform.time.monotonicNs() >= self.deadline_ns) return error.Timeout;
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                }
+                return error.OutOfMemory;
+            }
+            if (call != 1) return error.UnexpectedReaderConstruction;
+            // Prove a real release notification, rather than passing because
+            // the join's periodic 10ms cancellation timeout eventually fired.
+            platform.sync.lockYielding(&self.pool.mutex);
+            const event = self.queued_event orelse {
+                self.pool.mutex.unlock();
+                return error.MissingQueuedReader;
+            };
+            const signalled = event.isSet();
+            self.pool.mutex.unlock();
+            if (!signalled) return error.ReaderCreationFailureDidNotWakeWaiter;
+            self.notified.store(true, .release);
+            return raw;
+        }
+        fn destroy(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.destroyed.fetchAdd(1, .acq_rel);
+        }
+        fn first(self: *@This()) !void {
+            const result = self.pool.join(.{ .io = std.testing.io, .deadline_ns = self.deadline_ns }, 1, self, create, destroy);
+            if (result) |lease| {
+                var unexpected = lease;
+                unexpected.release();
+                return error.ExpectedReaderConstructionFailure;
+            } else |err| {
+                if (err != error.OutOfMemory) return err;
+            }
+        }
+        fn second(self: *@This()) !void {
+            var lease = try self.pool.join(.{ .io = std.testing.io, .deadline_ns = self.deadline_ns }, 1, self, create, destroy);
+            defer lease.release();
+            try std.testing.expectEqual(@as(*anyopaque, @ptrCast(self)), lease.context);
+        }
+    };
+    var pool = Pool{};
+    var probe = Probe{ .pool = &pool, .deadline_ns = platform.time.monotonicNs() + 5 * std.time.ns_per_s };
+    var first = try std.testing.io.concurrent(Probe.first, .{&probe});
+    // Every error path releases the blocked creator BEFORE waiting/canceling
+    // either future, including failure to start the queued second task.
+    defer {
+        probe.allow_failure.store(true, .release);
+        first.cancel(std.testing.io) catch {};
+    }
+    while (!probe.entered.load(.acquire)) {
+        if (platform.time.monotonicNs() >= probe.deadline_ns) return error.Timeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    var second = try std.testing.io.concurrent(Probe.second, .{&probe});
+    defer {
+        probe.allow_failure.store(true, .release);
+        second.cancel(std.testing.io) catch {};
+    }
+    while (true) {
+        platform.sync.lockYielding(&pool.mutex);
+        if (pool.waiters) |waiter| {
+            probe.queued_event = &waiter.ready;
+            const reserved = pool.creating and pool.context == null and pool.users == 0;
+            pool.mutex.unlock();
+            try std.testing.expect(reserved);
+            break;
+        }
+        pool.mutex.unlock();
+        if (platform.time.monotonicNs() >= probe.deadline_ns) return error.Timeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.calls.load(.acquire));
+    probe.allow_failure.store(true, .release);
+    try first.await(std.testing.io);
+    try second.await(std.testing.io);
+    try std.testing.expect(probe.notified.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), probe.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), probe.destroyed.load(.acquire));
+    try std.testing.expect(pool.context == null and !pool.creating and pool.users == 0 and pool.waiters == null);
+    try std.testing.expect(pool.event_waits.load(.acquire) > 0);
+    try std.testing.expectEqual(@as(usize, 0), pool.poll_waits.load(.acquire));
+}
+
+test "reader pool incompatible frozen geometry drains before FIFO compatible refills" {
+    const Shared = struct {
+        created: std.atomic.Value(usize) = .init(0),
+        destroyed: std.atomic.Value(usize) = .init(0),
+        finish: std.atomic.Value(bool) = .init(false),
+    };
+    const Request = struct {
+        tokens: usize,
+        shared: *Shared,
+        fn create(raw: *anyopaque) !*anyopaque {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.shared.created.fetchAdd(1, .monotonic);
+            return raw;
+        }
+        fn destroy(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.shared.destroyed.fetchAdd(1, .monotonic);
+        }
+        fn covers(raw: *const anyopaque, wanted: *const anyopaque) bool {
+            const available: *const @This() = @ptrCast(@alignCast(raw));
+            const request: *const @This() = @ptrCast(@alignCast(wanted));
+            return available.tokens >= request.tokens;
+        }
+        fn join(pool: *Pool, request: *@This()) !void {
+            var lease = try pool.joinBoundedMatching(.{ .io = std.testing.io, .deadline_ns = platform.time.monotonicNs() + 5 * std.time.ns_per_s }, 3, 64, request, create, destroy, covers);
+            defer lease.release();
+            while (!request.shared.finish.load(.acquire)) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        fn waitQueued(pool: *Pool, count: usize) !void {
+            const deadline = platform.time.monotonicNs() + std.time.ns_per_s;
+            while (true) {
+                platform.sync.lockYielding(&pool.mutex);
+                var n: usize = 0;
+                var next = pool.waiters;
+                while (next) |w| : (next = w.next) n += 1;
+                pool.mutex.unlock();
+                if (n == count) return;
+                if (platform.time.monotonicNs() >= deadline) return error.Timeout;
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+    };
+    var shared = Shared{};
+    var small = Request{ .tokens = 8, .shared = &shared };
+    var large = Request{ .tokens = 32, .shared = &shared };
+    var refill = Request{ .tokens = 4, .shared = &shared };
+    var pool = Pool{};
+    var held = try pool.joinBoundedMatching(.{}, 3, 64, &small, Request.create, Request.destroy, Request.covers);
+    var held_live = true;
+    defer if (held_live) held.release();
+    var first = try std.testing.io.concurrent(Request.join, .{ &pool, &large });
+    defer {
+        shared.finish.store(true, .release);
+        first.cancel(std.testing.io) catch {};
+    }
+    try Request.waitQueued(&pool, 1);
+    var second = try std.testing.io.concurrent(Request.join, .{ &pool, &refill });
+    defer {
+        shared.finish.store(true, .release);
+        second.cancel(std.testing.io) catch {};
+    }
+    try Request.waitQueued(&pool, 2);
+    platform.sync.lockYielding(&pool.mutex);
+    const drained = pool.draining and pool.users == 1 and pool.joins == 1;
+    pool.mutex.unlock();
+    try std.testing.expect(drained);
+    held.release();
+    held_live = false;
+    const deadline = platform.time.monotonicNs() + std.time.ns_per_s;
+    while (true) {
+        platform.sync.lockYielding(&pool.mutex);
+        const both_joined = pool.users == 2;
+        const correct = pool.context == @as(*anyopaque, &large) and pool.joins == 2 and !pool.draining;
+        pool.mutex.unlock();
+        if (both_joined) {
+            try std.testing.expect(correct);
+            break;
+        }
+        if (platform.time.monotonicNs() >= deadline) return error.Timeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    shared.finish.store(true, .release);
+    try first.await(std.testing.io);
+    try second.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 2), shared.created.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), shared.destroyed.load(.acquire));
+    try std.testing.expect(pool.context == null and pool.waiters == null);
 }

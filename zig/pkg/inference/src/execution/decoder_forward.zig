@@ -112,6 +112,10 @@ pub fn metalDirectTailEnabled() bool {
 }
 
 pub const Runtime = struct {
+    fn classifyDeviceStep(result: DeviceStepResult) @import("invocation_observation.zig").ResultClassification {
+        return .{ .unsupported = result == .declined };
+    }
+
     context: graph_mod.execution.Context,
     graph_cache: ?*graph_mod.cache.GraphCache = null,
     io: ?std.Io = null,
@@ -128,6 +132,10 @@ pub const Runtime = struct {
     };
 
     pub fn forwardDeviceStep(self: *Runtime, state: *NativeDecodeState, request: DeviceStepRequest, events: *DeviceStepEvents) !DeviceStepResult {
+        return @import("invocation_observation.zig").callContextOperationClassified(&self.context, .decode_step, classifyDeviceStep, @This().forwardDeviceStepUnobserved, .{ self, state, request, events });
+    }
+
+    fn forwardDeviceStepUnobserved(self: *Runtime, state: *NativeDecodeState, request: DeviceStepRequest, events: *DeviceStepEvents) !DeviceStepResult {
         const cb = self.context.cb;
         const allocator = self.context.allocator;
         const model = self.context.gpt_config.*;
@@ -174,6 +182,10 @@ pub const Runtime = struct {
     }
 
     pub fn forwardDeviceTokenTensor(self: *Runtime, state: *NativeDecodeState, sequence_length: usize, input: ops.CT, drain_budget: usize, events: *DeviceStepEvents) !?ops.CT {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .decode_step, @This().forwardDeviceTokenTensorUnobserved, .{ self, state, sequence_length, input, drain_budget, events });
+    }
+
+    fn forwardDeviceTokenTensorUnobserved(self: *Runtime, state: *NativeDecodeState, sequence_length: usize, input: ops.CT, drain_budget: usize, events: *DeviceStepEvents) !?ops.CT {
         const cb = self.context.cb;
         const model = self.context.gpt_config.*;
         cb.drainPrefetchBudget(drain_budget);
@@ -200,6 +212,15 @@ pub const Runtime = struct {
         total_seq_len: usize,
         decode_state: *NativeDecodeState,
     ) !void {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .decode_step, @This().materializeAcceptedTokenKvUnobserved, .{ self, token_ids, total_seq_len, decode_state });
+    }
+
+    fn materializeAcceptedTokenKvUnobserved(
+        self: *Runtime,
+        token_ids: []const i64,
+        total_seq_len: usize,
+        decode_state: *NativeDecodeState,
+    ) !void {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         if (decode_state.requiresFullRecompute()) {
             _ = try decode_runtime.appendGeneratedToken();
@@ -221,6 +242,13 @@ pub const Runtime = struct {
     }
 
     pub fn greedyTargetChoiceFromFinalHiddenDevice(
+        self: *Runtime,
+        final_hidden: ops.CT,
+    ) !?u32 {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .decode_step, @This().greedyTargetChoiceFromFinalHiddenDeviceUnobserved, .{ self, final_hidden });
+    }
+
+    fn greedyTargetChoiceFromFinalHiddenDeviceUnobserved(
         self: *Runtime,
         final_hidden: ops.CT,
     ) !?u32 {
@@ -263,12 +291,32 @@ pub const Runtime = struct {
         decode_context: *const gpt_arch.DecodeContext,
         hidden_source: HiddenSource,
     ) !ForwardHiddenDevice {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().materializeMtpCanonicalHiddenUnobserved, .{ self, token_ids, total_seq_len, decode_context, hidden_source });
+    }
+
+    fn materializeMtpCanonicalHiddenUnobserved(
+        self: *Runtime,
+        token_ids: []const i64,
+        total_seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        hidden_source: HiddenSource,
+    ) !ForwardHiddenDevice {
         if (total_seq_len == 0 or token_ids.len < total_seq_len) return error.InvalidTensorShape;
         if (try self.materializeAcceptedTokenKvActiveHiddenForMtp(token_ids, total_seq_len, decode_context, hidden_source)) |result| return result;
         return self.forwardTargetHiddenDeviceNoReplay(token_ids[total_seq_len - 1 .. total_seq_len], 1, total_seq_len, decode_context, hidden_source);
     }
 
     pub fn materializeAcceptedTokenKvActiveHiddenForMtp(
+        self: *Runtime,
+        token_ids: []const i64,
+        total_seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        hidden_source: HiddenSource,
+    ) !?ForwardHiddenDevice {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().materializeAcceptedTokenKvActiveHiddenForMtpUnobserved, .{ self, token_ids, total_seq_len, decode_context, hidden_source });
+    }
+
+    fn materializeAcceptedTokenKvActiveHiddenForMtpUnobserved(
         self: *Runtime,
         token_ids: []const i64,
         total_seq_len: usize,
@@ -308,6 +356,16 @@ pub const Runtime = struct {
     }
 
     pub fn materializeAcceptedTokenKvForMtp(
+        self: *Runtime,
+        token_ids: []const i64,
+        total_seq_len: usize,
+        decode_state: *NativeDecodeState,
+        hidden_source: HiddenSource,
+    ) !?u32 {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .decode_step, @This().materializeAcceptedTokenKvForMtpUnobserved, .{ self, token_ids, total_seq_len, decode_state, hidden_source });
+    }
+
+    fn materializeAcceptedTokenKvForMtpUnobserved(
         self: *Runtime,
         token_ids: []const i64,
         total_seq_len: usize,
@@ -382,6 +440,16 @@ pub const Runtime = struct {
         decode_state: *NativeDecodeState,
         hidden_source: HiddenSource,
     ) !MtpMaterializedHostActivation {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .decode_step, @This().materializeAcceptedTokenKvAndReturnHiddenUnobserved, .{ self, token_ids, total_seq_len, decode_state, hidden_source });
+    }
+
+    fn materializeAcceptedTokenKvAndReturnHiddenUnobserved(
+        self: *Runtime,
+        token_ids: []const i64,
+        total_seq_len: usize,
+        decode_state: *NativeDecodeState,
+        hidden_source: HiddenSource,
+    ) !MtpMaterializedHostActivation {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         if (decode_state.requiresFullRecompute()) return error.MissingMaterializedHiddenState;
         _ = try decode_runtime.appendGeneratedToken();
@@ -444,6 +512,17 @@ pub const Runtime = struct {
     }
 
     pub fn materializeAcceptedTokenKvAndCopyHiddenToBackend(
+        self: *Runtime,
+        token_ids: []const i64,
+        total_seq_len: usize,
+        decode_state: *NativeDecodeState,
+        hidden_source: HiddenSource,
+        dst_cb: *const ComputeBackend,
+    ) !MtpMaterializedDeviceActivation {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .decode_step, @This().materializeAcceptedTokenKvAndCopyHiddenToBackendUnobserved, .{ self, token_ids, total_seq_len, decode_state, hidden_source, dst_cb });
+    }
+
+    fn materializeAcceptedTokenKvAndCopyHiddenToBackendUnobserved(
         self: *Runtime,
         token_ids: []const i64,
         total_seq_len: usize,
@@ -530,6 +609,16 @@ pub const Runtime = struct {
         seq_len: usize,
         decode_context: *const gpt_arch.DecodeContext,
     ) ![]f32 {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().forwardLastLogitsUnobserved, .{ self, input_ids, batch, seq_len, decode_context });
+    }
+
+    fn forwardLastLogitsUnobserved(
+        self: *Runtime,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+    ) ![]f32 {
         const query_seq_len = decode_context.query_sequence_len;
         try self.rejectUnsupportedDeepSeekV4GraphMode();
         if (self.graph_cache) |cache| {
@@ -571,6 +660,10 @@ pub const Runtime = struct {
     }
 
     pub fn forwardCompiledGreedy(self: *Runtime, input_ids: []const i64, batch: usize, seq_len: usize, decode_context: *const gpt_arch.DecodeContext) !?usize {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().forwardCompiledGreedyUnobserved, .{ self, input_ids, batch, seq_len, decode_context });
+    }
+
+    fn forwardCompiledGreedyUnobserved(self: *Runtime, input_ids: []const i64, batch: usize, seq_len: usize, decode_context: *const gpt_arch.DecodeContext) !?usize {
         try self.rejectUnsupportedDeepSeekV4GraphMode();
         const cache = self.graph_cache orelse return null;
         if (self.context.compiled_partition_backend == null or self.context.compiled_attachment_target != .whole_model) return null;
@@ -589,6 +682,10 @@ pub const Runtime = struct {
     }
 
     pub fn forwardCompiledSampled(self: *Runtime, input_ids: []const i64, seq_len: usize, decode_context: *const gpt_arch.DecodeContext, sampling: graph_mod.model_runtime.SamplingConfig, token_history: []const i64, eligible: bool) !?usize {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().forwardCompiledSampledUnobserved, .{ self, input_ids, seq_len, decode_context, sampling, token_history, eligible });
+    }
+
+    fn forwardCompiledSampledUnobserved(self: *Runtime, input_ids: []const i64, seq_len: usize, decode_context: *const gpt_arch.DecodeContext, sampling: graph_mod.model_runtime.SamplingConfig, token_history: []const i64, eligible: bool) !?usize {
         if (self.context.cb.kind() != .metal or !compiledSampledDecodeEnabled(self.context.gpt_config.*) or !eligible) return null;
         try self.rejectUnsupportedDeepSeekV4GraphMode();
         const cache = self.graph_cache orelse return null;
@@ -626,6 +723,16 @@ pub const Runtime = struct {
     }
 
     pub fn forwardAllLogitsAndHiddenHost(
+        self: *Runtime,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+    ) !ForwardAllWithHiddenHost {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().forwardAllLogitsAndHiddenHostUnobserved, .{ self, input_ids, batch, seq_len, decode_context });
+    }
+
+    fn forwardAllLogitsAndHiddenHostUnobserved(
         self: *Runtime,
         input_ids: []const i64,
         batch: usize,
@@ -697,6 +804,16 @@ pub const Runtime = struct {
         seq_len: usize,
         decode_context: *const gpt_arch.DecodeContext,
     ) !ForwardHiddenDevice {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().forwardHiddenDeviceUnobserved, .{ self, input_ids, batch, seq_len, decode_context });
+    }
+
+    fn forwardHiddenDeviceUnobserved(
+        self: *Runtime,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+    ) !ForwardHiddenDevice {
         try self.rejectUnsupportedDeepSeekV4GraphMode();
         if (self.context.compiled_partition_backend != null) return error.MissingGraphCacheForCompiledPartitionBackend;
         const allocator = self.context.allocator;
@@ -736,6 +853,17 @@ pub const Runtime = struct {
     }
 
     pub fn tryMetalFinalHiddenFrame(
+        self: *Runtime,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        retained_prefix_tokens: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+    ) !?ForwardHiddenDevice {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().tryMetalFinalHiddenFrameUnobserved, .{ self, input_ids, batch, seq_len, retained_prefix_tokens, decode_context });
+    }
+
+    fn tryMetalFinalHiddenFrameUnobserved(
         self: *Runtime,
         input_ids: []const i64,
         batch: usize,
@@ -823,11 +951,34 @@ pub const Runtime = struct {
         retained_prefix_tokens: usize,
         decode_context: *const gpt_arch.DecodeContext,
     ) !ForwardHiddenDevice {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().forwardFinalHiddenDeviceUnobserved, .{ self, input_ids, batch, seq_len, retained_prefix_tokens, decode_context });
+    }
+
+    fn forwardFinalHiddenDeviceUnobserved(
+        self: *Runtime,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        retained_prefix_tokens: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+    ) !ForwardHiddenDevice {
         return (try self.tryMetalFinalHiddenFrame(input_ids, batch, seq_len, retained_prefix_tokens, decode_context)) orelse
             self.forwardHiddenDevice(input_ids, batch, seq_len, decode_context);
     }
 
     pub fn forwardTargetHiddenDevice(
+        self: *Runtime,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        hidden_source: HiddenSource,
+        replay_label: []const u8,
+    ) !ForwardHiddenDevice {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().forwardTargetHiddenDeviceUnobserved, .{ self, input_ids, batch, seq_len, decode_context, hidden_source, replay_label });
+    }
+
+    fn forwardTargetHiddenDeviceUnobserved(
         self: *Runtime,
         input_ids: []const i64,
         batch: usize,
@@ -858,6 +1009,19 @@ pub const Runtime = struct {
         replay_label: []const u8,
         suppress_token_ids: []const i32,
     ) !ForwardHiddenDevice {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().forwardTargetHiddenDevicePreparedArgmaxUnobserved, .{ self, input_ids, batch, seq_len, decode_context, hidden_source, replay_label, suppress_token_ids });
+    }
+
+    fn forwardTargetHiddenDevicePreparedArgmaxUnobserved(
+        self: *Runtime,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        hidden_source: HiddenSource,
+        replay_label: []const u8,
+        suppress_token_ids: []const i32,
+    ) !ForwardHiddenDevice {
         return self.forwardTargetHiddenDeviceReplayMode(
             input_ids,
             batch,
@@ -878,6 +1042,17 @@ pub const Runtime = struct {
         decode_context: *const gpt_arch.DecodeContext,
         hidden_source: HiddenSource,
     ) !ForwardHiddenDevice {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().forwardTargetHiddenDeviceNoReplayUnobserved, .{ self, input_ids, batch, seq_len, decode_context, hidden_source });
+    }
+
+    fn forwardTargetHiddenDeviceNoReplayUnobserved(
+        self: *Runtime,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        hidden_source: HiddenSource,
+    ) !ForwardHiddenDevice {
         return self.forwardTargetHiddenDeviceReplayMode(
             input_ids,
             batch,
@@ -891,6 +1066,20 @@ pub const Runtime = struct {
     }
 
     pub fn forwardTargetHiddenDeviceReplayMode(
+        self: *Runtime,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        hidden_source: HiddenSource,
+        replay_label: []const u8,
+        allow_replay: bool,
+        prepared_tail_suppress_token_ids: ?[]const i32,
+    ) !ForwardHiddenDevice {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().forwardTargetHiddenDeviceReplayModeUnobserved, .{ self, input_ids, batch, seq_len, decode_context, hidden_source, replay_label, allow_replay, prepared_tail_suppress_token_ids });
+    }
+
+    fn forwardTargetHiddenDeviceReplayModeUnobserved(
         self: *Runtime,
         input_ids: []const i64,
         batch: usize,
@@ -1018,6 +1207,16 @@ pub const Runtime = struct {
         seq_len: usize,
         decode_context: *const gpt_arch.DecodeContext,
     ) !ForwardAllWithHiddenDevice {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().forwardAllLogitsAndHiddenDeviceUnobserved, .{ self, input_ids, batch, seq_len, decode_context });
+    }
+
+    fn forwardAllLogitsAndHiddenDeviceUnobserved(
+        self: *Runtime,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+    ) !ForwardAllWithHiddenDevice {
         try self.rejectUnsupportedDeepSeekV4GraphMode();
         if (self.context.compiled_partition_backend != null) return error.MissingGraphCacheForCompiledPartitionBackend;
         const allocator = self.context.allocator;
@@ -1075,6 +1274,15 @@ pub const Runtime = struct {
         row: usize,
         source: HiddenSource,
     ) ![]f32 {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().dupeTargetHiddenRowUnobserved, .{ self, result, row, source });
+    }
+
+    fn dupeTargetHiddenRowUnobserved(
+        self: *Runtime,
+        result: *const ForwardAllWithHiddenHost,
+        row: usize,
+        source: HiddenSource,
+    ) ![]f32 {
         const hidden_size: usize = @intCast(self.context.gpt_config.*.hidden_size);
         if (row >= result.rows) return error.InvalidTensorShape;
         const hidden = switch (source) {
@@ -1086,6 +1294,15 @@ pub const Runtime = struct {
     }
 
     pub fn dupeTargetHiddenRowFromDevice(
+        self: *Runtime,
+        result: *const ForwardAllWithHiddenDevice,
+        row: usize,
+        source: HiddenSource,
+    ) ![]f32 {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().dupeTargetHiddenRowFromDeviceUnobserved, .{ self, result, row, source });
+    }
+
+    fn dupeTargetHiddenRowFromDeviceUnobserved(
         self: *Runtime,
         result: *const ForwardAllWithHiddenDevice,
         row: usize,
@@ -1106,6 +1323,15 @@ pub const Runtime = struct {
     }
 
     pub fn dupeTargetHiddenRowFromHiddenDevice(
+        self: *Runtime,
+        result: *const ForwardHiddenDevice,
+        row: usize,
+        source: HiddenSource,
+    ) ![]f32 {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().dupeTargetHiddenRowFromHiddenDeviceUnobserved, .{ self, result, row, source });
+    }
+
+    fn dupeTargetHiddenRowFromHiddenDeviceUnobserved(
         self: *Runtime,
         result: *const ForwardHiddenDevice,
         row: usize,
@@ -1132,6 +1358,16 @@ pub const Runtime = struct {
         source: HiddenSource,
         dst_cb: *const ComputeBackend,
     ) !?ops.CT {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().copyTargetHiddenRowToBackendUnobserved, .{ self, result, row, source, dst_cb });
+    }
+
+    fn copyTargetHiddenRowToBackendUnobserved(
+        self: *Runtime,
+        result: *const ForwardAllWithHiddenDevice,
+        row: usize,
+        source: HiddenSource,
+        dst_cb: *const ComputeBackend,
+    ) !?ops.CT {
         const hidden_size: usize = @intCast(self.context.gpt_config.*.hidden_size);
         if (row >= result.rows) return error.InvalidTensorShape;
         const hidden = switch (source) {
@@ -1150,6 +1386,16 @@ pub const Runtime = struct {
         source: HiddenSource,
         dst_cb: *const ComputeBackend,
     ) !?ops.CT {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().copyTargetHiddenRowFromHiddenToBackendUnobserved, .{ self, result, row, source, dst_cb });
+    }
+
+    fn copyTargetHiddenRowFromHiddenToBackendUnobserved(
+        self: *Runtime,
+        result: *const ForwardHiddenDevice,
+        row: usize,
+        source: HiddenSource,
+        dst_cb: *const ComputeBackend,
+    ) !?ops.CT {
         const hidden_size: usize = @intCast(self.context.gpt_config.*.hidden_size);
         if (row >= result.rows) return error.InvalidTensorShape;
         const hidden = switch (source) {
@@ -1162,6 +1408,17 @@ pub const Runtime = struct {
     }
 
     pub fn graphForward(
+        self: *Runtime,
+        cache: *graph_mod.cache.GraphCache,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+    ) ![]f32 {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().graphForwardUnobserved, .{ self, cache, input_ids, batch, seq_len, decode_context });
+    }
+
+    fn graphForwardUnobserved(
         self: *Runtime,
         cache: *graph_mod.cache.GraphCache,
         input_ids: []const i64,
@@ -1360,4 +1617,159 @@ test "decoder device step matches independent Native greedy output without advan
 
 test "decoder device step preserves actual Metal greedy output and pre-numerical sampled decline" {
     try @import("../ops/media_residency_test.zig").onMetal(populateDeviceStepWeights, checkActualDeviceStep);
+}
+
+const DecoderObservationFixture = struct {
+    const session_mod = @import("../backends/session.zig");
+    const helper = @import("../ops/media_residency_test.zig");
+    const weights = @import("testing/decoder.zig");
+    const embedding_fn = @FieldType(ops.ComputeBackend.VTable, "embeddingLookup");
+    var original_embedding: embedding_fn = undefined;
+    var original_snapshot: @FieldType(ops.ComputeBackend.VTable, "debugTimingSnapshot") = null;
+    var expected_gate: ?*std.atomic.Mutex = null;
+    var snapshot_calls: usize = 0;
+    fn snapshot(raw: *anyopaque) ops.BackendDebugTimingSnapshot {
+        if (expected_gate) |gate| {
+            const unlocked = gate.tryLock();
+            if (unlocked) gate.unlock();
+            std.debug.assert(!unlocked);
+        }
+        snapshot_calls += 1;
+        return if (original_snapshot) |sample| sample(raw) else .{};
+    }
+    var expected_context: *anyopaque = undefined;
+    var expect_registry: bool = false;
+    var calls: usize = 0;
+    var failure: ?anyerror = null;
+    fn embedding(raw: *anyopaque, weight: ops.CT, ids: []const i64, total: usize, width: usize) !ops.CT {
+        if (raw != expected_context) return error.DecoderObservationChangedBackend;
+        if (@import("allocation_registry.zig").enabled() != expect_registry) return error.DecoderObservationChangedDisabledPath;
+        calls += 1;
+        if (failure) |err| return err;
+        return original_embedding(raw, weight, ids, total, width);
+    }
+    fn info(_: *anyopaque) []const @import("../backends/tensor.zig").TensorInfo {
+        return &.{};
+    }
+    fn kind(raw: *anyopaque) @import("../backends/backends.zig").BackendType {
+        const backend: *const ComputeBackend = @ptrCast(@alignCast(raw));
+        return if (backend.kind() == .metal) .metal else .native;
+    }
+    fn close(_: *anyopaque) void {}
+    const table = session_mod.Session.VTable{ .run = undefined, .inputInfo = info, .outputInfo = info, .backend = kind, .close = close };
+    fn check(actual: ComputeBackend, reference: ComputeBackend) !void {
+        const a = std.testing.allocator;
+        const cfg = weights.config();
+        const ids = [_]i64{ 0, 1 };
+        const expected = try weights.eager(reference, cfg, &ids);
+        defer a.free(expected);
+        var cb = actual;
+        var backend_table = actual.vtable.*;
+        original_embedding = actual.vtable.embeddingLookup;
+        original_snapshot = actual.vtable.debugTimingSnapshot;
+        backend_table.debugTimingSnapshot = snapshot;
+        expected_gate = null;
+        snapshot_calls = 0;
+        expected_context = actual.ptr;
+        backend_table.embeddingLookup = embedding;
+        cb.vtable = &backend_table;
+        calls = 0;
+        failure = null;
+        expect_registry = false;
+        var diagnostics = @import("diagnostics.zig").Diagnostics{};
+        const session = session_mod.Session{ .ptr = &cb, .vtable = &table, .invocation_diagnostics = .{ .diagnostics = &diagnostics, .stable_backend = actual } };
+        var decoder = Runtime{ .context = .{ .allocator = a, .cb = &cb, .gpt_config = &cfg, .session = session } };
+        const decode = gpt_arch.DecodeContext{ .attention_mode = .full_recompute, .total_sequence_len = ids.len, .query_sequence_len = ids.len, .kv_sequence_len = ids.len };
+        const disabled = try decoder.forwardLastLogits(&ids, 1, ids.len, &decode);
+        defer a.free(disabled);
+        try std.testing.expect(diagnostics.snapshot() == null);
+        const disabled_calls = calls;
+        try std.testing.expect(disabled_calls != 0);
+        for (expected, disabled) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.001);
+        diagnostics.configureBackend(true, &actual); // cold owner configuration
+        expect_registry = true;
+        const enabled = try decoder.forwardLastLogits(&ids, 1, ids.len, &decode);
+        defer a.free(enabled);
+        try std.testing.expectEqual(disabled_calls * 2, calls);
+        for (disabled, enabled) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.001);
+        var measured = diagnostics.snapshot() orelse return error.MissingDecoderObservation;
+        try std.testing.expect(measured.outcome == .success and measured.operation == .forward);
+        try std.testing.expectEqual(actual.kind(), measured.context_backend.?);
+        try std.testing.expect(measured.context_runtime_scope == .borrowed_execution_backend_context);
+        try std.testing.expect(measured.execution == null); // eager has no program plan
+        try std.testing.expect(measured.runtime.submission != null);
+        if (actual.kind() == .metal) try std.testing.expect(measured.runtime.submission.?.metal_encoded_dispatches.? != 0);
+        if (actual.kind() == .native) {
+            var cache = graph_mod.cache.GraphCache.init(a);
+            defer cache.deinit();
+            decoder.graph_cache = &cache;
+            defer decoder.graph_cache = null;
+            const programmed = try decoder.forwardLastLogits(&ids, 1, ids.len, &decode);
+            defer a.free(programmed);
+            measured = diagnostics.snapshot().?;
+            try std.testing.expect(measured.execution != null);
+            try std.testing.expect(measured.execution_scope == .last_published_program);
+            for (expected, programmed) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.001);
+        }
+        // A backend's actual cancellation/failure result must replace success.
+        failure = error.Cancelled;
+        const single = gpt_arch.DecodeContext{ .attention_mode = .full_recompute, .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1 };
+        try std.testing.expectError(error.Cancelled, decoder.forwardLastLogits(ids[0..1], 1, 1, &single));
+        measured = diagnostics.snapshot().?;
+        try std.testing.expect(measured.outcome == .failed and measured.operation == .forward);
+        try std.testing.expectEqualStrings("Cancelled", measured.error_name.?.view());
+        try std.testing.expect(measured.execution == null);
+        failure = error.ObservedDecoderFailure;
+        try std.testing.expectError(error.ObservedDecoderFailure, decoder.forwardLastLogits(ids[0..1], 1, 1, &single));
+        try std.testing.expectEqualStrings("ObservedDecoderFailure", diagnostics.snapshot().?.error_name.?.view());
+        failure = null;
+        // Real prefill transaction, including its early cancellation and clean
+        // resize outcome, uses the same actual backend and publication owner.
+        const prefill = @import("decoder_prefill.zig");
+        var state = NativeDecodeState.initContiguous(a);
+        defer state.deinit();
+        var gate: std.atomic.Mutex = .unlocked;
+        expected_gate = &gate;
+        defer expected_gate = null;
+        var owner = prefill.Runtime{ .forward = decoder, .state = &state, .execution = .{ .mutex = &gate } };
+        const request = prefill.ChunkRequest{ .token_ids = &ids, .total_chunk_end = ids.len, .prompt_tokens = ids.len, .already_prefilled = 0, .processed_rows = 0, .output_intent = .last_logits, .capture_hidden = false, .shared_kv_pruning = false, .prepared_metal_whole_prompt = false, .metal_target_last_logits = false, .cuda_direct_last_logits = false, .typed_outputs = false, .attempted_chunk_size = 2, .allow_resize = true };
+        const output = try owner.runChunk(request);
+        defer if (output.complete.last_logits) |values| a.free(values);
+        measured = diagnostics.snapshot().?;
+        try std.testing.expect(measured.operation == .prefill and measured.outcome == .success);
+        for (expected, output.complete.last_logits.?) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.001);
+        const Cancel = struct {
+            fn check(_: ?*anyopaque) !void {
+                if (@import("allocation_registry.zig").enabled()) return error.ObservationStartedBeforeLaneAcquisition;
+                return error.Cancelled;
+            }
+        };
+        owner.execution.control = .{ .check_fn = Cancel.check };
+        const before_cancel = calls;
+        const snapshots_before_cancel = snapshot_calls;
+        try std.testing.expectError(error.Cancelled, owner.runChunk(request));
+        try std.testing.expectEqual(before_cancel, calls);
+        try std.testing.expectEqual(snapshots_before_cancel, snapshot_calls);
+        measured = diagnostics.snapshot().?;
+        try std.testing.expect(measured.outcome == .failed and measured.operation == .prefill);
+        try std.testing.expectEqualStrings("Cancelled", measured.error_name.?.view());
+        try std.testing.expect(measured.context_runtime_scope == .unavailable);
+        try std.testing.expect(measured.runtime.submission == null and measured.runtime.cuda == null);
+        expected_gate = null;
+        diagnostics.configure(false);
+        expect_registry = false;
+        const after_disable = try decoder.forwardLastLogits(&ids, 1, ids.len, &decode);
+        defer a.free(after_disable);
+        try std.testing.expect(diagnostics.snapshot() == null);
+        try std.testing.expect(cb.ptr == actual.ptr and cb.vtable == &backend_table);
+        // Backend pointer/table and every callback result remain unchanged.
+    }
+};
+
+test "physical decoder publishes actual Native prefill decode failures and disabled callback parity" {
+    try DecoderObservationFixture.helper.onNative(DecoderObservationFixture.weights.populate, DecoderObservationFixture.check);
+}
+
+test "physical decoder publishes actual Metal prefill decode and explicit submission scopes" {
+    try DecoderObservationFixture.helper.onMetal(DecoderObservationFixture.weights.populate, DecoderObservationFixture.check);
 }

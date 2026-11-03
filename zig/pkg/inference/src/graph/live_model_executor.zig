@@ -107,6 +107,8 @@ const RuntimeContext = struct {
     }
 
     pub fn deinit(self: *RuntimeContext) void {
+        var cleanup = self.definition.beginCleanup();
+        defer cleanup.deinit();
         self.decode_runtime.deinit();
         self.kv_manager.deinit();
         self.cb.deinit();
@@ -175,7 +177,16 @@ const RuntimeContext = struct {
     }
 };
 
+fn acceptsOperationBackend(table: *const model_runtime.ModelRuntime.VTable) bool {
+    return table == &runtime_vtable;
+}
+fn operationBackend(raw: *anyopaque) *const ops.ComputeBackend {
+    const self: *RuntimeContext = @ptrCast(@alignCast(raw));
+    return &self.cb;
+}
 const runtime_vtable = model_runtime.ModelRuntime.VTable{
+    .operation_backend = operationBackend,
+    .accepts_operation_backend = acceptsOperationBackend,
     .capabilities = runtimeCapabilities,
     .prefill = runtimePrefill,
     .decode = runtimeDecode,
@@ -281,11 +292,11 @@ fn runtimeDecodeSample(
     }
 
     var output = try runtimeDecode(ctx, allocator, request.decode);
-    defer output.deinit(allocator);
+    defer output.deinitWithCleanup(allocator, .{ .boundary = request.decode.cleanup_epoch, .operation = request.decode.backend_operation });
     return .{
         .token_id = @intCast(model_runtime.sampleTokenFromLogits(
             allocator,
-            try output.hostLogits(allocator),
+            try output.hostLogitsWithCleanup(allocator, .{ .boundary = request.decode.cleanup_epoch, .operation = request.decode.backend_operation }),
             request.sampling,
             request.token_history,
         )),

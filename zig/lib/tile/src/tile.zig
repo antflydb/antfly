@@ -166,6 +166,9 @@ pub const Channel = struct { name: []const u8, reduce: Reducer, where: Expr };
 /// A named bool shared by several channels, evaluated once per element.
 pub const Let = struct { name: []const u8, expr: Expr };
 
+/// Optional bounded scalar gathers into padding slots of the final CUDA
+/// combined record. Existing partial and Metal schedules remain unchanged.
+pub const OutputProbe = struct { offset: u32, index_param: []const u8, fallback: enum { zero, negative_infinity } = .zero };
 pub const RowReduce = struct {
     /// Kernel symbol in generated sources.
     name: []const u8,
@@ -183,6 +186,7 @@ pub const RowReduce = struct {
     partial_stride: u32,
     lets: []const Let = &.{},
     channels: []const Channel,
+    output_probes: []const OutputProbe = &.{},
 
     pub fn validate(comptime k: RowReduce) void {
         if (k.partial_stride < 2 * k.channels.len) @compileError(k.name ++ ": partial_stride too small");
@@ -195,6 +199,11 @@ pub const RowReduce = struct {
         };
         for (k.lets) |l| k.checkExpr(l.expr);
         for (k.channels) |c| k.checkExpr(c.where);
+        for (k.output_probes, 0..) |probe, i| {
+            if (probe.offset < 2 * k.channels.len or probe.offset >= k.partial_stride) @compileError(k.name ++ ": output probe overlaps channels or exceeds record");
+            _ = k.paramIndex(probe.index_param);
+            for (k.output_probes[0..i]) |prior| if (prior.offset == probe.offset) @compileError(k.name ++ ": duplicate output probe slot");
+        }
     }
 
     fn checkExpr(comptime k: RowReduce, comptime e: Expr) void {

@@ -132,7 +132,15 @@ pub const PartitionBufferView = struct {
     }
 };
 
+/// An implementation may refine inferred storage before any allocation IDs or
+/// alias lifetimes are assigned. The returned descriptor must retain the shape.
+pub const OutputLayoutResolver = struct {
+    context: *anyopaque,
+    resolve: *const fn (*anyopaque, BackendKind, NodeId, TensorDesc) TensorDesc,
+};
+
 pub const BuildOptions = struct {
+    output_layout: ?OutputLayoutResolver = null,
     tensor_descs: ?[]const ?TensorDesc = null,
     output_nodes: ?[]const NodeId = null,
 };
@@ -147,8 +155,13 @@ pub const BufferPlan = struct {
     transfers: []TransferEdge,
     transfer_index: std.AutoHashMapUnmanaged(u64, usize),
     allocator: std.mem.Allocator,
+    /// Borrowed immutable executable cache authority, never a fresh analysis.
+    execution_reachable: ?[]const bool = null,
+    /// Private prepared projection; empty retains the full compatibility plan.
+    allocation_enabled: []bool = &.{},
 
     pub fn deinit(self: *BufferPlan) void {
+        self.allocator.free(self.allocation_enabled);
         self.allocator.free(self.slots);
         self.allocator.free(self.node_slots);
         self.allocator.free(self.node_positions);
@@ -166,6 +179,7 @@ pub const BufferPlan = struct {
         const storage: TensorStorageClass = switch (backend) {
             .native => .host_f32,
             .cuda => .cuda_buffer,
+            .metal => .metal_buffer,
             else => return error.UnsupportedWorkspaceBackend,
         };
         const id: AllocationId = @intCast(self.allocations.len);
@@ -216,36 +230,68 @@ pub const BufferPlan = struct {
         return id;
     }
 
+    pub fn projectReachable(self: *BufferPlan, graph: *const Graph, reachable: []const bool) !void {
+        if (reachable.len != self.node_slots.len or reachable.len != graph.nodeCount()) return error.InvalidReachabilityTable;
+        for (graph.outputs.items) |output| if (output >= reachable.len or !reachable[output]) return error.InvalidReachabilityTable;
+        for (self.slots) |slot| {
+            if (slot.node_id >= reachable.len) return error.InvalidBufferPlan;
+            if (!reachable[slot.node_id]) continue;
+            if (slot.source_slot) |source| {
+                if (source >= self.slots.len or self.slots[source].node_id >= reachable.len or !reachable[self.slots[source].node_id]) return error.InvalidReachabilityTable;
+            }
+            for (graph.node(slot.node_id).getInputs()) |input| if (input != null_node and (input >= reachable.len or !reachable[input])) return error.InvalidReachabilityTable;
+        }
+        self.execution_reachable = reachable;
+        // Inactive logical nodes retain their actual kind/descriptor, but
+        // cannot name any physical bank in the projected executable.
+        for (self.slots) |*slot| if (!reachable[slot.node_id]) {
+            slot.allocation = invalid_allocation;
+        };
+    }
+
+    pub fn allocationById(self: *const BufferPlan, id: AllocationId) ?*const PhysicalAllocation {
+        if (id == invalid_allocation or id >= self.allocations.len) return null;
+        if (self.allocation_enabled.len != 0 and (id >= self.allocation_enabled.len or !self.allocation_enabled[id])) return null;
+        if (self.allocations[id].id != id) return null;
+        return &self.allocations[id];
+    }
+
     fn viewAllocation(self: *const BufferPlan, slot: LogicalSlot) !AllocationId {
-        const source = self.slots[slot.source_slot orelse return error.InvalidBufferPlan];
+        const source_id = slot.source_slot orelse return error.InvalidBufferPlan;
+        if (source_id >= self.slots.len) return error.InvalidBufferPlan;
+        const source = self.slotForNode(self.slots[source_id].node_id) orelse return error.InvalidBufferPlan;
         if (source.backend == slot.backend) return source.allocation;
         const index = self.transfer_index.get(transferKey(source.node_id, slot.partition_index)) orelse return error.MissingViewTransfer;
         return self.transfers[index].allocation;
     }
 
     pub fn positionForNode(self: *const BufferPlan, node: NodeId) u32 {
+        if (node >= self.node_positions.len or self.slotForNode(node) == null) return std.math.maxInt(u32);
         return self.node_positions[node];
     }
 
     pub fn slotForNode(self: *const BufferPlan, node_id: NodeId) ?*const LogicalSlot {
         const index: usize = @intCast(node_id);
         if (index >= self.node_slots.len) return null;
+        if (self.execution_reachable) |reachable| if (index >= reachable.len or !reachable[index]) return null;
         const slot_id = self.node_slots[index];
-        if (slot_id == invalid_slot) return null;
+        if (slot_id == invalid_slot or slot_id >= self.slots.len or self.slots[slot_id].node_id != node_id) return null;
         return &self.slots[@intCast(slot_id)];
     }
 
     pub fn allocationForSlot(self: *const BufferPlan, slot_id: SlotId) ?*const PhysicalAllocation {
         const slot_index: usize = @intCast(slot_id);
         if (slot_index >= self.slots.len) return null;
+        if (self.slotForNode(self.slots[slot_index].node_id) == null) return null;
         const allocation_id = self.slots[slot_index].allocation;
         if (allocation_id == invalid_allocation) return null;
-        return &self.allocations[@intCast(allocation_id)];
+        return self.allocationById(allocation_id);
     }
 
     pub fn totalAllocationBytes(self: *const BufferPlan, backend: ?BackendKind, storage: ?TensorStorageClass) u64 {
         var total: u64 = 0;
         for (self.allocations) |allocation| {
+            if (self.allocationById(allocation.id) == null) continue;
             if (backend) |b| {
                 if (allocation.backend != b) continue;
             }
@@ -267,7 +313,7 @@ pub const BufferPlan = struct {
         if (part_index >= partition_plan.partitions.len) return error.InvalidPartitionPlan;
         const part = partition_plan.partitions[part_index];
 
-        if (partition_plan.partitions.len == 1 and partition_index == 0 and self.transfers.len == 0) {
+        if (self.execution_reachable == null and partition_plan.partitions.len == 1 and partition_index == 0 and self.transfers.len == 0) {
             const slots = try allocator.alloc(PartitionSlotView, self.slots.len);
             errdefer allocator.free(slots);
             for (self.slots, slots) |slot, *slot_view| {
@@ -317,6 +363,7 @@ pub const BufferPlan = struct {
             }
         }
         for (self.slots, slot_roles) |slot, roles| {
+            if (self.slotForNode(slot.node_id) == null) continue;
             if (roles.local or roles.input or roles.output or roles.graph_output)
                 try slots.append(allocator, .{ .slot = slot, .roles = roles });
         }
@@ -345,6 +392,11 @@ pub const BufferPlan = struct {
         const node_count: usize = @intCast(graph.nodeCount());
         if (self.node_slots.len != node_count) return error.InvalidBufferPlan;
         if (self.slots.len != node_count) return error.InvalidBufferPlan;
+        if (self.execution_reachable) |reachable| {
+            if (reachable.len != node_count) return error.InvalidReachabilityTable;
+            for (graph.outputs.items) |output| if (output >= reachable.len or !reachable[output]) return error.InvalidReachabilityTable;
+        }
+        if (self.allocation_enabled.len != 0 and self.allocation_enabled.len != self.allocations.len) return error.InvalidBufferPlan;
 
         for (self.node_slots, 0..) |slot_id, node_index| {
             if (slot_id == invalid_slot) return error.InvalidBufferPlan;
@@ -355,6 +407,10 @@ pub const BufferPlan = struct {
             if (slot.partition_index >= partition_plan.partitions.len) return error.InvalidPartitionPlan;
             if (!slot.desc.shape.eq(graph.node(slot.node_id).output_shape)) return error.TensorDescriptorShapeMismatch;
 
+            if (self.execution_reachable) |reachable| if (!reachable[node_index]) {
+                if (slot.allocation != invalid_allocation or slot.roles.graph_output) return error.InvalidBufferPlan;
+                continue;
+            };
             if (slot.kind == .view) {
                 const source_slot_id = slot.source_slot orelse return error.InvalidBufferPlan;
                 const source_index: usize = @intCast(source_slot_id);
@@ -375,7 +431,7 @@ pub const BufferPlan = struct {
 
         for (self.allocations, 0..) |allocation, i| {
             if (allocation.id != @as(AllocationId, @intCast(i))) return error.InvalidBufferPlan;
-            if (allocation.byte_size == 0) return error.InvalidBufferPlan;
+            if (allocation.byte_size == 0 and self.allocationById(allocation.id) != null) return error.InvalidBufferPlan;
             if (allocation.first_use > allocation.last_use) return error.InvalidBufferPlan;
         }
 
@@ -453,7 +509,10 @@ pub fn build(
         if (!desc.shape.eq(graph.node(node_id).output_shape)) return error.TensorDescriptorShapeMismatch;
         // These CUDA kernels materialize dense buffers. Resolve this before
         // assigning allocation IDs so downstream views retain the right source.
-        if (part.backend == .cuda) {
+        if (options.output_layout) |provider| {
+            desc = provider.resolve(provider.context, part.backend, node_id, desc);
+            if (!desc.shape.eq(graph.node(node_id).output_shape)) return error.TensorDescriptorShapeMismatch;
+        } else if (part.backend == .cuda) {
             const node = graph.node(node_id);
             switch (node.op) {
                 .transpose, .broadcast_in_dim => {

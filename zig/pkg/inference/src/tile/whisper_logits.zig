@@ -73,6 +73,12 @@ pub const kernel: tile.RowReduce = .{
             ),
         ).andAlso(tile.notListed("suppress_ids")) },
     },
+    // Historical adapter: generic final-record scalar gathers only. Metal
+    // partial and tuned final-reduce bodies remain byte-identical.
+    .output_probes = &.{
+        .{ .offset = 14, .index_param = "probe_id" },
+        .{ .offset = 15, .index_param = "eot", .fallback = .negative_infinity },
+    },
     .channels = &.{
         .{ .name = "best", .reduce = .argmax, .where = ref("allowed") },
         .{ .name = "text", .reduce = .argmax, .where = ref("allowed").andAlso(ref("is_ts").negate()) },

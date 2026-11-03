@@ -117,7 +117,13 @@ pub const Timing = struct {
     }
 };
 
+/// Actual selected decode termination. Unknown is the default for other
+/// result constructors; output-budget exhaustion remains a propagated error.
+pub const Termination = enum { unknown, eos, context_limit, output_budget, silence };
+const PipelinedTermination = enum { declined, eos, context_limit };
 pub const TranscribeResult = struct {
+    termination: Termination = .unknown,
+    selected_attempt_termination: Termination = .unknown,
     text: []const u8,
     language: ?[]const u8,
     allocator: std.mem.Allocator,
@@ -154,6 +160,9 @@ pub fn maxPromptPrefixTokens(max_length: usize) usize {
 }
 
 pub const TranscriptionPipeline = struct {
+    /// Explicit cold caller contract, set only at reviewed server factories.
+    /// Public init remains unqualified; live mutex state is never consulted.
+    incremental_cleanup_contract: enum { unqualified, no_enclosing_lanes } = .unqualified,
     batch_dispatch: ?@import("../server/tensor_microbatch.zig").Dispatch = null,
     allocator: std.mem.Allocator,
     encoder: backends.Session,
@@ -279,6 +288,7 @@ pub const TranscriptionPipeline = struct {
             .host_preprocess_bytes = std.math.add(usize, pcm_bytes, mel_bytes) catch return error.ResourceLimitExceeded,
         });
         defer encoder_permit.deinit();
+        try stage_runtime.prepareEncoderPermit(self.encoder, self.decoder, self.batch_dispatch, self.execution_control, true, &encoder_permit);
 
         const mel_started = platform.time.monotonicNs();
         const mel = try audio.whisperMelFromPcmSecondsMels(allocator, samples, sample_rate, context_seconds, @intCast(n_mels));
@@ -290,8 +300,21 @@ pub const TranscriptionPipeline = struct {
         const mel_shape = [_]i64{ 1, @intCast(n_mels), @intCast(n_frames) };
         var mel_tensor = try backends.Tensor.initFloat32(allocator, "input_features", &mel_shape, mel);
         defer mel_tensor.deinit();
-        var encoder_outputs = try stage_runtime.encodeWithPermit(allocator, self.encoder, self.decoder, &.{mel_tensor}, self.batch_dispatch, self.execution_control, &encoder_permit);
-        defer encoder_outputs.deinit(allocator);
+        const RootInput = @import("../execution/owned_incremental_input.zig");
+        const receiver = if (self.incremental_cleanup_contract == .no_enclosing_lanes and self.encoder.backend() == .cuda and self.decoder.backend() == .cuda and (self.encoder.ptr != self.decoder.ptr or self.encoder.vtable != self.decoder.vtable))
+            @import("../execution/architecture_session.zig").IncrementalDecoderAdapter.qualify(self.encoder, self.decoder)
+        else
+            null;
+        const supervised_async = if (self.execution_control) |active| active.native_call_policy == .require_supervision and active.deadline_ns != null else false;
+        const async_root = if (receiver) |value| supervised_async and value.backend == .cuda and !value.same_model_owner else false;
+        var input_cleanup: RootInput.Cleanup = if (self.incremental_cleanup_contract == .no_enclosing_lanes and async_root)
+            try RootInput.Cleanup.beginTaskWithoutEnclosingLanes(self.execution_control)
+        else
+            .unqualified;
+        defer input_cleanup.finish();
+        var encoder_outputs = try stage_runtime.encodeForIncrementalWithPermit(allocator, self.encoder, self.decoder, &.{mel_tensor}, self.batch_dispatch, self.execution_control, &encoder_permit);
+        var encoder_outputs_live = true;
+        defer if (encoder_outputs_live) encoder_outputs.deinit(allocator);
         timing.encoder_ns = platform.time.monotonicNs() -| encoder_started;
         const enc_seq_len: usize = switch (encoder_outputs) {
             .host => |outputs| if (outputs.len == 0) return error.NoEncoderOutput else if (outputs[0].shape.len >= 2) @intCast(outputs[0].shape[1]) else 1,
@@ -300,6 +323,9 @@ pub const TranscriptionPipeline = struct {
         const enc_mask = try allocator.alloc(i64, enc_seq_len);
         defer allocator.free(enc_mask);
         @memset(enc_mask, 1);
+        var owned_input = try RootInput.OwnedIncrementalInput.take(allocator, &encoder_outputs, self.decoder, &input_cleanup);
+        encoder_outputs_live = false;
+        defer owned_input.deinit();
 
         // 2. Decode, retrying at rising temperature when the greedy pass
         //    fails the reference guards (repetitive text or low confidence).
@@ -308,12 +334,11 @@ pub const TranscriptionPipeline = struct {
         defer if (chosen) |*attempt| attempt.deinit(allocator);
         for (temperatures, 0..) |temperature, attempt_index| {
             if (attempt_index > 0 and !self.config.temperature_fallback) break;
-            var attempt = try self.decodeAttempt(&encoder_outputs, enc_seq_len, enc_mask, prompt_prefix, temperature, attempt_index, &timing);
+            var attempt = try self.decodeAttempt(&owned_input.encoder, if (owned_input.source) |*source| source else null, enc_seq_len, enc_mask, prompt_prefix, temperature, attempt_index, &timing);
             errdefer attempt.deinit(allocator);
             const needs_fallback = attempt.compression_ratio > self.config.compression_ratio_threshold or
                 attempt.avg_logprob < self.config.logprob_threshold;
-            if (chosen) |*previous| previous.deinit(allocator);
-            chosen = attempt;
+            replaceChosenAttempt(allocator, &chosen, attempt);
             if (!needs_fallback) break;
         }
         var attempt = chosen.?;
@@ -374,6 +399,8 @@ pub const TranscriptionPipeline = struct {
             .compression_ratio = attempt.compression_ratio,
             .temperature = attempt.temperature,
             .silent = silent,
+            .termination = if (silent) .silence else attempt.termination,
+            .selected_attempt_termination = attempt.termination,
         };
     }
 
@@ -396,6 +423,7 @@ pub const TranscriptionPipeline = struct {
 
     /// One full decode of the window at `temperature` (0 = greedy).
     const Attempt = struct {
+        termination: Termination = .unknown,
         generated: std.ArrayListUnmanaged(i32),
         detected_language: ?[]const u8,
         no_speech_prob: f32,
@@ -408,9 +436,15 @@ pub const TranscriptionPipeline = struct {
         }
     };
 
+    fn replaceChosenAttempt(allocator: std.mem.Allocator, chosen: *?Attempt, next: Attempt) void {
+        if (chosen.*) |*previous| previous.deinit(allocator);
+        chosen.* = next;
+    }
+
     fn decodeAttempt(
         self: *TranscriptionPipeline,
         encoder_output: *const stage_runtime.EncoderOutputs,
+        incremental_source: ?*const decoder_stage.RetainedEncoderSource,
         enc_seq_len: usize,
         enc_mask: []const i64,
         prompt_prefix: []const i32,
@@ -456,7 +490,7 @@ pub const TranscriptionPipeline = struct {
         var logprob_sum: f64 = 0;
         var no_speech_prob: f32 = 0;
 
-        var decoder_runtime = try decoder_stage.Decoder.init(allocator, self.decoder, encoder_output, enc_seq_len, enc_mask, self.config.vocab_size, self.execution_control);
+        var decoder_runtime = try decoder_stage.Decoder.initWithSource(allocator, self.decoder, encoder_output, enc_seq_len, enc_mask, self.config.vocab_size, self.execution_control, .{}, incremental_source);
         defer decoder_runtime.deinit();
         timing.kv_cached = decoder_runtime.native != null;
         // Suppression list handed to the device token-choice kernel.
@@ -466,6 +500,7 @@ pub const TranscriptionPipeline = struct {
             @as(usize, @intCast(rules.timestamp_begin)) < self.config.vocab_size;
 
         var completed = false;
+        var termination: Termination = .context_limit;
         while (dec_len < max_len) {
             if (forced_index < forced.len and forced[forced_index].position + offset == dec_len) {
                 if (forced[forced_index].token_id) |token_id| {
@@ -578,6 +613,7 @@ pub const TranscriptionPipeline = struct {
                 try self.output_token_budget.consume();
                 if (best_token == self.config.eos_token_id) {
                     completed = true;
+                    termination = .eos;
                     break;
                 }
             }
@@ -595,9 +631,18 @@ pub const TranscriptionPipeline = struct {
             // backend declines leaves the loop on the synchronous path.
             if (decoder_runtime.native) |*decoder| {
                 if (temperature == 0 and step_stats != null and generated_position == prompt_end and dec_len < max_len) {
-                    if (try self.decodePipelined(decoder, dec_ids, &dec_len, &generated, &suppress_scratch, rules, rules_active, &logprob_sum, timing)) {
-                        completed = true;
-                        break;
+                    switch (try self.decodePipelined(decoder, dec_ids, &dec_len, &generated, &suppress_scratch, rules, rules_active, &logprob_sum, timing)) {
+                        .declined => {},
+                        .eos => {
+                            termination = .eos;
+                            completed = true;
+                            break;
+                        },
+                        .context_limit => {
+                            termination = .context_limit;
+                            completed = true;
+                            break;
+                        },
                     }
                 }
             }
@@ -611,6 +656,7 @@ pub const TranscriptionPipeline = struct {
         defer allocator.free(text);
         return .{
             .generated = generated,
+            .termination = termination,
             .detected_language = detected_language,
             .no_speech_prob = no_speech_prob,
             .avg_logprob = avg_logprob,
@@ -622,8 +668,8 @@ pub const TranscriptionPipeline = struct {
     /// Greedy free-text steps with one step in flight: while the frame
     /// for position p runs, the host encodes the frame for p+1 (embedding
     /// the token slot the frame for p writes), then waits for p and
-    /// submits p+1. Returns true when decoding finished here (end of text
-    /// or the length limit); false when the backend could not pipeline
+    /// submits p+1. Returns an actual EOS or context-limit reason when decoding finished
+    /// here; declined means the backend could not pipeline
     /// and the caller must continue synchronously from `dec_len`, which
     /// is then consistent with the decoder cache.
     fn decodePipelined(
@@ -637,7 +683,7 @@ pub const TranscriptionPipeline = struct {
         rules_active: bool,
         logprob_sum: *f64,
         timing: *Timing,
-    ) !bool {
+    ) !PipelinedTermination {
         const allocator = self.allocator;
         const max_len = try self.output_token_budget.decodeEnd(dec_len.*, self.config.max_length);
         const trace = platform.env.getenvBool("TERMITE_WHISPER_TRACE_PIPELINE");
@@ -652,7 +698,7 @@ pub const TranscriptionPipeline = struct {
         const state = whisper_timestamps.grammarState(rules, generated.items, vocab, rules_active);
         var stage = pending_step.PipelinedStage(session_factory.WhisperNativeDecoder).begin(decoder, &state) orelse {
             if (trace) std.debug.print("whisper_pipeline: declined (backend pipeline or grammar seed)\n", .{});
-            return false;
+            return .declined;
         };
         defer stage.deinit();
         var mode: u32 = ops.whisper_logits_mode_device_window | ops.whisper_logits_mode_choose;
@@ -672,7 +718,7 @@ pub const TranscriptionPipeline = struct {
 
         // The first in-flight step embeds the token the host just chose.
         var step_started = platform.time.monotonicNs();
-        if (!try stage.encodePrefix(dec_ids[0..dec_len.*], params, suppress_scratch.items)) return false;
+        if (!try stage.encodePrefix(dec_ids[0..dec_len.*], params, suppress_scratch.items)) return .declined;
         try stage.submit();
         var steps: usize = 0;
         defer if (trace) std.debug.print("whisper_pipeline: {d} steps in flight mode\n", .{steps});
@@ -699,7 +745,7 @@ pub const TranscriptionPipeline = struct {
             if (token == self.config.eos_token_id) {
                 // The encoded lookahead, if any, predicted past the end.
                 if (lookahead) stage.discardLookahead();
-                return true;
+                return .eos;
             }
             dec_ids[dec_len.*] = token;
             dec_len.* += 1;
@@ -709,7 +755,7 @@ pub const TranscriptionPipeline = struct {
                 // encode the lookahead; the cache is consistent with
                 // `dec_len` either way.
                 try self.output_token_budget.check();
-                return dec_len.* >= max_len;
+                return if (dec_len.* >= max_len) .context_limit else .declined;
             }
             try stage.submitLookahead();
         }
@@ -865,7 +911,7 @@ test "exhausted transcription fails before touching model resources" {
     try std.testing.expectError(error.InferenceOutputTokensExceeded, pipeline.transcribePcmConditioned(&.{0.1}, 16000, &.{}));
 }
 
-fn checkTranscriptionPendingFault(fail_on_encode: usize) !void {
+fn checkTranscriptionPendingFault(fail_on_encode: usize, choice_token: i32, expected: ?PipelinedTermination, remaining: ?usize) !void {
     if (comptime !build_options.enable_native) return error.SkipZigTest;
     if (!platform.env.getenvBool("TERMITE_WHISPER_ENABLE_PIPELINED_DECODE")) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -874,6 +920,7 @@ fn checkTranscriptionPendingFault(fail_on_encode: usize) !void {
     const Probe = struct {
         compute: native.NativeCompute,
         fail_on_encode: usize,
+        choice_token: i32,
         encodes: usize = 0,
         submits: usize = 0,
         waits: usize = 0,
@@ -934,9 +981,9 @@ fn checkTranscriptionPendingFault(fail_on_encode: usize) !void {
             if (self.encodes == self.fail_on_encode) return error.UnsupportedOperation;
             return true;
         }
-        fn read(_: *anyopaque, _: usize, stats: *ops.WhisperLogitsStatsRaw) bool {
+        fn read(raw: *anyopaque, _: usize, stats: *ops.WhisperLogitsStatsRaw) bool {
             @memset(stats, 0);
-            stats[whisper_timestamps.stats_choice_token] = 1;
+            stats[whisper_timestamps.stats_choice_token] = @bitCast(@as(u32, @intCast(get(raw).choice_token)));
             return true;
         }
     };
@@ -946,7 +993,7 @@ fn checkTranscriptionPendingFault(fail_on_encode: usize) !void {
     try fixture.putWeight(&weights, "model.decoder.embed_positions.weight", &.{ 8, 4 }, null);
     try fixture.putWeight(&weights, "model.decoder.layer_norm.weight", &.{4}, 1);
     try fixture.putWeight(&weights, "model.decoder.layer_norm.bias", &.{4}, 0);
-    var probe = Probe{ .compute = native.NativeCompute.init(a, &weights, null), .fail_on_encode = fail_on_encode };
+    var probe = Probe{ .compute = native.NativeCompute.init(a, &weights, null), .fail_on_encode = fail_on_encode, .choice_token = choice_token };
     defer probe.compute.deinit();
     const base = probe.compute.computeBackend();
     const config = whisper_arch.Config{ .d_model = 4, .decoder_layers = 0, .decoder_attention_heads = 1, .vocab_size = 4, .max_target_positions = 8 };
@@ -970,7 +1017,7 @@ fn checkTranscriptionPendingFault(fail_on_encode: usize) !void {
     backend.vtable = &table;
     var decoder = session_factory.WhisperNativeDecoder{ .allocator = a, .cb = .{ .backend = backend, .guard = .{}, .owns_backend = false }, .config = config, .encoder_hidden = encoder, .cache = cache, .gate = null };
     defer decoder.deinit();
-    var task = TranscriptionPipeline.init(a, undefined, undefined, undefined, .{ .vocab_size = 4, .max_length = 4, .eos_token_id = 3 });
+    var task = TranscriptionPipeline.init(a, undefined, undefined, undefined, .{ .vocab_size = 4, .max_length = 4, .eos_token_id = 3, .max_output_tokens = remaining });
     var tokens = [_]i64{ 0, 1, 0, 0 };
     var length: usize = 2;
     var generated = std.ArrayListUnmanaged(i32).empty;
@@ -979,6 +1026,24 @@ fn checkTranscriptionPendingFault(fail_on_encode: usize) !void {
     defer suppressed.deinit(a);
     var logprob: f64 = 0;
     var timing = Timing{};
+    if (fail_on_encode == 0) {
+        try std.testing.expectError(error.InferenceOutputTokensExceeded, task.decodePipelined(&decoder, &tokens, &length, &generated, &suppressed, .{ .timestamp_begin = 4, .eot = 3, .no_timestamps = 4 }, false, &logprob, &timing));
+        try std.testing.expect(!probe.active and !probe.submitted);
+        return;
+    }
+    if (expected) |reason| {
+        const actual = try task.decodePipelined(&decoder, &tokens, &length, &generated, &suppressed, .{ .timestamp_begin = 4, .eot = 3, .no_timestamps = 4 }, false, &logprob, &timing);
+        try std.testing.expectEqual(reason, actual);
+        try std.testing.expect(!probe.active and !probe.submitted);
+        if (reason == .eos) {
+            try std.testing.expectEqual(@as(usize, 0), generated.items.len);
+            try std.testing.expectEqual(@as(usize, 2), length);
+        } else {
+            try std.testing.expectEqual(@as(usize, 2), generated.items.len);
+            try std.testing.expectEqual(@as(usize, 4), length);
+        }
+        return;
+    }
     try std.testing.expectError(error.UnsupportedOperation, task.decodePipelined(&decoder, &tokens, &length, &generated, &suppressed, .{ .timestamp_begin = 4, .eot = 3, .no_timestamps = 4 }, false, &logprob, &timing));
     try std.testing.expectEqual(fail_on_encode, probe.encodes);
     try std.testing.expect(!probe.active and !probe.submitted);
@@ -989,8 +1054,39 @@ fn checkTranscriptionPendingFault(fail_on_encode: usize) !void {
 }
 
 test "transcription initial pipeline error cannot decline after actual decoder projection" {
-    try checkTranscriptionPendingFault(1);
+    try checkTranscriptionPendingFault(1, 1, null, null);
 }
 test "transcription lookahead error cannot publish after actual decoder projection" {
-    try checkTranscriptionPendingFault(2);
+    try checkTranscriptionPendingFault(2, 1, null, null);
+}
+
+test "transcription selected fallback cannot inherit previous attempt EOS termination" {
+    const a = std.testing.allocator;
+    const Make = struct {
+        fn attempt(allocator: std.mem.Allocator, termination: Termination) !TranscriptionPipeline.Attempt {
+            var generated = std.ArrayListUnmanaged(i32).empty;
+            try generated.append(allocator, 1);
+            return .{ .generated = generated, .detected_language = null, .no_speech_prob = 0, .avg_logprob = 0, .compression_ratio = 0, .temperature = 0, .termination = termination };
+        }
+    };
+    var chosen: ?TranscriptionPipeline.Attempt = null;
+    defer if (chosen) |*attempt| attempt.deinit(a);
+    TranscriptionPipeline.replaceChosenAttempt(a, &chosen, try Make.attempt(a, .eos));
+    try std.testing.expect(chosen.?.termination == .eos);
+    TranscriptionPipeline.replaceChosenAttempt(a, &chosen, try Make.attempt(a, .context_limit));
+    try std.testing.expect(chosen.?.termination == .context_limit);
+    TranscriptionPipeline.replaceChosenAttempt(a, &chosen, try Make.attempt(a, .unknown));
+    try std.testing.expect(chosen.?.termination == .unknown);
+    const other_path = TranscribeResult{ .text = "", .language = null, .allocator = a };
+    try std.testing.expect(other_path.termination == .unknown and other_path.selected_attempt_termination == .unknown);
+}
+
+test "transcription actual pipelined EOT and context limit have distinct termination evidence" {
+    try checkTranscriptionPendingFault(std.math.maxInt(usize), 3, .eos, null);
+    try checkTranscriptionPendingFault(std.math.maxInt(usize), 1, .context_limit, null);
+}
+
+test "transcription actual last output budget slot can be EOS while exhaustion remains explicit error" {
+    try checkTranscriptionPendingFault(std.math.maxInt(usize), 3, .eos, 1);
+    try checkTranscriptionPendingFault(0, 1, null, 1);
 }

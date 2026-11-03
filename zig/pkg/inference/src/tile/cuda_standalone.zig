@@ -133,4 +133,7 @@ pub const encoder_decoder_f16_entries = .{
 };
 pub const encoder_decoder_f16 = nativeProfile("encoder_decoder_f16", "florence_fused.ptx", "vision_f16_programs.cu", 80, encoder_decoder_f16_entries, &.{});
 
-pub const profiles = [_]Profile{ attention, encoder } ++ gelu ++ residual ++ top1 ++ [_]Profile{ activation_bf16, paged_attention_bf16, gated_delta, vision_projection_bf16, encoder_decoder_f16 };
+// Legacy exported names adapt the existing shared RowReduce source ABI.
+pub const row_selection_stats_f32_entries = .{ .partials = "antfly_tile_whisper_logits_partials", .combine = "antfly_tile_whisper_logits_partials_combine" };
+pub const row_selection_stats_f32 = nativeProfile("row_selection_stats_f32", "row_selection_stats_f32.ptx", "../generated/tile_whisper_logits.cu", 75, row_selection_stats_f32_entries, &.{ "--fmad=false", "-std=c++17" });
+pub const profiles = [_]Profile{ attention, encoder } ++ gelu ++ residual ++ top1 ++ [_]Profile{ activation_bf16, paged_attention_bf16, gated_delta, vision_projection_bf16, encoder_decoder_f16, row_selection_stats_f32 };

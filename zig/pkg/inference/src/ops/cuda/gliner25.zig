@@ -200,18 +200,12 @@ fn view(self: *Compute, ct: CT, shape: []const i32, limits: resident.Limits) !CT
     const dims = try self.allocator.alloc(i64, shape.len);
     errdefer self.allocator.free(dims);
     for (shape, 0..) |d, i| dims[i] = d;
-    const result = try self.allocator.create(Tensor);
-    result.* = source.*;
-    result.shape = dims;
-    result.owns_shape = true;
-    result.owns_buffer = false;
-    result.owns_tc_quant = false;
-    result.owns_bf16_mirror = false;
-    result.owns_training_upload_host = false;
-    result.owns_resident_indices = false;
-    result.resident_parent = source;
-    result.resident_references = 1;
-    source.resident_references += 1;
+    const result = try api.makeRetainedTensorView(self, source, source.buffer, dims, source.elem_count);
+    const retained = tensor(result);
+    retained.resident_owner = self;
+    retained.strict_resident_training = source.strict_resident_training;
+    retained.resident_indices = source.resident_indices;
+    retained.owns_resident_indices = false;
     return result;
 }
 
@@ -1015,7 +1009,7 @@ test "CUDA boundary retained views keep physical integer metadata alive after so
     };
     const retained = try view(&self, source, &.{ 1, 2 }, .{});
     defer api.freeTensor(&self, retained);
-    try std.testing.expectEqual(@as(usize, 2), source.resident_references);
+    try std.testing.expectEqual(@as(usize, 2), source.resident_references.load(.monotonic));
     api.freeTensor(&self, source);
     try std.testing.expectEqualSlices(i32, &.{ 16_777_216, 16_777_217 }, tensor(retained).resident_indices.?);
     // Reject before touching CUDA: the original upload's allowance does not

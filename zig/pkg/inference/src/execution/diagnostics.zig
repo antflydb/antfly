@@ -22,7 +22,7 @@ const ops = @import("../ops/ops.zig");
 pub const ExecutionStats = @import("stats.zig").ExecutionStats;
 pub const Specializations = @import("specialization_cache.zig").Stats;
 const observation = @import("runtime_observation.zig");
-pub const Start = struct { runtime: ops.RuntimeTelemetry, scope: observation.Scope };
+pub const Start = struct { runtime: ops.RuntimeTelemetry, scope: observation.Scope, device_owners: ?*const @import("device_owner_registry.zig").Registry = null };
 pub const Text = struct {
     bytes: [128]u8 = @splat(0),
     len: u8 = 0,
@@ -41,7 +41,47 @@ pub const Text = struct {
     }
 };
 
+pub const Operation = enum { forward, encoder, decoder_init, prefill, decode_step };
+
+pub const ContextRuntimeScope = enum { unavailable, program_backend_context, model_stable_backend_context, borrowed_execution_backend_context, shared_backend_context_interval };
+
+/// All fields are owned by value. IDs are process-local numerical operation
+/// identities, not completion claims or pointers to live request resources.
+pub const Batch = struct {
+    pub const Kind = enum { scheduled_step, positioned_prefill };
+    pub const Participant = struct {
+        request_id: ?u64 = null,
+        phase: enum { unknown, prefill, decode } = .unknown,
+        query_rows: usize = 0,
+        total_rows: usize = 0,
+    };
+    identity: u64,
+    kind: Kind,
+    participant_count: usize,
+    participants: [32]Participant = @splat(.{}),
+    stored_count: u8 = 0,
+    truncated: bool = false,
+};
+/// A synchronous phase in a longer pending resource lifetime. A successful
+/// submission is not GPU completion. Await labels describe only the actual
+/// readback/driver-await return; completed kernel totals remain unavailable.
+pub const PendingInterval = struct {
+    pub const Phase = enum { acquire, submit, encode_next, await_readback, cancel, drain };
+    pub const Completion = enum { unavailable, readback_returned, driver_await_returned };
+    identity: u64,
+    request_id: ?u64 = null,
+    sequence: u64,
+    phase: Phase,
+    completion: Completion = .unavailable,
+    /// Earlier physical failure remains visible through later cleanup phases.
+    prior_failure: ?Text = null,
+    counters_scope: enum { synchronous_phase_only } = .synchronous_phase_only,
+    whole_interval_counters: enum { unavailable } = .unavailable,
+};
+pub const PublicationScope = enum { program_execution, session_numerical_dispatch, shared_batch_numerical_dispatch };
+
 pub const Snapshot = struct {
+    report: ?@import("invocation_report.zig").Report = null,
     specializations: ?Specializations = null,
     /// Legacy architecture execution has no program plan/counters.
     execution: ?ExecutionStats = null,
@@ -51,8 +91,11 @@ pub const Snapshot = struct {
     /// Context counters/gauges remain the sampled backend's observations,
     /// even when the outer submitting-thread scope spans several providers.
     context_backend: ?ops.BackendKind = null,
-    context_runtime_scope: enum { unavailable, program_backend_context, model_stable_backend_context } = .unavailable,
-    scope: enum { program_execution, session_numerical_dispatch } = .program_execution,
+    context_runtime_scope: ContextRuntimeScope = .unavailable,
+    operation: Operation = .forward,
+    scope: PublicationScope = .program_execution,
+    batch: ?Batch = null,
+    pending_interval: ?PendingInterval = null,
     outcome: enum { success, failed, unsupported } = .success,
     error_name: ?Text = null,
     /// Owned error text from the last program snapshot. The corresponding
@@ -64,6 +107,7 @@ pub const Snapshot = struct {
             result.program_error = Text.init(message);
             program.physical_replay_error = null;
         };
+        result.report = @import("invocation_report.zig").Report.init(result);
         return result;
     }
 };
@@ -99,7 +143,10 @@ pub const Capture = struct {
     fn specializationsPublished(diagnostics: *const Diagnostics, stats: Specializations) void {
         var current = active_capture;
         while (current) |capture| : (current = capture.previous) if (capture.last_program_owner == @intFromPtr(diagnostics)) {
-            if (capture.latest) |*value| value.specializations = stats;
+            if (capture.latest) |*value| {
+                value.specializations = stats;
+                value.* = value.owned();
+            }
         };
     }
     pub fn finish(self: *Capture) ?Snapshot {
@@ -126,11 +173,27 @@ pub const ProgramMetadata = union(enum) {
     }
 };
 
+fn observedRuntime(after: ops.RuntimeTelemetry, before: ?Start) ops.RuntimeTelemetry {
+    var runtime = if (before) |start| after.since(start.runtime) else ops.RuntimeTelemetry{};
+    if (before) |start| {
+        runtime.submission = start.scope.snapshot();
+        if (start.device_owners) |owners| runtime.device_owners = owners.snapshot();
+    }
+    return runtime;
+}
+
 pub const Diagnostics = struct {
     enabled: std.atomic.Value(bool) = .init(false),
+    export_owner: u64 = 0,
     mutex: std.atomic.Mutex = .unlocked,
     last: ?Snapshot = null,
 
+    /// Cold policy installation before publication. This method performs no IO.
+    pub fn configureExport(self: *Diagnostics) void {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.export_owner == 0) self.export_owner = @import("diagnostic_export.zig").ownerIdentity();
+    }
     pub fn configure(self: *Diagnostics, enabled: bool) void {
         const previous = self.enabled.swap(enabled, .acq_rel);
         if (previous and !enabled) {
@@ -138,6 +201,12 @@ pub const Diagnostics = struct {
             defer self.mutex.unlock();
             self.last = null;
         }
+    }
+    /// Owner configuration occurs at a quiescent cold boundary. Configuring
+    /// raw statistics alone intentionally never mutates a numerical provider.
+    pub fn configureBackend(self: *Diagnostics, enabled: bool, backend: *const ops.ComputeBackend) void {
+        if (enabled) backend.enableRuntimeObservation();
+        self.configure(enabled);
     }
     pub fn isEnabled(self: *const Diagnostics) bool {
         return self.enabled.load(.acquire) or Capture.programObservationEnabled();
@@ -152,7 +221,10 @@ pub const Diagnostics = struct {
         Capture.published(self, owned);
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
-        if (self.enabled.load(.acquire)) self.last = owned;
+        if (self.enabled.load(.acquire)) {
+            self.last = owned;
+            if (self.export_owner != 0) @import("diagnostic_export.zig").enqueue(self.export_owner, owned);
+        }
     }
     /// Only real executable events opt into an enclosing model's program
     /// observation. Arbitrary unrelated-owner publish calls stay excluded.
@@ -185,11 +257,17 @@ pub const Diagnostics = struct {
         defer self.mutex.unlock();
         if (self.enabled.load(.acquire)) if (self.last) |*last| {
             last.specializations = stats;
+            last.* = last.owned();
         };
     }
     pub fn begin(self: *const Diagnostics, backend: *const ops.ComputeBackend) ?Start {
         if (!self.isEnabled()) return null;
-        backend.enableRuntimeObservation();
+        return self.beginEnabled(backend);
+    }
+    /// The caller checked enabled at a quiescent owner boundary. Returned state
+    /// contains no address-registered owner; it may move before being borrowed.
+    pub fn beginEnabled(_: *const Diagnostics, backend: *const ops.ComputeBackend) Start {
+        backend.registerRuntimeObservation();
         return .{ .scope = observation.Scope.init(), .runtime = backend.debugTimingSnapshot().runtime };
     }
     /// Every caller defers this immediately after begin, including error exits.
@@ -199,11 +277,15 @@ pub const Diagnostics = struct {
             scope.deinit();
         }
     }
+    pub fn recordFailure(self: *Diagnostics, backend: *const ops.ComputeBackend, before: ?Start, failure: anyerror) void {
+        if (!self.isEnabled()) return;
+        const after = backend.debugTimingSnapshot();
+        self.publishProgram(.{ .outcome = .failed, .error_name = Text.init(@errorName(failure)), .context_backend = backend.kind(), .context_runtime_scope = .program_backend_context, .provider = if (after.native_quant_null) null else after.provider, .runtime = observedRuntime(after.runtime, before) });
+    }
     pub fn record(self: *Diagnostics, stats: ExecutionStats, backend: *const ops.ComputeBackend, before: ?Start) void {
         if (!self.isEnabled()) return;
         const after = backend.debugTimingSnapshot();
-        var runtime = if (before) |start| after.runtime.since(start.runtime) else ops.RuntimeTelemetry{};
-        if (before) |start| runtime.submission = start.scope.snapshot();
+        const runtime = observedRuntime(after.runtime, before);
         self.publishProgram(.{ .execution = stats, .execution_scope = .program_execution, .context_backend = backend.kind(), .context_runtime_scope = .program_backend_context, .provider = if (after.native_quant_null) null else after.provider, .runtime = runtime });
     }
 };
@@ -226,7 +308,7 @@ test "native execution observations include nested work and unwind every failed 
     defer program.deinit();
     var executable = try executables.prepare(a, &program, &backend, .compiled_preferred);
     defer executable.deinit();
-    executable.diagnostics.configure(true);
+    executable.configureExecutionDiagnostics(true);
     const value = try backend.fromFloat32Shape(&.{ -1, 2, -3, 4 }, &.{4});
     defer backend.free(value);
     const inputs = [_]@import("../graph/interpreter.zig").RuntimeInput{.{ .node_id = program.id_map[input], .value = value }};
@@ -256,7 +338,7 @@ test "native execution observations include nested work and unwind every failed 
     try std.testing.checkAllAllocationFailures(a, Case.run, .{ &executable, @as([]const @import("../graph/interpreter.zig").RuntimeInput, &inputs) });
     // Child failures must not turn off the still-live outer scope.
     const before = outer.snapshot().native_assigned_dispatches;
-    executable.diagnostics.configure(false);
+    executable.configureExecutionDiagnostics(false);
     var result = try executable.run(a, .{ .runtime_inputs = &inputs });
     defer result.deinit(&executable.runtime);
     try std.testing.expectEqual(before + 1, outer.snapshot().native_assigned_dispatches);

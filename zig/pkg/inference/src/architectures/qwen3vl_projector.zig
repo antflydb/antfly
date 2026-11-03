@@ -3267,10 +3267,15 @@ test "LightOnOCR3 CUDA vision block activation follows checkpoint tanh GELU inde
     try Oracle.check(&cb, cfg);
     if (comptime build_options.enable_cuda) {
         const CudaCompute = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
-        var cuda = try CudaCompute.init(a);
-        defer cuda.deinit();
-        const cuda_cb = cuda.computeBackend();
-        try Oracle.check(&cuda_cb, cfg);
+        optional_cuda: {
+            var cuda = CudaCompute.testing.init(a) catch |err| switch (err) {
+                error.SkipZigTest => break :optional_cuda,
+                else => return err,
+            };
+            defer cuda.deinit();
+            const cuda_cb = cuda.computeBackend();
+            try Oracle.check(&cuda_cb, cfg);
+        }
     }
     cfg.block_gelu_tanh = false;
     const input = try cb.fromFloat32(&.{2.5});

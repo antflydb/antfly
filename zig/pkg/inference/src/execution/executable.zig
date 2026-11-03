@@ -32,25 +32,59 @@ pub const Executable = struct {
     runtime: runtime_module.Runtime,
 
     pub fn run(self: *Executable, allocator: std.mem.Allocator, options: interpreter.ExecuteOptions) !runtime_module.Result {
-        const before = self.diagnostics.begin(self.runtime.default_backend);
-        defer @import("diagnostics.zig").Diagnostics.end(before);
-        var prepared_options = options;
+        var result: runtime_module.Result = undefined;
+        try self.runInto(allocator, &options, &result);
+        return result;
+    }
+
+    /// Borrow invocation options synchronously and write a fresh caller-owned
+    /// result directly. The value API remains available to existing callers.
+    pub fn runInto(self: *Executable, allocator: std.mem.Allocator, options: *const interpreter.ExecuteOptions, result: *runtime_module.Result) !void {
+        var device_owners: @import("device_owner_registry.zig").Registry = undefined;
+        const observing = self.diagnostics.isEnabled();
+        if (observing) device_owners.begin(@import("allocation_registry.zig").metadataAllocator());
+        defer if (observing) {
+            _ = device_owners.end();
+        };
+        var before: ?@import("diagnostics.zig").Start = if (observing) self.diagnostics.beginEnabled(self.runtime.default_backend) else null;
+        if (before) |*start| start.device_owners = &device_owners;
+        if (observing) if (options.runtime_inputs) |inputs| for (inputs) |input| {
+            (input.source_backend orelse self.runtime.default_backend).registerTensorOwnershipObservation(input.value);
+        };
+        defer if (observing) @import("diagnostics.zig").Diagnostics.end(before);
+        var prepared_options = options.*;
         prepared_options.cached_analysis = self.analysis;
         prepared_options.mutable_parameters = self.mutable_parameters;
         if (self.runtime.default_backend.kind() == .metal) prepared_options.planned_device_execution = true;
         if (self.diagnostics.isEnabled()) prepared_options.collect_partition_stats = true;
-        const result = try self.runtime.execute(allocator, self.graph, prepared_options);
-        self.diagnostics.record(result.stats, self.runtime.default_backend, before);
-        return result;
+        if (comptime @import("build_options").enable_wasm) {
+            result.* = self.runtime.execute(allocator, self.graph, prepared_options) catch |err| {
+                if (observing) self.diagnostics.recordFailure(self.runtime.default_backend, before, err);
+                return err;
+            };
+        } else self.runtime.executeInto(allocator, self.graph, &prepared_options, result) catch |err| {
+            if (observing) self.diagnostics.recordFailure(self.runtime.default_backend, before, err);
+            return err;
+        };
+        if (observing) self.diagnostics.record(result.stats, self.runtime.default_backend, before);
     }
 
+    /// Cold mutable provider configuration; direct executable users quiesce
+    /// concurrent backend users before enabling, including metadata readers.
+    pub fn configureExecutionDiagnostics(self: *Executable, enabled: bool) void {
+        self.diagnostics.configureBackend(enabled, self.runtime.default_backend);
+    }
     pub fn deinit(self: *Executable) void {
-        self.runtime.deinit();
+        self.deinitWithCleanup(.{});
+    }
+    pub fn deinitWithCleanup(self: *Executable, cleanup: @import("cleanup_context.zig").Context) void {
+        self.runtime.deinitWithCleanup(cleanup);
     }
 };
 
 pub const PrepareOptions = struct {
     physical_replay: bool = true,
+    immutable_input_bindings: ?[]const @import("kernel_route.zig").InputBinding = null,
     input_bindings: ?[]const interpreter.RuntimeInput = null,
     tensor_descs: ?[]const ?@import("../graph/backend_contracts.zig").TensorDesc = null,
     region_costs: ?@import("placement.zig").RegionCosts = .{},
@@ -97,10 +131,14 @@ pub fn prepareAnalyzedGraph(allocator: std.mem.Allocator, graph: *const @import(
             tensor_descs = seeds;
         }
     }
-    return .{ .graph = graph, .analysis = analysis, .runtime = if (comptime @import("build_options").enable_wasm)
+    var result: Executable = .{ .graph = graph, .analysis = analysis, .runtime = if (comptime @import("build_options").enable_wasm)
         try runtime_module.Runtime.init(allocator, graph, backend, strategy)
     else
         try runtime_module.Runtime.initWithOptions(allocator, graph, backend, strategy, .{ .tensor_descs = tensor_descs, .analysis = analysis, .region_costs = options.region_costs }) };
+    errdefer result.deinit();
+    configureOwnedCoverage(&result, graph, analysis);
+    if (comptime !@import("build_options").enable_wasm) if (result.runtime.physical_pool) |pool| try pool.configureRoutes(options.immutable_input_bindings orelse &.{});
+    return result;
 }
 
 test "prepared executable reuses CPU Metal and CUDA plans with resident outputs" {
@@ -131,7 +169,7 @@ test "prepared executable reuses CPU Metal and CUDA plans with resident outputs"
         var executable = try prepare(a, &program, &cb, .compiled_preferred);
         defer executable.deinit();
         try std.testing.expect(executable.diagnostics.snapshot() == null);
-        executable.diagnostics.configure(true);
+        executable.configureExecutionDiagnostics(true);
         var tensor = try @import("../backends/tensor.zig").Tensor.initFloat32(a, "x", &.{ 1, 8 }, &.{ -4, -3, -2, -1, 0, 1, 2, 3 });
         defer tensor.deinit();
         const input = try context.importHostTensor(a, &tensor);
@@ -310,7 +348,10 @@ fn testPhysicalFrameLifetime(comptime backend_kind: @import("../backends/backend
     const ml = @import("ml");
     const ResidentOutputs = @import("../backends/session.zig").ResidentOutputs;
     const a = std.testing.allocator;
-    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, backend_kind, null);
+    var context = @import("../backends/compute_context.zig").BackendContext.init(a, backend_kind, null) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => if (backend_kind == .cuda) return error.SkipZigTest else return err,
+        else => return err,
+    };
     defer context.deinit(a);
     const cb = context.computeBackend();
     var graph = ml.graph.Graph.init(a);
@@ -407,6 +448,7 @@ test "prepared physical workspace is declared once reused and owned by its frame
     var functions = vtable.kernels.?.*;
     functions.assignedKernelWorkspace = ScratchKernel.requirement;
     functions.runAssignedKernel = ScratchKernel.run;
+    functions.implementation_table = &vtable; // Explicit fixture physical-program opt-in.
     vtable.kernels = &functions;
     cb.vtable = &vtable;
     var graph = ml.graph.Graph.init(a);
@@ -517,6 +559,7 @@ test "prepared physical transfer protocol binds download and upload storage with
     table.backendKind = Probe.kind;
     var functions = table.kernels.?.*;
     functions.writePhysicalFloat32 = Probe.upload;
+    functions.implementation_table = &table; // Explicit fixture physical-program opt-in.
     table.kernels = &functions;
     var cb = context.computeBackend();
     cb.vtable = &table;
@@ -646,6 +689,7 @@ test "prepared auxiliary planes reuse primary lifetimes and survive frame retire
     var functions = vtable.kernels.?.*;
     functions.assignedKernelAuxiliaries = SavedKernel.requirement;
     functions.runAssignedKernel = SavedKernel.run;
+    functions.implementation_table = &vtable; // Explicit fixture physical-program opt-in.
     vtable.kernels = &functions;
     cb.vtable = &vtable;
     var graph = ml.graph.Graph.init(a);
@@ -999,6 +1043,7 @@ test "prepared physical CUDA capture failure falls back before submission and re
     Failure.original_factory = functions.createPhysicalReplay;
     functions.createPhysicalReplay = Failure.create;
     var failure_vtable = original.vtable.*;
+    functions.implementation_table = &failure_vtable; // Explicit fixture physical-program opt-in.
     failure_vtable.kernels = &functions;
     var failing_backend = original;
     failing_backend.vtable = &failure_vtable;
@@ -1710,7 +1755,7 @@ test "prepared physical warm claims lend exact bank quota without a release or c
     pool.max_frames = 1;
     var held: ?ops.CT = null;
     defer if (held) |value| cb.free(value);
-    const cap = admission.Capability{ .identity = .{ .controller = &owner.controller, .backend_class = .cpu }, .context = &owner, .reserve_fn = Owner.reserve };
+    const cap = admission.Capability{ .identity = .{ .controller = &owner.controller, .backend_class = .cpu }, .context = &owner, .services = &.{ .reserve = Owner.reserve } };
     for (0..3) |iteration| {
         order.admitted = false;
         var claim = try pool.claimWarm(cap.identity);
@@ -1842,6 +1887,7 @@ test "prepared physical warm capacity excludes measured allocator padding" {
     var kernels = original_backend.vtable.kernels.?.*;
     kernels.physicalStorageReservationBytes = Padded.bound;
     var table = original_backend.vtable.*;
+    kernels.implementation_table = &table; // Explicit fixture physical-program opt-in.
     table.kernels = &kernels;
     const cb = ops.ComputeBackend{ .ptr = original_backend.ptr, .vtable = &table };
 
@@ -1860,7 +1906,7 @@ test "prepared physical warm capacity excludes measured allocator padding" {
     try std.testing.expectEqual(@as(usize, 192), (try pool.storageRequirement()).host_scratch_bytes);
     var held: ?ops.CT = null;
     defer if (held) |value| cb.free(value);
-    const cap = admission.Capability{ .identity = .{ .controller = &owner.controller, .backend_class = .cpu }, .context = &owner, .reserve_fn = Owner.reserve };
+    const cap = admission.Capability{ .identity = .{ .controller = &owner.controller, .backend_class = .cpu }, .context = &owner, .services = &.{ .reserve = Owner.reserve } };
     for (0..3) |iteration| {
         order.admitted = false;
         var claim = try pool.claimWarm(cap.identity);
@@ -1934,4 +1980,1461 @@ test "prepared physical warm capacity excludes measured allocator padding" {
     held = null;
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, owner.controller.snapshot());
     try std.testing.expectEqual(@as(usize, 1), owner.refs);
+}
+
+test "prepared immutable literal banks reuse once and publish independent held outputs" {
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const constant = try builder.tensorConst(&.{ 1, -2, 3, -4 }, ml.graph.Shape.init(.f32, &.{ 2, 2 }));
+    const input = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{ 2, 2 }));
+    try graph.markOutput(constant);
+    try graph.markOutput(try builder.neg(input));
+    var program = try ModelProgram.init(a, &graph, &.{.{ .name = "x", .node_id = input, .kind = .input }});
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .compiled_preferred);
+    var owned = true;
+    defer if (owned) executable.deinit();
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    pool.max_frames = 2;
+    const ledger = pool.accounting.?;
+    ledger.retain();
+    defer ledger.release();
+    var held: ?ops.CT = null;
+    defer if (held) |value| cb.free(value);
+    const input_value = try cb.fromFloat32Shape(&.{ 8, 7, 6, 5 }, &.{ 2, 2 });
+    defer cb.free(input_value);
+    for (0..5) |iteration| {
+        var bindings = [_]interpreter.RuntimeInput{.{ .node_id = input, .value = input_value, .source_backend = &cb }};
+        var result = try executable.run(a, .{ .runtime_inputs = try program.remapInputs(&bindings), .output_placement = .producer });
+        defer result.deinit(&executable.runtime);
+        const output = try cb.toFloat32(result.outputs[0], a);
+        defer a.free(output);
+        try std.testing.expectEqualSlices(f32, &.{ 1, -2, 3, -4 }, output);
+        try std.testing.expectEqual(@as(u64, 1), result.stats.graph_output_owned_copies);
+        if (iteration > 1) try std.testing.expectEqual(@as(u64, 0), result.stats.physical_storage_allocations);
+        if (iteration == 0) {
+            held = try cb.primReshape(result.outputs[0], &.{ 1, 4 });
+            // A public result is independently writable. This must never alter
+            // the immutable literal that later invocations will borrow.
+            try cb.vtable.kernels.?.copyPhysicalInput.?(cb.ptr, result.outputs[0], input_value);
+        }
+    }
+    const changed = try cb.toFloat32(held.?, a);
+    defer a.free(changed);
+    try std.testing.expectEqualSlices(f32, &.{ 8, 7, 6, 5 }, changed);
+    executable.deinit();
+    owned = false;
+    try std.testing.expectEqual(@as(u64, 0), ledger.snapshot().constant.requested_live_bytes);
+    try std.testing.expectEqual(@as(u64, 16), ledger.snapshot().activation.requested_live_bytes);
+    cb.free(held.?);
+    held = null;
+    try std.testing.expectEqual(@as(u64, 0), ledger.snapshot().activation.requested_live_bytes);
+}
+
+test "prepared immutable literal construction and independent publication unwind every allocation failure" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const ml = @import("ml");
+            var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+            defer context.deinit(a);
+            const cb = context.computeBackend();
+            var graph = ml.graph.Graph.init(a);
+            defer graph.deinit();
+            var b = ml.graph.Builder.init(&graph);
+            const literal = try b.tensorConst(&.{ 1, 2, 3, 4 }, ml.graph.Shape.init(.f32, &.{ 2, 2 }));
+            try graph.markOutput(literal);
+            var program = try ModelProgram.init(a, &graph, &.{});
+            defer program.deinit();
+            var executable = try prepare(a, &program, &cb, .compiled_preferred);
+            defer executable.deinit();
+            var result = try executable.run(a, .{ .output_placement = .producer });
+            defer result.deinit(&executable.runtime);
+            const values = try cb.toFloat32(result.outputs[0], a);
+            defer a.free(values);
+            try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, values);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "prepared immutable literal selections lend only their own pinned bank credit" {
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const memory = @import("../runtime/tier/memory.zig");
+    const admission = @import("storage_admission.zig");
+    const Owner = struct {
+        controller: memory.AdmissionController = .{},
+        lease: memory.AdmissionLease = undefined,
+        fn reserve(raw: *anyopaque, allocator: std.mem.Allocator, kind: @import("../graph/backend_contracts.zig").BackendKind, class: @import("storage_accounting.zig").Class, bytes: usize) !admission.Reservation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return admission.fromRunLease(allocator, &self.lease, .{ .controller = &self.controller, .backend_class = .cpu, .limits = .{}, .check_live_memory = false }, kind, class, bytes);
+        }
+    };
+    var owner = Owner{};
+    defer owner.controller.deinit();
+    owner.lease = try owner.controller.tryAcquire(.cpu, .{}, .{}, false);
+    defer owner.lease.release();
+    const cap = admission.Capability{ .context = &owner, .identity = .{ .controller = &owner.controller, .backend_class = .cpu }, .services = &.{ .reserve = Owner.reserve } };
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    try graph.markOutput(try b.tensorConst(&.{ 1, 2, 3, 4 }, ml.graph.Shape.init(.f32, &.{ 2, 2 })));
+    try graph.markOutput(try b.tensorConst(&.{ 5, 6, 7, 8, 9, 10, 11, 12 }, ml.graph.Shape.init(.f32, &.{ 2, 4 })));
+    var program = try ModelProgram.init(a, &graph, &.{});
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .compiled_preferred);
+    var executable_owned = true;
+    defer if (executable_owned) executable.deinit();
+    const store = executable.runtime.physical_pool.?.literal_store.?;
+    try std.testing.expectEqual(@as(usize, 2), store.literals.len);
+    for (store.literals, 0..) |_, index| _ = try store.value(index, cap, null);
+    const Selection = @import("immutable_literals.zig").SharedLiteralStore.LiteralSelection;
+    var mask = [_]bool{ true, false };
+    const first = try Selection.create(a, store, &mask);
+    defer first.release();
+    mask = .{ false, true }; // Reusing the caller slice cannot alter first's mask.
+    const second = try Selection.create(a, store, &mask);
+    defer second.release();
+    var first_claim = try store.claimImmutableFor(cap.identity, first);
+    defer first_claim.release();
+    var second_claim = try store.claimImmutableFor(cap.identity, second);
+    defer second_claim.release();
+    try std.testing.expectEqual(store.literals[0].data.len * 4, first_claim.totals.credit.host_scratch_bytes);
+    try std.testing.expectEqual(store.literals[1].data.len * 4, second_claim.totals.credit.host_scratch_bytes);
+    var all_claim = try store.claimImmutable(cap.identity);
+    defer all_claim.release();
+    try std.testing.expectEqual(@as(usize, 48), all_claim.totals.credit.host_scratch_bytes);
+    executable.deinit();
+    executable_owned = false;
+    // Selection and claims own their bank independently of the evicted pool.
+    try first_claim.validate(store, cap);
+    try second_claim.validate(store, cap);
+    try std.testing.expectEqual(@as(usize, 48), owner.controller.snapshot().host_scratch_bytes);
+}
+
+fn exercisePreparedRouteEviction(allocator: std.mem.Allocator) !void {
+    const ml = @import("ml");
+    const route = @import("kernel_route.zig");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    var graph = ml.graph.Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const shape = ml.graph.Shape.init(.f32, &.{ 1, 4 });
+    const input_node = try builder.parameter("x", shape);
+    const output_node = try builder.relu(input_node);
+    try graph.markOutput(output_node);
+    var program = try ModelProgram.init(allocator, &graph, &.{ .{ .name = "x", .node_id = input_node, .kind = .input }, .{ .name = "out", .node_id = output_node, .kind = .output } });
+    defer program.deinit();
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(allocator, .native, null);
+    defer context.deinit(allocator);
+    const backend = context.computeBackend();
+    var executable = try prepareWithOptions(allocator, &program, &backend, .compiled_preferred, .{ .physical_replay = false });
+    defer executable.deinit();
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    pool.variant_cache.?.limit = 1;
+    const node = program.id_map[input_node];
+    const facts = [_]route.InputBinding{.{ .node_id = node, .value = .{ .imported_host = .{ .logical = shape, .target = .native } } }};
+    const selected = (try pool.prepareRoutes(&facts)) orelse return error.MissingPreparedRoutes;
+    var selected_owned = true;
+    defer if (selected_owned) selected.release();
+    const again = (try pool.prepareRoutes(&facts)) orelse return error.MissingPreparedRoutes;
+    try std.testing.expect(selected == again);
+    again.release();
+    try selected.validate(&facts);
+    try std.testing.expect(selected.pool.preparedKernelRoute(program.graph.outputs.items[0]) != null);
+    var tensor = try Tensor.initFloat32(allocator, "x", &.{ 1, 4 }, &.{ -2, -1, 1, 2 });
+    defer tensor.deinit();
+    const input = try context.importHostTensor(allocator, &tensor);
+    defer backend.free(input);
+    const values = [_]interpreter.RuntimeInput{.{ .node_id = node, .value = input, .source_backend = &backend }};
+    var result = try executable.run(allocator, .{ .runtime_inputs = &values, .prepared_routes = selected, .output_placement = .producer, .activation_readbacks = .forbidden });
+    defer result.deinit(&executable.runtime);
+    try std.testing.expect(result.stats.assigned_kernel_dispatches > 0);
+    selected_owned = false;
+    selected.release();
+    // Eviction retires the entire old variant/frame while this published
+    // output retains only its physical Lease and stable slot authority.
+    const unknown = [_]route.InputBinding{.{ .node_id = node, .value = .unknown }};
+    const second = (try pool.prepareRoutes(&unknown)) orelse return error.MissingPreparedRoutes;
+    defer second.release();
+    try std.testing.expectEqual(@as(u64, 1), pool.variant_cache.?.snapshot().evictions);
+    const actual = try result.backendFor(&executable.runtime, 0).toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 1, 2 }, actual);
+}
+
+test "prepared exact Native routes intern metadata and published outputs survive variant eviction" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    try exercisePreparedRouteEviction(std.testing.allocator);
+}
+
+test "prepared exact Native route owners unwind every metadata allocation failure" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exercisePreparedRouteEviction, .{});
+}
+
+test "prepared model parameter bindings cannot be overridden as runtime inputs" {
+    const ml = @import("ml");
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const route = @import("kernel_route.zig");
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const shape = ml.graph.Shape.init(.f32, &.{ 1, 4 });
+    const x = try builder.parameter("x", shape);
+    const weight = try builder.parameter("weight", shape);
+    const output = try builder.add(x, weight);
+    try graph.markOutput(output);
+    var program = try ModelProgram.init(a, &graph, &.{
+        .{ .name = "x", .node_id = x, .kind = .input },
+        .{ .name = "weight", .node_id = weight, .kind = .weight },
+        .{ .name = "output", .node_id = output, .kind = .output },
+    });
+    defer program.deinit();
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    const bound = try backend.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 4 });
+    defer backend.free(bound);
+    const replacement = try backend.fromFloat32Shape(&.{ 10, 20, 30, 40 }, &.{ 1, 4 });
+    defer backend.free(replacement);
+    const weight_node = program.id_map[weight];
+    const x_node = program.id_map[x];
+    const immutable = [_]route.InputBinding{.{ .node_id = weight_node, .value = .{ .tensor = .{
+        .value = bound,
+        .implementation = .{ .context = backend.ptr, .table = backend.vtable },
+    } } }};
+    var executable = try prepareWithOptions(a, &program, &backend, .partitioned, .{
+        .physical_replay = false,
+        .immutable_input_bindings = &immutable,
+    });
+    defer executable.deinit();
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const facts = [_]route.InputBinding{.{ .node_id = x_node, .value = .{ .imported_host = .{ .logical = shape, .target = .native } } }};
+    const selected = (try pool.prepareRoutes(&facts)) orelse return error.MissingPreparedRoutes;
+    defer selected.release();
+    try std.testing.expectError(error.PreparedImmutableBindingChanged, selected.validateRuntimeInputs(&.{.{ .node_id = weight_node, .value = replacement }}, &backend));
+    try std.testing.expectError(error.InvalidRuntimeKernelFact, pool.prepareRoutes(&.{.{ .node_id = weight_node, .value = .{ .imported_host = .{ .logical = shape, .target = .native } } }}));
+    try selected.validateRuntimeInputs(&.{.{ .node_id = weight_node, .value = bound }}, &backend);
+    try std.testing.expectEqual(@as(usize, 0), selected.pool.frames.items.len);
+}
+
+test "prepared dense Native reshape chains preserve exact downstream routes" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input_shape = ml.graph.Shape.init(.f32, &.{ 1, 4 });
+    const output_shape = ml.graph.Shape.init(.f32, &.{ 2, 2 });
+    const input_node = try builder.parameter("x", input_shape);
+    const positive = try builder.relu(input_node);
+    const alias = try builder.reshape(positive, output_shape);
+    const output_node = try builder.neg(alias);
+    try graph.markOutput(output_node);
+    var analysis = try interpreter.CachedAnalysis.compute(a, &graph);
+    defer analysis.deinit(a);
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    var executable = try prepareAnalyzedGraph(a, &graph, analysis, &backend, .compiled_preferred, .{ .physical_replay = false });
+    defer executable.deinit();
+    const facts = [_]@import("kernel_route.zig").InputBinding{.{ .node_id = input_node, .value = .{ .imported_host = .{ .logical = input_shape, .target = .native } } }};
+    const selected = (try executable.runtime.physical_pool.?.prepareRoutes(&facts)).?;
+    defer selected.release();
+    try std.testing.expect(selected.pool.preparedKernelRoute(positive) != null);
+    try std.testing.expect(selected.pool.preparedKernelRoute(output_node) != null);
+    try std.testing.expectEqual(@as(u8, 1), selected.pool.selection.?.plane_counts[alias]);
+    try std.testing.expect(selected.pool.selection.?.planes[alias][0].descriptor.shape.eq(output_shape));
+    var tensor = try Tensor.initFloat32(a, "x", &.{ 1, 4 }, &.{ -2, -1, 1, 2 });
+    defer tensor.deinit();
+    const input = try context.importHostTensor(a, &tensor);
+    defer backend.free(input);
+    var result = try executable.run(a, .{ .runtime_inputs = &.{.{ .node_id = input_node, .value = input, .source_backend = &backend }}, .prepared_routes = selected, .output_placement = .producer, .activation_readbacks = .forbidden });
+    defer result.deinit(&executable.runtime);
+    const values = try result.backendFor(&executable.runtime, 0).toFloat32(result.outputs[0], a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, -1, -2 }, values);
+    try std.testing.expectEqual(@as(u64, 2), result.stats.assigned_kernel_dispatches);
+}
+
+fn exercisePreparedTransientFrame(a: std.mem.Allocator) !void {
+    const ml = @import("ml");
+    const memory = @import("../runtime/tier/memory.zig");
+    const admission = @import("storage_admission.zig");
+    const Owner = struct {
+        controller: memory.AdmissionController = .{},
+        current: memory.AdmissionLease = undefined,
+        credit: memory.AdmissionAmounts = .{},
+        refs: usize = 1,
+        supplementary: bool = false,
+        fn retain(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+            return true;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs -= 1;
+        }
+        fn reserve(raw: *anyopaque, allocator: std.mem.Allocator, kind: ops.BackendKind, class: @import("storage_accounting.zig").Class, bytes: usize) !admission.Reservation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const reservation = try admission.fromRunLease(allocator, &self.current, .{ .controller = &self.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 80, .combined_limit_bytes = 80 }, .check_live_memory = false, .credit = &self.credit, .lifetime = .{ .context = self, .retain = retain, .release = release } }, kind, class, bytes);
+            self.supplementary = self.supplementary or reservation.leases[1] != null;
+            return reservation;
+        }
+    };
+    var owner = Owner{};
+    defer owner.controller.deinit();
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const shape = ml.graph.Shape.init(.f32, &.{4});
+    const input_node = try builder.parameter("x", shape);
+    try graph.markOutput(try builder.neg(input_node));
+    var analysis = try interpreter.CachedAnalysis.compute(a, &graph);
+    defer analysis.deinit(a);
+    var executable = try prepareAnalyzedGraph(a, &graph, analysis, &backend, .compiled_preferred, .{ .physical_replay = false });
+    var executable_owned = true;
+    defer if (executable_owned) executable.deinit();
+    const pool = executable.runtime.physical_pool.?;
+    const facts = [_]@import("kernel_route.zig").InputBinding{.{ .node_id = input_node, .value = .{ .imported_host = .{ .logical = shape, .target = .native } } }};
+    const selected = (try pool.prepareRoutes(&facts)).?;
+    var selected_owned = true;
+    defer if (selected_owned) selected.release();
+    const cold = try selected.storageRequirement();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 16 }, cold);
+    const input = try backend.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{4});
+    defer backend.free(input);
+    var results: [5]?runtime_module.Result = @splat(null);
+    defer for (&results) |*maybe| if (maybe.*) |*result| result.deinit(&executable.runtime);
+    const capability = admission.Capability{ .identity = .{ .controller = &owner.controller, .backend_class = .cpu }, .context = &owner, .services = &.{ .reserve = Owner.reserve } };
+    for (&results, 0..) |*result, index| {
+        // Every call has full cold admission and no warm claim; the fifth
+        // request must partition this exact token, never admit a new deficit.
+        owner.current = try owner.controller.tryAcquire(.cpu, .{ .host_limit_bytes = 80, .combined_limit_bytes = 80 }, cold, false);
+        defer owner.current.release();
+        owner.credit = cold;
+        result.* = try executable.run(a, .{ .runtime_inputs = &.{.{ .node_id = input_node, .value = input, .source_backend = &backend }}, .prepared_routes = selected, .storage_admission = capability, .output_placement = .producer, .collect_partition_stats = true, .activation_readbacks = .forbidden });
+        try std.testing.expectEqual(@as(u64, 0), result.*.?.stats.physical_frame_busy_fallbacks);
+        try std.testing.expectEqual(@as(u64, 0), result.*.?.stats.physical_graph_replays);
+        try std.testing.expectEqual(@as(u64, 0), result.*.?.stats.physical_graph_captures);
+        try std.testing.expectEqual(@as(usize, @min(index + 1, 4)), selected.pool.frames.items.len);
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = (index + 1) * 16 }, owner.controller.snapshot());
+    }
+    try std.testing.expect(!owner.supplementary);
+    const actual = try results[4].?.backendFor(&executable.runtime, 0).toFloat32(results[4].?.outputs[0], a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ -1, -2, -3, -4 }, actual);
+    results[4].?.deinit(&executable.runtime);
+    results[4] = null;
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 64 }, owner.controller.snapshot());
+    for (results[0..4]) |*maybe| {
+        maybe.*.?.deinit(&executable.runtime);
+        maybe.* = null;
+    }
+    selected_owned = false;
+    selected.release();
+    executable_owned = false;
+    executable.deinit();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, owner.controller.snapshot());
+    try std.testing.expectEqual(@as(usize, 1), owner.refs);
+}
+
+test "prepared fifth held Native output uses an admitted transient exact frame" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    try exercisePreparedTransientFrame(std.testing.allocator);
+}
+
+test "prepared transient exact frame unwinds every allocation failure without replay" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exercisePreparedTransientFrame, .{});
+}
+
+test "prepared CUDA host ingress uploads once without replay and preserves held output banks" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = @import("../backends/compute_context.zig").BackendContext.init(a, .cuda, null) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    var graph = @import("ml").graph.Graph.init(a);
+    defer graph.deinit();
+    var b = @import("ml").graph.Builder.init(&graph);
+    const x = try b.parameter("x", @import("ml").graph.Shape.init(.f32, &.{ 1, 8 }));
+    try graph.markOutput(try b.neg(x));
+    var program = try ModelProgram.init(a, &graph, &.{.{ .name = "x", .node_id = x, .kind = .input }});
+    defer program.deinit();
+    var executable = try prepareWithOptions(a, &program, &cb, .partitioned, .{ .physical_replay = false });
+    defer executable.deinit();
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const routes = (try pool.prepareRoutes(&.{.{ .node_id = x, .value = .{ .imported_host = .{ .logical = graph.node(x).output_shape, .target = .cuda, .owned_ingress = true } } }})) orelse return error.MissingPreparedKernelRoute;
+    defer routes.release();
+    const legacy = (try pool.prepareRoutes(&.{.{ .node_id = x, .value = .{ .imported_host = .{ .logical = graph.node(x).output_shape, .target = .cuda } } }})) orelse return error.MissingPreparedKernelRoute;
+    defer legacy.release();
+    try std.testing.expect(legacy != routes);
+    try std.testing.expectEqual(@as(usize, 0), legacy.pool.host_input_plans.len);
+    try std.testing.expect(!routes.pool.hostIngressBackingKnown());
+    const direct_requirement = try routes.storageRequirement();
+    const legacy_requirement = try legacy.storageRequirement();
+    try std.testing.expectEqual(legacy_requirement.host_scratch_bytes + 32, direct_requirement.host_scratch_bytes);
+    try std.testing.expectEqual(legacy_requirement.backend_scratch_bytes + 32, direct_requirement.backend_scratch_bytes);
+    routes.pool.max_frames = 1;
+    var input = try @import("../backends/tensor.zig").Tensor.initFloat32(a, "x", &.{ 1, 8 }, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    defer input.deinit();
+    const ingress = [_]@import("host_ingress.zig").Input{.{ .node_id = x, .value = &input }};
+    try std.testing.expect(routes.pool.supportsHostInputs(&ingress));
+    const before = context.cuda.stats.d2d_bytes;
+    var audit = @import("transfer_audit.zig").Audit{ .forbid_device_host_access = true };
+    try @import("transfer_audit.zig").begin(&audit);
+    var first = executable.run(a, .{ .host_inputs = &ingress, .prepared_routes = routes, .collect_partition_stats = true, .activation_readbacks = .forbidden }) catch |err| {
+        @import("transfer_audit.zig").end();
+        return err;
+    };
+    @import("transfer_audit.zig").end();
+    defer first.deinit(&executable.runtime);
+    try std.testing.expectEqual(@as(u64, 1), audit.upload_calls);
+    try std.testing.expectEqual(@as(u64, 32), audit.upload_bytes);
+    try std.testing.expectEqual(@as(u64, 0), audit.download_calls);
+    try std.testing.expectEqual(before, context.cuda.stats.d2d_bytes);
+    try std.testing.expectEqual(@as(u64, 0), first.stats.physical_input_copies);
+    // Held first output prevents bank reuse; the second exact plan uses its
+    // admitted transient frame, leaving the first result unchanged.
+    input.asFloat32Mut()[0] = 9;
+    var second = try executable.run(a, .{ .host_inputs = &ingress, .prepared_routes = routes, .collect_partition_stats = true });
+    defer second.deinit(&executable.runtime);
+    const first_values = try cb.toFloat32(first.outputs[0], a);
+    defer a.free(first_values);
+    const second_values = try cb.toFloat32(second.outputs[0], a);
+    defer a.free(second_values);
+    try std.testing.expectEqualSlices(f32, &.{ -1, -2, -3, -4, -5, -6, -7, -8 }, first_values);
+    try std.testing.expectEqualSlices(f32, &.{ -9, -2, -3, -4, -5, -6, -7, -8 }, second_values);
+}
+
+test "prepared CUDA host ingress keeps one upload through graph capture and replay" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = @import("../backends/compute_context.zig").BackendContext.init(a, .cuda, null) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    var graph = @import("ml").graph.Graph.init(a);
+    defer graph.deinit();
+    var b = @import("ml").graph.Builder.init(&graph);
+    const x = try b.parameter("x", @import("ml").graph.Shape.init(.f32, &.{ 1, 8 }));
+    const positive = try b.absOp(x);
+    var out = positive;
+    for (0..8) |_| out = try b.relu(try b.add(out, positive));
+    try graph.markOutput(out);
+    var program = try ModelProgram.init(a, &graph, &.{.{ .name = "x", .node_id = x, .kind = .input }});
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .partitioned);
+    defer executable.deinit();
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const routes = (try pool.prepareRoutes(&.{.{ .node_id = x, .value = .{ .imported_host = .{ .logical = graph.node(x).output_shape, .target = .cuda, .owned_ingress = true } } }})) orelse return error.MissingPreparedKernelRoute;
+    defer routes.release();
+    try std.testing.expect(routes.pool.replay_backend != null);
+    var input = try @import("../backends/tensor.zig").Tensor.initFloat32(a, "x", &.{ 1, 8 }, &.{ 1, 1, 1, 1, 1, 1, 1, 1 });
+    defer input.deinit();
+    const ingress = [_]@import("host_ingress.zig").Input{.{ .node_id = x, .value = &input }};
+    // Cold immutable initialization is measured separately from mutable ingress.
+    // This optimized graph legitimately retains one shared scalar ReLU literal.
+    for (program.graph.nodes.items, 0..) |node, id| {
+        const live = routes.pool.coverage_reachable.?[id];
+        const replay_index = routes.pool.replay_input_indices[id];
+        const literal = if (replay_index != @import("ml").graph.null_node) routes.pool.replay_inputs[replay_index].constant != null else false;
+        std.debug.print("CUDA_REPLAY_IR id={d} op={s} inputs={any} vjp={d} reachable={} route={} literal={}\n", .{ id, @tagName(node.op), node.getInputs(), node.vjp_alternate, live, routes.pool.preparedKernelRoute(@intCast(id)) != null, literal });
+    }
+    {
+        const d2d = context.cuda.stats.d2d_bytes;
+        var audit = @import("transfer_audit.zig").Audit{ .forbid_device_host_access = true };
+        try @import("transfer_audit.zig").begin(&audit);
+        var cold = executable.run(a, .{ .host_inputs = &ingress, .prepared_routes = routes, .collect_partition_stats = true, .activation_readbacks = .forbidden }) catch |err| {
+            @import("transfer_audit.zig").end();
+            return err;
+        };
+        @import("transfer_audit.zig").end();
+        defer cold.deinit(&executable.runtime);
+        std.debug.print("CUDA_INGRESS_COLD uploads={d} bytes={d} capture={d} replay={d} decision={s}\n", .{ audit.upload_calls, audit.upload_bytes, cold.stats.physical_graph_captures, cold.stats.physical_graph_replays, @tagName(cold.stats.physical_replay) });
+        try std.testing.expectEqual(@as(u64, 2), audit.upload_calls);
+        try std.testing.expectEqual(@as(u64, 36), audit.upload_bytes);
+        try std.testing.expectEqual(@as(u64, 0), audit.download_calls);
+        try std.testing.expectEqual(d2d, context.cuda.stats.d2d_bytes);
+        try std.testing.expectEqual(@as(u64, 0), cold.stats.physical_graph_captures);
+        try std.testing.expectEqual(@as(u64, 0), cold.stats.physical_graph_replays);
+    }
+    var captures: u64 = 0;
+    var replays: u64 = 0;
+    for (0..4) |iteration| {
+        @memset(input.asFloat32Mut(), @floatFromInt(iteration + 1));
+        const before = context.cuda.stats.d2d_bytes;
+        var audit = @import("transfer_audit.zig").Audit{ .forbid_device_host_access = true };
+        try @import("transfer_audit.zig").begin(&audit);
+        var result = executable.run(a, .{ .host_inputs = &ingress, .prepared_routes = routes, .collect_partition_stats = true, .activation_readbacks = .forbidden }) catch |err| {
+            @import("transfer_audit.zig").end();
+            return err;
+        };
+        @import("transfer_audit.zig").end();
+        defer result.deinit(&executable.runtime);
+        std.debug.print("CUDA_INGRESS_CAPTURE iteration={d} uploads={d} upload_bytes={d} downloads={d} d2d_delta={d} copies={d} captures={d} replays={d}\n", .{ iteration, audit.upload_calls, audit.upload_bytes, audit.download_calls, context.cuda.stats.d2d_bytes - before, result.stats.physical_input_copies, result.stats.physical_graph_captures, result.stats.physical_graph_replays });
+        if (audit.upload_calls != 1) return error.CudaHostIngressUploadMultiplicity;
+        try std.testing.expectEqual(@as(u64, 32), audit.upload_bytes);
+        std.debug.print("CUDA_INGRESS_DECISION {s}\n", .{@tagName(result.stats.physical_replay)});
+        try std.testing.expectEqual(@as(u64, 0), audit.download_calls);
+        try std.testing.expectEqual(before, context.cuda.stats.d2d_bytes);
+        try std.testing.expectEqual(@as(u64, 0), result.stats.physical_input_copies);
+        captures += result.stats.physical_graph_captures;
+        replays += result.stats.physical_graph_replays;
+        const values = try cb.toFloat32(result.outputs[0], a);
+        defer a.free(values);
+        for (values) |value| try std.testing.expectEqual(@as(f32, @floatFromInt(9 * (iteration + 1))), value);
+    }
+    std.debug.print("CUDA_INGRESS_CAPTURE_TOTAL captures={d} replays={d}\n", .{ captures, replays });
+    if (captures != 1) return error.CudaHostIngressCaptureMultiplicity;
+    if (replays < 2) return error.CudaHostIngressInsufficientReplay;
+}
+
+test "direct executable diagnostics replace success with actual failed invocation telemetry" {
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const x = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{4}));
+    const y = try builder.relu(x);
+    try graph.markOutput(y);
+    var program = try ModelProgram.init(a, &graph, &.{ .{ .name = "x", .node_id = x, .kind = .input }, .{ .name = "y", .node_id = y, .kind = .output } });
+    defer program.deinit();
+    var executable = try prepare(a, &program, &backend, .partitioned);
+    defer executable.deinit();
+    executable.configureExecutionDiagnostics(true);
+    const input = try backend.fromFloat32Shape(&.{ -1, 2, -3, 4 }, &.{4});
+    defer backend.free(input);
+    var bound = [_]interpreter.RuntimeInput{.{ .node_id = x, .value = input }};
+    var result = try executable.run(a, .{ .runtime_inputs = try program.remapInputs(&bound) });
+    result.deinit(&executable.runtime);
+    try std.testing.expectEqual(.success, executable.diagnostics.snapshot().?.outcome);
+    const invalid = [_]interpreter.RuntimeInput{.{ .node_id = std.math.maxInt(ml.graph.NodeId), .value = input }};
+    if (executable.run(a, .{ .runtime_inputs = &invalid })) |unexpected| {
+        var owned = unexpected;
+        owned.deinit(&executable.runtime);
+        return error.ExpectedRuntimeInputFailure;
+    } else |failure| {
+        const measured = executable.diagnostics.snapshot().?;
+        try std.testing.expectEqual(.failed, measured.outcome);
+        try std.testing.expectEqualStrings(@errorName(failure), measured.error_name.?.view());
+        try std.testing.expect(measured.execution == null);
+        try std.testing.expect(measured.runtime.device_owners != null);
+    }
+    try std.testing.expect(!@import("device_owner_registry.zig").enabled());
+}
+
+fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").graph.Graph, analysis: interpreter.CachedAnalysis) void {
+    if (comptime @import("build_options").enable_wasm) return;
+    const pool = executable.runtime.physical_pool orelse return;
+    pool.coverage_graph = graph;
+    pool.coverage_reachable = analysis.reachable;
+    pool.native_frame_dispatch = false;
+    pool.coverage_backend = .{ .ptr = executable.runtime.default_backend.ptr, .vtable = executable.runtime.default_backend.vtable };
+    if (executable.runtime.default_backend.vtable != &@import("../ops/native_compute.zig").vtable_impl) return;
+    const plan = executable.runtime.plan orelse return;
+    if (analysis.reachable.len != graph.nodeCount()) return;
+    for (plan.base.partitions) |part| {
+        var executed = false;
+        for (part.node_ids) |id| {
+            if (id >= analysis.reachable.len) return;
+            executed = executed or analysis.reachable[id];
+        }
+        if (!executed) continue;
+        if (part.backend != .native) return;
+        const actual = part.executor orelse return;
+        var found = false;
+        for (executable.runtime.native_partition_executors.items) |owner| {
+            if (actual.ptr == @as(*anyopaque, @ptrCast(owner)) and actual.vtable == owner.pe.vtable and owner.graph == graph and owner.backend.ptr == executable.runtime.default_backend.ptr and owner.backend.vtable == &@import("../ops/native_compute.zig").vtable_impl) {
+                for (pool.backends) |backend| if (backend.ptr == owner.backend.ptr and backend.vtable == owner.backend.vtable) {
+                    found = true;
+                };
+            }
+        }
+        if (!found) return;
+    }
+    pool.native_frame_dispatch = true;
+}
+
+test "owned payload coverage follows exact Native routes publication aliases and actual executor identity" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const coverage = @import("owned_coverage.zig");
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{4}));
+    const negative = try builder.neg(input);
+    const alias = try builder.reshape(negative, ml.graph.Shape.init(.f32, &.{ 2, 2 }));
+    const literal = try builder.tensorConst(&.{ 1, 2, 3, 4 }, ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(alias);
+    try graph.markOutput(literal);
+    var program = try ModelProgram.init(a, &graph, &.{.{ .name = "x", .node_id = input, .kind = .input }});
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .partitioned);
+    defer executable.deinit();
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const x = program.id_map[input];
+    const constant = program.id_map[literal];
+    const bindings = [_]@import("kernel_route.zig").InputBinding{.{ .node_id = x, .value = .{ .imported_host = .{ .logical = program.graph.node(x).output_shape, .target = .native, .owned_ingress = true } } }};
+    const routes = (try pool.prepareRoutes(&bindings)) orelse return error.MissingPreparedKernelRoute;
+    defer routes.release();
+    const complete = routes.pool.completeOwnedPayload() orelse return error.MissingOwnedPayloadWitness;
+    try std.testing.expectEqual(routes.pool.selection.?.epoch, complete.epoch);
+    // Allocation sizes and descriptor counts stay unchanged when the actual
+    // selected operation or publication owner is absent.
+    var operation_id: ?usize = null;
+    for (routes.pool.selection.?.routes, 0..) |owned, id| if (owned != null) {
+        operation_id = id;
+        break;
+    };
+    const selected_operation = operation_id orelse return error.MissingSelectedNativeOperation;
+    {
+        const operation = routes.pool.selection.?.routes[selected_operation];
+        routes.pool.selection.?.routes[selected_operation] = null;
+        defer routes.pool.selection.?.routes[selected_operation] = operation;
+        try std.testing.expect(coverage.assess(routes.pool) == .compatibility);
+    }
+    const store = routes.pool.literal_store orelse return error.MissingLiteralStore;
+    if (constant >= store.publications.len) return error.MissingLiteralPublication;
+    {
+        const publication = store.publications[constant];
+        store.publications[constant] = null;
+        defer store.publications[constant] = publication;
+        try std.testing.expectEqual(coverage.Reason.output_publication, coverage.assess(routes.pool).compatibility);
+    }
+    try std.testing.expect(coverage.assess(routes.pool) == .complete);
+    const unknown = (try pool.prepareRoutes(&.{.{ .node_id = x, .value = .unknown }})) orelse return error.MissingPreparedKernelRoute;
+    defer unknown.release();
+    try std.testing.expect(unknown.pool.completeOwnedPayload() == null);
+    const Policy = struct {
+        fn deny(_: *anyopaque, _: ops.CT) !ops.CT {
+            return error.CustomNumericsMustNotBeBypassed;
+        }
+    };
+    var table = cb.vtable.*;
+    table.negate = Policy.deny;
+    var custom = cb;
+    custom.vtable = &table;
+    var custom_executable = try prepare(a, &program, &custom, .partitioned);
+    defer custom_executable.deinit();
+    if (custom_executable.runtime.physical_pool) |custom_pool| {
+        const selected = (try custom_pool.prepareRoutes(&bindings)) orelse return error.MissingPreparedKernelRoute;
+        defer selected.release();
+        try std.testing.expect(selected.pool.completeOwnedPayload() == null);
+    }
+    var unsupported_graph = ml.graph.Graph.init(a);
+    defer unsupported_graph.deinit();
+    var b = ml.graph.Builder.init(&unsupported_graph);
+    const source = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 2, 2 }));
+    try unsupported_graph.markOutput(try b.absOp(try b.transpose(try b.neg(source), &.{ 1, 0 })));
+    var unsupported_program = try ModelProgram.init(a, &unsupported_graph, &.{.{ .name = "x", .node_id = source, .kind = .input }});
+    defer unsupported_program.deinit();
+    var unsupported = try prepare(a, &unsupported_program, &cb, .partitioned);
+    defer unsupported.deinit();
+    const unsupported_pool = unsupported.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const source_id = unsupported_program.id_map[source];
+    const partial = (try unsupported_pool.prepareRoutes(&.{.{ .node_id = source_id, .value = .{ .imported_host = .{ .logical = unsupported_program.graph.node(source_id).output_shape, .target = .native, .owned_ingress = true } } }})) orelse return error.MissingPreparedKernelRoute;
+    defer partial.release();
+    try std.testing.expect(partial.pool.completeOwnedPayload() == null);
+}
+
+test "Native planned concat slice gather execute only declared banks across warm and held-output OOM" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const Gate = struct {
+        backing: std.mem.Allocator,
+        deny_payloads: bool = false,
+        denied: usize = 0,
+        fn alloc(raw: *anyopaque, n: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.deny_payloads and (n == 24 or n == 48)) {
+                self.denied += 1;
+                return null;
+            }
+            return self.backing.rawAlloc(n, alignment, ret);
+        }
+        fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+            return false;
+        }
+        fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+            return null;
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.backing.rawFree(bytes, alignment, ret);
+        }
+        const table = std.mem.Allocator.VTable{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &table };
+        }
+    };
+    var gate = Gate{ .backing = a };
+    const payload_allocator = gate.allocator();
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(payload_allocator, .native, null);
+    defer context.deinit(payload_allocator);
+    const cb = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 2, 3 }));
+    const joined = try b.concat(x, x, 1);
+    const sliced = try b.sliceLastDim(joined, 1, 4);
+    const indices = try b.tensorConst(&.{ -1, 0 }, ml.graph.Shape.init(.f32, &.{2}));
+    const gathered = try b.gather(sliced, indices, ml.graph.Shape.init(.f32, &.{ 2, 3 }));
+    try graph.markOutput(gathered);
+    var program = try ModelProgram.init(a, &graph, &.{.{ .name = "x", .node_id = x, .kind = .input }});
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .partitioned);
+    defer executable.deinit();
+    const node = program.id_map[x];
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const routes = (try pool.prepareRoutes(&.{.{ .node_id = node, .value = .{ .imported_host = .{ .logical = program.graph.node(node).output_shape, .target = .native, .owned_ingress = true } } }})) orelse return error.MissingPreparedKernelRoute;
+    defer routes.release();
+    if (routes.pool.completeOwnedPayload() == null) {
+        const selected_pool = routes.pool;
+        std.debug.print("NATIVE_LAYOUT_COLD coverage={s} reason={s} frame_dispatch={} regions={d} epoch={d}\n", .{ @tagName(std.meta.activeTag(selected_pool.payload_coverage)), if (selected_pool.payload_coverage == .compatibility) @tagName(selected_pool.payload_coverage.compatibility) else "none", selected_pool.native_frame_dispatch, selected_pool.regions.len, selected_pool.selection.?.epoch });
+        for (selected_pool.plan.slots) |slot| {
+            std.debug.print("NATIVE_LAYOUT_NODE node={d} op={s} kind={s} shape={any} dtype={s} output={} route={} allocation={d}\n", .{ slot.node_id, @tagName(std.meta.activeTag(program.graph.node(slot.node_id).op)), @tagName(slot.kind), slot.desc.shape.dims[0..slot.desc.shape.rank()], @tagName(slot.desc.shape.dtype), slot.roles.graph_output, selected_pool.preparedKernelRoute(slot.node_id) != null, slot.allocation });
+            if (selected_pool.preparedKernelRoute(slot.node_id)) |owned| std.debug.print("NATIVE_LAYOUT_RESOURCE node={d} primary={d} host={d} probe_host={d} alignment={d}\n", .{ slot.node_id, owned.requirements.primary_bytes, owned.requirements.workspace.host_byte_size, owned.requirements.probe_workspace.host_byte_size, owned.requirements.host_alignment });
+        }
+        return error.NativeLayoutMissingCompletePayloadWitness;
+    }
+    for ([_]ml.graph.NodeId{ joined, sliced, gathered }) |original| {
+        const id = program.id_map[original];
+        if (routes.pool.preparedKernelRoute(id) == null) {
+            std.debug.print("NATIVE_LAYOUT_MISSING_ROUTE original={d} optimized={d}\n", .{ original, id });
+            return error.NativeLayoutMissingSelectedOperation;
+        }
+    }
+    var input = try @import("../backends/tensor.zig").Tensor.initFloat32(a, "x", &.{ 2, 3 }, &.{ 1, 2, 3, 4, 5, 6 });
+    defer input.deinit();
+    const options = interpreter.ExecuteOptions{ .host_inputs = &.{.{ .node_id = node, .value = &input }}, .prepared_routes = routes };
+    {
+        var result = try executable.run(a, options);
+        defer result.deinit(&executable.runtime);
+        const output = try cb.toFloat32(result.outputs[0], a);
+        defer a.free(output);
+        try std.testing.expectEqualSlices(f32, &.{ 5, 6, 4, 2, 3, 1 }, output);
+    }
+    // Every allocating compatibility implementation needs a 24/48-byte float
+    // payload. Warm assigned execution may allocate metadata, never these data.
+    gate.deny_payloads = true;
+    var held = try executable.run(a, options);
+    defer held.deinit(&executable.runtime);
+    if (gate.denied != 0) {
+        std.debug.print("NATIVE_LAYOUT_WARM_DENIAL denied={d}\n", .{gate.denied});
+        return error.NativeLayoutUnexpectedWarmPayloadAllocation;
+    }
+    const before = try cb.toFloat32(held.outputs[0], a);
+    defer a.free(before);
+    try std.testing.expectError(error.OutOfMemory, executable.run(a, options));
+    if (gate.denied == 0) return error.NativeLayoutHeldOutputDidNotExerciseAllocatorFailure;
+    const after = try cb.toFloat32(held.outputs[0], a);
+    defer a.free(after);
+    try std.testing.expectEqualSlices(f32, before, after);
+    gate.deny_payloads = false;
+    _ = try routes.pool.reclaimRetiredFrames();
+    var retry = try executable.run(a, options);
+    defer retry.deinit(&executable.runtime);
+    const values = try cb.toFloat32(retry.outputs[0], a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 5, 6, 4, 2, 3, 1 }, values);
+}
+
+test "Native declared typed ingress executes exact gather and retains held outputs across index failure" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 2, 3 }));
+    const idx = try b.parameter("indices", ml.graph.Shape.init(.i64, &.{2}));
+    const gather = try b.gather(x, idx, ml.graph.Shape.init(.f32, &.{ 2, 3 }));
+    try graph.markOutput(gather);
+    var program = try ModelProgram.init(a, &graph, &.{ .{ .name = "x", .node_id = x, .kind = .input }, .{ .name = "indices", .node_id = idx, .kind = .input } });
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .partitioned);
+    defer executable.deinit();
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const x_id = program.id_map[x];
+    const index_id = program.id_map[idx];
+    const facts = [_]@import("kernel_route.zig").InputBinding{ .{ .node_id = x_id, .value = .{ .imported_host = .{ .logical = program.graph.node(x_id).output_shape, .target = .native, .owned_ingress = true } } }, .{ .node_id = index_id, .value = .{ .imported_host = .{ .logical = program.graph.node(index_id).output_shape, .target = .native, .owned_ingress = true } } } };
+    const routes = (try pool.prepareRoutes(&facts)) orelse return error.MissingPreparedKernelRoute;
+    defer routes.release();
+    try std.testing.expect(routes.pool.completeOwnedPayload() != null);
+    try std.testing.expectEqual(@as(usize, 2), routes.pool.host_input_plans.len);
+    var input = try Tensor.initFloat32(a, "x", &.{ 2, 3 }, &.{ 1, 2, 3, 4, 5, 6 });
+    defer input.deinit();
+    var storage: [17]u8 = undefined;
+    const offset: usize = if (@intFromPtr(&storage) % 8 == 0) 1 else 0;
+    const raw = storage[offset..][0..16];
+    const valid = [_]i64{ 1, -2 };
+    @memcpy(raw, std.mem.sliceAsBytes(&valid));
+    try std.testing.expect(@intFromPtr(raw.ptr) % 8 != 0);
+    const indices = Tensor{ .data = raw, .dtype = .i64, .shape = &.{2}, .name = "indices", .allocator = a, .owns_data = false, .owns_shape = false };
+    const options = interpreter.ExecuteOptions{ .host_inputs = &.{ .{ .node_id = x_id, .value = &input }, .{ .node_id = index_id, .value = &indices } }, .prepared_routes = routes };
+    var held = try executable.run(a, options);
+    defer held.deinit(&executable.runtime);
+    const before = try cb.toFloat32(held.outputs[0], a);
+    defer a.free(before);
+    try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6, 1, 2, 3 }, before);
+    // This value would round through F32. Exact indices must reject it, leave
+    // the first published frame untouched, and retire the failed frame safely.
+    const invalid = [_]i64{ 0, 9_007_199_254_740_993 };
+    @memcpy(raw, std.mem.sliceAsBytes(&invalid));
+    try std.testing.expectError(error.IndexOutOfBounds, executable.run(a, options));
+    const after = try cb.toFloat32(held.outputs[0], a);
+    defer a.free(after);
+    try std.testing.expectEqualSlices(f32, before, after);
+    _ = try routes.pool.reclaimRetiredFrames();
+    @memcpy(raw, std.mem.sliceAsBytes(&valid));
+    var retry = try executable.run(a, options);
+    defer retry.deinit(&executable.runtime);
+    const actual = try cb.toFloat32(retry.outputs[0], a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, before, actual);
+}
+
+test "raw cached CUDA reachability excludes actual dead gather literals from upload and capture legality" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = @import("../backends/compute_context.zig").BackendContext.init(a, .cuda, null) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    const ml = @import("ml");
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input_node = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{ 1, 8 }));
+    const payload = try a.alloc(f32, 16384);
+    defer a.free(payload);
+    @memset(payload, 7);
+    const dead_table = try builder.tensorConst(payload, ml.graph.Shape.init(.f32, &.{ 8192, 2 }));
+    const dead_indices = try builder.tensorConst(&.{1}, ml.graph.Shape.init(.f32, &.{1}));
+    const dead_gather = try builder.gather(dead_table, dead_indices, ml.graph.Shape.init(.f32, &.{ 1, 2 }));
+    var output = try builder.absOp(input_node);
+    for (0..24) |_| output = try builder.neg(output);
+    try graph.markOutput(output);
+    var analysis = try interpreter.CachedAnalysis.compute(a, &graph);
+    defer analysis.deinit(a);
+    try std.testing.expect(!analysis.reachable[dead_table] and !analysis.reachable[dead_indices] and !analysis.reachable[dead_gather]);
+    var executable = try prepareAnalyzedGraph(a, &graph, analysis, &backend, .partitioned, .{});
+    defer executable.deinit();
+    const root = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    try root.prepareReplay(&graph, &executable.runtime.buffer_plan.?, &.{.{ .name = "x", .node_id = input_node, .kind = .input }}, .{});
+    try std.testing.expect(root.replay_backend != null);
+    try std.testing.expectEqual(@as(usize, 25), root.replay_kernel_count);
+    const routes = (try root.prepareRoutes(&.{.{ .node_id = input_node, .value = .{ .imported_host = .{ .logical = graph.node(input_node).output_shape, .target = .cuda, .owned_ingress = true } } }})) orelse return error.MissingPreparedRoutes;
+    defer routes.release();
+    try std.testing.expectEqual(@as(usize, 1), routes.pool.replay_inputs.len);
+    try std.testing.expectEqual(ml.graph.null_node, routes.pool.replay_input_indices[dead_table]);
+    try std.testing.expectEqual(ml.graph.null_node, routes.pool.replay_input_indices[dead_indices]);
+    var input = try @import("../backends/tensor.zig").Tensor.initFloat32(a, "x", &.{ 1, 8 }, &.{ 1, 1, 1, 1, 1, 1, 1, 1 });
+    defer input.deinit();
+    const inputs = [_]@import("host_ingress.zig").Input{.{ .node_id = input_node, .value = &input }};
+    var captures: u64 = 0;
+    var replays: u64 = 0;
+    for (0..5) |iteration| {
+        @memset(input.asFloat32Mut(), @floatFromInt(iteration + 1));
+        const d2d = context.cuda.stats.d2d_bytes;
+        var audit = @import("transfer_audit.zig").Audit{ .forbid_device_host_access = true };
+        try @import("transfer_audit.zig").begin(&audit);
+        var result = executable.run(a, .{ .host_inputs = &inputs, .prepared_routes = routes, .collect_partition_stats = true, .activation_readbacks = .forbidden }) catch |err| {
+            @import("transfer_audit.zig").end();
+            return err;
+        };
+        @import("transfer_audit.zig").end();
+        defer result.deinit(&executable.runtime);
+        std.debug.print("RAW_REPLAY iteration={d} uploads={d} bytes={d} capture={d} replay={d} decision={s}\n", .{ iteration, audit.upload_calls, audit.upload_bytes, result.stats.physical_graph_captures, result.stats.physical_graph_replays, @tagName(result.stats.physical_replay) });
+        try std.testing.expectEqual(@as(u64, 1), audit.upload_calls);
+        try std.testing.expectEqual(@as(u64, 32), audit.upload_bytes);
+        try std.testing.expectEqual(@as(u64, 0), audit.download_calls);
+        try std.testing.expectEqual(d2d, context.cuda.stats.d2d_bytes);
+        captures += result.stats.physical_graph_captures;
+        replays += result.stats.physical_graph_replays;
+        const actual = try backend.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        for (actual) |value| try std.testing.expectEqual(@as(f32, @floatFromInt(iteration + 1)), value);
+    }
+    try std.testing.expectEqual(@as(u64, 1), captures);
+    try std.testing.expect(replays >= 3);
+}
+
+test "owned host generation exhaustion retires the frame before scope and permits clean retry" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(try b.neg(x));
+    var program = try ModelProgram.init(a, &graph, &.{.{ .name = "x", .node_id = x, .kind = .input }});
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .partitioned);
+    defer executable.deinit();
+    const node = program.id_map[x];
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const routes = (try pool.prepareRoutes(&.{.{ .node_id = node, .value = .{ .imported_host = .{ .logical = program.graph.node(node).output_shape, .target = .native, .owned_ingress = true } } }})).?;
+    defer routes.release();
+    const frame = (try routes.pool.acquire()).?;
+    frame.host_input_generation = std.math.maxInt(u64);
+    try std.testing.expectError(error.HostInputGenerationExhausted, frame.begin());
+    try std.testing.expect(frame.retired);
+    _ = try frame.finish();
+    try std.testing.expect(try routes.pool.reclaimRetiredFrames());
+    var input = try @import("../backends/tensor.zig").Tensor.initFloat32(a, "x", &.{4}, &.{ 1, 2, 3, 4 });
+    defer input.deinit();
+    var result = try executable.run(a, .{ .host_inputs = &.{.{ .node_id = node, .value = &input }}, .prepared_routes = routes });
+    defer result.deinit(&executable.runtime);
+    const values = try cb.toFloat32(result.outputs[0], a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ -1, -2, -3, -4 }, values);
+}
+
+fn exerciseReachableNativeProjection(a: std.mem.Allocator) !void {
+    const ml = @import("ml");
+    const memory = @import("../runtime/tier/memory.zig");
+    const storage_admission = @import("storage_admission.zig");
+    const Owner = struct {
+        controller: memory.AdmissionController = .{},
+        current: memory.AdmissionLease = undefined,
+        credit: memory.AdmissionAmounts = .{},
+        refs: usize = 1,
+        fn retain(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+            return true;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs -= 1;
+        }
+        fn reserve(raw: *anyopaque, allocator: std.mem.Allocator, kind: ops.BackendKind, class: @import("storage_accounting.zig").Class, bytes: usize) !storage_admission.Reservation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return storage_admission.fromRunLease(allocator, &self.current, .{ .controller = &self.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 48, .combined_limit_bytes = 48 }, .check_live_memory = false, .credit = &self.credit, .lifetime = .{ .context = self, .retain = retain, .release = release } }, kind, class, bytes);
+        }
+    };
+    var owner = Owner{};
+    defer owner.controller.deinit();
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const shape = ml.graph.Shape.init(.f32, &.{4});
+    const input_node = try builder.parameter("x", shape);
+    const large = try a.alloc(f32, 16384);
+    defer a.free(large);
+    @memset(large, 7);
+    const dead_literal = try builder.tensorConst(large, ml.graph.Shape.init(.f32, &.{16384}));
+    const dead_kernel = try builder.neg(dead_literal);
+    const middle = try builder.neg(input_node);
+    const alias = try builder.reshape(middle, ml.graph.Shape.init(.f32, &.{ 2, 2 }));
+    const output = try builder.neg(alias);
+    try graph.markOutput(output);
+    var analysis = try interpreter.CachedAnalysis.compute(a, &graph);
+    defer analysis.deinit(a);
+    var executable = try prepareAnalyzedGraph(a, &graph, analysis, &backend, .compiled_preferred, .{ .physical_replay = false });
+    var executable_owned = true;
+    defer if (executable_owned) executable.deinit();
+    const root = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const original_bank = root.plan.slotForNode(dead_kernel).?.allocation;
+    try std.testing.expectEqual(original_bank, root.plan.slotForNode(middle).?.allocation);
+    try std.testing.expectEqual(@as(u64, 65536), root.plan.allocations[original_bank].byte_size);
+    const routes = (try root.prepareRoutes(&.{.{ .node_id = input_node, .value = .{ .imported_host = .{ .logical = shape, .target = .native, .owned_ingress = true } } }})) orelse return error.MissingPreparedRoutes;
+    var routes_owned = true;
+    defer if (routes_owned) routes.release();
+    try std.testing.expect(routes.pool.completeOwnedPayload() != null);
+    try std.testing.expect(routes.pool.plan.slotForNode(dead_kernel) == null);
+    try std.testing.expect(routes.pool.plan.slotForNode(dead_literal) == null);
+    try std.testing.expect(routes.pool.preparedKernelRoute(dead_kernel) == null);
+    try std.testing.expectEqual(@import("../graph/buffer_plan.zig").invalid_allocation, routes.pool.outputSlot(dead_kernel, 65536).allocation);
+    try std.testing.expect(root.plan.slotForNode(dead_kernel) != null);
+    try std.testing.expectEqual(@as(u64, 65536), root.plan.allocations[original_bank].byte_size);
+    try std.testing.expectEqual(@as(u64, 16), routes.pool.plan.allocations[original_bank].byte_size);
+    const store = routes.pool.literal_store orelse return error.MissingLiteralStore;
+    const literal_index = store.node_indices[dead_literal];
+    try std.testing.expect(!routes.pool.literalEnabled(literal_index));
+    try std.testing.expect(routes.pool.plan.allocationById(store.literals[literal_index].allocation) == null);
+    try routes.pool.plan.validate(&graph, &executable.runtime.plan.?.base);
+    // Inactivity is not a fabricated alias: a dead slot may never recover a
+    // writable allocation merely because that bank is live for another node.
+    routes.pool.plan.slots[dead_kernel].allocation = original_bank;
+    const malformed = routes.pool.plan.validate(&graph, &executable.runtime.plan.?.base);
+    routes.pool.plan.slots[dead_kernel].allocation = @import("../graph/buffer_plan.zig").invalid_allocation;
+    try std.testing.expectError(error.InvalidBufferPlan, malformed);
+    const bad_reachable = try a.dupe(bool, analysis.reachable);
+    defer a.free(bad_reachable);
+    bad_reachable[input_node] = false;
+    try std.testing.expectError(error.InvalidReachabilityTable, routes.pool.plan.projectReachable(&graph, bad_reachable));
+    try std.testing.expect(routes.pool.plan.slotForNode(input_node) != null);
+    try std.testing.expectEqual(@as(u64, 48), routes.pool.plan.totalAllocationBytes(null, null));
+    var partition = try routes.pool.plan.partitionView(a, &executable.runtime.plan.?.base, 0);
+    defer partition.deinit(a);
+    for (partition.slots) |slot| try std.testing.expect(slot.slot.node_id != dead_kernel and slot.slot.node_id != dead_literal);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 48 }, try routes.storageRequirement());
+    {
+        const saved = root.coverage_reachable;
+        root.coverage_reachable = null;
+        defer root.coverage_reachable = saved;
+        const compatibility = (try root.prepareRoutes(&.{.{ .node_id = input_node, .value = .unknown }})) orelse return error.MissingCompatibilityRoutes;
+        defer compatibility.release();
+        try std.testing.expect(compatibility.pool.plan.execution_reachable == null);
+        try std.testing.expect(compatibility.pool.completeOwnedPayload() == null);
+        try std.testing.expect((try compatibility.storageRequirement()).host_scratch_bytes >= 131072);
+    }
+    owner.current = try owner.controller.tryAcquire(.cpu, .{ .host_limit_bytes = 48, .combined_limit_bytes = 48 }, .{}, false);
+    defer owner.current.release();
+    const cap = storage_admission.Capability{ .identity = .{ .controller = &owner.controller, .backend_class = .cpu }, .context = &owner, .services = &.{ .reserve = Owner.reserve } };
+    var input = try @import("../backends/tensor.zig").Tensor.initFloat32(a, "x", &.{4}, &.{ 1, 2, 3, 4 });
+    defer input.deinit();
+    const inputs = [_]@import("host_ingress.zig").Input{.{ .node_id = input_node, .value = &input }};
+    var result: ?runtime_module.Result = null;
+    defer if (result) |*value| value.deinit(&executable.runtime);
+    var held: ?ops.CT = null;
+    defer if (held) |value| backend.free(value);
+    result = try executable.run(a, .{ .host_inputs = &inputs, .prepared_routes = routes, .storage_admission = cap, .output_placement = .producer, .activation_readbacks = .forbidden, .collect_partition_stats = true });
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 48 }, owner.controller.snapshot());
+    try std.testing.expectEqual(@as(u64, 48), routes.pool.accounting.?.snapshot().total.requested_live_bytes);
+    try std.testing.expectEqual(@as(u64, 0), routes.pool.accounting.?.snapshot().constant.requested_live_bytes);
+    try std.testing.expectError(error.InactivePhysicalNode, routes.pool.frames.items[0].execute(&backend, &.{}, dead_kernel, null));
+    if (executable.run(a, .{ .host_inputs = &inputs, .prepared_routes = routes, .storage_admission = cap, .output_placement = .producer })) |unexpected| {
+        var cleanup = unexpected;
+        cleanup.deinit(&executable.runtime);
+        return error.UnexpectedPhysicalQuotaGap;
+    } else |err| {
+        if (err != error.ResourceTemporarilyUnavailable) return err;
+    }
+    const first = try backend.toFloat32(result.?.outputs[0], a);
+    defer a.free(first);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, first);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 48 }, owner.controller.snapshot());
+    result.?.deinit(&executable.runtime);
+    result = null;
+    var claim = (try routes.pool.claimWarm(cap.identity)) orelse return error.MissingWarmProjectedFrame;
+    defer claim.release();
+    @memset(input.asFloat32Mut(), 9);
+    result = try executable.run(a, .{ .host_inputs = &inputs, .prepared_routes = routes, .physical_frame_claim = &claim, .storage_admission = cap, .output_placement = .producer, .collect_partition_stats = true });
+    try std.testing.expectEqual(@as(u64, 0), result.?.stats.physical_storage_allocations);
+    held = try backend.primReshape(result.?.outputs[0], &.{4});
+    result.?.deinit(&executable.runtime);
+    result = null;
+    routes.release();
+    routes_owned = false;
+    executable.deinit();
+    executable_owned = false;
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 16 }, owner.controller.snapshot());
+    const final = try backend.toFloat32(held.?, a);
+    defer a.free(final);
+    try std.testing.expectEqualSlices(f32, &.{ 9, 9, 9, 9 }, final);
+    backend.free(held.?);
+    held = null;
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, owner.controller.snapshot());
+    try std.testing.expectEqual(@as(usize, 1), owner.refs);
+}
+
+test "cached reachability removes real dead literal payload and shrinks reused Native banks under exact quota" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    try exerciseReachableNativeProjection(std.testing.allocator);
+}
+test "reachable physical projection unwinds every allocation failure with held output and hard quota" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseReachableNativeProjection, .{});
+}
+
+fn borrowedResultHandoffCase(allocator: std.mem.Allocator) !void {
+    if (comptime @import("build_options").enable_wasm or !@import("build_options").enable_native) return error.SkipZigTest;
+    const ml = @import("ml");
+    const partition = @import("../graph/partition.zig");
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(allocator, .native, null);
+    defer context.deinit(allocator);
+    const backend = context.computeBackend();
+    var graph = ml.graph.Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input_node = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{ 1, 4 }));
+    try graph.markOutput(try builder.neg(input_node));
+    var analysis = try interpreter.CachedAnalysis.compute(allocator, &graph);
+    defer analysis.deinit(allocator);
+    var executable = try prepareAnalyzedGraph(allocator, &graph, analysis, &backend, .partitioned, .{});
+    var executable_live = true;
+    defer if (executable_live) executable.deinit();
+    const input = try backend.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 4 });
+    defer backend.free(input);
+    const inputs = [_]interpreter.RuntimeInput{.{ .node_id = input_node, .value = input, .source_backend = &backend }};
+    const options = interpreter.ExecuteOptions{ .runtime_inputs = &inputs, .collect_partition_stats = true };
+    var direct: runtime_module.Result = undefined;
+    const Probe = struct {
+        inner: ?*const partition.PartitionExecutor,
+        expected: *@import("stats.zig").ExecutionStats,
+        observed: bool = false,
+        fn execute(raw: *anyopaque, values: []?ops.CT, devices: []@import("../graph/device_mesh.zig").DeviceId, nodes: []const ml.graph.NodeId, device: @import("../graph/device_mesh.zig").DeviceId, exec_ctx: partition.PartitionExecutor.ExecutionContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const actual = exec_ctx.stats orelse return error.MissingBorrowedStatsSink;
+            if (actual != self.expected) return error.CopiedBorrowedStatsSink;
+            self.observed = true;
+            if (self.inner) |inner| return inner.execute(values, devices, nodes, device, exec_ctx);
+            var native = @import("../graph/native_partition_executor.zig").NativePartitionExecutor.initBorrowed(exec_ctx.allocator.?, exec_ctx.graph.?, exec_ctx.backend.?);
+            try native.partitionExecutor().execute(values, devices, nodes, device, exec_ctx);
+        }
+        fn deinit(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.inner) |inner| inner.deinitExecutor();
+        }
+        const table = partition.PartitionExecutor.VTable{ .execute = execute, .deinit = deinit };
+    };
+    const plan = &executable.runtime.plan.?;
+    var probe = Probe{ .inner = plan.base.partitions[0].executor, .expected = &direct.stats };
+    const probe_executor = partition.PartitionExecutor{ .ptr = &probe, .vtable = &Probe.table };
+    plan.base.partitions[0].executor = &probe_executor;
+    try executable.runInto(allocator, &options, &direct);
+    defer direct.deinit(&executable.runtime);
+    try std.testing.expect(probe.observed);
+    try std.testing.expect(options.cached_analysis == null and options.physical_frame == null);
+    try std.testing.expect(@intFromPtr(options.runtime_inputs.?.ptr) == @intFromPtr(&inputs));
+    const first = try backend.toFloat32(direct.outputs[0], allocator);
+    defer allocator.free(first);
+    try std.testing.expectEqualSlices(f32, &.{ -1, -2, -3, -4 }, first);
+    // Distinct caller-owned sinks/results may remain live together. Restore the
+    // normal executor before comparing the unchanged compatibility value API.
+    plan.base.partitions[0].executor = probe.inner;
+    var legacy = try executable.run(allocator, options);
+    defer legacy.deinit(&executable.runtime);
+    const second = try backend.toFloat32(legacy.outputs[0], allocator);
+    defer allocator.free(second);
+    try std.testing.expectEqualSlices(f32, first, second);
+    try std.testing.expectEqual(direct.stats.assigned_kernel_dispatches, legacy.stats.assigned_kernel_dispatches);
+    try std.testing.expectEqual(direct.stats.partitions_executed, legacy.stats.partitions_executed);
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    var cancelled = options;
+    cancelled.execution_control = .{ .check_fn = Cancel.check, .native_call_policy = .in_process };
+    var failed: runtime_module.Result = undefined;
+    if (executable.runInto(allocator, &cancelled, &failed)) |_| {
+        failed.deinit(&executable.runtime);
+        return error.ExpectedCancelledBorrowedSubmission;
+    } else |err| {
+        // The all-allocation-failure harness may deny frame metadata before
+        // the existing downstream cancellation checkpoint is reached.
+        if (err == error.OutOfMemory) return err;
+        try std.testing.expectEqual(error.Cancelled, err);
+    }
+    // Debugging disabled still uses invocation-local storage and real counters;
+    // no diagnostic singleton or borrowed pointer escapes request completion.
+    var quiet = options;
+    quiet.collect_partition_stats = false;
+    var third: runtime_module.Result = undefined;
+    try executable.runInto(allocator, &quiet, &third);
+    defer third.deinit(&executable.runtime);
+    const final = try backend.toFloat32(third.outputs[0], allocator);
+    defer allocator.free(final);
+    try std.testing.expectEqualSlices(f32, first, final);
+    executable.deinit();
+    executable_live = false;
+    const held = try backend.toFloat32(direct.outputs[0], allocator);
+    defer allocator.free(held);
+    try std.testing.expectEqualSlices(f32, first, held);
+}
+
+test "borrowed options and caller result preserve real stats address parity held outputs cancellation and every allocation failure" {
+    try borrowedResultHandoffCase(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, borrowedResultHandoffCase, .{});
+}
+
+fn nativeAffineGraphParity(a: std.mem.Allocator) !void {
+    const ml = @import("ml");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    const memory = @import("../runtime/tier/memory.zig");
+    const admission = @import("storage_admission.zig");
+    const Owner = struct {
+        controller: memory.AdmissionController = .{},
+        current: memory.AdmissionLease = undefined,
+        fn reserve(raw: *anyopaque, allocator: std.mem.Allocator, kind: ops.BackendKind, class: @import("storage_accounting.zig").Class, bytes: usize) !admission.Reservation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return admission.fromRunLease(allocator, &self.current, .{ .controller = &self.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 96, .combined_limit_bytes = 96 }, .check_live_memory = false }, kind, class, bytes);
+        }
+    };
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    for (0..4) |mode| {
+        var owner = Owner{};
+        defer owner.controller.deinit();
+        owner.current = try owner.controller.tryAcquire(.cpu, .{}, .{}, false);
+        defer owner.current.release();
+        const cap = admission.Capability{ .context = &owner, .identity = .{ .controller = &owner.controller, .backend_class = .cpu }, .services = &.{ .reserve = Owner.reserve } };
+        var graph = ml.graph.Graph.init(a);
+        defer graph.deinit();
+        var builder = ml.graph.Builder.init(&graph);
+        const shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+        const x = try builder.parameter("x", shape);
+        const negative = try builder.neg(x);
+        const alias = switch (mode) {
+            0 => try builder.reshape(negative, ml.graph.Shape.init(.f32, &.{ 3, 2 })),
+            1 => try builder.transpose(negative, &.{ 1, 0 }),
+            2 => block: {
+                var axes: [ml.graph.shape.max_rank]u8 = @splat(0);
+                axes[0] = 1;
+                axes[1] = 2;
+                break :block try graph.addNode(.{ .op = .{ .broadcast_in_dim = .{ .target_shape = ml.graph.Shape.init(.f32, &.{ 2, 2, 3 }), .broadcast_axes = axes, .num_axes = 2 } }, .output_shape = ml.graph.Shape.init(.f32, &.{ 2, 2, 3 }), .inputs = .{ negative, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node }, .num_inputs = 1 });
+            },
+            else => try builder.sliceLastDim(negative, 0, 3),
+        };
+        try graph.markOutput(alias);
+        var analysis = try interpreter.CachedAnalysis.compute(a, &graph);
+        defer analysis.deinit(a);
+        var executable = try prepareAnalyzedGraph(a, &graph, analysis, &backend, .partitioned, .{ .physical_replay = false });
+        defer executable.deinit();
+        const root = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+        const routes = (try root.prepareRoutes(&.{.{ .node_id = x, .value = .{ .imported_host = .{ .logical = shape, .target = .native, .owned_ingress = true } } }})) orelse return error.MissingPreparedRoutes;
+        defer routes.release();
+        if (routes.pool.completeOwnedPayload() == null) return error.MissingAffineCoverage;
+        try std.testing.expectEqual(routes.pool.plan.slotForNode(negative).?.allocation, routes.pool.plan.slotForNode(alias).?.allocation);
+        const requirement = try routes.pool.storageRequirement();
+        try std.testing.expectEqual(@as(usize, 48), requirement.host_scratch_bytes);
+        try std.testing.expectError(error.ResourceLimitExceeded, owner.controller.tryAcquire(.cpu, .{ .host_limit_bytes = 47, .combined_limit_bytes = 47 }, requirement, false));
+        var input = try Tensor.initFloat32(a, "x", &.{ 2, 3 }, &.{ 1, 2, 3, 4, 5, 6 });
+        defer input.deinit();
+        const options = interpreter.ExecuteOptions{ .host_inputs = &.{.{ .node_id = x, .value = &input }}, .prepared_routes = routes, .storage_admission = cap, .output_placement = .producer, .activation_readbacks = .forbidden };
+        var held = try executable.run(a, options);
+        defer held.deinit(&executable.runtime);
+        var second = try executable.run(a, options);
+        defer second.deinit(&executable.runtime);
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 96 }, owner.controller.snapshot());
+        if (executable.run(a, options)) |unexpected| {
+            var cleanup = unexpected;
+            cleanup.deinit(&executable.runtime);
+            return error.AffineHeldOutputQuotaGap;
+        } else |err| {
+            if (err != error.ResourceTemporarilyUnavailable) return err;
+        }
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 96 }, owner.controller.snapshot());
+        const expected: []const f32 = switch (mode) {
+            1 => &.{ -1, -4, -2, -5, -3, -6 },
+            2 => &.{ -1, -2, -3, -4, -5, -6, -1, -2, -3, -4, -5, -6 },
+            else => &.{ -1, -2, -3, -4, -5, -6 },
+        };
+        const exported = (try backend.exportTensorData(held.outputs[0], a)) orelse return error.MissingAffineExport;
+        defer a.free(exported.payload.bytes);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), exported.payload.bytes);
+        const exported_again = (try backend.exportTensorData(second.outputs[0], a)) orelse return error.MissingAffineExport;
+        defer a.free(exported_again.payload.bytes);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), exported_again.payload.bytes);
+    }
+}
+
+test "Native affine aliases use exact retained banks across warm and held outputs" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    try nativeAffineGraphParity(std.testing.allocator);
+}
+test "Native affine graph owners unwind every allocation failure" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    // Enumerate every allocate/copy/free fallback independently of the
+    // backing allocator's layout-dependent in-place remap successes.
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, nativeAffineGraphParity, .{});
+}
+
+test "Native opaque affine consumer preserves source liveness across intervening same-size allocation" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+    const x = try builder.parameter("x", shape);
+    const original = try builder.neg(x);
+    const alias = try builder.transpose(original, &.{ 1, 0 });
+    const intervening = try builder.absOp(x);
+    const reduced = try builder.reduceSum(alias, &.{1});
+    try graph.markOutput(intervening);
+    try graph.markOutput(reduced);
+    var analysis = try interpreter.CachedAnalysis.compute(a, &graph);
+    defer analysis.deinit(a);
+    var executable = try prepareAnalyzedGraph(a, &graph, analysis, &backend, .partitioned, .{ .physical_replay = false });
+    defer executable.deinit();
+    const root = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const routes = (try root.prepareRoutes(&.{.{ .node_id = x, .value = .{ .imported_host = .{ .logical = shape, .target = .native, .owned_ingress = true } } }})) orelse return error.MissingPreparedRoutes;
+    defer routes.release();
+    try std.testing.expect(routes.pool.completeOwnedPayload() == null);
+    try std.testing.expect(routes.pool.preparedKernelRoute(reduced) == null);
+    try std.testing.expectEqual(@as(u8, 0), routes.pool.selection.?.plane_counts[alias]);
+    const original_slot = routes.pool.plan.slotForNode(original).?;
+    const intervening_slot = routes.pool.plan.slotForNode(intervening).?;
+    try std.testing.expect(original_slot.allocation != intervening_slot.allocation);
+    try std.testing.expect(original_slot.last_use >= routes.pool.plan.positionForNode(reduced));
+    var input = try Tensor.initFloat32(a, "x", &.{ 2, 3 }, &.{ 1, 2, 3, 4, 5, 6 });
+    defer input.deinit();
+    var result = try executable.run(a, .{ .host_inputs = &.{.{ .node_id = x, .value = &input }}, .prepared_routes = routes });
+    defer result.deinit(&executable.runtime);
+    const first = try backend.toFloat32(result.outputs[0], a);
+    defer a.free(first);
+    const second = try backend.toFloat32(result.outputs[1], a);
+    defer a.free(second);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6 }, first);
+    try std.testing.expectEqualSlices(f32, &.{ -5, -7, -9 }, second);
+}
+
+test "Native imported parameter affine aliases keep opaque routes and legacy numerical parity" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    for (0..2) |mode| {
+        var graph = ml.graph.Graph.init(a);
+        defer graph.deinit();
+        var b = ml.graph.Builder.init(&graph);
+        const shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+        const x = try b.parameter("x", shape);
+        const alias = if (mode == 0) try b.transpose(x, &.{ 1, 0 }) else block: {
+            var axes: [ml.graph.shape.max_rank]u8 = @splat(0);
+            axes[0] = 1;
+            axes[1] = 2;
+            const output_shape = ml.graph.Shape.init(.f32, &.{ 2, 2, 3 });
+            break :block try graph.addNode(.{ .op = .{ .broadcast_in_dim = .{ .target_shape = output_shape, .broadcast_axes = axes, .num_axes = 2 } }, .output_shape = output_shape, .inputs = .{ x, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node }, .num_inputs = 1 });
+        };
+        const output = try b.neg(alias);
+        try graph.markOutput(output);
+        var analysis = try interpreter.CachedAnalysis.compute(a, &graph);
+        defer analysis.deinit(a);
+        var executable = try prepareAnalyzedGraph(a, &graph, analysis, &backend, .partitioned, .{ .physical_replay = false });
+        defer executable.deinit();
+        const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+        const routes = (try pool.prepareRoutes(&.{.{ .node_id = x, .value = .{ .imported_host = .{ .logical = shape, .target = .native, .owned_ingress = true } } }})) orelse return error.MissingPreparedRoutes;
+        defer routes.release();
+        try std.testing.expect(routes.pool.completeOwnedPayload() == null);
+        try std.testing.expectEqual(@as(u8, 0), routes.pool.selection.?.plane_counts[alias]);
+        try std.testing.expect(routes.pool.preparedKernelRoute(output) == null);
+        var input = try Tensor.initFloat32(a, "x", &.{ 2, 3 }, &.{ 1, 2, 3, 4, 5, 6 });
+        defer input.deinit();
+        var result = try executable.run(a, .{ .host_inputs = &.{.{ .node_id = x, .value = &input }}, .prepared_routes = routes });
+        defer result.deinit(&executable.runtime);
+        const actual = try backend.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        const expected: []const f32 = if (mode == 0) &.{ -1, -4, -2, -5, -3, -6 } else &.{ -1, -2, -3, -4, -5, -6, -1, -2, -3, -4, -5, -6 };
+        try std.testing.expectEqualSlices(f32, expected, actual);
+    }
+}
+
+fn affineResidentSourceConsumerParity(a: std.mem.Allocator) !void {
+    if (comptime @import("build_options").enable_wasm or !@import("build_options").enable_native) return error.SkipZigTest;
+    const ml = @import("ml");
+    const ownership = @import("storage_ownership.zig");
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    const original = try backend.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 3, 2 });
+    defer backend.free(original);
+    const input = try backend.primTranspose(original, &.{ 1, 0 }, &.{ 3, 2 });
+    defer backend.free(input);
+    const Collector = struct {
+        plane: ?ownership.Plane = null,
+        fn emit(raw: *anyopaque, report: ownership.Report) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (report == .plane and report.plane.role == .primary) {
+                if (self.plane != null) return error.AmbiguousAffineInput;
+                self.plane = report.plane;
+            }
+        }
+    };
+    var source = Collector{};
+    const query = backend.vtable.kernels.?.storageOwnership.?;
+    try std.testing.expect(try query(backend.ptr, input, .{ .context = &source, .visit = Collector.emit }) == .complete);
+    const plane = source.plane orelse return error.MissingAffineResidentPlane;
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, plane.descriptor.strides.asSlice());
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+    const x = try builder.parameter("x", shape);
+    // Both branches remain observable, with legacy materialization scheduled
+    // before the second branch tries to construct its frozen alias.
+    const early = try builder.neg(x);
+    const alias = try builder.transpose(x, &.{ 1, 0 });
+    const late = try builder.neg(alias);
+    try graph.markOutput(early);
+    try graph.markOutput(late);
+    var analysis = try interpreter.CachedAnalysis.compute(a, &graph);
+    defer analysis.deinit(a);
+    var executable = try prepareAnalyzedGraph(a, &graph, analysis, &backend, .partitioned, .{ .physical_replay = false });
+    defer executable.deinit();
+    const pool = executable.runtime.physical_pool orelse return error.MissingAffinePool;
+    const planes = [_]ownership.Plane{plane};
+    const facts = [_]@import("kernel_route.zig").InputBinding{.{ .node_id = x, .value = .{ .resident = .{ .logical = shape, .planes = &planes, .implementation = .{ .context = backend.ptr, .table = backend.vtable } } } }};
+    const selected = (try pool.prepareRoutes(&facts)) orelse return error.MissingAffineRoutes;
+    defer selected.release();
+    const inputs = [_]interpreter.RuntimeInput{.{ .node_id = x, .value = input, .source_backend = &backend }};
+    var result = try executable.run(a, .{ .runtime_inputs = &inputs, .prepared_routes = selected, .collect_partition_stats = true });
+    defer result.deinit(&executable.runtime);
+    const first = (try backend.exportTensorData(result.outputs[0], a)) orelse return error.MissingAffineOutput;
+    defer a.free(first.payload.bytes);
+    const second = (try backend.exportTensorData(result.outputs[1], a)) orelse return error.MissingAffineOutput;
+    defer a.free(second.payload.bytes);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(@as([]const f32, &.{ -1, -3, -5, -2, -4, -6 })), first.payload.bytes);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(@as([]const f32, &.{ -1, -2, -3, -4, -5, -6 })), second.payload.bytes);
+    // These assertions follow execution so the old implementation reproduces
+    // its real PreparedMetadataAliasChanged failure before coverage checks.
+    try std.testing.expectEqual(@as(u8, 0), selected.pool.selection.?.plane_counts[alias]);
+    try std.testing.expect(selected.pool.preparedKernelRoute(late) == null);
+    try std.testing.expect(selected.pool.completeOwnedPayload() == null);
+}
+
+test "Native affine resident source with earlier opaque materialization preserves both branch outputs" {
+    try affineResidentSourceConsumerParity(std.testing.allocator);
 }

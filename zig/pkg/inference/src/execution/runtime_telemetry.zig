@@ -42,6 +42,9 @@ pub const Counters = struct {
 };
 pub const Memory = struct {
     scope: enum { unavailable, backend_device_buffers, backend_runtime_buffers } = .unavailable,
+    /// CUDA ownership handed off to retained cleanup owners is separate and
+    /// is never included in this context gauge after that handoff.
+    excludes_detached_owners: bool = false,
     live_bytes: ?u64 = null,
     /// Lifetime high-water gauge; not an invocation's peak allocation.
     lifetime_peak_bytes: ?u64 = null,
@@ -175,10 +178,15 @@ pub const Cuda = struct {
     }
 };
 pub const Snapshot = struct {
+    resolved_project_metal_dispatches: ?@import("runtime_observation.zig").MetalDispatches = null,
+    terminal_native_bodies: ?@import("runtime_observation.zig").NativeBodies = null,
+    resolved_project_cuda_launches: ?@import("runtime_observation.zig").Kernels = null,
+    transfers: ?@import("transfer_audit.zig").Measurements = null,
     counters: Counters = .{},
     native_allocations: ?NativeAllocations = null,
     /// Immutable deduplicated owner intervals for observed numerical dispatch.
     allocation_owners: ?@import("allocation_registry.zig").Summary = null,
+    device_owners: ?@import("device_owner_registry.zig").Summary = null,
     cuda: ?Cuda = null,
     memory: Memory = .{},
     /// Invocation interval on its submitting thread, including CPU fallbacks.
@@ -187,6 +195,10 @@ pub const Snapshot = struct {
     process: ?Process = null,
     pub fn since(self: Snapshot, before: Snapshot) Snapshot {
         return .{
+            .resolved_project_metal_dispatches = self.resolved_project_metal_dispatches,
+            .terminal_native_bodies = self.terminal_native_bodies,
+            .resolved_project_cuda_launches = self.resolved_project_cuda_launches,
+            .transfers = self.transfers,
             .counters = self.counters.since(before.counters),
             .memory = self.memory,
             .cuda = if (self.cuda) |after| if (before.cuda) |start| after.since(start) else after else null,

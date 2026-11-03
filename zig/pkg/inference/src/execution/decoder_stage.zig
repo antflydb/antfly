@@ -6,7 +6,7 @@
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
 const ops = @import("../ops/ops.zig");
-const native_arch = @import("../architectures/whisper.zig");
+const Native = architecture.IncrementalDecoderAdapter;
 const architecture = @import("architecture_session.zig");
 const stages = @import("encoder_decoder_runtime.zig");
 const merged = @import("seq2seq_runtime.zig");
@@ -28,6 +28,21 @@ pub const Row = struct {
     }
 };
 
+pub const RetainedEncoderSource = Native.Source;
+
+/// The caller owns the mutable encoder holder during promotion. The source
+/// owns its shape snapshot and an independent complete storage/provider pin.
+pub fn retainIncrementalSource(allocator: std.mem.Allocator, encoded: *stages.EncoderOutputs, decoder: backends.Session) !?RetainedEncoderSource {
+    const resident = switch (encoded.*) {
+        .host => return null,
+        .resident => |*value| value,
+    };
+    const receiver = resident.incremental_receiver orelse return null;
+    if (receiver.destination_ptr != decoder.ptr or receiver.destination_vtable != decoder.vtable or resident.values.outputs.len != 1) return error.InvalidIncrementalReceiver;
+    const pin = try resident.values.retainResources(allocator);
+    return .{ .receiver = receiver, .value = resident.values.outputs[0], .backend = resident.values.backend, .shape = resident.shape, .resources = pin };
+}
+
 pub const Decoder = struct {
     pub const Options = struct {
         allow_native: bool = true,
@@ -40,7 +55,7 @@ pub const Decoder = struct {
     encoder_mask: []const i64,
     vocab_size: usize,
     control: ?Control,
-    native: ?architecture.WhisperNativeDecoder,
+    native: ?Native.State,
     options: Options,
     incremental: ?merged.State,
 
@@ -49,11 +64,18 @@ pub const Decoder = struct {
     }
 
     pub fn initWithOptions(allocator: std.mem.Allocator, session: backends.Session, encoder: *const stages.EncoderOutputs, encoder_length: usize, encoder_mask: []const i64, vocab_size: usize, control: ?Control, options: Options) !Decoder {
+        return initWithSource(allocator, session, encoder, encoder_length, encoder_mask, vocab_size, control, options, null);
+    }
+
+    pub fn initWithSource(allocator: std.mem.Allocator, session: backends.Session, encoder: *const stages.EncoderOutputs, encoder_length: usize, encoder_mask: []const i64, vocab_size: usize, control: ?Control, options: Options, source: ?*const Native.Source) !Decoder {
         const host: ?backends.Tensor = switch (encoder.*) {
             .host => |outputs| if (outputs.len != 0) outputs[0] else return error.NoEncoderOutput,
             .resident => null,
         };
-        var native = if (options.allow_native and host != null) try architecture.whisperNativeDecoder(session, allocator, control, host.?.asFloat32(), encoder_length) else null;
+        var native: ?Native.State = if (source) |resident| blk: {
+            if (!options.allow_native) return error.InvalidIncrementalSource;
+            break :blk try Native.fromResident(session, allocator, control, try resident.retained());
+        } else if (options.allow_native and host != null) try Native.fromHost(session, allocator, control, host.?.asFloat32(), encoder_length) else null;
         errdefer if (native) |*value| value.deinit();
         return .{
             .allocator = allocator,
@@ -76,7 +98,7 @@ pub const Decoder = struct {
 
     /// Dispatch stays a synchronous borrowed capability; no task pointer or
     /// tokenizer is retained. Rows preserve provider ownership without copies.
-    pub fn step(self: *Decoder, prefix: []const i64, stats_request: ?native_arch.StatsRequest, dispatch: anytype) !Row {
+    pub fn step(self: *Decoder, prefix: []const i64, stats_request: ?Native.StatsRequest, dispatch: anytype) !Row {
         var row = Row{ .allocator = self.allocator, .vocab_size = self.vocab_size };
         errdefer row.deinit();
         if (self.native) |*decoder| {

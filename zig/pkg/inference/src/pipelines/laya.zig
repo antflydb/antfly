@@ -454,7 +454,7 @@ fn runPackedRow(session: Session, scratch: std.mem.Allocator, row: tree.Row, que
     };
     var request = try session.planShapes(&signature, 1);
     request.host_preprocess_bytes = request.input_bytes;
-    var execution = try session.admitShapeRequest(.{ .shapes = &signature }, request, scratch, control);
+    var execution = try session.admitShapeRequest(.{ .host_shapes = &signature }, request, scratch, control);
     defer execution.deinit();
     var inputs: [7]Tensor = undefined;
     var initialized: usize = 0;

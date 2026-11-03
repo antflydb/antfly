@@ -147,8 +147,8 @@ test "LightOnOCR3 CUDA pinned input wrap preserves queued bytes without draining
     var controller = memory.AdmissionController{};
     var arena = Arena{ .lease = try controller.tryAcquire(.gpu, .{ .host_limit_bytes = capacity }, .{ .host_scratch_bytes = capacity }, false), .host = .{ .ptr = storage.ptr, .len = storage.len }, .event = @ptrFromInt(1), .offset = capacity - 256 };
     var ctx: context.CudaContext = undefined;
-    ctx.observation = null;
-    ctx.observation_enable_failed = false;
+    ctx.observation.store(null, .release);
+    ctx.observation_enable_failed.store(false, .release);
     ctx.ctx = @ptrFromInt(1);
     ctx.stream = null;
     ctx.stats = .{};

@@ -74,6 +74,9 @@ pub const HostBuffer = struct {
 };
 
 pub const DeviceBuffer = struct {
+    /// CUDA cuMemAlloc base guarantee, also used by canonical cuBLASLt profiles.
+    /// Borrowed private KV slots preserve this base selection contract.
+    pub const allocation_alignment: usize = 256;
     ptr: driver_mod.CUdeviceptr = 0,
     len: usize = 0,
     /// Original allocation size, independent of a logical view's length.
@@ -104,6 +107,23 @@ pub const DeviceBuffer = struct {
         }
         ctx.device_allocations.allocated(len);
         return .{ .ptr = ptr, .len = len, .allocation_bytes = len };
+    }
+
+    /// Retained owners must preserve both the address and its physical charge
+    /// on driver failure. Legacy free keeps its existing best-effort contract.
+    pub fn freeChecked(self: *DeviceBuffer, ctx: *context_mod.CudaContext) !usize {
+        if (self.borrowed) {
+            self.* = .{};
+            return 0;
+        }
+        if (self.ptr == 0) return 0;
+        try ctx.makeCurrent();
+        const bytes = self.allocation_bytes;
+        const result = ctx.driver.fns.cuMemFree(self.ptr);
+        if (result != driver_mod.CUDA_SUCCESS) return error.CudaDriverError;
+        ctx.device_allocations.freed(bytes);
+        self.* = .{};
+        return bytes;
     }
 
     pub fn free(self: *DeviceBuffer, ctx: *context_mod.CudaContext) void {
@@ -172,6 +192,7 @@ pub const DeviceBuffer = struct {
             std.log.err("CUDA cuMemcpyDtoDAsync failed: bytes={d} error={s} ({s})", .{ len, ctx.driver.errorName(result), ctx.driver.errorString(result) });
             return error.CudaDriverError;
         }
+        transfer_audit.deviceCopy(len);
     }
 };
 
@@ -227,8 +248,8 @@ test "CUDA physical OOM releases its reservation and permits a later allocation"
         }
     };
     var ctx: context_mod.CudaContext = undefined;
-    ctx.observation = null;
-    ctx.observation_enable_failed = false;
+    ctx.observation.store(null, .release);
+    ctx.observation_enable_failed.store(false, .release);
     ctx.ctx = @ptrFromInt(1);
     ctx.device_allocations = .{ .limit = 32 };
     ctx.driver.fns.cuCtxSetCurrent = Mock.setCurrent;

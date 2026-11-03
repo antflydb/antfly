@@ -923,7 +923,7 @@ pub const RerankingPipeline = struct {
         const width = self.batchSequenceWidth(sequence);
         const text_plan = try text_inputs.Plan.init(self.session.inputInfo(), &.{ @intCast(batch), @intCast(width) }, .{ .attention_heads = self.session.model_contract.text_attention_heads });
         const signature = text_plan.signature();
-        var permit = try self.session.admitShapeRequest(.{ .shapes = signature.slice() }, .{
+        var permit = try self.session.admitShapeRequest(.{ .host_shapes = signature.slice() }, .{
             .batch = batch,
             .sequence = width,
             .input_bytes = text_plan.input_bytes,

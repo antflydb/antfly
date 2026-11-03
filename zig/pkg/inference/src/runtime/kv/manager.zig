@@ -16,6 +16,7 @@
 const std = @import("std");
 const block = @import("block.zig");
 const block_table = @import("block_table.zig");
+const writable = @import("writable_blocks.zig");
 const pool_mod = @import("pool.zig");
 const storage_mod = @import("storage.zig");
 
@@ -93,8 +94,13 @@ pub const KvManager = struct {
             seq_state.reserved_tail_blocks.clearRetainingCapacity();
             return id;
         }
-        const id: SequenceId = @intCast(self.sequences.items.len + 1);
-        try self.sequences.append(self.allocator, .{
+        const next = try std.math.add(usize, self.sequences.items.len, 1);
+        const id = std.math.cast(SequenceId, next) orelse return error.KvSequenceLimitExceeded;
+        // Reserve every future retirement slot before publishing this ID.
+        // Valid retirement/reuse never allocates, including destructor cleanup.
+        try self.free_sequence_indices.ensureTotalCapacity(self.allocator, next);
+        try self.sequences.ensureUnusedCapacity(self.allocator, 1);
+        self.sequences.appendAssumeCapacity(.{
             .id = id,
             .pool_id = pool_id,
         });
@@ -175,8 +181,11 @@ pub const KvManager = struct {
     pub fn reserveTailBlock(self: *KvManager, sequence_id: SequenceId) !block.KvBlockId {
         const sequence_state = try self.sequenceMut(sequence_id);
         const storage = &self.pools.items[sequence_state.pool_id];
-        if (sequence_state.block_table.last()) |last_id| {
-            if (sequence_state.block_table.tail_tokens < storage.config.page_size_tokens) return last_id;
+        if (sequence_state.block_table.last() != null) {
+            if (sequence_state.block_table.tail_tokens < storage.config.page_size_tokens) {
+                try writable.ensureRange(storage, &sequence_state.block_table, &sequence_state.reserved_tail_blocks, self.allocator, (sequence_state.block_table.blocks.items.len - 1) * storage.config.page_size_tokens, 1, true);
+                return sequence_state.block_table.last().?;
+            }
         }
         if (sequence_state.reserved_tail_blocks.items.len > 0) {
             const id = sequence_state.reserved_tail_blocks.items[0];
@@ -189,9 +198,7 @@ pub const KvManager = struct {
             sequence_state.reserved_tail_blocks.items.len -= 1;
             return id;
         }
-        const id = try storage.acquire(self.allocator);
-        try sequence_state.block_table.append(self.allocator, id);
-        return id;
+        return writable.appendAcquired(storage, &sequence_state.block_table, self.allocator);
     }
 
     pub fn reserveTokenCapacity(self: *KvManager, sequence_id: SequenceId, token_capacity: usize) !void {
@@ -200,13 +207,16 @@ pub const KvManager = struct {
         const storage = &self.pools.items[sequence_state.pool_id];
         const page_size: usize = storage.config.page_size_tokens;
         if (page_size == 0) return error.InvalidPoolId;
-        const target_blocks = std.math.divCeil(usize, token_capacity, page_size) catch return error.InvalidPoolId;
+        if (token_capacity <= sequence_state.block_table.tokenCount(@intCast(page_size))) return;
+        const logical_blocks = std.math.divCeil(usize, token_capacity, page_size) catch return error.InvalidPoolId;
+        const copies = writable.tailCopies(storage, &sequence_state.block_table) orelse return error.InvalidBlockId;
+        const target_blocks = try std.math.add(usize, logical_blocks, copies);
         var available_blocks = sequence_state.block_table.blocks.items.len + sequence_state.reserved_tail_blocks.items.len;
         while (available_blocks < target_blocks) : (available_blocks += 1) {
             {
+                try sequence_state.reserved_tail_blocks.ensureUnusedCapacity(self.allocator, 1);
                 const id = try storage.acquire(self.allocator);
-                errdefer _ = storage.releaseRef(self.allocator, id) catch {};
-                try sequence_state.reserved_tail_blocks.append(self.allocator, id);
+                sequence_state.reserved_tail_blocks.appendAssumeCapacity(id);
             }
         }
     }
@@ -277,9 +287,11 @@ pub const KvManager = struct {
         const has_open_tail = seq_state.block_table.blocks.items.len > 0 and tail_tokens < page_size;
         const slack_in_tail: usize = if (has_open_tail) page_size - tail_tokens else 0;
 
-        if (additional_tokens <= slack_in_tail) return 0;
+        const copies = writable.tailCopies(storage, &seq_state.block_table) orelse return null;
+        if (additional_tokens <= slack_in_tail) return copies -| seq_state.reserved_tail_blocks.items.len;
         const overflow = additional_tokens - slack_in_tail;
-        return (overflow + page_size - 1) / page_size;
+        const required = std.math.add(usize, (std.math.divCeil(usize, overflow, page_size) catch return null), copies) catch return null;
+        return required -| seq_state.reserved_tail_blocks.items.len;
     }
 
     /// Headroom in additional block acquires the pool can serve before
@@ -316,6 +328,8 @@ pub const KvManager = struct {
         if (k_rows.len != token_count * key_width or v_rows.len != token_count * value_width) return error.InvalidKvShape;
         if (token_count > sequence_state.block_table.tokenCount(storage.config.page_size_tokens)) return error.KvCapacityTooSmall;
 
+        try writable.ensureRange(storage, &sequence_state.block_table, &sequence_state.reserved_tail_blocks, self.allocator, 0, token_count, true);
+
         for (0..token_count) |token_idx| {
             const block_idx = token_idx / storage.config.page_size_tokens;
             const token_offset = token_idx % storage.config.page_size_tokens;
@@ -348,6 +362,7 @@ pub const KvManager = struct {
         if (total_token_count > sequence_state.block_table.tokenCount(storage.config.page_size_tokens)) return error.KvCapacityTooSmall;
 
         const start_token = total_token_count - suffix_token_count;
+        try writable.ensureRange(storage, &sequence_state.block_table, &sequence_state.reserved_tail_blocks, self.allocator, start_token, suffix_token_count, true);
 
         if (actual_key_width == key_width and actual_value_width == value_width) {
             // Fast path: layer width matches pool width, no padding needed.
@@ -431,24 +446,9 @@ pub const KvManager = struct {
         const before = sequence_state.block_table.tokenCount(page_size);
         if (count == 0 or before == 0) return 0;
 
-        const old_len = sequence_state.block_table.blocks.items.len;
-        const excess_blocks: usize = blk: {
-            if (count >= before) break :blk old_len;
-            const target = before - count;
-            const needed_blocks = (target + page_size - 1) / page_size;
-            break :blk if (old_len > needed_blocks) old_len - needed_blocks else 0;
-        };
-
-        const dropped_block_ids: []const block.KvBlockId = if (excess_blocks > 0)
-            try self.allocator.dupe(
-                block.KvBlockId,
-                sequence_state.block_table.blocks.items[old_len - excess_blocks .. old_len],
-            )
-        else
-            &[_]block.KvBlockId{};
-        defer if (excess_blocks > 0) self.allocator.free(dropped_block_ids);
-
-        _ = sequence_state.block_table.dropTailTokens(page_size, count);
+        const dropped_block_ids = sequence_state.block_table.dropTailTokens(page_size, count);
+        // Own this table through the loop; storage callbacks must not reenter
+        // and mutate it. Custom storage release errors still propagate.
         for (dropped_block_ids) |block_id| {
             _ = try storage.releaseRef(self.allocator, block_id);
         }
@@ -530,18 +530,13 @@ pub const KvManager = struct {
         seq_state.reserved_tail_blocks.clearRetainingCapacity();
         seq_state.compacted = false;
         seq_state.active = false;
-        self.free_sequence_indices.append(self.allocator, idx) catch {};
+        self.free_sequence_indices.appendAssumeCapacity(idx);
     }
 
     fn recycledSequenceIndex(self: *KvManager) ?usize {
-        while (self.free_sequence_indices.pop()) |idx| {
-            if (idx < self.sequences.items.len and !self.sequences.items[idx].active) return idx;
-        }
-        // ponytail: fallback scan covers OOM while recording a released slot; keep a real freelist if this ever profiles hot.
-        for (self.sequences.items, 0..) |seq_state, idx| {
-            if (!seq_state.active) return idx;
-        }
-        return null;
+        const idx = self.free_sequence_indices.pop() orelse return null;
+        std.debug.assert(idx < self.sequences.items.len and !self.sequences.items[idx].active);
+        return idx;
     }
 };
 
@@ -992,4 +987,291 @@ test "poolAvailableBlocks reflects target_max_blocks cap" {
 
     manager.setPoolTargetMaxBlocks(pool_id, null);
     try std.testing.expectEqual(@as(?usize, null), manager.poolAvailableBlocks(pool_id));
+}
+
+test "manager retires and reuses the reserved sequence recycler under forced allocation failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var manager = KvManager.init(failing.allocator());
+    defer manager.deinit();
+    const pool_id = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 4 });
+    const first = try manager.attachSequence(pool_id);
+    try std.testing.expect(manager.free_sequence_indices.capacity >= manager.sequences.items.len);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try manager.releaseSequence(first);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), manager.free_sequence_indices.items.len);
+    const next = try manager.attachSequence(pool_id);
+    try std.testing.expectEqual(first, next);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), manager.sequences.items.len);
+    try std.testing.expectEqual(@as(?usize, 0), manager.tokenCount(next));
+}
+
+test "manager shared prefix truncation and full rollback retire grown blocks under forced allocation failure" {
+    const a = std.testing.allocator;
+    var manager = KvManager.init(a);
+    defer manager.deinit();
+    const pool_id = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 2 });
+    const source = try manager.attachSequence(pool_id);
+    try manager.appendTokens(source, 9);
+    const shared = try manager.attachSequenceWithSharedPrefix(pool_id, source, 8);
+    var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = 0, .resize_fail_index = 0 });
+    manager.allocator = failure.allocator();
+    defer manager.allocator = a;
+    try std.testing.expectEqual(@as(usize, 3), try manager.truncateSequence(shared, 3));
+    try std.testing.expectEqual(@as(u32, 3), manager.blockTable(shared).?.shared_prefix_blocks);
+    try std.testing.expectEqual(@as(usize, 5), try manager.truncateSequence(shared, 99));
+    try std.testing.expectEqual(@as(usize, 9), try manager.truncateSequence(source, 99));
+    try std.testing.expect(!failure.has_induced_failure);
+    const storage = manager.getPoolMut(pool_id).?.hostPool().?;
+    try std.testing.expectEqual(@as(usize, 5), storage.free_list.items.len);
+    try std.testing.expectEqual(@as(?usize, 0), manager.tokenCount(source));
+}
+
+test "shared prefix truncate then supported suffix append preserves source KV values" {
+    const a = std.testing.allocator;
+    var manager = KvManager.init(a);
+    defer manager.deinit();
+    const pool_id = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 1 });
+    const source = try manager.attachSequence(pool_id);
+    try manager.appendTokens(source, 6);
+    try manager.writeFullLayerKv(source, 0, 6, &.{ 10, 20, 30, 40, 50, 60 }, &.{ 11, 21, 31, 41, 51, 61 });
+    const derived = try manager.attachSequenceWithSharedPrefix(pool_id, source, 6);
+    try std.testing.expectEqual(@as(usize, 1), try manager.truncateSequence(derived, 1));
+    try manager.appendTokens(derived, 1);
+    try manager.writeLayerKvSuffix(derived, 0, 6, 1, &.{999}, &.{1000});
+    const source_values = try manager.gatherLayerKv(a, source, 0, 6);
+    defer a.free(source_values.k);
+    defer a.free(source_values.v);
+    try std.testing.expectEqualSlices(f32, &.{ 10, 20, 30, 40, 50, 60 }, source_values.k);
+    try std.testing.expectEqualSlices(f32, &.{ 11, 21, 31, 41, 51, 61 }, source_values.v);
+    const derived_values = try manager.gatherLayerKv(a, derived, 0, 6);
+    defer a.free(derived_values.k);
+    defer a.free(derived_values.v);
+    try std.testing.expectEqualSlices(f32, &.{ 10, 20, 30, 40, 50, 999 }, derived_values.k);
+    try std.testing.expectEqualSlices(f32, &.{ 11, 21, 31, 41, 51, 1000 }, derived_values.v);
+}
+
+test "manager failed tail metadata append leaves no orphaned acquired KV ref" {
+    const a = std.testing.allocator;
+    var failures: usize = 0;
+    var success = false;
+    for (0..32) |failure_index| {
+        var manager = KvManager.init(a);
+        defer manager.deinit();
+        const pool_id = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 1 });
+        const sequence = try manager.attachSequence(pool_id);
+        var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = failure_index, .resize_fail_index = 0 });
+        manager.allocator = failure.allocator();
+        defer manager.allocator = a;
+        manager.appendTokens(sequence, 1) catch |err| {
+            if (err != error.OutOfMemory) return err;
+            failures += 1;
+        };
+        const sequence_state = try manager.sequenceMut(sequence);
+        const storage = manager.getPoolMut(pool_id).?.hostPool().?;
+        var live_refs: usize = 0;
+        for (storage.blocks.items) |entry| live_refs += entry.meta.refcount;
+        try std.testing.expectEqual(sequence_state.block_table.blocks.items.len + sequence_state.reserved_tail_blocks.items.len, live_refs);
+        if (!failure.has_induced_failure) {
+            success = true;
+            break;
+        }
+    }
+    try std.testing.expect(success and failures != 0);
+}
+
+fn exerciseSharedKvWrites(a: std.mem.Allocator) !void {
+    var manager = KvManager.init(a);
+    defer manager.deinit();
+    const pool_id = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_layers_packed = 2, .num_kv_heads = 1, .head_dim = 1 });
+    const source = try manager.attachSequence(pool_id);
+    try manager.appendTokens(source, 6);
+    try manager.writeFullLayerKv(source, 0, 6, &.{ 10, 20, 30, 40, 50, 60 }, &.{ 11, 21, 31, 41, 51, 61 });
+    try manager.writeFullLayerKv(source, 1, 6, &.{ 110, 120, 130, 140, 150, 160 }, &.{ 111, 121, 131, 141, 151, 161 });
+    var cached: std.ArrayListUnmanaged(block.KvBlockId) = .empty;
+    defer cached.deinit(a);
+    try manager.retainSequencePrefixBlocks(source, 6, &cached);
+    defer manager.releaseRetainedBlocks(pool_id, cached.items);
+    // The original sequence has no shared-prefix marker, yet its cache holds
+    // real physical refs. Writing that source must protect the cached prefix.
+    try std.testing.expectEqual(@as(u32, 0), manager.blockTable(source).?.shared_prefix_blocks);
+    try manager.writeLayerKvSuffix(source, 0, 6, 1, &.{99}, &.{100});
+    const storage = manager.getPoolMut(pool_id).?;
+    const cached_row = try storage.readToken(cached.items[2], 0, 1);
+    try std.testing.expectEqualSlices(f32, &.{60}, cached_row.k);
+    try std.testing.expectEqualSlices(f32, &.{61}, cached_row.v);
+    const derived = try manager.attachSequenceWithRetainedBlocks(pool_id, cached.items, 6);
+    try std.testing.expectEqual(@as(usize, 1), try manager.truncateSequence(derived, 1));
+    try std.testing.expectEqual(@as(usize, 1), manager.estimateBlocksFor(derived, 1).?);
+    {
+        var no_op = std.testing.FailingAllocator.init(a, .{ .fail_index = 0, .resize_fail_index = 0 });
+        manager.allocator = no_op.allocator();
+        defer manager.allocator = a;
+        try manager.reserveTokenCapacity(derived, 5);
+        try std.testing.expect(!no_op.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 0), (try manager.sequenceMut(derived)).reserved_tail_blocks.items.len);
+    }
+    try manager.reserveTokenCapacity(derived, 6);
+    try std.testing.expectEqual(@as(usize, 0), manager.estimateBlocksFor(derived, 1).?);
+    try std.testing.expectEqual(@as(usize, 1), (try manager.sequenceMut(derived)).reserved_tail_blocks.items.len);
+    storage.setTargetMaxBlocks(storage.liveBlocks());
+    try std.testing.expectEqual(@as(?usize, 0), storage.availableBlocks());
+    const physical_before = storage.liveBlocks();
+    var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = 0, .resize_fail_index = 0 });
+    manager.allocator = failure.allocator();
+    defer manager.allocator = a;
+    // The exact pre-reserved unique page covers COW even at the physical cap;
+    // source/derived/cache ownership does not require any new allocation.
+    try manager.appendTokens(derived, 1);
+    try manager.writeLayerKvSuffix(derived, 0, 6, 1, &.{999}, &.{1000});
+    try std.testing.expect(!failure.has_induced_failure);
+    try std.testing.expectEqual(physical_before, storage.liveBlocks());
+    const source_values = try manager.gatherLayerKv(a, source, 0, 6);
+    defer a.free(source_values.k);
+    defer a.free(source_values.v);
+    try std.testing.expectEqualSlices(f32, &.{ 10, 20, 30, 40, 50, 99 }, source_values.k);
+    const derived_values = try manager.gatherLayerKv(a, derived, 0, 6);
+    defer a.free(derived_values.k);
+    defer a.free(derived_values.v);
+    try std.testing.expectEqualSlices(f32, &.{ 10, 20, 30, 40, 50, 999 }, derived_values.k);
+    const other_layer = try manager.gatherLayerKv(a, derived, 1, 6);
+    defer a.free(other_layer.k);
+    defer a.free(other_layer.v);
+    // COW preserved every existing encoded layer, not only the one written.
+    try std.testing.expectEqualSlices(f32, &.{ 110, 120, 130, 140, 150 }, other_layer.k[0..5]);
+    const cached_again = try storage.readToken(cached.items[2], 1, 1);
+    try std.testing.expectEqualSlices(f32, &.{160}, cached_again.k);
+}
+
+test "manager shared KV source and retained prefix writes preserve all layers with reserved COW capacity" {
+    try exerciseSharedKvWrites(std.testing.allocator);
+}
+test "manager shared KV COW and retained owners unwind every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseSharedKvWrites, .{});
+}
+
+test "manager shared partial tail allocation failure leaves source and logical derived state unchanged" {
+    const a = std.testing.allocator;
+    var failures: usize = 0;
+    var success = false;
+    for (0..32) |index| {
+        var manager = KvManager.init(a);
+        defer manager.deinit();
+        const pool_id = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 1 });
+        const source = try manager.attachSequence(pool_id);
+        try manager.appendTokens(source, 6);
+        try manager.writeFullLayerKv(source, 0, 6, &.{ 1, 2, 3, 4, 5, 6 }, &.{ 7, 8, 9, 10, 11, 12 });
+        const derived = try manager.attachSequenceWithSharedPrefix(pool_id, source, 6);
+        _ = try manager.truncateSequence(derived, 1);
+        const original_tail = manager.blockTable(derived).?.last().?;
+        var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = index });
+        manager.allocator = failure.allocator();
+        defer manager.allocator = a;
+        manager.appendTokens(derived, 1) catch |err| {
+            if (err != error.OutOfMemory) return err;
+            failures += 1;
+            try std.testing.expectEqual(@as(?usize, 5), manager.tokenCount(derived));
+            try std.testing.expectEqual(original_tail, manager.blockTable(derived).?.last().?);
+        };
+        const source_values = try manager.gatherLayerKv(a, source, 0, 6);
+        defer a.free(source_values.k);
+        defer a.free(source_values.v);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6 }, source_values.k);
+        var refs: usize = 0;
+        for (manager.getPoolMut(pool_id).?.hostPool().?.blocks.items) |entry| refs += entry.meta.refcount;
+        try std.testing.expectEqual(manager.blockTable(source).?.blocks.items.len + manager.blockTable(derived).?.blocks.items.len, refs);
+        if (!failure.has_induced_failure) {
+            success = true;
+            break;
+        }
+    }
+    try std.testing.expect(success and failures != 0);
+}
+
+fn exerciseRetiredSequenceMetadata(a: std.mem.Allocator) !void {
+    var manager = KvManager.init(a);
+    defer manager.deinit();
+    const pool_id = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 1 });
+    var ids: [17]SequenceId = undefined;
+    for (&ids) |*id| {
+        id.* = try manager.attachSequence(pool_id);
+        try manager.appendTokens(id.*, 1);
+    }
+    try std.testing.expect(manager.free_sequence_indices.capacity >= manager.sequences.items.len);
+    const selected = [_]usize{ 2, 15, 7, 0 };
+    var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = 0, .resize_fail_index = 0 });
+    manager.allocator = failure.allocator();
+    defer manager.allocator = a;
+    for (0..3) |_| {
+        for (selected) |index| {
+            try manager.releaseSequence(ids[index]);
+            try manager.releaseSequence(ids[index]); // idempotent, no duplicate ID
+        }
+        try std.testing.expectEqual(selected.len, manager.free_sequence_indices.items.len);
+        for (0..selected.len) |index| {
+            const selected_index = selected[selected.len - index - 1];
+            const reused = try manager.attachSequence(pool_id);
+            try std.testing.expectEqual(ids[selected_index], reused);
+            try std.testing.expectEqual(@as(?usize, 0), manager.tokenCount(reused));
+        }
+        try std.testing.expectEqual(@as(usize, 0), manager.free_sequence_indices.items.len);
+        try std.testing.expectEqual(@as(usize, 17), manager.sequences.items.len);
+    }
+    try std.testing.expect(!failure.has_induced_failure);
+    // Reusing a retired slot preserves every unrelated live sequence.
+    try std.testing.expectEqual(@as(?usize, 1), manager.tokenCount(ids[1]));
+}
+
+test "manager noncontiguous sequence retirement and reuse require no allocator calls" {
+    try exerciseRetiredSequenceMetadata(std.testing.allocator);
+}
+test "manager sequence and recycler publication unwind every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseRetiredSequenceMetadata, .{});
+}
+
+test "manager cold recycler metadata failure publishes no sequence or ID gap" {
+    const a = std.testing.allocator;
+    for (0..2) |index| {
+        var manager = KvManager.init(a);
+        defer manager.deinit();
+        const pool_id = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 1 });
+        var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = index });
+        manager.allocator = failure.allocator();
+        defer manager.allocator = a;
+        try std.testing.expectError(error.OutOfMemory, manager.attachSequence(pool_id));
+        try std.testing.expectEqual(@as(usize, 0), manager.sequences.items.len);
+        try std.testing.expectEqual(@as(usize, 0), manager.free_sequence_indices.items.len);
+        failure.fail_index = std.math.maxInt(usize);
+        const id = try manager.attachSequence(pool_id);
+        try std.testing.expectEqual(@as(SequenceId, 1), id);
+        try std.testing.expect(manager.free_sequence_indices.capacity >= manager.sequences.items.len);
+    }
+}
+
+test "manager custom retirement failure preserves the active sequence and is never recycled" {
+    const a = std.testing.allocator;
+    var manager = KvManager.init(a);
+    defer manager.deinit();
+    const pool_id = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 1 });
+    const id = try manager.attachSequence(pool_id);
+    try manager.appendTokens(id, 1);
+    const storage = manager.getPoolMut(pool_id).?;
+    const original = storage.vtable;
+    var altered = original.*;
+    const Refuse = struct {
+        fn release(_: *anyopaque, _: std.mem.Allocator, _: block.KvBlockId) !bool {
+            return error.CustomRetirementFailure;
+        }
+    };
+    altered.releaseRef = Refuse.release;
+    storage.vtable = &altered;
+    defer storage.vtable = original;
+    try std.testing.expectError(error.CustomRetirementFailure, manager.releaseSequence(id));
+    try std.testing.expect((try manager.sequenceMut(id)).active);
+    try std.testing.expectEqual(@as(usize, 0), manager.free_sequence_indices.items.len);
+    storage.vtable = original;
+    try manager.releaseSequence(id);
+    try std.testing.expectEqual(@as(usize, 1), manager.free_sequence_indices.items.len);
 }

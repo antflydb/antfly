@@ -1103,8 +1103,8 @@ test "embeddinggemma2 video staging fences coalesce repeats and drain consumer e
     };
     Mock.synchronizations = 0;
     var ctx: context.CudaContext = undefined;
-    ctx.observation = null;
-    ctx.observation_enable_failed = false;
+    ctx.observation.store(null, .release);
+    ctx.observation_enable_failed.store(false, .release);
     ctx.ctx = @ptrFromInt(1);
     ctx.stream = @ptrFromInt(2);
     ctx.stats = .{};

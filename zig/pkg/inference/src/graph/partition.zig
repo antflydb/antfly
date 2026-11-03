@@ -75,6 +75,36 @@ pub const PartitionExecutor = struct {
 
     pub const ExecutionStats = @import("../execution/stats.zig").ExecutionStats;
 
+    /// Immutable lookup shared by all synchronous partitions of one run.
+    /// This borrows the run owner's maps and never owns tensor values.
+    pub const RuntimeInputIndex = struct {
+        values: std.AutoHashMapUnmanaged(NodeId, CT) = .empty,
+        donated: std.AutoHashMapUnmanaged(NodeId, void) = .empty,
+        borrowed: bool = false,
+
+        pub fn init(allocator: std.mem.Allocator, options: interpreter.ExecuteOptions) !RuntimeInputIndex {
+            var result = RuntimeInputIndex{};
+            errdefer result.deinit(allocator);
+            if (options.runtime_inputs) |inputs| for (inputs, 0..) |input, index| {
+                try result.values.put(allocator, input.node_id, input.value);
+                if (options.donate) |donate| {
+                    if (index < donate.len and donate[index]) try result.donated.put(allocator, input.node_id, {});
+                }
+            };
+            return result;
+        }
+        pub fn borrow(self: *const RuntimeInputIndex) RuntimeInputIndex {
+            return .{ .values = self.values, .donated = self.donated, .borrowed = true };
+        }
+        pub fn deinit(self: *RuntimeInputIndex, allocator: std.mem.Allocator) void {
+            if (!self.borrowed) {
+                self.values.deinit(allocator);
+                self.donated.deinit(allocator);
+            }
+            self.* = .{};
+        }
+    };
+
     pub const ExecutionContext = struct {
         allocator: ?std.mem.Allocator = null,
         graph: ?*const Graph = null,
@@ -86,6 +116,9 @@ pub const PartitionExecutor = struct {
         partition_plan: ?*const PartitionPlan = null,
         buffer_plan: ?*const buffer_plan_mod.BufferPlan = null,
         owned_runtime_transfers: ?*std.AutoHashMapUnmanaged(NodeId, void) = null,
+        /// Valid only for these exact runtime_inputs/donate options and the
+        /// synchronous execute call. Individual executors may not mutate it.
+        runtime_input_index: ?*const RuntimeInputIndex = null,
         materialize_boundary_outputs: bool = true,
         stats: ?*ExecutionStats = null,
         attention: ?*const contracts.AttentionContext = null,
@@ -93,6 +126,11 @@ pub const PartitionExecutor = struct {
         pair_second: ?*?CT = null,
         embedding_ids: ?[]const i64 = null,
         runtime_shape_tracker: ?*interpreter.RuntimeShapeTracker = null,
+
+        pub fn runtimeInputIndex(self: @This(), allocator: std.mem.Allocator, options: interpreter.ExecuteOptions) !RuntimeInputIndex {
+            if (self.runtime_input_index) |index| return index.borrow();
+            return RuntimeInputIndex.init(allocator, options);
+        }
 
         /// Every partition backend shares this checkpoint contract. Compiled
         /// executors additionally wire the control into their native runtime
@@ -1819,4 +1857,29 @@ test "parameter current storage stays separate from proposed uploadable residenc
     defer actual_device.deinit();
     try std.testing.expectEqual(BackendKind.metal, actual_device.partitions[actual_device.node_assignment[x]].backend);
     try std.testing.expectEqual(@as(usize, 0), actual_device.partitions[actual_device.node_assignment[out]].external_inputs.len);
+}
+
+fn runtimeInputIndexOwnershipCase(allocator: std.mem.Allocator) !void {
+    var marker: u8 = 0;
+    const value: CT = @ptrCast(&marker);
+    const options = interpreter.ExecuteOptions{ .runtime_inputs = &.{ .{ .node_id = 2, .value = value }, .{ .node_id = 3, .value = value } }, .donate = &.{ false, true } };
+    var owned = try PartitionExecutor.RuntimeInputIndex.init(allocator, options);
+    defer owned.deinit(allocator);
+    var no_storage: [0]u8 = .{};
+    var forbidden = std.heap.FixedBufferAllocator.init(&no_storage);
+    const context = PartitionExecutor.ExecutionContext{ .runtime_input_index = &owned };
+    var borrowed = try context.runtimeInputIndex(forbidden.allocator(), options);
+    borrowed.deinit(forbidden.allocator());
+    try std.testing.expectEqual(value, owned.values.get(2).?);
+    try std.testing.expect(!owned.donated.contains(2) and owned.donated.contains(3));
+    // A direct partition still owns its lookup and must unwind either map's
+    // allocation failure without consuming the borrowed tensor values.
+    var direct = try (PartitionExecutor.ExecutionContext{}).runtimeInputIndex(allocator, options);
+    defer direct.deinit(allocator);
+    try std.testing.expectEqual(value, direct.values.get(3).?);
+}
+
+test "partition runtime input indices borrow without allocation and preserve owning cleanup on every failure" {
+    try runtimeInputIndexOwnershipCase(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, runtimeInputIndexOwnershipCase, .{});
 }

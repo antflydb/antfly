@@ -25,6 +25,16 @@ const gguf_tensor_types = @import("../gguf/tensor_types.zig");
 const safetensors = @import("safetensors.zig");
 const c_file = @import("../util/c_file.zig");
 
+var panel_epoch: std.atomic.Value(u64) = .init(1);
+fn nextPanelEpoch() u64 {
+    var before = panel_epoch.load(.monotonic);
+    while (true) {
+        // Exhaustion is unknown coverage, never a recycled representation ID.
+        if (before == std.math.maxInt(u64)) return 0;
+        if (panel_epoch.cmpxchgWeak(before, before + 1, .monotonic, .monotonic)) |actual| before = actual else return before;
+    }
+}
+
 pub const QuantizedStorage = struct {
     pub const PackedExpertView = struct {
         expert_index: u32,
@@ -36,6 +46,21 @@ pub const QuantizedStorage = struct {
     };
 
     pub const PreparedGroupCache = struct {
+        const Owner = struct {
+            allocator: std.mem.Allocator,
+            references: std.atomic.Value(usize) = .init(1),
+            packed_bytes: []u8,
+            partner_keys: [2][]u8,
+            partner_count: u8,
+
+            fn release(self: *Owner) void {
+                if (self.references.fetchSub(1, .acq_rel) != 1) return;
+                for (self.partner_keys[0..self.partner_count]) |key| self.allocator.free(key);
+                self.allocator.free(self.packed_bytes);
+                self.allocator.destroy(self);
+            }
+        };
+
         pub const Format = enum {
             panel16_projection_group,
         };
@@ -50,6 +75,25 @@ pub const QuantizedStorage = struct {
         projection_count: u8,
         panel_cols: u16,
         row_blocks: u32,
+        source_epochs: [3]u64 = @splat(0),
+        retention: ?*Owner = null,
+
+        /// Adopt already staged bytes atomically, without a second payload.
+        pub fn adopt(self: *PreparedGroupCache, allocator: std.mem.Allocator) !void {
+            std.debug.assert(self.retention == null);
+            const owner = try allocator.create(Owner);
+            owner.* = .{ .allocator = allocator, .packed_bytes = self.packed_bytes, .partner_keys = self.partner_keys, .partner_count = self.partner_count };
+            self.retention = owner;
+        }
+        fn retain(self: PreparedGroupCache) ?PreparedGroupCache {
+            const owner = self.retention orelse return null;
+            const before = owner.references.fetchAdd(1, .monotonic);
+            std.debug.assert(before > 0);
+            return self;
+        }
+        fn unique(self: PreparedGroupCache) bool {
+            return if (self.retention) |owner| owner.references.load(.acquire) == 1 else true;
+        }
 
         pub fn ownedBytes(self: *const PreparedGroupCache) usize {
             var total = self.packed_bytes.len;
@@ -62,8 +106,11 @@ pub const QuantizedStorage = struct {
         }
 
         pub fn deinit(self: *PreparedGroupCache, allocator: std.mem.Allocator) void {
-            for (self.partnerKeys()) |key| allocator.free(key);
-            allocator.free(self.packed_bytes);
+            if (self.retention) |owner| owner.release() else {
+                for (self.partnerKeys()) |key| allocator.free(key);
+                allocator.free(self.packed_bytes);
+            }
+            self.* = undefined;
         }
     };
 
@@ -156,8 +203,29 @@ pub const QuantizedStorage = struct {
     raw_mmap_region: ?c_file.MmapRegion = null,
     prepared: PreparedQuantCache = .{},
     prepared_group_cache: ?PreparedGroupCache = null,
+    /// Cache publication/retention only; never held while a numerical program
+    /// executes. Optional replacement declines while an old reader is active,
+    /// preserving exact model-cache charging until the bytes actually retire.
+    prepared_group_mutex: std.atomic.Mutex = .unlocked,
+    panel16_epoch: std.atomic.Value(u64) = .init(0),
     allocator: std.mem.Allocator,
 
+    pub fn retainPreparedGroup(self: *const QuantizedStorage) ?PreparedGroupCache {
+        const mutable = @constCast(self);
+        @import("antfly_platform").sync.lockYielding(&mutable.prepared_group_mutex);
+        defer mutable.prepared_group_mutex.unlock();
+        const cache = self.prepared_group_cache orelse return null;
+        return cache.retain();
+    }
+    pub const GroupReplacement = union(enum) { busy, replaced: ?PreparedGroupCache };
+    pub fn replaceUnusedPreparedGroup(self: *QuantizedStorage, replacement: ?PreparedGroupCache) GroupReplacement {
+        @import("antfly_platform").sync.lockYielding(&self.prepared_group_mutex);
+        defer self.prepared_group_mutex.unlock();
+        if (self.prepared_group_cache) |cache| if (!cache.unique()) return .busy;
+        const previous = self.prepared_group_cache;
+        self.prepared_group_cache = replacement;
+        return .{ .replaced = previous };
+    }
     pub fn preparedBytes(self: *const QuantizedStorage, layout: PreparedQuantLayout) ?[]u8 {
         return self.prepared.get(layout);
     }
@@ -174,6 +242,7 @@ pub const QuantizedStorage = struct {
         row_blocks: u32,
     ) void {
         self.prepared.setOwned(self.allocator, layout, bytes, panel_cols, row_blocks);
+        if (layout == .panel16) self.panel16_epoch.store(nextPanelEpoch(), .release);
     }
 
     pub fn deinit(self: *QuantizedStorage) void {
@@ -534,4 +603,70 @@ test "dense weight conversion releases every partial allocation" {
     defer already_f32.deinit();
     try std.testing.expectError(error.UnsupportedConversion, convertToF32(a, &already_f32));
     try std.testing.expectEqualSlices(f32, &.{7}, already_f32.asFloat32());
+}
+
+fn exercisePreparedGroupOwnership(a: std.mem.Allocator) !void {
+    var storage = QuantizedStorage{ .tensor_type = .{ .known = .Q4_K }, .raw_bytes = &.{}, .shape = try a.dupe(i64, &.{ 1, 1 }), .raw_owned = false, .allocator = a };
+    var storage_owned = true;
+    defer if (storage_owned) storage.deinit();
+    const bytes = try a.dupe(u8, &.{ 1, 2, 3, 4 });
+    var bytes_owned = true;
+    defer if (bytes_owned) a.free(bytes);
+    const key_b = try a.dupe(u8, "same.b");
+    var key_b_owned = true;
+    defer if (key_b_owned) a.free(key_b);
+    const key_c = try a.dupe(u8, "same.c");
+    var key_c_owned = true;
+    defer if (key_c_owned) a.free(key_c);
+    var staged = QuantizedStorage.PreparedGroupCache{ .format = .panel16_projection_group, .packed_bytes = bytes, .partner_keys = .{ key_b, key_c }, .partner_count = 2, .projection_count = 3, .panel_cols = 16, .row_blocks = 1, .source_epochs = .{ 1, 2, 3 } };
+    try staged.adopt(a);
+    bytes_owned = false;
+    key_b_owned = false;
+    key_c_owned = false;
+    var staged_owned = true;
+    defer if (staged_owned) staged.deinit(a);
+    switch (storage.replaceUnusedPreparedGroup(staged)) {
+        .busy => return error.UnexpectedBusyCache,
+        .replaced => |previous| try std.testing.expect(previous == null),
+    }
+    staged_owned = false;
+    var first = storage.retainPreparedGroup() orelse return error.MissingPreparedGroup;
+    var first_owned = true;
+    defer if (first_owned) first.deinit(a);
+    try std.testing.expect(storage.replaceUnusedPreparedGroup(null) == .busy);
+    try std.testing.expectEqual(@as(usize, 16), first.ownedBytes());
+    var second = storage.retainPreparedGroup() orelse return error.MissingPreparedGroup;
+    defer second.deinit(a);
+    first.deinit(a);
+    first_owned = false;
+    try std.testing.expect(storage.replaceUnusedPreparedGroup(null) == .busy);
+    // The copied program owns its bytes/keys independently of the mutable
+    // storage slot. Managed model teardown separately requires quiescent users.
+    storage.deinit();
+    storage_owned = false;
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, second.packed_bytes);
+    try std.testing.expectEqualStrings("same.b", second.partnerKeys()[0]);
+}
+
+test "prepared quantized group owners pin immutable payload and reject replacement during numerical use" {
+    try exercisePreparedGroupOwnership(std.testing.allocator);
+}
+
+test "prepared quantized group ownership unwinds every metadata allocation failure" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exercisePreparedGroupOwnership, .{});
+}
+
+test "prepared panel identities survive cache epochs without pointer identity reuse" {
+    const a = std.testing.allocator;
+    var first = QuantizedStorage{ .tensor_type = .{ .known = .Q4_K }, .raw_bytes = &.{}, .shape = try a.dupe(i64, &.{ 1, 1 }), .raw_owned = false, .allocator = a };
+    defer first.deinit();
+    var second = QuantizedStorage{ .tensor_type = .{ .known = .Q4_K }, .raw_bytes = &.{}, .shape = try a.dupe(i64, &.{ 1, 1 }), .raw_owned = false, .allocator = a };
+    defer second.deinit();
+    try std.testing.expectEqual(@as(u64, 0), first.panel16_epoch.load(.acquire));
+    first.setPreparedBytes(.panel16, try a.dupe(u8, &.{1}), 16, 1);
+    const original = first.panel16_epoch.load(.acquire);
+    second.setPreparedBytes(.panel16, try a.dupe(u8, &.{1}), 16, 1);
+    try std.testing.expect(original != 0 and second.panel16_epoch.load(.acquire) != original);
+    first.setPreparedBytes(.panel16, try a.dupe(u8, &.{2}), 16, 1);
+    try std.testing.expect(first.panel16_epoch.load(.acquire) != original);
 }

@@ -365,7 +365,7 @@ test "gliner boundary socket pinned small Metal queued cancellation releases adm
         // The shared helper establishes Node.serve's authoritative resource
         // domain before publishing the listener. Keep that pointer stable.
         const domain = node.model_manager.resource_domain orelse return error.MissingResourceDomain;
-        const resource_admission = &domain.admission;
+        const resource_admission = domain.admission;
         try std.testing.expectEqual(memory.AdmissionAmounts{}, resource_admission.snapshot());
         try transport.start();
         try std.testing.expect(!node.test_allow_unqualified_gliner_boundary);

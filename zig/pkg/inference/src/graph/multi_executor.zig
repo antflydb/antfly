@@ -81,16 +81,13 @@ pub const DevicePartitionPlan = struct {
     }
 };
 
-/// Result of multi-device graph execution.
-pub const MultiExecutionResult = struct {
-    /// Output tensors (same order as graph.outputs).
+/// Owned output handles, independent of optional execution diagnostics. The
+/// caller's stats sink is invocation-local and never retained by this payload.
+pub const DeviceOutputs = struct {
     outputs: []CT,
-    /// Which device produced each output.
     output_devices: []DeviceId,
-    stats: ExecutionStats = .{},
     allocator: std.mem.Allocator,
-
-    pub fn deinit(self: *MultiExecutionResult, mesh: *const DeviceMesh) void {
+    pub fn deinit(self: *DeviceOutputs, mesh: *const DeviceMesh) void {
         const trace = traceOutputsEnabled();
         for (self.outputs, self.output_devices, 0..) |ct, dev_id, idx| {
             var duplicate = false;
@@ -115,6 +112,19 @@ pub const MultiExecutionResult = struct {
         }
         self.allocator.free(self.outputs);
         self.allocator.free(self.output_devices);
+    }
+};
+
+/// Compatibility value result. Internal submissions write their large stats
+/// directly to a caller-owned sink rather than copying it through each layer.
+pub const MultiExecutionResult = struct {
+    outputs: []CT,
+    output_devices: []DeviceId,
+    stats: ExecutionStats = .{},
+    allocator: std.mem.Allocator,
+    pub fn deinit(self: *MultiExecutionResult, mesh: *const DeviceMesh) void {
+        var outputs = DeviceOutputs{ .outputs = self.outputs, .output_devices = self.output_devices, .allocator = self.allocator };
+        outputs.deinit(mesh);
     }
 };
 
@@ -261,6 +271,21 @@ pub fn executeMultiDevice(
     mesh: *const DeviceMesh,
     options: ExecuteOptions,
 ) !MultiExecutionResult {
+    var stats: ExecutionStats = undefined;
+    const outputs = try executeDeviceOutputs(allocator, graph, plan, mesh, &options, &stats);
+    return .{ .outputs = outputs.outputs, .output_devices = outputs.output_devices, .allocator = outputs.allocator, .stats = stats };
+}
+
+/// Synchronous submission. Options and the writable stats sink must outlive
+/// this call; neither pointer escapes into cached plans, tensors or resources.
+pub fn executeDeviceOutputs(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    plan: *const DevicePartitionPlan,
+    mesh: *const DeviceMesh,
+    options: *const ExecuteOptions,
+    stats: *ExecutionStats,
+) !DeviceOutputs {
     const transfer_audit = @import("../execution/transfer_audit.zig");
     var audit = transfer_audit.Audit{ .forbid_activation_readbacks = options.activation_readbacks == .forbidden };
     const auditing = options.collect_partition_stats or audit.forbid_activation_readbacks;
@@ -269,12 +294,13 @@ pub fn executeMultiDevice(
     };
     if (auditing) try transfer_audit.begin(&audit);
     defer if (auditing) transfer_audit.end();
-    var result = try executeMultiDeviceImpl(allocator, graph, plan, mesh, options);
-    audit.recordStats(&result.stats);
+    const result = try executeMultiDeviceImpl(allocator, graph, plan, mesh, options, stats);
+    audit.recordStats(stats);
     return result;
 }
 
-fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, plan: *const DevicePartitionPlan, mesh: *const DeviceMesh, options: ExecuteOptions) !MultiExecutionResult {
+fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, plan: *const DevicePartitionPlan, mesh: *const DeviceMesh, options: *const ExecuteOptions, stats: *ExecutionStats) !DeviceOutputs {
+    stats.* = .{};
     if (options.execution_control) |control| try control.check();
     const count = graph.nodeCount();
     // Validate ownership before querying tensor metadata or consuming inputs.
@@ -301,20 +327,14 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
     @memset(value_device, 0);
 
     // Build runtime input lookup.
-    var rt_map = std.AutoHashMapUnmanaged(NodeId, CT).empty;
-    defer rt_map.deinit(allocator);
-    var donated = std.AutoHashMapUnmanaged(NodeId, void).empty;
-    defer donated.deinit(allocator);
+    var runtime_input_index = try PartitionExecutor.RuntimeInputIndex.init(allocator, options.*);
+    defer runtime_input_index.deinit(allocator);
+    const rt_map = runtime_input_index.values;
+    const donated = runtime_input_index.donated;
     var owned_runtime_transfers = std.AutoHashMapUnmanaged(NodeId, void).empty;
     defer owned_runtime_transfers.deinit(allocator);
     if (options.runtime_inputs) |inputs| {
-        for (inputs, 0..) |ri, idx| {
-            try rt_map.put(allocator, ri.node_id, ri.value);
-            if (options.donate) |donate| {
-                if (idx < donate.len and donate[idx]) {
-                    try donated.put(allocator, ri.node_id, {});
-                }
-            }
+        for (inputs) |ri| {
             values[@intCast(ri.node_id)] = ri.value;
             value_device[@intCast(ri.node_id)] = try runtimeInputDevice(mesh, ri);
         }
@@ -322,7 +342,7 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
     errdefer {
         cleanup: for (values, 0..) |maybe_value, index| {
             const value = maybe_value orelse continue;
-            if (interpreter.isBorrowedRuntimeValue(options, value)) continue;
+            if (interpreter.isBorrowedRuntimeValue(options.*, value)) continue;
             for (values[0..index]) |prior| {
                 if (prior == value) continue :cleanup;
             }
@@ -364,7 +384,7 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
     var pair_second: ?CT = null;
     var exec_attention = options.attention;
     const collect_stats = options.collect_partition_stats or executor_stats.enabled();
-    var exec_stats: ExecutionStats = .{};
+    const exec_stats = stats;
     const trace_partitions = tracePartitionsEnabled();
 
     // Execute each partition in order.
@@ -436,14 +456,15 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
             .graph = graph,
             .backend = cb,
             .mesh = mesh,
-            .options = options,
+            .options = options.*,
             .reachable = reachable,
             .last_use = last_use,
             .partition_plan = &plan.base,
             .buffer_plan = graph_buffer_plan,
             .owned_runtime_transfers = &owned_runtime_transfers,
+            .runtime_input_index = &runtime_input_index,
             .materialize_boundary_outputs = part.backend != .metal,
-            .stats = if (collect_stats) &exec_stats else null,
+            .stats = if (collect_stats) exec_stats else null,
             .attention = if (exec_attention) |*attn| attn else null,
             .attention_layer = &attention_layer,
             .pair_second = &pair_second,
@@ -471,7 +492,7 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
             // Build per-partition ExecState.
             var exec_state = interpreter.ExecState{
                 .attention_layer = attention_layer,
-                .options = options,
+                .options = options.*,
                 .last_use = last_use,
                 .pair_second = pair_second,
                 .runtime_shapes = runtime_shape_tracker.runtimeShapes(),
@@ -580,7 +601,19 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
                 }
             }
         }
-        if (aliases_rt) {
+        const planned_copy = if (options.physical_frame) |frame| try frame.publishLiteralOutput(out_entry.backend, out_id, ct) else null;
+        if (planned_copy) |independent| {
+            outputs[idx] = independent;
+            values[@intCast(out_id)] = independent;
+            if (!aliases_rt) {
+                var retained_elsewhere = false;
+                for (values) |other| if (other == ct) {
+                    retained_elsewhere = true;
+                    break;
+                };
+                if (!retained_elsewhere) out_entry.backend.free(ct);
+            }
+        } else if (aliases_rt) {
             const one_data: [1]f32 = .{1.0};
             const one = try out_entry.backend.fromFloat32(&one_data);
             defer out_entry.backend.free(one);
@@ -634,13 +667,12 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
         if (mesh.device(entry.value_ptr.*)) |device| device.backend.free(entry.key_ptr.*);
     }
 
-    if (collect_stats) executor_stats.record(exec_stats);
-    if (executor_stats.enabled()) executor_stats.print(exec_stats);
+    if (collect_stats) executor_stats.record(exec_stats.*);
+    if (executor_stats.enabled()) executor_stats.print(exec_stats.*);
 
     return .{
         .outputs = outputs,
         .output_devices = output_devices,
-        .stats = exec_stats,
         .allocator = allocator,
     };
 }

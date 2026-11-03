@@ -3672,7 +3672,10 @@ test "LightOnOCR3 CUDA Florence packed self KV preserves page prefixes and retur
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
     const CudaCompute = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
     const allocator = std.testing.allocator;
-    var compute = try CudaCompute.init(allocator);
+    var compute = CudaCompute.init(allocator) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer compute.deinit();
     const cb = compute.computeBackend();
     const batch = 3;

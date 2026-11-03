@@ -128,6 +128,7 @@ pub const CudaDriver = struct {
         cuStreamDestroy: *const fn (hStream: CUstream) callconv(.c) CUresult,
         cuEventCreate: *const fn (phEvent: *CUevent, flags: c_uint) callconv(.c) CUresult,
         cuEventRecord: *const fn (hEvent: CUevent, hStream: CUstream) callconv(.c) CUresult,
+        cuEventQuery: *const fn (CUevent) callconv(.c) CUresult,
         cuEventSynchronize: *const fn (hEvent: CUevent) callconv(.c) CUresult,
         cuEventElapsedTime: *const fn (pMilliseconds: *f32, hStart: CUevent, hEnd: CUevent) callconv(.c) CUresult,
         cuEventDestroy: *const fn (hEvent: CUevent) callconv(.c) CUresult,
@@ -196,6 +197,7 @@ pub const CudaDriver = struct {
                 .cuStreamWaitEvent = lookup(&lib, @TypeOf(@as(Table, undefined).cuStreamWaitEvent), "cuStreamWaitEvent") catch return error.CudaSymbolMissing,
                 .cuStreamDestroy = lookup(&lib, @TypeOf(@as(Table, undefined).cuStreamDestroy), "cuStreamDestroy") catch return error.CudaSymbolMissing,
                 .cuEventCreate = lookup(&lib, @TypeOf(@as(Table, undefined).cuEventCreate), "cuEventCreate") catch return error.CudaSymbolMissing,
+                .cuEventQuery = lookup(&lib, @TypeOf(@as(Table, undefined).cuEventQuery), "cuEventQuery") catch return error.CudaSymbolMissing,
                 .cuEventRecord = lookup(&lib, @TypeOf(@as(Table, undefined).cuEventRecord), "cuEventRecord") catch return error.CudaSymbolMissing,
                 .cuEventSynchronize = lookup(&lib, @TypeOf(@as(Table, undefined).cuEventSynchronize), "cuEventSynchronize") catch return error.CudaSymbolMissing,
                 .cuEventElapsedTime = lookup(&lib, @TypeOf(@as(Table, undefined).cuEventElapsedTime), "cuEventElapsedTime") catch return error.CudaSymbolMissing,
@@ -303,3 +305,5 @@ test "CUDA driver function handles preserve pointer ABI without erasing identity
     try std.testing.expect(CUfunction != CUmodule);
     try std.testing.expect(CUfunction != ?*anyopaque);
 }
+
+pub const CUDA_ERROR_NOT_READY: CUresult = 600;

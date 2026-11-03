@@ -26,6 +26,10 @@ const MetalWeights = if (build_options.enable_metal) @import("../ops/gpu_hosted_
 pub const MetalJitOptions = if (build_options.enable_metal) metal_runtime.MetalJitOptions else void;
 
 pub const NativePolicy = struct {
+    /// Cold construction policy, independent of submitting-thread registries.
+    /// Requested owned spans are observed from creation; allocator padding and
+    /// model storage retain their separate coverage and lifetime contracts.
+    observe_allocations: bool = false,
     quantized_activations: native.QuantizedActivationPolicy = .automatic,
     borrow_bf16_linear_weights: bool = false,
     cache_bf16_weight_mirrors: bool = false,
@@ -40,18 +44,26 @@ pub fn createNative(allocator: std.mem.Allocator, weights: *native.WeightStore, 
     var effective_allocator = allocator;
     var owned_observer: ?*observers.State = null;
     defer if (owned_observer) |owner| owner.release();
-    if (registry.enabled()) {
+    const register = registry.enabled();
+    if (register) {
         if (observers.State.forAllocator(weights.allocator)) |owner| registry.bind(.model, owner) else registry.missing(.model);
+    }
+    var observation_failed = false;
+    if (policy.observe_allocations or register) {
         if (observers.State.forAllocator(allocator)) |owner| {
-            registry.bind(.compute, owner);
+            if (register) registry.bind(.compute, owner);
         } else if (observers.State.create(allocator, .from_owner_creation) catch null) |owner| {
             owned_observer = owner;
             effective_allocator = owner.allocator();
-            registry.bind(.compute, owner);
-        } else registry.missing(.compute);
+            if (register) registry.bind(.compute, owner);
+        } else {
+            observation_failed = true;
+            if (register) registry.missing(.compute);
+        }
     }
     const compute = try effective_allocator.create(native.NativeCompute);
     compute.* = if (io) |handle| native.NativeCompute.initWithIo(effective_allocator, weights, budget, handle) else native.NativeCompute.init(effective_allocator, weights, budget);
+    compute.allocation_observer_enable_failed = observation_failed;
     compute.quantized_activation_policy = policy.quantized_activations;
     compute.borrow_bf16_linear_weights = policy.borrow_bf16_linear_weights;
     compute.cache_embeddinggemma2_bf16_weights = policy.cache_bf16_weight_mirrors;
@@ -72,9 +84,13 @@ pub fn createMetal(allocator: std.mem.Allocator, weights: *MetalWeights, budget:
     const compute = try allocator.create(metal.MetalCompute);
     errdefer allocator.destroy(compute);
     try compute.initInPlaceWithKernelJitOptions(allocator, weights, budget, io, jit);
+    errdefer compute.deinit();
     compute.require_f32_linears = policy.require_f32_linears;
     compute.qwen35_ocr_deferred_attention = policy.deferred_attention;
     compute.lightonocr3_projections = policy.projection_fusions;
+    // Engine callers carry this explicit provider-operation capability through
+    // outer frames and cached-runtime calls, independently of model lifetime.
+    try compute.beginEngineOperation();
     // Initialization holds the model's shared-provider execution lease.
     if (compute.provider_impl.raw_decode_runtime) |raw| {
         metal_runtime.termite_metal_decode_runtime_set_embeddinggemma2_rms_norm(raw, @intFromBool(policy.encoder_rms_norm));
@@ -267,4 +283,82 @@ test "observed native factory retires its caller arena before immutable interval
     try std.testing.expect(measured.maximum_individual_lifetime_peak_bytes.? > 0);
     try std.testing.expectEqual(@as(usize, 1), measured.missing_model_registrations);
     try std.testing.expectEqual(@as(usize, 0), measured.missing_compute_registrations);
+}
+
+test "explicit cold Native factory observation preserves default allocator and escaped storage ownership" {
+    const a = std.testing.allocator;
+    const observers = @import("../execution/allocation_observer.zig");
+    const registry = @import("../execution/allocation_registry.zig");
+    try std.testing.expect(!registry.enabled());
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer weights.deinitOwned();
+    var ordinary = try createNative(a, &weights, null, null, .{});
+    defer ordinary.deinit();
+    const raw: *native.NativeCompute = @ptrCast(@alignCast(ordinary.ptr));
+    try std.testing.expect(raw.allocator.ptr == a.ptr and raw.allocator.vtable == a.vtable);
+    try std.testing.expect(observers.State.forAllocator(raw.allocator) == null);
+    var measured = try createNative(a, &weights, null, null, .{ .observe_allocations = true });
+    var live = true;
+    defer if (live) measured.deinit();
+    const compute: *native.NativeCompute = @ptrCast(@alignCast(measured.ptr));
+    const owner = (observers.State.forAllocator(compute.allocator) orelse return error.MissingColdFactoryObserver).retain();
+    defer owner.release();
+    try std.testing.expect(owner.coverage == .from_owner_creation);
+    const tensor = try measured.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+    defer ordinary.free(tensor);
+    measured.deinit();
+    live = false;
+    try std.testing.expect(owner.snapshot().requested_live_bytes != 0);
+    const values = try ordinary.toFloat32(tensor, a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, values);
+    try std.testing.expect(!registry.enabled());
+}
+
+test "explicit cold Native factory construction and tensor retirement unwind every required allocation fault" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var weights = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+            defer weights.deinitOwned();
+            var cb = try createNative(a, &weights, null, null, .{ .observe_allocations = true });
+            defer cb.deinit();
+            const tensor = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+            defer cb.free(tensor);
+            const values = try cb.toFloat32(tensor, a);
+            defer a.free(values);
+            try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, values);
+        }
+    };
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), Case.run, .{});
+}
+
+/// Cold allocation before reader/provider/model execution lanes. The retained
+/// target moves only when a concrete prepared bank is returned. Unsupported
+/// private/match modes retain original admission and numerical preparation.
+pub fn prepareKvBanks(target: *@import("cold_compute_target.zig").Retained, dtype: @import("../runtime/kv/pool.zig").KvDType, window: @import("../runtime/kv/device_capacity.zig").Window, mode: @import("../execution/prepared_kv_banks.zig").Mode, geometry: []const @import("../runtime/kv/device_capacity.zig").LayerGeometry, admission: @import("../runtime/kv/device_capacity.zig").Admission, control: @import("../execution_control.zig").InferenceExecutionControl, cleanup: *const @import("../execution/retirement_sink.zig").Epoch) !?@import("../execution/prepared_kv_banks.zig").Owned {
+    const Banks = @import("../execution/prepared_kv_banks.zig").Owned;
+    switch (target.target) {
+        .cuda => {
+            if (comptime !build_options.enable_cuda) return null;
+            const Leaf = @import("../ops/cuda/cuda_compute.zig").ColdKvBank;
+            const leaf = (try Leaf.prepare(target, dtype, window, mode, geometry, admission, control, cleanup)) orelse return null;
+            return Banks.fromLeaf(Leaf, leaf);
+        },
+        .metal => {
+            if (comptime !build_options.enable_metal) return null;
+            const Leaf = @import("metal_kv_storage.zig").MetalKvStorage.ColdKvBank;
+            const leaf = (try Leaf.prepare(target, dtype, window, mode, geometry, admission, control, cleanup)) orelse return null;
+            return Banks.fromLeaf(Leaf, leaf);
+        },
+    }
+}
+
+/// Metadata only; the caller's actual retained model keeps Target valid. The
+/// returned Descriptor owns rows inline and must be placed before coverage().
+pub fn describeKvCoverage(target: @import("cold_compute_target.zig").Target, dtype: @import("../runtime/kv/pool.zig").KvDType, window: @import("../runtime/kv/device_capacity.zig").Window, mode: @import("../execution/prepared_kv_banks.zig").Mode, geometry: []const @import("../runtime/kv/device_capacity.zig").LayerGeometry) !?@import("../execution/prepared_kv_banks.zig").Descriptor {
+    return switch (target) {
+        .cuda => if (comptime build_options.enable_cuda) try @import("../ops/cuda/cuda_compute.zig").ColdKvBank.describeCoverage(target, dtype, window, mode, geometry) else null,
+        .metal => if (comptime build_options.enable_metal) try @import("metal_kv_storage.zig").MetalKvStorage.ColdKvBank.describeCoverage(target, dtype, window, mode, geometry) else null,
+    };
 }

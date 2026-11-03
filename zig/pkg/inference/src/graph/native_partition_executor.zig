@@ -121,20 +121,10 @@ pub const NativePartitionExecutor = struct {
         const reachable = exec_ctx.reachable orelse return error.MissingPartitionExecutionContext;
         const last_use = exec_ctx.last_use orelse return error.MissingPartitionExecutionContext;
 
-        var rt_map = std.AutoHashMapUnmanaged(NodeId, CT).empty;
-        defer rt_map.deinit(allocator);
-        var donated = std.AutoHashMapUnmanaged(NodeId, void).empty;
-        defer donated.deinit(allocator);
-        if (options.runtime_inputs) |inputs| {
-            for (inputs, 0..) |ri, idx| {
-                try rt_map.put(allocator, ri.node_id, ri.value);
-                if (options.donate) |donate| {
-                    if (idx < donate.len and donate[idx]) {
-                        try donated.put(allocator, ri.node_id, {});
-                    }
-                }
-            }
-        }
+        var runtime_input_index = try exec_ctx.runtimeInputIndex(allocator, options);
+        defer runtime_input_index.deinit(allocator);
+        const rt_map = runtime_input_index.values;
+        const donated = runtime_input_index.donated;
 
         var exec_state = interpreter.ExecState{
             .allocator = allocator,

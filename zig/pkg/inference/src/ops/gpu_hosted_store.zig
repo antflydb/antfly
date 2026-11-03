@@ -57,6 +57,9 @@ pub const PackedExpertViewEntry = struct {
 
 pub const LazyWeightEntry = struct {
     tensor_ref: tensor_store_mod.LazyTensorRef,
+    /// Immutable checkpoint value identity, shared by transient lookup handles.
+    /// Assigned from execution/source_identity's shared non-recycling namespace.
+    prepared_value_identity: std.atomic.Value(u64) = .init(0),
     quantized_storage: ?QuantizedStorage = null,
     host_loaded: ?@import("../models/weight_source.zig").LoadedWeight = null,
     expert_coord: ?ExpertCoord = null,

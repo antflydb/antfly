@@ -384,7 +384,8 @@ pub fn renderCudaCombine(comptime k: tile.RowReduce) []const u8 {
     comptime {
         @setEvalBranchQuota(100_000);
         const d = cuda;
-        var out: []const u8 = fmt("\nextern \"C\" __global__ void {s}_combine(const float *__restrict__ partials, float *__restrict__ out, const unsigned int partial_count) {{\n", .{k.name});
+        const probe_args = if (k.output_probes.len == 0) "" else fmt(", const float *__restrict__ values, const {s} p", .{k.params_type});
+        var out: []const u8 = fmt("\nextern \"C\" __global__ void {s}_combine(const float *__restrict__ partials, float *__restrict__ out, const unsigned int partial_count{s}) {{\n", .{ k.name, probe_args });
         out = out ++ "    if (blockIdx.x != 0u || threadIdx.x != 0u) return;\n";
         out = out ++ identity(k, d, true, "    ");
         out = out ++ "    for (unsigned int r = 0u; r < partial_count; ++r) {\n";
@@ -404,6 +405,13 @@ pub fn renderCudaCombine(comptime k: tile.RowReduce) []const u8 {
             out = out ++ fmt("    out[{d}] = {s}; out[{d}] = {s};\n", .{ 2 * ci, stateName(ci, "a"), 2 * ci + 1, second });
         }
         for (2 * k.channels.len..k.partial_stride) |pad| out = out ++ fmt("    out[{d}] = 0.0f;\n", .{pad});
+        for (k.output_probes) |probe| {
+            const fallback = switch (probe.fallback) {
+                .zero => "0.0f",
+                .negative_infinity => d.neg_inf,
+            };
+            out = out ++ fmt("    out[{d}] = (p.{s} < p.{s}) ? values[p.{s}] : {s};\n", .{ probe.offset, probe.index_param, k.extent, probe.index_param, fallback });
+        }
         return out ++ "}\n";
     }
 }

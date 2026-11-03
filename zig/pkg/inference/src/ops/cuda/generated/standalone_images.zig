@@ -32,4 +32,5 @@ pub const images = struct {
     pub const @"lighton_recurrent.ptx" = @embedFile("../lighton_recurrent.ptx") ++ "\x00";
     pub const @"lighton_vision.ptx" = @embedFile("../lighton_vision.ptx") ++ "\x00";
     pub const @"florence_fused.ptx" = @embedFile("../florence_fused.ptx") ++ "\x00";
+    pub const @"row_selection_stats_f32.ptx" = @embedFile("../row_selection_stats_f32.ptx") ++ "\x00";
 };

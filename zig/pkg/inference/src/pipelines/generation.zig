@@ -2454,6 +2454,10 @@ pub const NativeGenerationPipeline = struct {
     io: ?std.Io = null,
     cb: ComputeBackend,
     session: ?backends.Session = null,
+    /// Optional observation-only model capability; never changes provider,
+    /// compiled graph, residency, numerical policy or Session attribution.
+    diagnostics_binding: ?@import("../execution/invocation_observation.zig").Binding = null,
+    draft_diagnostics_binding: ?@import("../execution/invocation_observation.zig").Binding = null,
     gpt_config: gpt_mod.Config,
     kv_dtype: ?runtime.kv.pool.KvDType = null,
     /// Content-bound identity of this loaded model generation.
@@ -2751,6 +2755,7 @@ pub const NativeGenerationPipeline = struct {
         return .{
             .allocator = self.allocator,
             .cb = draft_cb,
+            .diagnostics_binding = self.draft_diagnostics_binding,
             .gpt_config = draft_gpt_config,
             .tokenizer = self.tokenizer,
             .artifact_dir = self.artifact_dir,
@@ -4567,7 +4572,6 @@ pub const NativeGenerationPipeline = struct {
         allow_resident_greedy_token: bool,
         capture_last_hidden: bool,
     ) !PrefillOutput {
-        const allocator = self.allocator;
         // Private opt-in qualification only. Preserve admitted chunk shapes,
         // scheduler turns and the original final-logit projection.
         const exact_prefill_probe = platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_EXACT_PREFILL_PROBE");
@@ -4643,7 +4647,6 @@ pub const NativeGenerationPipeline = struct {
                 use_prefill_greedy_token,
             },
         );
-        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
 
         if (self.scheduler) |scheduler| {
             if (self.scheduler_lease) |lease| {
@@ -4689,50 +4692,23 @@ pub const NativeGenerationPipeline = struct {
                 const chunk_end = @min(prompt_ids.len, processed + prefill_chunk_size);
                 const chunk = prompt_ids[processed..chunk_end];
                 const total_chunk_end = prefilled_tokens + chunk_end;
-                const decode_context = decode_runtime.preparePrefill(total_chunk_end, chunk.len) catch |err| {
-                    debugGenerationStage(
-                        "executePrefill whole-model KV advance failed chunk_start={d} chunk_end={d} err={s}",
-                        .{ processed, chunk_end, @errorName(err) },
-                    );
-                    return err;
-                };
                 const is_last_chunk = chunk_end == prompt_ids.len;
-                var output = (graph_mod.execution.graphForwardCompiledModelOutput(
-                    &self.graphExecutionContext(),
-                    self.graph_cache.?,
-                    chunk,
-                    1,
-                    total_chunk_end,
-                    &decode_context,
-                ) catch |err| {
-                    debugGenerationStage(
-                        "executePrefill whole-model chunk failed chunk_start={d} chunk_end={d} err={s}",
-                        .{ processed, chunk_end, @errorName(err) },
-                    );
+                const wants_greedy = is_last_chunk and allow_resident_greedy_token and isPureGreedyConfig(config) and config.grammar == null;
+                var compiled_prefill = self.prefillRuntime(decode_state, null);
+                const output = compiled_prefill.runCompiledChunk(.{ .token_ids = chunk, .total_sequence_length = total_chunk_end, .output = if (wants_greedy) .greedy_token else if (is_last_chunk) .last_logits else .kv_only }) catch |err| {
+                    debugGenerationStage("executePrefill whole-model chunk failed chunk_start={d} chunk_end={d} err={s}", .{ processed, chunk_end, @errorName(err) });
                     return err;
-                }) orelse {
-                    debugGenerationStage(
-                        "executePrefill whole-model chunk declined chunk_start={d} chunk_end={d}",
-                        .{ processed, chunk_end },
-                    );
-                    return error.MissingCompiledModelRuntime;
                 };
-                defer output.deinit(allocator);
-                if (is_last_chunk and allow_resident_greedy_token and
-                    isPureGreedyConfig(config) and config.grammar == null)
-                {
-                    const token = try output.greedyToken(allocator, self.gpt_config.vocab_size);
-                    if (token < 0) return error.InvalidModelOutput;
+                if (output.greedy_token != null) {
                     if (self.scheduler) |scheduler| {
                         if (self.scheduler_lease) |lease| {
                             scheduler.notePrefillProgress(lease, total_chunk_end, seq_len);
                             scheduler.finishTurn(lease, .prefill);
                         }
                     }
-                    return .{ .greedy_token = @intCast(token) };
-                } else if (is_last_chunk) {
-                    prefill_last_logits = try output.takeHostLogits(allocator);
+                    return .{ .greedy_token = output.greedy_token.? };
                 }
+                if (output.last_logits) |logits| prefill_last_logits = logits;
                 processed = chunk_end;
                 if (self.scheduler) |scheduler| {
                     if (self.scheduler_lease) |lease| {
@@ -4746,126 +4722,72 @@ pub const NativeGenerationPipeline = struct {
 
         if (decode_state.isPaged() and seq_len > 1) {
             const query_len = prompt_ids.len;
-            const configured_plan = config.prefill_chunk_plan;
-            const leased_plan = if (self.scheduler_lease) |lease|
-                if (lease.prefill_chunk_plan.isAdmitted()) lease.prefill_chunk_plan else null
-            else
-                null;
-            if (configured_plan != null and leased_plan != null and
-                configured_plan.?.fingerprint != leased_plan.?.fingerprint)
-            {
-                return error.InvalidPrefillChunkPlan;
-            }
-            const borrowed_plan = if (config.kv_cache_mode == .select_v1) null else configured_plan orelse leased_plan;
-            const admitted_plan: ?runtime.scheduler.native_generate.PrefillChunkPlan = if (borrowed_plan) |plan| blk: {
-                try plan.validate();
-                if (prefilled_tokens != 0 and self.checkpoint_resume == null) {
+            var cursor = try decoder_prefill.ChunkCursor.select(.{
+                .query_tokens = query_len,
+                .prefilled_tokens = prefilled_tokens,
+                .prompt_tokens = seq_len,
+                .greedy_output = use_prefill_greedy_token,
+                .capture_hidden = capture_last_hidden,
+                .execution_control = self.execution_control,
+            }, .{
+                .configured_plan = config.prefill_chunk_plan,
+                .leased_plan = if (self.scheduler_lease) |lease| if (lease.prefill_chunk_plan.isAdmitted()) lease.prefill_chunk_plan else null else null,
+                .configured_chunk_rows = config.prefill_chunk_size,
+                .scheduler_chunk_rows = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
+                .selected_kv = config.kv_cache_mode == .select_v1,
+                .checkpoint_resume = self.checkpoint_resume != null,
+                .backend = self.cb.kind(),
+                .pure_greedy = isPureGreedyConfig(config) and config.grammar == null,
+                .resident_greedy_allowed = allow_resident_greedy_token,
+                .first_token_enabled = enableCudaPrefillFirstToken(),
+                .coalesce_token_limit = cudaPrefillFirstTokenCoalesceTokenLimit(),
+            });
+            const admitted_plan = cursor.options.admitted_plan;
+            switch (cursor.plan_decision) {
+                .none => {},
+                .bypassed_prompt_cache => |plan| std.log.info(
+                    "prefill_chunk_plan: status=bypassed reason=prompt_cache_hit fingerprint={x} cached_tokens={d}",
+                    .{ plan.fingerprint, prefilled_tokens },
+                ),
+                .bypassed_geometry => |plan| std.log.info(
+                    "prefill_chunk_plan: status=bypassed reason=prompt_token_mismatch fingerprint={x} plan_prompt_tokens={d} pipeline_prompt_tokens={d}",
+                    .{ plan.fingerprint, plan.prompt_tokens, query_len },
+                ),
+                .execute => |plan| {
+                    const tail = plan.tail();
                     std.log.info(
-                        "prefill_chunk_plan: status=bypassed reason=prompt_cache_hit fingerprint={x} cached_tokens={d}",
-                        .{ plan.fingerprint, prefilled_tokens },
+                        "prefill_chunk_plan: status=execute fingerprint={x} selection={s} fairness={s} prompt_tokens={d} chunks={d} max_chunk_rows={d} max_scratch_bytes={d} forced_drain_budget_bytes={d} tail_rows={d} tail_weight_route={s}",
+                        .{ plan.fingerprint, @tagName(plan.selection), @tagName(plan.fairness), plan.prompt_tokens, plan.chunks.len, plan.max_chunk_rows, plan.max_scratch_bytes, plan.forced_drain_budget_bytes, tail.rows, @tagName(tail.weight_route_hint) },
                     );
-                    break :blk null;
-                }
-                if (plan.prompt_tokens != query_len) {
-                    if (self.checkpoint_resume != null) return error.InvalidPrefillChunkPlan;
-                    std.log.info(
-                        "prefill_chunk_plan: status=bypassed reason=prompt_token_mismatch fingerprint={x} plan_prompt_tokens={d} pipeline_prompt_tokens={d}",
-                        .{ plan.fingerprint, plan.prompt_tokens, query_len },
-                    );
-                    break :blk null;
-                }
-                const tail = plan.tail();
-                std.log.info(
-                    "prefill_chunk_plan: status=execute fingerprint={x} selection={s} fairness={s} prompt_tokens={d} chunks={d} max_chunk_rows={d} max_scratch_bytes={d} forced_drain_budget_bytes={d} tail_rows={d} tail_weight_route={s}",
-                    .{
-                        plan.fingerprint,
-                        @tagName(plan.selection),
-                        @tagName(plan.fairness),
-                        plan.prompt_tokens,
-                        plan.chunks.len,
-                        plan.max_chunk_rows,
-                        plan.max_scratch_bytes,
-                        plan.forced_drain_budget_bytes,
-                        tail.rows,
-                        @tagName(tail.weight_route_hint),
-                    },
-                );
-                break :blk plan;
-            } else null;
-            var current_chunk_size = blk: {
-                if (admitted_plan) |plan| break :blk plan.max_chunk_rows;
-                const scheduler_chunk = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0;
-                if (config.prefill_chunk_size > 0 and scheduler_chunk > 0) {
-                    break :blk @min(config.prefill_chunk_size, scheduler_chunk);
-                }
-                if (config.prefill_chunk_size > 0) break :blk config.prefill_chunk_size;
-                if (scheduler_chunk > 0) break :blk scheduler_chunk;
-                break :blk query_len;
-            };
-            current_chunk_size = @max(@min(current_chunk_size, query_len), 1);
-            if (config.kv_cache_mode == .select_v1) {
-                current_chunk_size = @min(current_chunk_size, runtime.kv.selection.defaults.prefill_chunk_rows);
+                },
             }
-            var first_token_coalesced = false;
-            if (borrowed_plan == null and config.kv_cache_mode != .select_v1) {
-                const coalesced_chunk_size = coalescedPrefillChunkSizeForFirstToken(
-                    self.cb.kind(),
-                    isPureGreedyConfig(config) and config.grammar == null,
-                    !allow_resident_greedy_token,
-                    enableCudaPrefillFirstToken(),
-                    query_len,
-                    current_chunk_size,
-                    cudaPrefillFirstTokenCoalesceTokenLimit(),
-                );
-                first_token_coalesced = coalesced_chunk_size > current_chunk_size;
-                if (first_token_coalesced) {
-                    debugFirstToken(
-                        "prefill_first_token legacy_coalesced_prefill_chunk_size from={d} to={d} seq_len={d}",
-                        .{ current_chunk_size, coalesced_chunk_size, query_len },
-                    );
-                    current_chunk_size = coalesced_chunk_size;
-                }
-            }
+            if (cursor.options.first_token_coalesced) debugFirstToken(
+                "prefill_first_token legacy_coalesced_prefill_chunk_size from={d} to={d} seq_len={d}",
+                .{ cursor.uncoalesced_chunk_size, cursor.current_chunk_size, query_len },
+            );
             const max_speculative_rows = @min(@as(usize, @intCast(config.speculative_k)), 16) + 1;
             decode_state.configureKvMaxInflightTokens(
-                @max(current_chunk_size, max_speculative_rows),
+                @max(cursor.current_chunk_size, max_speculative_rows),
                 self.cb.kind() == .metal and
                     prefilled_tokens == 0 and
                     metalRingDecodeRequestEligible(config),
             );
-            var processed: usize = 0;
-            var plan_chunk_index: usize = 0;
-            while (processed < query_len) {
+            while (try cursor.next(if (self.scheduler_lease) |lease| lease.prefill_chunk_size else cursor.current_chunk_size)) |attempt| {
+                defer cursor.cancel(attempt) catch {};
+                const processed = attempt.start;
                 var direct_prefill_turn_acquired = false;
                 defer if (direct_prefill_turn_acquired) {
                     self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);
                 };
-                const planned_chunk = if (admitted_plan) |plan| blk: {
-                    if (plan_chunk_index >= plan.chunks.len) return error.InvalidPrefillChunkPlan;
-                    break :blk plan.chunks[plan_chunk_index];
-                } else runtime.scheduler.native_generate.PrefillChunk{
-                    .rows = blk: {
-                        const scheduler_chunk = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else current_chunk_size;
-                        break :blk @max(@min(
-                            current_chunk_size,
-                            schedulerChunkForPrefillIteration(scheduler_chunk, current_chunk_size, first_token_coalesced),
-                        ), 1);
-                    },
-                };
+                const planned_chunk = attempt.chunk;
                 const chunk_size = planned_chunk.rows;
-                const chunk_end = @min(query_len, processed + chunk_size);
-                if (admitted_plan != null and chunk_end - processed != chunk_size)
-                    return error.InvalidPrefillChunkPlan;
-                const total_chunk_end = prefilled_tokens + chunk_end;
+                const chunk_end = attempt.end;
+                const total_chunk_end = attempt.total_end;
                 const chunk = prompt_ids[processed..chunk_end];
-                const output_intent = prefillOutputIntent(
-                    total_chunk_end == seq_len,
-                    use_prefill_greedy_token,
-                    capture_last_hidden,
-                );
+                const output_intent = attempt.output_intent;
                 debugGenerationStage(
                     "executePrefill chunk start processed={d} chunk_len={d} total_chunk_end={d} current_chunk_size={d} output={s} weight_route_hint={s}",
-                    .{ processed, chunk.len, total_chunk_end, current_chunk_size, @tagName(output_intent), @tagName(planned_chunk.weight_route_hint) },
+                    .{ processed, chunk.len, total_chunk_end, cursor.current_chunk_size, @tagName(output_intent), @tagName(planned_chunk.weight_route_hint) },
                 );
                 if (self.scheduler) |scheduler| {
                     if (self.scheduler_lease) |lease| {
@@ -4878,16 +4800,12 @@ pub const NativeGenerationPipeline = struct {
                                 use_metal_target_last_logits,
                             )) {
                                 prefill_last_logits = self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, chunk, total_chunk_end, chunk.len, total_chunk_end == seq_len, allow_shared_kv_prefill) catch |err| {
-                                    if (admitted_plan == null and err == error.MemoryBudgetExceeded and chunk_size > 1) {
-                                        current_chunk_size = @max(chunk_size / 2, 1);
-                                        continue;
-                                    }
+                                    if (try cursor.retryMemoryBudgetExceeded(attempt, err)) continue;
                                     return err;
                                 };
                                 if (config.kv_cache_mode == .select_v1) try decode_state.compactSelectedGlobalDonors(self.gpt_config, self.execution_control, select_v1_gpu_oracle);
-                                processed = chunk_end;
-                                if (admitted_plan != null) plan_chunk_index += 1;
-                                scheduler.notePrefillProgress(lease, prefilled_tokens + processed, seq_len);
+                                try cursor.commit(attempt);
+                                scheduler.notePrefillProgress(lease, prefilled_tokens + cursor.processed, seq_len);
                                 continue;
                             }
                         }
@@ -4930,7 +4848,7 @@ pub const NativeGenerationPipeline = struct {
                 });
                 switch (outcome) {
                     .retry_chunk_size => |smaller| {
-                        current_chunk_size = smaller;
+                        try cursor.retry(attempt, smaller);
                         continue;
                     },
                     .complete => |output| {
@@ -4942,11 +4860,10 @@ pub const NativeGenerationPipeline = struct {
                         }
                     },
                 }
-                processed = chunk_end;
-                if (admitted_plan != null) plan_chunk_index += 1;
+                try cursor.commit(attempt);
                 if (self.scheduler) |scheduler| {
                     if (self.scheduler_lease) |lease| {
-                        scheduler.notePrefillProgress(lease, prefilled_tokens + processed, seq_len);
+                        scheduler.notePrefillProgress(lease, prefilled_tokens + cursor.processed, seq_len);
                         scheduler.finishTurn(lease, .prefill);
                         // The scoped defer is the error/continue safety net.
                         // Once the successful path releases the turn, disarm
@@ -4956,9 +4873,7 @@ pub const NativeGenerationPipeline = struct {
                     }
                 }
             }
-            if (admitted_plan) |plan| {
-                if (plan_chunk_index != plan.chunks.len) return error.InvalidPrefillChunkPlan;
-            }
+            try cursor.finish();
         } else {
             if (prefilled_tokens != 0) return error.UnsupportedShape;
             if (self.scheduler) |scheduler| {
@@ -4967,13 +4882,16 @@ pub const NativeGenerationPipeline = struct {
                         prefill_last_logits = try self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, prompt_ids, seq_len, seq_len, true, allow_shared_kv_prefill);
                         scheduler.notePrefillProgress(lease, seq_len, seq_len);
                     } else {
-                        _ = try decode_runtime.preparePrefill(seq_len, seq_len);
+                        var eager_prefill = self.prefillRuntime(decode_state, null);
+                        try eager_prefill.prepareWholePrompt(seq_len);
                     }
                 } else {
-                    _ = try decode_runtime.preparePrefill(seq_len, seq_len);
+                    var eager_prefill = self.prefillRuntime(decode_state, null);
+                    try eager_prefill.prepareWholePrompt(seq_len);
                 }
             } else {
-                _ = try decode_runtime.preparePrefill(seq_len, seq_len);
+                var eager_prefill = self.prefillRuntime(decode_state, null);
+                try eager_prefill.prepareWholePrompt(seq_len);
             }
 
             if (self.scheduler) |scheduler| {
@@ -5098,6 +5016,8 @@ pub const NativeGenerationPipeline = struct {
         if (items.len > max_prepared_qwen_prefill_items) return error.InvalidBatchDecodeState;
         var requests: [max_prepared_qwen_prefill_items]decoder_prefill.PositionedEmbeddingBatchItem = undefined;
         for (items, requests[0..items.len]) |item, *request| request.* = .{
+            .diagnostics_binding = if (item.pipeline.session) |session| session.invocation_diagnostics else null,
+            .request_id = if (item.pipeline.scheduler_lease) |lease| lease.request_id else null,
             .allocator = item.pipeline.allocator,
             .backend = &item.pipeline.cb,
             .model = &item.pipeline.gpt_config,
@@ -5721,6 +5641,7 @@ pub const NativeGenerationPipeline = struct {
 
     fn pendingStepContext(self: *NativeGenerationPipeline, state: *NativeDecodeState) pending_step.Context {
         return .{
+            .observation = @import("../execution/pending_observation.zig").Source.fromSession(self.session, if (self.scheduler_lease) |lease| lease.request_id else null),
             .allocator = self.allocator,
             .backend = &self.cb,
             .model = &self.gpt_config,
@@ -6621,6 +6542,7 @@ pub const NativeGenerationPipeline = struct {
             .artifact_dir = self.artifact_dir,
             .pjrt_client = self.pjrt_client,
             .session = self.session,
+            .diagnostics_binding = self.diagnostics_binding,
             .kv_dtype = self.kv_dtype,
             .shared_moe_cache = self.shared_moe_cache,
             .device_mesh = self.device_mesh,
@@ -8708,6 +8630,7 @@ pub const NativeGenerationPipeline = struct {
         context.weights = null;
         return .{
             .context = context,
+            .batch_diagnostics = if (self.session) |session| session.invocation_diagnostics else null,
             .graph_cache = self.graph_cache,
             .pad_token = self.tokenizer.specialTokens().pad_id,
             .continuation = self.continuationControl(),
@@ -15407,4 +15330,163 @@ test "decoder runtime weight semantics bind actual backend and model without a p
     defer a.free(custom_data);
     try std.testing.expectEqualSlices(f32, &.{ 11, 12 }, custom_data);
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
+}
+
+test "generation prefill entry honors admitted cursor shapes and eager logits with actual paged state" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var model: PreparedEmbeddingsTestModel = undefined;
+    model.init(a);
+    defer model.deinit(a);
+    try model.putWeight(a, "model.norm.weight", &.{4}, &.{ 1, 1, 1, 1 });
+    try model.putWeight(a, "model.embed_tokens.weight", &.{ 2, 4 }, &.{ 1, 0, 0, 0, 0, 1, 0, 0 });
+    var pipeline = model.pipeline(a, .{ .family = .llama, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .intermediate_size = 8, .vocab_size = 2, .weight_tying = true, .norm_type = .rms_norm, .position_encoding = .rope });
+    const ids = [_]i64{ 0, 1, 0 };
+    var eager_state = NativeDecodeState.initContiguous(a);
+    defer eager_state.deinit();
+    var eager_runtime = BorrowedDecodeStateRuntime.init(&eager_state);
+    try eager_runtime.appendPrefillChunk(ids.len);
+    const eager_context = eager_runtime.makeDecodeContext(ids.len, ids.len);
+    const eager = try gpt_arch.forward(&pipeline.cb, a, pipeline.gpt_config, &ids, 1, ids.len, &eager_context);
+    defer a.free(eager);
+    const Probe = struct {
+        var rows: [8]usize = @splat(0);
+        var count: usize = 0;
+        fn embedding(ctx: *anyopaque, weight: ops.CT, input_ids: []const i64, total: usize, dim: usize) !ops.CT {
+            if (count >= rows.len) return error.UnexpectedPrefillDispatch;
+            rows[count] = input_ids.len;
+            count += 1;
+            return PreparedEmbeddingsTestModel.native_compute.vtable_impl.embeddingLookup(ctx, weight, input_ids, total, dim);
+        }
+    };
+    var table = PreparedEmbeddingsTestModel.native_compute.vtable_impl;
+    table.embeddingLookup = Probe.embedding;
+    pipeline.cb.vtable = &table;
+    Probe.count = 0;
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 4, .store_cpu_bytes = false });
+    var state = NativeDecodeState.initPaged(a, &manager, pool, null);
+    defer state.deinit();
+    var plan = try runtime.scheduler.native_generate.PrefillChunkPlan.init(a, ids.len, 2, 4096, .shared, .fixed_ceiling);
+    defer plan.deinit(a);
+    const result = try pipeline.executePrefill(&ids, ids.len, 0, &state, .{ .max_tokens = 2, .prefill_chunk_size = 99, .prefill_chunk_plan = plan }, false, false);
+    defer if (result.last_logits) |values| a.free(values);
+    defer if (result.last_hidden) |hidden| pipeline.cb.free(hidden);
+    try std.testing.expectEqualSlices(usize, &.{ 2, 1 }, Probe.rows[0..Probe.count]);
+    try std.testing.expectEqualSlices(f32, eager[(ids.len - 1) * pipeline.gpt_config.vocab_size ..][0..pipeline.gpt_config.vocab_size], result.last_logits.?);
+    try std.testing.expectEqual(@as(usize, 3), state.total_tokens);
+    try std.testing.expectEqual(@as(usize, 3), manager.tokenCount(state.sequence_id.?).?);
+    try plan.validate();
+    // An invalid admitted envelope must be rejected by the actual task entry
+    // before another model dispatch or numerical KV reservation takes place.
+    var rejected_state = NativeDecodeState.initPaged(a, &manager, pool, null);
+    defer rejected_state.deinit();
+    var invalid = plan;
+    invalid.fingerprint ^= 1;
+    const before = Probe.count;
+    try std.testing.expectError(error.InvalidPrefillChunkPlan, pipeline.executePrefill(&ids, ids.len, 0, &rejected_state, .{ .max_tokens = 2, .prefill_chunk_plan = invalid }, false, false));
+    try std.testing.expectEqual(before, Probe.count);
+    try std.testing.expectEqual(@as(usize, 0), rejected_state.total_tokens);
+    try std.testing.expect(rejected_state.sequence_id == null);
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    pipeline.execution_control = .{ .check_fn = Cancel.check };
+    try std.testing.expectError(error.Cancelled, pipeline.executePrefill(&ids, ids.len, 0, &rejected_state, .{ .max_tokens = 2, .prefill_chunk_plan = plan }, false, false));
+    try std.testing.expectEqual(before, Probe.count);
+    try std.testing.expectEqual(@as(usize, 0), rejected_state.total_tokens);
+    try std.testing.expect(rejected_state.sequence_id == null);
+}
+
+// The actual speculative adapter must bind the draft model's publication owner
+// without acquiring any of the target Session's numerical capabilities.
+test "actual Native speculative forwardAll observes independent target and draft owners with unchanged disabled callbacks" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const diagnostics_mod = @import("../execution/diagnostics.zig");
+    const native = PreparedEmbeddingsTestModel.native_compute;
+    var target: PreparedEmbeddingsTestModel = undefined;
+    target.init(a);
+    defer target.deinit(a);
+    var assistant: PreparedEmbeddingsTestModel = undefined;
+    assistant.init(a);
+    defer assistant.deinit(a);
+    try target.putWeight(a, "model.norm.weight", &.{4}, &.{ 1, 1, 1, 1 });
+    try target.putWeight(a, "model.embed_tokens.weight", &.{ 2, 4 }, &.{ 1, 0, 0, 0, 0, 1, 0, 0 });
+    try assistant.putWeight(a, "model.norm.weight", &.{4}, &.{ 1, 1, 1, 1 });
+    try assistant.putWeight(a, "model.embed_tokens.weight", &.{ 2, 4 }, &.{ 0, 0, 2, 0, 0, 0, 0, 2 });
+    const cfg = gpt_mod.Config{ .family = .llama, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .intermediate_size = 8, .vocab_size = 2, .weight_tying = true, .norm_type = .rms_norm, .position_encoding = .rope };
+    var target_diagnostics = diagnostics_mod.Diagnostics{};
+    var draft_diagnostics = diagnostics_mod.Diagnostics{};
+    var pipeline = target.pipeline(a, cfg);
+    pipeline.diagnostics_binding = .{ .diagnostics = &target_diagnostics };
+    pipeline.draft_diagnostics_binding = .{ .diagnostics = &draft_diagnostics };
+    var draft = pipeline.makeSpeculativeDraftPipeline(assistant.compute.computeBackend(), cfg);
+    try std.testing.expect(draft.session == null and draft.graph_cache == null and draft.compiled_partition_backend == null);
+    try std.testing.expect(draft.diagnostics_binding.?.diagnostics == &draft_diagnostics);
+    const Probe = struct {
+        var calls: usize = 0;
+        var observed: bool = false;
+        var failing_context: ?*anyopaque = null;
+        fn embedding(ctx: *anyopaque, weight: ops.CT, ids: []const i64, total: usize, width: usize) !ops.CT {
+            if (@import("../execution/allocation_registry.zig").enabled() != observed) return error.SpeculativeDisabledPathChanged;
+            calls += 1;
+            if (ctx == failing_context) return error.Cancelled;
+            return native.vtable_impl.embeddingLookup(ctx, weight, ids, total, width);
+        }
+    };
+    Probe.calls = 0;
+    Probe.observed = false;
+    Probe.failing_context = null;
+    var table = native.vtable_impl;
+    table.embeddingLookup = Probe.embedding;
+    pipeline.cb.vtable = &table;
+    draft.cb.vtable = &table;
+    const ids = [_]i64{ 0, 1 };
+    const decode = gpt_arch.DecodeContext{ .attention_mode = .full_recompute, .total_sequence_len = ids.len, .query_sequence_len = ids.len, .kv_sequence_len = ids.len };
+    const target_expected = try pipeline.forwardAllLogits(&ids, 1, ids.len, &decode);
+    defer a.free(target_expected);
+    const draft_expected = try draft.forwardAllLogits(&ids, 1, ids.len, &decode);
+    defer a.free(draft_expected);
+    try std.testing.expect(target_diagnostics.snapshot() == null and draft_diagnostics.snapshot() == null);
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+    try std.testing.expect(!std.mem.eql(f32, target_expected, draft_expected));
+    target_diagnostics.configureBackend(true, &pipeline.cb);
+    draft_diagnostics.configureBackend(true, &draft.cb);
+    Probe.observed = true;
+    const target_values = try pipeline.forwardAllLogits(&ids, 1, ids.len, &decode);
+    defer a.free(target_values);
+    try std.testing.expectEqualSlices(f32, target_expected, target_values);
+    const first = target_diagnostics.snapshot().?;
+    try std.testing.expect(first.outcome == .success and first.operation == .forward);
+    try std.testing.expect(first.context_runtime_scope == .borrowed_execution_backend_context);
+    try std.testing.expect(draft_diagnostics.snapshot() == null);
+    const draft_values = try draft.forwardAllLogits(&ids, 1, ids.len, &decode);
+    defer a.free(draft_values);
+    try std.testing.expectEqualSlices(f32, draft_expected, draft_values);
+    const second = draft_diagnostics.snapshot().?;
+    try std.testing.expect(second.outcome == .success and second.operation == .forward);
+    try std.testing.expect(first.runtime.native_allocations.?.compute.?.owner_identity != second.runtime.native_allocations.?.compute.?.owner_identity);
+    try std.testing.expectEqual(@as(usize, 4), Probe.calls);
+    Probe.failing_context = draft.cb.ptr;
+    if (draft.forwardAllLogits(&ids, 1, ids.len, &decode)) |unexpected| {
+        a.free(unexpected);
+        return error.ExpectedSpeculativeCancellation;
+    } else |err| try std.testing.expectEqual(error.Cancelled, err);
+    const failed = draft_diagnostics.snapshot().?;
+    try std.testing.expect(failed.outcome == .failed);
+    try std.testing.expectEqualStrings("Cancelled", failed.error_name.?.view());
+    try std.testing.expect(target_diagnostics.snapshot().?.outcome == .success);
+    Probe.failing_context = null;
+    target_diagnostics.configure(false);
+    draft_diagnostics.configure(false);
+    Probe.observed = false;
+    const after_disable = try draft.forwardAllLogits(&ids, 1, ids.len, &decode);
+    defer a.free(after_disable);
+    try std.testing.expectEqualSlices(f32, draft_expected, after_disable);
+    try std.testing.expect(draft_diagnostics.snapshot() == null);
+    try std.testing.expect(!@import("../execution/allocation_registry.zig").enabled());
 }

@@ -1757,7 +1757,41 @@ pub const EmbeddingStageControl = struct {
     }
 };
 
+/// Cold cleanup hooks must veto inherited/copied target tables before any
+/// context cast. Unqualified wrappers retain their original freeTensor policy.
+pub const ColdCleanupServices = struct {
+    accepts: *const fn (*const ComputeBackend.VTable) bool,
+    free: *const fn (*anyopaque, CT, @import("../execution/cleanup_context.zig").Context) void,
+    deinit_backend: ?*const fn (*const ComputeBackend, @import("../execution/cleanup_context.zig").Context) void = null,
+};
+
 pub const ComputeBackend = struct {
+    /// Bind a caller-supplied exact outer cleanup boundary. No token/epoch
+    /// is stored in this backend value; only explicit target owners support it.
+    pub fn bindCleanupEpoch(self: *const ComputeBackend, epoch: *const @import("../execution/retirement_sink.zig").Epoch) !bool {
+        const services = self.vtable.operation_services orelse return false;
+        if (!services.accepts(self.vtable)) return false;
+        const bind = services.bindCleanupEpoch orelse return false;
+        return bind(self.ptr, epoch);
+    }
+    pub fn retainCleanupGuard(self: *const ComputeBackend, guard: *@import("../execution/retirement_finish_holder.zig").Holder) !bool {
+        const services = self.vtable.operation_services orelse return false;
+        if (!services.accepts(self.vtable)) return false;
+        const retain_guard = services.retainCleanupGuard orelse return false;
+        return retain_guard(self.ptr, guard);
+    }
+    pub fn retainCleanupFinish(self: *const ComputeBackend) ?*@import("../execution/retirement_finish_holder.zig").Holder {
+        const services = self.vtable.operation_services orelse return null;
+        if (!services.accepts(self.vtable)) return null;
+        const retain_finish = services.retainCleanupFinish orelse return null;
+        return retain_finish(self.ptr);
+    }
+    pub fn operationToken(self: *const ComputeBackend) ?@import("../execution/backend_operation.zig").Borrowed {
+        if (self.vtable.operation_services) |services| if (services.accepts(self.vtable)) {
+            if (services.currentToken) |current| if (current(self.ptr)) |token| return token;
+        };
+        return null;
+    }
     ptr: *anyopaque,
     vtable: *const VTable,
     /// Borrowed for one synchronous request. Architecture sessions install it
@@ -2367,6 +2401,9 @@ pub const ComputeBackend = struct {
         kernels: ?*const KernelBackend = null,
         deinitBackend: *const fn (ctx: *anyopaque) void,
         freeTensor: *const fn (ctx: *anyopaque, tensor: CT) void,
+        /// Cold final-owner cleanup only. The borrowed epoch is valid during
+        /// this callback; an asynchronous payload owner must retain its own pin.
+        cold_cleanup_services: ?*const ColdCleanupServices = null,
         /// Optional backend-provided device-write hook installer. CUDA and
         /// Metal use this when the storage config matches their device KV
         /// fast paths; backends without a device KV implementation leave it
@@ -2376,6 +2413,14 @@ pub const ComputeBackend = struct {
         /// Read immutable scalar inference metadata from resident model
         /// storage. Implementations may cache both values and missing names.
         immutableResidentScalarF32: ?*const fn (ctx: *anyopaque, name: []const u8) anyerror!ImmutableScalarF32Lookup = null,
+
+        /// Target-owned retirement of complete charges retained by physical
+        /// output backings. Numerical ptr/table identity remains unchanged.
+        resource_retirement_services: ?*const @import("../execution/resource_retirement.zig").Services = null,
+
+        /// Backend-owned numerical operation exclusion. This never replaces
+        /// numerical callbacks or borrows an unrelated Session's model gate.
+        operation_services: ?*const @import("../execution/backend_operation.zig").Services = null,
 
         /// Optional request boundary for shared backend implementations.
         beginRequest: ?*const fn (ctx: *anyopaque) anyerror!void = null,
@@ -3312,7 +3357,13 @@ pub const ComputeBackend = struct {
         /// Snapshot backend-owned debug timing counters for diagnostic
         /// printing. Backends that do not support this can leave it null.
         debugTimingSnapshot: ?*const fn (ctx: *anyopaque) BackendDebugTimingSnapshot = null,
+        /// Cold owner configuration. Raw backend callers must quiesce all
+        /// compute/metadata users; Session configuration acquires its published
+        /// execution gate when present. Never invoked by a dispatch scope.
         enableRuntimeObservation: ?*const fn (ctx: *anyopaque) void = null,
+        /// Register already-installed owners in the submitting thread only.
+        /// This hook must not replace allocators or install shared pointers.
+        registerRuntimeObservation: ?*const fn (ctx: *anyopaque) void = null,
         modelStorageInventory: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?@import("../execution/storage_inventory.zig").Snapshot = null,
 
         /// Reset backend-owned debug timing counters for diagnostic
@@ -3496,9 +3547,35 @@ pub const ComputeBackend = struct {
     pub fn deinit(self: *const ComputeBackend) void {
         self.vtable.deinitBackend(self.ptr);
     }
+    pub fn deinitWithCleanup(self: *const ComputeBackend, current: @import("../execution/cleanup_context.zig").Context) void {
+        if (self.vtable.cold_cleanup_services) |services| if (services.accepts(self.vtable)) {
+            if (services.deinit_backend) |close| {
+                close(self, current);
+                return;
+            }
+        };
+        self.deinit();
+    }
 
     pub fn free(self: *const ComputeBackend, tensor: CT) void {
         self.vtable.freeTensor(self.ptr, tensor);
+    }
+
+    pub fn freeWithBoundary(self: *const ComputeBackend, tensor: CT, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
+        self.freeWithCleanup(tensor, .{ .boundary = boundary });
+    }
+    /// Synchronous cleanup only. The selected target validates any borrowed
+    /// operation BEFORE using it as provider/SDK authority. An Epoch alone
+    /// never grants that authority; foreign-parent cleanup may ignore a token.
+    pub fn freeWithCleanup(self: *const ComputeBackend, tensor: CT, cleanup: @import("../execution/cleanup_context.zig").Context) void {
+        if (self.vtable.cold_cleanup_services) |services| {
+            // Static target veto must precede any opaque-context callback.
+            if (services.accepts(self.vtable)) {
+                services.free(self.ptr, tensor, cleanup);
+                return;
+            }
+        }
+        self.free(tensor);
     }
 
     pub fn getWeight(self: *const ComputeBackend, name: []const u8) !CT {
@@ -3633,8 +3710,27 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    inline fn observeBackendEntry(self: *const ComputeBackend, comptime family: @import("../execution/runtime_observation.zig").Entry, callback: anytype, args: anytype) @TypeOf(@call(.auto, callback, args)) {
+        if (!@import("../execution/runtime_observation.zig").enabled()) return @call(.auto, callback, args);
+        return self.observeBackendEntryEnabled(family, callback, args);
+    }
+    noinline fn observeBackendEntryEnabled(self: *const ComputeBackend, comptime family: @import("../execution/runtime_observation.zig").Entry, callback: anytype, args: anytype) @TypeOf(@call(.auto, callback, args)) {
+        const observed = @import("../execution/runtime_observation.zig");
+        const result = @call(.auto, callback, args) catch |err| {
+            observed.backendEntry(self.kind(), family, @intFromPtr(callback), .failed, @errorName(err));
+            return err;
+        };
+        const declined = switch (@typeInfo(@TypeOf(result))) {
+            .optional => result == null,
+            .bool => !result,
+            else => false,
+        };
+        observed.backendEntry(self.kind(), family, @intFromPtr(callback), if (declined) .declined else .selected, null);
+        return result;
+    }
+
     pub fn linear(self: *const ComputeBackend, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize) !CT {
-        return self.vtable.linear(self.ptr, input, weight, bias, rows, in_dim, out_dim);
+        return self.observeBackendEntry(.linear, self.vtable.linear, .{ self.ptr, input, weight, bias, rows, in_dim, out_dim });
     }
 
     pub fn linearWithPlan(
@@ -3664,7 +3760,7 @@ pub const ComputeBackend = struct {
     }
 
     pub fn linearNoBias(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) !CT {
-        return self.vtable.linearNoBias(self.ptr, input, weight, rows, in_dim, out_dim);
+        return self.observeBackendEntry(.linear_no_bias, self.vtable.linearNoBias, .{ self.ptr, input, weight, rows, in_dim, out_dim });
     }
 
     /// Writes to caller-owned storage, preserving it across recyclable frames.
@@ -4250,7 +4346,7 @@ pub const ComputeBackend = struct {
     }
 
     pub fn layerNorm(self: *const ComputeBackend, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !CT {
-        return self.vtable.layerNorm(self.ptr, input, gamma, beta, dim, eps);
+        return self.observeBackendEntry(.layer_norm, self.vtable.layerNorm, .{ self.ptr, input, gamma, beta, dim, eps });
     }
 
     pub fn layerNormConsumeInput(self: *const ComputeBackend, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !?CT {
@@ -4345,7 +4441,12 @@ pub const ComputeBackend = struct {
     /// immediately when no frame is active). False means the caller must
     /// fall back to reading the logits row.
     pub fn whisperLogitsStatsEncode(self: *const ComputeBackend, logits: CT, params: *const WhisperLogitsParams, suppress_ids: []const i32) !bool {
-        if (self.vtable.regions.token_selection.encodeLogitsStats) |f| return f(self.ptr, logits, params, suppress_ids);
+        if (self.vtable.regions.token_selection.encodeLogitsStats) |f| {
+            try self.checkExecutionControl();
+            const accepted = try f(self.ptr, logits, params, suppress_ids);
+            try self.checkExecutionControl();
+            return accepted;
+        }
         return false;
     }
 
@@ -4422,7 +4523,7 @@ pub const ComputeBackend = struct {
     }
 
     pub fn gelu(self: *const ComputeBackend, input: CT) !CT {
-        return self.vtable.gelu(self.ptr, input);
+        return self.observeBackendEntry(.gelu, self.vtable.gelu, .{ self.ptr, input });
     }
 
     pub fn geluExact(self: *const ComputeBackend, input: CT) !?CT {
@@ -4538,7 +4639,7 @@ pub const ComputeBackend = struct {
     }
 
     pub fn add(self: *const ComputeBackend, a: CT, b: CT) !CT {
-        return self.vtable.add(self.ptr, a, b);
+        return self.observeBackendEntry(.add, self.vtable.add, .{ self.ptr, a, b });
     }
 
     pub fn addBiasRowsConsume(self: *const ComputeBackend, input: CT, bias: CT, rows: usize, out_dim: usize) !?CT {
@@ -4645,7 +4746,7 @@ pub const ComputeBackend = struct {
     /// a model-scoped route retain the regular portable implementation.
     pub fn scaledDotProductAttentionQwen3VlVision(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
         if (self.vtable.regions.vision.unmaskedTensorCore) |f| {
-            return f(self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim);
+            return self.observeBackendEntry(.encoder_attention, f, .{ self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim });
         }
         return self.scaledDotProductAttention(Q, K, V, &.{}, null, batch, seq_len, num_heads, head_dim);
     }
@@ -4706,11 +4807,11 @@ pub const ComputeBackend = struct {
     }
 
     pub fn causalSelfAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
-        return self.vtable.causalSelfAttention(self.ptr, Q, K, V, attn_bias, batch, seq_len, num_heads, head_dim);
+        return self.observeBackendEntry(.causal_attention, self.vtable.causalSelfAttention, .{ self.ptr, Q, K, V, attn_bias, batch, seq_len, num_heads, head_dim });
     }
 
     pub fn crossAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, enc_mask: []const i64, batch: usize, dec_seq: usize, enc_seq: usize, num_heads: usize, head_dim: usize) !CT {
-        return self.vtable.crossAttention(self.ptr, Q, K, V, enc_mask, batch, dec_seq, enc_seq, num_heads, head_dim);
+        return self.observeBackendEntry(.cross_attention, self.vtable.crossAttention, .{ self.ptr, Q, K, V, enc_mask, batch, dec_seq, enc_seq, num_heads, head_dim });
     }
 
     pub fn relativePositionBias(self: *const ComputeBackend, weight: CT, q_len: usize, k_len: usize, num_heads: usize, num_buckets: usize, max_distance: usize, bidirectional: bool) !CT {
@@ -4915,11 +5016,11 @@ pub const ComputeBackend = struct {
     }
 
     pub fn conv1d(self: *const ComputeBackend, input: CT, weight: CT, bias: CT, batch: usize, in_channels: usize, out_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize) !CT {
-        return self.vtable.conv1d(self.ptr, input, weight, bias, batch, in_channels, out_channels, time_steps, kernel_size, stride, padding);
+        return self.observeBackendEntry(.convolution_1d, self.vtable.conv1d, .{ self.ptr, input, weight, bias, batch, in_channels, out_channels, time_steps, kernel_size, stride, padding });
     }
 
     pub fn conv2d(self: *const ComputeBackend, input: CT, weight: CT, bias: CT, batch: usize, in_channels: usize, out_channels: usize, height: usize, width: usize, kernel_h: usize, kernel_w: usize, stride_h: usize, stride_w: usize, padding_h: usize, padding_w: usize, groups: usize) !CT {
-        return self.vtable.conv2d(self.ptr, input, weight, bias, batch, in_channels, out_channels, height, width, kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w, groups);
+        return self.observeBackendEntry(.convolution_2d, self.vtable.conv2d, .{ self.ptr, input, weight, bias, batch, in_channels, out_channels, height, width, kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w, groups });
     }
     pub fn convTranspose(self: *const ComputeBackend, request: *const ConvTransposeRequest) !?CT {
         const op = self.vtable.convTranspose orelse return null;
@@ -5888,6 +5989,14 @@ pub const ComputeBackend = struct {
         return query(self.ptr, allocator);
     }
 
+    pub fn registerTensorOwnershipObservation(self: *const ComputeBackend, tensor: CT) void {
+        const kernels = self.vtable.kernels orelse return;
+        if (!kernels.accepts(self.vtable)) return;
+        if (kernels.registerTensorOwnershipObservation) |register| register(self.ptr, tensor);
+    }
+    pub fn registerRuntimeObservation(self: *const ComputeBackend) void {
+        if (self.vtable.registerRuntimeObservation) |op| op(self.ptr);
+    }
     pub fn enableRuntimeObservation(self: *const ComputeBackend) void {
         if (self.vtable.enableRuntimeObservation) |op| op(self.ptr);
     }
@@ -6070,7 +6179,7 @@ pub const ComputeBackend = struct {
 
     pub fn decoderRuntimeApplyLinear(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearRequest) !?CT {
         if (self.vtable.regions.decoder.applyLinear) |op| {
-            return op(self.ptr, request);
+            return self.observeBackendEntry(.prepared_linear, op, .{ self.ptr, request });
         }
         return null;
     }
@@ -6098,7 +6207,7 @@ pub const ComputeBackend = struct {
 
     pub fn decoderRuntimeApplyLinearPair(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearPairRequest) !?LinearNoBiasPairResult {
         if (self.vtable.regions.decoder.applyLinearPair) |op| {
-            return op(self.ptr, request);
+            return self.observeBackendEntry(.prepared_linear_pair, op, .{ self.ptr, request });
         }
         return null;
     }
@@ -6107,7 +6216,7 @@ pub const ComputeBackend = struct {
     /// such as rows of a resident cache. False (nothing written) when the
     /// backend cannot place the output.
     pub fn decoderRuntimeApplyLinearInto(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearRequest, out: CT) !bool {
-        if (self.vtable.regions.decoder.applyLinearInto) |op| return op(self.ptr, request, out);
+        if (self.vtable.regions.decoder.applyLinearInto) |op| return self.observeBackendEntry(.prepared_linear_into, op, .{ self.ptr, request, out });
         return false;
     }
 
@@ -6115,7 +6224,7 @@ pub const ComputeBackend = struct {
     /// `v_out` (device row views, e.g. rows of a resident cache) and Q is
     /// returned. Null when the backend cannot place the outputs.
     pub fn decoderRuntimeApplyLinearQkvInto(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearQkvRequest, k_out: CT, v_out: CT) !?CT {
-        if (self.vtable.regions.decoder.applyLinearQkvInto) |op| return op(self.ptr, request, k_out, v_out);
+        if (self.vtable.regions.decoder.applyLinearQkvInto) |op| return self.observeBackendEntry(.prepared_qkv_into, op, .{ self.ptr, request, k_out, v_out });
         return null;
     }
 
@@ -6134,7 +6243,7 @@ pub const ComputeBackend = struct {
 
     pub fn decoderRuntimeApplyLinearQkv(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearQkvRequest) !?LinearNoBiasTripleResult {
         if (self.vtable.regions.decoder.applyLinearQkv) |op| {
-            return op(self.ptr, request);
+            return self.observeBackendEntry(.prepared_qkv, op, .{ self.ptr, request });
         }
         return null;
     }

@@ -1421,21 +1421,27 @@ const RuntimeContext = struct {
     }
 
     pub fn deinit(self: *RuntimeContext) void {
+        self.deinitWithCleanup(.{ .outside_execution = true });
+    }
+    pub fn deinitWithCleanup(self: *RuntimeContext, current: @import("../execution/cleanup_context.zig").Context) void {
         const previous = self.references.fetchSub(1, .acq_rel);
         std.debug.assert(previous != 0);
         if (previous != 1) return;
+        var cleanup = self.definition.beginCleanup();
+        defer cleanup.deinit();
         // Sampled and greedy pipelining intentionally leave the next frame
         // submitted after returning a token. The runtime borrows the shared
         // Metal provider, so its ComputeBackend teardown does not own or drain
         // that frame. Complete it before releasing KV storage and ending the
         // borrowed request that the in-flight command buffer depends on.
         self.drainPipelinedDecode();
-        self.clearGreedyDeviceToken();
+        self.clearGreedyDeviceTokenWithCleanup(current);
         self.moe_runtime.deinit();
         self.kv_metadata.deinit(&self.kv_storage);
-        self.kv_storage.deinit();
+        self.kv_storage.deinitWithBoundary(current.boundary);
         self.cb.deinit();
-        self.definition.release();
+        cleanup.deinit();
+        self.definition.releaseWithCleanup(current);
         self.allocator.destroy(self);
     }
 
@@ -1450,8 +1456,11 @@ const RuntimeContext = struct {
     }
 
     fn clearGreedyDeviceToken(self: *RuntimeContext) void {
+        self.clearGreedyDeviceTokenWithCleanup(.{});
+    }
+    fn clearGreedyDeviceTokenWithCleanup(self: *RuntimeContext, current: @import("../execution/cleanup_context.zig").Context) void {
         if (self.greedy_device_token_tensor) |token| {
-            self.cb.free(token);
+            self.cb.freeWithCleanup(token, current);
         }
         self.greedy_device_token_tensor = null;
         self.greedy_device_token_id = null;
@@ -1879,8 +1888,12 @@ const RuntimeContext = struct {
     }
 
     fn drainPipelinedDecode(self: *RuntimeContext) void {
+        self.drainPipelinedDecodeChecked() catch platform.inference_process_supervisor.restartWorker();
+    }
+
+    fn drainPipelinedDecodeChecked(self: *RuntimeContext) !void {
         if (!self.pipelined_decode_armed) return;
-        _ = metal_runtime.decoderRuntimePipelinedAwaitToken(&self.cb) catch null;
+        _ = (try metal_runtime.decoderRuntimePipelinedAwaitToken(&self.cb)) orelse return error.PendingDecodeAwaitDeclined;
         self.pipelined_decode_armed = false;
         self.pipelined_decode_mode = null;
         self.pipelined_sampling = null;
@@ -2138,7 +2151,17 @@ fn executorKvSlidingWindowSize(config: gpt_mod.Config) ?u32 {
     return config.kvPoolSlidingWindowSize(false);
 }
 
+fn acceptsOperationBackend(table: *const model_runtime.ModelRuntime.VTable) bool {
+    return table == &runtime_vtable;
+}
+fn operationBackend(raw: *anyopaque) *const ops.ComputeBackend {
+    const self: *RuntimeContext = @ptrCast(@alignCast(raw));
+    return &self.cb;
+}
+const runtime_cleanup_services = model_runtime.ModelRuntime.ColdCleanupServices{ .accepts = acceptsOperationBackend, .deinit = runtimeDeinitWithCleanup };
 const runtime_vtable = model_runtime.ModelRuntime.VTable{
+    .operation_backend = operationBackend,
+    .accepts_operation_backend = acceptsOperationBackend,
     .capabilities = runtimeCapabilities,
     .prepare = runtimePrepare,
     .prefill = runtimePrefill,
@@ -2147,6 +2170,7 @@ const runtime_vtable = model_runtime.ModelRuntime.VTable{
     .supports_sample_decode_request = runtimeSupportsSampleDecodeRequest,
     .decode_greedy = runtimeDecodeGreedy,
     .deinit = runtimeDeinit,
+    .cold_cleanup_services = &runtime_cleanup_services,
     .retain_output_owner = runtimeRetainOutputOwner,
     .reset = runtimeReset,
     .debug_timing_stats = runtimeDebugTimingStats,
@@ -2434,7 +2458,21 @@ fn runtimeRetainOutputOwner(ctx: *anyopaque) model_runtime.OutputOwner {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
     const previous = runtime_ctx.references.fetchAdd(1, .monotonic);
     std.debug.assert(previous != 0);
-    return .{ .ptr = ctx, .release = runtimeReleaseOutputOwner };
+    return .{ .ptr = ctx, .release = runtimeReleaseOutputOwner, .begin_cleanup = runtimeBeginOutputCleanup, .cleanup_services = &runtime_output_cleanup_services };
+}
+
+fn acceptsRuntimeOutputCleanup(owner: *const model_runtime.OutputOwner) bool {
+    return owner.release == runtimeReleaseOutputOwner and owner.begin_cleanup == runtimeBeginOutputCleanup;
+}
+fn runtimeReleaseOutputOwnerWithCleanup(ctx: *anyopaque, current: @import("../execution/cleanup_context.zig").Context) void {
+    const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    runtime_ctx.deinitWithCleanup(current);
+}
+const runtime_output_cleanup_services = model_runtime.OutputOwner.CleanupServices{ .accepts = acceptsRuntimeOutputCleanup, .release = runtimeReleaseOutputOwnerWithCleanup };
+
+fn runtimeBeginOutputCleanup(ctx: *anyopaque) @import("../backends/session.zig").Session.CloseScope {
+    const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    return runtime_ctx.definition.beginCleanup();
 }
 
 fn runtimeReleaseOutputOwner(ctx: *anyopaque) void {
@@ -2443,11 +2481,17 @@ fn runtimeReleaseOutputOwner(ctx: *anyopaque) void {
 }
 
 fn runtimeDeinit(ctx: *anyopaque) void {
+    runtimeDeinitWithCleanup(ctx, .{});
+}
+fn runtimeDeinitWithCleanup(ctx: *anyopaque, current: @import("../execution/cleanup_context.zig").Context) void {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    var cleanup = runtime_ctx.definition.beginCleanup();
+    defer cleanup.deinit();
     // Stop speculative work when cache ownership retires, even if published
     // outputs keep the backend and its prepared tail slots alive.
     runtime_ctx.drainPipelinedDecode();
-    runtime_ctx.deinit();
+    cleanup.deinit();
+    runtime_ctx.deinitWithCleanup(current);
 }
 
 fn runtimePrefill(
@@ -2668,7 +2712,7 @@ fn runtimeDecodeSample(
         };
     }
     timing_stats.decode_sample_fallback_nanos += @intCast(monotonicNowNs() - fallback_started_at);
-    defer output.deinit(allocator);
+    defer output.deinitWithCleanup(allocator, .{ .boundary = request.decode.cleanup_epoch, .operation = request.decode.backend_operation });
     if (output.final_logit_softcap <= 0.0) {
         if (output.device_logits) |device_logits| {
             const backend = output.device_logits_backend orelse return error.InvalidModelOutput;
@@ -2692,7 +2736,7 @@ fn runtimeDecodeSample(
     return .{
         .token_id = @intCast(model_runtime.sampleTokenFromLogits(
             allocator,
-            try output.hostLogits(allocator),
+            try output.hostLogitsWithCleanup(allocator, .{ .boundary = request.decode.cleanup_epoch, .operation = request.decode.backend_operation }),
             request.sampling,
             request.token_history,
         )),
@@ -2756,7 +2800,7 @@ fn runtimeDecodeGreedy(
     }
     if (try runtime_ctx.forwardDecoderRuntimeLastLogits(allocator, request.token_id, step.seq_len, &step.decode_context)) |output| {
         var owned_output = output;
-        defer owned_output.deinit(allocator);
+        defer owned_output.deinitWithCleanup(allocator, .{ .boundary = request.cleanup_epoch, .operation = request.backend_operation });
         if (owned_output.device_logits) |device_logits| {
             const backend = owned_output.device_logits_backend orelse return error.InvalidModelOutput;
             if (try backend.argmaxLastRow(device_logits, 1, runtime_ctx.definition.configuration.value.vocab_size)) |token_id| {
@@ -2765,7 +2809,7 @@ fn runtimeDecodeGreedy(
                 return .{ .token_id = @intCast(token_id) };
             }
         }
-        const logits = try owned_output.hostLogits(allocator);
+        const logits = try owned_output.hostLogitsWithCleanup(allocator, .{ .boundary = request.cleanup_epoch, .operation = request.backend_operation });
         var best_idx: usize = 0;
         for (logits[1..], 1..) |value, idx| {
             if (value > logits[best_idx]) best_idx = idx;
@@ -3012,8 +3056,12 @@ test "resident Metal model output retains its actual backend across runtime evic
     var session = try session_factory.createMetalSession(a, path);
     defer session.close();
     session_factory.attachIo(session, std.testing.io);
-    var request_backend = try session_factory.getComputeBackend(session, a);
-    defer request_backend.deinit();
+    // Initialize the shared provider before the independent runtime acquires
+    // its own numerical-operation scope.
+    {
+        var initial_backend = try session_factory.getComputeBackend(session, a);
+        defer initial_backend.deinit();
+    }
     const config = session_factory.getGptConfig(session).?;
     const Probe = struct {
         fn prefill(ctx: *anyopaque, _: std.mem.Allocator, _: model_runtime.PrefillRequest) !model_runtime.ModelOutput {
@@ -3109,8 +3157,12 @@ test "resident Metal decoder releases host mirrors across prompts and runtime ev
     var session = try session_factory.createMetalSession(a, path);
     defer session.close();
     session_factory.attachIo(session, std.testing.io);
-    var request_backend = try session_factory.getComputeBackend(session, a);
-    defer request_backend.deinit();
+    // Initialize the shared provider before the independent runtime acquires
+    // its own numerical-operation scope.
+    {
+        var initial_backend = try session_factory.getComputeBackend(session, a);
+        defer initial_backend.deinit();
+    }
     const config = session_factory.getGptConfig(session).?;
     var executor = try createModelExecutor(a, session, config, null, null);
     defer executor.deinit();
@@ -3141,4 +3193,136 @@ test "resident Metal decoder releases host mirrors across prompts and runtime ev
         const mirrors = @import("../backends/metal_tensor.zig").memoryStatsSnapshot().host_mirror_live_bytes;
         if (baseline) |expected| try std.testing.expectEqual(expected, mirrors) else baseline = mirrors;
     }
+}
+
+test "metal executor armed await failure preserves pending ownership before any physical retirement" {
+    const Probe = struct {
+        fail: bool = true,
+        decline: bool = false,
+        calls: usize = 0,
+        fn decode(raw: *anyopaque, request: *const ops.DecoderRuntimeDecodeRequest) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(.await_only, request.phase);
+            if (self.fail) return error.InjectedArmedAwaitFailure;
+            if (self.decline) return false;
+            request.output_token_ids[0] = 7;
+            return true;
+        }
+    };
+    var probe = Probe{};
+    // The real armed teardown route only touches its decode control callback.
+    // No GPU work exists in this bounded fault fixture, and no tensor/backend
+    // destructor is called until its uncertain ownership has been asserted.
+    var table: ops.ComputeBackend.VTable = undefined;
+    table.regions.decoder.decode = Probe.decode;
+    var context: RuntimeContext = undefined;
+    context.cb = .{ .ptr = &probe, .vtable = &table };
+    context.pipelined_decode_armed = true;
+    context.pipelined_decode_mode = .greedy;
+    context.pipelined_sampling = null;
+    context.pipelined_kv_advanced_for = 7;
+    try std.testing.expectError(error.InjectedArmedAwaitFailure, context.drainPipelinedDecodeChecked());
+    try std.testing.expect(context.pipelined_decode_armed);
+    try std.testing.expectEqual(PipelinedDecodeMode.greedy, context.pipelined_decode_mode.?);
+    try std.testing.expectEqual(@as(?usize, 7), context.pipelined_kv_advanced_for);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    probe.fail = false;
+    probe.decline = true;
+    try std.testing.expectError(error.PendingDecodeAwaitDeclined, context.drainPipelinedDecodeChecked());
+    try std.testing.expect(context.pipelined_decode_armed);
+    probe.decline = false;
+    try context.drainPipelinedDecodeChecked();
+    try std.testing.expect(!context.pipelined_decode_armed);
+    try std.testing.expect(context.pipelined_decode_mode == null);
+    try std.testing.expect(context.pipelined_kv_advanced_for == null);
+}
+
+test "resident Metal maintained decoder reset preserves exact logits beyond transient handle slot pressure" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const path = platform.env.getenv("ANTFLY_UNIFIED_DECODER_FIXTURE") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var session = try session_factory.createMetalSession(a, path);
+    defer session.close();
+    session_factory.attachIo(session, std.testing.io);
+    // Initialize the shared provider before the independent runtime acquires
+    // its own numerical-operation scope.
+    {
+        var initial_backend = try session_factory.getComputeBackend(session, a);
+        defer initial_backend.deinit();
+    }
+    const config = session_factory.getGptConfig(session).?;
+    if (config.vocab_size <= 16 or config.max_position_embeddings < 20) return error.InvalidDecoderFixture;
+    var executor = try createModelExecutor(a, session, config, null, null);
+    defer executor.deinit();
+    var instance = try executor.createRuntime(a);
+    defer instance.deinit();
+    _ = try instance.prepare(a, .{ .kv_tokens_hint = 20 });
+    const prompt = [_]i64{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    var reference = std.ArrayListUnmanaged(f32).empty;
+    defer reference.deinit(a);
+    for (0..32) |iteration| {
+        try instance.reset();
+        var values = std.ArrayListUnmanaged(f32).empty;
+        defer values.deinit(a);
+        {
+            var output = try instance.prefill(a, .{ .input_ids = &prompt, .seq_len = prompt.len, .query_seq_len = prompt.len, .attention_mode = .paged_prefill });
+            defer output.deinit(a);
+            const logits = try output.hostLogits(a);
+            try std.testing.expectEqual(config.vocab_size, logits.len);
+            try values.appendSlice(a, logits);
+        }
+        for (0..4) |step| {
+            var output = try instance.decode(a, .{ .token_id = @intCast(11 + step), .position = prompt.len + step });
+            defer output.deinit(a);
+            const logits = try output.hostLogits(a);
+            try std.testing.expectEqual(config.vocab_size, logits.len);
+            try values.appendSlice(a, logits);
+        }
+        if (iteration == 0) try reference.appendSlice(a, values.items) else if (!std.mem.eql(f32, reference.items, values.items)) {
+            const physical: *RuntimeContext = @ptrCast(@alignCast(instance.ptr));
+            const compute: *@import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(physical.cb.ptr));
+            for (reference.items, values.items, 0..) |before, after, index| if (before != after) {
+                std.debug.print("metal_reset_mismatch iteration={d} phase={d} index={d} reference={d} actual={d} linear_slots={d} rms_slots={d} layer_slots={d}\n", .{ iteration, index / config.vocab_size, index % config.vocab_size, before, after, compute.dynamic_linear_slots.count(), compute.dynamic_rms_norm_slots.count(), compute.dynamic_layer_norm_slots.count() });
+                break;
+            };
+            return error.DecoderResetOutputChanged;
+        }
+    }
+}
+
+test "retiring cached Metal runtime preserves a newer request actual empty frame" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const path = platform.env.getenv("ANTFLY_UNIFIED_DECODER_FIXTURE") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var session = try session_factory.createMetalSession(a, path);
+    defer session.close();
+    session_factory.attachIo(session, std.testing.io);
+    {
+        const warm = try session_factory.getComputeBackend(session, a);
+        warm.deinit();
+    }
+    const config = session_factory.getGptConfig(session).?;
+    var executor = try createModelExecutor(a, session, config, null, null);
+    defer executor.deinit();
+    var cached = try executor.createRuntime(a);
+    var cached_live = true;
+    defer if (cached_live) cached.deinit();
+    const context: *RuntimeContext = @ptrCast(@alignCast(cached.ptr));
+    const newer = try session_factory.getComputeBackend(session, a);
+    defer newer.deinit();
+    try std.testing.expectEqual(.metal, newer.kind());
+    const metal = @import("../ops/metal_compute.zig").MetalCompute;
+    const newer_compute: *metal = @ptrCast(@alignCast(newer.ptr));
+    const cached_compute: *metal = @ptrCast(@alignCast(context.cb.ptr));
+    const frame_runtime = newer_compute.provider_impl.raw_decode_runtime orelse return error.ExpectedActualMetalProvider;
+    try std.testing.expect(frame_runtime == cached_compute.provider_impl.raw_decode_runtime.?);
+    try metal_runtime.beginFrame(frame_runtime);
+    defer if (metal_runtime.hasActiveFrame(frame_runtime)) metal_runtime.cancelFrame(frame_runtime) catch unreachable;
+    try std.testing.expect(metal_runtime.hasActiveFrame(frame_runtime));
+    // No GPU work is submitted. The baseline failure is bounded: old cached
+    // private teardown must not cancel a distinct owner's actual active frame.
+    cached.deinit();
+    cached_live = false;
+    try std.testing.expect(metal_runtime.hasActiveFrame(frame_runtime));
 }
