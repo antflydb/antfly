@@ -103,7 +103,10 @@ visible.
    Keep explicit provisioning checks; object operations retain authorization.
 2. Reuse verified immutable native chunks across short-lived snapshot readers,
    with node-owned, process-accounted residency (at most 32 MiB), optional
-   admission and nonblocking pressure reclamation. Manifest authorization, expiry,
+   admission and nonblocking pressure reclamation. Reclamation returns unused
+   allocator credit before evicting payloads and reports actual charge relief.
+   Pinned buffers remain protected and contended owners are skipped.
+   Manifest authorization, expiry,
    namespace/generation checks and credential isolation remain authoritative.
    Authoritative retirement invalidates shared residency. A cold-loss test must
    remove both the physical local cut and any verified shared chunk copy.
@@ -196,10 +199,11 @@ callback ABI. That establishes one concrete failure path; it does not establish
 the cause of every timeout or the original 3.9-second local outlier. Failed
 attempts remain part of the qualification evidence in issue #1471.
 
-The final Debug engine passed 64 API and five embedded snapshot tests without
-allocator leaks, 180 copied-state real-GCS overlay queries, and all six retained-
-cursor recovery cases across filesystem, an S3 fixture and real GCS with both
-vector-storage modes. The 25 relevant Python harness tests also pass.
+At the benchmark revisions below, the full Debug engine passed 64 API and five
+embedded snapshot tests without allocator leaks, 180 copied-state real-GCS overlay
+queries, and all six retained-cursor recovery cases across filesystem, an S3 fixture
+and real GCS with both vector-storage modes. The harness had 25 passing Python
+tests then; the subsequent readiness and matrix-summary fixes bring that to 27.
 
 ## Matched optimized result (November 3)
 
