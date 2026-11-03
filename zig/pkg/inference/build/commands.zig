@@ -84,7 +84,13 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
     const aarch64_cuda_http_release = ctx.target.result.os.tag == .linux and
         ctx.target.result.cpu.arch == .aarch64 and ctx.backend.enable_cuda and
         ctx.optimize == .fast and ctx.strip;
-    const http_compile_memory_mb: usize = if (native_cpu_http_release) 3840 else if (aarch64_cuda_http_release) 14 * 1024 else http_default_memory_gib * 1024;
+    // Native F32 HTTP-only ReleaseFast/strip on GB10/aarch64 measured a
+    // 10.84 GB compiler peak. 13 GiB retains at least 25% headroom; the
+    // smaller x86_64 baseline claim above remains independently qualified.
+    const aarch64_cpu_http_release = ctx.target.result.os.tag == .linux and
+        ctx.target.result.cpu.arch == .aarch64 and !ctx.hasAccelerator() and
+        ctx.optimize == .fast and ctx.strip;
+    const http_compile_memory_mb: usize = if (native_cpu_http_release) 3840 else if (aarch64_cuda_http_release) 14 * 1024 else if (aarch64_cpu_http_release) 13 * 1024 else http_default_memory_gib * 1024;
     const http_server = b.addExecutable(.{
         .name = "antfly-inference-http-server",
         .max_rss = http_compile_memory_mb * 1024 * 1024,
