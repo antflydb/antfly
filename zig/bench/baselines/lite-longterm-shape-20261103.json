@@ -189,6 +189,20 @@
       "failed": 1,
       "leaked": 0,
       "failure": "Conflict fixture expected rejection while building an unrelated speculative statement; the staged predicates are validated at COMMIT. Corrected fixture asserts COMMIT serialization failure, preservation of the peer row and no staged publication. No production change for this correction."
+    },
+    {
+      "suite": "Integrated Debug producer at 6ab8674668",
+      "whole_build_returncode": 1,
+      "public_exports": 134,
+      "failure": "C signal smoke fixture left the new first/second.aflite.lock.q directories, each containing only tail. Fixture cleanup now explicitly removes its closed known queue files, preserves failure on unexpected contents, and passes a direct C smoke diagnostic. No library from this failed aggregate build was frozen or benchmarked."
+    },
+    {
+      "suite": "Model-free native C API component diagnostic at 6ab8674668 after aggregate failure",
+      "passed": 150,
+      "skipped": 0,
+      "failed": 1,
+      "leaked": 0,
+      "failure": "COMMIT correctly rejected a peer insert with 23505; fixture expected 40001. The duplicate primary-key value has separate generated row identities, so the uniqueness refusal is correct. Corrected expectation rerun pending; no production change for that expectation."
     }
   ],
   "remaining": [
@@ -784,6 +798,12 @@
       "first_b_rebuilds": 1,
       "first_b_prior_entries_revisited": 16
     },
-    "fix": "Validate previous completed-entry scope and adopt wider witness when unchanged. Regression observed no prior entries revisited with unrelated peer publication; relevant peer or schema publication rebuilt 16 entries. Corrected COMMIT-conflict fixture rerun pending."
+    "fix": "Validate previous completed-entry scope and adopt wider witness when unchanged. Regression observed no prior entries revisited with unrelated peer publication; relevant peer or schema publication rebuilt 16 entries. Corrected COMMIT uniqueness-conflict fixture rerun pending."
+  },
+  "pending_replay_cache_storage_phase": {
+    "qualification": false,
+    "finding": "A later physical-storage yield discarded a successful pending-replay runtime; diagnostics recorded before physical service missed this discard. Post-storage index restamping could also hide a foreign checkpoint adopted by allocator service.",
+    "implementation": "Preserve successful pending-source cache across explicit benign storage-phase yields with no uncertain outcome. Capture index witness before physical service; index_inputs_changed prevents retention. Never stamp old immutable runtime with an adopted foreign index identity. Residency and fresh primary-epoch rules remain unchanged.",
+    "regression": "Public SQL replay diagnostic injects physical admission yield, requires successful runtime reuse, and in the two-namespace case publishes a foreign index checkpoint before allocator-service adoption, then requires the original cached witness and rejection of that foreign generation. Drain/acknowledged-row/integrity checks follow. Pending rerun."
   }
 }

@@ -138,6 +138,34 @@ static int run_inference_smoke(void) {
     return 0;
 }
 
+#if defined(SIGIO)
+/* Queue coordination persists after owner close. This fixture owns both
+ * databases and has closed every handle, so its known queue files can now be
+ * removed. Unexpected contents still fail cleanup instead of being hidden. */
+static int remove_closed_signal_queue(const char *path) {
+    DIR *entries = opendir(path);
+    if (!entries) return errno == ENOENT ? 0 : 1;
+    int failed = 0;
+    struct dirent *entry;
+    while ((entry = readdir(entries)) != NULL) {
+        const char *name = entry->d_name;
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+        const bool ticket = strlen(name) == 18 && strncmp(name, "t-", 2) == 0 &&
+                            strspn(name + 2, "0123456789abcdef") == 16;
+        if (strcmp(name, "tail") != 0 && !ticket) {
+            failed = 1;
+            continue;
+        }
+        char file_path[1600];
+        const int length = snprintf(file_path, sizeof(file_path), "%s/%s", path, name);
+        if (length < 0 || length >= (int)sizeof(file_path) || remove(file_path) != 0) failed = 1;
+    }
+    if (closedir(entries) != 0) failed = 1;
+    if (rmdir(path) != 0) failed = 1;
+    return failed;
+}
+#endif
+
 /* Exercise the public shared-library boundary: two independent Lite owners
  * must not restore the host signal disposition while a peer can still wake. */
 static int run_signal_lifetime_smoke(void) {
@@ -211,6 +239,10 @@ static int run_signal_lifetime_smoke(void) {
         }
         closedir(entries);
     }
+    snprintf(first_path, sizeof(first_path), "%s/first.aflite.lock.q", directory);
+    snprintf(second_path, sizeof(second_path), "%s/second.aflite.lock.q", directory);
+    failed |= remove_closed_signal_queue(first_path);
+    failed |= remove_closed_signal_queue(second_path);
     if (rmdir(directory) != 0) {
         fprintf(stderr, "signal smoke directory cleanup failed: %s\n", strerror(errno));
         failed = 1;

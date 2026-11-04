@@ -232,6 +232,9 @@ const TextRuntimeCacheDiagnostics = struct {
     miss_control: u64 = 0,
     not_retained_settled: u64 = 0,
     not_retained_failed: u64 = 0,
+    not_retained_index_inputs: u64 = 0,
+    not_retained_storage_error: u64 = 0,
+    retained_storage_yield: u64 = 0,
     blocked_manual: u64 = 0,
     blocked_enrichment: u64 = 0,
     blocked_queries: u64 = 0,
@@ -1368,7 +1371,7 @@ pub const Owner = struct {
     test_before_allocator_reader_close: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *native.NativeFile) void } else void = if (h.builtin.is_test) null else {},
     test_allocator_wait: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
     test_after_stop: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
-    test_before_storage_service: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *h.Handle) void } else void = if (h.builtin.is_test) null else {},
+    test_before_storage_service: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *h.Handle, bool) void } else void = if (h.builtin.is_test) null else {},
     test_before_replay_index_publication: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *h.Handle) void } else void = if (h.builtin.is_test) null else {},
     test_before_maintenance_capture: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
 
@@ -3193,9 +3196,14 @@ pub const Owner = struct {
         // an obsolete reader fence throughout its own reuse/vacuum attempt.
         if (catalog) |*proof| proof.deinit();
         catalog = null;
-        const retain_source_runtime = source_runtime_cache != null and source_more and maintenance_error == null;
-        if (source_runtime_cache != null and !retain_source_runtime) {
-            if (maintenance_error != null) self.publication_stats.text_runtime_cache.not_retained_failed +|= 1 else self.publication_stats.text_runtime_cache.not_retained_settled +|= 1;
+        const retain_source_runtime = source_runtime_cache != null and source_more and maintenance_error == null and !publication.index_inputs_changed;
+        if (retain_source_runtime) {
+            // This witness belongs to the runtime we just serviced. Physical
+            // service may adopt a foreign index checkpoint without rebinding
+            // that runtime; never certify its old inputs with the newer cut.
+            source_runtime_cache.?.indexes = store.file.activeCheckpoint().logical.indexes;
+        } else if (source_runtime_cache != null) {
+            if (maintenance_error != null) self.publication_stats.text_runtime_cache.not_retained_failed +|= 1 else if (publication.index_inputs_changed) self.publication_stats.text_runtime_cache.not_retained_index_inputs +|= 1 else self.publication_stats.text_runtime_cache.not_retained_settled +|= 1;
         }
         const retained_logical: ?native.LogicalGenerations = if (retain_artifact_runtime or retain_source_runtime) store.file.activeCheckpoint().logical else null;
         const merge_owns_root = if (self.pending_text_merge) |active| active.root == root else false;
@@ -3211,7 +3219,7 @@ pub const Owner = struct {
         // namespace into source work. Keep its retry signal separate.
         const artifacts_finished = @import("antfly_platform").time.monotonicNs();
         const artifact_failed = maintenance_error != null;
-        if (comptime h.builtin.is_test) if (self.test_before_storage_service) |hook| hook.notify(hook.ptr, root);
+        if (comptime h.builtin.is_test) if (self.test_before_storage_service) |hook| hook.notify(hook.ptr, root, retain_source_runtime);
         store.defer_background_vacuum = self.pending_text_merge != null;
         defer store.defer_background_vacuum = false;
         store.maintainBackgroundOnce(&self.verification_cancel) catch |err| {
@@ -3234,12 +3242,18 @@ pub const Owner = struct {
         self.publication_stats.maintenance_storage_ns +|= @import("antfly_platform").time.monotonicNs() -| artifacts_finished;
         self.maintenance_retained_logical = retained_logical;
         self.clearTextSourceRuntimeCache();
-        if (retain_source_runtime and maintenance_error == null) {
-            const cache = source_runtime_cache.?;
-            cache.indexes = store.file.activeCheckpoint().logical.indexes;
-            self.text_source_runtime_cache = cache;
+        const storage_yield = maintenance_error_phase == .storage and if (maintenance_error) |err| switch (err) {
+            error.EnrichmentWaitCanceled, error.FileBusy, error.WouldBlock => true,
+            else => false,
+        } else false;
+        // A physical-service yield does not invalidate successful source work.
+        // Every later reuse still checks the pre-service index witness, inode,
+        // catalog and controls against a fresh admitted checkpoint.
+        if (retain_source_runtime and !needsOutcomeReconciliation(root) and (maintenance_error == null or storage_yield)) {
+            self.text_source_runtime_cache = source_runtime_cache.?;
             source_runtime_cache = null;
-        }
+            if (storage_yield) self.publication_stats.text_runtime_cache.retained_storage_yield +|= 1;
+        } else if (retain_source_runtime) self.publication_stats.text_runtime_cache.not_retained_storage_error +|= 1;
         if (merge_owns_root and !retain_source_runtime and !retain_artifact_runtime) {
             std.debug.assert(self.maintenance_snapshot == root);
             self.maintenance_snapshot = null;
@@ -6990,7 +7004,11 @@ test "capi native allocator proof issue1431 physical maintenance releases detach
     var probe: Probe = .{};
     owner.test_after_capture = .{ .ptr = &probe, .notify = Probe.notify };
     defer owner.test_after_capture = null;
-    owner.test_before_storage_service = .{ .ptr = &probe, .notify = Probe.notify };
+    owner.test_before_storage_service = .{ .ptr = &probe, .notify = struct {
+        fn notify(ptr: *anyopaque, root: *h.Handle, _: bool) void {
+            Probe.notify(ptr, root);
+        }
+    }.notify };
     defer owner.test_before_storage_service = null;
     for (0..8) |_| {
         owner.maintenance_pending = true;
@@ -8193,6 +8211,79 @@ test "capi native maintenance relational replay diagnoses bounded runtime reuse"
                 try table.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
             _ = try owner.groupSourceStateNamed(table, name);
         }
+        const StorageProbe = struct {
+            connection: *Connection,
+            foreign: bool,
+            failure: ?anyerror = null,
+            original: ?@import("../storage/lite/docstore.zig").WriterAdmission = null,
+            injected: bool = false,
+            adopted: bool = false,
+            verify_cache: bool = false,
+            checked: bool = false,
+            expected_indexes: [16]u8 = undefined,
+            refusals: usize = 0,
+
+            fn notify(ptr: *anyopaque, root: *h.Handle, reusable: bool) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                const store = root.owned_lite_backend.?.native_docstore.?;
+                self.original = store.writer_admission;
+                if (self.foreign and reusable and !self.injected) {
+                    self.expected_indexes = store.file.activeCheckpoint().logical.indexes;
+                    self.publishForeignIndex() catch |err| {
+                        self.failure = err;
+                        return;
+                    };
+                    self.injected = true;
+                    self.verify_cache = true;
+                }
+                store.writer_admission = .{ .ptr = self, .enter = refuse, .leave = leave };
+            }
+            fn publishForeignIndex(self: *@This()) !void {
+                var lease = try self.connection.acquire();
+                defer {
+                    lease.close();
+                    self.connection.gate.mutex.unlock(h.handleLockIo());
+                }
+                const live = try self.connection.owner.refresh();
+                try live.owned_lite_backend.?.native_docstore.?.file.putIndexCatalogRecord("/outside/replay-cache-probe", "foreign checkpoint");
+            }
+            fn refuse(ptr: *anyopaque, scope: PublicationScope) !void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.refusals += 1;
+                if (self.verify_cache and !self.adopted) {
+                    // Exercise allocator-service adoption, then yield before
+                    // physical work. Its new header cannot certify old inputs.
+                    const original = self.original orelse return error.TestUnexpectedResult;
+                    try original.enter(original.ptr, scope);
+                    original.leave(original.ptr);
+                    self.adopted = true;
+                }
+                return error.EnrichmentWaitCanceled;
+            }
+            fn leave(_: *anyopaque) void {
+                unreachable; // Every injected admission refuses before work.
+            }
+            fn check(self: *@This()) !void {
+                if (self.failure) |err| return err;
+                if (!self.verify_cache) return;
+                try std.testing.expect(self.adopted);
+                var lease = try self.connection.acquire();
+                defer {
+                    lease.close();
+                    self.connection.gate.mutex.unlock(h.handleLockIo());
+                }
+                const cache = self.connection.owner.text_source_runtime_cache orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqualSlices(u8, &self.expected_indexes, &cache.indexes);
+                const live = &self.connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+                try std.testing.expect(!std.mem.eql(u8, &self.expected_indexes, &live.activeCheckpoint().logical.indexes));
+                try std.testing.expect(!try cache.matches(live));
+                self.verify_cache = false;
+                self.checked = true;
+            }
+        };
+        var storage_probe: StorageProbe = .{ .connection = fixture.connection, .foreign = namespace_count == 2 };
+        owner.test_before_storage_service = .{ .ptr = &storage_probe, .notify = StorageProbe.notify };
+        defer owner.test_before_storage_service = null;
         owner.publication_stats.text_runtime_cache = .{};
         const opens_before = owner.publication_stats.maintenance_runtime_opens;
         const reuses_before = owner.publication_stats.maintenance_source_runtime_reuses;
@@ -8213,10 +8304,15 @@ test "capi native maintenance relational replay diagnoses bounded runtime reuse"
                 error.EnrichmentWaitCanceled, error.EnrichmentSourceChanged, error.FileBusy, error.WouldBlock => true,
                 else => return err,
             };
+            try storage_probe.check();
         }
+        owner.test_before_storage_service = null;
+        try std.testing.expect(storage_probe.refusals > 0);
+        if (namespace_count == 2) try std.testing.expect(storage_probe.checked);
         const diagnostics = owner.publication_stats.text_runtime_cache;
         std.debug.print("LITE_RELATIONAL_RUNTIME namespaces={d} opens={d} reuses={d} diagnostics={f}\n", .{ namespace_count, owner.publication_stats.maintenance_runtime_opens - opens_before, owner.publication_stats.maintenance_source_runtime_reuses - reuses_before, std.json.fmt(diagnostics, .{}) });
         try std.testing.expect(diagnostics.capture_attempts > 0);
+        try std.testing.expect(diagnostics.retained_storage_yield > 0);
         try std.testing.expect(owner.publication_stats.maintenance_source_runtime_reuses > reuses_before);
         try std.testing.expectEqual(@as(u64, 0), diagnostics.capture_namespace_limit);
         // Verify the diagnostic uses the real replay path. Drain only after

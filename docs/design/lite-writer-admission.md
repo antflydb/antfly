@@ -172,6 +172,13 @@ still rebuild; legacy physical-cut witnesses do not use this shortcut. Owned
 target names share the session memory budget and are freed on invalidation.
 COMMIT continues to validate every staged predicate and constraint.
 
+Successful pending replay retains its source runtime across a later physical
+storage phase yielding to a writer. Source errors and uncertain publication
+still prevent retention. The cache's index witness is captured before physical
+service: allocator service may adopt a foreign checkpoint, and that adoption
+must not certify the old immutable runtime. The next admitted reuse checks the
+original index witness and rejects any changed input generation.
+
 Runtime-cache counters distinguish unsupported state, changed identities and
 controls, namespace limits, and settling from successful reuse. They are needed
 to distinguish safe invalidation from repeated startup work in the importer;
