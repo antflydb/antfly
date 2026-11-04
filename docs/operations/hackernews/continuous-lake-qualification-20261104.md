@@ -152,7 +152,50 @@ failures or qualify retention. No slow Debug request crossed the three-second
 stack-capture threshold. A retained ReleaseFast slow-query profile accounted for
 only milliseconds of its 2.8-second total in measured opening/ranking/delivery
 phases; unlisted admission, WAL-cut setup and cleanup still need attribution.
-There is no established engine root cause or claimed engine fix from this work.
+These observations alone do not establish the cause of the original timeouts.
+
+## Engine corrections under validation
+
+The follow-up merges main's #1479 writer-admission changes and addresses three
+independently established implementation problems:
+
+- Standalone metadata callbacks checked cancellation before an unbounded mutex
+  wait. Request-aware admission now checks cancellation/deadlines while queued
+  and checks the deadline after acquisition. Cancellation callbacks run outside
+  the metadata mutex because they may read the same catalog. HA
+  mutation-barrier admission follows the same contract and retains the existing
+  barrier-before-catalog ordering and role-binding checks. This bounds admission;
+  it does not change the outcome contract of an already admitted durable commit.
+- Reachability and retirement inserted URIs into immutable tries individually,
+  persisting intermediate roots. Bounded batch insertion writes the final changed
+  nodes bottom-up and preserves the existing canonical format. Checkpoints and
+  proofs publish only after the nodes are durable. Retirement still requires an
+  exact-metadata reachability proof and catalog HEAD CAS; cancellation cannot
+  authorize deletion through an unpublished partial root.
+- A reachability turn discarded its partial checkpoint if HEAD changed during
+  traversal, so frequent appends could repeatedly erase useful work. An
+  interleaving test reproduced the missing checkpoint. Progress now persists
+  through its own CAS even after an append. Before retargeting a checkpoint for
+  a different metadata document, the worker checks that its selected table is
+  still current. This prevents a stale table read from rebasing newer work
+  backwards; the checkpoint CAS also protects a competing worker's later save.
+
+Request-local slow-query profiles now expose reader admission and native
+catalog/WAL-cut preparation separately. Inline publications with no dense/sparse
+segments also skip empty recent-vector preparation; directory-backed publications
+still resolve their declarations. Incomplete qualification vacuum jobs resume at
+one-second intervals, independently of the interval between new jobs per table.
+
+These changes require a fresh optimized workload and continuation of the retained
+GCS maintenance job. They do not retroactively qualify the original measurements
+or establish that all publication lag and accepted-search failures are resolved.
+
+Focused validation passes: 45 Python tests, 65 shared runtime contract tests,
+the standalone admission and public catalog cancellation tests, and 694 lake
+tests (one additional test skipped), with no native test leaks. The checkpoint
+interleaving regression failed with a missing checkpoint before the guard change
+and passed afterward. API checks and fresh Debug/ReleaseFast qualification remain
+in progress.
 
 Next work should:
 

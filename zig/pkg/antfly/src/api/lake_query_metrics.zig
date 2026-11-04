@@ -47,6 +47,8 @@ pub const Phase = enum {
     composed_leaf,
     composed_native_leaf,
     composed_cursor,
+    admission,
+    wal_cut,
 };
 const count = @typeInfo(Phase).@"enum".field_names.len;
 pub const Navigation = struct {
@@ -194,7 +196,7 @@ pub fn append(writer: *std.Io.Writer, memory: anytype, disk: anytype, query: any
     }
     try prom.appendPromMetric(writer, "antfly_lake_query_slow_profile_drops_total", "counter", "Slow composed profiles skipped due to diagnostic contention", query.slow_profile_drops);
     if (query.slowest_lake) |profile| {
-        inline for (.{ "total", "source", "publication", "ranking", "cursor_retention", "result_delivery" }) |phase| {
+        inline for (.{ "total", "admission", "wal_cut", "source", "publication", "ranking", "cursor_retention", "result_delivery" }) |phase| {
             try prom.appendPromMetric(writer, "antfly_lake_query_slowest_lake_" ++ phase ++ "_nanoseconds", "gauge", "Request-local phase of slowest lake request above 750 ms since startup; unlisted setup is part of total", profile.duration(@field(Phase, phase)));
         }
     }
@@ -232,6 +234,8 @@ test "external lake single request outlier profiles isolate interleaved phases a
     var slow: ComposedProfile = .{};
     fast.add(&metrics, .ranking, 100 * std.time.ns_per_ms);
     slow.add(&metrics, .publication, 3000 * std.time.ns_per_ms);
+    slow.add(&metrics, .admission, 500 * std.time.ns_per_ms);
+    fast.add(&metrics, .wal_cut, 10 * std.time.ns_per_ms);
     fast.add(&metrics, .total, 150 * std.time.ns_per_ms);
     slow.add(&metrics, .total, 4000 * std.time.ns_per_ms);
     metrics.retainSlowLake(fast);
@@ -239,6 +243,8 @@ test "external lake single request outlier profiles isolate interleaved phases a
     metrics.retainSlowLake(slow);
     const profile = metrics.snapshot().slowest_lake.?;
     try std.testing.expectEqual(@as(u64, 3000 * std.time.ns_per_ms), profile.duration(.publication));
+    try std.testing.expectEqual(@as(u64, 500 * std.time.ns_per_ms), profile.duration(.admission));
+    try std.testing.expectEqual(@as(u64, 0), profile.duration(.wal_cut));
     try std.testing.expectEqual(@as(u64, 0), profile.duration(.ranking));
     try std.testing.expect(metrics.slow_mutex.tryLock());
     metrics.retainSlowLake(slow);

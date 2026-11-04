@@ -73,6 +73,38 @@ def test_failed_admission_retains_intent_without_acknowledging(run, monkeypatch)
     assert "SECRET" not in (run.state / "events.jsonl").read_text()
 
 
+def test_maintenance_resumes_incomplete_job_without_recreating_completed_job(
+    run, monkeypatch
+):
+    run.args.maintenance_interval = 15
+    now = [100.0]
+    calls = []
+    monkeypatch.setattr(lake.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(run, "record_vacuum", lambda *_: None)
+
+    def request(method, route, body):
+        table = route.split("/")[2]
+        assert (
+            json.loads((run.state / "pending-vacuum.json").read_text())[table] == body
+        )
+        calls.append((table, copy.deepcopy(body)))
+        return {"complete": table == lake.TABLES[1]}
+
+    monkeypatch.setattr(run, "call", request)
+    next_start = {}
+    sequence = run.maintenance_turn(0, next_start)
+    assert sequence == 1
+    assert len(calls) == 2
+    now[0] += 1
+    sequence = run.maintenance_turn(sequence, next_start)
+    assert len(calls) == 3
+    assert calls[0] == calls[2]
+    now[0] += 15
+    run.maintenance_turn(sequence, next_start)
+    assert len(calls) == 5
+    assert calls[-1][1]["operation_id"] != calls[1][1]["operation_id"]
+
+
 def test_gcs_configuration_has_only_secret_reference(tmp_path):
     args = SimpleNamespace(
         state=tmp_path,

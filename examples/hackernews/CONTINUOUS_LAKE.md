@@ -19,7 +19,9 @@ The default bounded profile uses two dedicated object tables:
 
 Both tables use the Antfly-managed Iceberg catalog. Vacuum runs with its normal
 minimum ten-minute retention and a bounded deletion budget. Incomplete operations
-keep the same operation ID across turns and restart. The driver separately checks
+keep the same operation ID across turns and restart. The driver resumes unfinished
+jobs every second (or the shorter configured maintenance interval), while spacing
+new jobs for each table by `--maintenance-interval`. It separately checks
 that some observed expired snapshot manifest-list objects are actually absent.
 Manifest merging is not Parquet compaction; deleting metadata objects does not
 establish reclamation of all superseded row data.

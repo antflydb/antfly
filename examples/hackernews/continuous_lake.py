@@ -792,6 +792,48 @@ class Run:
             self.stop.set()
             self.stop_server()
 
+    def maintenance_turn(self, sequence, next_start):
+        """Resume durable jobs promptly; rate-limit creation per table."""
+        pending = self.pending_vacuum
+        for name in TABLES:
+            if name not in pending and time.monotonic() < next_start.get(name, 0):
+                continue
+            request = pending.setdefault(
+                name,
+                {
+                    "action": "vacuum",
+                    "operation_id": f"continuous-vacuum-{sequence}-{name}",
+                    "dry_run": False,
+                    "exclusive_ownership": True,
+                    "retain_ms": 600000,
+                    "keep_latest": 2,
+                    "max_deleted": 32,
+                },
+            )
+            atomic_json(self.state / "pending-vacuum.json", pending)
+            try:
+                result = self.call("POST", f"/tables/{name}/lake/maintenance", request)
+            except RequestFailure as error:
+                if error.record.get("http_status", 503) in (
+                    409,
+                    429,
+                    500,
+                    502,
+                    503,
+                    504,
+                ):
+                    self.event("vacuum_retry", table=name, failure=error.record)
+                    continue
+                raise
+            self.record_vacuum(name, request, result)
+            self.event("vacuum", table=name, request=request, result=result)
+            if result.get("complete"):
+                del pending[name]
+                sequence += 1
+                next_start[name] = time.monotonic() + self.args.maintenance_interval
+            atomic_json(self.state / "pending-vacuum.json", pending)
+        return sequence
+
     def continuous(self, rows):
         started = time.monotonic()
         end = min(self.deadline - 120, time.monotonic() + self.args.duration_seconds)
@@ -841,45 +883,10 @@ class Run:
 
         def maintain():
             sequence = 0
-            pending = self.pending_vacuum
+            next_start = {}
             while not self.stop.is_set() and time.monotonic() < end:
-                for name in TABLES:
-                    request = pending.setdefault(
-                        name,
-                        {
-                            "action": "vacuum",
-                            "operation_id": f"continuous-vacuum-{sequence}-{name}",
-                            "dry_run": False,
-                            "exclusive_ownership": True,
-                            "retain_ms": 600000,
-                            "keep_latest": 2,
-                            "max_deleted": 32,
-                        },
-                    )
-                    atomic_json(self.state / "pending-vacuum.json", pending)
-                    try:
-                        result = self.call(
-                            "POST", f"/tables/{name}/lake/maintenance", request
-                        )
-                    except RequestFailure as error:
-                        if error.record.get("http_status", 503) in (
-                            409,
-                            429,
-                            500,
-                            502,
-                            503,
-                            504,
-                        ):
-                            self.event("vacuum_retry", table=name, failure=error.record)
-                            continue
-                        raise
-                    self.record_vacuum(name, request, result)
-                    self.event("vacuum", table=name, request=request, result=result)
-                    if result.get("complete"):
-                        del pending[name]
-                        sequence += 1
-                    atomic_json(self.state / "pending-vacuum.json", pending)
-                self.stop.wait(self.args.maintenance_interval)
+                sequence = self.maintenance_turn(sequence, next_start)
+                self.stop.wait(min(1, self.args.maintenance_interval))
 
         def observe():
             while not self.stop.is_set() and time.monotonic() < end:

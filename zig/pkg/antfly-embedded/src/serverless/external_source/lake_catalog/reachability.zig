@@ -45,8 +45,8 @@ pub const Result = struct { ready: bool, members: ?Digest = null, steps: usize =
 pub const Builder = struct {
     files: rows.Files,
     prefix: []const u8,
-    /// Used only to avoid replacing a newer build checkpoint with a stale one.
-    /// Proofs themselves are immutable and bound to the complete metadata hash.
+    /// Fence retargeting when the selected table became stale before reading
+    /// a different checkpoint. Progress writes use the checkpoint's own CAS.
     head_key: []const u8,
     index: retired.Index,
     inventories: inventory.Store,
@@ -159,14 +159,25 @@ pub const Builder = struct {
         else
             .{ .metadata_hash = hash, .roots = try roots(a, table.metadata_json) };
         if (progress.version != 1 or progress.snapshot > progress.roots.snapshots.len or progress.statistic > progress.roots.statistics.len) return error.InvalidLakeReachability;
-        if (!std.mem.eql(u8, &progress.metadata_hash, &hash)) try retarget(a, &progress, try roots(a, table.metadata_json), hash);
+        if (!std.mem.eql(u8, &progress.metadata_hash, &hash)) {
+            // A newer worker may have saved its checkpoint after this caller
+            // selected the table but before it read build.json. Do not rebase
+            // that work backwards to an already obsolete metadata document.
+            var head = (try self.get(a, self.head_key, 64 * 1024)) orelse return error.LakeTableNotFound;
+            defer head.deinit(a);
+            const current = try std.json.parseFromSliceLeaky(std.json.Value, a, head.body, .{});
+            if (!std.mem.eql(u8, try metadata.str(try metadata.get(current, "metadata_location")), table.metadata_location)) return .{ .ready = false };
+            try retarget(a, &progress, try roots(a, table.metadata_json), hash);
+        }
         var work = max_steps;
+        var members: std.ArrayList([]const u8) = .empty;
+        var completed: std.StringHashMapUnmanaged(void) = .empty;
         // Read-only shared-manifest edges do not consume the mutation budget,
         // but still have their own bound and deadline checks.
         var edges: usize = 4096;
         var sources: usize = 4;
         while (work != 0 and try self.canWork() and progress.statistic < progress.roots.statistics.len) {
-            progress.members = try self.index.insert(progress.members, progress.roots.statistics[progress.statistic]);
+            try members.append(a, progress.roots.statistics[progress.statistic]);
             progress.statistic += 1;
             work -= 1;
         }
@@ -174,7 +185,7 @@ pub const Builder = struct {
             const uri = progress.roots.snapshots[progress.snapshot].uri;
             const list = (try self.inventories.load(a, uri, true, &sources)) orelse break;
             if (!progress.list_marked) {
-                progress.members = try self.index.insert(progress.members, uri);
+                try members.append(a, uri);
                 progress.list_marked = true;
                 work -= 1;
             }
@@ -188,7 +199,7 @@ pub const Builder = struct {
                     work -= 1;
                     break;
                 };
-                if (try self.index.contains(progress.manifests, manifest)) {
+                if (completed.contains(manifest) or try self.index.contains(progress.manifests, manifest)) {
                     progress.manifest += 1;
                     progress.file = 0;
                     edges -= 1;
@@ -198,13 +209,13 @@ pub const Builder = struct {
                 var reader: inventory.Store.Reader = .{ .store = &self.inventories, .a = a, .inventory_ = files };
                 while (work != 0 and edges != 0 and try self.canWork()) {
                     const file = (try reader.next(progress.file)) orelse {
-                        progress.manifests = try self.index.insert(progress.manifests, manifest);
+                        try completed.put(a, manifest, {});
                         progress.manifest += 1;
                         progress.file = 0;
                         work -= 1;
                         break;
                     };
-                    progress.members = try self.index.insert(progress.members, file);
+                    try members.append(a, file);
                     progress.file += 1;
                     work -= 1;
                 }
@@ -212,26 +223,30 @@ pub const Builder = struct {
             }
             if (sources == 0 or edges == 0 or !try self.canWork()) break;
         }
+        // Publish all children before either the proof or mutable checkpoint
+        // can expose these roots. Cancellation leaves only unreachable nodes.
+        progress.members = try self.index.insertMany(progress.members, members.items);
+        var manifests: std.ArrayList([]const u8) = .empty;
+        var done = completed.keyIterator();
+        while (done.next()) |uri| try manifests.append(a, uri.*);
+        progress.manifests = try self.index.insertMany(progress.manifests, manifests.items);
         const complete = progress.snapshot == progress.roots.snapshots.len and progress.statistic == progress.roots.statistics.len;
         if (complete) {
             try self.immutable(a, proof_key, try std.json.Stringify.valueAlloc(a, Proof{ .metadata_hash = hash, .members = progress.members }, .{}));
         }
-        // Do not regress a newer metadata build when a stale worker resumes.
-        // This guard is an optimization; retirement's HEAD CAS is the fence.
-        var head = (try self.get(a, self.head_key, 64 * 1024)) orelse return error.LakeTableNotFound;
-        defer head.deinit(a);
-        const current = try std.json.parseFromSliceLeaky(std.json.Value, a, head.body, .{});
-        if (std.mem.eql(u8, try metadata.str(try metadata.get(current, "metadata_location")), table.metadata_location)) {
-            const bytes = try std.json.Stringify.valueAlloc(a, progress, .{});
-            if (bytes.len > 64 * 1024 * 1024) return error.LakeMetadataTooLarge;
-            var client = self.files.client;
-            client.allocator = a;
-            var stored = client.compareAndPut(self.files.bucket, progress_key, bytes, if (saved) |object| object.metadata.writeRevision() orelse return error.MissingObjectRevision else null, .{ .cancellation = types.contextCancellation(&self.files.context) }) catch |err| switch (err) {
-                error.PreconditionFailed => return .{ .ready = complete, .members = progress.members, .steps = max_steps - work },
-                else => return err,
-            };
-            stored.deinit(a);
-        }
+        // Keep useful partial work even if a writer advanced HEAD during this
+        // turn. The next worker retargets append-only roots or resets removed
+        // roots; exact-hash proofs and retirement's HEAD CAS remain the fence.
+        // This CAS prevents overwriting a checkpoint saved since our read.
+        const bytes = try std.json.Stringify.valueAlloc(a, progress, .{});
+        if (bytes.len > 64 * 1024 * 1024) return error.LakeMetadataTooLarge;
+        var client = self.files.client;
+        client.allocator = a;
+        var stored = client.compareAndPut(self.files.bucket, progress_key, bytes, if (saved) |object| object.metadata.writeRevision() orelse return error.MissingObjectRevision else null, .{ .cancellation = types.contextCancellation(&self.files.context) }) catch |err| switch (err) {
+            error.PreconditionFailed => return .{ .ready = complete, .members = progress.members, .steps = max_steps - work },
+            else => return err,
+        };
+        stored.deinit(a);
         // The caller charges these mutations against traversal's remaining
         // work. A complete exact-metadata proof is usable immediately, even
         // when the next maintenance turn will observe another catalog commit.

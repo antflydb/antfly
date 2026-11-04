@@ -64,6 +64,18 @@ pub fn executeWithDelivery(a: A, server: *server_api.ApiHttpServer, table: local
     };
 }
 pub fn reconcileRecent(a: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, request: local.api_operation.RequestContext) !void {
+    try request.ensureActive();
+    // Recent preparation emits dense/sparse segments only. Inline text/scalar
+    // publications need no catalog, WAL capture or serving leases here. A
+    // directory-backed publication must still resolve its declarations: an
+    // empty inline list does not establish that it has no vector segments.
+    var state = try local.metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json);
+    defer state.deinit();
+    const publication = state.value.published orelse return;
+    const needed = publication.directory != null or for (publication.declarations) |declaration| {
+        if (declaration.artifact.kind == .vector_segment or declaration.artifact.kind == .sparse_segment) break true;
+    } else false;
+    if (!needed) return;
     if (try executePinned(a, server, table, .{}, request, null, true)) |value| {
         var response = value;
         response.deinit(a);
@@ -111,7 +123,11 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     var state = try local.metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json);
     defer state.deinit();
     const publication = state.value.published orelse return error.ExternalLakeIndexNotPublished;
-    const lease = try server.lake_reader_leases.acquireRetained(server.embedding_provider_runtime.io, authority, table.table_id, publication.generation, context, if (retained) |cut| cut.reader_token else null);
+    const lease = admitted: {
+        const admission_started = @import("antfly_platform").time.monotonicNs();
+        defer request_profile.record(&server.lake_query_metrics, .admission, admission_started);
+        break :admitted try server.lake_reader_leases.acquireRetained(server.embedding_provider_runtime.io, authority, table.table_id, publication.generation, context, if (retained) |cut| cut.reader_token else null);
+    };
     defer lease.deinit();
     context = lease.readContext();
     try server.prepareLakeCache();
@@ -146,6 +162,8 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     // well as cloud connections. Accepted visibility must follow that same
     // authority rather than silently ignoring locally acknowledged WAL rows.
     if (retained == null and schema.binding.write_policy == .iceberg_writer and server.cfg.node_config != null) {
+        const wal_started = @import("antfly_platform").time.monotonicNs();
+        defer request_profile.record(&server.lake_query_metrics, .wal_cut, wal_started);
         const catalog = local.serverless_external_source_mod.lake_catalog;
         var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(a, schema.binding, options, context, .load);
         defer current.deinit(a);
@@ -6018,4 +6036,12 @@ test "external lake hydration projection keeps virtual identity sorting outside 
     } } };
     const fields = (try owner.planHydration(.{ .fields = &.{ "*", "-body" }, .order_by = &.{.{ .field = "_id" }} })).?;
     try std.testing.expectEqualSlices([]const u8, &.{"id"}, fields);
+}
+
+test "external lake recent reconciliation needs no serving owner before vector publication" {
+    const table: local.common_topology_records.TableRecord = .{ .table_id = 4, .name = "text_only", .schema_json = "{}", .indexes_json = "{\"body\":{\"type\":\"full_text\"}}" };
+    // No publication can produce a recent vector segment. In particular this
+    // path must not touch credentials, a WAL owner or server runtime handles.
+    try reconcileRecent(std.testing.allocator, undefined, table, .{});
+    try std.testing.expectError(error.DeadlineExceeded, reconcileRecent(std.testing.allocator, undefined, table, .{ .deadline_ns = 0 }));
 }

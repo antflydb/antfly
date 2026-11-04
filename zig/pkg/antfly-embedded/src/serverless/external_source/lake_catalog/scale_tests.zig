@@ -456,6 +456,107 @@ test "lake catalog retirement conflicts when authority advances during cold proo
     try std.testing.expect(current.retirement_root == null);
 }
 
+test "lake catalog reachability checkpoints partial work when HEAD advances inside a turn" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory = storage.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var faults = storage.ScriptedFaultClient.init(alloc, memory.client());
+    defer faults.deinit();
+    var table = try Table.init(alloc, faults.client(), "archive", "events", "gs://archive/events", "gs://archive/events");
+    defer table.deinit(alloc);
+    try table.commitRow(alloc, 2);
+    const Advance = struct {
+        a: A,
+        table: *Table,
+        advanced: bool = false,
+        fn run(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.table.commitRow(self.a, 3) catch return;
+            self.advanced = true;
+        }
+        fn matches(_: *anyopaque, _: []const u8, key: []const u8) bool {
+            return std.mem.endsWith(u8, key, ".avro");
+        }
+    };
+    var advance: Advance = .{ .a = alloc, .table = &table };
+    faults.get_filter = .{ .ptr = &advance, .matches = Advance.matches };
+    faults.next_get = .{ .complete_then_callback = .{ .ptr = &advance, .run = Advance.run } };
+    var first = try table.catalog.referencesBounded(alloc, .{ .objects = &.{}, .max_steps = 1 });
+    defer first.deinit(alloc);
+    try std.testing.expect(advance.advanced and !first.ready);
+    const Checkpoint = struct { metadata_hash: [64]u8, list_marked: bool, file: usize };
+    var client = memory.client();
+    const key = "events/metadata/antfly-catalog/reachability/build.json";
+    var saved = try client.getObject("archive", key, .{});
+    defer saved.deinit(alloc);
+    const before = try std.json.parseFromSliceLeaky(Checkpoint, a, saved.body, .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqual(types.digestHex(first.table.metadata_json), before.metadata_hash);
+    try std.testing.expect(before.list_marked);
+    var second = try table.catalog.referencesBounded(alloc, .{ .objects = &.{}, .max_steps = 1 });
+    defer second.deinit(alloc);
+    try std.testing.expect(!second.ready);
+    var resumed = try client.getObject("archive", key, .{});
+    defer resumed.deinit(alloc);
+    const after = try std.json.parseFromSliceLeaky(Checkpoint, a, resumed.body, .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqual(types.digestHex(table.current.metadata_json), after.metadata_hash);
+    try std.testing.expectEqual(@as(usize, 1), after.file);
+    // A competing cold worker advances the checkpoint after this worker reads
+    // it. Only the checkpoint CAS, rather than a HEAD observation, can protect
+    // the winning worker's progress from a stale replacement.
+    const Winner = struct {
+        a: A,
+        catalog: managed.Managed,
+        append: ?*Table = null,
+        expected: ?[]const u8 = null,
+        fn run(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.append) |appending| appending.commitRow(self.catalog.client.allocator, 4) catch return;
+            var result = self.catalog.referencesBounded(self.a, .{ .objects = &.{}, .max_steps = 2 }) catch return;
+            defer result.deinit(self.a);
+            var winner_client = self.catalog.client;
+            var checkpoint = winner_client.getObject("archive", "events/metadata/antfly-catalog/reachability/build.json", .{}) catch return;
+            defer checkpoint.deinit(winner_client.allocator);
+            self.expected = self.a.dupe(u8, checkpoint.body) catch return;
+        }
+        fn matches(_: *anyopaque, _: []const u8, path: []const u8) bool {
+            return std.mem.endsWith(u8, path, "/reachability/build.json");
+        }
+        fn matchesMetadata(_: *anyopaque, _: []const u8, path: []const u8) bool {
+            return std.mem.endsWith(u8, path, ".metadata.json");
+        }
+    };
+    var winner: Winner = .{ .a = a, .catalog = table.catalog };
+    faults.get_filter = .{ .ptr = &winner, .matches = Winner.matches };
+    faults.next_get = .{ .complete_then_callback = .{ .ptr = &winner, .run = Winner.run } };
+    var loser = try table.catalog.referencesBounded(alloc, .{ .objects = &.{}, .max_steps = 1 });
+    defer loser.deinit(alloc);
+    try std.testing.expect(winner.expected != null);
+    var won = try client.getObject("archive", key, .{});
+    defer won.deinit(alloc);
+    try std.testing.expectEqualStrings(winner.expected.?, won.body);
+    // The selected table can already be stale before this worker reads the
+    // checkpoint. Do not retarget a newer checkpoint backwards in that case.
+    var newer: Winner = .{ .a = a, .catalog = table.catalog, .append = &table };
+    faults.get_filter = .{ .ptr = &newer, .matches = Winner.matchesMetadata };
+    faults.next_get = .{ .complete_then_callback = .{ .ptr = &newer, .run = Winner.run } };
+    var stale = try table.catalog.referencesBounded(alloc, .{ .objects = &.{}, .max_steps = 1 });
+    defer stale.deinit(alloc);
+    try std.testing.expect(newer.expected != null and !stale.ready);
+    try std.testing.expectEqual(@as(usize, 0), stale.steps);
+    var latest = try client.getObject("archive", key, .{});
+    defer latest.deinit(alloc);
+    try std.testing.expectEqualStrings(newer.expected.?, latest.body);
+    const current_metadata = try metadata.parse(a, table.current.metadata_json);
+    const snapshots = (try metadata.get(current_metadata, "snapshots")).array.items;
+    const newest_list = try metadata.str(try metadata.get(snapshots[snapshots.len - 1], "manifest-list"));
+    var proof = try awaitReferences(alloc, table.catalog, &.{ "gs://archive/events/data/dead.parquet", newest_list });
+    defer proof.deinit(alloc);
+    try std.testing.expect(proof.ready and !proof.referenced[0] and proof.referenced[1]);
+}
+
 test "lake catalog reachability completes without an idle metadata turn" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);

@@ -115,6 +115,52 @@ pub const Index = struct {
         if (uri.len == 0 or uri.len > 4096) return error.InvalidLakeRetirementIndex;
         return self.insertAt(root, uri, 0);
     }
+    /// Apply one bounded set update bottom-up. Only final changed nodes are
+    /// published; intermediate roots from individual insertions are not durable
+    /// inputs and need not amplify each checkpoint into hundreds of PUTs.
+    /// The returned root has the same canonical wire format as insert(). A
+    /// caller must publish its checkpoint only after this method succeeds.
+    pub fn insertMany(self: *Index, root: ?Digest, uris: []const []const u8) !?Digest {
+        try self.context.ensureActive();
+        if (uris.len > 4096) return error.LakeRetirementIndexBudgetExceeded;
+        for (uris) |uri| if (uri.len == 0 or uri.len > 4096) return error.InvalidLakeRetirementIndex;
+        return self.insertManyAt(root, uris, 0);
+    }
+    fn insertManyAt(self: *Index, root: ?Digest, uris: []const []const u8, depth: usize) anyerror!?Digest {
+        try self.context.ensureActive();
+        if (uris.len == 0) return root;
+        const a = self.arena.allocator();
+        const node = if (root) |hash| try self.read(hash) else Node{};
+        if (node.children) |existing| {
+            if (depth == 64) return error.InvalidLakeRetirementIndex;
+            var groups: [16]std.ArrayList([]const u8) = @splat(.empty);
+            for (uris) |uri| try groups[nibble(uri, depth)].append(a, uri);
+            var children = existing;
+            for (&children, groups) |*child, group| child.* = try self.insertManyAt(child.*, group.items, depth + 1);
+            return try self.write(.{ .children = children });
+        }
+        var items: std.ArrayList([]const u8) = .empty;
+        try items.appendSlice(a, node.items);
+        try items.appendSlice(a, uris);
+        std.mem.sort([]const u8, items.items, {}, struct {
+            fn less(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.less);
+        var count: usize = 0;
+        for (items.items) |uri| {
+            if (count != 0 and std.mem.eql(u8, items.items[count - 1], uri)) continue;
+            items.items[count] = uri;
+            count += 1;
+        }
+        if (count <= 8) return try self.write(.{ .items = items.items[0..count] });
+        if (depth == 64) return error.LakeRetirementHashCollision;
+        var groups: [16]std.ArrayList([]const u8) = @splat(.empty);
+        for (items.items[0..count]) |uri| try groups[nibble(uri, depth)].append(a, uri);
+        var children: [16]?Digest = @splat(null);
+        for (&children, groups) |*child, group| child.* = try self.insertManyAt(null, group.items, depth + 1);
+        return try self.write(.{ .children = children });
+    }
     fn insertAt(self: *Index, root: ?Digest, uri: []const u8, depth: usize) anyerror!Digest {
         const node = if (root) |hash| try self.read(hash) else Node{};
         if (node.children) |existing| {
@@ -173,4 +219,42 @@ test "lake retirement index retains roots across restart and cannot mutate earli
     const same = try reopened.insert(root, "s3://archive/extra.parquet");
     try std.testing.expectEqual(root.?, same);
     try std.testing.expect(!try reopened.contains(root, "s3://archive/missing.parquet"));
+}
+
+test "external lake retirement batch preserves canonical roots with bounded object writes" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var sequential = Index.init(a, memory.client(), "archive", "sequential", .{});
+    defer sequential.deinit();
+    var batch = Index.init(a, memory.client(), "archive", "batch", .{});
+    defer batch.deinit();
+    var uris: [64][]const u8 = undefined;
+    var expected: ?Digest = null;
+    for (&uris, 0..) |*uri, i| {
+        uri.* = try std.fmt.allocPrint(ca, "s3://archive/data/{d}.parquet", .{i});
+        expected = try sequential.insert(expected, uri.*);
+    }
+    const root = try batch.insertMany(null, &uris);
+    try std.testing.expectEqual(expected.?, root.?);
+    var client = memory.client();
+    var single_objects = try client.listObjects("archive", .{ .prefix = "sequential/", .max_keys = 1000 });
+    defer single_objects.deinit(a);
+    var batch_objects = try client.listObjects("archive", .{ .prefix = "batch/", .max_keys = 1000 });
+    defer batch_objects.deinit(a);
+    try std.testing.expect(batch_objects.entries.len * 2 < single_objects.entries.len);
+    var reopened = Index.init(a, memory.client(), "archive", "batch", .{});
+    defer reopened.deinit();
+    for (uris) |uri| try std.testing.expect(try reopened.contains(root, uri));
+    const extended = try reopened.insertMany(root, &.{ uris[0], "s3://archive/new.parquet", uris[0] });
+    try std.testing.expect(!try batch.contains(root, "s3://archive/new.parquet"));
+    try std.testing.expect(try reopened.contains(extended, "s3://archive/new.parquet"));
+    try std.testing.expectEqual(extended.?, (try reopened.insertMany(extended, &uris)).?);
+    var canceled = Index.init(a, memory.client(), "archive", "batch", .{ .deadline_ns = 0 });
+    defer canceled.deinit();
+    try std.testing.expectError(error.DeadlineExceeded, canceled.insertMany(root, &.{"s3://archive/canceled.parquet"}));
+    try std.testing.expect(!try reopened.contains(root, "s3://archive/canceled.parquet"));
 }
