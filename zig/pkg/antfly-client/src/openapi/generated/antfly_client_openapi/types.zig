@@ -26491,12 +26491,44 @@ pub const HierarchyArtifactSource = struct {
 
 pub const HierarchyChildParent = struct {
     level: []const u8,
-    id: []const u8,
+    id: ?[]const u8 = null,
+    /// Bounded source selection for member traversal; unit traversal requires id.
+    ids: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "level", "level", false },
+        .{ "id", "id", true },
+        .{ "ids", "ids", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("level");
+        try jw.write(self.level);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.ids) |value| {
+            try jw.objectField("ids");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HierarchyChildren = struct {
     parent: HierarchyChildParent,
-    /// Child level to enumerate. Unit traversal reads the versioned extraction hierarchy rather than a relevance index, so empty and failed units are included. Member traversal requires artifact and seeks that producer's native storage prefix within the selected source. It includes generic assets and chunks. Scalar member payloads are returned as {"$": value} in _source so every query hit retains an object-shaped projection. Continuation requires the remote_snapshot returned with the first page.
+    /// Child level to enumerate. Unit traversal reads the versioned extraction hierarchy rather than a relevance index, so empty and failed units are included. Member traversal requires artifact and seeks that producer's native storage prefixes within the selected source or parent.ids batch (up to 100). One global cursor orders the selected members; it includes generic assets and chunks. Scalar member payloads are returned as {"$": value} in _source so every query hit retains an object-shaped projection. Continuation requires the remote_snapshot returned with the first page.
     level: []const u8,
     /// Producer name; required for member traversal and omitted for unit traversal.
     artifact: ?[]const u8 = null,

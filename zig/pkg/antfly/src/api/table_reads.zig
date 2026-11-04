@@ -10828,15 +10828,17 @@ fn memberParentAdmissionRequest(req: db_mod.types.SearchRequest, parent: []const
     probe.return_mode = .parent;
     probe.order_by = &.{};
     probe.search_after = &.{};
-    probe.limit = 1;
+    probe.limit = @intCast(parent.len);
     probe.fields = &.{};
     probe.include_stored = false;
     probe.include_all_fields = false;
     probe.query = .{ .doc_id = .{ .ids = parent } };
     return probe;
 }
-fn admittedMemberRequest(req: db_mod.types.SearchRequest) db_mod.types.SearchRequest {
+fn admittedMemberRequest(req: db_mod.types.SearchRequest, parents: []const []const u8) db_mod.types.SearchRequest {
     var member = req;
+    member.hierarchy_children.?.parent_id = "";
+    member.hierarchy_children.?.parent_ids = parents;
     member.hierarchy_parent_admitted = true;
     member.filter_query_json = "";
     member.exclusion_query_json = "";
@@ -10867,12 +10869,24 @@ fn queryProvisionedAcrossGroupsAtGenerations(
     defer alloc.free(selected_generations);
     @memset(selected_generations, null);
     var member_req = req;
+    var admitted_arena = std.heap.ArenaAllocator.init(alloc);
+    defer admitted_arena.deinit();
     if (req.hierarchy_children) |children| if (children.artifact_name != null) {
-        const parent_ids = [_][]const u8{children.parent_id};
-        var parent = try queryProvisionedAcrossGroupsPhase(self, alloc, group_ids, memberParentAdmissionRequest(req, &parent_ids), table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
+        const single = [_][]const u8{children.parent_id};
+        const parent_ids = if (children.parent_ids.len != 0) children.parent_ids else &single;
+        var parent = try queryProvisionedAcrossGroupsPhase(self, alloc, group_ids, memberParentAdmissionRequest(req, parent_ids), table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
         defer parent.deinit();
-        if (parent.hits.len != 1 or !std.mem.eql(u8, parent.hits[0].id, children.parent_id)) return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
-        member_req = admittedMemberRequest(req);
+        if (parent.hits.len == 0) return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
+        if (parent.hits.len > parent_ids.len) return error.InvalidQueryRequest;
+        const authorized = try admitted_arena.allocator().alloc([]const u8, parent.hits.len);
+        for (parent.hits, 0..) |hit, i| {
+            const expected = for (parent_ids) |id| {
+                if (std.mem.eql(u8, hit.id, id)) break true;
+            } else false;
+            if (!expected) return error.InvalidQueryRequest;
+            authorized[i] = try admitted_arena.allocator().dupe(u8, hit.id);
+        }
+        member_req = admittedMemberRequest(req, authorized);
     };
     var selected = try queryProvisionedAcrossGroupsPhase(self, alloc, group_ids, member_req, table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
     errdefer selected.deinit();
@@ -11011,12 +11025,24 @@ fn queryHostedAcrossGroupsAtGenerations(
     defer alloc.free(selected_generations);
     @memset(selected_generations, null);
     var member_req = req;
+    var admitted_arena = std.heap.ArenaAllocator.init(alloc);
+    defer admitted_arena.deinit();
     if (req.hierarchy_children) |children| if (children.artifact_name != null) {
-        const parent_ids = [_][]const u8{children.parent_id};
-        var parent = try queryHostedAcrossGroupsPhase(active_self, alloc, group_ids, memberParentAdmissionRequest(req, &parent_ids), table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
+        const single = [_][]const u8{children.parent_id};
+        const parent_ids = if (children.parent_ids.len != 0) children.parent_ids else &single;
+        var parent = try queryHostedAcrossGroupsPhase(active_self, alloc, group_ids, memberParentAdmissionRequest(req, parent_ids), table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
         defer parent.deinit();
-        if (parent.hits.len != 1 or !std.mem.eql(u8, parent.hits[0].id, children.parent_id)) return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
-        member_req = admittedMemberRequest(req);
+        if (parent.hits.len == 0) return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
+        if (parent.hits.len > parent_ids.len) return error.InvalidQueryRequest;
+        const authorized = try admitted_arena.allocator().alloc([]const u8, parent.hits.len);
+        for (parent.hits, 0..) |hit, i| {
+            const expected = for (parent_ids) |id| {
+                if (std.mem.eql(u8, hit.id, id)) break true;
+            } else false;
+            if (!expected) return error.InvalidQueryRequest;
+            authorized[i] = try admitted_arena.allocator().dupe(u8, hit.id);
+        }
+        member_req = admittedMemberRequest(req, authorized);
     };
     var selected = try queryHostedAcrossGroupsPhase(active_self, alloc, group_ids, member_req, table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
     errdefer selected.deinit();

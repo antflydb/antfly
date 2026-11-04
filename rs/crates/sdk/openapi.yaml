@@ -31496,7 +31496,17 @@ components:
       additionalProperties: false
       required:
         - level
-        - id
+      not:
+        anyOf:
+          - required:
+              - id
+              - ids
+          - not:
+              anyOf:
+                - required:
+                    - id
+                - required:
+                    - ids
       properties:
         level:
           type: string
@@ -31505,12 +31515,44 @@ components:
         id:
           type: string
           minLength: 1
+        ids:
+          type: array
+          minItems: 1
+          maxItems: 100
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+          description: Bounded source selection for member traversal; unit traversal requires id.
     HierarchyChildren:
       type: object
       additionalProperties: false
       required:
         - parent
         - level
+      not:
+        anyOf:
+          - required:
+              - artifact
+            properties:
+              level:
+                enum:
+                  - unit
+          - properties:
+              level:
+                enum:
+                  - unit
+              parent:
+                not:
+                  required:
+                    - id
+          - properties:
+              level:
+                enum:
+                  - member
+            not:
+              required:
+                - artifact
       properties:
         parent:
           $ref: '#/components/schemas/HierarchyChildParent'
@@ -31526,7 +31568,9 @@ components:
 
             Member traversal requires artifact and seeks that producer's native storage
 
-            prefix within the selected source. It includes generic assets and chunks.
+            prefixes within the selected source or parent.ids batch (up to 100).
+
+            One global cursor orders the selected members; it includes generic assets and chunks.
 
             Scalar member payloads are returned as {"$": value} in _source so
 

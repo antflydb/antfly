@@ -791,6 +791,8 @@ The smoke starts an isolated loopback database, acquires actual source/media
 records, waits for native producers and indexes, and searches the native members
 with the real grep executable. It covers text synchronization/deletion, PDF pages,
 timed audio, image captions, a video audio route, summaries, incomplete extraction,
-transient transcription failure and bounded cursor pagination. Model HTTP replies
+transient transcription failure, bounded cursor pagination, a 1,000-document
+member batch, source-versus-artifact trigram isolation, path/type exclusions and
+retained snapshot completion. Model HTTP replies
 are deterministic fixtures; this validates the integration, not GPU/model quality.
 Private-IP fetching is enabled only in the isolated smoke configuration.

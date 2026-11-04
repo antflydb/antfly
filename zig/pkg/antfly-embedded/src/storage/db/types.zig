@@ -2301,7 +2301,14 @@ pub fn canonicalHierarchyChildrenRequestIsValid(req: SearchRequest) bool {
     comptime auditHierarchyChildrenSearchRequestFields();
     const children = req.hierarchy_children orelse return !req.hierarchy_parent_admitted;
     if (req.hierarchy_parent_admitted and children.artifact_name == null) return false;
-    if (children.parent_id.len == 0 or children.parent_level != .source or children.level != .unit) return false;
+    if (children.parent_level != .source or children.level != .unit) return false;
+    if (children.parent_ids.len != 0) {
+        if (children.parent_id.len != 0 or children.artifact_name == null or children.parent_ids.len > 100) return false;
+        for (children.parent_ids, 0..) |id, i| {
+            if (id.len == 0) return false;
+            for (children.parent_ids[0..i]) |prior| if (std.mem.eql(u8, id, prior)) return false;
+        }
+    } else if (children.parent_id.len == 0) return false;
     if (req.return_mode != (if (children.artifact_name != null) ReturnMode.member else ReturnMode.unit) or req.hierarchy_grouped_matches or req.max_chunks_per_parent != 0) return false;
     // Traversal is deliberately not a retrieval operation. Reject every
     // scoring, ranking, or transform control at this final typed boundary so
@@ -2483,7 +2490,8 @@ pub const HierarchyGroupLevel = enum {
 
 pub const HierarchyChildrenRequest = struct {
     artifact_name: ?[]const u8 = null,
-    parent_id: []const u8,
+    parent_id: []const u8 = "",
+    parent_ids: []const []const u8 = &.{},
     parent_level: HierarchyGroupLevel = .source,
     level: HierarchyGroupLevel = .unit,
 };

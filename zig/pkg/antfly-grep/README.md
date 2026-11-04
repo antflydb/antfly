@@ -5083,9 +5083,12 @@ locators are not fabricated.
 
 Grep validates its ordinary native artifact-backed full-text index binding,
 then enumerates authorized source rows and seeks each selected producer through
-`hierarchy.children` member traversal. Parent and member pages share one retained
+`hierarchy.children` member traversal. It applies path/type exclusions before
+fetching members and batches up to 100 authorized parents per traversal using
+`parent: {level: "source", ids: [...]}`. Parent and member pages share one retained
 snapshot; native prefix cursors bound page work without collecting or sorting
-the global artifact population. The regex
+the global artifact population. Original-content `candidate_index` trigrams
+never prune artifact text; their certificate does not cover derived content. The regex
 runs locally over the actual selected text. Native stream readiness and index
 incarnation and target/published data revisions are checked before and after the scan.
 Each member page also requires producer completion on the retained storage cut,

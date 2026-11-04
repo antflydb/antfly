@@ -23,7 +23,8 @@ class HierarchyChildren:
         level (HierarchyChildrenLevel): Child level to enumerate. Unit traversal reads the versioned extraction
             hierarchy rather than a relevance index, so empty and failed units are included.
             Member traversal requires artifact and seeks that producer's native storage
-            prefix within the selected source. It includes generic assets and chunks.
+            prefixes within the selected source or parent.ids batch (up to 100).
+            One global cursor orders the selected members; it includes generic assets and chunks.
             Scalar member payloads are returned as {"$": value} in _source so
             every query hit retains an object-shaped projection. Continuation
             requires the remote_snapshot returned with the first page.

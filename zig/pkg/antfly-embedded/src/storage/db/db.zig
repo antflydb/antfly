@@ -42915,7 +42915,9 @@ pub const DB = struct {
     /// Sequential producer traversal seeks native keys inside one authorized
     /// source. It never scores, sorts, or hydrates the global text population.
     fn navigateArtifactMembers(self: *DB, alloc: Allocator, req: types.SearchRequest, artifact_name: []const u8) !types.SearchResult {
-        const parent = req.hierarchy_children.?.parent_id;
+        const navigation = req.hierarchy_children.?;
+        const single = [_][]const u8{navigation.parent_id};
+        const parents = if (navigation.parent_ids.len != 0) navigation.parent_ids else &single;
         // A local owner consumes transport capabilities when it opens the
         // authenticated immutable cut. Validate retention against that DB too,
         // rather than requiring a token that execution intentionally removed.
@@ -42935,19 +42937,21 @@ pub const DB = struct {
             break;
         }
         const member_kind = kind orelse return error.InvalidQueryRequest;
-        const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, parent, if (member_kind == .asset) "asset" else "chunk", artifact_name);
-        defer alloc.free(prefix);
-        const state_key = try assetStateKeyAlloc(alloc, parent, artifact_name);
-        defer alloc.free(state_key);
-        const state = try self.core.getStoreValue(alloc, state_key);
-        defer if (state) |value| alloc.free(value);
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update(prefix);
-        // The retained cut, required on continuation, fences content changes.
-        // Prefix identity is identical across independent member owners.
-        var digest: [32]u8 = undefined;
-        hash.final(&digest);
-        const revision = std.fmt.bytesToHex(digest, .lower);
+        const prefixes = try alloc.alloc([]u8, parents.len);
+        var initialized: usize = 0;
+        defer {
+            for (prefixes[0..initialized]) |prefix| alloc.free(prefix);
+            alloc.free(prefixes);
+        }
+        for (parents) |parent| {
+            prefixes[initialized] = try internal_keys.artifactNamedPrefixAlloc(alloc, parent, if (member_kind == .asset) "asset" else "chunk", artifact_name);
+            initialized += 1;
+        }
+        std.mem.sort([]u8, prefixes, {}, struct {
+            fn less(_: void, a: []u8, b: []u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.less);
         var cursor: ?[]u8 = null;
         defer if (cursor) |key| alloc.free(key);
         if (req.search_after.len != 0) {
@@ -42955,10 +42959,13 @@ pub const DB = struct {
             defer ref.deinit(alloc);
             const key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, ref);
             cursor = key;
-            if (!std.mem.startsWith(u8, key, prefix)) return error.InvalidQueryRequest;
+            const selected = for (prefixes) |prefix| {
+                if (std.mem.startsWith(u8, key, prefix)) break true;
+            } else false;
+            if (!selected) return error.InvalidQueryRequest;
             const hex = try bytesToHexAlloc(alloc, key);
             defer alloc.free(hex);
-            const expected = try std.fmt.allocPrint(alloc, "am1:{s}:{s}", .{ revision, hex });
+            const expected = try std.fmt.allocPrint(alloc, "am1:{s}", .{hex});
             defer alloc.free(expected);
             if (!std.mem.eql(u8, expected, req.search_after[0].string)) return error.HierarchyCursorStale;
         }
@@ -42967,31 +42974,35 @@ pub const DB = struct {
             for (hits.items) |*hit| hit.deinit(alloc);
             hits.deinit(alloc);
         }
-        while (hits.items.len < req.limit) {
-            try checkHierarchyNavigationCancelled(req);
-            const keys = try self.core.store.scanPrefixKeysPage(alloc, prefix, cursor, @as(usize, req.limit) - hits.items.len);
-            defer freeOwnedKeySlice(alloc, keys);
-            if (keys.len == 0) break;
-            for (keys) |key| {
-                var ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, key)) orelse continue;
-                defer ref.deinit(alloc);
-                if (ref.kind != member_kind) continue;
-                if (member_kind == .asset and extraction and ref.unit_id == null) continue;
-                if (member_kind == .chunk and ref.chunk_id == null) continue;
-                var hit = types.SearchHit{ .id = try alloc.dupe(u8, key), .score = 1 };
-                errdefer hit.deinit(alloc);
-                hit.artifact_ref = try ref.clone(alloc);
-                hit.sort_values = try alloc.alloc(std.json.Value, 2);
-                @memset(hit.sort_values, .null);
-                const hex = try bytesToHexAlloc(alloc, key);
-                defer alloc.free(hex);
-                hit.sort_values[0] = .{ .string = try std.fmt.allocPrint(alloc, "am1:{s}:{s}", .{ revision, hex }) };
-                hit.sort_values[1] = .{ .string = try artifact_ids.artifactPublicIdAlloc(alloc, ref) };
-                try hits.append(alloc, hit);
+        for (prefixes) |prefix| {
+            if (hits.items.len == req.limit) break;
+            if (cursor) |key| if (std.mem.order(u8, prefix, key) == .lt and !std.mem.startsWith(u8, key, prefix)) continue;
+            while (hits.items.len < req.limit) {
+                try checkHierarchyNavigationCancelled(req);
+                const keys = try self.core.store.scanPrefixKeysPage(alloc, prefix, cursor, @as(usize, req.limit) - hits.items.len);
+                defer freeOwnedKeySlice(alloc, keys);
+                if (keys.len == 0) break;
+                for (keys) |key| {
+                    var ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, key)) orelse continue;
+                    defer ref.deinit(alloc);
+                    if (ref.kind != member_kind) continue;
+                    if (member_kind == .asset and extraction and ref.unit_id == null) continue;
+                    if (member_kind == .chunk and ref.chunk_id == null) continue;
+                    var hit = types.SearchHit{ .id = try alloc.dupe(u8, key), .score = 1 };
+                    errdefer hit.deinit(alloc);
+                    hit.artifact_ref = try ref.clone(alloc);
+                    hit.sort_values = try alloc.alloc(std.json.Value, 2);
+                    @memset(hit.sort_values, .null);
+                    const hex = try bytesToHexAlloc(alloc, key);
+                    defer alloc.free(hex);
+                    hit.sort_values[0] = .{ .string = try std.fmt.allocPrint(alloc, "am1:{s}", .{hex}) };
+                    hit.sort_values[1] = .{ .string = try artifact_ids.artifactPublicIdAlloc(alloc, ref) };
+                    try hits.append(alloc, hit);
+                }
+                const next = try alloc.dupe(u8, keys[keys.len - 1]);
+                if (cursor) |old| alloc.free(old);
+                cursor = next;
             }
-            const next = try alloc.dupe(u8, keys[keys.len - 1]);
-            if (cursor) |old| alloc.free(old);
-            cursor = next;
         }
         const page = try hits.toOwnedSlice(alloc);
         var full = req;
@@ -43020,10 +43031,37 @@ pub const DB = struct {
                 }
             }
         }
-        const after = try self.core.getStoreValue(alloc, state_key);
-        defer if (after) |value| alloc.free(value);
-        if ((state == null) != (after == null) or (state != null and !std.mem.eql(u8, state.?, after.?))) return error.StorageReadTemporarilyUnavailable;
         return result;
+    }
+
+    fn artifactMemberParentVisible(self: *DB, alloc: Allocator, req: types.SearchRequest, parent: []const u8) !bool {
+        const key = try encodeStoreLookupKeyAlloc(self, alloc, parent);
+        defer alloc.free(key);
+        const raw = (try self.core.getStoreValue(alloc, key)) orelse return false;
+        defer alloc.free(raw);
+        const hits = blk: {
+            const stored = try self.core.index_manager.materializeStoredValueAlloc(alloc, key, raw);
+            errdefer alloc.free(stored);
+            const id = try alloc.dupe(u8, parent);
+            errdefer alloc.free(id);
+            const source_hits = try alloc.alloc(types.SearchHit, 1);
+            source_hits[0] = .{ .id = id, .stored_data = stored };
+            break :blk source_hits;
+        };
+        var visible = try db_query_result_shape.filterVisibleSearchResult(alloc, .{ .alloc = alloc, .hits = hits, .total_hits = 1 }, .{
+            .ctx = self,
+            .func = isVisibleSearchHitCallback,
+            .filter_many = filterVisibleSearchHitsManyCallback,
+        });
+        defer visible.deinit();
+        visible = try db_query_result_shape.applyStoredSearchPatternFilters(alloc, req, visible, .{
+            .ctx = self,
+            .load_stored = loadStoredForHitCallback,
+            .load_many_stored = loadStoredSearchDocumentManyCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+        });
+        return visible.hits.len == 1;
     }
 
     pub fn navigateHierarchyChildren(
@@ -43035,9 +43073,20 @@ pub const DB = struct {
         const navigation = req.hierarchy_children orelse return error.InvalidQueryRequest;
         if (navigation.parent_level != .source or navigation.level != .unit) return error.UnsupportedQueryRequest;
 
-        if (req.hierarchy_parent_admitted) {
-            const name = navigation.artifact_name orelse return error.InvalidQueryRequest;
-            return self.navigateArtifactMembers(alloc, req, name);
+        if (navigation.artifact_name) |name| {
+            if (req.hierarchy_parent_admitted) return self.navigateArtifactMembers(alloc, req, name);
+            const single = [_][]const u8{navigation.parent_id};
+            const parents = if (navigation.parent_ids.len != 0) navigation.parent_ids else &single;
+            var authorized: std.ArrayList([]const u8) = .empty;
+            defer authorized.deinit(alloc);
+            for (parents) |parent| if (try self.artifactMemberParentVisible(alloc, req, parent)) {
+                try authorized.append(alloc, parent);
+            };
+            if (authorized.items.len == 0) return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
+            var member = req;
+            member.hierarchy_children.?.parent_id = "";
+            member.hierarchy_children.?.parent_ids = authorized.items;
+            return self.navigateArtifactMembers(alloc, member, name);
         }
 
         const source_key = try encodeStoreLookupKeyAlloc(self, alloc, navigation.parent_id);
@@ -43082,8 +43131,6 @@ pub const DB = struct {
         if (!parent_visible) {
             return try hierarchyChildrenInaccessibleParentResult(alloc, req);
         }
-
-        if (navigation.artifact_name) |name| return self.navigateArtifactMembers(alloc, req, name);
 
         var artifacts = std.ArrayListUnmanaged(HierarchyNavigationArtifact).empty;
         defer {

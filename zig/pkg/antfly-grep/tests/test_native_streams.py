@@ -249,7 +249,7 @@ class NativeStreams(unittest.TestCase):
         self.assertTrue(any(body.get("search_after") for body in posts))
         self.assertTrue(
             all(
-                body["hierarchy"]["children"]["parent"]["id"] == "recording"
+                body["hierarchy"]["children"]["parent"]["ids"] == ["recording"]
                 for body in posts
                 if body.get("hierarchy")
             )
@@ -298,6 +298,118 @@ class NativeStreams(unittest.TestCase):
         result = self.run_grep("absent")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn('"complete":false', result.stdout)
+
+    def test_native_paths_honor_globs_and_types_before_member_fetch(self):
+        for flags in [("--glob", "!**"), ("--type", "py")]:
+            self.requests.clear()
+            result = self.run_grep("Tuesday", *flags)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertFalse(
+                any(
+                    method == "POST" and body.get("hierarchy", {}).get("children")
+                    for method, body in self.requests
+                )
+            )
+
+    def test_source_candidate_index_does_not_prune_artifact_text(self):
+        config = json.loads(self.config.read_text())
+        config["tables"][0]["candidate_index"] = {
+            "version": 1,
+            "field": "grep_trigrams",
+        }
+        self.config.write_text(json.dumps(config))
+        # Plain output enables candidate pruning; JSON mode deliberately does not.
+        result = subprocess.run(
+            [BINARY, "--table-config", str(self.config), "Tuesday"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parents = [
+            body
+            for method, body in self.requests
+            if method == "POST" and not body.get("hierarchy", {}).get("children")
+        ]
+        self.assertTrue(parents)
+        self.assertNotIn("grep_trigrams", json.dumps(parents))
+
+    def test_thousand_one_unit_sources_fit_default_request_budget(self):
+        config = json.loads(self.config.read_text())
+        config["page_size"] = 100
+        self.config.write_text(json.dumps(config))
+        owner = self
+
+        def batch_post(request):
+            body = json.loads(
+                request.rfile.read(int(request.headers["Content-Length"]))
+            )
+            owner.requests.append(("POST", body))
+            children = body.get("hierarchy", {}).get("children")
+            hits = []
+            if children is None:
+                start = (
+                    int(body["search_after"][0][4:]) + 1
+                    if body.get("search_after")
+                    else 0
+                )
+                for i in range(start, min(1000, start + body["limit"])):
+                    parent = f"doc-{i:04d}"
+                    hits.append(
+                        {
+                            "_id": parent,
+                            "_sort": [parent],
+                            "_source": {
+                                "source": {
+                                    "uri": f"gs://fixture/{parent}.wav",
+                                    "path": f"{parent}.wav",
+                                    "revision": "1",
+                                    "indexed_at": 1,
+                                },
+                                "permissions": {"public": True, "readers": []},
+                                "metadata": {},
+                            },
+                        }
+                    )
+            elif not body.get("search_after"):
+                self.assertLessEqual(len(children["parent"]["ids"]), 100)
+                for parent in children["parent"]["ids"]:
+                    key = parent + "-unit"
+                    hits.append(
+                        {
+                            "_id": key,
+                            "_sort": [parent, key],
+                            "_source": {"text": "haystack"},
+                            "hierarchy": {
+                                "parent_doc_key": parent,
+                                "artifact": {
+                                    "name": "speech",
+                                    "kind": "asset",
+                                    "revision": "1",
+                                    "unit_id": "1",
+                                },
+                            },
+                        }
+                    )
+            request.reply(
+                {
+                    "responses": [
+                        {
+                            "status": 200,
+                            "remote_snapshot": "retained-1",
+                            "hits": {"hits": hits},
+                        }
+                    ]
+                }
+            )
+
+        self.server.RequestHandlerClass.do_POST = batch_post
+        result = self.run_grep("absent")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        summary = json.loads(result.stdout.splitlines()[-1])
+        self.assertTrue(summary["stats"]["complete"])
+        self.assertEqual(summary["stats"]["files"], 1000)
+        self.assertLessEqual(summary["stats"]["index_requests"], 40)
 
     def test_pending_unknown_and_budget_are_errors(self):
         self.complete = False

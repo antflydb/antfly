@@ -11649,7 +11649,8 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     freeOwnedStringSlice(alloc, req.hierarchy_source_fields);
     freeOwnedStringSlice(alloc, req.hierarchy_unit_fields);
     if (req.hierarchy_children) |children| {
-        alloc.free(@constCast(children.parent_id));
+        if (children.parent_id.len != 0) alloc.free(@constCast(children.parent_id));
+        freeOwnedStringSlice(alloc, children.parent_ids);
         if (children.artifact_name) |name| alloc.free(@constCast(name));
     }
     if (req.resolved_doc_filter_owned) {
@@ -12819,16 +12820,28 @@ fn applyPublicHierarchyControls(
                 if (value.object.count() != 3 or artifact == null or artifact.? != .string or artifact.?.string.len == 0) return error.InvalidQueryRequest;
             } else if (value.object.count() != 2) return error.InvalidQueryRequest;
             const parent_level = parent.object.get("level") orelse return error.InvalidQueryRequest;
-            const parent_id = parent.object.get("id") orelse return error.InvalidQueryRequest;
-            if (parent.object.count() != 2 or parent_level != .string or parent_id != .string or parent_id.string.len == 0) {
-                return error.InvalidQueryRequest;
-            }
+            const parent_id = parent.object.get("id");
+            const parent_ids = parent.object.get("ids");
+            if (parent.object.count() != 2 or parent_level != .string or (parent_id == null) == (parent_ids == null)) return error.InvalidQueryRequest;
             if (!std.mem.eql(u8, parent_level.string, "source")) return error.UnsupportedQueryRequest;
+            if (parent_id) |id| {
+                if (id != .string or id.string.len == 0) return error.InvalidQueryRequest;
+            }
+            if (parent_ids) |ids| {
+                if (!member or ids != .array or ids.array.items.len == 0 or ids.array.items.len > 100) return error.InvalidQueryRequest;
+                for (ids.array.items, 0..) |id, i| {
+                    if (id != .string or id.string.len == 0) return error.InvalidQueryRequest;
+                    for (ids.array.items[0..i]) |prior| if (std.mem.eql(u8, prior.string, id.string)) return error.InvalidQueryRequest;
+                }
+            }
             req.hierarchy_children = blk: {
-                const owned_parent = try alloc.dupe(u8, parent_id.string);
-                errdefer alloc.free(owned_parent);
+                const owned_parent = if (parent_id) |id| try alloc.dupe(u8, id.string) else "";
+                errdefer if (owned_parent.len != 0) alloc.free(owned_parent);
+                const owned_ids = if (parent_ids) |ids| try parseStringArrayJsonAlloc(alloc, ids) else &.{};
+                errdefer freeOwnedStringSlice(alloc, owned_ids);
                 break :blk .{
                     .parent_id = owned_parent,
+                    .parent_ids = owned_ids,
                     .artifact_name = if (member) try alloc.dupe(u8, artifact.?.string) else null,
                     .parent_level = .source,
                     .level = .unit,

@@ -111,8 +111,17 @@ func TestNativeMemberNavigationIntegration(t *testing.T) {
 	require.Len(t, first.Responses, 1)
 	require.Len(t, first.Responses[0].Hits.Hits, 1)
 	query["search_after"] = first.Responses[0].Hits.Hits[0].Sort
-	_, err = publisher.call(t.Context(), "POST", tablePath(table)+"/query", query)
-	require.Error(t, err, "member continuation requires the retained snapshot")
+	raw, err = publisher.call(t.Context(), "POST", tablePath(table)+"/query", query)
+	if err == nil {
+		var rejection struct {
+			Responses []struct {
+				Status int `json:"status"`
+			} `json:"responses"`
+		}
+		require.NoError(t, json.Unmarshal(raw, &rejection))
+		require.Len(t, rejection.Responses, 1)
+		require.NotEqual(t, 200, rejection.Responses[0].Status, "member continuation requires the retained snapshot")
+	}
 	// Public callers must never be able to manufacture the coordinator proof.
 	_, err = publisher.call(t.Context(), "POST", tablePath(table)+"/query", map[string]any{"_hierarchy_parent_admitted": true, "hierarchy": map[string]any{"children": map[string]any{"parent": map[string]any{"level": "source", "id": "doc-00"}, "level": "member", "artifact": "copied"}}, "order_by": []any{map[string]any{"field": "_hierarchy.position"}}, "limit": 1})
 	require.Error(t, err, "public requests must reject private parent admission")
@@ -209,4 +218,97 @@ func TestNativeMemberSnapshotCompletionIntegration(t *testing.T) {
 	raw, err = publisher.call(t.Context(), "POST", tablePath(table)+"/query", query)
 	require.NoError(t, err)
 	require.Contains(t, string(raw), "finished summary")
+}
+
+func TestNativeMemberBatchIntegration(t *testing.T) {
+	endpoint, binary := os.Getenv("ANTFLY_SOURCE_TEST_ENDPOINT"), os.Getenv("ANTFLY_GREP_TEST_BINARY")
+	if endpoint == "" || binary == "" {
+		t.Skip("set native source endpoint and grep binary")
+	}
+	publisher := &Publisher{Endpoint: endpoint}
+	table := fmt.Sprintf("native_batch_%d", time.Now().UnixNano())
+	_, err := publisher.call(t.Context(), "POST", tablePath(table), map[string]any{"num_shards": 3, "indexes": map[string]any{"summary_text": map[string]any{"type": "full_text", "sources": []any{map[string]any{"artifact": "summary"}}, "enrichments": []any{map[string]any{"name": "summary", "kind": "asset", "template": "Tuesday", "producer_json": `{"type":"copy"}`}}}}})
+	require.NoError(t, err)
+	defer publisher.call(context.Background(), "DELETE", tablePath(table), nil)
+	records := map[string]any{}
+	for i := 0; i < 1000; i++ {
+		id := fmt.Sprintf("doc-%04d", i)
+		records[id] = map[string]any{"source": map[string]any{"uri": "gs://fixture/" + id + ".txt", "path": id + ".txt", "revision": "1", "indexed_at": 1}, "content": map[string]any{"text": "Monday"}, "permissions": map[string]any{"public": true, "readers": []string{}}, "metadata": map[string]any{}, "grep_trigrams_version": "raw-byte-trigrams-v1", "grep_trigrams": []string{"4d6f6e", "6f6e64", "6e6461", "646179"}}
+	}
+	require.NoError(t, publisher.Batch(t.Context(), table, records, nil))
+	var readiness string
+	require.Eventually(t, func() bool {
+		raw, err := publisher.call(t.Context(), "GET", tablePath(table)+"/indexes/summary_text", nil)
+		if err != nil {
+			return false
+		}
+		readiness = string(raw)
+		var body struct {
+			Status struct {
+				Readiness struct {
+					Complete bool `json:"complete"`
+				} `json:"readiness"`
+			} `json:"status"`
+		}
+		return json.Unmarshal(raw, &body) == nil && body.Status.Readiness.Complete
+	}, time.Minute, 100*time.Millisecond, "producer did not complete: %s", readiness)
+	file := filepath.Join(t.TempDir(), "grep.json")
+	config := map[string]any{"version": 1, "endpoint": endpoint, "principals": []string{}, "page_size": 100, "tables": []any{map[string]any{"name": table, "fields": CanonicalDocumentFields(), "candidate_index": map[string]any{"version": 1, "field": "grep_trigrams"}, "streams": []TextStream{{Name: "summary", Artifact: "summary", Index: "summary_text", Field: "$", Generated: true, Default: true}}}}}
+	require.NoError(t, writeJSON(file, config, 1<<20))
+	// Plain output enables optional trigram pruning. Source trigrams certify
+	// Monday, whereas the selected artifact contains Tuesday.
+	output, err := exec.CommandContext(t.Context(), binary, "--table-config", file, "Tuesday").CombinedOutput()
+	require.NoError(t, err, string(output))
+	require.Equal(t, 1000, strings.Count(string(output), "Tuesday"), string(output))
+	output, err = exec.CommandContext(t.Context(), binary, "--table-config", file, "--json", "Tuesday").CombinedOutput()
+	require.NoError(t, err, string(output))
+	var summary struct {
+		Stats struct {
+			Complete bool `json:"complete"`
+			Files    int  `json:"files"`
+			Requests int  `json:"index_requests"`
+		} `json:"stats"`
+	}
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	require.NoError(t, json.Unmarshal([]byte(lines[len(lines)-1]), &summary))
+	require.True(t, summary.Stats.Complete)
+	require.Equal(t, 1000, summary.Stats.Files)
+	require.LessOrEqual(t, summary.Stats.Requests, 40)
+	t.Logf("searched %d native members using %d index requests", summary.Stats.Files, summary.Stats.Requests)
+	// A direct public traversal establishes its own retained snapshot, and its
+	// continuation resumes across two independent source prefixes.
+	query := map[string]any{"hierarchy": map[string]any{"children": map[string]any{"parent": map[string]any{"level": "source", "ids": []string{"doc-0000", "doc-0001"}}, "level": "member", "artifact": "summary"}}, "order_by": []any{map[string]any{"field": "_hierarchy.position"}}, "limit": 1}
+	raw, err := publisher.call(t.Context(), "POST", tablePath(table)+"/query", query)
+	require.NoError(t, err)
+	var first struct {
+		Responses []struct {
+			Snapshot string `json:"remote_snapshot"`
+			Hits     struct {
+				Hits []struct {
+					ID   string `json:"_id"`
+					Sort []any  `json:"_sort"`
+				} `json:"hits"`
+			} `json:"hits"`
+		} `json:"responses"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &first))
+	require.Len(t, first.Responses, 1)
+	require.NotEmpty(t, first.Responses[0].Snapshot)
+	require.Len(t, first.Responses[0].Hits.Hits, 1)
+	query["remote_snapshot"], query["search_after"] = first.Responses[0].Snapshot, first.Responses[0].Hits.Hits[0].Sort
+	raw, err = publisher.call(t.Context(), "POST", tablePath(table)+"/query", query)
+	require.NoError(t, err)
+	var second struct {
+		Responses []struct {
+			Hits struct {
+				Hits []struct {
+					ID string `json:"_id"`
+				} `json:"hits"`
+			} `json:"hits"`
+		} `json:"responses"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &second))
+	require.Len(t, second.Responses, 1)
+	require.Len(t, second.Responses[0].Hits.Hits, 1)
+	require.NotEqual(t, first.Responses[0].Hits.Hits[0].ID, second.Responses[0].Hits.Hits[0].ID)
 }

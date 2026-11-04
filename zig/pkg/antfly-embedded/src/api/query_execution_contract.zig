@@ -3906,8 +3906,16 @@ pub fn appendQueryHierarchyField(
     try appendJsonFieldName(alloc, out, first, "hierarchy");
     try out.append(alloc, '{');
     if (req.hierarchy_children) |children| {
-        try out.appendSlice(alloc, "\"children\":{\"parent\":{\"level\":\"source\",\"id\":");
-        try appendJsonString(alloc, out, children.parent_id);
+        try out.appendSlice(alloc, "\"children\":{\"parent\":{\"level\":\"source\",");
+        if (children.parent_ids.len != 0) {
+            try out.appendSlice(alloc, "\"ids\":");
+            const ids_json = try std.json.Stringify.valueAlloc(alloc, children.parent_ids, .{});
+            defer alloc.free(ids_json);
+            try out.appendSlice(alloc, ids_json);
+        } else {
+            try out.appendSlice(alloc, "\"id\":");
+            try appendJsonString(alloc, out, children.parent_id);
+        }
         if (children.artifact_name) |name| {
             try out.appendSlice(alloc, "},\"level\":\"member\",\"artifact\":");
             try appendJsonString(alloc, out, name);
