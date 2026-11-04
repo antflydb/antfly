@@ -1296,6 +1296,13 @@ pressure yields to those downstream consumers without charging a provider retry.
 The direct replay fallback without registered workers obeys the same completed
 prefix and document-fan-out bounds as the registered manual executor.
 Explicit idle drains continue to inspect and complete all relevant work.
+Promotion's SQL coordinator uses the same bounded consumer reserve as its
+replay caller. A full producer quota still refuses new foreground decisions,
+but cannot refuse a consumer decision while that reserve has headroom. Once
+the durable decision exists, participant recovery retains its completion fence.
+Group retirement pages enumerate keys without reading or hashing unrelated
+document payloads; apply rechecks current ownership and catalog membership.
+Source baseline pages retain their afterimage hashes and stale-source checks.
 
 Bounded allocator reuse, retirement and orphan service run independently of
 optional whole-generation shrinking. Automatic shrink assessments wait for the

@@ -8871,20 +8871,26 @@ test "capi native retirement selection never materializes primary payload pages"
     defer std.testing.allocator.free(value);
     @memset(value, 'v');
     try root.db.core.store.put("retirement-payload", value);
+    const cached = file.page_cache_enabled.swap(false, .monotonic);
+    defer file.page_cache_enabled.store(cached, .monotonic);
     var txn = try root.db.core.store.beginReadTxn();
     defer txn.abort();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const pages = @import("../storage/db/group_source_page.zig");
-    const before = file.test_value_read_bytes.load(.monotonic);
+    const before = file.test_backing_read_bytes.load(.monotonic);
     const retired = try pages.prepare(arena.allocator(), &txn, 7, 3, .retire, "", "retirement-payload");
     try std.testing.expectEqual(@as(usize, 1), retired.candidates.len);
     try std.testing.expect(retired.done);
-    try std.testing.expectEqual(before, file.test_value_read_bytes.load(.monotonic));
+    // Index navigation and the liveness header are small; the external
+    // payload must remain unread, even with all page-cache hits disabled.
+    const retired_bytes = file.test_backing_read_bytes.load(.monotonic) - before;
+    try std.testing.expect(retired_bytes < 64 * 1024);
+    const scan_before = file.test_backing_read_bytes.load(.monotonic);
     const scanned = try pages.prepare(arena.allocator(), &txn, 7, 3, .scan, "", "retirement-payload");
     try std.testing.expectEqual(@as(usize, 1), scanned.candidates.len);
     try std.testing.expectEqual(@import("../storage/db/group_sources.zig").digest(value), scanned.candidates[0].digest);
-    try std.testing.expect(file.test_value_read_bytes.load(.monotonic) - before >= value.len);
+    try std.testing.expect(file.test_backing_read_bytes.load(.monotonic) - scan_before >= value.len);
 }
 
 test "capi native publication generated consumer uses live reserve at producer quota" {
