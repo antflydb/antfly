@@ -170,14 +170,32 @@ test "distributed SQL runtime executes broadcast and shuffle SQL join semantics 
                 // Lose the coordinator after task dispatch. A new process resumes
                 // accepted task records against the original retained input cuts.
                 fixture.now = 92001;
-                const replacement = fixture.service(a, memory.client(), "coordinator-b");
-                const next = (try replacement.acquire(query)).?;
+                var replacement = fixture.service(a, memory.client(), "coordinator-b");
+                var next = (try replacement.acquire(query)).?;
                 try std.testing.expectError(error.SqlExecutionFenced, coordinator.tick(query, claim, .{ .ptr = &dispatch, .dispatch = Dispatch.run }));
                 var complete = false;
+                var resumed_adaptive = false;
                 for (0..128) |_| {
                     complete = try replacement.tick(query, next, .{ .ptr = &dispatch, .dispatch = Dispatch.run });
                     if (complete) break;
+                    if (strategy == .shuffle and aggregate and !resumed_adaptive) {
+                        const record_key = try replacement.state_store.key(sa, query, null, 0);
+                        var record = (try replacement.state_store.load(sa, record_key)).?;
+                        defer record.deinit(sa);
+                        if (record.value.adaptive != null) {
+                            // Lose the process after a bounded statistics batch.
+                            // The next owner resumes its authenticated progress.
+                            fixture.now += 92001;
+                            const stale = replacement;
+                            const stale_claim = next;
+                            replacement = fixture.service(a, memory.client(), "coordinator-c");
+                            next = (try replacement.acquire(query)).?;
+                            try std.testing.expectError(error.SqlExecutionFenced, stale.tick(query, stale_claim, .{ .ptr = &dispatch, .dispatch = Dispatch.run }));
+                            resumed_adaptive = true;
+                        }
+                    }
                 }
+                if (strategy == .shuffle and aggregate) try std.testing.expect(resumed_adaptive);
                 try std.testing.expect(complete);
                 const result = (try replacement.pollResult(sa, query)).?;
                 if (strategy == .shuffle) {

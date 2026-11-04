@@ -355,7 +355,9 @@ pub const Service = struct {
             var value = (try self.store().load(sa, key)) orelse return error.InvalidSqlExecutionState;
             defer value.deinit(sa);
             if (value.value.status != .succeeded) return error.InvalidSqlExecutionState;
-            const directory = try self.exchange_store.footer(sa, value.value.output.?);
+            var objects = self.exchange_store;
+            objects.context = self.context;
+            const directory = try objects.footer(sa, value.value.output.?);
             if (directory.partitions.len != spec.partitions) return error.InvalidSqlExchange;
             for (directory.partitions, bytes, rows) |partition, *size, *row_count| {
                 size.* +|= partition.retained_bytes;
