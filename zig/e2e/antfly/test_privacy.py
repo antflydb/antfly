@@ -1330,3 +1330,128 @@ def test_preview_identifier_and_streaming_sample_budgets(stateful_api):
             {"policy": policy, "sample": {"limit": limit}},
         )
         assert response["sampled"] == min(limit, 2)
+
+
+def test_privacy_multifield_batches_release_detector_scratch(stateful_api):
+    padding = "x" * (32 * 1024)
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            prompt = json.loads(request["messages"][1]["content"])
+            calls.append(len(prompt["items"]))
+            items = [
+                {"item": item["id"], "value": {"findings": [], "padding": padding}}
+                for item in prompt["items"]
+            ]
+            payload = json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "id": "fixture",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "antfly_output",
+                                            "arguments": json.dumps({"items": items}),
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = start_http_server(server)
+    api = stateful_api
+    table = "privacy_batch_memory_" + uuid4().hex[:8]
+    api.create_table(table)
+    fields = ["f" + str(i) for i in range(64)]
+    api.batch_write(
+        table,
+        inserts={"doc" + str(i): {name: "hello" for name in fields} for i in range(50)},
+    )
+    try:
+        for count, docs in ((1, 4), (4, 1), (4, 4), (32, 4), (64, 4), (64, 50)):
+            policy = {
+                "mode": "monitor",
+                "fields": fields[:count],
+                "category_groups": [],
+                "categories": [{"name": "email"}],
+                "producer": {
+                    "type": "generator",
+                    "revision": "memory-fixture-v1",
+                    "config": {
+                        "generator": {
+                            "provider": "openai",
+                            "model": "gpt-4.1",
+                            "api_key": "",
+                            "url": f"http://127.0.0.1:{server.server_port}/v1",
+                        },
+                        "output": "auto",
+                        "output_schema": {
+                            "type": "object",
+                            "properties": {
+                                "findings": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "category": {"type": "string"},
+                                            "start": {"type": "integer"},
+                                            "end": {"type": "integer"},
+                                        },
+                                        "required": ["category", "start", "end"],
+                                        "additionalProperties": False,
+                                    },
+                                },
+                                "padding": {"type": "string"},
+                            },
+                            "required": ["findings", "padding"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+            }
+            response = api.s.post(
+                api.url + f"/tables/{table}/privacy/preview",
+                json={
+                    "policy": policy,
+                    "sample": {"keys": ["doc" + str(i) for i in range(docs)]},
+                },
+                timeout=180,
+            )
+            assert response.status_code == 200, (
+                count,
+                docs,
+                calls,
+                response.text[:1000],
+                api.debug_logs()[-12000:],
+            )
+            result = response.json()
+            assert result["sampled"] == docs
+            assert len(result["documents"]) == docs
+            assert all(len(row["fields"]) == count for row in result["documents"])
+            assert "padding" not in response.text
+            assert sum(calls) == count * docs
+            assert max(calls) <= 8
+            if docs > 1:
+                assert max(calls) == min(8, count * docs)
+            calls.clear()
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()

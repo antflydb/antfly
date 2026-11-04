@@ -59,6 +59,7 @@ pub fn handle(server: anytype, a: A, table: []const u8, action: Action, args: Ar
     return execute(server, a, table, action, args, try request.platformDeadline()) catch |err| switch (err) {
         error.PrivacyPreconditionRequired => failure(a, 428, "privacy_precondition_required", "Replacing a policy requires its exact If-Match ETag."),
         error.PrivacyPreconditionFailed => failure(a, 412, "privacy_precondition_failed", "The policy changed; reload it before saving."),
+        error.PrivacyCheckpointCapacityExceeded => failure(a, 422, "privacy_checkpoint_capacity_exceeded", "This table has reached its checkpoint byte budget; allow cleanup to finish and use fewer or smaller concurrent range scans before retrying."),
         error.PrivacySampleTooLarge => failure(a, 422, "privacy_sample_too_large", "Preview samples (including identifiers) and responses are limited to 8 MiB each; request fewer or smaller documents."),
         error.PrivacyScanLimitExceeded => failure(a, 409, "privacy_scan_limit_exceeded", "Sixteen scans are active; wait for one to finish before requesting another."),
         error.PrivacyInternalAuthRequired => failure(a, 422, "privacy_internal_auth_required", "Distributed privacy inspection requires internal-service credentials."),
@@ -943,6 +944,15 @@ pub fn advanceOnce(server: anytype, a: A) !void {
     var chosen = .{ .scan = nextRunnableScan(resource.scans, now) };
     if (resource.coverage.retry_after_millis <= now and
         (chosen.scan == null or resource.coverage.updated_at_millis < resource.scans[chosen.scan.?].updated_at_millis)) chosen.scan = null;
+    defer if (checkpoint.capacity_limited) {
+        // Retain the last committed, already-encoded cursors. Capacity is
+        // backpressure, not terminal failure or permission to skip a page.
+        // Yield this table so GC and other tables can make progress.
+        const retry = checkpointCapacityBackoff(a, current.value, chosen.scan, now) catch current.value;
+        persistScan(server, a, table, retry, work.term) catch |persist_err| {
+            std.log.debug("privacy capacity backoff persistence failed: {s}", .{@errorName(persist_err)});
+        };
+    };
     {
         if (chosen.scan == null) {
             if (resource.coverage.started_at_millis == 0) resource.coverage.started_at_millis = now;
@@ -1069,6 +1079,43 @@ pub fn advanceOnce(server: anytype, a: A) !void {
             return;
         }
     }
+}
+
+fn checkpointCapacityBackoff(a: A, current: catalog.Resource, scan: ?usize, now: i64) !catalog.Resource {
+    var result = current;
+    // Capacity is shared by the entire table. Cooling only the chosen job
+    // would let its sibling scans or census immediately pin the queue again.
+    const copies = try a.dupe(catalog.Scan, current.scans);
+    for (copies) |*entry| {
+        if (entry.phase != .queued and entry.phase != .running and entry.phase != .processing) continue;
+        entry.updated_at_millis = now;
+        entry.retry_after_millis = @max(entry.retry_after_millis, now + 5000);
+    }
+    if (scan) |index| copies[index].last_error = "PrivacyCheckpointCapacityExceeded";
+    result.scans = copies;
+    result.coverage.updated_at_millis = now;
+    result.coverage.retry_after_millis = @max(result.coverage.retry_after_millis, now + 5000);
+    return result;
+}
+
+test "privacy checkpoint capacity yields work without advancing committed cursors or failing scans" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var resource = try catalog.next(a, null, .{ .mode = .monitor, .fields = &.{"body"} }, null);
+    _ = try catalog.startScan(a, &resource, "", "", 100);
+    resource.coverage.cursor = "pk1:retained-census";
+    const coverage = try checkpointCapacityBackoff(a, resource, null, 1000);
+    try std.testing.expectEqualStrings(resource.coverage.cursor.?, coverage.coverage.cursor.?);
+    try std.testing.expectEqual(@as(i64, 6000), coverage.coverage.retry_after_millis);
+    try std.testing.expectEqual(@as(i64, 0), resource.coverage.retry_after_millis);
+    try std.testing.expectEqual(@as(i64, 6000), coverage.scans[0].retry_after_millis);
+    try std.testing.expectEqual(@as(i64, 0), resource.scans[0].retry_after_millis);
+    const scan = try checkpointCapacityBackoff(a, resource, 0, 1000);
+    try std.testing.expectEqual(resource.scans[0].phase, scan.scans[0].phase);
+    try std.testing.expectEqual(@as(i64, 6000), scan.scans[0].retry_after_millis);
+    try std.testing.expectEqual(@as(u64, 0), scan.scans[0].scanned);
+    try std.testing.expectEqual(resource.policy_version, scan.policy_version);
 }
 
 /// A readiness probe is availability work, not a terminal inspection failure.

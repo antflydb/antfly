@@ -345,6 +345,35 @@ response allocations cannot pin whole-document temporary copies.
 Scratch backing uses the platform allocator's arena-unwrapping helper, retaining
 allocation accounting and failure injection beneath request arenas.
 
+Managed inspection shares one validated policy/normalizer across its field
+cohort. Physical batches retain only normalized, source-bound field evidence;
+provider envelopes and arbitrary extra response fields are released per batch.
+Composition uses the same inspector for serial and batched execution. The host
+memory plan covers logical output retention plus the largest physical field
+batch, including configuration and field-control overhead. A scratch allocator
+unwraps arenas while preserving every nested invocation quota; temporary frees
+therefore release actual backing memory even when results are interleaved.
+
+Checkpoint reclamation shares eight chunks (at most 2 MiB), 32 CAS operations,
+and a 25 ms soft time budget across each quantum. A completed small blob can
+lose its header in the same quantum. Partial blobs rotate behind later rows.
+Backlogged work polls after 100 ms; idle work polls after one second, subject to
+the maintenance supervisor's scheduling frequency. Writer-side reference and
+term checks still fence every deletion.
+
+New checkpoint generations retain a per-table payload charge until final header
+erasure, including attached and retired generations; each generation charges at
+least 4 KiB. The retained limit is 8 GiB, alongside the existing 256 MiB staged
+upload limit. Denied reservations change neither counter nor manifest. Capacity
+pressure yields the entire table for five seconds using its last committed
+cursors, allowing cleanup and other tables to progress. It never skips a source
+page or turns capacity pressure into a terminal inspection failure.
+
+Metadata protocol 81 gates new accounting writes. Legacy headers remain
+readable and drain normally; their serialized bytes omit the new false flag so
+historical CAS hashes continue to replay exactly. New accounting counters and
+partial reclamation progress survive snapshots and restart.
+
 ## Validation
 
 ### Latest preview and listener fixes (2026-11-04)

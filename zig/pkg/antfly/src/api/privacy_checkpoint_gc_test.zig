@@ -57,3 +57,104 @@ test "privacy checkpoint GC page does not copy a large table for each header" {
     try std.testing.expectEqual(@as(usize, 0), page.value.rows.len);
     try std.testing.expect(page.value.next != null);
 }
+
+test "privacy GC drains many small generations fairly within a shared chunk budget" {
+    const jobs = @import("../metadata/job_state.zig");
+    const collector = @import("privacy_checkpoints.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.init(std.testing.allocator, .{ .root_dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/privacy-drain", .{tmp.sub_path}) });
+    defer store.deinit();
+    const group = 7304;
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 1, .name = "gc" } });
+    const Backend = struct {
+        store: *Store,
+        a: std.mem.Allocator,
+        erased: usize = 0,
+        chunks: usize = 0,
+        calls: usize = 0,
+        fn get(raw: *anyopaque, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.store.getJobState(alloc, group, key);
+        }
+        fn scan(raw: *anyopaque, alloc: std.mem.Allocator, after: ?[]const u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.store.scanJobState(alloc, group, after);
+        }
+        fn cas(raw: *anyopaque, key: []const u8, expected: ?[]const u8, value: []const u8, term: u64) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u64, 9), term);
+            const before = (try self.store.getJobState(self.a, group, key)) orelse return false;
+            if (expected == null or !std.mem.eql(u8, &jobs.digest(before), expected.?)) return false;
+            try self.store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = key, .expected_hash = expected.?, .value = value } });
+            self.calls += 1;
+            if (std.mem.eql(u8, value, checkpoints.erase)) {
+                try std.testing.expect(try self.store.getJobState(self.a, group, key) == null);
+                self.erased += 1;
+            } else {
+                const old = try std.json.parseFromSliceLeaky(checkpoints.Header, self.a, before, .{});
+                const next = try std.json.parseFromSliceLeaky(checkpoints.Header, self.a, value, .{});
+                self.chunks += next.deleted_chunks - old.deleted_chunks;
+                try std.testing.expectEqualStrings(value, (try self.store.getJobState(self.a, group, key)).?);
+            }
+            return true;
+        }
+    };
+    const Source = struct {
+        pub fn privacyAuthorityTerm(_: @This()) !?u64 {
+            return 9;
+        }
+    };
+    var backend = Backend{ .store = &store, .a = a };
+    var server = struct {
+        source: Source = .{},
+        privacy_checkpoint_gc: collector.GC = .{ .quantum_ns = std.math.maxInt(u64) },
+        document_job_store: struct { replicated: ?jobs.Persistence },
+    }{ .document_job_store = .{ .replicated = jobs.Persistence.fromLocal(&backend, .{ .get = Backend.get, .scan = Backend.scan, .cas = Backend.cas }) } };
+    var manifests: [33][]const u8 = undefined;
+    for (&manifests, 0..) |*manifest, i| {
+        var generation: [16]u8 = @splat(0);
+        generation[0] = @intCast(i);
+        const ref: checkpoints.Ref = .{ .digest = @splat('a'), .generation = std.fmt.bytesToHex(generation, .lower) };
+        var buffer: [128]u8 = undefined;
+        manifest.* = try a.dupe(u8, try ref.storageKey(&buffer, 1, null));
+        // Expired incomplete uploads are valid GC work even without chunks.
+        const header = try std.json.Stringify.valueAlloc(a, checkpoints.Header{ .accounted = true, .length = if (i == 0) checkpoints.chunk_bytes * 9 else 1, .created_at_millis = 1 }, .{});
+        try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest.*, .expected_hash = "", .value = header } });
+    }
+    try collector.collect(&server, a);
+    try std.testing.expectEqual(@as(usize, 8), backend.chunks);
+    try std.testing.expectEqual(@as(usize, 0), backend.erased);
+    server.privacy_checkpoint_gc.next_ns = 0;
+    server.privacy_checkpoint_gc.quantum_ns = 0;
+    backend.calls = 0;
+    backend.chunks = 0;
+    try collector.collect(&server, a);
+    try std.testing.expectEqual(@as(usize, 1), backend.erased);
+    try std.testing.expectEqual(@as(usize, 2), backend.calls);
+    server.privacy_checkpoint_gc.next_ns = 0;
+    server.privacy_checkpoint_gc.quantum_ns = std.math.maxInt(u64);
+    backend.calls = 0;
+    backend.chunks = 0;
+    try collector.collect(&server, a);
+    try std.testing.expectEqual(@as(usize, 9), backend.erased);
+    try std.testing.expectEqual(@as(usize, 8), backend.chunks);
+    try std.testing.expect(backend.calls <= 32);
+    try std.testing.expect(try store.getJobState(a, group, manifests[0]) != null);
+    for (0..16) |_| {
+        server.privacy_checkpoint_gc.next_ns = 0;
+        backend.calls = 0;
+        backend.chunks = 0;
+        try collector.collect(&server, a);
+        try std.testing.expect(backend.chunks <= checkpoints.gc_chunks);
+        try std.testing.expect(backend.calls <= 32);
+        if (backend.erased == manifests.len) break;
+    }
+    try std.testing.expectEqual(manifests.len, backend.erased);
+    var buffer: [64]u8 = undefined;
+    try std.testing.expect(try store.getJobState(a, group, try checkpoints.quotaKey(&buffer, 1, true)) == null);
+    try std.testing.expect(try store.getJobState(a, group, try checkpoints.quotaKey(&buffer, 1, false)) == null);
+}

@@ -713,16 +713,19 @@ pub const Runtime = struct {
     }
 
     fn privacyRequestsEmpty(alloc: Allocator, requests: []const asset_producer.Request) !bool {
-        if (requests.len == 0) return false;
+        if (requests.len == 0 or !requestsShareRoute(requests)) return false;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
         const privacy = @import("privacy/document.zig");
+        if (!try privacy.isManaged(a, requests[0].config_json)) return false;
+        const config = try std.json.parseFromSliceLeaky(std.json.Value, a, requests[0].config_json, .{});
+        const policy = try std.json.parseFromValueLeaky(privacy.contract.Policy, a, config.object.get(privacy.config_key).?, .{});
         for (requests) |request| {
-            if (request.producer_type == .copy or !try privacy.isManaged(a, request.config_json)) return false;
-            const config = try std.json.parseFromSliceLeaky(std.json.Value, a, request.config_json, .{});
-            const policy = try std.json.parseFromValueLeaky(privacy.contract.Policy, a, config.object.get(privacy.config_key).?, .{});
-            const source = try std.json.parseFromSliceLeaky(std.json.Value, a, request.source_text, .{ .parse_numbers = false });
+            var document_backing = inference_work.ReclaimingInvocationAllocator.init(alloc);
+            var document_arena = std.heap.ArenaAllocator.init(document_backing.allocator());
+            defer document_arena.deinit();
+            const source = try std.json.parseFromSliceLeaky(std.json.Value, document_arena.allocator(), request.source_text, .{ .parse_numbers = false });
             if (source != .object) return false;
             for (policy.fields) |field| {
                 const value = source.object.get(field) orelse .null;
@@ -732,6 +735,58 @@ pub const Runtime = struct {
         return true;
     }
 
+    fn privacyInvocationMemory(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) anyerror!inference_work.InvocationMemoryPlan {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const inspector = try @import("privacy/document.zig").Inspector.init(a, requests[0].config_json);
+        const config = try std.json.Stringify.valueAlloc(a, inspector.producer.config, .{});
+        var largest: [8]asset_producer.Request = undefined;
+        var count: usize = 0;
+        const capacity: usize = if (requests.len < 2) 1 else inspector.policy.execution.batch_items;
+        for (requests) |request| {
+            var document_backing = inference_work.ReclaimingInvocationAllocator.init(alloc);
+            var document_arena = std.heap.ArenaAllocator.init(document_backing.allocator());
+            defer document_arena.deinit();
+            const source = try std.json.parseFromSliceLeaky(std.json.Value, document_arena.allocator(), request.source_text, .{ .parse_numbers = false });
+            if (source != .object) return error.InvalidPrivacyDocument;
+            for (inspector.policy.fields) |field| {
+                const value = source.object.get(field) orelse .null;
+                // Invalid field types become per-document failures at execution.
+                if (value != .string or value.string.len == 0) continue;
+                const input: asset_producer.Request = .{ .producer_type = if (inspector.producer.type == .extractor) .extractor else .generator, .config_json = config, .source_text = value.string, .content_type = "application/json" };
+                var index: usize = 0;
+                while (index < count and largest[index].source_text.len >= input.source_text.len) : (index += 1) {}
+                if (index >= capacity) continue;
+                var next = @min(count, capacity - 1);
+                while (next > index) : (next -= 1) largest[next] = largest[next - 1];
+                largest[index] = input;
+                largest[index].source_text = try a.dupe(u8, input.source_text);
+                count = @min(count + 1, capacity);
+            }
+        }
+        // Host composition retains only normalized receipts and the bounded
+        // logical outputs. At most one physical detector batch is resident.
+        var host_runtime = self.*;
+        host_runtime.result_limits.copy_bytes_per_item = self.result_limits.forProducer(requests[0].producer_type);
+        const host = try a.dupe(asset_producer.Request, requests);
+        for (host) |*request| {
+            request.producer_type = .copy;
+            request.config_json = "";
+        }
+        var plan = try invocationMemoryForRequests(&host_runtime, a, host);
+        const cells = try std.math.mul(usize, requests.len, inspector.policy.fields.len);
+        const control = try std.math.add(usize, try std.math.mul(usize, requests[0].config_json.len, invocation_nonmedia_allocator_multiplier), try std.math.mul(usize, cells, 512));
+        plan.fixed_bytes = try std.math.add(usize, plan.fixed_bytes, control);
+        plan.allocator_limit_bytes = try std.math.add(usize, plan.allocator_limit_bytes, control);
+        if (count != 0) {
+            const physical = try invocationMemoryForRequests(self, a, largest[0..count]);
+            plan.fixed_bytes = try std.math.add(usize, plan.fixed_bytes, physical.fixed_bytes);
+            plan.allocator_limit_bytes = try std.math.add(usize, plan.allocator_limit_bytes, physical.allocator_limit_bytes);
+        }
+        return plan;
+    }
+
     fn invocationMemoryForRequests(
         ptr: *anyopaque,
         alloc: Allocator,
@@ -739,15 +794,8 @@ pub const Runtime = struct {
     ) !inference_work.InvocationMemoryPlan {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         if (requests.len == 0) return .{ .attachment_transport = .borrowed_binary, .fixed_bytes = 0 };
-        if (try privacyRequestsEmpty(alloc, requests)) {
-            // Empty inspections still reserve the ordinary bounded host JSON
-            // envelope, but invoke no model and need no inference provider.
-            const host = try alloc.dupe(asset_producer.Request, requests);
-            defer alloc.free(host);
-            for (host) |*request| request.producer_type = .copy;
-            return invocationMemoryForRequests(ptr, alloc, host);
-        }
         if (!requestsShareRoute(requests)) return error.InferenceInvocationMemoryUnavailable;
+        if (try @import("privacy/document.zig").isManaged(alloc, requests[0].config_json)) return self.privacyInvocationMemory(alloc, requests);
 
         var nonmedia_bytes: usize = 0;
         for (requests) |request| {
@@ -1865,11 +1913,11 @@ pub const Runtime = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const tree = try std.json.parseFromSlice(std.json.Value, a, requests[0].config_json, .{});
-        const policy = try std.json.parseFromValue(privacy.contract.Policy, a, tree.value.object.get(privacy.config_key) orelse return error.InvalidPrivacyProducer, .{});
-        const resolved = try privacy.resolve(a, policy.value, false);
+        const inspector = try privacy.Inspector.init(a, requests[0].config_json);
+        const policy = inspector.policy;
+        const resolved = inspector.producer;
         const config = try std.json.Stringify.valueAlloc(a, resolved.config, .{});
-        const field_count = policy.value.fields.len;
+        const field_count = policy.fields.len;
         const cells = try std.math.mul(usize, requests.len, field_count);
         const cached = try a.alloc(?[]const u8, cells);
         @memset(cached, null);
@@ -1889,11 +1937,11 @@ pub const Runtime = struct {
                 invalid[index] = err;
                 continue;
             };
-            if (document.value != .object) {
+            if (document.value != .object or document.value.object.contains("_privacy")) {
                 invalid[index] = error.InvalidPrivacyDocument;
                 continue;
             }
-            for (policy.value.fields) |field| {
+            for (policy.fields) |field| {
                 const value = document.value.object.get(field) orelse .null;
                 if (value != .null and value != .string) {
                     invalid[index] = error.InvalidPrivacyFieldType;
@@ -1901,20 +1949,46 @@ pub const Runtime = struct {
                 }
             }
             if (invalid[index] != null) continue;
-            for (policy.value.fields, 0..) |field, ordinal| {
+            for (policy.fields, 0..) |field, ordinal| {
                 const value = document.value.object.get(field) orelse .null;
                 if (value == .null or value.string.len == 0) continue;
                 try inputs.append(a, .{ .producer_type = if (resolved.type == .extractor) .extractor else .generator, .config_json = config, .source_text = value.string, .content_type = "application/json" });
                 try owners.append(a, index * field_count + ordinal);
             }
         }
+        const retained_bytes = try a.alloc(usize, requests.len);
+        @memset(retained_bytes, 0);
+        // Retry one field from its first batched response, then invoke the
+        // ordinary producer for any subsequent evidence-validation attempt.
+        const Adapter = struct {
+            runtime: *Runtime,
+            first: ?[]const u8 = null,
+            fn check(ptr: *anyopaque) !void {
+                const ctx: *@This() = @ptrCast(@alignCast(ptr));
+                try ctx.runtime.execution.check(platform.time.monotonicNs());
+            }
+            fn produce(ptr: *anyopaque, out: Allocator, detector: privacy.contract.Producer, text: []const u8) anyerror![]u8 {
+                const ctx: *@This() = @ptrCast(@alignCast(ptr));
+                if (ctx.first) |value| {
+                    ctx.first = null;
+                    return out.dupe(u8, value);
+                }
+                const raw = try std.json.Stringify.valueAlloc(out, detector.config, .{});
+                defer out.free(raw);
+                return ctx.runtime.producer().produce(out, .{ .producer_type = if (detector.type == .extractor) .extractor else .generator, .config_json = raw, .source_text = text, .content_type = "application/json" });
+            }
+        };
         var report = inference_work.ExecutionReport.serial(requests.len);
         var offset: usize = 0;
         while (offset < inputs.items.len) {
-            const end = @min(inputs.items.len, offset + policy.value.execution.batch_items);
+            const end = @min(inputs.items.len, offset + policy.execution.batch_items);
             // Enter normal admission with the actual selected text, not a
             // whole-document request or a detector-window surrogate.
-            var batch = self.producer().produceBatchReported(a, inputs.items[offset..end]) catch |err| {
+            var batch_backing = inference_work.ReclaimingInvocationAllocator.init(alloc);
+            var batch_arena = std.heap.ArenaAllocator.init(batch_backing.allocator());
+            defer batch_arena.deinit();
+            const batch_alloc = batch_arena.allocator();
+            var batch = self.producer().produceBatchReported(batch_alloc, inputs.items[offset..end]) catch |err| {
                 if (err == error.OutOfMemory or err == error.Canceled or err == error.Cancelled or err == error.Timeout or err == error.DeadlineExceeded) return err;
                 for (owners.items[offset..end]) |owner| {
                     field_errors[owner] = .{ .cause = err, .code = .upstream_failure, .retryable = true };
@@ -1923,14 +1997,29 @@ pub const Runtime = struct {
                 offset = end;
                 continue;
             };
-            defer batch.deinit(a);
+            defer batch.deinit(batch_alloc);
             const native = batch.execution.native_items == batch.items.len and batch.items.len > 1;
-            for (batch.items, owners.items[offset..end]) |item, owner| {
+            for (batch.items, owners.items[offset..end], inputs.items[offset..end]) |item, owner, input| {
+                const document_index = owner / field_count;
+                if (native) native_seen[document_index] = true else serial_seen[document_index] = true;
+                if (invalid[document_index] != null) continue;
                 switch (item.result) {
-                    .value => |value| cached[owner] = try a.dupe(u8, value),
+                    .value => |value| {
+                        var adapter = Adapter{ .runtime = self, .first = value };
+                        const normalized = inspector.inspect(a, policy.fields[owner % field_count], input.source_text, .{ .ptr = &adapter, .produce = Adapter.produce, .check = Adapter.check }) catch |err| {
+                            if (err == error.OutOfMemory or err == error.Canceled or err == error.Cancelled or err == error.Timeout or err == error.DeadlineExceeded) return err;
+                            field_errors[owner] = .{ .cause = err, .code = .generation_failed };
+                            continue;
+                        };
+                        retained_bytes[document_index] +|= normalized.len;
+                        if (retained_bytes[document_index] > self.result_limits.forProducer(requests[document_index].producer_type)) {
+                            invalid[document_index] = error.InferenceResultTooLarge;
+                            continue;
+                        }
+                        cached[owner] = normalized;
+                    },
                     .item_error => |failure| field_errors[owner] = failure,
                 }
-                if (native) native_seen[owner / field_count] = true else serial_seen[owner / field_count] = true;
             }
             offset = end;
         }
@@ -1941,34 +2030,6 @@ pub const Runtime = struct {
         // This envelope counts logical documents. Physical field/window batch
         // telemetry is reported by the nested invocation in its own domain.
         report.native_batches = if (report.native_items != 0) 1 else 0;
-        const Adapter = struct {
-            runtime: *Runtime,
-            cached: []const ?[]const u8,
-            failures: []const ?inference_work.ItemFailure,
-            field: usize = 0,
-            used_cache: bool = false,
-            fn accepted(ptr: *anyopaque) void {
-                const ctx: *@This() = @ptrCast(@alignCast(ptr));
-                ctx.field += 1;
-                ctx.used_cache = false;
-            }
-            fn check(ptr: *anyopaque) !void {
-                const ctx: *@This() = @ptrCast(@alignCast(ptr));
-                try ctx.runtime.execution.cancellation.check();
-                _ = try ctx.runtime.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms);
-            }
-            fn produce(ptr: *anyopaque, out: Allocator, detector: privacy.contract.Producer, text: []const u8) anyerror![]u8 {
-                const ctx: *@This() = @ptrCast(@alignCast(ptr));
-                if (ctx.failures[ctx.field]) |failure| return failure.cause;
-                if (!ctx.used_cache) if (ctx.cached[ctx.field]) |value| {
-                    ctx.used_cache = true;
-                    return out.dupe(u8, value);
-                };
-                const raw = try std.json.Stringify.valueAlloc(out, detector.config, .{});
-                defer out.free(raw);
-                return ctx.runtime.producer().produce(out, .{ .producer_type = if (detector.type == .extractor) .extractor else .generator, .config_json = raw, .source_text = text, .content_type = "application/json" });
-            }
-        };
         const items = try alloc.alloc(asset_producer.ProducedItem, requests.len);
         var initialized: usize = 0;
         errdefer {
@@ -1976,20 +2037,21 @@ pub const Runtime = struct {
             alloc.free(items);
         }
         for (requests, invalid, items, 0..) |request, problem, *item, index| {
-            var adapter = Adapter{ .runtime = self, .cached = cached[index * field_count ..][0..field_count], .failures = field_errors[index * field_count ..][0..field_count] };
-            const produced: ?[]u8 = if (problem == null) privacy.produce(alloc, request.config_json, request.source_text, .{ .ptr = &adapter, .produce = Adapter.produce, .check = Adapter.check, .accepted = Adapter.accepted }) catch |err| blk: {
-                if (err == error.OutOfMemory or err == error.Canceled or err == error.Cancelled or err == error.Timeout or err == error.DeadlineExceeded) return err;
-                var failure = inference_work.ItemFailure{ .cause = err, .code = .generation_failed };
-                for (adapter.failures) |field_failure| if (field_failure) |value| {
-                    failure = value;
-                    break;
-                };
-                item.* = .{ .identity = .{ .item_id = request.item_id, .source_fingerprint = request.source_fingerprint, .page_number = request.page_number }, .result = .{ .item_error = failure } };
-                break :blk null;
-            } else null;
-            if (problem) |cause| {
-                item.* = .{ .identity = .{ .item_id = request.item_id, .source_fingerprint = request.source_fingerprint, .page_number = request.page_number }, .result = .{ .item_error = .{ .cause = cause, .code = .invalid_request } } };
-            } else if (produced) |output| {
+            try self.execution.check(platform.time.monotonicNs());
+            var failure: ?inference_work.ItemFailure = if (problem) |cause| .{ .cause = cause, .code = .invalid_request } else null;
+            for (field_errors[index * field_count ..][0..field_count]) |field_failure| if (field_failure) |value| {
+                failure = value;
+                break;
+            };
+            if (failure) |value| {
+                item.* = .{ .identity = .{ .item_id = request.item_id, .source_fingerprint = request.source_fingerprint, .page_number = request.page_number }, .result = .{ .item_error = value } };
+            } else {
+                const fields = try a.alloc([]const u8, field_count);
+                for (policy.fields, cached[index * field_count ..][0..field_count], fields) |name, normalized, *field| {
+                    var adapter = Adapter{ .runtime = self };
+                    field.* = normalized orelse try inspector.inspect(a, name, "", .{ .ptr = &adapter, .produce = Adapter.produce, .check = Adapter.check });
+                }
+                const output = try inspector.compose(alloc, request.source_text, fields);
                 item.* = .{ .identity = .{ .item_id = request.item_id, .source_fingerprint = request.source_fingerprint, .page_number = request.page_number }, .result = .{ .value = output } };
             }
             initialized += 1;
@@ -9112,4 +9174,38 @@ test "privacy empty selected fields reserve host memory without an inference pro
     const parsed = try std.json.parseFromSlice(std.json.Value, scratch, output, .{});
     try std.testing.expect(parsed.value.object.get("body").? == .null);
     try std.testing.expectEqual(@as(i64, 7), parsed.value.object.get("other").?.integer);
+}
+
+test "privacy maximum field cohort planning releases document DOMs within the resolution budget" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(a, io_impl.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = Runtime.init(a, &client);
+    defer runtime.deinit();
+    runtime.execution.max_response_bytes = 8 * 1024 * 1024;
+    var fields: [64][]const u8 = undefined;
+    var document: std.json.Value = .{ .object = .empty };
+    for (&fields, 0..) |*field, i| {
+        field.* = try std.fmt.allocPrint(scratch, "f{d}", .{i});
+        try document.object.put(scratch, field.*, .{ .string = "he\"llo" });
+    }
+    const source = try std.json.Stringify.valueAlloc(scratch, document, .{});
+    const cfg = try std.json.parseFromSliceLeaky(std.json.Value, scratch,
+        \\{"generator":{"provider":"openai","model":"gpt-4.1","api_key":"","url":"http://127.0.0.1:1/v1"},"output":"auto","output_schema":{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"category":{"type":"string"},"start":{"type":"integer"},"end":{"type":"integer"}},"required":["category","start","end"],"additionalProperties":false}},"padding":{"type":"string"}},"required":["findings","padding"],"additionalProperties":false}}
+    , .{});
+    const privacy = @import("privacy/document.zig");
+    const resolved = try privacy.resolve(scratch, .{ .mode = .monitor, .fields = &fields, .category_groups = &.{}, .categories = &.{.{ .name = "email" }}, .producer = .{ .type = .generator, .revision = "memory-fixture-v1", .config = cfg } }, true);
+    const config = try std.json.Stringify.valueAlloc(scratch, resolved.config, .{});
+    var requests: [50]asset_producer.Request = undefined;
+    for (&requests) |*request| request.* = .{ .producer_type = .generator, .config_json = config, .source_text = source, .content_type = "application/json" };
+    const plan = try runtime.producer().invocationMemoryForRequests(a, &requests);
+    try plan.validate();
+    try std.testing.expectEqual(inference_work.InvocationAllocatorOwner.caller, plan.allocator_owner);
+    try std.testing.expect(plan.fixed_bytes < 512 * 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 50 * 1024 * 1024), plan.max_result_bytes);
 }

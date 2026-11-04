@@ -24,7 +24,7 @@ const operation = @import("antfly_local_sources").api_operation;
 const time = @import("antfly_platform").time;
 const A = std.mem.Allocator;
 
-pub const GC = struct { after: [128]u8 = undefined, len: usize = 0, next_ns: u64 = 0 };
+pub const GC = struct { after: [128]u8 = undefined, len: usize = 0, next_ns: u64 = 0, quantum_ns: u64 = 25 * std.time.ns_per_ms };
 pub const RetryCache = struct {
     a: A,
     table: u64 = 0,
@@ -42,6 +42,7 @@ pub const Context = struct {
     retained: std.ArrayList([]const u8) = .empty,
     refs: std.ArrayList(keys.Ref) = .empty,
     retry: ?*RetryCache = null,
+    capacity_limited: bool = false,
 
     pub fn init(server: anytype, a: A, table: u64, term: u64, resource: catalog.Resource, request: operation.RequestContext) !Context {
         var self: Context = .{ .a = a, .persistence = null, .table = table, .term = term, .request = request };
@@ -100,10 +101,29 @@ pub const Context = struct {
         const ref: keys.Ref = .{ .digest = digest, .generation = std.fmt.bytesToHex(entropy, .lower) };
         var buffer: [128]u8 = undefined;
         const manifest = try ref.storageKey(&buffer, self.table, null);
-        var header: keys.Header = .{ .length = @intCast(value.len), .created_at_millis = @intCast(@divFloor(time.realtimeNs(), std.time.ns_per_ms)) };
+        var header: keys.Header = .{ .accounted = true, .length = @intCast(value.len), .created_at_millis = @intCast(@divFloor(time.realtimeNs(), std.time.ns_per_ms)) };
         const initial = try std.json.Stringify.valueAlloc(self.a, header, .{});
         defer self.a.free(initial);
-        try self.cas(manifest, null, initial);
+        self.cas(manifest, null, initial) catch |err| {
+            if (err != error.TableGenerationChanged) return err;
+            // Diagnose capacity only on a miss; successful uploads need no
+            // extra metadata reads. Owner quota checks remain authoritative.
+            for ([_]bool{ false, true }) |retained| {
+                var quota_buffer: [64]u8 = undefined;
+                const quota = try persistence.get(self.a, try keys.quotaKey(&quota_buffer, self.table, retained));
+                defer if (quota) |bytes| self.a.free(bytes);
+                if (quota) |bytes| {
+                    if (bytes.len != 8) return error.InvalidDocumentCheckpoint;
+                    const used = std.mem.readInt(u64, bytes[0..8], .little);
+                    const limit = if (retained) keys.max_retained_bytes else keys.max_pending_bytes;
+                    if (@max(value.len, 4096) > limit -| used) {
+                        self.capacity_limited = true;
+                        return error.PrivacyCheckpointCapacityExceeded;
+                    }
+                }
+            }
+            return err;
+        };
         // A single reusable chunk avoids retaining an additional copy of every
         // large key in the request arena while staging it.
         const backing = @import("antfly_platform").allocator.reclaimingScratch(self.a);
@@ -122,7 +142,6 @@ pub const Context = struct {
         defer self.a.free(ready);
         const expected = jobs.digest(initial);
         try self.cas(manifest, &expected, ready);
-        _ = persistence;
         if (self.retry) |cache| try cache.refs.append(cache.a, ref);
         const token = try self.a.dupe(u8, &ref.token());
         try self.retain(token);
@@ -198,6 +217,8 @@ pub const Context = struct {
     }
 };
 
+/// Spend shared chunk, operation and elapsed-time budgets across manifests.
+/// Busy collections run promptly; idle catalogs need only a slow poll.
 pub fn collect(server: anytype, a: A) !void {
     if (comptime !@hasField(@TypeOf(server.*), "privacy_checkpoint_gc")) return;
     const persistence = server.document_job_store.replicated orelse return;
@@ -210,31 +231,53 @@ pub fn collect(server: anytype, a: A) !void {
     defer a.free(raw);
     var page = try std.json.parseFromSlice(jobs.Page, a, raw, .{});
     defer page.deinit();
-    // The owner filters live/leased generations and rechecks references in the
-    // same writer transaction as each deletion. Elections fence every quantum.
-    if (page.value.rows.len != 0) {
-        const row = page.value.rows[0];
+    var chunks: usize = keys.gc_chunks;
+    var operations: usize = 32;
+    const deadline = now +| state.quantum_ns;
+    for (page.value.rows, 0..) |row, index| {
+        if (operations == 0 or (index != 0 and time.monotonicNs() >= deadline)) {
+            state.next_ns = now +| 100 * std.time.ns_per_ms;
+            return;
+        }
         var parsed = try std.json.parseFromSlice(keys.Header, a, row.value, .{});
         defer parsed.deinit();
         var header = parsed.value;
-        const expected = jobs.digest(row.value);
-        if (header.state == .deleting and header.deleted_chunks == header.chunks()) {
-            _ = try persistence.compareExchange(row.key, &expected, keys.erase, term);
-        } else {
+        var expected = jobs.digest(row.value);
+        if (header.deleted_chunks != header.chunks()) {
+            if (chunks == 0) {
+                state.next_ns = now +| 100 * std.time.ns_per_ms;
+                return;
+            }
+            const count = @min(header.chunks() - header.deleted_chunks, chunks);
             header.state = .deleting;
-            header.deleted_chunks = @intCast(@min(header.chunks(), header.deleted_chunks + keys.gc_chunks));
+            header.deleted_chunks += @intCast(count);
             const next = try std.json.Stringify.valueAlloc(a, header, .{});
             defer a.free(next);
-            _ = try persistence.compareExchange(row.key, &expected, next, term);
+            const changed = try persistence.compareExchange(row.key, &expected, next, term);
+            operations -= 1;
+            chunks -= count;
+            if (changed) expected = jobs.digest(next);
+            if (!changed) {
+                try gcAfter(state, row.key);
+                continue;
+            }
         }
-        // Keep the cursor before this row until every chunk has been removed.
-        return;
+        // Owner-side reference and progress checks fence both CAS operations.
+        // Finishing a small blob need not cost a second scheduler tick.
+        if (header.deleted_chunks == header.chunks() and operations != 0) {
+            _ = try persistence.compareExchange(row.key, &expected, keys.erase, term);
+            operations -= 1;
+        }
+        // Rotate after partial blobs too; unfinished rows return on wrap.
+        try gcAfter(state, row.key);
     }
-    if (page.value.next) |next| {
-        if (next.len > state.after.len) return error.InvalidDocumentCheckpoint;
-        @memcpy(state.after[0..next.len], next);
-        state.len = next.len;
-    } else state.len = 0;
+    if (page.value.next) |next| try gcAfter(state, next) else state.len = 0;
+    if (page.value.rows.len != 0 or page.value.next != null) state.next_ns = now +| 100 * std.time.ns_per_ms;
+}
+fn gcAfter(state: *GC, key: []const u8) !void {
+    if (key.len > state.after.len) return error.InvalidDocumentCheckpoint;
+    @memcpy(state.after[0..key.len], key);
+    state.len = key.len;
 }
 
 test "privacy key generations round trip deduplicate and escape reference-shaped user keys" {

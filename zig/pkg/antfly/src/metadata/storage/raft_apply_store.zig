@@ -17852,9 +17852,9 @@ pub const RaftApplyStore = struct {
         // can retain extra data, but can never reclaim a live reference.
         return std.mem.indexOf(u8, try privacyIndexes(txn, group, table), &ref.token()) != null;
     }
-    fn privacyQuota(txn: *docstore.DocStore.Txn, group: u64, table: u64, bytes: usize, increase: bool) !void {
+    fn privacyQuota(txn: *docstore.DocStore.Txn, group: u64, table: u64, bytes: usize, increase: bool, retained: bool) !void {
         var logical_buffer: [64]u8 = undefined;
-        const logical = try std.fmt.bufPrint(&logical_buffer, "privacy/q/{x:0>16}", .{table});
+        const logical = try privacy_keys.quotaKey(&logical_buffer, table, retained);
         var buffer: [256]u8 = undefined;
         const selected = try jobStateKeyForGroup(&buffer, group, logical);
         const raw = txn.get(selected) catch |err| if (err == error.NotFound) null else return err;
@@ -17862,7 +17862,7 @@ pub const RaftApplyStore = struct {
         const previous = if (raw) |value| std.mem.readInt(u64, value[0..8], .little) else 0;
         const charge = @max(bytes, 4096);
         const next = if (increase) std.math.add(u64, previous, charge) catch return error.ResourceBudgetExceeded else std.math.sub(u64, previous, charge) catch return error.InvalidDocumentCheckpoint;
-        if (next > privacy_keys.max_pending_bytes) return error.ResourceBudgetExceeded;
+        if (next > (if (retained) privacy_keys.max_retained_bytes else privacy_keys.max_pending_bytes)) return error.ResourceBudgetExceeded;
         var encoded: [8]u8 = undefined;
         std.mem.writeInt(u64, &encoded, next, .little);
         if (next == 0) {
@@ -17892,17 +17892,26 @@ pub const RaftApplyStore = struct {
         if (std.mem.eql(u8, value, privacy_keys.erase)) {
             const header = old orelse return .skip;
             if (header.state != .deleting or header.deleted_chunks != header.chunks()) return error.InvalidDocumentCheckpoint;
+            if (header.accounted) try privacyQuota(txn, group, selected.table, header.length, false, true);
             return .erase;
         }
         const next = try privacyHeader(a, value);
         if (old == null) {
             if (next.state != .staged or next.attached or next.deleted_chunks != 0) return error.InvalidDocumentCheckpoint;
             _ = txn.get(try tableKeyForGroup(&buffer, group, selected.table)) catch |err| if (err == error.NotFound) return .skip else return err;
-            privacyQuota(txn, group, selected.table, next.length, true) catch |err| if (err == error.ResourceBudgetExceeded) return .skip else return err;
+            if (next.accounted) {
+                const quota_key = try privacy_keys.quotaKey(&logical_buffer, selected.table, true);
+                const quota = txn.get(try jobStateKeyForGroup(&buffer, group, quota_key)) catch |err| if (err == error.NotFound) null else return err;
+                if (quota != null and quota.?.len != 8) return error.InvalidDocumentCheckpoint;
+                const used = if (quota) |bytes| std.mem.readInt(u64, bytes[0..8], .little) else 0;
+                if (@max(next.length, 4096) > privacy_keys.max_retained_bytes -| used) return .skip;
+            }
+            privacyQuota(txn, group, selected.table, next.length, true, false) catch |err| if (err == error.ResourceBudgetExceeded) return .skip else return err;
+            if (next.accounted) try privacyQuota(txn, group, selected.table, next.length, true, true);
             return .store;
         }
         const previous = old.?;
-        if (next.length != previous.length or next.created_at_millis != previous.created_at_millis or next.attached != previous.attached) return error.InvalidDocumentCheckpoint;
+        if (next.length != previous.length or next.created_at_millis != previous.created_at_millis or next.attached != previous.attached or next.accounted != previous.accounted) return error.InvalidDocumentCheckpoint;
         if (next.state == .ready) {
             if (previous.state != .staged) return .skip;
             if (next.deleted_chunks != 0) return error.InvalidDocumentCheckpoint;
@@ -17919,7 +17928,7 @@ pub const RaftApplyStore = struct {
         }
         if (next.state != .deleting or (previous.state == .deleting and next.deleted_chunks < previous.deleted_chunks) or next.deleted_chunks > previous.deleted_chunks + privacy_keys.gc_chunks) return error.InvalidDocumentCheckpoint;
         if (try privacyReferenced(txn, group, selected.table, ref)) return .skip;
-        if (previous.state != .deleting and !previous.attached) try privacyQuota(txn, group, selected.table, previous.length, false);
+        if (previous.state != .deleting and !previous.attached) try privacyQuota(txn, group, selected.table, previous.length, false, false);
         for (previous.deleted_chunks..next.deleted_chunks) |index| {
             txn.delete(try jobStateKeyForGroup(&buffer, group, try ref.storageKey(&logical_buffer, selected.table, index))) catch |err| if (err != error.NotFound) return err;
         }
@@ -17962,7 +17971,7 @@ pub const RaftApplyStore = struct {
                 const raw = try std.json.Stringify.valueAlloc(a, header, .{});
                 defer a.free(raw);
                 try txn.put(selected, raw);
-                try privacyQuota(txn, group, table.table_id, header.length, false);
+                try privacyQuota(txn, group, table.table_id, header.length, false, false);
             }
         }
     }
@@ -44375,7 +44384,7 @@ test "privacy key attachment and incremental reclamation are atomic and survive 
     const ref: keys.Ref = .{ .digest = std.fmt.bytesToHex(jobs.digest(content), .lower), .generation = @splat('a') };
     var buffer: [128]u8 = undefined;
     const manifest = try a.dupe(u8, try ref.storageKey(&buffer, 1, null));
-    var header: keys.Header = .{ .length = @intCast(content.len), .created_at_millis = 1 };
+    var header: keys.Header = .{ .accounted = true, .length = @intCast(content.len), .created_at_millis = 1 };
     const initial = try std.json.Stringify.valueAlloc(a, header, .{});
     try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = "", .value = initial } });
     resource.checkpoint_encoding = 1;
@@ -44400,6 +44409,8 @@ test "privacy key attachment and incremental reclamation are atomic and survive 
     var parsed_header = try std.json.parseFromSlice(keys.Header, a, attached_header, .{});
     defer parsed_header.deinit();
     try std.testing.expect(parsed_header.value.attached);
+    const retained_key = try a.dupe(u8, try keys.quotaKey(&buffer, 1, true));
+    try std.testing.expectEqual(@as(u64, content.len), std.mem.readInt(u64, (try store.getJobState(a, group, retained_key)).?[0..8], .little));
     // Reclamation and table attachment serialize through the same transaction.
     header = parsed_header.value;
     header.state = .deleting;
@@ -44431,6 +44442,7 @@ test "privacy key attachment and incremental reclamation are atomic and survive 
     const final_hash = jobs.digest(final);
     try restored.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &final_hash, .value = keys.erase } });
     try std.testing.expect(try restored.getJobState(a, group, manifest) == null);
+    try std.testing.expect(try restored.getJobState(a, group, retained_key) == null);
     try std.testing.expect(try restored.getJobState(a, group, try ref.storageKey(&buffer, 1, 9)) == null);
     // A late uploader cannot recreate chunks after the manifest was erased.
     try restored.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = try ref.storageKey(&buffer, 1, 9), .expected_hash = "", .value = "Vxxx" } });
@@ -44454,4 +44466,69 @@ test "privacy checkpoint ownership borrows large table records without allocator
         try std.testing.expect(@intFromPtr(indexes.ptr) + indexes.len <= @intFromPtr(record.ptr) + record.len);
     }
     try std.testing.expectError(error.InvalidMetadataTransitionEncoding, borrowTableProjection(record[0 .. record.len - 1], .query));
+}
+
+test "privacy retained capacity denies staging atomically and releases only on final erase" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/privacy-capacity", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const group = 7305;
+    const keys = RaftApplyStore.privacy_keys;
+    const jobs = @import("../job_state.zig");
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 1, .name = "capacity" } });
+    var logical_buffer: [128]u8 = undefined;
+    const quota = try a.dupe(u8, try keys.quotaKey(&logical_buffer, 1, true));
+    defer a.free(quota);
+    var physical_buffer: [256]u8 = undefined;
+    // Model already-attached payloads without allocating gigabytes in a test.
+    var encoded: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, keys.max_retained_bytes - 4096, .little);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(try jobStateKeyForGroup(&physical_buffer, group, quota), &encoded);
+        try txn.commit();
+    }
+    const ref: keys.Ref = .{ .digest = @splat('a'), .generation = @splat('b') };
+    const manifest = try a.dupe(u8, try ref.storageKey(&logical_buffer, 1, null));
+    defer a.free(manifest);
+    var header: keys.Header = .{ .accounted = true, .length = 1, .created_at_millis = 1 };
+    const staged = try std.json.Stringify.valueAlloc(a, header, .{});
+    defer a.free(staged);
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = "", .value = staged } });
+    const second: keys.Ref = .{ .digest = @splat('c'), .generation = @splat('d') };
+    const denied = try a.dupe(u8, try second.storageKey(&logical_buffer, 1, null));
+    defer a.free(denied);
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = denied, .expected_hash = "", .value = staged } });
+    try std.testing.expect(try store.getJobState(a, group, denied) == null);
+    const pending_key = try a.dupe(u8, try keys.quotaKey(&logical_buffer, 1, false));
+    defer a.free(pending_key);
+    const pending = (try store.getJobState(a, group, pending_key)).?;
+    defer a.free(pending);
+    try std.testing.expectEqual(@as(u64, 4096), std.mem.readInt(u64, pending[0..8], .little));
+    header.state = .deleting;
+    header.deleted_chunks = 1;
+    const deleting = try std.json.Stringify.valueAlloc(a, header, .{});
+    defer a.free(deleting);
+    const staged_hash = jobs.digest(staged);
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &staged_hash, .value = deleting } });
+    const retained = (try store.getJobState(a, group, quota)).?;
+    defer a.free(retained);
+    try std.testing.expectEqual(keys.max_retained_bytes, std.mem.readInt(u64, retained[0..8], .little));
+    const deleting_hash = jobs.digest(deleting);
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &deleting_hash, .value = keys.erase } });
+    const released = (try store.getJobState(a, group, quota)).?;
+    defer a.free(released);
+    try std.testing.expectEqual(keys.max_retained_bytes - 4096, std.mem.readInt(u64, released[0..8], .little));
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = denied, .expected_hash = "", .value = staged } });
+    const admitted = (try store.getJobState(a, group, denied)).?;
+    defer a.free(admitted);
+    try std.testing.expectEqualStrings(staged, admitted);
+    var legacy = try std.json.parseFromSlice(keys.Header, a, "{\"length\":1,\"created_at_millis\":1}", .{});
+    defer legacy.deinit();
+    try std.testing.expect(!legacy.value.accounted);
 }

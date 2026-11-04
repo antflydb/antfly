@@ -89,6 +89,10 @@ pub const checkpoints = struct {
     pub const max_bytes = 65 * 1024 * 1024;
     pub const max_pending_bytes = 256 * 1024 * 1024;
     pub const gc_chunks = 8;
+    pub const max_retained_bytes: u64 = 8 * 1024 * 1024 * 1024;
+    pub fn quotaKey(buffer: []u8, table: u64, retained: bool) ![]const u8 {
+        return std.fmt.bufPrint(buffer, "privacy/{s}/{x:0>16}", .{ if (retained) "b" else "q", table });
+    }
     pub const lease_ms = std.time.ms_per_hour;
     pub const erase = "\x00";
     pub const Header = struct {
@@ -96,9 +100,25 @@ pub const checkpoints = struct {
         length: u32,
         created_at_millis: i64,
         attached: bool = false,
+        // Legacy headers are readable and drain normally after upgrade.
+        accounted: bool = false,
         deleted_chunks: u32 = 0,
         pub fn chunks(self: @This()) usize {
             return std.math.divCeil(usize, self.length, chunk_bytes) catch unreachable;
+        }
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            try writer.beginObject();
+            inline for (.{ "state", "length", "created_at_millis", "attached", "deleted_chunks" }) |name| {
+                try writer.objectField(name);
+                try writer.write(@field(self, name));
+            }
+            // Preserve the exact old framing during WAL replay: adding a
+            // false field would invalidate a later recorded CAS digest.
+            if (self.accounted) {
+                try writer.objectField("accounted");
+                try writer.write(true);
+            }
+            try writer.endObject();
         }
     };
     pub const Ref = struct {
@@ -139,7 +159,7 @@ pub const checkpoints = struct {
         const table = parts.next() orelse return error.InvalidDocumentCheckpoint;
         if (table.len != 16) return error.InvalidDocumentCheckpoint;
         var result: Key = .{ .table = std.fmt.parseUnsigned(u64, table, 16) catch return error.InvalidDocumentCheckpoint, .kind = undefined };
-        if (std.mem.eql(u8, kind, "q")) {
+        if (std.mem.eql(u8, kind, "q") or std.mem.eql(u8, kind, "b")) {
             result.kind = .quota;
         } else {
             result.kind = if (std.mem.eql(u8, kind, "m")) .manifest else if (std.mem.eql(u8, kind, "c")) .chunk else return error.InvalidDocumentCheckpoint;
@@ -920,4 +940,15 @@ test "privacy reconciliation preserves runtime state and rejects stale policy bi
     resource.resource_version += 1;
     const changed = try replaceResource(a, before, resource);
     try std.testing.expect(try reconcileIndexes(a, changed, before) == null);
+}
+
+test "privacy legacy checkpoint headers retain their CAS bytes after upgrade" {
+    const a = std.testing.allocator;
+    const raw = "{\"state\":\"ready\",\"length\":1,\"created_at_millis\":1,\"attached\":true,\"deleted_chunks\":0}";
+    var parsed = try std.json.parseFromSlice(checkpoints.Header, a, raw, .{});
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.accounted);
+    const encoded = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    defer a.free(encoded);
+    try std.testing.expectEqualStrings(raw, encoded);
 }

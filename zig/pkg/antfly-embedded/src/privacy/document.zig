@@ -140,56 +140,95 @@ pub fn isManaged(a: A, config_json: []const u8) !bool {
     return parsed.value == .object and parsed.value.object.contains(config_key);
 }
 
+/// Invocation-owned policy state shared across fields and physical batches.
+/// Only normalized, source-bound evidence escapes an inspection attempt.
+pub const Inspector = struct {
+    policy: contract.Policy,
+    version: [64]u8,
+    producer: contract.Producer,
+    categories: []const contract.Category,
+
+    pub fn init(a: A, config_json: []const u8) !Inspector {
+        const tree = try std.json.parseFromSliceLeaky(std.json.Value, a, config_json, .{});
+        if (tree != .object) return error.InvalidPrivacyProducer;
+        const policy = try std.json.parseFromValueLeaky(contract.Policy, a, tree.object.get(config_key) orelse return error.InvalidPrivacyProducer, .{});
+        try policy.validate();
+        return .{ .policy = policy, .version = try policy.identity(a), .producer = try resolve(a, policy, false), .categories = try policy.labels(a) };
+    }
+
+    pub fn inspect(self: Inspector, a: A, field: []const u8, text: []const u8, invoke: Invoke) ![]u8 {
+        const marker = materialize.Marker{ .policy_version = self.version, .field = field, .categories = self.categories, .replacement = self.policy.replacement, .producer_revision = self.producer.revision, .require_window_receipt = text.len != 0 and isNativeDefault(self.producer) };
+        var attempt: u8 = 0;
+        while (true) {
+            try invoke.check(invoke.ptr);
+            attempt += 1;
+            // Every attempt has releasable backing, including rejected evidence.
+            var backing = @import("antfly_inference_work").ReclaimingInvocationAllocator.init(a);
+            var arena = std.heap.ArenaAllocator.init(backing.allocator());
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const validation = try std.json.Stringify.valueAlloc(scratch, .{ .privacy = marker }, .{});
+            const produced = if (text.len == 0) "{\"findings\":[]}" else try invoke.produce(invoke.ptr, scratch, self.producer, text);
+            const output = materialize.output(scratch, text, validation, produced) catch |err| {
+                if (isControl(err) or err == error.OutOfMemory or attempt >= self.policy.execution.max_attempts) return err;
+                continue;
+            };
+            return a.dupe(u8, output.?);
+        }
+    }
+
+    /// Fields must come from inspect in policy order. Source values and numbers
+    /// retain their original representation; receipts bind the complete source.
+    pub fn compose(self: Inspector, a: A, source: []const u8, fields: []const []const u8) ![]u8 {
+        if (fields.len != self.policy.fields.len) return error.InvalidPrivacyReceipt;
+        var backing = @import("antfly_inference_work").ReclaimingInvocationAllocator.init(a);
+        var arena = std.heap.ArenaAllocator.init(backing.allocator());
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var projected = try std.json.parseFromSliceLeaky(std.json.Value, scratch, source, .{ .parse_numbers = false });
+        if (projected != .object or projected.object.contains("_privacy")) return error.InvalidPrivacyDocument;
+        var values: std.json.Value = .{ .array = .init(scratch) };
+        for (self.policy.fields, fields) |name, raw| {
+            const result = try std.json.parseFromSliceLeaky(std.json.Value, scratch, raw, .{});
+            if (result != .object) return error.InvalidPrivacyReceipt;
+            const field = result.object.get("field") orelse return error.InvalidPrivacyReceipt;
+            if (field != .string or !std.mem.eql(u8, field.string, name)) return error.InvalidPrivacyReceipt;
+            const original = projected.object.get(name) orelse .null;
+            if (original == .string) try projected.object.put(scratch, name, result.object.get("text") orelse return error.InvalidPrivacyReceipt) else if (original != .null) return error.InvalidPrivacyFieldType;
+            try values.array.append(result);
+        }
+        var receipt: std.json.Value = .{ .object = .empty };
+        try receipt.object.put(scratch, "policy_version", .{ .string = &self.version });
+        try receipt.object.put(scratch, "source_fingerprint", .{ .string = try scratch.dupe(u8, &contract.fingerprint(source)) });
+        try receipt.object.put(scratch, "fields", values);
+        try projected.object.put(scratch, "_privacy", receipt);
+        return std.json.Stringify.valueAlloc(a, projected, .{});
+    }
+};
+
 pub fn produce(a: A, config_json: []const u8, source: []const u8, invoke: Invoke) ![]u8 {
-    var arena = std.heap.ArenaAllocator.init(a);
+    var backing = @import("antfly_inference_work").ReclaimingInvocationAllocator.init(a);
+    var arena = std.heap.ArenaAllocator.init(backing.allocator());
     defer arena.deinit();
     const scratch = arena.allocator();
-    const tree = try std.json.parseFromSlice(std.json.Value, scratch, config_json, .{});
-    if (tree.value != .object) return error.InvalidPrivacyProducer;
-    const policy = try std.json.parseFromValue(contract.Policy, scratch, tree.value.object.get(config_key) orelse return error.InvalidPrivacyProducer, .{});
-    try policy.value.validate();
-    const version = try policy.value.identity(scratch);
-    const producer = try resolve(scratch, policy.value, false);
-    const document = try std.json.parseFromSlice(std.json.Value, scratch, source, .{ .parse_numbers = false });
-    if (document.value != .object or document.value.object.contains("_privacy")) return error.InvalidPrivacyDocument;
-    var projected = document.value;
-    var fields: std.json.Value = .{ .array = std.array_list.Managed(std.json.Value).init(scratch) };
-    for (policy.value.fields) |field| {
-        try invoke.check(invoke.ptr);
-        const value = projected.object.get(field) orelse .null;
+    const inspector = try Inspector.init(scratch, config_json);
+    const document = try std.json.parseFromSliceLeaky(std.json.Value, scratch, source, .{ .parse_numbers = false });
+    if (document != .object or document.object.contains("_privacy")) return error.InvalidPrivacyDocument;
+    const fields = try scratch.alloc([]const u8, inspector.policy.fields.len);
+    for (inspector.policy.fields, fields) |field, *result| {
+        const value = document.object.get(field) orelse .null;
         const text = switch (value) {
             .null => "",
             .string => |v| v,
             else => return error.InvalidPrivacyFieldType,
         };
-        const marker = materialize.Marker{ .policy_version = version, .field = field, .categories = try policy.value.labels(scratch), .replacement = policy.value.replacement, .producer_revision = producer.revision, .require_window_receipt = text.len != 0 and isNativeDefault(producer) };
-        const validation = try std.json.Stringify.valueAlloc(scratch, .{ .privacy = marker }, .{});
-        var attempt: u8 = 0;
-        const result = retry: while (true) {
-            try invoke.check(invoke.ptr);
-            attempt += 1;
-            // Transport/admission failures retain the artifact runtime's
-            // backoff and retry ownership. Only invalid privacy evidence is
-            // retried here; do not hammer a rate-limited provider or repeat an
-            // invocation whose memory admission was denied.
-            const produced = if (text.len == 0) "{\"findings\":[]}" else try invoke.produce(invoke.ptr, scratch, producer, text);
-            const output = materialize.output(scratch, text, validation, produced) catch |err| {
-                if (isControl(err) or err == error.OutOfMemory or attempt >= policy.value.execution.max_attempts) return err;
-                continue;
-            };
-            break :retry (try std.json.parseFromSlice(std.json.Value, scratch, output.?, .{})).value;
-        };
-        if (value == .string) try projected.object.put(scratch, field, result.object.get("text").?);
-        try fields.array.append(result);
+        result.* = try inspector.inspect(scratch, field, text, invoke);
         if (invoke.accepted) |accepted| accepted(invoke.ptr);
     }
-    var receipt: std.json.Value = .{ .object = .empty };
-    try receipt.object.put(scratch, "policy_version", .{ .string = try scratch.dupe(u8, &version) });
-    try receipt.object.put(scratch, "source_fingerprint", .{ .string = try scratch.dupe(u8, &contract.fingerprint(source)) });
-    try receipt.object.put(scratch, "fields", fields);
-    try projected.object.put(scratch, "_privacy", receipt);
-    return std.json.Stringify.valueAlloc(a, projected, .{});
+    try invoke.check(invoke.ptr);
+    return inspector.compose(a, source, fields);
 }
+
 fn isControl(err: anyerror) bool {
     return err == error.Canceled or err == error.Cancelled or err == error.DeadlineExceeded or err == error.Timeout;
 }

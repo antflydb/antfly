@@ -289,3 +289,27 @@ test "privacy checkpoint job commands require the same coordinated decoder as ca
     try std.testing.expectEqual(protocol.privacy_version, service.transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_set_job_state = .{ .key = "privacy/c/checkpoint", .expected_hash = "", .value = "Vchunk" } }));
     try std.testing.expectEqual(protocol.job_state_version, service.transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_set_job_state = .{ .key = "documents/run", .expected_hash = "", .value = "{}" } }));
 }
+
+test "privacy scratch preserves both outer and inner invocation limits" {
+    const work = @import("antfly_inference_work");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var outer = work.BoundedInvocationAllocator.init(arena.allocator(), 64);
+    var inner = work.BoundedInvocationAllocator.init(outer.allocator(), 1024);
+    var scratch = work.ReclaimingInvocationAllocator.init(inner.allocator());
+    const a = scratch.allocator();
+    const bytes = try a.alloc(u8, 32);
+    try std.testing.expectEqual(@as(usize, 32), outer.live_bytes);
+    try std.testing.expectEqual(@as(usize, 32), inner.live_bytes);
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 40));
+    try std.testing.expect(outer.limit_exceeded);
+    try std.testing.expect(!inner.limit_exceeded);
+    a.free(bytes);
+    try std.testing.expectEqual(@as(usize, 0), outer.live_bytes);
+    try std.testing.expectEqual(@as(usize, 0), inner.live_bytes);
+    outer.limit_exceeded = false;
+    inner.max_live_bytes = 16;
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 17));
+    try std.testing.expect(inner.limit_exceeded);
+    try std.testing.expect(!outer.limit_exceeded);
+}

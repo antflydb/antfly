@@ -175,3 +175,10 @@ identifiers, have an 8 MiB budget; preview responses also have an 8 MiB budget.
 Exceeding either returns HTTP 422 (`privacy_sample_too_large`); request fewer or
 smaller documents. Automatic sampling streams rows and stops before retaining
 an oversized sample. A rejected preview does not install a policy.
+
+Private range checkpoints have per-table budgets of 256 MiB for staged uploads
+and 8 GiB for retained payloads, including retired generations awaiting cleanup.
+Capacity exhaustion returns HTTP 422 (`privacy_checkpoint_capacity_exceeded`);
+allow cleanup to finish and use fewer or smaller concurrent range scans before
+retrying. Metadata protocol 81 is required for new privacy mutations. Older
+checkpoint headers remain readable and are reclaimed during upgrade.
