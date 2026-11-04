@@ -742,6 +742,9 @@ noinline fn runNormBackward(init: std.process.Init, options: Options) !void {
 /// backend default selection is deliberately left to each session contract.
 fn runEmbeddingStages(init: std.process.Init, model: *inference.server.model_manager.LoadedModel, a: std.mem.Allocator, options: Options) !void {
     var pipeline = model.embeddingPipeline(a);
+    // This standalone benchmark process owns its lifetime and has no serving
+    // supervisor. Use the same explicit native-call policy on every backend.
+    pipeline.execution_control = .{ .native_call_policy = .in_process };
     pipeline.config.pooling = options.embedding_pool.?;
     pipeline.config.normalize = options.embedding_normalize;
     if (options.embedding_resident) |enabled| pipeline.config.resident_text_encoder = enabled;

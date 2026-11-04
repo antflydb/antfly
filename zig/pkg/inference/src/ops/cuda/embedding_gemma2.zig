@@ -1418,7 +1418,10 @@ test "EmbeddingGemma 2 resident contrastive objective bounds logical batch" {
 
 test "embeddinggemma2 CUDA packed column split preserves BF16 bits and row tails" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
-    var ctx = try Context.initDefault();
+    var ctx = Context.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer ctx.deinit();
     var module = try Module.init(&ctx);
     defer module.deinit(&ctx);
@@ -1444,7 +1447,10 @@ test "embeddinggemma2 CUDA packed column split preserves BF16 bits and row tails
 
 test "embeddinggemma2 CUDA extended flash matches scalar attention with mask holes and tile tails" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
-    var ctx = try Context.initDefault();
+    var ctx = Context.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer ctx.deinit();
     if (!@import("artifact.zig").hasBf16WmmaCodeFor(ctx.info.compute_major, ctx.info.compute_minor)) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -1514,7 +1520,10 @@ test "embeddinggemma2 CUDA extended flash matches scalar attention with mask hol
 
 test "CUDA BF16 GELU product preserves PLE and FFN adapter outputs and tails" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
-    var ctx = try Context.initDefault();
+    var ctx = Context.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer ctx.deinit();
     var module = try Module.init(&ctx);
     defer module.deinit(&ctx);

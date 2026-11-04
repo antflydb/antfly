@@ -101,7 +101,7 @@ const ConstructorTrace = struct {
 fn inspectRoot(comptime Cuda: type, source: anytype, bytes: usize) !*Cuda.CudaTensor {
     var root: *Cuda.CudaTensor = @ptrCast(@alignCast(source.value));
     for (0..64) |_| {
-        if (!root.owned_by_tensor or root.resident_references.load(.acquire) != 1 or root.storage_retirement != null or root.resident_owner != null or hasForeignClone(Cuda.CudaTensor, root) or root.physical_lease != null or root.model_constant or root.model_constant_lease != null or root.immutable_cache_backing or root.strict_resident_training or root.quant_type != null or root.tc_quant != null or root.bf16_mirror.ptr != 0 or root.training_upload_host.ptr != null or root.training_upload_generation != null or root.resident_indices != null or root.physical_storage_base) return error.UnsupportedSourcePhysicalOwner;
+        if (!root.owned_by_tensor or root.resident_references.load(.acquire) != 1 or root.storage_retirement != null or root.resident_owner != null or hasForeignClone(Cuda.CudaTensor, root) or root.physical_lease != null or root.model_constant or root.model_constant_quota.hasLease() or root.immutable_cache_backing or root.strict_resident_training or root.quant_type != null or root.tc_quant != null or root.bf16_mirror.ptr != 0 or root.training_upload_host.ptr != null or root.training_upload_generation != null or root.resident_indices != null or root.physical_storage_base) return error.UnsupportedSourcePhysicalOwner;
         for (root.auxiliary_leases) |lease| if (lease != null) return error.UnsupportedSourcePhysicalOwner;
         if (root.buffer.len != bytes or root.elem_count != bytes / 4 or root.dtype != .f32) return error.NonFullSpanSource;
         if (root.owns_buffer) {

@@ -8064,7 +8064,10 @@ test "embeddinggemma2 CUDA BF16 depthwise preparation widens before transpose an
     var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
     defer store.deinitOwned();
     try populateBf16DepthwiseWeight(&store);
-    var compute = try @import("../ops/cuda/cuda_compute.zig").CudaCompute.init(a);
+    var compute = @import("../ops/cuda/cuda_compute.zig").CudaCompute.init(a) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer compute.deinit();
     compute.capability_profile = .embedding_gemma2;
     var it = store.resident_weights.iterator();

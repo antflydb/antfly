@@ -509,6 +509,8 @@ pub const EmbeddingPipeline = struct {
     }
 
     fn embedCohort(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
+        // Cancellation precedes model inspection and selecting its lane order.
+        if (self.execution_control) |control| try control.check();
         // All text routes for one actual dense Qwen model obey the SAME
         // ready/model -> numerical lane order, independent of batching flags.
         const lane = if (self.usesQwenWorkspaceLaneProtocol()) null else try self.enterExecutionLane();
@@ -4601,12 +4603,12 @@ test "resident qwen3 embedding requires a live guard before backend preparation"
         .execution_control = .{ .deadline_ns = 0 },
     };
     const cfg = gpt_arch.Config{ .hidden_size = 4, .num_hidden_layers = 1, .num_attention_heads = 1, .intermediate_size = 8 };
-    try std.testing.expectError(error.Timeout, pipeline.embedTextResidentQwen3(cfg, &.{1}, &.{1}, 1, 1));
+    try std.testing.expectError(error.Timeout, pipeline.embedTextResidentQwen3(cfg, &.{1}, &.{1}, 1, 1, .{ .outside_execution = true }));
     pipeline.execution_control = .{};
-    try std.testing.expectError(error.ProcessIsolationRequired, pipeline.embedTextResidentQwen3(cfg, &.{1}, &.{1}, 1, 1));
+    try std.testing.expectError(error.ProcessIsolationRequired, pipeline.embedTextResidentQwen3(cfg, &.{1}, &.{1}, 1, 1, .{ .outside_execution = true }));
     pipeline.execution_control = .{ .hard_cancellation = .{ .ptr = &probe, .arm_fn = Probe.arm, .disarm_fn = Probe.disarm } };
     // Even backend construction failure must release the pipeline's guard.
-    try std.testing.expectError(error.UnsupportedSessionComputeBackend, pipeline.embedTextResidentQwen3(cfg, &.{1}, &.{1}, 1, 1));
+    try std.testing.expectError(error.UnsupportedSessionComputeBackend, pipeline.embedTextResidentQwen3(cfg, &.{1}, &.{1}, 1, 1, .{ .outside_execution = true }));
     try std.testing.expectEqual(@as(usize, 1), probe.disarms);
     try std.testing.expect(!probe.armed);
 }
