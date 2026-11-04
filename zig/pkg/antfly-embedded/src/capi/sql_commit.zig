@@ -1034,7 +1034,7 @@ test "capi SQL outcome receipt for a named table on a directory handle resolves 
     try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, code);
     const receipt = try lastReceiptAlloc();
     defer std.testing.allocator.free(receipt);
-    const parsed_receipt = try receipts.parse(receipt);
+    const parsed_receipt = try @import("outcome_receipts.zig").parse(receipt);
     const target = parsed_receipt.table().?;
     try std.testing.expectEqualStrings("t", target.name);
     api.antfly_db_close(id);
