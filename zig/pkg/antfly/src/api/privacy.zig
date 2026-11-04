@@ -557,6 +557,7 @@ fn preview(server: anytype, a: A, table: []const u8, body: []const u8, request: 
     const scratch = arena.allocator();
     const input = try std.json.parseFromSlice(Preview, scratch, body, .{});
     try input.value.policy.validate();
+    const version = try scratch.dupe(u8, &(try input.value.policy.identity(scratch)));
     const producer = try projection.resolve(scratch, input.value.policy, true);
     const config = try std.json.Stringify.valueAlloc(scratch, producer.config, .{});
     const documents = try sampleDocuments(server, scratch, table, input.value.sample, request, false);
@@ -588,7 +589,7 @@ fn preview(server: anytype, a: A, table: []const u8, body: []const u8, request: 
             try field.object.put(scratch, "original", if (original == .null) .{ .string = "" } else original);
             for (field.object.getPtr("findings").?.array.items) |*finding| {
                 try finding.object.put(scratch, "document", .{ .string = document.key });
-                try finding.object.put(scratch, "policy_version", .{ .string = try scratch.dupe(u8, &(try input.value.policy.identity(scratch))) });
+                try finding.object.put(scratch, "policy_version", .{ .string = version });
             }
         }
         var row: std.json.Value = .{ .object = .empty };
@@ -596,7 +597,7 @@ fn preview(server: anytype, a: A, table: []const u8, body: []const u8, request: 
         try row.object.put(scratch, "fields", fields);
         try output.array.append(row);
     }
-    const result = .{ .policy_version = (try input.value.policy.identity(scratch))[0..], .sampled = documents.len, .complete_table_scan = false, .external_processing = external(server, producer), .documents = output };
+    const result = .{ .policy_version = version, .sampled = documents.len, .complete_table_scan = false, .external_processing = external(server, producer), .documents = output };
     var size = PreviewSize{ .remaining = @import("antfly_public_limits").privacy_preview_response_bytes };
     try size.add(result);
     return json(a, 200, result);

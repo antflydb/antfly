@@ -1131,6 +1131,11 @@ def test_privacy_large_id_coverage_and_internal_reads(stateful_api, key_bytes):
     path = f"/tables/{table}/privacy"
     installed = stateful_api.put(path, {"mode": "monitor", "fields": ["body"]})
 
+    if key_bytes >= 5_000_000:
+        # A 1,000-row rescan must still split these two 5 MB identifiers at
+        # the discovery byte ceiling, even though every source body is tiny.
+        installed = stateful_api.post(path + "/scans", {"limit": 1000})
+
     def progress_diagnostic():
         return json.dumps(
             {
@@ -1179,6 +1184,7 @@ def test_privacy_large_id_coverage_and_internal_reads(stateful_api, key_bytes):
     assert status["coverage"]["total"] == len(documents), diagnostic
     assert status["coverage"]["current"] == len(documents), diagnostic
     assert scan["phase"] == "succeeded", diagnostic
+    assert scan["scanned"] == len(documents), diagnostic
 
     # Force real HTTP dispatch even when this fixture's shard is resident.
     ranges = stateful_api.get("/cluster")["data"]["ranges"]
@@ -1342,6 +1348,7 @@ def test_preview_identifier_and_streaming_sample_budgets(stateful_api):
 
 def test_privacy_multifield_batches_release_detector_scratch(stateful_api):
     padding = "x" * (32 * 1024)
+    dense_findings = False
     calls = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -1353,7 +1360,18 @@ def test_privacy_multifield_batches_release_detector_scratch(stateful_api):
             prompt = json.loads(request["messages"][1]["content"])
             calls.append(len(prompt["items"]))
             items = [
-                {"item": item["id"], "value": {"findings": [], "padding": padding}}
+                {
+                    "item": item["id"],
+                    "value": {
+                        "findings": [
+                            {"category": "email", "start": 2 * i, "end": 2 * i + 1}
+                            for i in range(2000)
+                        ]
+                        if dense_findings and item["input"] == "a " * 2000
+                        else [],
+                        "padding": padding,
+                    },
+                }
                 for item in prompt["items"]
             ]
             payload = json.dumps(
@@ -1519,6 +1537,25 @@ def test_privacy_multifield_batches_release_detector_scratch(stateful_api):
             assert document[fields[0]] == (
                 large if key == "large-selected" else "hello"
             )
+        # A dense response reuses one policy identity across all findings,
+        # including when category descriptions make canonicalization expensive.
+        api.batch_write(
+            table,
+            inserts={"dense-findings": {fields[0]: "a " * 2000}},
+            sync_level="full_index",
+        )
+        dense_findings = True
+        dense_policy = {
+            **policy,
+            "categories": [{"name": "email", "description": "x" * 16384}],
+        }
+        dense = api.post(
+            f"/tables/{table}/privacy/preview",
+            {"policy": dense_policy, "sample": {"keys": ["dense-findings"]}},
+        )
+        findings = dense["documents"][0]["fields"][0]["findings"]
+        assert len(findings) == 2000
+        assert all(row["policy_version"] == dense["policy_version"] for row in findings)
         # Raising the host projection allowance must not raise provider limits.
         padding = "x" * (1024 * 1024 + 1)
         response = api.s.post(
@@ -1530,6 +1567,152 @@ def test_privacy_multifield_batches_release_detector_scratch(stateful_api):
         assert response.json()["code"] == "InferenceResultTooLarge", response.text[
             :1000
         ]
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_privacy_execution_override_retries_without_changing_identity(stateful_api):
+    calls = []
+    behavior = {"recover_after": None}
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            prompt = json.loads(request["messages"][1]["content"])
+            calls.append(len(prompt["items"]))
+            recovered = (
+                behavior["recover_after"] is not None
+                and len(calls) > behavior["recover_after"]
+            )
+            findings = (
+                [] if recovered else [{"category": "email", "start": 999, "end": 1000}]
+            )
+            items = [
+                {"item": item["id"], "value": {"findings": findings}}
+                for item in prompt["items"]
+            ]
+            payload = json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "id": "fixture",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "antfly_output",
+                                            "arguments": json.dumps({"items": items}),
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = start_http_server(server)
+    api = stateful_api
+    table = "privacy_controls_" + uuid4().hex[:8]
+    api.create_table(table)
+    api.batch_write(table, inserts={"doc": {"body": "hello"}}, sync_level="full_index")
+    policy = {
+        "mode": "monitor",
+        "fields": ["body"],
+        "category_groups": [],
+        "categories": [{"name": "email"}],
+        "execution": {"batch_items": 1, "max_attempts": 1},
+        "producer": {
+            "type": "generator",
+            "revision": "controls-fixture-v1",
+            "config": {
+                "generator": {
+                    "provider": "openai",
+                    "model": "gpt-4.1",
+                    "api_key": "",
+                    "url": f"http://127.0.0.1:{server.server_port}/v1",
+                },
+                "output_schema": {
+                    "type": "object",
+                    "properties": {
+                        "findings": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "category": {"type": "string"},
+                                    "start": {"type": "integer"},
+                                    "end": {"type": "integer"},
+                                },
+                                "required": ["category", "start", "end"],
+                                "additionalProperties": False,
+                            },
+                        }
+                    },
+                    "required": ["findings"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    }
+    path = f"/tables/{table}/privacy"
+
+    def finished(scan_id):
+        scan = api.get(f"{path}/scans/{scan_id}")
+        return scan if scan["phase"] in ("succeeded", "failed") else None
+
+    try:
+        preview = api.s.post(
+            api.url + path + "/preview",
+            json={"policy": policy, "sample": {"keys": ["doc"]}},
+            timeout=90,
+        )
+        assert preview.status_code == 422 and calls == [1], preview.text[:1000]
+        installed = api.put(path, policy)
+        failed = wait_until(
+            lambda: finished(installed["scan_id"]), timeout_s=90, interval_s=0.2
+        )
+        assert failed and failed["phase"] == "failed", failed
+
+        # Tuning is stored separately from immutable producer identity. It must
+        # survive restart, keep current receipts, and govern the next attempt.
+        policy["execution"]["max_attempts"] = 5
+        tuned = api.s.put(
+            api.url + path,
+            json=policy,
+            headers={"If-Match": api.get(path)["etag"]},
+            timeout=90,
+        )
+        assert tuned.status_code == 202, tuned.text[:1000]
+        for field in ("policy_version", "generation", "scan_id"):
+            assert tuned.json()[field] == installed[field]
+        if api.supports_restart:
+            api.restart_server()
+        assert api.get(path)["policy"]["execution"]["max_attempts"] == 5
+        calls.clear()
+        behavior["recover_after"] = 4
+        retry = api.post(path + "/scans", {"limit": 1})
+        recovered = wait_until(
+            lambda: finished(retry["scan_id"]), timeout_s=90, interval_s=0.2
+        )
+        assert recovered and recovered["phase"] == "succeeded", (
+            recovered,
+            calls,
+            api.debug_logs()[-12000:],
+        )
+        assert len(calls) >= 5 and set(calls) == {1}, calls
     finally:
         server.shutdown()
         thread.join(timeout=5)

@@ -18792,6 +18792,76 @@ pub const DB = struct {
         return try self.repairArtifactIssues(alloc, .embedding, limit);
     }
 
+    /// Discovery queues only durable document references. Source capture,
+    /// mapping and detector admission belong to the replay owner, after this
+    /// byte-bounded page has been released. One oversized ID may advance alone.
+    const PrivacyDiscoveryPage = struct {
+        alloc: Allocator,
+        artifact_name: []const u8,
+        limit: usize,
+        byte_limit: usize = 8 * 1024 * 1024,
+        bytes: usize,
+        more: bool = false,
+        references: std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef) = .empty,
+
+        fn init(alloc: Allocator, artifact_name: []const u8, limit: usize) !@This() {
+            if (limit == 0 or limit > 1000) return error.InvalidPrivacyScan;
+            var self = @This(){ .alloc = alloc, .artifact_name = artifact_name, .limit = limit, .bytes = limit * @sizeOf(enrichment_types.GeneratedEnrichmentRef) };
+            try self.references.ensureTotalCapacityPrecise(alloc, limit);
+            return self;
+        }
+        fn deinit(self: *@This()) void {
+            for (self.references.items) |ref| enrichment_types.freeGeneratedRef(self.alloc, ref);
+            self.references.deinit(self.alloc);
+        }
+        fn append(self: *@This(), id: []const u8) !bool {
+            const size = std.math.add(usize, id.len, try std.math.mul(usize, 2, self.artifact_name.len)) catch return error.Overflow;
+            if (self.references.items.len == self.limit or (self.references.items.len != 0 and size > self.byte_limit -| self.bytes)) {
+                self.more = true;
+                return false;
+            }
+            const ref = try enrichment_types.cloneGeneratedRef(self.alloc, .{ .kind = .asset, .index_name = self.artifact_name, .artifact_name = self.artifact_name, .doc_key = id });
+            self.references.appendAssumeCapacity(ref);
+            self.bytes = try std.math.add(usize, self.bytes, size);
+            // Avoid reading a lookahead row (potentially another huge ID).
+            // An extra empty page at exact EOF is safe and advances no work.
+            self.more = self.references.items.len == self.limit or self.bytes >= self.byte_limit;
+            return !self.more;
+        }
+        fn visit(raw: ?*anyopaque, entry: types.ScanVisitEntry) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (!try self.append(entry.id)) return error.Canceled;
+        }
+    };
+
+    fn collectPrivacyDiscovery(self: *DB, alloc: Allocator, artifact_name: []const u8, req: types.DocumentArtifactTableReprocessRequest) !PrivacyDiscoveryPage {
+        var page = try PrivacyDiscoveryPage.init(self.alloc, artifact_name, if (req.limit == 0) 100 else req.limit);
+        errdefer page.deinit();
+        self.scanVisit(alloc, req.from_key, req.to_key, .{ .privacy_original = true, .include_documents = false }, .{ .context = &page, .visit = PrivacyDiscoveryPage.visit }) catch |err| {
+            if (!page.more or err != error.Canceled) return err;
+        };
+        return page;
+    }
+
+    fn reprocessPrivacyRange(self: *DB, alloc: Allocator, artifact_name: []const u8, req: types.DocumentArtifactTableReprocessRequest) !types.DocumentArtifactTableReprocessResult {
+        var page = try self.collectPrivacyDiscovery(alloc, artifact_name, req);
+        defer page.deinit();
+        const count = page.references.items.len;
+        if (count != 0 and self.enrichment_runtime == null) return error.PrivacyReadUnavailable;
+        var result = types.DocumentArtifactTableReprocessResult{ .limit = req.limit, .scanned = count, .reprocessed = count };
+        errdefer result.deinit(alloc);
+        if (page.more and count != 0) result.next_key = try alloc.dupe(u8, page.references.items[count - 1].doc_key);
+        if (count != 0) {
+            var pending = derived_types.DerivedBatch{ .generated_enrichment_refs = try page.references.toOwnedSlice(self.alloc) };
+            defer derived_types.deinitDerivedBatch(self.alloc, &pending);
+            const sequence = try appendDerivedBatchRecord(self, pending);
+            self.executor.notifySequence(sequence);
+            self.enrichment_runtime.?.notifySequence(sequence);
+            self.notifyResolverReplayRuntimes(sequence);
+        }
+        return result;
+    }
+
     pub fn reprocessDocumentArtifactRange(
         self: *DB,
         alloc: Allocator,
@@ -18836,9 +18906,10 @@ pub const DB = struct {
         }
 
         const limit = if (effective_req.limit == 0) @as(u32, 100) else effective_req.limit;
+        effective_req.limit = limit;
+        if (@import("../../privacy/document.zig").isArtifactName(artifact_name)) return self.reprocessPrivacyRange(alloc, artifact_name, effective_req);
         const scan_limit = if (limit == std.math.maxInt(u32)) limit else limit + 1;
         var scanned = try self.scan(alloc, effective_req.from_key, effective_req.to_key, .{
-            .privacy_original = @import("../../privacy/document.zig").isArtifactName(artifact_name),
             .include_documents = true,
             .limit = scan_limit,
         });
@@ -18856,38 +18927,6 @@ pub const DB = struct {
         errdefer result.deinit(alloc);
 
         const process_len = @min(scanned.documents.len, @as(usize, @intCast(limit)));
-        if (@import("../../privacy/document.zig").isArtifactName(artifact_name)) {
-            if (process_len != 0 and self.enrichment_runtime == null) return error.PrivacyReadUnavailable;
-            // Queue native producer references without rewriting originals or
-            // their TTLs. Accepted current receipts may be reused; failed and
-            // stale inputs enter the ordinary batched producer/retry lane.
-            var inputs = std.ArrayListUnmanaged(types.BatchWrite).empty;
-            defer inputs.deinit(alloc);
-            var mapped = std.ArrayListUnmanaged(mapper.ExtractedWrite).empty;
-            defer {
-                for (mapped.items) |*value| value.deinit(alloc);
-                mapped.deinit(alloc);
-            }
-            for (scanned.documents[0..process_len]) |doc| {
-                try inputs.append(alloc, .{ .key = doc.id, .value = doc.json });
-                var extracted = try mapper.extractWrite(alloc, doc.id, doc.json);
-                errdefer extracted.deinit(alloc);
-                try mapped.append(alloc, extracted);
-            }
-            var pending: derived_types.DerivedBatch = .{};
-            defer derived_types.deinitDerivedBatch(self.alloc, &pending);
-            try appendGeneratedEnrichments(self, &pending, .{ .writes = inputs.items, .sync_level = .write }, mapped.items, &.{artifact_name}, false);
-            if (pending.generated_enrichment_refs.len != 0) {
-                const sequence = try appendDerivedBatchRecord(self, pending);
-                self.executor.notifySequence(sequence);
-                self.enrichment_runtime.?.notifySequence(sequence);
-                self.notifyResolverReplayRuntimes(sequence);
-            }
-            result.scanned = process_len;
-            result.reprocessed = process_len;
-            if (scanned.documents.len > process_len and process_len > 0) result.next_key = try alloc.dupe(u8, scanned.documents[process_len - 1].id);
-            return result;
-        }
         for (scanned.documents[0..process_len]) |doc| {
             result.scanned += 1;
             const handled = self.reprocessDocumentArtifact(alloc, doc.id, artifact_name) catch |err| switch (err) {
@@ -145058,6 +145097,46 @@ test "privacy ID scans retain bounded request memory with large original documen
     var visitor = Visitor{ .a = request_arena.allocator(), .tracker = &tracker, .expected_hash = std.hash.Wyhash.hash(0, raw) };
     try db.scanVisit(request_arena.allocator(), "", "", .{ .privacy_original = true, .include_documents = false }, .{ .context = &visitor, .visit = Visitor.visit });
     try std.testing.expectEqual(@as(usize, 12), visitor.count);
+    // Exercise the production discovery collector, not just its scan primitive.
+    // The page owns identifiers/references only, independent of source size.
+    var page = try db.collectPrivacyDiscovery(request_arena.allocator(), @import("../../privacy/document.zig").artifact_name, .{ .limit = 1000 });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 12), page.references.items.len);
+    try std.testing.expect(!page.more);
+    try std.testing.expect(tracker.allocated_bytes - tracker.freed_bytes < 256 * 1024);
+    for (page.references.items, 0..) |ref, i| {
+        const expected = try std.fmt.allocPrint(a, "doc-{d:0>2}", .{i});
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, ref.doc_key);
+        try std.testing.expectEqualStrings(@import("../../privacy/document.zig").artifact_name, ref.artifact_name);
+    }
+}
+
+test "privacy discovery bounds reference bytes and row count while advancing oversized IDs" {
+    const a = std.testing.allocator;
+    const name = @import("../../privacy/document.zig").artifact_name;
+    var page = try DB.PrivacyDiscoveryPage.init(a, name, 3);
+    defer page.deinit();
+    page.byte_limit = page.bytes + 2 * name.len + 4;
+    try std.testing.expect(try page.append("abc"));
+    try std.testing.expect(!try page.append("def"));
+    try std.testing.expect(page.more);
+    try std.testing.expectEqual(@as(usize, 1), page.references.items.len);
+    try std.testing.expectEqualStrings("abc", page.references.items[0].doc_key);
+
+    var oversized = try DB.PrivacyDiscoveryPage.init(a, name, 1000);
+    defer oversized.deinit();
+    oversized.byte_limit = 1;
+    try std.testing.expect(!try oversized.append("one-oversized-id"));
+    try std.testing.expect(oversized.more);
+    try std.testing.expectEqual(@as(usize, 1), oversized.references.items.len);
+
+    var rows = try DB.PrivacyDiscoveryPage.init(a, name, 1);
+    defer rows.deinit();
+    try std.testing.expect(!try rows.append("one"));
+    try std.testing.expect(rows.more);
+    try std.testing.expectEqual(@as(usize, 1), rows.references.items.len);
+    try std.testing.expectError(error.InvalidPrivacyScan, DB.PrivacyDiscoveryPage.init(a, name, 1001));
 }
 
 test "public graph metric borrowed wire document scan producers preserve projection and cancellation" {
