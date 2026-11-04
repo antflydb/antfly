@@ -1285,6 +1285,13 @@ before releasing the predecessor. Unchanged immutable artifact ranges transfer
 through the inode/root-fenced source pool, so fresh mutable replay actors do not
 require fresh durable leases for every unchanged segment. Failed construction
 leaves the predecessor owned; an active merge keeps its independent reference.
+When providers require ending the old runtime before replacement, a separate
+handoff pins only immutable text readers, with one file-wide limit of 256 MiB
+and 1,024 segments. It retains no primary epoch or provider/query capability.
+The successor consumes the pins after opening the same namespace; unused pins
+expire after five seconds and are released by the maintenance audit or close.
+This optional bridge grants no runtime reuse or publication authority: new
+readers still match inode and immutable value identity through the source pool.
 Private merge staging preserves the runtime's original logical witnesses even
 when allocator admission adopts a newer physical checkpoint. Private bytes do
 not grant authority over a foreign index publication. Nested writer leases also

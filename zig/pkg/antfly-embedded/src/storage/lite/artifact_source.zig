@@ -169,6 +169,14 @@ pub const Registry = struct {
         self.release();
     }
 
+    /// Immutable decoder metadata can outlive its Store even when its range
+    /// Source was pooled from a different registry. Keep this Store's resource
+    /// accounting owner alive until that metadata is released. Backend close
+    /// transfers the owned manager here before dropping its owner reference.
+    pub fn retainOwner(self: *Registry) void {
+        _ = self.references.fetchAdd(1, .monotonic);
+    }
+
     fn beginCallback(self: *Registry) ?*docs.Store {
         const runtime = self.io();
         self.mutex.lockUncancelable(runtime);

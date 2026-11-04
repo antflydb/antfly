@@ -370,6 +370,55 @@ const TextSourceRuntimeCache = struct {
     }
 };
 
+const ImmutableTextHandoff = struct {
+    const Pins = @import("immutable_text_handoff.zig").Handoff(@import("../index.zig").IndexSnapshot, segment_mod.SegmentSource);
+    const max_bytes = 256 * 1024 * 1024;
+    const max_segments = 1024;
+    const lifetime_ns = 5 * std.time.ns_per_s;
+    pins: Pins = .{ .allocator = alloc },
+    resource_owner: *artifact_source.Registry,
+    table_id: u64,
+    incarnation: @FieldType(h.db_mod.DB, "root_incarnation"),
+    expires_ns: u64,
+
+    fn capture(root: *h.Handle, database: *h.db_mod.DB) !?ImmutableTextHandoff {
+        const backend = &root.owned_lite_backend.?;
+        const manager = backend.owned_resource_manager orelse return null;
+        // A borrowed/external resource manager needs its own lifetime
+        // capability. Keep those runtimes on the ordinary cold path.
+        if (database.core.index_manager.resource_manager != manager or database.core.index_manager.owned_resource_manager != null) return null;
+        const resource_owner = backend.native_docstore.?.artifact_registry orelse return null;
+        resource_owner.retainOwner();
+        var result: ImmutableTextHandoff = .{
+            .resource_owner = resource_owner,
+            .table_id = database.core.identity_namespace.table_id,
+            .incarnation = database.root_incarnation,
+            .expires_ns = @import("antfly_platform").time.monotonicNs() +| lifetime_ns,
+        };
+        errdefer result.deinit();
+        const indexes = database.core.index_manager;
+        indexes.catalog_mutex.lockShared();
+        defer indexes.catalog_mutex.unlockShared();
+        for (indexes.text_indexes.items, 0..) |*entry, ordinal| {
+            if (ordinal == 128 or result.pins.segments == max_segments or result.pins.bytes == max_bytes) break;
+            _ = try result.pins.append(entry.persistent.acquireSnapshot(), max_bytes, max_segments);
+        }
+        if (result.pins.uses.items.len == 0) {
+            result.deinit();
+            return null;
+        }
+        return result;
+    }
+
+    fn deinit(self: *ImmutableTextHandoff) void {
+        // The range may belong to an older pooled registry. Decoder memory
+        // still belongs to this runtime's manager, including on second and
+        // later handoffs after its DB and backend have already closed.
+        self.pins.deinit();
+        self.resource_owner.releaseOwner();
+    }
+};
+
 // Completed producer bytes are delivered to the current runtime, rather than
 // replaying inference whenever an unrelated primary commit moves the file tip.
 pub const ShadowScope = struct { name: []const u8, generation: u64, prefix: []const u8 };
@@ -1254,6 +1303,7 @@ pub const Owner = struct {
     // No primary read epoch or borrowed catalog proof is retained here.
     maintenance_retained_logical: ?native.LogicalGenerations = null,
     text_source_runtime_cache: ?*TextSourceRuntimeCache = null,
+    immutable_text_handoff: ?ImmutableTextHandoff = null,
     maintenance_table_cursor: usize = 0,
     maintenance_round_pending: bool = false,
     maintenance_round_ttl_pending: bool = false,
@@ -2181,9 +2231,38 @@ pub const Owner = struct {
         self.text_source_runtime_cache = null;
     }
 
+    fn clearImmutableTextHandoff(self: *Owner) void {
+        if (self.immutable_text_handoff) |*handoff| handoff.deinit();
+        self.immutable_text_handoff = null;
+    }
+
+    fn preserveImmutableTextHandoff(self: *Owner, root: *h.Handle, database: *h.db_mod.DB) void {
+        // Caller owns the owner gate. Snapshot acquisition and Source uses
+        // are bounded metadata/refcount operations; they perform no I/O.
+        // This is one file-wide optional budget, not one per namespace. An
+        // allocation or resource refusal must not alter a committed outcome.
+        self.clearImmutableTextHandoff();
+        if (self.stopping.load(.acquire)) return;
+        if (self.current) |current| if (needsOutcomeReconciliation(current)) return;
+        self.immutable_text_handoff = ImmutableTextHandoff.capture(root, database) catch null;
+    }
+
+    fn consumeImmutableTextHandoff(self: *Owner, database: *h.db_mod.DB) void {
+        if (self.immutable_text_handoff) |handoff| {
+            if (handoff.table_id == database.core.identity_namespace.table_id and handoff.incarnation == database.root_incarnation)
+                self.clearImmutableTextHandoff();
+        }
+    }
+
+    fn expireImmutableTextHandoff(self: *Owner, now_ns: u64) void {
+        if (self.immutable_text_handoff) |handoff| if (now_ns >= handoff.expires_ns)
+            self.clearImmutableTextHandoff();
+    }
+
     /// Caller owns the gate and a quiescent local turn. A merge owns its own
     /// reference, so retiring this cache cannot close its inputs.
     fn discardMaintenanceRuntime(self: *Owner) void {
+        self.clearImmutableTextHandoff();
         self.clearTextSourceRuntimeCache();
         self.maintenance_retained_logical = null;
         // A failed physical publication can already have cleared its source
@@ -2310,7 +2389,8 @@ pub const Owner = struct {
                 snapshot.sql_ddl_recovery_needed = physical_tip != null or foreground.sql_ddl_recovery_needed;
                 snapshot.sql_ddl_recovery_generation = foreground.sql_ddl_recovery_generation;
                 self.configureRetirementBudget(cached_store);
-                if (name) |selected_name| _ = try self.openMaintenanceNamespace(snapshot, selected_name);
+                const selected_database = if (name) |selected_name| try self.openMaintenanceNamespace(snapshot, selected_name) else &snapshot.db;
+                if (need_database) self.consumeImmutableTextHandoff(selected_database);
                 return snapshot;
             }
         }
@@ -2381,7 +2461,8 @@ pub const Owner = struct {
         // without republishing one durable lease per segment. Mutable actors
         // are still freshly constructed, and inode/root identities fence each
         // pooled range. A failed open leaves the old snapshot owned here.
-        if (name) |selected_name| _ = try self.openMaintenanceNamespace(snapshot, selected_name);
+        const selected_database = if (name) |selected_name| try self.openMaintenanceNamespace(snapshot, selected_name) else &snapshot.db;
+        if (need_database) self.consumeImmutableTextHandoff(selected_database);
         if (self.maintenance_snapshot) |old| {
             try store.file.inheritAllocatorVerification(&old.owned_lite_backend.?.native_docstore.?.file);
             // Policy scheduling and telemetry belong to this connection;
@@ -2764,6 +2845,7 @@ pub const Owner = struct {
         var gate_locked = true;
         defer if (gate_locked) self.gate.mutex.unlock(io);
         if (self.stopping.load(.acquire)) return false;
+        self.expireImmutableTextHandoff(@import("antfly_platform").time.monotonicNs());
         // A foreground proof owns the admission lane. Refresh can open index
         // sources and publish lease metadata, so yield before even capturing
         // a runtime. The gate protects this flag through the capture boundary.
@@ -3297,6 +3379,14 @@ pub const Owner = struct {
         const retained_logical: ?native.LogicalGenerations = if (retain_artifact_runtime or retain_source_runtime) store.file.activeCheckpoint().logical else null;
         const merge_owns_root = if (self.pending_text_merge) |active| active.root == root else false;
         if (independent and root.db_live and !retain_artifact_runtime and !retain_source_runtime and !merge_owns_root) {
+            // Provider/query actors and their primary observations still end
+            // here. Only a bounded immutable reader bridge survives to the
+            // next constructor, and only while this namespace has source debt.
+            if (run_source and source_more and maintenance_error == null) {
+                self.gate.mutex.lockUncancelable(io);
+                self.preserveImmutableTextHandoff(root, database);
+                self.gate.mutex.unlock(io);
+            }
             // End the input fences before reclamation. Keeping them in an
             // idle runtime would needlessly prevent in-place page service.
             @import("tables.zig").closeAll(root);
@@ -3788,6 +3878,7 @@ pub const Owner = struct {
 
     fn deinit(self: *Owner) void {
         if (self.worker) |worker| worker.join();
+        self.clearImmutableTextHandoff();
         self.clearTextSourceRuntimeCache();
         const uncertain_merge = if (self.pending_text_merge) |pending| needsOutcomeReconciliation(pending.root) else false;
         self.discardPendingTextMerge();
@@ -8592,20 +8683,46 @@ test "capi native named runtime replacement hands off immutable artifact sources
     const first = try owner.refreshMaintenanceSnapshotNamed(foreground, .source, "active");
     try std.testing.expect(first.embedded_tables.contains("active"));
     try std.testing.expect(first.owned_lite_backend.?.native_docstore.?.file.allocator_work.artifact_source_opens != 0);
-    try foreground.owned_lite_backend.?.native_docstore.?.file.putDocument("handoff-primary-tip", "fresh");
+    const live = try owner.refresh();
+    try live.owned_lite_backend.?.native_docstore.?.file.putDocument("handoff-primary-tip", "fresh");
+    const selected = try tables.get(first, "active");
+    var rejected: ImmutableTextHandoff.Pins = .{ .allocator = alloc };
+    defer rejected.deinit();
+    try std.testing.expect(!try rejected.append(selected.core.index_manager.text_indexes.items[0].persistent.acquireSnapshot(), 0, 0));
+    owner.preserveImmutableTextHandoff(first, selected);
+    try std.testing.expect(owner.immutable_text_handoff != null);
+    try std.testing.expect(owner.immutable_text_handoff.?.pins.bytes <= ImmutableTextHandoff.max_bytes);
+    // Exercise the actual unsupported-runtime boundary: every mutable actor
+    // and DB is closed before construction of its replacement starts.
+    tables.closeAll(first);
+    first.db.closeImmutableSnapshot();
+    first.db_live = false;
     // No mutable-runtime witness is installed. This is a real replacement,
     // even though every immutable input remains identical.
     try std.testing.expect(owner.text_source_runtime_cache == null);
-    const second = try owner.refreshMaintenanceSnapshotNamed(foreground, .source, "active");
+    const second = try owner.refreshMaintenanceSnapshotNamed(live, .source, "active");
     try std.testing.expect(second != first);
     const file = &second.owned_lite_backend.?.native_docstore.?.file;
     try std.testing.expectEqual(@as(u64, 0), file.allocator_work.artifact_source_opens);
     try std.testing.expect(file.allocator_work.artifact_source_reuses != 0);
-    var row = (try (try tables.get(second, "active")).lookup(std.testing.allocator, "one", .{})) orelse return error.TestUnexpectedResult;
-    defer row.deinit(std.testing.allocator);
+    try std.testing.expect(owner.immutable_text_handoff == null);
+    {
+        var row = (try (try tables.get(second, "active")).lookup(std.testing.allocator, "one", .{})) orelse return error.TestUnexpectedResult;
+        defer row.deinit(std.testing.allocator);
+    }
     const fresh = (try file.getDocumentAlloc(std.testing.allocator, "handoff-primary-tip")) orelse return error.TestUnexpectedResult;
     defer std.testing.allocator.free(fresh);
     try std.testing.expectEqualStrings("fresh", fresh);
+    try std.testing.expect((try file.check()).valid);
+    owner.preserveImmutableTextHandoff(second, try tables.get(second, "active"));
+    try std.testing.expect(owner.immutable_text_handoff != null);
+    // The reused range belongs to the first registry, but the new decoder's
+    // allocations belong to the second. Both must survive full backend close.
+    owner.maintenance_snapshot = null;
+    Owner.closeMaintenanceSnapshot(second);
+    try std.testing.expect(owner.immutable_text_handoff.?.resource_owner.owned_resources != null);
+    owner.expireImmutableTextHandoff(std.math.maxInt(u64));
+    try std.testing.expect(owner.immutable_text_handoff == null);
 }
 
 test "capi native maintenance relational replay diagnoses bounded runtime reuse" {
