@@ -223,6 +223,8 @@ const Execution = struct {
 fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Binding, options: configured.BindingObjectStoreOpenOptions, request: Options, protected: []const []const u8, pin_store: pins.Store, destination: catalog.row_commit.Files, plans: *plan.Store, job: Job) !Result {
     var client = plans.client;
     const context = plans.context;
+    var visits: ?catalog.retirement_index.Index = null;
+    defer if (visits) |*index| index.deinit();
     const key = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-execution/{s}.json", .{ plans.prefix, catalog.types.digestHex(request.operation_id) });
     const job_hash = try a.dupe(u8, &catalog.types.digestHex(try std.json.Stringify.valueAlloc(a, job, .{})));
     var saved = client.getObject(plans.bucket, key, .{ .max_response_bytes = catalog.types.max_commit_bytes, .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
@@ -273,9 +275,11 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
                 if (!ready.references.ready) break :selection;
                 var candidates: std.ArrayList([]const u8) = .empty;
                 var selected: std.ArrayList([]const u8) = .empty;
-                var seen = catalog.retirement_index.Index.init(a, client, plans.bucket, try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-traversal", .{plans.prefix}), context);
-                defer seen.deinit();
-                var walker = try plan.Walker.init(plans, job.retired, &seen, progress.cursor);
+                visits = catalog.retirement_index.Index.init(a, client, plans.bucket, try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-traversal", .{plans.prefix}), context);
+                const seen = &visits.?;
+                if (progress.cursor.visited != null) seen.loadHints() catch {};
+                try context.ensureActive();
+                var walker = try plan.Walker.init(plans, job.retired, seen, progress.cursor);
                 var steps = catalog.types.max_reference_steps - ready.references.steps;
                 if (steps == 0) break :selection;
                 var exhausted = false;
@@ -344,6 +348,12 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
     else
         try client.putObject(plans.bucket, key, bytes, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&context) });
     stored.deinit(client.allocator);
+    // Only the saved cursor admits traversal. Reuse authenticated visited nodes
+    // across cold turns, publishing this optional cache after the progress CAS.
+    if (visits) |*index| {
+        index.saveHints(&.{progress.cursor.visited}) catch {};
+        try context.ensureActive();
+    }
     result.complete = progress.complete and try input_store.finish(a);
     return result;
 }
@@ -1033,6 +1043,12 @@ test "external lake vacuum resumes 200 snapshots within remote budgets and reval
     for (job.retired) |retired| {
         try std.testing.expect(retired.objects.len == 0 and retired.object_plan != null);
     }
+    // Cold turns must reuse bounded visited-node metadata, not fetch the same
+    // immutable trie on every resume. The saved cursor remains the authority.
+    const hint_key = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-traversal/warm-v1.json", .{try ingestion.prefix(a, queue.prefix, binding, options)});
+    var hint = try queue.client.getObject(queue.bucket, hint_key, .{});
+    defer hint.deinit(queue.client.allocator);
+    try std.testing.expect(hint.body.len <= catalog.retirement_index.hint_bytes);
     // Expired source lists are gone. A fresh process must finish from journal
     // inventories, without relying on their cached source bytes.
     const replay = try run(alloc, binding, options, .{}, request, &.{});

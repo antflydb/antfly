@@ -479,6 +479,18 @@ excessive node count and bounded partial-cache fallback. All six hint tests and
 700 Debug lake tests passed, with one additional skip and no leaks. Fresh
 provider and optimized workload qualification of these changes remains required.
 
+A later, heavier Debug job expired 108 snapshots and continued making deletion
+progress, but remained pending after two bounded continuations. Samples located
+additional cold reads in `Walker.enter`: the visited-set trie was batched but
+did not reuse persisted hints across turns. Its traversal namespace now has its
+own bounded hint key, loaded on resume and warmed only after the execution cursor
+CAS succeeds. The cursor and canonical hash checks remain authoritative; absent
+or invalid hints fall back to required reads. A 200-snapshot integration control
+failed with a missing hint before this change and passes afterward, alongside
+all 25 focused vacuum tests without leaks. Fresh optimized qualification remains
+required; the larger job's durations are not a controlled comparison with the
+earlier qualification workload.
+
 Next work should:
 
 1. Attribute the remaining accepted-search failures with live public stages,
