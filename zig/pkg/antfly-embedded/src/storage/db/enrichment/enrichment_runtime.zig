@@ -2765,8 +2765,21 @@ fn logicalRequestFingerprint(supplied: enrichment_types.GeneratedEnrichmentReque
     return finishFailureFingerprint(&hash);
 }
 
+/// Volatile state belongs to this runtime's immutable owner/lease key and one
+/// acquired epoch. No allocations are needed to retain a failed commit. A new
+/// tenure must reload durable state: slot ownership and retry debt may have
+/// changed while another worker owned the namespace.
+const PendingScopedRetries = struct {
+    state: scoped_retries.State,
+    lease_epoch: u64,
+    fn deinit(self: *@This(), a: Allocator) void {
+        self.state.deinit(a);
+    }
+};
+
 const ScopedReplay = struct {
     state: scoped_retries.State,
+    lease_epoch: u64 = 0,
     unsaved: bool = false,
     mutex: Io.Mutex = .init,
     hints: std.AutoHashMapUnmanaged(u64, u64) = .empty,
@@ -2774,10 +2787,23 @@ const ScopedReplay = struct {
     sources: std.AutoHashMapUnmanaged(u64, [32]u8) = .empty,
     hint_failed: bool = false,
 
+    fn load(runtime: *EnrichmentRuntime) !@This() {
+        const fence = try requiredRuntimeStoreWriteFence(runtime);
+        const epoch = if (fence) |value| value.epoch else 0;
+        var pending = runtime.pending_scoped_retries;
+        runtime.pending_scoped_retries = null;
+        if (pending) |*saved| {
+            if (saved.lease_epoch == epoch)
+                return .{ .state = saved.state, .lease_epoch = epoch, .unsaved = true };
+            saved.deinit(runtime.alloc);
+        }
+        return .{ .state = try enrichment_state.loadScopedRetries(runtime.alloc, runtime.store), .lease_epoch = epoch };
+    }
+
     fn retainUncommitted(self: *@This(), runtime: *EnrichmentRuntime) void {
         if (!self.unsaved) return;
         std.debug.assert(runtime.pending_scoped_retries == null);
-        runtime.pending_scoped_retries = self.state;
+        runtime.pending_scoped_retries = .{ .state = self.state, .lease_epoch = self.lease_epoch };
         self.state = .{};
     }
     fn deinit(self: *@This(), a: Allocator) void {
@@ -3112,6 +3138,10 @@ const ScopedReplay = struct {
     }
     fn saveAssumeLocked(self: *@This(), runtime: *EnrichmentRuntime, store: backend_erased.Store, fence: ?GeneratedWriteFence) !void {
         self.unsaved = true;
+        // A fresh fence cannot authorize a snapshot from an older tenure.
+        // The transaction-local check below still protects takeover/expiry
+        // after this in-memory comparison.
+        if (self.lease_epoch != (if (fence) |value| value.epoch else @as(u64, 0))) return error.EnrichmentLeaseFenceLost;
         const Guard = struct {
             runtime: *EnrichmentRuntime,
             fence: ?GeneratedWriteFence,
@@ -6926,7 +6956,7 @@ const UnsupportedEnrichmentRuntime = struct {
     next_retry_at_ms: u64 = 0,
     retry_after_hint_ms: u64 = 0,
     retry_scheduler: ?*ScopedReplay = null,
-    pending_scoped_retries: ?scoped_retries.State = null,
+    pending_scoped_retries: ?PendingScopedRetries = null,
     scoped_retry_pending: bool = false,
     scoped_retry_full: bool = false,
     scoped_retry_has_tail: bool = false,
@@ -7470,7 +7500,7 @@ const PlatformEnrichmentRuntime = struct {
     next_retry_at_ms: u64 = 0,
     retry_after_hint_ms: u64 = 0,
     retry_scheduler: ?*ScopedReplay = null,
-    pending_scoped_retries: ?scoped_retries.State = null,
+    pending_scoped_retries: ?PendingScopedRetries = null,
     scoped_retry_pending: bool = false,
     scoped_retry_full: bool = false,
     scoped_retry_has_tail: bool = false,
@@ -9840,9 +9870,7 @@ fn runForegroundCatchUpPassOwned(
     runtime.mutex.unlock(io);
     if (already_failed) return;
     try scavengeSharedPdfConsumerAttempts(runtime);
-    const pending_state = runtime.pending_scoped_retries;
-    var scheduler = ScopedReplay{ .state = pending_state orelse try enrichment_state.loadScopedRetries(runtime.alloc, runtime.store), .unsaved = pending_state != null };
-    runtime.pending_scoped_retries = null;
+    var scheduler = try ScopedReplay.load(runtime);
     defer {
         // A failed metadata commit must retry persistence before another provider
         // call. Transfer ownership without allocating on the failure path.
@@ -43450,9 +43478,9 @@ test "durable enrichment scoped retry permits healthy targets and restores exact
     try std.testing.expectError(error.InputOutput, restarted.saveAssumeLocked(&runtime, failing, null));
     restarted.retainUncommitted(&runtime);
     try std.testing.expectEqual(@as(usize, 0), restarted.state.tickets.items.len);
-    var recovered = ScopedReplay{ .state = runtime.pending_scoped_retries.?, .unsaved = true };
-    runtime.pending_scoped_retries = null;
+    var recovered = try ScopedReplay.load(&runtime);
     defer recovered.deinit(a);
+    try std.testing.expect(recovered.unsaved);
     try std.testing.expectEqual(deadline, recovered.state.deadline());
     try recovered.saveAssumeLocked(&runtime, erased, null);
     try std.testing.expect(!recovered.unsaved);
@@ -43494,10 +43522,12 @@ test "durable enrichment scoped retry fences superseded metadata writers" {
     };
     defer runtime.ownership.deinit(a);
     try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
-    var scheduler = ScopedReplay{ .state = .{ .scanned_sequence = 123 } };
+    var scheduler = ScopedReplay{ .state = .{ .scanned_sequence = 123 }, .lease_epoch = runtime.ownership.lease_epoch };
     defer scheduler.deinit(a);
     try scheduler.state.park(a, .{ .doc_key = "old", .sequence = 123 }, 1_800_000_000_000, .{ .fingerprint = 1, .logical_fingerprint = 1, .failures = 1 }, null);
     try scheduler.save(&runtime);
+    // A failed invocation dirties a slot before the current tenure is lost.
+    try scheduler.state.park(a, .{ .doc_key = "old", .sequence = 123 }, 1_800_000_000_000, .{ .fingerprint = 1, .logical_fingerprint = 1, .failures = 2 }, null);
     const replacement = try std.fmt.allocPrint(a, "{{\"owner_id\":\"second\",\"epoch\":{d},\"expires_at_ms\":{d}}}", .{ runtime.ownership.lease_epoch + 1, runtime.clock.nowRealtimeMs() + 30_000 });
     defer a.free(replacement);
     {
@@ -43523,4 +43553,41 @@ test "durable enrichment scoped retry fences superseded metadata writers" {
     defer after.deinit(a);
     try std.testing.expect(rejected);
     try std.testing.expect(after.hasDocument("c3VjY2Vzc29y"));
+
+    // The old runtime can regain ownership after the successor's lease ends.
+    // Its new fence must not authorize the old dirty slot or scan cursor.
+    const old_epoch = runtime.ownership.lease_epoch;
+    const expired = try std.fmt.allocPrint(a, "{{\"owner_id\":\"second\",\"epoch\":{d},\"expires_at_ms\":0}}", .{old_epoch + 1});
+    defer a.free(expired);
+    {
+        var txn = try erased.beginBatch();
+        errdefer txn.abort();
+        try txn.put(enrichment_lease.default_lease_key, expired);
+        try txn.commit();
+    }
+    runtime.ownership.noteAcquireFailure();
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    try std.testing.expect(runtime.ownership.lease_epoch > old_epoch);
+    try std.testing.expectError(error.EnrichmentLeaseFenceLost, scheduler.save(&runtime));
+    scheduler.retainUncommitted(&runtime);
+    var resumed = try ScopedReplay.load(&runtime);
+    defer resumed.deinit(a);
+    try std.testing.expect(runtime.pending_scoped_retries == null);
+    try std.testing.expect(!resumed.unsaved);
+    try std.testing.expectEqual(runtime.ownership.lease_epoch, resumed.lease_epoch);
+    try std.testing.expect(!resumed.state.hasDocument("b2xk"));
+    try std.testing.expect(resumed.state.hasDocument("c3VjY2Vzc29y"));
+    try std.testing.expectEqual(@as(u64, 124), resumed.state.scanned_sequence);
+    try std.testing.expectEqual(@as(u64, 123), resumed.state.appliedThrough(200));
+    try std.testing.expectEqual(@as(u32, 3), resumed.state.prior(2).failures);
+    try std.testing.expectEqual(@as(u64, 1_900_000_000_000), resumed.state.deadline());
+    // New work in the resumed tenure coexists with the successor's debt.
+    try resumed.state.park(a, .{ .doc_key = "fresh", .sequence = 125 }, 2_000_000_000_000, .{ .fingerprint = 3, .failures = 1 }, null);
+    try resumed.save(&runtime);
+    var final_state = try enrichment_state.loadScopedRetries(a, erased);
+    defer final_state.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), final_state.tickets.items.len);
+    try std.testing.expect(final_state.hasDocument("c3VjY2Vzc29y"));
+    try std.testing.expectEqual(@as(u32, 3), final_state.prior(2).failures);
+    try std.testing.expectEqual(@as(u32, 1), final_state.prior(3).failures);
 }

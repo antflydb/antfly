@@ -319,9 +319,13 @@ actually attempted, preserving other clocks and failures scheduled during the
 pass. The contiguous applied watermark stays behind the earliest deferred
 source, retaining its journal history while healthy discovery advances. Legacy
 per-lane cursors cannot certify completion during scoped replay. If a metadata
-commit fails, the runtime retains the bounded uncommitted state and flushes it
-before invoking another provider. Artifact source guards keep crash replay
-idempotent; volatile publication receipts are cleared after each durable scan.
+commit fails, the runtime retains the bounded uncommitted state with its
+originating lease epoch and flushes it before invoking another provider in that
+same tenure. A new tenure discards that volatile snapshot and reloads the durable
+queue, preserving a successor's slot ownership, clocks, budgets, and scan cursor.
+A fresh lease fence cannot authorize a snapshot from an older epoch. Artifact
+source guards keep crash replay idempotent; volatile publication receipts are
+cleared after each durable scan.
 
 One behavior changed deliberately from the historical strictly-sequential
 implementation: a fatal (non-retryable) error in one lane no longer aborts
