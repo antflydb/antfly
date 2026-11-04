@@ -167,6 +167,10 @@ const TensorCorePlanLease = struct {
         const key = self.pending_key orelse return true;
         const allocator = cublas.allocator orelse return false;
         spinLock(&cublas.tensor_core_plans_mutex);
+        if (cublas.plan_cache_cleanup_pending) {
+            cublas.tensor_core_plans_mutex.unlock();
+            return false;
+        }
         if (cublas.tensor_core_plans.contains(key)) {
             cublas.tensor_core_plans_mutex.unlock();
             self.pending_key = null;
@@ -282,6 +286,7 @@ pub const CublasLt = struct {
     plan_cache_misses: usize = 0,
     uncached_plans: usize = 0,
     plan_cache_refreshes: usize = 0,
+    plan_cache_cleanup_pending: bool = false,
     // Bias pointers are invocation data in a cached descriptor. Serialize
     // biased submissions through the API call that consumes that descriptor;
     // ordinary serving plans never share this descriptor kind.
@@ -303,23 +308,26 @@ pub const CublasLt = struct {
         self.plan_cache_capacity = capacity;
     }
 
-    /// Caller owns the complete backend execution lane and has retired every
-    /// graph that could reference these plans. Refresh only at that boundary,
-    /// never by evicting a descriptor borrowed by an asynchronous invocation.
-    /// The configured capacity and retained hash-map allocation stay unchanged.
+    /// Caller owns the complete backend execution lane: no host invocation may
+    /// still borrow a cached descriptor. cuBLASLt consumes these host-side
+    /// descriptors during submission; captured graph nodes own copied launch
+    /// arguments, not the descriptors. Matrix/workspace addresses and the
+    /// library/context lifetime remain owned independently by the graph.
+    /// Refresh refuses active capture and drains prior submissions. The cache
+    /// retains failed SDK handles so a checked retry can finish destruction.
     pub fn reserveTensorCorePlanSlots(self: *CublasLt, ctx: *context_mod.CudaContext, slots: usize) Error!bool {
         if (slots == 0 or slots > self.plan_cache_capacity or self.allocator == null) return false;
         spinLock(&self.tensor_core_plans_mutex);
-        const refresh = self.tensor_core_plans.count() > self.plan_cache_capacity - slots;
+        const refresh = self.plan_cache_cleanup_pending or self.tensor_core_plans.count() > self.plan_cache_capacity - slots;
         self.tensor_core_plans_mutex.unlock();
         if (!refresh) return false;
         if (ctx.streamCaptureActive() catch return error.CublasLtError) return error.CublasLtUnsupported;
         ctx.synchronize() catch return error.CublasLtError;
         spinLock(&self.tensor_core_plans_mutex);
         defer self.tensor_core_plans_mutex.unlock();
-        var plans = self.tensor_core_plans.valueIterator();
-        while (plans.next()) |plan| self.destroyTensorCorePlan(plan.*);
-        self.tensor_core_plans.clearRetainingCapacity();
+        self.plan_cache_cleanup_pending = true;
+        try self.clearTensorCorePlansChecked();
+        self.plan_cache_cleanup_pending = false;
         self.plan_cache_refreshes += 1;
         return true;
     }
@@ -834,9 +842,12 @@ pub const CublasLt = struct {
         precision: DensePrecision,
         with_bias: bool,
 
-        pub fn deinit(self: *PreparedDense) void {
-            self.owner.destroyTensorCorePlan(self.plan);
+        pub fn deinitChecked(self: *PreparedDense) Error!void {
+            try self.owner.destroyTensorCorePlanChecked(&self.plan);
             self.* = undefined;
+        }
+        pub fn deinit(self: *PreparedDense) void {
+            self.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         }
 
         /// Binding validation is metadata-only and precedes submission. The
@@ -946,6 +957,10 @@ pub const CublasLt = struct {
         try self.validateContext(ctx);
         if (ctx.streamCaptureActive() catch return error.CublasLtError) return error.CublasLtUnsupported;
         spinLock(&self.tensor_core_plans_mutex);
+        if (self.plan_cache_cleanup_pending) {
+            self.tensor_core_plans_mutex.unlock();
+            return error.CublasLtError;
+        }
         const cached = self.tensor_core_plans.get(key);
         self.tensor_core_plans_mutex.unlock();
         const tuning = layout.request.tuning.normalized();
@@ -983,6 +998,10 @@ pub const CublasLt = struct {
         if (tuning.enabled) lockYielding(&self.tensor_core_tuning_mutex);
         defer if (tuning.enabled) self.tensor_core_tuning_mutex.unlock();
         spinLock(&self.tensor_core_plans_mutex);
+        if (self.plan_cache_cleanup_pending) {
+            self.tensor_core_plans_mutex.unlock();
+            return error.CublasLtError;
+        }
         const cached = self.tensor_core_plans.get(key);
         self.tensor_core_plans_mutex.unlock();
         const plan = if (cached) |selected|
@@ -1039,6 +1058,10 @@ pub const CublasLt = struct {
                 lockYielding(&self.owner.tensor_core_tuning_mutex);
                 tuning_locked = true;
                 spinLock(&self.owner.tensor_core_plans_mutex);
+                if (self.owner.plan_cache_cleanup_pending) {
+                    self.owner.tensor_core_plans_mutex.unlock();
+                    return error.CublasLtError;
+                }
                 const cached = self.owner.tensor_core_plans.get(metadata.key);
                 self.owner.tensor_core_plans_mutex.unlock();
                 if (cached) |plan| {
@@ -1130,6 +1153,10 @@ pub const CublasLt = struct {
         // longer tuning mutex is taken only after a cache miss, then the map
         // is checked again so a concurrent first user can publish the plan.
         spinLock(&self.tensor_core_plans_mutex);
+        if (self.plan_cache_cleanup_pending) {
+            self.tensor_core_plans_mutex.unlock();
+            return error.CublasLtError;
+        }
         const cached_plan = self.tensor_core_plans.get(key);
         if (cached_plan != null) self.plan_cache_hits += 1 else self.plan_cache_misses += 1;
         self.tensor_core_plans_mutex.unlock();
@@ -1154,6 +1181,10 @@ pub const CublasLt = struct {
         errdefer if (owns_tuning_mutex) self.tensor_core_tuning_mutex.unlock();
 
         spinLock(&self.tensor_core_plans_mutex);
+        if (self.plan_cache_cleanup_pending) {
+            self.tensor_core_plans_mutex.unlock();
+            return error.CublasLtError;
+        }
         const cached_after_tuning_wait = self.tensor_core_plans.get(key);
         const cache_has_capacity = self.tensor_core_plans.count() < self.plan_cache_capacity;
         self.tensor_core_plans_mutex.unlock();
@@ -1509,12 +1540,29 @@ pub const CublasLt = struct {
         return error.CublasLtError;
     }
 
-    fn destroyTensorCorePlan(self: *CublasLt, plan: TensorCorePlan) void {
-        if (plan.a_desc != null) _ = self.fns.cublasLtMatrixLayoutDestroy(plan.a_desc);
-        if (plan.b_desc != null) _ = self.fns.cublasLtMatrixLayoutDestroy(plan.b_desc);
-        if (plan.c_desc != null) _ = self.fns.cublasLtMatrixLayoutDestroy(plan.c_desc);
-        if (plan.d_desc != null) _ = self.fns.cublasLtMatrixLayoutDestroy(plan.d_desc);
-        if (plan.op_desc != null) _ = self.fns.cublasLtMatmulDescDestroy(plan.op_desc);
+    /// Destruction updates the actual owner only after each SDK success.
+    /// Partially destroyed records remain valid for cleanup retry, never reuse.
+    fn destroyTensorCorePlanChecked(self: *CublasLt, plan: *TensorCorePlan) Error!void {
+        inline for (.{ "a_desc", "b_desc", "c_desc", "d_desc" }) |field| {
+            if (@field(plan, field)) |handle| {
+                try self.check(self.fns.cublasLtMatrixLayoutDestroy(handle));
+                @field(plan, field) = null;
+            }
+        }
+        if (plan.op_desc) |handle| {
+            try self.check(self.fns.cublasLtMatmulDescDestroy(handle));
+            plan.op_desc = null;
+        }
+    }
+    fn destroyTensorCorePlan(self: *CublasLt, value: TensorCorePlan) void {
+        var plan = value;
+        self.destroyTensorCorePlanChecked(&plan) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+    }
+    /// Requires tensor_core_plans_mutex and exclusive host submission custody.
+    fn clearTensorCorePlansChecked(self: *CublasLt) Error!void {
+        var plans = self.tensor_core_plans.valueIterator();
+        while (plans.next()) |plan| try self.destroyTensorCorePlanChecked(plan);
+        self.tensor_core_plans.clearRetainingCapacity();
     }
 
     /// Tensor-core strided-batched row-major GEMM. The logical operation is
@@ -2588,4 +2636,117 @@ test "strided vendor preflight rejects every malformed binding before context SD
     }
     try std.testing.expectError(error.CublasLtUnsupported, blas.preflightF16StridedBatched(&no_driver, valid, 0, 3, 32, 16));
     try std.testing.expectError(error.CublasLtUnsupported, blas.preflightF16StridedBatched(&no_driver, valid, 2, 3, std.math.maxInt(usize), 16));
+}
+
+test "CUDA vendor cache descriptor destruction retains every failed handle for exact retry" {
+    const Failure = struct {
+        var calls: usize = 0;
+        var fail_at: usize = 0;
+        fn destroy(handle: ?*anyopaque) callconv(.c) Status {
+            calls += 1;
+            if (calls == fail_at) return 3;
+            return VendorTestSdk.destroy(handle);
+        }
+    };
+    const allocator = std.testing.allocator;
+    for (1..6) |ordinal| {
+        VendorTestSdk.reset(0);
+        var owner = VendorDispatchTestContext.owner(allocator);
+        defer VendorDispatchTestContext.close(&owner, allocator);
+        var ctx = VendorDispatchTestContext.context();
+        const invocation = VendorDispatchTestContext.invocation;
+        const key = owner.tensorCoreKey(.dense, CUDA_R_16BF, CUDA_R_32F, 1, 3, 32, 16, 4096, .{}, invocation);
+        const plan = try owner.createTensorCoreDescriptors(key, invocation);
+        try owner.tensor_core_plans.put(allocator, key, plan);
+        try owner.setPlanCacheCapacity(1);
+        owner.fns.cublasLtMatrixLayoutDestroy = Failure.destroy;
+        owner.fns.cublasLtMatmulDescDestroy = Failure.destroy;
+        Failure.calls = 0;
+        Failure.fail_at = ordinal;
+        try std.testing.expectError(error.CublasLtError, owner.reserveTensorCorePlanSlots(&ctx, 1));
+        try std.testing.expect(owner.plan_cache_cleanup_pending);
+        try std.testing.expectEqual(@as(usize, 1), owner.tensor_core_plans.count());
+        try std.testing.expectEqual(@as(usize, 0), owner.plan_cache_refreshes);
+        try std.testing.expectEqual(6 - ordinal, VendorTestSdk.count());
+        const partial = owner.tensor_core_plans.get(key).?;
+        inline for (.{ "a_desc", "b_desc", "c_desc", "d_desc", "op_desc" }, 0..) |field, index| {
+            if (index < ordinal - 1) try std.testing.expect(@field(partial, field) == null) else try std.testing.expectEqual(@field(plan, field), @field(partial, field));
+        }
+        // Partial cleanup is an explicit unusable cache state, not a miss
+        // that could discover/submit new numerical work over invalid handles.
+        try std.testing.expectError(error.CublasLtError, owner.preflightUntunedDense(&ctx, .{ .precision = .bf16, .rows = 3, .in_dim = 32, .out_dim = 16 }, invocation));
+        try std.testing.expectEqual(@as(usize, 0), VendorDispatchTestContext.submissions);
+        Failure.fail_at = 0;
+        try std.testing.expect(try owner.reserveTensorCorePlanSlots(&ctx, 1));
+        try std.testing.expect(!owner.plan_cache_cleanup_pending);
+        try std.testing.expectEqual(@as(usize, 0), VendorTestSdk.count());
+        try std.testing.expectEqual(@as(usize, 0), owner.tensor_core_plans.count());
+        try std.testing.expectEqual(@as(usize, 1), owner.plan_cache_refreshes);
+        try std.testing.expectEqual(@as(usize, 6), Failure.calls);
+    }
+}
+
+test "CUDA vendor captured GEMM replays after checked descriptor eviction and peer plan replacement" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var ctx = context_mod.CudaContext.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var owner = CublasLt.openWithAllocator(std.testing.allocator, &ctx) catch |err| switch (err) {
+        error.CublasLtUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer owner.deinit();
+    try owner.setPlanCacheCapacity(1);
+    var input = try buffer_mod.DeviceBuffer.alloc(&ctx, 3 * 32 * 4);
+    defer input.free(&ctx);
+    var weight = try buffer_mod.DeviceBuffer.alloc(&ctx, 16 * 32 * 4);
+    defer weight.free(&ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(&ctx, 3 * 16 * 4);
+    defer output.free(&ctx);
+    var workspace = try buffer_mod.DeviceBuffer.alloc(&ctx, 4096);
+    defer workspace.free(&ctx);
+    var host_input: [3 * 32]f32 = @splat(1);
+    const host_weight: [16 * 32]f32 = @splat(1);
+    try input.copyFromHost(&ctx, std.mem.sliceAsBytes(&host_input));
+    try weight.copyFromHost(&ctx, std.mem.sliceAsBytes(&host_weight));
+    try ctx.synchronize();
+    try owner.matmulF32WeightF32OutWithWorkspace(&ctx, output, input, weight, workspace, 3, 32, 16);
+    try ctx.synchronize();
+    try std.testing.expectEqual(@as(usize, 1), owner.tensor_core_plans.count());
+    const graph_mod = @import("graph.zig");
+    try graph_mod.beginCapture(&ctx);
+    var capturing = true;
+    errdefer if (capturing) {
+        const abandoned = ctx.endStreamCapture() catch null;
+        if (abandoned != null) ctx.destroyGraph(abandoned);
+    };
+    try owner.matmulF32WeightF32OutWithWorkspace(&ctx, output, input, weight, workspace, 3, 32, 16);
+    // The actual refresh path refuses active capture before destroying any
+    // descriptors. Host submission remains serialized throughout this test.
+    try std.testing.expectError(error.CublasLtUnsupported, owner.reserveTensorCorePlanSlots(&ctx, 1));
+    try std.testing.expectEqual(@as(usize, 1), owner.tensor_core_plans.count());
+    var graph = try graph_mod.endCapture(&ctx);
+    capturing = false;
+    defer graph.deinit(&ctx);
+    const graph_handle = graph.exec;
+    try std.testing.expect(try owner.reserveTensorCorePlanSlots(&ctx, 1));
+    try std.testing.expectEqual(@as(usize, 0), owner.tensor_core_plans.count());
+    // A different real geometry replaces the entire host-side cache while
+    // ALL original device buffers/workspace/library/context stay strongly owned.
+    try owner.matmulF32WeightF32OutWithWorkspace(&ctx, output, input, weight, workspace, 2, 32, 16);
+    try ctx.synchronize();
+    try std.testing.expectEqual(@as(usize, 1), owner.tensor_core_plans.count());
+    for ([_]f32{ 2, 3 }) |value| {
+        @memset(&host_input, value);
+        try input.copyFromHost(&ctx, std.mem.sliceAsBytes(&host_input));
+        try graph.launch(&ctx);
+        var actual: [3 * 16]f32 = undefined;
+        try output.copyToHost(&ctx, std.mem.sliceAsBytes(&actual));
+        try ctx.synchronize();
+        for (actual) |element| try std.testing.expectEqual(32 * value, element);
+        try std.testing.expectEqual(graph_handle, graph.exec);
+    }
+    try std.testing.expectEqual(@as(usize, 1), owner.plan_cache_refreshes);
 }

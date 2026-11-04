@@ -46,7 +46,28 @@ pub const Weights = struct {
 /// compilation. Backend/weight adapters are explicit borrows; task publication
 /// is outside this interface. The backend owner must outlive cache bindings
 /// and resident outputs.
+/// Explicit physical Reader ownership seam. The synchronous callback retains
+/// its SAME worker step while dropping/reacquiring all actual numerical lanes.
+/// Disabled builds contain no CUDA graph type or runtime callback work.
+/// Synchronous borrowed release of the numerical caller's actual KV mutex.
+/// The Reader may invoke this only after deciding to leave execution; it must
+/// never retain this stack capability or treat it as model/quota authority.
+pub const CapturedGraphOutside = struct {
+    ptr: *anyopaque,
+    release_fn: *const fn (*anyopaque) void,
+    pub fn release(self: CapturedGraphOutside) void {
+        self.release_fn(self.ptr);
+    }
+};
+
+pub const CapturedGraphPreparation = if (build_options.enable_cuda) struct {
+    const graph = @import("../ops/cuda/lighton_decode_graph.zig");
+    ptr: *anyopaque,
+    prepare_fn: *const fn (*anyopaque, *const ops.ComputeBackend, graph.Descriptor, *graph.GraphPhase, CapturedGraphOutside, InferenceExecutionControl) anyerror!bool,
+} else struct {};
+
 pub const Context = struct {
+    graph_preparation: ?CapturedGraphPreparation = null,
     allocator: std.mem.Allocator,
     cb: *const ops.ComputeBackend,
     gpt_config: *const @import("../models/gpt.zig").Config,
@@ -59,6 +80,7 @@ pub const Context = struct {
     session: ?@import("../backends/session.zig").Session = null,
     /// Borrowed exact outer owner; reader stores it in stable epoch allocation.
     cleanup_epoch: ?*const @import("../execution/retirement_sink.zig").Epoch = null,
+    cleanup_owner: ?*const @import("../execution/cleanup_owner.zig").Owner = null,
     /// Borrowed from the actual retaining model owner. A standalone/draft
     /// execution need not acquire Session numerical/provider capabilities just
     /// to publish its physical observations. The model outlives this context.
@@ -69,6 +91,13 @@ pub const Context = struct {
     parallel_config: ?parallel_strategy.ParallelConfig = null,
     compiled_partition_backend: ?contracts.BackendKind = null,
     compiled_attachment_target: compiled_backend.AttachmentTarget = .partitioned,
+
+    /// Explicit final-address caller ownership only. Persistent reader callers
+    /// read it AFTER acquiring their ExecutionAccess; a park can rotate B while
+    /// those consumers wait. No provider activity or ambient epoch is consulted.
+    pub fn cleanupEpoch(self: *const Context) ?*const @import("../execution/retirement_sink.zig").Epoch {
+        return if (self.cleanup_owner) |owner| owner.epoch() else self.cleanup_epoch;
+    }
 
     pub fn diagnosticsBinding(self: *const Context) ?@import("../execution/invocation_observation.zig").Binding {
         if (self.diagnostics_binding) |binding| return binding;
@@ -577,7 +606,7 @@ const RequestCleanupEpoch = struct {
     supplied: ?*const @import("../execution/retirement_sink.zig").Epoch = null,
     inherited: ?@import("../execution/retirement_sink.zig").Epoch = null,
     fn init(context: *const Context) !@This() {
-        if (context.cleanup_epoch) |epoch| {
+        if (context.cleanupEpoch()) |epoch| {
             if (try epoch.isSealed()) return error.RetirementEpochSealed;
             return .{ .supplied = epoch };
         }

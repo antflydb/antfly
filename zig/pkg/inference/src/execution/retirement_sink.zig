@@ -122,6 +122,18 @@ pub const Epoch = struct {
         if (self.nonce == 0 or record.nonce != self.nonce or record.references == 0) return error.RetirementEpochConsumed;
         return record;
     }
+    /// Pure origin attestation, not cleanup authority. Keep the stable sink
+    /// alive without occupying one of its bounded epoch records. A record can
+    /// be reused only after its previous nonce was sealed and released.
+    pub fn sealWitness(self: Epoch) !SealWitness {
+        const record = self.record orelse return error.RetirementEpochConsumed;
+        const owner = record.owner;
+        owner.lock();
+        defer owner.mutex.unlock();
+        _ = try self.validateLocked();
+        owner.retain();
+        return .{ .sink = .{ .owner = owner, .identity = owner.identity }, .record = record, .nonce = self.nonce };
+    }
     pub fn retain(self: Epoch) !Epoch {
         const record = self.record orelse return error.RetirementEpochConsumed;
         const owner = record.owner;
@@ -142,8 +154,10 @@ pub const Epoch = struct {
         record.references -= 1;
         if (record.references == 0) {
             std.debug.assert(record.head == null and record.tail == null);
-            record.nonce = 0;
-            record.sealed = false;
+            // Retain the last sealed generation for pure SealWitness readers.
+            // Zero references already revoke every Epoch/boundary capability;
+            // enter() publishes a strictly newer nonce when reusing this slot.
+            std.debug.assert(record.nonce != 0 and record.sealed);
         }
         owner.mutex.unlock();
         self.record = null;
@@ -195,6 +209,26 @@ pub const Epoch = struct {
         owner.mutex.unlock();
         node.release_fn(node.context);
         held.release();
+    }
+};
+
+/// A completed-origin witness owns only process metadata. It never supplies an
+/// Epoch, DeferredBoundary, operation token or numerical target. Reading under
+/// the SAME sink mutex makes both sealing and monotonic record reuse race-free;
+/// exhausted nonces are rejected before enter() can publish another generation.
+pub const SealWitness = struct {
+    sink: Ref,
+    record: *Owner.Record,
+    nonce: u64,
+    pub fn wasSealed(self: *const SealWitness) !bool {
+        const owner = try self.sink.get();
+        owner.lock();
+        defer owner.mutex.unlock();
+        if (self.record.owner != owner or self.nonce == 0 or self.record.nonce < self.nonce) return error.InvalidRetirementSealWitness;
+        return self.record.nonce > self.nonce or self.record.sealed;
+    }
+    pub fn release(self: *SealWitness) void {
+        self.sink.release();
     }
 };
 
@@ -456,4 +490,95 @@ test "retirement guard forks wait for exact provider and outer unlock in either 
         defer next.finish();
         try std.testing.expectEqual(@as(usize, 1), count.calls);
     }
+}
+
+test "retirement origin seal witness survives record reuse without pinning its old epoch" {
+    var sink = try Ref.createWithAllocator(std.testing.allocator);
+    var first = try sink.enter();
+    var old = try first.epoch.sealWitness();
+    defer old.release();
+    try std.testing.expect(!try old.wasSealed());
+    const record = first.epoch.record;
+    const stale = first.epoch;
+    first.finish();
+    try std.testing.expect(try old.wasSealed());
+    try std.testing.expectError(error.RetirementEpochConsumed, stale.boundary());
+    try std.testing.expectError(error.RetirementEpochConsumed, stale.retain());
+    try std.testing.expectError(error.RetirementEpochConsumed, stale.sealWitness());
+    var second = try sink.enter();
+    try std.testing.expect(second.epoch.record == record);
+    try std.testing.expect(second.epoch.nonce > old.nonce);
+    var current = try second.epoch.sealWitness();
+    defer current.release();
+    try std.testing.expect(try old.wasSealed());
+    try std.testing.expect(!try current.wasSealed());
+    second.finish();
+    try std.testing.expect(try current.wasSealed());
+    try sink.close();
+    sink.release(); // Witnesses independently retain pure metadata afterwards.
+    try std.testing.expect(try old.wasSealed());
+    try std.testing.expect(try current.wasSealed());
+}
+
+test "retirement origin seal witness neither allocates nor accepts stale or foreign generation" {
+    var allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var sink = try Ref.createWithAllocator(allocator.allocator());
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    var witness = try guard.epoch.sealWitness();
+    defer witness.release();
+    try std.testing.expect(!try witness.wasSealed());
+    try std.testing.expectError(error.OutOfMemory, Ref.createWithAllocator(allocator.allocator()));
+    const stale = Epoch{ .record = guard.epoch.record, .nonce = guard.epoch.nonce + 1 };
+    try std.testing.expectError(error.RetirementEpochConsumed, stale.sealWitness());
+    var another = try Ref.createWithAllocator(std.testing.allocator);
+    defer another.release();
+    var foreign = witness;
+    foreign.sink = another;
+    try std.testing.expectError(error.InvalidRetirementSealWitness, foreign.wasSealed());
+}
+
+test "retirement origin seal witness observes concurrent seal and refuses nonce exhaustion as progress" {
+    const Observer = struct {
+        witness: *const SealWitness,
+        started: std.atomic.Value(bool) = .init(false),
+        observed: std.atomic.Value(bool) = .init(false),
+        failed: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            const deadline = platform.time.monotonicNs() + std.time.ns_per_s;
+            while (platform.time.monotonicNs() < deadline) {
+                const sealed = self.witness.wasSealed() catch {
+                    self.failed.store(true, .release);
+                    return;
+                };
+                if (sealed) {
+                    self.observed.store(true, .release);
+                    return;
+                }
+                platform.time.sleepNs(100 * std.time.ns_per_us);
+            }
+            self.failed.store(true, .release);
+        }
+    };
+    var sink = try Ref.createWithAllocator(std.testing.allocator);
+    defer sink.release();
+    var first = try sink.enter();
+    var witness = try first.epoch.sealWitness();
+    defer witness.release();
+    const next = sink.owner.?.next_nonce;
+    sink.owner.?.next_nonce = std.math.maxInt(u64);
+    try std.testing.expectError(error.RetirementEpochIdentityExhausted, sink.enter());
+    try std.testing.expect(!try witness.wasSealed());
+    sink.owner.?.next_nonce = next;
+    var observer = Observer{ .witness = &witness };
+    const thread = try std.Thread.spawn(.{}, Observer.run, .{&observer});
+    while (!observer.started.load(.acquire)) platform.time.sleepNs(100 * std.time.ns_per_us);
+    first.finish();
+    var reused = try sink.enter();
+    defer reused.finish();
+    thread.join();
+    try std.testing.expect(!observer.failed.load(.acquire));
+    try std.testing.expect(observer.observed.load(.acquire));
 }

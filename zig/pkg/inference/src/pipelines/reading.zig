@@ -635,12 +635,6 @@ pub const ReadingPipeline = struct {
     ) ![]ReadResult {
         defer if (platform.env.getenvBool("ANTFLY_FLORENCE2_TRACE_NO_REPEAT_ARGMAX"))
             std.debug.print("FLORENCE2 batch_items={d}\n", .{batch});
-        const lane: ?@import("../execution_control.zig").ExecutionLane.Lease =
-            if (self.native_execution_lane) |owner|
-                try owner.acquire(self.execution_control orelse .{ .io = self.config.preprocess_io })
-            else
-                null;
-        defer if (lane) |lease| lease.release();
         const allocator = self.allocator;
         var run_permit: ?session_mod.RunPermit = null;
         defer if (run_permit) |*permit| permit.deinit();
@@ -690,8 +684,27 @@ pub const ReadingPipeline = struct {
         if (incremental_admission and platform.env.getenvBool("ANTFLY_FLORENCE2_TRACE_NO_REPEAT_ARGMAX"))
             std.debug.print("FLORENCE2 cuda_incremental_admission_items={d}\n", .{batch});
 
-        var managed = try compute_provider.acquireWithControl(self.vision_encoder, allocator, self.execution_control);
-        defer managed.deinit();
+        const PreparedOcrRequest = if (build_options.enable_cuda) @import("../execution/architecture_session.zig").PreparedComputeAdmission.LockedRequest else struct {};
+        var prepared_ocr: ?*PreparedOcrRequest = null;
+        if (comptime build_options.enable_cuda) if (run_permit.?.lease) |*primary| {
+            prepared_ocr = try PreparedOcrRequest.acquireAfterAdmissionWithUploadBytes(self.vision_encoder, primary, try std.math.mul(usize, pixel_values.len, @sizeOf(f32)), null, self.native_execution_lane, self.execution_control orelse .{ .io = self.config.preprocess_io });
+        };
+        defer if (comptime build_options.enable_cuda) if (prepared_ocr) |prepared| prepared.deinit();
+        const lane: ?@import("../execution_control.zig").ExecutionLane.Lease =
+            if (prepared_ocr == null) (if (self.native_execution_lane) |owner|
+                try owner.acquire(self.execution_control orelse .{ .io = self.config.preprocess_io })
+            else
+                null) else null;
+        defer if (lane) |lease| lease.release();
+        var managed = if (comptime build_options.enable_cuda) blk: {
+            if (prepared_ocr) |prepared| break :blk try prepared.acquireManaged(allocator, self.execution_control);
+            break :blk try compute_provider.acquireWithControl(self.vision_encoder, allocator, self.execution_control);
+        } else try compute_provider.acquireWithControl(self.vision_encoder, allocator, self.execution_control);
+        defer {
+            if (comptime build_options.enable_cuda) {
+                if (prepared_ocr) |prepared| prepared.closeManaged(&managed) else managed.deinit();
+            } else managed.deinit();
+        }
         const cb = &managed.backend;
 
         if (debug_cuda_session) std.log.info("reading: native florence batch encoder start batch={d}", .{batch});
@@ -1126,12 +1139,6 @@ pub const ReadingPipeline = struct {
     }
 
     fn readPixelValues(self: *ReadingPipeline, pixel_values: []const f32) !ReadResult {
-        const lane: ?@import("../execution_control.zig").ExecutionLane.Lease =
-            if (self.native_execution_lane) |owner|
-                try owner.acquire(self.execution_control orelse .{ .io = self.config.preprocess_io })
-            else
-                null;
-        defer if (lane) |lease| lease.release();
         const allocator = self.allocator;
         const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
         const img_size: u32 = @intCast(self.config.image_size);
@@ -1140,6 +1147,12 @@ pub const ReadingPipeline = struct {
         // 2. Run vision encoder
         const img_sz: i64 = @intCast(img_size);
         if (try self.readPixelValuesFlorenceResident(pixel_values)) |result| return result;
+        const lane: ?@import("../execution_control.zig").ExecutionLane.Lease =
+            if (self.native_execution_lane) |owner|
+                try owner.acquire(self.execution_control orelse .{ .io = self.config.preprocess_io })
+            else
+                null;
+        defer if (lane) |lease| lease.release();
 
         const pv_shape = [_]i64{ 1, 3, img_sz, img_sz };
         if (debug_cuda_session) std.log.info("reading: pixel tensor init start", .{});
@@ -1235,8 +1248,27 @@ pub const ReadingPipeline = struct {
             self.config.max_length,
         ));
 
-        var managed = try compute_provider.acquireWithControl(self.vision_encoder, allocator, self.execution_control);
-        defer managed.deinit();
+        const PreparedOcrRequest = if (build_options.enable_cuda) @import("../execution/architecture_session.zig").PreparedComputeAdmission.LockedRequest else struct {};
+        var prepared_ocr: ?*PreparedOcrRequest = null;
+        if (comptime build_options.enable_cuda) if (run_permit.?.lease) |*primary| {
+            prepared_ocr = try PreparedOcrRequest.acquireAfterAdmissionWithUploadBytes(self.vision_encoder, primary, try std.math.mul(usize, pixel_values.len, @sizeOf(f32)), null, self.native_execution_lane, self.execution_control orelse .{ .io = self.config.preprocess_io });
+        };
+        defer if (comptime build_options.enable_cuda) if (prepared_ocr) |prepared| prepared.deinit();
+        const lane: ?@import("../execution_control.zig").ExecutionLane.Lease =
+            if (prepared_ocr == null) (if (self.native_execution_lane) |owner|
+                try owner.acquire(self.execution_control orelse .{ .io = self.config.preprocess_io })
+            else
+                null) else null;
+        defer if (lane) |lease| lease.release();
+        var managed = if (comptime build_options.enable_cuda) blk: {
+            if (prepared_ocr) |prepared| break :blk try prepared.acquireManaged(allocator, self.execution_control);
+            break :blk try compute_provider.acquireWithControl(self.vision_encoder, allocator, self.execution_control);
+        } else try compute_provider.acquireWithControl(self.vision_encoder, allocator, self.execution_control);
+        defer {
+            if (comptime build_options.enable_cuda) {
+                if (prepared_ocr) |prepared| prepared.closeManaged(&managed) else managed.deinit();
+            } else managed.deinit();
+        }
         const cb = &managed.backend;
 
         if (debug_cuda_session) std.log.info("reading: native florence encoder tensor run start", .{});
@@ -1388,8 +1420,27 @@ pub const ReadingPipeline = struct {
             self.config.max_length,
         ));
 
-        var managed = try compute_provider.acquireWithControl(self.vision_encoder, allocator, self.execution_control);
-        defer managed.deinit();
+        const PreparedOcrRequest = if (build_options.enable_cuda) @import("../execution/architecture_session.zig").PreparedComputeAdmission.LockedRequest else struct {};
+        var prepared_ocr: ?*PreparedOcrRequest = null;
+        if (comptime build_options.enable_cuda) if (run_permit.?.lease) |*primary| {
+            prepared_ocr = try PreparedOcrRequest.acquireAfterAdmissionWithUploadBytes(self.vision_encoder, primary, try std.math.mul(usize, pixel_values.len, @sizeOf(f32)), null, self.native_execution_lane, self.execution_control orelse .{ .io = self.config.preprocess_io });
+        };
+        defer if (comptime build_options.enable_cuda) if (prepared_ocr) |prepared| prepared.deinit();
+        const lane: ?@import("../execution_control.zig").ExecutionLane.Lease =
+            if (prepared_ocr == null) (if (self.native_execution_lane) |owner|
+                try owner.acquire(self.execution_control orelse .{ .io = self.config.preprocess_io })
+            else
+                null) else null;
+        defer if (lane) |lease| lease.release();
+        var managed = if (comptime build_options.enable_cuda) blk: {
+            if (prepared_ocr) |prepared| break :blk try prepared.acquireManaged(allocator, self.execution_control);
+            break :blk try compute_provider.acquireWithControl(self.vision_encoder, allocator, self.execution_control);
+        } else try compute_provider.acquireWithControl(self.vision_encoder, allocator, self.execution_control);
+        defer {
+            if (comptime build_options.enable_cuda) {
+                if (prepared_ocr) |prepared| prepared.closeManaged(&managed) else managed.deinit();
+            } else managed.deinit();
+        }
         const cb = &managed.backend;
 
         const encoder = (try session_factory.runFlorenceEncoderResident(

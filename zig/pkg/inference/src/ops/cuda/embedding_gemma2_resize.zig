@@ -24,29 +24,41 @@ const driver = @import("driver.zig");
 const memory = @import("../../runtime/tier/memory.zig");
 const processing = @import("antfly_image").processing;
 const prepared = @import("prepared_cache.zig");
+const CacheQuota = @import("cache_quota.zig").Quota;
+const Cleanup = @import("../../execution/cleanup_context.zig").Context;
 pub const Key = struct { width: u32, height: u32, target_width: u32, target_height: u32, resident: bool };
 pub const Plan = struct {
     key: Key,
     x: processing.BicubicAxis,
     y: processing.BicubicAxis,
     device: [6]Buffer = @splat(.{}),
-    lease: ?memory.AdmissionLease = null,
+    quota: CacheQuota = .none,
     bytes: usize,
     fn deinit(self: *Plan, ctx: *Context) void {
-        for (&self.device) |*b| b.free(ctx);
-        self.releaseHost();
-    }
-    fn releaseHost(self: *Plan) void {
+        // Only the legacy raw replacement caller reaches this private helper.
+        // It supplies no current cleanup authority for an admitted prepared bank.
+        self.quota.validateLegacyRaw() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        for (&self.device) |*buffer| _ = buffer.freeChecked(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         self.x.deinit();
         self.y.deinit();
-        if (self.lease) |*lease| lease.release();
+        self.quota.releaseLegacyRawAfterSdkDeath() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+    }
+    fn deinitWithCleanup(self: *Plan, ctx: *Context, current: Cleanup) !void {
+        try self.quota.validateCleanup(current);
+        for (&self.device) |*buffer| _ = try buffer.freeChecked(ctx);
+        try self.releaseHost(current);
+    }
+    fn releaseHost(self: *Plan, current: Cleanup) !void {
+        self.x.deinit();
+        self.y.deinit();
+        try self.quota.releaseAfterSdkDeath(current);
     }
 };
 const Source = struct {
     host: buffers.HostBuffer = .{},
     event: driver.CUevent = null,
     pending: bool = false,
-    lease: ?memory.AdmissionLease = null,
+    quota: CacheQuota = .none,
     fn wait(self: *Source, ctx: *Context) !void {
         if (self.pending) {
             try ctx.makeCurrent();
@@ -101,6 +113,16 @@ pub const Cache = struct {
         // An actual Stage's exact targeted carrier must have retired victims
         // outside all lanes before publishing the bound funding table.
         if (ctx.prepared_cache_funding != null and (slot.* != null or over)) return error.PreparedCacheVictimChanged;
+        // A legacy unbound invocation cannot mint outside-execution authority
+        // for an independently prepared victim. Its actual Stage must detach
+        // that victim using the targeted cold carrier first.
+        if (ctx.prepared_cache_funding == null) {
+            if (over) {
+                for (self.plans) |value| if (value) |plan_value| {
+                    if (plan_value.quota == .prepared) return error.UnpreparedCacheAdmission;
+                };
+            } else if (slot.*) |value| if (value.quota == .prepared) return error.UnpreparedCacheAdmission;
+        }
         var lease: prepared.Lease = .{};
         errdefer lease.releaseAfterSdkDeath();
         if (ctx.prepared_cache_funding != null) lease = try prepared.acquire(ctx, request(key), .{ .host_scratch_bytes = bytes, .backend_scratch_bytes = bytes });
@@ -138,7 +160,7 @@ pub const Cache = struct {
             b.* = try Buffer.alloc(ctx, slice.len);
             try b.copyFromHost(ctx, slice);
         }
-        slot.* = .{ .key = key, .x = x, .y = y, .device = device, .bytes = bytes, .lease = lease.publish() };
+        slot.* = .{ .key = key, .x = x, .y = y, .device = device, .bytes = bytes, .quota = lease.publishQuota() };
         self.bytes += bytes;
         self.next_plan += 1;
         self.misses += 1;
@@ -149,7 +171,8 @@ pub const Cache = struct {
         const index = self.next_source % self.sources.len;
         const slot = &self.sources[index];
         const grow = slot.host.len < bytes.len;
-        if (grow and ctx.prepared_cache_funding != null and (slot.host.ptr != null or slot.lease != null)) return error.PreparedCacheVictimChanged;
+        if (grow and ctx.prepared_cache_funding != null and (slot.host.ptr != null or slot.quota.hasLease())) return error.PreparedCacheVictimChanged;
+        if (grow and ctx.prepared_cache_funding == null) slot.quota.validateLegacyRaw() catch return error.UnpreparedCacheAdmission;
         var lease: prepared.Lease = .{};
         errdefer lease.releaseAfterSdkDeath();
         if (grow and ctx.prepared_cache_funding != null) lease = try prepared.acquire(ctx, .{ .source = .{ .index = @intCast(index), .bytes = bytes.len } }, .{ .host_scratch_bytes = bytes.len });
@@ -157,11 +180,10 @@ pub const Cache = struct {
         if (slot.event == null) slot.event = try ctx.createStreamEvent();
         if (grow) {
             slot.host.free(ctx);
-            if (slot.lease) |*old| old.release(); // Bound path proved empty above.
-            slot.lease = null;
+            slot.quota.releaseLegacyRawAfterSdkDeath() catch @import("antfly_platform").inference_process_supervisor.restartWorker(); // Bound path proved empty above.
             if (ctx.prepared_cache_funding == null) lease = try prepared.acquire(ctx, .{ .source = .{ .index = @intCast(index), .bytes = bytes.len } }, .{ .host_scratch_bytes = bytes.len });
             slot.host = try buffers.HostBuffer.alloc(ctx, bytes.len);
-            slot.lease = lease.publish();
+            slot.quota = lease.publishQuota();
         }
         @memcpy(slot.host.bytes()[0..bytes.len], bytes);
         // On an event-record error a full drain preserves source lifetime.
@@ -179,42 +201,54 @@ pub const Cache = struct {
         const quotas = @import("cache_retirement.zig");
         var count: usize = 0;
         for (self.plans) |entry| if (entry) |value| {
-            count += try quotas.scanLease(value.lease, controller);
+            count += try quotas.scanLease(value.quota.peek(), controller);
         };
-        for (self.sources) |source| count += try quotas.scanLease(source.lease, controller);
+        for (self.sources) |source| count += try quotas.scanLease(source.quota.peek(), controller);
         return count;
     }
     pub fn parkRetirementLeases(self: *Cache, quotas: *@import("cache_retirement.zig").PreparedQuotas) void {
-        for (&self.plans) |*entry| if (entry.*) |*value| @import("cache_retirement.zig").parkLease(quotas, &value.lease);
-        for (&self.sources) |*source| @import("cache_retirement.zig").parkLease(quotas, &source.lease);
+        for (&self.plans) |*entry| if (entry.*) |*value| value.quota.park(quotas);
+        for (&self.sources) |*source| source.quota.park(quotas);
+    }
+    pub fn validateCleanup(self: *const Cache, current: Cleanup) !void {
+        for (self.plans) |entry| if (entry) |value| try value.quota.validateCleanup(current);
+        for (self.sources) |source| try source.quota.validateCleanup(current);
     }
     pub fn clear(self: *Cache, ctx: *Context) !void {
+        return self.clearWithCleanup(ctx, .{ .outside_execution = true });
+    }
+    pub fn clearWithCleanup(self: *Cache, ctx: *Context, current: Cleanup) !void {
+        try self.validateCleanup(current);
         if (self.next_plan == 0 and self.sources[0].event == null and self.sources[1].event == null) return;
         try ctx.synchronize();
-        try self.clearRetired(ctx);
+        try self.clearRetiredWithCleanup(ctx, current);
     }
     /// Actual exclusive owner already established completion. Typed detach
     /// parks every lease first; this body then contains no supplier callbacks.
     pub fn clearRetired(self: *Cache, ctx: *Context) !void {
+        return self.clearRetiredWithCleanup(ctx, .{ .outside_execution = true });
+    }
+    pub fn clearRetiredWithCleanup(self: *Cache, ctx: *Context, current: Cleanup) !void {
+        try self.validateCleanup(current);
         for (&self.plans) |*entry| if (entry.*) |*value| {
             for (&value.device) |*device| _ = try device.freeChecked(ctx);
-            value.releaseHost();
+            try value.releaseHost(current);
             entry.* = null;
         };
         for (&self.sources) |*source| {
             try source.host.freeChecked(ctx);
             try ctx.destroyEventChecked(&source.event);
-            if (source.lease) |*lease| lease.release();
+            try source.quota.releaseAfterSdkDeath(current);
             source.* = .{};
         }
         self.* = .{};
     }
     pub fn releaseAfterContextDestroyed(self: *Cache, ctx: *Context) void {
-        for (&self.plans) |*entry| if (entry.*) |*value| value.releaseHost();
+        for (&self.plans) |*entry| if (entry.*) |*value| value.releaseHost(.{ .outside_execution = true }) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         // cuMemFreeHost remains callable until the driver is unloaded.
         for (&self.sources) |*source| {
             source.host.free(ctx);
-            if (source.lease) |*lease| lease.release();
+            source.quota.releaseOutsideExecution();
         }
         self.* = .{};
     }

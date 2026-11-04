@@ -21,6 +21,8 @@ const Buffer = @import("buffer.zig").DeviceBuffer;
 const driver = @import("driver.zig");
 const memory = @import("../../runtime/tier/memory.zig");
 const prepared = @import("prepared_cache.zig");
+const CacheQuota = @import("cache_quota.zig").Quota;
+const Cleanup = @import("../../execution/cleanup_context.zig").Context;
 pub const packed_limit = 512 * 1024 * 1024;
 pub const arena_limit = 128 * 1024 * 1024;
 pub const graph_rows_limit = 4096;
@@ -35,7 +37,7 @@ pub const Arena = struct {
     attention_workspace: usize = 0,
     weight_generation: usize = 0,
     buffers: [11]Buffer = @splat(.{}),
-    lease: ?memory.AdmissionLease = null,
+    quota: CacheQuota = .none,
     graph: driver.CUgraphExec = null,
     warm: bool = false,
     disabled: bool = false,
@@ -52,7 +54,7 @@ pub const Arena = struct {
     pending: bool = false,
     fence_valid: bool = false,
     pub fn hasBacking(self: *const Arena) bool {
-        return self.bytes() != 0 or self.graph != null or self.completion != null or self.timing != null or self.lease != null;
+        return self.bytes() != 0 or self.graph != null or self.completion != null or self.timing != null or self.quota.hasLease();
     }
     pub fn noteUse(self: *Arena, ctx: *Context) void {
         self.pending = true;
@@ -104,15 +106,20 @@ pub const Arena = struct {
         self.disabled = err != error.Cancelled and err != error.Timeout;
     }
     fn deinit(self: *Arena, ctx: *Context) void {
-        if (self.timing) |pair| ctx.destroyProfileEventPair(pair);
-        if (self.completion != null) ctx.destroyEvent(self.completion);
-        if (self.graph != null) ctx.destroyGraphExec(self.graph);
-        for (&self.buffers) |*buffer| buffer.free(ctx);
-        if (self.lease) |*lease| lease.release();
+        self.quota.validateLegacyRaw() catch @import("antfly_platform").inference_process_supervisor.restartWorker(); // BEFORE graph/event/buffer SDK destruction
+        if (self.timing) |*pair| {
+            ctx.destroyEventChecked(&pair.start) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            ctx.destroyEventChecked(&pair.end) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            self.timing = null;
+        }
+        ctx.destroyEventChecked(&self.completion) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        ctx.destroyGraphExecChecked(&self.graph) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        for (&self.buffers) |*buffer| _ = buffer.freeChecked(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        self.quota.releaseLegacyRawAfterSdkDeath() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         self.* = .{};
     }
 };
-const Packed = struct { buffer: Buffer, lease: ?memory.AdmissionLease };
+const Packed = struct { buffer: Buffer, quota: CacheQuota };
 pub const Cache = struct {
     weights: std.StringHashMapUnmanaged(Packed) = .empty,
     packed_bytes: usize = 0,
@@ -124,24 +131,37 @@ pub const Cache = struct {
     pub fn retirementLeaseCount(self: *const Cache, controller: *?*memory.AdmissionController) !usize {
         const quotas = @import("cache_retirement.zig");
         var count: usize = 0;
-        for (self.arenas) |arena_value| count += try quotas.scanLease(arena_value.lease, controller);
+        for (self.arenas) |arena_value| count += try quotas.scanLease(arena_value.quota.peek(), controller);
         var iterator = self.weights.iterator();
-        while (iterator.next()) |entry| count += try quotas.scanLease(entry.value_ptr.lease, controller);
+        while (iterator.next()) |entry| count += try quotas.scanLease(entry.value_ptr.quota.peek(), controller);
         return count;
     }
     pub fn parkRetirementLeases(self: *Cache, quotas: *@import("cache_retirement.zig").PreparedQuotas) void {
-        for (&self.arenas) |*entry| @import("cache_retirement.zig").parkLease(quotas, &entry.lease);
+        for (&self.arenas) |*entry| entry.quota.park(quotas);
         var iterator = self.weights.iterator();
-        while (iterator.next()) |entry| @import("cache_retirement.zig").parkLease(quotas, &entry.value_ptr.lease);
+        while (iterator.next()) |entry| entry.value_ptr.quota.park(quotas);
+    }
+    pub fn validateCleanup(self: *const Cache, current: Cleanup) !void {
+        for (self.arenas) |entry| try entry.quota.validateCleanup(current);
+        var iterator = self.weights.iterator();
+        while (iterator.next()) |entry| try entry.value_ptr.quota.validateCleanup(current);
     }
     pub fn clear(self: *Cache, allocator: std.mem.Allocator, ctx: *Context) !void {
+        return self.clearWithCleanup(allocator, ctx, .{ .outside_execution = true });
+    }
+    pub fn clearWithCleanup(self: *Cache, allocator: std.mem.Allocator, ctx: *Context, current: Cleanup) !void {
+        try self.validateCleanup(current);
         if (self.weights.capacity() == 0 and self.next_arena == 0) return;
         try ctx.synchronize();
-        try self.clearRetired(allocator, ctx);
+        try self.clearRetiredWithCleanup(allocator, ctx, current);
     }
     /// Fenced detach cleanup. Failure preserves the remaining SDK handles and
     /// all old quota. No second wait or hidden replacement storage is created.
     pub fn clearRetired(self: *Cache, allocator: std.mem.Allocator, ctx: *Context) !void {
+        return self.clearRetiredWithCleanup(allocator, ctx, .{ .outside_execution = true });
+    }
+    pub fn clearRetiredWithCleanup(self: *Cache, allocator: std.mem.Allocator, ctx: *Context, current: Cleanup) !void {
+        try self.validateCleanup(current);
         for (&self.arenas) |*entry| {
             if (entry.timing) |*pair| {
                 try ctx.destroyEventChecked(&pair.start);
@@ -151,7 +171,7 @@ pub const Cache = struct {
             try ctx.destroyEventChecked(&entry.completion);
             try ctx.destroyGraphExecChecked(&entry.graph);
             for (&entry.buffers) |*buffer| _ = try buffer.freeChecked(ctx);
-            if (entry.lease) |*lease| lease.release();
+            try entry.quota.releaseAfterSdkDeath(current);
             entry.* = .{};
         }
         var iterator = self.weights.iterator();
@@ -160,7 +180,7 @@ pub const Cache = struct {
         // retry after a partial driver failure cannot observe freed map keys.
         iterator = self.weights.iterator();
         while (iterator.next()) |entry| {
-            if (entry.value_ptr.lease) |*lease| lease.release();
+            try entry.value_ptr.quota.releaseAfterSdkDeath(current);
             allocator.free(entry.key_ptr.*);
         }
         self.weights.deinit(allocator);
@@ -171,10 +191,10 @@ pub const Cache = struct {
     /// destruction owns all device cleanup, release host keys and admission
     /// without making further calls through the lost driver context.
     pub fn releaseAfterContextDestroyed(self: *Cache, allocator: std.mem.Allocator) void {
-        for (&self.arenas) |*entry| if (entry.lease) |*lease| lease.release();
+        for (&self.arenas) |*entry| entry.quota.releaseOutsideExecution();
         var iterator = self.weights.iterator();
         while (iterator.next()) |entry| {
-            if (entry.value_ptr.lease) |*lease| lease.release();
+            entry.value_ptr.quota.releaseOutsideExecution();
             allocator.free(entry.key_ptr.*);
         }
         self.weights.deinit(allocator);
@@ -182,27 +202,20 @@ pub const Cache = struct {
     }
 
     pub fn discardPacked(self: *Cache, allocator: std.mem.Allocator, ctx: *Context, key: []const u8) !void {
+        const value = self.weights.getPtr(key) orelse return;
+        if (ctx.prepared_cache_funding == null) try value.quota.validateLegacyRaw();
         try ctx.synchronize();
-        if (ctx.prepared_cache_funding) |funding| {
-            const value = self.weights.getPtr(key) orelse return;
-            const bytes = value.buffer.len;
-            const request = try prepared.Request.packedSpan(key, bytes);
-            _ = try value.buffer.freeChecked(ctx); // Failure preserves cache/key/quota ownership.
-            var removed = self.weights.fetchRemove(key).?;
-            self.packed_bytes -= bytes;
-            self.weight_generation +%= 1;
-            funding.rollbackPublished(request, &removed.value.lease);
-            allocator.free(removed.key);
-            return;
-        }
-        if (self.weights.fetchRemove(key)) |entry| {
-            var value = entry.value;
-            self.packed_bytes -= value.buffer.len;
-            self.weight_generation +%= 1;
-            value.buffer.free(ctx);
-            if (value.lease) |*lease| lease.release();
-            allocator.free(entry.key);
-        }
+        const bytes = value.buffer.len;
+        const request = if (ctx.prepared_cache_funding != null) try prepared.Request.packedSpan(key, bytes) else undefined;
+        _ = try value.buffer.freeChecked(ctx); // Failed SDK death preserves map/key/quota.
+        var removed = self.weights.fetchRemove(key).?;
+        self.packed_bytes -= bytes;
+        self.weight_generation +%= 1;
+        if (ctx.prepared_cache_funding) |funding|
+            funding.rollbackPublished(request, &removed.value.quota)
+        else
+            try removed.value.quota.releaseLegacyRawAfterSdkDeath();
+        allocator.free(removed.key);
     }
 
     pub fn findPacked(self: *Cache, key: []const u8) ?Buffer {
@@ -226,8 +239,8 @@ pub const Cache = struct {
         } else buffer.free(ctx);
         const name = try allocator.dupe(u8, key);
         errdefer allocator.free(name);
-        try self.weights.put(allocator, name, .{ .buffer = buffer, .lease = lease.value });
-        _ = lease.publish();
+        try self.weights.ensureUnusedCapacity(allocator, 1);
+        self.weights.putAssumeCapacity(name, .{ .buffer = buffer, .quota = lease.publishQuota() });
         self.packed_bytes += bytes;
         self.weight_generation +%= 1;
         return buffer;
@@ -294,6 +307,9 @@ pub const Cache = struct {
         };
         self.clock +|= 1;
         const selected = preview orelse return null;
+        if (!selected.hit and ctx.prepared_cache_funding == null) {
+            for (self.arenas, 0..) |value, index| if (selected.victims & (@as(u8, 1) << @intCast(index)) != 0 and value.quota == .prepared) return null;
+        }
         if (!selected.hit and selected.victims != 0 and ctx.prepared_cache_funding != null) return null;
         const entry = &self.arenas[selected.index];
         if (selected.hit) {
@@ -326,7 +342,7 @@ pub const Cache = struct {
         }
         candidate.last_used = self.clock;
         candidate.uses = 1;
-        candidate.lease = lease.publish();
+        candidate.quota = lease.publishQuota();
         entry.* = candidate;
         self.next_arena += 1;
         return entry;
@@ -437,7 +453,7 @@ test "embeddinggemma2 execution cache releases admission after a lost context is
     const lease = try controller.tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = 8 }, false);
     var cache = Cache{};
     const name = try std.testing.allocator.dupe(u8, "lost");
-    try cache.weights.put(std.testing.allocator, name, .{ .buffer = .{ .ptr = 1, .len = 8 }, .lease = lease });
+    try cache.weights.put(std.testing.allocator, name, .{ .buffer = .{ .ptr = 1, .len = 8 }, .quota = CacheQuota.fromRawAdmission(lease) });
     try std.testing.expectEqual(@as(usize, 8), controller.snapshot().backend_scratch_bytes);
     cache.releaseAfterContextDestroyed(std.testing.allocator);
     cache.releaseAfterContextDestroyed(std.testing.allocator);

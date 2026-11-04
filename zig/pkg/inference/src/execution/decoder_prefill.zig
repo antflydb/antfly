@@ -377,7 +377,7 @@ pub const Runtime = struct {
         var prefill_last_hidden_rows: usize = 0;
         errdefer if (prefill_last_logits) |values| allocator.free(values);
         errdefer if (prefill_last_hidden) |tensor| self.forward.context.cb.free(tensor);
-        try decode_runtime.appendPrefillChunk(chunk.len);
+        try decode_runtime.appendPrefillChunkWithCleanup(chunk.len, .{ .boundary = self.forward.context.cleanupEpoch(), .operation = self.forward.context.cb.operationToken() });
         const decode_context = decode_runtime.makeDecodeContext(total_chunk_end, chunk.len);
         // Shared-KV pruning is only valid for these explicit output
         // intents. Checkpoint fitting collects queries from every
@@ -572,11 +572,12 @@ pub const Runtime = struct {
     fn runCompiledChunkWithOwnedLane(self: *Runtime, request: CompiledChunk, cache: *graph_mod.cache.GraphCache, comptime forward_fn: anytype) !Output {
         const allocator = self.forward.context.allocator;
         var logical = BorrowedDecodeStateRuntime.init(self.state);
-        const context = try logical.preparePrefill(request.total_sequence_length, request.token_ids.len);
+        const context = try logical.preparePrefillWithCleanup(request.total_sequence_length, request.token_ids.len, .{ .boundary = self.forward.context.cleanupEpoch(), .operation = self.forward.context.cb.operationToken() });
         const cleanup_operation = self.forward.context.cb.operationToken();
-        var inherited = if (self.forward.context.cleanup_epoch == null and cleanup_operation != null) try cleanup_operation.?.retainCleanupEpoch() else null;
+        const supplied_cleanup = self.forward.context.cleanupEpoch();
+        var inherited = if (supplied_cleanup == null and cleanup_operation != null) try cleanup_operation.?.retainCleanupEpoch() else null;
         defer if (inherited) |*epoch| epoch.release();
-        const cleanup = @import("cleanup_context.zig").Context{ .boundary = self.forward.context.cleanup_epoch orelse if (inherited) |*epoch| epoch else null, .operation = cleanup_operation };
+        const cleanup = @import("cleanup_context.zig").Context{ .boundary = supplied_cleanup orelse if (inherited) |*epoch| epoch else null, .operation = cleanup_operation };
         var output = (try forward_fn(&self.forward.context, cache, request.token_ids, 1, request.total_sequence_length, &context)) orelse return error.MissingCompiledModelRuntime;
         defer output.deinitWithCleanup(allocator, cleanup);
         return switch (request.output) {
@@ -637,7 +638,7 @@ pub const Runtime = struct {
 
     pub fn prepareWholePrompt(self: *Runtime, sequence_length: usize) !void {
         var state = BorrowedDecodeStateRuntime.init(self.state);
-        _ = try state.preparePrefill(sequence_length, sequence_length);
+        _ = try state.preparePrefillWithCleanup(sequence_length, sequence_length, .{ .boundary = self.forward.context.cleanupEpoch(), .operation = self.forward.context.cb.operationToken() });
     }
     pub const EmbeddingRequest = struct {
         /// Ownership transfers under the execution lane, after successful

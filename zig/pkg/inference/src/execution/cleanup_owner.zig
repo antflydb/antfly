@@ -14,6 +14,34 @@ pub const Owner = struct {
     guard: ?sink.Guard = null,
     owned_epoch: ?sink.Epoch = null,
     prepared_finish: ?*@import("retirement_finish_holder.zig").Holder = null,
+    outside_cleanup: bool = false,
+
+    /// Explicit outside cleanup entry only: no enclosing numerical/metadata
+    /// lane or borrowed operation may be held. Reserve BEFORE taking the
+    /// caller's own cleanup mutexes, and finish only AFTER their real unlock.
+    /// This never substitutes for a supplied current caller B.
+    pub fn beginOutsideCleanup() !Owner {
+        var retained = try sink.Ref.create();
+        errdefer retained.release();
+        var guard = try retained.enter();
+        errdefer guard.finish();
+        const epoch_value = try guard.retainEpoch();
+        return .{ .retained_sink = retained, .guard = guard, .owned_epoch = epoch_value, .outside_cleanup = true };
+    }
+
+    /// This capability is valid only for our genuine local outside guard;
+    /// admitted/resident/borrowed B owners cannot turn raw leases into late work.
+    pub fn synchronousOutsideContext(self: *const Owner, pending: *@import("resource_retirement.zig").SynchronousOutsideRawLeases) !@import("cleanup_context.zig").Context {
+        const epoch_value = try self.outsideCleanupEpoch();
+        try pending.begin(self);
+        return .{ .boundary = epoch_value, .synchronous_outside_raw = pending };
+    }
+    pub fn outsideCleanupEpoch(self: *const Owner) !*const sink.Epoch {
+        const guard = if (self.guard) |*value| value else return error.MissingOutsideCleanupOwner;
+        const epoch_value = self.epoch() orelse return error.MissingOutsideCleanupOwner;
+        if (!self.outside_cleanup or !guard.held or guard.epoch.record != epoch_value.record or guard.epoch.nonce != epoch_value.nonce) return error.MissingOutsideCleanupOwner;
+        return epoch_value;
+    }
 
     /// Explicit admitted owners only. Ordinary unadmitted CPU runs do not
     /// create a sink, epoch or metadata allocation through this entry point.
@@ -73,6 +101,25 @@ pub const Owner = struct {
         if (!transferred) prepared.withdrawUnpublishedWithOuter(current) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         return transferred;
     }
+    /// A suspended persistent owner has ended ALL actual numerical gates,
+    /// while independent physical roots remain owned. Reserve the next exact
+    /// epoch from the SAME embedded sink before sealing the old boundary, so
+    /// metadata-capacity failure leaves the original owner resumable. No heap,
+    /// model lookup, SDK call, provider access, or old creation-B authority is
+    /// used. An unused cold finish cell moves forward without warm allocation.
+    pub fn rotateAfterUnlock(self: *Owner) !void {
+        const source = self.retained_sink orelse return;
+        var retained = try source.retain();
+        errdefer retained.release();
+        var guard = try retained.enter();
+        errdefer guard.finish();
+        const next_epoch = try guard.retainEpoch();
+        var previous = self.*;
+        self.* = .{ .retained_sink = retained, .guard = guard, .owned_epoch = next_epoch, .prepared_finish = previous.prepared_finish };
+        previous.prepared_finish = null;
+        previous.finishAfterUnlock();
+    }
+
     /// Caller has ended ALL actual provider and outer model/lane ownership.
     /// Clear publication before callbacks; callbacks can create a fresh owner
     /// but cannot recover this old epoch from a half-finished owner object.

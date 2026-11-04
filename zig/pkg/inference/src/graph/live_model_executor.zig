@@ -99,12 +99,20 @@ const RuntimeContext = struct {
     }
 
     fn resetState(self: *RuntimeContext) !void {
+        return self.resetStateWithCleanup(.{});
+    }
+    fn resetStateWithCleanup(self: *RuntimeContext, current: @import("../execution/cleanup_context.zig").Context) !void {
+        if (comptime @import("build_options").enable_cuda) if (self.cb.kind() == .cuda) {
+            const C = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+            if (current.boundary != null or current.outside_execution) try C.invalidateLightOnDecodeGraphWithCleanup(&self.cb, current) else C.invalidateLightOnDecodeGraph(&self.cb);
+        };
         // Recurrent storage belongs to this immutable model/runtime, not one
         // prefill call. Reset its contents while retaining the same warmed
         // host/device backing; KV and other request state keep their teardown.
         const recurrent = self.decode_runtime.state.qwen35_linear_cache;
         self.decode_runtime.state.qwen35_linear_cache = null;
-        self.decode_runtime.deinit();
+        errdefer self.decode_runtime.state.qwen35_linear_cache = recurrent;
+        try self.decode_runtime.deinitWithCleanup(current);
         self.decode_runtime = decode_state_runtime.DecodeStateRuntime.initPaged(
             self.allocator,
             &self.kv_manager,
@@ -117,12 +125,15 @@ const RuntimeContext = struct {
     }
 
     pub fn deinit(self: *RuntimeContext) void {
+        self.deinitWithCleanup(.{ .outside_execution = true });
+    }
+    pub fn deinitWithCleanup(self: *RuntimeContext, current: @import("../execution/cleanup_context.zig").Context) void {
         var cleanup = self.definition.beginCleanup();
         defer cleanup.deinit();
-        self.decode_runtime.deinit();
+        self.decode_runtime.deinitWithCleanup(current) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         self.kv_manager.deinit();
-        self.cb.deinit();
-        self.definition.release();
+        self.cb.deinitWithCleanup(current);
+        self.definition.releaseWithCleanup(current);
         self.allocator.destroy(self);
     }
 
@@ -194,6 +205,15 @@ fn operationBackend(raw: *anyopaque) *const ops.ComputeBackend {
     const self: *RuntimeContext = @ptrCast(@alignCast(raw));
     return &self.cb;
 }
+fn runtimeDeinitWithCleanup(raw: *anyopaque, current: @import("../execution/cleanup_context.zig").Context) void {
+    const ctx: *RuntimeContext = @ptrCast(@alignCast(raw));
+    ctx.deinitWithCleanup(current);
+}
+fn runtimeResetWithCleanup(raw: *anyopaque, current: @import("../execution/cleanup_context.zig").Context) !void {
+    const ctx: *RuntimeContext = @ptrCast(@alignCast(raw));
+    try ctx.resetStateWithCleanup(current);
+}
+const runtime_cleanup_services = model_runtime.ModelRuntime.ColdCleanupServices{ .accepts = acceptsOperationBackend, .deinit = runtimeDeinitWithCleanup, .reset = runtimeResetWithCleanup };
 const runtime_vtable = model_runtime.ModelRuntime.VTable{
     .operation_backend = operationBackend,
     .accepts_operation_backend = acceptsOperationBackend,
@@ -203,6 +223,7 @@ const runtime_vtable = model_runtime.ModelRuntime.VTable{
     .decode_sample = runtimeDecodeSample,
     .decode_greedy = runtimeDecodeGreedy,
     .deinit = runtimeDeinit,
+    .cold_cleanup_services = &runtime_cleanup_services,
     .reset = runtimeReset,
 };
 

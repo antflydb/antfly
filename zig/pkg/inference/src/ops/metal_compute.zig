@@ -900,7 +900,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // Only the canonical table authorizes this context cast. Cached and
         // request computes may be distinct owners on the SAME actual provider.
         const target: *MetalCompute = @ptrCast(@alignCast(request.implementation.context));
-        if (@as(*anyopaque, @ptrCast(target.provider_impl)) != record.provider or target.embedding_stage_suspended) return error.BackendOperationChanged;
+        if (@as(*anyopaque, @ptrCast(target.provider_impl)) != record.provider or target.embedding_stage_suspended or target.reader_epoch_suspended) return error.BackendOperationChanged;
         if (!operation_mod.allowsMode(record.mode, request.mode)) return error.BackendOperationChanged;
         // Numerical exclusion alone does not include the independent residency
         // index read lock. Only an explicitly owned metadata scope grants this
@@ -922,7 +922,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(raw));
         if (request.implementation.context != raw) return error.BackendOperationChanged;
         const table: *const ops.ComputeBackend.VTable = @ptrCast(@alignCast(request.implementation.table));
-        if (!operationAccepts(table) or self.embedding_stage_suspended) return error.BackendOperationChanged;
+        if (!operationAccepts(table) or self.embedding_stage_suspended or self.reader_epoch_suspended) return error.BackendOperationChanged;
         const prepared = try self.provider_impl.operations.prepare(@ptrCast(self.provider_impl), request);
         output.* = .{ .context = prepared.record, .nonce = prepared.nonce, .mode = request.mode, .implementation = request.implementation, .vtable = &operation_vtable };
         return true;
@@ -1034,7 +1034,27 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (current.outside_execution) value.providerFinishedOutsideExecution() catch @import("antfly_platform").inference_process_supervisor.restartWorker() else value.providerFinished(current.boundary) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         }
     }
-    const operation_services = operation_mod.Services{ .accepts = operationAccepts, .prepare_into = operationPrepareInto, .currentToken = currentEngineOperation, .bindCleanupEpoch = bindCurrentEngineCleanupEpoch, .retainCleanupGuard = retainCurrentEngineCleanupGuard, .retainCleanupFinish = retainCurrentCleanupFinish };
+    fn snapshotOwnedMetadata(backend: *const ops.ComputeBackend, token: operation_mod.Borrowed) !?ops.BackendDebugTimingSnapshot {
+        if (!operationAccepts(backend.vtable)) return error.BackendOperationChanged;
+        const self: *MetalCompute = @ptrCast(@alignCast(backend.ptr));
+        const owned = if (self.engine_operation) |*lease| lease.borrow() orelse return error.BackendOperationInactive else return error.BackendOperationUnavailable;
+        // Attest exact owner/token shape BEFORE invoking any supplied token
+        // callback. A forged/copy/foreign token never grants a context cast.
+        if (owned.context != token.context or owned.nonce != token.nonce or owned.vtable != token.vtable or owned.mode != token.mode) return error.BackendOperationChanged;
+        try token.validate(.{ .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .program = null, .mode = .managed });
+        if (self.provider_impl.raw_decode_runtime == null or metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) or metal_runtime.hasSubmittedFrame(self.provider_impl.raw_decode_runtime)) return null;
+        // The live Engine token owns the provider; this independent read lock
+        // additionally excludes the residency index writer. Contention makes
+        // optional metadata unavailable without changing the numerical scope.
+        if (!self.provider_impl.linear_slot_index_mutex.tryLock()) return null;
+        defer self.provider_impl.linear_slot_index_mutex.unlock();
+        // The shared snapshot also reads the optional relative cache. Keep
+        // this entire optional reader nonblocking, without skipping fields.
+        if (!self.provider_impl.deberta_relative_projection_cache_mutex.tryLock()) return null;
+        defer self.provider_impl.deberta_relative_projection_cache_mutex.unlock();
+        return self.debugTimingSnapshotWithRelativeLock(true);
+    }
+    const operation_services = operation_mod.Services{ .accepts = operationAccepts, .prepare_into = operationPrepareInto, .currentToken = currentEngineOperation, .snapshot_owned_metadata = snapshotOwnedMetadata, .bindCleanupEpoch = bindCurrentEngineCleanupEpoch, .retainCleanupGuard = retainCurrentEngineCleanupGuard, .retainCleanupFinish = retainCurrentCleanupFinish };
 
     /// Explicit engine outer operation, composed with the existing per-request
     /// provider lease. The value capability can be passed into cached runtimes
@@ -1800,6 +1820,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     // frame resources. Its lease covers execution and teardown, not just lazy
     // creation. Fused model batches share this lane; other stores remain free.
     shared_provider_lease_io: ?std.Io = null,
+    reader_epoch_suspended: bool = false,
     engine_operation: ?@import("../execution/backend_operation.zig").Lease = null,
     engine_cleanup_finish: ?*@import("../execution/retirement_finish_holder.zig").Holder = null,
     engine_borrowed_operation: ?@import("../execution/backend_operation.zig").Borrowed = null,
@@ -1949,12 +1970,98 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         weights: [8]?CT = @splat(null),
         norms: [2]?MetalTensor = @splat(null),
         slots: [8]usize = undefined,
+        declarations: [8]u64 = undefined,
+        payload_pins: [8]?@import("../backends/prepared_slot_owner.zig").Owner.Pin = @splat(null),
+        private_pins: [8]?(if (build_options.enable_metal) MetalNativeProvider.PrivateLinearPin else void) = @splat(null),
         fn deinit(plan: *LightOnPreparedLayer, self: *MetalCompute) void {
+            for (plan.payload_pins) |maybe_pin| if (maybe_pin) |pin| pin.release();
+            if (comptime build_options.enable_metal) for (plan.private_pins) |maybe_pin| if (maybe_pin) |pin| pin.release();
             for (plan.weights) |weight| if (weight) |value| freeOp(self, value);
             for (&plan.norms) |*norm| if (norm.*) |*value| value.deinit();
             plan.* = .{};
         }
     };
+
+    /// Cold process metadata, reused for every warm reader admission. The
+    /// epoch keeps the actual model/provider alive; custody carries no saved B
+    /// or numerical token and moves the same SDK cache backing, without clones.
+    pub const ReaderEpochPark = struct {
+        custody: *metal_runtime_mod.DecoderCacheCustody,
+        retired: *@import("../backends/metal_custody_cell.zig").Cell,
+        compute: ?*MetalCompute = null,
+
+        pub fn metadataBytes() !usize {
+            return std.math.add(usize, try @import("../backends/metal_custody_cell.zig").Cell.metadataBytes(), metal_runtime_mod.antfly_metal_decoder_cache_custody_metadata_bytes());
+        }
+        pub fn prepare() !ReaderEpochPark {
+            const custody = metal_runtime_mod.antfly_metal_decoder_cache_custody_create() orelse return error.OutOfMemory;
+            errdefer metal_runtime_mod.antfly_metal_decoder_cache_custody_destroy(custody);
+            return .{ .custody = custody, .retired = try @import("../backends/metal_custody_cell.zig").Cell.prepare() };
+        }
+        pub fn adoptMetadata(self: *ReaderEpochPark, source: *@import("../runtime/tier/memory.zig").AdmissionLease, domain: *const @import("../runtime/tier/admission_domain.zig").Pin) !void {
+            try self.retired.adoptMetadata(source, domain);
+        }
+        pub fn deinit(self: *ReaderEpochPark) void {
+            if (self.compute != null) @import("antfly_platform").inference_process_supervisor.restartWorker();
+            metal_runtime_mod.antfly_metal_decoder_cache_custody_destroy(self.custody);
+            self.retired.release(); // registered Node may independently outlive Reader
+        }
+        pub fn park(self: *ReaderEpochPark, cb: *const ops.ComputeBackend, current: @import("../execution/cleanup_context.zig").Context) !void {
+            if (self.compute != null or !acceptsEmbeddingStage(cb)) return error.UnsupportedReaderEpochBackend;
+            if (current.outside_execution or current.boundary == null) return error.MissingCurrentCleanupEpoch;
+            const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+            if (compute.owned_native_provider or compute.data.shared_metal_native_provider != compute.provider_impl or compute.embedding_stage_suspended or compute.reader_epoch_suspended or compute.shared_provider_lease_io == null or compute.engine_operation == null or compute.engine_borrowed_operation != null or compute.audio_capture != null) return error.ReaderEpochBackendBusy;
+            _ = try current.operationFor(cb);
+            // Finish actual numerical work, including a retained empty frame;
+            // quota suspension never cancels an admitted cohort's commands.
+            try operationQuiesce(compute.provider_impl, false);
+            try compute.validateReaderPreparedDeclarations();
+            const runtime = compute.provider_impl.raw_decode_runtime orelse return error.RuntimeUnavailable;
+            if (metal_runtime_mod.antfly_metal_decoder_cache_custody_take(runtime, self.custody) != 0) return error.ReaderEpochBackendBusy;
+            compute.finishEngineOperationWithCleanup(current);
+            const io = compute.shared_provider_lease_io.?;
+            compute.shared_provider_lease_io = null;
+            compute.reader_epoch_suspended = true;
+            unlockSharedMetalData(compute.data, io);
+            compute.finishRetainedCleanupGuard(current);
+            self.compute = compute;
+        }
+        pub fn restore(self: *ReaderEpochPark, cb: *const ops.ComputeBackend, current: @import("../execution/cleanup_context.zig").Context) !void {
+            if (!acceptsEmbeddingStage(cb)) return error.UnsupportedReaderEpochBackend;
+            const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+            if (self.compute != compute or !compute.reader_epoch_suspended or compute.data.shared_metal_native_provider != compute.provider_impl or compute.shared_provider_lease_io != null or compute.engine_operation != null) return error.ForeignReaderEpochPark;
+            if (current.outside_execution or current.boundary == null) return error.MissingCurrentCleanupEpoch;
+            const io = try lockSharedMetalData(compute.data, compute.io);
+            compute.shared_provider_lease_io = io;
+            compute.reader_epoch_suspended = false;
+            errdefer {
+                compute.quiesceEngineOperation() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+                compute.finishEngineOperationWithCleanup(current);
+                compute.shared_provider_lease_io = null;
+                compute.reader_epoch_suspended = true;
+                unlockSharedMetalData(compute.data, io);
+                compute.finishRetainedCleanupGuard(current);
+            }
+            try compute.beginEngineOperation();
+            if (!try cb.bindCleanupEpoch(current.boundary.?)) return error.BackendOperationCleanupUnavailable;
+            // Epoch-owned source handles/declarations remain live; a peer may
+            // retire its own raw slots but must not silently rebind these plans.
+            try compute.validateReaderPreparedDeclarations();
+            const runtime = compute.provider_impl.raw_decode_runtime orelse return error.RuntimeUnavailable;
+            try self.retired.queueForCurrentBoundary(current); // BEFORE any SDK exchange
+            if (metal_runtime_mod.antfly_metal_decoder_cache_custody_restore_into(runtime, self.custody, self.retired.custody) != 0) return error.ReaderEpochBackendBusy;
+            self.compute = null;
+        }
+    };
+    fn validateReaderPreparedDeclarations(self: *MetalCompute) !void {
+        for (self.lighton_prepared_layers) |maybe_plan| if (maybe_plan) |plan| {
+            for (plan.slots, plan.declarations, plan.payload_pins, plan.private_pins) |slot, declaration, maybe_pin, private_pin| {
+                if (declaration == 0 or self.provider_impl.privateSlotDeclaration(.linear, slot) != declaration or metal_runtime.preparedBindingRetired(self.provider_impl, .linear, slot)) return error.ReaderEpochDeclarationChanged;
+                if (maybe_pin) |pin| if (!pin.valid()) return error.ReaderEpochDeclarationChanged;
+                if (comptime build_options.enable_metal) if (private_pin) |pin| if (!pin.valid()) return error.ReaderEpochDeclarationChanged;
+            }
+        };
+    }
 
     pub fn setLightOnActivationPool(cb: *const ops.ComputeBackend, enabled: bool) !void {
         return setLightOnActivationPoolConfigured(cb, enabled, false);
@@ -2601,6 +2708,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 const bias = try self.cachedZeroBiasBuf(out_dim);
                 defer freeOp(self, bias);
                 plan.slots[index] = (try self.ensureDynamicLinearSlot(weight, bias, in_dim, out_dim)) orelse return null;
+                plan.declarations[index] = self.provider_impl.privateSlotDeclaration(.linear, plan.slots[index]);
+                plan.payload_pins[index] = try self.provider_impl.pinLinearSlotForPersistentUse(plan.slots[index]);
+                // The payload pin freezes shared-cache bytes; the declaration
+                // pin also excludes late raw metadata retirement/replacement.
+                plan.private_pins[index] = if (plan.payload_pins[index]) |payload|
+                    try self.provider_impl.pinCachedLinearDeclaration(plan.slots[index], plan.declarations[index], payload)
+                else
+                    try self.provider_impl.pinPrivateLinearDeclaration(plan.slots[index], plan.declarations[index]);
                 // Native BF16 slots own their backing lease. A plan retains
                 // descriptor identities, not an otherwise idle F32 host mirror.
                 if (toBuf(weight).native_dense_host_cache) |mirror| {
@@ -6122,6 +6237,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn deinitPooledWithCleanup(self: *MetalCompute, current: @import("../execution/cleanup_context.zig").Context) void {
+        if (self.reader_epoch_suspended) @import("antfly_platform").inference_process_supervisor.restartWorker();
         if (self.embedding_stage_suspended) return;
         const owns_provider = self.ownsProviderCleanup();
         // The borrowing constructor does not configure these provider-global
@@ -35073,6 +35189,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         ctx: *anyopaque,
         request: *const ops.DecoderRuntimeGraphCommandPlanFrameRequest,
     ) anyerror!bool {
+        if (request.cleanup) |current| {
+            if (current.outside_execution or current.boundary == null) return error.MissingCurrentCleanupEpoch;
+            var backend = self.computeBackend();
+            _ = try current.operationFor(&backend);
+        }
+
         if (request.contract != .qwen3_dense_text_prefill) return self.declinePrefillFrameExecute(.invalid_contract);
         if (request.rows <= 1 or request.layer_count == 0 or request.layers.len != request.layer_count) return self.declinePrefillFrameExecute(.invalid_shape);
         if (request.batch == 0 or request.seq_len == 0 or request.rows != request.batch * request.seq_len) return self.declinePrefillFrameExecute(.invalid_shape);
@@ -35091,7 +35213,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         var hidden = request.hidden;
         var owns_hidden = false;
-        defer if (owns_hidden) freeOp(ctx, hidden);
+        defer if (owns_hidden) freeWithCleanupOp(ctx, hidden, if (request.cleanup) |current| current.* else .{});
 
         const full_frame_contract = self.activePrefillFrameFullContract() orelse {
             if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-prefill-frame decline=full-contract\n", .{});
@@ -35128,7 +35250,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-prefill-frame decline=attn-rms layer={d}\n", .{layer_index});
                 return self.declinePrefillFrameExecute(.plan_mismatch);
             };
-            defer freeOp(ctx, attn_normed);
+            defer freeWithCleanupOp(ctx, attn_normed, if (request.cleanup) |current| current.* else .{});
 
             var attention = request.attention;
             attention.mode = .dense_causal;
@@ -35190,7 +35312,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-prefill-frame decline=block layer={d}\n", .{layer_index});
                 return self.declinePrefillFrameExecute(.plan_mismatch);
             };
-            if (owns_hidden) freeOp(ctx, prev_hidden);
+            if (owns_hidden) freeWithCleanupOp(ctx, prev_hidden, if (request.cleanup) |current| current.* else .{});
             hidden = block_hidden;
             owns_hidden = true;
         }
@@ -35210,7 +35332,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-prefill-frame decline=final-rms\n", .{});
             return self.declinePrefillFrameExecute(.plan_mismatch);
         };
-        if (owns_hidden) freeOp(ctx, hidden);
+        if (owns_hidden) freeWithCleanupOp(ctx, hidden, if (request.cleanup) |current| current.* else .{});
         request.output_hidden.* = final_hidden;
         owns_hidden = false;
         self.timing_stats.prefill_frame_execute_successes += 1;
@@ -35505,6 +35627,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn debugTimingSnapshotOp(ctx: *anyopaque) ops.BackendDebugTimingSnapshot {
         const self: *const MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.debugTimingSnapshotWithRelativeLock(false);
+    }
+    fn debugTimingSnapshotWithRelativeLock(self: *const MetalCompute, comptime relative_cache_locked: bool) ops.BackendDebugTimingSnapshot {
         var provider_stats = self.timing_stats;
         // Prewarm is model/runtime lifecycle state, while the surrounding
         // timing counters are request-scoped and may be reset immediately
@@ -35517,7 +35642,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             provider_stats.a4b_moe_mapped_layer0_prewarm_page_touches = prewarm.page_touches;
             provider_stats.a4b_moe_mapped_layer0_prewarm_nanos = self.a4b_mapped_layer0_prewarm_nanos;
         }
-        self.populateMemoryDebugStats(&provider_stats);
+        self.populateMemoryDebugStats(&provider_stats, relative_cache_locked);
         const memory = metal_runtime.runtimeMemorySnapshot(self.provider_impl.raw_decode_runtime);
         return .{
             .runtime = .{
@@ -35600,7 +35725,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
     }
 
-    fn populateMemoryDebugStats(self: *const MetalCompute, stats: *ops.NativeQuantTimingStats) void {
+    fn populateMemoryDebugStats(self: *const MetalCompute, stats: *ops.NativeQuantTimingStats, comptime relative_cache_locked: bool) void {
         const tensor_stats = metal_tensor_mod.memoryStatsSnapshot();
         stats.metal_tensor_device_owned_buffers_created = tensor_stats.device_owned_buffers_created;
         stats.metal_tensor_device_owned_buffers_released = tensor_stats.device_owned_buffers_released;
@@ -35678,8 +35803,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var relative_cache_bytes: u64 = 0;
         var relative_cache_buffers: u64 = 0;
         {
-            while (!self.provider_impl.deberta_relative_projection_cache_mutex.tryLock()) std.atomic.spinLoopHint();
-            defer self.provider_impl.deberta_relative_projection_cache_mutex.unlock();
+            if (!relative_cache_locked) while (!self.provider_impl.deberta_relative_projection_cache_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer if (!relative_cache_locked) self.provider_impl.deberta_relative_projection_cache_mutex.unlock();
             const embedding_cache = &self.provider_impl.deberta_relative_embedding_cache;
             if (embedding_cache.valid) {
                 if (embedding_cache.tensor) |*tensor| {
@@ -54817,4 +54942,248 @@ test "Metal model mapped raw16 cache admits canonical roots and closes provider 
     deinitSharedNativeProvider(&data);
     try std.testing.expect(data.shared_metal_native_provider == null);
     try std.testing.expectEqual(@as(u16, 0x3f80), std.mem.readInt(u16, mapped[1536..1538], .little));
+}
+
+test "Metal private prepared declaration pin refuses raw peer replacement and clear before SDK mutation" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const Context = @import("../backends/compute_context.zig").BackendContext;
+    const a = std.testing.allocator;
+    var context = try Context.init(a, .metal, null);
+    defer context.deinit(a);
+    var cb = context.computeBackend();
+    const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    compute.require_f32_linears = true;
+    const dim = 16;
+    const input_data: [dim]f32 = @splat(0.25);
+    const weights: [dim * dim]f32 = @splat(0.125);
+    const replacement_weights: [dim * dim]f32 = @splat(0.25);
+    const input = try auditDeviceTensor(compute, &cb, &input_data, &.{ 1, dim });
+    defer cb.free(input);
+    const weight = try auditDeviceTensor(compute, &cb, &weights, &.{ dim, dim });
+    defer cb.free(weight);
+    const replacement = try auditDeviceTensor(compute, &cb, &replacement_weights, &.{ dim, dim });
+    defer cb.free(replacement);
+    const zero = try compute.cachedZeroBiasBuf(dim);
+    defer cb.free(zero);
+    const slot = (try compute.ensureDynamicLinearSlot(weight, zero, dim, dim)) orelse return error.ExpectedPreparedSlot;
+    const provider = compute.provider_impl;
+    try std.testing.expect((try provider.pinLinearSlotForPersistentUse(slot)) == null); // actual private namespace
+    const declaration = provider.privateSlotDeclaration(.linear, slot);
+    var held: ?MetalCompute.MetalNativeProvider.PrivateLinearPin = try provider.pinPrivateLinearDeclaration(slot, declaration);
+    defer if (held) |pin| pin.release();
+    const before = metal_runtime_mod.runtimeMemorySnapshot(provider.raw_decode_runtime);
+    try std.testing.expect(!try cb.decoderRuntimePrepareLinear(&.{ .slot = slot, .weight = replacement, .bias = zero, .in_dim = dim, .out_dim = dim }));
+    metal_runtime_mod.clearRawLinearSlot(provider, slot);
+    metal_runtime_mod.releaseRawLinearSlot(provider, slot);
+    provider.replacePrivateSlotDeclaration(.linear, slot);
+    provider.requestPrivateSlotRetirement(.linear, slot, declaration);
+    try std.testing.expect(held.?.valid());
+    try std.testing.expectEqual(declaration, provider.privateSlotDeclaration(.linear, slot));
+    try std.testing.expect(!metal_runtime_mod.preparedBindingRetired(provider, .linear, slot));
+    try std.testing.expect(provider.raw_linear_slots_prepared[slot]);
+    const after = metal_runtime_mod.runtimeMemorySnapshot(provider.raw_decode_runtime);
+    try std.testing.expectEqual(before.dense_linear_bytes, after.dense_linear_bytes);
+    const actual = (try cb.decoderRuntimeApplyLinear(&.{ .slot = slot, .input = input, .in_dim = dim, .out_dim = dim })) orelse return error.ExpectedActualProjection;
+    defer cb.free(actual);
+    const host = try cb.toFloat32(actual, a);
+    defer a.free(host);
+    for (host) |value| try std.testing.expectApproxEqAbs(@as(f32, 0.5), value, 0.00001);
+    held.?.release();
+    held = null;
+    try std.testing.expect(provider.allowsOwnedSlotMutation(slot));
+    // The pending pure retirement now retries through the ACTUAL entered
+    // operation ticket. Raw same-geometry prepare intentionally reuses an
+    // existing slot, so retirement must clear it before replacement is tested.
+    const Operation = @import("../execution/backend_operation.zig");
+    var actual_scope: Operation.Scope = undefined;
+    try Operation.enterInto(&cb, null, null, .managed, &actual_scope);
+    defer actual_scope.deinitChecked() catch @panic("actual declaration fixture scope cleanup failed");
+    const actual_token = actual_scope.token() orelse return error.ExpectedActualOperationToken;
+    const terminal = try MetalCompute.operationRecord(actual_token.context, actual_token.nonce);
+    try std.testing.expectEqual(@as(usize, 1), try provider.retirePrivateSlotsAtTerminal(&terminal));
+    try std.testing.expect(!provider.raw_linear_slots_prepared[slot]);
+    try std.testing.expect(provider.privateSlotDeclaration(.linear, slot) != declaration);
+
+    // Preserve the ORIGINAL prepared F32 MPS/storage policy. The unqualified
+    // raw default chooses a different handwritten route for this tiny shape.
+    try std.testing.expect(try compute.prepareLinearWithF32Storage(&.{ .slot = slot, .weight = replacement, .bias = zero, .in_dim = dim, .out_dim = dim, .prefer_f32_mps_fallback = true, .require_preferred_dense_precision = true }, .owned_shared_if_unified));
+    try std.testing.expect(provider.privateSlotDeclaration(.linear, slot) != declaration);
+    const next = (try cb.decoderRuntimeApplyLinear(&.{ .slot = slot, .input = input, .in_dim = dim, .out_dim = dim })) orelse return error.ExpectedActualProjection;
+    defer cb.free(next);
+    const next_host = try cb.toFloat32(next, a);
+    defer a.free(next_host);
+    for (next_host) |value| try std.testing.expectApproxEqAbs(@as(f32, 1), value, 0.00001);
+}
+
+test "Metal shared cached declaration rejects private raw metadata mutation and only cache owner retires it" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const dim = 64;
+    const bytes = (dim * dim + dim) * @sizeOf(f32);
+    const name = "vision_tower.patch_embedder.input_proj.weight";
+    var matrix: [dim * dim]f32 = @splat(0.125);
+    var controller = runtime_root.tier.memory.AdmissionController{};
+    controller.configureSharedLimits(.{ .unified_limit_bytes = bytes });
+    defer controller.deinit();
+    var store = testMetalWeightStoreInit(a);
+    store.tier_cache = runtime_root.tier.cache.SharedCache.init(.{ .backend_limit_bytes = bytes });
+    defer store.tier_cache.?.deinitAdmission();
+    try store.tier_cache.?.configureAdmission(a, &controller, .gpu, .{ .backend_limit_bytes = bytes, .combined_limit_bytes = bytes }, .{});
+    defer store.lazy_weights.deinit(a);
+    try addLegacyGlinerMpsTestWeight(&store, name, &matrix, &.{ dim, dim });
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer deinitSharedNativeProvider(&store);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    compute.require_f32_linears = true;
+    var cb = compute.computeBackend();
+    const weight = try cb.getWeight(name);
+    defer cb.free(weight);
+    const zero = try compute.cachedZeroBiasBuf(dim);
+    defer cb.free(zero);
+    const slot = (try compute.ensureDynamicLinearSlot(weight, zero, dim, dim)) orelse return error.ExpectedChargedSlot;
+    const provider = compute.provider_impl;
+    const profile = provider.profileLinearSlot(slot) orelse return error.ExpectedActualCacheOwner;
+    defer profile.release();
+    var payload: ?@import("../backends/prepared_slot_owner.zig").Owner.Pin = profile.pin() orelse return error.ExpectedActualPayloadPin;
+    defer if (payload) |pin| pin.release();
+    const generation = provider.privateSlotDeclaration(.linear, slot);
+    var declaration: ?MetalCompute.MetalNativeProvider.PrivateLinearPin = try provider.pinCachedLinearDeclaration(slot, generation, payload.?);
+    defer if (declaration) |pin| pin.release();
+    const Operation = @import("../execution/backend_operation.zig");
+    var actual_scope: Operation.Scope = undefined;
+    try Operation.enterInto(&cb, null, null, .managed, &actual_scope);
+    defer actual_scope.deinitChecked() catch @panic("actual declaration fixture scope cleanup failed");
+    const actual_token = actual_scope.token() orelse return error.ExpectedActualOperationToken;
+    const terminal = try MetalCompute.operationRecord(actual_token.context, actual_token.nonce);
+    provider.replacePrivateSlotDeclaration(.linear, slot);
+    provider.requestPrivateSlotRetirement(.linear, slot, generation);
+    metal_runtime_mod.releaseRawLinearSlot(provider, slot);
+    metal_runtime_mod.clearRawLinearSlot(provider, slot);
+    try std.testing.expect(!try cb.decoderRuntimePrepareLinear(&.{ .slot = slot, .weight = weight, .bias = zero, .in_dim = dim, .out_dim = dim }));
+    try std.testing.expectEqual(@as(usize, 0), try provider.retirePrivateSlotsAtTerminal(&terminal));
+    try std.testing.expectEqual(generation, provider.privateSlotDeclaration(.linear, slot));
+    try std.testing.expect(declaration.?.valid() and payload.?.valid() and profile.live());
+    const input_values: [dim]f32 = @splat(0.25);
+    const input = try auditDeviceTensor(&compute, &cb, &input_values, &.{ 1, dim });
+    defer cb.free(input);
+    const output = (try cb.decoderRuntimeApplyLinear(&.{ .slot = slot, .input = input, .in_dim = dim, .out_dim = dim })) orelse return error.ExpectedActualProjection;
+    defer cb.free(output);
+    const values = try cb.toFloat32(output, a);
+    defer a.free(values);
+    for (values) |value| try std.testing.expectApproxEqAbs(@as(f32, 2), value, 0.00001);
+    payload.?.release();
+    payload = null;
+    declaration.?.release();
+    declaration = null;
+    // A transient PRIVATE cleanup does not gain cache ownership when the last
+    // selector pin ends. The exact same cached declaration remains live.
+    provider.requestPrivateSlotRetirement(.linear, slot, generation);
+    try std.testing.expectEqual(@as(usize, 0), try provider.retirePrivateSlotsAtTerminal(&terminal));
+    try std.testing.expectEqual(generation, provider.privateSlotDeclaration(.linear, slot));
+    try std.testing.expect(profile.live());
+    try std.testing.expectEqual(@as(usize, bytes), controller.snapshot().backend_weight_bytes);
+    store.prefetch.lock();
+    const reclaimed = provider.reclaimEmbeddingGemma2Weights(.vision) catch |err| {
+        store.prefetch.unlock();
+        return err;
+    };
+    store.prefetch.unlock();
+    try std.testing.expectEqual(@as(usize, bytes), reclaimed);
+    try std.testing.expect(!profile.live());
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_weight_bytes);
+}
+
+test "Metal owned metadata uses exact live Engine and independent nonblocking index authority" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const metadata = @import("../execution/metadata_sample.zig");
+    const operation = @import("../execution/backend_operation.zig");
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    const compute: *MetalCompute = @ptrCast(@alignCast(backend.ptr));
+    const sample = backend.vtable.operation_services.?.snapshot_owned_metadata.?;
+    const invalid = operation.Borrowed{ .context = @ptrFromInt(0x1000), .nonce = 1, .mode = .managed, .vtable = @ptrFromInt(0x2000) };
+    try std.testing.expect(metadata.snapshotOwned(&backend, invalid) == null);
+    // An externally acquired managed operation is not this compute's explicit
+    // Engine owner; same-provider numerical exclusion alone cannot sample.
+    {
+        var external = try operation.enter(backend, null, null, .managed);
+        defer external.deinitChecked() catch @panic("metadata external scope");
+        try std.testing.expect(metadata.snapshotOwned(&backend, external.token().?) == null);
+        try external.finish();
+    }
+    try compute.beginEngineOperation();
+    const token = backend.operationToken() orelse return error.ExpectedActualEngineOperation;
+    const runtime = compute.provider_impl.raw_decode_runtime orelse return error.ExpectedActualRuntime;
+    const before_frames = metal_runtime_mod.frameCommandBufferCount(runtime);
+    compute.timing_stats.prefill_frame_execute_successes = 7;
+    const observed = metadata.snapshotOwned(&backend, token) orelse return error.ExpectedOwnedMetadata;
+    try std.testing.expectEqual(@as(u64, 7), observed.provider.prefill_frame_execute_successes);
+    try std.testing.expect(compute.engine_operation != null);
+    try token.validate(.{ .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .program = null, .mode = .managed });
+    try std.testing.expectError(error.BackendOperationChanged, operation.enter(backend, null, token, .metadata));
+    // Full table must be accepted before the implementation pointer is cast.
+    var copied = backend.vtable.*;
+    var wrapped = backend;
+    wrapped.vtable = &copied;
+    wrapped.ptr = @ptrFromInt(0x1000);
+    try std.testing.expect(metadata.snapshotOwned(&wrapped, token) == null);
+    try std.testing.expectError(error.BackendOperationChanged, sample(&wrapped, token));
+    // Exact owner comparison precedes callbacks through a supplied token table.
+    try std.testing.expectError(error.BackendOperationChanged, sample(&backend, invalid));
+    {
+        var foreign = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+        defer foreign.deinit(a);
+        const foreign_backend = foreign.computeBackend();
+        const foreign_compute: *MetalCompute = @ptrCast(@alignCast(foreign_backend.ptr));
+        try foreign_compute.beginEngineOperation();
+        const foreign_token = foreign_backend.operationToken() orelse return error.ExpectedActualEngineOperation;
+        try std.testing.expect(foreign_compute.provider_impl != compute.provider_impl);
+        try std.testing.expectError(error.BackendOperationChanged, sample(&backend, foreign_token));
+        try std.testing.expect(metadata.snapshotOwned(&backend, foreign_token) == null);
+    }
+    var wrong_mode = token;
+    wrong_mode.mode = .metadata;
+    try std.testing.expectError(error.BackendOperationChanged, sample(&backend, wrong_mode));
+    wrong_mode.mode = .legacy_unknown_frame;
+    try std.testing.expectError(error.BackendOperationChanged, sample(&backend, wrong_mode));
+    try std.testing.expect(compute.provider_impl.linear_slot_index_mutex.tryLock());
+    const busy_index = metadata.snapshotOwned(&backend, token);
+    compute.provider_impl.linear_slot_index_mutex.unlock();
+    try std.testing.expect(busy_index == null);
+    try std.testing.expect(compute.provider_impl.deberta_relative_projection_cache_mutex.tryLock());
+    const busy_relative = metadata.snapshotOwned(&backend, token);
+    compute.provider_impl.deberta_relative_projection_cache_mutex.unlock();
+    try std.testing.expect(busy_relative == null);
+    var fail_warm = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    {
+        const original_allocator = compute.allocator;
+        compute.allocator = fail_warm.allocator();
+        defer compute.allocator = original_allocator;
+        try std.testing.expect(metadata.snapshotOwned(&backend, token) != null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fail_warm.alloc_index);
+    try std.testing.expect(!fail_warm.has_induced_failure);
+    try std.testing.expectEqual(before_frames, metal_runtime_mod.frameCommandBufferCount(runtime));
+    // Never force completion just to make optional telemetry available.
+    try metal_runtime_mod.beginFrame(runtime);
+    try std.testing.expect(metadata.snapshotOwned(&backend, token) == null);
+    try std.testing.expect(metal_runtime_mod.hasActiveFrame(runtime));
+    try metal_runtime_mod.submitFrame(runtime);
+    try std.testing.expect(metadata.snapshotOwned(&backend, token) == null);
+    try metal_runtime_mod.waitFrame(runtime);
+    try std.testing.expect(metadata.snapshotOwned(&backend, token) != null);
+    compute.finishEngineOperation();
+    try std.testing.expect(metadata.snapshotOwned(&backend, token) == null);
+    try compute.beginEngineOperation();
+    const replacement = backend.operationToken() orelse return error.ExpectedActualEngineOperation;
+    try std.testing.expect(token.nonce != replacement.nonce);
+    try std.testing.expectError(error.BackendOperationChanged, sample(&backend, token));
+    try std.testing.expect(metadata.snapshotOwned(&backend, replacement) != null);
 }

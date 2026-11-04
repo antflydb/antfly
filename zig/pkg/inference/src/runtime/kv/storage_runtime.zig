@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const Cleanup = @import("../../execution/cleanup_context.zig").Context;
 const block = @import("block.zig");
 const writable = @import("writable_blocks.zig");
 const block_table = @import("block_table.zig");
@@ -349,6 +350,9 @@ pub const DeviceWriteHook = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Concrete physical mutation owner, called synchronously before any
+        /// logical publication. No current Epoch is stored in this hook.
+        prepareMutationWithCleanup: ?*const fn (*anyopaque, *const anyopaque, Cleanup) anyerror!void = null,
         planCapacity: ?*const fn (*anyopaque, *const anyopaque, usize, u16, []const device_capacity.LayerGeometry, *device_capacity.Plan) anyerror!void = null,
         growCapacity: ?*const fn (*anyopaque, *const anyopaque, *const device_capacity.Plan, *device_capacity.Claim, *const @import("../../execution/retirement_sink.zig").Epoch) anyerror!void = null,
         deinitWithBoundary: ?*const fn (*anyopaque, std.mem.Allocator, ?*const @import("../../execution/retirement_sink.zig").Epoch) void = null,
@@ -500,6 +504,10 @@ pub const DeviceWriteHook = struct {
         return score_fn(self.ctx, request);
     }
 
+    pub fn prepareMutationWithCleanup(self: DeviceWriteHook, current: Cleanup) !void {
+        if (self.vtable.prepareMutationWithCleanup) |prepare| try prepare(self.ctx, self.vtable, current);
+    }
+
     pub fn truncateSequence(self: DeviceWriteHook, sequence_id: SequenceId, retained_token_count: usize) void {
         const truncate_fn = self.vtable.truncateSequence orelse return;
         truncate_fn(self.ctx, sequence_id, retained_token_count);
@@ -555,6 +563,7 @@ pub const KvStorageRuntime = struct {
         self.deinitWithBoundary(null);
     }
     pub fn deinitWithBoundary(self: *KvStorageRuntime, cleanup: ?*const @import("../../execution/retirement_sink.zig").Epoch) void {
+        if (cleanup != null) if (self.device_write_hook) |hook| hook.prepareMutationWithCleanup(.{ .boundary = cleanup }) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         for (self.sequences.items, 0..) |_, idx| {
             self.releaseSequenceByIndex(idx) catch {};
         }
@@ -799,6 +808,11 @@ pub const KvStorageRuntime = struct {
         return sequence_id;
     }
 
+    pub fn releaseSequenceWithCleanup(self: *KvStorageRuntime, sequence_id: SequenceId, current: Cleanup) !void {
+        if (self.device_write_hook) |hook| try hook.prepareMutationWithCleanup(current);
+        try self.releaseSequence(sequence_id);
+    }
+
     pub fn releaseSequence(self: *KvStorageRuntime, sequence_id: SequenceId) !void {
         const idx = sequenceIndex(sequence_id) orelse return error.InvalidSequenceId;
         if (idx >= self.sequences.items.len) return error.InvalidSequenceId;
@@ -851,15 +865,21 @@ pub const KvStorageRuntime = struct {
     }
 
     fn ensureWritableRange(self: *KvStorageRuntime, state: *SequenceState, first: usize, count: usize) !void {
-        const provider: ?block_copy.Provider = if (self.device_write_hook) |hook| if (hook.vtable.copySharedBlockPrefixes) |copy| .{ .context = hook.ctx, .implementation = hook.vtable, .copy_and_wait = copy } else null else null;
+        return self.ensureWritableRangeUsing(state, first, count, .{});
+    }
+    fn ensureWritableRangeUsing(self: *KvStorageRuntime, state: *SequenceState, first: usize, count: usize, current: Cleanup) !void {
+        const provider: ?block_copy.Provider = if (self.device_write_hook) |hook| if (hook.vtable.copySharedBlockPrefixes) |copy| .{ .context = hook.ctx, .implementation = hook.vtable, .copy_and_wait = copy, .cleanup = current } else null else null;
         try writable.ensureRangeWithProvider(&self.storage, &state.block_table, &state.reserved_tail_blocks, self.allocator, first, count, state.id, self.device_write_hook == null, provider);
     }
 
     pub fn reserveTailBlock(self: *KvStorageRuntime, sequence_id: SequenceId) !block.KvBlockId {
+        return self.reserveTailBlockWithCleanup(sequence_id, .{});
+    }
+    pub fn reserveTailBlockWithCleanup(self: *KvStorageRuntime, sequence_id: SequenceId, current: Cleanup) !block.KvBlockId {
         const sequence_state = try self.sequenceMut(sequence_id);
         if (sequence_state.block_table.last() != null) {
             if (sequence_state.block_table.tail_tokens < self.storage.config.page_size_tokens) {
-                try self.ensureWritableRange(sequence_state, (sequence_state.block_table.blocks.items.len - 1) * self.storage.config.page_size_tokens, 1);
+                try self.ensureWritableRangeUsing(sequence_state, (sequence_state.block_table.blocks.items.len - 1) * self.storage.config.page_size_tokens, 1, current);
                 return sequence_state.block_table.last().?;
             }
         }
@@ -951,10 +971,13 @@ pub const KvStorageRuntime = struct {
     }
 
     pub fn appendTokens(self: *KvStorageRuntime, sequence_id: SequenceId, count: u16) !void {
+        return self.appendTokensWithCleanup(sequence_id, count, .{});
+    }
+    pub fn appendTokensWithCleanup(self: *KvStorageRuntime, sequence_id: SequenceId, count: u16, current: Cleanup) !void {
         var remaining = count;
         const sequence_state = try self.sequenceMut(sequence_id);
         while (remaining > 0) {
-            _ = try self.reserveTailBlock(sequence_id);
+            _ = try self.reserveTailBlockWithCleanup(sequence_id, current);
             const space = self.storage.config.page_size_tokens - sequence_state.block_table.tail_tokens;
             const consumed = @min(space, remaining);
             sequence_state.block_table.tail_tokens += consumed;
@@ -1094,6 +1117,11 @@ pub const KvStorageRuntime = struct {
         }
 
         return .{ .k = k, .v = v };
+    }
+
+    pub fn truncateSequenceWithCleanup(self: *KvStorageRuntime, sequence_id: SequenceId, count: usize, current: Cleanup) !usize {
+        if (self.device_write_hook) |hook| try hook.prepareMutationWithCleanup(current);
+        return self.truncateSequence(sequence_id, count);
     }
 
     pub fn truncateSequence(self: *KvStorageRuntime, sequence_id: SequenceId, count: usize) !usize {

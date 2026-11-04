@@ -502,6 +502,27 @@ pub const RunAdmission = struct {
         }
     }
 
+    /// Cold additional mandatory producers belong to the SAME request as
+    /// its already-owned run floor. Classify that exact sum before acquiring
+    /// a second lease; other executions remain genuine temporary contention.
+    fn validateOwnedRunAmounts(self: RunAdmission, amounts: memory.AdmissionAmounts) !void {
+        const violation = amounts.firstLimitExceeded(self.limits) catch return error.ResourceLimitExceeded;
+        const shared = self.controller.sharedLimitsSnapshot();
+        const host = amounts.hostTotalBytes();
+        const combined = std.math.add(usize, host, amounts.backendTotalBytes()) catch return error.ResourceLimitExceeded;
+        if (violation != null or
+            (shared.host_limit_bytes != 0 and host > shared.host_limit_bytes) or
+            (shared.unified_limit_bytes != 0 and combined > shared.unified_limit_bytes))
+        {
+            if (self.denial_observer) |observer| observer.record(observer.context, error.ResourceLimitExceeded, null, .{
+                .backend_class = self.backend_class,
+                .limits = self.limits,
+                .amounts = amounts,
+            });
+            return error.ResourceLimitExceeded;
+        }
+    }
+
     fn estimateResidentAmounts(
         self: RunAdmission,
         inputs: []const ResidentInput,
@@ -1054,22 +1075,446 @@ pub const OutputCredits = struct {
         return .{ .entries = entries, .remaining_groups = groups, .covered = covered };
     }
 
-    pub fn release(self: *OutputCredits, index: usize, lease: *memory.AdmissionLease) void {
+    /// Metadata-only row retirement, shared with typed final host owners.
+    /// The caller applies any quota shrink after releasing its metadata lock.
+    fn retire(self: *OutputCredits, index: usize) ?memory.AdmissionAmounts {
         const group = &self.entries[self.entries[index].group];
         std.debug.assert(group.remaining > 0);
         group.remaining -= 1;
-        if (group.remaining != 0) return;
+        if (group.remaining != 0) return null;
         self.remaining_groups -= 1;
+        return group.amounts;
+    }
+    pub fn release(self: *OutputCredits, index: usize, lease: *memory.AdmissionLease) void {
+        const released = self.retire(index) orelse return;
         // The final group uses release(), never a redundant retain-then-release.
         if (self.remaining_groups == 0 or !self.covered) return;
         var retained = lease.amounts;
-        retained.host_scratch_bytes -= group.amounts.host_scratch_bytes;
-        retained.host_kv_bytes -= group.amounts.host_kv_bytes;
+        retained.host_scratch_bytes -= released.host_scratch_bytes;
+        retained.host_kv_bytes -= released.host_kv_bytes;
         if (!std.meta.eql(retained, lease.amounts)) lease.retain(retained) catch {};
     }
 
     pub fn deinit(self: *OutputCredits, allocator: std.mem.Allocator) void {
         allocator.free(self.entries);
+    }
+};
+
+/// Reclaiming final host backing, funded by a partition of the original run.
+/// A row is borrowed until taken; every owned value has an explicit death
+/// capability. No raw Tensor lifetime callback can infer an outside lane.
+pub const OwnedHostVector = struct {
+    owner: ?*HostOutputAdmission,
+    index: usize,
+    pub fn values(self: OwnedHostVector) []const f32 {
+        const owner = self.owner orelse @panic("consumed host vector");
+        std.debug.assert(owner.rows[self.index].live and owner.rows[self.index].filled);
+        return owner.tensors[self.index].asFloat32();
+    }
+    pub fn deinitWithCleanup(self: *OwnedHostVector, current: @import("../execution/cleanup_context.zig").Context) !void {
+        const owner = self.owner orelse return;
+        self.owner = null;
+        errdefer self.owner = owner; // authority refusal precedes row mutation
+        try owner.releaseRow(self.index, current);
+    }
+    pub fn deinitOutsideExecution(self: *OwnedHostVector) void {
+        self.deinitWithCleanup(.{ .outside_execution = true }) catch unreachable;
+    }
+};
+
+/// A movable ordered batch of independently funded source cohorts. Each link
+/// owns the ORIGINAL container root; appending allocates no rows/metadata and
+/// neither retains a model nor acquires new quota.
+pub const OwnedHostVectors = struct {
+    owner: ?*HostOutputAdmission,
+    const Position = struct { owner: *HostOutputAdmission, index: usize };
+    fn position(self: OwnedHostVectors, index: usize) ?Position {
+        var current = self.owner;
+        var offset = index;
+        while (current) |owner| {
+            if (offset < owner.rows.len) return .{ .owner = owner, .index = offset };
+            offset -= owner.rows.len;
+            current = owner.next_cohort;
+        }
+        return null;
+    }
+    pub const Iterator = struct {
+        cohort: ?*HostOutputAdmission,
+        index: usize = 0,
+        pub fn next(self: *@This()) ?[]const f32 {
+            while (self.cohort) |owner| {
+                if (self.index < owner.rows.len) {
+                    const index = self.index;
+                    self.index += 1;
+                    std.debug.assert(owner.rows[index].in_container and owner.rows[index].live and owner.rows[index].filled);
+                    return owner.tensors[index].asFloat32();
+                }
+                self.cohort = owner.next_cohort;
+                self.index = 0;
+            }
+            return null;
+        }
+    };
+    pub fn iterator(self: OwnedHostVectors) Iterator {
+        return .{ .cohort = self.owner };
+    }
+    /// Serialize public rows only; owner pointers never enter product JSON.
+    pub fn jsonStringify(self: OwnedHostVectors, writer: anytype) !void {
+        try writer.beginArray();
+        var rows = self.iterator();
+        while (rows.next()) |row| try writer.write(row);
+        try writer.endArray();
+    }
+    pub fn len(self: OwnedHostVectors) usize {
+        var count: usize = 0;
+        var current = self.owner;
+        while (current) |owner| : (current = owner.next_cohort) count += owner.rows.len;
+        return count;
+    }
+    pub fn values(self: OwnedHostVectors, index: usize) []const f32 {
+        const row = self.position(index) orelse @panic("invalid owned host output index");
+        std.debug.assert(row.owner.rows[row.index].in_container);
+        return (OwnedHostVector{ .owner = row.owner, .index = row.index }).values();
+    }
+    pub fn take(self: *OwnedHostVectors, index: usize) !OwnedHostVector {
+        if (self.owner == null) return error.HostOutputsConsumed;
+        const row = self.position(index) orelse return error.HostOutputConsumed;
+        if (!row.owner.rows[row.index].in_container or !row.owner.rows[row.index].live) return error.HostOutputConsumed;
+        row.owner.rows[row.index].in_container = false;
+        return .{ .owner = row.owner, .index = row.index };
+    }
+    /// Preserve task row order with a no-allocation ownership move. Reject
+    /// aliases/previously consumed rows before changing either value.
+    pub fn appendMove(self: *OwnedHostVectors, other: *OwnedHostVectors) !void {
+        const incoming = other.owner orelse return;
+        _ = try std.math.add(usize, self.len(), other.len());
+        var current = self.owner;
+        var tail: ?*HostOutputAdmission = null;
+        while (current) |owner| : (current = owner.next_cohort) {
+            for (owner.rows) |row| if (!row.in_container or !row.live) return error.HostOutputConsumed;
+            var peer: ?*HostOutputAdmission = incoming;
+            while (peer) |candidate| : (peer = candidate.next_cohort) if (candidate == owner) return error.HostOutputAlias;
+            tail = owner;
+        }
+        current = incoming;
+        while (current) |owner| : (current = owner.next_cohort) {
+            for (owner.rows) |row| if (!row.in_container or !row.live) return error.HostOutputConsumed;
+        }
+        if (tail) |last| last.next_cohort = incoming else self.owner = incoming;
+        other.owner = null;
+    }
+    pub fn deinitWithCleanup(self: *OwnedHostVectors, current: @import("../execution/cleanup_context.zig").Context) !void {
+        var cohort = self.owner;
+        self.owner = null; // callback reentry consumes no original root twice
+        while (cohort) |owner| {
+            const next = owner.next_cohort;
+            for (owner.rows, 0..) |*row, index| if (row.in_container) {
+                row.in_container = false;
+                owner.releaseRow(index, current) catch |err| {
+                    row.in_container = true;
+                    self.owner = owner; // still-owned remainder only
+                    return err;
+                };
+            };
+            owner.releaseContainer(current) catch |err| {
+                self.owner = owner;
+                return err;
+            };
+            // This root may already be gone. Captured next owns the next
+            // original container root; no read through the old owner follows.
+            cohort = next;
+        }
+    }
+    pub fn deinitOutsideExecution(self: *OwnedHostVectors) void {
+        self.deinitWithCleanup(.{ .outside_execution = true }) catch unreachable;
+    }
+};
+
+/// An ordered move-only view of original row roots split by a synchronous
+/// microbatch. Links live in the already-funded stable Row slots, so a peer
+/// request never needs a fresh matrix, reservation, model pin or final arena.
+pub const OwnedHostRows = struct {
+    head: ?*HostOutputAdmission.Row = null,
+    tail: ?*HostOutputAdmission.Row = null,
+    count: usize = 0,
+    pub const Iterator = struct {
+        row: ?*HostOutputAdmission.Row,
+        pub fn next(self: *@This()) ?[]const f32 {
+            const row = self.row orelse return null;
+            std.debug.assert(row.in_row_list and row.live and row.filled and !row.in_container);
+            self.row = row.next_output;
+            return row.owner.tensors[row.index].asFloat32();
+        }
+    };
+    pub fn len(self: @This()) usize {
+        return self.count;
+    }
+    pub fn iterator(self: @This()) Iterator {
+        return .{ .row = self.head };
+    }
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginArray();
+        var rows = self.iterator();
+        while (rows.next()) |row| try writer.write(row);
+        try writer.endArray();
+    }
+    pub fn appendRowMove(self: *@This(), source: *OwnedHostVector) !void {
+        const owner = source.owner orelse return error.HostOutputConsumed;
+        if (source.index >= owner.rows.len) return error.HostOutputConsumed;
+        const row = &owner.rows[source.index];
+        if (!row.live or !row.filled or row.in_container or row.in_row_list) return error.HostOutputConsumed;
+        const count = try std.math.add(usize, self.count, 1);
+        row.in_row_list = true;
+        row.next_output = null;
+        if (self.tail) |tail| tail.next_output = row else self.head = row;
+        self.tail = row;
+        self.count = count;
+        source.owner = null;
+    }
+    pub fn deinitWithCleanup(self: *@This(), current: @import("../execution/cleanup_context.zig").Context) !void {
+        var next = self.head;
+        var remaining = self.count;
+        const tail = self.tail;
+        self.* = .{}; // public custody is consumed before callback-capable drop
+        while (next) |row| {
+            next = row.next_output;
+            row.next_output = null;
+            row.in_row_list = false;
+            row.owner.releaseRow(row.index, current) catch |err| {
+                row.next_output = next;
+                row.in_row_list = true;
+                self.* = .{ .head = row, .tail = tail, .count = remaining };
+                return err;
+            };
+            remaining -= 1;
+        }
+    }
+    pub fn deinitOutsideExecution(self: *@This()) void {
+        self.deinitWithCleanup(.{ .outside_execution = true }) catch unreachable;
+    }
+};
+
+/// Cold metadata and final backing are allocated before partition commit.
+/// The source retains this producer reference through its actual unlock; an
+/// error may destroy rows under current B without refunding their quota early.
+pub const HostOutputProducer = struct {
+    owner: ?*HostOutputAdmission,
+    outputs: ?OwnedHostVectors,
+
+    pub fn requiredBytes(count: usize, width: usize) !usize {
+        if (count == 0 or width == 0 or width > std.math.maxInt(i64)) return error.InvalidHostOutputGeometry;
+        const row_bytes = try addBytes(try mulBytes(width, @sizeOf(f32)), @sizeOf(i64));
+        const metadata_bytes = try addBytes(@sizeOf(HostOutputAdmission), try mulBytes(count, @sizeOf(Tensor) + @sizeOf(HostOutputAdmission.Row) + @sizeOf(OutputCredits.Entry)));
+        return addBytes(metadata_bytes, try mulBytes(count, row_bytes));
+    }
+    pub fn prepare(lease: *memory.AdmissionLease, pin: *const @import("../runtime/tier/admission_domain.zig").Pin, rows: usize, width: usize) !HostOutputProducer {
+        const a = @import("antfly_platform").allocator.processAllocator(@import("antfly_platform").allocator.concurrentFallback());
+        return prepareWithAllocator(a, lease, pin, rows, width);
+    }
+    fn prepareWithAllocator(a: std.mem.Allocator, lease: *memory.AdmissionLease, pin: *const @import("../runtime/tier/admission_domain.zig").Pin, count: usize, width: usize) !HostOutputProducer {
+        if (count == 0 or width == 0 or width > std.math.maxInt(i64)) return error.InvalidHostOutputGeometry;
+        if (lease.controller != pin.controller()) return error.ForeignAdmissionDomain;
+        const metadata_bytes = try addBytes(@sizeOf(HostOutputAdmission), try mulBytes(count, @sizeOf(Tensor) + @sizeOf(HostOutputAdmission.Row) + @sizeOf(OutputCredits.Entry)));
+        const total = try requiredBytes(count, width);
+        if (total > lease.amounts.host_scratch_bytes) return error.InsufficientHostOutputEscrow;
+        const owner = try a.create(HostOutputAdmission);
+        errdefer a.destroy(owner);
+        const tensors = try a.alloc(Tensor, count);
+        errdefer a.free(tensors);
+        var initialized: usize = 0;
+        errdefer for (tensors[0..initialized]) |*tensor| tensor.deinit();
+        for (tensors) |*tensor| {
+            const data = try a.alloc(f32, width);
+            tensor.* = Tensor.initFloat32Owned(a, "embedding", &.{@intCast(width)}, data) catch |err| {
+                a.free(data);
+                return err;
+            };
+            initialized += 1;
+        }
+        const rows = try a.alloc(HostOutputAdmission.Row, count);
+        errdefer a.free(rows);
+        for (rows, 0..) |*row, index| row.* = .{ .owner = owner, .index = index };
+        var credits = try OutputCredits.init(a, tensors, false, false);
+        errdefer credits.deinit(a);
+        // Last fallible operation. Until this succeeds every byte remains in
+        // the original lease; no source run, pin or allocation has escaped.
+        var partition = try lease.preparePartition(a, .{ .host_scratch_bytes = total });
+        defer partition.abort();
+        owner.* = .{ .allocator = a, .tensors = tensors, .rows = rows, .credits = credits, .metadata_bytes = metadata_bytes, .lease = partition.commit(), .domain = pin.retain(), .references = .init(count + 2) };
+        return .{ .owner = owner, .outputs = .{ .owner = owner } };
+    }
+    pub fn writeRow(self: *HostOutputProducer, index: usize, values: []const f32) !void {
+        const owner = self.owner orelse return error.HostOutputProducerConsumed;
+        if (index >= owner.rows.len or !owner.rows[index].live or owner.rows[index].filled or values.len != owner.tensors[index].elementCount()) return error.InvalidHostOutputGeometry;
+        @memcpy(owner.tensors[index].asFloat32Mut(), values);
+        owner.rows[index].filled = true;
+    }
+    pub fn publish(self: *HostOutputProducer) !OwnedHostVectors {
+        const owner = self.owner orelse return error.HostOutputProducerConsumed;
+        for (owner.rows) |row| if (!row.filled) return error.IncompleteHostOutputs;
+        const outputs = self.outputs orelse return error.HostOutputsPublished;
+        self.outputs = null;
+        return outputs;
+    }
+    /// Transfer the producer root to the actual current B, or explicitly
+    /// finish outside every enclosing execution lane. Unlocking this source's
+    /// own stage does not establish the latter contract for a foreign caller.
+    pub fn finishWithCleanup(self: *HostOutputProducer, current: @import("../execution/cleanup_context.zig").Context) !void {
+        const owner = self.owner orelse return;
+        if (self.outputs != null) return error.HostOutputsNotPublishedOrAborted;
+        self.owner = null;
+        errdefer self.owner = owner; // registration failure transfers no root
+        if (current.boundary) |epoch| {
+            if (try epoch.isSealed()) return error.RetirementEpochSealed;
+            const boundary = try epoch.boundary();
+            owner.producer_node = .{ .context = owner, .release_fn = HostOutputAdmission.retireProducer };
+            try boundary.register(boundary.context, boundary.nonce, &owner.producer_node);
+        } else {
+            if (!current.outside_execution) return error.MissingHostOutputCleanupAuthority;
+            HostOutputAdmission.retireProducer(owner);
+        }
+    }
+    pub fn finishOutsideExecution(self: *HostOutputProducer) void {
+        self.finishWithCleanup(.{ .outside_execution = true }) catch unreachable;
+    }
+    pub fn abortWithCleanup(self: *HostOutputProducer, current: @import("../execution/cleanup_context.zig").Context) !void {
+        if (self.outputs) |*outputs| try outputs.deinitWithCleanup(current);
+        self.outputs = null;
+        // The actual source owner still calls finishOutsideExecution after
+        // unlock, including when abort happens in numerical error cleanup.
+    }
+};
+
+const HostOutputAdmission = struct {
+    next_cohort: ?*HostOutputAdmission = null,
+    allocator: std.mem.Allocator,
+    tensors: []Tensor,
+    rows: []Row,
+    credits: OutputCredits,
+    metadata_bytes: usize,
+    // Detached while its caller performs an external shrink. Reentrant row
+    // deaths update pure credits and leave reconciliation to that caller.
+    lease: ?memory.AdmissionLease,
+    domain: @import("../runtime/tier/admission_domain.zig").Pin,
+    references: std.atomic.Value(usize),
+    mutex: std.atomic.Mutex = .unlocked,
+    producer_pending: bool = true,
+    producer_node: @import("../execution/resource_retirement.zig").Node = undefined,
+    container_node: @import("../execution/resource_retirement.zig").Node = undefined,
+    fn retireContainer(raw: *anyopaque) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.dropReference();
+    }
+    fn releaseContainer(self: *@This(), current: @import("../execution/cleanup_context.zig").Context) !void {
+        if (current.boundary) |epoch| {
+            if (try epoch.isSealed()) return error.RetirementEpochSealed;
+            const boundary = try epoch.boundary();
+            self.container_node = .{ .context = self, .release_fn = retireContainer };
+            try boundary.register(boundary.context, boundary.nonce, &self.container_node);
+            return;
+        }
+        if (!current.outside_execution) return error.MissingHostOutputCleanupAuthority;
+        self.dropReference();
+    }
+    const Row = struct {
+        owner: *HostOutputAdmission,
+        index: usize,
+        live: bool = true,
+        filled: bool = false,
+        in_container: bool = true,
+        in_row_list: bool = false,
+        next_output: ?*Row = null,
+        node: @import("../execution/resource_retirement.zig").Node = undefined,
+        fn retire(raw: *anyopaque) callconv(.c) void {
+            const row: *@This() = @ptrCast(@alignCast(raw));
+            const owner = row.owner;
+            @import("antfly_platform").sync.lockYielding(&owner.mutex);
+            _ = owner.credits.retire(row.index);
+            owner.mutex.unlock();
+            owner.reconcileQuota();
+            owner.dropReference(); // the original row root moved to this node
+        }
+    };
+    fn releaseRow(self: *HostOutputAdmission, index: usize, current: @import("../execution/cleanup_context.zig").Context) !void {
+        if (index >= self.rows.len or !self.rows[index].live) return error.HostOutputConsumed;
+        const row = &self.rows[index];
+        if (current.boundary) |epoch| {
+            if (try epoch.isSealed()) return error.RetirementEpochSealed;
+            const boundary = try epoch.boundary();
+            row.node = .{ .context = row, .release_fn = Row.retire };
+            // A live current call owns B until after its return/unlock. Queue
+            // the already-owned row root before physical backing is destroyed.
+            try boundary.register(boundary.context, boundary.nonce, &row.node);
+            row.live = false;
+            self.tensors[index].deinit();
+            return;
+        }
+        if (!current.outside_execution) return error.MissingHostOutputCleanupAuthority;
+        row.live = false;
+        self.tensors[index].deinit();
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        _ = self.credits.retire(index);
+        self.mutex.unlock();
+        self.reconcileQuota();
+        self.dropReference();
+    }
+    fn retireProducer(raw: *anyopaque) callconv(.c) void {
+        const self: *HostOutputAdmission = @ptrCast(@alignCast(raw));
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        std.debug.assert(self.producer_pending);
+        self.producer_pending = false;
+        self.mutex.unlock();
+        self.reconcileQuota();
+        self.dropReference();
+    }
+    /// Caller holds its original row/producer reference throughout this
+    /// operation. No supplier runs with the metadata lock held, and another
+    /// callback never waits for a callback stack which may have invoked it.
+    fn reconcileQuota(self: *HostOutputAdmission) void {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        if (self.producer_pending or self.lease == null) {
+            self.mutex.unlock();
+            return;
+        }
+        var lease = self.lease.?;
+        self.lease = null;
+        while (true) {
+            var retained: memory.AdmissionAmounts = .{ .host_scratch_bytes = self.metadata_bytes };
+            for (self.credits.entries) |entry| if (entry.remaining != 0) {
+                retained.host_scratch_bytes += entry.amounts.host_scratch_bytes;
+            };
+            if (std.meta.eql(retained, lease.amounts)) {
+                self.lease = lease;
+                self.mutex.unlock();
+                return;
+            }
+            self.mutex.unlock();
+            lease.retain(retained) catch {
+                // A refused shrink conservatively preserves the exact larger
+                // reservation. Physical row storage is already dead; another
+                // death may retry and final release still owns the same token.
+                @import("antfly_platform").sync.lockYielding(&self.mutex);
+                self.lease = lease;
+                self.mutex.unlock();
+                return;
+            };
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            // Row deaths are monotonic. Resnapshot after arbitrary supplier
+            // reentry rather than publishing an obsolete retained amount.
+        }
+    }
+    fn dropReference(self: *HostOutputAdmission) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
+        std.debug.assert(!self.producer_pending and self.credits.remaining_groups == 0);
+        const a = self.allocator;
+        var lease = self.lease.?;
+        const domain = self.domain;
+        self.credits.deinit(a);
+        a.free(self.rows);
+        a.free(self.tensors);
+        a.destroy(self);
+        lease.release();
+        domain.release();
     }
 };
 
@@ -1100,9 +1545,20 @@ pub const ModelContract = struct {
     text_attention_heads: u32 = 0,
 };
 
+/// Host-only eager owner. Only its complete static table may certify and run
+/// the actual original implementation; copied/forwarded unknown tables decline.
+pub const EagerHostRunServices = struct {
+    accepts: *const fn (*const Session.VTable) bool,
+    recurrent_layout: *const fn (*anyopaque) anyerror!?@import("../execution/recurrent_state_admission.zig").Layout,
+    run: *const fn (*anyopaque, []const Tensor, std.mem.Allocator, ?InferenceExecutionControl, *const @import("../execution/invocation_context.zig").Context) anyerror![]Tensor,
+};
+
 pub const ComputeBackendOptions = struct {
     run_budget: ?*memory.RunBudget = null,
     borrow_shared_provider: bool = false,
+    /// Current synchronous acquisition only. Providers must not retain this
+    /// epoch/operation in a backend, cache, model or later cleanup owner.
+    cleanup: @import("../execution/cleanup_context.zig").Context = .{},
 };
 
 /// Typed acquisition operation published by the loaded model owner. Wrappers
@@ -1544,6 +2000,7 @@ pub const Session = struct {
         /// and after it; the owner can then route those backends through the
         /// supervised process boundary without a silent uncontrolled fallback.
         runWithControl: *const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror![]Tensor = &unsupportedControlledRun,
+        eager_host_services: ?*const EagerHostRunServices = null,
         runResidentWithControl: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror!?ResidentOutputs = null,
         runResidentInputsWithControl: ?*const fn (ptr: *anyopaque, inputs: []const ResidentInput, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror!?ResidentOutputs = null,
         runResidentTextEmbeddingWithControl: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, request: ResidentTextEmbeddingRequest, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror!?ResidentOutputs = null,
@@ -1563,7 +2020,30 @@ pub const Session = struct {
     }
 
     /// Run a forward pass with the given input tensors.
+    fn validateEagerHostServices(self: Session) !void {
+        if (self.run_admission == null) return;
+        const services = self.vtable.eager_host_services orelse return;
+        // Inherited ownership claims cannot fall through to their old raw
+        // implementation. Truly custom tables with no service keep their ABI.
+        if (!services.accepts(self.vtable)) return error.UnsupportedRecurrentStateTarget;
+    }
+    fn needsEagerRecurrentFunding(self: Session) !bool {
+        try self.validateEagerHostServices();
+        if (self.run_admission == null) return false;
+        const services = self.vtable.eager_host_services orelse return false;
+        return try services.recurrent_layout(self.ptr) != null;
+    }
+    /// This top-level host execution entry is cold: all external admission
+    /// precedes its numerical Model/provider acquisition.
+    fn runColdEager(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) anyerror![]Tensor {
+        var source: PreparedSource = .{};
+        try source.initBeforeExecutionInto(self, self, self.execution_gate, .{ .host = inputs }, try self.planRun(inputs, null), null, .host, allocator, control);
+        defer source.deinit();
+        try source.enter();
+        return source.runHost(inputs);
+    }
     pub fn run(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
+        if (try self.needsEagerRecurrentFunding()) return self.runColdEager(inputs, allocator, null);
         if (self.preparesInvocation()) {
             var permit: RunPermit = undefined;
             try self.admitInputsInto(inputs, allocator, null, &permit);
@@ -1592,6 +2072,7 @@ pub const Session = struct {
         allocator: std.mem.Allocator,
         control: ?InferenceExecutionControl,
     ) ![]Tensor {
+        if (try self.needsEagerRecurrentFunding()) return self.runColdEager(inputs, allocator, control);
         if (self.preparesInvocation()) {
             var permit: RunPermit = undefined;
             try self.admitInputsInto(inputs, allocator, control, &permit);
@@ -1628,6 +2109,7 @@ pub const Session = struct {
     /// Optional typed-decision route. Only an unsupported/disabled capability
     /// returns null; execution and admission failures propagate without fallback.
     pub fn runLayaDecisionsWithControl(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !?[]Tensor {
+        try self.validateEagerHostServices();
         const run_decisions = self.vtable.runLayaDecisions orelse return null;
         if (self.vtable.hasLayaDecisions) |supported| if (!supported(self.ptr)) return null;
         const active = control orelse InferenceExecutionControl{};
@@ -2009,6 +2491,7 @@ pub const Session = struct {
     }
 
     fn resolveRunGeometry(self: *const Session, inputs: ShapeInputs, request: *RunRequest) !void {
+        try self.validateEagerHostServices();
         const resolved_geometry = if (self.vtable.runGeometry) |geometry| try geometry(self.ptr, inputs, request.batch) else null;
         const concrete = resolved_geometry orelse if (self.cached_decoder_geometry) |geometry| try geometry.resolve(inputs, self.outputInfo(), request.batch) else if (self.output_geometry) |geometry| try geometry.resolve(inputs, request.batch) else null;
         if (concrete) |resolved| {
@@ -2550,7 +3033,13 @@ pub const Session = struct {
 pub const PreparedSource = struct {
     const Owner = @import("../execution/cleanup_owner.zig").Owner;
     const Waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter;
-    pub const Placement = enum { host, resident_consumer };
+    pub const Placement = enum {
+        host,
+        /// Backend-resident temporaries are consumed synchronously into host
+        /// outputs; current cleanup is required but no escaping shell is lent.
+        resident_transient,
+        resident_consumer,
+    };
     const Phase = enum { empty, preparing, ready, executing, released, closed };
 
     allocator: std.mem.Allocator = undefined,
@@ -2565,6 +3054,9 @@ pub const PreparedSource = struct {
     phase: Phase = .empty,
     executed: bool = false,
     synchronous_consumers: usize = 0,
+    host_output_producer: ?HostOutputProducer = null,
+    host_remaining_charges: [2]?@import("../execution/resource_retirement.zig").PreparedCharge = .{ null, null },
+    host_output_finish: ?*@import("../execution/retirement_finish_holder.zig").Holder = null,
 
     pub fn initBeforeExecutionInto(self: *PreparedSource, source: Session, fallback_scheduling: Session, fallback_gate: ?*std.atomic.Mutex, inputs: invocation.Inputs, declared: RunRequest, supplied_preprocess: ?*RunPermit, placement: Placement, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !void {
         if (self.phase != .empty) return error.SourceInvocationAlreadyInitialized;
@@ -2579,7 +3071,7 @@ pub const PreparedSource = struct {
             self.scheduling_model = model.retain();
         };
         errdefer self.deinit();
-        self.cleanup = if (placement == .resident_consumer or source.preparesInvocation()) try Owner.beginResident(source) else try Owner.beginAdmitted(source);
+        self.cleanup = if (placement != .host or source.preparesInvocation()) try Owner.beginResident(source) else try Owner.beginAdmitted(source);
         try scheduling.selectReadyCohort(gate, control orelse .{}, &self.waiter);
         const envelope = if (supplied_preprocess) |supplied| original: {
             if (supplied.session.ptr != source.ptr or supplied.session.vtable != source.vtable or supplied.dispatch_cleanup_epoch != null or supplied.invocation_started or supplied.prepared != null or supplied.physical_storage != null) return error.InvalidSourcePreprocessingPermit;
@@ -2641,7 +3133,7 @@ pub const PreparedSource = struct {
             self.scheduling_model = model.retain();
         };
         errdefer self.deinit();
-        self.cleanup = if (placement == .resident_consumer or source.preparesInvocation()) try Owner.beginResident(source) else try Owner.beginAdmitted(source);
+        self.cleanup = if (placement != .host or source.preparesInvocation()) try Owner.beginResident(source) else try Owner.beginAdmitted(source);
         try scheduling.selectReadyCohort(source.execution_gate orelse fallback_gate, control orelse .{}, &self.waiter);
         if (workspace) |owner| {
             const actual = owner.session orelse return error.InvalidSourceWorkspace;
@@ -2660,6 +3152,62 @@ pub const PreparedSource = struct {
         } else {
             self.shape_scope = .{ .permit = try source.admitShapeRequestBeforeExecution(shapes, request, allocator, control) };
         }
+    }
+
+    /// Exact final backing plus cold transient cleanup custody. This remains
+    /// a declaration floor, not physical-buffer or workspace reuse credit.
+    pub fn hostOutputRequestBytes(rows: usize, width: usize) !usize {
+        const charges = try mulBytes(2, try @import("../execution/resource_retirement.zig").PreparedCharge.requestedMetadataBytes(0));
+        return addBytes(try addBytes(try HostOutputProducer.requiredBytes(rows, width), charges), @sizeOf(@import("../execution/retirement_finish_holder.zig").Holder));
+    }
+
+    /// Cold final-host escrow from this source's ORIGINAL admitted run. The
+    /// declaration already includes this exact final backing/metadata geometry;
+    /// partitioning cannot borrow protected input/workspace bytes accidentally.
+    /// This owner keeps the producer root through actual completion/unlock.
+    pub fn prepareHostOutputsBeforeExecution(self: *PreparedSource, rows: usize, width: usize) !void {
+        if ((self.phase != .preparing and self.phase != .ready) or self.executed or self.host_output_producer != null) return error.InvalidHostOutputProducerPhase;
+        const original = if (self.shape_scope) |*scope| &scope.permit else if (self.permit) |*permit| permit else return error.SourceInvocationNotPreparing;
+        const request = original.request orelse return error.MissingRunRequest;
+        const bytes = try hostOutputRequestBytes(rows, width);
+        if ((request.output_bytes orelse 0) < bytes) return error.HostOutputGeometryNotPreflighted;
+        const model = self.source_model orelse return error.MissingSourceModelLifetime;
+        const policy = original.session.run_admission orelse return error.UnmanagedHostOutput;
+        const pin = model.retainAdmissionDomain(policy.controller) orelse return error.ForeignAdmissionDomain;
+        defer pin.release();
+        // Before partition commit and BEFORE any execution lane. This cell
+        // can later carry Source Guard A through a CURRENT foreign consumer B.
+        const finish = try @import("../execution/retirement_finish_holder.zig").Holder.prepare();
+        errdefer finish.discardEmpty();
+        var charges: [2]?@import("../execution/resource_retirement.zig").PreparedCharge = .{ null, null };
+        errdefer for (&charges) |*maybe| if (maybe.*) |*charge| charge.destroyUnused();
+        for (&charges) |*slot| slot.* = try @import("../execution/resource_retirement.zig").PreparedCharge.prepare(0);
+        const producer = if (self.shape_scope) |*scope| try scope.prepareHostOutputsBeforeExecution(&pin, rows, width) else blk: {
+            const lease = if (original.lease) |*value| value else return error.MissingHostOutputEscrow;
+            break :blk try HostOutputProducer.prepare(lease, &pin, rows, width);
+        };
+        self.host_output_finish = finish;
+        self.host_remaining_charges = charges;
+        self.host_output_producer = producer; // last infallible ownership moves
+    }
+    /// Copy only the final public vectors to cold, independently reclaiming
+    /// backing. All source-dependent pooling/projection has already completed.
+    /// The numerical source is consumed regardless of an export error.
+    pub fn publishHostOutputs(self: *PreparedSource, rows: []const []const f32) !OwnedHostVectors {
+        if (!self.executed or (self.phase != .executing and self.phase != .released)) return error.SourceInvocationNotExecuted;
+        const producer = if (self.host_output_producer) |*value| value else return error.MissingHostOutputEscrow;
+        const owner = producer.owner orelse return error.HostOutputProducerConsumed;
+        if (rows.len != owner.rows.len) return error.InvalidHostOutputGeometry;
+        for (rows, 0..) |values, index| try producer.writeRow(index, values);
+        return producer.publish();
+    }
+    fn finishHostOutputProducer(self: *PreparedSource, current: @import("../execution/cleanup_context.zig").Context) void {
+        var producer = self.host_output_producer orelse return;
+        self.host_output_producer = null;
+        // Error/cancellation closes unpublished backing under the actual B.
+        // Successful output roots remain independent of the source Model.
+        producer.abortWithCleanup(current) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        producer.finishWithCleanup(current) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
     }
 
     pub fn bindInputsBeforeExecution(self: *PreparedSource, inputs: invocation.Inputs, placement: Placement) !void {
@@ -2834,8 +3382,47 @@ pub const PreparedSource = struct {
         self.phase = .released;
     }
 
+    fn validateForeignPermitCleanup(self: *PreparedSource, permit: *const RunPermit, slot: usize) !void {
+        if (permit.resource_pin) |pin| if (pin.release_with_boundary_fn == null) return error.SourceForeignCleanupUnsupported;
+        if (permit.lease != null and self.host_remaining_charges[slot] == null) return error.SourceForeignCleanupUnprepared;
+    }
+    fn deferForeignPermitLease(self: *PreparedSource, permit: *RunPermit, slot: usize, current: *const @import("../execution/retirement_sink.zig").Epoch) void {
+        if (permit.lease == null) return;
+        const fatal = @import("antfly_platform").inference_process_supervisor.restartWorker;
+        var pin: ?@import("../runtime/tier/admission_domain.zig").Pin = if (self.source_model) |model| if (permit.lease.?.controller) |controller| model.retainAdmissionDomain(controller) else null else null;
+        if (pin == null) fatal();
+        const shell = if (self.host_remaining_charges[slot]) |*value| value else fatal();
+        const charge = shell.arm(&permit.lease, &pin) catch fatal();
+        charge.holdUntilBoundary(current.boundary() catch fatal()) catch fatal();
+        charge.release();
+    }
+
+    /// Historical raw source callers guarantee ALL enclosing execution lanes
+    /// ended. Typed output owners must use one of the explicit methods below.
     pub fn deinit(self: *PreparedSource) void {
         if (self.phase == .empty or self.phase == .closed) return;
+        if (self.host_output_producer != null) @import("antfly_platform").inference_process_supervisor.restartWorker();
+        self.deinitOutsideExecution();
+    }
+    pub fn deinitOutsideExecution(self: *PreparedSource) void {
+        self.deinitWithCleanup(.{ .outside_execution = true }) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+    }
+    /// Teardown receives the actual NOW-current consumer boundary. An owned
+    /// source epoch is never inferred to be an ancestor of a foreign caller.
+    /// Keep A unsealed behind that B with the existing cold Holder; numerical
+    /// destruction still uses the source's exact bound A and no synthetic token.
+    pub fn deinitWithCleanup(self: *PreparedSource, consumer: @import("../execution/cleanup_context.zig").Context) !void {
+        if (self.phase == .empty or self.phase == .closed) return;
+        if (consumer.boundary == null and !consumer.outside_execution) return error.MissingHostOutputCleanupAuthority;
+        if (consumer.boundary) |current| {
+            if (try current.isSealed()) return error.RetirementEpochSealed;
+            const own = self.epoch() orelse return error.MissingCurrentCleanupEpoch;
+            if (current.record == own.record and current.nonce == own.nonce) return error.SourceTeardownRequiresOuterBoundary;
+            if (self.host_output_finish == null or self.cleanup.guard == null) return error.SourceForeignCleanupUnprepared;
+            if (self.shape_scope) |*scope| try scope.validateEmptyPrepaidRetirement();
+            if (self.permit) |*permit| try self.validateForeignPermitCleanup(permit, 0);
+            if (self.shape_scope) |*scope| try self.validateForeignPermitCleanup(&scope.permit, 1);
+        }
         if (self.synchronous_consumers != 0)
             @import("antfly_platform").inference_process_supervisor.restartWorker();
         const b = self.epoch();
@@ -2845,17 +3432,41 @@ pub const PreparedSource = struct {
             scheduling.releaseSelectedCohortGate(&self.waiter);
             scheduling.leaveSelectedCohort(&self.waiter);
         }
+        self.phase = .closed;
         // All numerical/provider ownership has ended before external callbacks.
-        if (self.permit) |*permit| permit.deinitWithCleanup(.{ .boundary = b });
+        if (consumer.boundary) |current| {
+            const finish = self.host_output_finish.?;
+            const fatal = @import("antfly_platform").inference_process_supervisor.restartWorker;
+            var fork = self.cleanup.guard.?.fork() catch fatal();
+            defer fork.finish();
+            finish.adopt(&fork) catch fatal();
+            const local = finish.retainLocal() catch fatal();
+            finish.providerFinished(current) catch fatal();
+            self.host_output_finish = null; // actual source death moved to cell
+            local.releaseLocalWithBoundary(current) catch fatal();
+            if (self.shape_scope) |*scope| scope.detachEmptyPrepaidFunding() catch fatal();
+            if (self.permit) |*permit| self.deferForeignPermitLease(permit, 0, current);
+            if (self.shape_scope) |*scope| self.deferForeignPermitLease(&scope.permit, 1, current);
+        } else if (self.host_output_finish) |finish| {
+            self.host_output_finish = null;
+            finish.discardEmpty();
+        }
+        self.finishHostOutputProducer(consumer);
+        for (&self.host_remaining_charges) |*slot| {
+            if (slot.*) |*charge| charge.destroyUnused();
+            slot.* = null;
+        }
+        const pure_cleanup = if (consumer.boundary != null) consumer else @import("../execution/cleanup_context.zig").Context{ .boundary = b };
+        if (self.permit) |*permit| permit.deinitWithCleanup(pure_cleanup);
         self.permit = null;
-        if (self.shape_scope) |*scope| scope.deinitWithCleanup(.{ .boundary = b });
+        if (self.shape_scope) |*scope| scope.deinitWithCleanup(pure_cleanup);
         self.shape_scope = null;
         if (self.scheduling_model) |model| {
-            if (b != null) model.releaseWithBoundary(b) else model.release();
+            if (pure_cleanup.boundary != null) model.releaseWithBoundary(pure_cleanup.boundary) else model.release();
         }
         self.scheduling_model = null;
         if (self.source_model) |model| {
-            if (b != null) model.releaseWithBoundary(b) else model.release();
+            if (pure_cleanup.boundary != null) model.releaseWithBoundary(pure_cleanup.boundary) else model.release();
         }
         self.source_model = null;
         self.phase = .closed;
@@ -2870,6 +3481,7 @@ pub const RunPermit = struct {
     physical_credit: memory.AdmissionAmounts = .{},
     physical_storage: ?*@import("../execution/prepared_storage_admission.zig").Prepared = null,
     physical_prepared: bool = false,
+    temporary_recurrent: ?*@import("../execution/recurrent_state_admission.zig").Budget = null,
     // Synchronous dispatch pin, even when the cold Set is empty/warm. Never
     // transferred to a returned output or used for later physical destruction.
     dispatch_cleanup_epoch: ?@import("../execution/retirement_sink.zig").Epoch = null,
@@ -2894,6 +3506,12 @@ pub const RunPermit = struct {
         defer if (dispatch_epoch) |*held| held.release();
         if (dispatch_epoch != null and cleanup.boundary == null)
             @import("antfly_platform").inference_process_supervisor.restartWorker();
+        if (self.temporary_recurrent) |budget| {
+            self.temporary_recurrent = null; // consume before outside rollback callbacks
+            if (budget.current != null or cleanup.boundary != null) {
+                budget.retireWithCleanup(cleanup) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            } else budget.destroyUnusedOutsideExecution() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        }
         self.retirePhysicalStorageWithBoundary(cleanup.boundary);
         if (self.prepared) |*selected| selected.deinitWithCleanup(cleanup);
         self.prepared = null;
@@ -2905,6 +3523,7 @@ pub const RunPermit = struct {
     pub fn preparePhysicalStorage(self: *RunPermit, allocator: std.mem.Allocator) !void {
         if (self.physical_prepared) return;
         if (self.lease == null) return; // Raw execution owns no supplier.
+        try self.prepareTemporaryRecurrentBeforeExecution();
         const selected = if (self.prepared) |*value| value else {
             if (self.session.preparesInvocation()) return error.MissingPreparedInvocation;
             return; // Custom callbacks preserve their own allocation policy.
@@ -2934,6 +3553,51 @@ pub const RunPermit = struct {
         self.physical_prepared = true;
     }
 
+    fn prepareTemporaryRecurrentBeforeExecution(self: *RunPermit) !void {
+        if (self.temporary_recurrent != null) return;
+        const services = self.session.vtable.eager_host_services orelse return;
+        if (!services.accepts(self.session.vtable)) return error.UnsupportedRecurrentStateTarget;
+        const layout = (try services.recurrent_layout(self.session.ptr)) orelse return;
+        const policy = self.session.run_admission orelse return;
+        if (policy.backend_class != .gpu) return error.ForeignRecurrentStateAdmission;
+        const additional = memory.AdmissionAmounts{ .backend_scratch_bytes = try layout.bytes() };
+        const original = self.lease orelse return error.MissingRecurrentStateRunFloor;
+        if (original.controller != policy.controller) return error.ForeignAdmissionDomain;
+        try policy.validateOwnedRunAmounts(try original.amounts.merge(additional));
+        const model = self.session.model_lifetime orelse return error.MissingRecurrentStateModel;
+        const pin = model.retainAdmissionDomain(policy.controller) orelse return error.MissingRecurrentStateDomain;
+        var domain: ?@import("../runtime/tier/admission_domain.zig").Pin = pin;
+        defer if (domain) |held| held.release();
+        const target = (try self.session.coldComputeTarget(null)) orelse return error.UnsupportedRecurrentStateTarget;
+        const identity = if (comptime @import("build_options").enable_cuda)
+            (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.temporaryRecurrentTarget(target)) orelse return error.UnsupportedRecurrentStateTarget
+        else
+            return error.UnsupportedRecurrentStateTarget;
+        const budget = try @import("../execution/recurrent_state_admission.zig").Budget.prepare(layout, identity);
+        errdefer budget.destroyUnusedOutsideExecution() catch unreachable;
+        var lease: ?memory.AdmissionLease = try policy.acquireAmounts(additional);
+        defer if (lease) |*held| held.release();
+        try budget.arm(&lease, &domain);
+        self.temporary_recurrent = budget;
+    }
+    fn eagerHostRun(self: *RunPermit, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) anyerror!?[]Tensor {
+        const budget = self.temporary_recurrent orelse {
+            if (try self.session.needsEagerRecurrentFunding()) return error.UnpreparedRecurrentStateBudget;
+            return null;
+        };
+        const services = self.session.vtable.eager_host_services orelse return error.UnsupportedRecurrentStateTarget;
+        if (!services.accepts(self.session.vtable)) return error.UnsupportedRecurrentStateTarget;
+        const epoch = if (self.dispatch_cleanup_epoch) |*value| value else return error.MissingCurrentCleanupEpoch;
+        const context = @import("../execution/invocation_context.zig").Context{ .cleanup = .{ .boundary = epoch }, .recurrent_state = budget };
+        if (control) |active| try active.check();
+        var hard_cancellation = if (control) |active| try active.enterUninterruptible(self.session.interruption()) else null;
+        defer if (hard_cancellation) |*value| value.deinit();
+        const outputs = try @import("../execution/invocation_observation.zig").call(self.session.invocation_diagnostics, services.run, .{ self.session.ptr, inputs, allocator, control, &context });
+        errdefer deinitTensorSlice(outputs, allocator);
+        if (control) |active| try active.check();
+        return outputs;
+    }
+
     /// The actual owner binds current B before acquiring model/provider gates.
     /// Raw resident dispatch also needs B even when no physical Set was admitted.
     pub fn bindPhysicalCleanupEpoch(self: *RunPermit, epoch: *const @import("../execution/retirement_sink.zig").Epoch) !void {
@@ -2952,6 +3616,7 @@ pub const RunPermit = struct {
         errdefer held.release();
         if (try held.isSealed()) return error.RetirementEpochSealed;
         if (self.physical_storage) |prepared| try prepared.bindConstructionEpoch(epoch);
+        if (self.temporary_recurrent) |budget| try budget.bind(epoch);
         self.dispatch_cleanup_epoch = held;
     }
 
@@ -3203,9 +3868,11 @@ pub const RunPermit = struct {
         inputs: []const Tensor,
         allocator: std.mem.Allocator,
     ) ![]Tensor {
+        try self.session.validateEagerHostServices();
         try self.resolveGeometry(inputs);
         if (self.execution_yielded) return self.runWithControl(inputs, allocator, null);
         if (try self.executePrepared(.{ .host = inputs }, .host, allocator, null)) |result| return result.host;
+        if (try self.eagerHostRun(inputs, allocator, null)) |outputs| return outputs;
         return @import("../execution/invocation_observation.zig").call(self.session.invocation_diagnostics, self.session.vtable.run, .{
             self.session.ptr,
             inputs,
@@ -3219,6 +3886,7 @@ pub const RunPermit = struct {
         allocator: std.mem.Allocator,
         control: ?InferenceExecutionControl,
     ) ![]Tensor {
+        try self.session.validateEagerHostServices();
         try self.resolveGeometry(inputs);
         if (self.execution_yielded) {
             var execution = try self.acquireExecutionInputs(.{ .host = inputs }, allocator, control);
@@ -3228,6 +3896,7 @@ pub const RunPermit = struct {
             return Session.attachOutputAdmission(outputs, allocator, &execution.lease, self.session.resourcePin());
         }
         if (try self.executePrepared(.{ .host = inputs }, .host, allocator, control)) |result| return result.host;
+        if (try self.eagerHostRun(inputs, allocator, control)) |outputs| return outputs;
         const active = control orelse return self.run(inputs, allocator);
         try active.check();
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
@@ -3250,6 +3919,7 @@ pub const RunPermit = struct {
         allocator: std.mem.Allocator,
         control: ?InferenceExecutionControl,
     ) !?[]Tensor {
+        try self.session.validateEagerHostServices();
         const run_decisions = self.session.vtable.runLayaDecisions orelse return null;
         if (self.session.vtable.hasLayaDecisions) |supported| if (!supported(self.session.ptr)) return null;
         try self.resolveGeometry(inputs);
@@ -3280,6 +3950,7 @@ pub const RunPermit = struct {
         inputs: []const Tensor,
         allocator: std.mem.Allocator,
     ) !?ResidentOutputs {
+        try self.session.validateEagerHostServices();
         try self.resolveGeometry(inputs);
         if (self.execution_yielded) return self.runResidentWithControl(inputs, allocator, null);
         if (try self.executePreparedResident(.{ .host = inputs }, allocator, null)) |outputs| return outputs;
@@ -3300,6 +3971,7 @@ pub const RunPermit = struct {
         control: ?InferenceExecutionControl,
     ) !?ResidentOutputs {
         try self.validateResidentDispatch();
+        try self.session.validateEagerHostServices();
         try self.resolveGeometry(inputs);
         if (self.execution_yielded) {
             var execution = try self.acquireExecutionInputs(.{ .host = inputs }, allocator, control);
@@ -6491,4 +7163,405 @@ test "prepared exact amount admission observer preserves warm credit and both re
         try std.testing.expect(probe.pressure != null);
         try std.testing.expectEqual(@as(usize, 1), model.references.load(.acquire));
     }
+}
+
+fn hostOutputEscrowOomCase(a: std.mem.Allocator) !void {
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    const External = struct {
+        fn reserve(_: *anyopaque, _: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+            return 1;
+        }
+        fn retain(_: *anyopaque, _: usize, _: memory.AdmissionAmounts) memory.AdmissionResourceError!void {}
+        fn release(_: *anyopaque, _: usize) void {}
+    };
+    var marker: u8 = 0;
+    try domain.controller.configureResourceBudget(.{ .context = &marker, .try_reserve = External.reserve, .retain = External.retain, .release = External.release });
+    var source = try domain.controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 65536 }, false);
+    defer source.release();
+    const original = source.amounts;
+    var producer = HostOutputProducer.prepareWithAllocator(a, &source, &pin, 2, 3) catch |err| {
+        try std.testing.expectEqual(@as(?usize, 1), source.external_lease);
+        try std.testing.expect(source.shared_external == null);
+        try std.testing.expectEqualDeep(original, source.amounts);
+        try std.testing.expectEqualDeep(original, domain.controller.snapshot());
+        return err;
+    };
+    defer producer.finishOutsideExecution();
+    try producer.abortWithCleanup(.{ .outside_execution = true });
+}
+
+test "host output escrow all cold allocation failures preserve the original exact lease" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, hostOutputEscrowOomCase, .{});
+}
+
+test "owned host vectors retain original quota across producer and two actual foreign cleanup epochs" {
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const Sink = @import("../execution/retirement_sink.zig");
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    const Probe = struct {
+        gate: std.atomic.Mutex = .unlocked,
+        calls: usize = 0,
+        under_gate: bool = false,
+        fn check(self: *@This()) void {
+            self.calls += 1;
+            if (self.gate.tryLock()) self.gate.unlock() else self.under_gate = true;
+        }
+        fn reserve(raw: *anyopaque, _: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+            return 1;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: memory.AdmissionAmounts) memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+    };
+    var probe: Probe = .{};
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    var source = try domain.controller.tryAcquire(.gpu, .{}, .{ .host_scratch_bytes = 65536, .backend_scratch_bytes = 512 * 1024 }, false);
+    var source_open = true;
+    defer if (source_open) source.release();
+    var producer = try HostOutputProducer.prepareWithAllocator(std.testing.allocator, &source, &pin, 2, 3);
+    var producer_open = true;
+    defer if (producer_open) {
+        producer.abortWithCleanup(.{ .outside_execution = true }) catch unreachable;
+        producer.finishOutsideExecution();
+    };
+    try producer.writeRow(0, &.{ 1, 2, 3 });
+    try producer.writeRow(1, &.{ 4, 5, 6 });
+    var vectors = try producer.publish();
+    defer vectors.deinitOutsideExecution();
+    var first = try vectors.take(0);
+    defer first.deinitOutsideExecution();
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var first_guard = try sink.enter();
+    defer first_guard.finish();
+    var first_epoch = try first_guard.retainEpoch();
+    defer first_epoch.release();
+    try std.testing.expect(probe.gate.tryLock());
+    const calls = probe.calls;
+    const before = domain.controller.snapshot();
+    try first.deinitWithCleanup(.{ .boundary = &first_epoch });
+    try std.testing.expectEqual(calls, probe.calls);
+    try std.testing.expectEqualDeep(before, domain.controller.snapshot());
+    probe.gate.unlock();
+    producer.finishOutsideExecution();
+    producer_open = false;
+    source.release();
+    source_open = false;
+    const pending = domain.controller.snapshot().host_scratch_bytes;
+    try std.testing.expect(pending < 65536 and pending > 2 * 3 * @sizeOf(f32));
+    try std.testing.expectEqual(@as(usize, 0), domain.controller.snapshot().backendTotalBytes());
+    first_guard.finish();
+    try std.testing.expectEqual(pending - (3 * @sizeOf(f32) + @sizeOf(i64)), domain.controller.snapshot().host_scratch_bytes);
+    try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, vectors.values(1));
+    var last_guard = try sink.enter();
+    defer last_guard.finish();
+    var last_epoch = try last_guard.retainEpoch();
+    defer last_epoch.release();
+    try std.testing.expect(probe.gate.tryLock());
+    const last_calls = probe.calls;
+    try vectors.deinitWithCleanup(.{ .boundary = &last_epoch });
+    try std.testing.expectEqual(last_calls, probe.calls);
+    try std.testing.expect(domain.controller.snapshot().host_scratch_bytes > 0);
+    probe.gate.unlock();
+    last_guard.finish();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
+    try std.testing.expect(!probe.under_gate);
+}
+
+test "owned host output escrow rejects foreign funding and absent late cleanup authority before mutation" {
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const original = try Domain.create();
+    defer original.release();
+    const foreign = try Domain.create();
+    defer foreign.release();
+    const pin = original.pin();
+    defer pin.release();
+    const foreign_pin = foreign.pin();
+    defer foreign_pin.release();
+    var source = try original.controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 65536 }, false);
+    defer source.release();
+    const before = source.amounts;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.ForeignAdmissionDomain, HostOutputProducer.prepareWithAllocator(failing.allocator(), &source, &foreign_pin, 1, 2));
+    try std.testing.expectEqualDeep(before, source.amounts);
+    var producer = try HostOutputProducer.prepareWithAllocator(std.testing.allocator, &source, &pin, 1, 2);
+    defer producer.finishOutsideExecution();
+    try producer.writeRow(0, &.{ 1, 2 });
+    var vectors = try producer.publish();
+    defer vectors.deinitOutsideExecution();
+    var row = try vectors.take(0);
+    defer row.deinitOutsideExecution();
+    const held = original.controller.snapshot();
+    try std.testing.expectError(error.MissingHostOutputCleanupAuthority, row.deinitWithCleanup(.{}));
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, row.values());
+    try std.testing.expectEqualDeep(held, original.controller.snapshot());
+}
+
+test "owned host producer uses actual foreign B and every partial supplier observes unlocked metadata" {
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const Sink = @import("../execution/retirement_sink.zig");
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    const Probe = struct {
+        gate: std.atomic.Mutex = .unlocked,
+        owner: ?*HostOutputAdmission = null,
+        under_gate: bool = false,
+        under_metadata: bool = false,
+        metadata_checks: usize = 0,
+        fn check(self: *@This()) void {
+            if (self.gate.tryLock()) self.gate.unlock() else self.under_gate = true;
+            if (self.owner) |owner| {
+                self.metadata_checks += 1;
+                if (owner.mutex.tryLock()) owner.mutex.unlock() else self.under_metadata = true;
+            }
+        }
+        fn reserve(_: *anyopaque, _: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+            return 71;
+        }
+        fn retain(raw: *anyopaque, token: usize, _: memory.AdmissionAmounts) memory.AdmissionResourceError!void {
+            std.debug.assert(token == 71);
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+        fn release(raw: *anyopaque, token: usize) void {
+            std.debug.assert(token == 71);
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+    };
+    var probe: Probe = .{};
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    var source = try domain.controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 65536 }, false);
+    defer source.release();
+    var producer = try HostOutputProducer.prepareWithAllocator(std.testing.allocator, &source, &pin, 2, 3);
+    defer {
+        producer.abortWithCleanup(.{ .outside_execution = true }) catch unreachable;
+        producer.finishOutsideExecution();
+    }
+    probe.owner = producer.owner;
+    defer probe.owner = null;
+    try producer.writeRow(0, &.{ 1, 2, 3 });
+    try producer.writeRow(1, &.{ 4, 5, 6 });
+    var outputs = try producer.publish();
+    defer outputs.deinitOutsideExecution();
+    var first = try outputs.take(0);
+    defer first.deinitOutsideExecution();
+    try std.testing.expectError(error.MissingHostOutputCleanupAuthority, producer.finishWithCleanup(.{}));
+    try std.testing.expect(producer.owner != null);
+    var row_sink = try Sink.Ref.create();
+    defer row_sink.release();
+    var row_guard = try row_sink.enter();
+    defer row_guard.finish();
+    var row_epoch = try row_guard.retainEpoch();
+    defer row_epoch.release();
+    var producer_sink = try Sink.Ref.create();
+    defer producer_sink.release();
+    var producer_guard = try producer_sink.enter();
+    defer producer_guard.finish();
+    var producer_epoch = try producer_guard.retainEpoch();
+    defer producer_epoch.release();
+    try std.testing.expect(probe.gate.tryLock());
+    try first.deinitWithCleanup(.{ .boundary = &row_epoch });
+    const before = domain.controller.snapshot();
+    try producer.finishWithCleanup(.{ .boundary = &producer_epoch });
+    try std.testing.expect(producer.owner == null);
+    try std.testing.expectEqualDeep(before, domain.controller.snapshot());
+    probe.gate.unlock();
+    source.release();
+    const pending = domain.controller.snapshot().host_scratch_bytes;
+    try std.testing.expectEqual(try HostOutputProducer.requiredBytes(2, 3), pending);
+    row_guard.finish();
+    // Closing another source's row B cannot retire this producer's root.
+    try std.testing.expectEqual(pending, domain.controller.snapshot().host_scratch_bytes);
+    producer_guard.finish();
+    try std.testing.expectEqual(pending - (3 * @sizeOf(f32) + @sizeOf(i64)), domain.controller.snapshot().host_scratch_bytes);
+    try std.testing.expect(probe.metadata_checks > 0);
+    try std.testing.expect(!probe.under_metadata and !probe.under_gate);
+    try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, outputs.values(1));
+    // The final release destroys the owner before the external token. Do not
+    // inspect a logically dead owner from the supplier's final callback.
+    probe.owner = null;
+    outputs.deinitOutsideExecution();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
+    try std.testing.expect(!probe.under_gate);
+}
+
+test "owned host cleanup consumes public handles before reentrant supplier callbacks" {
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    const Probe = struct {
+        producer: ?*HostOutputProducer = null,
+        outputs: ?*OwnedHostVectors = null,
+        producer_reentered: bool = false,
+        outputs_reentered: bool = false,
+        failed: bool = false,
+        fn reserve(_: *anyopaque, _: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+            return 91;
+        }
+        fn retain(raw: *anyopaque, token: usize, _: memory.AdmissionAmounts) memory.AdmissionResourceError!void {
+            std.debug.assert(token == 91);
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.producer) |producer| if (!self.producer_reentered) {
+                self.producer_reentered = true;
+                producer.finishWithCleanup(.{ .outside_execution = true }) catch {
+                    self.failed = true;
+                };
+            };
+            if (self.outputs) |outputs| if (!self.outputs_reentered) {
+                self.outputs_reentered = true;
+                if (outputs.take(2)) |_| {
+                    self.failed = true;
+                } else |err| {
+                    if (err != error.HostOutputsConsumed) self.failed = true;
+                }
+                outputs.deinitWithCleanup(.{ .outside_execution = true }) catch {
+                    self.failed = true;
+                };
+            };
+        }
+        fn release(_: *anyopaque, token: usize) void {
+            std.debug.assert(token == 91);
+        }
+    };
+    var probe: Probe = .{};
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    var source = try domain.controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 65536 }, false);
+    defer source.release();
+    var producer = try HostOutputProducer.prepareWithAllocator(std.testing.allocator, &source, &pin, 3, 2);
+    defer {
+        producer.abortWithCleanup(.{ .outside_execution = true }) catch unreachable;
+        producer.finishOutsideExecution();
+    }
+    for (0..3) |index| try producer.writeRow(index, &.{ 1, 2 });
+    var outputs = try producer.publish();
+    defer outputs.deinitOutsideExecution();
+    var first = try outputs.take(0);
+    defer first.deinitOutsideExecution();
+    first.deinitOutsideExecution(); // no refund until the producer finishes
+    source.release();
+    probe.producer = &producer;
+    producer.finishOutsideExecution();
+    try std.testing.expect(probe.producer_reentered and !probe.failed);
+    try std.testing.expect(producer.owner == null);
+    probe.outputs = &outputs;
+    outputs.deinitOutsideExecution();
+    try std.testing.expect(probe.outputs_reentered and !probe.failed);
+    try std.testing.expect(outputs.owner == null);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
+}
+
+test "transient resident source has actual cleanup without escaping shell and seals after FIFO model unlock" {
+    var raw: u8 = 0;
+    var gate: std.atomic.Mutex = .unlocked;
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    const source = Session{ .ptr = &raw, .vtable = &DeadlineProbeSession.vtable, .execution_gate = &gate, .cohort_scheduler = &scheduler };
+    var fail = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var prepared: PreparedSource = .{};
+    defer prepared.deinit();
+    try prepared.initBeforeExecutionInto(source, source, &gate, .{ .host = &.{} }, .{}, null, .resident_transient, fail.allocator(), null);
+    try std.testing.expectEqual(@as(usize, 0), fail.alloc_index);
+    try std.testing.expect(prepared.epoch() != null);
+    try std.testing.expect(prepared.permit.?.output_retirement_shell == null);
+    var observed = try prepared.epoch().?.retain();
+    defer observed.release();
+    const Probe = struct {
+        gate: *std.atomic.Mutex,
+        scheduler: *@import("../runtime/embedding_scheduler.zig").Scheduler,
+        calls: usize = 0,
+        unsafe: bool = false,
+        fn finish(raw_context: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw_context));
+            if (self.gate.tryLock()) self.gate.unlock() else self.unsafe = true;
+            if (self.scheduler.mutex.tryLock()) {
+                if (self.scheduler.head != null) self.unsafe = true;
+                self.scheduler.mutex.unlock();
+            } else self.unsafe = true;
+            self.calls += 1;
+        }
+    };
+    var probe: Probe = .{ .gate = &gate, .scheduler = &scheduler };
+    var node: @import("../execution/resource_retirement.zig").Node = .{ .context = &probe, .release_fn = Probe.finish };
+    const boundary = try observed.boundary();
+    try boundary.register(boundary.context, boundary.nonce, &node);
+    try prepared.enter();
+    try std.testing.expect(!gate.tryLock());
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(!probe.unsafe);
+    try std.testing.expect(try observed.isSealed());
+    try std.testing.expect(prepared.epoch() == null and scheduler.head == null);
+}
+
+test "mandatory producer delta classifies exact own run sum as permanent and preserves real peer contention" {
+    const Probe = struct {
+        last: ?anyerror = null,
+        last_amounts: memory.AdmissionAmounts = .{},
+        calls: usize = 0,
+        fn record(raw: *anyopaque, err: anyerror, _: ?memory.AdmissionPressure, request: memory.AdmissionRequest) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.last = err;
+            self.last_amounts = request.amounts;
+            self.calls += 1;
+        }
+    };
+    var controller = memory.AdmissionController{};
+    const floor = memory.AdmissionAmounts{ .host_scratch_bytes = 16, .backend_scratch_bytes = 32 };
+    const delta = memory.AdmissionAmounts{ .backend_scratch_bytes = 16 };
+    const sum = try floor.merge(delta);
+    var original = try controller.tryAcquire(.gpu, .{}, floor, false);
+    defer original.release();
+    var probe = Probe{};
+    var policy = RunAdmission{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false, .denial_observer = .{ .context = &probe, .record = Probe.record } };
+    for ([_]memory.Limits{ .{ .backend_limit_bytes = 47 }, .{ .scratch_limit_bytes = 63 }, .{ .combined_limit_bytes = 63 } }) |limits| {
+        policy.limits = limits;
+        try std.testing.expectError(error.ResourceLimitExceeded, policy.validateOwnedRunAmounts(sum));
+        try std.testing.expectEqualDeep(floor, controller.snapshot());
+        try std.testing.expectEqualDeep(sum, probe.last_amounts);
+        try std.testing.expectEqual(error.ResourceLimitExceeded, probe.last.?);
+    }
+    policy.limits = .{ .host_limit_bytes = 16, .backend_limit_bytes = 48, .scratch_limit_bytes = 64, .combined_limit_bytes = 64 };
+    original.release();
+    controller.configureSharedLimits(.{ .unified_limit_bytes = 63 });
+    original = try controller.tryAcquire(.gpu, .{}, floor, false);
+    try std.testing.expectError(error.ResourceLimitExceeded, policy.validateOwnedRunAmounts(sum));
+    try std.testing.expectEqualDeep(floor, controller.snapshot());
+    original.release();
+    controller.configureSharedLimits(.{});
+    original = try controller.tryAcquire(.gpu, .{}, floor, false);
+    const callbacks = probe.calls;
+    try policy.validateOwnedRunAmounts(sum);
+    try std.testing.expectEqual(callbacks, probe.calls);
+    var peer = try controller.tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = 8 }, false);
+    defer peer.release();
+    try policy.validateOwnedRunAmounts(sum); // peer is not charged to this request's intrinsic size
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, policy.acquireAmounts(delta));
+    try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, probe.last.?);
+    try std.testing.expectEqualDeep(delta, probe.last_amounts); // actual contended delta
+    peer.release();
+    var added = try policy.acquireAmounts(delta);
+    defer added.release();
+    try std.testing.expectEqualDeep(sum, controller.snapshot());
+    added.release();
+    original.release();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
 }

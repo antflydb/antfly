@@ -15,11 +15,14 @@
 
 #include "../src/ops/cuda/video_decode.c"
 #include <assert.h>
+#include <string.h>
 
 static unsigned creates, destroys, maps, unmaps, consumes;
 static int selection = 1, consume_result = 1;
 static unsigned reservations, releases, live_budgets;
 static int admit_decoder = 1, fail_create = 0;
+static int publish_failed_endpoint, fail_destroy, fail_parser_destroy;
+static unsigned destroy_attempts, parser_destroy_attempts;
 static cudaVideoCodec created_codec;
 static int fake_reserve(void *user, unsigned width, unsigned height, unsigned surfaces) {
     (void)user; assert(width && height && surfaces);
@@ -37,12 +40,21 @@ static CUresult CUDAAPI fake_caps(CUVIDDECODECAPS *c) {
 }
 static CUresult CUDAAPI fake_create(CUvideodecoder *out, CUVIDDECODECREATEINFO *c) {
     assert(c->ulNumDecodeSurfaces <= 32 && c->ulNumOutputSurfaces == 1);
-    if (fail_create) return (CUresult)2; // simulated allocation failure
+    if (fail_create) {
+        if (publish_failed_endpoint) { *out = (CUvideodecoder)(uintptr_t)1; creates++; }
+        return (CUresult)2; // SDK failure may still publish an owned endpoint
+    }
     created_codec = c->CodecType;
     *out = (CUvideodecoder)(uintptr_t)1; creates++; return CUDA_SUCCESS;
 }
 static CUresult CUDAAPI fake_destroy(CUvideodecoder decoder) {
-    assert(decoder); destroys++; return CUDA_SUCCESS;
+    assert(decoder); destroy_attempts++;
+    if (fail_destroy) return (CUresult)2;
+    destroys++; return CUDA_SUCCESS;
+}
+static CUresult CUDAAPI fake_destroy_parser(CUvideoparser parser) {
+    assert(parser); parser_destroy_attempts++;
+    return fail_parser_destroy ? (CUresult)2 : CUDA_SUCCESS;
 }
 static CUresult CUDAAPI fake_map(CUvideodecoder decoder, int index, unsigned long long *device, unsigned *pitch, CUVIDPROCPARAMS *p) {
     (void)index; (void)p; assert(decoder);
@@ -79,8 +91,80 @@ static Decoder decoder(void) {
     d.matrix_override = d.range_override = -1;
     d.reserve_budget = fake_reserve; d.release_budget = fake_release;
     d.caps = fake_caps; d.create_decoder = fake_create; d.destroy_decoder = fake_destroy;
+    d.destroy_parser = fake_destroy_parser;
     d.map = fake_map; d.unmap = fake_unmap; d.status = fake_status; d.frame = fake_frame;
     return d;
+}
+// The same driver-death contract applies to legacy and prepared callers.
+static Decoder *move_to_heap(Decoder *d) {
+    Decoder *owned = malloc(sizeof(*owned)); assert(owned);
+    *owned = *d; memset(d, 0, sizeof(*d)); return owned;
+}
+static void set_mode(Decoder *d, unsigned prepared, CUVIDEOFORMAT *f) {
+    d->require_prepared_sequence = prepared;
+    d->prepared_sequence = (AntflyNvdecSequence){160, 96, 160, 96, 4,
+        (uint32_t)f->codec, 0, 0, 2, 0};
+}
+static void checked_death_failures(void) {
+    for (unsigned mode = 0; mode != 2; ++mode) {
+        Decoder d = decoder(); CUVIDEOFORMAT f = format(); set_mode(&d, mode, &f);
+        unsigned old_releases = releases, old_destroys = destroys;
+        // A failed create can return a live endpoint, and its failed destruction
+        // must preserve both the exact endpoint and its budget for later close.
+        fail_create = publish_failed_endpoint = fail_destroy = 1;
+        assert(sequence(&d, &f) == 0 && d.failed == 3);
+        assert(d.decoder && d.budget_live && live_budgets == 1);
+        assert(releases == old_releases && destroys == old_destroys);
+        fail_create = publish_failed_endpoint = fail_destroy = 0;
+        assert(antfly_nvdec_close_checked(move_to_heap(&d)) == 0);
+        assert(releases == old_releases + 1 && !live_budgets);
+
+        d = decoder(); f = format(); set_mode(&d, mode, &f);
+        assert(sequence(&d, &f) == 4);
+        unsigned old_attempts = destroy_attempts, old_reservations = reservations;
+        old_releases = releases;
+        d.sequence_seen = 0; d.expected_codec = f.codec = cudaVideoCodec_HEVC;
+        fail_destroy = 1;
+        assert(sequence(&d, &f) == 0 && d.failed == (mode ? 2 : 3));
+        // Prepared mode rejects a changed recipe before destruction. Legacy
+        // mode attempts its original replacement, retaining a failed endpoint.
+        assert(destroy_attempts == old_attempts + !mode);
+        assert(d.decoder && d.budget_live && reservations == old_reservations);
+        assert(releases == old_releases);
+        fail_destroy = 0;
+        assert(antfly_nvdec_close_checked(move_to_heap(&d)) == 0);
+
+        d = decoder(); f = format(); set_mode(&d, mode, &f);
+        assert(sequence(&d, &f) == 4);
+        Decoder *owned = move_to_heap(&d);
+        owned->parser = (CUvideoparser)(uintptr_t)2;
+        old_releases = releases; old_attempts = destroy_attempts;
+        fail_parser_destroy = 1;
+        assert(antfly_nvdec_close_checked(owned) == 3);
+        assert(owned->parser && owned->decoder && owned->budget_live);
+        assert(releases == old_releases && destroy_attempts == old_attempts);
+        fail_parser_destroy = 0; fail_destroy = 1;
+        assert(antfly_nvdec_close_checked(owned) == 3);
+        assert(!owned->parser && owned->decoder && owned->budget_live);
+        assert(releases == old_releases);
+        unsigned parser_attempts = parser_destroy_attempts;
+        fail_destroy = 0;
+        assert(antfly_nvdec_close_checked(owned) == 0);
+        assert(parser_destroy_attempts == parser_attempts && releases == old_releases + 1);
+
+        d = decoder(); f = format(); set_mode(&d, mode, &f);
+        assert(sequence(&d, &f) == 4);
+        d.parser = (CUvideoparser)(uintptr_t)2;
+        old_releases = releases; fail_parser_destroy = 1;
+        assert(antfly_nvdec_finish_checked(&d) == 3 && d.parser && d.decoder);
+        assert(d.budget_live && releases == old_releases);
+        assert(!antfly_nvdec_retirement_ready(&d, d.budget_user, d.release_budget));
+        fail_parser_destroy = 0;
+        assert(antfly_nvdec_finish_checked(&d) == 0 && !d.parser && d.decoder);
+        assert(releases == old_releases);
+        assert(antfly_nvdec_close_checked(move_to_heap(&d)) == 0);
+        assert(!live_budgets && reservations == releases && creates == destroys);
+    }
 }
 int main(void) {
     Decoder d = decoder(); CUVIDEOFORMAT f = format();
@@ -114,7 +198,7 @@ int main(void) {
     Decoder *cached = malloc(sizeof(*cached)); assert(cached);
     *cached = decoder();
     assert(sequence(cached, &f) == 4 && live_budgets == 1);
-    antfly_nvdec_close(cached);
+    assert(antfly_nvdec_close_checked(cached) == 0);
     assert(!live_budgets && reservations == releases);
     d = decoder(); d.reserve_budget = NULL;
     assert(sequence(&d, &f) == 0 && d.failed == 6 && !live_budgets);
@@ -166,5 +250,6 @@ int main(void) {
     }
     fake_destroy(d.decoder); release_budget(&d);
     assert(!live_budgets && reservations == releases && creates == destroys);
+    checked_death_failures();
     return 0;
 }

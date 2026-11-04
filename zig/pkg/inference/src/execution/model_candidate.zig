@@ -132,7 +132,7 @@ fn resetRuntimeAtPrefillStart(runtime: *model_runtime.ModelRuntime, request: mod
     // runtime-owned KV written by earlier chunks.
     if (request.seq_len == request.query_seq_len) {
         try request.check();
-        try runtime.resetWithOperation(request.backend_operation);
+        try runtime.resetWithCleanup(.{ .boundary = request.cleanup_epoch, .operation = request.backend_operation });
         try request.check();
     }
 }

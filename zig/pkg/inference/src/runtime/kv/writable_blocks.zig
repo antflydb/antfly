@@ -76,7 +76,7 @@ pub fn ensureRangeWithProvider(storage: *storage_mod.KvStorage, table: *tables.S
         prepared += 1;
     }
     std.debug.assert(prepared == count);
-    const request = BlockCopy.Request{ .sequence = sequence, .page_size = storage.config.page_size_tokens, .layers = storage.config.num_layers_packed, .items = items };
+    const request = BlockCopy.Request{ .sequence = sequence, .page_size = storage.config.page_size_tokens, .layers = storage.config.num_layers_packed, .items = items, .cleanup = if (provider) |value| value.cleanup else .{} };
     try request.validate();
     // No metadata/ID is published until ALL numerical copies finish. Providers
     // must prove drain on every attempted-submit error before returning here.

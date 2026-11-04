@@ -1404,6 +1404,8 @@ pub const DecoderRuntimePrefillFramePlanRequest = struct {
 };
 
 pub const DecoderRuntimeGraphCommandPlanFrameRequest = struct {
+    /// Borrowed per synchronous call only; never saved in a prepared plan.
+    cleanup: ?*const @import("../execution/cleanup_context.zig").Context = null,
     contract: DecoderRuntimeDecodeContract,
     layer_count: usize,
     rows: usize,

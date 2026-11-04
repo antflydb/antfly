@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const Cleanup = @import("../execution/cleanup_context.zig").Context;
 const cache_mod = @import("cache.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const gpt_mod = @import("../models/gpt.zig");
@@ -617,6 +618,76 @@ pub const NativeDecodeState = struct {
         };
     }
 
+    pub fn deinitWithCleanup(self: *NativeDecodeState, current: Cleanup) !void {
+        if (current.outside_execution) {
+            var typed_cuda_owner = if (self.kv_storage) |storage| if (storage.device_write_hook) |hook| hook.vtable.prepareMutationWithCleanup != null else false else false;
+            if (comptime @import("build_options").enable_cuda) if (self.qwen35_linear_cache) |cache| for (cache.layers) |layer| {
+                typed_cuda_owner = typed_cuda_owner or layer.cuda_device.prepare_release_with_cleanup != null;
+            };
+            if (typed_cuda_owner) {
+                if (current.boundary != null or current.operation != null) return error.ConflictingCleanupAuthority;
+                // This function will own KV/graph mutexes below. Its genuine
+                // local B is reserved before either lock and seals only after
+                // the recursive typed teardown has released ALL those locks.
+                var pending: @import("../execution/resource_retirement.zig").SynchronousOutsideRawLeases = .{};
+                var local = try @import("../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
+                defer {
+                    const registered = pending.boundary_context != null;
+                    local.finishAfterUnlock();
+                    if (registered) std.debug.assert(pending.finished);
+                }
+                const kv_current = try local.synchronousOutsideContext(&pending);
+                // Only our KV/graph critical section needs this local B. Raw
+                // recurrent quota remains explicit outside AFTER KV unlock.
+                return self.deinitUsing(kv_current, current);
+            }
+        }
+        return self.deinitUsing(current, current);
+    }
+    fn deinitUsing(self: *NativeDecodeState, kv_current: Cleanup, resource_current: Cleanup) !void {
+        if (self.qwen35_linear_cache) |*cache| try cache.validateCleanup(resource_current);
+        {
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            if (self.sequence_id) |sequence| {
+                // Checked physical invalidation precedes logical publication.
+                if (self.kv_storage) |storage| try storage.releaseSequenceWithCleanup(sequence, kv_current);
+                if (self.kv_manager) |manager| try manager.releaseSequence(sequence);
+                // Publish successful retirement before any later fallible
+                // recurrent SDK death. A retry must not release this ID again.
+                self.sequence_id = null;
+                self.kv_view = null;
+                self.kv_compacted = false;
+            }
+        }
+        // Recurrent quota callbacks on an explicit outside path must not run
+        // while this request's KV mutex remains held.
+        if (self.qwen35_linear_cache) |*cache| {
+            try cache.deinitWithCleanup(resource_current);
+            self.qwen35_linear_cache = null;
+        }
+        // No irreversible host metadata is destroyed until every fallible SDK
+        // root has died or transferred its independently funded cache custody.
+        self.moe_runtime.deinit();
+        self.gemma4_layer_spec_cache.deinit(self.allocator);
+        if (self.deepseek_v4_compressed_cache) |*cache| cache.deinit();
+        self.clearSelectionQueries();
+        self.selection_queries.deinit(self.allocator);
+        self.selection_queries = .empty;
+        self.kv_block_ids.deinit(self.allocator);
+        self.kv_block_ids = .empty;
+        self.sequence_id = null;
+        self.kv_view = null;
+        self.kv_compacted = false;
+        self.qwen35_linear_cache = null;
+        self.deepseek_v4_compressed_cache = null;
+        self.kv_storage = null;
+        self.kv_manager = null;
+        self.kv_lock = null;
+        self.pool_id = null;
+        self.total_tokens = 0;
+    }
+
     pub fn deinit(self: *NativeDecodeState) void {
         const lock = self.lockPagedKv();
         defer if (lock) |mutex| mutex.unlock();
@@ -652,13 +723,16 @@ pub const NativeDecodeState = struct {
     }
 
     pub fn notePrefill(self: *NativeDecodeState, token_count: usize) !void {
+        return self.notePrefillWithCleanup(token_count, .{});
+    }
+    pub fn notePrefillWithCleanup(self: *NativeDecodeState, token_count: usize, current: Cleanup) !void {
         self.total_tokens = token_count;
         if (self.isPaged()) {
             const lock = self.lockPagedKv();
             defer if (lock) |mutex| mutex.unlock();
             try self.ensureAttachedUnlocked();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, @intCast(token_count));
-            if (self.kv_storage) |storage| try storage.appendTokens(self.sequence_id.?, @intCast(token_count));
+            if (self.kv_storage) |storage| try storage.appendTokensWithCleanup(self.sequence_id.?, @intCast(token_count), current);
             try self.reservePagedKvReplayCapacity();
             self.kv_compacted = false;
             self.syncPagedKvViewForPrefill();
@@ -673,13 +747,16 @@ pub const NativeDecodeState = struct {
     }
 
     pub fn appendPrefillChunk(self: *NativeDecodeState, token_count: usize) !void {
+        return self.appendPrefillChunkWithCleanup(token_count, .{});
+    }
+    pub fn appendPrefillChunkWithCleanup(self: *NativeDecodeState, token_count: usize, current: Cleanup) !void {
         self.total_tokens += token_count;
         if (self.isPaged()) {
             const lock = self.lockPagedKv();
             defer if (lock) |mutex| mutex.unlock();
             try self.ensureAttachedUnlocked();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, @intCast(token_count));
-            if (self.kv_storage) |storage| try storage.appendTokens(self.sequence_id.?, @intCast(token_count));
+            if (self.kv_storage) |storage| try storage.appendTokensWithCleanup(self.sequence_id.?, @intCast(token_count), current);
             try self.reservePagedKvReplayCapacity();
             self.kv_compacted = false;
             self.syncPagedKvViewForPrefill();
@@ -694,21 +771,27 @@ pub const NativeDecodeState = struct {
     }
 
     pub fn appendGeneratedToken(self: *NativeDecodeState) !void {
+        return self.appendGeneratedTokenWithCleanup(.{});
+    }
+    pub fn appendGeneratedTokenWithCleanup(self: *NativeDecodeState, current: Cleanup) !void {
         const lock = if (self.isPaged()) self.lockPagedKv() else null;
         defer if (lock) |mutex| mutex.unlock();
-        try self.appendGeneratedTokenWithKvLockHeld();
+        try self.appendGeneratedTokenWithKvLockHeldWithCleanup(current);
     }
 
     /// Graph replay holds the common KV lock before its owner mutex, through
     /// readback; page retirement follows the same lock order.
     pub fn appendGeneratedTokenWithKvLockHeld(self: *NativeDecodeState) !void {
+        return self.appendGeneratedTokenWithKvLockHeldWithCleanup(.{});
+    }
+    pub fn appendGeneratedTokenWithKvLockHeldWithCleanup(self: *NativeDecodeState, current: Cleanup) !void {
         self.total_tokens += 1;
         if (self.isPaged()) {
             try self.ensureAttachedUnlocked();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, 1);
             _ = try self.kv_manager.?.trimSequenceToSlidingWindow(self.sequence_id.?);
             if (self.kv_storage) |storage| {
-                try storage.appendTokens(self.sequence_id.?, 1);
+                try storage.appendTokensWithCleanup(self.sequence_id.?, 1, current);
                 _ = try storage.trimSequenceToSlidingWindow(self.sequence_id.?);
             }
             try self.reservePagedKvReplayCapacity();
@@ -726,6 +809,9 @@ pub const NativeDecodeState = struct {
     /// Append `count` generated tokens at once (used by speculative decoding
     /// after accepting a batch of draft tokens).
     pub fn appendGeneratedTokens(self: *NativeDecodeState, count: usize) !void {
+        return self.appendGeneratedTokensWithCleanup(count, .{});
+    }
+    pub fn appendGeneratedTokensWithCleanup(self: *NativeDecodeState, count: usize, current: Cleanup) !void {
         self.total_tokens += count;
         if (self.isPaged()) {
             const lock = self.lockPagedKv();
@@ -734,7 +820,7 @@ pub const NativeDecodeState = struct {
             try self.kv_manager.?.appendTokens(self.sequence_id.?, @intCast(count));
             _ = try self.kv_manager.?.trimSequenceToSlidingWindow(self.sequence_id.?);
             if (self.kv_storage) |storage| {
-                try storage.appendTokens(self.sequence_id.?, @intCast(count));
+                try storage.appendTokensWithCleanup(self.sequence_id.?, @intCast(count), current);
                 _ = try storage.trimSequenceToSlidingWindow(self.sequence_id.?);
             }
             try self.reservePagedKvReplayCapacity();
@@ -754,8 +840,12 @@ pub const NativeDecodeState = struct {
     /// Roll back `count` tokens from the KV cache (used by speculative
     /// decoding when draft tokens are rejected).
     pub fn truncateTokens(self: *NativeDecodeState, count: usize) !void {
+        return self.truncateTokensWithCleanup(count, .{});
+    }
+    pub fn truncateTokensWithCleanup(self: *NativeDecodeState, count: usize, current: Cleanup) !void {
         if (count == 0) return;
         if (count > self.total_tokens) return error.TruncateBeyondStart;
+        if (self.kv_storage) |storage| if (storage.device_write_hook) |hook| try hook.prepareMutationWithCleanup(current);
         const was_paged = self.isPaged();
         self.total_tokens -= count;
         if (was_paged) {
@@ -764,7 +854,7 @@ pub const NativeDecodeState = struct {
             const manager = self.kv_manager.?;
             if (self.sequence_id) |seq_id| {
                 const removed = try manager.truncateSequence(seq_id, count);
-                if (self.kv_storage) |storage| _ = try storage.truncateSequence(seq_id, count);
+                if (self.kv_storage) |storage| _ = try storage.truncateSequenceWithCleanup(seq_id, count, current);
                 const prior_kv_tokens = if (self.kv_view) |view| view.token_count else 0;
                 const kv_tokens = prior_kv_tokens - @min(prior_kv_tokens, removed);
                 try self.syncPagedKvBlockTable();
@@ -940,13 +1030,19 @@ fn StateRuntime(comptime ownership: enum { owned, borrowed }) type {
             return self.beginDecodeStepForMode(position, null);
         }
         pub fn reservePrefillTo(self: *Self, target: usize) !usize {
+            return self.reservePrefillToWithCleanup(target, .{});
+        }
+        pub fn reservePrefillToWithCleanup(self: *Self, target: usize, current: Cleanup) !usize {
             if (target < self.currentTokenCount()) return error.InvalidPrefillAdvance;
             const missing = target - self.currentTokenCount();
-            if (missing != 0) try self.appendPrefillChunk(missing);
+            if (missing != 0) try self.appendPrefillChunkWithCleanup(missing, current);
             return missing;
         }
         pub fn rollbackReservedPrefill(self: *Self, reserved: usize) !void {
-            if (reserved != 0) try self.truncateGeneratedTokens(reserved);
+            return self.rollbackReservedPrefillWithCleanup(reserved, .{});
+        }
+        pub fn rollbackReservedPrefillWithCleanup(self: *Self, reserved: usize, current: Cleanup) !void {
+            if (reserved != 0) try self.truncateGeneratedTokensWithCleanup(reserved, current);
         }
 
         pub fn initPaged(
@@ -960,10 +1056,26 @@ fn StateRuntime(comptime ownership: enum { owned, borrowed }) type {
             };
         }
 
+        pub fn deinitWithCleanup(self: *Self, current: Cleanup) !void {
+            if (ownership == .owned) try self.state.deinitWithCleanup(current);
+        }
         pub fn deinit(self: *Self) void {
             if (ownership == .owned) self.state.deinit();
         }
 
+        pub fn notePrefillWithCleanup(self: *Self, count: usize, current: Cleanup) !void {
+            try self.state.notePrefillWithCleanup(count, current);
+        }
+        pub fn appendPrefillChunkWithCleanup(self: *Self, count: usize, current: Cleanup) !void {
+            try self.state.appendPrefillChunkWithCleanup(count, current);
+        }
+        pub fn appendGeneratedTokensWithCleanup(self: *Self, count: usize, current: Cleanup) !usize {
+            try self.state.appendGeneratedTokensWithCleanup(count, current);
+            return self.currentTokenCount();
+        }
+        pub fn truncateGeneratedTokensWithCleanup(self: *Self, count: usize, current: Cleanup) !void {
+            try self.state.truncateTokensWithCleanup(count, current);
+        }
         pub fn configureForGptConfig(self: *Self, config: gpt_mod.Config) void {
             self.state.configureForGptConfig(config);
         }
@@ -1023,14 +1135,20 @@ fn StateRuntime(comptime ownership: enum { owned, borrowed }) type {
             query_seq_len: usize,
             attention_mode: ?cache_mod.AttentionMode,
         ) !gpt_arch.DecodeContext {
+            return self.preparePrefillForModeWithCleanup(seq_len, query_seq_len, attention_mode, .{});
+        }
+        pub fn preparePrefillWithCleanup(self: *Self, seq_len: usize, query_seq_len: usize, current: Cleanup) !gpt_arch.DecodeContext {
+            return self.preparePrefillForModeWithCleanup(seq_len, query_seq_len, null, current);
+        }
+        pub fn preparePrefillForModeWithCleanup(self: *Self, seq_len: usize, query_seq_len: usize, attention_mode: ?cache_mod.AttentionMode, current: Cleanup) !gpt_arch.DecodeContext {
             if (query_seq_len > seq_len) return error.UnsupportedShape;
             if (self.currentTokenCount() == 0) {
                 if (seq_len != query_seq_len) return error.UnsupportedShape;
-                try self.notePrefill(query_seq_len);
+                try self.notePrefillWithCleanup(query_seq_len, current);
             } else {
                 const expected_prior = seq_len - query_seq_len;
                 if (self.currentTokenCount() != expected_prior) return error.InvalidPrefillSequence;
-                try self.appendPrefillChunk(query_seq_len);
+                try self.appendPrefillChunkWithCleanup(query_seq_len, current);
             }
             return self.makeDecodeContextForMode(seq_len, query_seq_len, attention_mode);
         }
@@ -1188,7 +1306,7 @@ test "decode state KV metadata uses its own distinct allocator for initial reser
         try std.testing.expectEqualSlices(runtime.kv.block.KvBlockId, state.kv_block_ids.items, legacy.items);
         try std.testing.expectEqual(state_allocations, state_alloc.alloc_index);
     }
-    state.deinit();
+    try state.deinitWithCleanup(.{ .outside_execution = true });
     state_live = false;
     try std.testing.expectEqual(state_alloc.allocated_bytes, state_alloc.freed_bytes);
     try std.testing.expectEqual(state_alloc.allocations, state_alloc.deallocations);

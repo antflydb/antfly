@@ -14,6 +14,9 @@ pub const Context = struct {
     /// Explicit raw outside-execution API contract. Absence of an epoch never
     /// implies this contract and this marker grants no numerical authority.
     outside_execution: bool = false,
+    /// Borrowed only through a local explicit-outside cleanup function. The
+    /// actual outside Owner seals its real B before this stack capability dies.
+    synchronous_outside_raw: ?*@import("resource_retirement.zig").SynchronousOutsideRawLeases = null,
 
     /// Validate against the actual target-owned table/provider. Metadata and
     /// absent scopes never confer numerical cleanup authority. A supplied B

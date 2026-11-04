@@ -407,6 +407,76 @@ pub const EmbeddingPipeline = struct {
         };
     }
 
+    /// Cold eligibility only; a decline means no encoder was attempted.
+    /// Unknown lane/workspace geometries keep their separately-owned adapter.
+    pub fn canEmbedOwned(self: *const EmbeddingPipeline) bool {
+        if ((self.execution_lane != null and !self.usesQwenWorkspaceLaneProtocol()) or self.execution_lane_held or self.execution_gate_held or self.gemma_workspace != null) return false;
+        if (session_factory.getEmbeddingGemma2Config(self.session) != null or self.boundedQwenBatchingEnabled()) return false;
+        const source = self.textEncodingSession();
+        const policy = source.run_admission orelse return false;
+        const model = source.model_lifetime orelse return false;
+        const domain = model.admission_domain orelse return false;
+        if (domain.controller() != policy.controller) return false;
+        _ = self.ownedTextOutputWidth() catch return false;
+        return true;
+    }
+
+    /// Final vectors own exact original-run credit across bounded cohorts.
+    /// Explicit caller cleanup governs this synchronous source teardown; no
+    /// raw result escapes and no source is replayed after export failure.
+    pub fn embedOwned(self: *EmbeddingPipeline, texts: []const []const u8, consumer_cleanup: CleanupContext) !session_mod.OwnedHostVectors {
+        if (!consumer_cleanup.outside_execution or consumer_cleanup.boundary != null or consumer_cleanup.operation != null) return error.OwnedOutputRequiresOutsideEntry;
+        if (!self.canEmbedOwned()) return error.UnsupportedOwnedEmbeddingEntry;
+        if (consumer_cleanup.boundary) |current| if (try current.isSealed()) return error.RetirementEpochSealed;
+        var scoped = self.*;
+        scoped.allocator = @import("embedding_gemma2.zig").workspaceBackingAllocator(self.session.backend());
+        scoped.last_input_tokens = 0;
+        defer {
+            self.last_input_tokens = scoped.last_input_tokens;
+            self.last_resident_backend_timing = scoped.last_resident_backend_timing;
+        }
+        if (texts.len == 0) return .{ .owner = null };
+        if (scoped.execution_control) |control| try control.update(.tokenizing, 0, @intCast(texts.len));
+        if (textSessionBatchPlan(scoped.textEncodingSession(), texts.len)) |plan|
+            return scoped.embedWithBatchPlanOwned(texts, plan, consumer_cleanup);
+        return scoped.embedAdaptiveOwned(texts, consumer_cleanup);
+    }
+
+    fn embedWithBatchPlanOwned(self: *EmbeddingPipeline, texts: []const []const u8, plan: TextSessionBatchPlan, consumer_cleanup: CleanupContext) !session_mod.OwnedHostVectors {
+        if (plan.batch_size == 0) return error.InvalidInputShape;
+        var output = session_mod.OwnedHostVectors{ .owner = null };
+        errdefer output.deinitWithCleanup(consumer_cleanup) catch platform.inference_process_supervisor.restartWorker();
+        var offset: usize = 0;
+        while (offset < texts.len) {
+            if (self.execution_control) |control| try control.check();
+            const real_count = @min(plan.batch_size, texts.len - offset);
+            if (real_count != plan.batch_size and !plan.pad_final_batch) return error.InvalidInputShape;
+            var cohort = try self.embedDirectResult(texts[offset..][0..real_count], plan.batch_size, true, consumer_cleanup);
+            defer cohort.deinitWithCleanup(consumer_cleanup) catch platform.inference_process_supervisor.restartWorker();
+            if (cohort.len() != real_count) return error.UnexpectedOutputShape;
+            try output.appendMove(&cohort);
+            offset += real_count;
+        }
+        return output;
+    }
+    /// SAME ResourceLimit-only bisection and midpoint as the raw adapter.
+    /// Joining original container roots replaces a temporary pointer-array
+    /// allocation; arithmetic schedules for every selected cohort are unchanged.
+    fn embedAdaptiveOwned(self: *EmbeddingPipeline, texts: []const []const u8, consumer_cleanup: CleanupContext) anyerror!session_mod.OwnedHostVectors {
+        return self.embedDirectResult(texts, texts.len, true, consumer_cleanup) catch |err| {
+            if (err != error.ResourceLimitExceeded or texts.len <= 1) return err;
+            const midpoint = (texts.len + 1) / 2;
+            var left = try self.embedAdaptiveOwned(texts[0..midpoint], consumer_cleanup);
+            errdefer left.deinitWithCleanup(consumer_cleanup) catch platform.inference_process_supervisor.restartWorker();
+            if (left.len() != midpoint) return error.UnexpectedOutputShape;
+            var right = try self.embedAdaptiveOwned(texts[midpoint..], consumer_cleanup);
+            defer right.deinitWithCleanup(consumer_cleanup) catch platform.inference_process_supervisor.restartWorker();
+            if (right.len() != texts.len - midpoint) return error.UnexpectedOutputShape;
+            try left.appendMove(&right);
+            return left;
+        };
+    }
+
     /// Embed a batch of texts, returning [batch_size][hidden_dim] embeddings.
     /// Caller owns the returned slices and must free them with the allocator.
     pub fn embed(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
@@ -439,7 +509,9 @@ pub const EmbeddingPipeline = struct {
     }
 
     fn embedCohort(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
-        const lane = try self.enterExecutionLane();
+        // All text routes for one actual dense Qwen model obey the SAME
+        // ready/model -> numerical lane order, independent of batching flags.
+        const lane = if (self.usesQwenWorkspaceLaneProtocol()) null else try self.enterExecutionLane();
         defer self.leaveExecutionLane(lane);
         self.last_input_tokens = 0;
         if (!self.config.resident_embedding_gemma2 and session_factory.getEmbeddingGemma2Config(self.session) != null and texts.len != 0) {
@@ -801,6 +873,12 @@ pub const EmbeddingPipeline = struct {
         return self.embedDirect(texts, texts.len);
     }
 
+    fn usesQwenWorkspaceLaneProtocol(self: *const EmbeddingPipeline) bool {
+        const session = self.textEncodingSession();
+        const cfg = session_factory.getGptConfig(session) orelse return false;
+        return qwenWorkspaceLaneModel(session.backend(), cfg);
+    }
+
     fn boundedQwenBatchingEnabled(self: *const EmbeddingPipeline) bool {
         if (!metal_runtime.appleSimdgroupFeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true) or
             self.text_projection != null) return false;
@@ -905,6 +983,9 @@ pub const EmbeddingPipeline = struct {
     fn runBoundedQwenChunk(self: *EmbeddingPipeline, comptime Row: type, rows: []const Row, indices: []const usize, pressure: *?memory_admission.AdmissionPressure, admission_denied: *bool) ![][]f32 {
         const alloc = self.allocator;
         const session = self.textEncodingSession();
+        var cleanup_owner = try @import("../execution/cleanup_owner.zig").Owner.beginResident(session);
+        defer cleanup_owner.finishAfterUnlock();
+        const cleanup: CleanupContext = .{ .boundary = cleanup_owner.epoch() };
         var seq_len: usize = 1;
         for (indices) |index| seq_len = @max(seq_len, rows[index].encoded.ids.len);
         // The resident dense frame requires at least two physical rows.
@@ -914,10 +995,20 @@ pub const EmbeddingPipeline = struct {
         const total = try std.math.mul(usize, indices.len, seq_len);
         const lock_started = if (self.trace != null) embedding_trace.now() else 0;
         if (self.execution_control) |control| try control.check();
-        if (self.execution_lock) |gate| {
+        var qwen_waiter: @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter = .{};
+        const qwen_gate = session.execution_gate orelse self.execution_lock;
+        try session.enterExecutionCohort(qwen_gate, self.execution_control orelse .{}, &qwen_waiter);
+        defer session.leaveExecutionCohort(qwen_gate, &qwen_waiter);
+        // Preserve a separately supplied external serialization gate. The
+        // canonical source cohort always precedes it; never wait for a ready
+        // turn while owning either the external gate or numerical lane.
+        const extra_gate = if (self.execution_lock != qwen_gate) self.execution_lock else null;
+        if (extra_gate) |gate| {
             if (self.execution_control) |control| try control.lock(gate) else platform.sync.lockYielding(gate);
         }
-        defer if (self.execution_lock) |gate| gate.unlock();
+        defer if (extra_gate) |gate| gate.unlock();
+        const qwen_lane = try self.enterExecutionLane();
+        defer self.leaveExecutionLane(qwen_lane);
         if (self.trace) |trace| {
             trace.execution_lock_ns += embedding_trace.now() -| lock_started;
             var lengths: [32]usize = undefined;
@@ -966,7 +1057,7 @@ pub const EmbeddingPipeline = struct {
         defer if (self.trace) |trace| {
             trace.execute_pool_normalize_ns += embedding_trace.now() -| execute_started;
         };
-        const vectors = (self.embedBoundedQwenPacked(Row, rows, indices, seq_len) catch |err| {
+        const vectors = (self.embedBoundedQwenPacked(Row, rows, indices, seq_len, cleanup) catch |err| {
             session_factory.finishQwenMetalWorkspace(session, &permit.lease) catch |capacity_err| return capacity_err;
             workspace_finished = true;
             return err;
@@ -981,7 +1072,7 @@ pub const EmbeddingPipeline = struct {
         return vectors;
     }
 
-    fn embedBoundedQwenPacked(self: *EmbeddingPipeline, comptime Row: type, rows: []const Row, indices: []const usize, seq_len: usize) !?[][]f32 {
+    fn embedBoundedQwenPacked(self: *EmbeddingPipeline, comptime Row: type, rows: []const Row, indices: []const usize, seq_len: usize, cleanup: CleanupContext) !?[][]f32 {
         const alloc = self.allocator;
         const total = try std.math.mul(usize, indices.len, seq_len);
         const ids = try alloc.alloc(i64, total);
@@ -994,7 +1085,7 @@ pub const EmbeddingPipeline = struct {
             ids[row * seq_len + col] = id;
             mask[row * seq_len + col] = active;
         };
-        return self.tryEmbedTextResidentQwen3(mask, ids, indices.len, seq_len);
+        return self.tryEmbedTextResidentQwen3(mask, ids, indices.len, seq_len, cleanup);
     }
 
     fn configOutputWidth(self: *const EmbeddingPipeline) usize {
@@ -1006,12 +1097,19 @@ pub const EmbeddingPipeline = struct {
     /// any required static-batch padding is added after tokenization by copying
     /// the final encoded row. This keeps fixed-batch compatibility from
     /// multiplying tokenizer and prefix-allocation work on short tail batches.
-    fn embedDirect(
+    fn embedDirect(self: *EmbeddingPipeline, texts: []const []const u8, execution_batch: usize) ![][]f32 {
+        return self.embedDirectResult(texts, execution_batch, false, .{});
+    }
+
+    fn embedDirectResult(
         self: *EmbeddingPipeline,
         texts: []const []const u8,
         execution_batch: usize,
-    ) ![][]f32 {
+        comptime owned: bool,
+        consumer_cleanup: CleanupContext,
+    ) anyerror!(if (owned) session_mod.OwnedHostVectors else [][]f32) {
         if (texts.len == 0 or execution_batch < texts.len) return error.InvalidInputShape;
+        const output_width = if (owned) try self.ownedTextOutputWidth() else 0;
 
         const text_session = self.textEncodingSession();
         const alloc = self.allocator;
@@ -1081,7 +1179,10 @@ pub const EmbeddingPipeline = struct {
         // The runtime source owns its exact FIFO/model lane and whole-consumer B.
         if (self.execution_gate_held) return error.PreparedAdmissionRequiresReadyTurn;
         var source: session_mod.PreparedSource = .{};
-        defer source.deinit();
+        var typed_source_ready = false;
+        defer if (owned) {
+            if (typed_source_ready) source.deinitWithCleanup(consumer_cleanup) catch platform.inference_process_supervisor.restartWorker() else source.deinitOutsideExecution();
+        } else source.deinit();
         var projection_execution: ?session_mod.RunPermit = null;
         defer if (projection_execution) |*permit| permit.deinitWithCleanup(.{ .boundary = source.epoch() });
         const signature = text_plan.signature();
@@ -1090,7 +1191,12 @@ pub const EmbeddingPipeline = struct {
             .sequence = effective_len,
             .input_bytes = text_plan.input_bytes,
             .host_preprocess_bytes = text_plan.temporary_bytes,
+            .output_bytes = if (owned) try session_mod.PreparedSource.hostOutputRequestBytes(texts.len, output_width) else null,
         });
+        if (owned) {
+            try source.prepareHostOutputsBeforeExecution(texts.len, output_width);
+            typed_source_ready = true;
+        }
         if (self.execution_control) |control| try control.check();
 
         const all_ids = try alloc.alloc(i32, batch * effective_len);
@@ -1132,6 +1238,8 @@ pub const EmbeddingPipeline = struct {
         var projection_shell = if (self.text_projection) |projection| try projection.prepareResidentRetirement() else null;
         defer if (projection_shell) |*shell| shell.destroyUnused();
         try source.enter();
+        const qwen_lane = if (self.usesQwenWorkspaceLaneProtocol()) try self.enterExecutionLane() else null;
+        defer self.leaveExecutionLane(qwen_lane);
         const active_permit = try source.beginExecutionDispatch();
         self.execution_gate_held = true;
         defer {
@@ -1154,18 +1262,64 @@ pub const EmbeddingPipeline = struct {
             self.last_input_tokens +|= 1;
         };
         if (self.batch_observation) |observation| observation.record(texts.len);
+        if (owned) {
+            defer freeEmbeddingSlices(alloc, vectors);
+            if (vectors.len != execution_batch) return error.UnexpectedOutputShape;
+            // Preserve padded execution shape; only real caller rows escape.
+            return source.publishHostOutputs(vectors[0..texts.len]);
+        }
         return vectors;
     }
 
     /// Benchmark-facing encoder contract without tokenization or model load.
-    pub fn embedTokenized(
+    pub fn embedTokenized(self: *EmbeddingPipeline, input_ids: []const i64, attention_mask: []const i64, batch: usize, seq_len: usize) ![][]f32 {
+        return self.embedTokenizedResult(input_ids, attention_mask, batch, seq_len, false, .{});
+    }
+
+    /// One exact tokenized cohort, with original-run-funded final backing.
+    /// The caller supplies no enclosing task execution lane. Native/Metal/CUDA
+    /// numerical and projection choices are the SAME existing shared body.
+    /// No unmanaged raw fallback or encoder replay is performed by this API.
+    pub fn embedTokenizedOwned(self: *EmbeddingPipeline, input_ids: []const i64, attention_mask: []const i64, batch: usize, seq_len: usize, consumer_cleanup: CleanupContext) !session_mod.OwnedHostVectors {
+        // Final and temporary output allocations must really reclaim. A
+        // request Arena's logical free cannot justify retiring its run quota.
+        if (!consumer_cleanup.outside_execution or consumer_cleanup.boundary != null or consumer_cleanup.operation != null) return error.OwnedOutputRequiresOutsideEntry;
+        if (self.gemma_workspace != null) return error.OwnedOutputRequiresColdWorkspaceOwner;
+        var scoped = self.*;
+        scoped.allocator = @import("embedding_gemma2.zig").workspaceBackingAllocator(self.session.backend());
+        defer {
+            self.last_resident_backend_timing = scoped.last_resident_backend_timing;
+            self.last_input_tokens = scoped.last_input_tokens;
+        }
+        return scoped.embedTokenizedResult(input_ids, attention_mask, batch, seq_len, true, consumer_cleanup);
+    }
+
+    fn ownedTextOutputWidth(self: *const EmbeddingPipeline) !usize {
+        if (self.text_projection == null and self.residentTextEncoderEnabled() and self.config.normalize and self.config.pooling == .mean and session_factory.getEmbeddingGemma2Config(self.session) != null)
+            return self.config.embedding_gemma2_dimensions;
+        const final_session = self.text_projection orelse self.textEncodingSession();
+        return @import("../execution/architecture_session.zig").pooledEmbeddingOutputWidth(final_session) orelse error.UnsupportedOwnedOutputGeometry;
+    }
+
+    fn embedTokenizedResult(
         self: *EmbeddingPipeline,
         input_ids: []const i64,
         attention_mask: []const i64,
         batch: usize,
         seq_len: usize,
-    ) ![][]f32 {
-        const lane = try self.enterExecutionLane();
+        comptime owned: bool,
+        consumer_cleanup: CleanupContext,
+    ) anyerror!(if (owned) session_mod.OwnedHostVectors else [][]f32) {
+        // An enclosing task lane is not outside-execution authority. The
+        // admitted owned entry must cold-prepare its original escrow first.
+        // Existing raw entry keeps its original lane/fairness behavior.
+        if (owned and (!consumer_cleanup.outside_execution or consumer_cleanup.boundary != null or consumer_cleanup.operation != null)) return error.OwnedOutputRequiresOutsideEntry;
+        if (owned) if (consumer_cleanup.boundary) |current| {
+            if (try current.isSealed()) return error.RetirementEpochSealed;
+        };
+        if (owned and ((self.execution_lane != null and !self.usesQwenWorkspaceLaneProtocol()) or self.execution_lane_held)) return error.OwnedOutputRequiresColdLaneEntry;
+        const output_width = if (owned) try self.ownedTextOutputWidth() else 0;
+        const lane = if (owned or self.usesQwenWorkspaceLaneProtocol()) null else try self.enterExecutionLane();
         defer self.leaveExecutionLane(lane);
         if (batch == 0 or seq_len == 0) return error.InvalidInputShape;
         if (self.config.strict_max_length and seq_len > self.config.max_length)
@@ -1207,14 +1361,22 @@ pub const EmbeddingPipeline = struct {
         // The runtime source owns its exact FIFO/model lane and whole-consumer B.
         if (self.execution_gate_held) return error.PreparedAdmissionRequiresReadyTurn;
         var source: session_mod.PreparedSource = .{};
-        defer source.deinit();
+        var typed_source_ready = false;
+        defer if (owned) {
+            // Before successful cold producer commitment this synchronous
+            // path has acquired NO task/model/provider lane. No foreign
+            // numerical consumer has been entered by this function yet.
+            if (typed_source_ready) source.deinitWithCleanup(consumer_cleanup) catch platform.inference_process_supervisor.restartWorker() else source.deinitOutsideExecution();
+        } else source.deinit();
         var projection_execution: ?session_mod.RunPermit = null;
         defer if (projection_execution) |*permit| permit.deinitWithCleanup(.{ .boundary = source.epoch() });
         const signature = text_plan.signature();
         try self.prepareTextSource(&source, text_session, .{ .host_shapes = signature.slice() }, .{
             .batch = if (compact_policy) 1 else batch,
             .sequence = if (compact_policy) active_rows else seq_len,
-            .output_bytes = if (compact_policy) batch * self.config.embedding_gemma2_dimensions * @sizeOf(f32) else null,
+            .output_bytes = if (owned)
+                @max(if (compact_policy) batch * self.config.embedding_gemma2_dimensions * @sizeOf(f32) else 0, try session_mod.PreparedSource.hostOutputRequestBytes(batch, output_width))
+            else if (compact_policy) batch * self.config.embedding_gemma2_dimensions * @sizeOf(f32) else null,
             .input_bytes = text_plan.input_bytes,
             .host_preprocess_bytes = if (preprocess_permit != null) text_plan.temporary_bytes else try std.math.add(usize, try std.math.mul(usize, total, 32), text_plan.temporary_bytes),
             .workspace_bytes = if (session_factory.getEmbeddingGemma2Config(self.session) != null)
@@ -1222,6 +1384,10 @@ pub const EmbeddingPipeline = struct {
             else
                 0,
         });
+        if (owned) {
+            try source.prepareHostOutputsBeforeExecution(batch, output_width);
+            typed_source_ready = true;
+        }
         if (self.execution_control) |control| try control.check();
         var input_set = try text_plan.materialize(alloc, input_ids_tensor, attention_mask_tensor, .{});
         defer input_set.deinit();
@@ -1230,19 +1396,34 @@ pub const EmbeddingPipeline = struct {
         var projection_shell = if (self.text_projection) |projection| try projection.prepareResidentRetirement() else null;
         defer if (projection_shell) |*shell| shell.destroyUnused();
         try source.enter();
+        const qwen_lane = if (self.usesQwenWorkspaceLaneProtocol()) try self.enterExecutionLane() else null;
+        defer self.leaveExecutionLane(qwen_lane);
         const active_permit = try source.beginExecutionDispatch();
         self.execution_gate_held = true;
         defer {
             source.leaveExecution();
             self.execution_gate_held = false;
         }
-        return self.embedPreparedTextInputs(input_set.slice(), mask_i32, input_ids, batch, seq_len, active_permit, &projection_shell, .{ .boundary = source.epoch() }, &projection_execution, .{ .prepared = &source });
+        const vectors = try self.embedPreparedTextInputs(input_set.slice(), mask_i32, input_ids, batch, seq_len, active_permit, &projection_shell, .{ .boundary = source.epoch() }, &projection_execution, .{ .prepared = &source });
+        if (owned) {
+            // Reclaim every temporary row BEFORE source cleanup retires its
+            // original run. The returned backing is independently owned.
+            defer freeEmbeddingSlices(alloc, vectors);
+            return source.publishHostOutputs(vectors);
+        }
+        return vectors;
     }
 
     /// Returns backend telemetry for the most recent successful resident
     /// encoder request. Consumers must read this before starting another run.
     pub fn lastResidentBackendTiming(self: *const EmbeddingPipeline) ?ops_mod.BackendDebugTimingSnapshot {
         return self.last_resident_backend_timing;
+    }
+
+    fn textSourcePlacement(self: *const EmbeddingPipeline, session: session_mod.Session) session_mod.PreparedSource.Placement {
+        if (self.usesResidentTextOutputs()) return .resident_consumer;
+        const cfg = session_factory.getGptConfig(session) orelse return .host;
+        return if (residentQwen3EmbeddingEligible(session, cfg, self.config)) .resident_transient else .host;
     }
 
     fn prepareTextSource(self: *EmbeddingPipeline, source: *session_mod.PreparedSource, session: session_mod.Session, shapes: session_mod.ShapeInputs, request: session_mod.RunRequest) !void {
@@ -1267,9 +1448,9 @@ pub const EmbeddingPipeline = struct {
                 .{ .name = "input_ids", .dtype = .i64, .shape = &token_shape },
                 .{ .name = "attention_mask", .dtype = .i64, .shape = &token_shape },
             };
-            return source.initShapesBeforeExecutionInto(session, self.session, self.execution_lock, .{ .shapes = &numerical_inputs }, planned, workspace, if (self.usesResidentTextOutputs()) .resident_consumer else .host, self.allocator, self.execution_control);
+            return source.initShapesBeforeExecutionInto(session, self.session, self.execution_lock, .{ .shapes = &numerical_inputs }, planned, workspace, self.textSourcePlacement(session), self.allocator, self.execution_control);
         };
-        return source.initShapesBeforeExecutionInto(session, self.session, self.execution_lock, shapes, request, null, if (self.usesResidentTextOutputs()) .resident_consumer else .host, self.allocator, self.execution_control);
+        return source.initShapesBeforeExecutionInto(session, self.session, self.execution_lock, shapes, request, null, self.textSourcePlacement(session), self.allocator, self.execution_control);
     }
 
     fn embedPreparedTextInputs(
@@ -1357,7 +1538,7 @@ pub const EmbeddingPipeline = struct {
             if (try self.tryEmbedTextResidentEncoder(inputs, all_mask, batch, effective_len, run_permit, cleanup)) |resident_embeddings| {
                 return resident_embeddings;
             }
-        } else if (try self.tryEmbedTextResidentQwen3(all_mask, ids_i64, batch, effective_len)) |resident_embeddings| {
+        } else if (try self.tryEmbedTextResidentQwen3(all_mask, ids_i64, batch, effective_len, cleanup)) |resident_embeddings| {
             return resident_embeddings;
         }
 
@@ -1431,7 +1612,8 @@ pub const EmbeddingPipeline = struct {
         return embeddings;
     }
 
-    fn textEncodingSession(self: *const EmbeddingPipeline) backends.Session {
+    /// Metadata-only source selection shared by cold physical custody owners.
+    pub fn textEncodingSession(self: *const EmbeddingPipeline) backends.Session {
         if (self.vision_session) |vs| {
             if (session_factory.getClapConfig(self.session) != null and
                 session_factory.getClipConfig(vs) != null and
@@ -2938,6 +3120,7 @@ pub const EmbeddingPipeline = struct {
         input_ids: []const i64,
         batch: usize,
         seq_len: usize,
+        cleanup: CleanupContext,
     ) !?[][]f32 {
         const cfg = session_factory.getGptConfig(self.session) orelse {
             if (self.residentProjectionRequired()) {
@@ -2952,7 +3135,7 @@ pub const EmbeddingPipeline = struct {
             return null;
         }
 
-        return self.embedTextResidentQwen3(cfg, mask, input_ids, batch, seq_len);
+        return self.embedTextResidentQwen3(cfg, mask, input_ids, batch, seq_len, cleanup);
     }
 
     fn embedTextResidentQwen3(
@@ -2962,15 +3145,34 @@ pub const EmbeddingPipeline = struct {
         input_ids: []const i64,
         batch: usize,
         seq_len: usize,
+        cleanup: CleanupContext,
     ) !?[][]f32 {
         var compute = try compute_provider.acquireWithControl(self.session, self.allocator, self.execution_control);
-        defer compute.deinit();
+        var current = cleanup;
+        defer compute.deinitWithCleanup(current);
         const cb = &compute.backend;
         if (cb.kind() != .metal) {
             return self.residentProjectionFallback(.text, "text.encoder.qwen3.resident", batch, "not_metal_backend");
         }
 
-        if (try self.tryEmbedTextResidentQwen3Graph(cb, cfg, mask, input_ids, batch, seq_len)) |graph_embeddings| {
+        const canonical = if (comptime build_options.enable_metal)
+            @import("../ops/metal_compute.zig").MetalCompute.acceptsEmbeddingStage(cb)
+        else
+            false;
+        var scoped: ?*const CleanupContext = null;
+        if (canonical) {
+            const boundary = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+            if (!try cb.bindCleanupEpoch(boundary)) return error.BackendOperationCleanupUnavailable;
+            current.operation = cb.operationToken();
+            _ = try current.operationFor(cb);
+            scoped = &current;
+        }
+
+        if (try self.tryEmbedTextResidentQwen3Graph(cb, cfg, mask, input_ids, batch, seq_len, scoped)) |graph_embeddings| {
+            self.last_resident_backend_timing = if (current.operation) |token|
+                @import("../execution/metadata_sample.zig").snapshotOwned(cb, token)
+            else
+                null;
             return graph_embeddings;
         }
 
@@ -2984,11 +3186,12 @@ pub const EmbeddingPipeline = struct {
             return self.residentProjectionFallback(.text, "text.prepare.qwen3.resident", batch, "prepare_failed");
         }
 
-        const overrides = decoder_gated_runtime.buildOverridesWithLevel(
+        var overrides = decoder_gated_runtime.buildOverridesWithLevel(
             cfg,
             cfg.num_hidden_layers,
             qwen3_embedding_resident_override_level,
         );
+        overrides.cleanup = scoped;
         const encoder_start = embedTimingStart(self.print_timing);
         const hidden = try gpt_arch.hiddenForwardResidentWithOverrides(
             cb,
@@ -3004,7 +3207,7 @@ pub const EmbeddingPipeline = struct {
 
         // A borrowed stack vector needs no fallible metadata allocation after
         // the actual producer. The original backend owns the one hidden CT.
-        defer cb.free(hidden);
+        defer if (scoped) |cleanup_scope| cb.freeWithCleanup(hidden, cleanup_scope.*) else cb.free(hidden);
         var output_storage = [_]ops_mod.CT{hidden};
         var encoder_outputs = session_mod.ResidentOutputs{
             .outputs = &output_storage,
@@ -3012,7 +3215,11 @@ pub const EmbeddingPipeline = struct {
             .allocator = self.allocator,
         };
 
-        const embeddings = try self.finishProducedTextRows(&encoder_outputs, mask, batch, seq_len, self.config.normalize, "text.pool.qwen3.resident", "text.encoder.qwen3.resident");
+        const embeddings = try self.finishProducedTextRowsWithCleanup(&encoder_outputs, mask, batch, seq_len, self.config.normalize, "text.pool.qwen3.resident", "text.encoder.qwen3.resident", scoped);
+        self.last_resident_backend_timing = if (current.operation) |token|
+            @import("../execution/metadata_sample.zig").snapshotOwned(cb, token)
+        else
+            null;
         return embeddings;
     }
 
@@ -3024,6 +3231,7 @@ pub const EmbeddingPipeline = struct {
         input_ids: []const i64,
         batch: usize,
         seq_len: usize,
+        cleanup: ?*const CleanupContext,
     ) !?[][]f32 {
         const selected_rows = if (self.config.pooling == .last)
             gpt_arch.activeFinalRowIndices(i32, self.allocator, mask, batch, seq_len) catch |err| switch (err) {
@@ -3038,11 +3246,12 @@ pub const EmbeddingPipeline = struct {
             self.boundedQwenBatchingEnabled() and !disable_frame_normalize;
         const encoder_start = embedTimingStart(self.print_timing);
         const output = (try gpt_arch.tryDenseQwen3Prefill(cb, self.allocator, cfg, input_ids, mask, batch, seq_len, .{
+            .cleanup = cleanup,
             .output_rows = selected_rows,
             .normalize_selected_rows = normalize_in_frame,
             .profile = embedTimingEnabled(self.print_timing),
         })) orelse return null;
-        defer cb.free(output);
+        defer if (cleanup) |current_scope| cb.freeWithCleanup(output, current_scope.*) else cb.free(output);
         logEmbedTiming("text.encoder.qwen3.graph", batch, encoder_start);
         if (embedTimingEnabled(self.print_timing)) {
             const stats = cb.debugTimingSnapshot().provider;
@@ -3057,14 +3266,17 @@ pub const EmbeddingPipeline = struct {
             .allocator = self.allocator,
         };
 
-        const embeddings = try self.finishProducedTextRows(&encoder_outputs, mask, batch, seq_len, self.config.normalize and !normalize_in_frame, "text.pool.qwen3.graph", "text.encoder.qwen3.graph");
+        const embeddings = try self.finishProducedTextRowsWithCleanup(&encoder_outputs, mask, batch, seq_len, self.config.normalize and !normalize_in_frame, "text.pool.qwen3.graph", "text.encoder.qwen3.graph", cleanup);
         return embeddings;
     }
 
     /// Null is reserved for pre-producer eligibility. A completed hidden CT
     /// survives pooling refusal and is consumed exactly once by the host path.
     fn finishProducedTextRows(self: *EmbeddingPipeline, outputs: *session_mod.ResidentOutputs, mask: []const i32, batch: usize, sequence: usize, normalize: bool, phase: []const u8, success_phase: []const u8) ![][]f32 {
-        const rows = self.finishResidentTextRows(outputs, mask, batch, sequence, normalize) catch |err| switch (err) {
+        return self.finishProducedTextRowsWithCleanup(outputs, mask, batch, sequence, normalize, phase, success_phase, null);
+    }
+    fn finishProducedTextRowsWithCleanup(self: *EmbeddingPipeline, outputs: *session_mod.ResidentOutputs, mask: []const i32, batch: usize, sequence: usize, normalize: bool, phase: []const u8, success_phase: []const u8, cleanup: ?*const CleanupContext) ![][]f32 {
+        const rows = self.finishResidentTextRowsWithCleanup(outputs, mask, batch, sequence, normalize, cleanup) catch |err| switch (err) {
             error.UnsupportedResidentTextPooling,
             error.UnsupportedPrimitiveOp,
             error.UnsupportedOperation,
@@ -3446,17 +3658,20 @@ pub const EmbeddingPipeline = struct {
     }
 
     fn finishResidentTextRows(self: *EmbeddingPipeline, outputs: *session_mod.ResidentOutputs, mask: []const i32, batch: usize, sequence: usize, normalize: bool) ![][]f32 {
-        return @import("../execution/backend_operation.zig").callOpaque(outputs.backend.*, outputs.backend.operationToken(), finishResidentTextRowsImpl, .{ self, outputs, mask, batch, sequence, normalize });
+        return self.finishResidentTextRowsWithCleanup(outputs, mask, batch, sequence, normalize, null);
+    }
+    fn finishResidentTextRowsWithCleanup(self: *EmbeddingPipeline, outputs: *session_mod.ResidentOutputs, mask: []const i32, batch: usize, sequence: usize, normalize: bool, cleanup: ?*const CleanupContext) ![][]f32 {
+        return @import("../execution/backend_operation.zig").callOpaque(outputs.backend.*, if (cleanup) |current| current.operation else outputs.backend.operationToken(), finishResidentTextRowsImpl, .{ self, outputs, mask, batch, sequence, normalize, cleanup });
     }
 
-    fn finishResidentTextRowsImpl(self: *EmbeddingPipeline, outputs: *session_mod.ResidentOutputs, mask: []const i32, batch: usize, sequence: usize, normalize: bool) ![][]f32 {
+    fn finishResidentTextRowsImpl(self: *EmbeddingPipeline, outputs: *session_mod.ResidentOutputs, mask: []const i32, batch: usize, sequence: usize, normalize: bool, cleanup: ?*const CleanupContext) ![][]f32 {
         if (outputs.outputs.len == 0) return error.NoOutputTensors;
-        const rows = try sequence_pool.finishHostRows(self.allocator, outputs.backend, outputs.outputs[0], mask, batch, sequence, switch (self.config.pooling) {
+        const rows = try sequence_pool.finishHostRowsWithCleanup(self.allocator, outputs.backend, outputs.outputs[0], mask, batch, sequence, switch (self.config.pooling) {
             .mean => .mean,
             .cls => .cls,
             .max => .max,
             .last => .last,
-        }, normalize);
+        }, normalize, cleanup);
         errdefer freeEmbeddingSlices(self.allocator, rows);
         if (self.config.resident_embedding_gemma2) for (rows) |row| try validateEmbeddingGemma2Vector(row);
         return rows;
@@ -3891,6 +4106,10 @@ fn embedResidentFailClosedEnabled() bool {
 
 fn residentQwen3EmbeddingEligible(session: backends.Session, cfg: gpt_arch.Config, embedding_config: EmbeddingConfig) bool {
     return residentQwen3EmbeddingEligibleForBackend(session.backend(), cfg, embedding_config);
+}
+
+fn qwenWorkspaceLaneModel(backend: backends.BackendType, cfg: gpt_arch.Config) bool {
+    return backend == .metal and gpt_arch.denseQwen3PrefillEligible(cfg);
 }
 
 fn residentQwen3EmbeddingEligibleForBackend(backend: backends.BackendType, cfg: gpt_arch.Config, embedding_config: EmbeddingConfig) bool {
@@ -6329,4 +6548,592 @@ test "Qwen selected graph row host fallback preserves completed normalization bo
     defer freeEmbeddingSlices(a, rows);
     try std.testing.expectEqualSlices(f32, &normalized, rows[0]);
     try std.testing.expect(pipeline.config.normalize);
+}
+
+test "Qwen lane model protocol is independent of adaptive and fixed batch policy" {
+    var cfg = gpt_arch.Config{
+        .family = .qwen3,
+        .norm_type = .rms_norm,
+        .position_encoding = .rope,
+        .activation = .silu,
+        .hidden_size = 64,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .intermediate_size = 128,
+    };
+    try std.testing.expect(qwenWorkspaceLaneModel(.metal, cfg));
+    try std.testing.expect(!qwenWorkspaceLaneModel(.native, cfg));
+    // Capability comes from the actual model, not a task batching/env flag.
+    // The source helper has no EmbeddingConfig argument to accidentally vary.
+    cfg.family = .qwen3_5;
+    try std.testing.expect(!qwenWorkspaceLaneModel(.metal, cfg));
+    cfg.family = .qwen3;
+    cfg.num_local_experts = 4;
+    cfg.num_experts_per_tok = 2;
+    try std.testing.expect(!qwenWorkspaceLaneModel(.metal, cfg));
+}
+
+test "Qwen injected numerical lane cannot invert selected source and legacy chunk in either order" {
+    if (comptime build_options.enable_wasm) return error.SkipZigTest;
+    const Scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler;
+    const Lane = @import("../execution_control.zig").ExecutionLane;
+    const Probe = struct {
+        gate: *std.atomic.Mutex,
+        lane: *Lane,
+        failure: ?anyerror = null,
+        callbacks: usize = 0,
+        fn reserve(raw: *anyopaque, _: memory_admission.AdmissionAmounts) memory_admission.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reenter();
+            return 1;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: memory_admission.AdmissionAmounts) memory_admission.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reenter();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reenter();
+        }
+        fn reenter(self: *@This()) void {
+            self.callbacks += 1;
+            if (!self.gate.tryLock()) {
+                self.failure = error.SelectedQwenSupplierStillOwnsModel;
+                return;
+            }
+            self.gate.unlock();
+            const lease = self.lane.acquire(.{ .deadline_ns = platform.time.monotonicNs() + 2 * std.time.ns_per_s }) catch |err| {
+                self.failure = err;
+                return;
+            };
+            lease.release();
+        }
+        fn run(_: *anyopaque, _: []const Tensor, _: std.mem.Allocator) ![]Tensor {
+            return error.UnexpectedQwenSchedulingNumerics;
+        }
+        fn info(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn kind(_: *anyopaque) backends.BackendType {
+            return .metal;
+        }
+        fn close(_: *anyopaque) void {}
+        const table = backends.Session.VTable{ .run = run, .inputInfo = info, .outputInfo = info, .backend = kind, .close = close };
+    };
+    const Worker = struct {
+        session: backends.Session,
+        lane: *Lane,
+        source: bool,
+        control: InferenceExecutionControl,
+        waiter: Scheduler.Waiter = .{},
+        failure: ?anyerror = null,
+        done: std.atomic.Value(bool) = .init(false),
+        fn execute(self: *@This()) !void {
+            if (self.source) {
+                try self.session.selectReadyCohort(self.session.execution_gate, self.control, &self.waiter);
+                errdefer self.session.leaveSelectedCohort(&self.waiter);
+                try self.session.acquireSelectedCohort(self.control, &self.waiter);
+            } else try self.session.enterExecutionCohort(self.session.execution_gate, self.control, &self.waiter);
+            defer self.session.leaveExecutionCohort(self.session.execution_gate, &self.waiter);
+            // EXACT order used by119's source and68a's chunk: the real model
+            // cohort is acquired before the injected numerical lane.
+            const lane = try self.lane.acquire(self.control);
+            defer lane.release();
+        }
+        fn start(self: *@This()) void {
+            self.execute() catch |err| {
+                self.failure = err;
+            };
+            self.done.store(true, .release);
+        }
+    };
+    for ([_]bool{ true, false }) |source_first| {
+        var gate: std.atomic.Mutex = .unlocked;
+        var lane: Lane = .{};
+        var scheduler: Scheduler = .{};
+        var probe = Probe{ .gate = &gate, .lane = &lane };
+        const session = backends.Session{ .ptr = &probe, .vtable = &Probe.table, .execution_gate = &gate, .cohort_scheduler = &scheduler };
+        const control = InferenceExecutionControl{ .deadline_ns = platform.time.monotonicNs() + 2 * std.time.ns_per_s };
+        var head: Scheduler.Waiter = .{};
+        var head_live = true;
+        if (source_first) {
+            try session.selectReadyCohort(&gate, control, &head);
+        } else try session.enterExecutionCohort(&gate, control, &head);
+        var head_lane: ?Lane.Lease = if (source_first) null else try lane.acquire(control);
+        var worker = Worker{ .session = session, .lane = &lane, .source = !source_first, .control = control };
+        var spawned = false;
+        errdefer if (!spawned) {
+            if (head_lane) |owned| owned.release();
+            if (head_live) session.leaveSelectedCohort(&head);
+        };
+        const thread = try std.Thread.spawn(.{}, Worker.start, .{&worker});
+        spawned = true;
+        defer {
+            // Even a failed assertion releases the original owner before join.
+            if (head_lane) |owned| owned.release();
+            if (head_live) session.leaveSelectedCohort(&head);
+            thread.join();
+        }
+        while (true) {
+            // Selected cold sources have not acquired the model yet. Query
+            // the exact queued successor under the actual publication lock;
+            // hasPeer intentionally requires acquired numerical ownership.
+            while (!scheduler.mutex.tryLock()) {
+                try control.check();
+                std.Thread.yield() catch {};
+            }
+            const peer_queued = scheduler.head == &head and head.next == &worker.waiter;
+            scheduler.mutex.unlock();
+            if (peer_queued) break;
+            try control.check();
+            if (worker.done.load(.acquire)) return worker.failure orelse error.QwenPeerSkippedCohort;
+            std.Thread.yield() catch {};
+        }
+        if (source_first) {
+            // The peer has joined the ACTUAL FIFO but must own no lane. This
+            // real supplier reenters both physical owners while head is cold.
+            var controller: memory_admission.AdmissionController = .{};
+            defer controller.deinit();
+            try controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+            var lease = try controller.tryAcquire(.gpu, .{ .backend_limit_bytes = 64 }, .{ .backend_scratch_bytes = 64 }, false);
+            lease.release();
+            try std.testing.expect(probe.failure == null);
+            try std.testing.expectEqual(@as(usize, 2), probe.callbacks);
+            try session.acquireSelectedCohort(control, &head);
+            head_lane = try lane.acquire(control);
+        }
+        try std.testing.expect(!worker.done.load(.acquire));
+        head_lane.?.release();
+        head_lane = null;
+        session.leaveSelectedCohort(&head);
+        head_live = false;
+        while (!worker.done.load(.acquire)) {
+            try control.check();
+            std.Thread.yield() catch {};
+        }
+        if (worker.failure) |err| return err;
+    }
+}
+
+// Real, complete, hash-pinned HF fixtures; only QA assets are supplied by env.
+const DenseQwen68Qa = struct {
+    const a = std.testing.allocator;
+    const FilePin = struct { name: []const u8, sha: []const u8 };
+    const Pins = struct { hidden: usize, files: [5]FilePin };
+    const fixtures = [_]Pins{
+        .{ .hidden = 64, .files = .{ .{ .name = "config.json", .sha = "db1e66565df4b1bbab35305c3d3f2ce15f46ec090f348cbb064d9c4894f0f923" }, .{ .name = "model.safetensors", .sha = "20043bf1993e7279bdf5a86f399abb726c623bf6a73dd4811210aea684e91a3e" }, .{ .name = "model_manifest.json", .sha = "3d54e3eff4551555de6afa1d58ed6b6147867a7d3f5ae9c6206cd3d118de6bad" }, .{ .name = "tokenizer.json", .sha = "fdd36f2129669781a8342a38c2b57dcde7f3abdd20aec517d89404f66395ca9e" }, .{ .name = "tokenizer_config.json", .sha = "0124b7e26d88568ac8c06f2267057273093c50a1ac864ce6bfa56bb765860956" } } },
+        .{ .hidden = 128, .files = .{ .{ .name = "config.json", .sha = "d40ef381f49e75b71fc1b7ebd43dd08d6f124c8a87d9b31758ca458b66d1afd3" }, .{ .name = "model.safetensors", .sha = "67c03f5612fda7cf027911ce4aee666ac72e17bf8f6b72e8e3e16d23b0c6d43c" }, .{ .name = "model_manifest.json", .sha = "3d54e3eff4551555de6afa1d58ed6b6147867a7d3f5ae9c6206cd3d118de6bad" }, .{ .name = "tokenizer.json", .sha = "fdd36f2129669781a8342a38c2b57dcde7f3abdd20aec517d89404f66395ca9e" }, .{ .name = "tokenizer_config.json", .sha = "0124b7e26d88568ac8c06f2267057273093c50a1ac864ce6bfa56bb765860956" } } },
+    };
+    fn hashFile(root: []const u8, file: []const u8) ![64]u8 {
+        const path = try std.fs.path.join(a, &.{ root, file });
+        defer a.free(path);
+        const bytes = try @import("../util/c_file.zig").readFile(a, path);
+        defer a.free(bytes);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        return std.fmt.bytesToHex(digest, .lower);
+    }
+    fn fixture() !struct { path: []const u8, hidden: usize } {
+        const path = platform.env.getenv("ANTFLY_UNIFIED_DENSE_QWEN68_FIXTURE") orelse return error.SkipZigTest;
+        const config_hash = try hashFile(path, "config.json");
+        for (fixtures) |pin| {
+            if (!std.mem.eql(u8, &config_hash, pin.files[0].sha)) continue;
+            for (pin.files) |file| try std.testing.expectEqualStrings(file.sha, &(try hashFile(path, file.name)));
+            return .{ .path = path, .hidden = pin.hidden };
+        }
+        return error.UnknownDenseQwen68Fixture;
+    }
+    fn tokenizer(path: []const u8) !*@import("inference_hf_tokenizer").HfTokenizer {
+        const filename = try std.fs.path.join(a, &.{ path, "tokenizer.json" });
+        defer a.free(filename);
+        const bytes = try @import("../util/c_file.zig").readFile(a, filename);
+        defer a.free(bytes);
+        return @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, bytes);
+    }
+    const control = InferenceExecutionControl{ .native_call_policy = .in_process };
+    /// Publish the actual shared provider/runtime through its normal cold
+    /// constructor, without running model arithmetic or warming hidden states.
+    fn publishMetalProvider(session: session_mod.Session) !void {
+        session_factory.attachIo(session, std.testing.io);
+        var backend = try compute_provider.acquireWithControl(session, a, control);
+        backend.deinit(); // real outside entry, before run admission/numerical gates
+        const target = (try session.coldComputeTarget(control)) orelse return error.ExpectedActualMetalProvider;
+        if (target != .metal) return error.ExpectedActualMetalProvider;
+    }
+    fn publishEmbeddingContract(session: *session_mod.Session, manifest: *const @import("../models/manifest.zig").ModelManifest) !void {
+        // SAME loaded-runtime resolver: explicit artifact semantics, never a
+        // fixture-only hidden-width guess or a broadened production contract.
+        session.model_contract = @import("../models/session_contract.zig").resolve(session.model_contract, manifest, session.backend());
+        try std.testing.expect(session.model_contract.embedding.?.family == .last_token_decoder);
+        try std.testing.expect(session.model_contract.embedding.?.pooling == .last);
+        try std.testing.expect(session.model_contract.embedding.?.normalize);
+    }
+    fn reportDifferences(label: []const u8, batch: usize, sequence: usize, row: usize, expected: []const f32, actual: []const f32) void {
+        var maximum: f64 = 0;
+        var squared: f64 = 0;
+        for (expected, actual) |x, y| {
+            const diff = @abs(@as(f64, x) - @as(f64, y));
+            maximum = @max(maximum, diff);
+            squared += diff * diff;
+        }
+        std.debug.print("dense-qwen68 parity={s} B={d} S={d} row={d} max_abs={d:.9} rms={d:.9}\n", .{ label, batch, sequence, row, maximum, @sqrt(squared / @as(f64, @floatFromInt(expected.len))) });
+    }
+    fn config(resident: bool, pooling: PoolingStrategy) EmbeddingConfig {
+        return .{ .normalize = true, .pooling = pooling, .max_length = 32, .batch_size = 2, .resident_qwen3_embedding = resident, .resident_text_encoder = false, .trim_padding_to_batch_max = true, .ensure_trailing_eos_id = 63 };
+    }
+    fn inputs(batch: usize, sequence: usize, ids: *[32]i64, mask: *[32]i64) void {
+        for (0..batch * sequence) |i| {
+            ids[i] = if ((i + 1) % sequence == 0) 63 else @intCast(2 + (i * 7) % 13);
+            mask[i] = 1;
+        }
+    }
+    fn compare(expected: []const f32, actual: []const f32, hidden: usize) !void {
+        try std.testing.expectEqual(hidden, expected.len);
+        try std.testing.expectEqual(hidden, actual.len);
+        var norm: f64 = 0;
+        for (expected, actual) |reference, value| {
+            try std.testing.expect(std.math.isFinite(reference) and std.math.isFinite(value));
+            try std.testing.expectApproxEqAbs(reference, value, 3e-4);
+            norm += @as(f64, value) * value;
+        }
+        try std.testing.expectApproxEqAbs(@as(f64, 1), norm, 1e-4);
+    }
+    fn graphExecutions(pipeline: *const EmbeddingPipeline) u64 {
+        const timing = pipeline.lastResidentBackendTiming() orelse return 0;
+        return timing.provider.prefill_frame_execute_successes;
+    }
+    fn close(session: session_mod.Session) void {
+        const sink_mod = @import("../execution/retirement_sink.zig");
+        var sink = sink_mod.Ref.create() catch @panic("dense Qwen QA close sink");
+        defer sink.release();
+        var guard = sink.enter() catch @panic("dense Qwen QA close guard");
+        defer guard.finish();
+        var epoch = guard.retainEpoch() catch @panic("dense Qwen QA close epoch");
+        defer epoch.release();
+        session.closeWithBoundary(&epoch);
+    }
+    const Probe = struct {
+        model_gate: ?*std.atomic.Mutex = null,
+        provider_gate: ?*std.atomic.Mutex = null,
+        foreign_gate: ?*std.atomic.Mutex = null,
+        tokens: [1024]memory_admission.AdmissionAmounts = @splat(.{}),
+        next: usize = 1,
+        calls: usize = 0,
+        releases: usize = 0,
+        references: usize = 1,
+        violation: bool = false,
+        fn observe(self: *@This()) void {
+            for ([_]?*std.atomic.Mutex{ self.model_gate, self.provider_gate, self.foreign_gate }) |maybe| if (maybe) |gate| {
+                const available = gate.tryLock();
+                if (available) gate.unlock() else self.violation = true;
+            };
+            self.calls += 1;
+        }
+        fn retainContext(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            self.references += 1;
+            return true;
+        }
+        fn releaseContext(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            self.references -= 1;
+        }
+        fn reserve(raw: *anyopaque, amount: memory_admission.AdmissionAmounts) memory_admission.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            if (self.next == self.tokens.len) return error.ResourceLimitExceeded;
+            const index = self.next;
+            self.next += 1;
+            self.tokens[index] = amount;
+            return index;
+        }
+        fn retain(raw: *anyopaque, token: usize, amount: memory_admission.AdmissionAmounts) memory_admission.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            if (token == 0 or token >= self.next) return error.ResourceLimitExceeded;
+            self.tokens[token] = amount;
+        }
+        fn release(raw: *anyopaque, token: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            if (token == 0 or token >= self.next) @panic("dense Qwen QA unknown token");
+            self.tokens[token] = .{};
+            self.releases += 1;
+        }
+    };
+};
+
+test "dense Qwen68 complete HF Native Metal eager resident normalized output and warm parity" {
+    if (comptime !build_options.enable_native or !build_options.enable_metal) return error.SkipZigTest;
+    const Q = DenseQwen68Qa;
+    const fixture = try Q.fixture();
+    var manifest = try @import("../models/manifest.zig").loadFromDir(Q.a, fixture.path);
+    defer manifest.deinit();
+    try std.testing.expect(manifest.isLastTokenDecoderEmbedder());
+    const hf = try Q.tokenizer(fixture.path);
+    defer hf.deinitSelf();
+    var native = try session_factory.createNativeSession(Q.a, fixture.path);
+    defer Q.close(native);
+    try Q.publishEmbeddingContract(&native, &manifest);
+    var metal = try session_factory.createMetalSession(Q.a, fixture.path);
+    defer Q.close(metal);
+    try Q.publishEmbeddingContract(&metal, &manifest);
+    try Q.publishMetalProvider(metal);
+    const cfg = session_factory.getGptConfig(metal) orelse return error.ExpectedActualQwenConfiguration;
+    try std.testing.expect(cfg.family == .qwen3 and gpt_arch.denseQwen3PrefillEligible(cfg));
+    var reference = EmbeddingPipeline.init(Q.a, native, hf.tokenizer(), Q.config(false, .last));
+    var eager = EmbeddingPipeline.init(Q.a, metal, hf.tokenizer(), Q.config(false, .last));
+    var resident = EmbeddingPipeline.init(Q.a, metal, hf.tokenizer(), Q.config(true, .last));
+    reference.execution_control = Q.control;
+    eager.execution_control = Q.control;
+    resident.execution_control = Q.control;
+    var graph_dispatches: u64 = 0;
+    var ids: [32]i64 = undefined;
+    var mask: [32]i64 = undefined;
+    // Actual B1/B2 and a shape change exercise reused and replaced plans.
+    for ([_][2]usize{ .{ 1, 16 }, .{ 1, 16 }, .{ 2, 16 }, .{ 2, 16 }, .{ 1, 7 }, .{ 1, 16 } }) |shape| {
+        const batch = shape[0];
+        const sequence = shape[1];
+        Q.inputs(batch, sequence, &ids, &mask);
+        const count = batch * sequence;
+        const expected = try reference.embedTokenized(ids[0..count], mask[0..count], batch, sequence);
+        defer freeEmbeddingSlices(Q.a, expected);
+        const ordinary = try eager.embedTokenized(ids[0..count], mask[0..count], batch, sequence);
+        defer freeEmbeddingSlices(Q.a, ordinary);
+        const actual = try resident.embedTokenized(ids[0..count], mask[0..count], batch, sequence);
+        defer freeEmbeddingSlices(Q.a, actual);
+        try std.testing.expectEqual(batch, actual.len);
+        std.debug.print("dense-qwen68 snapshot_available={} actual_frame_successes={d} B={d} S={d}\n", .{ resident.lastResidentBackendTiming() != null, Q.graphExecutions(&resident), batch, sequence });
+        for (0..batch) |row| {
+            Q.reportDifferences("Native/eagerMetal", batch, sequence, row, expected[row], ordinary[row]);
+            Q.reportDifferences("Native/residentMetal", batch, sequence, row, expected[row], actual[row]);
+            Q.reportDifferences("eagerMetal/residentMetal", batch, sequence, row, ordinary[row], actual[row]);
+            try Q.compare(expected[row], ordinary[row], fixture.hidden);
+            try Q.compare(expected[row], actual[row], fixture.hidden);
+        }
+        graph_dispatches += Q.graphExecutions(&resident);
+    }
+    // Real tokenizer and normal public text entry, not a fake tokenizer.
+    const texts = [_][]const u8{ "hello world alpha beta", "tiny query document again" };
+    const expected_text = try reference.embed(&texts);
+    defer freeEmbeddingSlices(Q.a, expected_text);
+    const actual_text = try resident.embed(&texts);
+    defer freeEmbeddingSlices(Q.a, actual_text);
+    for (expected_text, actual_text) |expected, actual| try Q.compare(expected, actual, fixture.hidden);
+    graph_dispatches += Q.graphExecutions(&resident);
+    // Mean remains a real supported pooling fallback; no geometry is forced.
+    reference.config.pooling = .mean;
+    resident.config.pooling = .mean;
+    Q.inputs(1, 16, &ids, &mask);
+    const expected_mean = try reference.embedTokenized(ids[0..16], mask[0..16], 1, 16);
+    defer freeEmbeddingSlices(Q.a, expected_mean);
+    const actual_mean = try resident.embedTokenized(ids[0..16], mask[0..16], 1, 16);
+    defer freeEmbeddingSlices(Q.a, actual_mean);
+    try Q.compare(expected_mean[0], actual_mean[0], fixture.hidden);
+    std.debug.print("dense-qwen68 hidden={d} actual_graph_success_evidence={d} (zero is not fallback proof; inspect snapshot availability)\n", .{ fixture.hidden, graph_dispatches });
+    if (platform.env.getenvBoolDefault("ANTFLY_UNIFIED_QWEN68_REQUIRE_GRAPH", false)) try std.testing.expect(graph_dispatches > 0);
+}
+
+test "dense Qwen68 actual admitted pipeline cap refusal retained outputs and foreign B cleanup" {
+    if (comptime !build_options.enable_native or !build_options.enable_metal) return error.SkipZigTest;
+    const Q = DenseQwen68Qa;
+    const fixture = try Q.fixture();
+    var manifest = try @import("../models/manifest.zig").loadFromDir(Q.a, fixture.path);
+    defer manifest.deinit();
+    try std.testing.expect(manifest.isLastTokenDecoderEmbedder());
+    const hf = try Q.tokenizer(fixture.path);
+    defer hf.deinitSelf();
+    var native = try session_factory.createNativeSession(Q.a, fixture.path);
+    defer Q.close(native);
+    try Q.publishEmbeddingContract(&native, &manifest);
+    var reference = EmbeddingPipeline.init(Q.a, native, hf.tokenizer(), Q.config(false, .last));
+    reference.execution_control = Q.control;
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    var probe = Q.Probe{};
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .retain_context = Q.Probe.retainContext, .release_context = Q.Probe.releaseContext, .try_reserve = Q.Probe.reserve, .retain = Q.Probe.retain, .release = Q.Probe.release });
+    var configured = true;
+    defer if (configured) domain.controller.configureResourceBudget(null) catch @panic("dense Qwen QA live quota");
+    var metal = try session_factory.createMetalSession(Q.a, fixture.path);
+    var metal_live = true;
+    defer if (metal_live) {
+        probe.model_gate = null;
+        probe.provider_gate = null;
+        Q.close(metal);
+    };
+    try Q.publishMetalProvider(metal);
+    try Q.publishEmbeddingContract(&metal, &manifest);
+    try metal.installOwnedExecutionGate(Q.a);
+    probe.model_gate = metal.execution_gate;
+    const model = metal.model_lifetime orelse return error.ExpectedActualModelLifetime;
+    try std.testing.expect(model.admission_domain == null);
+    model.admission_domain = domain.pin();
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    metal.cohort_scheduler = &scheduler;
+    const cold = (try metal.coldComputeTarget(Q.control)) orelse return error.ExpectedActualMetalProvider;
+    probe.provider_gate = switch (cold) {
+        .metal => |target| &target.exclusion.mutex,
+        else => return error.ExpectedActualMetalProvider,
+    };
+    const MiB = 1024 * 1024;
+    metal.run_admission = .{ .controller = &domain.controller, .backend_class = .gpu, .limits = .{ .host_limit_bytes = 512 * MiB, .backend_limit_bytes = 512 * MiB, .combined_limit_bytes = 768 * MiB }, .static_workspace_bytes = 0, .check_live_memory = false };
+    var pipeline = EmbeddingPipeline.init(Q.a, metal, hf.tokenizer(), Q.config(true, .last));
+    pipeline.execution_lock = metal.execution_gate;
+    pipeline.execution_control = Q.control;
+    var ids: [32]i64 = undefined;
+    var mask: [32]i64 = undefined;
+    Q.inputs(2, 16, &ids, &mask);
+    const expected = try reference.embedTokenized(&ids, &mask, 2, 16);
+    defer freeEmbeddingSlices(Q.a, expected);
+    // Cold and warm calls use the same actual managed provider and admission.
+    for (0..3) |_| {
+        var outputs = try pipeline.embedTokenizedOwned(&ids, &mask, 2, 16, .{ .outside_execution = true });
+        defer outputs.deinitOutsideExecution();
+        try std.testing.expectEqual(@as(usize, 2), outputs.len());
+        for (0..2) |row| try Q.compare(expected[row], outputs.values(row), fixture.hidden);
+    }
+    const before_denial = domain.controller.snapshot();
+    const original = pipeline.session.run_admission.?;
+    pipeline.session.run_admission.?.limits = .{ .host_limit_bytes = 1, .backend_limit_bytes = 1, .combined_limit_bytes = 1 };
+    if (pipeline.embedTokenizedOwned(&ids, &mask, 2, 16, .{ .outside_execution = true })) |value| {
+        var unexpected = value;
+        unexpected.deinitOutsideExecution();
+        return error.ExpectedActualAdmissionDenial;
+    } else |err| try std.testing.expect(err == error.ResourceLimitExceeded);
+    pipeline.session.run_admission = original;
+    try std.testing.expectEqualDeep(before_denial, domain.controller.snapshot());
+    var held = try pipeline.embedTokenizedOwned(&ids, &mask, 2, 16, .{ .outside_execution = true });
+    defer held.deinitOutsideExecution();
+    // Borrowed diagnostic pointers end before actual Model/provider close.
+    probe.model_gate = null;
+    probe.provider_gate = null;
+    Q.close(metal);
+    metal_live = false;
+    for (0..2) |row| try Q.compare(expected[row], held.values(row), fixture.hidden);
+    try std.testing.expect(domain.controller.snapshot().hostTotalBytes() > 0);
+    const sink_mod = @import("../execution/retirement_sink.zig");
+    var sink = try sink_mod.Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    var foreign_gate: std.atomic.Mutex = .unlocked;
+    const releases_before_b = probe.releases;
+    {
+        try std.testing.expect(foreign_gate.tryLock());
+        probe.foreign_gate = &foreign_gate;
+        // Every error/failed assertion unlocks before guard.finish callbacks.
+        defer {
+            foreign_gate.unlock();
+            probe.foreign_gate = null;
+        }
+        try held.deinitWithCleanup(.{ .boundary = &epoch });
+        try std.testing.expectEqual(releases_before_b, probe.releases);
+    }
+    guard.finish();
+    try std.testing.expect(probe.releases > releases_before_b);
+    try std.testing.expectEqualDeep(memory_admission.AdmissionAmounts{}, domain.controller.snapshot());
+    for (probe.tokens) |amount| try std.testing.expectEqualDeep(memory_admission.AdmissionAmounts{}, amount);
+    try std.testing.expect(!probe.violation and probe.calls > 4);
+    try std.testing.expect(scheduler.head == null and scheduler.tail == null);
+    try domain.controller.configureResourceBudget(null);
+    configured = false;
+    try std.testing.expectEqual(@as(usize, 1), probe.references);
+}
+
+test "dense Qwen68 default Q8 resident baseline exports exact ordered normalized F32 vectors" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const Q = DenseQwen68Qa;
+    // This is a separate production-default prepared-weight policy oracle.
+    // The original Native/F32 comparison retains its independent strict gate.
+    if (platform.env.getenv("TERMITE_METAL_Q8_RUNTIME_STAGING_MAX_MB")) |value| {
+        const actual = std.fmt.parseUnsigned(usize, value, 10) catch return error.SkipZigTest;
+        if (actual != 32) return error.SkipZigTest;
+    }
+    const fixture = try Q.fixture();
+    var manifest = try @import("../models/manifest.zig").loadFromDir(Q.a, fixture.path);
+    defer manifest.deinit();
+    try std.testing.expect(manifest.isLastTokenDecoderEmbedder());
+    const hf = try Q.tokenizer(fixture.path);
+    defer hf.deinitSelf();
+    var metal = try session_factory.createMetalSession(Q.a, fixture.path);
+    defer Q.close(metal);
+    try Q.publishEmbeddingContract(&metal, &manifest);
+    try Q.publishMetalProvider(metal);
+    const cfg = session_factory.getGptConfig(metal) orelse return error.ExpectedActualQwenConfiguration;
+    try std.testing.expect(cfg.family == .qwen3 and gpt_arch.denseQwen3PrefillEligible(cfg));
+    var pipeline = EmbeddingPipeline.init(Q.a, metal, hf.tokenizer(), Q.config(true, .last));
+    pipeline.execution_control = Q.control;
+    var flat: std.ArrayListUnmanaged(f32) = .empty;
+    defer flat.deinit(Q.a);
+    var metadata: std.Io.Writer.Allocating = .init(Q.a);
+    defer metadata.deinit();
+    const config_hash = try Q.hashFile(fixture.path, "config.json");
+    const weights_hash = try Q.hashFile(fixture.path, "model.safetensors");
+    try metadata.writer.print("{{\"schema\":\"antfly.dense_qwen68.default_q8.v1\",\"encoding\":\"f32_little_endian\",\"q8_staging_max_mb\":32,\"fixture_config_sha256\":\"{s}\",\"fixture_weights_sha256\":\"{s}\",\"hidden\":{d},\"cases\":[", .{ config_hash, weights_hash, fixture.hidden });
+    const Export = struct {
+        fn append(writer: *std.Io.Writer, destination: *std.ArrayListUnmanaged(f32), ordinal: usize, kind: []const u8, pooling: []const u8, batch: usize, sequence: usize, hidden: usize, rows: [][]f32) !void {
+            try std.testing.expectEqual(batch, rows.len);
+            const offset = destination.items.len;
+            for (rows) |row| {
+                try std.testing.expectEqual(hidden, row.len);
+                var norm: f64 = 0;
+                for (row) |value| {
+                    try std.testing.expect(std.math.isFinite(value));
+                    norm += @as(f64, value) * value;
+                }
+                try std.testing.expectApproxEqAbs(@as(f64, 1), norm, 1e-4);
+                try destination.appendSlice(Q.a, row); // preserve exact returned F32 bits/order
+            }
+            if (ordinal != 0) try writer.writeAll(",");
+            try writer.print("{{\"ordinal\":{d},\"kind\":\"{s}\",\"pooling\":\"{s}\",\"shape\":[{d},{d}],\"input_sequence\":", .{ ordinal, kind, pooling, batch, hidden });
+            if (sequence == 0) try writer.writeAll("null") else try writer.print("{d}", .{sequence});
+            try writer.print(",\"offset_elements\":{d},\"elements\":{d}}}", .{ offset, destination.items.len - offset });
+        }
+    };
+    var ids: [32]i64 = undefined;
+    var mask: [32]i64 = undefined;
+    var ordinal: usize = 0;
+    // Exactly the original fixture's sequence/order; repeats preserve a real
+    // warm baseline, and B2/shape changes exercise the established schedules.
+    for ([_][2]usize{ .{ 1, 16 }, .{ 1, 16 }, .{ 2, 16 }, .{ 2, 16 }, .{ 1, 7 }, .{ 1, 16 } }) |shape| {
+        const batch = shape[0];
+        const sequence = shape[1];
+        Q.inputs(batch, sequence, &ids, &mask);
+        const count = batch * sequence;
+        const rows = try pipeline.embedTokenized(ids[0..count], mask[0..count], batch, sequence);
+        defer freeEmbeddingSlices(Q.a, rows);
+        try Export.append(&metadata.writer, &flat, ordinal, "tokenized", "last", batch, sequence, fixture.hidden, rows);
+        ordinal += 1;
+    }
+    const texts = [_][]const u8{ "hello world alpha beta", "tiny query document again" };
+    {
+        const rows = try pipeline.embed(&texts);
+        defer freeEmbeddingSlices(Q.a, rows);
+        try Export.append(&metadata.writer, &flat, ordinal, "text", "last", texts.len, 0, fixture.hidden, rows);
+        ordinal += 1;
+    }
+    pipeline.config.pooling = .mean;
+    Q.inputs(1, 16, &ids, &mask);
+    {
+        const rows = try pipeline.embedTokenized(ids[0..16], mask[0..16], 1, 16);
+        defer freeEmbeddingSlices(Q.a, rows);
+        try Export.append(&metadata.writer, &flat, ordinal, "tokenized", "mean", 1, 16, fixture.hidden, rows);
+        ordinal += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 8), ordinal);
+    try metadata.writer.print("],\"elements\":{d}}}\n", .{flat.items.len});
+    if (platform.env.getenv("ANTFLY_UNIFIED_DENSE_QWEN68_DEFAULT_OUTPUT")) |path| {
+        if (path.len == 0) return error.InvalidDefaultQwenOutputPath;
+        // The explicit test runner chooses an ignored QA asset path; no file
+        // is emitted by ordinary production inference or without this opt-in.
+        try @import("../util/c_file.zig").writeF32LeFile(Q.a, std.testing.io, path, flat.items);
+        const sidecar = try std.fmt.allocPrint(Q.a, "{s}.json", .{path});
+        defer Q.a.free(sidecar);
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = sidecar, .data = metadata.written() });
+    }
 }

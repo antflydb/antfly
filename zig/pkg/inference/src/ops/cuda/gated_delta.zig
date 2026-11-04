@@ -13,9 +13,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const std = @import("std");
 const context = @import("context.zig");
 const driver = @import("driver.zig");
 const buffer = @import("buffer.zig");
+
+const Cleanup = @import("../../execution/cleanup_context.zig").Context;
 
 pub const State = struct {
     ctx: ?*context.CudaContext = null,
@@ -30,12 +33,17 @@ pub const State = struct {
     // Its ordinary admitted cache can retain exact persistent allocations.
     release_context: ?*anyopaque = null,
     release_buffer: ?*const fn (*anyopaque, *buffer.DeviceBuffer) void = null,
+    prepare_release_with_cleanup: ?*const fn (*anyopaque, Cleanup) anyerror!void = null,
+    release_buffer_with_cleanup: ?*const fn (*anyopaque, *buffer.DeviceBuffer, bool, Cleanup) anyerror!void = null,
     weight_sources: [4]driver.CUdeviceptr = @splat(0),
     key_heads: usize = 0,
     value_heads: usize = 0,
     initialized: bool = false,
     failed: bool = false,
     admission: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null,
+    // ONLY a synchronous temporary eager owner may install this borrowed loan.
+    // Persistent decode/cache/graph State never receives a RunContext budget.
+    temporary_budget: ?*@import("../../execution/recurrent_state_admission.zig").Budget = null,
 
     pub fn reset(self: *State) void {
         self.initialized = false;
@@ -55,7 +63,42 @@ pub const State = struct {
         value.free(ctx);
     }
 
+    pub fn validateCleanup(self: *const State, current: Cleanup) !void {
+        // The separate generic additional-state producer still has its legacy
+        // raw quota. Do not pretend a late Context supplies its missing cold
+        // retirement shell, or refund it under a caller's numerical lanes.
+        if (self.admission != null and !current.outside_execution) return error.UnpreparedRecurrentStateQuotaRetirement;
+        if (self.temporary_budget) |budget| try budget.validateCleanup(current);
+        if (current.boundary) |epoch| if (try epoch.isSealed()) return error.RetirementEpochSealed;
+    }
+    pub fn deinitWithCleanup(self: *State, current: Cleanup) !void {
+        try self.validateCleanup(current);
+        if (self.prepare_release_with_cleanup) |prepare| try prepare(self.release_context.?, current);
+        if (self.ctx) |ctx| {
+            for (&self.history) |*value| try self.releaseOwnedWithCleanup(ctx, value, current);
+            try self.releaseOwnedWithCleanup(ctx, &self.recurrent, current);
+            for (&self.weights, self.owns_weights) |*value, owned| if (owned) try self.releaseOwnedWithCleanup(ctx, value, current);
+            try self.releaseOwnedWithCleanup(ctx, &self.packed_storage, current);
+        }
+        const temporary_budget = self.temporary_budget;
+        if (temporary_budget) |budget| try budget.returnAfterBackingRetired(current);
+        var admission = self.admission;
+        self.* = .{}; // consume original handle before arbitrary outside refund
+        if (admission) |*lease| lease.release(); // explicit outside-only above
+    }
+    fn releaseOwnedWithCleanup(self: *State, ctx: *context.CudaContext, value: *buffer.DeviceBuffer, current: Cleanup) !void {
+        if (value.ptr == 0) return;
+        if (value.borrowed) {
+            _ = try value.freeChecked(ctx);
+            return;
+        }
+        if (self.release_buffer_with_cleanup) |release| {
+            try release(self.release_context.?, value, !self.failed and self.release_buffer != null, current);
+        } else _ = try value.freeChecked(ctx);
+    }
+
     pub fn deinit(self: *State) void {
+        if (self.temporary_budget != null) @import("antfly_platform").inference_process_supervisor.restartWorker();
         if (self.ctx) |ctx| {
             for (&self.history) |*value| self.releaseOwned(ctx, value);
             self.releaseOwned(ctx, &self.recurrent);
@@ -120,6 +163,12 @@ comptime {
 // Native export names remain the compatibility ABI of the qualified PTX.
 const catalog = @import("../../tile/cuda_standalone.zig");
 const Program = @import("embedded_module.zig").EmbeddedModule(@import("embedded_module.zig").profile(catalog.gated_delta).image, catalog.gated_delta_entries);
+
+/// Geometry implemented by the existing independent-page packet kernels.
+/// Generic recurrent shapes retain their established ordinary core path.
+pub fn packetGeometrySupported(key_heads: usize, value_heads: usize, dim: usize, value_dim: usize, conv_kernel: usize) bool {
+    return dim == 128 and value_dim == 128 and conv_kernel == 4 and key_heads == 16 and (value_heads == 16 or value_heads == 32);
+}
 
 pub const Module = struct {
     program: Program = .{},
@@ -287,3 +336,71 @@ pub const Module = struct {
         self.cached_single_calls += @intFromBool(cached_gates);
     }
 };
+
+test "typed recurrent state cleanup prepares actual current B once and releases only allocating root not borrowed packed views" {
+    const Sink = @import("../../execution/retirement_sink.zig");
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var old_guard = try sink.enter();
+    var old = try old_guard.retainEpoch();
+    defer old.release();
+    old_guard.finish();
+    var current = try sink.enter();
+    defer current.finish();
+    var epoch = try current.retainEpoch();
+    defer epoch.release();
+    const Probe = struct {
+        expected: *const Sink.Epoch,
+        prepares: usize = 0,
+        roots: usize = 0,
+        fn prepare(raw: *anyopaque, cleanup: Cleanup) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const actual = cleanup.boundary orelse return error.MissingCurrentCleanupEpoch;
+            if (try actual.isSealed()) return error.RetirementEpochSealed;
+            try std.testing.expect(actual.record == self.expected.record and actual.nonce == self.expected.nonce);
+            self.prepares += 1;
+        }
+        fn release(raw: *anyopaque, value: *buffer.DeviceBuffer, recycle: bool, _: Cleanup) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 1), self.prepares);
+            try std.testing.expect(recycle and !value.borrowed);
+            try std.testing.expectEqual(@as(driver.CUdeviceptr, 0x1000), value.ptr);
+            self.roots += 1;
+            value.* = .{};
+        }
+        fn legacy(_: *anyopaque, _: *buffer.DeviceBuffer) void {
+            @panic("typed release must not enter legacy callback");
+        }
+    };
+    var probe = Probe{ .expected = &epoch };
+    var ctx: context.CudaContext = undefined; // callbacks never dereference SDK
+    var state = State{ .ctx = &ctx, .release_context = &probe, .release_buffer = Probe.legacy, .prepare_release_with_cleanup = Probe.prepare, .release_buffer_with_cleanup = Probe.release, .owns_weights = @splat(false), .history = .{ .{ .ptr = 0x1000, .len = 16, .borrowed = true }, .{ .ptr = 0x1010, .len = 16, .borrowed = true } }, .recurrent = .{ .ptr = 0x1020, .len = 32, .borrowed = true }, .packed_storage = .{ .ptr = 0x1000, .len = 64 } };
+    try std.testing.expectError(error.RetirementEpochSealed, state.deinitWithCleanup(.{ .boundary = &old }));
+    try std.testing.expectEqual(@as(usize, 0), probe.roots);
+    try std.testing.expectEqual(@as(driver.CUdeviceptr, 0x1000), state.packed_storage.ptr);
+    try state.deinitWithCleanup(.{ .boundary = &epoch });
+    try std.testing.expectEqual(@as(usize, 1), probe.prepares);
+    try std.testing.expectEqual(@as(usize, 1), probe.roots);
+    try std.testing.expect(state.ctx == null);
+}
+
+test "typed recurrent cleanup refuses legacy additional state quota before mutating borrowed or SDK roots" {
+    const Memory = @import("../../runtime/tier/memory.zig");
+    var controller = Memory.AdmissionController{};
+    const lease = try controller.tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = 64 }, false);
+    var state = State{ .admission = lease, .packed_storage = .{ .ptr = 0x1000, .len = 64 }, .initialized = true };
+    try std.testing.expectError(error.UnpreparedRecurrentStateQuotaRetirement, state.deinitWithCleanup(.{}));
+    try std.testing.expect(state.initialized and state.packed_storage.ptr == 0x1000);
+    try std.testing.expectEqual(@as(usize, 64), controller.snapshot().backend_scratch_bytes);
+    // Explicit outside-only legacy quota owner, no SDK endpoint in this pure
+    // fixture. The cold additional-state producer successor replaces this arm.
+    try state.deinitWithCleanup(.{ .outside_execution = true });
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+}
+
+test "CUDA captured recurrent packet geometry preserves actual supported selectors" {
+    try std.testing.expect(packetGeometrySupported(16, 16, 128, 128, 4));
+    try std.testing.expect(packetGeometrySupported(16, 32, 128, 128, 4));
+    for ([_][5]usize{ .{ 1, 1, 128, 128, 4 }, .{ 8, 16, 128, 128, 4 }, .{ 16, 8, 128, 128, 4 }, .{ 16, 16, 64, 128, 4 }, .{ 16, 16, 128, 64, 4 }, .{ 16, 16, 128, 128, 3 } }) |shape|
+        try std.testing.expect(!packetGeometrySupported(shape[0], shape[1], shape[2], shape[3], shape[4]));
+}

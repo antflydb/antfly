@@ -25916,8 +25916,8 @@ fn ownedLinearSlotGroupMutationAllowed(self: anytype, slot: usize) bool {
 }
 
 pub fn releaseRawLinearSlot(self: anytype, slot: usize) void {
-    if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.linear, slot);
     if (!ownedLinearSlotMutationAllowed(self, slot)) return;
+    if (comptime @hasDecl(@TypeOf(self.*), "replacePrivateSlotDeclaration")) self.replacePrivateSlotDeclaration(.linear, slot);
     if (self.raw_decode_runtime) |runtime| {
         _ = termite_metal_decode_runtime_clear_linear_slot(runtime, slot);
     }
@@ -51295,4 +51295,226 @@ test "Metal model raw16 embedding cache separates F16 BF16 and revisions" {
     @memset(&words, 0x4000);
     try Check.run(true, &provider, std.mem.sliceAsBytes(&words), .{ .value = value, .revision = 1 }, 2.0);
     try Check.run(false, &provider, std.mem.sliceAsBytes(&words), .{ .value = value, .revision = 1 }, 2.0);
+}
+
+/// Cold metadata owner for admitted decoder cache backing across an explicit
+/// epoch suspension. C functions require actual provider exclusion and checked
+/// completion; the opaque shell holds no model, Io, allocator or callback.
+pub const DecoderCacheCustody = opaque {};
+pub extern fn antfly_metal_decoder_cache_custody_metadata_bytes() usize;
+pub extern fn antfly_metal_decoder_cache_custody_restore_into(runtime: ?*RawMetalDecodeRuntime, state: *DecoderCacheCustody, retired: *DecoderCacheCustody) c_int;
+pub extern fn antfly_metal_decoder_cache_custody_create() ?*DecoderCacheCustody;
+pub extern fn antfly_metal_decoder_cache_custody_destroy(*DecoderCacheCustody) void;
+pub extern fn antfly_metal_decoder_cache_custody_clear(*DecoderCacheCustody) c_int;
+pub extern fn antfly_metal_decoder_cache_custody_take(?*RawMetalDecodeRuntime, *DecoderCacheCustody) c_int;
+pub extern fn antfly_metal_decoder_cache_custody_restore(?*RawMetalDecodeRuntime, *DecoderCacheCustody) c_int;
+
+test "Metal SDK custody cell delays actual displaced cache death and old A quota until later B unlock after Reader closes" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+    const Cell = @import("metal_custody_cell.zig").Cell;
+    const R = @import("../execution/resource_retirement.zig");
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const Sink = @import("../execution/retirement_sink.zig");
+    const domain = try Domain.create();
+    defer domain.release();
+    var model_gate: std.atomic.Mutex = .unlocked;
+    const Probe = struct {
+        gate: *std.atomic.Mutex,
+        under_gate: bool = false,
+        next: usize = 1,
+        fn check(self: *@This()) void {
+            if (self.gate.tryLock()) self.gate.unlock() else self.under_gate = true;
+        }
+        fn reserve(raw: *anyopaque, _: @import("../runtime/tier/memory.zig").AdmissionAmounts) @import("../runtime/tier/memory.zig").AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+            const token = self.next;
+            self.next += 1;
+            return token;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: @import("../runtime/tier/memory.zig").AdmissionAmounts) @import("../runtime/tier/memory.zig").AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+    };
+    var probe = Probe{ .gate = &model_gate };
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer {
+        provider.deinitOwned();
+        _ = R.poll();
+    }
+    const raw = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const reusable = antfly_metal_decoder_cache_custody_create() orelse return error.OutOfMemory;
+    var reusable_parked = false;
+    var reusable_destroyed = false;
+    defer if (!reusable_destroyed) {
+        if (reusable_parked and antfly_metal_decoder_cache_custody_restore(raw, reusable) != 0) @panic("test custody restore failed");
+        antfly_metal_decoder_cache_custody_destroy(reusable);
+    };
+    const cell = try Cell.prepare();
+    var cell_root = true;
+    defer if (cell_root) cell.release();
+    const declared = try std.math.add(usize, try Cell.metadataBytes(), antfly_metal_decoder_cache_custody_metadata_bytes());
+    var metadata = try domain.controller.tryAcquire(.gpu, .{}, .{ .host_scratch_bytes = declared }, false);
+    defer {
+        // Exact reusable-bank metadata must die BEFORE its remaining quota,
+        // including assertion/OOM unwind. Independent Cell retains its child.
+        if (!reusable_destroyed) {
+            if (reusable_parked and antfly_metal_decoder_cache_custody_restore(raw, reusable) != 0) @panic("test custody restore failed");
+            antfly_metal_decoder_cache_custody_destroy(reusable);
+            reusable_destroyed = true;
+        }
+        metadata.release();
+    }
+    const metadata_pin = domain.pin();
+    defer metadata_pin.release();
+    try cell.adoptMetadata(&metadata, &metadata_pin);
+    try std.testing.expectEqual(antfly_metal_decoder_cache_custody_metadata_bytes(), metadata.amounts.host_scratch_bytes);
+    try std.testing.expectEqual(@as(c_int, 0), antfly_metal_decoder_cache_custody_take(raw, reusable));
+    reusable_parked = true;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_set_lighton_activation_pool(raw, 8 * 1024 * 1024));
+    const PeerFrame = struct {
+        runtime: *RawMetalDecodeRuntime,
+        backing: ?*anyopaque = null, // +0: actual activation cache owns it
+        bytes: usize = 0,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) !void {
+            try beginFrame(self.runtime);
+            defer {
+                if (hasActiveFrame(self.runtime)) cancelFrame(self.runtime) catch unreachable;
+                if (hasSubmittedFrame(self.runtime)) waitFrame(self.runtime) catch unreachable;
+            }
+            try setActiveFrameRegime(self.runtime, .decode);
+            const buffer = termite_metal_buffer_alloc_fresh(self.runtime, 512, 1) orelse return error.OutOfMemory;
+            self.bytes = termite_metal_buffer_allocated_size(buffer);
+            self.backing = buffer;
+            termite_metal_decode_runtime_release_buffer(self.runtime, buffer);
+            try submitFrame(self.runtime);
+            try waitFrame(self.runtime);
+        }
+        fn pooled(raw_peer: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw_peer));
+            self.run() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var peer = PeerFrame{ .runtime = raw };
+    // Match the real peer producer's lexical SDK autorelease boundary. A
+    // completed command buffer's autorelease tail is not cache ownership and
+    // must die BEFORE attaching the later cache-only death witness.
+    termite_metal_with_autorelease_pool(&peer, PeerFrame.pooled);
+    if (peer.failure) |err| return err;
+    const backing = peer.backing orelse return error.MissingActualPeerBuffer;
+    const bytes = peer.bytes;
+    try std.testing.expect(bytes >= 512);
+    try std.testing.expect(!hasActiveFrame(raw) and !hasSubmittedFrame(raw));
+    try std.testing.expectEqual(@as(u64, 0), runtimeMemorySnapshot(raw).frame_retained_bytes);
+    var pool: [4]u64 = undefined;
+    termite_metal_decode_runtime_lighton_activation_pool_stats(raw, &pool);
+    try std.testing.expect(pool[2] >= bytes);
+    // Production Group/Payload observes ACTUAL SDK destruction of that exact
+    // cache-owned buffer. The borrowed handle remains protected by the cache.
+    const Origin = struct {
+        runtime: *RawMetalDecodeRuntime,
+        handle: *anyopaque,
+        fn begin(ctx: *anyopaque, _: []const @import("../ops/ops.zig").CT) !R.Scope.Begun {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            var identity: u64 = 0;
+            const pending = antfly_metal_output_retirement_begin(self.runtime, &identity, R.Queue.createIdentity);
+            if (pending < 0) return error.InvalidResourceRetirement;
+            return .{ .origin = .{ .identity = identity }, .pending_batches = @intCast(pending) };
+        }
+        fn attach(ctx: *anyopaque, _: []const @import("../ops/ops.zig").CT, nodes: []R.Node, payload: R.Payload) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const handles = [_]*anyopaque{self.handle};
+            const witness = antfly_metal_prepare_retirement_witnesses_with_frames(self.runtime, &handles, 1, payload) orelse return error.OutOfMemory;
+            defer antfly_metal_discard_retirement_witnesses(witness);
+            if (antfly_metal_output_retirement_attach(self.runtime, nodes.ptr, nodes.len, witness) != 0) return error.InvalidResourceRetirement;
+        }
+        fn end(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            antfly_metal_output_retirement_end(self.runtime);
+        }
+        const table = R.Scope.VTable{ .begin = begin, .attach = attach, .end = end };
+    };
+    var output_lease: ?@import("../runtime/tier/memory.zig").AdmissionLease = try domain.controller.tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = bytes }, false);
+    defer if (output_lease) |*lease| lease.release();
+    var output_pin: ?@import("../runtime/tier/admission_domain.zig").Pin = domain.pin();
+    defer if (output_pin) |pin| pin.release();
+    var prepared = try R.PreparedCharge.prepare(1);
+    defer prepared.destroyUnused();
+    const charge = try prepared.arm(&output_lease, &output_pin);
+    var charge_root = true;
+    defer if (charge_root) charge.release();
+    var origin = Origin{ .runtime = raw, .handle = backing };
+    const begun = try Origin.begin(&origin, &.{});
+    var scope = R.Scope{ .context = &origin, .origin = begun.origin, .pending_batches = begun.pending_batches, .outputs = &.{}, .active = true, .vtable = &Origin.table };
+    defer scope.end();
+    try charge.attach(&scope);
+    scope.end();
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var old = try sink.enter();
+    defer old.finish();
+    var a = try old.retainEpoch();
+    defer a.release();
+    try charge.holdUntilBoundary(try a.boundary());
+    charge.release();
+    charge_root = false;
+    old.finish();
+    _ = R.poll();
+    try std.testing.expectEqual(bytes, domain.controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectError(error.RetirementEpochSealed, cell.queueForCurrentBoundary(.{ .boundary = &a }));
+    try std.testing.expectEqual(declared, domain.controller.snapshot().host_scratch_bytes);
+    var current = try sink.enter();
+    defer current.finish();
+    var b = try current.retainEpoch();
+    defer b.release();
+    try std.testing.expect(model_gate.tryLock());
+    var locked = true;
+    defer if (locked) model_gate.unlock();
+    try cell.queueForCurrentBoundary(.{ .boundary = &b });
+    try std.testing.expectEqual(@as(c_int, 0), antfly_metal_decoder_cache_custody_restore_into(raw, reusable, cell.custody));
+    reusable_parked = false;
+    // Reader root is gone BEFORE B. Node alone owns SDK handles+host metadata.
+    cell.release();
+    cell_root = false;
+    const CpuPoll = struct {
+        fn run() void {
+            // Legal independently running CPU poll owns NO numerical gate.
+            // It must not retire old sealed-A quota while B retains backing.
+            _ = R.poll();
+        }
+    };
+    const poller = try std.Thread.spawn(.{}, CpuPoll.run, .{});
+    poller.join();
+    try std.testing.expectEqual(bytes, domain.controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(declared, domain.controller.snapshot().host_scratch_bytes);
+    try std.testing.expect(!probe.under_gate);
+    model_gate.unlock();
+    locked = false;
+    current.finish();
+    // Pinned-domain Groups require the real pure-domain collector, not
+    // pollRawController (which deliberately excludes nonnull Domain pins).
+    // waitUntilCompleted and the producer autorelease pool do not promise that
+    // the SDK command queue has dropped its final completed-CB resource retain.
+    // Keep the exact charge until the ACTUAL buffer witness dies; never force
+    // provider close, synthesize release, trim ownership or refund on wait.
+    const sdk_deadline = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (domain.controller.snapshot().backend_scratch_bytes != 0) {
+        _ = R.poll();
+        if (domain.controller.snapshot().backend_scratch_bytes == 0) break;
+        if (@import("antfly_platform").time.monotonicNs() >= sdk_deadline) break;
+        @import("antfly_platform").time.sleepNs(100 * std.time.ns_per_us);
+    }
+    try std.testing.expectEqual(@as(usize, 0), domain.controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(antfly_metal_decoder_cache_custody_metadata_bytes(), domain.controller.snapshot().host_scratch_bytes);
+    try std.testing.expect(!probe.under_gate);
 }

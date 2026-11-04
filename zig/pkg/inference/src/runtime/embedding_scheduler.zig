@@ -115,6 +115,14 @@ pub const Scheduler = struct {
         return waiter.next != null;
     }
 
+    /// Identity proof under the same metadata exclusion that publishes acquisition.
+    /// The caller must keep its final-address waiter alive and must not move it.
+    pub fn ownsAcquired(self: *Scheduler, waiter: *const Waiter, gate: *std.atomic.Mutex) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        return self.head == waiter and waiter.owner == self and waiter.gate == gate and waiter.acquired;
+    }
+
     pub fn leave(waiter: *Waiter) void {
         const self = waiter.owner orelse return;
         @import("antfly_platform").sync.lockYielding(&self.mutex);
@@ -278,4 +286,27 @@ test "cancelled ready execution retains cleanup turn before successor admission"
     try std.testing.expect(!scheduler.take(&peer));
     Scheduler.leave(&selected);
     try std.testing.expect(scheduler.take(&peer));
+}
+
+test "execution cohort authority rejects copied stale and foreign waiters" {
+    var scheduler: Scheduler = .{};
+    var foreign: Scheduler = .{};
+    var gate: std.atomic.Mutex = .unlocked;
+    var other_gate: std.atomic.Mutex = .unlocked;
+    var waiter: Scheduler.Waiter = .{};
+    try scheduler.enter(&waiter, &gate, .{});
+    defer Scheduler.leave(&waiter);
+    try std.testing.expect(scheduler.ownsAcquired(&waiter, &gate));
+    const copied = waiter;
+    try std.testing.expect(!scheduler.ownsAcquired(&copied, &gate));
+    try std.testing.expect(!foreign.ownsAcquired(&waiter, &gate));
+    try std.testing.expect(!scheduler.ownsAcquired(&waiter, &other_gate));
+    Scheduler.leave(&waiter);
+    try std.testing.expect(!scheduler.ownsAcquired(&waiter, &gate));
+    try scheduler.selectReady(&waiter, &gate, .{});
+    try std.testing.expect(!scheduler.ownsAcquired(&waiter, &gate));
+    try Scheduler.acquireSelected(&waiter, .{});
+    try std.testing.expect(scheduler.ownsAcquired(&waiter, &gate));
+    Scheduler.releaseGate(&waiter);
+    try std.testing.expect(!scheduler.ownsAcquired(&waiter, &gate));
 }

@@ -37,6 +37,7 @@ pub const ModelRuntime = struct {
     pub const ColdCleanupServices = struct {
         accepts: *const fn (*const VTable) bool,
         deinit: *const fn (*anyopaque, CleanupContext) void,
+        reset: ?*const fn (*anyopaque, CleanupContext) anyerror!void = null,
     };
 
     ptr: *anyopaque,
@@ -132,6 +133,14 @@ pub const ModelRuntime = struct {
         if (!accepts(self.vtable)) return null;
         const getter = self.vtable.operation_backend orelse return null;
         return getter(self.ptr).*;
+    }
+    pub fn resetWithCleanup(self: *ModelRuntime, current: CleanupContext) !void {
+        if (self.vtable.cold_cleanup_services) |services| {
+            if (services.accepts(self.vtable)) if (services.reset) |reset_fn| {
+                return @import("../execution/backend_operation.zig").callOpaque(self.operationBackend(), current.operation, reset_fn, .{ self.ptr, current });
+            };
+        }
+        return self.resetWithOperation(current.operation);
     }
     pub fn reset(self: *ModelRuntime) !void {
         return self.resetWithOperation(null);

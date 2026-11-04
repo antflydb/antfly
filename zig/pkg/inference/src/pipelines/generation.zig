@@ -188,6 +188,27 @@ fn qwenVisionLimits(allocator: std.mem.Allocator, model_dir: []const u8, config:
     return .{ .min_merged_tokens = min_tokens, .max_merged_tokens = max_tokens, .hard_max_merged_tokens = max_tokens };
 }
 
+/// Cold optional pinned-input planning only. Reuses the exact resident CUDA
+/// producer's resize geometry and prompt-limited vision policy. The caller may
+/// precommit-decline this optimization on metadata failure; the ordinary image
+/// validation/CPU preprocessing still executes once at its original boundary.
+/// No image payload, SDK object, cache or quota is created here.
+pub fn nativeCudaPinnedPatchUploadBytes(allocator: std.mem.Allocator, model_dir: []const u8, config: gpt_mod.Config, messages: []const Message, requested_output_tokens: usize) !usize {
+    return nativeCudaPinnedPatchUploadBytesAtMost(allocator, model_dir, config, messages, requested_output_tokens, std.math.maxInt(usize));
+}
+pub fn nativeCudaPinnedPatchUploadBytesAtMost(allocator: std.mem.Allocator, model_dir: []const u8, config: gpt_mod.Config, messages: []const Message, requested_output_tokens: usize, maximum_upload_bytes: usize) !usize {
+    if (!config.hasQwen35VisionArchitectureContract() or !messagesHaveImages(messages)) return 0;
+    const images = try collectImagesInPromptOrder(allocator, messages);
+    defer allocator.free(images);
+    if (images.len == 0 or images.len > 8) return error.ImageLimitExceeded;
+    const expanded_limit = try nativeGenerationPromptTokenLimit(config, null, requested_output_tokens, 0, 0);
+    var limits = try qwenVisionLimits(allocator, model_dir, config);
+    const per_image_budget = expanded_limit / images.len;
+    if (per_image_budget < limits.min_merged_tokens) return error.InputTokenLimitExceeded;
+    limits.max_merged_tokens = @min(limits.max_merged_tokens, per_image_budget);
+    return qwen3vl_projector.planResidentCudaPatchUploadBytesAtMost(config, images, limits, maximum_upload_bytes);
+}
+
 pub fn nativeGenerationMediaAdmission(
     allocator: std.mem.Allocator,
     model_dir: []const u8,
@@ -2499,6 +2520,9 @@ pub const NativeGenerationPipeline = struct {
     execution_lock: ?*std.atomic.Mutex = null,
     /// Optional FIFO/event admission for the same atomic backend mutex.
     execution_gate: ?*execution_control_mod.ExecutionLane = null,
+    execution_pause: ?*const execution_control_mod.ExecutionPause = null,
+    execution_cleanup_owner: ?*const @import("../execution/cleanup_owner.zig").Owner = null,
+    draft_execution_cleanup_owner: ?*const @import("../execution/cleanup_owner.zig").Owner = null,
     /// Optional bounded polling for a shared epoch gate; zero retains yielding.
     execution_contention_wait_ns: u64 = 0,
     prepared_lighton_decode: bool = false,
@@ -2558,6 +2582,7 @@ pub const NativeGenerationPipeline = struct {
         return .{
             .mutex = mutex,
             .gate = if (shared) self.execution_gate else null,
+            .pause = if (shared) self.execution_pause else null,
             .io = self.io,
             .control = self.execution_control,
             .contention_wait_ns = self.execution_contention_wait_ns,
@@ -2858,7 +2883,9 @@ pub const NativeGenerationPipeline = struct {
             config.grammar != null and
             self.gpt_config.usesGemma4Channels();
         var fallback_decode_state = NativeDecodeState.initContiguous(allocator);
-        defer fallback_decode_state.deinit();
+        defer if (self.execution_cleanup_owner) |owner| {
+            fallback_decode_state.deinitWithCleanup(.{ .boundary = owner.epoch(), .operation = self.cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker();
+        } else fallback_decode_state.deinit();
         const decode_state = self.decode_state orelse &fallback_decode_state;
         decode_state.configureForGptConfig(self.gpt_config);
         try self.rejectUnsupportedDeepSeekV4GraphMode();
@@ -3743,7 +3770,9 @@ pub const NativeGenerationPipeline = struct {
 
             // Create a temporary draft pipeline (borrows self's allocator/tokenizer)
             var draft_fallback_state = NativeDecodeState.initContiguous(allocator);
-            defer draft_fallback_state.deinit();
+            defer if (self.draft_execution_cleanup_owner) |owner| {
+                draft_fallback_state.deinitWithCleanup(.{ .boundary = owner.epoch(), .operation = if (self.draft_cb) |backend| backend.operationToken() else null }) catch platform.inference_process_supervisor.restartWorker();
+            } else draft_fallback_state.deinit();
             const attached_draft_state = self.draft_decode_state;
             const use_contiguous_draft_state = ordinaryMetalGemmaDraftNeedsContiguousState(
                 draft_cb.kind(),
@@ -6349,6 +6378,7 @@ pub const NativeGenerationPipeline = struct {
 
     fn graphExecutionContext(self: *NativeGenerationPipeline) graph_mod.execution.Context {
         return .{
+            .cleanup_owner = self.execution_cleanup_owner,
             .allocator = self.allocator,
             .cb = &self.cb,
             .gpt_config = &self.gpt_config,
@@ -14720,7 +14750,10 @@ test "LightOnOCR3 CUDA burst readback releases the execution lane and reacquires
         var pipeline: NativeGenerationPipeline = undefined;
         pipeline.execution_lock = &mutex;
         pipeline.execution_gate = if (event_gate) &gate else null;
+        pipeline.execution_pause = null;
         pipeline.execution_phase_waiters = null;
+        pipeline.execution_phase_wake = null;
+        pipeline.execution_phase_wake_io = null;
         pipeline.execution_control = null;
         pipeline.execution_contention_wait_ns = 100 * std.time.ns_per_us;
         pipeline.io = std.testing.io;
@@ -15424,4 +15457,39 @@ test "generation audio PCM follows content part order and validates alignment" {
     try std.testing.expectEqual(@intFromPtr(samples[0..].ptr), @intFromPtr(inputs[1].pcm.samples.ptr));
     message.decoded_audio = pcm[0..1];
     try std.testing.expectError(error.InvalidMessageAudioIndex, collectAudioInPromptOrder(a, &.{message}));
+}
+
+test "LightOn cold pinned patch hint matches actual prompt limited temporal array and text stays allocation free" {
+    const a = std.testing.allocator;
+    var cfg = try gpt_mod.parseConfig(a, @embedFile("../models/testdata/lightonocr3/config.json"));
+    cfg.max_position_embeddings = 1024;
+    var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectEqual(@as(usize, 0), try nativeCudaPinnedPatchUploadBytes(fail.allocator(), "missing-must-not-be-read", cfg, &.{.{ .role = "user", .content = "text only" }}, 128));
+    try std.testing.expect(!fail.has_induced_failure);
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "preprocessor_config.json", .data = @embedFile("../models/testdata/lightonocr3/preprocessor_config.json") });
+    const model_dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer a.free(model_dir);
+    const image = @embedFile("../models/testdata/lightonocr3/invoice.png");
+    const messages = [_]Message{.{ .role = "user", .content = "read", .image_bytes = &.{ image, image }, .content_parts = &.{ .{ .image = 0 }, .{ .image = 1 }, .{ .text = "read" } } }};
+    const bytes = try nativeCudaPinnedPatchUploadBytes(a, model_dir, cfg, &messages, 128);
+    var limits = try qwenVisionLimits(a, model_dir, cfg);
+    limits.max_merged_tokens = @min(limits.max_merged_tokens, (1024 - 128) / 2);
+    var actual = try qwen3vl_projector.prepareProjectedImageResident(a, cfg, image, limits, .{});
+    defer actual.deinit();
+    const temporal = try actual.cudaTemporalPatchRows(a);
+    defer a.free(temporal);
+    try std.testing.expectEqual(std.mem.sliceAsBytes(temporal).len, bytes); // two images never sum their upload spans
+    try std.testing.expect(bytes > 1024 * 1024);
+    try std.testing.expectEqual(bytes, try actual.cudaPatchUploadBytes(cfg, limits));
+    // Two real request policies can select different exact spans. A larger
+    // ineligible upload must not hide a smaller eligible page in their cohort.
+    const small = try nativeCudaPinnedPatchUploadBytes(a, model_dir, cfg, &messages, 600);
+    try std.testing.expect(small > 0 and small < bytes);
+    const maximum = small + (bytes - small) / 2;
+    const large_bounded = try nativeCudaPinnedPatchUploadBytesAtMost(a, model_dir, cfg, &messages, 128, maximum);
+    const small_bounded = try nativeCudaPinnedPatchUploadBytesAtMost(a, model_dir, cfg, &messages, 600, maximum);
+    try std.testing.expectEqual(@as(usize, 0), large_bounded);
+    try std.testing.expectEqual(small, @max(large_bounded, small_bounded));
 }

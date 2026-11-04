@@ -141,15 +141,20 @@ pub fn acquireCuda(compute: *if (build_options.enable_cuda) @import("../ops/cuda
 }
 
 pub fn beginRequest(session: @import("session.zig").Session, backend: *const ops.ComputeBackend) !void {
+    return beginRequestWithCleanup(session, backend, .{});
+}
+pub fn beginRequestWithCleanup(session: @import("session.zig").Session, backend: *const ops.ComputeBackend, current: @import("../execution/cleanup_context.zig").Context) !void {
     if (comptime build_options.enable_cuda) {
         if (backend.kind() == .cuda) {
             try @import("../ops/cuda/cuda_compute.zig").CudaCompute.checkRequestCacheRetirement(backend);
             const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(backend.ptr));
-            try compute.configureEmbeddingGemma2Admission(if (session.run_admission) |admission| .{
+            try compute.configureEmbeddingGemma2AdmissionWithCleanup(if (session.run_admission) |admission| .{
                 .controller = admission.controller,
                 .limits = admission.limits,
                 .check_live_memory = admission.check_live_memory,
-            } else null);
+            } else null, current);
+            try @import("../ops/cuda/cuda_compute.zig").CudaCompute.beginRequestWithCleanup(backend, current);
+            return;
         }
     }
     // Invalidate request-local capture/budget state even when an early cache
@@ -208,6 +213,12 @@ pub fn createCuda(allocator: std.mem.Allocator, config: @import("../graph/kernel
 pub fn closeCuda(allocator: std.mem.Allocator, compute: *if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig").CudaCompute else void) void {
     if (comptime !build_options.enable_cuda) return;
     compute.deinit();
+    allocator.destroy(compute);
+}
+
+pub fn closeCudaWithBoundary(allocator: std.mem.Allocator, compute: *if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig").CudaCompute else void, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
+    if (comptime !build_options.enable_cuda) return;
+    compute.deinitWithBoundary(boundary);
     allocator.destroy(compute);
 }
 

@@ -221,6 +221,15 @@ pub const KvManager = struct {
         }
     }
 
+    /// Metadata-only capacity already owned by this sequence, including its
+    /// reserved tail. This grants no allocation/quota credit and never grows.
+    pub fn reservedTokenCapacity(self: *const KvManager, sequence_id: SequenceId) !usize {
+        const state = try self.sequenceState(sequence_id);
+        const storage = self.getPool(state.pool_id) orelse return error.InvalidPoolId;
+        const count = try std.math.add(usize, state.block_table.blocks.items.len, state.reserved_tail_blocks.items.len);
+        return std.math.mul(usize, count, storage.config.page_size_tokens);
+    }
+
     pub fn logicalBlocksWithReservations(
         self: *const KvManager,
         sequence_id: SequenceId,
@@ -1279,4 +1288,24 @@ test "manager custom retirement failure preserves the active sequence and is nev
     storage.vtable = original;
     try manager.releaseSequence(id);
     try std.testing.expectEqual(@as(usize, 1), manager.free_sequence_indices.items.len);
+}
+
+test "manager reserved capacity query keeps visible count unchanged and rejects retired identity" {
+    var manager = KvManager.init(std.testing.allocator);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 1 });
+    const sequence = try manager.attachSequence(pool);
+    try std.testing.expectEqual(@as(usize, 0), try manager.reservedTokenCapacity(sequence));
+    try manager.reserveTokenCapacity(sequence, 5);
+    const visible = manager.tokenCount(sequence);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const original = manager.allocator;
+    manager.allocator = failing.allocator();
+    const capacity = try manager.reservedTokenCapacity(sequence);
+    manager.allocator = original;
+    try std.testing.expect(capacity >= 5);
+    try std.testing.expectEqual(visible, manager.tokenCount(sequence));
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try manager.releaseSequence(sequence);
+    try std.testing.expectError(error.InvalidSequenceId, manager.reservedTokenCapacity(sequence));
 }

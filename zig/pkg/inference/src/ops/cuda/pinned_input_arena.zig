@@ -20,18 +20,39 @@ const context = @import("context.zig");
 const buffer = @import("buffer.zig");
 const driver = @import("driver.zig");
 const memory = @import("../../runtime/tier/memory.zig");
+const Quota = @import("cache_quota.zig").Quota;
+const Cleanup = @import("../../execution/cleanup_context.zig").Context;
 
 pub const capacity: usize = 32 * 1024 * 1024;
 pub const Arena = struct {
     host: buffer.HostBuffer = .{},
     event: driver.CUevent = null,
-    lease: ?memory.AdmissionLease = null,
+    quota: Quota = .none,
     offset: usize = 0,
     pending: bool = false,
     failed: bool = false,
     wraps: usize = 0,
 
+    /// Explicit legacy raw/outside entry. Managed callers supply current B.
     pub fn clear(self: *Arena, ctx: *context.CudaContext) !void {
+        try self.quota.validateLegacyRaw();
+        return self.clearWithCleanup(ctx, .{ .outside_execution = true });
+    }
+    pub fn clearWithCleanup(self: *Arena, ctx: *context.CudaContext, current: Cleanup) !void {
+        try self.quota.validateCleanup(current); // before any SDK mutation
+        try self.clearPayloadChecked(ctx);
+        var retired = self.quota;
+        self.* = .{}; // consume old handles before any external refund callback
+        retired.releaseAfterSdkDeath(current) catch |err| {
+            // Validation/registration failures precede all callbacks. Retain
+            // the pure old charge for exact retry; actual SDK payload is dead.
+            self.quota = retired;
+            return err;
+        };
+    }
+    /// Actual payload death only. A containing metadata owner moves/releases
+    /// the SAME quota after its own mutex unlock; no quota callback here.
+    pub fn clearPayloadChecked(self: *Arena, ctx: *context.CudaContext) !void {
         errdefer self.failed = true;
         if (self.failed) {
             try ctx.synchronize();
@@ -40,9 +61,15 @@ pub const Arena = struct {
             try ctx.driver.check(ctx.synchronizeEventResult(self.event));
         }
         try self.host.freeChecked(ctx);
-        ctx.destroyEvent(self.event);
-        if (self.lease) |*lease| lease.release();
-        self.* = .{};
+        if (self.event != null) {
+            try ctx.makeCurrent();
+            if (ctx.driver.fns.cuEventDestroy(self.event) != driver.CUDA_SUCCESS) return error.CudaDriverError;
+            self.event = null;
+        }
+        self.offset = 0;
+        self.pending = false;
+        self.failed = false;
+        self.wraps = 0;
     }
 
     pub fn deinit(self: *Arena, ctx: *context.CudaContext) void {
@@ -53,6 +80,47 @@ pub const Arena = struct {
         };
     }
 
+    /// Caller owns a cold-funded token and the actual current execution B.
+    /// Optional host/event allocation failure declines only before any copy.
+    pub fn prepareAdmitted(self: *Arena, ctx: *context.CudaContext, lease: *@import("prepared_cache.zig").Lease, current: Cleanup) !bool {
+        return self.prepareAdmittedForKind(ctx, lease, current, .pinned_metadata_host);
+    }
+    pub fn prepareAdmittedForKind(self: *Arena, ctx: *context.CudaContext, lease: *@import("prepared_cache.zig").Lease, current: Cleanup, kind: @import("prepared_cache.zig").Auxiliary.Kind) !bool {
+        if (kind != .pinned_metadata_host and kind != .pinned_input_host) return error.InvalidPreparedCacheAmount;
+        if (self.host.ptr != null or self.event != null or self.quota.hasLease() or self.failed) return error.InvalidCacheRetirementState;
+        // A typed ready-token borrow is synchronous: validate its actual bound
+        // phase, exact host-only role/amounts and NOW B before any SDK allocation.
+        const owner = lease.owner orelse return error.UnpreparedCacheAdmission;
+        const entry = lease.entry orelse return error.InvalidPreparedCacheState;
+        const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+        if (current.outside_execution or owner.state != .bound or entry.state != .taken) return error.InvalidPreparedCacheState;
+        const expected_epoch = owner.boundary orelse return error.InvalidPreparedCacheState;
+        if (try epoch.isSealed() or try expected_epoch.isSealed()) return error.RetirementEpochSealed;
+        const actual = try epoch.boundary();
+        const expected = try expected_epoch.boundary();
+        if (actual.context != expected.context or actual.nonce != expected.nonce) return error.ForeignPreparedCacheBoundary;
+        var found = false;
+        for (owner.entries) |*candidate| if (candidate == entry) {
+            found = true;
+            break;
+        };
+        if (!found or entry.request != .auxiliary or entry.request.auxiliary.kind != kind or entry.request.auxiliary.device_bytes != 0 or entry.request.auxiliary.host_bytes != capacity) return error.PreparedCacheAmountChanged;
+        const value = lease.value orelse return error.MissingCacheRetirementLease;
+        const pin = owner.domain_pin orelse return error.MissingCacheRetirementDomain;
+        if (value.controller != pin.controller() or !std.meta.eql(value.amounts, memory.AdmissionAmounts{ .host_scratch_bytes = capacity })) return error.ForeignAdmissionDomain;
+        self.host = buffer.HostBuffer.alloc(ctx, capacity) catch return false;
+        self.quota = lease.publishQuota();
+        self.event = ctx.createStreamEvent() catch {
+            try self.clearWithCleanup(ctx, current);
+            return false;
+        };
+        return true;
+    }
+    /// No allocation or supplier on a managed numerical upload.
+    pub fn uploadPrepared(self: *Arena, ctx: *context.CudaContext, device: buffer.DeviceBuffer, bytes: []const u8) !bool {
+        if (self.host.ptr == null or self.event == null) return false;
+        return self.upload(ctx, device, bytes);
+    }
     pub fn upload(self: *Arena, ctx: *context.CudaContext, device: buffer.DeviceBuffer, bytes: []const u8) !bool {
         if (self.failed or bytes.len == 0 or bytes.len > capacity or ctx.debug_graph_capture_active) return false;
         if (device.ptr == 0 or device.len < bytes.len) return error.InvalidShape;
@@ -65,7 +133,7 @@ pub const Arena = struct {
                 return false;
             };
             self.host = host;
-            self.lease = lease;
+            self.quota = Quota.fromRawAdmission(lease);
             self.event = ctx.createStreamEvent() catch {
                 self.clear(ctx) catch {};
                 return false;
@@ -108,6 +176,7 @@ test "LightOnOCR3 CUDA pinned input wrap preserves queued bytes without draining
         var producer_ran: bool = false;
         var stream_waits: usize = 0;
         var reject_free: bool = false;
+        var reject_event: bool = false;
         fn setCurrent(_: driver.CUcontext) callconv(.c) driver.CUresult {
             return driver.CUDA_SUCCESS;
         }
@@ -136,7 +205,7 @@ test "LightOnOCR3 CUDA pinned input wrap preserves queued bytes without draining
             return driver.CUDA_SUCCESS;
         }
         fn destroy(_: driver.CUevent) callconv(.c) driver.CUresult {
-            return driver.CUDA_SUCCESS;
+            return if (reject_event) 1 else driver.CUDA_SUCCESS;
         }
         fn freeHost(_: ?*anyopaque) callconv(.c) driver.CUresult {
             return if (reject_free) 1 else driver.CUDA_SUCCESS;
@@ -145,7 +214,7 @@ test "LightOnOCR3 CUDA pinned input wrap preserves queued bytes without draining
     const storage = try std.testing.allocator.alloc(u8, capacity);
     defer std.testing.allocator.free(storage);
     var controller = memory.AdmissionController{};
-    var arena = Arena{ .lease = try controller.tryAcquire(.gpu, .{ .host_limit_bytes = capacity }, .{ .host_scratch_bytes = capacity }, false), .host = .{ .ptr = storage.ptr, .len = storage.len }, .event = @ptrFromInt(1), .offset = capacity - 256 };
+    var arena = Arena{ .quota = Quota.fromRawAdmission(try controller.tryAcquire(.gpu, .{ .host_limit_bytes = capacity }, .{ .host_scratch_bytes = capacity }, false)), .host = .{ .ptr = storage.ptr, .len = storage.len }, .event = @ptrFromInt(1), .offset = capacity - 256 };
     var ctx: context.CudaContext = undefined;
     ctx.observation.store(null, .release);
     ctx.observation_enable_failed.store(false, .release);
@@ -166,6 +235,7 @@ test "LightOnOCR3 CUDA pinned input wrap preserves queued bytes without draining
     Fake.producer_ran = false;
     Fake.stream_waits = 0;
     Fake.reject_free = false;
+    Fake.reject_event = false;
     var source: [256]u8 = @splat(17);
     var first: [256]u8 = @splat(0);
     var second: [256]u8 = @splat(0);
@@ -182,10 +252,15 @@ test "LightOnOCR3 CUDA pinned input wrap preserves queued bytes without draining
     try std.testing.expectEqual(@as(usize, 1), arena.wraps);
     Fake.reject_free = true;
     try std.testing.expectError(error.CudaDriverError, arena.clear(&ctx));
-    try std.testing.expect(arena.failed and arena.host.ptr != null and arena.lease != null);
+    try std.testing.expect(arena.failed and arena.host.ptr != null and arena.quota.hasLease());
     try std.testing.expectEqual(@as(usize, capacity), controller.snapshot().host_scratch_bytes);
     try std.testing.expect(!try arena.upload(&ctx, .{ .ptr = @intFromPtr(&second), .len = second.len }, &source));
     Fake.reject_free = false;
+    Fake.reject_event = true;
+    try std.testing.expectError(error.CudaDriverError, arena.clear(&ctx));
+    try std.testing.expect(arena.failed and arena.host.ptr == null and arena.event != null and arena.quota.hasLease());
+    try std.testing.expectEqual(@as(usize, capacity), controller.snapshot().host_scratch_bytes);
+    Fake.reject_event = false;
     try arena.clear(&ctx);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
     try std.testing.expect(Fake.producer_ran);

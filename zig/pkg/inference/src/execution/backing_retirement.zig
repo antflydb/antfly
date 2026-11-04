@@ -27,6 +27,8 @@ pub const BackingOwner = struct {
     physical_finished: bool = false,
     shrink_ready: bool = false,
     measured: bool = false,
+    active_uses: usize = 0,
+    shrinking: bool = false,
 
     pub const Metadata = struct {
         context: *anyopaque,
@@ -57,6 +59,20 @@ pub const BackingOwner = struct {
         return self.charge.storageAmountsForBytes(self.admittedBytes());
     }
 
+    /// A concrete SDK witness may outlive the final logical cache/view ref.
+    /// Its Group retains only this pure metadata pin, and releases it from
+    /// the existing CPU collector AFTER actual SDK payload death. No SDK
+    /// deallocation callback destroys metadata or invokes a quota supplier.
+    pub fn retainMetadataPin(self: *BackingOwner) Metadata {
+        const previous = self.references.fetchAdd(1, .monotonic);
+        std.debug.assert(previous != 0 and previous != std.math.maxInt(usize));
+        return .{ .context = self, .release = releaseMetadataPin };
+    }
+    fn releaseMetadataPin(raw: *anyopaque) void {
+        const self: *BackingOwner = @ptrCast(@alignCast(raw));
+        self.dropMetadata();
+    }
+
     fn lock(self: *BackingOwner) void {
         platform.sync.lockYielding(&self.mutex);
     }
@@ -69,23 +85,75 @@ pub const BackingOwner = struct {
         charge.release();
         metadata.release(metadata.context);
     }
+    /// Cold actual-owner/scope preparation only, BEFORE numerical ownership.
+    /// A new use cannot race an outside padding callback into an owned lane.
+    /// No SDK capture, supplier callback, Epoch array, or metadata allocation.
+    pub fn beginUseOutsideExecution(self: *BackingOwner) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.physical_released) return error.BackingAlreadyRetired;
+        if (self.shrinking) return error.ResourceTemporarilyUnavailable;
+        try self.retainUseLocked();
+    }
+    /// A concrete cold-prepared root may establish its initial use BEFORE
+    /// first SDK allocation/publication. No measurement/shrink exists yet,
+    /// so this infallible-capacity path invokes no supplier under the owner.
+    pub fn beginInitialUseBeforePublication(self: *BackingOwner) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.measured or self.physical_released or self.active_uses != 0 or self.shrinking)
+            return error.BackingAlreadyPublished;
+        try self.retainUseLocked();
+    }
+    fn retainUseLocked(self: *BackingOwner) !void {
+        if (self.active_uses == std.math.maxInt(usize)) return error.BackingUseReferenceOverflow;
+        var references = self.references.load(.monotonic);
+        while (true) {
+            if (references == 0 or references == std.math.maxInt(usize)) return error.BackingUseReferenceOverflow;
+            references = self.references.cmpxchgWeak(references, references + 1, .monotonic, .monotonic) orelse break;
+        }
+        self.active_uses += 1;
+    }
+    /// Each use ends ONLY after its own actual current B sealed, or cold
+    /// cancellation outside every lane. A use pins both final credit AND any
+    /// pending padding refund; a plain Charge ref would protect only the first.
+    pub fn endUseOutsideExecution(self: *BackingOwner) void {
+        self.lock();
+        std.debug.assert(self.active_uses != 0);
+        self.active_uses -= 1;
+        const shrink = self.takeShrinkLocked();
+        self.mutex.unlock();
+        if (shrink) self.runShrinkOutsideExecution();
+        self.dropMetadata(); // this independently prepared use's pure pin
+    }
+    fn takeShrinkLocked(self: *BackingOwner) bool {
+        if (!self.shrink_ready or self.shrinking or self.active_uses != 0 or
+            (self.physical_released and !self.physical_finished)) return false;
+        self.shrink_ready = false;
+        self.shrinking = true;
+        return true;
+    }
+    fn runShrinkOutsideExecution(self: *BackingOwner) void {
+        // The original shrink metadata ref spans the callback and all state
+        // publication. Never call supplier retain under this owner's mutex.
+        self.charge.shrinkStorageBytes(self.measured_bytes);
+        const remaining = self.charge.storageBytes().?;
+        self.lock();
+        std.debug.assert(self.shrinking and self.active_uses == 0);
+        self.admitted_bytes.store(remaining, .release);
+        self.shrinking = false;
+        self.mutex.unlock();
+        self.dropMetadata(); // one exact deferred shrink pin, consumed once
+    }
     fn finishShrink(raw: *anyopaque) callconv(.c) void {
         const self: *BackingOwner = @ptrCast(@alignCast(raw));
         self.lock();
         var epoch = self.shrink_epoch.?;
         self.shrink_epoch = null;
-        // A physical cleanup under a newer epoch already owns the plane.
-        // Its gate must end before even a conservative-padding refund runs.
-        if (self.physical_released and !self.physical_finished) {
-            self.shrink_ready = true;
-            self.mutex.unlock();
-            epoch.release();
-            return; // B's callback owns this shrink metadata pin now.
-        }
+        self.shrink_ready = true;
+        const shrink = self.takeShrinkLocked();
         self.mutex.unlock();
-        self.charge.shrinkStorageBytes(self.measured_bytes);
-        self.admitted_bytes.store(self.charge.storageBytes().?, .release);
-        self.dropMetadata();
+        if (shrink) self.runShrinkOutsideExecution();
         epoch.release();
     }
     /// Actual SDK spans can be below conservative bounds. Prepare one shrink
@@ -115,17 +183,27 @@ pub const BackingOwner = struct {
         self.physical_finished = true;
         var epoch = self.cleanup_epoch.?;
         self.cleanup_epoch = null;
-        const shrink = self.shrink_ready;
-        self.shrink_ready = false;
+        const shrink = self.takeShrinkLocked();
         self.mutex.unlock();
-        if (shrink) {
-            self.charge.shrinkStorageBytes(self.measured_bytes);
-            self.admitted_bytes.store(self.charge.storageBytes().?, .release);
-            self.dropMetadata(); // deferred shrink metadata pin
-        }
+        if (shrink) self.runShrinkOutsideExecution();
         self.dropMetadata(); // actual physical cleanup's pin
         epoch.release();
     }
+    /// Explicit outside-execution final destruction, after SDK witness
+    /// publication. This is never selected merely because boundary is null.
+    /// A still-pending shrink retains its own earlier pin; physical cleanup
+    /// obtains no authority from that earlier epoch.
+    pub fn releaseOutsideExecution(self: *BackingOwner) void {
+        self.lock();
+        std.debug.assert(!self.physical_released);
+        self.physical_released = true;
+        self.physical_finished = true;
+        const shrink = self.takeShrinkLocked();
+        self.mutex.unlock();
+        if (shrink) self.runShrinkOutsideExecution();
+        self.dropMetadata();
+    }
+
     /// Called only after actual CPU/CUDA release or Metal buffer-witness publication.
     /// ALWAYS record the actual CURRENT cleanup epoch, even when an earlier
     /// shrink callback still pins this metadata. No fallible retirement work.
@@ -141,3 +219,8 @@ pub const BackingOwner = struct {
         // A sealed epoch can execute finish synchronously; do not read self.
     }
 };
+
+// Exercise the same cold cells/owner barrier through the existing lifecycle root.
+test {
+    _ = @import("../backends/metal_workspace_fence.zig");
+}

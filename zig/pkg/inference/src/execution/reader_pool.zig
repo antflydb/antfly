@@ -19,6 +19,30 @@ const std = @import("std");
 const platform = @import("antfly_platform");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 
+/// Only observed numerical cohort progress extends admission grace; retrying
+/// the same denied lease is not progress. Cold creators have no running cohort.
+pub const AdmissionWait = struct {
+    last_progress_ns: u64,
+    observed_steps: u64 = 0,
+    retry_delay_ns: u64 = std.time.ns_per_ms,
+
+    pub fn nextRetryDelayNs(self: *AdmissionWait) u64 {
+        const delay = self.retry_delay_ns;
+        self.retry_delay_ns = @min(delay * 2, 10 * std.time.ns_per_ms);
+        return delay;
+    }
+
+    pub fn expired(self: *AdmissionWait, now: u64, steps: ?u64) bool {
+        if (steps) |current| {
+            if (current != self.observed_steps) {
+                self.observed_steps = current;
+                self.last_progress_ns = now;
+            }
+        }
+        return now -| self.last_progress_ns >= 30 * std.time.ns_per_s;
+    }
+};
+
 pub const Pool = struct {
     pub const max_capacity: usize = 128;
     mutex: std.atomic.Mutex = .unlocked,
@@ -29,6 +53,7 @@ pub const Pool = struct {
     /// An incompatible head request closes this epoch to further refills.
     draining: bool = false,
     users: usize = 0,
+    retiring: usize = 0,
     joins: usize = 0,
     max_epoch_joins: usize = 64,
     destroy_fn: ?*const fn (*anyopaque) void = null,
@@ -62,28 +87,79 @@ pub const Pool = struct {
         }
     }
 
+    /// A departing shared page keeps its context alive while releasing its
+    /// own quota outside numerical lanes. A concurrent final page transfers its
+    /// lease into that context; the last retirement invokes ordinary destruction
+    /// and that context releases the final page only after SDK/model cleanup.
+    pub const Retirement = struct {
+        owner: *Pool,
+        context: *anyopaque,
+        pub fn finish(self: *Retirement) void {
+            const owner = self.owner;
+            const context = self.context;
+            platform.sync.lockYielding(&owner.mutex);
+            std.debug.assert(owner.context == context and owner.retiring > 0);
+            owner.retiring -= 1;
+            const destroy = if (owner.users == 0 and owner.retiring == 0) owner.detachContextLocked() else null;
+            owner.wakeWaiters();
+            owner.mutex.unlock();
+            if (destroy) |finish_context| finish_context(context);
+            // Destruction may free an embedded Pool. Do not access it again.
+        }
+    };
+
+    fn detachContextLocked(self: *Pool) ?*const fn (*anyopaque) void {
+        const destroy = self.destroy_fn;
+        std.debug.assert(self.users == 0 and self.retiring == 0 and destroy != null);
+        self.context = null;
+        self.destroy_fn = null;
+        self.joins = 0;
+        self.draining = false;
+        self.max_epoch_joins = 64;
+        return destroy;
+    }
+
     pub const Lease = struct {
         owner: *Pool,
         context: *anyopaque,
-        pub fn release(self: *Lease) void {
-            platform.sync.lockYielding(&self.owner.mutex);
-            std.debug.assert(self.owner.context == self.context and self.owner.users > 0);
-            self.owner.users -= 1;
-            const destroy = if (self.owner.users == 0) self.owner.destroy_fn else null;
-            if (destroy != null) {
-                self.owner.context = null;
-                self.owner.destroy_fn = null;
-                self.owner.joins = 0;
-                self.owner.draining = false;
-                self.owner.max_epoch_joins = 64;
+
+        /// adopt_final is a synchronous pure metadata move under Poolmutex:
+        /// no allocation, SDK, quota/provider callbacks or nested lock. It is
+        /// called only when prior shared retirements keep the final context
+        /// alive, and transfers the final page resource to that exact owner.
+        /// A returned Retirement retains context until finish; otherwise this
+        /// call may already have destroyed it and callers must not dereference.
+        pub fn depart(self: *Lease, resource: anytype, comptime adopt_final: fn (*anyopaque, @TypeOf(resource)) void) ?Retirement {
+            return self.departInternal(resource, adopt_final, true);
+        }
+        fn departInternal(self: *Lease, resource: anytype, comptime adopt_final: fn (*anyopaque, @TypeOf(resource)) void, comptime retain_shared: bool) ?Retirement {
+            const owner = self.owner;
+            const context = self.context;
+            platform.sync.lockYielding(&owner.mutex);
+            std.debug.assert(owner.context == context and owner.users > 0);
+            owner.users -= 1;
+            const shared = owner.users != 0;
+            var destroy: ?*const fn (*anyopaque) void = null;
+            if (shared) {
+                if (retain_shared) owner.retiring += 1;
+            } else if (owner.retiring == 0) {
+                destroy = owner.detachContextLocked();
+            } else {
+                // New refills wait for the pending final context destruction;
+                // no caller blocks waiting on an admission callback's stack.
+                owner.draining = true;
+                adopt_final(context, resource);
             }
-            // Publish retirement before callback reentry. A replacement epoch
-            // can wait for its actual model/provider gate without holding this
-            // pool's metadata lock. Each factory owns its resource exclusion.
-            self.owner.wakeWaiters();
-            self.owner.mutex.unlock();
-            if (destroy) |finish| finish(self.context);
-            // The callback can destroy an embedded pool; never access it again.
+            owner.wakeWaiters();
+            owner.mutex.unlock();
+            if (destroy) |finish_context| finish_context(context);
+            return if (retain_shared and shared) .{ .owner = owner, .context = context } else null;
+        }
+        pub fn release(self: *Lease) void {
+            const Empty = struct {
+                fn adopt(_: *anyopaque, _: void) void {}
+            };
+            _ = self.departInternal({}, Empty.adopt, false);
         }
     };
 
@@ -123,7 +199,7 @@ pub const Pool = struct {
             if (first and self.context != null and !compatible(self.context.?, factory)) self.draining = true;
             // Bound each epoch as well as its instantaneous occupancy so a
             // permanent stream cannot monopolize the model execution lane.
-            if (first and !self.creating and !self.draining and self.users < capacity and (self.context == null or self.joins < self.max_epoch_joins)) {
+            if (first and !self.creating and !self.draining and self.users + self.retiring < capacity and (self.context == null or self.joins < self.max_epoch_joins)) {
                 const new_epoch = self.context == null;
                 if (new_epoch) {
                     self.creating = true;
@@ -136,7 +212,7 @@ pub const Pool = struct {
                         return err;
                     };
                     platform.sync.lockYielding(&self.mutex);
-                    std.debug.assert(self.creating and self.context == null and self.users == 0);
+                    std.debug.assert(self.creating and self.context == null and self.users == 0 and self.retiring == 0);
                     self.context = created;
                     self.destroy_fn = destroy;
                     self.max_epoch_joins = max_epoch_joins;
@@ -852,4 +928,51 @@ test "reader pool incompatible frozen geometry drains before FIFO compatible ref
     try std.testing.expectEqual(@as(usize, 2), shared.created.load(.acquire));
     try std.testing.expectEqual(@as(usize, 2), shared.destroyed.load(.acquire));
     try std.testing.expect(pool.context == null and pool.waiters == null);
+}
+
+test "reader pool concurrent final page transfers quota until the last shared retirement destroys backing" {
+    const Fake = struct {
+        pool: *Pool,
+        final_quota: bool = false,
+        backing_live: bool = true,
+        destroyed: usize = 0,
+        released_final: bool = false,
+        fn create(raw: *anyopaque) !*anyopaque {
+            return raw;
+        }
+        fn adopt(raw: *anyopaque, resource: *bool) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.final_quota and resource.*);
+            self.final_quota = resource.*;
+            resource.* = false;
+        }
+        fn destroy(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.pool.context == null and self.pool.users == 0 and self.pool.retiring == 0);
+            self.backing_live = false;
+            self.destroyed += 1;
+            self.released_final = self.final_quota;
+            self.final_quota = false;
+        }
+    };
+    var pool = Pool{};
+    var fake = Fake{ .pool = &pool };
+    var first = try pool.join(.{}, 2, &fake, Fake.create, Fake.destroy);
+    var last = try pool.join(.{}, 2, &fake, Fake.create, Fake.destroy);
+    var first_quota = true;
+    var last_quota = true;
+    var retirement = first.depart(&first_quota, Fake.adopt) orelse return error.ExpectedSharedRetirement;
+    try std.testing.expect(last.depart(&last_quota, Fake.adopt) == null);
+    try std.testing.expect(!last_quota and fake.final_quota);
+    try std.testing.expect(fake.backing_live and fake.destroyed == 0);
+    // A quota callback can reenter pool metadata; no numerical or metadata lock
+    // is held, and a new epoch does not replace this pending final context.
+    try std.testing.expect(pool.mutex.tryLock());
+    pool.mutex.unlock();
+    try std.testing.expectError(error.Timeout, pool.join(.{ .deadline_ns = 0 }, 2, &fake, Fake.create, Fake.destroy));
+    first_quota = false;
+    retirement.finish();
+    try std.testing.expect(!first_quota and !fake.backing_live and fake.released_final);
+    try std.testing.expectEqual(@as(usize, 1), fake.destroyed);
+    try std.testing.expect(pool.context == null and pool.users == 0 and pool.retiring == 0);
 }

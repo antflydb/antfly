@@ -28,6 +28,12 @@ pub fn packetSupported(compute_major: i32, driver_version: i32) bool {
     return compute_major >= 8 and driver_version >= 13000;
 }
 
+/// Concrete geometry of the checked-in packet, shared by numerical dispatch
+/// and graph preflight. Other shapes keep the ordinary attention route.
+pub fn geometrySupported(heads: usize, kv_heads: usize, head_dim: usize) bool {
+    return head_dim == 256 and ((heads == 8 and kv_heads == 2) or (heads == 16 and kv_heads == 4));
+}
+
 pub fn useChunk128(requested: ?bool, heads: usize) bool {
     return requested orelse (heads == 16);
 }
@@ -166,4 +172,11 @@ test "LightOnOCR3 CUDA attention packet capacity is aggregate and fails before m
     try std.testing.expect(!params.appendPage(4, 1, 0, ids[0..1]));
     try std.testing.expect(!params.appendPage(0, 0, 0, ids[0..1]));
     try std.testing.expect(!params.appendPage(0, 1, 1, ids[0..1]));
+}
+
+test "CUDA captured attention geometry matches the actual packet before any SDK access" {
+    try std.testing.expect(geometrySupported(8, 2, 256));
+    try std.testing.expect(geometrySupported(16, 4, 256));
+    for ([_][3]usize{ .{ 2, 1, 32 }, .{ 8, 2, 128 }, .{ 16, 2, 256 }, .{ 8, 4, 256 }, .{ 0, 0, 0 } }) |shape|
+        try std.testing.expect(!geometrySupported(shape[0], shape[1], shape[2]));
 }

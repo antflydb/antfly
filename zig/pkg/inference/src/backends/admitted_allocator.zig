@@ -69,6 +69,46 @@ pub const AdmittedAllocator = struct {
         owner: ?*AdmittedAllocator = null,
         reservation: ?*Reservation = null,
 
+        /// Cold original-run output partition. The remaining prepaid capacity
+        /// must still cover every actual source allocation and metadata byte;
+        /// no supplier or allocation is reached for an unfunded source.
+        pub fn prepareHostOutputsBeforeExecution(self: *@This(), pin: *const @import("../runtime/tier/admission_domain.zig").Pin, count: usize, width: usize) !sessions.HostOutputProducer {
+            const lease = if (self.permit.lease) |*value| value else return error.MissingHostOutputEscrow;
+            const bytes = try sessions.HostOutputProducer.requiredBytes(count, width);
+            if (self.owner) |owner| {
+                const capacity = try std.math.add(usize, owner.reserved_bytes, owner.prepaid_host_bytes);
+                const used = try std.math.add(usize, owner.live_bytes, owner.metadata_bytes);
+                if (bytes > owner.prepaid_host_bytes or used > capacity - bytes) return error.HostOutputEscrowWouldUnfundSource;
+            }
+            const producer = try sessions.HostOutputProducer.prepare(lease, pin, count, width);
+            // Partition commitment was the last fallible step. Never lend the
+            // transferred output bytes again to Native source allocations.
+            if (self.owner) |owner| owner.prepaid_host_bytes -= bytes;
+            return producer;
+        }
+
+        /// Pure typed-final teardown only. No borrowed payload may remain;
+        /// the caller moves this exact permit lease into its cold current-B
+        /// Charge after numerical retirement. No trim/supplier callback here.
+        pub fn validateEmptyPrepaidRetirement(self: *const @This()) !void {
+            if (self.owner) |owner| {
+                const actual = owner.session orelse return error.InvalidAdmissionLeaseReduction;
+                if (actual.ptr != self.permit.session.ptr or actual.vtable != self.permit.session.vtable or actual.model_lifetime != self.permit.session.model_lifetime) return error.InvalidAdmissionLeaseReduction;
+                if (owner.live_bytes != 0) return error.SourceForeignWorkspaceStillLive;
+                if (self.reservation == null or owner.prepaid_host_bytes == 0) return error.InvalidAdmissionLeaseReduction;
+            }
+        }
+        pub fn detachEmptyPrepaidFunding(self: *@This()) !void {
+            try self.validateEmptyPrepaidRetirement();
+            if (self.owner) |owner| {
+                owner.prepaid_host_bytes = 0;
+                owner.metadata_bytes -= @sizeOf(Reservation);
+                owner.backing.destroy(self.reservation.?);
+                self.reservation = null;
+                self.owner = null;
+            }
+        }
+
         pub fn deinit(self: *@This()) void {
             self.deinitWithCleanup(.{});
         }
@@ -417,4 +457,64 @@ test "admission prepaid workspace grows only its deficit and rolls back failed s
     a.free(payload);
     scope.deinit();
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+}
+
+test "Native output escrow removes the exact prepaid subset while source allocations and final vectors survive independently" {
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const Info = struct {
+        fn outputs(_: *anyopaque) []const @import("tensor.zig").TensorInfo {
+            return &.{};
+        }
+    };
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var table: sessions.Session.VTable = undefined;
+    table.outputInfo = Info.outputs;
+    const session = sessions.Session{ .ptr = undefined, .vtable = &table, .run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{ .scratch_limit_bytes = 256 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var admitted = AdmittedAllocator{ .backing = std.testing.allocator, .session = session, .trim_on_free = true };
+    defer admitted.deinit();
+    var scope = try admitted.admitRun(.{ .workspace_bytes = 64 * 1024, .output_bytes = 0 });
+    var scope_live = true;
+    defer if (scope_live) scope.deinit();
+    const a = admitted.allocator();
+    const source = try a.alloc(u8, 4096);
+    var source_live = true;
+    defer if (source_live) a.free(source);
+    const extra_source = try a.alloc(u8, 40 * 1024);
+    const guarded = admitted.prepaid_host_bytes;
+    const original_amounts = scope.permit.lease.?.amounts;
+    try std.testing.expectError(error.HostOutputEscrowWouldUnfundSource, scope.prepareHostOutputsBeforeExecution(&pin, 2, 3000));
+    try std.testing.expectEqual(guarded, admitted.prepaid_host_bytes);
+    try std.testing.expectEqualDeep(original_amounts, scope.permit.lease.?.amounts);
+    a.free(extra_source);
+    const before = admitted.prepaid_host_bytes;
+    const bytes = try sessions.HostOutputProducer.requiredBytes(2, 3);
+    const quota = domain.controller.snapshot();
+    var producer = try scope.prepareHostOutputsBeforeExecution(&pin, 2, 3);
+    var producer_live = true;
+    defer if (producer_live) {
+        producer.abortWithCleanup(.{ .outside_execution = true }) catch unreachable;
+        producer.finishOutsideExecution();
+    };
+    try std.testing.expectEqual(before - bytes, admitted.prepaid_host_bytes);
+    try std.testing.expectEqualDeep(quota, domain.controller.snapshot());
+    try producer.writeRow(0, &.{ 1, 2, 3 });
+    try producer.writeRow(1, &.{ 4, 5, 6 });
+    var vectors = try producer.publish();
+    defer vectors.deinitOutsideExecution();
+    producer.finishOutsideExecution();
+    producer_live = false;
+    scope.deinit();
+    scope_live = false;
+    try std.testing.expectEqual(@as(usize, 0), admitted.prepaid_host_bytes);
+    try std.testing.expect(domain.controller.snapshot().host_scratch_bytes >= admitted.live_bytes + bytes);
+    a.free(source);
+    source_live = false;
+    try admitted.trim();
+    try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, vectors.values(1));
+    try std.testing.expectEqual(bytes, domain.controller.snapshot().host_scratch_bytes);
+    vectors.deinitOutsideExecution();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
 }

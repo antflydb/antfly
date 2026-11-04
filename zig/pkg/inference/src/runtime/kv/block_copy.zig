@@ -15,6 +15,8 @@ pub const Item = extern struct {
     table_index: usize,
 };
 pub const Request = struct {
+    /// Synchronous actual caller cleanup; never retained by a provider.
+    cleanup: @import("../../execution/cleanup_context.zig").Context = .{},
     sequence: u32,
     page_size: u16,
     layers: u16,
@@ -34,6 +36,7 @@ pub const Request = struct {
     }
 };
 pub const Provider = struct {
+    cleanup: @import("../../execution/cleanup_context.zig").Context = .{},
     context: *anyopaque,
     implementation: *const anyopaque,
     /// Borrows request metadata synchronously. May not retain a stack pointer.

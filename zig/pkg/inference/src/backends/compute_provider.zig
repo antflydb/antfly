@@ -77,12 +77,22 @@ pub fn acquireWithControl(session: Session, allocator: std.mem.Allocator, contro
 /// Compatibility constructors participate in exactly the same protection and
 /// rollback protocol as independently published compute providers.
 pub fn acquireWith(session: Session, allocator: std.mem.Allocator, run_budget: ?*memory.RunBudget, control: ?Control, constructor: Acquire) !ManagedComputeBackend {
+    return acquireWithOptions(session, allocator, run_budget, control, constructor, .{});
+}
+
+/// The actual owner borrows its current cleanup context only through this
+/// synchronous constructor. Providers retain no creation epoch.
+pub fn acquireWithCleanup(session: Session, allocator: std.mem.Allocator, control: ?Control, current: @import("../execution/cleanup_context.zig").Context) !ManagedComputeBackend {
+    return acquireWithOptions(session, allocator, null, control, acquirePublished, current);
+}
+
+fn acquireWithOptions(session: Session, allocator: std.mem.Allocator, run_budget: ?*memory.RunBudget, control: ?Control, constructor: Acquire, current: @import("../execution/cleanup_context.zig").Context) !ManagedComputeBackend {
     const effective = control orelse Control{};
     try effective.check();
     var guard = try effective.enterUninterruptible(session.interruption());
     errdefer guard.deinit();
-    var backend = try constructor(session, allocator, .{ .run_budget = run_budget });
-    errdefer backend.deinit();
+    var backend = try constructor(session, allocator, .{ .run_budget = run_budget, .cleanup = current });
+    errdefer if (current.boundary != null or current.outside_execution) backend.deinitWithCleanup(current) else backend.deinit();
     backend.execution_control = control;
     if (control) |active| try active.check();
     return .{ .backend = backend, .guard = guard };

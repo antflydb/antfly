@@ -112,6 +112,14 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     // Atomic marks own no caller metadata. The provider already owns the
     // corresponding SDK payload and fallback clones until actual retirement.
     private_retirement_dirty: std.atomic.Value(bool) = .init(false),
+    // Exact private declaration use, distinct from shared-cache payload charge.
+    // Provider/model custody outlives every plan pin. Pure metadata only.
+    private_declaration_mutex: std.atomic.Mutex = .unlocked,
+    private_linear_pins: [decoder_runtime_linear_slot_capacity]std.atomic.Value(usize) = @splat(.init(0)),
+    private_linear_pin_epochs: [decoder_runtime_linear_slot_capacity]u64 = @splat(0),
+    // Same declaration record: a cached epoch is retired only by its actual
+    // cache owner, never by a transient PRIVATE slot cleanup callback.
+    cached_linear_declaration_epochs: [decoder_runtime_linear_slot_capacity]u64 = @splat(0),
     private_linear_retirements: [decoder_runtime_linear_slot_capacity]std.atomic.Value(u64) = @splat(.init(0)),
     private_layer_norm_retirements: [decoder_runtime_layer_norm_slot_capacity]std.atomic.Value(u64) = @splat(.init(0)),
     private_rms_norm_retirements: [decoder_runtime_rms_norm_slot_capacity]std.atomic.Value(u64) = @splat(.init(0)),
@@ -194,8 +202,69 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     pub fn privateSlotDeclaration(self: *MetalNativeProvider, kind: metal_runtime.PreparedBindingKind, slot: usize) u64 {
         return metal_runtime.antfly_metal_prepared_declaration(self.raw_decode_runtime, kind, slot);
     }
+    fn lockPrivateDeclarations(self: *MetalNativeProvider) void {
+        while (!self.private_declaration_mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+    pub const PrivateLinearPin = struct {
+        provider: *MetalNativeProvider,
+        slot: usize,
+        epoch: u64,
+        pub fn valid(self: @This()) bool {
+            self.provider.lockPrivateDeclarations();
+            defer self.provider.private_declaration_mutex.unlock();
+            return self.provider.private_linear_pins[self.slot].load(.acquire) != 0 and self.provider.private_linear_pin_epochs[self.slot] == self.epoch and self.provider.privateSlotDeclaration(.linear, self.slot) == self.epoch;
+        }
+        pub fn release(self: @This()) void {
+            const provider = self.provider;
+            provider.lockPrivateDeclarations();
+            defer provider.private_declaration_mutex.unlock();
+            std.debug.assert(provider.private_linear_pin_epochs[self.slot] == self.epoch);
+            const previous = provider.private_linear_pins[self.slot].fetchSub(1, .acq_rel);
+            std.debug.assert(previous > 0);
+            if (previous == 1 and provider.private_linear_retirements[self.slot].load(.acquire) != 0) provider.private_retirement_dirty.store(true, .release);
+        }
+    };
+    /// Actual provider ownership already excludes numerical mutation. This
+    /// narrow mutex also orders asynchronous pure retirement marks with pins.
+    pub fn pinPrivateLinearDeclaration(self: *MetalNativeProvider, slot: usize, expected: u64) !PrivateLinearPin {
+        if (slot >= decoder_runtime_linear_slot_capacity or expected == 0 or (expected & 1) != 0) return error.PreparedSlotUnavailable;
+        self.lockPrivateDeclarations();
+        defer self.private_declaration_mutex.unlock();
+        if (self.privateSlotDeclaration(.linear, slot) != expected) return error.PreparedSlotUnavailable;
+        const count = self.private_linear_pins[slot].load(.acquire);
+        if (count == std.math.maxInt(usize)) return error.PreparedSlotPinOverflow;
+        if (count != 0 and self.private_linear_pin_epochs[slot] != expected) return error.PreparedSlotUnavailable;
+        self.private_linear_pin_epochs[slot] = expected;
+        self.private_linear_pins[slot].store(count + 1, .release);
+        return .{ .provider = self, .slot = slot, .epoch = expected };
+    }
+    pub fn pinCachedLinearDeclaration(self: *MetalNativeProvider, slot: usize, expected: u64, payload: prepared_slot.Owner.Pin) !PrivateLinearPin {
+        if (!self.linear_slot_index_mutex.tryLock()) return error.QueueFull;
+        defer self.linear_slot_index_mutex.unlock();
+        var found = false;
+        var iterator = self.embeddinggemma2_linear_cache.valueIterator();
+        while (iterator.next()) |entry| if (entry.slot == slot and entry.owner == payload.owner) {
+            found = true;
+            break;
+        };
+        if (!found or !payload.valid()) return error.ForeignPreparedSlotOwner;
+        const pin = try self.pinPrivateLinearDeclaration(slot, expected);
+        self.lockPrivateDeclarations();
+        // Pin already excludes declaration mutation, so this pure ownership
+        // publication cannot race a physical replacement. Discard only a
+        // deferred PRIVATE mark for this SAME proven cache-owned epoch.
+        self.cached_linear_declaration_epochs[slot] = expected;
+        _ = self.private_linear_retirements[slot].cmpxchgStrong(expected, 0, .acq_rel, .acquire);
+        self.private_declaration_mutex.unlock();
+        return pin;
+    }
     pub fn replacePrivateSlotDeclaration(self: *MetalNativeProvider, kind: metal_runtime.PreparedBindingKind, slot: usize) void {
+        self.lockPrivateDeclarations();
+        defer self.private_declaration_mutex.unlock();
+        if (kind == .linear and slot < self.private_linear_pins.len and self.private_linear_pins[slot].load(.acquire) != 0) return;
+        if (kind == .linear and slot < self.cached_linear_declaration_epochs.len and self.cached_linear_declaration_epochs[slot] != 0 and !self.allowsOwnedSlotMutation(slot)) return;
         metal_runtime.antfly_metal_replace_prepared_declaration(self.raw_decode_runtime, kind, slot);
+        if (kind == .linear and slot < self.cached_linear_declaration_epochs.len) self.cached_linear_declaration_epochs[slot] = 0;
     }
 
     fn privateRetirementMarks(self: *MetalNativeProvider, kind: metal_runtime.PreparedBindingKind) []std.atomic.Value(u64) {
@@ -211,7 +280,16 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     pub fn requestPrivateSlotRetirement(self: *MetalNativeProvider, kind: metal_runtime.PreparedBindingKind, slot: usize, generation: u64) void {
         const marks = self.privateRetirementMarks(kind);
         std.debug.assert(slot < marks.len and generation != 0);
-        const retired_generation = metal_runtime.antfly_metal_retire_prepared_binding(self.raw_decode_runtime, kind, slot, generation);
+        self.lockPrivateDeclarations();
+        defer self.private_declaration_mutex.unlock();
+        if ((generation & 1) != 0) return;
+        if (kind == .linear and self.cached_linear_declaration_epochs[slot] == generation) return;
+        // Preserve the live declaration while a parked plan still owns it.
+        // The SAME generation is marked/cleared by the actual terminal owner
+        // after its last pin, never by a metadata-only callback.
+        const pinned = kind == .linear and self.private_linear_pins[slot].load(.acquire) != 0;
+        if (pinned and self.privateSlotDeclaration(kind, slot) != generation) return;
+        const retired_generation = if (pinned) generation else metal_runtime.antfly_metal_retire_prepared_binding(self.raw_decode_runtime, kind, slot, generation);
         if (retired_generation == 0) return;
         var previous = marks[slot].load(.acquire);
         while (previous < retired_generation) {
@@ -238,7 +316,14 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         inline for ([_]metal_runtime.PreparedBindingKind{ .linear, .layer_norm, .rms_norm }) |kind| {
             const marks = self.privateRetirementMarks(kind);
             for (marks, 0..) |*mark, slot| {
-                const expected = mark.swap(0, .acq_rel);
+                if (kind == .linear and self.private_linear_pins[slot].load(.acquire) != 0) continue;
+                var expected = mark.swap(0, .acq_rel);
+                if (expected == 0) continue;
+                if ((expected & 1) == 0) {
+                    self.lockPrivateDeclarations();
+                    expected = metal_runtime.antfly_metal_retire_prepared_binding(self.raw_decode_runtime, kind, slot, expected);
+                    self.private_declaration_mutex.unlock();
+                }
                 if (expected == 0 or expected != self.privateSlotDeclaration(kind, slot)) continue;
                 switch (kind) {
                     .linear => {
@@ -548,9 +633,25 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         return null;
     }
 
+    /// A persistent compiled/decoder plan must distinguish a proven private
+    /// declaration from failure to pin an actual shared cache member. Returned
+    /// pins retain the existing payload/charge; no duplicate reservation exists.
+    pub fn pinLinearSlotForPersistentUse(self: *MetalNativeProvider, slot: usize) !?prepared_slot.Owner.Pin {
+        if (!self.linear_slot_index_mutex.tryLock()) return error.QueueFull;
+        defer self.linear_slot_index_mutex.unlock();
+        var iterator = self.embeddinggemma2_linear_cache.valueIterator();
+        while (iterator.next()) |entry| {
+            if (entry.slot != slot) continue;
+            const owner = entry.owner orelse return error.MissingPreparedSlotOwner;
+            return owner.tryPin(owner.epoch) orelse return error.PreparedSlotUnavailable;
+        }
+        return null; // Exact cache membership was checked under its mutation lock.
+    }
+
     /// A cached payload cannot be cleared/reassigned behind a frozen selector.
     /// Only its marked retirement (or a noncached legacy slot) permits mutation.
     pub fn allowsOwnedSlotMutation(self: *MetalNativeProvider, slot: usize) bool {
+        if (slot < self.private_linear_pins.len and self.private_linear_pins[slot].load(.acquire) != 0) return false;
         var iterator = self.embeddinggemma2_linear_cache.valueIterator();
         while (iterator.next()) |entry| {
             if (entry.slot != slot) continue;

@@ -17,6 +17,11 @@
 //! Masks/row IDs are explicit host metadata; activations stay on their backend.
 const std = @import("std");
 const ops = @import("../ops/ops.zig");
+const Cleanup = @import("cleanup_context.zig").Context;
+
+inline fn freeTensor(backend: *const ops.ComputeBackend, value: ops.CT, cleanup: ?*const Cleanup) void {
+    if (cleanup) |current| backend.freeWithCleanup(value, current.*) else backend.free(value);
+}
 pub const Kind = enum { mean, cls, max, last };
 
 pub const Value = struct {
@@ -26,6 +31,9 @@ pub const Value = struct {
 
     pub fn deinit(self: Value) void {
         if (self.owns_value) self.backend.free(self.value);
+    }
+    pub fn deinitWithCleanup(self: Value, current: Cleanup) void {
+        if (self.owns_value) self.backend.freeWithCleanup(self.value, current);
     }
 };
 
@@ -37,6 +45,19 @@ pub fn maskedMean(
     batch: usize,
     seq_len: usize,
     hidden: usize,
+) !Value {
+    return maskedMeanWithCleanup(allocator, backend, output, mask, batch, seq_len, hidden, null);
+}
+
+pub fn maskedMeanWithCleanup(
+    allocator: std.mem.Allocator,
+    backend: *const ops.ComputeBackend,
+    output: ops.CT,
+    mask: []const i32,
+    batch: usize,
+    seq_len: usize,
+    hidden: usize,
+    cleanup: ?*const Cleanup,
 ) !Value {
     const rows = std.math.mul(usize, batch, seq_len) catch return error.ShapeMismatch;
     if (batch == 0 or seq_len == 0 or hidden == 0 or mask.len != rows) return error.ShapeMismatch;
@@ -78,19 +99,19 @@ pub fn maskedMean(
     const pooled_shape = [_]i64{ @intCast(batch), @intCast(hidden) };
 
     const mask_ct = try backend.fromFloat32Shape(mask_values, &mask_shape_i32);
-    defer backend.free(mask_ct);
+    defer freeTensor(backend, mask_ct, cleanup);
     const zero = try backend.fromFloat32Shape(&.{0}, &.{1});
-    defer backend.free(zero);
+    defer freeTensor(backend, zero, cleanup);
     const masked_output = try backend.primWhereSelect(mask_ct, output, zero);
-    defer backend.free(masked_output);
+    defer freeTensor(backend, masked_output, cleanup);
     const summed = try backend.primReduceSum(masked_output, &.{1}, &output_shape);
-    defer backend.free(summed);
+    defer freeTensor(backend, summed, cleanup);
     const counts = try backend.fromFloat32Shape(denominators, &.{ @intCast(batch), 1, 1 });
-    defer backend.free(counts);
+    defer freeTensor(backend, counts, cleanup);
     const count_broadcast = try backend.primBroadcastInDim(counts, &sum_shape, &.{ 0, 1, 2 }, &count_shape);
-    defer backend.free(count_broadcast);
+    defer freeTensor(backend, count_broadcast, cleanup);
     const mean3d = try backend.primDivide(summed, count_broadcast);
-    defer backend.free(mean3d);
+    defer freeTensor(backend, mean3d, cleanup);
     const mean2d = try backend.primReshape(mean3d, &pooled_shape);
 
     return .{ .value = mean2d, .backend = backend, .owns_value = true };
@@ -104,13 +125,25 @@ pub fn cls(
     seq_len: usize,
     hidden: usize,
 ) !Value {
+    return clsWithCleanup(allocator, backend, output, batch, seq_len, hidden, null);
+}
+
+pub fn clsWithCleanup(
+    allocator: std.mem.Allocator,
+    backend: *const ops.ComputeBackend,
+    output: ops.CT,
+    batch: usize,
+    seq_len: usize,
+    hidden: usize,
+    cleanup: ?*const Cleanup,
+) !Value {
     const flat_rows = std.math.mul(usize, batch, seq_len) catch return error.ShapeMismatch;
     const flat_shape = [_]i64{
         std.math.cast(i64, flat_rows) orelse return error.ShapeMismatch,
         std.math.cast(i64, hidden) orelse return error.ShapeMismatch,
     };
     const flat = try backend.primReshape(output, &flat_shape);
-    defer backend.free(flat);
+    defer freeTensor(backend, flat, cleanup);
     const row_ids = try allocator.alloc(u32, batch);
     defer allocator.free(row_ids);
     for (row_ids, 0..) |*row_id, b| {
@@ -127,7 +160,7 @@ pub fn cls(
     const strides = [_]i64{ 1, 1, 1 };
     const pooled_shape = [_]i64{ @intCast(batch), @intCast(hidden) };
     const sliced = try backend.primSlice(output, &starts, &limits, &strides, &input_shape);
-    defer backend.free(sliced);
+    defer freeTensor(backend, sliced, cleanup);
     const pooled = try backend.primReshape(sliced, &pooled_shape);
     return .{ .value = pooled, .backend = backend, .owns_value = true };
 }
@@ -140,6 +173,19 @@ pub fn last(
     batch: usize,
     seq_len: usize,
     hidden: usize,
+) !Value {
+    return lastWithCleanup(allocator, backend, output, mask, batch, seq_len, hidden, null);
+}
+
+pub fn lastWithCleanup(
+    allocator: std.mem.Allocator,
+    backend: *const ops.ComputeBackend,
+    output: ops.CT,
+    mask: []const i32,
+    batch: usize,
+    seq_len: usize,
+    hidden: usize,
+    cleanup: ?*const Cleanup,
 ) !Value {
     const rows = std.math.mul(usize, batch, seq_len) catch return error.ShapeMismatch;
     if (batch == 0 or seq_len == 0 or hidden == 0 or mask.len != rows) return error.ShapeMismatch;
@@ -156,7 +202,7 @@ pub fn last(
 
     const flat_shape = [_]i64{ @intCast(batch * seq_len), @intCast(hidden) };
     const flat = try backend.primReshape(output, &flat_shape);
-    defer backend.free(flat);
+    defer freeTensor(backend, flat, cleanup);
     if (try backend.takeRows(flat, row_ids, batch, hidden)) |pooled| {
         return .{ .value = pooled, .backend = backend, .owns_value = true };
     }
@@ -164,57 +210,65 @@ pub fn last(
     defer allocator.free(indices);
     for (row_ids, indices) |row, *index| index.* = std.math.cast(i32, row) orelse return error.UnsupportedShape;
     const index_tensor = (try backend.fromInt32Shape(indices, &.{@intCast(batch)})) orelse return error.UnsupportedResidentTextPooling;
-    defer backend.free(index_tensor);
+    defer freeTensor(backend, index_tensor, cleanup);
     const pooled = try backend.primGather(flat, index_tensor, 0, &flat_shape);
     return .{ .value = pooled, .backend = backend, .owns_value = true };
 }
 
 pub fn poolOutput(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, output: ops.CT, mask: []const i32, batch: usize, seq_len: usize, kind: Kind) !Value {
+    return poolOutputWithCleanup(allocator, backend, output, mask, batch, seq_len, kind, null);
+}
+
+pub fn poolOutputWithCleanup(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, output: ops.CT, mask: []const i32, batch: usize, seq_len: usize, kind: Kind, cleanup: ?*const Cleanup) !Value {
     if (batch == 0 or seq_len == 0) return error.ShapeMismatch;
     const shape = try backend.tensorShape(output, allocator);
     defer allocator.free(shape);
-    return poolKnownShape(allocator, backend, output, shape, mask, batch, seq_len, kind);
+    return poolKnownShape(allocator, backend, output, shape, mask, batch, seq_len, kind, cleanup);
 }
 
-fn poolKnownShape(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, output: ops.CT, shape: []const i64, mask: []const i32, batch: usize, seq_len: usize, kind: Kind) !Value {
+fn poolKnownShape(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, output: ops.CT, shape: []const i64, mask: []const i32, batch: usize, seq_len: usize, kind: Kind, cleanup: ?*const Cleanup) !Value {
     const rows = std.math.mul(usize, batch, seq_len) catch return error.ShapeMismatch;
     if (shape.len == 2 and shape[0] == @as(i64, @intCast(batch)) and shape[1] > 0)
         return .{ .value = output, .backend = backend, .owns_value = false };
     if (shape.len == 2 and shape[0] == @as(i64, @intCast(rows)) and shape[1] > 0) {
         const dims = [_]i64{ @intCast(batch), @intCast(seq_len), shape[1] };
         const reshaped = try backend.primReshape(output, &dims);
-        defer backend.free(reshaped);
-        return poolSequence(allocator, backend, reshaped, mask, batch, seq_len, @intCast(shape[1]), kind);
+        defer freeTensor(backend, reshaped, cleanup);
+        return poolSequence(allocator, backend, reshaped, mask, batch, seq_len, @intCast(shape[1]), kind, cleanup);
     }
     if (shape.len != 3) return error.UnexpectedOutputShape;
     if (shape[0] != @as(i64, @intCast(batch)) or shape[1] != @as(i64, @intCast(seq_len)) or shape[2] <= 0) return error.ShapeMismatch;
-    return poolSequence(allocator, backend, output, mask, batch, seq_len, @intCast(shape[2]), kind);
+    return poolSequence(allocator, backend, output, mask, batch, seq_len, @intCast(shape[2]), kind, cleanup);
 }
 
-fn poolSequence(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, output: ops.CT, mask: []const i32, batch: usize, seq_len: usize, hidden: usize, kind: Kind) !Value {
+fn poolSequence(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, output: ops.CT, mask: []const i32, batch: usize, seq_len: usize, hidden: usize, kind: Kind, cleanup: ?*const Cleanup) !Value {
     return switch (kind) {
-        .mean => maskedMean(allocator, backend, output, mask, batch, seq_len, hidden),
-        .cls => cls(allocator, backend, output, batch, seq_len, hidden),
-        .last => last(allocator, backend, output, mask, batch, seq_len, hidden),
-        .max => maskedMax(allocator, backend, output, mask, batch, seq_len, hidden),
+        .mean => maskedMeanWithCleanup(allocator, backend, output, mask, batch, seq_len, hidden, cleanup),
+        .cls => clsWithCleanup(allocator, backend, output, batch, seq_len, hidden, cleanup),
+        .last => lastWithCleanup(allocator, backend, output, mask, batch, seq_len, hidden, cleanup),
+        .max => maskedMaxWithCleanup(allocator, backend, output, mask, batch, seq_len, hidden, cleanup),
     };
 }
 
 pub fn maskedMax(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, output: ops.CT, mask: []const i32, batch: usize, seq_len: usize, hidden: usize) !Value {
+    return maskedMaxWithCleanup(allocator, backend, output, mask, batch, seq_len, hidden, null);
+}
+
+pub fn maskedMaxWithCleanup(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, output: ops.CT, mask: []const i32, batch: usize, seq_len: usize, hidden: usize, cleanup: ?*const Cleanup) !Value {
     const rows = std.math.mul(usize, batch, seq_len) catch return error.ShapeMismatch;
     if (batch == 0 or seq_len == 0 or hidden == 0 or mask.len != rows) return error.ShapeMismatch;
     const mask_values = try allocator.alloc(f32, rows);
     defer allocator.free(mask_values);
     for (mask, mask_values) |flag, *value| value.* = if (flag > 0) 1 else 0;
     const mask_tensor = try backend.fromFloat32Shape(mask_values, &.{ @intCast(batch), @intCast(seq_len), 1 });
-    defer backend.free(mask_tensor);
+    defer freeTensor(backend, mask_tensor, cleanup);
     const empty = try backend.fromFloat32Shape(&.{-std.math.inf(f32)}, &.{1});
-    defer backend.free(empty);
+    defer freeTensor(backend, empty, cleanup);
     const selected = try backend.primWhereSelect(mask_tensor, output, empty);
-    defer backend.free(selected);
+    defer freeTensor(backend, selected, cleanup);
     const dims = [_]i64{ @intCast(batch), @intCast(seq_len), @intCast(hidden) };
     const pooled3d = try backend.primReduceMax(selected, &.{1}, &dims);
-    defer backend.free(pooled3d);
+    defer freeTensor(backend, pooled3d, cleanup);
     const pooled = try backend.primReshape(pooled3d, &.{ @intCast(batch), @intCast(hidden) });
     return .{ .value = pooled, .backend = backend, .owns_value = true };
 }
@@ -243,6 +297,14 @@ fn isTokenShape(shape: []const i64, batch: usize, sequence: usize) bool {
 /// Pool and normalize in one device batch, then materialize only the requested
 /// final rows. Encoder outputs and the actual backend owner remain borrowed.
 pub fn finishHostRows(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, output: ops.CT, mask: []const i32, batch: usize, sequence: usize, kind: Kind, normalize: bool) ![][]f32 {
+    return finishHostRowsWithCleanup(allocator, backend, output, mask, batch, sequence, kind, normalize, null);
+}
+
+pub fn finishHostRowsWithCleanup(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, output: ops.CT, mask: []const i32, batch: usize, sequence: usize, kind: Kind, normalize: bool, cleanup: ?*const Cleanup) ![][]f32 {
+    if (cleanup) |current| {
+        if (current.outside_execution or current.boundary == null) return error.MissingCurrentCleanupEpoch;
+        _ = try current.operationFor(backend);
+    }
     if (batch == 0 or sequence == 0) return error.ShapeMismatch;
     const source_shape = try backend.tensorShape(output, allocator);
     defer allocator.free(source_shape);
@@ -260,9 +322,9 @@ pub fn finishHostRows(allocator: std.mem.Allocator, backend: *const ops.ComputeB
                 break :pooled value;
             }
         }
-        break :pooled try poolKnownShape(allocator, backend, output, source_shape, mask, batch, sequence, kind);
+        break :pooled try poolKnownShape(allocator, backend, output, source_shape, mask, batch, sequence, kind, cleanup);
     };
-    defer pooled.deinit();
+    defer if (cleanup) |current| pooled.deinitWithCleanup(current.*) else pooled.deinit();
     const shape = try backend.tensorShape(pooled.value, allocator);
     defer allocator.free(shape);
     if (shape.len != 2 or shape[0] != (std.math.cast(i64, batch) orelse return error.ShapeMismatch) or shape[1] <= 0) return error.UnexpectedOutputShape;
@@ -272,9 +334,9 @@ pub fn finishHostRows(allocator: std.mem.Allocator, backend: *const ops.ComputeB
         // to normalize CLS/last/max results without a unit-weight tensor.
         if (try tryFusedMeanNormalize(allocator, backend, pooled.value, null, batch, 1, width)) |result|
             break :normalized result.value;
-        break :normalized try @import("../graph/resident_ops.zig").l2NormalizeLastDim(allocator, backend, pooled.value, shape);
+        break :normalized try @import("../graph/resident_ops.zig").l2NormalizeLastDimWithCleanup(allocator, backend, pooled.value, shape, cleanup);
     } else pooled.value;
-    defer if (normalize and !normalized_in_pool) backend.free(value);
+    defer if (normalize and !normalized_in_pool) freeTensor(backend, value, cleanup);
     try submission.finish();
     const host = try backend.toFloat32(value, allocator);
     defer allocator.free(host);
@@ -524,4 +586,11 @@ test "resident sequence pooling Metal handles masks empty rows and exact gather 
 test "resident sequence pooling CUDA handles masks empty rows and exact gather without activation reads" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     try checkPoolingBackend(.cuda);
+}
+
+test "sequence pooling explicit cleanup rejects missing current boundary before backend access" {
+    var unused_context: u8 = 0;
+    const backend: ops.ComputeBackend = .{ .ptr = &unused_context, .vtable = undefined };
+    const missing: Cleanup = .{};
+    try std.testing.expectError(error.MissingCurrentCleanupEpoch, finishHostRowsWithCleanup(std.testing.allocator, &backend, undefined, &.{}, 1, 1, .last, false, &missing));
 }

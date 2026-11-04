@@ -1341,6 +1341,64 @@ pub const Runtime = struct {
         return self.embeddingPipelineLocked(allocator);
     }
 
+    /// Short-lived physical custody for a previously selected pure-text task.
+    /// The caller holds an embedding asset lease while taking this snapshot.
+    /// This value retains the exact Session owners, not optional registry slots;
+    /// a concurrent exclusive asset reclamation may remove its slot afterwards.
+    pub const RetainedTextAssets = struct {
+        pipeline: EmbeddingPipeline,
+        models: [3]?*backends.Session.ModelLifetime = @splat(null),
+        count: usize = 0,
+        pub fn deinitOutsideExecution(self: *@This()) void {
+            const models = self.models;
+            self.models = @splat(null);
+            self.count = 0;
+            for (models) |model| if (model) |owner| owner.releaseOutsideExecution();
+        }
+    };
+
+    pub fn retainTextPipelineAssets(self: *const LoadedModel, pipeline: *const EmbeddingPipeline) !RetainedTextAssets {
+        if (!sameTextAssetSession(self.session, pipeline.session) or
+            !sameOptionalTextAssetSession(self.vision_session, pipeline.vision_session) or
+            !sameOptionalTextAssetSession(self.text_projection, pipeline.text_projection))
+            return error.ForeignTextPipelineAssets;
+        // Primary configuration/fallback scheduling, ACTUAL selected text
+        // source, then its optional head. An unused visual tower must remain
+        // reclaimable during cold suppliers; selection has one shared body.
+        const text_source = pipeline.textEncodingSession();
+        const sessions = [_]?backends.Session{ pipeline.session, text_source, pipeline.text_projection };
+        // Validate all fallible conditions before retaining any owner. Error
+        // unwind here must not create retirement scopes under the asset gate.
+        for (sessions) |session| if (session) |actual| {
+            if (actual.model_lifetime == null) return error.MissingTextAssetModelLifetime;
+        };
+        var retained = RetainedTextAssets{ .pipeline = pipeline.* };
+        // Freeze pure-text selection while the asset lease protects metadata.
+        // Future cold suppliers may reclaim an unused visual tower entirely.
+        if (sameTextAssetSession(text_source, pipeline.session)) retained.pipeline.vision_session = null;
+        for (sessions) |session| if (session) |actual| {
+            const model = actual.model_lifetime.?;
+            var duplicate = false;
+            for (retained.models[0..retained.count]) |prior| if (prior == model) {
+                duplicate = true;
+                break;
+            };
+            if (!duplicate) {
+                retained.models[retained.count] = model.retain();
+                retained.count += 1;
+            }
+        };
+        return retained;
+    }
+
+    fn sameTextAssetSession(a: backends.Session, b: backends.Session) bool {
+        return a.ptr == b.ptr and a.vtable == b.vtable and a.model_lifetime == b.model_lifetime;
+    }
+    fn sameOptionalTextAssetSession(a: ?backends.Session, b: ?backends.Session) bool {
+        if (a) |first| return if (b) |second| sameTextAssetSession(first, second) else false;
+        return b == null;
+    }
+
     pub fn embeddingPipelineLocked(self: *LoadedModel, allocator: std.mem.Allocator) EmbeddingPipeline {
         const tok = self.getTokenizer();
         const contract = if (self.session.model_contract.resolved) self.session.model_contract else @import("../models/session_contract.zig").resolve(self.session.model_contract, &self.manifest, self.session.backend());
@@ -2164,4 +2222,78 @@ test "metadata planning owns tokenizer and identity without constructing the req
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, loadPlanningAssets(a, directory, std.testing.io, denied, .{}));
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expectError(error.Cancelled, loadPlanningAssets(a, "/missing-cancelled-model", std.testing.io, preparation, .{ .check_fn = Deny.cancel }));
+}
+
+test "actual optional text head stays numeric and quota funded after asset slot reclamation while unused vision is unpinned" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const imported = @import("../backends/imported_onnx_session.zig");
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const value = try builder.parameter("input", ml.graph.Shape.init(.f32, &.{ 1, 2 }));
+    try graph.markOutput(try builder.add(value, value));
+    const bytes = try @import("onnx_graph").exportGraph(a, &graph, .{});
+    defer a.free(bytes);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "head.onnx", .data = bytes });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "head.onnx", a);
+    defer a.free(path);
+    const primary = try imported.createSessionWithOptions(a, path, .native, .{ .graph_runtime_strategy = .partitioned });
+    defer primary.close();
+    const vision = try imported.createSessionWithOptions(a, path, .native, .{ .graph_runtime_strategy = .partitioned });
+    var vision_live = true;
+    defer if (vision_live) vision.close();
+    const head = try imported.createSessionWithOptions(a, path, .native, .{ .graph_runtime_strategy = .partitioned });
+    var head_live = true;
+    defer if (head_live) head.close();
+    const domain = try Domain.create();
+    defer domain.release();
+    try std.testing.expect(head.model_lifetime.?.admission_domain == null);
+    head.model_lifetime.?.admission_domain = domain.pin();
+    var lease: ?runtime.tier.memory.AdmissionLease = try domain.controller.tryAcquire(.cpu, .{}, .{ .host_weight_bytes = 4096 }, false);
+    defer if (lease) |*quota| quota.release();
+    var model: LoadedModel = undefined;
+    model.session = primary;
+    model.vision_session = vision;
+    model.text_projection = head;
+    model.embedding_asset_gate = .{};
+    var pipeline = EmbeddingPipeline{ .allocator = a, .session = primary, .vision_session = vision, .text_projection = head, .tok = undefined, .config = .{} };
+    var assets = model.acquireEmbeddingAssetLease(false);
+    defer assets.release();
+    var retained = try model.retainTextPipelineAssets(&pipeline);
+    defer retained.deinitOutsideExecution();
+    try std.testing.expectEqual(@as(usize, 2), retained.count);
+    try std.testing.expect(retained.pipeline.vision_session == null);
+    try std.testing.expectEqual(@as(usize, 1), vision.model_lifetime.?.references.load(.acquire));
+    assets.release();
+    // Same closeRetainingResources endpoint as optional runtime reclamation:
+    // move ORIGINAL quota into the actual still-retained Session model owner.
+    try std.testing.expect(model.embedding_asset_gate.tryLockExclusive());
+    head.closeRetainingResources(&lease);
+    head_live = false;
+    model.text_projection = null;
+    vision.close();
+    vision_live = false;
+    model.vision_session = null;
+    model.embedding_asset_gate.unlockExclusive();
+    try std.testing.expect(lease == null);
+    try std.testing.expectEqual(@as(usize, 4096), domain.controller.snapshot().host_weight_bytes);
+    // The copied selected head is still the ORIGINAL accepted executable, not
+    // a reloaded model or pass-through fake numerical callback.
+    var input = try backends.Tensor.initFloat32(a, "input", &.{ 1, 2 }, &.{ 3, 7 });
+    defer input.deinit();
+    const outputs = try retained.pipeline.text_projection.?.runWithControl(&.{input}, a, .{ .native_call_policy = .in_process });
+    defer a.free(outputs);
+    var outputs_live = true;
+    defer if (outputs_live) for (outputs) |*output| output.deinit();
+    try std.testing.expectEqualSlices(f32, &.{ 6, 14 }, outputs[0].asFloat32());
+    for (outputs) |*output| output.deinit();
+    outputs_live = false;
+    retained.deinitOutsideExecution();
+    pipeline.text_projection = null; // borrowed descriptor dies with pin custody
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
 }

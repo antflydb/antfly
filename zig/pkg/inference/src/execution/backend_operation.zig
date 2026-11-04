@@ -150,6 +150,9 @@ pub const Services = struct {
     /// Only explicit per-request engine owners expose their own scope. A
     /// shared backend MUST NOT lend whichever provider operation is active.
     currentToken: ?*const fn (*anyopaque) ?Borrowed = null,
+    /// Explicit completed numerical owner plus a separately acquired metadata
+    /// read domain. This is not a managed-to-metadata operation upgrade.
+    snapshot_owned_metadata: ?*const fn (*const @import("../ops/ops.zig").ComputeBackend, Borrowed) anyerror!?@import("../ops/ops.zig").BackendDebugTimingSnapshot = null,
     /// Cold explicit binding of the concrete target's OWN engine Lease.
     /// Borrowed/raw targets return false; ambient provider lookup is forbidden.
     bindCleanupEpoch: ?*const fn (*anyopaque, *const @import("retirement_sink.zig").Epoch) anyerror!bool = null,

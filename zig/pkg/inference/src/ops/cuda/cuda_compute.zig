@@ -20,6 +20,8 @@ const kernel_geometry = ops.kernel_descriptor.kernel_geometry;
 const tensor_mod = @import("../../backends/tensor.zig");
 const buffer_mod = @import("buffer.zig");
 const context_mod = @import("context.zig");
+const CacheQuota = @import("cache_quota.zig").Quota;
+const CacheCleanup = @import("../../execution/cleanup_context.zig").Context;
 const driver_mod = @import("driver.zig");
 const embedding_gemma2_policy_mod = @import("embedding_gemma2_policy.zig");
 const execution_plan = @import("execution_plan.zig");
@@ -91,7 +93,7 @@ pub const CudaTensor = struct {
     // Constant snapshots bypass the temporary pool. The last borrower owns
     // both the direct allocation and its retained shared-admission lease.
     model_constant: bool = false,
-    model_constant_lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null,
+    model_constant_quota: CacheQuota = .none,
     cache_retirement_slot: ?*@import("cache_retirement.zig").PreparedQuotas.Slot = null,
 
     buffer: buffer_mod.DeviceBuffer,
@@ -2285,9 +2287,909 @@ const EncoderPrecisionProfile = enum {
     }
 };
 
+/// One operation cache owns its exact physical planes and common quota.
+/// Host words are present only for the explicit U32 position layout.
+const AuxiliaryCacheSlot = struct {
+    device: buffer_mod.DeviceBuffer = .{},
+    host_u32: std.ArrayListUnmanaged(u32) = .empty,
+    quota: CacheQuota = .none,
+};
+
 pub const CudaCompute = struct {
+    /// Exact roots selected while an owned decoder graph is authored. The cold
+    /// epoch header owns final-address slots and immutable norm requests; this
+    /// value borrows them and the actual model keeps compute alive. No cleanup
+    /// boundary, operation token, request allocator or supplier is stored.
+    pub const CapturedCacheRoots = struct {
+        pub const Slot = struct {
+            tensor: ?*CudaTensor = null,
+            // Discovery identities never own/dereference a parent outside exclusion.
+            discovered_parent: ?*CudaTensor = null,
+            discovered_buffer: driver_mod.CUdeviceptr = 0,
+            upgrade: ?@import("cache_quota.zig").RawUpgrade = null,
+        };
+        slots: []Slot,
+        requests: []const @import("prepared_cache.zig").Request,
+        epoch: u64 = 0,
+        generation: u64 = 0,
+
+        pub fn init(slots: []Slot, requests: []const @import("prepared_cache.zig").Request) !CapturedCacheRoots {
+            if (slots.len < requests.len) return error.CapturedCacheRootCapacity;
+            for (requests) |request| switch (request) {
+                .constant => |named| if (!std.mem.startsWith(u8, named.name.slice(), "lighton.norm_weight.")) return error.InvalidCapturedCacheRequest,
+                else => return error.InvalidCapturedCacheRequest,
+            };
+            @memset(slots, .{});
+            return .{ .slots = slots, .requests = requests };
+        }
+        /// Cold weak discovery copies exact values under the cache metadata
+        /// mutex. Allocate shells before taking any strong legacy raw parent:
+        /// OOM therefore cannot strand a final raw owner outside its cohort.
+        pub fn prepareLegacyQuotasOutside(self: *CapturedCacheRoots, compute: *CudaCompute, model: *const @import("../../backends/session.zig").Session.ModelLifetime) !void {
+            self.finishLegacyPreparationOutside();
+            errdefer self.finishLegacyPreparationOutside();
+            for (self.requests, 0..) |request, index| {
+                const slot = &self.slots[index];
+                compute.lockConstantMetadata();
+                const found = compute.embedding_gemma2_constants.get(request.constant.name.slice());
+                var lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null;
+                if (found) |parent| if (parent.model_constant_quota == .raw) {
+                    slot.discovered_parent = parent;
+                    slot.discovered_buffer = parent.buffer.ptr;
+                    lease = parent.model_constant_quota.raw;
+                };
+                compute.unlockConstantMetadata();
+                if (lease) |actual| {
+                    const controller = actual.controller orelse return error.MissingResourceRetirementLease;
+                    const pin = model.retainAdmissionDomain(controller) orelse return error.MissingCacheRetirementDomain;
+                    defer pin.release();
+                    slot.upgrade = try @import("cache_quota.zig").RawUpgrade.prepare(actual, &pin);
+                }
+            }
+        }
+        pub fn finishLegacyPreparationOutside(self: *CapturedCacheRoots) void {
+            for (self.slots) |*slot| {
+                if (slot.upgrade) |*upgrade| upgrade.deinitOutsideExecution();
+                slot.upgrade = null;
+                slot.discovered_parent = null;
+                slot.discovered_buffer = 0;
+            }
+        }
+        /// Caller owns the actual Session cohort, before selecting/capturing any
+        /// graph. No allocation, supplier, SDK work, or source pointer borrow.
+        pub fn commitLegacyQuotas(self: *CapturedCacheRoots, compute: *CudaCompute) !void {
+            for (self.requests, 0..) |request, index| {
+                const slot = &self.slots[index];
+                const parent = compute.embedding_gemma2_constants.get(request.constant.name.slice()) orelse {
+                    if (slot.upgrade != null) return error.PreparedCachePlanChanged;
+                    continue;
+                };
+                if (parent.model_constant_quota != .raw) continue;
+                const upgrade = if (slot.upgrade) |*value| value else return error.PreparedCachePlanChanged;
+                if (slot.discovered_parent != parent or slot.discovered_buffer != parent.buffer.ptr) return error.PreparedCachePlanChanged;
+                retainResidentTensor(parent); // actual revalidated parent, not discovery
+                defer {
+                    const previous = parent.resident_references.fetchSub(1, .acq_rel);
+                    std.debug.assert(previous > 1); // map still owns the same parent
+                }
+                _ = try upgrade.install(&parent.model_constant_quota);
+            }
+            // All current raw norm parents are now exact prepared owners.
+            // Later peers cannot create an unprepared replacement for them.
+            compute.managed_norm_publication = true;
+        }
+        fn identity(self: *const CapturedCacheRoots) usize {
+            return @intFromPtr(self);
+        }
+        fn releaseRoots(self: *CapturedCacheRoots, compute: *CudaCompute, current: @import("../../execution/cleanup_context.zig").Context) void {
+            for (self.slots) |*slot| if (slot.tensor) |tensor| {
+                slot.tensor = null;
+                freeTensorWithCleanup(compute, @ptrCast(tensor), current);
+            };
+            self.epoch = 0;
+            self.generation = 0;
+        }
+        fn beginGeneration(self: *CapturedCacheRoots, compute: *CudaCompute, current: @import("../../execution/cleanup_context.zig").Context) !void {
+            if (current.outside_execution or current.boundary == null) return error.MissingCurrentCleanupEpoch;
+            const graph = &compute.lighton_decode_graph;
+            if (self.epoch != graph.epoch_id or self.generation != graph.invalidations) {
+                // A changed generation is published by clear/reset only
+                // after its existing checked wait and graph destruction.
+                self.releaseRoots(compute, current);
+                self.epoch = graph.epoch_id;
+                self.generation = graph.invalidations;
+            }
+            graph.captured_roots_identity = self.identity();
+        }
+        fn selected(self: *CapturedCacheRoots, compute: *CudaCompute, key: []const u8, tensor: *CudaTensor) !void {
+            const graph = &compute.lighton_decode_graph;
+            if (!graph.active) return;
+            if (graph.captured_roots_identity != self.identity() or self.epoch != graph.epoch_id or self.generation != graph.invalidations) return error.CapturedCacheOwnerChanged;
+            const bytes = blk: {
+                for (self.requests) |request| if (std.mem.eql(u8, request.constant.name.slice(), key)) break :blk request.constant.bytes;
+                return error.UnownedCapturedCacheKey;
+            };
+            if (!tensor.model_constant or tensor.resident_parent != null or !tensor.owned_by_tensor or !tensor.owns_buffer or tensor.dtype != .f32 or tensor.buffer.len < bytes or try checkedMul(tensor.elem_count, 4) != bytes) return error.CapturedCacheRootChanged;
+            var empty: ?*Slot = null;
+            for (self.slots) |*slot| {
+                if (slot.tensor == tensor) return;
+                if (slot.tensor == null and empty == null) empty = slot;
+            }
+            const target = empty orelse return error.CapturedCacheRootCapacity;
+            retainResidentTensor(tensor);
+            target.tensor = tensor;
+        }
+        pub fn bind(self: *CapturedCacheRoots, cb: *const ops.ComputeBackend, expected: *CudaCompute) !void {
+            if (!acceptsPhysicalImplementation(cb.vtable) or cb.ptr != @as(*anyopaque, @ptrCast(expected))) return error.UnsupportedReaderEpochBackend;
+            if (expected.captured_cache_roots != null) return error.CapturedCacheOwnerAlreadyBound;
+            expected.captured_cache_roots = self;
+        }
+        pub fn unbind(self: *CapturedCacheRoots, cb: *const ops.ComputeBackend, expected: *CudaCompute) !void {
+            if (!acceptsPhysicalImplementation(cb.vtable) or cb.ptr != @as(*anyopaque, @ptrCast(expected)) or expected.captured_cache_roots != self) return error.CapturedCacheOwnerChanged;
+            expected.captured_cache_roots = null;
+        }
+        /// Checked quiescence occurs before any owner or numerical gate yields.
+        /// A historical graph authored without this explicit owner cannot park.
+        pub fn prepareToPark(self: *CapturedCacheRoots, cb: *const ops.ComputeBackend, expected: *CudaCompute) !void {
+            if (!acceptsPhysicalImplementation(cb.vtable) or cb.ptr != @as(*anyopaque, @ptrCast(expected)) or expected.captured_cache_roots != self) return error.CapturedCacheOwnerChanged;
+            if (expected.execution_scope != null or expected.lighton_decode_graph.active or expected.ctx.debug_graph_capture_active or expected.debug_cuda_graph_capture_active) return error.ReaderEpochBackendBusy;
+            if (expected.ctx.driver.fns.cuStreamIsCapturing == null or try expected.ctx.streamCaptureActive()) return error.ReaderEpochBackendBusy;
+            try expected.ctx.synchronize();
+            const graph = &expected.lighton_decode_graph;
+            if (graph.graph != null and (graph.captured_roots_identity != self.identity() or self.epoch != graph.epoch_id or self.generation != graph.invalidations)) return error.UnownedCapturedProgram;
+        }
+        pub fn finishAfterGraph(self: *CapturedCacheRoots, cb: *const ops.ComputeBackend, expected: *CudaCompute, current: @import("../../execution/cleanup_context.zig").Context) !void {
+            if (!acceptsPhysicalImplementation(cb.vtable) or cb.ptr != @as(*anyopaque, @ptrCast(expected))) return error.UnsupportedReaderEpochBackend;
+            if (current.outside_execution or current.boundary == null) return error.MissingCurrentCleanupEpoch;
+            if (expected.captured_cache_roots == self) return error.CapturedCacheOwnerStillBound;
+            const graph = &expected.lighton_decode_graph;
+            if (graph.graph != null and graph.captured_roots_identity == self.identity()) return error.CapturedProgramStillLive;
+            try expected.ctx.synchronize();
+            self.releaseRoots(expected, current);
+        }
+    };
+
+    /// Movable exclusive custody of the existing graph and its separately
+    /// allocated vendor workspace. The epoch holds the model, roots, and stable
+    /// RunBudget through restoration; no old cleanup authority is captured.
+    pub const ReaderEpochPark = struct {
+        graph: @import("lighton_decode_graph.zig").Module = .{},
+        workspace: scratch_mod.DeviceScratch = .{},
+        budget: ?*run_memory.RunBudget = null,
+        policy: @import("runtime_policy.zig").Policy = .{},
+        compute: ?*CudaCompute = null,
+        roots: ?*CapturedCacheRoots = null,
+        restore_prepared: bool = false,
+
+        pub fn park(self: *ReaderEpochPark, cb: *const ops.ComputeBackend, expected: *CudaCompute, roots: *CapturedCacheRoots) !void {
+            if (self.compute != null) return error.ReaderEpochAlreadyParked;
+            if (cb.vtable != &scoped_run_budget_vtable or cb.ptr != @as(*anyopaque, @ptrCast(expected))) return error.UnsupportedReaderEpochBackend;
+            if (expected.shared_operation_owner != null or expected.run_budget == null or expected.audio_execution_active or expected.lighton_burst_readback.busy) return error.ReaderEpochBackendBusy;
+            if (expected.ctx.prepared_cache_funding != null) return error.ReaderEpochFundingStillBound;
+            try roots.prepareToPark(cb, expected);
+            // No active claim may refer to the module's final address. Step
+            // exclusion remains owned, and checked completion above is final.
+            if (!expected.lighton_decode_graph.mutex.tryLock()) return error.ReaderEpochBackendBusy;
+            expected.lighton_decode_graph.mutex.unlock();
+            try roots.unbind(cb, expected);
+            self.* = .{ .graph = expected.lighton_decode_graph, .workspace = expected.cublaslt_workspace_scratch, .budget = expected.run_budget, .policy = expected.runtime_policy, .compute = expected, .roots = roots };
+            expected.lighton_decode_graph = .{};
+            expected.cublaslt_workspace_scratch = .{};
+            expected.configureRunBudget(null);
+        }
+        /// Actual reader/model exclusion is reacquired first. The caller has
+        /// already revalidated/configured funding with the current epoch while
+        /// this detached graph remains inaccessible to policy cleanup.
+        pub fn prepareRestore(self: *ReaderEpochPark, cb: *const ops.ComputeBackend, expected: *CudaCompute) !void {
+            if (self.compute != expected or self.budget == null or self.roots == null) return error.ForeignReaderEpochPark;
+            if (cb.vtable != &scoped_run_budget_vtable or cb.ptr != @as(*anyopaque, @ptrCast(expected))) return error.UnsupportedReaderEpochBackend;
+            if (expected.run_budget != null or expected.captured_cache_roots != null or expected.execution_scope != null or expected.lighton_decode_graph.active or expected.lighton_decode_graph.graph != null or expected.lighton_decode_graph.plan != null or expected.debug_cuda_graph_capture_active or expected.ctx.debug_graph_capture_active or expected.audio_execution_active or expected.lighton_burst_readback.busy) return error.ReaderEpochBackendBusy;
+            if (expected.ctx.driver.fns.cuStreamIsCapturing == null or try expected.ctx.streamCaptureActive()) return error.ReaderEpochBackendBusy;
+            try expected.ctx.synchronize();
+            // Peer scratch belongs to its completed request. Preserve the old
+            // graph's exact workspace allocation, never a guessed byte credit.
+            _ = try expected.cublaslt_workspace_scratch.buffer.freeChecked(&expected.ctx);
+            expected.runtime_policy = self.policy;
+            expected.configureRunBudget(self.budget);
+            self.restore_prepared = true;
+        }
+        /// Before another outside funding attempt, remove the stable epoch's
+        /// scoped pointer again; no peer can borrow it across actual lane yield.
+        pub fn suspendRestoreBinding(self: *ReaderEpochPark, expected: *CudaCompute) void {
+            if (!self.restore_prepared) return;
+            if (self.compute != expected or expected.run_budget != self.budget) platform.inference_process_supervisor.restartWorker();
+            expected.configureRunBudget(null);
+            self.restore_prepared = false;
+        }
+        pub fn restore(self: *ReaderEpochPark, cb: *const ops.ComputeBackend, expected: *CudaCompute) !void {
+            if (self.compute != expected or !self.restore_prepared or self.roots == null or self.budget == null) return error.ForeignReaderEpochPark;
+            if (cb.vtable != &scoped_run_budget_vtable or cb.ptr != @as(*anyopaque, @ptrCast(expected))) return error.UnsupportedReaderEpochBackend;
+            if (expected.run_budget != self.budget or expected.captured_cache_roots != null or expected.execution_scope != null or expected.lighton_decode_graph.graph != null or expected.lighton_decode_graph.plan != null or expected.cublaslt_workspace_scratch.buffer.ptr != 0) return error.ReaderEpochBackendBusy;
+            expected.lighton_decode_graph = self.graph;
+            expected.cublaslt_workspace_scratch = self.workspace;
+            expected.captured_cache_roots = self.roots;
+            self.* = .{};
+        }
+    };
+    const LightOnNormRecord = struct {
+        name: @import("prepared_cache.zig").Name,
+        header: usize,
+        buffer: driver_mod.CUdeviceptr,
+        dimension: usize,
+        eligible: bool,
+        bf16_matrix: bool = false,
+        rows: usize = 0,
+        columns: usize = 0,
+    };
+    fn lockConstantMetadata(self: *const CudaCompute) void {
+        const mutex = &@constCast(self).constant_metadata_mutex;
+        while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+    fn unlockConstantMetadata(self: *const CudaCompute) void {
+        @constCast(self).constant_metadata_mutex.unlock();
+    }
+    fn invalidateLightOnNormCatalog(self: *CudaCompute) void {
+        if (self.lighton_norm_catalog_published) self.lighton_norm_catalog_valid.store(false, .release);
+    }
+    /// Actual cold weight-load owner ONLY, before publishing this Session.
+    /// Records contain copied names/numeric identities, never borrowed map keys.
+    /// No SDK, stream, quota callback or numerical work occurs here.
+    pub fn publishLightOnNormCatalog(self: *CudaCompute) !void {
+        if (self.lighton_norm_catalog_published) return error.ModelWeightsAlreadyPublished;
+        if (self.capability_profile != .lightonocr3 or self.lazy_host_store != null) return;
+        try self.embedding_gemma2_constants.ensureTotalCapacity(self.allocator, @import("../../models/embedding_gemma2_weight_cache.zig").prepared_max_entries);
+        try self.lighton_projection_cache.ensureTotalCapacity(self.allocator, 32);
+        try self.lighton_gate_up_cache.ensureTotalCapacity(self.allocator, 32);
+        var count: usize = 0;
+        var iterator = self.resident_weights.iterator();
+        while (iterator.next()) |entry| {
+            const value = entry.value_ptr;
+            _ = value;
+            if (entry.key_ptr.*.len != 0 and entry.key_ptr.*.len <= 256) count += 1;
+        }
+        const records = try self.allocator.alloc(LightOnNormRecord, count);
+        errdefer self.allocator.free(records);
+        iterator = self.resident_weights.iterator();
+        var index: usize = 0;
+        while (iterator.next()) |entry| {
+            const value = entry.value_ptr;
+            if (entry.key_ptr.*.len == 0 or entry.key_ptr.*.len > 256) continue;
+            const eligible = value.dtype == .f32 and value.quant_type == null and !value.owned_by_tensor and value.shape.len == 1 and (value.elem_count == 128 or value.elem_count == 256 or value.elem_count == 1024 or value.elem_count == 2560) and value.buffer.len >= value.elem_count * 4;
+            records[index] = .{ .name = try @import("prepared_cache.zig").Name.init(entry.key_ptr.*), .header = @intFromPtr(value), .buffer = value.buffer.ptr, .dimension = value.elem_count, .eligible = eligible, .bf16_matrix = value.dtype == .bf16 and value.quant_type == null and !value.owned_by_tensor and value.shape.len == 2 and value.buffer.len >= try checkedMul(value.elem_count, 2), .rows = if (value.shape.len == 2) @intCast(value.shape[0]) else 0, .columns = if (value.shape.len == 2) @intCast(value.shape[1]) else 0 };
+            index += 1;
+        }
+        self.lighton_norm_catalog = records;
+        self.lighton_norm_catalog_published = true;
+        self.lighton_norm_catalog_valid.store(true, .release);
+    }
+    /// Same immutable resident identities used by the actual BF16 producers.
+    /// Prefix/original/bare lookup order matches getModelWeight; an ineligible
+    /// first existing operand declines the whole optional concatenation.
+    fn derivedRecord(self: *const CudaCompute, config: @import("../../models/gpt.zig").Config, logical: []const u8) !?LightOnNormRecord {
+        if (!self.lighton_norm_catalog_published or !self.lighton_norm_catalog_valid.load(.acquire)) return null;
+        var prefixed: [256]u8 = undefined;
+        const bare = logical["model.".len..];
+        if (config.weight_prefix.len != 0 and config.weight_prefix.len > prefixed.len - 1 - bare.len) return null;
+        const names = [_][]const u8{ if (config.weight_prefix.len != 0) try std.fmt.bufPrint(&prefixed, "{s}.{s}", .{ config.weight_prefix, bare }) else logical, logical, bare };
+        for (names) |name| for (self.lighton_norm_catalog) |record| {
+            if (std.mem.eql(u8, record.name.slice(), name)) return if (record.bf16_matrix) record else null;
+        };
+        return null;
+    }
+    pub fn appendDerivedWeightWorkload(self: *const CudaCompute, config: @import("../../models/gpt.zig").Config, builder: *CacheFunding.Builder) !void {
+        if (self.capability_profile != .lightonocr3 or !config.isQwen35() or self.lazy_host_store != null) return;
+        for (0..config.num_hidden_layers) |layer| {
+            if (self.lighton_fused_projections and config.layerUsesQwen35LinearAttention(layer)) {
+                const kh: usize = config.qwen35_linear_num_key_heads;
+                const vh: usize = config.qwen35_linear_num_value_heads;
+                const kd = try checkedMul(kh, config.qwen35_linear_key_head_dim);
+                const vd = try checkedMul(vh, config.qwen35_linear_value_head_dim);
+                const mixed = try std.math.add(usize, try checkedMul(kd, 2), vd);
+                if (inputProjectionGeometry(config.hidden_size, mixed, vd, vh)) {
+                    const widths = [4]usize{ mixed, vd, vh, vh };
+                    const suffixes = [_][]const u8{ "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a" };
+                    var request: CacheFunding.DerivedWeight = .{ .kind = .input_projection, .sources = @splat(0), .widths = widths, .hidden = config.hidden_size };
+                    var valid = true;
+                    for (suffixes, widths, 0..) |suffix, width, i| {
+                        var name: [256]u8 = undefined;
+                        const logical = std.fmt.bufPrint(&name, "model.layers.{d}.linear_attn.{s}.weight", .{ layer, suffix }) catch {
+                            valid = false;
+                            break;
+                        };
+                        const record = (try self.derivedRecord(config, logical)) orelse {
+                            valid = false;
+                            break;
+                        };
+                        if (record.rows != width or record.columns != config.hidden_size) {
+                            valid = false;
+                            break;
+                        }
+                        request.sources[i] = record.buffer;
+                    }
+                    if (valid) try builder.add(.{ .derived_weight = request });
+                }
+            }
+            if (self.lighton_fused_ffn and gateUpGeometry(config.hidden_size, config.intermediate_size)) {
+                var request: CacheFunding.DerivedWeight = .{ .kind = .gate_up, .sources = @splat(0), .widths = .{ config.intermediate_size, config.intermediate_size, 0, 0 }, .hidden = config.hidden_size };
+                var valid = true;
+                for ([_][]const u8{ "gate_proj", "up_proj" }, 0..) |suffix, i| {
+                    var name: [256]u8 = undefined;
+                    const logical = std.fmt.bufPrint(&name, "model.layers.{d}.mlp.{s}.weight", .{ layer, suffix }) catch {
+                        valid = false;
+                        break;
+                    };
+                    const record = (try self.derivedRecord(config, logical)) orelse {
+                        valid = false;
+                        break;
+                    };
+                    if (record.rows != config.intermediate_size or record.columns != config.hidden_size) {
+                        valid = false;
+                        break;
+                    }
+                    request.sources[i] = record.buffer;
+                }
+                if (valid) try builder.add(.{ .derived_weight = request });
+            }
+        }
+    }
+    fn inputProjectionGeometry(hidden: usize, mixed: usize, z: usize, heads: usize) bool {
+        return (hidden == 1024 and mixed == 6144 and z == 2048 and heads == 16) or (hidden == 2560 and mixed == 8192 and z == 4096 and heads == 32);
+    }
+    fn gateUpGeometry(hidden: usize, intermediate: usize) bool {
+        return (hidden == 1024 and intermediate == 3584) or (hidden == 2560 and intermediate == 9216);
+    }
+    fn validateDerivedWeight(self: *const CudaCompute, value: CacheFunding.DerivedWeight, actual: bool) !void {
+        _ = try value.bytes();
+        if (!self.lighton_norm_catalog_published or !self.lighton_norm_catalog_valid.load(.acquire)) return error.PreparedCachePlanChanged;
+        const eligible = if (value.kind == .input_projection) inputProjectionGeometry(value.hidden, value.widths[0], value.widths[1], value.widths[2]) and value.widths[2] == value.widths[3] else gateUpGeometry(value.hidden, value.widths[0]) and value.widths[0] == value.widths[1];
+        if (!eligible) return error.InvalidPreparedCacheAmount;
+        for (0..value.count()) |i| {
+            var found = false;
+            for (self.lighton_norm_catalog) |record| {
+                if (!record.bf16_matrix or record.buffer != value.sources[i] or record.rows != value.widths[i] or record.columns != value.hidden) continue;
+                if (actual) {
+                    const source = self.resident_weights.getPtr(record.name.slice()) orelse return error.PreparedCachePlanChanged;
+                    if (@intFromPtr(source) != record.header or source.buffer.ptr != record.buffer or source.dtype != .bf16 or source.quant_type != null or source.owned_by_tensor or source.shape.len != 2 or source.shape[0] != @as(i64, @intCast(record.rows)) or source.shape[1] != @as(i64, @intCast(record.columns))) return error.PreparedCachePlanChanged;
+                }
+                found = true;
+                break;
+            }
+            if (!found) return error.PreparedCachePlanChanged;
+        }
+    }
+    fn derivedWeightQuota(self: *const CudaCompute, value: CacheFunding.DerivedWeight) ?*CacheQuota {
+        const mutable = @constCast(self);
+        const item = if (value.kind == .input_projection) mutable.lighton_projection_cache.getPtr(.{ .sources = value.sources, .hidden = value.hidden, .width = value.widths[0] + value.widths[1] + value.widths[2] + value.widths[3] }) else mutable.lighton_gate_up_cache.getPtr(.{ .gate = value.sources[0], .up = value.sources[1], .hidden = value.hidden, .intermediate = value.widths[0] });
+        return if (item) |cached| &cached.quota else null;
+    }
+    fn derivedWeightHitLocked(self: *const CudaCompute, value: CacheFunding.DerivedWeight, desired: ?@import("video_cache_budget.zig").Admission) !bool {
+        if (self.derived_weights_retiring) return error.QueueFull;
+        const item = if (value.kind == .input_projection) self.lighton_projection_cache.get(.{ .sources = value.sources, .hidden = value.hidden, .width = value.widths[0] + value.widths[1] + value.widths[2] + value.widths[3] }) else self.lighton_gate_up_cache.get(.{ .gate = value.sources[0], .up = value.sources[1], .hidden = value.hidden, .intermediate = value.widths[0] });
+        const cached = item orelse return false;
+        if (cached.buffer.ptr == 0) return false;
+        if (cached.buffer.len != try value.bytes()) return error.PreparedCacheAmountChanged;
+        if (desired) |policy| {
+            const lease = cached.quota.peek() orelse return error.MissingCacheRetirementLease;
+            if (lease.controller != policy.controller or lease.amounts.backend_weight_bytes != cached.buffer.len) return error.ForeignAdmissionDomain;
+        }
+        return true;
+    }
+    fn acquireDerivedWeight(self: *CudaCompute, request: CacheFunding.DerivedWeight) !?CacheFunding.Lease {
+        if (self.derived_weights_retiring) return null;
+        if (self.ctx.prepared_cache_funding) |funding| {
+            for (funding.entries) |entry| if (std.meta.eql(entry.request, CacheFunding.Request{ .derived_weight = request }) and entry.state == .failed) return null;
+            return funding.take(.{ .derived_weight = request }, .{ .backend_weight_bytes = try request.bytes() }) catch |err| switch (err) {
+                error.UnpreparedCacheAdmission => null,
+                else => return err,
+            };
+        }
+        // Explicit legacy/unmanaged producer contract. Scoped actual requests
+        // may never fall through to a supplier under their numerical owner.
+        if (self.run_budget != null or self.managed_derived_weight_publication) return null;
+        return CacheFunding.acquireRaw(&self.ctx, .{ .backend_weight_bytes = try request.bytes() }) catch |err| switch (err) {
+            error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => null,
+        };
+    }
+    const DerivedWeightStorage = struct {
+        buffer: buffer_mod.DeviceBuffer,
+        quota: CacheQuota = .none,
+    };
+    fn clearDerivedWeightsWithCleanup(self: *CudaCompute, current: CacheCleanup) !void {
+        // Keep failed physical owners in their map for checked retry. Publish
+        // successful death before a callback can reenter this same cache.
+        self.lockConstantMetadata();
+        self.derived_weights_retiring = true;
+        self.unlockConstantMetadata();
+        var projections = self.lighton_projection_cache.iterator();
+        while (projections.next()) |entry| try self.retireDerivedWeight(entry.value_ptr, current);
+        var pairs = self.lighton_gate_up_cache.iterator();
+        while (pairs.next()) |entry| try self.retireDerivedWeight(entry.value_ptr, current);
+        self.lockConstantMetadata();
+        self.lighton_projection_cache.clearRetainingCapacity();
+        self.lighton_gate_up_cache.clearRetainingCapacity();
+        self.derived_weights_retiring = false;
+        self.unlockConstantMetadata();
+    }
+    fn retireDerivedWeight(self: *CudaCompute, item: *DerivedWeightStorage, current: CacheCleanup) !void {
+        try item.quota.validateCleanup(current);
+        var buffer = item.buffer;
+        if (buffer.ptr != 0) try self.ctx.synchronize();
+        _ = try buffer.freeChecked(&self.ctx);
+        self.lockConstantMetadata();
+        var quota = item.quota;
+        item.* = .{ .buffer = buffer };
+        self.unlockConstantMetadata();
+        try quota.releaseAfterSdkDeath(current);
+    }
+    pub fn temporaryRecurrentTarget(target: @import("../../backends/cold_compute_target.zig").Target) !?usize {
+        const selected = switch (target) {
+            .cuda => |value| value,
+            else => return null,
+        };
+        // Exact full table acceptance precedes the implementation context cast.
+        if (!acceptsPhysicalImplementation(selected.implementation_table)) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(selected.implementation_context));
+        if (self.ctx.ctx != selected.primary_context or self.ctx.device != selected.device) return null;
+        return @intFromPtr(self);
+    }
+    pub fn validateTemporaryRecurrentBackend(cb: *const ops.ComputeBackend, budget: *const @import("../../execution/recurrent_state_admission.zig").Budget) !void {
+        if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedRecurrentStateTarget;
+        if (@intFromPtr(cb.ptr) != budget.expected_compute) return error.ForeignRecurrentStateBudget;
+        _ = try budget.cleanup();
+    }
+    pub fn lightOnNormCompute(target: @import("../../backends/cold_compute_target.zig").Target) !?*CudaCompute {
+        const selected = switch (target) {
+            .cuda => |value| value,
+            else => return null,
+        };
+        if (selected.implementation_table != @as(*const anyopaque, @ptrCast(&vtable)) and selected.implementation_table != @as(*const anyopaque, @ptrCast(&scoped_run_budget_vtable))) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(selected.implementation_context));
+        if (self.ctx.ctx != selected.primary_context or self.ctx.device != selected.device or (self.capability_profile != .lightonocr3 and self.capability_profile != .florence2)) return null;
+        return self;
+    }
+    fn lightOnNormCacheKey(buffer: []u8, header: usize, device: driver_mod.CUdeviceptr, dimension: usize, offset: f32) ![]const u8 {
+        return std.fmt.bufPrint(buffer, "lighton.norm_weight.{x}.{x}.{d}.{x}", .{ header, device, dimension, @as(u32, @bitCast(offset)) });
+    }
+    /// Immutable operation-policy metadata only. No SDK/weight access or
+    /// guessed credit: every retained byte belongs to one actual cache owner.
+    fn auxiliaryCacheRequest(self: *const CudaCompute, kind: CacheFunding.Auxiliary.Kind) ?CacheFunding.Request {
+        if (kind == .pinned_input_host) return if (self.ocr_pinned_input.quota == .raw or (self.ocr_pinned_inputs_enabled and (self.capability_profile == .lightonocr3 or self.capability_profile == .florence2)))
+            .{ .auxiliary = .{ .kind = kind, .device_bytes = 0, .host_bytes = @import("pinned_input_arena.zig").capacity } }
+        else
+            null;
+        if (self.capability_profile != .lightonocr3) return null;
+        return switch (kind) {
+            .pinned_input_host => unreachable,
+            .burst_readback_host => if (!cudaPinnedScalarDownloadsDisabled() or self.lighton_burst_readback.quota == .raw)
+                .{ .auxiliary = .{ .kind = kind, .device_bytes = 0, .host_bytes = @import("burst_readback.zig").capacity } }
+            else
+                null,
+            .rotary_positions_u32 => if (self.lighton_cached_mrope_enabled)
+                .{ .auxiliary = .{ .kind = kind, .device_bytes = lighton_mrope_position_capacity * @sizeOf(u32), .host_bytes = lighton_mrope_position_capacity * @sizeOf(u32) } }
+            else
+                null,
+            .pinned_metadata_host => if (self.ocr_pinned_metadata_enabled or self.ocr_pinned_metadata_arena.quota == .raw)
+                .{ .auxiliary = .{ .kind = kind, .device_bytes = 0, .host_bytes = @import("pinned_input_arena.zig").capacity } }
+            else
+                null,
+            .rounded_bf16_output => if ((self.lighton_bf16_decode_outputs or self.lighton_bf16_projection_outputs) and
+                self.lazy_host_store == null and !self.resident_training_cache and lightOnDevice(self).tensorCores() and self.cublaslt != null)
+                .{ .auxiliary = .{ .kind = kind, .device_bytes = if (self.lighton_bf16_projection_outputs) 128 * 1024 * 1024 else lighton_bf16_decode_scratch_bytes } }
+            else
+                null,
+        };
+    }
+    pub fn appendAuxiliaryCacheWorkload(self: *const CudaCompute, builder: *CacheFunding.Builder) !void {
+        inline for (std.enums.values(CacheFunding.Auxiliary.Kind)) |kind| {
+            // A materialized raw owner needs SAME-lease metadata upgrade even
+            // on a disabled/zero-hint managed request. This never reserves an
+            // empty arena or allocates SDK payload.
+            if (kind != .pinned_input_host or self.ocr_pinned_input.quota == .raw) if (self.auxiliaryCacheRequest(kind)) |request| try builder.add(request);
+        }
+    }
+    /// Exact synchronous upload-byte hint, independent of model/shape guesses.
+    /// Both actual producers upload whole arrays; larger inputs use ordinary
+    /// copies, so reserving this fixed arena for them would fund unused storage.
+    pub fn appendPinnedInputCacheWorkload(self: *const CudaCompute, builder: *CacheFunding.Builder, input_bytes: usize) !void {
+        if (input_bytes <= pinned_upload_arena_capacity or input_bytes > ocr_pinned_input_capacity) return;
+        if (self.auxiliaryCacheRequest(.pinned_input_host)) |request| {
+            for (builder.storage[0..builder.len]) |existing| if (std.meta.eql(existing, request)) return;
+            try builder.add(request);
+        }
+    }
+    fn pinnedArena(self: anytype, kind: CacheFunding.Auxiliary.Kind) @TypeOf(&self.ocr_pinned_metadata_arena) {
+        return if (kind == .pinned_input_host) &self.ocr_pinned_input else &self.ocr_pinned_metadata_arena;
+    }
+    fn auxiliaryCache(self: anytype, kind: CacheFunding.Auxiliary.Kind) @TypeOf(&self.auxiliary_caches[0]) {
+        return &self.auxiliary_caches[@backingInt(kind)];
+    }
+    fn auxiliaryQuota(self: anytype, kind: CacheFunding.Auxiliary.Kind) @TypeOf(&self.auxiliary_caches[0].quota) {
+        if (kind == .burst_readback_host) return &self.lighton_burst_readback.quota;
+        return if (kind == .pinned_metadata_host or kind == .pinned_input_host) &self.pinnedArena(kind).quota else &self.auxiliaryCache(kind).quota;
+    }
+    fn auxiliaryShapeMatches(self: *const CudaCompute, value: CacheFunding.Auxiliary) bool {
+        if (value.kind == .burst_readback_host) {
+            const slot = &self.lighton_burst_readback;
+            return slot.host.ptr != null and slot.host.len == value.host_bytes and slot.event != null and !slot.failed;
+        }
+        if (value.kind == .pinned_metadata_host or value.kind == .pinned_input_host) {
+            const arena = self.pinnedArena(value.kind);
+            return arena.host.ptr != null and arena.host.len == value.host_bytes and arena.event != null and !arena.failed;
+        }
+        const slot = self.auxiliaryCache(value.kind);
+        return slot.device.ptr != 0 and slot.device.len == value.device_bytes and slot.host_u32.capacity >= value.host_bytes / @sizeOf(u32);
+    }
+    // Caller holds the same short metadata exclusion as the norm/retention
+    // snapshot. No cold pointer/credit is borrowed: the actual current slot
+    // must still have the exact capacity and real compatible quota at bind.
+    fn auxiliaryCacheMissLocked(self: *const CudaCompute, request: CacheFunding.Request, desired: ?@import("video_cache_budget.zig").Admission) !bool {
+        const value = request.auxiliary;
+        const expected = self.auxiliaryCacheRequest(value.kind) orelse return error.PreparedCachePlanChanged;
+        if (!std.meta.eql(expected, request)) return error.PreparedCachePlanChanged;
+        if (!sameCacheAdmission(self.constant_policy, desired)) return true;
+        const quota = self.auxiliaryQuota(value.kind);
+        const present = if (value.kind == .burst_readback_host) self.lighton_burst_readback.host.ptr != null or self.lighton_burst_readback.event != null else if (value.kind == .pinned_metadata_host or value.kind == .pinned_input_host) self.pinnedArena(value.kind).host.ptr != null or self.pinnedArena(value.kind).event != null else self.auxiliaryCache(value.kind).device.ptr != 0;
+        if (!present) {
+            if (quota.hasLease()) return error.InvalidCacheRetirementState;
+            return true;
+        }
+        if (!self.auxiliaryShapeMatches(value)) return error.PreparedCacheAmountChanged;
+        if (desired) |policy| {
+            const lease = quota.peek() orelse return error.MissingCacheRetirementLease;
+            if (lease.controller != policy.controller or !std.meta.eql(lease.amounts, value.amounts())) return error.ForeignAdmissionDomain;
+        }
+        return false;
+    }
+    fn acquireAuxiliaryCache(self: *CudaCompute, request: CacheFunding.Request) !?CacheFunding.Lease {
+        if (self.ctx.prepared_cache_funding) |funding| {
+            // An optional SDK allocation may already have declined once in
+            // this phase. Repeated consumers cannot spend its failed token.
+            for (funding.entries) |entry| if (std.meta.eql(entry.request, request) and entry.state == .failed) return null;
+        }
+        return CacheFunding.acquire(&self.ctx, request, request.auxiliary.amounts()) catch |err| switch (err) {
+            error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.UnpreparedCacheAdmission => null,
+            else => return err,
+        };
+    }
+    /// One constructor for independently funded fixed-layout caches. The hot
+    /// path is a constant slot access; only a real miss consumes a cold token.
+    fn acquireAuxiliaryStorage(self: *CudaCompute, kind: CacheFunding.Auxiliary.Kind) !?*AuxiliaryCacheSlot {
+        if (kind == .pinned_metadata_host or kind == .pinned_input_host or kind == .burst_readback_host) return error.UnsupportedPreparedCacheWorkload;
+        const slot = self.auxiliaryCache(kind);
+        if (slot.device.ptr != 0) return slot;
+        const request = self.auxiliaryCacheRequest(kind) orelse return null;
+        var lease = (try self.acquireAuxiliaryCache(request)) orelse return null;
+        defer lease.releaseAfterSdkDeath();
+        var host: std.ArrayListUnmanaged(u32) = .empty;
+        errdefer host.deinit(self.allocator);
+        if (request.auxiliary.host_bytes != 0) try host.ensureTotalCapacityPrecise(self.allocator, request.auxiliary.host_bytes / @sizeOf(u32));
+        const buffer = buffer_mod.DeviceBuffer.alloc(&self.ctx, request.auxiliary.device_bytes) catch |err| switch (err) {
+            error.CudaMemoryLimitExceeded => {
+                host.deinit(self.allocator);
+                return null;
+            },
+            else => return err,
+        };
+        self.lockConstantMetadata();
+        slot.* = .{ .device = buffer, .host_u32 = host, .quota = lease.publishQuota() };
+        self.unlockConstantMetadata();
+        return slot;
+    }
+    fn acquirePinnedMetadataArena(self: *CudaCompute) !?*@import("pinned_input_arena.zig").Arena {
+        return self.acquirePinnedArena(.pinned_metadata_host);
+    }
+    fn acquirePinnedArena(self: *CudaCompute, kind: CacheFunding.Auxiliary.Kind) !?*@import("pinned_input_arena.zig").Arena {
+        const arena = self.pinnedArena(kind);
+        if (arena.host.ptr != null and arena.event != null and !arena.failed) {
+            const policy = self.ctx.video_cache_budget.admission orelse return arena;
+            const owned = arena.quota.peek() orelse return null;
+            if (owned.controller != policy.controller or owned.amounts.host_scratch_bytes != @import("pinned_input_arena.zig").capacity) return error.PreparedCacheAmountChanged;
+            return arena;
+        }
+        const funding = self.ctx.prepared_cache_funding orelse return null; // no late raw supplier
+        const request = self.auxiliaryCacheRequest(kind) orelse return null;
+        var lease = (try self.acquireAuxiliaryCache(request)) orelse return null;
+        defer lease.releaseAfterSdkDeath();
+        const current = CacheCleanup{ .boundary = funding.boundary };
+        self.lockConstantMetadata();
+        defer self.unlockConstantMetadata();
+        if (!try arena.prepareAdmittedForKind(&self.ctx, &lease, current, kind)) return null;
+        return arena;
+    }
+    /// SAME bounded slot, with independently cold-funded host backing. A
+    /// missing optional token declines to the existing synchronous readback.
+    fn acquireBurstReadbackSlot(self: *CudaCompute) !?*@import("burst_readback.zig").Slot {
+        const slot = &self.lighton_burst_readback;
+        if (slot.busy or slot.failed) return null;
+        if (slot.host.ptr != null and slot.event != null) {
+            const policy = self.ctx.video_cache_budget.admission orelse return slot;
+            const owned = slot.quota.peek() orelse return null;
+            if (owned.controller != policy.controller or !std.meta.eql(owned.amounts, @import("../../runtime/tier/memory.zig").AdmissionAmounts{ .host_scratch_bytes = @import("burst_readback.zig").capacity })) return error.PreparedCacheAmountChanged;
+            return slot;
+        }
+        const funding = self.ctx.prepared_cache_funding orelse return null;
+        const request = self.auxiliaryCacheRequest(.burst_readback_host) orelse return null;
+        var lease = (try self.acquireAuxiliaryCache(request)) orelse return null;
+        defer lease.releaseAfterSdkDeath();
+        self.lockConstantMetadata();
+        defer self.unlockConstantMetadata();
+        if (!try slot.prepareAdmitted(&self.ctx, &lease, .{ .boundary = funding.boundary })) return null;
+        return slot;
+    }
+    /// These private backings are excluded from capture by their actual callers.
+    /// Validate every quota before SDK mutation. Preserve a failed handle;
+    /// refund successful deaths only after releasing the short metadata lock.
+    fn detachAuxiliaryCacheData(self: *CudaCompute, current: CacheCleanup) ![CacheFunding.Auxiliary.count]CacheQuota {
+        if (self.lighton_burst_readback.busy) return error.ResourceTemporarilyUnavailable;
+        inline for (std.enums.values(CacheFunding.Auxiliary.Kind)) |kind| try self.auxiliaryQuota(kind).validateCleanup(current);
+        var retired: [CacheFunding.Auxiliary.count]CacheQuota = @splat(.none);
+        errdefer for (&retired) |*quota| quota.releaseAfterSdkDeath(current) catch platform.inference_process_supervisor.restartWorker();
+        for (self.auxiliary_caches) |slot| if (slot.device.ptr != 0) {
+            try self.ctx.synchronize();
+            break;
+        };
+        self.lockConstantMetadata();
+        defer self.unlockConstantMetadata();
+        try self.ocr_pinned_metadata_arena.clearPayloadChecked(&self.ctx);
+        try self.ocr_pinned_input.clearPayloadChecked(&self.ctx);
+        try self.lighton_burst_readback.clearPayloadChecked(&self.ctx);
+        for (&self.auxiliary_caches, &retired, 0..) |*slot, *quota, index| {
+            if (index == @backingInt(CacheFunding.Auxiliary.Kind.burst_readback_host)) {
+                quota.* = self.lighton_burst_readback.quota;
+                self.lighton_burst_readback.quota = .none;
+                continue;
+            }
+            if (index == @backingInt(CacheFunding.Auxiliary.Kind.pinned_metadata_host) or index == @backingInt(CacheFunding.Auxiliary.Kind.pinned_input_host)) {
+                const kind: CacheFunding.Auxiliary.Kind = if (index == @backingInt(CacheFunding.Auxiliary.Kind.pinned_metadata_host)) .pinned_metadata_host else .pinned_input_host;
+                const arena = self.pinnedArena(kind);
+                quota.* = arena.quota;
+                arena.quota = .none;
+                continue;
+            }
+            _ = try slot.device.freeChecked(&self.ctx);
+            slot.host_u32.deinit(self.allocator);
+            slot.host_u32 = .empty;
+            quota.* = slot.quota;
+            slot.quota = .none;
+        }
+        return retired;
+    }
+
+    pub fn lightOnNormCacheRequest(self: *const CudaCompute, candidates: []const []const u8, dimension: usize, offset: f32) !?@import("prepared_cache.zig").Request {
+        if (self.capability_profile != .lightonocr3 or !self.lighton_norm_weight_cache_enabled or !self.lighton_norm_catalog_published or !self.lighton_norm_catalog_valid.load(.acquire) or offset != 1) return null;
+        for (candidates) |name| {
+            if (name.len == 0 or name.len > 256) return null;
+            for (self.lighton_norm_catalog) |record| {
+                if (!std.mem.eql(u8, record.name.slice(), name)) continue;
+                if (!record.eligible or record.dimension != dimension) return null; // same first existing-name semantics
+                var key: [128]u8 = undefined;
+                const result = try @import("prepared_cache.zig").Request.constantSpan(try lightOnNormCacheKey(&key, record.header, record.buffer, dimension, offset), try checkedMul(dimension, 4));
+                if (!self.lighton_norm_catalog_valid.load(.acquire)) return null;
+                return result;
+            }
+        }
+        return null;
+    }
+
+    fn lightOnNormRecord(self: *const CudaCompute, request: @import("prepared_cache.zig").Request) !LightOnNormRecord {
+        if (!self.lighton_norm_catalog_published or !self.lighton_norm_catalog_valid.load(.acquire)) return error.PreparedCachePlanChanged;
+        if (request != .constant) return error.UnsupportedPreparedCacheWorkload;
+        const prefix = "lighton.norm_weight.";
+        const key = request.constant.name.slice();
+        if (!std.mem.startsWith(u8, key, prefix)) return error.UnsupportedPreparedCacheWorkload;
+        var fields = std.mem.splitScalar(u8, key[prefix.len..], '.');
+        const header = std.fmt.parseInt(usize, fields.next() orelse return error.InvalidPreparedCacheName, 16) catch return error.InvalidPreparedCacheName;
+        const device = std.fmt.parseInt(driver_mod.CUdeviceptr, fields.next() orelse return error.InvalidPreparedCacheName, 16) catch return error.InvalidPreparedCacheName;
+        const dimension = std.fmt.parseInt(usize, fields.next() orelse return error.InvalidPreparedCacheName, 10) catch return error.InvalidPreparedCacheName;
+        const offset = std.fmt.parseInt(u32, fields.next() orelse return error.InvalidPreparedCacheName, 16) catch return error.InvalidPreparedCacheName;
+        if (fields.next() != null or offset != @as(u32, @bitCast(@as(f32, 1))) or request.constant.bytes != try checkedMul(dimension, 4)) return error.InvalidPreparedCacheName;
+        for (self.lighton_norm_catalog) |record| if (record.eligible and record.header == header and record.buffer == device and record.dimension == dimension) return record;
+        return error.PreparedCachePlanChanged;
+    }
+    fn lightOnNormMetadataAvailable(self: *const CudaCompute) !void {
+        // The same idle/deferred envelope belongs to both OCR profiles.
+        // Actual adjusted-norm operands remain strictly LightOn-only below.
+        if (self.capability_profile != .lightonocr3 and self.capability_profile != .florence2) return error.UnsupportedPreparedCacheWorkload;
+    }
+    // Caller holds constant_metadata_mutex; no SDK/query/allocation/callback.
+    fn lightOnNormMissLocked(self: *const CudaCompute, request: @import("prepared_cache.zig").Request, desired: ?@import("video_cache_budget.zig").Admission) !bool {
+        if (request == .ocr_retention) {
+            const actual = desired orelse return error.UnsupportedPreparedCacheWorkload;
+            if (!std.meta.eql(request, try self.lightOnRetentionRequest(actual, request.ocr_retention.pressure_step))) return error.PreparedCachePlanChanged;
+            if (!sameCacheAdmission(self.constant_policy, desired) or !self.ocr_retention_configured or !self.ocr_retained_cache_quota.hasLease()) return request.ocr_retention.cache_bytes != 0 or request.ocr_retention.deferred_bytes != 0;
+            if (self.ocr_retained_cache_quota.peek()) |lease| if (lease.controller != actual.controller) return error.ForeignAdmissionDomain;
+            // Existing same-policy geometry owns its independently charged
+            // ceiling. A new caller need not replace a smaller pressure result.
+            return false;
+        }
+        if (request == .auxiliary) return self.auxiliaryCacheMissLocked(request, desired);
+        if (request == .derived_weight) {
+            try self.validateDerivedWeight(request.derived_weight, false);
+            return !try self.derivedWeightHitLocked(request.derived_weight, desired);
+        }
+        _ = try self.lightOnNormRecord(request);
+        if (!sameCacheAdmission(self.constant_policy, desired)) return true; // upcoming actual request clears old policy
+        const root = self.embedding_gemma2_constants.get(request.constant.name.slice()) orelse return true;
+        if (!root.model_constant or root.dtype != .f32 or root.buffer.len != request.constant.bytes) return error.PreparedCacheAmountChanged;
+        if (desired) |policy| {
+            const lease = root.model_constant_quota.peek() orelse return error.MissingCacheRetirementLease;
+            if (lease.controller != policy.controller) return error.ForeignAdmissionDomain;
+        }
+        return false;
+    }
+    pub fn lightOnNormNeedsFunding(self: *const CudaCompute, work: @import("prepared_cache.zig").Workload, desired: ?@import("video_cache_budget.zig").Admission) !bool {
+        try self.lightOnNormMetadataAvailable();
+        self.lockConstantMetadata();
+        defer self.unlockConstantMetadata();
+        if (self.cacheRetirementPending()) return error.QueueFull;
+        for (work.requests) |request| {
+            if (try self.lightOnNormMissLocked(request, desired)) return true;
+            if (request == .auxiliary and self.auxiliaryQuota(request.auxiliary.kind).* == .raw) return true;
+            if (request == .derived_weight) if (self.derivedWeightQuota(request.derived_weight)) |quota| {
+                if (quota.* == .raw) return true;
+            };
+        }
+        return false;
+    }
+    pub fn snapshotLightOnNormFunding(self: *const CudaCompute, funding: *@import("prepared_cache.zig").Funding, desired: ?@import("video_cache_budget.zig").Admission) !void {
+        try self.lightOnNormMetadataAvailable();
+        if (funding.state != .created) return error.InvalidPreparedCacheState;
+        self.lockConstantMetadata();
+        defer self.unlockConstantMetadata();
+        if (self.cacheRetirementPending()) return error.QueueFull;
+        const policy = @import("../../models/embedding_gemma2_weight_cache.zig");
+        var remaining = if (sameCacheAdmission(self.constant_policy, desired)) policy.prepared_max_bytes - self.embedding_gemma2_constant_bytes.load(.acquire) else policy.prepared_max_bytes;
+        var slots = if (sameCacheAdmission(self.constant_policy, desired)) policy.prepared_max_entries - self.embedding_gemma2_constant_count.load(.acquire) else policy.prepared_max_entries;
+        var projection_slots = 32 - self.lighton_projection_cache.count();
+        var pair_slots = 32 - self.lighton_gate_up_cache.count();
+        for (funding.entries, 0..) |entry, index| {
+            const miss = try self.lightOnNormMissLocked(entry.request, desired);
+            if (entry.request == .ocr_retention) {
+                const geometry = entry.request.ocr_retention;
+                const bytes = try std.math.add(usize, geometry.cache_bytes, geometry.deferred_bytes);
+                if (miss) try funding.noteMiss(index, .{ .backend_scratch_bytes = bytes }, 0);
+                continue;
+            }
+            if (entry.request == .auxiliary) {
+                if (miss) try funding.noteMiss(index, entry.request.auxiliary.amounts(), 0);
+                const quota = self.auxiliaryQuota(entry.request.auxiliary.kind).*;
+                if (quota == .raw) {
+                    const actual_policy = desired orelse return error.MissingCacheRetirementDomain;
+                    if (quota.raw.controller != actual_policy.controller) return error.ForeignAdmissionDomain;
+                    funding.entries[index].upgrade_raw = true;
+                }
+                continue;
+            }
+            if (entry.request == .derived_weight) {
+                const slots_left = if (entry.request.derived_weight.kind == .input_projection) &projection_slots else &pair_slots;
+                if (miss and slots_left.* != 0) {
+                    try funding.noteMiss(index, .{ .backend_weight_bytes = try entry.request.derived_weight.bytes() }, 0);
+                    slots_left.* -= 1;
+                } else if (miss) funding.entries[index].optional_declined = true;
+                if (self.derivedWeightQuota(entry.request.derived_weight)) |quota| if (quota.* == .raw) {
+                    const actual_policy = desired orelse return error.MissingCacheRetirementDomain;
+                    if (quota.raw.controller != actual_policy.controller) return error.ForeignAdmissionDomain;
+                    funding.entries[index].upgrade_raw = true;
+                };
+                continue;
+            }
+            const bytes = entry.request.constant.bytes;
+            if (miss and bytes <= remaining and slots != 0) {
+                try funding.noteMiss(index, .{ .backend_scratch_bytes = bytes }, 0);
+                remaining -= bytes;
+                slots -= 1;
+            } else if (miss) funding.entries[index].optional_declined = true;
+        }
+        funding.compute_identity = @intFromPtr(self);
+        funding.admission = desired;
+        funding.state = .snapped;
+    }
+    /// Actual native_generate_lock/reader lane owner, before ctx publication;
+    /// no inference that Session.execution_gate is the caller's real gate.
+    pub fn validateLightOnNormFundingForEpoch(cb: *const ops.ComputeBackend, expected: *CudaCompute, work: @import("prepared_cache.zig").Workload, funding: *const @import("prepared_cache.zig").Funding, desired: ?@import("video_cache_budget.zig").Admission) !void {
+        if ((cb.vtable != &vtable and cb.vtable != &scoped_run_budget_vtable) or cb.ptr != @as(*anyopaque, @ptrCast(expected))) return error.UnsupportedPreparedCacheWorkload;
+        try expected.lightOnNormMetadataAvailable();
+        for (work.requests) |request| {
+            if (request == .ocr_retention) {
+                if (expected.resident_training_cache) return error.PreparedCachePlanChanged;
+                continue;
+            }
+            if (request == .auxiliary) {
+                if (expected.auxiliaryCacheRequest(request.auxiliary.kind) == null) return error.PreparedCachePlanChanged;
+                continue;
+            }
+            if (request == .derived_weight) {
+                try expected.validateDerivedWeight(request.derived_weight, true);
+                continue;
+            }
+            const record = try expected.lightOnNormRecord(request);
+            const source = expected.resident_weights.getPtr(record.name.slice()) orelse return error.PreparedCachePlanChanged;
+            if (@intFromPtr(source) != record.header or source.buffer.ptr != record.buffer or source.dtype != .f32 or source.quant_type != null or source.owned_by_tensor or source.shape.len != 1 or source.elem_count != record.dimension) return error.PreparedCachePlanChanged;
+        }
+        expected.lockConstantMetadata();
+        defer expected.unlockConstantMetadata();
+        if (expected.cacheRetirementPending()) return error.QueueFull;
+        const empty = !funding.heap_owned;
+        if (!empty and (funding.compute_identity != @intFromPtr(expected) or !sameCacheAdmission(funding.admission, desired) or funding.entries.len != work.requests.len)) return error.PreparedCachePlanChanged;
+        for (work.requests, 0..) |request, index| {
+            const miss = try expected.lightOnNormMissLocked(request, desired);
+            if (funding.deny_cold_misses or (request == .constant and funding.deny_constants)) continue;
+            if (empty) {
+                if (miss) return error.PreparedCachePlanChanged;
+            } else {
+                const entry = funding.entries[index];
+                if (!std.meta.eql(request, entry.request)) return error.PreparedCachePlanChanged;
+                if (entry.optional_declined and (request == .constant or request == .auxiliary or request == .derived_weight)) continue;
+                if (entry.state == .published) {
+                    if ((funding.state == .bound or funding.state == .unbound) and !miss) continue;
+                    return error.PreparedCachePlanChanged; // spent token cannot fund a new miss
+                }
+                if (miss != entry.miss) return error.PreparedCachePlanChanged;
+            }
+        }
+    }
+    /// Actual reader owner calls this after page admission and before its
+    /// ordinary budgeted compute acquisition. The exact same funding remains
+    /// bound through numerical execution; no construction token is retained.
+    /// This step is metadata-only; the ordinary getter retains numerical setup.
+    pub fn beginLightOnNormFunding(expected: *CudaCompute, work: @import("prepared_cache.zig").Workload, funding: *@import("prepared_cache.zig").Funding, epoch: *const @import("../../execution/retirement_sink.zig").Epoch, desired: ?@import("video_cache_budget.zig").Admission) !void {
+        const cb = expected.computeBackend();
+        if (expected.ctx.prepared_cache_funding != null) return error.InvalidPreparedCacheState;
+        try validateLightOnNormFundingForEpoch(&cb, expected, work, funding, desired);
+        try funding.bind(epoch);
+        errdefer funding.unbind();
+        expected.lockConstantMetadata();
+        defer expected.unlockConstantMetadata();
+        for (funding.entries) |*entry| if (entry.upgrade_raw) {
+            const quota = if (entry.request == .derived_weight) expected.derivedWeightQuota(entry.request.derived_weight) orelse return error.PreparedCachePlanChanged else expected.auxiliaryQuota(entry.request.auxiliary.kind);
+            if (quota.* == .raw) {
+                const derived = entry.request == .derived_weight;
+                const amounts = if (derived) @import("../../runtime/tier/memory.zig").AdmissionAmounts{ .backend_weight_bytes = try entry.request.derived_weight.bytes() } else entry.request.auxiliary.amounts();
+                const pin = funding.domain_pin orelse return error.MissingCacheRetirementDomain;
+                if (entry.upgrade.owner == null or (!derived and !expected.auxiliaryShapeMatches(entry.request.auxiliary)) or !std.meta.eql(quota.raw.amounts, amounts)) return error.PreparedCachePlanChanged;
+                if (quota.raw.controller != pin.controller()) return error.ForeignAdmissionDomain;
+                var original: ?@import("../../runtime/tier/memory.zig").AdmissionLease = quota.raw;
+                var held_pin: ?@import("../../runtime/tier/admission_domain.zig").Pin = pin.retain();
+                errdefer if (held_pin) |owned| owned.release(); // funding still pins the Domain
+                quota.* = try CacheQuota.arm(&entry.upgrade, &original, &held_pin);
+            }
+            entry.upgrade_raw = false; // SAME current quota; no reservation/SDK
+        };
+        expected.managed_derived_weight_publication = true;
+        expected.ctx.prepared_cache_funding = funding;
+        // Metadata-only binding. The original budgeted getter performs its
+        // original beginRequestWithCleanup at its actual numerical ownership
+        // boundary; that call consumes the retention token before publishing
+        // policy. No stream/SDK action is moved earlier by preparation.
+    }
+    pub fn bindLightOnNormFunding(cb: *const ops.ComputeBackend, expected: *CudaCompute, work: @import("prepared_cache.zig").Workload, funding: *@import("prepared_cache.zig").Funding, epoch: *const @import("../../execution/retirement_sink.zig").Epoch) !void {
+        if (expected.ctx.prepared_cache_funding) |bound| {
+            if (bound != funding or funding.state != .bound or funding.boundary != epoch) return error.InvalidPreparedCacheState;
+            return validateLightOnNormFundingForEpoch(cb, expected, work, funding, expected.ctx.video_cache_budget.admission);
+        }
+        const desired: ?@import("video_cache_budget.zig").Admission = if (funding.heap_owned) funding.admission else expected.ctx.video_cache_budget.admission;
+        try validateLightOnNormFundingForEpoch(cb, expected, work, funding, desired);
+        if (!sameCacheAdmission(expected.ctx.video_cache_budget.admission, desired)) return error.PreparedCachePlanChanged;
+        try funding.bind(epoch);
+        expected.ctx.prepared_cache_funding = funding;
+    }
+
     /// Cache only immutable, resident checkpoint norm weights. The ordinary
     /// addScalar operation remains valid for mutable request tensors.
+    /// Actual source owner checks this BEFORE adjusted math and before cache
+    /// copy/admission/publication. An unfunded legacy miss keeps the ordinary
+    /// result path once; no global cache flag or valid existing root changes.
+    fn managedNormMissFunded(self: *const CudaCompute, key: []const u8, bytes: usize) bool {
+        if (!self.managed_norm_publication) return true; // historical raw compatibility before ownership
+        const funding = self.ctx.prepared_cache_funding orelse return false;
+        if (funding.state != .bound or funding.boundary == null or funding.deny_cold_misses or funding.deny_constants) return false;
+        for (funding.entries) |entry| {
+            if (entry.request != .constant or !std.mem.eql(u8, entry.request.constant.name.slice(), key)) continue;
+            return entry.request.constant.bytes == bytes and entry.miss and !entry.optional_declined and entry.state == .ready and entry.lease != null and entry.failure.owner != null and funding.domain_pin != null;
+        }
+        return false;
+    }
+
     pub fn lightOnAdjustedNormWeight(cb: *const ops.ComputeBackend, weight: CT, dim: usize, offset: f32) !?CT {
         if (comptime !cuda_enabled) return null;
         if (cb.kind() != .cuda) return null;
@@ -2302,7 +3204,8 @@ pub const CudaCompute = struct {
         // Resident weight metadata belongs to the model (owned_by_tensor=false),
         // independently of whether that entry owns its device allocation.
         // Include handle identity so an external alias cannot hit this cache.
-        const key = try std.fmt.bufPrint(&key_buf, "lighton.norm_weight.{x}.{x}.{d}.{x}", .{ @intFromPtr(source), source.buffer.ptr, dim, @as(u32, @bitCast(offset)) });
+        if (self.lighton_norm_catalog_published and !self.lighton_norm_catalog_valid.load(.acquire)) return null;
+        const key = try lightOnNormCacheKey(&key_buf, @intFromPtr(source), source.buffer.ptr, dim, offset);
         if (try modelConstantOp(self, key, null)) |cached| {
             self.lighton_norm_weight_cache_hits += 1;
             return cached;
@@ -2317,6 +3220,7 @@ pub const CudaCompute = struct {
             break;
         };
         if (!found) return null;
+        if (!self.managedNormMissFunded(key, try checkedMul(dim, 4))) return null;
         const adjusted = (try addScalar(self, weight, offset)) orelse return null;
         errdefer cb.free(adjusted);
         if (try modelConstantOp(self, key, adjusted)) |snapshot| {
@@ -2567,7 +3471,12 @@ pub const CudaCompute = struct {
             const self = burst.owner;
             if (self.capability_profile != .lightonocr3 or cudaPinnedScalarDownloadsDisabled() or
                 self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return null;
-            const pending = try self.lighton_burst_readback.begin(&self.ctx, tensorFromCt(burst.bank).buffer, try checkedMul(count, @sizeOf(u32)));
+            const source = tensorFromCt(burst.bank).buffer;
+            const bytes = try checkedMul(count, @sizeOf(u32));
+            const pending = if (self.ctx.video_cache_budget.admission != null)
+                if (try self.acquireBurstReadbackSlot()) |slot| try slot.beginPrepared(&self.ctx, source, bytes) else null
+            else
+                try self.lighton_burst_readback.begin(&self.ctx, source, bytes);
             if (pending != null) {
                 if (burst.steps == 1) self.lighton_packed_async_downloads += 1 else self.lighton_async_burst_downloads += 1;
                 self.stats.d2h_bytes += count * @sizeOf(u32);
@@ -2629,18 +3538,41 @@ pub const CudaCompute = struct {
         if (self.cublaslt) |*blas| _ = try blas.reserveTensorCorePlanSlots(&self.ctx, 64);
     }
 
+    pub fn endLightOnDecodeGraphEpochWithCleanup(cb: *const ops.ComputeBackend, epoch: u64, current: CacheCleanup) !void {
+        if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedReaderEpochBackend;
+        if (epoch == 0) return;
+        if (current.outside_execution) {
+            if (current.boundary != null or current.operation != null) return error.ConflictingCleanupAuthority;
+            var pending: @import("../../execution/resource_retirement.zig").SynchronousOutsideRawLeases = .{};
+            var local = try @import("../../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
+            defer {
+                const registered = pending.boundary_context != null;
+                local.finishAfterUnlock();
+                if (registered) std.debug.assert(pending.finished);
+            }
+            const scoped = try local.synchronousOutsideContext(&pending);
+            return endLightOnDecodeGraphEpochWithCleanup(cb, epoch, scoped);
+        }
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        const owner = &self.lighton_decode_graph;
+        if (!owner.mutex.tryLock()) return error.ReaderEpochBackendBusy;
+        defer owner.mutex.unlock();
+        if (owner.epoch_id != epoch) return;
+        try self.clearCapturedGraphWithCleanup(current);
+        owner.epoch_id = 0;
+    }
     pub fn endLightOnDecodeGraphEpoch(cb: *const ops.ComputeBackend, epoch: u64) void {
-        if (cb.kind() != .cuda or epoch == 0) return;
+        if (!acceptsPhysicalImplementation(cb.vtable) or epoch == 0) return;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         const owner = &self.lighton_decode_graph;
         while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
         defer owner.mutex.unlock();
         if (owner.epoch_id != epoch) return;
-        owner.clear(&self.ctx) catch {};
+        owner.clear(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
         owner.epoch_id = 0;
     }
     pub fn invalidateLightOnDecodeGraph(cb: *const ops.ComputeBackend) void {
-        if (cb.kind() != .cuda) return;
+        if (!acceptsPhysicalImplementation(cb.vtable)) return;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (self.lighton_decode_graph_enabled) self.lighton_decode_graph.invalidate(&self.ctx);
     }
@@ -2655,6 +3587,14 @@ pub const CudaCompute = struct {
             return null;
         }
         return tensor.buffer.ptr;
+    }
+    pub fn peekLightOnGraphWorkspacePointer(cb: *const ops.ComputeBackend) ?driver_mod.CUdeviceptr {
+        if (!acceptsPhysicalImplementation(cb.vtable)) return null;
+        const self: *const CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        const bytes = self.runtime_policy.workspace_bytes;
+        if (bytes == 0) return 0;
+        if (self.cublaslt_workspace_scratch.buffer.ptr == 0 or self.cublaslt_workspace_scratch.buffer.len < bytes) return null;
+        return self.cublaslt_workspace_scratch.buffer.ptr;
     }
     pub fn lightOnGraphWorkspacePointer(cb: *const ops.ComputeBackend) driver_mod.CUdeviceptr {
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
@@ -2749,7 +3689,7 @@ pub const CudaCompute = struct {
             const owner = &self.compute.lighton_decode_graph;
             try self.compute.lighton_attention.advanceGraph(&self.compute.ctx, owner.positions().ptr, owner.counter().ptr, @intCast(owner.rows * 3));
         }
-        pub fn run(self: *@This(), context: *anyopaque, callback: *const fn (*anyopaque, *@This()) anyerror!void) !void {
+        pub fn run(self: *@This(), context: *anyopaque, callback: *const fn (*anyopaque, *@This()) anyerror!void, cleanup_owner: ?*const @import("../../execution/cleanup_owner.zig").Owner, cleanup_epoch: ?*const @import("../../execution/retirement_sink.zig").Epoch) !void {
             const compute = self.compute;
             const owner = &compute.lighton_decode_graph;
             if (owner.phase == .replay) {
@@ -2771,10 +3711,10 @@ pub const CudaCompute = struct {
                 compute.execution_scope = null;
                 owner.active = false;
                 if (capture_active) {
-                    if (compute.ctx.endStreamCapture()) |g| compute.ctx.destroyGraph(g) else |_| {}
+                    owner.pending_graph = compute.ctx.endStreamCapture() catch platform.inference_process_supervisor.restartWorker();
                 }
                 owner.disabled_epoch = owner.epoch_id;
-                owner.clear(&compute.ctx) catch {};
+                compute.clearCapturedGraphWithCleanup(.{ .boundary = if (cleanup_owner) |source| source.epoch() else cleanup_epoch }) catch platform.inference_process_supervisor.restartWorker();
             }
             if (capture) {
                 try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
@@ -2804,11 +3744,11 @@ pub const CudaCompute = struct {
                 } else owner.phase = .capture;
             } else if (capture) {
                 const matches = scope.valid and scope.cursor == owner.plan.?.event_count and compute.stats.h2d_bytes == h2d and compute.stats.d2h_bytes == d2h and compute.lighton_attention.calls - attention_calls == owner.expected_attention_calls;
-                const graph = try compute.ctx.endStreamCapture();
+                owner.pending_graph = try compute.ctx.endStreamCapture();
                 capture_active = false;
-                defer compute.ctx.destroyGraph(graph);
                 if (!matches) return error.InvalidExecutionPlan;
-                owner.graph = try compute.ctx.instantiateGraph(graph);
+                owner.graph = try compute.ctx.instantiateGraph(owner.pending_graph);
+                try compute.ctx.destroyGraphChecked(&owner.pending_graph);
                 try compute.ctx.launchGraph(owner.graph);
                 owner.captures += 1;
                 owner.phase = .replay;
@@ -2839,12 +3779,114 @@ pub const CudaCompute = struct {
             while (it.next()) |entry| entry.value_ptr.token_count = @max(entry.value_ptr.token_count, max_tokens);
         }
     };
-    pub fn beginLightOnDecodeGraph(cb: *const ops.ComputeBackend, epoch: u64, key: []const u64, positions: []const u32, rows: usize, hidden: usize, vocab: usize, future_tokens: usize, attention_layers: usize, recurrent_layers: usize) !?LightOnGraphClaim {
+    pub const GraphPhaseDecision = enum { ready, outside, unsupported };
+    pub fn beginRequestWithCleanup(cb: *const ops.ComputeBackend, current: CacheCleanup) !void {
+        if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedReaderEpochBackend;
+        try beginRequestUsing(cb.ptr, current);
+    }
+    pub fn invalidateLightOnDecodeGraphWithCleanup(cb: *const ops.ComputeBackend, current: CacheCleanup) !void {
+        if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedReaderEpochBackend;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (!self.lighton_decode_graph_enabled and self.lighton_decode_graph.metadata.ptr == 0 and self.lighton_decode_graph.arena.ptr == 0 and self.lighton_decode_graph.head.ptr == 0 and self.lighton_decode_graph.graph == null and self.lighton_decode_graph.pending_graph == null) return;
+        if (current.outside_execution) {
+            if (current.boundary != null or current.operation != null) return error.ConflictingCleanupAuthority;
+            var pending: @import("../../execution/resource_retirement.zig").SynchronousOutsideRawLeases = .{};
+            var local = try @import("../../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
+            defer {
+                const registered = pending.boundary_context != null;
+                local.finishAfterUnlock();
+                if (registered) std.debug.assert(pending.finished);
+            }
+            const scoped = try local.synchronousOutsideContext(&pending);
+            return invalidateLightOnDecodeGraphWithCleanup(cb, scoped);
+        }
+        if (!self.lighton_decode_graph.mutex.tryLock()) return error.ReaderEpochBackendBusy;
+        defer self.lighton_decode_graph.mutex.unlock();
+        try self.clearCapturedGraphWithCleanup(current);
+    }
+    pub fn inspectCapturedGraphPhase(cb: *const ops.ComputeBackend, phase: *@import("lighton_decode_graph.zig").GraphPhase, current: CacheCleanup) !GraphPhaseDecision {
+        if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedReaderEpochBackend;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        const descriptor = phase.descriptor;
+        _ = try descriptor.layout();
+        if (phase.cold != null or phase.bound) return error.InvalidPreparedCacheState;
+        if (current.outside_execution or current.boundary == null or try current.boundary.?.isSealed()) return error.MissingCurrentCleanupEpoch;
+        if (!lightOnDecodeGraphEnabled(cb) or descriptor.rows > (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64) or
+            descriptor.future_tokens == 0 or descriptor.future_tokens > @import("paged_attention_bf16.zig").max_native_context_tokens or
+            (descriptor.hidden != 1024 and descriptor.hidden != 2560) or (descriptor.rows > 64 and (descriptor.rows % 64 == 1 or !self.lighton_ragged_recurrent_enabled))) return .unsupported;
+        if (self.execution_scope != null) return .unsupported;
+        const owner = &self.lighton_decode_graph;
+        if (!owner.mutex.tryLock()) return error.ReaderEpochBackendBusy;
+        defer owner.mutex.unlock();
+        if (owner.disabled_epoch == descriptor.epoch) return .unsupported;
+        phase.expected_compute = @intFromPtr(self);
+        phase.admission = self.ctx.video_cache_budget.admission;
+        phase.old = owner.snapshot();
+        if (phase.old.hasRaw()) {
+            if (try self.ctx.streamCaptureActive()) return .unsupported;
+            phase.mode = .upgrade;
+            return .outside;
+        }
+        if (owner.epoch_id != descriptor.epoch or !owner.matches(descriptor.key, descriptor.positions)) {
+            if (try self.ctx.streamCaptureActive()) return .unsupported;
+            // Exact invalid graph dies under the ACTUAL B before outside
+            // reservation, so its quota returns when this caller parks.
+            try owner.clearWithCleanup(&self.ctx, current);
+            if (self.captured_cache_roots) |roots| roots.releaseRoots(self, current);
+            phase.old = owner.snapshot();
+            phase.mode = .storage;
+            return .outside;
+        }
+        if (owner.phase == .disabled) return .unsupported;
+        if (owner.phase == .capture and owner.arena.ptr == 0) {
+            if (try self.ctx.streamCaptureActive()) return .unsupported;
+            if (owner.plan == null or !owner.plan.?.valid or owner.plan.?.peak == 0 or owner.plan.?.peak > @import("execution_arena.zig").limit) return error.InvalidExecutionPlan;
+            phase.mode = .arena;
+            return .outside;
+        }
+        phase.mode = .none;
+        return .ready;
+    }
+    /// Reader restored its SAME graph/workspace under actual owner lanes.
+    /// Revalidate the full concrete snapshot and policy, never a weak hash.
+    pub fn bindCapturedGraphPhase(cb: *const ops.ComputeBackend, phase: *@import("lighton_decode_graph.zig").GraphPhase, current: CacheCleanup) !bool {
+        if (!acceptsPhysicalImplementation(cb.vtable) or @intFromPtr(cb.ptr) != phase.expected_compute) return error.UnsupportedReaderEpochBackend;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (current.outside_execution or current.boundary == null or try current.boundary.?.isSealed()) return error.MissingCurrentCleanupEpoch;
+        if (self.execution_scope != null or try self.ctx.streamCaptureActive()) return error.ReaderEpochBackendBusy;
+        if (!sameCacheAdmission(self.ctx.video_cache_budget.admission, phase.admission)) return error.PreparedCachePlanChanged;
+        const owner = &self.lighton_decode_graph;
+        if (!owner.mutex.tryLock()) return error.ReaderEpochBackendBusy;
+        defer owner.mutex.unlock();
+        if (!std.meta.eql(owner.snapshot(), phase.old)) return error.PreparedCachePlanChanged;
+        if (phase.mode == .upgrade) {
+            const cold = phase.cold orelse return error.InvalidPreparedCacheState;
+            const quotas = [_]*CacheQuota{ &owner.metadata_quota, &owner.arena_quota, &owner.head_quota };
+            for (quotas, 0..) |quota, index| if (cold.upgrades[index]) |*upgrade| {
+                _ = try upgrade.install(quota);
+            };
+            return false; // close pure upgrade node under NOW B, inspect again
+        }
+        if (phase.mode == .arena and (owner.epoch_id != phase.descriptor.epoch or !owner.matches(phase.descriptor.key, phase.descriptor.positions))) return error.PreparedCachePlanChanged;
+        try phase.bind(current);
+        return true;
+    }
+    pub fn clearCapturedGraphWithCleanup(self: *CudaCompute, current: CacheCleanup) !void {
+        try self.lighton_decode_graph.clearWithCleanup(&self.ctx, current);
+        if (self.captured_cache_roots) |roots| roots.releaseRoots(self, current);
+    }
+
+    pub fn beginLightOnDecodeGraph(cb: *const ops.ComputeBackend, current: @import("../../execution/cleanup_context.zig").Context, graph_phase: ?*@import("lighton_decode_graph.zig").GraphPhase, epoch: u64, key: []const u64, positions: []const u32, rows: usize, hidden: usize, vocab: usize, future_tokens: usize, attention_layers: usize, recurrent_layers: usize) !?LightOnGraphClaim {
+        if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedReaderEpochBackend;
         if (!lightOnDecodeGraphEnabled(cb) or epoch == 0 or rows < 2 or rows > (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64) or vocab == 0 or future_tokens == 0 or future_tokens > @import("paged_attention_bf16.zig").max_native_context_tokens or positions.len != rows * 3 or (hidden != 1024 and hidden != 2560)) return null;
         if (rows > 64 and rows % 64 == 1) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (rows > 64 and !self.lighton_ragged_recurrent_enabled) return null;
         if (self.execution_scope != null or try self.ctx.streamCaptureActive()) return null;
+        if (graph_phase) |prepared_phase| {
+            const descriptor = prepared_phase.descriptor;
+            if (prepared_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or descriptor.attention_layers != attention_layers or descriptor.recurrent_layers != recurrent_layers or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions)) return error.PreparedCachePlanChanged;
+        }
         const owner = &self.lighton_decode_graph;
         while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
         var claimed = false;
@@ -2860,7 +3902,11 @@ pub const CudaCompute = struct {
                 });
                 owner.resets_logged += 1;
             }
-            owner.reset(&self.ctx, key, positions, rows, hidden, vocab) catch |err| switch (err) {
+            const reset_result = if (graph_phase) |prepared_phase| owner.resetPrepared(&self.ctx, prepared_phase) else raw: {
+                if (!current.outside_execution) return error.UnpreparedCapturedGraphAdmission;
+                break :raw owner.reset(&self.ctx, key, positions, rows, hidden, vocab);
+            };
+            reset_result catch |err| switch (err) {
                 error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.CudaMemoryLimitExceeded => {
                     owner.admission_denials += 1;
                     return null;
@@ -2870,14 +3916,22 @@ pub const CudaCompute = struct {
             owner.epoch_id = epoch;
         }
         if (owner.phase == .disabled) return null;
-        if (owner.phase == .capture) owner.reserveArena(&self.ctx) catch |err| switch (err) {
-            error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.CudaMemoryLimitExceeded => {
-                owner.admission_denials += 1;
-                owner.phase = .disabled;
-                return null;
-            },
-            else => return err,
-        };
+        if (self.captured_cache_roots) |roots| try roots.beginGeneration(self, current);
+        if (owner.phase == .capture) arena: {
+            const result = if (graph_phase) |prepared_phase| owner.reserveArenaPrepared(&self.ctx, prepared_phase) else raw: {
+                if (!current.outside_execution) return error.UnpreparedCapturedGraphAdmission;
+                break :raw owner.reserveArena(&self.ctx);
+            };
+            result catch |err| switch (err) {
+                error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.CudaMemoryLimitExceeded => {
+                    owner.admission_denials += 1;
+                    owner.phase = .disabled;
+                    return null;
+                },
+                else => return err,
+            };
+            break :arena;
+        }
         try self.lighton_attention.init(&self.ctx);
         if (owner.phase != .replay) {
             owner.progress = 0;
@@ -3102,7 +4156,7 @@ pub const CudaCompute = struct {
         if (!lightOnDevice(self).portableKernels() or
             !cudaCublasLtEnabled() or self.cublaslt == null or self.lighton_bf16_decode_outputs or
             rows == 0 or rows > 8192 or
-            !((hidden == 1024 and intermediate == 3584) or (hidden == 2560 and intermediate == 9216))) return null;
+            !CudaCompute.gateUpGeometry(hidden, intermediate)) return null;
         if (!std.math.isFinite(request.eps) or request.eps <= 0 or !std.math.isFinite(request.weight_offset)) return error.InvalidShape;
         const input = tensorFromCt(request.input);
         const norm = tensorFromCt(request.norm);
@@ -3363,9 +4417,9 @@ pub const CudaCompute = struct {
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (self.lazy_host_store != null or ((self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) and !lightOnOwnedDecodeCapture(self)) or
             !lightOnDevice(self).portableKernels() or
-            rows == 0 or rows > 8192 or !((hidden == 1024 and mixed_dim == 6144 and z_dim == 2048 and heads == 16) or
-            (hidden == 2560 and mixed_dim == 8192 and z_dim == 4096 and heads == 32)) or
+            rows == 0 or rows > 8192 or !inputProjectionGeometry(hidden, mixed_dim, z_dim, heads) or
             !cudaCublasLtEnabled() or self.cublaslt == null) return null;
+        if (self.derived_weights_retiring) return null;
         const input = tensorFromCt(input_ct);
         try ensureF32(input);
         try ensureCount(input, try checkedMul(rows, hidden));
@@ -3380,22 +4434,17 @@ pub const CudaCompute = struct {
         }
         const total_width = mixed_dim + z_dim + 2 * heads;
         const key = LightOnProjectionKey{ .sources = sources, .hidden = hidden, .width = total_width };
-        const combined = self.lighton_projection_cache.get(key) orelse create: {
+        const combined_owner = self.lighton_projection_cache.get(key) orelse create: {
             if (self.lighton_projection_cache.count() >= 32) return null;
+            const request: CacheFunding.DerivedWeight = .{ .kind = .input_projection, .sources = sources, .widths = widths, .hidden = hidden };
+            var lease = (try self.acquireDerivedWeight(request)) orelse return null;
+            defer lease.releaseAfterSdkDeath();
             try self.lighton_projection_cache.ensureUnusedCapacity(self.allocator, 1);
-            try self.lighton_projection_leases.ensureUnusedCapacity(self.allocator, 1);
-            const bytes = try checkedMul(try checkedMul(total_width, hidden), 2);
-            var lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null;
-            if (self.ctx.video_cache_budget.admission) |policy|
-                lease = policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_weight_bytes = bytes }, policy.check_live_memory) catch return null;
-            var storage = buffer_mod.DeviceBuffer.alloc(&self.ctx, bytes) catch {
-                if (lease) |*active| active.release();
-                return null;
-            };
-            if (lease) |active| self.lighton_projection_leases.appendAssumeCapacity(active);
+            const bytes = try request.bytes();
+            var storage = buffer_mod.DeviceBuffer.alloc(&self.ctx, bytes) catch return null;
             errdefer {
-                self.ctx.synchronize() catch {};
-                storage.free(&self.ctx);
+                self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+                _ = storage.freeChecked(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
             }
             var offset: usize = 0;
             for (weights, widths) |ct, width| {
@@ -3403,9 +4452,13 @@ pub const CudaCompute = struct {
                 try copyFromDeviceTracked(self, .{ .ptr = storage.ptr + offset, .len = n }, tensorFromCt(ct).buffer, n);
                 offset += n;
             }
-            self.lighton_projection_cache.putAssumeCapacity(key, storage);
-            break :create storage;
+            const owner: DerivedWeightStorage = .{ .buffer = storage, .quota = lease.publishQuota() };
+            self.lockConstantMetadata();
+            self.lighton_projection_cache.putAssumeCapacity(key, owner);
+            self.unlockConstantMetadata();
+            break :create owner;
         };
+        const combined = combined_owner.buffer;
         const staged = (try stageBf16ActivationForCublasLt(self, input, rows, hidden)) orelse return null;
         const count = try checkedMul(rows, total_width);
         var joined = try allocDeviceBuffer(self, try checkedMul(count, 4));
@@ -3593,8 +4646,7 @@ pub const CudaCompute = struct {
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (!self.lighton_recurrent_batch_enabled or self.capability_profile != .lightonocr3 or states.len < 2 or states.len > 64) return null;
         if (((self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) and !lightOnOwnedDecodeCapture(self))) return error.CudaGraphCaptureUnsafeTempAlloc;
-        if (request.dim != 128 or request.value_dim != 128 or request.conv_kernel != 4 or
-            request.key_heads != 16 or (request.value_heads != 16 and request.value_heads != 32)) return null;
+        if (!@import("gated_delta.zig").packetGeometrySupported(request.key_heads, request.value_heads, request.dim, request.value_dim, request.conv_kernel)) return null;
         if (!std.math.isFinite(request.eps) or request.eps <= 0) return error.InvalidTensorShape;
         const kh = request.key_heads;
         const vh = request.value_heads;
@@ -3704,8 +4756,7 @@ pub const CudaCompute = struct {
         if (states.len > 64 and !self.lighton_physical128_enabled) return null;
         if (((self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) and !lightOnOwnedDecodeCapture(self))) return error.CudaGraphCaptureUnsafeTempAlloc;
         if (lengths.len != states.len) return error.InvalidTensorShape;
-        if (request.dim != 128 or request.value_dim != 128 or request.conv_kernel != 4 or
-            request.key_heads != 16 or (request.value_heads != 16 and request.value_heads != 32)) return null;
+        if (!@import("gated_delta.zig").packetGeometrySupported(request.key_heads, request.value_heads, request.dim, request.value_dim, request.conv_kernel)) return null;
         if (!std.math.isFinite(request.eps) or request.eps <= 0) return error.InvalidTensorShape;
         const kh = request.key_heads;
         const vh = request.value_heads;
@@ -3839,8 +4890,7 @@ pub const CudaCompute = struct {
         if (!self.lighton_prefix_batch_enabled or self.capability_profile != .lightonocr3 or states.len < 2 or states.len > item_limit) return null;
         if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return error.CudaGraphCaptureUnsafeTempAlloc;
         const n = request.seq_len;
-        if (n < 2 or n > row_limit / states.len or request.dim != 128 or request.value_dim != 128 or request.conv_kernel != 4 or
-            request.key_heads != 16 or (request.value_heads != 16 and request.value_heads != 32)) return null;
+        if (n < 2 or n > row_limit / states.len or !@import("gated_delta.zig").packetGeometrySupported(request.key_heads, request.value_heads, request.dim, request.value_dim, request.conv_kernel)) return null;
         if (!std.math.isFinite(request.eps) or request.eps <= 0) return error.InvalidTensorShape;
         const kh = request.key_heads;
         const vh = request.value_heads;
@@ -3942,8 +4992,13 @@ pub const CudaCompute = struct {
         errdefer {
             // An accepted widening/copy must drain before a failed unpublished
             // owner can be freed. Failure never publishes partial descriptors.
-            self.ctx.synchronize() catch {};
-            storage.free(&self.ctx);
+            if (state.temporary_budget != null) {
+                self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+                _ = storage.freeChecked(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
+            } else {
+                self.ctx.synchronize() catch {};
+                storage.free(&self.ctx);
+            }
         }
         const history = [_]buffer_mod.DeviceBuffer{
             .{ .ptr = storage.ptr, .len = history_bytes, .borrowed = true },
@@ -3984,6 +5039,13 @@ pub const CudaCompute = struct {
     }
 
     fn prepareLightOnRecurrentState(self: *CudaCompute, state: *@import("gated_delta.zig").State, weights: [4]CT, weight_counts: [4]usize, kh: usize, vh: usize, pre_admitted: bool) !void {
+        return self.prepareLightOnRecurrentStateWithBudget(state, weights, weight_counts, kh, vh, pre_admitted, null);
+    }
+    fn prepareLightOnRecurrentStateWithBudget(self: *CudaCompute, state: *@import("gated_delta.zig").State, weights: [4]CT, weight_counts: [4]usize, kh: usize, vh: usize, pre_admitted: bool, budget: ?*@import("../../execution/recurrent_state_admission.zig").Budget) !void {
+        // Exact owner callback is installed even when optional pooling is off.
+        state.release_context = self;
+        state.release_buffer_with_cleanup = &recycleLightOnStateBufferWithCleanup;
+        state.prepare_release_with_cleanup = &prepareLightOnStateReleaseWithCleanup;
         if (lightOnStatePoolEnabled(self)) {
             state.release_context = self;
             state.release_buffer = &recycleLightOnStateBuffer;
@@ -3994,9 +5056,16 @@ pub const CudaCompute = struct {
             // generation acquires a separate lease for this additional GPU
             // state, retained until its physical buffers have been freed.
             if (!pre_admitted) {
-                if (self.ctx.video_cache_budget.admission) |admission| {
-                    const bytes = channels * 4 * 4 * 3 + vh * 128 * 128 * 4 + (2 * vh + 128) * 4;
-                    state.admission = try admission.controller.tryAcquire(.gpu, admission.limits, .{ .backend_scratch_bytes = bytes }, admission.check_live_memory);
+                const layout = @import("../../execution/recurrent_state_admission.zig").Layout{ .key_heads = kh, .value_heads = vh };
+                if (budget) |prepared| {
+                    try prepared.acquire(@intFromPtr(self), layout);
+                    state.temporary_budget = prepared;
+                    // A borrowed invocation peak may return only after SDK
+                    // death or transfer to an independently FUNDED cache root.
+                    // Legacy admission==null alone is no such root witness.
+                    if (!self.ocr_retained_cache_quota.hasLease()) state.release_buffer = null;
+                } else if (self.ctx.video_cache_budget.admission) |admission| {
+                    state.admission = try admission.controller.tryAcquire(.gpu, admission.limits, .{ .backend_scratch_bytes = try layout.bytes() }, admission.check_live_memory);
                 }
             }
             state.ctx = &self.ctx;
@@ -4026,7 +5095,10 @@ pub const CudaCompute = struct {
                 continue;
             }
             var owned = try allocLightOnStateBuffer(self, count * 4);
-            errdefer owned.free(&self.ctx);
+            errdefer if (budget != null) {
+                self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+                _ = owned.freeChecked(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
+            } else owned.free(&self.ctx);
             if (tensor.dtype == .f32) {
                 try copyFromDeviceTracked(self, owned, tensor.buffer, count * 4);
             } else {
@@ -4088,7 +5160,14 @@ pub const CudaCompute = struct {
         }
         try self.lighton_recurrent.init(&self.ctx);
         const pre_admitted = if (@hasField(@TypeOf(request), "device_state_admitted")) request.device_state_admitted else false;
-        try self.prepareLightOnRecurrentState(state, weights, weight_counts, kh, vh, pre_admitted);
+        const temporary_budget = if (cb.call_context) |active| active.recurrent_state else null;
+        if (temporary_budget) |budget| {
+            const is_temporary = if (@hasField(@TypeOf(request), "temporary_state")) request.temporary_state else false;
+            if (!is_temporary) return error.PersistentRecurrentStateCannotBorrowInvocationPeak;
+            if (state.ctx != null and state.temporary_budget != budget) return error.ForeignRecurrentStateBudget;
+            try validateTemporaryRecurrentBackend(cb, budget);
+        }
+        try self.prepareLightOnRecurrentStateWithBudget(state, weights, weight_counts, kh, vh, pre_admitted, temporary_budget);
         const shape = [_]i32{ @intCast(n), @intCast(width) };
         const output = if (request.destination) |destination| try borrowModelConstant(self, tensorFromCt(destination)) else (try allocUninitF32ShapeOp(self, &shape)).?;
         errdefer cb.free(output);
@@ -4160,7 +5239,8 @@ pub const CudaCompute = struct {
     florence_fused: @import("encoder_decoder_fusions.zig").Module = .{},
     florence_fused_depthwise_enabled: bool = false,
     ocr_retained_cache_bytes: usize = 0,
-    ocr_retained_cache_lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null,
+    ocr_retention_configured: bool = false,
+    ocr_retained_cache_quota: CacheQuota = .none,
     ocr_temp_cache_budget_bytes: ?usize = null,
     ocr_deferred_free_budget_bytes: ?usize = null,
     lighton_fused_vision_mlp_enabled: bool = false,
@@ -4219,21 +5299,17 @@ pub const CudaCompute = struct {
     ocr_pinned_metadata_event_uploads: usize = 0,
     ocr_pinned_metadata_arena: @import("pinned_input_arena.zig").Arena = .{},
     lighton_cached_mrope_enabled: bool = false,
-    lighton_mrope_cache_device: buffer_mod.DeviceBuffer = .{},
-    lighton_mrope_cache_host: std.ArrayListUnmanaged(u32) = .empty,
-    lighton_mrope_cache_lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null,
+    auxiliary_caches: [CacheFunding.Auxiliary.count]AuxiliaryCacheSlot = @splat(.{}),
     lighton_mrope_cache_hits: usize = 0,
     lighton_mrope_cache_uploads: usize = 0,
-    lighton_gate_up_cache: std.AutoHashMapUnmanaged(LightOnGateUpKey, buffer_mod.DeviceBuffer) = .{},
-    lighton_gate_up_leases: std.ArrayListUnmanaged(@import("../../runtime/tier/memory.zig").AdmissionLease) = .empty,
-    lighton_bf16_decode_scratch: buffer_mod.DeviceBuffer = .{},
-    lighton_bf16_decode_lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null,
+    managed_derived_weight_publication: bool = false,
+    derived_weights_retiring: bool = false,
+    lighton_gate_up_cache: std.AutoHashMapUnmanaged(LightOnGateUpKey, DerivedWeightStorage) = .{},
     lighton_fused_batch_recurrent: bool = false,
     lighton_wide_microbatches: bool = false,
     lighton_fused_projections: bool = false,
     lighton_fused_projection_calls: usize = 0,
-    lighton_projection_cache: std.AutoHashMapUnmanaged(LightOnProjectionKey, buffer_mod.DeviceBuffer) = .{},
-    lighton_projection_leases: std.ArrayListUnmanaged(@import("../../runtime/tier/memory.zig").AdmissionLease) = .empty,
+    lighton_projection_cache: std.AutoHashMapUnmanaged(LightOnProjectionKey, DerivedWeightStorage) = .{},
     lighton_prefix_batch_enabled: bool = false,
     lighton_prefix_shared_qk_enabled: bool = false,
     lighton_state_pool_enabled: bool = false,
@@ -4392,6 +5468,15 @@ pub const CudaCompute = struct {
     embedding_gemma2_native_vision_launches: usize = 0,
     embedding_gemma2_media_batches: usize = 0,
     embedding_gemma2_constants: std.StringHashMapUnmanaged(*CudaTensor) = .empty,
+    // This exclusion protects only constant map/policy metadata. Numerical
+    // callers still require their actual execution owner; no SDK/supplier runs
+    // while it is held. Cold reader preflight can inspect without joining a
+    // long-lived decoder epoch's numerical/model lane.
+    constant_metadata_mutex: std.atomic.Mutex = .unlocked,
+    constant_policy: ?@import("video_cache_budget.zig").Admission = null,
+    lighton_norm_catalog: []const LightOnNormRecord = &.{},
+    lighton_norm_catalog_published: bool = false,
+    lighton_norm_catalog_valid: std.atomic.Value(bool) = .init(false),
     // Actual live roots include held borrowers after cache membership moves.
     embedding_gemma2_constant_bytes: std.atomic.Value(usize) = .init(0),
     embedding_gemma2_constant_count: std.atomic.Value(usize) = .init(0),
@@ -4405,6 +5490,10 @@ pub const CudaCompute = struct {
     audio_execution_active: bool = false,
     execution_scope: ?*@import("execution_arena.zig").Scope = null,
     lighton_decode_graph: @import("lighton_decode_graph.zig").Module = .{},
+    captured_cache_roots: ?*CapturedCacheRoots = null,
+    // Armed only by real managed cold publication after legacy roots upgraded.
+    // Existing hits stay usable; new norm roots require actual cold Funding.
+    managed_norm_publication: bool = false,
     lighton_decode_graph_enabled: bool = false,
 
     audio_arena_executes: u64 = 0,
@@ -4698,65 +5787,131 @@ pub const CudaCompute = struct {
     /// result. Projections use cuBLASLt BF16-output matmuls; the bounded exact
     /// kernel remains a fail-closed fallback and is counted in runtime stats.
     /// Preserve the BF16 lookup/scale rounding contract without a host bounce.
-    fn configureOcrRetainedCache(self: *CudaCompute, policy: @import("video_cache_budget.zig").Admission) void {
-        if (self.ocr_retained_cache_lease != null) return;
-        // Charge the configured idle cache and deferred-free queue independently
-        // of a request's active workspace. Under pressure retain less, while
-        // leaving at least half of each explicit ceiling for active work.
-        var cache = cudaTempCacheConfiguredBytes(self);
-        var deferred = if (cudaDeferredFreeEnabled()) cudaDeferredFreeConfiguredBytes() else 0;
-        var retained_limit: usize = std.math.maxInt(usize);
-        const limits = policy.limits;
-        for ([_]usize{ limits.backend_limit_bytes, limits.combined_limit_bytes, limits.scratch_limit_bytes }) |limit| {
-            if (limit != 0) retained_limit = @min(retained_limit, limit / 2);
+    /// Exact original retention selector, with a finite outside-lane pressure
+    /// step. No mutable runtime/cache arrays, SDK, allocator or supplier here.
+    pub fn lightOnRetentionRequest(self: *const CudaCompute, desired: @import("video_cache_budget.zig").Admission, pressure_step: usize) !@import("prepared_cache.zig").Request {
+        if (self.capability_profile != .lightonocr3 and self.capability_profile != .florence2) return error.UnsupportedPreparedCacheWorkload;
+        // The public OCR inference contract never enters training-cache mode.
+        // Use the immutable inference policy; adoption checks the actual mode.
+        return @import("prepared_cache.zig").Request.retentionEnvelope(self.runtime_policy.cacheBytes(false), if (cudaDeferredFreeEnabled()) cudaDeferredFreeConfiguredBytes() else 0, desired.limits, pressure_step);
+    }
+    fn configureOcrRetainedCache(self: *CudaCompute, policy: @import("video_cache_budget.zig").Admission, current: CacheCleanup) !void {
+        if (self.ocr_retained_cache_quota.hasLease()) return;
+        // A prior pressure result of ZERO is not a permanent cache-disable
+        // policy. Each later cold request retries the original envelope; its
+        // current Funding supplies the newly accepted result without callbacks.
+        if (self.ctx.prepared_cache_funding) |funding| {
+            if (self.resident_training_cache) return error.PreparedCachePlanChanged;
+            for (funding.entries) |entry| {
+                if (entry.request != .ocr_retention) continue;
+                const geometry = entry.request.ocr_retention;
+                const bytes = try std.math.add(usize, geometry.cache_bytes, geometry.deferred_bytes);
+                var quota: CacheQuota = .none;
+                if (bytes != 0) {
+                    var lease = try funding.take(entry.request, .{ .backend_scratch_bytes = bytes });
+                    quota = lease.publishQuota();
+                }
+                self.lockConstantMetadata();
+                self.ocr_retained_cache_quota = quota;
+                self.ocr_retained_cache_bytes = bytes;
+                self.ocr_retention_configured = true;
+                self.ocr_temp_cache_budget_bytes = geometry.cache_bytes;
+                self.ocr_deferred_free_budget_bytes = geometry.deferred_bytes;
+                self.unlockConstantMetadata();
+                return;
+            }
+            // A compatibility binding explicitly declines optional retention.
+            if (funding.deny_cold_misses or !funding.heap_owned) {
+                self.lockConstantMetadata();
+                self.ocr_retention_configured = true;
+                self.ocr_temp_cache_budget_bytes = 0;
+                self.ocr_deferred_free_budget_bytes = 0;
+                self.unlockConstantMetadata();
+                return;
+            }
+            return error.UnpreparedCacheAdmission;
         }
-        while (cache > std.math.maxInt(usize) - deferred or cache + deferred > retained_limit) {
-            cache /= 2;
-            deferred /= 2;
-        }
-        while (cache +| deferred != 0) {
-            const lease = policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_scratch_bytes = cache + deferred }, policy.check_live_memory) catch {
-                cache /= 2;
-                deferred /= 2;
-                continue;
-            };
-            self.ocr_retained_cache_lease = lease;
-            self.ocr_retained_cache_bytes = cache + deferred;
-            self.ocr_temp_cache_budget_bytes = cache;
-            self.ocr_deferred_free_budget_bytes = deferred;
+        if (!current.outside_execution) return error.UnpreparedCacheAdmission;
+        // Historical unmanaged outside-execution API keeps its availability and
+        // pressure-halving policy. Accepted managed callers use the cold token.
+        var step: usize = 0;
+        while (true) : (step += 1) {
+            const request = @import("prepared_cache.zig").Request.retentionEnvelope(cudaTempCacheConfiguredBytes(self), if (cudaDeferredFreeEnabled()) cudaDeferredFreeConfiguredBytes() else 0, policy.limits, step);
+            const geometry = request.ocr_retention;
+            const bytes = geometry.cache_bytes + geometry.deferred_bytes;
+            if (bytes == 0) break;
+            const lease = policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_scratch_bytes = bytes }, policy.check_live_memory) catch continue;
+            self.lockConstantMetadata();
+            self.ocr_retained_cache_quota = CacheQuota.fromRawAdmission(lease);
+            self.ocr_retained_cache_bytes = bytes;
+            self.ocr_retention_configured = true;
+            self.ocr_temp_cache_budget_bytes = geometry.cache_bytes;
+            self.ocr_deferred_free_budget_bytes = geometry.deferred_bytes;
+            self.unlockConstantMetadata();
             return;
         }
+        self.lockConstantMetadata();
+        self.ocr_retention_configured = true;
         self.ocr_temp_cache_budget_bytes = 0;
         self.ocr_deferred_free_budget_bytes = 0;
+        self.unlockConstantMetadata();
     }
 
+    /// Explicit unmanaged outside-execution compatibility entrypoint.
     pub fn configureEmbeddingGemma2Admission(self: *CudaCompute, admission: ?@import("video_cache_budget.zig").Admission) !void {
+        return self.configureEmbeddingGemma2AdmissionWithCleanup(admission, .{ .outside_execution = true });
+    }
+    pub fn configureEmbeddingGemma2AdmissionWithCleanup(self: *CudaCompute, admission: ?@import("video_cache_budget.zig").Admission, current: CacheCleanup) !void {
+        // Validate all cold publication requirements BEFORE policy mutation,
+        // stream waits, cache destruction, or supplier-visible ownership moves.
+        if ((self.capability_profile == .lightonocr3 or self.capability_profile == .florence2) and admission != null and !current.outside_execution and
+            (!sameCacheAdmission(self.constant_policy, admission) or !self.ocr_retained_cache_quota.hasLease()))
+        {
+            const funding = self.ctx.prepared_cache_funding orelse return error.UnpreparedCacheAdmission;
+            if (funding.state != .bound or (funding.heap_owned and !sameCacheAdmission(funding.admission, admission))) return error.PreparedCachePlanChanged;
+            if (!funding.deny_cold_misses and funding.heap_owned) {
+                var found = false;
+                for (funding.entries) |entry| if (entry.request == .ocr_retention) {
+                    if (!std.meta.eql(entry.request, try self.lightOnRetentionRequest(admission.?, entry.request.ocr_retention.pressure_step))) return error.PreparedCachePlanChanged;
+                    const bytes = try std.math.add(usize, entry.request.ocr_retention.cache_bytes, entry.request.ocr_retention.deferred_bytes);
+                    if (bytes != 0 and entry.state != .ready) return error.PreparedCachePlanChanged;
+                    found = true;
+                };
+                if (!found) return error.UnpreparedCacheAdmission;
+            }
+        }
+        if (!current.outside_execution and current.boundary != null) self.managed_derived_weight_publication = true;
         if (!std.meta.eql(self.ctx.video_cache_budget.admission, admission)) {
-            // A pending reader owns this slot until its execution lane is
-            // reacquired. Policy replacement cannot destroy its live event.
-            if (self.lighton_burst_readback.busy) return error.ResourceTemporarilyUnavailable;
-            try self.lighton_burst_readback.clear(&self.ctx);
-            try self.ocr_pinned_metadata_arena.clear(&self.ctx);
-            try self.ocr_pinned_input.clear(&self.ctx);
-            self.lighton_decode_graph.invalidate(&self.ctx);
+            try self.validateCacheCleanup(current); // before ANY policy/SDK mutation
+            var auxiliary_quotas = try self.detachAuxiliaryCacheData(current);
+            for (&auxiliary_quotas) |*quota| try quota.releaseAfterSdkDeath(current);
+            try self.clearCapturedGraphWithCleanup(current);
             self.lighton_decode_graph.epoch_id = 0;
             if (self.lighton_recurrent.bf16_prefill) |*prefill| try prefill.clearWorkspace(&self.ctx);
-            try self.embedding_gemma2_execution.clear(self.allocator, &self.ctx);
-            try self.embedding_gemma2_resize.clear(&self.ctx);
-            try self.clearEmbeddingGemma2Constants(false);
+            try self.embedding_gemma2_execution.clearWithCleanup(self.allocator, &self.ctx, current);
+            try self.embedding_gemma2_resize.clearWithCleanup(&self.ctx, current);
+            try self.clearEmbeddingGemma2ConstantsWithCleanup(false, current);
             if (self.capability_profile == .lightonocr3 or self.capability_profile == .florence2) {
                 // Idle allocations must retire under the policy that admitted
                 // them before their reservation moves to another controller.
-                while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
-                defer self.temp_buffer_mutex.unlock();
-                try synchronizeAndDrainDeferredDeviceFreesUnlocked(self);
-                for (self.temp_buffers.buffers.items) |*buffer| buffer.free(&self.ctx);
-                self.temp_buffers.clearRetainingCapacity();
-
-                self.stats.temp_buffer_cached_bytes = 0;
-                if (self.ocr_retained_cache_lease) |*lease| lease.release();
-                self.ocr_retained_cache_lease = null;
+                {
+                    while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+                    defer self.temp_buffer_mutex.unlock();
+                    try self.ctx.synchronize();
+                    for (self.deferred_device_frees.items) |*buffer| _ = try buffer.freeChecked(&self.ctx);
+                    self.deferred_device_frees.clearRetainingCapacity();
+                    self.deferred_device_free_bytes = 0;
+                    for (self.temp_buffers.buffers.items) |*buffer| _ = try buffer.freeChecked(&self.ctx);
+                    self.temp_buffers.clearRetainingCapacity();
+                    self.stats.temp_buffer_cached_bytes = 0;
+                }
+                self.lockConstantMetadata();
+                var old_retention = self.ocr_retained_cache_quota;
+                self.ocr_retained_cache_quota = .none;
                 self.ocr_retained_cache_bytes = 0;
+                self.ocr_retention_configured = false;
+                self.unlockConstantMetadata();
+                try old_retention.releaseAfterSdkDeath(current);
                 // A later policy-validation failure leaves retention disabled;
                 // it must not restore the unreserved configured cache size.
                 self.ocr_temp_cache_budget_bytes = 0;
@@ -4773,24 +5928,51 @@ pub const CudaCompute = struct {
             if (limits.combined_limit_bytes != 0) ceiling = @min(ceiling, limits.combined_limit_bytes);
             try self.ctx.device_allocations.setLimit(ceiling);
         }
-        try self.ctx.configureVideoAdmission(admission);
+        if (!std.meta.eql(self.ctx.video_cache_budget.admission, admission)) {
+            try @import("video.zig").closeCachedDecoderWithCleanup(&self.ctx, current);
+            self.ctx.video_cache_budget.admission = admission;
+        }
+        self.lockConstantMetadata();
+        self.constant_policy = admission;
+        self.unlockConstantMetadata();
         if ((self.capability_profile == .lightonocr3 or self.capability_profile == .florence2) and admission != null)
-            self.configureOcrRetainedCache(admission.?);
+            try self.configureOcrRetainedCache(admission.?, current);
     }
 
     fn clearEmbeddingGemma2Constants(self: *CudaCompute, context_destroyed: bool) !void {
-        if (self.embedding_gemma2_constants.capacity() == 0) return;
-        self.embedding_gemma2_constant_generation +%= 1;
-        if (!context_destroyed and self.embedding_gemma2_constants.count() != 0) try self.ctx.synchronize();
+        return self.clearEmbeddingGemma2ConstantsWithCleanup(context_destroyed, .{ .outside_execution = true });
+    }
+    fn validateConstantCleanup(self: *const CudaCompute, current: CacheCleanup) !void {
         var iterator = self.embedding_gemma2_constants.iterator();
         while (iterator.next()) |entry| {
-            if (context_destroyed) entry.value_ptr.*.buffer = .{};
-            freeTensor(self, entry.value_ptr.*);
-            self.allocator.free(entry.key_ptr.*);
+            const root = entry.value_ptr.*;
+            if (root.cache_retirement_slot) |slot| try slot.validateCleanup(current) else try root.model_constant_quota.validateCleanup(current);
         }
-        self.embedding_gemma2_constants.deinit(self.allocator);
-        self.embedding_gemma2_constants = .empty;
-        // Live detached borrowers keep their bytes/leases until release.
+    }
+    fn clearEmbeddingGemma2ConstantsWithCleanup(self: *CudaCompute, context_destroyed: bool, current: CacheCleanup) !void {
+        try self.validateConstantCleanup(current);
+        if (self.embedding_gemma2_constants.capacity() == 0) return;
+        if (!context_destroyed and self.embedding_gemma2_constants.count() != 0) try self.ctx.synchronize();
+        const Entry = struct { key: []const u8, root: *CudaTensor };
+        var entries: [@import("../../models/embedding_gemma2_weight_cache.zig").prepared_max_entries]Entry = undefined;
+        self.lockConstantMetadata();
+        const count = self.embedding_gemma2_constants.count();
+        std.debug.assert(count <= entries.len);
+        var iterator = self.embedding_gemma2_constants.iterator();
+        var index: usize = 0;
+        while (iterator.next()) |entry| {
+            entries[index] = .{ .key = entry.key_ptr.*, .root = entry.value_ptr.* };
+            index += 1;
+        }
+        self.embedding_gemma2_constants.clearRetainingCapacity();
+        self.embedding_gemma2_constant_generation +%= 1;
+        self.unlockConstantMetadata();
+        for (entries[0..count]) |entry| {
+            if (context_destroyed) entry.root.buffer = .{};
+            freeTensorWithCleanup(self, entry.root, current);
+            self.allocator.free(entry.key);
+        }
+        // Detached borrowers keep their exact physical bytes/currentB quota.
     }
 
     /// Exact model-owned CUDA stages borrow the stable compute, not a copied
@@ -4893,7 +6075,7 @@ pub const CudaCompute = struct {
         if (self.physical_execution_storage != null or self.capturing_physical_storage.values.items.len != 0) return false;
         const input = tensorFromCt(value);
         if (input.resident_owner) |owner| if (owner != self) return false;
-        if (!input.owned_by_tensor or !input.owns_buffer or !input.owns_shape or input.resident_references.load(.acquire) != 1 or input.resident_parent != null or input.storage_retirement != null or input.foreign_payload_owner != null or input.foreign_clone_owner != null or input.foreign_header_allocator != null or input.physical_lease != null or input.physical_storage_base or input.model_constant or input.model_constant_lease != null or input.immutable_cache_backing or input.strict_resident_training or input.quant_type != null or input.tc_quant != null or input.resident_indices != null or input.training_upload_host.ptr != null or input.training_upload_generation != null) return false;
+        if (!input.owned_by_tensor or !input.owns_buffer or !input.owns_shape or input.resident_references.load(.acquire) != 1 or input.resident_parent != null or input.storage_retirement != null or input.foreign_payload_owner != null or input.foreign_clone_owner != null or input.foreign_header_allocator != null or input.physical_lease != null or input.physical_storage_base or input.model_constant or input.model_constant_quota.hasLease() or input.immutable_cache_backing or input.strict_resident_training or input.quant_type != null or input.tc_quant != null or input.resident_indices != null or input.training_upload_host.ptr != null or input.training_upload_generation != null) return false;
         for (input.auxiliary_leases) |lease| if (lease != null) return false;
         if (input.dtype != .f32 and input.dtype != .bf16) return false;
         const primary = try input.dtype.byteCount(input.elem_count);
@@ -4920,9 +6102,15 @@ pub const CudaCompute = struct {
 
     pub const CacheRetirementSelection = union(enum) {
         all,
-        geometry: struct { resize_plans: u4 = 0, resize_sources: u2 = 0, execution_arenas: u8 = 0 },
+        geometry: struct { resize_plans: u4 = 0, resize_sources: u2 = 0, execution_arenas: u8 = 0, video: bool = false },
         fn full(self: @This()) bool {
             return std.meta.activeTag(self) == .all;
+        }
+        fn video(self: @This()) bool {
+            return switch (self) {
+                .all => true,
+                .geometry => |mask| mask.video,
+            };
         }
         fn plan(self: @This(), index: usize) bool {
             return switch (self) {
@@ -4946,6 +6134,29 @@ pub const CudaCompute = struct {
     pub fn cacheRetirementPending(self: *const CudaCompute) bool {
         return self.cache_retirement_pending.load(.acquire) != 0;
     }
+    /// Final-address synchronous cold SDK metadata exclusion. The actual outer
+    /// owner retains model/context, claims under its real model gate, releases
+    /// that gate for SDK parsing, then clears BEFORE any supplier callback.
+    /// Same existing pending word as checked cache retirement, no new queue.
+    pub const CacheMetadataPreparation = struct {
+        compute: *CudaCompute,
+        active: bool = false,
+        pub fn beginInto(self: *@This(), cb: *const ops.ComputeBackend, expected: *CudaCompute) !void {
+            try validateEmbeddingStage(cb, expected);
+            if (expected.capability_profile != .embedding_gemma2) return error.UnsupportedEmbeddingStage;
+            self.* = .{ .compute = expected };
+            if (expected.cache_retirement_pending.cmpxchgStrong(0, @intFromPtr(self), .acq_rel, .acquire) != null) return error.QueueFull;
+            self.active = true;
+        }
+        pub fn validate(self: *const @This(), ctx: *const context_mod.CudaContext) !void {
+            if (!self.active or ctx != &self.compute.ctx or self.compute.cache_retirement_pending.load(.acquire) != @intFromPtr(self)) return error.InvalidCacheRetirementOwner;
+        }
+        pub fn finishOutsideExecution(self: *@This()) void {
+            if (!self.active) return;
+            if (self.compute.cache_retirement_pending.cmpxchgStrong(@intFromPtr(self), 0, .release, .monotonic) != null) platform.inference_process_supervisor.restartWorker();
+            self.active = false;
+        }
+    };
     pub const CacheRetirement = struct {
         const Session = @import("../../backends/session.zig").Session;
         const Memory = @import("../../runtime/tier/memory.zig");
@@ -4954,7 +6165,6 @@ pub const CudaCompute = struct {
         const Resize = @import("embedding_gemma2_resize.zig").Cache;
         const Execution = @import("embedding_gemma2_execution.zig").Cache;
         const Decoder = @import("video.zig").DetachedDecoder;
-        const Constants = @FieldType(CudaCompute, "embedding_gemma2_constants");
         const Epoch = @import("../../execution/retirement_sink.zig").Epoch;
         pub const Requirements = struct {
             compute_identity: usize,
@@ -4971,7 +6181,6 @@ pub const CudaCompute = struct {
         compute: ?*CudaCompute = null,
         payload_allocator: ?std.mem.Allocator = null,
         quotas: ?*Quotas = null,
-        constants: Constants = .empty,
         constant_entries: []Constant,
         resize: Resize = .{},
         execution: Execution = .{},
@@ -5018,7 +6227,7 @@ pub const CudaCompute = struct {
             // This is the only fallible metadata move. It verifies old opaque
             // callback identity and binds OLD budget userdata to this address.
             const selection = self.requirements.selection;
-            if (selection.full()) try self.decoder.detach(&expected.ctx);
+            if (selection.video()) try self.decoder.detach(&expected.ctx);
             if (selection.full()) {
                 self.resize = expected.embedding_gemma2_resize;
                 expected.embedding_gemma2_resize = .{};
@@ -5047,20 +6256,21 @@ pub const CudaCompute = struct {
             if (self.quotas) |q| {
                 self.resize.parkRetirementLeases(q);
                 self.execution.parkRetirementLeases(q);
-                @import("cache_retirement.zig").parkLease(q, &self.decoder.budget.lease);
+                self.decoder.budget.quota.park(q);
             }
             if (selection.full()) {
                 var iterator = expected.embedding_gemma2_constants.iterator();
                 var index: usize = 0;
                 while (iterator.next()) |entry| {
                     const root = entry.value_ptr.*;
-                    if (root.model_constant_lease) |lease| root.cache_retirement_slot = self.quotas.?.reserve(lease) catch unreachable;
+                    if (root.model_constant_quota.peek()) |lease| root.cache_retirement_slot = self.quotas.?.reserve(lease) catch unreachable;
                     self.constant_entries[index] = .{ .root = root, .key = entry.key_ptr.* };
                     index += 1;
                 }
-                self.constants = expected.embedding_gemma2_constants;
-                expected.embedding_gemma2_constants = .empty;
-                if (self.constants.capacity() != 0) expected.embedding_gemma2_constant_generation +%= 1;
+                expected.lockConstantMetadata();
+                expected.embedding_gemma2_constants.clearRetainingCapacity();
+                expected.embedding_gemma2_constant_generation +%= 1;
+                expected.unlockConstantMetadata();
                 expected.audio_plans.clear();
             }
             self.compute = expected;
@@ -5090,8 +6300,6 @@ pub const CudaCompute = struct {
                 if (entry.key) |key| allocator.free(key);
                 entry.key = null;
             }
-            self.constants.deinit(allocator);
-            self.constants = .empty;
             if (compute.cache_retirement_pending.cmpxchgStrong(@intFromPtr(self), 0, .release, .monotonic) != null) return error.InvalidCacheRetirementOwner;
             self.compute = null;
             self.payload_allocator = null;
@@ -5138,8 +6346,8 @@ pub const CudaCompute = struct {
     pub fn cacheRetirementRequirements(cb: *const ops.ComputeBackend, expected: *CudaCompute, selection: CacheRetirementSelection) !CacheRetirement.Requirements {
         try validateEmbeddingStage(cb, expected);
         if (expected.cacheRetirementPending()) return error.QueueFull;
-        if (expected.capability_profile != .embedding_gemma2 or expected.ocr_retained_cache_lease != null) return error.UnsupportedEmbeddingStage;
-        if (selection.full()) try @import("video.zig").DetachedDecoder.ready(&expected.ctx);
+        if (expected.capability_profile != .embedding_gemma2 or expected.ocr_retained_cache_quota.hasLease()) return error.UnsupportedEmbeddingStage;
+        if (selection.video()) try @import("video.zig").DetachedDecoder.ready(&expected.ctx);
         var hash = std.hash.Wyhash.init(0x4341434845);
         var controller: ?*@import("../../runtime/tier/memory.zig").AdmissionController = null;
         var leases: usize = 0;
@@ -5148,7 +6356,7 @@ pub const CudaCompute = struct {
             CacheRetirement.word(&hash, @intFromBool(plan != null));
             if (plan) |value| {
                 for (value.device) |device| CacheRetirement.buffer(&hash, device);
-                leases += try CacheRetirement.leaseWord(&hash, value.lease, &controller);
+                leases += try CacheRetirement.leaseWord(&hash, value.quota.peek(), &controller);
                 CacheRetirement.word(&hash, value.key.width);
                 CacheRetirement.word(&hash, value.key.height);
                 CacheRetirement.word(&hash, value.key.target_width);
@@ -5160,7 +6368,7 @@ pub const CudaCompute = struct {
             CacheRetirement.word(&hash, if (source.host.ptr) |ptr| @intFromPtr(ptr) else 0);
             CacheRetirement.word(&hash, source.host.len);
             CacheRetirement.word(&hash, @intFromPtr(source.event));
-            leases += try CacheRetirement.leaseWord(&hash, source.lease, &controller);
+            leases += try CacheRetirement.leaseWord(&hash, source.quota.peek(), &controller);
         }
         for (expected.embedding_gemma2_execution.arenas, 0..) |arena, index| {
             if (!selection.arena(index)) continue;
@@ -5171,14 +6379,14 @@ pub const CudaCompute = struct {
                 CacheRetirement.word(&hash, @intFromPtr(pair.start));
                 CacheRetirement.word(&hash, @intFromPtr(pair.end));
             }
-            leases += try CacheRetirement.leaseWord(&hash, arena.lease, &controller);
+            leases += try CacheRetirement.leaseWord(&hash, arena.quota.peek(), &controller);
         }
         if (selection.full()) {
             var packed_entries = expected.embedding_gemma2_execution.weights.iterator();
             while (packed_entries.next()) |entry| {
                 hash.update(entry.key_ptr.*);
                 CacheRetirement.buffer(&hash, entry.value_ptr.buffer);
-                leases += try CacheRetirement.leaseWord(&hash, entry.value_ptr.lease, &controller);
+                leases += try CacheRetirement.leaseWord(&hash, entry.value_ptr.quota.peek(), &controller);
             }
             if (expected.embedding_gemma2_constants.count() > 128) return error.CacheRetirementCapacityChanged;
             var constants = expected.embedding_gemma2_constants.iterator();
@@ -5189,8 +6397,10 @@ pub const CudaCompute = struct {
                 hash.update(entry.key_ptr.*);
                 CacheRetirement.word(&hash, @intFromPtr(root));
                 CacheRetirement.buffer(&hash, root.buffer);
-                leases += try CacheRetirement.leaseWord(&hash, root.model_constant_lease, &controller);
+                leases += try CacheRetirement.leaseWord(&hash, root.model_constant_quota.peek(), &controller);
             }
+        }
+        if (selection.video()) {
             CacheRetirement.word(&hash, if (expected.ctx.video_decoder_cache) |decoder| @intFromPtr(decoder) else 0);
             CacheRetirement.word(&hash, expected.ctx.video_cache_budget.bytes);
         }
@@ -5200,7 +6410,7 @@ pub const CudaCompute = struct {
             inline for (@typeInfo(@TypeOf(policy.limits)).@"struct".field_names) |name| CacheRetirement.word(&hash, @field(policy.limits, name));
             CacheRetirement.word(&hash, @intFromBool(policy.check_live_memory));
         }
-        if (selection.full()) leases += try CacheRetirement.leaseWord(&hash, expected.ctx.video_cache_budget.lease, &controller);
+        if (selection.video()) leases += try CacheRetirement.leaseWord(&hash, expected.ctx.video_cache_budget.quota.peek(), &controller);
         CacheRetirement.word(&hash, expected.embedding_gemma2_constant_generation);
         CacheRetirement.word(&hash, expected.embedding_gemma2_execution.weight_generation);
         CacheRetirement.word(&hash, expected.embedding_gemma2_resize.next_plan);
@@ -5231,6 +6441,7 @@ pub const CudaCompute = struct {
     fn validateCacheWorkload(work: CacheFunding.Workload) !void {
         var resize: usize = 0;
         var arena: usize = 0;
+        var decoder: usize = 0;
         for (work.requests) |request| switch (request) {
             .resize => {
                 resize += 1;
@@ -5240,11 +6451,21 @@ pub const CudaCompute = struct {
                 arena += 1;
                 if (arena > 1) return error.UnsupportedPreparedCacheWorkload;
             },
+            .decoder => {
+                decoder += 1;
+                if (decoder > 1) return error.UnsupportedPreparedCacheWorkload;
+            },
             else => {},
         };
     }
     fn cacheRequestState(self: *CudaCompute, request: CacheFunding.Request) !CacheRequestState {
         switch (request) {
+            .decoder => |sequence| {
+                const bytes = try sequence.bytes();
+                if (@import("video.zig").cachedSequenceMatches(&self.ctx, sequence) and self.ctx.video_cache_budget.currentCleanupPrepared()) return .{};
+                return .{ .miss = true, .amounts = .{ .backend_scratch_bytes = bytes }, .victims = .{ .video = self.ctx.video_decoder_cache != null or self.ctx.video_cache_budget.bytes != 0 } };
+            },
+            .ocr_retention, .auxiliary, .derived_weight, .captured_storage, .captured_arena => return error.UnsupportedPreparedCacheWorkload,
             .resize => |geometry| {
                 const cache = &self.embedding_gemma2_resize;
                 const key: @import("embedding_gemma2_resize.zig").Key = .{ .width = geometry.width, .height = geometry.height, .target_width = geometry.target_width, .target_height = geometry.target_height, .resident = geometry.resident };
@@ -5257,7 +6478,7 @@ pub const CudaCompute = struct {
                 if (source.bytes == 0 or source.bytes > @import("embedding_gemma2_resize.zig").source_limit) return error.ResourceLimitExceeded;
                 const value = &self.embedding_gemma2_resize.sources[source.index];
                 if (value.host.len >= source.bytes) return .{};
-                return .{ .miss = true, .amounts = .{ .host_scratch_bytes = source.bytes }, .victims = .{ .resize_sources = if (value.host.ptr != null or value.lease != null) @as(u2, 1) << source.index else 0 } };
+                return .{ .miss = true, .amounts = .{ .host_scratch_bytes = source.bytes }, .victims = .{ .resize_sources = if (value.host.ptr != null or value.quota.hasLease()) @as(u2, 1) << source.index else 0 } };
             },
             .arena => |geometry| {
                 const selected = (try self.embedding_gemma2_execution.selectArena(geometry)) orelse return .{}; // Original optional hot-shape policy decline.
@@ -5294,6 +6515,7 @@ pub const CudaCompute = struct {
             victims.resize_plans |= state.victims.resize_plans;
             victims.resize_sources |= state.victims.resize_sources;
             victims.execution_arenas |= state.victims.execution_arenas;
+            victims.video = victims.video or state.victims.video;
         }
         return .{ .geometry = victims };
     }
@@ -5307,6 +6529,7 @@ pub const CudaCompute = struct {
         if (expected.capability_profile != .embedding_gemma2 or funding.state != .created) return error.InvalidPreparedCacheState;
         var resize_count: usize = 0;
         var arena_count: usize = 0;
+        var decoder_count: usize = 0;
         for (funding.entries) |entry| switch (entry.request) {
             .resize => {
                 resize_count += 1;
@@ -5315,6 +6538,10 @@ pub const CudaCompute = struct {
             .arena => {
                 arena_count += 1;
                 if (arena_count > 1) return error.UnsupportedPreparedCacheWorkload;
+            },
+            .decoder => {
+                decoder_count += 1;
+                if (decoder_count > 1) return error.UnsupportedPreparedCacheWorkload;
             },
             else => {},
         };
@@ -5327,7 +6554,7 @@ pub const CudaCompute = struct {
             entry.amounts = .{};
             entry.temporary_host_bytes = 0;
             const actual = try expected.cacheRequestState(entry.request);
-            if (actual.victims.resize_plans != 0 or actual.victims.resize_sources != 0 or actual.victims.execution_arenas != 0) return error.CacheVictimsRequireRetirement;
+            if (actual.victims.resize_plans != 0 or actual.victims.resize_sources != 0 or actual.victims.execution_arenas != 0 or actual.victims.video) return error.CacheVictimsRequireRetirement;
             if (actual.miss) {
                 switch (entry.request) {
                     .packed_weight => |span| {
@@ -5365,8 +6592,12 @@ pub const CudaCompute = struct {
         var constant_slots = constant_policy.prepared_max_entries - expected.embedding_gemma2_constant_count.load(.acquire);
         for (work.requests, 0..) |request, index| {
             var actual = try expected.cacheRequestState(request);
-            if (funding.deny_cold_misses) continue; // Preserve compatibility, never acquire a new cache lease.
-            if (actual.victims.resize_plans != 0 or actual.victims.resize_sources != 0 or actual.victims.execution_arenas != 0) return error.PreparedCachePlanChanged;
+            if (funding.deny_cold_misses) {
+                if (request == .decoder and actual.miss) return error.UnpreparedDecoderAdmission;
+                continue; // Only optional cache misses may retain compatibility.
+            }
+            if (funding.optional_disabled and request != .decoder) continue;
+            if (actual.victims.resize_plans != 0 or actual.victims.resize_sources != 0 or actual.victims.execution_arenas != 0 or actual.victims.video) return error.PreparedCachePlanChanged;
             if (actual.miss) switch (request) {
                 .packed_weight => |span| {
                     if (span.bytes > packed_remaining) actual.miss = false else packed_remaining -= span.bytes;
@@ -5388,10 +6619,14 @@ pub const CudaCompute = struct {
         }
 
         try funding.bind(epoch);
+        funding.decoder_sequence = null;
+        for (work.requests) |request| if (request == .decoder) {
+            funding.decoder_sequence = request.decoder;
+        };
         expected.ctx.prepared_cache_funding = funding;
     }
     pub fn unbindCacheFunding(cb: *const ops.ComputeBackend, expected: *CudaCompute, funding: *CacheFunding.Funding) void {
-        if (!acceptsEmbeddingStage(cb, expected) or expected.ctx.prepared_cache_funding != funding) platform.inference_process_supervisor.restartWorker();
+        if ((cb.vtable != &vtable and cb.vtable != &scoped_run_budget_vtable) or cb.ptr != @as(*anyopaque, @ptrCast(expected)) or expected.ctx.prepared_cache_funding != funding) platform.inference_process_supervisor.restartWorker();
         expected.ctx.prepared_cache_funding = null;
         funding.unbind();
     }
@@ -6135,6 +7370,8 @@ pub const CudaCompute = struct {
             .dispatch_stats = .{ .enabled = cudaDispatchStatsEnabled() },
             .runtime_jit_shape_gating = jit_config.mode.activates(),
         };
+        if (profile == .embedding_gemma2 or self.lighton_norm_weight_cache_enabled)
+            try self.embedding_gemma2_constants.ensureTotalCapacity(allocator, @import("../../models/embedding_gemma2_weight_cache.zig").prepared_max_entries);
         std.log.info("cuda_generated_q4_policy compute={d}.{d} portable_matmul_capable={} evidence_target=sm_89 mmv={} mm={} pair={}", .{ ctx.info.compute_major, ctx.info.compute_minor, quant_kernel_catalog.portableCudaDeviceSupported(ctx.info.compute_major, ctx.info.compute_minor), generated_q4_0_gates.mmv, generated_q4_0_gates.mm, generated_q4_0_gates.pair });
         if (profile == .lightonocr3) std.log.info("lighton_cuda_policy compute={d}.{d} driver={d} automatic={} graph={s} specialized_kernels={}", .{ ctx.info.compute_major, ctx.info.compute_minor, ctx.info.driver_version, lighton_auto, @tagName(self.lightOnGraphDecision()), lighton_device.specializedKernels() });
     }
@@ -6151,7 +7388,31 @@ pub const CudaCompute = struct {
         return self;
     }
 
+    fn validateCacheCleanup(self: *const CudaCompute, current: CacheCleanup) !void {
+        var projection_quotas = self.lighton_projection_cache.valueIterator();
+        while (projection_quotas.next()) |value| try value.quota.validateCleanup(current);
+        var pair_quotas = self.lighton_gate_up_cache.valueIterator();
+        while (pair_quotas.next()) |value| try value.quota.validateCleanup(current);
+        try self.lighton_decode_graph.validateCleanup(current);
+        try self.embedding_gemma2_resize.validateCleanup(current);
+        try self.embedding_gemma2_execution.validateCleanup(current);
+        try self.validateConstantCleanup(current);
+        try self.ctx.video_cache_budget.validateCleanup(current);
+        try self.ocr_retained_cache_quota.validateCleanup(current);
+        try self.auxiliaryCache(.rotary_positions_u32).quota.validateCleanup(current);
+        try self.auxiliaryCache(.rounded_bf16_output).quota.validateCleanup(current);
+        try self.ocr_pinned_metadata_arena.quota.validateCleanup(current);
+        try self.ocr_pinned_input.quota.validateCleanup(current);
+        try self.lighton_burst_readback.quota.validateCleanup(current);
+    }
+    pub fn deinitWithBoundary(self: *CudaCompute, boundary: ?*const @import("../../execution/retirement_sink.zig").Epoch) void {
+        self.deinitWithCleanup(.{ .boundary = boundary });
+    }
     pub fn deinit(self: *CudaCompute) void {
+        self.deinitWithCleanup(.{ .outside_execution = true });
+    }
+    pub fn deinitWithCleanup(self: *CudaCompute, current: CacheCleanup) void {
+        self.validateCacheCleanup(current) catch platform.inference_process_supervisor.restartWorker();
         if ((self.capability_profile == .lightonocr3 or self.capability_profile == .florence2) and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
             const stats = self.snapshotStats();
             const physical = self.ctx.device_allocations.snapshot();
@@ -6170,15 +7431,14 @@ pub const CudaCompute = struct {
         for (&self.debug_cuda_graph_slots) |*slot| deinitCudaGraphReplaySlot(self, slot);
         self.audio_plans.clear();
         const retained_cleanup_failed = failed: {
-            self.embedding_gemma2_resize.clear(&self.ctx) catch break :failed true;
-            self.embedding_gemma2_execution.clear(self.allocator, &self.ctx) catch break :failed true;
-            self.clearEmbeddingGemma2Constants(false) catch break :failed true;
+            self.embedding_gemma2_resize.clearWithCleanup(&self.ctx, current) catch break :failed true;
+            self.embedding_gemma2_execution.clearWithCleanup(self.allocator, &self.ctx, current) catch break :failed true;
+            self.clearEmbeddingGemma2ConstantsWithCleanup(false, current) catch break :failed true;
             break :failed false;
         };
-        if (self.lighton_bf16_decode_scratch.ptr != 0) {
-            self.ctx.synchronize() catch {};
-            self.lighton_bf16_decode_scratch.free(&self.ctx);
-        }
+        if (retained_cleanup_failed and !current.outside_execution) platform.inference_process_supervisor.restartWorker();
+        @import("video.zig").closeCachedDecoderWithCleanup(&self.ctx, current) catch platform.inference_process_supervisor.restartWorker();
+        var auxiliary_quotas = self.detachAuxiliaryCacheData(current) catch platform.inference_process_supervisor.restartWorker();
         self.scalar_clamp_kernel.deinit(&self.ctx);
         self.row_selection_stats.deinit(&self.ctx);
         if (self.capability_profile == .florence2 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
@@ -6230,7 +7490,7 @@ pub const CudaCompute = struct {
             std.debug.print("LIGHTONOCR3 cuda_fused_head_calls={d}\n", .{self.lighton_head.calls});
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_vision_down_gemm_calls={d}\n", .{self.lighton_vision_down.calls + self.lighton_vision_bf16.down.calls});
-        self.lighton_decode_graph.invalidate(&self.ctx);
+        self.clearCapturedGraphWithCleanup(current) catch platform.inference_process_supervisor.restartWorker();
         self.lighton_activation.deinit(&self.ctx);
         self.lighton_vision_bf16.deinit(&self.ctx);
         self.lighton_attention_inputs.deinit(&self.ctx);
@@ -6321,11 +7581,9 @@ pub const CudaCompute = struct {
         self.bf16_pair_mirror_cache.deinit(self.allocator);
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_fused_projection_calls={d} packed_projection_weights={d}\n", .{ self.lighton_fused_projection_calls, self.lighton_projection_cache.count() });
-        var projection_weights = self.lighton_projection_cache.valueIterator();
-        while (projection_weights.next()) |weight| weight.free(&self.ctx);
+        self.clearDerivedWeightsWithCleanup(current) catch platform.inference_process_supervisor.restartWorker();
         self.lighton_projection_cache.deinit(self.allocator);
-        var lighton_pairs = self.lighton_gate_up_cache.valueIterator();
-        while (lighton_pairs.next()) |buf| buf.free(&self.ctx);
+
         self.lighton_gate_up_cache.deinit(self.allocator);
         var scalar_it = self.immutable_scalar_cache.iterator();
         while (scalar_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
@@ -6345,9 +7603,6 @@ pub const CudaCompute = struct {
         self.debug_cuda_decode_scalars.free(&self.ctx);
         self.pinned_scalar_upload_ring.host.free(&self.ctx);
         self.pinned_upload_arena.host.free(&self.ctx);
-        self.ocr_pinned_metadata_arena.deinit(&self.ctx);
-        self.ocr_pinned_input.deinit(&self.ctx);
-        self.lighton_burst_readback.deinit(&self.ctx);
         self.pinned_scalar_download_buffer.host.free(&self.ctx);
         self.pinned_bulk_download_buffer.free(&self.ctx);
         if (self.async_i32_scalar_download.in_use and self.async_i32_scalar_download.event != null) {
@@ -6370,17 +7625,16 @@ pub const CudaCompute = struct {
         self.temp_pinned_slots.deinit(self.allocator);
         self.temp_arena_planner.deinit(self.allocator);
         self.generated_gqa_score_prework_templates.deinit(self.allocator);
-        for (self.temp_buffers.buffers.items) |*buffer| buffer.free(&self.ctx);
+        for (self.temp_buffers.buffers.items) |*buffer| _ = buffer.freeChecked(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
         self.temp_buffers.deinit(self.allocator);
 
         if (self.deferred_device_frees.items.len != 0) {
-            synchronizeAndDrainDeferredDeviceFrees(self) catch {};
-            drainDeferredDeviceFreesAfterSyncUnlocked(self);
+            self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+            for (self.deferred_device_frees.items) |*buffer| _ = buffer.freeChecked(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
+            self.deferred_device_frees.clearRetainingCapacity();
         }
         self.deferred_device_frees.deinit(self.allocator);
         self.temp_ids_masks.deinit(&self.ctx);
-        self.lighton_mrope_cache_device.free(&self.ctx);
-        self.lighton_mrope_cache_host.deinit(self.allocator);
         self.attention_mask_scratch.deinit(&self.ctx);
         self.cross_attention_split_scratch.deinit(&self.ctx);
         self.attention_mask_cache_host.deinit(self.allocator);
@@ -6430,23 +7684,21 @@ pub const CudaCompute = struct {
         self.kernels.unload(&self.ctx);
         closeStorageRetirement(self);
         self.ctx.releaseResources();
-        if (self.ocr_retained_cache_lease) |*lease| lease.release();
-        self.ocr_retained_cache_lease = null;
-        if (self.lighton_mrope_cache_lease) |*lease| lease.release();
-        self.lighton_mrope_cache_lease = null;
-        for (self.lighton_projection_leases.items) |*lease| lease.release();
-        self.lighton_projection_leases.deinit(self.allocator);
-        for (self.lighton_gate_up_leases.items) |*lease| lease.release();
-        self.lighton_gate_up_leases.deinit(self.allocator);
+        self.ocr_retained_cache_quota.releaseAfterSdkDeath(current) catch platform.inference_process_supervisor.restartWorker();
+        for (&auxiliary_quotas) |*quota| quota.releaseAfterSdkDeath(current) catch platform.inference_process_supervisor.restartWorker();
         // Keep the extra workspace charged through physical/context teardown,
         // including an exceptional failed device free.
-        if (self.lighton_bf16_decode_lease) |*lease| lease.release();
-        self.lighton_bf16_decode_lease = null;
+
         if (retained_cleanup_failed) {
             self.clearEmbeddingGemma2Constants(true) catch {};
             self.embedding_gemma2_execution.releaseAfterContextDestroyed(self.allocator);
             self.embedding_gemma2_resize.releaseAfterContextDestroyed(&self.ctx);
         }
+        self.lockConstantMetadata();
+        var constant_map = self.embedding_gemma2_constants;
+        self.embedding_gemma2_constants = .empty;
+        self.unlockConstantMetadata();
+        constant_map.deinit(self.allocator);
         self.ctx.driver.deinit();
     }
 
@@ -7304,22 +8556,27 @@ pub const CudaCompute = struct {
     /// Resident-weight insertion consumes owned_key on success and failure.
     /// Internal conversion stages borrow it until the map accepts ownership.
     pub fn insertWeightFromLoaded(self: *CudaCompute, owned_key: []const u8, loaded: *const weight_source_mod.LoadedWeight) !void {
+        self.invalidateLightOnNormCatalog();
         return self.insertOwnedWeight(owned_key, loaded, insertWeightFromLoadedBorrowedKey);
     }
 
     pub fn insertBf16WeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+        self.invalidateLightOnNormCatalog();
         return self.insertOwnedWeight(owned_key, tensor, insertBf16WeightFromTensorBorrowedKey);
     }
 
     pub fn insertF16WeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+        self.invalidateLightOnNormCatalog();
         return self.insertOwnedWeight(owned_key, tensor, insertF16WeightFromTensorBorrowedKey);
     }
 
     pub fn insertBf16WeightFromF32Tensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+        self.invalidateLightOnNormCatalog();
         return self.insertOwnedWeight(owned_key, tensor, insertBf16WeightFromF32TensorBorrowedKey);
     }
 
     pub fn insertWeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+        self.invalidateLightOnNormCatalog();
         return self.insertOwnedWeight(owned_key, tensor, insertWeightFromTensorBorrowedKey);
     }
 
@@ -7777,6 +9034,9 @@ pub const CudaCompute = struct {
 };
 
 fn deinitResidentWeights(self: *CudaCompute) void {
+    self.lighton_norm_catalog_valid.store(false, .release);
+    self.allocator.free(self.lighton_norm_catalog);
+    self.lighton_norm_catalog = &.{};
     var it = self.resident_weights.iterator();
     while (it.next()) |entry| {
         freeCudaTensorStorageUncached(self, entry.value_ptr);
@@ -7907,7 +9167,6 @@ const CudaKvLayer = struct {
     v: buffer_mod.DeviceBuffer = .{},
     block_table: buffer_mod.DeviceBuffer = .{},
     capacity_tokens: usize = 0,
-    reserved_capacity_tokens: usize = 0,
     token_count: usize = 0,
     row_width: usize = 0,
     key_row_bytes: usize = 0,
@@ -8269,7 +9528,7 @@ const CudaKvDeviceStorage = struct {
             const epoch = cleanup orelse @import("antfly_platform").inference_process_supervisor.restartWorker();
             if (epoch.isSealed() catch true) @import("antfly_platform").inference_process_supervisor.restartWorker();
             preparePersistentCudaBufferReallocation(self.compute) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-            if (self.compute.lighton_decode_graph_enabled) self.compute.lighton_decode_graph.invalidate(&self.compute.ctx);
+            if (self.compute.lighton_decode_graph_enabled) self.compute.clearCapturedGraphWithCleanup(.{ .boundary = cleanup }) catch platform.inference_process_supervisor.restartWorker();
             self.compute.ctx.synchronize() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         }
         if (self.match_binding) |binding| {
@@ -8346,8 +9605,9 @@ const CudaKvDeviceStorage = struct {
         logical_blocks: []const kv_block_mod.KvBlockId,
         token_count: usize,
         page_size_tokens: u16,
+        reserved_capacity_tokens: usize,
     ) !void {
-        const upload_blocks = try blockTableUploadBlockCount(@max(token_count, layer.reserved_capacity_tokens), page_size_tokens, logical_blocks);
+        const upload_blocks = try blockTableUploadBlockCount(@max(token_count, reserved_capacity_tokens), page_size_tokens, logical_blocks);
         if (upload_blocks == 0) return;
         const block_table_bytes = try checkedMul(upload_blocks, @sizeOf(kv_block_mod.KvBlockId));
         const signature = blockTableSignature(logical_blocks, upload_blocks, page_size_tokens);
@@ -8425,9 +9685,8 @@ const CudaKvDeviceStorage = struct {
         layer.value_format = value_format;
         layer.page_size_tokens = write.page_size_tokens;
         layer.position_offset = write.position_offset;
-        // Keep the full reserved page table stable during both writes and
-        // attention reads; token_count continues to bound readable KV rows.
-        layer.reserved_capacity_tokens = write.device_capacity_limit_tokens;
+        // Per-sequence reservation limits are passed to each table upload.
+        // The global compressed layer may serve unequal peer reservations.
 
         const required_capacity = if (compressed_format != null and write.logical_blocks != null and write.page_size_tokens != 0) blk: {
             const logical_blocks = write.logical_blocks.?;
@@ -8492,7 +9751,7 @@ const CudaKvDeviceStorage = struct {
         }
         if (compressed_format != null) {
             const logical_blocks = write.logical_blocks orelse return error.InvalidPagedKvState;
-            try self.ensureLayerBlockTable(layer, logical_blocks, write.total_token_count, write.page_size_tokens);
+            try self.ensureLayerBlockTable(layer, logical_blocks, write.total_token_count, write.page_size_tokens, write.device_capacity_limit_tokens);
         }
         return layer;
     }
@@ -8649,6 +9908,13 @@ const CudaKvDeviceStorage = struct {
         };
     }
 
+    fn prepareMutationWithCleanup(ctx: *anyopaque, implementation: *const anyopaque, current: CacheCleanup) !void {
+        if (implementation != @as(*const anyopaque, @ptrCast(&hook_vtable))) return error.UnsupportedReaderEpochBackend;
+        const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        const backend = self.compute.computeBackend();
+        try invalidateCapturedGraphForMutation(self.compute, &backend, current);
+    }
+
     fn releaseSequence(ctx: *anyopaque, sequence_id: kv_storage_runtime.SequenceId) void {
         const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
         if (self.compute.lighton_decode_graph_enabled) self.compute.lighton_decode_graph.invalidate(&self.compute.ctx);
@@ -8764,7 +10030,8 @@ const CudaKvDeviceStorage = struct {
             }
         }
         invalidateDebugFinalHiddenGraph(self.compute);
-        if (self.compute.lighton_decode_graph_enabled) self.compute.lighton_decode_graph.invalidate(&self.compute.ctx);
+        const backend = self.compute.computeBackend();
+        try invalidateCapturedGraphForMutation(self.compute, &backend, request.cleanup);
         var attempted = false;
         errdefer if (attempted) self.compute.ctx.synchronize() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         for (0..request.layers) |index| {
@@ -8862,7 +10129,7 @@ const CudaKvDeviceStorage = struct {
         errdefer if (attempted) self.compute.ctx.synchronize() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         claim.attempted = true;
         try preparePersistentCudaBufferReallocation(self.compute);
-        if (self.compute.lighton_decode_graph_enabled) self.compute.lighton_decode_graph.invalidate(&self.compute.ctx);
+        if (self.compute.lighton_decode_graph_enabled) try self.compute.clearCapturedGraphWithCleanup(.{ .boundary = cleanup });
         // Allocate the complete replacement before copying or publishing any
         // plane. Claims already cover all new allocations plus retained olds.
         for (plan.layers[0..plan.count], 0..) |layer, index| {
@@ -8987,7 +10254,7 @@ const CudaKvDeviceStorage = struct {
                 layer.block_table = try buffer_mod.DeviceBuffer.allocWithPurpose(&staged.compute.ctx, table_bytes, .kv_state);
                 layer.block_table_capacity = table_capacity;
                 staged.compute.noteDeviceBytes(table_bytes);
-                try staged.ensureLayerBlockTable(layer, request.destination_blocks, request.tokens, request.page_size);
+                try staged.ensureLayerBlockTable(layer, request.destination_blocks, request.tokens, request.page_size, 0);
             }
         }
         try destination.compute.ctx.synchronize();
@@ -9042,6 +10309,7 @@ const CudaKvDeviceStorage = struct {
     }
 
     const hook_vtable = kv_storage_runtime.DeviceWriteHook.VTable{
+        .prepareMutationWithCleanup = prepareMutationWithCleanup,
         .readExactAttentionMatchKv = readExactAttentionMatchKv,
         .cloneExactPrefix = cloneExactPrefix,
         .copySharedBlockPrefixes = copySharedBlockPrefixes,
@@ -9895,6 +11163,11 @@ fn provisionKvDeviceWriteHook(ctx: *anyopaque, storage: *kv_storage_runtime.KvSt
 }
 
 fn beginRequest(ctx: *anyopaque) anyerror!void {
+    // Legacy entry has no cleanup authority. Empty/unmanaged state is valid;
+    // a live charged graph requires the explicit factory/current-B entry.
+    return beginRequestUsing(ctx, .{});
+}
+fn beginRequestUsing(ctx: *anyopaque, current: CacheCleanup) anyerror!void {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (self.cacheRetirementPending()) return error.QueueFull;
     // A graph launch may still reference its captured temporary addresses.
@@ -9903,7 +11176,7 @@ fn beginRequest(ctx: *anyopaque) anyerror!void {
     // by token readback, but making it explicit keeps the ownership invariant
     // independent of sampling and response plumbing.
     if (self.ctx.debug_graph_capture_active) return error.InvalidCudaState;
-    self.lighton_decode_graph.invalidate(&self.ctx);
+    try self.clearCapturedGraphWithCleanup(current);
     self.lighton_decode_graph.epoch_id = 0;
     try synchronizeAndDrainDeferredDeviceFrees(self);
     try resetDebugCudaGraphRequestState(self);
@@ -9935,7 +11208,9 @@ fn deinitBackendClearRunBudget(ctx: *anyopaque) void {
 }
 
 fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor, current: @import("../../execution/cleanup_context.zig").Context) void {
-    if (cuda_tensor.cache_retirement_slot) |slot| slot.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
+    if (cuda_tensor.cache_retirement_slot) |slot| {
+        slot.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
+    } else if (cuda_tensor.model_constant) cuda_tensor.model_constant_quota.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
     if (cuda_tensor.physical_storage_base) {
         freePhysicalRootChecked(self, cuda_tensor) catch platform.inference_process_supervisor.restartWorker();
         return;
@@ -9958,13 +11233,13 @@ fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor, current: 
             _ = cuda_tensor.buffer.freeChecked(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
             _ = self.embedding_gemma2_constant_bytes.fetchSub(cuda_tensor.elem_count * @sizeOf(f32), .acq_rel);
             _ = self.embedding_gemma2_constant_count.fetchSub(1, .acq_rel);
-            slot.finishAfterSdkDeath(&cuda_tensor.model_constant_lease, current) catch platform.inference_process_supervisor.restartWorker();
+            cuda_tensor.model_constant_quota.finishRetainedAfterSdkDeath(slot, current) catch platform.inference_process_supervisor.restartWorker();
             cuda_tensor.cache_retirement_slot = null;
         } else {
-            cuda_tensor.buffer.free(&self.ctx);
+            _ = cuda_tensor.buffer.freeChecked(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
             _ = self.embedding_gemma2_constant_bytes.fetchSub(cuda_tensor.elem_count * @sizeOf(f32), .acq_rel);
             _ = self.embedding_gemma2_constant_count.fetchSub(1, .acq_rel);
-            if (cuda_tensor.model_constant_lease) |*lease| lease.release();
+            cuda_tensor.model_constant_quota.releaseAfterSdkDeath(current) catch platform.inference_process_supervisor.restartWorker();
         }
     } else if (cuda_tensor.owns_buffer) releaseDeviceBuffer(self, &cuda_tensor.buffer);
     if (cuda_tensor.owns_shape) self.allocator.free(cuda_tensor.shape);
@@ -10493,14 +11768,16 @@ fn copyFromHostTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, byte
         // staging wraps must not drain later encoder/decoder work on SM121.
         // Host-admission denial retains the ordinary ring/arena fallback.
         const event_eligible = if (bytes.len <= pinned_scalar_upload_slot_size) !cudaPinnedScalarUploadsDisabled() else !cudaPinnedUploadArenaDisabled();
-        if (event_eligible and self.capability_profile == .lightonocr3 and
-            try self.ocr_pinned_metadata_arena.upload(&self.ctx, device, bytes))
-        {
+        const arena = if (event_eligible and self.capability_profile == .lightonocr3) if (self.ctx.video_cache_budget.admission != null)
+            try self.acquirePinnedMetadataArena()
+        else
+            &self.ocr_pinned_metadata_arena else null;
+        if (arena) |selected| if (if (self.ctx.video_cache_budget.admission != null) try selected.uploadPrepared(&self.ctx, device, bytes) else try selected.upload(&self.ctx, device, bytes)) {
             self.stats.h2d_bytes += bytes.len;
             self.ocr_pinned_metadata_uploads += 1;
             self.ocr_pinned_metadata_event_uploads += 1;
             return;
-        }
+        };
         // Pageable CUDA uploads can wait for preceding stream work. Retain a
         // private pinned copy until the ring/arena is safely synchronized and
         // reused, so caller-owned stack/heap data may retire immediately.
@@ -11694,8 +12971,12 @@ fn copyFromPinnedOcrInputArena(self: *CudaCompute, device: buffer_mod.DeviceBuff
         (self.capability_profile != .lightonocr3 and self.capability_profile != .florence2) or
         self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
         bytes.len <= pinned_upload_arena_capacity or bytes.len > ocr_pinned_input_capacity) return false;
-    const wraps = self.ocr_pinned_input.wraps;
-    if (!try self.ocr_pinned_input.upload(&self.ctx, device, bytes)) return false;
+    const arena = if (self.ctx.video_cache_budget.admission != null)
+        (try self.acquirePinnedArena(.pinned_input_host)) orelse return false
+    else
+        &self.ocr_pinned_input;
+    const wraps = arena.wraps;
+    if (if (self.ctx.video_cache_budget.admission != null) !try arena.uploadPrepared(&self.ctx, device, bytes) else !try arena.upload(&self.ctx, device, bytes)) return false;
     self.stats.h2d_bytes += bytes.len;
     self.ocr_pinned_input_uploads += 1;
     self.ocr_pinned_input_wraps += self.ocr_pinned_input.wraps - wraps;
@@ -12723,10 +14004,11 @@ fn lightOnGatedFfnNoBias(ctx: *anyopaque, request: *const ops.GatedFfnNoBiasRequ
         !lightOnDevice(self).portableKernels() or
         request.rows == 0 or request.rows > 8192 or request.activation != .silu or
         self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return null;
+    if (self.derived_weights_retiring) return null;
     const rows = request.rows;
     const hidden = request.hidden_size;
     const intermediate = request.intermediate_size;
-    if (!((hidden == 1024 and intermediate == 3584) or (hidden == 2560 and intermediate == 9216))) return null;
+    if (!CudaCompute.gateUpGeometry(hidden, intermediate)) return null;
     const input = tensorFromCt(request.input);
     try ensureF32(input);
     try ensureCount(input, try checkedMul(rows, hidden));
@@ -12762,35 +14044,27 @@ fn lightOnGatedFfnNoBias(ctx: *anyopaque, request: *const ops.GatedFfnNoBiasRequ
         return output;
     }
     const key = LightOnGateUpKey{ .gate = gate.buffer.ptr, .up = up.buffer.ptr, .hidden = hidden, .intermediate = intermediate };
-    const pair = self.lighton_gate_up_cache.get(key) orelse create: {
+    const pair_owner = self.lighton_gate_up_cache.get(key) orelse create: {
         if (self.lighton_gate_up_cache.count() >= 32) return null;
+        const derived_request: @import("prepared_cache.zig").DerivedWeight = .{ .kind = .gate_up, .sources = .{ gate.buffer.ptr, up.buffer.ptr, 0, 0 }, .widths = .{ intermediate, intermediate, 0, 0 }, .hidden = hidden };
+        var lease = (try self.acquireDerivedWeight(derived_request)) orelse return null;
+        defer lease.releaseAfterSdkDeath();
         try self.lighton_gate_up_cache.ensureUnusedCapacity(self.allocator, 1);
-        try self.lighton_gate_up_leases.ensureUnusedCapacity(self.allocator, 1);
         const half_bytes = try checkedMul(weight_count, 2);
-        const bytes = try checkedMul(half_bytes, 2);
-        // These immutable model-lifetime copies are derived weights. Their
-        // device/combined admission remains mandatory, while the scratch
-        // sublimit is reserved for independently admitted working memory.
-        var lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null;
-        if (self.ctx.video_cache_budget.admission) |policy|
-            lease = policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_weight_bytes = bytes }, policy.check_live_memory) catch return null;
-        var combined = buffer_mod.DeviceBuffer.alloc(&self.ctx, bytes) catch {
-            if (lease) |*active| active.release();
-            return null;
-        };
-        // From the first queued copy, retain admission through context teardown
-        // even on an exceptional copy/free failure. Normal retirement frees all
-        // paired weights before releasing these leases.
-        if (lease) |active| self.lighton_gate_up_leases.appendAssumeCapacity(active);
+        var combined = buffer_mod.DeviceBuffer.alloc(&self.ctx, try derived_request.bytes()) catch return null;
         errdefer {
-            self.ctx.synchronize() catch {};
-            combined.free(&self.ctx);
+            self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+            _ = combined.freeChecked(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
         }
         try copyFromDeviceTracked(self, .{ .ptr = combined.ptr, .len = half_bytes }, gate.buffer, half_bytes);
         try copyFromDeviceTracked(self, .{ .ptr = combined.ptr + half_bytes, .len = half_bytes }, up.buffer, half_bytes);
-        self.lighton_gate_up_cache.putAssumeCapacity(key, combined);
-        break :create combined;
+        const owner: CudaCompute.DerivedWeightStorage = .{ .buffer = combined, .quota = lease.publishQuota() };
+        self.lockConstantMetadata();
+        self.lighton_gate_up_cache.putAssumeCapacity(key, owner);
+        self.unlockConstantMetadata();
+        break :create owner;
     };
+    const pair = pair_owner.buffer;
     const staged = (try stageBf16ActivationForCublasLt(self, input, rows, hidden)) orelse return null;
     const two_intermediate = try checkedMul(intermediate, 2);
     var projected = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, two_intermediate), 4));
@@ -12850,23 +14124,10 @@ fn prepareRoundedBf16Projection(self: *CudaCompute, dst: buffer_mod.DeviceBuffer
     if (bytes > scratch_bytes) return null;
     // The execution policy is immutable after initialization. A test changing
     // policy must not reuse a smaller scratch allocation.
-    if (self.lighton_bf16_decode_scratch.ptr != 0 and self.lighton_bf16_decode_scratch.len < bytes) return null;
+    if (self.auxiliaryCache(.rounded_bf16_output).device.ptr != 0 and self.auxiliaryCache(.rounded_bf16_output).device.len < bytes) return null;
     const blas = &(self.cublaslt orelse return null);
-    if (self.lighton_bf16_decode_scratch.ptr == 0) {
-        // This extra physical working set has its own retained admission. It
-        // cannot consume headroom promised to the epoch's existing envelopes.
-        var lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null;
-        if (self.ctx.video_cache_budget.admission) |policy| {
-            lease = policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_scratch_bytes = scratch_bytes }, policy.check_live_memory) catch return null;
-        }
-        const buffer = buffer_mod.DeviceBuffer.alloc(&self.ctx, scratch_bytes) catch {
-            if (lease) |*active| active.release();
-            return null;
-        };
-        self.lighton_bf16_decode_scratch = buffer;
-        self.lighton_bf16_decode_lease = lease;
-    }
-    const reduced = buffer_mod.DeviceBuffer{ .ptr = self.lighton_bf16_decode_scratch.ptr, .len = bytes };
+    const scratch = (try self.acquireAuxiliaryStorage(.rounded_bf16_output)) orelse return null;
+    const reduced = buffer_mod.DeviceBuffer{ .ptr = scratch.device.ptr, .len = bytes };
     try buffer_mod.validateRegions(5, .{ input, weight, workspace, reduced, dst }, .{ try checkedMul(try checkedMul(rows, in_dim), 2), try checkedMul(try checkedMul(out_dim, in_dim), 2), workspace.len, bytes, try checkedMul(count, 4) }, .{ 2, 2, 256, 2, 4 }, 3);
     const vendor = blas.preflightDense(&self.ctx, .{ .precision = .bf16, .output_precision = .bf16, .rows = rows, .in_dim = in_dim, .out_dim = out_dim }, .{ .dst = reduced, .input = input, .weight = weight, .workspace = workspace }) catch |err| switch (err) {
         error.CublasLtUnsupported => return null,
@@ -14174,17 +15435,29 @@ fn noteLearnedTempArenaBoundary(self: *CudaCompute) !void {
 }
 
 fn drainDeferredDeviceFreesAfterSyncUnlocked(self: *CudaCompute) void {
+    drainDeferredDeviceFreesAfterSyncUnlockedUsing(self, false) catch unreachable;
+}
+fn drainDeferredDeviceFreesAfterSyncUnlockedUsing(self: *CudaCompute, comptime checked: bool) !void {
     if (self.deferred_device_frees.items.len == 0) return;
     var reclaimed: usize = 0;
     for (self.deferred_device_frees.items) |*buffer| {
-        reclaimed += buffer.len;
-        self.stats.device_free_calls += 1;
-        buffer.free(&self.ctx);
+        if (checked) {
+            const bytes = buffer.len;
+            self.stats.device_free_calls += 1;
+            _ = try buffer.freeChecked(&self.ctx);
+            // Earlier successful SDK deaths remain observable even when a
+            // later root fails and keeps the conservative queue charge.
+            self.stats.deferred_free_reclaimed_bytes += bytes;
+        } else {
+            reclaimed += buffer.len;
+            self.stats.device_free_calls += 1;
+            buffer.free(&self.ctx);
+        }
     }
     self.deferred_device_frees.clearRetainingCapacity();
     self.deferred_device_free_bytes = 0;
     self.stats.deferred_free_drains += 1;
-    self.stats.deferred_free_reclaimed_bytes += reclaimed;
+    if (!checked) self.stats.deferred_free_reclaimed_bytes += reclaimed;
 }
 
 fn synchronizeAndDrainDeferredDeviceFrees(self: *CudaCompute) !void {
@@ -14194,8 +15467,11 @@ fn synchronizeAndDrainDeferredDeviceFrees(self: *CudaCompute) !void {
 }
 
 fn synchronizeAndDrainDeferredDeviceFreesUnlocked(self: *CudaCompute) !void {
+    try synchronizeAndDrainDeferredDeviceFreesUnlockedUsing(self, false);
+}
+fn synchronizeAndDrainDeferredDeviceFreesUnlockedUsing(self: *CudaCompute, comptime checked: bool) !void {
     try self.ctx.synchronize();
-    drainDeferredDeviceFreesAfterSyncUnlocked(self);
+    try drainDeferredDeviceFreesAfterSyncUnlockedUsing(self, checked);
     self.training_upload_generation +%= 1;
     // Both page-locked upload staging areas are stream ordered. A completed
     // stream makes every previously submitted source slice reusable.
@@ -14204,8 +15480,11 @@ fn synchronizeAndDrainDeferredDeviceFreesUnlocked(self: *CudaCompute) !void {
 }
 
 fn forceDrainDeferredDeviceFreesUnlocked(self: *CudaCompute) !void {
+    try forceDrainDeferredDeviceFreesUnlockedUsing(self, false);
+}
+fn forceDrainDeferredDeviceFreesUnlockedUsing(self: *CudaCompute, comptime checked: bool) !void {
     if (self.deferred_device_frees.items.len == 0) return;
-    try synchronizeAndDrainDeferredDeviceFreesUnlocked(self);
+    try synchronizeAndDrainDeferredDeviceFreesUnlockedUsing(self, checked);
     self.stats.deferred_free_forced_drains += 1;
 }
 
@@ -14560,7 +15839,7 @@ fn lightOnStatePoolEnabled(self: *const CudaCompute) bool {
         self.lazy_host_store == null and !self.resident_training_cache and
         !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active and
         cudaTempCacheBudgetBytes(self) != 0 and
-        (self.ctx.video_cache_budget.admission == null or self.ocr_retained_cache_lease != null);
+        (self.ctx.video_cache_budget.admission == null or self.ocr_retained_cache_quota.hasLease());
 }
 
 /// The caller holds temp_buffer_mutex. These owned allocations are still
@@ -14576,7 +15855,7 @@ fn takeLightOnDeferredBufferUnlocked(self: *CudaCompute, len: usize, exact: bool
     // it must retain the original conservative allocation/free behavior.
     if (deferred_budget == 0 or self.deferred_device_free_bytes >= deferred_budget or
         cudaTempCacheBudgetBytes(self) == 0 or cudaTempCacheMaxBuffers(self) == 0 or
-        (self.ctx.video_cache_budget.admission != null and self.ocr_retained_cache_lease == null)) return null;
+        (self.ctx.video_cache_budget.admission != null and !self.ocr_retained_cache_quota.hasLease())) return null;
     var best_index: ?usize = null;
     var best_len: usize = std.math.maxInt(usize);
     for (self.deferred_device_frees.items, 0..) |buffer, i| {
@@ -14625,13 +15904,43 @@ fn allocLightOnStateBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuf
     return buffer_mod.DeviceBuffer.alloc(&self.ctx, len);
 }
 
+fn invalidateCapturedGraphForMutation(self: *CudaCompute, backend: *const ops.ComputeBackend, current: CacheCleanup) !void {
+    if (current.boundary != null or current.outside_execution) {
+        try CudaCompute.invalidateLightOnDecodeGraphWithCleanup(backend, current);
+    } else if (self.lighton_decode_graph_enabled) {
+        // Legacy raw/empty custody only. No inferred outside authority.
+        self.lighton_decode_graph.invalidate(&self.ctx);
+    }
+}
+
+fn prepareLightOnStateReleaseWithCleanup(context: *anyopaque, current: CacheCleanup) !void {
+    const self: *CudaCompute = @ptrCast(@alignCast(context));
+    const backend = self.computeBackend();
+    try invalidateCapturedGraphForMutation(self, &backend, current);
+}
+fn recycleLightOnStateBufferWithCleanup(context: *anyopaque, buffer: *buffer_mod.DeviceBuffer, recycle: bool, current: CacheCleanup) !void {
+    _ = current; // caller prepared the actual owner once before all descriptors
+    if (buffer.ptr == 0) return;
+    const self: *CudaCompute = @ptrCast(@alignCast(context));
+    if (recycle and self.lighton_state_pool_enabled and self.capability_profile == .lightonocr3 and
+        cudaTempCacheBudgetBytes(self) != 0 and
+        (self.ctx.video_cache_budget.admission == null or self.ocr_retained_cache_quota.hasLease()))
+    {
+        _ = self.lighton_state_pool_releases.fetchAdd(1, .monotonic);
+        try releaseDeviceBufferUsing(self, buffer, true);
+    } else _ = try buffer.freeChecked(&self.ctx);
+}
+
 fn recycleLightOnStateBuffer(context: *anyopaque, buffer: *buffer_mod.DeviceBuffer) void {
     if (buffer.ptr == 0) return;
     const self: *CudaCompute = @ptrCast(@alignCast(context));
     if (self.lighton_decode_graph_enabled) self.lighton_decode_graph.invalidate(&self.ctx);
+    recycleLightOnStateBufferAfterInvalidation(self, buffer);
+}
+fn recycleLightOnStateBufferAfterInvalidation(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) void {
     if (self.lighton_state_pool_enabled and self.capability_profile == .lightonocr3 and
         cudaTempCacheBudgetBytes(self) != 0 and
-        (self.ctx.video_cache_budget.admission == null or self.ocr_retained_cache_lease != null))
+        (self.ctx.video_cache_budget.admission == null or self.ocr_retained_cache_quota.hasLease()))
     {
         // The cache's independent retained reservation covers the allocation
         // after State.deinit releases the retiring page's own admission lease.
@@ -14641,6 +15950,9 @@ fn recycleLightOnStateBuffer(context: *anyopaque, buffer: *buffer_mod.DeviceBuff
 }
 
 fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) void {
+    releaseDeviceBufferUsing(self, buffer, false) catch unreachable;
+}
+fn releaseDeviceBufferUsing(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer, comptime checked: bool) !void {
     if (buffer.ptr == 0) return;
     if (self.execution_scope) |scope| {
         if (buffer.borrowed and buffer.ptr == scope.output_ptr) {
@@ -14669,37 +15981,40 @@ fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) voi
         self.temp_buffers.append(self.allocator, buffer.*) catch {
             self.stats.temp_buffer_evictions += 1;
             self.stats.device_free_calls += 1;
-            buffer.free(&self.ctx);
+            if (checked) _ = try buffer.freeChecked(&self.ctx) else buffer.free(&self.ctx);
             return;
         };
         self.stats.temp_buffer_releases += 1;
         buffer.* = .{};
         return;
     }
-    evictTempBufferUnlocked(self, buffer);
+    try evictTempBufferUnlockedUsing(self, buffer, checked);
 }
 
 fn evictTempBufferUnlocked(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) void {
+    evictTempBufferUnlockedUsing(self, buffer, false) catch unreachable;
+}
+fn evictTempBufferUnlockedUsing(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer, comptime checked: bool) !void {
     if (buffer.ptr == 0) return;
     self.stats.temp_buffer_evictions += 1;
     if (cudaDeferredFreeEnabled()) {
         self.deferred_device_frees.append(self.allocator, buffer.*) catch {
             self.stats.device_free_calls += 1;
-            synchronizeAndDrainDeferredDeviceFreesUnlocked(self) catch {};
-            buffer.free(&self.ctx);
+            if (checked) try synchronizeAndDrainDeferredDeviceFreesUnlockedUsing(self, true) else synchronizeAndDrainDeferredDeviceFreesUnlocked(self) catch {};
+            if (checked) _ = try buffer.freeChecked(&self.ctx) else buffer.free(&self.ctx);
             return;
         };
         self.deferred_device_free_bytes += buffer.len;
         self.stats.deferred_free_queued += 1;
         buffer.* = .{};
         if (self.deferred_device_free_bytes >= cudaDeferredFreeBudgetBytes(self)) {
-            forceDrainDeferredDeviceFreesUnlocked(self) catch {};
+            if (checked) try forceDrainDeferredDeviceFreesUnlockedUsing(self, true) else forceDrainDeferredDeviceFreesUnlocked(self) catch {};
         }
         return;
     }
     self.stats.device_free_calls += 1;
-    synchronizeAndDrainDeferredDeviceFreesUnlocked(self) catch {};
-    buffer.free(&self.ctx);
+    if (checked) try synchronizeAndDrainDeferredDeviceFreesUnlockedUsing(self, true) else synchronizeAndDrainDeferredDeviceFreesUnlocked(self) catch {};
+    if (checked) _ = try buffer.freeChecked(&self.ctx) else buffer.free(&self.ctx);
 }
 
 fn borrowModelConstant(self: *CudaCompute, parent: *CudaTensor) !CT {
@@ -14719,17 +16034,22 @@ fn modelConstantOp(ctx: *anyopaque, key: []const u8, value: ?CT) anyerror!?CT {
     const embedding_key = self.capability_profile == .embedding_gemma2 and std.mem.startsWith(u8, key, "audio_tower.prepared.");
     const lighton_key = self.capability_profile == .lightonocr3 and self.lighton_norm_weight_cache_enabled and std.mem.startsWith(u8, key, "lighton.norm_weight.");
     if (key.len > 256 or (!embedding_key and !lighton_key)) return null;
-    if (self.embedding_gemma2_constants.get(key)) |snapshot| {
+    self.lockConstantMetadata();
+    const cached = self.embedding_gemma2_constants.get(key);
+    self.unlockConstantMetadata();
+    if (cached) |snapshot| {
         if (value) |input| {
             const candidate = tensorFromCt(input);
             if (candidate.dtype != .f32 or !std.mem.eql(i64, candidate.shape, snapshot.shape)) return error.InvalidShape;
         }
         self.embedding_gemma2_constant_hits += 1;
         if (std.mem.startsWith(u8, key, "audio_tower.prepared.query_scale.")) self.embedding_gemma2_audio_constant_hits += 1;
+        if (self.lighton_decode_graph.active) if (self.captured_cache_roots) |roots| try roots.selected(self, key, snapshot);
         return borrowModelConstant(self, snapshot);
     }
     self.embedding_gemma2_constant_misses += 1;
     const source = tensorFromCt(value orelse return null);
+    if (lighton_key and !self.managedNormMissFunded(key, try checkedMul(source.elem_count, 4))) return null;
     try ensureF32(source);
     const bytes = try checkedMul(source.elem_count, @sizeOf(f32));
     if (bytes == 0 or bytes > policy.prepared_max_bytes - self.embedding_gemma2_constant_bytes.load(.acquire) or self.embedding_gemma2_constant_count.load(.acquire) >= policy.prepared_max_entries or try self.ctx.streamCaptureActive()) return null;
@@ -14754,12 +16074,18 @@ fn modelConstantOp(ctx: *anyopaque, key: []const u8, value: ?CT) anyerror!?CT {
     // runs on a cache hit and cannot pin a request's temporary allocation.
     try buffer.copyFromDevice(&self.ctx, source.buffer, bytes);
     try self.ctx.synchronize();
-    snapshot.* = .{ .buffer = buffer, .dtype = .f32, .shape = shape, .elem_count = source.elem_count, .model_constant = true, .model_constant_lease = lease.value };
+    snapshot.* = .{ .buffer = buffer, .dtype = .f32, .shape = shape, .elem_count = source.elem_count, .model_constant = true, .model_constant_quota = .none };
     const result = try borrowModelConstant(self, snapshot);
-    _ = lease.publish();
+    if (self.lighton_decode_graph.active) if (self.captured_cache_roots) |roots| roots.selected(self, key, snapshot) catch |err| {
+        freeTensor(self, result);
+        return err;
+    };
+    snapshot.model_constant_quota = lease.publishQuota();
     _ = self.embedding_gemma2_constant_bytes.fetchAdd(bytes, .release);
     _ = self.embedding_gemma2_constant_count.fetchAdd(1, .release);
+    self.lockConstantMetadata();
     self.embedding_gemma2_constants.putAssumeCapacityNoClobber(name, snapshot);
+    self.unlockConstantMetadata();
     return result;
 }
 
@@ -14822,7 +16148,7 @@ fn borrowedSlotTensor(tensor: *const CudaTensor) CudaTensor {
     borrowed.resident_parent = null;
     borrowed.resident_references = .init(1);
     borrowed.model_constant = false;
-    borrowed.model_constant_lease = null;
+    borrowed.model_constant_quota = .none;
     borrowed.cache_retirement_slot = null;
     borrowed.owns_buffer = false;
     borrowed.owns_tc_quant = false;
@@ -26983,8 +28309,17 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
     if (paged.page_size_tokens == 0) return error.DeviceReadFallback;
 
     const runtime = paged.runtime orelse return error.DeviceReadFallback;
+    const kv = attention.kv_cache orelse return error.DeviceReadFallback;
+    const storage = attention.kv_storage orelse kv.kv_storage orelse return error.DeviceReadFallback;
+    if (kv.kv_storage) |bound| if (bound != storage) return error.InvalidPagedKvState;
+    const hook = storage.device_write_hook orelse return error.DeviceReadFallback;
+    // Attest the concrete hook and SAME runtime before any descriptor cast.
+    if (hook.vtable != &CudaKvDeviceStorage.hook_vtable or hook.ctx != runtime) return error.InvalidPagedKvState;
     const device_storage: *CudaKvDeviceStorage = @ptrCast(@alignCast(runtime));
+    if (device_storage.compute != self or device_storage.dtype != storage.storage.config.dtype or paged.page_size_tokens != storage.storage.config.page_size_tokens) return error.InvalidPagedKvState;
+    const expected_key = try device_storage.layerKey(kv.sequence_id, attention.layer_index);
     const layer_key: u64 = @intCast(paged.slot);
+    if (layer_key != expected_key) return error.InvalidPagedKvState;
     const layer = device_storage.layers.getPtr(layer_key) orelse return error.DeviceReadFallback;
     if (layer.compressed_format == null or layer.compressed_format.? != paged.format) return error.DeviceReadFallback;
     if (layer.key_row_bytes != paged.key_row_bytes or layer.value_row_bytes != paged.v_row_stride) return error.DeviceReadFallback;
@@ -26992,13 +28327,12 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
     if (layer.value_format == cuda_kv_value_format_int8_per_head and layer.value_row_bytes != kv_pool_mod.KvDType.int8.bytesForValueRow(@intCast(num_kv_heads), @intCast(head_dim))) return error.DeviceReadFallback;
     if (layer.value_format == cuda_kv_value_format_int4_group and layer.value_row_bytes != kv_pool_mod.KvDType.int4.bytesForValueRow(@intCast(num_kv_heads), @intCast(head_dim))) return error.DeviceReadFallback;
     if (layer.value_format == cuda_kv_value_format_f16 and layer.value_row_bytes != kv_pool_mod.KvDType.f16.bytesForValueRow(@intCast(num_kv_heads), @intCast(head_dim))) return error.DeviceReadFallback;
-    const logical_blocks = if (attention.kv_cache) |kv| blk: {
-        if (kv.logical_blocks) |blocks| break :blk blocks;
-        const storage = attention.kv_storage orelse return error.DeviceReadFallback;
-        const table = storage.blockTable(kv.sequence_id) orelse return error.DeviceReadFallback;
-        break :blk table.blocks.items;
-    } else return error.DeviceReadFallback;
-    try device_storage.ensureLayerBlockTable(layer, logical_blocks, attention.kv_sequence_len, paged.page_size_tokens);
+    // Only this sequence's authoritative full table owns its future replay
+    // slots. Manager snapshots cover visible rows and may use other IDs.
+    const sequence = try storage.sequenceMut(kv.sequence_id);
+    const reserved_capacity_tokens = sequence.device_capacity_limit_tokens;
+    const logical_blocks = try storage.logicalBlocksWithReservations(kv.sequence_id);
+    try device_storage.ensureLayerBlockTable(layer, logical_blocks, attention.kv_sequence_len, paged.page_size_tokens, reserved_capacity_tokens);
 
     const bias_tensor: ?*CudaTensor = if (attn_bias_ct) |bct| tensorFromCt(bct) else null;
     const bias_mode = try biasModeFor(bias_tensor, batch, num_heads, attention.query_sequence_len, attention.kv_sequence_len);
@@ -27495,8 +28829,7 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
         !@import("paged_attention_bf16.zig").packetSupported(self.ctx.info.compute_major, self.ctx.info.driver_version) or
         attention.query_sequence_len != 1 or attention.skip_kv_write or
         attention.sliding_window != 0 or attention.attn_or_mask != null or attention.attention_sink.hasMetadata() or
-        views.len < 2 or views.len > 64 or dim != 256 or
-        !((heads == 8 and kv_heads == 2) or (heads == 16 and kv_heads == 4)) or
+        views.len < 2 or views.len > 64 or !@import("paged_attention_bf16.zig").geometrySupported(heads, kv_heads, dim) or
         ((self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) and !lightOnOwnedDecodeCapture(self))) return null;
     const module = @import("paged_attention_bf16.zig");
     const storage = views[0].kv_storage orelse return null;
@@ -28929,35 +30262,18 @@ fn cachedLightOnMropePositions(self: *CudaCompute, positions: []const u32) !?buf
     if (!self.lighton_cached_mrope_enabled or self.capability_profile != .lightonocr3 or
         self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
         positions.len == 0 or positions.len > lighton_mrope_position_capacity) return null;
-    if (self.lighton_mrope_cache_device.ptr == 0) {
-        const bytes = lighton_mrope_position_capacity * @sizeOf(u32);
-        var lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null;
-        if (self.ctx.video_cache_budget.admission) |policy|
-            lease = policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_scratch_bytes = bytes, .host_scratch_bytes = bytes }, policy.check_live_memory) catch return null;
-        errdefer if (lease) |*active| active.release();
-        try self.lighton_mrope_cache_host.ensureTotalCapacityPrecise(self.allocator, lighton_mrope_position_capacity);
-        self.lighton_mrope_cache_device = buffer_mod.DeviceBuffer.alloc(&self.ctx, bytes) catch |err| {
-            self.lighton_mrope_cache_host.deinit(self.allocator);
-            self.lighton_mrope_cache_host = .empty;
-            if (err == error.CudaMemoryLimitExceeded) {
-                if (lease) |*active| active.release();
-                return null;
-            }
-            return err;
-        };
-        self.lighton_mrope_cache_lease = lease;
-    }
-    if (std.mem.eql(u32, self.lighton_mrope_cache_host.items, positions)) {
+    const cache = (try self.acquireAuxiliaryStorage(.rotary_positions_u32)) orelse return null;
+    if (std.mem.eql(u32, cache.host_u32.items, positions)) {
         self.lighton_mrope_cache_hits += 1;
     } else {
         // Exact content comparison avoids hash-collision reuse. Dedicated
         // storage cannot be overwritten by token, mask or KV metadata uploads.
-        self.lighton_mrope_cache_host.clearRetainingCapacity();
-        try copyFromHostTracked(self, self.lighton_mrope_cache_device, std.mem.sliceAsBytes(positions));
-        self.lighton_mrope_cache_host.appendSliceAssumeCapacity(positions);
+        cache.host_u32.clearRetainingCapacity();
+        try copyFromHostTracked(self, cache.device, std.mem.sliceAsBytes(positions));
+        cache.host_u32.appendSliceAssumeCapacity(positions);
         self.lighton_mrope_cache_uploads += 1;
     }
-    return self.lighton_mrope_cache_device;
+    return cache.device;
 }
 
 fn mrope(
@@ -32644,7 +33960,7 @@ test "attention match CUDA authoritative snapshot reads f16 and f32 and rejects 
         }
         try layer.k.copyFromHost(&compute.ctx, if (dtype == .f16) std.mem.sliceAsBytes(&k16) else std.mem.sliceAsBytes(&k32));
         try layer.v.copyFromHost(&compute.ctx, if (dtype == .f16) std.mem.sliceAsBytes(&v16) else std.mem.sliceAsBytes(&v32));
-        if (dtype == .f16) try storage.ensureLayerBlockTable(layer, &.{0}, 4, 16);
+        if (dtype == .f16) try storage.ensureLayerBlockTable(layer, &.{0}, 4, 16, 0);
         try compute.ctx.synchronize();
         const baseline_live = compute.ctx.device_allocations.snapshot().live;
         const reader = try storage.hook().attentionMatchReader();
@@ -33154,7 +34470,7 @@ test "CUDA prefill KV reservation preserves allocations and page table through a
     try std.testing.expectEqual(@as(usize, 48), layer.capacity_tokens);
     // Attention reads still use the real token length, while the reserved
     // physical table stays stable across read/write dispatches.
-    try storage.ensureLayerBlockTable(layer, &blocks, 2, 16);
+    try storage.ensureLayerBlockTable(layer, &blocks, 2, 16, write.device_capacity_limit_tokens);
     write.total_token_count = 17;
     write.suffix_token_count = 15;
     const appended = try storage.ensureLayer(write);
@@ -33222,7 +34538,7 @@ test "attention match CUDA authoritative snapshot batches large half and float r
         if (dtype == .f16) {
             var blocks: [257]u32 = undefined;
             for (&blocks, 0..) |*block, i| block.* = @intCast(i);
-            try storage.ensureLayerBlockTable(layer, &blocks, logical, 16);
+            try storage.ensureLayerBlockTable(layer, &blocks, logical, 16, 0);
         }
         try compute.ctx.synchronize();
         const baseline = compute.ctx.device_allocations.snapshot().live;
@@ -33899,6 +35215,8 @@ test "embeddinggemma2 CUDA model constants keep independent admission through bo
             var controller = @import("../../runtime/tier/memory.zig").AdmissionController{};
             var compute: CudaCompute = undefined;
             compute.ctx.prepared_cache_funding = null;
+            compute.constant_metadata_mutex = .unlocked;
+            compute.cache_retirement_pending = .init(0);
             compute.ctx.observation.store(null, .release);
             compute.ctx.observation_enable_failed.store(false, .release);
 
@@ -33939,6 +35257,7 @@ test "embeddinggemma2 CUDA model constants keep independent admission through bo
             compute.ctx.driver.fns.cuMemcpyDtoDAsync = copy;
             defer {
                 compute.clearEmbeddingGemma2Constants(false) catch unreachable;
+                compute.embedding_gemma2_constants.deinit(a); // retained metadata belongs to this mock context
                 std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes) catch unreachable;
                 std.testing.expectEqual(@as(usize, 0), compute.ctx.device_allocations.snapshot().live) catch unreachable;
             }
@@ -33946,10 +35265,10 @@ test "embeddinggemma2 CUDA model constants keep independent admission through bo
             var source = CudaTensor{ .buffer = .{ .ptr = 1024, .len = 16 }, .shape = &shape, .elem_count = 4, .dtype = .f32, .owned_by_tensor = false };
             const key = "audio_tower.prepared.query_scale.fixture";
             const first = (try modelConstantOp(&compute, key, &source)).?;
-            defer freeTensor(&compute, first);
+            defer freeTensorWithCleanup(&compute, first, .{ .outside_execution = true });
             try std.testing.expect(tensorFromCt(first).buffer.ptr != source.buffer.ptr);
             const hit = (try modelConstantOp(&compute, key, null)).?;
-            defer freeTensor(&compute, hit);
+            defer freeTensorWithCleanup(&compute, hit, .{ .outside_execution = true });
             try std.testing.expectEqual(@as(usize, 1), copies);
             try std.testing.expectEqual(@as(u64, 1), compute.embedding_gemma2_audio_constant_hits);
             // A denied publication cannot consume request or shared memory.
@@ -34609,7 +35928,7 @@ fn storageOwnershipOp(ctx: *anyopaque, tensor: CT, visitor: @import("../../execu
     };
     if (physical) |lease| {
         if (lease.admission) |reserved| span.charged = .{ .identity = reserved.identity, .bytes = lease.admittedBytes() };
-    } else if (owner.model_constant_lease) |lease| {
+    } else if (owner.model_constant_quota.peek()) |lease| {
         if (lease.controller) |controller| span.charged = .{ .identity = .{ .controller = controller, .backend_class = .gpu }, .bytes = lease.amounts.backendTotalBytes() };
     }
     try visitor.emit(.{ .backing = span });
@@ -36666,10 +37985,16 @@ test "LightOnOCR3 CUDA pinned OCR metadata owns queued host bytes across arena a
         const events = allow_events;
         compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{ .host_limit_bytes = if (events) capacity else capacity - 1 }, .check_live_memory = false };
         defer compute.ctx.video_cache_budget.admission = null;
-        if (events) compute.ocr_pinned_metadata_arena.offset = capacity - 256;
         const small_count = pinned_scalar_upload_slot_count + 3;
         var small = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, small_count * 4);
         defer small.free(&compute.ctx);
+        if (events) {
+            // This legacy wrap fixture explicitly creates its raw backing
+            // outside execution. The managed cold-token path is tested below.
+            try std.testing.expect(try compute.ocr_pinned_metadata_arena.upload(&compute.ctx, small, &.{ 0, 0, 0, 0 }));
+            try compute.ctx.synchronize();
+            compute.ocr_pinned_metadata_arena.offset = capacity - 256;
+        }
         for (0..small_count) |i| {
             var value: u32 = @intCast(i * 17 + 31);
             try copyFromHostTracked(&compute, .{ .ptr = small.ptr + i * 4, .len = 4 }, std.mem.asBytes(&value));
@@ -36929,6 +38254,12 @@ test "LightOnOCR3 CUDA pinned OCR image inputs retain host admission and queued 
     try std.testing.expectEqual(@as(usize, 0), compute.ocr_pinned_input_uploads);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
     compute.ctx.video_cache_budget.admission.?.limits.host_limit_bytes = ocr_pinned_input_capacity;
+    {
+        var raw_destination = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, std.mem.sliceAsBytes(data).len);
+        defer raw_destination.free(&compute.ctx);
+        try std.testing.expect(try compute.ocr_pinned_input.upload(&compute.ctx, raw_destination, std.mem.sliceAsBytes(data)));
+        try compute.ctx.synchronize(); // explicit raw outside setup; numerical wrap assertions unchanged
+    }
     var tensors: [10]CT = undefined;
     for (&tensors, 0..) |*tensor, i| {
         @memset(data, @floatFromInt(i + 1));
@@ -37431,6 +38762,8 @@ test "LightOnOCR3 CUDA norm weight cache preserves bits readonly sources detache
     compute.lighton_norm_weight_cache_enabled = true;
     compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{ .backend_limit_bytes = 65536, .scratch_limit_bytes = 65536 }, .check_live_memory = false };
     const cb = compute.computeBackend();
+    // This direct component fixture owns no model/provider execution lane.
+    // Detached raw cache borrowers need this explicit final cleanup authority.
     var values: [2560]f32 = undefined;
     for (&values, 0..) |*x, i| x.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 31)) - 15)) / 32;
     for ([_]usize{ 128, 256, 1024, 2560 }) |dim| {
@@ -37440,17 +38773,17 @@ test "LightOnOCR3 CUDA norm weight cache preserves bits readonly sources detache
         const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(values[0..dim]), .dtype = .f32, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
         try compute.insertWeightFromTensor(try a.dupe(u8, name), &tensor);
         const source = try cb.getWeight(name);
-        defer cb.free(source);
+        defer cb.freeWithCleanup(source, .{ .outside_execution = true });
         const before = compute.stats.add_scalar_calls;
         const first = (try CudaCompute.lightOnAdjustedNormWeight(&cb, source, dim, 1)).?;
-        defer cb.free(first);
+        defer cb.freeWithCleanup(first, .{ .outside_execution = true });
         const hit = (try CudaCompute.lightOnAdjustedNormWeight(&cb, source, dim, 1)).?;
-        defer cb.free(hit);
+        defer cb.freeWithCleanup(hit, .{ .outside_execution = true });
         try std.testing.expectEqual(before + 1, compute.stats.add_scalar_calls);
         try std.testing.expect(tensorFromCt(first).buffer.ptr != tensorFromCt(source).buffer.ptr);
         try std.testing.expectEqual(tensorFromCt(first).buffer.ptr, tensorFromCt(hit).buffer.ptr);
         const ordinary = (try cb.addScalar(source, 1)).?;
-        defer cb.free(ordinary);
+        defer cb.freeWithCleanup(ordinary, .{ .outside_execution = true });
         const expected = try cb.toFloat32(ordinary, a);
         defer a.free(expected);
         const actual = try cb.toFloat32(hit, a);
@@ -37467,25 +38800,25 @@ test "LightOnOCR3 CUDA norm weight cache preserves bits readonly sources detache
     try std.testing.expectEqual(@as(usize, 4), compute.lighton_norm_weight_cache_hits);
     try std.testing.expectEqual(@as(usize, 4), compute.lighton_norm_weight_cache_misses);
     const mutable = try cb.fromFloat32Shape(values[0..128], &.{128});
-    defer cb.free(mutable);
+    defer cb.freeWithCleanup(mutable, .{ .outside_execution = true });
     try std.testing.expect(try CudaCompute.lightOnAdjustedNormWeight(&cb, mutable, 128, 1) == null);
     const last = try cb.getWeight("norm-cache.2560");
-    defer cb.free(last);
+    defer cb.freeWithCleanup(last, .{ .outside_execution = true });
     const detached = (try CudaCompute.lightOnAdjustedNormWeight(&cb, last, 2560, 1)).?;
     var detached_owned = true;
-    defer if (detached_owned) cb.free(detached);
+    defer if (detached_owned) cb.freeWithCleanup(detached, .{ .outside_execution = true });
     try compute.clearEmbeddingGemma2Constants(false);
     try std.testing.expectEqual(@as(usize, 2560 * 4), controller.snapshot().backend_scratch_bytes);
     const after_detach = try cb.toFloat32(detached, a);
     defer a.free(after_detach);
     for (after_detach, values) |x, y| try std.testing.expectEqual(y + 1, x);
-    cb.free(detached);
+    cb.freeWithCleanup(detached, .{ .outside_execution = true });
     detached_owned = false;
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
     // A denied snapshot still returns the ordinary owned adjusted tensor.
     compute.ctx.video_cache_budget.admission.?.limits.scratch_limit_bytes = 1;
     const denied = (try CudaCompute.lightOnAdjustedNormWeight(&cb, last, 2560, 1)).?;
-    defer cb.free(denied);
+    defer cb.freeWithCleanup(denied, .{ .outside_execution = true });
     try std.testing.expect(tensorFromCt(denied).resident_parent == null);
     try std.testing.expectEqual(@as(usize, 0), compute.embedding_gemma2_constant_count.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
@@ -41354,6 +42687,14 @@ test "CUDA selected projection routes preserve legacy outputs through eviction a
                     try std.testing.expect(program.cold_dense_recipe != null and program.profile.dequant_weight_bytes == width * columns * 2);
                     try std.testing.expect(selected.requirements.probe_output == .none);
                 }
+                // Retain the actual metadata record independently so the first
+                // negative probe distinguishes inactive from fully consumed.
+                var retained_metadata: ?@import("../../execution/operation_gate.zig").Gate.Ticket = if (format == .q4_0_vendor) blk: {
+                    const token = metadata.token().?;
+                    const record: *@import("../../execution/operation_owner.zig").Owner.Record = @ptrCast(@alignCast(token.context));
+                    break :blk try (try record.snapshot(token.nonce)).ticket.retain();
+                } else null;
+                defer if (retained_metadata) |*ticket| if (ticket.held) ticket.release() catch @panic("retained cold metadata cleanup");
                 try metadata.finish();
                 if (format == .q4_0_vendor) {
                     // The same record stays pinned here but has relinquished
@@ -41362,6 +42703,9 @@ test "CUDA selected projection routes preserve legacy outputs through eviction a
                     var stale = request;
                     stale.allocator = failing.allocator();
                     try std.testing.expectError(error.BackendOperationInactive, prepareKernelRouteOp(&compute, stale));
+                    try std.testing.expect(!failing.has_induced_failure);
+                    try retained_metadata.?.release();
+                    try std.testing.expectError(error.BackendOperationConsumed, prepareKernelRouteOp(&compute, stale));
                     try std.testing.expect(!failing.has_induced_failure);
                 }
                 const output_lease = (try ops.physical_storage.Lease.create(a, cb, selected.requirements.primary_bytes)).?;
@@ -41436,7 +42780,7 @@ fn pinCachedStorageRoot(self: *CudaCompute, source: *CudaTensor) !?*CudaTensor {
     if (source.resident_parent) |parent| return parent;
     if (!source.immutable_cache_backing or source.resident_owner != self or !source.owns_buffer or source.buffer.borrowed or source.strict_resident_training or source.model_constant or source.physical_lease != null or source.training_upload_host.ptr != null) return null;
     for (source.auxiliary_leases) |lease| if (lease != null) return null;
-    if (source.model_constant_lease != null or (source.bf16_mirror.ptr != 0 and !source.owns_bf16_mirror) or (source.tc_quant != null and !source.owns_tc_quant) or (source.resident_indices != null and !source.owns_resident_indices)) return null;
+    if (source.model_constant_quota.hasLease() or (source.bf16_mirror.ptr != 0 and !source.owns_bf16_mirror) or (source.tc_quant != null and !source.owns_tc_quant) or (source.resident_indices != null and !source.owns_resident_indices)) return null;
     if (source.buffer.ptr != 0 and source.buffer.allocation_bytes == 0) return null;
     if (source.owns_bf16_mirror and (source.bf16_mirror.borrowed or (source.bf16_mirror.ptr != 0 and source.bf16_mirror.allocation_bytes == 0))) return null;
     if (source.owns_tc_quant) if (source.tc_quant) |quant| {
@@ -42305,7 +43649,7 @@ test "CUDA RMS direct route keeps live auxiliary policy invocation scoped" {
 /// Planned banks have one direct allocation. Confirm physical retirement before
 /// any header/Lease reservation can disappear; uncertainty restarts the worker.
 fn freePhysicalRootChecked(self: *CudaCompute, tensor: *CudaTensor) !void {
-    if (!tensor.physical_storage_base or !tensor.owns_buffer or tensor.buffer.borrowed or tensor.physical_lease != null or tensor.resident_parent != null or tensor.model_constant or tensor.model_constant_lease != null or tensor.storage_retirement != null or tensor.tc_quant != null or tensor.bf16_mirror.ptr != 0 or tensor.training_upload_host.ptr != null or tensor.resident_indices != null) return error.InvalidPhysicalStorageRoot;
+    if (!tensor.physical_storage_base or !tensor.owns_buffer or tensor.buffer.borrowed or tensor.physical_lease != null or tensor.resident_parent != null or tensor.model_constant or tensor.model_constant_quota.hasLease() or tensor.storage_retirement != null or tensor.tc_quant != null or tensor.bf16_mirror.ptr != 0 or tensor.training_upload_host.ptr != null or tensor.resident_indices != null) return error.InvalidPhysicalStorageRoot;
     for (tensor.auxiliary_leases) |lease| if (lease != null) return error.InvalidPhysicalStorageRoot;
     if (tensor.buffer.ptr != 0) {
         self.stats.device_free_calls += 1;
@@ -43045,6 +44389,22 @@ test "CUDA admitted KV growth preserves every encoded plane on partial OOM and c
         try std.testing.expect(budget.provider_gate.tryLock());
         var final_gate_live = true;
         defer if (final_gate_live) budget.provider_gate.unlock();
+        // Admitted encoded planes are global pool backing, not per-sequence
+        // allocations. Logical retirement must retain them for another sequence;
+        // only the hook's final current-B teardown retires their SDK/quota roots.
+        var owned_planes: usize = 0;
+        var global_layers = owner.layers.valueIterator();
+        while (global_layers.next()) |layer| for (layer.capacity_owners) |physical| {
+            if (physical != null) owned_planes += 1;
+        };
+        try std.testing.expect(owned_planes > 0);
+        const layer_count = owner.layers.count();
+        const live_before_release = compute.ctx.device_allocations.snapshot().live;
+        try runtime.releaseSequenceWithCleanup(sequence, .{ .boundary = &cleanup });
+        try std.testing.expect(runtime.tokenCount(sequence) == null);
+        try std.testing.expectEqual(layer_count, owner.layers.count());
+        try std.testing.expectEqual(live_before_release, compute.ctx.device_allocations.snapshot().live);
+        try std.testing.expectEqual(peak, budget.domain.controller.snapshot().backend_kv_bytes);
         runtime.deinitWithBoundary(&cleanup);
         runtime_live = false;
         try std.testing.expectEqual(peak, budget.domain.controller.snapshot().backend_kv_bytes);
@@ -43458,7 +44818,7 @@ const ForeignCloneOwner = struct {
 fn detachedEncoderRoot(view: *CudaTensor) ?*CudaTensor {
     var root = view;
     for (0..64) |_| {
-        if (!root.owned_by_tensor or root.resident_references.load(.acquire) != 1 or root.storage_retirement != null or root.resident_owner != null or root.foreign_clone_owner != null or root.physical_lease != null or root.model_constant or root.model_constant_lease != null or root.immutable_cache_backing or root.strict_resident_training or root.quant_type != null or root.tc_quant != null or root.bf16_mirror.ptr != 0 or root.training_upload_host.ptr != null or root.training_upload_generation != null or root.resident_indices != null or root.physical_storage_base) return null;
+        if (!root.owned_by_tensor or root.resident_references.load(.acquire) != 1 or root.storage_retirement != null or root.resident_owner != null or root.foreign_clone_owner != null or root.physical_lease != null or root.model_constant or root.model_constant_quota.hasLease() or root.immutable_cache_backing or root.strict_resident_training or root.quant_type != null or root.tc_quant != null or root.bf16_mirror.ptr != 0 or root.training_upload_host.ptr != null or root.training_upload_generation != null or root.resident_indices != null or root.physical_storage_base) return null;
         for (root.auxiliary_leases) |auxiliary| if (auxiliary != null) return null;
         if (root.owns_buffer) {
             if (root.resident_parent != null or root.buffer.borrowed) return null;
@@ -43495,7 +44855,7 @@ fn prepareAsyncForeignTensorCopyPolicy(comptime failure_policy: ColdCopyFailureP
     if (logical_view.shape.len > 8) return null;
     if (source.run_budget != null or source.execution_scope != null) return null;
     if (tensor.elem_count > std.math.maxInt(usize) / 4 or tensor.buffer.len != tensor.elem_count * 4) return null;
-    if (tensor.dtype != .f32 or tensor.quant_type != null or tensor.buffer.len == 0 or tensor.buffer.allocation_bytes != tensor.buffer.len or tensor.buffer.borrowed or !tensor.owned_by_tensor or !tensor.owns_buffer or tensor.resident_references.load(.acquire) != 1 or tensor.resident_parent != null or tensor.resident_owner != null or tensor.storage_retirement != null or tensor.foreign_clone_owner != null or tensor.physical_lease != null or tensor.model_constant or tensor.model_constant_lease != null or tensor.immutable_cache_backing or tensor.strict_resident_training or tensor.tc_quant != null or tensor.bf16_mirror.ptr != 0 or tensor.training_upload_host.ptr != null or tensor.resident_indices != null) return null;
+    if (tensor.dtype != .f32 or tensor.quant_type != null or tensor.buffer.len == 0 or tensor.buffer.allocation_bytes != tensor.buffer.len or tensor.buffer.borrowed or !tensor.owned_by_tensor or !tensor.owns_buffer or tensor.resident_references.load(.acquire) != 1 or tensor.resident_parent != null or tensor.resident_owner != null or tensor.storage_retirement != null or tensor.foreign_clone_owner != null or tensor.physical_lease != null or tensor.model_constant or tensor.model_constant_quota.hasLease() or tensor.immutable_cache_backing or tensor.strict_resident_training or tensor.tc_quant != null or tensor.bf16_mirror.ptr != 0 or tensor.training_upload_host.ptr != null or tensor.resident_indices != null) return null;
     // Metadata was prefunded using exclusive source/base lease borrows before
     // any model/provider gate. Only exact declared logical spans can consume it.
     if (funded.bytes != tensor.buffer.len) return null;
@@ -48219,6 +49579,29 @@ test "CUDA legacy F32 vendor metadata decline precedes math and accepted SDK fai
     for (actual) |value| try std.testing.expectEqual(@as(f32, width * 0.125 * 0.03125), value);
 }
 
+test "CUDA OCR cold metadata retries zero retention after pressure without SDK or permanent policy disable" {
+    var controller = @import("../../runtime/tier/memory.zig").AdmissionController{};
+    defer controller.deinit();
+    const desired = @import("video_cache_budget.zig").Admission{ .controller = &controller, .limits = .{ .backend_limit_bytes = 4 * 1024 * 1024 }, .check_live_memory = false };
+    // Precisely the former pressure-zero publication. An undefined numerical
+    // endpoint proves this cold decision reads only immutable policy and the
+    // short actual cache metadata owner; no stream or SDK may be consulted.
+    var compute: CudaCompute = undefined;
+    compute.capability_profile = .lightonocr3;
+    compute.runtime_policy = .{ .temp_cache_mb = 1 };
+    compute.constant_metadata_mutex = .unlocked;
+    compute.constant_policy = desired;
+    compute.cache_retirement_pending = .init(0);
+    compute.ocr_retention_configured = true;
+    compute.ocr_retained_cache_quota = .none;
+    const preferred = try compute.lightOnRetentionRequest(desired, 0);
+    try std.testing.expect(preferred.ocr_retention.cache_bytes + preferred.ocr_retention.deferred_bytes != 0);
+    try std.testing.expect(try compute.lightOnNormNeedsFunding(.{ .requests = &.{preferred} }, desired));
+    const exhausted = try compute.lightOnRetentionRequest(desired, @bitSizeOf(usize));
+    try std.testing.expect(!try compute.lightOnNormNeedsFunding(.{ .requests = &.{exhausted} }, desired));
+    try std.testing.expectEqualDeep(@import("../../runtime/tier/memory.zig").AdmissionAmounts{}, controller.snapshot());
+}
+
 test "CUDA BF16 core grouped metadata and actual tuning SDK failures never replay" {
     try checkBf16VendorFailureBoundary();
 }
@@ -48575,4 +49958,1858 @@ test "CUDA materialized relative attention preflights all four GEMMs and never r
         for (0..seq) |ki| expected += values[(b * seq + ki) * hidden + feature] / seq;
         try std.testing.expectApproxEqAbs(expected, actual[(b * seq + qi) * hidden + feature], 0.00001);
     };
+}
+
+test "CUDA cold OCR cache target certifies both actual profiles and vetoes copied tables before context cast" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const Target = @import("../../backends/cold_compute_target.zig").Target;
+    // This is only immutable target/metadata certification: no SDK endpoint,
+    // stream, resident catalog, quota, allocator or mutable weight is touched.
+    var compute: CudaCompute = undefined;
+    compute.ctx.ctx = @ptrFromInt(0x1000);
+    compute.ctx.device = 0;
+    var target: Target = .{ .cuda = .{ .implementation_context = &compute, .implementation_table = @ptrCast(&vtable), .primary_context = compute.ctx.ctx.?, .device = 0 } };
+    for ([_]*const ops.ComputeBackend.VTable{ &vtable, &scoped_run_budget_vtable }) |table| {
+        target.cuda.implementation_table = @ptrCast(table);
+        compute.capability_profile = .lightonocr3;
+        try std.testing.expect((try CudaCompute.lightOnNormCompute(target)).? == &compute);
+        try compute.lightOnNormMetadataAvailable();
+        compute.capability_profile = .florence2;
+        try std.testing.expect((try CudaCompute.lightOnNormCompute(target)).? == &compute);
+        try compute.lightOnNormMetadataAvailable();
+        // No arbitrary model can borrow this preparation contract.
+        compute.capability_profile = .bert_encoder;
+        try std.testing.expect((try CudaCompute.lightOnNormCompute(target)) == null);
+        try std.testing.expectError(error.UnsupportedPreparedCacheWorkload, compute.lightOnNormMetadataAvailable());
+    }
+    const Custom = struct {
+        fn free(_: *anyopaque, _: CT) void {
+            @panic("cold target certification invoked custom destructor");
+        }
+    };
+    var copied = vtable;
+    copied.freeTensor = Custom.free;
+    target.cuda.implementation_table = @ptrCast(&copied);
+    target.cuda.implementation_context = @ptrFromInt(1);
+    try std.testing.expect((try CudaCompute.lightOnNormCompute(target)) == null);
+}
+
+test "CUDA auxiliary cache actual backing upgrades exact raw quota and retires only after current B" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const CacheFunding = @import("prepared_cache.zig");
+    const Domain = @import("../../runtime/tier/admission_domain.zig").Domain;
+    const Sink = @import("../../execution/retirement_sink.zig");
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var compute = try CudaCompute.testing.init(a);
+    var compute_live = true;
+    defer if (compute_live) compute.deinit();
+    compute.capability_profile = .lightonocr3;
+    compute.lighton_cached_mrope_enabled = true;
+    compute.lighton_bf16_decode_outputs = true;
+    compute.lighton_bf16_projection_outputs = false;
+    if (!lightOnDevice(&compute).tensorCores() or compute.cublaslt == null) return error.SkipZigTest;
+    const Probe = struct {
+        gate: std.atomic.Mutex = .unlocked,
+        callbacks: usize = 0,
+        reservations: usize = 0,
+        under_gate: bool = false,
+        fn check(self: *@This()) void {
+            self.callbacks += 1;
+            if (self.gate.tryLock()) self.gate.unlock() else self.under_gate = true;
+        }
+        fn reserve(raw: *anyopaque, _: @import("../../runtime/tier/memory.zig").AdmissionAmounts) @import("../../runtime/tier/memory.zig").AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+            self.reservations += 1;
+            return self.reservations;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: @import("../../runtime/tier/memory.zig").AdmissionAmounts) @import("../../runtime/tier/memory.zig").AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+    };
+    var probe: Probe = .{};
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    const desired: @import("video_cache_budget.zig").Admission = .{ .controller = &domain.controller, .limits = .{ .backend_limit_bytes = 64 * 1024 * 1024, .host_limit_bytes = 4 * 1024 * 1024, .combined_limit_bytes = 70 * 1024 * 1024 }, .check_live_memory = false };
+    var storage: [CacheFunding.Auxiliary.count + 1]CacheFunding.Request = undefined;
+    var builder: CacheFunding.Builder = .{ .storage = &storage };
+    for ([_]CacheFunding.Auxiliary.Kind{ .rotary_positions_u32, .rounded_bf16_output }) |kind| try builder.add(compute.auxiliaryCacheRequest(kind).?);
+    try std.testing.expectEqual(@as(usize, 2), builder.len); // isolate the two device auxiliary roles
+    // Zero optional idle retention is an actual supported pressure recipe;
+    // these tests isolate the independently owned auxiliary payloads.
+    try builder.add(try compute.lightOnRetentionRequest(desired, @bitSizeOf(usize)));
+    const work = builder.workload();
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    {
+        const cold = try CacheFunding.Funding.create(work);
+        defer cold.finishOutsideExecution();
+        try compute.snapshotLightOnNormFunding(cold, desired);
+        try cold.fundLightOnOutsideExecution(&pin);
+        var first_guard = try sink.enter();
+        defer first_guard.finish();
+        var first_epoch = try first_guard.retainEpoch();
+        defer first_epoch.release();
+        const cb = compute.computeBackend();
+        try std.testing.expect(probe.gate.tryLock());
+        defer probe.gate.unlock();
+        try CudaCompute.beginLightOnNormFunding(&compute, work, cold, &first_epoch, desired);
+        defer CudaCompute.unbindCacheFunding(&cb, &compute, cold);
+        try compute.configureEmbeddingGemma2AdmissionWithCleanup(desired, .{ .boundary = &first_epoch });
+    }
+    // The explicit unmanaged compatibility path creates REAL SDK backings and
+    // exact raw leases. Managed adoption below must transfer those SAME leases.
+    const positions = [_]u32{ 0, 2, 4, 6, 8, 10 };
+    const positions_buffer = (try cachedLightOnMropePositions(&compute, &positions)).?;
+    _ = (try compute.acquireAuxiliaryStorage(.rounded_bf16_output)).?;
+    var read_positions: [positions.len]u32 = undefined;
+    try positions_buffer.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&read_positions));
+    try compute.ctx.synchronize();
+    try std.testing.expectEqualSlices(u32, &positions, &read_positions);
+    for ([_]CacheFunding.Auxiliary.Kind{ .rotary_positions_u32, .rounded_bf16_output }) |kind| try std.testing.expect(compute.auxiliaryQuota(kind).* == .raw);
+    const before = domain.controller.snapshot();
+    const reservations = probe.reservations;
+    try std.testing.expect(try compute.lightOnNormNeedsFunding(work, desired));
+    const managed = try CacheFunding.Funding.create(work);
+    defer managed.finishOutsideExecution();
+    try compute.snapshotLightOnNormFunding(managed, desired);
+    try managed.fundLightOnOutsideExecution(&pin);
+    try std.testing.expectEqual(reservations, probe.reservations);
+    try std.testing.expectEqualDeep(before, domain.controller.snapshot());
+    const cb = compute.computeBackend();
+    const weights: [64 * 64]f32 = @splat(0.03125);
+    const weight = tensor_mod.Tensor{ .data = @constCast(std.mem.sliceAsBytes(&weights)), .shape = &.{ 64, 64 }, .dtype = .f32, .name = "aux.matrix", .allocator = a, .owns_data = false, .owns_shape = false };
+    try compute.insertBf16WeightFromF32Tensor(try a.dupe(u8, "aux.matrix"), &weight);
+    const wt = try cb.getWeight("aux.matrix");
+    var wt_live = true;
+    defer if (wt_live) cb.free(wt);
+    const inputs: [3 * 64]f32 = @splat(0.125);
+    const zeros: [3 * 64]f32 = @splat(0);
+    const xt = try cb.fromFloat32Shape(&inputs, &.{ 3, 64 });
+    var xt_live = true;
+    defer if (xt_live) cb.free(xt);
+    const output = try cb.fromFloat32Shape(&zeros, &.{ 3, 64 });
+    var output_live = true;
+    defer if (output_live) cb.free(output);
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    try std.testing.expect(probe.gate.tryLock());
+    var gate_owned = true;
+    defer if (gate_owned) probe.gate.unlock();
+    var managed_bound = false;
+    defer if (managed_bound) CudaCompute.unbindCacheFunding(&cb, &compute, managed);
+    const callbacks = probe.callbacks;
+    try CudaCompute.beginLightOnNormFunding(&compute, work, managed, &epoch, desired);
+    managed_bound = true;
+    try compute.configureEmbeddingGemma2AdmissionWithCleanup(desired, .{ .boundary = &epoch });
+    for ([_]CacheFunding.Auxiliary.Kind{ .rotary_positions_u32, .rounded_bf16_output }) |kind| try std.testing.expect(compute.auxiliaryQuota(kind).* == .prepared);
+    for (0..2) |_| {
+        const cached = (try cachedLightOnMropePositions(&compute, &positions)).?;
+        try std.testing.expectEqual(positions_buffer.ptr, cached.ptr);
+        try std.testing.expect(try tryCublasLtBf16Linear(&compute, tensorFromCt(output).buffer, tensorFromCt(xt), tensorFromCt(wt).buffer, 3, 64, 64));
+        const actual = try cb.toFloat32(output, a);
+        defer a.free(actual);
+        for (actual) |value| try std.testing.expectEqual(@as(f32, 0.25), value);
+    }
+    try std.testing.expectEqual(callbacks, probe.callbacks);
+    try std.testing.expectEqual(reservations, probe.reservations);
+    CudaCompute.unbindCacheFunding(&cb, &compute, managed);
+    managed_bound = false;
+    cb.free(output);
+    output_live = false;
+    cb.free(xt);
+    xt_live = false;
+    cb.free(wt);
+    wt_live = false;
+    compute.deinitWithCleanup(.{ .boundary = &epoch });
+    compute_live = false;
+    try std.testing.expectEqualDeep(before, domain.controller.snapshot());
+    try std.testing.expectEqual(callbacks, probe.callbacks);
+    probe.gate.unlock();
+    gate_owned = false;
+    guard.finish();
+    try std.testing.expectEqualDeep(@import("../../runtime/tier/memory.zig").AdmissionAmounts{}, domain.controller.snapshot());
+    try std.testing.expect(!probe.under_gate);
+}
+
+test "captured graph funding rejects copied backend tables before invalid context SDK or scope access" {
+    const Graph = @import("lighton_decode_graph.zig");
+    const positions = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    const key = [_]u64{ 1, 2 };
+    var phase: Graph.GraphPhase = undefined;
+    try phase.initInto(.{ .epoch = 1, .key = &key, .positions = &positions, .rows = 2, .hidden = 1024, .vocab = 8, .future_tokens = 16, .attention_layers = 1, .recurrent_layers = 1 });
+    const copied = vtable;
+    const backend = ops.ComputeBackend{ .ptr = @ptrFromInt(1), .vtable = &copied };
+    try std.testing.expectError(error.UnsupportedReaderEpochBackend, CudaCompute.inspectCapturedGraphPhase(&backend, &phase, .{}));
+    try std.testing.expectError(error.UnsupportedReaderEpochBackend, CudaCompute.bindCapturedGraphPhase(&backend, &phase, .{}));
+    try std.testing.expectError(error.UnsupportedReaderEpochBackend, CudaCompute.beginLightOnDecodeGraph(&backend, .{}, &phase, 1, &key, &positions, 2, 1024, 8, 16, 1, 1));
+}
+
+test "captured graph prefunded nonempty program and learned workspace replay after exact reader custody park and peer request" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const Graph = @import("lighton_decode_graph.zig");
+    const Domain = @import("../../runtime/tier/admission_domain.zig").Domain;
+    const Session = @import("../../backends/session.zig").Session;
+    const Sink = @import("../../execution/retirement_sink.zig");
+    var compute = try CudaCompute.testing.init(std.testing.allocator);
+    defer compute.deinit();
+    const domain = try Domain.create();
+    defer domain.release();
+    var marker: u8 = 0;
+    const Owner = struct {
+        fn close(_: *anyopaque) void {}
+    };
+    // This lower-level fixture qualifies exact SDK/custody mechanics. The
+    // public Reader fixture separately owns an actual loaded ModelLifetime.
+    var model = Session.ModelLifetime{ .owner = &marker, .destroy_fn = Owner.close, .admission_domain = domain.pin() };
+    defer model.release();
+    const admission = @import("video_cache_budget.zig").Admission{ .controller = &domain.controller, .limits = .{}, .check_live_memory = false };
+    compute.ctx.video_cache_budget.admission = admission;
+    defer compute.ctx.video_cache_budget.admission = null;
+    var workspace_lease = try domain.controller.tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = 4096 }, false);
+    defer workspace_lease.release();
+    var peer_lease = try domain.controller.tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = 2048 }, false);
+    defer peer_lease.release();
+    compute.runtime_policy.workspace_bytes = 4096;
+    _ = try compute.cublaslt_workspace_scratch.acquire(&compute.ctx, 4096);
+    var budget = run_memory.RunBudget.init(.{});
+    const scoped = ops.ComputeBackend{ .ptr = &compute, .vtable = &scoped_run_budget_vtable };
+    var slots: [0]CudaCompute.CapturedCacheRoots.Slot = .{};
+    var roots = try CudaCompute.CapturedCacheRoots.init(&slots, &.{});
+    compute.configureRunBudget(&budget);
+    try roots.bind(&scoped, &compute);
+    var parked = CudaCompute.ReaderEpochPark{};
+    defer {
+        if (compute.ctx.debug_graph_capture_active) {
+            compute.lighton_decode_graph.pending_graph = compute.ctx.endStreamCapture() catch platform.inference_process_supervisor.restartWorker();
+        }
+        if (parked.compute != null) {
+            parked.prepareRestore(&scoped, &compute) catch platform.inference_process_supervisor.restartWorker();
+            parked.restore(&scoped, &compute) catch platform.inference_process_supervisor.restartWorker();
+        }
+        compute.clearCapturedGraphWithCleanup(.{ .outside_execution = true }) catch platform.inference_process_supervisor.restartWorker();
+        if (compute.captured_cache_roots == &roots) roots.unbind(&scoped, &compute) catch platform.inference_process_supervisor.restartWorker();
+        compute.configureRunBudget(null);
+        _ = compute.cublaslt_workspace_scratch.buffer.freeChecked(&compute.ctx) catch platform.inference_process_supervisor.restartWorker();
+    }
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    const key = [_]u64{ 1, 2, 3 };
+    const positions = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    const descriptor = Graph.Descriptor{ .epoch = 1, .key = &key, .positions = &positions, .rows = 2, .hidden = 1024, .vocab = 8, .future_tokens = 16, .attention_layers = 1, .recurrent_layers = 1 };
+    var storage: Graph.GraphPhase = undefined;
+    try storage.initInto(descriptor);
+    storage.mode = .storage;
+    storage.expected_compute = @intFromPtr(&compute);
+    storage.admission = admission;
+    try storage.prepareOutside(&model);
+    defer storage.destroyOutside();
+    try storage.bind(.{ .boundary = &epoch });
+    try compute.lighton_decode_graph.resetPrepared(&compute.ctx, &storage);
+    compute.lighton_decode_graph.epoch_id = 1;
+    try storage.close(.{ .boundary = &epoch });
+    const owner = &compute.lighton_decode_graph;
+    owner.plan.?.allocate(1024, 0x1000);
+    owner.plan.?.release(0x1000);
+    try std.testing.expect(owner.plan.?.finishNoOutput());
+    owner.phase = .capture;
+    var arena: Graph.GraphPhase = undefined;
+    try arena.initInto(descriptor);
+    arena.mode = .arena;
+    arena.expected_compute = @intFromPtr(&compute);
+    arena.old = owner.snapshot();
+    arena.admission = admission;
+    try arena.prepareOutside(&model);
+    defer arena.destroyOutside();
+    try arena.bind(.{ .boundary = &epoch });
+    try owner.reserveArenaPrepared(&compute.ctx, &arena);
+    try arena.close(.{ .boundary = &epoch });
+    try roots.beginGeneration(&compute, .{ .boundary = &epoch });
+    const sentinel: [64]u8 = @splat(0x5a);
+    const zeros: [64]u8 = @splat(0);
+    try compute.cublaslt_workspace_scratch.buffer.copyFromHost(&compute.ctx, &sentinel);
+    try owner.arena.copyFromHost(&compute.ctx, &zeros);
+    try compute.ctx.synchronize();
+    try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_GLOBAL);
+    // One real D2D graph node consumes the exact independently retained vendor
+    // workspace and produces the separately learned/prefunded arena payload.
+    try owner.arena.copyFromDevice(&compute.ctx, compute.cublaslt_workspace_scratch.buffer, sentinel.len);
+    owner.pending_graph = try compute.ctx.endStreamCapture();
+    owner.graph = try compute.ctx.instantiateGraph(owner.pending_graph);
+    try compute.ctx.destroyGraphChecked(&owner.pending_graph);
+    owner.phase = .replay;
+    const graph_pointer = owner.graph;
+    const arena_pointer = owner.arena.ptr;
+    const workspace_pointer = compute.cublaslt_workspace_scratch.buffer.ptr;
+    const exact_owned = domain.controller.snapshot();
+    try compute.ctx.launchGraph(owner.graph);
+    try compute.ctx.synchronize();
+    var actual: [64]u8 = undefined;
+    try owner.arena.copyToHost(&compute.ctx, &actual);
+    try std.testing.expectEqualSlices(u8, &sentinel, &actual);
+    try owner.arena.copyFromHost(&compute.ctx, &zeros);
+    try compute.ctx.synchronize();
+    try parked.park(&scoped, &compute, &roots);
+    guard.finish();
+    epoch.release();
+    try std.testing.expect(compute.run_budget == null);
+    try std.testing.expect(compute.lighton_decode_graph.graph == null);
+    // An actual peer request mutates its own request state/workspace while the
+    // old graph and all its captured addresses remain in exclusive park custody.
+    guard = try sink.enter();
+    epoch = try guard.retainEpoch();
+    const raw = compute.computeBackend();
+    try CudaCompute.beginRequestWithCleanup(&raw, .{ .boundary = &epoch });
+    compute.runtime_policy.workspace_bytes = 2048;
+    _ = try compute.cublaslt_workspace_scratch.acquire(&compute.ctx, 2048);
+    try std.testing.expect(compute.cublaslt_workspace_scratch.buffer.ptr != workspace_pointer);
+    try parked.prepareRestore(&scoped, &compute);
+    try parked.restore(&scoped, &compute);
+    try std.testing.expectEqual(graph_pointer, owner.graph);
+    try std.testing.expectEqual(arena_pointer, owner.arena.ptr);
+    try std.testing.expectEqual(workspace_pointer, compute.cublaslt_workspace_scratch.buffer.ptr);
+    try std.testing.expect(compute.run_budget == &budget);
+    try std.testing.expectEqualDeep(exact_owned, domain.controller.snapshot());
+    try compute.ctx.launchGraph(owner.graph);
+    try compute.ctx.synchronize();
+    try owner.arena.copyToHost(&compute.ctx, &actual);
+    try std.testing.expectEqualSlices(u8, &sentinel, &actual);
+    try compute.clearCapturedGraphWithCleanup(.{ .boundary = &epoch });
+    try roots.unbind(&scoped, &compute);
+    compute.configureRunBudget(null);
+    _ = try compute.cublaslt_workspace_scratch.buffer.freeChecked(&compute.ctx);
+    try std.testing.expect(domain.controller.snapshot().backend_scratch_bytes > 4096 + 2048);
+    guard.finish();
+    workspace_lease.release();
+    peer_lease.release();
+    try std.testing.expectEqualDeep(@import("../../runtime/tier/memory.zig").AdmissionAmounts{}, domain.controller.snapshot());
+}
+
+test "CUDA KV typed mutation refuses copied hook table before invalid context cast" {
+    const copied = CudaKvDeviceStorage.hook_vtable;
+    try std.testing.expectError(error.UnsupportedReaderEpochBackend, CudaKvDeviceStorage.prepareMutationWithCleanup(@ptrFromInt(1), &copied, .{}));
+}
+
+test "CUDA typed recurrent SDK failure retains original allocating root and PAGE quota until checked retry" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const Memory = @import("../../runtime/tier/memory.zig");
+    const Sink = @import("../../execution/retirement_sink.zig");
+    var compute = try CudaCompute.testing.init(std.testing.allocator);
+    defer compute.deinit();
+    compute.lighton_state_pool_enabled = false;
+    var controller = Memory.AdmissionController{};
+    var page = try controller.tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = 64 }, false);
+    defer page.release();
+    const original_live = compute.ctx.device_allocations.snapshot().live;
+    var state = @import("gated_delta.zig").State{ .ctx = &compute.ctx, .release_context = &compute, .release_buffer = &recycleLightOnStateBuffer, .prepare_release_with_cleanup = &prepareLightOnStateReleaseWithCleanup, .release_buffer_with_cleanup = &recycleLightOnStateBufferWithCleanup, .owns_weights = @splat(false), .packed_storage = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 64) };
+    defer state.deinitWithCleanup(.{ .outside_execution = true }) catch platform.inference_process_supervisor.restartWorker();
+    const root = state.packed_storage.ptr;
+    state.history[0] = .{ .ptr = root, .len = 32, .borrowed = true };
+    const Free = struct {
+        fn fail(_: driver_mod.CUdeviceptr) callconv(.c) driver_mod.CUresult {
+            return 700;
+        }
+    };
+    const original = compute.ctx.driver.fns.cuMemFree;
+    compute.ctx.driver.fns.cuMemFree = Free.fail;
+    defer compute.ctx.driver.fns.cuMemFree = original;
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    try std.testing.expectError(error.CudaDriverError, state.deinitWithCleanup(.{ .boundary = &epoch }));
+    try std.testing.expectEqual(root, state.packed_storage.ptr);
+    try std.testing.expectEqual(original_live + 64, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 64), controller.snapshot().backend_scratch_bytes);
+    compute.ctx.driver.fns.cuMemFree = original;
+    try state.deinitWithCleanup(.{ .boundary = &epoch });
+    try std.testing.expectEqual(original_live, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 64), controller.snapshot().backend_scratch_bytes);
+    // The same checked branch also preserves a root transferred into the
+    // original deferred-free queue, rather than dropping failed SDK custody.
+    compute.runtime_policy.max_temp_buffers = 0;
+    compute.ocr_deferred_free_budget_bytes = 0;
+    var deferred = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 64);
+    defer _ = deferred.freeChecked(&compute.ctx) catch platform.inference_process_supervisor.restartWorker();
+    const deferred_root = deferred.ptr;
+    compute.ctx.driver.fns.cuMemFree = Free.fail;
+    try std.testing.expectError(error.CudaDriverError, releaseDeviceBufferUsing(&compute, &deferred, true));
+    var retained = deferred.ptr == deferred_root;
+    for (compute.deferred_device_frees.items) |value| if (value.ptr == deferred_root) {
+        retained = true;
+    };
+    try std.testing.expect(retained);
+    try std.testing.expectEqual(original_live + 64, compute.ctx.device_allocations.snapshot().live);
+    compute.ctx.driver.fns.cuMemFree = original;
+    _ = try deferred.freeChecked(&compute.ctx);
+    try synchronizeAndDrainDeferredDeviceFreesUnlockedUsing(&compute, true);
+    try std.testing.expectEqual(original_live, compute.ctx.device_allocations.snapshot().live);
+    guard.finish();
+    page.release();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+}
+
+test "CUDA checked deferred drain reports each successful SDK death before a later failure and exact retry" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    var compute = try CudaCompute.testing.init(std.testing.allocator);
+    defer compute.deinit();
+    const baseline = compute.ctx.device_allocations.snapshot().live;
+    const reported = compute.stats.deferred_free_reclaimed_bytes;
+    var first = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 64);
+    defer _ = first.freeChecked(&compute.ctx) catch platform.inference_process_supervisor.restartWorker();
+    var second = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 96);
+    defer _ = second.freeChecked(&compute.ctx) catch platform.inference_process_supervisor.restartWorker();
+    const second_pointer = second.ptr;
+    try compute.deferred_device_frees.append(std.testing.allocator, first);
+    first = .{};
+    try compute.deferred_device_frees.append(std.testing.allocator, second);
+    second = .{};
+    compute.deferred_device_free_bytes = 160;
+    const Free = struct {
+        var actual: @TypeOf(@as(CudaCompute, undefined).ctx.driver.fns.cuMemFree) = undefined;
+        var calls: usize = 0;
+        fn free(pointer: driver_mod.CUdeviceptr) callconv(.c) driver_mod.CUresult {
+            calls += 1;
+            return if (calls == 2) 700 else actual(pointer);
+        }
+    };
+    Free.actual = compute.ctx.driver.fns.cuMemFree;
+    Free.calls = 0;
+    compute.ctx.driver.fns.cuMemFree = Free.free;
+    defer compute.ctx.driver.fns.cuMemFree = Free.actual;
+    try std.testing.expectError(error.CudaDriverError, synchronizeAndDrainDeferredDeviceFreesUnlockedUsing(&compute, true));
+    try std.testing.expectEqual(baseline + 96, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(reported + 64, compute.stats.deferred_free_reclaimed_bytes);
+    try std.testing.expectEqual(@as(usize, 160), compute.deferred_device_free_bytes); // conservative whole queue until completion
+    try std.testing.expectEqual(second_pointer, compute.deferred_device_frees.items[1].ptr);
+    compute.ctx.driver.fns.cuMemFree = Free.actual;
+    try synchronizeAndDrainDeferredDeviceFreesUnlockedUsing(&compute, true);
+    try std.testing.expectEqual(baseline, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(reported + 160, compute.stats.deferred_free_reclaimed_bytes);
+}
+
+test "CUDA actual nonempty managed graph outside State cleanup refunds only after real KV and graph mutex unlock" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const Graph = @import("lighton_decode_graph.zig");
+    const Memory = @import("../../runtime/tier/memory.zig");
+    const Domain = @import("../../runtime/tier/admission_domain.zig").Domain;
+    const Session = @import("../../backends/session.zig").Session;
+    const NativeState = @import("../../graph/decode_state_runtime.zig").NativeDecodeState;
+    const Manager = @import("../../runtime/kv/manager.zig").KvManager;
+    const Sink = @import("../../execution/retirement_sink.zig");
+    var compute = try CudaCompute.testing.init(std.testing.allocator);
+    defer compute.deinit();
+    compute.lighton_decode_graph_enabled = true;
+    var kv_mutex: std.atomic.Mutex = .unlocked;
+    const Probe = struct {
+        kv: *std.atomic.Mutex,
+        compute: *CudaCompute,
+        releases: usize = 0,
+        held: bool = false,
+        fn check(self: *@This()) void {
+            if (!self.kv.tryLock()) self.held = true else self.kv.unlock();
+            if (!self.compute.lighton_decode_graph.mutex.tryLock()) self.held = true else self.compute.lighton_decode_graph.mutex.unlock();
+        }
+        fn reserve(raw: *anyopaque, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+            return 1;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+            self.releases += 1;
+        }
+    };
+    var probe = Probe{ .kv = &kv_mutex, .compute = &compute };
+    const domain = try Domain.create();
+    defer domain.release();
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    var marker: u8 = 0;
+    const Model = struct {
+        fn close(_: *anyopaque) void {}
+    };
+    var model = Session.ModelLifetime{ .owner = &marker, .destroy_fn = Model.close, .admission_domain = domain.pin() };
+    defer model.release();
+    var manager = Manager.init(std.testing.allocator);
+    defer manager.deinit();
+    const config: kv_pool_mod.KvPoolConfig = .{ .backend = .cuda, .dtype = .f16, .page_size_tokens = 4, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 8 };
+    const pool = try manager.addPool(config);
+    var storage = try kv_storage_runtime.KvStorageRuntime.init(std.testing.allocator, config);
+    defer storage.deinit();
+    const backend = compute.computeBackend();
+    try backend.provisionKvDeviceWriteHook(&storage);
+    var state = NativeState.initPaged(std.testing.allocator, &manager, pool, null);
+    state.kv_storage = &storage;
+    state.kv_lock = &kv_mutex;
+    var state_live = true;
+    defer if (state_live) state.deinitWithCleanup(.{ .outside_execution = true }) catch platform.inference_process_supervisor.restartWorker();
+    try state.notePrefill(1);
+    const key = [_]u64{ 1, 2, 3 };
+    const positions = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    var phase: Graph.GraphPhase = undefined;
+    try phase.initInto(.{ .epoch = 1, .key = &key, .positions = &positions, .rows = 2, .hidden = 1024, .vocab = 8, .future_tokens = 16, .attention_layers = 1, .recurrent_layers = 1 });
+    phase.mode = .storage;
+    phase.expected_compute = @intFromPtr(&compute);
+    phase.admission = .{ .controller = &domain.controller, .limits = .{}, .check_live_memory = false };
+    try phase.prepareOutside(&model);
+    defer phase.destroyOutside();
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    try phase.bind(.{ .boundary = &epoch });
+    const graph = &compute.lighton_decode_graph;
+    try graph.resetPrepared(&compute.ctx, &phase);
+    graph.epoch_id = 1;
+    try phase.close(.{ .boundary = &epoch });
+    guard.finish();
+    const zeros: [128]u8 = @splat(0);
+    try graph.metadata.copyFromHost(&compute.ctx, &zeros);
+    try compute.ctx.synchronize();
+    try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_GLOBAL);
+    const source = buffer_mod.DeviceBuffer{ .ptr = graph.metadata.ptr, .len = 64, .borrowed = true };
+    const target = buffer_mod.DeviceBuffer{ .ptr = graph.metadata.ptr + 64, .len = 64, .borrowed = true };
+    try target.copyFromDevice(&compute.ctx, source, 64);
+    graph.pending_graph = try compute.ctx.endStreamCapture();
+    graph.graph = try compute.ctx.instantiateGraph(graph.pending_graph);
+    try compute.ctx.destroyGraphChecked(&graph.pending_graph);
+    graph.phase = .replay;
+    try compute.ctx.launchGraph(graph.graph);
+    try compute.ctx.synchronize();
+    const releases = probe.releases;
+    try std.testing.expect(domain.controller.snapshot().backend_scratch_bytes > 0);
+    try state.deinitWithCleanup(.{ .outside_execution = true });
+    state_live = false;
+    try std.testing.expect(!probe.held);
+    try std.testing.expect(probe.releases > releases);
+    try std.testing.expect(state.sequence_id == null and graph.graph == null and graph.metadata.ptr == 0);
+    try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, domain.controller.snapshot());
+}
+
+test "CUDA NativeState teardown publishes KV retirement and preserves host owners until failed recurrent SDK root retries" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const StateRuntime = @import("../../graph/decode_state_runtime.zig");
+    const Manager = @import("../../runtime/kv/manager.zig").KvManager;
+    const Sink = @import("../../execution/retirement_sink.zig");
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    compute.lighton_state_pool_enabled = false;
+    var manager = Manager.init(a);
+    defer manager.deinit();
+    const config: kv_pool_mod.KvPoolConfig = .{ .backend = .cuda, .dtype = .f16, .page_size_tokens = 4, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 8 };
+    const pool = try manager.addPool(config);
+    var storage = try kv_storage_runtime.KvStorageRuntime.init(a, config);
+    defer storage.deinit();
+    const backend = compute.computeBackend();
+    try backend.provisionKvDeviceWriteHook(&storage);
+    var state = StateRuntime.NativeDecodeState.initPaged(a, &manager, pool, null);
+    var live = true;
+    defer if (live) state.deinitWithCleanup(.{ .outside_execution = true }) catch platform.inference_process_supervisor.restartWorker();
+    state.kv_storage = &storage;
+    var mutex: std.atomic.Mutex = .unlocked;
+    state.kv_lock = &mutex;
+    try state.notePrefill(1);
+    const sequence = state.sequence_id orelse return error.MissingActualKvSequence;
+    try state.ensureQwen35LinearCache(.{ .family = .qwen3_5, .num_hidden_layers = 1, .qwen35_has_linear_attention = true, .qwen35_device_only_state = true, .qwen35_full_attention_interval = 4, .qwen35_linear_num_key_heads = 1, .qwen35_linear_num_value_heads = 1, .qwen35_linear_key_head_dim = 128, .qwen35_linear_value_head_dim = 128, .qwen35_linear_conv_kernel_dim = 4 });
+    try state.moe_runtime.prepareLayer(0, 1);
+    const original_live = compute.ctx.device_allocations.snapshot().live;
+    const root = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 64);
+    state.qwen35_linear_cache.?.layers[0].cuda_device = .{ .ctx = &compute.ctx, .release_context = &compute, .release_buffer = &recycleLightOnStateBuffer, .prepare_release_with_cleanup = &prepareLightOnStateReleaseWithCleanup, .release_buffer_with_cleanup = &recycleLightOnStateBufferWithCleanup, .owns_weights = @splat(false), .packed_storage = root };
+    const Free = struct {
+        fn fail(_: driver_mod.CUdeviceptr) callconv(.c) driver_mod.CUresult {
+            return 700;
+        }
+    };
+    const actual_free = compute.ctx.driver.fns.cuMemFree;
+    compute.ctx.driver.fns.cuMemFree = Free.fail;
+    defer compute.ctx.driver.fns.cuMemFree = actual_free;
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    try std.testing.expectError(error.CudaDriverError, state.deinitWithCleanup(.{ .boundary = &epoch }));
+    try std.testing.expect(state.sequence_id == null and state.kv_view == null);
+    try std.testing.expect(manager.tokenCount(sequence) == null and storage.tokenCount(sequence) == null);
+    try std.testing.expectEqual(root.ptr, state.qwen35_linear_cache.?.layers[0].cuda_device.packed_storage.ptr);
+    try std.testing.expectEqual(@as(usize, 1), state.moe_runtime.layers.items.len);
+    try std.testing.expect(state.kv_block_ids.items.len != 0);
+    try std.testing.expectEqual(original_live + 64, compute.ctx.device_allocations.snapshot().live);
+    compute.ctx.driver.fns.cuMemFree = actual_free;
+    try state.deinitWithCleanup(.{ .boundary = &epoch });
+    live = false;
+    try std.testing.expect(state.qwen35_linear_cache == null and state.kv_manager == null and state.kv_storage == null);
+    try std.testing.expectEqual(@as(usize, 0), state.kv_block_ids.capacity);
+    try std.testing.expectEqual(@as(usize, 0), state.selection_queries.capacity);
+    try std.testing.expectEqual(@as(usize, 0), state.moe_runtime.layers.items.len);
+    try std.testing.expectEqual(original_live, compute.ctx.device_allocations.snapshot().live);
+    // Fully consumed typed teardown is harmless; no retired sequence/list is
+    // revisited, unlike the partial-failure retry above.
+    try state.deinitWithCleanup(.{ .boundary = &epoch });
+}
+
+test "CUDA legacy three raw graph quotas preserve explicit outside invalidate and end without supplier callbacks under graph mutex" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const Memory = @import("../../runtime/tier/memory.zig");
+    var compute = try CudaCompute.testing.init(std.testing.allocator);
+    defer compute.deinit();
+    var controller = Memory.AdmissionController{};
+    const Probe = struct {
+        compute: *CudaCompute,
+        held: bool = false,
+        releases: usize = 0,
+        fn check(self: *@This()) void {
+            if (!self.compute.lighton_decode_graph.mutex.tryLock()) self.held = true else self.compute.lighton_decode_graph.mutex.unlock();
+        }
+        fn reserve(raw: *anyopaque, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+            return 1;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+            self.releases += 1;
+        }
+    };
+    var probe = Probe{ .compute = &compute };
+    try controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{}, .check_live_memory = false };
+    defer compute.ctx.video_cache_budget.admission = null;
+    compute.lighton_decode_graph_enabled = true;
+    const backend = compute.computeBackend();
+    const key = [_]u64{ 1, 2, 3 };
+    const positions: [384]u32 = @splat(1);
+    for (0..2) |method| {
+        const graph = &compute.lighton_decode_graph;
+        try graph.reset(&compute.ctx, &key, &positions, 128, 1024, 8);
+        graph.epoch_id = method + 1;
+        graph.plan.?.allocate(512, 0x1000);
+        graph.plan.?.release(0x1000);
+        try std.testing.expect(graph.plan.?.finishNoOutput());
+        try graph.reserveArena(&compute.ctx);
+        try std.testing.expect(graph.metadata_quota == .raw and graph.arena_quota == .raw and graph.head_quota == .raw);
+        const before = controller.snapshot();
+        const frees = probe.releases;
+        if (method == 0) try CudaCompute.invalidateLightOnDecodeGraphWithCleanup(&backend, .{ .outside_execution = true }) else try CudaCompute.endLightOnDecodeGraphEpochWithCleanup(&backend, method + 1, .{ .outside_execution = true });
+        try std.testing.expect(!probe.held and probe.releases > frees);
+        try std.testing.expect(before.backend_scratch_bytes > 0 and before.host_scratch_bytes > 0);
+        try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, controller.snapshot());
+        try std.testing.expect(graph.metadata.ptr == 0 and graph.arena.ptr == 0 and graph.head.ptr == 0);
+    }
+}
+
+test "CUDA persistent host-capable cache with actual raw recurrent producer keeps explicit outside NativeState cleanup available" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const NativeState = @import("../../graph/decode_state_runtime.zig").NativeDecodeState;
+    const Manager = @import("../../runtime/kv/manager.zig").KvManager;
+    const Memory = @import("../../runtime/tier/memory.zig");
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    compute.lighton_state_pool_enabled = false;
+    var controller = Memory.AdmissionController{};
+    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{}, .check_live_memory = false };
+    defer compute.ctx.video_cache_budget.admission = null;
+    const cb = compute.computeBackend();
+    var manager = Manager.init(a);
+    defer manager.deinit();
+    const config: kv_pool_mod.KvPoolConfig = .{ .backend = .cuda, .dtype = .f16, .page_size_tokens = 4, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 8 };
+    const pool = try manager.addPool(config);
+    var storage = try kv_storage_runtime.KvStorageRuntime.init(a, config);
+    defer storage.deinit();
+    try cb.provisionKvDeviceWriteHook(&storage);
+    var state = NativeState.initPaged(a, &manager, pool, null);
+    var live = true;
+    defer if (live) state.deinitWithCleanup(.{ .outside_execution = true }) catch platform.inference_process_supervisor.restartWorker();
+    var mutex: std.atomic.Mutex = .unlocked;
+    state.kv_storage = &storage;
+    state.kv_lock = &mutex;
+    try state.notePrefill(1);
+    // Explicit host-capable persistent cache: a previously initialized CUDA
+    // child may remain live even when this flag is false. Do not assume null.
+    try state.ensureQwen35LinearCache(.{ .family = .qwen3_5, .num_hidden_layers = 1, .qwen35_has_linear_attention = true, .qwen35_device_only_state = false, .qwen35_full_attention_interval = 4, .qwen35_linear_num_key_heads = 1, .qwen35_linear_num_value_heads = 1, .qwen35_linear_key_head_dim = 128, .qwen35_linear_value_head_dim = 128, .qwen35_linear_conv_kernel_dim = 4 });
+    const mixed_values: [384]f32 = @splat(0);
+    const width_values: [128]f32 = @splat(0);
+    const convolution: [1536]f32 = @splat(0);
+    const norm: [128]f32 = @splat(1);
+    const scalar = [_]f32{0};
+    const mixed = try cb.fromFloat32(&mixed_values);
+    defer cb.free(mixed);
+    const z = try cb.fromFloat32(&width_values);
+    defer cb.free(z);
+    const beta = try cb.fromFloat32(&scalar);
+    defer cb.free(beta);
+    const ap = try cb.fromFloat32(&scalar);
+    defer cb.free(ap);
+    const conv = try cb.fromFloat32(&convolution);
+    defer cb.free(conv);
+    const norm_w = try cb.fromFloat32(&norm);
+    defer cb.free(norm_w);
+    const alog = try cb.fromFloat32(&scalar);
+    defer cb.free(alog);
+    const dt = try cb.fromFloat32(&scalar);
+    defer cb.free(dt);
+    const recurrent = &state.qwen35_linear_cache.?.layers[0].cuda_device;
+    const result = (try CudaCompute.qwen35LinearCore(&cb, recurrent, .{ .destination = @as(?CT, null), .device_state_admitted = false, .mixed = mixed, .z = z, .beta = beta, .a = ap, .conv_weight = conv, .a_log = alog, .dt_bias = dt, .norm_weight = norm_w, .seq_len = @as(usize, 1), .key_heads = @as(usize, 1), .value_heads = @as(usize, 1), .dim = @as(usize, 128), .value_dim = @as(usize, 128), .conv_kernel = @as(usize, 4), .eps = @as(f32, 1e-6) })) orelse return error.MissingActualRecurrentProducer;
+    defer cb.free(result);
+    try compute.ctx.synchronize();
+    try std.testing.expect(recurrent.initialized and recurrent.admission != null);
+    try std.testing.expect(controller.snapshot().backend_scratch_bytes > 0);
+    try state.deinitWithCleanup(.{ .outside_execution = true });
+    live = false;
+    try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "CUDA pinned metadata cold funding warm uploads and checked host event retirement preserve current B" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const CacheFunding = @import("prepared_cache.zig");
+    const Domain = @import("../../runtime/tier/admission_domain.zig").Domain;
+    const Sink = @import("../../execution/retirement_sink.zig");
+    const Arena = @import("pinned_input_arena.zig");
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    compute.capability_profile = .lightonocr3;
+    compute.ocr_pinned_metadata_enabled = true;
+    compute.lighton_cached_mrope_enabled = false;
+    compute.lighton_bf16_decode_outputs = false;
+    compute.lighton_bf16_projection_outputs = false;
+    const Probe = struct {
+        gate: std.atomic.Mutex = .unlocked,
+        callbacks: usize = 0,
+        under_gate: bool = false,
+        fn check(self: *@This()) void {
+            self.callbacks += 1;
+            if (self.gate.tryLock()) self.gate.unlock() else self.under_gate = true;
+        }
+        fn reserve(raw: *anyopaque, _: @import("../../runtime/tier/memory.zig").AdmissionAmounts) @import("../../runtime/tier/memory.zig").AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+            return self.callbacks;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: @import("../../runtime/tier/memory.zig").AdmissionAmounts) @import("../../runtime/tier/memory.zig").AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+        fn rejectHost(_: ?*anyopaque) callconv(.c) driver_mod.CUresult {
+            return 1;
+        }
+        fn rejectEvent(_: driver_mod.CUevent) callconv(.c) driver_mod.CUresult {
+            return 1;
+        }
+    };
+    var probe: Probe = .{};
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    const desired: @import("video_cache_budget.zig").Admission = .{ .controller = &domain.controller, .limits = .{ .host_limit_bytes = Arena.capacity }, .check_live_memory = false };
+    compute.ctx.video_cache_budget.admission = desired;
+    try std.testing.expect((try compute.acquirePinnedMetadataArena()) == null);
+    try std.testing.expectEqual(@as(usize, 0), probe.callbacks);
+    try std.testing.expect(compute.ocr_pinned_metadata_arena.host.ptr == null);
+    compute.ctx.video_cache_budget.admission = null;
+    var requests: [CacheFunding.Auxiliary.count + 1]CacheFunding.Request = undefined;
+    var builder: CacheFunding.Builder = .{ .storage = &requests };
+    try builder.add(compute.auxiliaryCacheRequest(.pinned_metadata_host).?);
+    compute.capability_profile = .florence2;
+    try std.testing.expect(compute.auxiliaryCacheRequest(.pinned_metadata_host) == null);
+    compute.capability_profile = .lightonocr3;
+    try std.testing.expectEqual(@as(usize, 1), builder.len);
+    try std.testing.expectEqual(CacheFunding.Auxiliary.Kind.pinned_metadata_host, requests[0].auxiliary.kind);
+    try builder.add(try compute.lightOnRetentionRequest(desired, @bitSizeOf(usize)));
+    const work = builder.workload();
+    const cold = try CacheFunding.Funding.create(work);
+    defer cold.finishOutsideExecution();
+    try compute.snapshotLightOnNormFunding(cold, desired);
+    try cold.fundLightOnOutsideExecution(&pin);
+    try std.testing.expectEqual(Arena.capacity, domain.controller.snapshot().host_scratch_bytes);
+    try std.testing.expect(compute.ocr_pinned_metadata_arena.host.ptr == null); // no unused SDK allocation
+    var device = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 32);
+    defer device.free(&compute.ctx);
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    try std.testing.expect(probe.gate.tryLock());
+    var gate_owned = true;
+    defer if (gate_owned) probe.gate.unlock();
+    const cb = compute.computeBackend();
+    try CudaCompute.beginLightOnNormFunding(&compute, work, cold, &epoch, desired);
+    var bound = true;
+    defer if (bound) CudaCompute.unbindCacheFunding(&cb, &compute, cold);
+    try compute.configureEmbeddingGemma2AdmissionWithCleanup(desired, .{ .boundary = &epoch });
+    const callbacks = probe.callbacks;
+    var taken = (try compute.acquireAuxiliaryCache(requests[0])).?;
+    try std.testing.expectError(error.MissingCurrentCleanupEpoch, compute.ocr_pinned_metadata_arena.prepareAdmitted(&compute.ctx, &taken, .{}));
+    var foreign_guard = try sink.enter();
+    defer foreign_guard.finish();
+    var foreign_epoch = try foreign_guard.retainEpoch();
+    defer foreign_epoch.release();
+    try std.testing.expectError(error.ForeignPreparedCacheBoundary, compute.ocr_pinned_metadata_arena.prepareAdmitted(&compute.ctx, &taken, .{ .boundary = &foreign_epoch }));
+    try std.testing.expect(compute.ocr_pinned_metadata_arena.host.ptr == null and compute.ocr_pinned_metadata_arena.event == null);
+    try std.testing.expectEqual(callbacks, probe.callbacks);
+    try taken.cancelBeforeSdk();
+    const input: [32]u8 = @splat(73);
+    try copyFromHostTracked(&compute, device, &input);
+    const arena = &compute.ocr_pinned_metadata_arena;
+    const host = arena.host.ptr;
+    const event = arena.event;
+    try std.testing.expect(host != null and event != null and arena.quota == .prepared);
+    var fail_warm = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    {
+        const saved = compute.allocator;
+        compute.allocator = fail_warm.allocator();
+        defer compute.allocator = saved;
+        for (0..3) |_| try copyFromHostTracked(&compute, device, &input);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fail_warm.alloc_index);
+    try std.testing.expect(!fail_warm.has_induced_failure);
+    try std.testing.expectEqual(host, arena.host.ptr);
+    try std.testing.expectEqual(event, arena.event);
+    try std.testing.expectEqual(@as(usize, 4), compute.ocr_pinned_metadata_event_uploads);
+    var actual: [32]u8 = undefined;
+    try device.copyToHost(&compute.ctx, &actual);
+    try compute.ctx.synchronize();
+    try std.testing.expectEqualSlices(u8, &input, &actual);
+    try std.testing.expectEqual(callbacks, probe.callbacks);
+    CudaCompute.unbindCacheFunding(&cb, &compute, cold);
+    bound = false;
+    const free_host = compute.ctx.driver.fns.cuMemFreeHost;
+    const destroy_event = compute.ctx.driver.fns.cuEventDestroy;
+    defer compute.ctx.driver.fns.cuMemFreeHost = free_host;
+    defer compute.ctx.driver.fns.cuEventDestroy = destroy_event;
+    compute.ctx.driver.fns.cuMemFreeHost = Probe.rejectHost;
+    try std.testing.expectError(error.CudaDriverError, arena.clearWithCleanup(&compute.ctx, .{ .boundary = &epoch }));
+    try std.testing.expectEqual(host, arena.host.ptr);
+    try std.testing.expectEqual(event, arena.event);
+    try std.testing.expect(arena.quota == .prepared);
+    compute.ctx.driver.fns.cuMemFreeHost = free_host;
+    compute.ctx.driver.fns.cuEventDestroy = Probe.rejectEvent;
+    try std.testing.expectError(error.CudaDriverError, arena.clearWithCleanup(&compute.ctx, .{ .boundary = &epoch }));
+    try std.testing.expect(arena.host.ptr == null);
+    try std.testing.expectEqual(event, arena.event);
+    try std.testing.expect(arena.quota == .prepared);
+    try std.testing.expectEqual(Arena.capacity, domain.controller.snapshot().host_scratch_bytes);
+    compute.ctx.driver.fns.cuEventDestroy = destroy_event;
+    try arena.clearWithCleanup(&compute.ctx, .{ .boundary = &epoch });
+    try std.testing.expect(arena.host.ptr == null and arena.event == null and !arena.quota.hasLease());
+    try std.testing.expectEqual(Arena.capacity, domain.controller.snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(callbacks, probe.callbacks);
+    probe.gate.unlock();
+    gate_owned = false;
+    guard.finish();
+    try std.testing.expectEqual(@as(usize, 0), domain.controller.snapshot().host_scratch_bytes);
+    try std.testing.expect(!probe.under_gate);
+}
+
+test "CUDA large pinned input exact cold byte hint warms real upload without supplier and retries actual host event failure" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const CacheFunding = @import("prepared_cache.zig");
+    const Domain = @import("../../runtime/tier/admission_domain.zig").Domain;
+    const Sink = @import("../../execution/retirement_sink.zig");
+    const Arena = @import("pinned_input_arena.zig");
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    compute.capability_profile = .florence2;
+    compute.ocr_pinned_metadata_enabled = false;
+    compute.ocr_pinned_inputs_enabled = true;
+    compute.lighton_cached_mrope_enabled = false;
+    compute.lighton_bf16_decode_outputs = false;
+    compute.lighton_bf16_projection_outputs = false;
+    const Probe = struct {
+        gate: std.atomic.Mutex = .unlocked,
+        callbacks: usize = 0,
+        under_gate: bool = false,
+        reenter_arena: ?*Arena.Arena = null,
+        reenter_ctx: ?*context_mod.CudaContext = null,
+        reenter_device: buffer_mod.DeviceBuffer = .{},
+        reenter_bytes: []const u8 = &.{},
+        reentered: bool = false,
+        reentry_failure: ?anyerror = null,
+        reentry_before_bytes: usize = 0,
+        reentry_after_bytes: usize = 0,
+        fn check(self: *@This()) void {
+            self.callbacks += 1;
+            if (self.gate.tryLock()) self.gate.unlock() else self.under_gate = true;
+        }
+        fn reserve(raw: *anyopaque, _: @import("../../runtime/tier/memory.zig").AdmissionAmounts) @import("../../runtime/tier/memory.zig").AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+            return self.callbacks;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: @import("../../runtime/tier/memory.zig").AdmissionAmounts) @import("../../runtime/tier/memory.zig").AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+            if (self.reenter_arena) |arena| {
+                self.reenter_arena = null; // one actual same-Arena callback
+                const controller = self.reenter_ctx.?.video_cache_budget.admission.?.controller;
+                self.reentry_before_bytes = controller.snapshot().host_scratch_bytes;
+                const uploaded = arena.upload(self.reenter_ctx.?, self.reenter_device, self.reenter_bytes) catch |err| {
+                    self.reentry_failure = err;
+                    return;
+                };
+                if (!uploaded) self.reentry_failure = error.SameArenaUploadDeclined else self.reentered = true;
+                self.reentry_after_bytes = controller.snapshot().host_scratch_bytes;
+            }
+        }
+        fn rejectHost(_: ?*anyopaque) callconv(.c) driver_mod.CUresult {
+            return 1;
+        }
+        fn rejectEvent(_: driver_mod.CUevent) callconv(.c) driver_mod.CUresult {
+            return 1;
+        }
+    };
+    var probe: Probe = .{};
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    const desired: @import("video_cache_budget.zig").Admission = .{ .controller = &domain.controller, .limits = .{ .host_limit_bytes = Arena.capacity }, .check_live_memory = false };
+    compute.ctx.video_cache_budget.admission = desired;
+    try std.testing.expect((try compute.acquirePinnedArena(.pinned_input_host)) == null);
+    try std.testing.expectEqual(@as(usize, 0), probe.callbacks);
+    try std.testing.expect(compute.ocr_pinned_input.host.ptr == null);
+    compute.ctx.video_cache_budget.admission = null;
+    var requests: [CacheFunding.Auxiliary.count + 1]CacheFunding.Request = undefined;
+    var builder: CacheFunding.Builder = .{ .storage = &requests };
+    // This fixture isolates upload hints from the other independent roles.
+    try std.testing.expectEqual(@as(usize, 0), builder.len); // text-only/default does not reserve a second arena
+    for ([_]usize{ 0, pinned_upload_arena_capacity, Arena.capacity + 1 }) |hint| {
+        try compute.appendPinnedInputCacheWorkload(&builder, hint);
+        try std.testing.expectEqual(@as(usize, 0), builder.len);
+    }
+    for ([_]usize{ pinned_upload_arena_capacity + 1, Arena.capacity }) |hint| {
+        try compute.appendPinnedInputCacheWorkload(&builder, hint);
+        try std.testing.expectEqual(@as(usize, 1), builder.len);
+        builder.len = 0;
+    }
+    const upload_bytes = 2 * 1024 * 1024 + 256;
+    try compute.appendPinnedInputCacheWorkload(&builder, upload_bytes);
+    try std.testing.expectEqual(@as(usize, 1), builder.len);
+    try std.testing.expectEqual(CacheFunding.Auxiliary.Kind.pinned_input_host, requests[0].auxiliary.kind);
+    try builder.add(try compute.lightOnRetentionRequest(desired, @bitSizeOf(usize)));
+    const work = builder.workload();
+    const cold = try CacheFunding.Funding.create(work);
+    defer cold.finishOutsideExecution();
+    try compute.snapshotLightOnNormFunding(cold, desired);
+    try cold.fundLightOnOutsideExecution(&pin);
+    try std.testing.expectEqual(Arena.capacity, domain.controller.snapshot().host_scratch_bytes);
+    try std.testing.expect(compute.ocr_pinned_input.host.ptr == null); // no unused SDK allocation
+    var device = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, upload_bytes);
+    defer device.free(&compute.ctx);
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    try std.testing.expect(probe.gate.tryLock());
+    var gate_owned = true;
+    defer if (gate_owned) probe.gate.unlock();
+    const cb = compute.computeBackend();
+    try CudaCompute.beginLightOnNormFunding(&compute, work, cold, &epoch, desired);
+    var bound = true;
+    defer if (bound) CudaCompute.unbindCacheFunding(&cb, &compute, cold);
+    try compute.configureEmbeddingGemma2AdmissionWithCleanup(desired, .{ .boundary = &epoch });
+    const callbacks = probe.callbacks;
+    var taken = (try compute.acquireAuxiliaryCache(requests[0])).?;
+    try std.testing.expectError(error.MissingCurrentCleanupEpoch, compute.ocr_pinned_input.prepareAdmittedForKind(&compute.ctx, &taken, .{}, .pinned_input_host));
+    var foreign_guard = try sink.enter();
+    defer foreign_guard.finish();
+    var foreign_epoch = try foreign_guard.retainEpoch();
+    defer foreign_epoch.release();
+    try std.testing.expectError(error.ForeignPreparedCacheBoundary, compute.ocr_pinned_input.prepareAdmittedForKind(&compute.ctx, &taken, .{ .boundary = &foreign_epoch }, .pinned_input_host));
+    try std.testing.expect(compute.ocr_pinned_input.host.ptr == null and compute.ocr_pinned_input.event == null);
+    try std.testing.expectEqual(callbacks, probe.callbacks);
+    try taken.cancelBeforeSdk();
+    const input = try a.alloc(u8, upload_bytes);
+    defer a.free(input);
+    @memset(input, 73);
+    try std.testing.expect(try copyFromPinnedOcrInputArena(&compute, device, input));
+    const arena = &compute.ocr_pinned_input;
+    const host = arena.host.ptr;
+    const event = arena.event;
+    try std.testing.expect(host != null and event != null and arena.quota == .prepared);
+    var fail_warm = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    {
+        const saved = compute.allocator;
+        compute.allocator = fail_warm.allocator();
+        defer compute.allocator = saved;
+        for (0..3) |_| try std.testing.expect(try copyFromPinnedOcrInputArena(&compute, device, input));
+    }
+    try std.testing.expectEqual(@as(usize, 0), fail_warm.alloc_index);
+    try std.testing.expect(!fail_warm.has_induced_failure);
+    try std.testing.expectEqual(host, arena.host.ptr);
+    try std.testing.expectEqual(event, arena.event);
+    try std.testing.expectEqual(@as(usize, 4), compute.ocr_pinned_input_uploads);
+    const actual = try a.alloc(u8, upload_bytes);
+    defer a.free(actual);
+    try device.copyToHost(&compute.ctx, actual);
+    try compute.ctx.synchronize();
+    try std.testing.expectEqualSlices(u8, input, actual);
+    try std.testing.expectEqual(callbacks, probe.callbacks);
+    CudaCompute.unbindCacheFunding(&cb, &compute, cold);
+    bound = false;
+    const free_host = compute.ctx.driver.fns.cuMemFreeHost;
+    const destroy_event = compute.ctx.driver.fns.cuEventDestroy;
+    defer compute.ctx.driver.fns.cuMemFreeHost = free_host;
+    defer compute.ctx.driver.fns.cuEventDestroy = destroy_event;
+    compute.ctx.driver.fns.cuMemFreeHost = Probe.rejectHost;
+    try std.testing.expectError(error.CudaDriverError, arena.clearWithCleanup(&compute.ctx, .{ .boundary = &epoch }));
+    try std.testing.expectEqual(host, arena.host.ptr);
+    try std.testing.expectEqual(event, arena.event);
+    try std.testing.expect(arena.quota == .prepared);
+    compute.ctx.driver.fns.cuMemFreeHost = free_host;
+    compute.ctx.driver.fns.cuEventDestroy = Probe.rejectEvent;
+    try std.testing.expectError(error.CudaDriverError, arena.clearWithCleanup(&compute.ctx, .{ .boundary = &epoch }));
+    try std.testing.expect(arena.host.ptr == null);
+    try std.testing.expectEqual(event, arena.event);
+    try std.testing.expect(arena.quota == .prepared);
+    try std.testing.expectEqual(Arena.capacity, domain.controller.snapshot().host_scratch_bytes);
+    compute.ctx.driver.fns.cuEventDestroy = destroy_event;
+    try arena.clearWithCleanup(&compute.ctx, .{ .boundary = &epoch });
+    try std.testing.expect(arena.host.ptr == null and arena.event == null and !arena.quota.hasLease());
+    try std.testing.expectEqual(Arena.capacity, domain.controller.snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(callbacks, probe.callbacks);
+    probe.gate.unlock();
+    gate_owned = false;
+    guard.finish();
+    try std.testing.expectEqual(@as(usize, 0), domain.controller.snapshot().host_scratch_bytes);
+    try std.testing.expect(!probe.under_gate);
+    // Legitimate historical raw outside publication, then a managed text-only
+    // request with the feature disabled. Upgrade SAME actual owner/lease only.
+    try std.testing.expect(try arena.upload(&compute.ctx, device, input));
+    const raw_host = arena.host.ptr;
+    const raw_event = arena.event;
+    const raw_lease = arena.quota.peek().?;
+    try std.testing.expect(arena.quota == .raw);
+    compute.ocr_pinned_inputs_enabled = false;
+    var transition_requests: [CacheFunding.Auxiliary.count + 1]CacheFunding.Request = undefined;
+    var transition_builder: CacheFunding.Builder = .{ .storage = &transition_requests };
+    try transition_builder.add(compute.auxiliaryCacheRequest(.pinned_input_host).?); // SAME raw arena, ZERO upload hint
+    try std.testing.expectEqual(@as(usize, 1), transition_builder.len);
+    try std.testing.expectEqual(CacheFunding.Auxiliary.Kind.pinned_input_host, transition_requests[0].auxiliary.kind);
+    // Supplying a hint too must not duplicate the already-inventoried owner.
+    try compute.appendPinnedInputCacheWorkload(&transition_builder, upload_bytes);
+    try std.testing.expectEqual(@as(usize, 1), transition_builder.len);
+    try transition_builder.add(try compute.lightOnRetentionRequest(desired, @bitSizeOf(usize)));
+    const transition_work = transition_builder.workload();
+    const upgrade = try CacheFunding.Funding.create(transition_work);
+    defer upgrade.finishOutsideExecution();
+    const before_upgrade = probe.callbacks;
+    try compute.snapshotLightOnNormFunding(upgrade, desired);
+    try upgrade.fundLightOnOutsideExecution(&pin);
+    try std.testing.expectEqual(before_upgrade, probe.callbacks);
+    try std.testing.expectEqual(Arena.capacity, domain.controller.snapshot().host_scratch_bytes);
+    var next_guard = try sink.enter();
+    defer next_guard.finish();
+    var next_epoch = try next_guard.retainEpoch();
+    defer next_epoch.release();
+    try std.testing.expect(probe.gate.tryLock());
+    gate_owned = true;
+    try CudaCompute.beginLightOnNormFunding(&compute, transition_work, upgrade, &next_epoch, desired);
+    var upgrade_bound = true;
+    defer if (upgrade_bound) CudaCompute.unbindCacheFunding(&cb, &compute, upgrade);
+    try compute.configureEmbeddingGemma2AdmissionWithCleanup(desired, .{ .boundary = &next_epoch });
+    try std.testing.expectEqual(raw_host, arena.host.ptr);
+    try std.testing.expectEqual(raw_event, arena.event);
+    try std.testing.expect(arena.quota == .prepared);
+    try std.testing.expectEqualDeep(raw_lease, arena.quota.peek().?);
+    try std.testing.expectEqual(before_upgrade, probe.callbacks);
+    // Final current-B policy cleanup is now supported with zero new credit.
+    try arena.clearWithCleanup(&compute.ctx, .{ .boundary = &next_epoch });
+    try std.testing.expectEqual(Arena.capacity, domain.controller.snapshot().host_scratch_bytes);
+    CudaCompute.unbindCacheFunding(&cb, &compute, upgrade);
+    upgrade_bound = false;
+    probe.gate.unlock();
+    gate_owned = false;
+    next_guard.finish();
+    try std.testing.expectEqual(@as(usize, 0), domain.controller.snapshot().host_scratch_bytes);
+    try std.testing.expect(!probe.under_gate);
+    // Exact raw explicit-outside refund can synchronously upload into this
+    // SAME now-empty Arena. Old cleanup must never reset that newly owned SDK
+    // Host/Event/quota after the callback has published them.
+    // The controller pins the OLD local reservation through its external
+    // release callback. Reentrant new backing therefore needs the real
+    // simultaneous 2x capacity; only this explicit outside phase allows it.
+    compute.ctx.video_cache_budget.admission.?.limits.host_limit_bytes = 2 * Arena.capacity;
+    try std.testing.expect(try arena.upload(&compute.ctx, device, input));
+    probe.reenter_arena = arena;
+    probe.reenter_ctx = &compute.ctx;
+    probe.reenter_device = device;
+    probe.reenter_bytes = input;
+    try arena.clear(&compute.ctx);
+    if (probe.reentry_failure) |failure| return failure;
+    try std.testing.expect(probe.reentered and arena.host.ptr != null and arena.event != null and arena.quota == .raw);
+    try std.testing.expectEqual(Arena.capacity, probe.reentry_before_bytes);
+    try std.testing.expectEqual(2 * Arena.capacity, probe.reentry_after_bytes);
+    try std.testing.expectEqual(Arena.capacity, domain.controller.snapshot().host_scratch_bytes);
+    try device.copyToHost(&compute.ctx, actual);
+    try compute.ctx.synchronize();
+    try std.testing.expectEqualSlices(u8, input, actual);
+    try arena.clear(&compute.ctx);
+    try std.testing.expect(arena.host.ptr == null and arena.event == null and !arena.quota.hasLease());
+    try std.testing.expectEqual(@as(usize, 0), domain.controller.snapshot().host_scratch_bytes);
+}
+
+test "CUDA actual temporary recurrent producer reuses one cold peak only after checked SDK retirement and retains it across failure retry" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const Admission = @import("../../runtime/tier/admission_domain.zig");
+    const Recurrent = @import("../../execution/recurrent_state_admission.zig");
+    const Memory = @import("../../runtime/tier/memory.zig");
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    compute.lighton_state_pool_enabled = false;
+    var backend = compute.computeBackend();
+    const domain = try Admission.Domain.create();
+    defer domain.release();
+    const Probe = struct {
+        gate: *std.atomic.Mutex,
+        held: bool = false,
+        releases: usize = 0,
+        fn check(self: *@This()) void {
+            if (!self.gate.tryLock()) self.held = true else self.gate.unlock();
+        }
+        fn reserve(raw: *anyopaque, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+            return 1;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+            self.releases += 1;
+        }
+    };
+    var model_gate: std.atomic.Mutex = .unlocked;
+    var probe = Probe{ .gate = &model_gate };
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    const layout = Recurrent.Layout{ .key_heads = 1, .value_heads = 1 };
+    const exact = try layout.bytes();
+    const before = compute.ctx.device_allocations.snapshot();
+    try std.testing.expectError(error.ResourceLimitExceeded, domain.controller.tryAcquire(.gpu, .{ .backend_limit_bytes = exact - 1 }, .{ .backend_scratch_bytes = exact }, false));
+    try std.testing.expectEqualDeep(before, compute.ctx.device_allocations.snapshot());
+    var owner = try @import("../../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
+    defer owner.finishAfterUnlock();
+    const epoch = owner.epoch().?;
+    const budget = try Recurrent.Budget.prepare(layout, @intFromPtr(&compute));
+    var budget_live = true;
+    defer if (budget_live) {
+        if (budget.current != null or budget.boundary_held) budget.retireWithCleanup(.{ .boundary = epoch }) catch platform.inference_process_supervisor.restartWorker() else budget.destroyUnusedOutsideExecution() catch platform.inference_process_supervisor.restartWorker();
+    };
+    var lease: ?Memory.AdmissionLease = try domain.controller.tryAcquire(.gpu, .{ .backend_limit_bytes = exact }, .{ .backend_scratch_bytes = exact }, false);
+    defer if (lease) |*value| value.release();
+    var pin: ?Admission.Pin = domain.pin();
+    defer if (pin) |value| value.release();
+    try budget.arm(&lease, &pin);
+    try budget.bind(epoch);
+    const call = @import("../../execution/invocation_context.zig").Context{ .cleanup = .{ .boundary = epoch }, .recurrent_state = budget };
+    backend.call_context = &call;
+    defer backend.call_context = null;
+    const channels: [384]f32 = @splat(0);
+    const width: [128]f32 = @splat(0);
+    const convolution: [1536]f32 = @splat(0);
+    const norm: [128]f32 = @splat(1);
+    const scalar = [_]f32{0};
+    const mixed = try backend.fromFloat32(&channels);
+    defer backend.free(mixed);
+    const z = try backend.fromFloat32(&width);
+    defer backend.free(z);
+    const beta = try backend.fromFloat32(&scalar);
+    defer backend.free(beta);
+    const ap = try backend.fromFloat32(&scalar);
+    defer backend.free(ap);
+    const conv = try backend.fromFloat32(&convolution);
+    defer backend.free(conv);
+    const nw = try backend.fromFloat32(&norm);
+    defer backend.free(nw);
+    const alog = try backend.fromFloat32(&scalar);
+    defer backend.free(alog);
+    const dt = try backend.fromFloat32(&scalar);
+    defer backend.free(dt);
+    while (!model_gate.tryLock()) std.atomic.spinLoopHint();
+    var gate_held = true;
+    defer if (gate_held) model_gate.unlock();
+    for (0..3) |iteration| {
+        var state: @import("gated_delta.zig").State = .{};
+        defer state.deinitWithCleanup(call.cleanup) catch platform.inference_process_supervisor.restartWorker();
+        const output = (try CudaCompute.qwen35LinearCore(&backend, &state, .{ .temporary_state = true, .destination = @as(?CT, null), .device_state_admitted = false, .mixed = mixed, .z = z, .beta = beta, .a = ap, .conv_weight = conv, .a_log = alog, .dt_bias = dt, .norm_weight = nw, .seq_len = @as(usize, 1), .key_heads = @as(usize, 1), .value_heads = @as(usize, 1), .dim = @as(usize, 128), .value_dim = @as(usize, 128), .conv_kernel = @as(usize, 4), .eps = @as(f32, 1e-6) })) orelse return error.MissingActualTemporaryRecurrentProducer;
+        var output_live = true;
+        defer if (output_live) backend.free(output);
+        const values = try backend.toFloat32(output, a);
+        defer a.free(values);
+        for (values) |value| try std.testing.expectEqual(@as(f32, 0), value);
+        try std.testing.expect(state.temporary_budget == budget and state.admission == null and budget.in_use);
+        var actual_state_bytes: usize = state.packed_storage.allocation_bytes;
+        for (state.history) |value| if (!value.borrowed) {
+            actual_state_bytes += value.allocation_bytes;
+        };
+        if (!state.recurrent.borrowed) actual_state_bytes += state.recurrent.allocation_bytes;
+        for (state.weights, state.owns_weights) |value, owned| if (owned and !value.borrowed) {
+            actual_state_bytes += value.allocation_bytes;
+        };
+        try std.testing.expect(actual_state_bytes > 0 and actual_state_bytes <= exact);
+        const before_retirement = compute.ctx.device_allocations.snapshot().live;
+        if (iteration == 1) {
+            const Free = struct {
+                fn fail(_: driver_mod.CUdeviceptr) callconv(.c) driver_mod.CUresult {
+                    return 700;
+                }
+            };
+            const original = compute.ctx.driver.fns.cuMemFree;
+            compute.ctx.driver.fns.cuMemFree = Free.fail;
+            defer compute.ctx.driver.fns.cuMemFree = original;
+            try std.testing.expectError(error.CudaDriverError, state.deinitWithCleanup(call.cleanup));
+            try std.testing.expect(budget.in_use);
+            try std.testing.expectError(error.RecurrentStateLoanStillLive, budget.acquire(@intFromPtr(&compute), layout));
+            try std.testing.expectEqual(exact, domain.controller.snapshot().backend_scratch_bytes);
+            compute.ctx.driver.fns.cuMemFree = original;
+        }
+        try state.deinitWithCleanup(call.cleanup);
+        try std.testing.expect(!budget.in_use);
+        try std.testing.expectEqual(before_retirement - actual_state_bytes, compute.ctx.device_allocations.snapshot().live);
+        backend.free(output);
+        output_live = false;
+        try compute.ctx.synchronize();
+        try std.testing.expectEqual(exact, domain.controller.snapshot().backend_scratch_bytes);
+        try std.testing.expect(!probe.held and probe.releases == 0);
+    }
+    model_gate.unlock();
+    gate_held = false;
+    backend.call_context = null;
+    try budget.retireWithCleanup(.{ .boundary = epoch });
+    budget_live = false;
+    try std.testing.expectEqual(exact, domain.controller.snapshot().backend_scratch_bytes);
+    owner.finishAfterUnlock();
+    try std.testing.expectEqual(@as(usize, 0), domain.controller.snapshot().backend_scratch_bytes);
+    try std.testing.expect(!probe.held and probe.releases == 1);
+}
+
+test "CUDA temporary recurrent cold target rejects copied table before invalid implementation context" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const copied = vtable;
+    const target = @import("../../backends/cold_compute_target.zig").Target{ .cuda = .{ .implementation_context = @ptrFromInt(1), .implementation_table = &copied, .primary_context = @ptrFromInt(2), .device = 0 } };
+    try std.testing.expect((try CudaCompute.temporaryRecurrentTarget(target)) == null);
+}
+
+test "CUDA burst readback cold quota warm event reuse optional denial and checked current B retirement" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const CacheFunding = @import("prepared_cache.zig");
+    const Readback = @import("burst_readback.zig");
+    const Domain = @import("../../runtime/tier/admission_domain.zig").Domain;
+    const Sink = @import("../../execution/retirement_sink.zig");
+    const Memory = @import("../../runtime/tier/memory.zig");
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var compute = try CudaCompute.testing.init(std.testing.allocator);
+    defer compute.deinit();
+    compute.capability_profile = .lightonocr3;
+    compute.ocr_pinned_metadata_enabled = false;
+    compute.ocr_pinned_inputs_enabled = false;
+    compute.lighton_cached_mrope_enabled = false;
+    compute.lighton_bf16_decode_outputs = false;
+    compute.lighton_bf16_projection_outputs = false;
+    if (cudaPinnedScalarDownloadsDisabled()) return error.SkipZigTest;
+    const Probe = struct {
+        gate: std.atomic.Mutex = .unlocked,
+        callbacks: usize = 0,
+        held: bool = false,
+        fn check(self: *@This()) void {
+            self.callbacks += 1;
+            if (self.gate.tryLock()) self.gate.unlock() else self.held = true;
+        }
+        fn reserve(raw: *anyopaque, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+            return self.callbacks;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+        fn rejectHost(_: ?*anyopaque) callconv(.c) driver_mod.CUresult {
+            return 1;
+        }
+        fn rejectEvent(_: driver_mod.CUevent) callconv(.c) driver_mod.CUresult {
+            return 1;
+        }
+    };
+    var probe: Probe = .{};
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    const desired: @import("video_cache_budget.zig").Admission = .{ .controller = &domain.controller, .limits = .{ .host_limit_bytes = Readback.capacity }, .check_live_memory = false };
+    const slot = &compute.lighton_burst_readback;
+    compute.ctx.video_cache_budget.admission = desired;
+    try std.testing.expect((try compute.acquireBurstReadbackSlot()) == null);
+    try std.testing.expect(slot.host.ptr == null and slot.event == null);
+    try std.testing.expectEqual(@as(usize, 0), probe.callbacks);
+    compute.ctx.video_cache_budget.admission = null;
+    var requests: [CacheFunding.Auxiliary.count + 1]CacheFunding.Request = undefined;
+    var builder: CacheFunding.Builder = .{ .storage = &requests };
+    try compute.appendAuxiliaryCacheWorkload(&builder);
+    try std.testing.expectEqual(@as(usize, 1), builder.len);
+    try std.testing.expectEqual(CacheFunding.Auxiliary.Kind.burst_readback_host, requests[0].auxiliary.kind);
+    try builder.add(try compute.lightOnRetentionRequest(desired, @bitSizeOf(usize)));
+    const work = builder.workload();
+    {
+        const denied = try CacheFunding.Funding.create(work);
+        defer denied.finishOutsideExecution();
+        var below = desired;
+        below.limits.host_limit_bytes = Readback.capacity - 1;
+        try compute.snapshotLightOnNormFunding(denied, below);
+        try denied.fundLightOnOutsideExecution(&pin); // optional role declines, run stays available
+        try std.testing.expect(denied.entries[0].optional_declined);
+        try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, domain.controller.snapshot());
+        try std.testing.expect(slot.host.ptr == null and slot.event == null);
+    }
+    const cold = try CacheFunding.Funding.create(work);
+    defer cold.finishOutsideExecution();
+    try compute.snapshotLightOnNormFunding(cold, desired);
+    try cold.fundLightOnOutsideExecution(&pin);
+    try std.testing.expectEqual(Readback.capacity, domain.controller.snapshot().host_scratch_bytes);
+    try std.testing.expect(slot.host.ptr == null and slot.event == null); // quota precedes SDK
+    var source = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 16);
+    defer source.free(&compute.ctx);
+    const values = [_]u32{ 17, 81, 6, 25 };
+    try source.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&values));
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    try std.testing.expect(probe.gate.tryLock());
+    var gate_owned = true;
+    defer if (gate_owned) probe.gate.unlock();
+    const cb = compute.computeBackend();
+    try CudaCompute.beginLightOnNormFunding(&compute, work, cold, &epoch, desired);
+    var bound = true;
+    defer if (bound) CudaCompute.unbindCacheFunding(&cb, &compute, cold);
+    try compute.configureEmbeddingGemma2AdmissionWithCleanup(desired, .{ .boundary = &epoch });
+    const callbacks = probe.callbacks;
+    var taken = (try compute.acquireAuxiliaryCache(requests[0])).?;
+    try std.testing.expectError(error.MissingCurrentCleanupEpoch, slot.prepareAdmitted(&compute.ctx, &taken, .{}));
+    var other_guard = try sink.enter();
+    defer other_guard.finish();
+    var other_epoch = try other_guard.retainEpoch();
+    defer other_epoch.release();
+    try std.testing.expectError(error.ForeignPreparedCacheBoundary, slot.prepareAdmitted(&compute.ctx, &taken, .{ .boundary = &other_epoch }));
+    try std.testing.expect(slot.host.ptr == null and slot.event == null);
+    try taken.cancelBeforeSdk();
+    try std.testing.expectEqual(slot, (try compute.acquireBurstReadbackSlot()).?);
+    const host = slot.host.ptr;
+    const event = slot.event;
+    try std.testing.expect(host != null and event != null and slot.quota == .prepared);
+    for (0..3) |_| {
+        try std.testing.expectEqual(slot, (try compute.acquireBurstReadbackSlot()).?);
+        var pending = (try slot.beginPrepared(&compute.ctx, source, 16)).?;
+        defer pending.deinit();
+        try std.testing.expect((try compute.acquireBurstReadbackSlot()) == null);
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, compute.configureEmbeddingGemma2AdmissionWithCleanup(null, .{ .boundary = &epoch }));
+        try pending.wait();
+        var got: [4]u32 = undefined;
+        try pending.copy(std.mem.sliceAsBytes(&got));
+        try std.testing.expectEqualSlices(u32, &values, &got);
+        try std.testing.expectEqual(host, slot.host.ptr);
+        try std.testing.expectEqual(event, slot.event);
+    }
+    try std.testing.expectEqual(callbacks, probe.callbacks);
+    const free_host = compute.ctx.driver.fns.cuMemFreeHost;
+    compute.ctx.driver.fns.cuMemFreeHost = Probe.rejectHost;
+    defer compute.ctx.driver.fns.cuMemFreeHost = free_host;
+    try std.testing.expectError(error.CudaDriverError, slot.clearWithCleanup(&compute.ctx, .{ .boundary = &epoch }));
+    try std.testing.expect(slot.host.ptr == host and slot.event == event and slot.failed and slot.quota == .prepared);
+    compute.ctx.driver.fns.cuMemFreeHost = free_host;
+    const destroy_event = compute.ctx.driver.fns.cuEventDestroy;
+    compute.ctx.driver.fns.cuEventDestroy = Probe.rejectEvent;
+    defer compute.ctx.driver.fns.cuEventDestroy = destroy_event;
+    try std.testing.expectError(error.CudaDriverError, slot.clearWithCleanup(&compute.ctx, .{ .boundary = &epoch }));
+    try std.testing.expect(slot.host.ptr == null and slot.event == event and slot.failed and slot.quota == .prepared);
+    try std.testing.expectEqual(Readback.capacity, domain.controller.snapshot().host_scratch_bytes);
+    compute.ctx.driver.fns.cuEventDestroy = destroy_event;
+    const generation = slot.generation;
+    try slot.clearWithCleanup(&compute.ctx, .{ .boundary = &epoch });
+    try std.testing.expect(slot.host.ptr == null and slot.event == null and !slot.busy and !slot.failed and slot.quota == .none);
+    try std.testing.expectEqual(generation, slot.generation);
+    try std.testing.expectEqual(callbacks, probe.callbacks);
+    try std.testing.expectEqual(Readback.capacity, domain.controller.snapshot().host_scratch_bytes);
+    CudaCompute.unbindCacheFunding(&cb, &compute, cold);
+    bound = false;
+    probe.gate.unlock();
+    gate_owned = false;
+    guard.finish();
+    try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, domain.controller.snapshot());
+    try std.testing.expect(!probe.held);
+}
+
+test "CUDA burst readback raw physical slot upgrades SAME lease before managed current B retirement" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const CacheFunding = @import("prepared_cache.zig");
+    const Readback = @import("burst_readback.zig");
+    const Domain = @import("../../runtime/tier/admission_domain.zig").Domain;
+    const Sink = @import("../../execution/retirement_sink.zig");
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var compute = try CudaCompute.testing.init(std.testing.allocator);
+    defer compute.deinit();
+    compute.capability_profile = .lightonocr3;
+    compute.ocr_pinned_metadata_enabled = false;
+    compute.ocr_pinned_inputs_enabled = false;
+    compute.lighton_cached_mrope_enabled = false;
+    compute.lighton_bf16_decode_outputs = false;
+    compute.lighton_bf16_projection_outputs = false;
+    const desired: @import("video_cache_budget.zig").Admission = .{ .controller = &domain.controller, .limits = .{ .host_limit_bytes = Readback.capacity }, .check_live_memory = false };
+    try compute.configureEmbeddingGemma2Admission(desired);
+    var source = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 4);
+    defer source.free(&compute.ctx);
+    const value = [_]u32{71};
+    try source.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&value));
+    const slot = &compute.lighton_burst_readback;
+    var pending = (try slot.begin(&compute.ctx, source, 4)).?;
+    try pending.wait();
+    pending.deinit();
+    const host = slot.host.ptr;
+    const event = slot.event;
+    const original = slot.quota.peek().?;
+    try std.testing.expect(slot.quota == .raw);
+    var requests: [CacheFunding.Auxiliary.count + 1]CacheFunding.Request = undefined;
+    var builder: CacheFunding.Builder = .{ .storage = &requests };
+    // Materialized raw custody is inventoried even with scalar download
+    // optimization disabled: this is a quota-shell upgrade, never new credit.
+    try compute.appendAuxiliaryCacheWorkload(&builder);
+    try std.testing.expectEqual(@as(usize, 1), builder.len);
+    try std.testing.expectEqual(CacheFunding.Auxiliary.Kind.burst_readback_host, requests[0].auxiliary.kind);
+    try builder.add(try compute.lightOnRetentionRequest(desired, @bitSizeOf(usize)));
+    const work = builder.workload();
+    const cold = try CacheFunding.Funding.create(work);
+    defer cold.finishOutsideExecution();
+    try compute.snapshotLightOnNormFunding(cold, desired);
+    try cold.fundLightOnOutsideExecution(&pin);
+    try std.testing.expectEqual(Readback.capacity, domain.controller.snapshot().host_scratch_bytes);
+    try std.testing.expect(cold.entries[0].upgrade_raw and !cold.entries[0].miss);
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    const cb = compute.computeBackend();
+    try CudaCompute.beginLightOnNormFunding(&compute, work, cold, &epoch, desired);
+    var bound = true;
+    defer if (bound) CudaCompute.unbindCacheFunding(&cb, &compute, cold);
+    try std.testing.expect(slot.quota == .prepared);
+    try std.testing.expectEqualDeep(original, slot.quota.peek().?);
+    try std.testing.expectEqual(host, slot.host.ptr);
+    try std.testing.expectEqual(event, slot.event);
+    try std.testing.expectError(error.CacheRetirementCleanupAuthorityRequired, slot.clear(&compute.ctx));
+    try std.testing.expectEqual(host, slot.host.ptr);
+    try std.testing.expectEqual(event, slot.event);
+    try slot.clearWithCleanup(&compute.ctx, .{ .boundary = &epoch });
+    try std.testing.expectEqual(Readback.capacity, domain.controller.snapshot().host_scratch_bytes);
+    CudaCompute.unbindCacheFunding(&cb, &compute, cold);
+    bound = false;
+    guard.finish();
+    try std.testing.expectEqual(@as(usize, 0), domain.controller.snapshot().host_scratch_bytes);
+}
+
+test "CUDA generic paged attention reads authoritative unequal reserved PAGE tables with stable warm allocations" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var storage = try kv_storage_runtime.KvStorageRuntime.init(a, .{ .backend = .cuda, .dtype = .f16, .page_size_tokens = 16, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 32 });
+    defer storage.deinit();
+    try cb.provisionKvDeviceWriteHook(&storage);
+    var manager = @import("../../runtime/kv/manager.zig").KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(storage.storage.config);
+    const hook = storage.device_write_hook.?;
+    const device: *CudaKvDeviceStorage = @ptrCast(@alignCast(hook.ctx));
+    var views: [2]ops.KvBatchView = undefined;
+    const lengths = [_]usize{ 17, 33 };
+    var query: [2 * 64]f32 = undefined;
+    var suffix_keys: [2 * 32]f32 = undefined;
+    var suffix_values: [2 * 32]f32 = undefined;
+    var expected: [2 * 64]f32 = undefined;
+    for (&query, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) / 16;
+    for (lengths, 0..) |n, page| {
+        const manager_sequence = try manager.attachSequence(pool);
+        try manager.appendTokens(manager_sequence, @intCast(n));
+        // Independent metadata reservations intentionally differ, as supported
+        // manager and physical allocators need not issue the same block IDs.
+        try manager.reserveTokenCapacity(manager_sequence, n + 16);
+        const sequence = try storage.attachSequence(pool);
+        try std.testing.expectEqual(manager_sequence, sequence);
+        try storage.appendTokens(sequence, @intCast(n));
+        const keys = try a.alloc(f32, n * 32);
+        defer a.free(keys);
+        const values = try a.alloc(f32, n * 32);
+        defer a.free(values);
+        for (keys, values, 0..) |*key, *value, i| {
+            key.* = @as(f32, @floatFromInt(@as(i32, @intCast((i + page * 7) % 31)) - 15)) / 16;
+            value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i + page * 11) % 29)) - 14)) / 16;
+        }
+        @memcpy(suffix_keys[page * 32 ..][0..32], keys[(n - 1) * 32 ..]);
+        @memcpy(suffix_values[page * 32 ..][0..32], values[(n - 1) * 32 ..]);
+        // Independent F64 softmax oracle; exact half inputs isolate the
+        // authoritative table/addressing contract from storage conversion.
+        for (0..2) |head| {
+            var scores: [33]f64 = undefined;
+            var maximum: f64 = -std.math.inf(f64);
+            for (0..n) |token| {
+                var score: f64 = 0;
+                for (0..32) |d| score += @as(f64, query[page * 64 + head * 32 + d]) * keys[token * 32 + d];
+                scores[token] = score / @sqrt(@as(f64, 32));
+                maximum = @max(maximum, scores[token]);
+            }
+            var denominator: f64 = 0;
+            for (scores[0..n]) |*score| {
+                score.* = @exp(score.* - maximum);
+                denominator += score.*;
+            }
+            for (0..32) |d| {
+                var total: f64 = 0;
+                for (0..n) |token| total += scores[token] * values[token * 32 + d];
+                expected[page * 64 + head * 32 + d] = @floatCast(total / denominator);
+            }
+        }
+        const kt = try cb.fromFloat32Shape(keys, &.{ @intCast(n), 32 });
+        defer cb.free(kt);
+        const vt = try cb.fromFloat32Shape(values, &.{ @intCast(n), 32 });
+        defer cb.free(vt);
+        try storage.reserveDeviceTokenCapacity(sequence, n + 32, n + 48);
+        try storage.writeLayerKvSuffixDevice(.{ .sequence_id = sequence, .layer_index = 0, .total_token_count = n, .suffix_token_count = n, .position_offset = 0, .num_kv_heads = 1, .head_dim = 32 }, .{ .handle = @ptrFromInt(tensorFromCt(kt).buffer.ptr), .byte_offset = 0, .byte_len = keys.len * 4 }, .{ .handle = @ptrFromInt(tensorFromCt(vt).buffer.ptr), .byte_offset = 0, .byte_len = values.len * 4 });
+        const table = storage.blockTable(sequence).?;
+        const manager_table = manager.blockTable(manager_sequence).?;
+        views[page] = .{ .kv_cache = .{ .sequence_id = sequence, .pool_id = pool, .logical_block_count = manager_table.len(), .tail_tokens = manager_table.tail_tokens, .logical_blocks = manager_table.blocks.items, .kv_storage = &storage }, .kv_manager = &manager, .kv_storage = &storage, .per_item_query_len = 1, .per_item_total_len = n, .per_item_kv_len = n, .per_item_kv_position_offset = 0, .per_item_mode = .paged_decode };
+        const state = try storage.sequenceMut(sequence);
+        try std.testing.expect(table.blocks.items.len < state.block_table.blocks.items.len + state.reserved_tail_blocks.items.len);
+    }
+    const qt = try cb.fromFloat32Shape(&query, &.{ 2, 64 });
+    defer cb.free(qt);
+    const kt = try cb.fromFloat32Shape(&suffix_keys, &.{ 2, 32 });
+    defer cb.free(kt);
+    const vt = try cb.fromFloat32Shape(&suffix_values, &.{ 2, 32 });
+    defer cb.free(vt);
+    const attention = ops.AttentionContext{ .mode = .paged_decode, .total_sequence_len = lengths[1], .query_sequence_len = 1, .kv_sequence_len = lengths[1], .kv_batch = &views, .skip_kv_write = true };
+    // The physical source is authoritative even when the independent manager
+    // view has different block IDs. Its short visible snapshot cannot stand
+    // in for the actual same-sequence full replay reservation.
+    try std.testing.expect(!std.mem.eql(u32, views[1].kv_cache.logical_blocks.?, storage.blockTable(views[1].kv_cache.sequence_id).?.blocks.items));
+    var fail_host = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    storage.allocator = fail_host.allocator();
+    defer storage.allocator = a; // restore before storage's actual destructor
+    const output = try cb.gqaPagedAttention(qt, kt, vt, null, attention, 2, 2, 1, 32);
+    defer cb.free(output);
+    const got = try cb.toFloat32(output, a);
+    defer a.free(got);
+    for (expected, got) |x, y| try std.testing.expectApproxEqAbs(x, y, 2e-5);
+    const layer = device.layers.getPtr(try device.layerKey(views[0].kv_cache.sequence_id, 0)).?;
+    const pointers = .{ layer.k.ptr, layer.v.ptr, layer.block_table.ptr };
+    const kv_reallocations = device.capacity_epoch;
+    const table_capacity = layer.block_table_capacity;
+    for (0..2) |_| {
+        const repeated = try cb.gqaPagedAttention(qt, kt, vt, null, attention, 2, 2, 1, 32);
+        defer cb.free(repeated);
+        const actual = try cb.toFloat32(repeated, a);
+        defer a.free(actual);
+        for (expected, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 2e-5);
+        try std.testing.expectEqual(pointers, .{ layer.k.ptr, layer.v.ptr, layer.block_table.ptr });
+        try std.testing.expectEqual(table_capacity, layer.block_table_capacity);
+        try std.testing.expectEqual(kv_reallocations, device.capacity_epoch);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fail_host.alloc_index); // first reserved read AND warm reuse require no host growth
+    try std.testing.expectEqual(@as(usize, 0), compute.lighton_attention.calls); // generic geometry, never force a packet
+}
+
+test "CUDA reserved paged table count refuses short visible prefix without lowering replay reservation" {
+    const visible = [_]u32{ 2, 7 };
+    const full = [_]u32{ 2, 7, 11, 13, 17, 19 };
+    try std.testing.expectError(error.InvalidPagedKvState, CudaKvDeviceStorage.blockTableUploadBlockCount(64, 16, &visible));
+    try std.testing.expectEqual(@as(usize, 4), try CudaKvDeviceStorage.blockTableUploadBlockCount(64, 16, &full));
+    try std.testing.expectEqual(@as(usize, 6), try CudaKvDeviceStorage.blockTableUploadBlockCount(96, 16, &full));
+    // Peer ordering never changes the caller's own explicit requested bound.
+    try std.testing.expectEqual(@as(usize, 4), try CudaKvDeviceStorage.blockTableUploadBlockCount(64, 16, &full));
+}
+
+test "CUDA reserved paged read rejects copied foreign hooks and invalid runtime before any SDK or layer dereference" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var storage = try kv_storage_runtime.KvStorageRuntime.init(a, .{ .backend = .cuda, .dtype = .f16, .page_size_tokens = 16, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 32 });
+    defer storage.deinit();
+    defer storage.device_write_hook = null; // synthetic hooks never own SDK state
+    var shape = [_]i64{ 1, 32 };
+    var query = CudaTensor{ .buffer = .{ .ptr = 1, .len = 128 }, .dtype = .f32, .shape = &shape, .elem_count = 32, .owns_buffer = false, .owns_shape = false };
+    var expected: CudaCompute = undefined;
+    var foreign: CudaCompute = undefined;
+    const attention = ops.AttentionContext{ .mode = .paged_decode, .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1, .kv_storage = &storage, .kv_cache = .{ .sequence_id = 1, .pool_id = 0, .logical_block_count = 1, .tail_tokens = 1, .logical_blocks = &.{0}, .kv_storage = &storage } };
+    var paged = kv_storage_runtime.DevicePagedKvLayer{ .runtime = @ptrFromInt(1), .slot = 0, .format = cuda_kv_format_f16, .token_count = 1, .key_row_bytes = 64, .base_key_row_bytes = 64, .v_row_stride = 64, .page_size_tokens = 16, .position_offset = 0 };
+    const copied = CudaKvDeviceStorage.hook_vtable;
+    storage.device_write_hook = .{ .ctx = @ptrFromInt(1), .vtable = &copied };
+    try std.testing.expectError(error.InvalidPagedKvState, gqaPagedAttentionWithCompressedDeviceKv(&expected, @ptrCast(&query), null, attention, paged, 1, 1, 1, 32));
+    storage.device_write_hook = .{ .ctx = @ptrFromInt(2), .vtable = &CudaKvDeviceStorage.hook_vtable };
+    try std.testing.expectError(error.InvalidPagedKvState, gqaPagedAttentionWithCompressedDeviceKv(&expected, @ptrCast(&query), null, attention, paged, 1, 1, 1, 32));
+    var other = CudaKvDeviceStorage{ .allocator = a, .compute = &foreign, .dtype = .f16 };
+    paged.runtime = &other;
+    storage.device_write_hook = .{ .ctx = &other, .vtable = &CudaKvDeviceStorage.hook_vtable };
+    try std.testing.expectError(error.InvalidPagedKvState, gqaPagedAttentionWithCompressedDeviceKv(&expected, @ptrCast(&query), null, attention, paged, 1, 1, 1, 32));
+    try std.testing.expect(other.layers.count() == 0); // no phantom allocation/publication
+}
+
+fn derivedWeightColdCase(raw_first: bool) !void {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Cache = @import("prepared_cache.zig");
+    const Domain = @import("../../runtime/tier/admission_domain.zig").Domain;
+    const Sink = @import("../../execution/retirement_sink.zig");
+    const owner = try Domain.create();
+    defer owner.release();
+    const pin = owner.pin();
+    defer pin.release();
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    compute.capability_profile = .lightonocr3;
+    compute.lighton_fused_projections = true;
+    compute.lighton_fused_ffn = true;
+    compute.lighton_ffn_bf16_inputs = false;
+    compute.lighton_bf16_projection_outputs = false;
+    if (!lightOnDevice(&compute).portableKernels() or !cudaCublasLtEnabled() or compute.cublaslt == null or compute.kernels.activation_multiply_fused_gate_up_f32 == null) return error.SkipZigTest;
+    const cb = compute.computeBackend();
+    const names = [_][]const u8{
+        "model.layers.0.linear_attn.in_proj_qkv.weight", "model.layers.0.linear_attn.in_proj_z.weight", "model.layers.0.linear_attn.in_proj_b.weight", "model.layers.0.linear_attn.in_proj_a.weight",
+        "model.layers.0.mlp.gate_proj.weight",           "model.layers.0.mlp.up_proj.weight",           "model.layers.0.mlp.down_proj.weight",
+    };
+    const widths = [_]usize{ 6144, 2048, 16, 16, 3584, 3584, 1024 };
+    var weights: [7]CT = undefined;
+    var acquired: usize = 0;
+    defer for (weights[0..acquired]) |weight| cb.free(weight);
+    for (names, widths, 0..) |name, width, index| {
+        const columns: usize = if (index == 6) 3584 else 1024;
+        const values = try a.alloc(u16, width * columns);
+        defer a.free(values);
+        for (values, 0..) |*value, i| value.* = @intCast(@as(u32, @bitCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + index * 11) % 29)) - 14)) / 1024)) >> 16);
+        const shape = [_]i64{ @intCast(width), @intCast(columns) };
+        const tensor: tensor_mod.Tensor = .{ .data = std.mem.sliceAsBytes(values), .dtype = .bf16, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
+        try compute.insertBf16WeightFromTensor(try a.dupe(u8, name), &tensor);
+        weights[index] = try cb.acquireWeight(name);
+        acquired += 1;
+    }
+    try compute.publishLightOnNormCatalog();
+    var config: @import("../../models/gpt.zig").Config = .{ .hidden_size = 1024, .intermediate_size = 3584, .num_hidden_layers = 1, .num_attention_heads = 8, .vocab_size = 64 };
+    config.family = .qwen3_5;
+    config.qwen35_has_linear_attention = true;
+    config.qwen35_linear_num_key_heads = 16;
+    config.qwen35_linear_num_value_heads = 16;
+    config.qwen35_linear_key_head_dim = 128;
+    config.qwen35_linear_value_head_dim = 128;
+    config.qwen35_linear_conv_kernel_dim = 4;
+    var storage: [3]Cache.Request = undefined;
+    var builder: Cache.Builder = .{ .storage = &storage };
+    try compute.appendDerivedWeightWorkload(config, &builder);
+    try std.testing.expectEqual(@as(usize, 2), builder.len);
+    var invalid = storage[0].derived_weight;
+    invalid.sources[0] = 1;
+    const before_invalid = compute.ctx.device_allocations.snapshot();
+    try std.testing.expectError(error.PreparedCachePlanChanged, compute.validateDerivedWeight(invalid, true));
+    try std.testing.expectEqualDeep(before_invalid, compute.ctx.device_allocations.snapshot());
+    try builder.add(.{ .ocr_retention = .{ .cache_bytes = 0, .deferred_bytes = 0, .pressure_step = @bitSizeOf(usize) } });
+    const Probe = struct {
+        gate: std.atomic.Mutex = .unlocked,
+        callbacks: usize = 0,
+        under_gate: bool = false,
+        fn observe(self: *@This()) void {
+            self.callbacks += 1;
+            if (self.gate.tryLock()) self.gate.unlock() else self.under_gate = true;
+        }
+        fn reserve(raw: *anyopaque, _: @import("../../runtime/tier/memory.zig").AdmissionAmounts) @import("../../runtime/tier/memory.zig").AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            return self.callbacks;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: @import("../../runtime/tier/memory.zig").AdmissionAmounts) @import("../../runtime/tier/memory.zig").AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+    };
+    var probe: Probe = .{};
+    try owner.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    const desired: @import("video_cache_budget.zig").Admission = .{ .controller = &owner.controller, .limits = .{ .backend_limit_bytes = 64 * 1024 * 1024, .scratch_limit_bytes = 1 }, .check_live_memory = false };
+    compute.constant_policy = desired;
+    compute.ctx.video_cache_budget.admission = desired;
+    const data: [1024]f32 = @splat(0.125);
+    const input = try cb.fromFloat32Shape(&data, &.{ 1, 1024 });
+    defer cb.free(input);
+    const ffn: ops.GatedFfnNoBiasRequest = .{ .input = input, .gate_weight = weights[4], .up_weight = weights[5], .down_weight = weights[6], .rows = 1, .hidden_size = 1024, .intermediate_size = 3584, .activation = .silu };
+    if (raw_first) {
+        const projections = (try CudaCompute.lightOnInputProjections(&cb, input, weights[0..4].*, 1, 1024, 6144, 2048, 16)).?;
+        for (projections) |value| cb.free(value);
+        const paired = (try cb.gatedFfnNoBias(&ffn)).?;
+        cb.free(paired);
+        var projection_it = compute.lighton_projection_cache.valueIterator();
+        var pair_it = compute.lighton_gate_up_cache.valueIterator();
+        try std.testing.expect(projection_it.next().?.quota == .raw);
+        try std.testing.expect(pair_it.next().?.quota == .raw);
+    }
+    const quota_before_funding = owner.controller.snapshot();
+    const funding = try Cache.Funding.create(builder.workload());
+    defer funding.finishOutsideExecution();
+    try compute.snapshotLightOnNormFunding(funding, desired);
+    try funding.fundLightOnOutsideExecution(&pin);
+    if (raw_first) try std.testing.expectEqualDeep(quota_before_funding, owner.controller.snapshot());
+    var source = try Sink.Ref.create();
+    defer source.release();
+    var guard = try source.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    var gate_owned = false;
+    defer if (gate_owned) probe.gate.unlock();
+    try std.testing.expect(probe.gate.tryLock());
+    gate_owned = true;
+    try CudaCompute.beginLightOnNormFunding(&compute, builder.workload(), funding, &epoch, desired);
+    var bound = true;
+    defer if (bound) CudaCompute.unbindCacheFunding(&cb, &compute, funding);
+    const before = probe.callbacks;
+    if (raw_first) {
+        var projection_it = compute.lighton_projection_cache.valueIterator();
+        var pair_it = compute.lighton_gate_up_cache.valueIterator();
+        try std.testing.expect(projection_it.next().?.quota == .prepared);
+        try std.testing.expect(pair_it.next().?.quota == .prepared);
+    }
+    var addresses: [2]driver_mod.CUdeviceptr = @splat(0);
+    for (0..2) |iteration| {
+        const outputs = (try CudaCompute.lightOnInputProjections(&cb, input, weights[0..4].*, 1, 1024, 6144, 2048, 16)).?;
+        defer for (outputs) |output| cb.free(output);
+        for (outputs, weights[0..4], widths[0..4]) |output, weight, width| {
+            const separate = try cb.linearNoBias(input, weight, 1, 1024, width);
+            defer cb.free(separate);
+            const expected = try cb.toFloat32(separate, a);
+            defer a.free(expected);
+            const actual = try cb.toFloat32(output, a);
+            defer a.free(actual);
+            for (expected, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 2e-4);
+        }
+        const output = (try cb.gatedFfnNoBias(&ffn)).?;
+        defer cb.free(output);
+        const gate_values = try cb.linearNoBias(input, weights[4], 1, 1024, 3584);
+        defer cb.free(gate_values);
+        const up_values = try cb.linearNoBias(input, weights[5], 1, 1024, 3584);
+        defer cb.free(up_values);
+        const activated_gate = try cb.silu(gate_values);
+        defer cb.free(activated_gate);
+        const activated = try cb.multiply(activated_gate, up_values);
+        defer cb.free(activated);
+        const separate_ffn = try cb.linearNoBias(activated, weights[6], 1, 3584, 1024);
+        defer cb.free(separate_ffn);
+        const expected_ffn = try cb.toFloat32(separate_ffn, a);
+        defer a.free(expected_ffn);
+        const actual_ffn = try cb.toFloat32(output, a);
+        defer a.free(actual_ffn);
+        for (expected_ffn, actual_ffn) |x, y| try std.testing.expectApproxEqAbs(x, y, 2e-4);
+
+        var pair_it = compute.lighton_gate_up_cache.valueIterator();
+        var projection_it = compute.lighton_projection_cache.valueIterator();
+        const pair = pair_it.next().?.buffer.ptr;
+        const projection = projection_it.next().?.buffer.ptr;
+        if (iteration == 0) addresses = .{ projection, pair } else try std.testing.expectEqualDeep(addresses, [2]driver_mod.CUdeviceptr{ projection, pair });
+        try std.testing.expectEqual(before, probe.callbacks);
+    }
+    try std.testing.expectEqual(@as(usize, 16842752 + 14680064), owner.controller.snapshot().backend_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.controller.snapshot().backend_scratch_bytes);
+    CudaCompute.unbindCacheFunding(&cb, &compute, funding);
+    bound = false;
+    probe.gate.unlock();
+    gate_owned = false;
+    guard.finish(); // publication A is gone; concrete cache owners remain
+    var final_guard = try source.enter();
+    defer final_guard.finish();
+    var final_epoch = try final_guard.retainEpoch();
+    defer final_epoch.release();
+    try std.testing.expect(probe.gate.tryLock());
+    gate_owned = true;
+    const Free = struct {
+        fn fail(_: driver_mod.CUdeviceptr) callconv(.c) driver_mod.CUresult {
+            return 1;
+        }
+    };
+    const actual_free = compute.ctx.driver.fns.cuMemFree;
+    compute.ctx.driver.fns.cuMemFree = Free.fail;
+    defer compute.ctx.driver.fns.cuMemFree = actual_free;
+    try std.testing.expectError(error.CudaDriverError, compute.clearDerivedWeightsWithCleanup(.{ .boundary = &final_epoch }));
+    try std.testing.expectEqual(@as(usize, 16842752 + 14680064), owner.controller.snapshot().backend_weight_bytes);
+    try std.testing.expectEqual(before, probe.callbacks);
+    compute.ctx.driver.fns.cuMemFree = actual_free;
+    try compute.clearDerivedWeightsWithCleanup(.{ .boundary = &final_epoch });
+    try std.testing.expectEqual(before, probe.callbacks);
+    probe.gate.unlock();
+    gate_owned = false;
+    final_guard.finish();
+    try std.testing.expectEqual(@as(usize, 0), owner.controller.snapshot().backend_weight_bytes);
+    try std.testing.expect(!probe.under_gate);
+}
+
+test "CUDA derived BF16 input and gate-up caches cold fund exact sources before numerical ownership and keep warm pointers" {
+    try derivedWeightColdCase(false);
+    try derivedWeightColdCase(true);
 }

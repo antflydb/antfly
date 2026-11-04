@@ -761,6 +761,7 @@ fn createCudaSessionWithRequiredProfile(
     };
     errdefer archClose(impl);
     try impl.model_lifetime.prepareFinalResources();
+    try impl.backend_data.cuda.compute.publishLightOnNormCatalog();
     return archSessionHandle(impl);
 }
 
@@ -2672,7 +2673,7 @@ const BackendData = union {
 
 const ArchSession = struct {
     diagnostics: @import("diagnostics.zig").Diagnostics = .{},
-    model_lifetime: Session.ModelLifetime = .{ .owner = undefined, .destroy_fn = archClose, .quiesce_fn = archQuiesce },
+    model_lifetime: Session.ModelLifetime = .{ .owner = undefined, .destroy_fn = archClose, .destroy_with_boundary_fn = archCloseWithBoundary, .quiesce_fn = archQuiesce },
     // Independent of the model execution lane: preparation can overlap model
     // work. Session close follows worker shutdown, like the borrowed device.
     video_coefficient_mutex: std.Io.Mutex = .init,
@@ -2927,6 +2928,7 @@ const arch_vtable = Session.VTable{
     .runLayaDecisions = archRunLayaDecisions,
     .run = &archRun,
     .runWithControl = &archRunWithControl,
+    .eager_host_services = &eager_host_services,
     .runResident = &archRunResident,
     .runResidentTextEmbedding = &archRunResidentTextEmbedding,
     .runResidentTextEmbeddingWithControl = &archRunResidentTextEmbeddingWithControl,
@@ -3896,12 +3898,20 @@ pub fn runFlorenceDecoderResident(
 
 /// Get a ComputeBackend from an architecture session.
 pub fn getComputeBackend(session: Session, allocator: std.mem.Allocator) !ops.ComputeBackend {
-    if (session.compute_backend_provider != null) return session.acquireComputeBackend(allocator, .{});
+    return acquireComputeBackendForRequest(session, allocator, .{});
+}
+
+fn acquireComputeBackendForRequest(session: Session, allocator: std.mem.Allocator, options: @import("../backends/session.zig").ComputeBackendOptions) !ops.ComputeBackend {
+    if (session.compute_backend_provider != null) return session.acquireComputeBackend(allocator, options);
     if (session.vtable != &arch_vtable) return error.NotArchSession;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
-    var cb = try makeComputeBackend(self, allocator, null);
-    errdefer cb.deinit();
-    try @import("../backends/compute_factory.zig").beginRequest(session, &cb);
+    var cb = try makeComputeBackend(self, allocator, options.run_budget);
+    const scoped_cleanup = options.cleanup.boundary != null or options.cleanup.operation != null or options.cleanup.outside_execution;
+    errdefer if (scoped_cleanup) cb.deinitWithCleanup(options.cleanup) else cb.deinit();
+    const factory = @import("../backends/compute_factory.zig");
+    if (scoped_cleanup) {
+        try factory.beginRequestWithCleanup(session, &cb, options.cleanup);
+    } else try factory.beginRequest(session, &cb);
     return cb;
 }
 
@@ -4547,8 +4557,7 @@ pub fn getManagedComputeBackend(session: Session, allocator: std.mem.Allocator, 
 
 fn acquireCompatibleComputeBackend(session: Session, allocator: std.mem.Allocator, options: @import("../backends/session.zig").ComputeBackendOptions) !ops.ComputeBackend {
     if (session.compute_backend_provider != null) return session.acquireComputeBackend(allocator, options);
-    if (options.run_budget) |budget| return getComputeBackendWithBudget(session, allocator, budget);
-    return getComputeBackend(session, allocator);
+    return acquireComputeBackendForRequest(session, allocator, options);
 }
 
 /// Prepare immutable FP32 state before publishing a model or reporting an
@@ -4850,17 +4859,18 @@ pub fn getComputeBackendWithBudget(
     allocator: std.mem.Allocator,
     run_budget: *runtime.tier.memory.RunBudget,
 ) !ops.ComputeBackend {
-    if (session.compute_backend_provider != null) return session.acquireComputeBackend(allocator, .{ .run_budget = run_budget });
-    if (session.vtable != &arch_vtable) return error.NotArchSession;
-    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
-    var cb = try makeComputeBackend(self, allocator, run_budget);
-    errdefer cb.deinit();
-    // The CUDA implementation is shared by the loaded session. Establish an
-    // unconditional request boundary here, before prompt-cache selection can
-    // bypass KV-hook provisioning, so no graph or pinned-address ABI survives
-    // from the preceding request.
-    try @import("../backends/compute_factory.zig").beginRequest(session, &cb);
-    return cb;
+    return acquireComputeBackendForRequest(session, allocator, .{ .run_budget = run_budget });
+}
+
+/// Actual owner supplies its current cleanup B before request-cache policy
+/// replacement. This borrows cleanup synchronously, never as late authority.
+pub fn getComputeBackendWithBudgetAndCleanup(
+    session: Session,
+    allocator: std.mem.Allocator,
+    run_budget: *runtime.tier.memory.RunBudget,
+    current: @import("cleanup_context.zig").Context,
+) !ops.ComputeBackend {
+    return acquireComputeBackendForRequest(session, allocator, .{ .run_budget = run_budget, .cleanup = current });
 }
 
 pub fn getGenericEncoderArchConfig(session: Session) !GenericEncoderArchConfig {
@@ -5234,8 +5244,7 @@ fn acquireArchComputeBackend(ctx: *anyopaque, session: Session, allocator: std.m
         if (options.run_budget != null) return error.UnsupportedComputeProviderMode;
         return getComputeBackendBorrowingSharedProvider(owner_session, allocator);
     }
-    if (options.run_budget) |budget| return getComputeBackendWithBudget(owner_session, allocator, budget);
-    return getComputeBackend(owner_session, allocator);
+    return acquireComputeBackendForRequest(owner_session, allocator, options);
 }
 
 const archComputeServices = @import("../backends/session.zig").ComputeBackendProvider.VTable{
@@ -5742,12 +5751,43 @@ fn runModernBertGlinerDecision(
     return result;
 }
 
+const eager_host_services = @import("../backends/session.zig").EagerHostRunServices{
+    .accepts = acceptsEagerHostTable,
+    .recurrent_layout = eagerHostRecurrentLayout,
+    .run = eagerHostRunWithContext,
+};
+fn acceptsEagerHostTable(table: *const Session.VTable) bool {
+    return table == &arch_vtable;
+}
+fn eagerHostRecurrentLayout(raw: *anyopaque) !?@import("recurrent_state_admission.zig").Layout {
+    if (comptime !build_options.enable_cuda) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(raw));
+    if (self.backend_type != .cuda or self.arch_config != .gpt or self.task != .generic) return null;
+    const cfg = self.arch_config.gpt;
+    if (!cfg.isQwen35() or !cfg.qwen35_has_linear_attention or !cfg.qwen35_device_only_state or cfg.qwen35_linear_key_head_dim != 128 or cfg.qwen35_linear_value_head_dim != 128 or cfg.qwen35_linear_conv_kernel_dim != 4) return null;
+    const layout = @import("recurrent_state_admission.zig").Layout{ .key_heads = @intCast(cfg.qwen35_linear_num_key_heads), .value_heads = @intCast(cfg.qwen35_linear_num_value_heads) };
+    _ = try layout.bytes();
+    return layout;
+}
+fn eagerHostRunWithContext(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, context: *const @import("invocation_context.zig").Context) ![]Tensor {
+    _ = (try eagerHostRecurrentLayout(raw)) orelse return error.UnsupportedRecurrentStateTarget;
+    const budget = context.recurrent_state orelse return error.UnpreparedRecurrentStateBudget;
+    const current = try budget.cleanup();
+    if (context.cleanup.boundary == null or current.boundary.?.record != context.cleanup.boundary.?.record or current.boundary.?.nonce != context.cleanup.boundary.?.nonce) return error.ForeignRecurrentStateCleanup;
+    // This exact entry always materializes owning host Tensors. No CT, local
+    // ComputeBackend header, ModelOutput or ResidentOutputs escapes its call.
+    return archRunImplWithContext(raw, inputs, allocator, control, context);
+}
+
 fn archRunImpl(
     ptr: *anyopaque,
     inputs: []const Tensor,
     allocator: std.mem.Allocator,
     control: ?InferenceExecutionControl,
 ) ![]Tensor {
+    return archRunImplWithContext(ptr, inputs, allocator, control, null);
+}
+fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, context: ?*const @import("invocation_context.zig").Context) ![]Tensor {
     if (control) |active| try active.check();
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
@@ -5755,9 +5795,16 @@ fn archRunImpl(
 
     // Create the appropriate ComputeBackend
     var cb = try makeComputeBackend(self, allocator, null);
+    defer if (context) |active| cb.deinitWithCleanup(active.cleanup) else cb.deinit();
     cb.execution_control = control;
+    cb.call_context = context;
+    if (context) |active| {
+        if (comptime build_options.enable_cuda) {
+            const budget = active.recurrent_state orelse return error.UnpreparedRecurrentStateBudget;
+            try cuda_compute_mod.CudaCompute.validateTemporaryRecurrentBackend(&cb, budget);
+        } else return error.CudaNotEnabled;
+    }
     if (debug_cuda_session) std.log.info("arch-run: compute backend made kind={s}", .{@tagName(cb.kind())});
-    defer cb.deinit();
 
     // Dispatch based on architecture
     switch (self.arch_config) {
@@ -7139,6 +7186,12 @@ fn archQuiesce(ptr: *anyopaque) void {
 }
 
 fn archClose(ptr: *anyopaque) void {
+    archCloseWithCleanup(ptr, .{ .outside_execution = true });
+}
+fn archCloseWithBoundary(ptr: *anyopaque, boundary: ?*const @import("retirement_sink.zig").Epoch) void {
+    archCloseWithCleanup(ptr, .{ .boundary = boundary });
+}
+fn archCloseWithCleanup(ptr: *anyopaque, current: @import("cleanup_context.zig").Context) void {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     self.model_lifetime.discardUnpublishedFinalResources();
     if (self.video_coefficients) |*cache| cache.deinit();
@@ -7169,7 +7222,10 @@ fn archClose(ptr: *anyopaque) void {
         },
         .cuda => {
             if (comptime build_options.enable_cuda) {
-                @import("../backends/compute_factory.zig").closeCuda(self.allocator, self.backend_data.cuda.compute);
+                if (current.outside_execution)
+                    @import("../backends/compute_factory.zig").closeCuda(self.allocator, self.backend_data.cuda.compute)
+                else
+                    @import("../backends/compute_factory.zig").closeCudaWithBoundary(self.allocator, self.backend_data.cuda.compute, current.boundary);
             }
         },
         .wasm => {},
@@ -10498,7 +10554,7 @@ pub const StagedExecution = struct {
             if (comptime build_options.enable_cuda) {
                 const desired = CudaPolicy.from(if (self.session.run_admission) |admission| .{ .controller = admission.controller, .limits = admission.limits, .check_live_memory = admission.check_live_memory } else null);
                 try self.establishCudaPolicy(desired);
-                try @import("../backends/compute_factory.zig").beginRequest(self.session, self.cb);
+                try @import("../backends/compute_factory.zig").beginRequestWithCleanup(self.session, self.cb, self.current());
             } else return error.CudaNotEnabled;
         }
         try self.attach();
@@ -11455,6 +11511,10 @@ test "actual CUDA staged quota boundaries let same model reenter while owned sna
                     };
                 }
                 fn reenter(self: *@This()) !void {
+                    // This peer is an actual managed call with its OWN current
+                    // cleanup epoch, reserved before its real Model lane.
+                    var peer_cleanup = try @import("cleanup_owner.zig").Owner.beginAdmitted(self.session);
+                    defer peer_cleanup.finishAfterUnlock();
                     const gate = self.session.execution_gate.?;
                     if (!gate.tryLock()) return error.SourceModelStillOwnedDuringSupplier;
                     defer gate.unlock();
@@ -11469,7 +11529,7 @@ test "actual CUDA staged quota boundaries let same model reenter while owned sna
                         // no borrowed test callback or raw field mutation fakes it.
                         self.changing_policy = true;
                         defer self.changing_policy = false;
-                        try @import("../backends/compute_factory.zig").beginRequest(peer, cb);
+                        try @import("../backends/compute_factory.zig").beginRequestWithCleanup(peer, cb, .{ .boundary = peer_cleanup.epoch() });
                     }
                     const input = try cb.fromFloat32(&.{ 2, 5 });
                     defer cb.free(input);
@@ -12104,5 +12164,1099 @@ test "actual Native source geometry preserves declared packed rows and refuses u
         session.execution_gate.?.unlock();
     }
     try std.testing.expect(scheduler.head == null);
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+/// Cold optional OCR cache admission shared by reader and ordinary request owners.
+/// Caller owns actual run/page admission before prepare, actual execution lanes
+/// before bind, and ends those lanes before finishAfterUnlock.
+pub const PreparedComputeAdmission = if (build_options.enable_cuda) struct {
+    pub const pinned_upload_capacity = @import("../ops/cuda/pinned_input_arena.zig").capacity;
+    const Cuda = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+    const Cache = @import("../ops/cuda/prepared_cache.zig");
+    allocator: std.mem.Allocator,
+    target: @import("../backends/cold_compute_target.zig").Retained,
+    compute: *Cuda,
+    requests: []Cache.Request,
+    request_count: usize,
+    norm_count: usize,
+    base_request_count: usize,
+    desired: ?@import("../ops/cuda/video_cache_budget.zig").Admission,
+    warm: Cache.Funding = Cache.Funding.empty(),
+    cold: ?*Cache.Funding = null,
+    bound: bool = false,
+    fn work(self: *const @This()) Cache.Workload {
+        return .{ .requests = self.requests[0..self.request_count] };
+    }
+    fn funding(self: *@This()) *Cache.Funding {
+        return self.cold orelse &self.warm;
+    }
+    pub fn prepare(session: Session, config: ?gpt_mod.Config, control: InferenceExecutionControl) !?*@This() {
+        return prepareWithUploadBytes(session, config, 0, control);
+    }
+    /// Largest actual whole-array upload bytes, never an aggregate tensor sum.
+    /// Ordinary text Reader epochs pass 0.
+    /// This synchronous value is consumed before any execution lane is entered.
+    pub fn prepareWithUploadBytes(session: Session, config: ?gpt_mod.Config, max_upload_bytes: usize, control: InferenceExecutionControl) !?*@This() {
+        if (session.backend() != .cuda) return null;
+        const policy = session.run_admission orelse return null;
+        var target = (try @import("../backends/cold_compute_target.zig").Retained.acquire(session, control)) orelse return null;
+        var target_owned = true;
+        defer if (target_owned) target.deinit();
+        const compute = (try Cuda.lightOnNormCompute(target.target)) orelse return null;
+        const a = std.heap.smp_allocator;
+        const request_capacity = try std.math.add(usize, 2 + Cache.Auxiliary.count, try std.math.mul(usize, if (config) |cfg| cfg.num_hidden_layers else 0, 6));
+        const requests = try a.alloc(Cache.Request, request_capacity);
+        var requests_owned = true;
+        defer if (requests_owned) a.free(requests);
+        var builder: Cache.Builder = .{ .storage = requests };
+        if (config) |cfg| {
+            var inventory = gpt_mod.Qwen35OffsetNormInventory{ .config = cfg };
+            while (inventory.next()) |weight| {
+                const owned_names = (try weight.lookupCandidates(cfg)) orelse continue;
+                var names: [3][]const u8 = undefined;
+                for (0..owned_names.count) |index| names[index] = owned_names.candidate(index);
+                if (try compute.lightOnNormCacheRequest(names[0..owned_names.count], weight.dim, weight.offset)) |request| try builder.add(request);
+            }
+        }
+        const norm_count = builder.len;
+        if (config) |cfg| try compute.appendDerivedWeightWorkload(cfg, &builder);
+        try compute.appendAuxiliaryCacheWorkload(&builder);
+        try compute.appendPinnedInputCacheWorkload(&builder, max_upload_bytes);
+        const self = try a.create(@This());
+        errdefer a.destroy(self);
+        self.* = .{ .allocator = a, .target = target, .compute = compute, .requests = requests, .request_count = builder.len, .norm_count = norm_count, .base_request_count = builder.len, .desired = .{ .controller = policy.controller, .limits = policy.limits, .check_live_memory = policy.check_live_memory } };
+        errdefer if (self.cold) |cold| cold.finishOutsideExecution();
+        try self.prepareFundingOutsideExecution(control);
+        target_owned = false;
+        requests_owned = false;
+        return self;
+    }
+    /// Only after actual reader/provider unlock. Header owns copied
+    /// requests/target, so no Factory/task/frame callback is retained.
+    /// Immutable value requests, excluding the independent OCR retention envelope.
+    /// Reader graph custody may use these exact keys; this owner allocates no graph slots.
+    pub fn normRequests(self: *const @This()) []const Cache.Request {
+        return self.requests[0..self.norm_count];
+    }
+    /// Read only under the actual acquired cohort/Reader step. No allocation
+    /// or supplier on an unchanged warm prepared-image upload.
+    pub fn needsPinnedInputUpload(self: *const @This(), max_upload_bytes: usize) !bool {
+        var slot: [1]Cache.Request = undefined;
+        var builder: Cache.Builder = .{ .storage = &slot };
+        try self.compute.appendPinnedInputCacheWorkload(&builder, max_upload_bytes);
+        if (builder.len == 0) return false;
+        for (self.requests[0..self.base_request_count]) |request| if (std.meta.eql(request, slot[0])) return false;
+        return true;
+    }
+    /// Only after AdmissionPark released ALL actual lanes. This extends pure
+    /// request metadata; the existing outside funding/recovery owner follows.
+    pub fn includePinnedInputUploadOutside(self: *@This(), max_upload_bytes: usize) !void {
+        if (self.bound) return error.PreparedComputeAdmissionStillBound;
+        if (!try self.needsPinnedInputUpload(max_upload_bytes)) return;
+        var builder: Cache.Builder = .{ .storage = self.requests, .len = self.base_request_count };
+        try self.compute.appendPinnedInputCacheWorkload(&builder, max_upload_bytes);
+        self.base_request_count = builder.len;
+        self.request_count = builder.len; // original retention slot rebuilt by outside preparation
+    }
+    pub fn expectedCudaCompute(self: *const @This()) *Cuda {
+        return self.compute;
+    }
+    /// Already-admitted Reader recovery only. The caller has observed optional
+    /// preparation OOM/resource denial and released ALL actual execution lanes.
+    /// Keep ordinary math/floors, decline optional new caches, and use the
+    /// existing explicit zero-retention policy instead of stranding old pages.
+    pub fn recoverOptionalFundingOutsideExecution(self: *@This()) !void {
+        std.debug.assert(!self.bound);
+        self.finishFundingOutsideExecution();
+        const desired = self.desired orelse return error.MissingPreparedCacheAdmission;
+        self.requests[self.base_request_count] = try self.compute.lightOnRetentionRequest(desired, @bitSizeOf(usize));
+        self.request_count = self.base_request_count + 1;
+        self.warm = Cache.Funding.compatibility();
+    }
+    /// PAGE has priority over only unused READY optional reservations. Called
+    /// outside ALL actual execution lanes. Published cache/graph quota lives
+    /// in its concrete backing, not in these already-consumed phase entries.
+    /// Preserve the exact request policy: existing charged retention remains
+    /// intact; compatibility declines only future misses. The next normal
+    /// outside preparation retries the original policy without permanent disable.
+    pub fn releaseUnusedFundingForPageOutside(self: *@This()) !bool {
+        if (self.bound) return error.PreparedComputeAdmissionStillBound;
+        var unused = false;
+        for (self.funding().entries) |entry| {
+            if (entry.state == .taken) return error.PreparedCacheAdmissionInUse;
+            if (entry.state == .ready and (entry.lease != null or entry.temporary != null)) unused = true;
+        }
+        if (!unused) return false;
+        self.finishFundingOutsideExecution();
+        self.warm = Cache.Funding.compatibility();
+        return true;
+    }
+    pub fn optionalRecoveryActive(self: *const @This()) bool {
+        return self.cold == null and self.warm.deny_cold_misses;
+    }
+
+    /// The primary run/page lease is borrowed only for this cold validation.
+    /// No amounts become cache credit, and no caller lease pointer is retained.
+    pub fn prepareAfterAdmission(session: Session, primary: *const runtime.tier.memory.AdmissionLease, control: InferenceExecutionControl) !?*@This() {
+        return prepareAfterAdmissionWithUploadBytes(session, primary, 0, control);
+    }
+    pub fn prepareAfterAdmissionWithUploadBytes(session: Session, primary: *const runtime.tier.memory.AdmissionLease, max_upload_bytes: usize, control: InferenceExecutionControl) !?*@This() {
+        if (session.backend() != .cuda) return null;
+        const policy = session.run_admission orelse return null;
+        if (primary.controller != policy.controller) return error.ForeignAdmissionDomain;
+        return prepareWithUploadBytes(session, getGptConfig(session), max_upload_bytes, control);
+    }
+    /// Explicit actual cohort proof; a native mutex or a matching kind alone
+    /// does not certify the Session model gate.
+    /// Restore an already-admitted Reader after non-destructive pause. The
+    /// caller restored its SAME RunBudget and owns the exact cohort; captured
+    /// graph roots stay detached until success. Null cb is pre-first-prepare.
+    pub fn resumeRequestForCohort(self: *@This(), session: Session, waiter: *const @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter, cb: ?*const ops.ComputeBackend, epoch: *const @import("../execution/retirement_sink.zig").Epoch) !void {
+        try self.validateForCohort(session, waiter);
+        const backend = cb orelse return;
+        try self.beginRequest(epoch);
+        errdefer self.unbindExpected();
+        try self.compute.configureEmbeddingGemma2AdmissionWithCleanup(self.desired, .{ .boundary = epoch });
+        try self.bind(backend, epoch);
+    }
+    pub fn validateForCohort(self: *@This(), session: Session, waiter: *const @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter) !void {
+        if (self.target.model != session.model_lifetime) return error.ForeignModelLifetime;
+        const scheduler = session.cohort_scheduler orelse return error.MissingExecutionCohortScheduler;
+        const gate = session.execution_gate orelse return error.MissingExecutionCohortGate;
+        if (!scheduler.ownsAcquired(waiter, gate)) return error.ExecutionCohortNotOwned;
+        try self.validateBeforePublication();
+    }
+    pub fn finishFundingOutsideExecution(self: *@This()) void {
+        std.debug.assert(!self.bound);
+        if (self.cold) |cold| cold.finishOutsideExecution();
+        self.cold = null;
+        self.warm = Cache.Funding.empty();
+    }
+    pub fn prepareFundingOutsideExecution(self: *@This(), control: InferenceExecutionControl) !void {
+        std.debug.assert(!self.bound and self.cold == null);
+        const desired = self.desired orelse return error.MissingPreparedCacheAdmission;
+        var builder: Cache.Builder = .{ .storage = self.requests, .len = self.base_request_count };
+        errdefer self.finishFundingOutsideExecution();
+        const model = self.target.model orelse return error.MissingModelLifetime;
+        const pin = model.retainAdmissionDomain(desired.controller) orelse return error.ForeignAdmissionDomain;
+        defer pin.release();
+        var prepared = false;
+        for (0..@bitSizeOf(usize) + 1) |pressure_step| {
+            try control.check();
+            builder.len = self.base_request_count;
+            // PAGE is already really owned. Preserve legacy retention
+            // priority/halving before independent optional norm caches.
+            try builder.add(try self.compute.lightOnRetentionRequest(desired, @intCast(pressure_step)));
+            self.request_count = builder.len;
+            if (!try self.compute.lightOnNormNeedsFunding(self.work(), self.desired)) {
+                prepared = true;
+                break;
+            }
+            const cold = try Cache.Funding.create(self.work());
+            self.cold = cold;
+            try self.compute.snapshotLightOnNormFunding(cold, self.desired);
+            cold.fundLightOnOutsideExecution(&pin) catch |err| {
+                if (err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable) return err;
+                cold.finishOutsideExecution();
+                self.cold = null;
+                continue;
+            };
+            prepared = true;
+            break;
+        }
+        if (!prepared) return error.ResourceTemporarilyUnavailable;
+    }
+    pub fn validateBeforePublication(self: *@This()) !void {
+        const cb = self.compute.computeBackend(); // header only, actual Model held
+        try Cuda.validateLightOnNormFundingForEpoch(&cb, self.compute, self.work(), self.funding(), self.desired);
+    }
+    pub fn beginRequest(self: *@This(), epoch: *const @import("../execution/retirement_sink.zig").Epoch) !void {
+        // Metadata ownership is already the actual reader's. This
+        // binds only metadata before the ordinary getter's ORIGINAL
+        // request entry consumes retention. No SDK wait/clear or
+        // budgeted engine/vision allocation moves ahead of admission.
+        try Cuda.beginLightOnNormFunding(self.compute, self.work(), self.funding(), epoch, self.desired);
+        self.bound = true;
+    }
+    pub fn bind(self: *@This(), cb: *const ops.ComputeBackend, epoch: *const @import("../execution/retirement_sink.zig").Epoch) !void {
+        if (!self.bound) return error.MissingPreparedNormRequestEntry;
+        try Cuda.bindLightOnNormFunding(cb, self.compute, self.work(), self.funding(), epoch);
+    }
+    pub fn unbindExpected(self: *@This()) void {
+        const cb = self.compute.computeBackend();
+        self.unbind(&cb);
+    }
+    pub fn unbind(self: *@This(), cb: *const ops.ComputeBackend) void {
+        if (!self.bound) return;
+        Cuda.unbindCacheFunding(cb, self.compute, self.funding());
+        self.bound = false;
+    }
+    pub fn finishAfterUnlock(self: *@This(), epoch: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
+        std.debug.assert(!self.bound);
+        self.finishFundingOutsideExecution();
+        if (epoch) |current| self.target.deinitWithBoundary(current) else self.target.deinit();
+        const a = self.allocator;
+        a.free(self.requests);
+        a.destroy(self);
+    }
+    /// Synchronous request entry for the existing native generation mutex.
+    /// Cold funding precedes BOTH this mutex and the Session model cohort.
+    /// The caller keeps its primary lease alive until deinit returns.
+    pub const LockedRequest = struct {
+        pub const pinned_input_upload_capacity = PreparedComputeAdmission.pinned_upload_capacity;
+        session: Session,
+        preparation: *PreparedComputeAdmission,
+        native_mutex: ?*std.atomic.Mutex,
+        execution_lane: ?*@import("../execution_control.zig").ExecutionLane,
+        lane_lease: ?@import("../execution_control.zig").ExecutionLane.Lease = null,
+        cleanup: @import("cleanup_owner.zig").Owner,
+        waiter: @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter = .{},
+        native_owned: bool = false,
+        cohort_owned: bool = false,
+        backend_live: bool = false,
+
+        pub fn acquireAfterAdmission(session: Session, primary: *const runtime.tier.memory.AdmissionLease, native_mutex: ?*std.atomic.Mutex, execution_lane: ?*@import("../execution_control.zig").ExecutionLane, control: InferenceExecutionControl) !?*@This() {
+            return acquireAfterAdmissionWithUploadBytes(session, primary, 0, native_mutex, execution_lane, control);
+        }
+        pub fn acquireAfterAdmissionWithUploadBytes(session: Session, primary: *const runtime.tier.memory.AdmissionLease, max_upload_bytes: usize, native_mutex: ?*std.atomic.Mutex, execution_lane: ?*@import("../execution_control.zig").ExecutionLane, control: InferenceExecutionControl) !?*@This() {
+            const preparation = (try PreparedComputeAdmission.prepareAfterAdmissionWithUploadBytes(session, primary, max_upload_bytes, control)) orelse return null;
+            var preparation_owned = true;
+            defer if (preparation_owned) preparation.finishAfterUnlock(null);
+            const self = try std.heap.smp_allocator.create(@This());
+            errdefer std.heap.smp_allocator.destroy(self);
+            self.* = .{ .session = session, .preparation = preparation, .native_mutex = native_mutex, .execution_lane = execution_lane, .cleanup = try @import("cleanup_owner.zig").Owner.beginAdmitted(session) };
+            errdefer self.cleanup.finishAfterUnlock();
+            const epoch = self.cleanup.epoch() orelse return error.MissingCurrentCleanupEpoch;
+            if (session.execution_gate == null or session.cohort_scheduler == null) return error.MissingExecutionCohortScheduler;
+            if (native_mutex != null and native_mutex == session.execution_gate) return error.ExecutionCohortGateChanged;
+            // A peer may warm/replace caches between the cold snapshot and
+            // actual ownership. Retry only stale metadata, before any math.
+            for (0..8) |_| {
+                try control.check();
+                if (execution_lane) |lane| self.lane_lease = try lane.acquire(control);
+                if (native_mutex) |mutex| {
+                    control.lock(mutex) catch |err| {
+                        self.leaveLanes();
+                        return err;
+                    };
+                    self.native_owned = true;
+                }
+                session.enterExecutionCohort(session.execution_gate, control, &self.waiter) catch |err| {
+                    self.leaveLanes();
+                    return err;
+                };
+                self.cohort_owned = true;
+                preparation.validateForCohort(session, &self.waiter) catch |err| {
+                    self.leaveLanes();
+                    if (err != error.PreparedCachePlanChanged) return err;
+                    preparation.finishFundingOutsideExecution();
+                    try preparation.prepareFundingOutsideExecution(control);
+                    continue;
+                };
+                preparation.beginRequest(epoch) catch |err| {
+                    self.leaveLanes();
+                    return err;
+                };
+                preparation_owned = false;
+                return self;
+            }
+            return error.PreparedCachePlanChanged;
+        }
+        fn leaveLanes(self: *@This()) void {
+            if (self.cohort_owned) {
+                self.cohort_owned = false;
+                self.session.leaveExecutionCohort(self.session.execution_gate, &self.waiter);
+            }
+            if (self.native_owned) {
+                self.native_owned = false;
+                self.native_mutex.?.unlock();
+            }
+            if (self.lane_lease) |lease| {
+                self.lane_lease = null;
+                lease.release();
+            }
+        }
+        /// Borrowed only until this actual locked request is consumed.
+        pub fn cleanupOwner(self: *const @This()) *const @import("cleanup_owner.zig").Owner {
+            return &self.cleanup;
+        }
+        pub fn acquireBackend(self: *@This(), allocator: std.mem.Allocator, budget: *runtime.tier.memory.RunBudget) !ops.ComputeBackend {
+            if (!self.cohort_owned or (self.native_mutex != null and !self.native_owned) or (self.execution_lane != null and self.lane_lease == null) or self.backend_live) return error.InvalidPreparedComputePhase;
+            const cb = try getComputeBackendWithBudgetAndCleanup(self.session, allocator, budget, .{ .boundary = self.cleanup.epoch() });
+            errdefer cb.deinitWithCleanup(.{ .boundary = self.cleanup.epoch() });
+            try self.preparation.bind(&cb, self.cleanup.epoch().?);
+            self.backend_live = true;
+            return cb;
+        }
+        pub fn acquireManaged(self: *@This(), allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !@import("../backends/compute_provider.zig").ManagedComputeBackend {
+            if (!self.cohort_owned or self.backend_live) return error.InvalidPreparedComputePhase;
+            var managed = try @import("../backends/compute_provider.zig").acquireWithCleanup(self.session, allocator, control, .{ .boundary = self.cleanup.epoch() });
+            errdefer managed.deinitWithCleanup(.{ .boundary = self.cleanup.epoch() });
+            try self.preparation.bind(&managed.backend, self.cleanup.epoch().?);
+            self.backend_live = true;
+            return managed;
+        }
+        pub fn closeManaged(self: *@This(), managed: *@import("../backends/compute_provider.zig").ManagedComputeBackend) void {
+            std.debug.assert(self.backend_live and self.cohort_owned);
+            self.backend_live = false;
+            self.preparation.unbind(&managed.backend);
+            managed.deinitWithCleanup(.{ .boundary = self.cleanup.epoch() });
+        }
+        pub fn closeBackend(self: *@This(), cb: *const ops.ComputeBackend) void {
+            std.debug.assert(self.backend_live and self.cohort_owned);
+            self.backend_live = false;
+            self.preparation.unbind(cb);
+            cb.deinitWithCleanup(.{ .boundary = self.cleanup.epoch() });
+        }
+        pub fn deinit(self: *@This()) void {
+            std.debug.assert(!self.backend_live);
+            self.preparation.unbindExpected();
+            self.leaveLanes();
+            self.preparation.finishAfterUnlock(self.cleanup.epoch());
+            self.cleanup.finishAfterUnlock();
+            std.heap.smp_allocator.destroy(self);
+        }
+    };
+    /// The existing target/draft request has at most two actual model owners.
+    /// Keep its original sorted native-lock order while preparing both optional
+    /// cache workloads before acquiring either numerical owner.
+    pub const GenerationPair = struct {
+        pub const pinned_input_upload_capacity = PreparedComputeAdmission.pinned_upload_capacity;
+        sessions: [2]?Session,
+        preparations: [2]?*PreparedComputeAdmission,
+        preparation_slots: [2]?usize = .{ null, null },
+        cleanup: [2]@import("cleanup_owner.zig").Owner = .{ .{}, .{} },
+        native_mutexes: [2]?*std.atomic.Mutex,
+        native_owned: [2]bool = .{ false, false },
+        waiters: [2]@import("../runtime/embedding_scheduler.zig").Scheduler.Waiter = .{ .{}, .{} },
+        cohort_owned: [2]bool = .{ false, false },
+        backend_live: [2]bool = .{ false, false },
+
+        pub fn acquireAfterAdmission(target: Session, draft: ?Session, primary: *const runtime.tier.memory.AdmissionLease, first_native: *std.atomic.Mutex, second_native: ?*std.atomic.Mutex, control: InferenceExecutionControl) !?*@This() {
+            return acquireAfterAdmissionWithUploadBytes(target, draft, primary, 0, first_native, second_native, control);
+        }
+        pub fn acquireAfterAdmissionWithUploadBytes(target: Session, draft: ?Session, primary: *const runtime.tier.memory.AdmissionLease, max_upload_bytes: usize, first_native: *std.atomic.Mutex, second_native: ?*std.atomic.Mutex, control: InferenceExecutionControl) !?*@This() {
+            if (second_native == first_native) return error.ExecutionCohortGateChanged;
+            var preparations: [2]?*PreparedComputeAdmission = .{ null, null };
+            var transferred = false;
+            defer if (!transferred) for (preparations) |maybe| if (maybe) |prepared| prepared.finishAfterUnlock(null);
+            var slots: [2]?usize = .{ null, null };
+            preparations[0] = try PreparedComputeAdmission.prepareAfterAdmissionWithUploadBytes(target, primary, max_upload_bytes, control);
+            if (preparations[0] != null) slots[0] = 0;
+            if (draft) |other| {
+                if (preparations[0]) |prepared| {
+                    if (sharesExecutionOwner(target, other)) {
+                        // Forwarded public handles can differ in ptr/table.
+                        // Certify the ORIGINAL full cold target before sharing
+                        // one Header/Funding/cohort; never acquire its gate twice.
+                        try certifyAlias(target, other, prepared, control);
+                        slots[1] = 0;
+                    } else {
+                        preparations[1] = try PreparedComputeAdmission.prepareAfterAdmission(other, primary, control);
+                        if (preparations[1] != null) slots[1] = 1;
+                    }
+                } else if (other.ptr != target.ptr or other.vtable != target.vtable or other.model_lifetime != target.model_lifetime) {
+                    preparations[1] = try PreparedComputeAdmission.prepareAfterAdmission(other, primary, control);
+                    if (preparations[1] != null) {
+                        // A shared gate/Model with only one certified physical
+                        // OCR owner is inconsistent. Refuse before ANY lock.
+                        if (sharesExecutionOwner(target, other)) return error.ExecutionCohortGateChanged;
+                        slots[1] = 1;
+                    }
+                }
+            }
+            if (preparations[0] == null and preparations[1] == null) return null;
+            const self = try std.heap.smp_allocator.create(@This());
+            errdefer std.heap.smp_allocator.destroy(self);
+            self.* = .{ .sessions = .{ target, draft }, .preparations = preparations, .preparation_slots = slots, .native_mutexes = .{ first_native, second_native } };
+            errdefer for (&self.cleanup) |*owner| owner.finishAfterUnlock();
+            for (0..2) |index| if (preparations[index] != null) {
+                const session = self.sessions[index].?;
+                self.cleanup[index] = try @import("cleanup_owner.zig").Owner.beginAdmitted(session);
+                if (self.cleanup[index].epoch() == null) return error.MissingCurrentCleanupEpoch;
+                if (session.execution_gate == null or session.cohort_scheduler == null) return error.MissingExecutionCohortScheduler;
+                for (self.native_mutexes) |maybe_mutex| if (maybe_mutex) |mutex| {
+                    if (session.execution_gate == mutex) return error.ExecutionCohortGateChanged;
+                };
+            };
+            for (0..8) |_| {
+                try control.check();
+                for (0..2) |index| if (self.native_mutexes[index]) |mutex| {
+                    control.lock(mutex) catch |err| {
+                        self.leaveLanes();
+                        return err;
+                    };
+                    self.native_owned[index] = true;
+                };
+                for (0..2) |index| if (preparations[index] != null) {
+                    const session = self.sessions[index].?;
+                    session.enterExecutionCohort(session.execution_gate, control, &self.waiters[index]) catch |err| {
+                        self.leaveLanes();
+                        return err;
+                    };
+                    self.cohort_owned[index] = true;
+                };
+                var stale = false;
+                for (0..2) |index| if (preparations[index]) |prepared| {
+                    prepared.validateForCohort(self.sessions[index].?, &self.waiters[index]) catch |err| {
+                        if (err != error.PreparedCachePlanChanged) {
+                            self.leaveLanes();
+                            return err;
+                        }
+                        stale = true;
+                        break;
+                    };
+                };
+                if (stale) {
+                    self.leaveLanes();
+                    for (preparations) |maybe| if (maybe) |prepared| {
+                        prepared.finishFundingOutsideExecution();
+                        try prepared.prepareFundingOutsideExecution(control);
+                    };
+                    continue;
+                }
+                for (0..2) |index| if (preparations[index]) |prepared| {
+                    prepared.beginRequest(self.cleanup[index].epoch().?) catch |err| {
+                        for (preparations) |maybe| if (maybe) |previous| previous.unbindExpected();
+                        self.leaveLanes();
+                        return err;
+                    };
+                };
+                transferred = true;
+                return self;
+            }
+            return error.PreparedCachePlanChanged;
+        }
+        fn sharesExecutionOwner(a: Session, b: Session) bool {
+            return (a.model_lifetime != null and a.model_lifetime == b.model_lifetime) or
+                (a.execution_gate != null and a.execution_gate == b.execution_gate) or
+                (a.cohort_scheduler != null and a.cohort_scheduler == b.cohort_scheduler);
+        }
+        fn certifyAlias(a: Session, b: Session, prepared: *PreparedComputeAdmission, control: InferenceExecutionControl) !void {
+            if (a.model_lifetime == null or a.model_lifetime != b.model_lifetime or
+                a.execution_gate == null or a.execution_gate != b.execution_gate or
+                a.cohort_scheduler == null or a.cohort_scheduler != b.cohort_scheduler or b.backend() != .cuda)
+                return error.ExecutionCohortGateChanged;
+            const desired = prepared.desired orelse return error.MissingPreparedCacheAdmission;
+            const other_policy = b.run_admission orelse return error.MissingPreparedCacheAdmission;
+            if (desired.controller != other_policy.controller or
+                !std.meta.eql(desired.limits, other_policy.limits) or desired.check_live_memory != other_policy.check_live_memory)
+                return error.ForeignAdmissionDomain;
+            var other_target = (try @import("../backends/cold_compute_target.zig").Retained.acquire(b, control)) orelse return error.MissingModelLifetime;
+            defer other_target.deinit();
+            const compute = (try Cuda.lightOnNormCompute(other_target.target)) orelse return error.ForeignComputeBackend;
+            if (compute != prepared.compute or other_target.model != prepared.target.model) return error.ForeignComputeBackend;
+        }
+        fn entry(self: *const @This(), slot: usize) ?usize {
+            return self.preparation_slots[slot];
+        }
+        pub fn cleanupOwner(self: *const @This(), slot: usize) ?*const @import("cleanup_owner.zig").Owner {
+            const index = self.entry(slot) orelse return null;
+            return &self.cleanup[index];
+        }
+        pub fn acquireBackend(self: *@This(), slot: usize, allocator: std.mem.Allocator, budget: *runtime.tier.memory.RunBudget) !ops.ComputeBackend {
+            if (slot >= 2 or self.backend_live[slot]) return error.InvalidPreparedComputePhase;
+            const session = self.sessions[slot] orelse return error.InvalidPreparedComputePhase;
+            const cb = if (self.entry(slot)) |index| try getComputeBackendWithBudgetAndCleanup(session, allocator, budget, .{ .boundary = self.cleanup[index].epoch() }) else try getComputeBackendWithBudget(session, allocator, budget);
+            errdefer if (self.entry(slot)) |index| cb.deinitWithCleanup(.{ .boundary = self.cleanup[index].epoch() }) else cb.deinit();
+            if (self.entry(slot)) |index| try self.preparations[index].?.bind(&cb, self.cleanup[index].epoch().?);
+            self.backend_live[slot] = true;
+            return cb;
+        }
+        pub fn closeBackend(self: *@This(), slot: usize, cb: *const ops.ComputeBackend) void {
+            std.debug.assert(slot < 2 and self.backend_live[slot]);
+            self.backend_live[slot] = false;
+            // A target and draft may alias the exact same model. Keep its one
+            // Funding binding until BOTH wrappers have closed, then unbind in
+            // deinit while the original lanes and copied metadata remain live.
+            if (self.entry(slot)) |index| cb.deinitWithCleanup(.{ .boundary = self.cleanup[index].epoch() }) else cb.deinit();
+        }
+        fn leaveLanes(self: *@This()) void {
+            var index: usize = 2;
+            while (index > 0) {
+                index -= 1;
+                if (self.cohort_owned[index]) {
+                    self.cohort_owned[index] = false;
+                    const session = self.sessions[index].?;
+                    session.leaveExecutionCohort(session.execution_gate, &self.waiters[index]);
+                }
+            }
+            index = 2;
+            while (index > 0) {
+                index -= 1;
+                if (self.native_owned[index]) {
+                    self.native_owned[index] = false;
+                    self.native_mutexes[index].?.unlock();
+                }
+            }
+        }
+        pub fn deinit(self: *@This()) void {
+            std.debug.assert(!self.backend_live[0] and !self.backend_live[1]);
+            for (self.preparations) |maybe| if (maybe) |prepared| prepared.unbindExpected();
+            self.leaveLanes();
+            for (0..2) |index| if (self.preparations[index]) |prepared| prepared.finishAfterUnlock(self.cleanup[index].epoch());
+            for (&self.cleanup) |*owner| owner.finishAfterUnlock();
+            std.heap.smp_allocator.destroy(self);
+        }
+    };
+} else struct {};
+
+/// Final pooled embedding feature width from actual immutable output metadata.
+/// Legacy architecture descriptors may be symbolic: resolve their OWN declared
+/// head/hidden width rather than asking task code to guess a generic 768.
+/// Classifier/extractor and unknown custom output contracts decline cold.
+pub fn pooledEmbeddingOutputWidth(session: Session) ?usize {
+    if (session.model_contract.task != .generic) return null;
+    const info = session.outputInfo();
+    if (info.len != 0 and info[0].shape.len != 0) {
+        const dimension = info[0].shape[info[0].shape.len - 1];
+        if (dimension > 0) return std.math.cast(usize, dimension);
+    }
+    if (session.vtable != &arch_vtable) return null;
+    const actual: *const ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (actual.task != .generic) return null;
+    return switch (actual.arch_config) {
+        .clip => |cfg| cfg.projection_dim,
+        .clap => |cfg| cfg.projection_dim,
+        .embedding_gemma2 => |cfg| cfg.embedding_dim,
+        .bert => |cfg| cfg.hidden_size,
+        .modern_bert => |cfg| if (cfg.laya == null) cfg.hidden_size else null,
+        .nomic_bert => |cfg| cfg.hidden_size,
+        .deberta => |cfg| cfg.hidden_size,
+        .gpt => |cfg| if (session.model_contract.embedding) |contract| (if (contract.family == .last_token_decoder) cfg.hidden_size else null) else null,
+        .t5 => |cfg| cfg.d_model,
+        else => null,
+    };
+}
+
+fn qualifyOwnedSourceFinalHost(a: std.mem.Allocator, cancel_before_math: bool, foreign_consumer: bool) !void {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const source_mod = @import("../backends/session.zig");
+    const Admitted = @import("../backends/admitted_allocator.zig").AdmittedAllocator;
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const Sink = @import("retirement_sink.zig");
+    var session = try mediaTextEntryFixtureSession(a, false);
+    var session_live = true;
+    defer if (session_live) session.close();
+    try session.installOwnedExecutionGate(a);
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    session.cohort_scheduler = &scheduler;
+    var ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 4 }, &.{ 0, 7, 7, 1 });
+    defer ids.deinit();
+    var mask = try Tensor.initInt64(a, "attention_mask", &.{ 1, 4 }, &.{ 1, 1, 1, 0 });
+    defer mask.deinit();
+    const inputs = [_]Tensor{ ids, mask };
+    // Independent existing raw host architecture route, before managed run
+    // admission. The actual tiny CLIP computes the same final projection.
+    const reference = try session.runWithControl(&inputs, a, .{ .native_call_policy = .in_process });
+    defer {
+        for (reference) |*value| value.deinit();
+        a.free(reference);
+    }
+    try std.testing.expect(reference.len == 1 and reference[0].elementCount() == 3);
+    const domain = try Domain.create();
+    defer domain.release();
+    session.model_lifetime.?.admission_domain = domain.pin();
+    const Probe = struct {
+        source_gate: ?*std.atomic.Mutex,
+        foreign_gate: *std.atomic.Mutex,
+        failure: bool = false,
+        cancelled: bool = false,
+        next: usize = 1,
+        fn observe(self: *@This()) void {
+            if (self.source_gate) |gate| {
+                if (gate.tryLock()) gate.unlock() else self.failure = true;
+            }
+            if (self.foreign_gate.tryLock()) self.foreign_gate.unlock() else self.failure = true;
+        }
+        fn reserve(raw: *anyopaque, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            const token = self.next;
+            self.next += 1;
+            return token;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancelled) return error.Cancelled;
+        }
+    };
+    var foreign_gate: std.atomic.Mutex = .unlocked;
+    var consumer_sink = try Sink.Ref.create();
+    defer consumer_sink.release();
+    var consumer_guard = try consumer_sink.enter();
+    defer consumer_guard.finish();
+    var consumer_epoch = try consumer_guard.retainEpoch();
+    defer consumer_epoch.release();
+    var probe = Probe{ .source_gate = session.execution_gate, .foreign_gate = &foreign_gate };
+    defer probe.source_gate = null;
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    session.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 8 * 1024 * 1024 }, .static_workspace_bytes = 4096, .check_live_memory = false };
+    var workspace = Admitted{ .backing = a, .session = session };
+    defer workspace.deinit();
+    const source_allocator = workspace.allocator();
+    const control = InferenceExecutionControl{ .ptr = &probe, .check_fn = Probe.check, .native_call_policy = .in_process };
+    const output_bytes = try source_mod.HostOutputProducer.requiredBytes(1, 3);
+    const declared_output = try source_mod.PreparedSource.hostOutputRequestBytes(1, 3);
+    {
+        var invalid: source_mod.PreparedSource = .{};
+        defer invalid.deinit();
+        try invalid.initShapesBeforeExecutionInto(session, session, session.execution_gate, .{ .tensors = &inputs }, .{ .batch = 1, .sequence = 4, .input_bytes = 64, .output_bytes = 12, .workspace_bytes = 512 * 1024 }, &workspace, .host, source_allocator, control);
+        const before = domain.controller.snapshot();
+        try std.testing.expectError(error.HostOutputGeometryNotPreflighted, invalid.prepareHostOutputsBeforeExecution(1, 3));
+        try std.testing.expectEqualDeep(before, domain.controller.snapshot());
+        try std.testing.expect(invalid.host_output_producer == null and !invalid.executed);
+    }
+    try workspace.trim();
+    var owned: ?source_mod.OwnedHostVectors = null;
+    defer if (owned) |*value| value.deinitOutsideExecution();
+    {
+        var source: source_mod.PreparedSource = .{};
+        defer source.deinitOutsideExecution();
+        try source.initShapesBeforeExecutionInto(session, session, session.execution_gate, .{ .tensors = &inputs }, .{ .batch = 1, .sequence = 4, .input_bytes = 64, .output_bytes = declared_output, .workspace_bytes = 512 * 1024 }, &workspace, .host, source_allocator, control);
+        try source.prepareHostOutputsBeforeExecution(1, 3);
+        try source.bindInputsBeforeExecution(.{ .host = &inputs }, .host);
+        if (cancel_before_math) {
+            probe.cancelled = true;
+            try std.testing.expectError(error.Cancelled, source.enter());
+            try std.testing.expect(!source.executed);
+            source.deinitOutsideExecution();
+            try workspace.trim();
+            try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+            try std.testing.expect(!probe.failure and scheduler.head == null);
+            return;
+        }
+        try source.enter();
+        const permit = try source.beginExecutionDispatch();
+        const host = try permit.runWithControl(&inputs, source_allocator, control);
+        var host_live = true;
+        defer if (host_live) {
+            for (host) |*value| value.deinit();
+            source_allocator.free(host);
+        };
+        try std.testing.expect(host.len == 1 and host[0].elementCount() == 3);
+        const rows = [_][]const f32{host[0].asFloat32()};
+        owned = try source.publishHostOutputs(&rows);
+        try std.testing.expectEqualSlices(f32, reference[0].asFloat32(), owned.?.values(0));
+        try std.testing.expectEqual(@as(usize, 1), owned.?.len());
+        if (foreign_consumer) {
+            source.leaveExecution();
+            const before_live_refusal = domain.controller.snapshot();
+            try std.testing.expect(foreign_gate.tryLock());
+            const refused = source.deinitWithCleanup(.{ .boundary = &consumer_epoch });
+            foreign_gate.unlock();
+            try std.testing.expectError(error.SourceForeignWorkspaceStillLive, refused);
+            try std.testing.expectEqualDeep(before_live_refusal, domain.controller.snapshot());
+            try std.testing.expect(source.executed and source.host_output_producer != null);
+            for (host) |*value| value.deinit();
+            source_allocator.free(host);
+            host_live = false;
+            source.leaveExecution();
+            const before_foreign = domain.controller.snapshot();
+            try std.testing.expectError(error.MissingHostOutputCleanupAuthority, source.deinitWithCleanup(.{}));
+            try std.testing.expectError(error.SourceTeardownRequiresOuterBoundary, source.deinitWithCleanup(.{ .boundary = source.epoch() }));
+            try std.testing.expectEqualDeep(before_foreign, domain.controller.snapshot());
+            try std.testing.expect(foreign_gate.tryLock());
+            var foreign_owned = true;
+            defer if (foreign_owned) foreign_gate.unlock();
+            try source.deinitWithCleanup(.{ .boundary = &consumer_epoch });
+            // Source remainder and final producer BOTH remain funded until
+            // the actual foreign gate ends; Source's own unlock is insufficient.
+            try std.testing.expectEqualDeep(before_foreign, domain.controller.snapshot());
+            try std.testing.expect(!probe.failure and source.cleanup.epoch() == null);
+            foreign_gate.unlock();
+            foreign_owned = false;
+            consumer_guard.finish();
+            try std.testing.expectEqual(output_bytes, domain.controller.snapshot().host_scratch_bytes);
+        }
+    }
+    try workspace.trim();
+    try std.testing.expectEqual(output_bytes, domain.controller.snapshot().host_scratch_bytes);
+    try std.testing.expect(workspace.live_bytes == 0 and scheduler.head == null and !probe.failure);
+    // The small final host owner has only its PURE Domain pin. It cannot keep
+    // a 512KiB source workspace or a late actual model/provider pin alive.
+    try std.testing.expectEqual(@as(usize, 1), session.model_lifetime.?.references.load(.acquire));
+    probe.source_gate = null; // actual embedded gate dies with ModelLifetime
+    session.close();
+    session_live = false;
+    try std.testing.expectEqualSlices(f32, reference[0].asFloat32(), owned.?.values(0));
+    var row = try owned.?.take(0);
+    defer row.deinitOutsideExecution();
+    owned.?.deinitOutsideExecution();
+    owned = null;
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    var foreign_epoch = try guard.retainEpoch();
+    defer foreign_epoch.release();
+    try std.testing.expect(foreign_gate.tryLock());
+    try row.deinitWithCleanup(.{ .boundary = &foreign_epoch });
+    try std.testing.expectEqual(output_bytes, domain.controller.snapshot().host_scratch_bytes);
+    foreign_gate.unlock();
+    guard.finish();
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+    try std.testing.expect(!probe.failure);
+}
+
+test "actual Native source final host backing survives source Model and settles only under current foreign B" {
+    try qualifyOwnedSourceFinalHost(std.testing.allocator, false, false);
+    try qualifyOwnedSourceFinalHost(std.testing.allocator, true, false);
+    try qualifyOwnedSourceFinalHost(std.testing.allocator, false, true);
+}
+
+fn ownedTextOutputFixtureSession(a: std.mem.Allocator) !Session {
+    const fixture = @import("../ops/media_residency_test.zig");
+    var weights = NativeData{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    errdefer weights.deinitOwned();
+    try fixture.putWeight(&weights, "embeddings.word_embeddings.weight", &.{ 8, 4 }, null);
+    try fixture.putWeight(&weights, "embeddings.position_embeddings.weight", &.{ 8, 4 }, null);
+    try fixture.putWeight(&weights, "embeddings.token_type_embeddings.weight", &.{ 1, 4 }, null);
+    try fixture.putWeight(&weights, "embeddings.LayerNorm.weight", &.{4}, 1);
+    try fixture.putWeight(&weights, "embeddings.LayerNorm.bias", &.{4}, 0);
+    const owner = try a.create(ArchSession);
+    errdefer a.destroy(owner);
+    owner.* = .{ .allocator = a, .arch_config = .{ .bert = .{ .vocab_size = 8, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 2, .intermediate_size = 8, .max_position_embeddings = 8, .type_vocab_size = 1 } }, .backend_type = .native, .backend_data = .{ .native = weights } };
+    try owner.model_lifetime.prepareFinalResources();
+    weights.resident_weights = .empty;
+    weights.lazy_weights = .empty;
+    return archSessionHandle(owner);
+}
+
+test "actual text pipeline tokenized owned final export preserves host reference after source teardown" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const Pipeline = @import("../pipelines/embedding.zig").EmbeddingPipeline;
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const a = std.testing.allocator;
+    var session = try ownedTextOutputFixtureSession(a);
+    defer session.close();
+    try session.installOwnedExecutionGate(a);
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    session.cohort_scheduler = &scheduler;
+    var pipeline = Pipeline{ .allocator = a, .session = session, .tok = undefined, .config = .{ .max_length = 4, .resident_text_encoder = false }, .execution_control = .{ .native_call_policy = .in_process } };
+    // The original unmanaged host call is an independent same-body reference.
+    const reference = try pipeline.embedTokenized(&.{ 0, 7, 7, 1 }, &.{ 1, 1, 1, 0 }, 1, 4);
+    defer {
+        for (reference) |row| a.free(row);
+        a.free(reference);
+    }
+    const domain = try Domain.create();
+    defer domain.release();
+    session.model_lifetime.?.admission_domain = domain.pin();
+    session.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 8 * 1024 * 1024 }, .static_workspace_bytes = 512 * 1024, .check_live_memory = false };
+    pipeline.session = session;
+    var owned = try pipeline.embedTokenizedOwned(&.{ 0, 7, 7, 1 }, &.{ 1, 1, 1, 0 }, 1, 4, .{ .outside_execution = true });
+    defer owned.deinitOutsideExecution();
+    try std.testing.expectEqual(@as(usize, 1), owned.len());
+    try std.testing.expectEqualSlices(f32, reference[0], owned.values(0));
+    const retained = try @import("../backends/session.zig").HostOutputProducer.requiredBytes(1, 4);
+    try std.testing.expectEqual(retained, domain.controller.snapshot().host_scratch_bytes);
+    try std.testing.expect(scheduler.head == null);
+    try std.testing.expect(session.execution_gate.?.tryLock());
+    session.execution_gate.?.unlock();
+    owned.deinitOutsideExecution();
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+}
+
+test "owned final source cohorts concatenate without new quota model pins or backing copies" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const source_mod = @import("../backends/session.zig");
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var first_run = try domain.controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 16384 }, false);
+    defer first_run.release();
+    var second_run = try domain.controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 16384 }, false);
+    defer second_run.release();
+    var first_producer = try source_mod.HostOutputProducer.prepare(&first_run, &pin, 1, 3);
+    defer {
+        first_producer.abortWithCleanup(.{ .outside_execution = true }) catch unreachable;
+        first_producer.finishOutsideExecution();
+    }
+    var second_producer = try source_mod.HostOutputProducer.prepare(&second_run, &pin, 1, 3);
+    defer {
+        second_producer.abortWithCleanup(.{ .outside_execution = true }) catch unreachable;
+        second_producer.finishOutsideExecution();
+    }
+    try first_producer.writeRow(0, &.{ 1, 2, 3 });
+    try second_producer.writeRow(0, &.{ 4, 5, 6 });
+    var first = try first_producer.publish();
+    defer first.deinitOutsideExecution();
+    var second = try second_producer.publish();
+    defer second.deinitOutsideExecution();
+    const first_pointer = first.values(0).ptr;
+    const second_pointer = second.values(0).ptr;
+    const before = domain.controller.snapshot();
+    var alias = first; // borrowed negative descriptor, never separately closed
+    try std.testing.expectError(error.HostOutputAlias, first.appendMove(&alias));
+    try std.testing.expectEqualDeep(before, domain.controller.snapshot());
+    try first.appendMove(&second);
+    try std.testing.expect(second.owner == null and first.len() == 2);
+    try std.testing.expect(first.values(0).ptr == first_pointer and first.values(1).ptr == second_pointer);
+    try std.testing.expectEqualDeep(before, domain.controller.snapshot());
+    first_producer.finishOutsideExecution();
+    second_producer.finishOutsideExecution();
+    first_run.release();
+    second_run.release();
+    try std.testing.expectEqual(2 * try source_mod.HostOutputProducer.requiredBytes(1, 3), domain.controller.snapshot().host_scratch_bytes);
+    var row = try first.take(1);
+    defer row.deinitOutsideExecution();
+    first.deinitOutsideExecution();
+    try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, row.values());
+    row.deinitOutsideExecution();
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+}
+
+test "actual owned text cold entry rejects foreign consumer before tokenizer or reservation" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const Pipeline = @import("../pipelines/embedding.zig").EmbeddingPipeline;
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const Sink = @import("retirement_sink.zig");
+    const a = std.testing.allocator;
+    var session = try ownedTextOutputFixtureSession(a);
+    defer session.close();
+    const domain = try Domain.create();
+    defer domain.release();
+    session.model_lifetime.?.admission_domain = domain.pin();
+    session.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 8 * 1024 * 1024 }, .static_workspace_bytes = 512 * 1024, .check_live_memory = false };
+    const Probe = struct {
+        calls: usize = 0,
+        fn reserve(raw: *anyopaque, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.ResourceLimitExceeded;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+    var probe = Probe{};
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    var foreign_gate: std.atomic.Mutex = .unlocked;
+    try std.testing.expect(foreign_gate.tryLock());
+    defer foreign_gate.unlock();
+    var pipeline = Pipeline{ .allocator = a, .session = session, .tok = undefined, .config = .{ .max_length = 4 }, .execution_control = .{ .native_call_policy = .in_process } };
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    const before = domain.controller.snapshot();
+    try std.testing.expectError(error.OwnedOutputRequiresOutsideEntry, pipeline.embedOwned(&.{"never tokenized"}, .{ .boundary = &epoch }));
+    try std.testing.expectError(error.OwnedOutputRequiresOutsideEntry, pipeline.embedTokenizedOwned(&.{0}, &.{1}, 1, 1, .{ .boundary = &epoch }));
+    try std.testing.expectEqualDeep(before, domain.controller.snapshot());
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+}
+
+test "actual owned text batches preserve original text numerics and close all cohort credits" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const Pipeline = @import("../pipelines/embedding.zig").EmbeddingPipeline;
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const a = std.testing.allocator;
+    var session = try ownedTextOutputFixtureSession(a);
+    defer session.close();
+    try session.installOwnedExecutionGate(a);
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    session.cohort_scheduler = &scheduler;
+    const tokenizer_json =
+        \\{"model":{"type":"WordPiece","unk_token":"[UNK]","continuing_subword_prefix":"##","vocab":{"[PAD]":0,"[UNK]":1,"hello":2,"world":3,"[CLS]":4,"[SEP]":5}},"added_tokens":[{"id":0,"content":"[PAD]","special":true},{"id":1,"content":"[UNK]","special":true},{"id":4,"content":"[CLS]","special":true},{"id":5,"content":"[SEP]","special":true}],"post_processor":{"type":"BertProcessing","cls":["[CLS]",4],"sep":["[SEP]",5]},"pre_tokenizer":{"type":"Whitespace"}}
+    ;
+    const hf = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_json);
+    defer hf.deinitSelf();
+    var pipeline = Pipeline.init(a, session, hf.tokenizer(), .{ .max_length = 4, .batch_size = 2, .normalize = false, .resident_text_encoder = false });
+    pipeline.execution_control = .{ .native_call_policy = .in_process };
+    const texts: []const []const u8 = &.{ "hello", "world", "hello world" };
+    const reference = try pipeline.embed(texts);
+    defer {
+        for (reference) |row| a.free(row);
+        a.free(reference);
+    }
+    const domain = try Domain.create();
+    defer domain.release();
+    session.model_lifetime.?.admission_domain = domain.pin();
+    session.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 8 * 1024 * 1024 }, .static_workspace_bytes = 512 * 1024, .check_live_memory = false };
+    pipeline.session = session;
+    var owned = try pipeline.embedOwned(texts, .{ .outside_execution = true });
+    defer owned.deinitOutsideExecution();
+    try std.testing.expectEqual(texts.len, owned.len());
+    for (reference, 0..) |row, i| try std.testing.expectEqualSlices(f32, row, owned.values(i));
+    try std.testing.expect(scheduler.head == null);
+    try std.testing.expect(session.execution_gate.?.tryLock());
+    session.execution_gate.?.unlock();
+    owned.deinitOutsideExecution();
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+}
+
+test "CUDA actual complete Qwen host Session run cold-funds temporary state before Model and preserves original host outputs" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const path = platform.env.getenv("ANTFLY_UNIFIED_QWEN_READER_FIXTURE") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var session = createCudaSession(a, path) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer session.close();
+    const actual: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const layout = (try eagerHostRecurrentLayout(session.ptr)) orelse return error.MissingActualEagerRecurrentConfig;
+    const compute = actual.backend_data.cuda.compute;
+    var ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 3 }, &.{ 1, 2, 3 });
+    defer ids.deinit();
+    const inputs = [_]Tensor{ids}; // synchronous borrow; ids owns the backing
+    const reference = try session.runWithControl(&inputs, a, .{ .native_call_policy = .in_process });
+    defer {
+        for (reference) |*value| value.deinit();
+        a.free(reference);
+    }
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    session.model_lifetime.?.admission_domain = domain.pin();
+    try session.installOwnedExecutionGate(a);
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    session.cohort_scheduler = &scheduler;
+    const Probe = struct {
+        gate: ?*std.atomic.Mutex,
+        held: bool = false,
+        calls: usize = 0,
+        fn check(self: *@This()) void {
+            self.calls += 1;
+            if (self.gate) |gate| {
+                if (!gate.tryLock()) self.held = true else gate.unlock();
+            }
+        }
+        fn reserve(raw: *anyopaque, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+            return self.calls;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+    };
+    var probe = Probe{ .gate = session.execution_gate };
+    defer probe.gate = null; // actual final model close destroys its gate
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    session.run_admission = .{ .controller = &domain.controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
+    var inspected = try session.admitInputs(&inputs, a, null);
+    const run_bytes = inspected.lease.?.amounts.backendTotalBytes();
+    inspected.deinit();
+    const exact_peak = try layout.bytes();
+    const before = compute.ctx.device_allocations.snapshot();
+    session.run_admission.?.limits.backend_limit_bytes = try std.math.add(usize, run_bytes, exact_peak - 1);
+    const model_references = session.model_lifetime.?.references.load(.acquire);
+    try std.testing.expectError(error.ResourceLimitExceeded, session.runWithControl(&inputs, a, .{ .native_call_policy = .in_process }));
+    try std.testing.expectEqual(model_references, session.model_lifetime.?.references.load(.acquire));
+    {
+        var failed_source: @import("../backends/session.zig").PreparedSource = .{};
+        defer failed_source.deinit();
+        try std.testing.expectError(error.ResourceLimitExceeded, failed_source.initBeforeExecutionInto(session, session, session.execution_gate, .{ .host = &inputs }, try session.planRun(&inputs, null), null, .host, a, .{ .native_call_policy = .in_process }));
+        // This exact failure path never creates a prepaid shape scope. Its
+        // own cleanup releases all permit/model/B custody before returning.
+        try std.testing.expect(failed_source.shape_scope == null and failed_source.permit == null and failed_source.source_model == null);
+        try std.testing.expect(failed_source.cleanup.epoch() == null);
+        try std.testing.expectEqual(model_references, session.model_lifetime.?.references.load(.acquire));
+    }
+    try std.testing.expectEqualDeep(before, compute.ctx.device_allocations.snapshot());
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+    try std.testing.expect(scheduler.head == null);
+    try std.testing.expect(session.execution_gate.?.tryLock());
+    session.execution_gate.?.unlock();
+    try std.testing.expect(!probe.held);
+    session.run_admission.?.limits = .{};
+    const Cancel = struct {
+        fn cancelled(_: ?*anyopaque) bool {
+            return true;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, session.runWithControl(&inputs, a, .{ .native_call_policy = .in_process, .cancellation = .{ .is_cancelled_fn = Cancel.cancelled } }));
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+    try std.testing.expect(scheduler.head == null);
+    try std.testing.expect(session.execution_gate.?.tryLock());
+    session.execution_gate.?.unlock();
+    for (0..2) |_| {
+        const output = try session.runWithControl(&inputs, a, .{ .native_call_policy = .in_process });
+        defer {
+            for (output) |*value| value.deinit();
+            a.free(output);
+        }
+        try std.testing.expectEqual(reference.len, output.len);
+        try std.testing.expect(scheduler.head == null); // Source has closed before the result escapes
+        for (output) |got| {
+            try std.testing.expect(got.lifetime != null and got.admitted_storage_domain == @as(*anyopaque, @ptrCast(&domain.controller)));
+            try std.testing.expect(got.shared_storage != null);
+            try std.testing.expect(got.shared_storage.?.ptr == got.data.ptr and got.shared_storage.?.len == got.data.len);
+        }
+        const retained = try @import("../backends/session.zig").retainedOutputAmounts(output, false);
+        try std.testing.expectEqualDeep(retained, domain.controller.snapshot());
+        // Keep the SAME returned backing live across another complete source
+        // invocation. Neither output adoption nor source destruction copies it.
+        const original_pointer = output[0].data.ptr;
+        const later = try session.runWithControl(&inputs, a, .{ .native_call_policy = .in_process });
+        var later_live = true;
+        defer if (later_live) {
+            for (later) |*value| value.deinit();
+            a.free(later);
+        };
+        try std.testing.expect(output[0].data.ptr == original_pointer);
+        try std.testing.expectEqualDeep(try retained.merge(try @import("../backends/session.zig").retainedOutputAmounts(later, false)), domain.controller.snapshot());
+        for (later) |*value| value.deinit();
+        a.free(later);
+        later_live = false;
+        try std.testing.expectEqualDeep(retained, domain.controller.snapshot());
+        for (reference, output) |expected, got| {
+            try std.testing.expectEqualSlices(i64, expected.shape, got.shape);
+            try std.testing.expectEqualStrings(expected.name, got.name);
+            const golden = expected.asFloat32();
+            const values = got.asFloat32();
+            try std.testing.expectEqual(golden.len, values.len);
+            for (golden, values) |x, y| try std.testing.expectApproxEqAbs(x, y, @as(f32, 1e-5));
+        }
+        try std.testing.expect(!probe.held and probe.calls > 0);
+        // Only actual owning host output admission survives. No invocation
+        // header, CT, budget loan or CUDA recurrent State is published here.
+        try std.testing.expect(domain.controller.snapshot().backend_scratch_bytes == 0);
+    }
+    try std.testing.expect(!probe.held);
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+}
+
+test "eager GPT host context requires exact original session callback table" {
+    const copied = arch_vtable;
+    try std.testing.expect(eager_host_services.accepts(&arch_vtable));
+    try std.testing.expect(!eager_host_services.accepts(&copied));
+}
+
+test "admitted inherited eager table refuses actual Session and RunPermit dispatch before invalid implementation metadata" {
+    const copied = arch_vtable;
+    var controller = runtime.tier.memory.AdmissionController{};
+    const session = Session{ .ptr = @ptrFromInt(1), .vtable = &copied, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false } };
+    try std.testing.expectError(error.UnsupportedRecurrentStateTarget, session.run(&.{}, std.testing.allocator));
+    try std.testing.expectError(error.UnsupportedRecurrentStateTarget, session.runWithControl(&.{}, std.testing.allocator, .{ .native_call_policy = .in_process }));
+    try std.testing.expectError(error.UnsupportedRecurrentStateTarget, session.runLayaDecisionsWithControl(&.{}, std.testing.allocator, .{ .native_call_policy = .in_process }));
+    var permit = @import("../backends/session.zig").RunPermit{ .session = session, .lease = null };
+    try std.testing.expectError(error.UnsupportedRecurrentStateTarget, permit.run(&.{}, std.testing.allocator));
+    try std.testing.expectError(error.UnsupportedRecurrentStateTarget, permit.runWithControl(&.{}, std.testing.allocator, .{ .native_call_policy = .in_process }));
+    try std.testing.expectError(error.UnsupportedRecurrentStateTarget, permit.runLayaDecisionsWithControl(&.{}, std.testing.allocator, .{ .native_call_policy = .in_process }));
     try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, controller.snapshot());
 }

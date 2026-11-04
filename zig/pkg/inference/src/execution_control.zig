@@ -682,6 +682,30 @@ test "LightOnOCR3 execution lane cleanup survives cancellation of its owning Io 
     try std.testing.expect(!lane.owned and lane.head == null and lane.tail == null);
 }
 
+/// A stable metadata flag owned by the same final-address epoch as its step
+/// mutex. The owner publishes pause while holding that mutex, then releases
+/// every numerical gate before invoking admission suppliers. Waiting consumers
+/// must recheck after acquiring the mutex so a prior queued waiter cannot enter
+/// a parked backend. Neither this flag nor its waiter carries backend authority.
+pub const ExecutionPause = struct {
+    paused: std.atomic.Value(bool) = .init(false),
+
+    pub fn pauseWithStepLocked(self: *ExecutionPause) !void {
+        if (self.paused.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
+            return error.ExecutionAlreadyPaused;
+    }
+    pub fn resumeWithStepLocked(self: *ExecutionPause) void {
+        std.debug.assert(self.paused.swap(false, .acq_rel));
+    }
+    fn wait(self: *const ExecutionPause, control: InferenceExecutionControl, poll_ns: u64) !void {
+        while (self.paused.load(.acquire)) {
+            try control.check();
+            platform_time.sleepNs(if (poll_ns == 0) 100 * std.time.ns_per_us else @min(poll_ns, std.time.ns_per_ms));
+        }
+        try control.check();
+    }
+};
+
 /// Borrowed admission for a physical backend lane. Callers retain all fields
 /// through the final drain and release; cleanup always ignores cancellation.
 pub const ExecutionAccess = struct {
@@ -693,6 +717,8 @@ pub const ExecutionAccess = struct {
     phase_waiters: ?*std.atomic.Value(usize) = null,
     phase_wake: ?*std.Io.Event = null,
     phase_wake_io: ?std.Io = null,
+    pause: ?*const ExecutionPause = null,
+    priority: bool = false,
 
     fn finishPhaseWait(self: ExecutionAccess) void {
         const count = self.phase_waiters orelse return;
@@ -702,24 +728,42 @@ pub const ExecutionAccess = struct {
     }
 
     pub fn acquire(self: ExecutionAccess) !void {
-        const mutex = self.mutex orelse return;
-        if (self.phase_waiters) |count| _ = count.fetchAdd(1, .acq_rel);
-        defer self.finishPhaseWait();
-        var control = self.control orelse InferenceExecutionControl{};
-        if (control.io == null) control.io = self.io;
-        const queued = if (self.gate) |lane| try lane.acquireWithPriority(control, self.phase_waiters != null) else null;
-        errdefer if (queued) |lease| lease.release();
-        try control.lockWithPoll(mutex, self.contention_wait_ns);
+        return self.acquirePolicy(true);
     }
-
-    pub fn acquireForCleanup(self: ExecutionAccess) void {
+    fn acquirePolicy(self: ExecutionAccess, comptime cancelable: bool) !void {
         const mutex = self.mutex orelse return;
         if (self.phase_waiters) |count| _ = count.fetchAdd(1, .acq_rel);
         defer self.finishPhaseWait();
-        if (self.gate) |lane| _ = lane.acquireForCleanup(self.io, self.phase_waiters != null);
-        if (self.phase_waiters != null) {
-            (InferenceExecutionControl{}).lockWithPoll(mutex, if (self.contention_wait_ns == 0) 100 * std.time.ns_per_us else self.contention_wait_ns) catch unreachable;
-        } else @import("antfly_platform").sync.lockYielding(mutex);
+        var control = if (cancelable) self.control orelse InferenceExecutionControl{} else InferenceExecutionControl{};
+        if (cancelable and control.io == null) control.io = self.io;
+        while (true) {
+            if (self.pause) |pause| {
+                if (cancelable) try pause.wait(control, self.contention_wait_ns) else {
+                    while (pause.paused.load(.acquire)) platform_time.sleepNs(if (self.contention_wait_ns == 0) 100 * std.time.ns_per_us else @min(self.contention_wait_ns, std.time.ns_per_ms));
+                }
+            }
+            const queued = if (self.gate) |lane|
+                if (cancelable) try lane.acquireWithPriority(control, self.priority or self.phase_waiters != null) else lane.acquireForCleanup(self.io, self.priority or self.phase_waiters != null)
+            else
+                null;
+            if (cancelable) {
+                control.lockWithPoll(mutex, self.contention_wait_ns) catch |err| {
+                    if (queued) |lease| lease.release();
+                    return err;
+                };
+            } else if (self.phase_waiters != null) {
+                (InferenceExecutionControl{}).lockWithPoll(mutex, if (self.contention_wait_ns == 0) 100 * std.time.ns_per_us else self.contention_wait_ns) catch unreachable;
+            } else @import("antfly_platform").sync.lockYielding(mutex);
+            if (self.pause) |pause| if (pause.paused.load(.acquire)) {
+                mutex.unlock();
+                if (queued) |lease| lease.release();
+                continue;
+            };
+            return;
+        }
+    }
+    pub fn acquireForCleanup(self: ExecutionAccess) void {
+        self.acquirePolicy(false) catch unreachable;
     }
 
     pub fn release(self: ExecutionAccess) void {
@@ -728,3 +772,124 @@ pub const ExecutionAccess = struct {
         if (self.gate) |lane| (ExecutionLane.Lease{ .lane = lane }).release();
     }
 };
+
+test "execution access pauses a queued worker while step exclusion is available to suppliers" {
+    const Worker = struct {
+        mutex: std.atomic.Mutex = .unlocked,
+        pause: ExecutionPause = .{},
+        started: std.atomic.Value(bool) = .init(false),
+        entered: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            const access = ExecutionAccess{ .mutex = &self.mutex, .pause = &self.pause };
+            access.acquireForCleanup();
+            defer access.release();
+            self.entered.store(true, .release);
+        }
+    };
+    var worker = Worker{};
+    // Queue the worker before publishing the pause under the same step lock.
+    try std.testing.expect(worker.mutex.tryLock());
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    while (!worker.started.load(.acquire)) platform_time.sleepNs(100 * std.time.ns_per_us);
+    try worker.pause.pauseWithStepLocked();
+    worker.mutex.unlock();
+    // Supplier reentry can take actual step exclusion while the epoch is parked.
+    try std.testing.expect(worker.mutex.tryLock());
+    worker.mutex.unlock();
+    platform_time.sleepNs(5 * std.time.ns_per_ms);
+    const entered_while_paused = worker.entered.load(.acquire);
+    @import("antfly_platform").sync.lockYielding(&worker.mutex);
+    worker.pause.resumeWithStepLocked();
+    worker.mutex.unlock();
+    thread.join();
+    try std.testing.expect(!entered_while_paused);
+    try std.testing.expect(worker.entered.load(.acquire));
+}
+
+test "execution access cancellation while parked leaves both numerical gates available" {
+    const ParkedCancellation = struct {
+        fn cancelled(_: ?*anyopaque) bool {
+            return true;
+        }
+    };
+    var mutex: std.atomic.Mutex = .unlocked;
+    var gate: ExecutionLane = .{};
+    var pause = ExecutionPause{};
+    try std.testing.expect(mutex.tryLock());
+    try pause.pauseWithStepLocked();
+    mutex.unlock();
+    const access = ExecutionAccess{
+        .mutex = &mutex,
+        .gate = &gate,
+        .pause = &pause,
+        .control = .{ .cancellation = .{ .is_cancelled_fn = ParkedCancellation.cancelled } },
+    };
+    try std.testing.expectError(error.Cancelled, access.acquire());
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
+    const available = try gate.acquire(.{});
+    available.release();
+    try std.testing.expect(mutex.tryLock());
+    pause.resumeWithStepLocked();
+    mutex.unlock();
+}
+
+test "paused execution access cleanup survives cancellation of its owning Io task" {
+    const Worker = struct {
+        fn run(access: *ExecutionAccess, started: *std.Io.Event, done: *std.atomic.Value(bool)) anyerror!void {
+            defer {
+                access.acquireForCleanup();
+                access.release();
+                done.store(true, .release);
+            }
+            started.set(std.testing.io);
+            return;
+        }
+        fn cancel(future: *std.Io.Future(anyerror!void), entered: *std.atomic.Value(bool)) void {
+            entered.store(true, .release);
+            _ = future.cancel(std.testing.io) catch {};
+        }
+    };
+    var lane: ExecutionLane = .{};
+    var mutex: std.atomic.Mutex = .unlocked;
+    var pause: ExecutionPause = .{};
+    var access = ExecutionAccess{ .mutex = &mutex, .gate = &lane, .io = std.testing.io, .pause = &pause };
+    const owner = try lane.acquire(.{});
+    var released = false;
+    var started: std.Io.Event = .unset;
+    var done: std.atomic.Value(bool) = .init(false);
+    var pending = try std.testing.io.concurrent(Worker.run, .{ &access, &started, &done });
+    var cancel_task: ?std.Io.Future(void) = null;
+    var cancel_entered: std.atomic.Value(bool) = .init(false);
+    defer {
+        if (!released) owner.release();
+        if (cancel_task) |*task| task.cancel(std.testing.io);
+        _ = pending.cancel(std.testing.io) catch {};
+    }
+    try started.wait(std.testing.io);
+    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        lane.lock();
+        const waiting = if (lane.head) |head| @atomicLoad(std.Io.Event, &head.ready, .acquire) == .waiting else false;
+        lane.mutex.unlock();
+        if (waiting) break;
+        if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    // Cancel while cleanup is already parked, rather than consuming the Io
+    // cancellation in an earlier operation before entering cleanup.
+    cancel_task = try std.testing.io.concurrent(Worker.cancel, .{ &pending, &cancel_entered });
+    while (!cancel_entered.load(.acquire)) {
+        if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    try std.testing.expect(!done.load(.acquire));
+    owner.release();
+    released = true;
+    cancel_task.?.await(std.testing.io);
+    cancel_task = null;
+    try std.testing.expect(done.load(.acquire));
+    try std.testing.expect(!lane.owned and lane.head == null and lane.tail == null);
+}

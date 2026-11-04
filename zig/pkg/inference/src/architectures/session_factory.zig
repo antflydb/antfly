@@ -124,6 +124,7 @@ pub const planGlinerBoundaryWorkspace = implementation.planGlinerBoundaryWorkspa
 pub const getManagedGlinerBoundaryComputeBackend = implementation.getManagedGlinerBoundaryComputeBackend;
 pub const replaceBlasResidentWeight = implementation.replaceBlasResidentWeight;
 pub const getComputeBackendWithBudget = implementation.getComputeBackendWithBudget;
+pub const getComputeBackendWithBudgetAndCleanup = implementation.getComputeBackendWithBudgetAndCleanup;
 pub const getGenericEncoderArchConfig = implementation.getGenericEncoderArchConfig;
 pub const getGlinerBoundaryConfig = implementation.getGlinerBoundaryConfig;
 pub const GlinerSpanConfig = implementation.GlinerSpanConfig;

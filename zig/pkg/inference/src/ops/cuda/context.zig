@@ -98,6 +98,13 @@ pub const CudaContext = struct {
     video_decoder_cache: ?*anyopaque = null,
     video_decoder_release: ?*const fn (*anyopaque) callconv(.c) void = null,
     video_cache_budget: @import("video_cache_budget.zig").CacheBudget = .{},
+    // Borrowed ONLY through a synchronous checked decoder-close call. This
+    // pure callback context grants no numerical authority and is cleared before
+    // returning; no construction epoch/operation token enters persistent cache.
+    video_callback_cleanup: ?struct {
+        boundary: ?*const @import("../../execution/retirement_sink.zig").Epoch,
+        outside_execution: bool,
+    } = null,
     stats: RuntimeStats = .{},
     observation: std.atomic.Value(?*@import("graph_observation.zig").State) = .init(null),
     observation_enable_failed: std.atomic.Value(bool) = .init(false),
@@ -433,6 +440,14 @@ pub const CudaContext = struct {
 
     /// Retained-cache payload owners keep failed handles/quota. Observation
     /// retires only after the actual SDK destruction succeeds.
+    pub fn destroyGraphChecked(self: *CudaContext, graph: *CUgraph) !void {
+        const value = graph.*;
+        if (value == null) return;
+        try self.makeCurrent();
+        try self.driver.check(self.driver.fns.cuGraphDestroy(value));
+        graph.* = null;
+    }
+
     pub fn destroyGraphExecChecked(self: *CudaContext, exec: *CUgraphExec) !void {
         const value = exec.*;
         if (value == null) return;

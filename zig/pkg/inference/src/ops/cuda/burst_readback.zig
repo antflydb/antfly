@@ -21,27 +21,82 @@ const context = @import("context.zig");
 const buffer = @import("buffer.zig");
 const driver = @import("driver.zig");
 const memory = @import("../../runtime/tier/memory.zig");
+const Quota = @import("cache_quota.zig").Quota;
+const Cleanup = @import("../../execution/cleanup_context.zig").Context;
 
 pub const capacity = 128 * 8 * @sizeOf(u32);
 pub const Slot = struct {
     host: buffer.HostBuffer = .{},
     event: driver.CUevent = null,
-    lease: ?memory.AdmissionLease = null,
+    quota: Quota = .none,
     busy: bool = false,
     failed: bool = false,
     generation: u64 = 0,
 
+    /// Explicit legacy raw/outside entry. Managed callers provide NOW B.
     pub fn clear(self: *Slot, ctx: *context.CudaContext) !void {
+        try self.quota.validateLegacyRaw();
+        return self.clearWithCleanup(ctx, .{ .outside_execution = true });
+    }
+    pub fn clearWithCleanup(self: *Slot, ctx: *context.CudaContext, current: Cleanup) !void {
+        try self.quota.validateCleanup(current);
+        try self.clearPayloadChecked(ctx);
+        var retired = self.quota;
+        const generation = self.generation;
+        self.* = .{ .generation = generation }; // consume BEFORE callback reentry
+        retired.releaseAfterSdkDeath(current) catch |err| {
+            self.quota = retired; // registration fails before external callbacks
+            return err;
+        };
+    }
+    /// Payload only: the containing cache owner retires quota after unlocking.
+    pub fn clearPayloadChecked(self: *Slot, ctx: *context.CudaContext) !void {
         errdefer self.failed = true;
-        if (self.busy) {
+        if (self.busy or self.failed) {
             try ctx.synchronize();
             self.busy = false;
         }
         try self.host.freeChecked(ctx);
-        ctx.destroyEvent(self.event);
-        if (self.lease) |*lease| lease.release();
-        const generation = self.generation;
-        self.* = .{ .generation = generation };
+        if (self.event != null) {
+            try ctx.makeCurrent();
+            if (ctx.driver.fns.cuEventDestroy(self.event) != driver.CUDA_SUCCESS) return error.CudaDriverError;
+            self.event = null;
+        }
+        self.failed = false;
+    }
+
+    /// A synchronous borrow of the exact cold token; no supplier on this path.
+    pub fn prepareAdmitted(self: *Slot, ctx: *context.CudaContext, lease: *@import("prepared_cache.zig").Lease, current: Cleanup) !bool {
+        if (self.host.ptr != null or self.event != null or self.quota.hasLease() or self.failed or self.busy) return error.InvalidCacheRetirementState;
+        const owner = lease.owner orelse return error.UnpreparedCacheAdmission;
+        const entry = lease.entry orelse return error.InvalidPreparedCacheState;
+        const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+        if (current.outside_execution or owner.state != .bound or entry.state != .taken) return error.InvalidPreparedCacheState;
+        const expected_epoch = owner.boundary orelse return error.InvalidPreparedCacheState;
+        if (try epoch.isSealed() or try expected_epoch.isSealed()) return error.RetirementEpochSealed;
+        const actual = try epoch.boundary();
+        const expected = try expected_epoch.boundary();
+        if (actual.context != expected.context or actual.nonce != expected.nonce) return error.ForeignPreparedCacheBoundary;
+        var found = false;
+        for (owner.entries) |*candidate| if (candidate == entry) {
+            found = true;
+            break;
+        };
+        if (!found or entry.request != .auxiliary or entry.request.auxiliary.kind != .burst_readback_host or entry.request.auxiliary.device_bytes != 0 or entry.request.auxiliary.host_bytes != capacity) return error.PreparedCacheAmountChanged;
+        const value = lease.value orelse return error.MissingCacheRetirementLease;
+        const pin = owner.domain_pin orelse return error.MissingCacheRetirementDomain;
+        if (value.controller != pin.controller() or !std.meta.eql(value.amounts, memory.AdmissionAmounts{ .host_scratch_bytes = capacity })) return error.ForeignAdmissionDomain;
+        self.host = buffer.HostBuffer.alloc(ctx, capacity) catch return false;
+        self.quota = lease.publishQuota();
+        self.event = ctx.createStreamEvent() catch {
+            try self.clearWithCleanup(ctx, current);
+            return false;
+        };
+        return true;
+    }
+    pub fn beginPrepared(self: *Slot, ctx: *context.CudaContext, source: buffer.DeviceBuffer, bytes: usize) !?Pending {
+        if (self.host.ptr == null or self.event == null) return null;
+        return self.begin(ctx, source, bytes);
     }
 
     pub fn deinit(self: *Slot, ctx: *context.CudaContext) void {
@@ -62,7 +117,7 @@ pub const Slot = struct {
                 return null;
             };
             self.host = host;
-            self.lease = lease;
+            self.quota = Quota.fromRawAdmission(lease);
             self.event = ctx.createStreamEvent() catch {
                 self.clear(ctx) catch {};
                 return null;
@@ -126,26 +181,32 @@ test "LightOnOCR3 CUDA burst readback failed physical free retains ownership and
         fn current(_: driver.CUcontext) callconv(.c) driver.CUresult {
             return driver.CUDA_SUCCESS;
         }
+        fn synchronize(_: driver.CUstream) callconv(.c) driver.CUresult {
+            return driver.CUDA_SUCCESS;
+        }
         fn free(_: ?*anyopaque) callconv(.c) driver.CUresult {
             return if (reject) 1 else driver.CUDA_SUCCESS;
         }
     };
     var controller = memory.AdmissionController{};
-    var slot = Slot{ .generation = 7, .host = .{ .ptr = @ptrFromInt(1), .len = capacity }, .lease = try controller.tryAcquire(.gpu, .{ .host_limit_bytes = capacity }, .{ .host_scratch_bytes = capacity }, false) };
+    var slot = Slot{ .generation = 7, .host = .{ .ptr = @ptrFromInt(1), .len = capacity }, .quota = Quota.fromRawAdmission(try controller.tryAcquire(.gpu, .{ .host_limit_bytes = capacity }, .{ .host_scratch_bytes = capacity }, false)) };
     var ctx: context.CudaContext = undefined;
     ctx.observation.store(null, .release);
     ctx.observation_enable_failed.store(false, .release);
     ctx.ctx = @ptrFromInt(1);
     ctx.driver.fns.cuCtxSetCurrent = Fake.current;
     ctx.driver.fns.cuMemFreeHost = Fake.free;
+    ctx.stream = null;
+    ctx.stats = .{};
+    ctx.driver.fns.cuStreamSynchronize = Fake.synchronize;
     Fake.reject = true;
     try std.testing.expectError(error.CudaDriverError, slot.clear(&ctx));
-    try std.testing.expect(slot.failed and slot.host.ptr != null and slot.lease != null);
+    try std.testing.expect(slot.failed and slot.host.ptr != null and slot.quota.hasLease());
     try std.testing.expectEqual(@as(usize, capacity), controller.snapshot().host_scratch_bytes);
     try std.testing.expect((try slot.begin(&ctx, .{}, 4)) == null);
     Fake.reject = false;
     try slot.clear(&ctx);
-    try std.testing.expect(slot.host.ptr == null and slot.lease == null);
+    try std.testing.expect(slot.host.ptr == null and !slot.quota.hasLease());
     try std.testing.expectEqual(@as(u64, 7), slot.generation);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
 }

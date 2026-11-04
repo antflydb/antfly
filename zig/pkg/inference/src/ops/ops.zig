@@ -1824,8 +1824,16 @@ pub const ComputeBackend = struct {
     /// universal bounded checkpoint even for architectures without a bespoke
     /// `forwardWithControl` entry point.
     execution_control: ?InferenceExecutionControl = null,
+    /// Borrowed from this synchronous invocation only. It is installed only
+    /// on a local header by a typed owner; ptr/vtable/affinity remain unchanged.
+    call_context: ?*const @import("../execution/invocation_context.zig").Context = null,
     embedding_stage: ?*const EmbeddingStageControl = null,
 
+    pub fn withoutInvocationContext(self: ComputeBackend) ComputeBackend {
+        var durable = self;
+        durable.call_context = null;
+        return durable;
+    }
     pub fn checkExecutionControl(self: *const ComputeBackend) !void {
         if (self.execution_control) |control| try control.check();
     }
@@ -7198,4 +7206,14 @@ test "decoder assigned output contracts decline legacy providers before submissi
     _ = try cb.decoderRuntimeApplyMultiplyAdd(&.{ .lhs = value, .rhs = value, .addend = value, .dim = 1 });
     _ = try cb.decoderRuntimeApplyMultiplyAdd2(&.{ .lhs0 = value, .rhs0 = value, .lhs1 = value, .rhs1 = value, .dim = 1 });
     try std.testing.expectEqual(@as(usize, 4), submissions);
+}
+
+test "durable backend copy removes only borrowed synchronous invocation context" {
+    const table: ComputeBackend.VTable = undefined; // address identity only
+    var endpoint: u8 = 0;
+    const context = @import("../execution/invocation_context.zig").Context{ .cleanup = .{} };
+    const local = ComputeBackend{ .ptr = &endpoint, .vtable = &table, .call_context = &context };
+    const durable = local.withoutInvocationContext();
+    try std.testing.expect(local.call_context == &context and durable.call_context == null);
+    try std.testing.expect(local.ptr == durable.ptr and local.vtable == durable.vtable);
 }

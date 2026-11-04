@@ -72842,3 +72842,196 @@ int antfly_metal_observation_identity_fixture(void *context, void (*nested)(void
 }
 int antfly_metal_observation_binding_map_fixture(void) { return 2; }
 #endif
+
+// Explicit custody of admitted decoder phase caches across a reader's quota
+// handoff. No numerical policy, buffer size, allocation purpose, or shader is
+// changed. Opaque process metadata is created before model/provider exclusion;
+// take/restore require the actual provider and checked command completion.
+// Retained native handles keep the SAME backing/observation identity. No callback,
+// Zig allocator, model, request, Io, or execution boundary is stored here.
+typedef struct antfly_metal_decoder_cache_custody {
+    termite_metal_decode_runtime *runtime;
+    bool occupied;
+    size_t lighton_activation_charges[128];
+    void *lighton_activation_buffers[128];
+    void *lighton_activation_fences[128];
+    void *lightonocr3_vision_pack_buffers[2];
+    void *lightonocr3_vision_pack_owners[2];
+    void *lighton_attention_batch_scratch[2];
+    size_t lighton_activation_limit;
+    size_t lighton_activation_bytes;
+    size_t lighton_activation_peak;
+    uint64_t lighton_activation_hits;
+    uint64_t lighton_activation_duplicate_retirements;
+    uint64_t lighton_activation_prefill_hits;
+    uint64_t lighton_activation_prefill_hit_bytes;
+    bool lighton_activation_prefill;
+    bool lighton_activation_capture_decode;
+    BOOL lighton_vision_workspace_keep;
+    uint64_t lighton_vision_workspace_allocations;
+    uint64_t lighton_vision_workspace_reuses;
+    uint64_t lighton_attention_batch_kernel_calls;
+    uint64_t lighton_attention_batch_calls;
+    uint64_t lighton_attention_batch_rows;
+    bool lighton_prefill_stream_pack_reuse;
+} antfly_metal_decoder_cache_custody;
+
+void *antfly_metal_decoder_cache_custody_create(void) {
+    return calloc(1, sizeof(antfly_metal_decoder_cache_custody));
+}
+
+int antfly_metal_decoder_cache_custody_clear(void *raw) {
+    antfly_metal_decoder_cache_custody *state = raw;
+    if (state == NULL || state->occupied || state->runtime != NULL) return -1;
+    for (size_t i = 0; i < 128; ++i) {
+        id<MTLBuffer> owned = (__bridge_transfer id<MTLBuffer>)state->lighton_activation_buffers[i];
+        state->lighton_activation_buffers[i] = NULL;
+        (void)owned;
+    }
+    for (size_t i = 0; i < 128; ++i) {
+        id<MTLCommandBuffer> owned = (__bridge_transfer id<MTLCommandBuffer>)state->lighton_activation_fences[i];
+        state->lighton_activation_fences[i] = NULL;
+        (void)owned;
+    }
+    for (size_t i = 0; i < 2; ++i) {
+        id<MTLBuffer> owned = (__bridge_transfer id<MTLBuffer>)state->lightonocr3_vision_pack_buffers[i];
+        state->lightonocr3_vision_pack_buffers[i] = NULL;
+        (void)owned;
+    }
+    for (size_t i = 0; i < 2; ++i) {
+        id<MTLCommandBuffer> owned = (__bridge_transfer id<MTLCommandBuffer>)state->lightonocr3_vision_pack_owners[i];
+        state->lightonocr3_vision_pack_owners[i] = NULL;
+        (void)owned;
+    }
+    for (size_t i = 0; i < 2; ++i) {
+        id<MTLBuffer> owned = (__bridge_transfer id<MTLBuffer>)state->lighton_attention_batch_scratch[i];
+        state->lighton_attention_batch_scratch[i] = NULL;
+        (void)owned;
+    }
+    memset(state, 0, sizeof(*state));
+    return 0;
+}
+
+void antfly_metal_decoder_cache_custody_destroy(void *raw) {
+    if (raw == NULL) return;
+    if (antfly_metal_decoder_cache_custody_clear(raw) != 0) abort();
+    free(raw);
+}
+
+static bool antfly_metal_decoder_cache_idle(termite_metal_decode_runtime *runtime) {
+    if (runtime == NULL || runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil || runtime->lighton_attention_batch != NULL) return false;
+    for (size_t i = 0; i < 128; ++i) {
+        id<MTLCommandBuffer> fence = runtime->lighton_activation_fences[i];
+        if (fence != nil && fence.status >= MTLCommandBufferStatusEnqueued && fence.status < MTLCommandBufferStatusCompleted) return false;
+    }
+    for (size_t i = 0; i < 2; ++i) {
+        id<MTLCommandBuffer> owner = runtime->lightonocr3_vision_pack_owners[i];
+        if (owner != nil && owner.status >= MTLCommandBufferStatusEnqueued && owner.status < MTLCommandBufferStatusCompleted) return false;
+    }
+    return true;
+}
+
+// Exchange rather than copy release authority. On take, state is empty and
+// runtime receives the empty phase bank. On restore, completed peer phase
+// resources move into state for checked-owner teardown; the old admitted bank
+// returns unchanged, including exact activation cache charges/configuration.
+static void antfly_metal_decoder_cache_exchange(termite_metal_decode_runtime *runtime, antfly_metal_decoder_cache_custody *state) {
+    for (size_t i = 0; i < 128; ++i) {
+        void *old = state->lighton_activation_buffers[i];
+        state->lighton_activation_buffers[i] = (__bridge_retained void *)runtime->lighton_activation_buffers[i];
+        runtime->lighton_activation_buffers[i] = (__bridge_transfer id<MTLBuffer>)old;
+    }
+    for (size_t i = 0; i < 128; ++i) {
+        void *old = state->lighton_activation_fences[i];
+        state->lighton_activation_fences[i] = (__bridge_retained void *)runtime->lighton_activation_fences[i];
+        runtime->lighton_activation_fences[i] = (__bridge_transfer id<MTLCommandBuffer>)old;
+    }
+    for (size_t i = 0; i < 2; ++i) {
+        void *old = state->lightonocr3_vision_pack_buffers[i];
+        state->lightonocr3_vision_pack_buffers[i] = (__bridge_retained void *)runtime->lightonocr3_vision_pack_buffers[i];
+        runtime->lightonocr3_vision_pack_buffers[i] = (__bridge_transfer id<MTLBuffer>)old;
+    }
+    for (size_t i = 0; i < 2; ++i) {
+        void *old = state->lightonocr3_vision_pack_owners[i];
+        state->lightonocr3_vision_pack_owners[i] = (__bridge_retained void *)runtime->lightonocr3_vision_pack_owners[i];
+        runtime->lightonocr3_vision_pack_owners[i] = (__bridge_transfer id<MTLCommandBuffer>)old;
+    }
+    for (size_t i = 0; i < 2; ++i) {
+        void *old = state->lighton_attention_batch_scratch[i];
+        state->lighton_attention_batch_scratch[i] = (__bridge_retained void *)runtime->lighton_attention_batch_scratch[i];
+        runtime->lighton_attention_batch_scratch[i] = (__bridge_transfer id<MTLBuffer>)old;
+    }
+    for (size_t i = 0; i < 128; ++i) {
+        size_t old = state->lighton_activation_charges[i];
+        state->lighton_activation_charges[i] = runtime->lighton_activation_charges[i];
+        runtime->lighton_activation_charges[i] = old;
+    }
+    { size_t old = state->lighton_activation_limit; state->lighton_activation_limit = runtime->lighton_activation_limit; runtime->lighton_activation_limit = old; }
+    { size_t old = state->lighton_activation_bytes; state->lighton_activation_bytes = runtime->lighton_activation_bytes; runtime->lighton_activation_bytes = old; }
+    { size_t old = state->lighton_activation_peak; state->lighton_activation_peak = runtime->lighton_activation_peak; runtime->lighton_activation_peak = old; }
+    { uint64_t old = state->lighton_activation_hits; state->lighton_activation_hits = runtime->lighton_activation_hits; runtime->lighton_activation_hits = old; }
+    { uint64_t old = state->lighton_activation_duplicate_retirements; state->lighton_activation_duplicate_retirements = runtime->lighton_activation_duplicate_retirements; runtime->lighton_activation_duplicate_retirements = old; }
+    { uint64_t old = state->lighton_activation_prefill_hits; state->lighton_activation_prefill_hits = runtime->lighton_activation_prefill_hits; runtime->lighton_activation_prefill_hits = old; }
+    { uint64_t old = state->lighton_activation_prefill_hit_bytes; state->lighton_activation_prefill_hit_bytes = runtime->lighton_activation_prefill_hit_bytes; runtime->lighton_activation_prefill_hit_bytes = old; }
+    { bool old = state->lighton_activation_prefill; state->lighton_activation_prefill = runtime->lighton_activation_prefill; runtime->lighton_activation_prefill = old; }
+    { bool old = state->lighton_activation_capture_decode; state->lighton_activation_capture_decode = runtime->lighton_activation_capture_decode; runtime->lighton_activation_capture_decode = old; }
+    { BOOL old = state->lighton_vision_workspace_keep; state->lighton_vision_workspace_keep = runtime->lighton_vision_workspace_keep; runtime->lighton_vision_workspace_keep = old; }
+    { uint64_t old = state->lighton_vision_workspace_allocations; state->lighton_vision_workspace_allocations = runtime->lighton_vision_workspace_allocations; runtime->lighton_vision_workspace_allocations = old; }
+    { uint64_t old = state->lighton_vision_workspace_reuses; state->lighton_vision_workspace_reuses = runtime->lighton_vision_workspace_reuses; runtime->lighton_vision_workspace_reuses = old; }
+    { uint64_t old = state->lighton_attention_batch_kernel_calls; state->lighton_attention_batch_kernel_calls = runtime->lighton_attention_batch_kernel_calls; runtime->lighton_attention_batch_kernel_calls = old; }
+    { uint64_t old = state->lighton_attention_batch_calls; state->lighton_attention_batch_calls = runtime->lighton_attention_batch_calls; runtime->lighton_attention_batch_calls = old; }
+    { uint64_t old = state->lighton_attention_batch_rows; state->lighton_attention_batch_rows = runtime->lighton_attention_batch_rows; runtime->lighton_attention_batch_rows = old; }
+    { bool old = state->lighton_prefill_stream_pack_reuse; state->lighton_prefill_stream_pack_reuse = runtime->lighton_prefill_stream_pack_reuse; runtime->lighton_prefill_stream_pack_reuse = old; }
+}
+
+int antfly_metal_decoder_cache_custody_take(termite_metal_decode_runtime *runtime, void *raw) {
+    antfly_metal_decoder_cache_custody *state = raw;
+    if (state == NULL || state->occupied || state->runtime != NULL) return -1;
+    if (!antfly_metal_decoder_cache_idle(runtime)) return -2;
+    antfly_metal_decoder_cache_exchange(runtime, state);
+    state->runtime = runtime;
+    state->occupied = true;
+    return 0;
+}
+
+int antfly_metal_decoder_cache_custody_restore(termite_metal_decode_runtime *runtime, void *raw) {
+    antfly_metal_decoder_cache_custody *state = raw;
+    if (state == NULL || !state->occupied || state->runtime != runtime) return -1;
+    if (!antfly_metal_decoder_cache_idle(runtime)) return -2;
+    antfly_metal_decoder_cache_exchange(runtime, state);
+    // Displaced completed peer handles now have explicit custody. Managed
+    // callers move them into an independently registered current-B SDK cell;
+    // no displaced backing is cleared under numerical/provider authority.
+    state->runtime = NULL;
+    state->occupied = false;
+    return 0;
+}
+
+// SDK-free byte declaration for both cold custody banks. Allocator bookkeeping
+// and opaque SDK internals are outside this exact authored metadata span.
+size_t antfly_metal_decoder_cache_custody_metadata_bytes(void) {
+    return sizeof(antfly_metal_decoder_cache_custody);
+}
+
+static bool antfly_metal_decoder_cache_custody_empty(const antfly_metal_decoder_cache_custody *state) {
+    if (state == NULL || state->occupied || state->runtime != NULL) return false;
+    for (size_t i = 0; i < 128; ++i)
+        if (state->lighton_activation_buffers[i] != NULL || state->lighton_activation_fences[i] != NULL) return false;
+    for (size_t i = 0; i < 2; ++i)
+        if (state->lightonocr3_vision_pack_buffers[i] != NULL || state->lightonocr3_vision_pack_owners[i] != NULL || state->lighton_attention_batch_scratch[i] != NULL) return false;
+    return true;
+}
+
+// Caller registers the independent destination cell under NOW's actual B
+// BEFORE this exchange. No SDK handle is released here: displaced peer backing
+// moves into that SDK-only cell, which clears only after B's actual unlock.
+int antfly_metal_decoder_cache_custody_restore_into(termite_metal_decode_runtime *runtime, void *raw, void *destination) {
+    antfly_metal_decoder_cache_custody *state = raw;
+    antfly_metal_decoder_cache_custody *retired = destination;
+    if (state == retired || !antfly_metal_decoder_cache_custody_empty(retired)) return -1;
+    int status = antfly_metal_decoder_cache_custody_restore(runtime, state);
+    if (status != 0) return status;
+    *retired = *state; // raw retained handles: move authority, no ARC copy/free
+    memset(state, 0, sizeof(*state));
+    return 0;
+}

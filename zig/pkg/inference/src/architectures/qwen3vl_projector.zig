@@ -829,7 +829,9 @@ fn encodeProjectedImagesFromStoreQualified(
 /// reside on the model compute backend. This is the BF16 counterpart of the
 /// split GGUF projector path and deliberately shares the exact preprocessing,
 /// M-RoPE, DeepStack, and decoder-injection graph.
-fn embedSpatialPatchRows(cb: *const ComputeBackend, allocator: std.mem.Allocator, weights: *WeightCache, cfg: Config, patches: []const f32, geometry: Geometry) !CT {
+fn embedSpatialPatchRows(cb: *const ComputeBackend, allocator: std.mem.Allocator, weights: *WeightCache, cfg: Config, prepared: *const PreparedImage) !CT {
+    const patches = prepared.patch_rows;
+    const geometry = prepared.geometry;
     const bias = try weights.weight("v.patch_embd.bias");
     const patch_dim = cfg.patch_size * cfg.patch_size * 3;
     const full = if (comptime build_options.enable_cuda)
@@ -837,7 +839,7 @@ fn embedSpatialPatchRows(cb: *const ComputeBackend, allocator: std.mem.Allocator
     else
         null;
     if (full) |weight| {
-        const temporal = try duplicateStillImageTemporalPatches(allocator, patches, geometry.patchCount(), cfg.patch_size);
+        const temporal = try prepared.cudaTemporalPatchRows(allocator);
         defer allocator.free(temporal);
         const input = try cb.fromFloat32Shape(temporal, &.{ @intCast(geometry.patchCount()), @intCast(patch_dim * 2) });
         defer cb.free(input);
@@ -994,7 +996,7 @@ fn encodePreparedProjectedImagesResidentBatchedPolicy(
         const current = prepared.geometry;
         if (index != 0 and (current.width != geometry.width or current.height != geometry.height)) return error.VisionBatchGeometryMismatch;
         if (index == 0) geometry = current;
-        const embedded = try embedSpatialPatchRows(cb, allocator, &weights, cfg, prepared.patch_rows, current);
+        const embedded = try embedSpatialPatchRows(cb, allocator, &weights, cfg, prepared);
         defer cb.free(embedded);
         const positioned = try addInterpolatedPositionsTensor(cb, allocator, &weights, embedded, cfg, current);
         defer cb.free(positioned);
@@ -1320,6 +1322,20 @@ pub const PreparedImage = struct {
     preprocess_ns: u64,
     patchify_ns: u64,
 
+    /// Actual integrated CUDA producer always uses the full resident temporal
+    /// patch weight and uploads C,T=2,H,W rows. No aggregate image/token bytes.
+    pub fn cudaPatchUploadBytes(self: *const PreparedImage, config: gpt_config.Config, limits: Limits) !usize {
+        const cfg = try configFromResidentModel(config);
+        try self.validateFor(cfg, limits);
+        return cudaPatchUploadBytesForGeometry(cfg, self.geometry);
+    }
+
+    /// Same C,T=2,H,W duplication consumed by the actual resident CUDA patch
+    /// embedding. No resize/normalization or alternate numerical body here.
+    pub fn cudaTemporalPatchRows(self: *const PreparedImage, allocator: std.mem.Allocator) ![]f32 {
+        return duplicateStillImageTemporalPatches(allocator, self.patch_rows, self.geometry.patchCount(), self.cfg.patch_size);
+    }
+
     pub fn deinit(self: *PreparedImage) void {
         self.allocator.free(self.patch_rows);
     }
@@ -1335,6 +1351,35 @@ pub const PreparedImage = struct {
         if (!std.meta.eql(expected, self.geometry) or self.patch_rows.len != try admissionMul(expected.patchCount(), patch_dim)) return error.InvalidPreparedImage;
     }
 };
+
+fn cudaPatchUploadBytesForGeometry(cfg: Config, geometry: Geometry) !usize {
+    const patch_dim = try admissionMul(try admissionMul(cfg.patch_size, cfg.patch_size), 3);
+    return admissionMul(try admissionMul(geometry.patchCount(), patch_dim), 2 * @sizeOf(f32));
+}
+
+/// Exact maximum SINGLE upload selected by embedSpatialPatchRows for resident
+/// CUDA. Reuses the real decoder header and resize/merge geometry; no pixel
+/// payload is allocated or retained and serial multi-image host peaks stay max.
+pub fn planResidentCudaPatchUploadBytes(config: gpt_config.Config, images: []const []const u8, limits: Limits) !usize {
+    return planResidentCudaPatchUploadBytesAtMost(config, images, limits, std.math.maxInt(usize));
+}
+/// Value-only maximum bounded by the actual receiving runtime's capacity.
+/// Larger actual uploads are excluded, never clamped into fabricated credit.
+pub fn planResidentCudaPatchUploadBytesAtMost(config: gpt_config.Config, images: []const []const u8, limits: Limits, maximum_upload_bytes: usize) !usize {
+    try limits.validate();
+    if (images.len == 0 or images.len > limits.max_images) return error.ImageLimitExceeded;
+    const cfg = try configFromResidentModel(config);
+    var largest: usize = 0;
+    for (images) |bytes| {
+        if (bytes.len == 0 or bytes.len > limits.max_encoded_image_bytes) return error.VisionAdmissionExceeded;
+        const info = try image.inspectEncodedForInference(bytes, null);
+        if (try admissionMul(info.width, info.height) > limits.max_decoded_pixels) return error.VisionAdmissionExceeded;
+        const geometry = try targetGeometry(cfg, info.width, info.height, limits);
+        const bytes_needed = try cudaPatchUploadBytesForGeometry(cfg, geometry);
+        if (bytes_needed <= maximum_upload_bytes) largest = @max(largest, bytes_needed);
+    }
+    return largest;
+}
 
 /// Decode, resize and patchify without accessing a shared ComputeBackend.
 /// The caller must acquire its page's full host admission before calling.
@@ -1539,7 +1584,7 @@ fn encodePreparedSingleImage(
         null;
     errdefer if (preprocess_spatial_patches) |patches| allocator.free(patches);
     failed_stage = "patch_embedding";
-    const embedded = embedSpatialPatchRows(cb, allocator, weights, cfg, patch_rows, geometry) catch |err| {
+    const embedded = embedSpatialPatchRows(cb, allocator, weights, cfg, prepared) catch |err| {
         zig017_return_error = err;
         return err;
     };
@@ -3006,6 +3051,11 @@ test "LightOnOCR3 CPU image preparation owns patches and binds model geometry" {
     defer prepared.deinit();
     try prepared.validateFor(try configFromResidentModel(model), .{});
     try std.testing.expect(prepared.patch_rows.len > 0 and prepared.geometry.tokenCount() > 0);
+    const planned = try planResidentCudaPatchUploadBytes(model, &.{ bytes, bytes }, .{});
+    const actual_upload = try prepared.cudaTemporalPatchRows(a);
+    defer a.free(actual_upload);
+    try std.testing.expectEqual(std.mem.sliceAsBytes(actual_upload).len, planned); // max single, never image sum
+    try std.testing.expectEqual(planned, try prepared.cudaPatchUploadBytes(model, .{}));
     var other = prepared.cfg;
     other.text_hidden += 1;
     try std.testing.expectError(error.InvalidPreparedImage, prepared.validateFor(other, .{}));
