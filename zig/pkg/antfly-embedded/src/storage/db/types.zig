@@ -1956,6 +1956,9 @@ pub const SearchRequest = struct {
     graph_work_budget: ?*@import("../../graph/work_budget.zig").WorkBudget = null,
     /// Trusted request-local preparation, never decoded from public input.
     value_search_execution: @import("../../search/value_query.zig").Policy = .{},
+    /// Borrowed, request-local proof of an already selected bounded key set.
+    /// Retained after native filters are consumed; never encoded on the wire.
+    value_search_candidate_keys: []const []const u8 = &.{},
     value_search_work: ?*@import("../../search/value_query.zig").Work = null,
     value_search_scope: ?@import("../../search/value_membership.zig").Scope = null,
     native_text_tie_rank: ?@import("../../search/scorer.zig").TieRank = null,
@@ -2174,6 +2177,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "field_projection_json",
     "field_projection_plan",
     "field_projection_transport",
+    "value_search_candidate_keys",
     "value_search_work",
     "value_search_scope",
     "document_authority_mode",

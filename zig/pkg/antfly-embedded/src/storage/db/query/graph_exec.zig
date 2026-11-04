@@ -3451,18 +3451,20 @@ pub const CompiledPatternFilter = union(enum) {
         };
     }
 
-    pub fn bindValueWork(self: CompiledPatternFilter, work: *@import("../../../search/value_query.zig").Work, policy: @import("../../../search/value_query.zig").Policy) !void {
+    pub const VerificationInput = enum { scan, known_keys };
+
+    pub fn bindValueWork(self: CompiledPatternFilter, work: *@import("../../../search/value_query.zig").Work, policy: @import("../../../search/value_query.zig").Policy, input: VerificationInput) !void {
         switch (self) {
             .logical_value => |matcher| {
-                if (!policy.allow_scan) return error.ValueSearchRequiresScan;
+                if (!policy.allow_scan and input != .known_keys) return error.ValueSearchRequiresScan;
                 matcher.work = work;
                 matcher.policy = policy;
             },
-            .conjuncts, .disjuncts => |items| for (items) |item| try item.bindValueWork(work, policy),
+            .conjuncts, .disjuncts => |items| for (items) |item| try item.bindValueWork(work, policy, input),
             .bool_query => |b| {
-                for (b.must) |item| try item.bindValueWork(work, policy);
-                for (b.should) |item| try item.bindValueWork(work, policy);
-                for (b.must_not) |item| try item.bindValueWork(work, policy);
+                for (b.must) |item| try item.bindValueWork(work, policy, input);
+                for (b.should) |item| try item.bindValueWork(work, policy, input);
+                for (b.must_not) |item| try item.bindValueWork(work, policy, input);
             },
             else => {},
         }

@@ -1471,6 +1471,29 @@ fn loadParentStoredForGroupedHits(
     }
 }
 
+// Verification over an exact, bounded key set is not table enumeration. Check
+// the actual result identities too; a bare result-size limit is not a proof.
+fn storedValueVerificationInput(req: types.SearchRequest, hits: []const types.SearchHit) graph_exec.CompiledPatternFilter.VerificationInput {
+    var single: [1][]const u8 = undefined;
+    const keys = if (req.value_search_candidate_keys.len != 0)
+        req.value_search_candidate_keys
+    else if (req.filter_doc_ids_positive or req.filter_doc_ids.len != 0)
+        req.filter_doc_ids
+    else if (req.hierarchy_children) |children| blk: {
+        if (children.artifact_name == null or req.hierarchy_parent_admitted) return .scan;
+        single[0] = children.parent_id;
+        break :blk if (children.parent_ids.len != 0) children.parent_ids else &single;
+    } else return .scan;
+    if (keys.len > types.max_canonical_hierarchy_groups or hits.len > keys.len) return .scan;
+    for (hits) |hit| {
+        const included = for (keys) |key| {
+            if (std.mem.eql(u8, hit.id, key)) break true;
+        } else false;
+        if (!included) return .scan;
+    }
+    return .known_keys;
+}
+
 pub fn applyStoredSearchPatternFilters(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -1534,8 +1557,9 @@ pub fn applyStoredSearchPatternFilters(
     var local_value_work: @import("../../../search/value_query.zig").Work = .{};
     defer local_value_work.deinit(alloc);
     const value_work = req.value_search_work orelse &local_value_work;
-    if (compiled_filter) |compiled| try compiled.bindValueWork(value_work, req.value_search_execution);
-    if (compiled_exclusion) |compiled| try compiled.bindValueWork(value_work, req.value_search_execution);
+    const verification_input = storedValueVerificationInput(req, result.hits);
+    if (compiled_filter) |compiled| try compiled.bindValueWork(value_work, req.value_search_execution, verification_input);
+    if (compiled_exclusion) |compiled| try compiled.bindValueWork(value_work, req.value_search_execution, verification_input);
 
     const logical_verification = (if (compiled_filter) |compiled| compiled.hasLogicalValues() else false) or
         (if (compiled_exclusion) |compiled| compiled.hasLogicalValues() else false);
@@ -3638,4 +3662,40 @@ test "native unit ancestry uses its configured producer name" {
     var info = try parseChunkAncestorInfoAlloc(alloc, key, "{\"_parent_doc_key\":\"doc:a\",\"text\":\"spoken words\"}");
     defer info.deinit(alloc);
     try std.testing.expectEqualStrings(key, info.unit_key.?);
+}
+
+test "native member value verification retains scan policy and work budgets" {
+    const alloc = std.testing.allocator;
+    const Loader = struct {
+        fn unused(_: ?*anyopaque, _: Allocator, _: []const u8) !?[]u8 {
+            return error.TestUnexpectedLoad;
+        }
+    };
+    for ([_]enum { keys, provenance, parent, unbounded, outside, budget }{ .keys, .provenance, .parent, .unbounded, .outside, .budget }) |mode| {
+        const hits = try alloc.alloc(types.SearchHit, 1);
+        hits[0] = .{ .id = try alloc.dupe(u8, if (mode == .outside) "outside" else "doc"), .stored_data = try alloc.dupe(u8, "{\"source_id\":\"selected\"}") };
+        var result: types.SearchResult = .{ .alloc = alloc, .hits = hits, .total_hits = 1 };
+        defer result.deinit();
+        var req: types.SearchRequest = .{ .filter_query_json = "{\"value\":{\"kind\":\"equals\",\"field\":\"source_id\",\"text\":\"selected\"}}" };
+        if (mode == .provenance) {
+            req.value_search_candidate_keys = &.{"doc"};
+        } else if (mode == .parent) {
+            req.hierarchy_children = .{ .parent_id = "doc", .artifact_name = "summary" };
+            req.return_mode = .member;
+        } else if (mode != .unbounded) {
+            req.filter_doc_ids = &.{"doc"};
+            req.filter_doc_ids_positive = true;
+        }
+        if (mode == .budget) req.value_search_execution.max_bytes = 1;
+        const executor: StoredPatternFilterExecutor = .{ .ctx = null, .load_stored = Loader.unused };
+        if (mode == .unbounded or mode == .outside) {
+            try std.testing.expectError(error.ValueSearchRequiresScan, applyStoredSearchPatternFilters(alloc, req, result, executor));
+        } else if (mode == .budget) {
+            try std.testing.expectError(error.ValueSearchLimitExceeded, applyStoredSearchPatternFilters(alloc, req, result, executor));
+        } else {
+            result = try applyStoredSearchPatternFilters(alloc, req, result, executor);
+            try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        }
+        try std.testing.expect(!req.value_search_execution.allow_scan);
+    }
 }
