@@ -16,6 +16,10 @@ All notable changes to Antfly will be documented in this file.
 
 ### [Unreleased]
 
+- **`@antfly/design-system` license** — first-party code in the package is now
+  Apache-2.0, matching the rest of the repository. shadcn/ui-derived code keeps
+  its MIT notice, and the Aeonik font files are excluded from the package license.
+
 - **evalaf removed** — remove the unused `go/pkg/evalaf` evaluation module and
   its Antfly plugin. Nothing in this repository depends on them.
 

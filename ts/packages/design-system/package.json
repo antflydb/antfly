@@ -3,7 +3,7 @@
   "version": "0.3.0",
   "description": "Antfly's shared shadcn/ui component library: primitives, compound components, brand blocks, design tokens, and Aeonik.",
   "author": "Antfly, Inc. <contact@antfly.io>",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/antflydb/antfly.git",
@@ -27,7 +27,9 @@
   ],
   "files": [
     "dist",
-    "src/fonts"
+    "src/fonts",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
