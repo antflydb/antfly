@@ -337,11 +337,11 @@ close the issuing handle and reopen first). Call
 `db.forgetOutcomeReceipt(receipt)` once resolved; afterwards it can no
 longer be resolved.
 
-`batchJson` / `batchJsonRaw` rejections carry `.outcomeReceipt` too: they use
-`antfly_db_batch_json_with_receipt`, which returns the receipt from the same
+`batch`, `batchJson` and `batchJsonRaw` rejections carry `.outcomeReceipt`
+too: they use `antfly_db_batch_with_receipt` and
+`antfly_db_batch_json_with_receipt`, which return the receipt from the same
 native call (the thread-local `antfly_last_error_outcome_receipt` cannot follow
-an async call to a worker thread). The struct-based `batch` has no same-call
-variant and carries no receipt; use `batchJson` when you need one.
+an async call to a worker thread).
 
 ## API surface
 

@@ -2685,14 +2685,19 @@ pub fn antfly_db_batch_json_with_receipt(handle_ptr: ?*anyopaque, request_json: 
         return @call(.auto, @extern(*const @TypeOf(antfly_db_batch_json_with_receipt), .{ .name = "antfly_db_batch_json_with_receipt" }), .{ handle_ptr, request_json, out_buf, receipt_out });
     if (receipt_out) |out| out.* = .{};
     const code = antfly_db_batch_json(handle_ptr, request_json, out_buf);
-    if (code == .outcome_unknown) if (receipt_out) |out| {
-        const receipts = @import("outcome_receipts.zig");
-        if (receipts.lastReceipt()) |receipt| {
-            var buf: [receipts.max_text_len]u8 = undefined;
-            out.* = dupBytes(receipts.format(receipt, &buf)) catch .{};
-        }
-    };
+    copyLastReceipt(code, receipt_out);
     return code;
+}
+
+/// The same-call receipt for the `*_with_receipt` exports.
+fn copyLastReceipt(code: capi.ErrorCode, receipt_out: ?*capi.Buffer) void {
+    if (code != .outcome_unknown) return;
+    const out = receipt_out orelse return;
+    const receipts = @import("outcome_receipts.zig");
+    if (receipts.lastReceipt()) |receipt| {
+        var buf: [receipts.max_text_len]u8 = undefined;
+        out.* = dupBytes(receipts.format(receipt, &buf)) catch .{};
+    }
 }
 
 pub const ANTFLY_OUTCOME_RECEIPT_APPLIED: u8 = 1;
@@ -2721,7 +2726,7 @@ pub fn antfly_db_outcome_receipt_status(handle_ptr: ?*anyopaque, receipt: capi.S
         if (@import("lite_connection.zig").Owner.needsOutcomeReconciliation(root))
             return capi.recordError(.stalled, @src().fn_name ++ ": the uncertain commit is not reconciled yet; retry");
     };
-    const database = receiptDatabase(root, &parsed) catch |err| return capi.mapErrorContext(err, if (err == error.UndefinedTable) @src().fn_name ++ ": the receipt's table was dropped or replaced; its outcome cannot be determined here" else @src().fn_name);
+    const database = receiptDatabase(root, &parsed) catch |err| return capi.mapErrorContext(err, if (err == error.TableNotFound) @src().fn_name ++ ": the receipt's table was dropped or replaced; its outcome cannot be determined here" else @src().fn_name);
     const persisted = database.readOutcomeMarker(marker.writer) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     const disposition = @import("../storage/db/apply_receipts.zig").outcomeDisposition(persisted, marker.sequence) catch
         return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": the receipt does not match this database");
@@ -2746,8 +2751,9 @@ fn receiptRoot(guard: HandleGuard) *Handle {
 /// receipt: report it missing rather than "not applied".
 fn receiptDatabase(root: *Handle, receipt: *const @import("outcome_receipts.zig").Receipt) !*db_mod.DB {
     const ref = receipt.table() orelse return &root.db;
-    const database = try @import("tables.zig").get(root, ref.name);
-    if (database.core.identity_namespace.table_id != ref.id) return error.UndefinedTable;
+    const database = @import("tables.zig").get(root, ref.name) catch |err|
+        return if (err == error.UndefinedTable) error.TableNotFound else err;
+    if (database.core.identity_namespace.table_id != ref.id) return error.TableNotFound;
     return database;
 }
 
@@ -2764,7 +2770,7 @@ pub fn antfly_db_outcome_receipt_forget(handle_ptr: ?*anyopaque, receipt: capi.S
     const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     defer guard.leave();
     if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
-    const database = receiptDatabase(receiptRoot(guard), &parsed) catch |err| return capi.mapErrorContext(err, if (err == error.UndefinedTable) @src().fn_name ++ ": the receipt's table was dropped or replaced; its outcome cannot be determined here" else @src().fn_name);
+    const database = receiptDatabase(receiptRoot(guard), &parsed) catch |err| return capi.mapErrorContext(err, if (err == error.TableNotFound) @src().fn_name ++ ": the receipt's table was dropped or replaced; its outcome cannot be determined here" else @src().fn_name);
     database.deleteOutcomeMarker(marker.writer) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     return .ok;
 }
@@ -4919,6 +4925,27 @@ pub fn antfly_db_batch(
     var primary_committed = false;
     batchInternal(handle, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level, &primary_committed) catch |err| return batchFailureCode(err, primary_committed);
     return .ok;
+}
+
+/// `antfly_db_batch` that also returns the outcome receipt in the same call,
+/// like `antfly_db_batch_json_with_receipt`. `receipt_out` is filled only on
+/// ANTFLY_OUTCOME_UNKNOWN with a receipt; the caller frees it.
+pub fn antfly_db_batch_with_receipt(
+    handle_ptr: ?*anyopaque,
+    writes_ptr: ?[*]const capi.WriteIntent,
+    write_count: usize,
+    predicates_ptr: ?[*]const capi.VersionPredicate,
+    predicate_count: usize,
+    timestamp_ns: u64,
+    sync_level: u8,
+    receipt_out: ?*capi.Buffer,
+) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_batch_with_receipt), .{ .name = "antfly_db_batch_with_receipt" }), .{ handle_ptr, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level, receipt_out });
+    if (receipt_out) |out| out.* = .{};
+    const code = antfly_db_batch(handle_ptr, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level);
+    copyLastReceipt(code, receipt_out);
+    return code;
 }
 
 pub fn antfly_db_batch_json(
@@ -10379,6 +10406,7 @@ comptime {
     @import("exports.zig").publish(@This(), &.{
         "antfly_last_error_outcome_receipt",
         "antfly_db_batch_json_with_receipt",
+        "antfly_db_batch_with_receipt",
         "antfly_db_outcome_receipt_status",
         "antfly_db_outcome_receipt_forget",
         "antfly_db_memory_json",

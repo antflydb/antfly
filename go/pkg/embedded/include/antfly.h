@@ -444,6 +444,17 @@ antfly_error_code antfly_db_batch_json_with_receipt(
     antfly_buffer *out,
     antfly_buffer *receipt_out
 );
+/* antfly_db_batch with the same-call receipt, as above. */
+antfly_error_code antfly_db_batch_with_receipt(
+    antfly_db *db,
+    const antfly_write_intent *writes,
+    size_t write_count,
+    const antfly_version_predicate *predicates,
+    size_t predicate_count,
+    uint64_t timestamp_ns,
+    uint8_t sync_level,
+    antfly_buffer *receipt_out
+);
 antfly_error_code antfly_db_outcome_receipt_status(
     antfly_db *db,
     antfly_slice receipt,

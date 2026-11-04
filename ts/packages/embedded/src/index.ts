@@ -92,11 +92,11 @@ export { SqlError } from "./sql-types.js";
 export type {
   Capabilities,
   CheckReport,
-  LiveByteAccounting,
-  LiveByteCategory,
   CompactReport,
   InferenceOptions,
   InferenceStatus,
+  LiveByteAccounting,
+  LiveByteCategory,
   MemoryAdmissionStats,
   OpenOptions,
   OutcomeReceiptStatus,

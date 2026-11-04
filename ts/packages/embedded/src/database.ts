@@ -383,16 +383,24 @@ export class Database implements AsyncDisposable {
   batch(writes: WriteIntent[], timestampNs: Uint64Like): Promise<void> {
     return this.#run(async (handle) => {
       const cWrites = writes.length ? writes.map(toNativeWriteIntent) : null;
+      // The same-call variant: the receipt cannot follow an async call to
+      // another worker thread through the thread-local accessor.
+      const receiptOut: DecodedBuffer = newBufferOut();
       const code = await callAsync(
-        this.#native.dbBatch,
+        this.#native.dbBatchWithReceipt,
         handle,
         cWrites,
         writes.length,
         null,
         0,
         timestampNs,
-        0
+        0,
+        receiptOut
       );
+      const receipt = takeBuffer(this.#native, receiptOut);
+      if (code === ErrorCode.OutcomeUnknown && receipt.length) {
+        throw new OutcomeUnknownError(undefined, receipt.toString("utf8"));
+      }
       checkCode(code);
     });
   }

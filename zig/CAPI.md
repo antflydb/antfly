@@ -754,7 +754,7 @@ equal means applied, lower or absent means not applied. A SQL write to a named
 table commits the marker in that table's own database, and its receipt names
 the table and its durable table id, so status and forget read the database the
 write committed to. If that table has since been dropped, or dropped and
-recreated under the same name, status and forget fail instead of answering:
+recreated under the same name, status and forget fail with `ANTFLY_NOT_FOUND`:
 the write's outcome can no longer be read. The
 cost is one small internal key overwrite per exported write. A clean close removes the handle's
 current marker; `antfly_db_outcome_receipt_forget` removes a resolved

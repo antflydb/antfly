@@ -341,7 +341,8 @@ test "capi SQL outcome receipt writer retires after an unknown outcome and track
     try std.testing.expect(writer.hasCloseCleanup());
     writer.retire(second, .{ .name = "orders", .id = 3 });
     try std.testing.expectEqual(second.sequence, lastReceipt().?.marker.sequence);
-    try std.testing.expectEqualStrings("orders", lastReceipt().?.table().?);
+    try std.testing.expectEqualStrings("orders", lastReceipt().?.table().?.name);
+    try std.testing.expectEqual(@as(u64, 3), lastReceipt().?.table().?.id);
     try std.testing.expect(isPending(second.writer));
     // A retired writer is never reused, and is not cleaned up at close.
     try std.testing.expect(!writer.hasCloseCleanup());
