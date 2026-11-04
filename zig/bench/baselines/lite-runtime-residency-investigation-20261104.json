@@ -29,7 +29,63 @@
     "leaked": 0,
     "failure": "Source cache absent after replay settled."
   },
-  "change": "Keep an eligible source-origin runtime after its target settles and through compatible artifact/control turns. Recheck its inode/index/catalog/control witnesses even on idle background turns, discard on uncertainty or changed inputs, and schedule released artifact leases for cleanup. Reuse still resets primary observations and takes a new primary epoch. Artifact-only runtimes cannot gain source authority. Residency remains bounded to root plus one named namespace; merge jobs retain independent references.",
-  "validation": "Full Debug C API/ABI/SDK gates and a seeded unchanged-importer run pending. This closes a reproduced lifetime gap; it does not yet establish that populated-database replay capacity is fixed.",
-  "reference_policy": "No reference rebuild or execution. Wolfspider is reserved for final qualification after local validation."
+  "change": "Keep eligible source-origin runtimes after their target settles and through compatible artifact/control turns. Retain a bounded working set of root plus eight named namespaces, evicting the least recently selected at capacity. Recheck every resident inode/index/catalog/control witness even on idle turns. Fresh primary epochs and mutable source-observation reset remain mandatory. Artifact-only runtimes cannot gain source authority; merge jobs retain independent references. Preserve canonical outcome uncertainty before discarding detached owners, even when their source witness was already cleared.",
+  "validation": "The exact b0c4777fdd candidate passes the integrated Debug build, all 153 selected C API/SQL tests, ABI/linkage/smoke, writer admission, and all 209 SDK tests. The seeded unchanged-importer diagnostic is running; no E2E capacity or optimized performance pass is claimed.",
+  "reference_policy": "No reference rebuild or execution. Wolfspider is reserved for final qualification after local validation.",
+  "validated_candidate": {
+    "source_commit": "b0c4777fddb177549f4e5584707d1e94248fb1be",
+    "library_sha256": "0b81b8264ae15e5b9e440d524b6429357c51eed3a17ce3fe4d607bb5895d7b46",
+    "mode": "Debug",
+    "build_seconds": 418.52723754209,
+    "api_passed": 153,
+    "api_skipped": 0,
+    "api_failed": 0,
+    "api_leaked": 0,
+    "sdk_passed": 209,
+    "sdk_seconds": 76.11,
+    "public_exports": 134,
+    "namespace_working_set_test": {
+      "selections_before_eviction": 16,
+      "namespace_opens": 8,
+      "resident_limit": 8,
+      "durable_catalog_entries": 9,
+      "checks": [
+        "stable runtime address across rotation",
+        "least-recently-selected eviction",
+        "complete durable name catalog preserved",
+        "fresh admitted checkpoint before source rebinding"
+      ]
+    },
+    "uncertainty_regression": {
+      "kinds": [
+        "sql",
+        "checkpoint",
+        "secret"
+      ],
+      "with_and_without_source_witness": true,
+      "canonical_owner_remains_fenced": true
+    },
+    "first_gate_failure": "The new fixture passed an obsolete foreground header after immutable-reader lease publications. Its checkpoint rebinding now follows ordinary Owner.refresh admission. The corrected full gate passes."
+  },
+  "preceding_seeded_diagnostic": {
+    "source_commit": "f3896694925cdeeeee5fbb7e73ec7f177751e854",
+    "library_sha256": "e0228bdf8b10b48d17094a80fa97a63e23c9f4e42d6cac29dec9d3cbc606e97e",
+    "mode": "Debug",
+    "qualified": false,
+    "failure": "LiteReplayBacklogExceeded",
+    "seconds": 318.372777834069,
+    "overlapping_native_build_peak": 8,
+    "source_turns": 173,
+    "maintenance_runtime_opens": 81,
+    "namespace_opens": 217,
+    "source_reuses": 168,
+    "allocator_full_loads": 1,
+    "primary_writes": 48128,
+    "derived_profile_documents": 41736,
+    "replay_retained_namespaces": 2,
+    "largest_namespace_replay_entries_per_lane": 67,
+    "largest_namespace_replay_min_sequence": 59,
+    "largest_namespace_replay_max_sequence": 125,
+    "notes": "Diagnostic counters and completed-operation profiles only; not a clean throughput comparison. Cold read-only inspection reports full-text and generated-enrichment watermarks behind the source target. Provider/index state unsupported by the retained-text contract still reopens conservatively."
+  }
 }
