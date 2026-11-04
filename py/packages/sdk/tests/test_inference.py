@@ -660,6 +660,20 @@ def test_native_region_with_unknown_geometry_round_trips():
     assert region.to_dict() == raw
 
 
+@pytest.mark.parametrize("kind", ["page", "slide", "image"])
+def test_document_read_decodes_null_audio_metadata(kind):
+    payload = {
+        "object": "list",
+        "model": "document-reader",
+        "data": [{"object": "read", "index": 0, "kind": kind, "text": "Hello", "audio": None}],
+    }
+    client = AntflyClient("http://test")
+    install_transport(client, httpx.MockTransport(lambda _: httpx.Response(200, json=payload)))
+    result = client.read({"model": "document-reader", "images": [{"url": "fixture"}]})
+    assert result.data[0].audio is None
+    assert result.to_dict() == payload
+
+
 def test_direct_document_read_preserves_page_identity_and_artifact():
     request = {
         "model": "balanced",
@@ -743,6 +757,85 @@ def test_anthropic_config_and_signed_assistant_history_roundtrip() -> None:
     }
     assert InferenceGenerateMessage.from_dict(payload).to_dict() == payload
     assert InferenceChatMessage.from_dict(payload).to_dict() == payload
+
+
+@pytest.mark.parametrize("duration_ms", [90000, None])
+def test_audio_read_preserves_options_and_temporal_evidence(duration_ms):
+    from antfly.client_generated.models import InferenceAudioReadOptions, InferenceReadRequest
+
+    request = InferenceReadRequest(
+        model="transcribers/meeting",
+        audio="AAAA",
+        audio_options=InferenceAudioReadOptions(language="en", timestamps=True, diarization=False),
+    )
+    wire = request.to_dict()
+    assert "max_tokens" not in wire
+    assert wire["audio_options"]["diarization"] is False
+    payload = {
+        "object": "list",
+        "model": "transcribers/meeting",
+        "usage": None,
+        "data": [
+            {
+                "object": "read",
+                "index": 0,
+                "source_id": "audio-0",
+                "kind": "audio",
+                "coordinate_space": "none",
+                "origin": "transcription",
+                "status": "truncated",
+                "text": "héllo",
+                "audio": {
+                    "language": "en",
+                    "language_source": "forced",
+                    "duration_ms": duration_ms,
+                    "segments": [{"text": "héllo", "text_start": 0, "text_end": 6, "start_ms": 65000, "end_ms": 66000}],
+                },
+            }
+        ],
+    }
+
+    def handle(incoming):
+        assert incoming.url.path == "/ai/v1/read"
+        assert json.loads(incoming.read()) == wire
+        return httpx.Response(200, json=payload)
+
+    client = AntflyClient("http://test")
+    install_transport(client, httpx.MockTransport(handle))
+    assert client.read(request).to_dict() == payload
+
+
+@pytest.mark.parametrize("model", ["transcribers/meeting", "generators/multimodal"])
+@pytest.mark.parametrize("duration_ms", [500, None])
+def test_untimed_audio_read_decodes_actual_null_metadata(model, duration_ms):
+    from antfly.client_generated.models import InferenceReadRequest
+
+    payload = {
+        "object": "list",
+        "model": model,
+        "usage": None,
+        "data": [
+            {
+                "object": "read",
+                "index": 0,
+                "kind": "audio",
+                "coordinate_space": "none",
+                "origin": "transcription",
+                "status": "complete",
+                "text": "hello",
+                "audio": {
+                    "duration_ms": duration_ms,
+                    "language": None,
+                    "language_source": "unknown",
+                    "segments": None,
+                    "speakers": None,
+                },
+            }
+        ],
+    }
+    client = AntflyClient("http://test")
+    install_transport(client, httpx.MockTransport(lambda _: httpx.Response(200, json=payload)))
+    assert client.read(InferenceReadRequest(model=model, audio="AAAA")).to_dict() == payload
 
 
 @pytest.mark.parametrize("model", ["lightonai/LightOnOCR-3-0.8B", "another-reader"])

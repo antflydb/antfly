@@ -132,7 +132,7 @@ no `DB` attached -- models load on first use and stay cached until `Close`.
 Each method sends and receives the JSON of the matching `/ai/v1` route of the
 Antfly inference HTTP API (see `specs/openapi/inference/api.yaml`):
 `Embed`, `Rerank`, `Chunk`, `Generate`, `GenerateBatch`, `Rewrite`, `Extract`,
-`Read` (OCR), `Transcribe`, and `ListModels`. `Generate` always returns a
+`Read` (documents, images, or audio), and `ListModels`. `Generate` always returns a
 complete response; a request with `"stream": true` fails with
 `InvalidArgument`. Use `GenerateStream` to stream chunks instead.
 

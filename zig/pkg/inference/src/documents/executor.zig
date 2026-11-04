@@ -22,6 +22,7 @@ const ir = @import("representation.zig");
 const support = @import("source_support.zig");
 pub const Action = c.Action;
 pub const Candidate = struct {
+    audio: ?@import("antfly_documents").types.AudioMetadata = null,
     model: ?[]const u8 = null,
     status: ?c.Status = null,
     origin: c.Origin = .transcription,
@@ -32,6 +33,8 @@ pub const Candidate = struct {
     /// Quality judgments are advisory, never source-evidence proofs.
     confidence: ?f64 = null,
     truncated: bool = false,
+    /// Established from decoded source samples by the trusted audio reader.
+    silent_audio: bool = false,
 };
 pub const Observation = struct {
     page: c.Page,
@@ -85,7 +88,8 @@ fn defaultAction(r: c.Read, page: c.Page, region: ?c.Region) Action {
             return if (r.accurate_reader != null) .accurate else .unresolved;
         return .accept;
     }
-    if (page.status != .complete or !meaningful(page.text) or ir.hasFinding(page, "native_text_coverage_incomplete")) return if (r.accurate_reader != null) .accurate else .unresolved;
+    const silent_audio = page.kind == .audio and page.text.len == 0 and ir.hasFinding(page, "audio_silence");
+    if (page.status != .complete or (!meaningful(page.text) and !silent_audio) or ir.hasFinding(page, "native_text_coverage_incomplete")) return if (r.accurate_reader != null) .accurate else .unresolved;
     return .accept;
 }
 
@@ -288,6 +292,9 @@ fn annotate(a: A, page: *c.Page) !void {
 
 fn applyPage(a: A, supplied: c.Page, candidate: Candidate, model: []const u8, limit: usize) !c.Page {
     var page = supplied;
+    if (candidate.silent_audio and (page.kind != .audio or candidate.text.len != 0 or candidate.truncated)) return error.InvalidDocumentModelResult;
+    try ir.finding(a, &page, "audio_silence", candidate.silent_audio);
+    page.audio = if (candidate.audio) |audio| try std.json.parseFromSliceLeaky(@import("antfly_documents").types.AudioMetadata, a, try std.json.Stringify.valueAlloc(a, audio, .{}), .{}) else null;
     page.text = try a.dupe(u8, candidate.text);
     page.regions = try ir.cloneRegions(a, candidate.regions, limit);
     page.tables = try ir.cloneTables(a, candidate.tables, limit);
@@ -1054,4 +1061,21 @@ test "document pixel ownership ends when a region worker fails before the group 
     try std.testing.expectEqual(@as(usize, 0), record.pending.len);
     try std.testing.expectEqual(@as(u64, 3), record.used.pixels);
     try std.testing.expectEqual(@as(u64, 3), record.uncertain.pixels);
+}
+
+test "document silence evidence accepts empty audio without accepting empty recognition" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const input = c.Page{ .source_id = "clip", .number = 1, .kind = .audio, .coordinate_space = .none };
+    const read = c.Read{ .reader = "speech", .accurate_reader = "backup" };
+    const silent = try applyPage(work, input, .{ .text = "", .status = .complete, .silent_audio = true }, "speech", 16);
+    try std.testing.expectEqual(Action.accept, defaultAction(read, silent, null));
+    try std.testing.expect(ir.hasFinding(silent, "audio_silence"));
+    const empty = try applyPage(work, input, .{ .text = "", .status = .complete }, "speech", 16);
+    try std.testing.expectEqual(Action.accurate, defaultAction(read, empty, null));
+    try std.testing.expect(!ir.hasFinding(empty, "audio_silence"));
+    try std.testing.expectError(error.InvalidDocumentModelResult, applyPage(work, input, .{ .text = "invented", .silent_audio = true }, "speech", 16));
+    try std.testing.expectError(error.InvalidDocumentModelResult, applyPage(work, .{ .source_id = "image", .number = 1, .kind = .image }, .{ .text = "", .silent_audio = true }, "speech", 16));
 }

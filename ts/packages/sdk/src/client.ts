@@ -4008,7 +4008,6 @@ export type InferenceGatewayOperation =
   | "read"
   | "extract"
   | "rewrite"
-  | "transcribe"
   | "dictate"
   | "synthesize"
   | "predict"

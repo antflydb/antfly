@@ -153,8 +153,6 @@ export type {
   RewriteResponse,
   Style,
   TextContentPart,
-  TranscribeRequest,
-  TranscribeResponse,
   TransientCapacityError,
 } from "./inference-types.js";
 export { logLevels, logStyles } from "./inference-types.js";
@@ -568,3 +566,4 @@ export type {
 
 export { encodeGraphParameter, decodeGraphValue } from "./graph-wire.js";
 export type { GraphValue, GraphIdentity, GraphData, GraphDecoded } from "./graph-wire.js";
+export type { AudioReadOptions, AudioReadMetadata, AudioReadSegment } from "./inference-types.js";

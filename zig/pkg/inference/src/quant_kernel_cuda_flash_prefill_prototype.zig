@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Standalone differential and timing harness for the default-off SM89 F16
+//! Standalone differential and timing harness for the opt-in SM89/GB10 F16
 //! paged-GQA flash-prefill prototype.
 //!
 //! The harness loads an explicitly supplied candidate cubin and the checked-in
@@ -158,6 +158,7 @@ const Config = struct {
     candidate_head_group: u8 = 1,
     candidate_gqa2_concurrent_layout: bool = false,
     candidate_e4b_warp_layout: bool = false,
+    production_e4b_candidate: bool = false,
     layout: LayoutSelection = .all,
     pattern: PatternSelection = .all,
     seed: u64 = 0x6a09_e667_f3bc_c909,
@@ -517,6 +518,8 @@ fn parseConfig(args: []const []const u8) !Config {
             index += 1;
             if (index >= args.len) return error.MissingValue;
             cfg.baseline_cubin_path = args[index];
+        } else if (std.mem.eql(u8, arg, "--production-e4b-candidate")) {
+            cfg.production_e4b_candidate = true;
         } else if (std.mem.eql(u8, arg, "--head-dim")) {
             index += 1;
             if (index >= args.len) return error.MissingValue;
@@ -613,6 +616,9 @@ fn validateConfig(cfg: Config) !void {
     if (cfg.help) return;
     if (cfg.candidate_cubin_path == null or cfg.candidate_cubin_path.?.len == 0) return error.MissingCandidateCubin;
     if (cfg.baseline_cubin_path == null or cfg.baseline_cubin_path.?.len == 0) return error.MissingBaselineCubin;
+    if (cfg.production_e4b_candidate and (cfg.kv_heads != 2 or cfg.baseline_route != .scalar or
+        !cfg.candidate_e4b_warp_layout or cfg.candidate_query_tile != 64 or
+        cfg.candidate_key_tile != 16 or cfg.candidate_head_group != 1)) return error.InvalidProductionE4bCandidate;
     if (cfg.head_dim) |value| if (value != 256 and value != 512) return error.InvalidHeadDim;
     _ = flashSharedBytes(256, cfg.candidate_query_tile, cfg.candidate_key_tile, cfg.candidate_head_group) catch |err| switch (err) {
         error.InvalidTile => return error.InvalidTile,
@@ -1434,8 +1440,12 @@ fn writeResultsJson(
     var pass = true;
     for (results) |result| pass = pass and result.passes(cfg);
     try writer.print(
-        "{{\"schema\":\"antfly.cuda_flash_prefill_prototype.v4\",\"runtime_integrated\":false,\"architecture\":\"sm_89\",\"compute_capability\":\"{d}.{d}\",\"artifacts\":{{\"candidate_sha256\":\"{s}\",\"baseline_sha256\":\"{s}\"}},\"candidate\":\"wmma-f16-kv-f32-q\",\"baseline\":\"{s}\",\"candidate_query_tile\":{d},\"candidate_key_tile\":{d},\"candidate_head_group\":{d},\"scalar_reference\":\"standalone-f16-kv-f32-q\",\"pass\":{s},",
-        .{ compute_major, compute_minor, candidate_artifact_sha, baseline_artifact_sha, cfg.baseline_route.label(), cfg.candidate_query_tile, cfg.candidate_key_tile, cfg.candidate_head_group, if (pass) "true" else "false" },
+        "{{\"schema\":\"antfly.cuda_flash_prefill_prototype.v4\",\"runtime_integrated\":false,\"architecture\":\"sm_{d}{d}\",\"compute_capability\":\"{d}.{d}\",\"artifacts\":{{\"candidate_sha256\":\"{s}\",\"baseline_sha256\":\"{s}\"}},\"candidate\":\"wmma-f16-kv-f32-q\",\"baseline\":\"{s}\",\"candidate_query_tile\":{d},\"candidate_key_tile\":{d},\"candidate_head_group\":{d},\"scalar_reference\":\"standalone-f16-kv-f32-q\",\"pass\":{s},",
+        .{ compute_major, compute_minor, compute_major, compute_minor, candidate_artifact_sha, baseline_artifact_sha, cfg.baseline_route.label(), cfg.candidate_query_tile, cfg.candidate_key_tile, cfg.candidate_head_group, if (pass) "true" else "false" },
+    );
+    try writer.print(
+        "\"production_e4b_candidate\":{s},",
+        .{if (cfg.production_e4b_candidate) "true" else "false"},
     );
     try writer.print(
         "\"gates\":{{\"require_bitwise_candidate\":{s},\"max_abs\":{e:.12},\"max_rms_normalized\":{e:.12},\"cpu_sample_max_abs\":{e:.12},\"max_timing_cv\":{e:.12}}},\"results\":[",
@@ -1530,6 +1540,8 @@ fn writeUsage(writer: *std.Io.Writer) !void {
         \\Options:
         \\  --candidate-cubin PATH          Standalone WMMA prototype artifact
         \\  --baseline-cubin PATH           Checked-in canonical CUDA cubin
+        \\  --production-e4b-candidate      Load actual production E4B symbols from candidate;
+        \\                                  baseline supplies the standalone scalar oracle
         \\  --kv-heads 1|2                 E4B requires explicit q-len/prefix and scalar/MMA baseline
         \\  --head-dim all|256|512          Default: all
         \\  --q-len all|512|3               Default: all
@@ -1587,12 +1599,19 @@ pub fn main(init: std.process.Init) !void {
 
     var ctx = try cuda_context.CudaContext.initDefault();
     defer ctx.deinit();
-    if (ctx.info.compute_major != 8 or ctx.info.compute_minor != 9) return error.UnsupportedCudaArchitecture;
+    const sm89 = ctx.info.compute_major == 8 and ctx.info.compute_minor == 9;
+    const gb10_e4b = ctx.info.compute_major == 12 and ctx.info.compute_minor == 1 and cfg.kv_heads == 2;
+    if (!sm89 and !gb10_e4b) return error.UnsupportedCudaArchitecture;
     var candidate_module = try Module.load(&ctx, candidate_image);
     defer candidate_module.deinit(&ctx);
     var baseline_module = try Module.load(&ctx, baseline_image);
     defer baseline_module.deinit(&ctx);
-    const candidate_functions = try candidate_module.functions(&ctx);
+    const candidate_functions: Functions = if (cfg.production_e4b_candidate) .{
+        .flash256 = try loadFunction(&ctx, candidate_module.module, "antfly_gqa_attention_prefill_flash_sm89_e4b_hd256_swa512_f32_v1"),
+        .flash512 = try loadFunction(&ctx, candidate_module.module, "antfly_gqa_attention_prefill_flash_sm89_e4b_hd512_global_f32_v1"),
+        .reference256 = try loadFunction(&ctx, baseline_module.module, reference_hd256),
+        .reference512 = try loadFunction(&ctx, baseline_module.module, reference_hd512),
+    } else try candidate_module.functions(&ctx);
     const baseline_functions = try baseline_module.baselineFunctions(&ctx, cfg.baseline_route);
     for (specs, 0..) |spec, index| {
         results[index] = try runCase(allocator, &ctx, cfg, candidate_functions, baseline_functions, spec);
@@ -1629,6 +1648,25 @@ pub fn main(init: std.process.Init) !void {
     }
     try stdout.flush();
     if (!pass) return error.FlashPrefillPrototypeDifferentialExceeded;
+}
+
+test "production E4B candidate requires its launch layout and scalar oracle" {
+    const cfg = try parseConfig(&.{
+        "--candidate-cubin",          "production.fatbin",      "--baseline-cubin", "reference.cubin",
+        "--production-e4b-candidate", "--baseline-route",       "scalar",           "--kv-heads",
+        "2",                          "--q-len",                "2",                "--prefix",
+        "0",                          "--candidate-query-tile", "64",               "--candidate-e4b-warp-layout",
+    });
+    try std.testing.expect(cfg.production_e4b_candidate);
+    var bad = cfg;
+    bad.kv_heads = 1;
+    try std.testing.expectError(error.InvalidProductionE4bCandidate, validateConfig(bad));
+    bad = cfg;
+    bad.baseline_route = .mma;
+    try std.testing.expectError(error.InvalidProductionE4bCandidate, validateConfig(bad));
+    bad = cfg;
+    bad.candidate_query_tile = 16;
+    try std.testing.expectError(error.InvalidProductionE4bCandidate, validateConfig(bad));
 }
 
 test "prototype config is fail-closed and covers only locked production shapes" {
