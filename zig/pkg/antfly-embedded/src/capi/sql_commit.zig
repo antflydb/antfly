@@ -451,6 +451,8 @@ test "capi SQL outcome autocommit failure after the primary commit is committed"
     for ([_]struct { err: anyerror, outcome: []const u8 }{
         .{ .err = error.ConcurrencyUnavailable, .outcome = "committed_pending" },
         .{ .err = error.Busy, .outcome = "committed_pending" },
+        // Later uncertainty does not override the confirmed primary write.
+        .{ .err = error.OutcomeUnknown, .outcome = "committed_pending" },
         .{ .err = error.EnrichmentWorkerFailed, .outcome = "committed_repair_required" },
     }) |case| {
         var f = try OutcomeFixture.init("outcome-autocommit-post");
@@ -584,11 +586,14 @@ test "capi SQL outcome COMMIT failure after a committed decision is committed" {
 test "capi SQL outcome batch export classifies each boundary" {
     const api = @import("db.zig");
     const mutation_commit = @import("../storage/db/mutation_commit.zig");
-    const Boundary = enum { pre, publication, post, enrichment };
+    const Boundary = enum { pre, publication, post, post_unknown, enrichment };
     for ([_]struct { at: Boundary, code: h.capi.ErrorCode, applied: bool }{
         .{ .at = .pre, .code = .internal, .applied = false },
         .{ .at = .publication, .code = .outcome_unknown, .applied = false },
         .{ .at = .post, .code = .stalled, .applied = true },
+        // A later publication of unknown outcome does not override the
+        // confirmed primary write.
+        .{ .at = .post_unknown, .code = .stalled, .applied = true },
         .{ .at = .enrichment, .code = .stalled, .applied = true },
     }) |case| {
         var f = try OutcomeFixture.init("outcome-batch");
@@ -597,6 +602,7 @@ test "capi SQL outcome batch export classifies each boundary" {
         switch (case.at) {
             .pre, .publication => fault.arm(),
             .post => mutation_commit.test_fail_after_primary_commit = error.Busy,
+            .post_unknown => mutation_commit.test_fail_after_primary_commit = error.OutcomeUnknown,
             .enrichment => mutation_commit.test_fail_after_primary_commit = error.EnrichmentWorkerFailed,
         }
         var out: h.capi.Buffer = .{};

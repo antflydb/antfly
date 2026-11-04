@@ -1148,8 +1148,10 @@ pub fn Adapter(comptime native: type) type {
             // left uncertain (reported as an unknown outcome).
             var primary_committed = false;
             self.db.batchTracked(request, &primary_committed) catch |err| {
-                if (outcomes.isUnknownOutcome(err)) return error.SqlMutationOutcomeUnknown;
+                // A confirmed primary write wins: later uncertainty in derived
+                // or control publication leaves it committed, not unknown.
                 if (primary_committed) return if (err == error.EnrichmentWorkerFailed) .committed_repair_required else .committed_pending;
+                if (outcomes.isUnknownOutcome(err)) return error.SqlMutationOutcomeUnknown;
                 if (err == error.VersionConflict) return error.SqlWriteConflict;
                 return outcomes.notApplied(err);
             };

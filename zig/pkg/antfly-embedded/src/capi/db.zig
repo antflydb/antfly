@@ -1279,7 +1279,8 @@ pub fn batchInternal(
 /// is committed (`ANTFLY_STALLED`, never a retryable code); before that the
 /// batch was not applied and its error maps normally.
 fn batchFailureCode(err: anyerror, primary_committed: bool) capi.ErrorCode {
-    if (antfly.capi_dependencies.sql_errors.isUnknownOutcome(err)) return capi.mapError(err);
+    // A confirmed primary write wins over later uncertainty in derived or
+    // control publication: the batch is committed, not of unknown outcome.
     if (primary_committed) return capi.recordError(.stalled, if (err == error.EnrichmentWorkerFailed)
         "batch primary write committed; enrichment failed and needs repair; do not retry the batch"
     else

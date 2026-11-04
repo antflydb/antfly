@@ -4274,6 +4274,10 @@ pub const Backend = struct {
             self.root_dir.?,
             oldest_active - 1,
         );
+        // A deferred repair of a retired segment has nothing left to repair.
+        if (self.wal_unrepaired_tail) |torn| if (torn.segment <= oldest_active - 1) {
+            self.wal_unrepaired_tail = null;
+        };
         self.syncTrackedWalRetentionUsageCurrentLocked();
     }
 
@@ -6144,6 +6148,10 @@ pub const Backend = struct {
             self.root_dir.?,
             self.writeStatsNowNs(),
         );
+        // The reset removed every segment, torn bytes included. A deferred
+        // repair offset belongs to the old generation and must not be applied
+        // to the new one.
+        self.wal_unrepaired_tail = null;
         self.syncTrackedWalRetentionUsageCurrentLocked();
         self.write_stats.wal_resets += 1;
         self.write_stats.wal_reset_ns += self.writeStatsElapsedNs(start_ns);
@@ -11512,6 +11520,49 @@ fn implementationTests() type {
             defer txn.abort();
             try txn.put(.{ .name = "docs" }, "doc:b", "beta");
             try txn.commit();
+        }
+
+        test "issue1431 lsm deferred wal repair is discharged by a later wal reset" {
+            var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+            defer storage.deinit();
+            const root_dir = "/lsm-deferred-repair-reset";
+            const options = Options{ .flush_threshold = 1 << 20, .storage = storage.storage() };
+            var backend = try Backend.open(std.testing.allocator, root_dir, options);
+            {
+                var txn = try backend.beginWrite();
+                defer txn.abort();
+                try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+                try txn.commit();
+            }
+            {
+                // Partial append whose immediate repair fails: deferred.
+                var txn = try backend.beginWrite();
+                defer txn.abort();
+                try txn.put(.{ .name = "docs" }, "doc:torn", "never acknowledged");
+                wal_mod.test_append_fault = .{ .bytes = 8, .fail_repairs = 1 };
+                defer wal_mod.test_append_fault = null;
+                try std.testing.expectError(error.InputOutput, txn.commit());
+            }
+            try std.testing.expect(backend.wal_unrepaired_tail != null);
+            // A durable sync flushes, checkpoints the manifest and resets the
+            // WAL, removing the torn segment with it.
+            try backend.sync(true);
+            try std.testing.expect(backend.wal_unrepaired_tail == null);
+            {
+                var txn = try backend.beginWrite();
+                defer txn.abort();
+                try txn.put(.{ .name = "docs" }, "doc:b", "beta");
+                try txn.commit();
+            }
+            backend.options.backend.read_only = true;
+            backend.close();
+            backend = try Backend.open(std.testing.allocator, root_dir, options);
+            defer backend.close();
+            var read = try backend.beginRead();
+            defer read.abort();
+            try std.testing.expectEqualStrings("alpha", try read.get(.{ .name = "docs" }, "doc:a"));
+            try std.testing.expectEqualStrings("beta", try read.get(.{ .name = "docs" }, "doc:b"));
+            try std.testing.expectError(error.NotFound, read.get(.{ .name = "docs" }, "doc:torn"));
         }
 
         test "lsm backend maintenance stats report retained wal debt across reopen and reset" {
