@@ -1035,7 +1035,7 @@ fn Engine(comptime Context: type) type {
                     .join => |join| {
                         if (recursive_id == null and !apply_mode and !join.correlation and join.membership == null) {
                             if (engine.context.backend.distributed_join) |remote| {
-                                self.remote_join = try remote.open(remote.ptr, alloc, node, engine.context.binding.relation.?.scans, engine.cursors, engine.context.parameters);
+                                self.remote_join = try remote.open(remote.ptr, alloc, node, engine.context.binding.relation.?.scans, engine.cursors, engine.context.parameters, engine.context.backend.distributed_context);
                                 if (self.remote_join != null) return self;
                             }
                         }

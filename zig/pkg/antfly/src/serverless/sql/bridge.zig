@@ -35,8 +35,9 @@ pub const Bridge = struct {
     pub fn port(self: *Bridge) catalog.DistributedJoin {
         return .{ .ptr = self, .open = open };
     }
-    fn open(raw: *anyopaque, a: A, node: *const local.sql_relation_binding.Node, scans: []const catalog.StatementScan, cursors: []const catalog.Cursor, parameters: []const std.json.Value) !?catalog.RelationCursor {
+    fn open(raw: *anyopaque, a: A, node: *const local.sql_relation_binding.Node, scans: []const catalog.StatementScan, cursors: []const catalog.Cursor, parameters: []const std.json.Value, request: local.api_operation.RequestContext) !?catalog.RelationCursor {
         const self: *Bridge = @ptrCast(@alignCast(raw));
+        try request.ensureActive();
         if (node.operation != .join) return null;
         const join = node.operation.join;
         if (join.left.operation != .scan or join.right.operation != .scan or join.membership != null or join.correlation or join.left_keys.len == 0 or join.left_keys.len > 32 or join.left_keys.len != join.right_keys.len) return null;
@@ -47,13 +48,18 @@ pub const Bridge = struct {
         const right_export = cursors[right.index].export_snapshot orelse return null;
         if ((cursors[left.index].estimated_bytes orelse std.math.maxInt(u64)) +| (cursors[right.index].estimated_bytes orelse std.math.maxInt(u64)) <= self.local_bytes) return null;
         const owner = try a.create(Owner);
-        owner.* = .{ .a = a, .arena = .init(a), .decode = .init(a), .service = self.service };
+        owner.* = .{ .a = a, .arena = .init(a), .decode = .init(a), .service = self.service, .request = request, .parent_context = self.service.context };
         var transferred = false;
         defer if (!transferred) {
             owner.decode.deinit();
             owner.arena.deinit();
             a.destroy(owner);
         };
+        var service = self.service;
+        const inherited = try request.platformDeadline();
+        if (inherited.deadline_ns) |deadline| service.context.deadline_ns = if (service.context.deadline_ns) |parent| @min(parent, deadline) else deadline;
+        service.context.cancellation = .{ .ptr = owner, .is_cancelled_fn = Owner.canceled };
+        owner.service = service;
         const scratch = owner.arena.allocator();
         var left_keys: [32]u16 = undefined;
         var right_keys: [32]u16 = undefined;
@@ -77,23 +83,23 @@ pub const Bridge = struct {
         if (join.output_order) |order| for (order, projection) |ordinal, *out| {
             out.* = std.math.cast(u16, ordinal) orelse return error.InvalidSqlBackendResponse;
         };
-        const specification = plan.choose(try self.input(scratch, scans[left.index].table, left.source_columns, l, left_filter), try self.input(scratch, scans[right.index].table, right.source_columns, r, right_filter), self.service.tenant, @min(l.expires_ms, r.expires_ms), .{ .kind = std.meta.stringToEnum(@FieldType(plan.Join, "kind"), @tagName(join.kind)) orelse return null, .left_keys = left_keys[0..join.left_keys.len], .right_keys = right_keys[0..join.right_keys.len], .projection = projection, .condition = condition }, self.limits, self.service.clock.now()) catch |err| switch (err) {
+        const specification = plan.choose(try self.input(scratch, scans[left.index].table, left.source_columns, l, left_filter), try self.input(scratch, scans[right.index].table, right.source_columns, r, right_filter), service.tenant, @min(l.expires_ms, r.expires_ms), .{ .kind = std.meta.stringToEnum(@FieldType(plan.Join, "kind"), @tagName(join.kind)) orelse return null, .left_keys = left_keys[0..join.left_keys.len], .right_keys = right_keys[0..join.right_keys.len], .projection = projection, .condition = condition }, self.limits, service.clock.now()) catch |err| switch (err) {
             error.SqlDistributedJoinUnsupported => return null,
             else => return err,
         };
-        const query = if (self.gateway) |gateway| try gateway.submit(specification, self.service.context) else try self.service.submit(specification);
+        const query = if (self.gateway) |gateway| try gateway.submit(specification, service.context) else try service.submit(specification);
         while (true) {
-            try self.service.context.ensureActive();
-            const result_ = if (self.gateway) |gateway| try gateway.result(scratch, .{ .tenant = self.service.tenant, .query = query }, self.service.context) else try self.service.pollResult(scratch, query);
+            try service.context.ensureActive();
+            const result_ = if (self.gateway) |gateway| try gateway.result(scratch, .{ .tenant = service.tenant, .query = query }, service.context) else try service.pollResult(scratch, query);
             if (result_) |result| {
                 owner.pages = result.pages;
                 transferred = true;
                 return .{ .ptr = owner, .next = Owner.next, .close = Owner.close };
             }
             if (self.gateway) |gateway| {
-                _ = try gateway.turn(.{ .tenant = self.service.tenant, .query = query }, self.service.context);
-            } else _ = try self.service.turn(query, self.dispatcher);
-            if (self.service.context.io) |io| try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+                _ = try gateway.turn(.{ .tenant = service.tenant, .query = query }, service.context);
+            } else _ = try service.turn(query, self.dispatcher);
+            if (service.context.io) |io| try std.Io.sleep(io, .fromMilliseconds(1), .awake);
         }
     }
     fn input(self: Bridge, a: A, table: catalog.Table, names: []const []const u8, cut: catalog.ReadCapability, filter: ?expression.Program) !plan.Input {
@@ -141,11 +147,17 @@ const Owner = struct {
     arena: std.heap.ArenaAllocator,
     decode: std.heap.ArenaAllocator,
     service: runtime.Service,
+    request: local.api_operation.RequestContext,
+    parent_context: local.serverless_query_lake_read_context.Context,
     pages: []const state.Output = &.{},
     page: usize = 0,
     data: ?@import("exchange.zig").Data = null,
     block: ?local.sql_spill.ColumnarBlock = null,
     row: usize = 0,
+    fn canceled(raw: *const anyopaque) bool {
+        const self: *const Owner = @ptrCast(@alignCast(raw));
+        return self.request.cancellation.isCancelled() or (if (self.parent_context.cancellation) |token| token.isCancelled() else false);
+    }
     fn next(raw: *anyopaque, a: A, maximum: usize) !local.sql_execution_batch.Batch {
         const self: *Owner = @ptrCast(@alignCast(raw));
         var rows: std.ArrayList([]const scalar.Datum) = .empty;

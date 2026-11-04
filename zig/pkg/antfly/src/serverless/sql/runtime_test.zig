@@ -488,6 +488,13 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
         defer a.free(result);
         try std.testing.expectEqualStrings(baseline, result);
         try std.testing.expect(backend.captures >= 2);
+        var canceled: bool = true;
+        distributed.distributed_context.cancellation = .{ .ptr = &canceled, .is_cancelled_fn = struct {
+            fn check(raw: *const anyopaque) bool {
+                return @as(*const bool, @ptrCast(@alignCast(raw))).*;
+            }
+        }.check };
+        try std.testing.expectError(error.Canceled, local.sql_runtime.execute(a, distributed, &compiled, &.{}, .{}));
         try std.testing.expectEqual(@as(usize, 0), backend.scanned);
     }
 }

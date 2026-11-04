@@ -650,7 +650,7 @@ pub const DistributedJoin = struct {
     ptr: *anyopaque,
     /// A local lowering port. The provider must emit its own versioned IR;
     /// relation nodes and captured cursor pointers never cross the transport.
-    open: *const fn (*anyopaque, std.mem.Allocator, *const @import("relation_binding.zig").Node, []const StatementScan, []const Cursor, []const std.json.Value) anyerror!?RelationCursor,
+    open: *const fn (*anyopaque, std.mem.Allocator, *const @import("relation_binding.zig").Node, []const StatementScan, []const Cursor, []const std.json.Value, @import("../api/operation.zig").RequestContext) anyerror!?RelationCursor,
 };
 pub const Cursor = struct {
     export_snapshot: ?struct { ptr: *anyopaque, export_cut: *const fn (*anyopaque, std.mem.Allocator) anyerror!?ReadCapability } = null,
@@ -842,6 +842,7 @@ pub const AggregatePartialCursor = struct {
 
 pub const Backend = struct {
     distributed_join: ?DistributedJoin = null,
+    distributed_context: @import("../api/operation.zig").RequestContext = .{},
     error_context: ?*@import("errors.zig").Context = null,
     /// Execution-local only: never store this owner in an immutable plan.
     regex_execution: ?*@import("regex_execution.zig") = null,
