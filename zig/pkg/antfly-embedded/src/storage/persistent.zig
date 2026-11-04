@@ -1639,6 +1639,8 @@ pub const PersistentIndex = struct {
 
             const active_ids = try loadActiveSegmentIdsFromTxn(&read_txn, alloc);
             defer alloc.free(active_ids);
+            var recovery: RecoveredSegments = .{ .alloc = alloc };
+            defer recovery.deinit();
             for (active_ids) |seg_id| {
                 const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
                 const seg_bytes = read_txn.get(.segments, &seg_key) catch |err| switch (err) {
@@ -1708,43 +1710,47 @@ pub const PersistentIndex = struct {
                 } else null;
                 var admission = if (marker) |value| try segment_admission.decode(alloc, value, seg_id, segment_data.?.len()) else null;
                 defer if (admission) |*owned| owned.deinit();
-                if (admission) |*owned| {
+                var reader: ?segment_mod.SegmentReader = if (admission) |*owned| blk: {
                     // Descriptor and active ID belong to this same catalog
                     // transaction. Payloads retain independent native range
                     // leases and authentication. No source pointers are cached.
-                    const reader = segment_mod.SegmentReader.initNativeCatalogAdmission(alloc, segment_data.?.source(), owned.metadata, owned.footer) catch |err| switch (err) {
+                    break :blk segment_mod.SegmentReader.initNativeCatalogAdmission(alloc, segment_data.?.source(), owned.metadata, owned.footer) catch |err| switch (err) {
                         error.InvalidSegment => return error.InvalidSegmentAdmission,
                         else => return err,
                     };
-                    try publishCatalogAdmittedSegment(&writer, seg_id, segment_data.?, reader);
-                } else {
-                    // Ordinary admission consumes data on success and error.
-                    // In particular, stale/corrupt sources are already closed.
-                    const ordinary_data = segment_data.?;
-                    segment_data = null;
-                    writer.addSegmentWithIdData(seg_id, ordinary_data) catch |err| {
+                } else blk: {
+                    var ordinary = segment_data.?.initReader(alloc) catch |err| {
                         if (isStaleActiveSegmentDataError(err)) {
+                            segment_data.?.deinit(alloc);
+                            segment_data = null;
                             try stale_active_ids.append(alloc, seg_id);
                             continue;
                         }
                         return err;
                     };
-                }
-                segment_data = null;
+                    if (segment_data.? == .owned_view) ordinary.postings_loader = segment_data.?.owned_view.postings_loader;
+                    break :blk ordinary;
+                };
+                defer if (reader) |*unconsumed| unconsumed.deinit();
 
+                var deleted: ?roaring.RoaringBitmap = null;
+                defer if (deleted) |*bitmap| bitmap.deinit();
                 const deletion_bytes = read_txn.get(.deletions, &seg_key) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
                 };
                 if (deletion_bytes) |bytes| {
-                    var bitmap = try roaring.RoaringBitmap.fromBytes(alloc, bytes);
-                    if (!bitmap.isEmpty()) {
-                        writer.setDeletionBitmap(seg_id, bitmap);
-                    } else {
-                        bitmap.deinit();
-                    }
+                    deleted = try roaring.RoaringBitmap.fromBytes(alloc, bytes);
                 }
+                try recovery.append(seg_id, segment_data.?, reader.?, deleted);
+                segment_data = null;
+                reader = null;
+                deleted = null;
             }
+            // Recovery has no visible intermediate snapshots. Admit every
+            // reader once and publish the complete catalog in linear work,
+            // rather than copying the growing segment list for each entry.
+            try recovery.publish(&writer);
 
             const next_seg_id_bytes = read_txn.get(.meta, meta_next_seg_id) catch |err| switch (err) {
                 error.NotFound => null,
@@ -3756,6 +3762,46 @@ pub const PersistentIndex = struct {
         defer publication.abort();
         publication.publish();
     }
+
+    const RecoveredSegments = struct {
+        alloc: Allocator,
+        replacements: std.ArrayListUnmanaged(index_mod.ReplacementSegmentData) = .empty,
+        deleted: std.ArrayListUnmanaged(?roaring.RoaringBitmap) = .empty,
+        published: bool = false,
+
+        /// Takes ownership only on success. Bitmap pointers are bound after
+        /// collection, when growing these staging arrays can no longer move them.
+        fn append(self: *@This(), id: u64, data: index_mod.SegmentData, reader: segment_mod.SegmentReader, bitmap: ?roaring.RoaringBitmap) !void {
+            try self.replacements.ensureUnusedCapacity(self.alloc, 1);
+            try self.deleted.ensureUnusedCapacity(self.alloc, 1);
+            self.replacements.appendAssumeCapacity(.{ .id = id, .data = data, .prepared_reader = reader });
+            self.deleted.appendAssumeCapacity(bitmap);
+        }
+
+        fn publish(self: *@This(), writer: *index_mod.IndexWriter) !void {
+            if (self.replacements.items.len == 0) return;
+            for (self.replacements.items, self.deleted.items) |*entry, *bitmap| {
+                entry.deleted = if (bitmap.*) |*value| value else null;
+            }
+            // Preparation consumes readers, including on failure; data stays
+            // ours until publication. The writer clones the caller's bitmaps.
+            var publication = try writer.prepareSegmentsManyData(&.{}, self.replacements.items);
+            defer publication.abort();
+            publication.publish();
+            self.published = true;
+        }
+
+        fn deinit(self: *@This()) void {
+            for (self.replacements.items) |*entry| {
+                if (entry.prepared_reader) |*reader| reader.deinit();
+                if (!self.published) entry.data.deinit(self.alloc);
+            }
+            for (self.deleted.items) |*bitmap| if (bitmap.*) |*value| value.deinit();
+            self.replacements.deinit(self.alloc);
+            self.deleted.deinit(self.alloc);
+            self.* = undefined;
+        }
+    };
 
     /// Navigation and active membership publish atomically. Legacy/oversized
     /// descriptors retain ordinary source admission. Optional allocation
@@ -6844,6 +6890,78 @@ test "persistent segment admission publication allocation failures release consu
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Run.run, .{ bytes, metadata, footer });
+}
+
+test "persistent recovery batches admitted and ordinary readers with allocation failure cleanup" {
+    const a = std.testing.allocator;
+    const bytes = try buildSimpleSegment(a, "doc:a", "alpha");
+    defer a.free(bytes);
+    var source_reader = try segment_mod.SegmentReader.init(a, bytes);
+    defer source_reader.deinit();
+    const metadata = try source_reader.admission(a);
+    defer metadata.deinit(a);
+    const footer = try segment_mod.SegmentReader.nativeCatalogFooter(.{ .contiguous = bytes });
+    const Run = struct {
+        fn run(alloc: Allocator, input: []const u8, descriptor: segment_mod.SegmentReader.Admission, expected_footer: segment_mod.SegmentReader.NativeCatalogFooter) !void {
+            var writer = try index_mod.IndexWriter.init(alloc);
+            defer writer.deinit();
+            var recovered: PersistentIndex.RecoveredSegments = .{ .alloc = alloc };
+            defer recovered.deinit();
+            for (0..3) |i| {
+                var data: ?index_mod.SegmentData = if (i == 1)
+                    index_mod.SegmentData.fromOwnedHeap(try alloc.dupe(u8, input))
+                else
+                    index_mod.SegmentData.fromNative(.{ .contiguous = input });
+                defer if (data) |*owned| owned.deinit(alloc);
+                var reader: ?segment_mod.SegmentReader = if (i == 1)
+                    try data.?.initReader(alloc)
+                else
+                    try segment_mod.SegmentReader.initNativeCatalogAdmission(alloc, data.?.source(), descriptor, expected_footer);
+                defer if (reader) |*owned| owned.deinit();
+                var bitmap: ?roaring.RoaringBitmap = if (i == 1) .init(alloc) else null;
+                defer if (bitmap) |*owned| owned.deinit();
+                if (bitmap) |*owned| try owned.add(0);
+                try recovered.append(17 + i, data.?, reader.?, bitmap);
+                data = null;
+                reader = null;
+                bitmap = null;
+            }
+            const epoch = writer.snapshot().epoch;
+            try recovered.publish(&writer);
+            try std.testing.expectEqual(epoch + 1, writer.snapshot().epoch);
+            try std.testing.expectEqual(@as(usize, 3), writer.snapshot().segments.len);
+            try std.testing.expectEqual(@as(u32, 2), writer.snapshot().liveDocCount());
+            try std.testing.expectEqual(@as(u64, 20), writer.next_segment_id);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Run.run, .{ bytes, metadata, footer });
+}
+
+test "persistent reopen publishes one complete recovered snapshot with deletions" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    {
+        var index = try PersistentIndex.open(a, .{ .path = path });
+        defer index.close();
+        for (0..32) |i| {
+            var key: [32]u8 = undefined;
+            const bytes = try buildSimpleSegment(a, try std.fmt.bufPrint(&key, "doc:{d}", .{i}), "alpha");
+            defer a.free(bytes);
+            try index.indexSegment(bytes);
+        }
+        _ = try index.deleteById("doc:7");
+        try index.sync(true);
+    }
+    var reopened = try PersistentIndex.open(a, .{ .path = path });
+    defer reopened.close();
+    // IndexWriter starts with epoch 0; all 32 recovered entries publish once.
+    try std.testing.expectEqual(@as(u64, 1), reopened.snapshot().epoch);
+    try std.testing.expectEqual(@as(usize, 32), reopened.snapshot().segments.len);
+    try std.testing.expectEqual(@as(u32, 31), reopened.snapshot().liveDocCount());
+    // Raw segment statistics include tombstones, as before recovery batching.
+    try std.testing.expectEqual(@as(u32, 32), try reopened.snapshot().termDocFreq(a, "body", "alpha"));
 }
 
 test "lite persistent segment admission survives merge reopen and aborted catalog publication with legacy fallback" {
