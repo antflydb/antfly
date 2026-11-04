@@ -5426,7 +5426,7 @@ pub const CudaCompute = struct {
         for (mask) |value| all = all and value == 1;
         var lengths: [32]i32 = undefined;
         const prefix = !all and batch <= lengths.len and cudnn_sdpa_mod.rightPaddedLengths(mask, batch, sequence, lengths[0..batch]);
-        return self.encoderArenaRequest(config, batch, actual_sequence, if (all) 0 else if (prefix) 1 else 2);
+        return try self.encoderArenaRequest(config, batch, actual_sequence, if (all) 0 else if (prefix) 1 else 2);
     }
     /// Complete backbone phase inventory, including packed weights when graph
     /// replay is disabled. Direct projection caches use the FIRST weight key;

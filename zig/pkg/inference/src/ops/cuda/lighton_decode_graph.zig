@@ -24,6 +24,34 @@ const memory = @import("../../runtime/tier/memory.zig");
 const plan_mod = @import("execution_arena.zig");
 pub const max_rows = 128;
 
+/// Exact independently retained buffers for a captured two-column sequence.
+/// Pure geometry is available to cold admission before any SDK teardown or
+/// allocation. It contains no page/key/weight pointer and grants no byte credit.
+pub const StorageLayout = struct {
+    bank_offset: usize,
+    positions_offset: usize,
+    progress_offset: usize,
+    metadata_bytes: usize,
+    host_bytes: usize,
+    head_bytes: usize,
+
+    pub fn init(rows: usize, hidden: usize, vocab: usize, key_words: usize) !StorageLayout {
+        if (rows < 2 or rows > max_rows or hidden == 0 or vocab == 0 or key_words == 0) return error.InvalidShape;
+        const input_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, hidden), @sizeOf(f32));
+        const bank_offset = try aligned(input_bytes);
+        const positions_offset = try std.math.add(usize, bank_offset, try aligned(rows * 2 * @sizeOf(u32)));
+        const progress_offset = try aligned(try std.math.add(usize, positions_offset, rows * 3 * @sizeOf(u32)));
+        const metadata_bytes = try std.math.add(usize, progress_offset, 256);
+        const host_bytes = try std.math.add(usize, @sizeOf(plan_mod.Plan), try std.math.mul(usize, key_words, @sizeOf(u64)));
+        const head_bytes = if (rows > 64) try std.math.mul(usize, try std.math.mul(usize, rows, vocab), @sizeOf(f32)) else 0;
+        if (head_bytes > plan_mod.limit) return error.InvalidShape;
+        return .{ .bank_offset = bank_offset, .positions_offset = positions_offset, .progress_offset = progress_offset, .metadata_bytes = metadata_bytes, .host_bytes = host_bytes, .head_bytes = head_bytes };
+    }
+    fn aligned(bytes: usize) !usize {
+        return (try std.math.add(usize, bytes, 255)) & ~@as(usize, 255);
+    }
+};
+
 /// The scheduler may rotate the same cohort between claims. Capture uses a
 /// stable sequence order, while publication retains the original claim order.
 pub fn canonicalOrder(sequences: []const u64, order: []usize) !void {
@@ -144,19 +172,16 @@ pub const Module = struct {
             std.mem.eql(u32, self.next_positions[0..host_positions.len], host_positions);
     }
     pub fn reset(self: *Module, ctx: *context.CudaContext, key: []const u64, host_positions: []const u32, rows: usize, hidden: usize, vocab: usize) !void {
+        const layout = try StorageLayout.init(rows, hidden, vocab, key.len);
+        if (host_positions.len != rows * 3) return error.InvalidShape;
+        // A malformed replacement cannot destroy the old admitted graph.
         try self.clear(ctx);
-        if (rows < 2 or rows > max_rows or host_positions.len != rows * 3 or key.len == 0 or vocab == 0)
-            return error.InvalidShape;
-        const input_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, hidden), 4);
-        const bank_offset = std.mem.alignForward(usize, input_bytes, 256);
-        const positions_offset = bank_offset + std.mem.alignForward(usize, rows * 2 * 4, 256);
-        const progress_offset = std.mem.alignForward(usize, positions_offset + host_positions.len * 4, 256);
-        const bytes = progress_offset + 256;
+        const bytes = layout.metadata_bytes;
         var lease: ?memory.AdmissionLease = null;
         if (ctx.video_cache_budget.admission) |policy|
             lease = try policy.controller.tryAcquire(.gpu, policy.limits, .{
                 .backend_scratch_bytes = bytes,
-                .host_scratch_bytes = @sizeOf(plan_mod.Plan) + key.len * @sizeOf(u64),
+                .host_scratch_bytes = layout.host_bytes,
             }, policy.check_live_memory);
         errdefer if (lease) |*value| value.release();
         const owned_key = try std.heap.c_allocator.dupe(u64, key);
@@ -169,9 +194,8 @@ pub const Module = struct {
         var head_lease: ?memory.AdmissionLease = null;
         errdefer if (head_lease) |*value| value.release();
         var head = buffer.DeviceBuffer{};
-        if (rows > 64) {
-            const head_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, vocab), 4);
-            if (head_bytes > plan_mod.limit) return error.InvalidShape;
+        if (layout.head_bytes != 0) {
+            const head_bytes = layout.head_bytes;
             if (ctx.video_cache_budget.admission) |policy|
                 head_lease = try policy.controller.tryAcquire(.gpu, policy.limits, .{
                     .backend_scratch_bytes = head_bytes,
@@ -187,9 +211,9 @@ pub const Module = struct {
         self.rows = rows;
         self.hidden = hidden;
         self.vocab = vocab;
-        self.bank_offset = bank_offset;
-        self.positions_offset = positions_offset;
-        self.progress_offset = progress_offset;
+        self.bank_offset = layout.bank_offset;
+        self.positions_offset = layout.positions_offset;
+        self.progress_offset = layout.progress_offset;
         @memcpy(self.base_positions[0..host_positions.len], host_positions);
         @memcpy(self.next_positions[0..host_positions.len], host_positions);
         self.phase = .warm;
@@ -227,3 +251,34 @@ pub const Module = struct {
         self.progress = next;
     }
 };
+
+test "captured sequence storage layout preserves existing narrow wide and aligned physical planes" {
+    const cases = [_]struct { rows: usize, hidden: usize, vocab: usize, bank: usize, positions: usize, progress: usize, bytes: usize, head: usize }{
+        .{ .rows = 2, .hidden = 1024, .vocab = 8, .bank = 8192, .positions = 8448, .progress = 8704, .bytes = 8960, .head = 0 },
+        .{ .rows = 64, .hidden = 1024, .vocab = 151936, .bank = 262144, .positions = 262656, .progress = 263424, .bytes = 263680, .head = 0 },
+        .{ .rows = 128, .hidden = 2560, .vocab = 151936, .bank = 1310720, .positions = 1311744, .progress = 1313280, .bytes = 1313536, .head = 77791232 },
+    };
+    for (cases) |value| {
+        const actual = try StorageLayout.init(value.rows, value.hidden, value.vocab, 24576);
+        try std.testing.expectEqual(value.bank, actual.bank_offset);
+        try std.testing.expectEqual(value.positions, actual.positions_offset);
+        try std.testing.expectEqual(value.progress, actual.progress_offset);
+        try std.testing.expectEqual(value.bytes, actual.metadata_bytes);
+        try std.testing.expectEqual(value.head, actual.head_bytes);
+        try std.testing.expectEqual(@sizeOf(plan_mod.Plan) + 196608, actual.host_bytes);
+    }
+}
+
+test "captured sequence malformed replacement refuses before old graph or SDK mutation" {
+    // Negative-only sentinels prove no context access or destruction. There
+    // is no SDK/GPU endpoint and this does not qualify a numerical replay.
+    var ctx: context.CudaContext = undefined;
+    var owner = Module{ .phase = .replay, .graph = @ptrFromInt(1), .metadata = .{ .ptr = 256, .len = 256 } };
+    try std.testing.expectError(error.InvalidShape, owner.reset(&ctx, &.{1}, &.{}, 1, 1024, 8));
+    try std.testing.expectError(error.InvalidShape, owner.reset(&ctx, &.{1}, &.{}, 2, 1024, 8));
+    try std.testing.expectError(error.Overflow, owner.reset(&ctx, &.{1}, &.{}, 128, std.math.maxInt(usize), 8));
+    try std.testing.expectError(error.Overflow, owner.reset(&ctx, &.{1}, &.{}, 128, 1024, std.math.maxInt(usize)));
+    try std.testing.expectError(error.InvalidShape, owner.reset(&ctx, &.{1}, &.{}, 128, 1024, 262145));
+    try std.testing.expect(owner.phase == .replay and owner.graph == @as(driver.CUgraphExec, @ptrFromInt(1)));
+    try std.testing.expectEqual(@as(u64, 256), owner.metadata.ptr);
+}
