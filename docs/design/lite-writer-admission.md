@@ -201,7 +201,7 @@ Component coverage includes ticket ordering, abandoned and dead predecessors,
 damaged counters, interrupted grants, failed enrollment, long coordination names,
 cancellation, and deadline expiry. Real process fixtures
 exercise immediate holder reentry, death while queued and while holding a turn,
-middle-waiter timeout, read cohorts, and interoperability with a legacy flock
+middle-waiter timeout, shared-reader exclusion, and interoperability with a legacy flock
 holder. Database/API tests must also cover ownership transfer, failed opens,
 allocator proof completion, local-lane timeouts, and suspended-call budgets.
 `antfly-generation-publication-test` independently exercises the control wrapper

@@ -136,29 +136,42 @@ class WriterQueueTests(unittest.TestCase):
         self.release(last)
         self.finished(first)
         self.finished(last)
-        queues = list(self.directory.glob(".aflite-writer-queue-v1-*.lock"))
-        self.assertEqual(len(queues), 1)
-        self.assertEqual(queues[0].stat().st_size, 64 + 1024 * 8)
+        queue = Path(str(self.path) + ".q")
+        tail = (queue / "tail").read_bytes()
+        self.assertEqual(len(tail), 16)
+        self.assertEqual(int.from_bytes(tail[:8], "little"), 3)
+        self.assertEqual(len(list(queue.glob("t-*"))), 1)
 
-    def test_reader_cohort_does_not_starve_an_intervening_writer(self):
+    def test_shared_readers_exclude_queued_writers_until_both_release(self):
         first = self.start("read")
         self.event(first, "acquired")
         second = self.start("read")
         self.event(second, "acquired")
         writer = self.start()
-        late_reader = self.start("read")
+        next_writer = self.start()
         self.waiting(writer)
-        self.waiting(late_reader)
+        self.waiting(next_writer)
         self.release(second)
         self.waiting(writer)
         self.release(first)
         self.event(writer, "acquired")
-        self.waiting(late_reader)
+        self.waiting(next_writer)
         self.release(writer)
-        self.event(late_reader, "acquired")
-        self.release(late_reader)
-        for process in [first, second, writer, late_reader]:
+        self.event(next_writer, "acquired")
+        self.release(next_writer)
+        for process in [first, second, writer, next_writer]:
             self.finished(process)
+
+    def test_completed_ticket_history_stays_bounded(self):
+        writer = self.start(rounds=32)
+        for round in range(32):
+            if round:
+                self.event(writer, "enrolled", round)
+            self.event(writer, "acquired", round)
+            queue = Path(str(self.path) + ".q")
+            self.assertLessEqual(len(list(queue.iterdir())), 2)
+            self.release(writer, round)
+        self.finished(writer)
 
     def test_legacy_holder_remains_authoritative_after_queued_head_dies(self):
         with self.path.open("r+b") as legacy:

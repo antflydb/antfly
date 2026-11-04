@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const queue = @import("writer_queue");
-const path_wait = @import("path_lock_wait");
+const path_wait = @import("writer_queue").path_lock_wait;
 const platform = @import("antfly_platform");
 
 fn announce(io: std.Io, event: []const u8, round: usize) !void {
@@ -28,29 +28,44 @@ fn run(init: std.process.Init) !void {
     defer arguments.deinit();
     _ = arguments.next();
     const path = arguments.next() orelse return error.MissingPath;
-    const kind: queue.Kind = if (std.mem.eql(u8, arguments.next() orelse return error.MissingKind, "read")) .shared else .exclusive;
+    const kind: std.Io.File.Lock = if (std.mem.eql(u8, arguments.next() orelse return error.MissingKind, "read")) .shared else .exclusive;
     const timeout_ms = try std.fmt.parseUnsigned(u64, arguments.next() orelse "5000", 10);
     const rounds = try std.fmt.parseUnsigned(usize, arguments.next() orelse "1", 10);
     for (0..rounds) |round| {
         {
+            var turn: ?queue.Turn = null;
+            defer if (turn) |*owned| owned.release(init.io);
             var file = try std.Io.Dir.cwd().createFile(init.io, path, .{ .read = true, .truncate = false });
             var file_owned = true;
-            var ticket: ?queue.Ticket = null;
-            defer {
-                if (file_owned) file.close(init.io);
-                if (ticket) |*owned| owned.close(init.io);
-            }
+            defer if (file_owned) file.close(init.io);
             const deadline = std.Io.Clock.awake.now(init.io).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
-            // Create even for read actors so the cohort case exercises the
-            // production queue, rather than the sidecar-free reader fallback.
-            ticket = try queue.enroll(init.gpa, init.io, path, kind, deadline, true);
-            if (ticket == null) return error.FileLocksUnsupported;
-            try announce(init.io, "enrolled", round);
-            try ticket.?.waitTurn(init.io, deadline);
-            const file_kind: std.Io.File.Lock = if (kind == .shared) .shared else .exclusive;
-            if (!try file.tryLock(init.io, file_kind)) {
+            if (kind == .exclusive) {
+                var writer_queue = try queue.Queue.open(init.gpa, init.io, path);
+                var queue_owned = true;
+                defer if (queue_owned) writer_queue.close(init.io);
+                var tail = try writer_queue.lockTail(init.io, deadline);
+                var tail_held = true;
+                defer if (tail_held) tail.release(init.io);
+                var ticket = try writer_queue.enqueue(init.io, &tail);
+                tail.release(init.io);
+                tail_held = false;
+                announce(init.io, "enrolled", round) catch |err| {
+                    // An unlocked waiting ticket is skipped as dead, while
+                    // successors still check every preceding live ticket.
+                    ticket.file.close(init.io);
+                    return err;
+                };
+                try writer_queue.awaitTurn(init.io, &ticket, deadline);
+                turn = .{ .queue = writer_queue, .ticket = ticket };
+                queue_owned = false;
+            } else {
+                // Production readers use the shared safety flock. Writer
+                // ordering belongs to the queue, independently of readers.
+                try announce(init.io, "enrolled", round);
+            }
+            if (!try file.tryLock(init.io, kind)) {
                 file_owned = false;
-                file = try path_wait.lockUntil(file, init.io, file_kind, deadline);
+                file = try path_wait.lockUntil(file, init.io, kind, deadline);
                 file_owned = true;
             }
             try announce(init.io, "acquired", round);

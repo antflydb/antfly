@@ -5827,14 +5827,15 @@ test "capi native SQL constraint overlay extends independent scopes after valida
             .conflict => "INSERT INTO items (id,v) VALUES (1,99)",
         }, null);
         if (change == .conflict) {
-            // Rebuilding speculative prior effects does not make them commit
-            // authority. The original unique-absence predicate must survive
-            // scope expansion and reject this conflicting peer at COMMIT.
+            // Speculative effects do not grant commit authority. COMMIT must
+            // reject the duplicate logical primary key, preserve the peer's
+            // row, and publish none of the staged writes.
             _ = try Probe.run(fixture.id, id, "INSERT INTO other (id,v) VALUES (1,1)", null);
             try std.testing.expectEqual(@as(usize, 2), session.test_overlay_rebuilds);
             try std.testing.expectEqual(entries_before + 16, stats.sql_constraint_overlay_rebuild_entries);
-            _ = try Probe.run(fixture.id, id, "COMMIT", "40001");
+            _ = try Probe.run(fixture.id, id, "COMMIT", "23505");
             _ = try Probe.run(fixture.id, id, "ROLLBACK", null);
+            try std.testing.expectEqual(@as(?i64, 99), try Probe.run(fixture.id, null, "SELECT v FROM items WHERE id=1", null));
             try std.testing.expectEqual(@as(?i64, 1), try Probe.run(fixture.id, null, "SELECT COUNT(*) FROM other", null));
         } else {
             _ = try Probe.run(fixture.id, id, "INSERT INTO other (id,v) VALUES (1,1)", null);

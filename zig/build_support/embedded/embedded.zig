@@ -702,10 +702,10 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     if (target.result.os.tag == .linux or target.result.os.tag == .macos) {
         const queue_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/lite/writer_queue.zig"), .target = target, .optimize = optimize, .link_libc = link_libc });
         queue_module.addImport("antfly_platform", platform_mod);
-        const wait_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/lite/path_lock_wait.zig"), .target = target, .optimize = optimize, .link_libc = link_libc });
+        const queue_tests = b.addTest(.{ .root_module = queue_module });
+        admission_step.dependOn(&b.addRunArtifact(queue_tests).step);
         const fixture_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/tests/writer_queue_process_fixture.zig"), .target = target, .optimize = optimize, .link_libc = link_libc });
         fixture_module.addImport("writer_queue", queue_module);
-        fixture_module.addImport("path_lock_wait", wait_module);
         fixture_module.addImport("antfly_platform", platform_mod);
         const fixture = b.addExecutable(.{ .name = "lite-writer-admission-fixture", .root_module = fixture_module });
         admission_step.dependOn(@import("antfly_platform").addNativeProcessTest(b, fixture, b.path("pkg/antfly-embedded/tests/test_writer_queue_process.py")));

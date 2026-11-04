@@ -203,6 +203,28 @@
       "failed": 1,
       "leaked": 0,
       "failure": "COMMIT correctly rejected a peer insert with 23505; fixture expected 40001. The duplicate primary-key value has separate generated row identities, so the uniqueness refusal is correct. Corrected expectation rerun pending; no production change for that expectation."
+    },
+    {
+      "suite": "Native C API gate at 57b629209c including storage-yield and foreign-checkpoint regressions",
+      "passed": 150,
+      "skipped": 0,
+      "failed": 1,
+      "leaked": 0,
+      "failure": "The SQL fixture still expected 40001 because its text replacement did not match. COMMIT returned the correct 23505. Exact function-scoped edit now asserts the replacement and adds peer-row preservation; final rerun pending. Both storage-yield/foreign-checkpoint cases, drain, acknowledged rows and integrity passed."
+    },
+    {
+      "suite": "Dedicated writer-admission gate after main-queue fixture port",
+      "whole_build_returncode": 0,
+      "unit_tests_passed": 19,
+      "real_process_cases_passed": 7,
+      "failed": 0,
+      "scope": "Queue ordering, abandoned/dead predecessors and holders, damaged counters, cancellation, FIFO immediate reentry, middle timeout, shared-reader safety, legacy flock safety and bounded history. Replaced obsolete slot-queue fixture API and removed duplicate path_lock_wait module ownership. Queue unit tests are now explicit gate dependencies.",
+      "code_blobs": {
+        "zig/build_support/embedded/embedded.zig": "ff00df33f71eb3718dc44a0c7451a143111cc41d",
+        "zig/pkg/antfly-embedded/src/storage/lite/writer_queue.zig": "421a80da14d53bf28aba07c8fba866b9bd8949cd",
+        "zig/pkg/antfly-embedded/tests/writer_queue_process_fixture.zig": "59eb2f8e311a521d3a9ea193675c17eb5690c63b",
+        "zig/pkg/antfly-embedded/tests/test_writer_queue_process.py": "82667076a39f46e82078f8930248e9d5fe01e9af"
+      }
     }
   ],
   "remaining": [
@@ -798,12 +820,94 @@
       "first_b_rebuilds": 1,
       "first_b_prior_entries_revisited": 16
     },
-    "fix": "Validate previous completed-entry scope and adopt wider witness when unchanged. Regression observed no prior entries revisited with unrelated peer publication; relevant peer or schema publication rebuilt 16 entries. Corrected COMMIT uniqueness-conflict fixture rerun pending."
+    "fix": "Validate previous completed-entry scope and adopt wider witness when unchanged. Regression observed no prior entries revisited with unrelated peer publication; relevant peer or schema publication rebuilt 16 entries. The COMMIT uniqueness-conflict fixture now expects 23505 and checks peer-row preservation; final rerun pending."
   },
   "pending_replay_cache_storage_phase": {
     "qualification": false,
     "finding": "A later physical-storage yield discarded a successful pending-replay runtime; diagnostics recorded before physical service missed this discard. Post-storage index restamping could also hide a foreign checkpoint adopted by allocator service.",
     "implementation": "Preserve successful pending-source cache across explicit benign storage-phase yields with no uncertain outcome. Capture index witness before physical service; index_inputs_changed prevents retention. Never stamp old immutable runtime with an adopted foreign index identity. Residency and fresh primary-epoch rules remain unchanged.",
-    "regression": "Public SQL replay diagnostic injects physical admission yield, requires successful runtime reuse, and in the two-namespace case publishes a foreign index checkpoint before allocator-service adoption, then requires the original cached witness and rejection of that foreign generation. Drain/acknowledged-row/integrity checks follow. Pending rerun."
+    "regression": "Passed at 57b629209c: storage admission yields preserve successful source runtimes; foreign checkpoint publication followed by allocator-service adoption preserves the old cache witness and rejects reuse. Both cases drain and verify acknowledged rows and integrity. No importer capacity claim.",
+    "observations": [
+      {
+        "namespaces": 1,
+        "maintenance_runtime_opens": 2,
+        "source_runtime_reuses": 1,
+        "cache_diagnostics": {
+          "capture_attempts": 3,
+          "captured": 3,
+          "capture_namespace_limit": 0,
+          "capture_control": 0,
+          "miss_no_cache": 0,
+          "miss_closed": 1,
+          "miss_inode": 0,
+          "miss_binding": 0,
+          "miss_borrow": 0,
+          "miss_namespace": 0,
+          "miss_indexes": 0,
+          "miss_metadata": 0,
+          "miss_config": 0,
+          "miss_control": 0,
+          "not_retained_settled": 1,
+          "not_retained_failed": 0,
+          "not_retained_index_inputs": 0,
+          "not_retained_storage_error": 0,
+          "retained_storage_yield": 2,
+          "blocked_manual": 0,
+          "blocked_enrichment": 0,
+          "blocked_queries": 0,
+          "blocked_policy": 0,
+          "blocked_transition": 0,
+          "blocked_index_loads": 0,
+          "blocked_admission": 0,
+          "blocked_resolver": 0,
+          "blocked_split": 0,
+          "blocked_groups": 0,
+          "blocked_nontext_indexes": 0,
+          "blocked_replacement": 0,
+          "blocked_repairs": 0,
+          "blocked_coalescer": 0
+        }
+      },
+      {
+        "namespaces": 2,
+        "maintenance_runtime_opens": 4,
+        "source_runtime_reuses": 3,
+        "cache_diagnostics": {
+          "capture_attempts": 7,
+          "captured": 7,
+          "capture_namespace_limit": 0,
+          "capture_control": 0,
+          "miss_no_cache": 0,
+          "miss_closed": 3,
+          "miss_inode": 0,
+          "miss_binding": 0,
+          "miss_borrow": 0,
+          "miss_namespace": 0,
+          "miss_indexes": 0,
+          "miss_metadata": 0,
+          "miss_config": 0,
+          "miss_control": 0,
+          "not_retained_settled": 1,
+          "not_retained_failed": 0,
+          "not_retained_index_inputs": 0,
+          "not_retained_storage_error": 0,
+          "retained_storage_yield": 6,
+          "blocked_manual": 0,
+          "blocked_enrichment": 0,
+          "blocked_queries": 0,
+          "blocked_policy": 0,
+          "blocked_transition": 0,
+          "blocked_index_loads": 0,
+          "blocked_admission": 0,
+          "blocked_resolver": 0,
+          "blocked_split": 0,
+          "blocked_groups": 0,
+          "blocked_nontext_indexes": 0,
+          "blocked_replacement": 0,
+          "blocked_repairs": 0,
+          "blocked_coalescer": 0
+        }
+      }
+    ]
   }
 }
