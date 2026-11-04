@@ -74,7 +74,11 @@ zig build antfly-api-sql-locking-test \
   antfly-pessimistic-lock-contract-test \
   antfly-pessimistic-lock-authority-test \
   antfly-pessimistic-lock-ledger-test \
+  antfly-pessimistic-lock-native-test \
   antfly-metadata-sql-prepared-test -Doptimize=Debug -j1
+zig build sql-test \
+  '-Dtest-filter=SQL original row-lock clauses on non-locking SQL surfaces reject before backend access' \
+  -Doptimize=Debug -j1
 ```
 
 Prepared identity admission and terminal receipt acknowledgement require the
