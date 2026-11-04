@@ -3521,13 +3521,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var applied_first_chunk = false;
                 while (!applied_first_chunk or write_start < collected.docs.items.len) {
                     const plan_base = write_start;
-                    var publication_plan = try ctx.index_manager.planTextMapperDocsPublication(
+                    const plan_started = monotonicTimeNs();
+                    var publication_plan = ctx.index_manager.planTextMapperDocsPublication(
                         ctx.store,
                         index_ref.name,
                         &publication_context,
                         collected.docs.items[plan_base..],
                         reservation_limit,
-                    );
+                    ) catch |err| {
+                        if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_plan_ns, plan_started);
+                        return err;
+                    };
+                    if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_plan_ns, plan_started);
                     defer publication_plan.deinit();
 
                     var relative_start: usize = 0;

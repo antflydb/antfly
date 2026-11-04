@@ -170,6 +170,16 @@ index/provider runtimes reopen until they define an equivalent rebinding
 contract. Selecting a named namespace uses the detached runtime directly,
 avoiding a duplicate serving-table open solely for maintenance discovery.
 
+Relational text tables use the same contract, including table storage settings,
+relational and policy catalogs, and initial-child publication controls in the
+configuration witness. Rebinding reloads the table catalog and durable worker
+positions. Query leases, active policies, restore and migration state prevent
+reuse. The cache, active turns, and immutable merge jobs own independent strong
+references. Starting a merge therefore does not evict a usable runtime; changing
+its inputs retires the cache reference while the merge retains its old owner
+until cancellation or completion is joined. Namespace switching never closes a
+table still borrowed by a merge.
+
 Both producer and consumer controllers size preparation windows from elapsed
 time minus measured admission/publication overhead. That fixed cost still
 counts toward call deadlines and yield decisions. Contention therefore does

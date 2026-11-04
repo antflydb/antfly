@@ -757,6 +757,7 @@ pub const BatchProfile = struct {
     derived_apply_ns: u64 = 0,
     sync_wait_ns: u64 = 0,
     full_text_apply_ns: u64 = 0,
+    full_text_plan_ns: u64 = 0,
     full_text_prepare_ns: u64 = 0,
     full_text_apply_lock_wait_ns: u64 = 0,
     full_text_apply_lock_held_ns: u64 = 0,

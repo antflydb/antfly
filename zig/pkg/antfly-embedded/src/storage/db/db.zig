@@ -1286,6 +1286,7 @@ fn addBatchProfile(total: *BatchProfile, delta: BatchProfile) void {
     total.derived_apply_ns += delta.derived_apply_ns;
     total.sync_wait_ns += delta.sync_wait_ns;
     total.full_text_apply_ns += delta.full_text_apply_ns;
+    total.full_text_plan_ns += delta.full_text_plan_ns;
     total.full_text_prepare_ns += delta.full_text_prepare_ns;
     total.full_text_apply_lock_wait_ns += delta.full_text_apply_lock_wait_ns;
     total.full_text_apply_lock_held_ns += delta.full_text_apply_lock_held_ns;
@@ -1501,12 +1502,13 @@ fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
         },
     );
     std.log.info(
-        "antfly_bench_batch_derived writes={d} total_ms={d} derived_apply_ms={d} full_text_apply_ms={d} full_text_prepare_ms={d} full_text_apply_lock_wait_ms={d} full_text_apply_lock_held_ms={d} dense_apply_ms={d} dense_delete_ms={d} dense_doc_index_ms={d} dense_embedding_apply_ms={d} sparse_apply_ms={d} graph_apply_ms={d} index_sync_ms={d} applied_sequence_save_ms={d} replay_journal_truncate_ms={d}",
+        "antfly_bench_batch_derived writes={d} total_ms={d} derived_apply_ms={d} full_text_apply_ms={d} full_text_plan_ms={d} full_text_prepare_ms={d} full_text_apply_lock_wait_ms={d} full_text_apply_lock_held_ms={d} dense_apply_ms={d} dense_delete_ms={d} dense_doc_index_ms={d} dense_embedding_apply_ms={d} sparse_apply_ms={d} graph_apply_ms={d} index_sync_ms={d} applied_sequence_save_ms={d} replay_journal_truncate_ms={d}",
         .{
             req.writes.len,
             nsToMs(profile.total_ns),
             nsToMs(profile.derived_apply_ns),
             nsToMs(profile.full_text_apply_ns),
+            nsToMs(profile.full_text_plan_ns),
             nsToMs(profile.full_text_prepare_ns),
             nsToMs(profile.full_text_apply_lock_wait_ns),
             nsToMs(profile.full_text_apply_lock_held_ns),
@@ -1643,7 +1645,7 @@ fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
 
 fn logDerivedWorkerProfile(index_ref: index_manager_mod.ManagedIndexRef, batch: derived_types.DerivedBatch, profile: BatchProfile) void {
     std.log.info(
-        "antfly_bench_derived_worker index={s} kind={s} sequence={d} documents={d} deletes={d} overwritten={d} dense_embeddings={d} sparse_embeddings={d} graph_writes={d} graph_deletes={d} total_ms={d} full_text_apply_ms={d} full_text_prepare_ms={d} full_text_apply_lock_wait_ms={d} full_text_apply_lock_held_ms={d} dense_apply_ms={d} dense_delete_ms={d} dense_doc_index_ms={d} dense_embedding_apply_ms={d} sparse_apply_ms={d} graph_apply_ms={d} index_sync_ms={d}",
+        "antfly_bench_derived_worker index={s} kind={s} sequence={d} documents={d} deletes={d} overwritten={d} dense_embeddings={d} sparse_embeddings={d} graph_writes={d} graph_deletes={d} total_ms={d} full_text_apply_ms={d} full_text_plan_ms={d} full_text_prepare_ms={d} full_text_apply_lock_wait_ms={d} full_text_apply_lock_held_ms={d} dense_apply_ms={d} dense_delete_ms={d} dense_doc_index_ms={d} dense_embedding_apply_ms={d} sparse_apply_ms={d} graph_apply_ms={d} index_sync_ms={d}",
         .{
             index_ref.name,
             @tagName(index_ref.kind),
@@ -1657,6 +1659,7 @@ fn logDerivedWorkerProfile(index_ref: index_manager_mod.ManagedIndexRef, batch: 
             batch.graph_deletes.len,
             nsToMs(profile.total_ns),
             nsToMs(profile.full_text_apply_ns),
+            nsToMs(profile.full_text_plan_ns),
             nsToMs(profile.full_text_prepare_ns),
             nsToMs(profile.full_text_apply_lock_wait_ns),
             nsToMs(profile.full_text_apply_lock_held_ns),
@@ -5011,7 +5014,12 @@ pub const DB = struct {
     /// source-view rebinding, rather than borrowing stale mutable caches.
     pub fn canRefreshDetachedTextSource(self: *DB) bool {
         const indexes = self.core.index_manager;
-        return self.executor.isManual() and !indexes.relational_base_rows and self.enrichment_runtime == null and
+        return self.executor.isManual() and self.enrichment_runtime == null and
+            self.retained_value_scope == null and self.retained_query_lease == null and self.retained_remote_query_lease == null and
+            self.local_execution.native_query_reuse == null and self.local_execution.row_policy_bundle == null and
+            self.core.table_catalog.row_policy_phase == .disabled and
+            !self.local_execution.initial_child_hidden.load(.acquire) and self.local_execution.initial_child_bootstrap == null and
+            !self.local_execution.restore_staging_required.load(.acquire) and !self.local_execution.vector_migration_active.load(.acquire) and
             indexes.failed_index_loads.count() == 0 and indexes.managed_admission_indexes.count() == 0 and
             !self.hasConfiguredResolvers() and !self.core.hasGeneratedEnrichmentTargets() and
             self.core.shard_manager.getSplitState() == null and
@@ -5039,12 +5047,18 @@ pub const DB = struct {
         if (shard.getSplitState() != null or !std.mem.eql(u8, previous_range.start, range.start) or
             !std.mem.eql(u8, previous_range.end, range.end)) return error.UnsupportedOperation;
         const summary = try doc_identity.visibilitySummaryFromStore(self.core.store);
+        const table_catalog = try db_core.loadTableCatalogForSchema(self.alloc, self.core.store, self.core.schema);
+        if (table_catalog.row_policy_phase != .disabled) return error.UnsupportedOperation;
         try self.refreshManagedIndexWorkersLocked();
         self.core.shard_manager.deinit();
         self.core.shard_manager.* = shard;
         self.core.identity_visibility.clearLive();
         self.core.identity_visibility.clearNonvisible();
         self.core.identity_visibility.summary = summary;
+        self.core.table_catalog = table_catalog;
+        self.core.artifact_cleanup_maybe.store(true, .release);
+        self.local_execution.native_query_reuse_epoch_ready = false;
+        self.relational_column_maintenance.waiting_until_ns.store(0, .release);
         self.local_source_completion_audit_pending = true;
     }
 

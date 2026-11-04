@@ -74,6 +74,7 @@ const PendingTextMerge = struct {
     ready: bool = false,
     applied: bool = false,
     elapsed_ns: u64 = 0,
+    owns_root: bool = false,
 
     fn run(self: *@This()) void {
         self.prepare() catch |err| {
@@ -103,7 +104,7 @@ const PendingTextMerge = struct {
         self.result = result;
     }
 
-    fn deinit(self: *@This(), close_root: bool) void {
+    fn deinit(self: *@This()) void {
         self.canceled.store(true, .release);
         if (self.thread) |thread| thread.join();
         if (self.construction) |*construction| construction.deinit();
@@ -114,7 +115,7 @@ const PendingTextMerge = struct {
         self.database.core.index_manager.cancelTextMergeTask(&self.task);
         self.task.deinit(alloc);
         self.arena.deinit();
-        if (close_root) Owner.closeMaintenanceSnapshot(self.root);
+        if (self.owns_root) Owner.closeMaintenanceSnapshot(self.root);
         alloc.destroy(self);
     }
 };
@@ -133,6 +134,14 @@ const PublicationCatalog = struct {
         @import("../storage/db/catalog/resolver_catalog.zig").merge_catalog_key,
         @import("../storage/db/resolver_projection.zig").epoch_key,
         &keys.identity_namespace_key,
+        @import("../storage/db/table_catalog.zig").key,
+        &keys.table_storage_settings_key,
+        @import("../storage/db/relational_index_catalog.zig").head_key,
+        @import("../storage/db/relational_integrity_catalog.zig").key,
+        @import("../storage/db/row_policy_bundle.zig").key,
+        @import("../storage/db/row_policy_bundle.zig").candidate_key,
+        @import("../storage/db/row_policy_bundle.zig").pending_key,
+        @import("../storage/db/relational_initial_child_publication.zig").key,
     };
     inode: u64,
     metadata_identity: [16]u8,
@@ -1839,7 +1848,15 @@ pub const Owner = struct {
         self.gate.mutex.unlock(h.handleLockIo());
     }
 
+    fn retainMaintenanceSnapshot(root: *h.Handle) void {
+        const before = root.maintenance_runtime_references.fetchAdd(1, .monotonic);
+        std.debug.assert(before != 0 and before < std.math.maxInt(usize));
+    }
+
     fn closeMaintenanceSnapshot(root: *h.Handle) void {
+        const before = root.maintenance_runtime_references.fetchSub(1, .acq_rel);
+        std.debug.assert(before != 0);
+        if (before != 1) return;
         root.lease_snapshot = true;
         const store = root.owned_lite_backend.?.native_docstore.?;
         store.read_only = true;
@@ -1956,7 +1973,10 @@ pub const Owner = struct {
                 // changed catalog/index identity or inode always opens anew.
                 if (!std.meta.eql(file.header, captured.header)) try cached_store.refreshIndexPublicationCheckpoint(file.header);
                 if (source_inputs_match) {
-                    errdefer self.clearTextSourceRuntimeCache();
+                    errdefer {
+                        self.clearTextSourceRuntimeCache();
+                        self.maintenance_retained_logical = null;
+                    }
                     try snapshot.db.refreshDetachedTextSource();
                     var tables = snapshot.embedded_tables.valueIterator();
                     while (tables.next()) |table| try table.*.db.refreshDetachedTextSource();
@@ -2025,6 +2045,8 @@ pub const Owner = struct {
             opened.* = .{ .alloc = alloc, .db = undefined, .db_live = false, .owned_lite_backend = backend, .open_mode = options.open_mode };
             break :blk opened;
         };
+        snapshot.maintenance_runtime_references.store(1, .release);
+        errdefer closeMaintenanceSnapshot(snapshot);
         snapshot.lease_snapshot = true;
         snapshot.sql_commit_recovery_needed = physical_tip != null or foreground.sql_commit_recovery_needed;
         snapshot.sql_ddl_recovery_needed = physical_tip != null or foreground.sql_ddl_recovery_needed;
@@ -2169,7 +2191,7 @@ pub const Owner = struct {
         const pending = try alloc.create(PendingTextMerge);
         pending.* = .{ .owner = self, .root = root, .database = database, .arena = .init(alloc), .catalog = catalog.*, .name = undefined, .task = task, .config_hash = h.db_mod.types.indexConfigHash(database.core.index_manager.textIndexEntry(task.index_name).?.config) };
         task_owned = false;
-        errdefer pending.deinit(false);
+        errdefer pending.deinit();
         const owned = pending.arena.allocator();
         pending.name = try owned.dupe(u8, name);
         for (&pending.catalog.paths, catalog.paths) |*path, original| path.* = try owned.dupe(u8, original);
@@ -2190,6 +2212,8 @@ pub const Owner = struct {
             self.gate.mutex.unlock(h.handleLockIo());
         }
         pending.thread = try std.Thread.spawn(.{}, PendingTextMerge.run, .{pending});
+        retainMaintenanceSnapshot(root);
+        pending.owns_root = true;
         self.gate.mutex.lockUncancelable(h.handleLockIo());
         self.pending_text_merge = pending;
         self.publication_stats.text_merge_jobs_started +|= 1;
@@ -2222,9 +2246,9 @@ pub const Owner = struct {
         self.releaseMaintenanceTurnAssumeLocked();
         self.maintenance_storage_pending = true;
         self.gate.mutex.unlock(io);
-        // Foreground refresh cannot borrow this owner or ledger any longer.
-        // Drain and release large resources outside the foreground gate.
-        pending.deinit(true);
+        // The cache and active turns have independent strong references.
+        // Join immutable work and release its reference outside the gate.
+        pending.deinit();
     }
 
     /// One bounded lease append alternates with replay/physical service. The
@@ -2269,6 +2293,17 @@ pub const Owner = struct {
             try pending.construction.?.seal(run.len());
             pending.ready = true;
         }
+        if (self.maintenance_snapshot == pending.root) if (self.text_source_runtime_cache) |cache| {
+            if (cache.root == pending.root) {
+                // Admission verified the prior recovery/configuration cut;
+                // this publication only staged private artifact bytes. Keep
+                // that known storage progress from reopening a shared runtime.
+                const logical = store.file.activeCheckpoint().logical;
+                cache.indexes = logical.indexes;
+                for (cache.proofs) |*proof| proof.metadata_identity = logical.metadata;
+                self.maintenance_retained_logical = logical;
+            }
+        };
     }
 
     fn finishPendingTextMerge(self: *Owner, root: *h.Handle, database: *h.db_mod.DB, name: []const u8) !bool {
@@ -2488,7 +2523,8 @@ pub const Owner = struct {
         defer if (selected_root) |root| {
             // Control-only early returns must not leave a newly opened index
             // owner retaining inputs through an otherwise idle poll interval.
-            if (self.maintenance_snapshot == root and root.db_live and root.maintenance_references == 0 and
+            const merge_borrows = if (self.pending_text_merge) |job| job.root == root else false;
+            if (!merge_borrows and self.maintenance_snapshot == root and root.db_live and root.maintenance_references == 0 and
                 self.text_source_runtime_cache == null and self.maintenance_retained_logical == null)
             {
                 @import("tables.zig").closeAll(root);
@@ -2518,6 +2554,18 @@ pub const Owner = struct {
             // startup merely to discover this turn's work.
             const namespace_root = if (self.options.profile == .native) blk: {
                 selected_root = try self.refreshMaintenanceSnapshot(foreground, .source);
+                // A merge can co-own the selected runtime. A namespace switch
+                // must retire that whole cache reference, never close the
+                // table whose immutable merge inputs still borrow its owner.
+                if (!selected_root.?.embedded_tables.contains(name)) {
+                    if (self.pending_text_merge) |job| if (job.root == selected_root.?) {
+                        self.clearTextSourceRuntimeCache();
+                        self.maintenance_retained_logical = null;
+                        self.maintenance_snapshot = null;
+                        closeMaintenanceSnapshot(selected_root.?);
+                        selected_root = try self.refreshMaintenanceSnapshot(foreground, .source);
+                    };
+                }
                 const selected_store = selected_root.?.owned_lite_backend.?.native_docstore.?;
                 selected_store.writer_admission = null;
                 selected_store.file.replay_consumer_admission = false;
@@ -2718,10 +2766,22 @@ pub const Owner = struct {
         // Keep the primary epoch until runBackgroundTurn returns and every
         // replay cursor has closed. Preparing the last text segment does not
         // end the journal cursor's borrowing lifetime.
+        if (independent) retainMaintenanceSnapshot(root);
+        defer if (independent) closeMaintenanceSnapshot(root);
         root.maintenance_references += 1;
+        var active_runtime_borrow = true;
+        defer if (active_runtime_borrow) {
+            std.debug.assert(gate_locked);
+            root.maintenance_references -= 1;
+        };
         root.maintenance_owner = self;
         root.maintenance_publication = if (run_database) &publication else null;
         const store = root.owned_lite_backend.?.native_docstore.?;
+        errdefer {
+            root.maintenance_owner = null;
+            root.maintenance_publication = null;
+            store.writer_admission = null;
+        }
         store.file.replay_consumer_admission = true;
         const split_index_work = independent and store.file.header.indexed_reclamation;
         if (split_index_work) {
@@ -2921,16 +2981,17 @@ pub const Owner = struct {
         self.publication_stats.maintenance_storage_ns +|= @import("antfly_platform").time.monotonicNs() -| artifacts_finished;
         self.maintenance_retained_logical = retained_logical;
         self.clearTextSourceRuntimeCache();
-        if (retain_source_runtime and maintenance_error == null and !merge_owns_root) {
+        if (retain_source_runtime and maintenance_error == null) {
             const cache = source_runtime_cache.?;
             cache.indexes = store.file.activeCheckpoint().logical.indexes;
             self.text_source_runtime_cache = cache;
             source_runtime_cache = null;
         }
-        if (merge_owns_root) {
+        if (merge_owns_root and !retain_source_runtime and !retain_artifact_runtime) {
             std.debug.assert(self.maintenance_snapshot == root);
             self.maintenance_snapshot = null;
             self.maintenance_retained_logical = null;
+            closeMaintenanceSnapshot(root);
         }
         if (maintenance_error) |err| {
             self.noteMaintenanceFailure(err, publication.identity.table_id, maintenance_error_phase);
@@ -2957,6 +3018,7 @@ pub const Owner = struct {
         store.writer_admission = null;
         root.maintenance_owner = null;
         root.maintenance_references -= 1;
+        active_runtime_borrow = false;
         if (independent) inheritReclamationTelemetry(self.current.?.owned_lite_backend.?.native_docstore.?, store);
         if (!independent and self.current != root) {
             store.read_only = true;
@@ -3042,6 +3104,8 @@ pub const Owner = struct {
         tip_open = false;
         const store = root.owned_lite_backend.?.native_docstore.?;
         const maintenance_entry_header = store.file.header;
+        retainMaintenanceSnapshot(root);
+        defer closeMaintenanceSnapshot(root);
         root.maintenance_references += 1;
         // Foreground refresh may retire its logical wrapper while physical
         // service is detached. Retain it until adoption has checked identity.
@@ -5449,6 +5513,10 @@ fn seedPausedPrivateMergeInTable(fixture: *AdmissionFollowupFixture, table_name:
 }
 
 fn seedPausedPrivateMergeWithDeletes(fixture: *AdmissionFollowupFixture, table_name: ?[]const u8, delete_inputs: bool) !*PendingTextMerge {
+    return seedPausedPrivateMergeFixture(fixture, table_name, delete_inputs, false);
+}
+
+fn seedPausedPrivateMergeFixture(fixture: *AdmissionFollowupFixture, table_name: ?[]const u8, delete_inputs: bool, primary_canary: bool) !*PendingTextMerge {
     try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
     if (table_name == null) try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
     const owner = fixture.connection.owner;
@@ -5463,6 +5531,7 @@ fn seedPausedPrivateMergeWithDeletes(fixture: *AdmissionFollowupFixture, table_n
             try child.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
             break :blk child;
         } else &root.db;
+        if (primary_canary) try database.batch(.{ .writes = &.{.{ .key = "initial-source", .value = "{\"text\":\"initial source\"}" }}, .sync_level = .write });
         const entry = database.core.index_manager.textIndexEntry("text").?;
         for (0..12) |i| {
             var id: [32]u8 = undefined;
@@ -5493,9 +5562,64 @@ fn seedPausedPrivateMergeWithDeletes(fixture: *AdmissionFollowupFixture, table_n
         try h.handleLockIo().sleep(.fromMilliseconds(1), .awake);
     }
     try std.testing.expect(test_private_merge_entered.load(.acquire));
-    try std.testing.expect(owner.maintenance_snapshot != pending.root);
+    try std.testing.expect(pending.owns_root);
+    try std.testing.expect(pending.root.maintenance_runtime_references.load(.acquire) >= 1);
+    if (owner.maintenance_snapshot == pending.root)
+        try std.testing.expect(pending.root.maintenance_runtime_references.load(.acquire) >= 2);
     try std.testing.expect(!pending.done.load(.acquire));
     return pending;
+}
+
+test "capi native asynchronous text merge coowns reusable runtimes through replay and cache eviction" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("shared-text-merge-runtime", 5000, .batch);
+    defer fixture.deinit();
+    defer test_pause_private_merge.store(false, .release);
+    const pending = try seedPausedPrivateMergeFixture(&fixture, "shared-merge", false, true);
+    const owner = fixture.connection.owner;
+    {
+        var lease = try fixture.connection.acquire();
+        defer {
+            lease.close();
+            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        const foreground = try owner.refresh();
+        const table = try @import("tables.zig").get(foreground, "shared-merge");
+        owner.clearTextSourceRuntimeCache();
+        if (owner.maintenance_snapshot != pending.root) {
+            if (owner.maintenance_snapshot) |old| Owner.closeMaintenanceSnapshot(old);
+            Owner.retainMaintenanceSnapshot(pending.root);
+            owner.maintenance_snapshot = pending.root;
+        }
+        const shared_store = pending.root.owned_lite_backend.?.native_docstore.?;
+        // The admitted foreground may have published fresh immutable-reader
+        // aliases. Those do not change the captured merge's input identity.
+        try shared_store.refreshIndexPublicationCheckpoint(foreground.owned_lite_backend.?.native_docstore.?.file.header);
+        owner.text_source_runtime_cache = (try TextSourceRuntimeCache.capture(pending.root)) orelse return error.TestUnexpectedResult;
+        owner.maintenance_retained_logical = shared_store.file.activeCheckpoint().logical;
+        const opens = owner.test_runtime_snapshot_opens;
+        try table.batch(.{ .writes = &.{.{ .key = "continued-source", .value = "{\"text\":\"continued source\"}" }}, .sync_level = .write });
+        const reused = try owner.refreshMaintenanceSnapshot(foreground, .source);
+        try std.testing.expectEqual(@intFromPtr(pending.root), @intFromPtr(reused));
+        try std.testing.expectEqual(opens, owner.test_runtime_snapshot_opens);
+        try std.testing.expect(!pending.done.load(.acquire));
+        // A changed immutable input really does require a fresh runtime. The
+        // merge's independent strong reference keeps its old owner alive.
+        var writer = segment_mod.SegmentWriter.init(std.testing.allocator);
+        defer writer.deinit();
+        try writer.addStoredDoc("new-immutable-input", "{}");
+        const bytes = try writer.build();
+        defer std.testing.allocator.free(bytes);
+        try table.core.index_manager.textIndexEntry("text").?.persistent.indexSegment(bytes);
+        const replacement = try owner.refreshMaintenanceSnapshot(foreground, .source);
+        try std.testing.expect(replacement != pending.root);
+        try std.testing.expectEqual(@as(usize, 1), pending.root.maintenance_runtime_references.load(.acquire));
+        try std.testing.expect(!pending.done.load(.acquire));
+    }
+    // Joins the canceled immutable worker before releasing its last owner.
+    owner.discardPendingTextMerge();
+    try std.testing.expect(owner.pending_text_merge == null);
+    try fixture.expectWritten(.batch, true);
 }
 
 test "capi native asynchronous text merge removes inputs already fully deleted at capture" {
@@ -7606,6 +7730,7 @@ test "capi native maintenance named selection opens only its detached table runt
         detached_open: bool = false,
         fn captured(ptr: *anyopaque, root: *h.Handle) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!root.embedded_tables.contains("active")) return;
             self.entered = true;
             self.serving_open = self.owner.current.?.embedded_tables.contains("active");
             self.detached_open = root != self.owner.current.? and root.embedded_tables.contains("active");
@@ -7622,6 +7747,47 @@ test "capi native maintenance named selection opens only its detached table runt
     }
     try std.testing.expect(probe.entered and probe.detached_open);
     try std.testing.expect(!probe.serving_open);
+}
+
+test "capi native maintenance text source reuse refreshes relational rows and fences table controls" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("relational-text-source-runtime", 5000, .sql);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    const owner = fixture.connection.owner;
+    var lease = try fixture.connection.acquire();
+    defer {
+        lease.close();
+        fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    }
+    const foreground = owner.current.?;
+    const table = try @import("tables.zig").get(foreground, "numbers");
+    try table.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    try table.batch(.{ .writes = &.{.{ .key = "first", .value = "{\"n\":1}" }}, .sync_level = .write });
+    const source = try owner.refreshMaintenanceSnapshot(foreground, .source);
+    const source_table = try @import("tables.zig").get(source, "numbers");
+    try std.testing.expect(source_table.core.index_manager.relational_base_rows);
+    owner.text_source_runtime_cache = (try TextSourceRuntimeCache.capture(source)) orelse return error.TestUnexpectedResult;
+    const opens = owner.test_runtime_snapshot_opens;
+    const old_head = source_table.core.store.lastReplaySequence(0);
+    const file = &foreground.owned_lite_backend.?.native_docstore.?.file;
+    try foreground.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(source.owned_lite_backend.?.native_docstore.?.file.header);
+    try table.batch(.{ .writes = &.{.{ .key = "second", .value = "{\"n\":2}" }}, .sync_level = .write });
+    try std.testing.expectEqual(source, try owner.refreshMaintenanceSnapshot(foreground, .source));
+    try std.testing.expectEqual(opens, owner.test_runtime_snapshot_opens);
+    try std.testing.expect(source_table.core.store.lastReplaySequence(0) > old_head);
+    var found = (try source_table.lookup(std.testing.allocator, "second", .{})) orelse return error.TestUnexpectedResult;
+    defer found.deinit(std.testing.allocator);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, found.json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("n").?.integer);
+    var changed_catalog = table.core.table_catalog;
+    changed_catalog.transaction_admission_bytes /= 2;
+    var change = try table.core.store.beginWriteTxn();
+    errdefer change.abort();
+    try change.put(@import("../storage/db/table_catalog.zig").key, &changed_catalog.encode());
+    try change.commit();
+    try std.testing.expect(!try owner.text_source_runtime_cache.?.matches(file));
 }
 
 test "capi native maintenance partial text replay earns another source turn without advancing coverage" {

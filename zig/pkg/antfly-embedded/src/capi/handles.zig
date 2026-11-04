@@ -73,6 +73,10 @@ pub const Handle = struct {
     sql_ddl_recovery_scans: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
     sql_commit_recovery_scans: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
     maintenance_references: usize = 0,
+    /// Strong ownership of internal detached runtimes: the cache, active
+    /// turns and immutable merge jobs release independently. Foreground and
+    /// public handles do not participate in this internal ownership domain.
+    maintenance_runtime_references: std.atomic.Value(usize) = .init(0),
     /// Independent proof readers borrow allocator/executor lifetime only;
     /// they do not require detaching the foreground DB runtime.
     allocator_verification_references: usize = 0,
