@@ -84,9 +84,10 @@ pub const TranscribeConfig = struct {
 
 pub const AudioContext = enum { full, dynamic };
 
-/// Phrase timed by Whisper timestamp tokens, relative to the window start.
+/// Text with measured phrase clocks or coarse recognition-window bounds.
 pub const TimedSegment = struct {
     text: []const u8,
+    granularity: whisper_timestamps.Granularity = .window,
     start_ms: u64,
     end_ms: u64,
 };
@@ -371,6 +372,7 @@ pub const TranscriptionPipeline = struct {
                 try segments.ensureUnusedCapacity(allocator, 1);
                 segments.appendAssumeCapacity(.{
                     .text = try allocator.dupe(u8, trimmed),
+                    .granularity = segment.granularity,
                     .start_ms = segment.start_ms,
                     .end_ms = segment.end_ms,
                 });
@@ -994,15 +996,56 @@ fn checkUtf8Window(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.Tokeni
     if (timestamps and expected.len > 0) {
         try std.testing.expectEqual(@as(usize, 1), result.segments.len);
         try std.testing.expectEqualStrings(expected, result.segments[0].text);
+        try std.testing.expectEqual(whisper_timestamps.Granularity.window, result.segments[0].granularity);
+        try std.testing.expectEqual(@as(u64, 0), result.segments[0].start_ms);
+        try std.testing.expectEqual(@as(u64, 1000), result.segments[0].end_ms);
     } else try std.testing.expectEqual(@as(usize, 0), result.segments.len);
 
     // The wire type must remain a JSON string, even at a byte-token cutoff.
-    const json = try std.json.Stringify.valueAlloc(allocator, .{ .text = result.text, .segments = result.segments }, .{});
-    defer allocator.free(json);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    // Keep wire assertions outside the result-ownership allocation sweep:
+    // JSON's arena growth can depend on the backing allocator's remaps.
+    const wire_allocator = std.testing.allocator;
+    const json = try std.json.Stringify.valueAlloc(wire_allocator, .{ .text = result.text, .segments = result.segments }, .{});
+    defer wire_allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, wire_allocator, json, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings(expected, parsed.value.object.get("text").?.string);
-    if (result.segments.len > 0) try std.testing.expectEqualStrings(expected, parsed.value.object.get("segments").?.array.items[0].object.get("text").?.string);
+    if (result.segments.len > 0) {
+        const segment = parsed.value.object.get("segments").?.array.items[0].object;
+        try std.testing.expectEqualStrings(expected, segment.get("text").?.string);
+        try std.testing.expectEqualStrings("window", segment.get("granularity").?.string);
+    }
+}
+
+fn checkTimestampEvidence(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.Tokenizer) !void {
+    var pipeline = TranscriptionPipeline.init(allocator, undefined, undefined, tokenizer, .{ .timestamps = true, .decode = .{ .timestamp_begin_id = 100 } });
+    var generated = std.ArrayListUnmanaged(i32).empty;
+    defer generated.deinit(allocator);
+    // One bracketed phrase followed by an unfinished, nonzero-start tail.
+    try generated.appendSlice(allocator, &.{ 100, 0, 150, 175, 1, 2 });
+    pipeline.output_token_budget = .{ .remaining = 0, .consumed = generated.items.len };
+    const attempt = TranscriptionPipeline.Attempt{ .generated = generated, .detected_language = null, .no_speech_prob = 0, .avg_logprob = 0, .compression_ratio = 1, .temperature = 0 };
+    var result = try pipeline.finishWindow(&attempt, 30000, .{}, generated.items.len);
+    defer result.deinit();
+    try std.testing.expect(result.truncated);
+    try std.testing.expectEqualStrings("oké", result.text);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1, 2 }, result.tokens);
+    try std.testing.expectEqual(@as(usize, 6), result.output_tokens);
+    try std.testing.expectEqual(@as(usize, 2), result.segments.len);
+    try std.testing.expectEqualStrings("ok", result.segments[0].text);
+    try std.testing.expectEqual(whisper_timestamps.Granularity.phrase, result.segments[0].granularity);
+    try std.testing.expectEqual(@as(u64, 0), result.segments[0].start_ms);
+    try std.testing.expectEqual(@as(u64, 1000), result.segments[0].end_ms);
+    try std.testing.expectEqualStrings("é", result.segments[1].text);
+    try std.testing.expectEqual(whisper_timestamps.Granularity.window, result.segments[1].granularity);
+    try std.testing.expectEqual(@as(u64, 0), result.segments[1].start_ms);
+    try std.testing.expectEqual(@as(u64, 30000), result.segments[1].end_ms);
+}
+
+test "Whisper preserves mixed phrase and window evidence through every allocation failure" {
+    var hf = try tokenizer_mod.hf.HfTokenizer.loadFromBytes(std.testing.allocator, utf8_test_tokenizer);
+    defer hf.deinitSelf();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkTimestampEvidence, .{hf.tokenizer()});
 }
 
 test "Whisper output cutoffs preserve UTF-8 strings for text and timed segments" {

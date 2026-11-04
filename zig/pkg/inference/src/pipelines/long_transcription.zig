@@ -58,7 +58,7 @@ pub const Window = struct {
 pub const Segment = struct {
     text: []u8,
     /// A decoded phrase clock or only the bounds of its recognition window.
-    granularity: enum { phrase, window } = .phrase,
+    granularity: whisper_timestamps.Granularity = .window,
     start_ms: u64,
     end_ms: u64,
     /// Word spans estimated inside the phrase; see `whisper_timestamps.splitWords`.
@@ -78,8 +78,9 @@ pub fn freeSegments(allocator: std.mem.Allocator, segments: []Segment) void {
     allocator.free(segments);
 }
 
-/// Build an owned segment with word spans from a phrase.
-pub fn makeSegment(allocator: std.mem.Allocator, text: []const u8, start_ms: u64, end_ms: u64) !Segment {
+/// Build an owned segment without upgrading its alignment evidence. Word
+/// spans remain estimates for internal consumers, regardless of granularity.
+pub fn makeSegment(allocator: std.mem.Allocator, text: []const u8, start_ms: u64, end_ms: u64, granularity: whisper_timestamps.Granularity) !Segment {
     const owned_text = try allocator.dupe(u8, text);
     errdefer allocator.free(owned_text);
     const spans = try whisper_timestamps.splitWords(allocator, owned_text, start_ms, end_ms);
@@ -94,7 +95,7 @@ pub fn makeSegment(allocator: std.mem.Allocator, text: []const u8, start_ms: u64
         words[i] = .{ .word = try allocator.dupe(u8, span.word), .start_ms = span.start_ms, .end_ms = span.end_ms };
         built += 1;
     }
-    return .{ .text = owned_text, .start_ms = start_ms, .end_ms = end_ms, .words = words };
+    return .{ .text = owned_text, .granularity = granularity, .start_ms = start_ms, .end_ms = end_ms, .words = words };
 }
 
 pub const Result = struct {
@@ -236,16 +237,17 @@ pub fn transcribeLong(
         const window_start_ms = vad.samplesToMs(sample_rate, window.start);
         const window_end_ms = vad.samplesToMs(sample_rate, window.end);
         if (result.segments.len > 0) {
+            try segments.ensureUnusedCapacity(allocator, result.segments.len);
             for (result.segments) |timed| {
                 const start_ms = @min(window_end_ms, window_start_ms + timed.start_ms);
                 const end_ms = @min(window_end_ms, @max(start_ms, window_start_ms + timed.end_ms));
-                try segments.append(allocator, try makeSegment(allocator, timed.text, start_ms, end_ms));
+                segments.appendAssumeCapacity(try makeSegment(allocator, timed.text, start_ms, end_ms, timed.granularity));
             }
         } else {
             const trimmed = std.mem.trim(u8, result.text, " \t\r\n");
             if (trimmed.len > 0) {
-                try segments.append(allocator, try makeSegment(allocator, trimmed, window_start_ms, window_end_ms));
-                segments.items[segments.items.len - 1].granularity = .window;
+                try segments.ensureUnusedCapacity(allocator, 1);
+                segments.appendAssumeCapacity(try makeSegment(allocator, trimmed, window_start_ms, window_end_ms, .window));
             }
         }
         if (options.condition_on_previous) {
@@ -299,6 +301,7 @@ const FakeTranscriber = struct {
     prefix_lens: [8]usize = @as([8]usize, @splat(0)),
     /// When set, every result carries two timed phrases instead of plain text.
     timed: bool = false,
+    coarse_tail: bool = false,
     /// Copied, because the window result that carried the code is freed
     /// before the test inspects it.
     locked_language_buf: [8]u8 = undefined,
@@ -336,8 +339,8 @@ const FakeTranscriber = struct {
         var segments: []transcription.TimedSegment = &.{};
         if (self.timed) {
             const timed = try self.allocator.alloc(transcription.TimedSegment, 2);
-            timed[0] = .{ .text = try self.allocator.dupe(u8, "first phrase"), .start_ms = 0, .end_ms = 1000 };
-            timed[1] = .{ .text = try self.allocator.dupe(u8, "second"), .start_ms = 1000, .end_ms = 2500 };
+            timed[0] = .{ .text = try self.allocator.dupe(u8, "first phrase"), .granularity = .phrase, .start_ms = 0, .end_ms = 1000 };
+            timed[1] = .{ .text = try self.allocator.dupe(u8, "second"), .granularity = if (self.coarse_tail) .window else .phrase, .start_ms = if (self.coarse_tail) 0 else 1000, .end_ms = if (self.coarse_tail) vad.samplesToMs(sample_rate, samples.len) else 2500 };
             segments = timed;
         }
         return .{
@@ -501,6 +504,33 @@ test "long transcription maps timestamped phrases onto the clip timeline" {
     try std.testing.expect(result.segments[2].start_ms >= 22_500);
     try std.testing.expect(result.segments[3].end_ms <= 45_000);
     try std.testing.expectEqualStrings("first phrase second first phrase second", result.text);
+}
+
+test "long transcription keeps coarse tails and measured phrases distinct across windows" {
+    const a = std.testing.allocator;
+    const samples = try a.alloc(f32, 1000 * 40);
+    defer a.free(samples);
+    @memset(samples, 0.1);
+    const windows = try planWindows(a, samples, 1000, .{});
+    defer a.free(windows);
+    var fake = FakeTranscriber{ .allocator = a, .timed = true, .coarse_tail = true, .output_budget = .{ .remaining = 6 } };
+    var result = try transcribeLong(a, &fake, samples, 1000, .{});
+    defer result.deinit();
+    try std.testing.expect(result.truncated);
+    try std.testing.expectEqual(@as(usize, 6), result.output_tokens);
+    try std.testing.expectEqualStrings("first phrase second first phrase second", result.text);
+    try std.testing.expectEqual(@as(usize, 4), result.segments.len);
+    for (result.segments, 0..) |segment, index| {
+        try std.testing.expectEqual(if (index % 2 == 0) whisper_timestamps.Granularity.phrase else .window, segment.granularity);
+    }
+    // VAD may choose a pause just before the hard limit. Each coarse tail
+    // must use that original window's exact bounds after rebasing.
+    try std.testing.expectEqual(@as(usize, 2), windows.len);
+    for (windows, 0..) |window, index| {
+        const coarse = result.segments[2 * index + 1];
+        try std.testing.expectEqual(vad.samplesToMs(1000, window.start), coarse.start_ms);
+        try std.testing.expectEqual(vad.samplesToMs(1000, window.end), coarse.end_ms);
+    }
 }
 
 test "long transcription drops empty window text" {

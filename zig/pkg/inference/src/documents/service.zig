@@ -26,7 +26,7 @@ const image = @import("antfly_image");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const A = std.mem.Allocator;
 const V = std.json.Value;
-const adapter_version = "antfly-documents-v14";
+const adapter_version = "antfly-documents-v15";
 const durable = @import("durable.zig");
 
 /// Payloads are borrowed for the complete synchronous operation. Durable runs

@@ -124,6 +124,12 @@ nonzero audio remains unresolved. Whisper token usage includes every generated
 token across windows and temperature retries, including timestamps, EOS, and
 output discarded by a no-speech decision.
 
+Whisper labels a segment `phrase` only when both bounding timestamp tokens
+were generated. Text missing either boundary, including a tail cut short by
+the output budget or EOS, remains available with `window` granularity and the
+original recognition-window bounds. Window stitching and diarization preserve
+this distinction; a coarse span does not claim measured phrase alignment.
+
 Durable execution pins effective recognition options separately from physical
 model identity. Provider defaults and output-affecting settings, together with
 the speaker-model artifact revision when diarization is enabled, must match
