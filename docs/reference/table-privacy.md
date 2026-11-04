@@ -98,7 +98,17 @@ and `output_schema`. Evidence must contain valid source spans; invalid evidence
 fails inspection. Custom producer revisions are mandatory. Credentials must be
 empty, environment references, or supported secret references; literal
 credentials are rejected. Remote producers receive original selected text;
-the preview and policy response disclose external processing.
+the preview and policy response disclose external processing. That disclosure
+uses execution's route selection, including `inference.api_url`, explicit
+producer endpoints, and task-specific linked callback availability. Generated
+extractors follow their generator's route.
+
+Managed document projections have a source-sized host budget, separate from
+producer response limits. Large selected values and unrelated document fields
+therefore do not consume the detector's evidence allowance. Preview still has
+its own 8 MiB sample and response limits; provider output remains independently
+bounded. Selected text must also fit the configured producer input budget;
+for constrained generators this is `producer.config.batch.max_input_bytes`.
 
 The union of expanded category groups and explicit custom categories is limited
 to 128 categories. Overrides of an existing group category count once. This
@@ -107,7 +117,10 @@ limit is checked before preview or policy installation.
 `execution.batch_items` (1–8) and `execution.max_attempts` (1–5) tune batching
 and invalid-evidence retries. Changing them preserves semantic policy identity
 and accepted inspection results. Transport backoff remains owned by the
-artifact runtime. Changing fields, categories, thresholds, replacement, mode,
+artifact runtime. Dependency priming honors the same durable, source-bound retry
+clock as ordinary replay, including after restart. A deferred inspection does
+not prevent independent documents' downstream work from progressing. Changing
+fields, categories, thresholds, replacement, mode,
 or producer identity creates a new policy version and schedules backfill.
 
 ## Protected serving

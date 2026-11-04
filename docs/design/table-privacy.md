@@ -356,6 +356,34 @@ every document within its resolution budget. A scratch allocator unwraps arenas
 while preserving every nested invocation quota; temporary frees
 therefore release actual backing memory even when results are interleaved.
 
+Detector evidence, normalized field text and final document projections have
+separate bounds. Normalized text may retain the source-sized selected values;
+composition also preserves unselected fields. The host's logical-result bound
+is three source byte lengths plus twice the producer evidence allowance and a
+512-byte envelope. Admission charges the actual source sum across the cohort
+and independently accounts for normalized receipts retained alongside final
+results; one large source never multiplies every sibling's reservation. Checked
+arithmetic fails closed on overflow. The underlying producer's result limits
+continue to bound raw detector output on every call.
+
+Dependency priming consults the same incarnation-, source- and definition-bound
+retry tickets as ordinary document replay. Its healthy path does one indexed
+lookup without reading primary bytes. It publishes successful siblings and
+allows durably parked provider failures to yield; control, publication and
+worker failures still stop the quantum. Ordinary replay reloads delayed roots
+after priming, so their consumers wait without re-invoking a rate-limited root.
+Provider Retry-After clocks survive restart and new document admissions.
+
+External-processing disclosure uses the same pure endpoint resolver and linked
+callback availability as execution. Explicit endpoints override callbacks;
+otherwise callbacks override the configured inference endpoint. Generated
+extractors use generator routing. Policy/status reads perform no capability
+fetch, credential resolution or model invocation to report this flag.
+Forwarded metadata acknowledgments are localized to the issuing data API's
+route, preserving ETags, mutation outcome and unknown response fields (including
+exact numeric literals). An already-correct flag or a scan-only response is
+returned without replacing its body.
+
 Checkpoint reclamation shares eight chunks (at most 2 MiB), 32 CAS operations,
 and a 25 ms soft time budget across each quantum. A completed small blob can
 lose its header in the same quantum. Partial blobs rotate behind later rows.
@@ -378,7 +406,41 @@ partial reclamation progress survive snapshots and restart.
 
 ## Validation
 
-### Latest detector memory and checkpoint retention fixes (2026-11-04)
+### Latest retry, projection and disclosure fixes (2026-11-04)
+
+- Merged main through `4bb2b815aa7d359d979d28cb9a4f4fa6205e70fc`. The merge
+  keeps compact producer enrollment separate from mutable readiness cursors,
+  adopts the bounded transaction-local empty-input proof, and regenerates the
+  Go client with its license and SQL transport policy hooks.
+- The real-store priming regression covers a one-hour provider retry, restart,
+  healthy-consumer progress after a write 30 seconds later, preservation of the
+  provider deadline, and completion when the failed root becomes due. All
+  three retry workset regressions pass on the integrated source, alongside
+  218 ordered-artifact tests and 10 owner/ABI checks (67/67 build steps).
+- The HTTP regression now covers 2 MiB selected and unrelated fields in serial
+  and native batched previews, protective backfill and reads, and rejection of
+  oversized raw provider output. The selected-text fixture explicitly configures
+  a 4 MiB constrained-input budget; production input defaults remain unchanged.
+  Pure tests cover overflow-safe budgets,
+  source-sum admission for mixed-size cohorts, explicit/default endpoints,
+  independent callback availability, and generated-extractor disclosure.
+- Integrated server/focused build: 106/106 steps, 58 API/metadata tests,
+  150 native storage/privacy tests and two ABI checks passed. The forwarded
+  acknowledgment regression verifies route correction without losing exact
+  numeric literals, future producer fields, ETags or unchanged-body reuse.
+- Full Go SDK tests, Zig/Python formatting and license checks passed. `make gc`
+  completed while protecting active builds. This review does not repeat
+  model-weight, Metal or CUDA qualification.
+- Qualified server SHA-256:
+  `7a7372f3f65702e3e3d948c3478d031538c30afa710ae69daa4c8db21ece10d9`.
+- Complete standalone HTTP suite: 20 passed, one optional model-weight test
+  skipped (393.29 seconds), including the expanded source-budget regression.
+- Complete Raft HTTP suite on the same binary: 20 passed, one optional
+  model-weight test skipped (771.49 seconds). Both suites include one/two
+  shards, policy replacement, restart, membership changes, large identifiers,
+  private scan boundaries, source-sized projections and raw-output limits.
+
+### Previous detector memory and checkpoint retention fixes (2026-11-04)
 
 - Merged main at `7bc16af5383a8be6e9f95877f4bd443487d06fc4`, retaining privacy
   dependency batching and failure markers alongside durable scoped retries and
