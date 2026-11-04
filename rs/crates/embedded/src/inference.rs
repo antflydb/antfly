@@ -554,7 +554,6 @@ impl Inference {
         })
     }
 
-
     /// `GET /models`: the installed models.
     pub fn list_models(&self) -> InferenceResult<Vec<u8>> {
         self.read_buffer(|h, out| unsafe { sys::antfly_inference_list_models_json(h, out) })

@@ -37,7 +37,7 @@ pub fn controlAdmissionHint(bytes: []const u8) bool {
     return mode != .publish and mode != .append_chunks;
 }
 comptime {
-    if (@typeInfo(publication.Command).@"struct".field_names.len != 19 or
+    if (@typeInfo(publication.Command).@"struct".field_names.len != 20 or
         @typeInfo(publication.Source).@"struct".field_names.len != 5 or
         @typeInfo(publication.ArtifactSource).@"struct".field_names.len != 4 or
         @typeInfo(publication.Mutation).@"struct".field_names.len != 4 or
@@ -73,6 +73,7 @@ fn positionSize(size: *usize, value: ?Position) !void {
 
 pub fn encodedLength(command: publication.Command) !usize {
     var size: usize = 4 + 1 + 1 + 24 + 8 + 32 + 8 + 32 + 4 * 4 + 32 + 4;
+    if (command.execution_identity != null) try add(&size, 32);
     try blobSize(&size, command.producer_name);
     try blobSize(&size, command.producer_artifact_name);
     try blobSize(&size, command.producer_scope_key);
@@ -156,7 +157,7 @@ pub fn encodeAlloc(alloc: Allocator, command: publication.Command) ![]u8 {
     const out = try alloc.alloc(u8, try encodedLength(command));
     errdefer alloc.free(out);
     var writer: Writer = .{ .bytes = out };
-    writer.write(magic);
+    writer.write(if (command.execution_identity != null) "APB2" else magic);
     writer.byte(@backingInt(command.mode));
     writer.byte(@backingInt(command.producer_kind));
     writer.write(&command.namespace);
@@ -164,6 +165,7 @@ pub fn encodeAlloc(alloc: Allocator, command: publication.Command) ![]u8 {
     writer.write(&command.catalog_digest);
     writer.writeU64(command.producer_generation);
     writer.write(&command.publication_digest);
+    if (command.execution_identity) |value| writer.write(&value);
     writer.blob(command.producer_name);
     writer.blob(command.producer_artifact_name);
     writer.blob(command.producer_scope_key);
@@ -322,7 +324,9 @@ fn decode(alloc: Allocator, bytes: []const u8, owns_bytes: bool) !Decoded {
     const expected = digest(bytes[0 .. bytes.len - 32]);
     if (!std.mem.eql(u8, &expected, bytes[bytes.len - 32 ..])) return error.ArtifactCatalogCorrupt;
     var cursor: Cursor = .{ .bytes = bytes[0 .. bytes.len - 32] };
-    if (!std.mem.eql(u8, try cursor.take(4), magic)) return error.InvalidBatchRequest;
+    const header = try cursor.take(4);
+    const extended = std.mem.eql(u8, header, "APB2");
+    if (!extended and !std.mem.eql(u8, header, magic)) return error.InvalidBatchRequest;
     const mode = std.enums.fromInt(@FieldType(publication.Command, "mode"), try cursor.byte()) orelse return error.InvalidBatchRequest;
     const kind = std.enums.fromInt(@FieldType(publication.Command, "producer_kind"), try cursor.byte()) orelse return error.InvalidBatchRequest;
     const namespace: publication.Namespace = (try cursor.take(24))[0..24].*;
@@ -330,6 +334,7 @@ fn decode(alloc: Allocator, bytes: []const u8, owns_bytes: bool) !Decoded {
     const catalog_digest: Digest = (try cursor.take(32))[0..32].*;
     const producer_generation = try cursor.readU64();
     const publication_digest: Digest = (try cursor.take(32))[0..32].*;
+    const execution_identity: ?Digest = if (extended) (try cursor.take(32))[0..32].* else null;
     const producer_name = try cursor.blob();
     const producer_artifact_name = try cursor.blob();
     const producer_scope_key = try cursor.blob();
@@ -467,6 +472,7 @@ fn decode(alloc: Allocator, bytes: []const u8, owns_bytes: bool) !Decoded {
         .catalog_digest = catalog_digest,
         .producer_name = producer_name,
         .producer_generation = producer_generation,
+        .execution_identity = execution_identity,
         .producer_artifact_name = producer_artifact_name,
         .producer_scope_key = producer_scope_key,
         .sources = sources,

@@ -55,10 +55,7 @@ const end_audio_token = "<audio|>";
 pub const Part = union(enum) {
     text: []const u8,
     image: []const u8,
-    audio: struct {
-        bytes: []const u8,
-        decode_options: audio.DecodeOptions = .{},
-    },
+    audio: audio.EncodedClip,
 };
 
 pub const Prepared = struct {
@@ -212,10 +209,10 @@ pub fn prepareResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, 
 
 /// Borrowed projected rows indexed by content part; the composer retains views.
 pub const Projected = struct { tensor: ops.CT, tokens: usize };
-pub fn prepareResidentProjected(cb: *const ComputeBackend, allocator: std.mem.Allocator, tok: Tokenizer, prefix: []const u8, parts: []const Part, max_tokens: usize, control: ?InferenceExecutionControl, projected: []const ?Projected) !Prepared {
+pub fn prepareResidentProjected(cb: *const ComputeBackend, allocator: std.mem.Allocator, tok: Tokenizer, prefix: []const u8, parts: []const Part, max_tokens: usize, max_audio_decode_working_bytes: usize, control: ?InferenceExecutionControl, projected: []const ?Projected) !Prepared {
     if (comptime !@import("build_options").enable_cuda) return error.UnsupportedEmbeddingGemma2Backend;
     if (cb.kind() != .cuda or parts.len != projected.len) return error.InvalidInputShape;
-    return prepareImpl(cb, allocator, tok, prefix, parts, max_tokens, 64 * 1024 * 1024, control, true, projected);
+    return prepareImpl(cb, allocator, tok, prefix, parts, max_tokens, max_audio_decode_working_bytes, control, true, projected);
 }
 
 fn prepareImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator, tok: Tokenizer, prefix: []const u8, parts: []const Part, max_tokens: usize, max_audio_decode_working_bytes: usize, control: ?InferenceExecutionControl, resident: bool, projected: ?[]const ?Projected) !Prepared {

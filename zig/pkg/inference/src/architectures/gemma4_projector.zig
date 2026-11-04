@@ -1743,12 +1743,18 @@ pub fn embeddingGemma2EncodedAudioSequenceBoundWithOptions(bytes: []const u8, op
 }
 
 pub fn prepareEmbeddingGemma2AudioForBackend(a: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, backend: @import("../backends/backends.zig").BackendType) !PreparedAudio {
-    if (backend != .cuda) return prepareEmbeddingGemma2AudioWithPacking(a, bytes, options, backend != .native);
+    return prepareEmbeddingGemma2AudioForBackendBounded(a, bytes, options, backend, audio.default_decode_working_bytes);
+}
+pub fn prepareEmbeddingGemma2AudioForBackendBounded(a: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, backend: @import("../backends/backends.zig").BackendType, max_decode_working_bytes: usize) !PreparedAudio {
+    if (backend != .cuda) return prepareEmbeddingGemma2AudioWithPackingBounded(a, bytes, options, backend != .native, max_decode_working_bytes);
     const cfg = embeddingGemma2AudioConfig();
-    return prepareAudioCpuBounded(a, bytes, options, cfg.mel_bins, cfg.reject_audio_truncation, true, cfg.max_audio_samples, 64 * 1024 * 1024, true);
+    return prepareAudioCpuBounded(a, bytes, options, cfg.mel_bins, cfg.reject_audio_truncation, true, cfg.max_audio_samples, max_decode_working_bytes, true);
 }
 pub fn prepareEmbeddingGemma2AudioWithPacking(allocator: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, pack_device: bool) !PreparedAudio {
-    return prepareAudioCpu(allocator, bytes, options, 128, true, pack_device);
+    return prepareEmbeddingGemma2AudioWithPackingBounded(allocator, bytes, options, pack_device, audio.default_decode_working_bytes);
+}
+pub fn prepareEmbeddingGemma2AudioWithPackingBounded(allocator: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, pack_device: bool, max_decode_working_bytes: usize) !PreparedAudio {
+    return prepareAudioCpuBounded(allocator, bytes, options, 128, true, pack_device, 480_000, max_decode_working_bytes, false);
 }
 fn prepareAudioCpu(allocator: std.mem.Allocator, audio_bytes: []const u8, decode_options: audio.DecodeOptions, mel_bins: usize, strict: bool, pack_gpu: bool) !PreparedAudio {
     return prepareAudioCpuBounded(allocator, audio_bytes, decode_options, mel_bins, strict, pack_gpu, 480_000, audio.default_decode_working_bytes, false);

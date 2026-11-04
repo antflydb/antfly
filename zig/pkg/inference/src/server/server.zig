@@ -18,6 +18,7 @@
 
 pub const chunk_response = @import("chunk_response.zig");
 const std = @import("std");
+const embedding_revision = httpx.embedding_revision;
 const builtin = @import("builtin");
 const build_info = @import("build_info");
 const build_options = @import("build_options");
@@ -1933,6 +1934,36 @@ fn runEmbeddingRuntimeRecoveryLoop(adapter: anytype) !void {
         adapter.succeed(&handle);
         return;
     }
+}
+
+// Check the acquired generation on every recovery attempt, before broker or
+// pipeline dispatch. Observing the alias before/after execution cannot fence ABA.
+fn requireLoadedEmbeddingRevision(expected: ?[32]u8, actual: ?[32]u8) !void {
+    try embedding_revision.require(expected, actual);
+}
+
+fn acknowledgeEmbeddingRevision(ctx: *httpx.Context, revision: ?[32]u8) !void {
+    if (revision) |value| {
+        const hex = std.fmt.bytesToHex(value, .lower);
+        try ctx.setHeader(embedding_revision.response_header, &hex);
+        // Make the proof readable by cross-origin JSON and numeric callers,
+        // preserving any exposure policy installed by middleware.
+        const existing = ctx.response.headers.get("Access-Control-Expose-Headers") orelse "";
+        var values = std.mem.splitScalar(u8, existing, ',');
+        while (values.next()) |name| if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, name, " \t"), embedding_revision.response_header)) return;
+        if (existing.len == 0) {
+            try ctx.setHeader("Access-Control-Expose-Headers", embedding_revision.response_header);
+        } else {
+            const exposed = try std.fmt.allocPrint(ctx.allocator, "{s}, {s}", .{ existing, embedding_revision.response_header });
+            defer ctx.allocator.free(exposed);
+            try ctx.setHeader("Access-Control-Expose-Headers", exposed);
+        }
+    }
+}
+
+fn embeddingRevisionFailureResponse(ctx: *httpx.Context) !httpx.Response {
+    try ctx.setHeader("X-Antfly-Capability-Stale", "true");
+    return ctx.status(409).json(.{ .@"error" = "MODEL_REVISION_MISMATCH", .message = "the acquired embedding model does not match model_revision; refresh capabilities and replan" });
 }
 
 fn runLoadedEmbeddingRuntimeWithRecovery(
@@ -5003,10 +5034,7 @@ pub const Node = struct {
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
-                if (attempt.expected_revision) |expected| {
-                    const actual = model.resolution_revision orelse return error.InferenceCapabilitiesStale;
-                    if (!std.mem.eql(u8, &expected, &actual)) return error.InferenceCapabilitiesStale;
-                }
+                try requireLoadedEmbeddingRevision(attempt.expected_revision, model.resolution_revision);
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
                 const input_tokens = try maxTokenizerTextTokens(
                     attempt.allocator,
@@ -6827,7 +6855,8 @@ pub const Node = struct {
         input: std.json.Value,
     ) ![][]f32 {
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        const media_admission = requestMediaAdmission(self, denseEmbedRequestMediaShape(input));
+        const media_shape = denseEmbedRequestMediaShape(input);
+        const media_admission = requestMediaAdmission(self, media_shape);
         try self.acquireAdmissionUnits(media_admission.units);
         var reserved_units = media_admission.units;
         defer self.releaseAdmissionUnits(reserved_units);
@@ -6844,7 +6873,13 @@ pub const Node = struct {
         try ensureDirectEmbeddingDeadline(deadline_ns);
 
         if (hasGroupedEmbeddingInput(input)) {
-            return self.embedGroupsFromPath(allocator, io, model_path, &admission_manifest, executor_contract, input, .{}, .{ .deadline_ns = deadline_ns }, media_admission.byte_cap);
+            const audio_admission = audioDecodeAdmission(self, media_admission.resident_byte_cap);
+            if (media_shape.has_audio) {
+                const required_units = @max(reserved_units, audio_admission.units);
+                try self.growAdmissionUnits(reserved_units, required_units);
+                reserved_units = required_units;
+            }
+            return self.embedGroupsFromPath(allocator, io, model_path, &admission_manifest, executor_contract, input, .{ .max_audio_decode_working_bytes = audio_admission.max_decode_working_bytes }, .{ .deadline_ns = deadline_ns }, .{ .media = media_admission, .reserved_units = &reserved_units });
         }
 
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
@@ -6868,6 +6903,7 @@ pub const Node = struct {
             .{ .deadline_ns = deadline_ns },
             executor_contract,
             .RETRIEVAL_DOCUMENT,
+            null,
             null,
         );
     }
@@ -6945,6 +6981,20 @@ pub const Node = struct {
         task_type_raw: ?[]const u8,
         instruction: ?[]const u8,
     ) ![][]f32 {
+        return self.embedDensePartsDirectWithExecutionControlAndTaskRevision(allocator, io, supplied_control, model_name, parts, task_type_raw, instruction, null);
+    }
+
+    pub fn embedDensePartsDirectWithExecutionControlAndTaskRevision(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        supplied_control: InferenceExecutionControl,
+        model_name: []const u8,
+        parts: []const DirectDenseEmbedPart,
+        task_type_raw: ?[]const u8,
+        instruction: ?[]const u8,
+        expected_revision: ?[32]u8,
+    ) ![][]f32 {
         const control = self.bindExecutionControl(io, supplied_control);
         if (parts.len == 0) return try allocator.alloc([]f32, 0);
         try control.check();
@@ -7009,6 +7059,7 @@ pub const Node = struct {
             executor_contract,
             task_type,
             instruction,
+            expected_revision,
         );
     }
 
@@ -7130,13 +7181,11 @@ pub const Node = struct {
             const groups = try allocator.alloc(grouped.Group, parsed.total_count);
             defer allocator.free(groups);
             for (parsed.audio.items, parts, groups, 0..) |input, *part, *group, index| {
-                // Ambiguous codecs retain the MIME-aware pipeline executor.
-                if (@import("../pipelines/audio.zig").detectFormat(input.bytes) == null) return null;
-                part.* = .{ .audio = input.bytes };
+                part.* = .{ .audio = .{ .bytes = input.bytes, .decode_options = .{ .mime_hint = input.mime_type } } };
                 group.* = .{ .content = parts[index..][0..1] };
             }
             const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
-            const batch = (try self.tryEmbedGemma4MediaGroups(allocator, model, groups, try groupedEmbeddingOptions(&model.manifest, contract, .{ .task_type = @tagName(task_type) }), control, contract)) orelse return null;
+            const batch = (try self.tryEmbedGemma4MediaGroups(allocator, model, groups, try groupedEmbeddingOptions(&model.manifest, contract, .{ .task_type = @tagName(task_type), .max_audio_decode_working_bytes = audio_working_bytes }), control, contract)) orelse return null;
             defer batch.deinit();
             const vectors = try allocator.alloc([]f32, parsed.total_count);
             @memset(vectors, &.{});
@@ -7920,6 +7969,7 @@ pub const Node = struct {
         executor_contract: ResolvedInferenceExecutorContract,
         task_type: EmbeddingTaskType,
         instruction: ?[]const u8,
+        expected_revision: ?[32]u8,
     ) ![][]f32 {
         if (parsed.total_count == 0) return try allocator.alloc([]f32, 0);
         try control.check();
@@ -7956,12 +8006,24 @@ pub const Node = struct {
             control: InferenceExecutionControl,
             task_type: EmbeddingTaskType,
             instruction: ?[]const u8,
+            expected_revision: ?[32]u8,
             vectors: ?[][]f32 = null,
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
+                try requireLoadedEmbeddingRevision(attempt.expected_revision, model.resolution_revision);
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
                 try model.verifyEmbeddingIdentityWithControl(attempt.control);
+                if (attempt.parsed.groups.items.len != 0) {
+                    if (attempt.instruction != null) return error.InstructionNotSupportedForModel;
+                    var groups = try embeddingGroupsForParsed(attempt.allocator, attempt.parsed);
+                    defer groups.deinit();
+                    attempt.vectors = try attempt.node.embedGroupsOnLoadedModel(attempt.allocator, model, groups.groups, .{
+                        .task_type = @tagName(attempt.task_type),
+                        .max_audio_decode_working_bytes = attempt.audio_decode_working_bytes,
+                    }, attempt.control);
+                    return;
+                }
                 const resident_embedding_gemma2 = model.manifest.embedding_style == .embedding_gemma2 and model.session.backend() == .cuda;
                 const request_prefix = try denseEmbeddingTextPrefix(attempt.allocator, model, attempt.task_type, attempt.instruction);
                 defer if (request_prefix.owned) |owned| attempt.allocator.free(owned);
@@ -8030,6 +8092,7 @@ pub const Node = struct {
             .control = control,
             .task_type = task_type,
             .instruction = instruction,
+            .expected_revision = expected_revision,
         };
         try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{ .execution_control = control }, &attempt, Attempt.run);
         return attempt.vectors.?;
@@ -13474,10 +13537,8 @@ pub const Node = struct {
             });
         };
 
-        const media_admission = requestMediaAdmission(
-            self,
-            denseEmbedRequestMediaShapeWithAttachments(request.input, borrowed_attachments),
-        );
+        const media_shape = denseEmbedRequestMediaShapeWithAttachments(request.input, borrowed_attachments);
+        const media_admission = requestMediaAdmission(self, media_shape);
         const admission_units = @max(self.estimateHttpRequestAdmissionUnits(ctx), media_admission.units);
         const trace_admission_started = if (tracing) embedding_trace.now() else 0;
         if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
@@ -13517,7 +13578,13 @@ pub const Node = struct {
         if (hasGroupedEmbeddingInput(request.input)) {
             if (admission_manifest.embedding_style != .embedding_gemma2) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "ordered content groups require an EmbeddingGemma 2 model" });
             if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
-            return self.createGroupedEmbedding(ctx, model_path, admission_manifest, executor_contract, request, borrowed_attachments, media_admission.byte_cap, execution_control) catch |err| {
+            const audio_admission = audioDecodeAdmission(self, media_admission.resident_byte_cap);
+            if (media_shape.has_audio) {
+                const required_units = @max(reserved_units, audio_admission.units);
+                if (try self.growSlotUnits(ctx, reserved_units, required_units)) |resp| return resp;
+                reserved_units = required_units;
+            }
+            return self.createGroupedEmbedding(ctx, model_path, admission_manifest, executor_contract, request, borrowed_attachments, .{ .media = media_admission, .reserved_units = &reserved_units, .audio_working_bytes = audio_admission.max_decode_working_bytes }, execution_control) catch |err| {
                 return groupedEmbeddingFailureResponse(ctx, err);
             };
         }
@@ -13558,9 +13625,11 @@ pub const Node = struct {
                 node: *Node,
                 prompt_tokens: usize = 0,
                 executor_contract: ResolvedInferenceExecutorContract,
+                model_revision: ?[32]u8,
 
                 fn run(attempt_ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                     const attempt: *@This() = @ptrCast(@alignCast(attempt_ctx));
+                    try requireLoadedEmbeddingRevision(attempt.model_revision, model.resolution_revision);
                     if (!model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
                     var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
                         .allocator = attempt.allocator,
@@ -13590,6 +13659,7 @@ pub const Node = struct {
                 .allocator = ctx.allocator,
                 .io = self.session_manager.io,
                 .texts = sparse_texts,
+                .model_revision = request.model_revision,
                 .node = self,
                 .executor_contract = executor_contract,
                 .execution_control = execution_control,
@@ -13598,6 +13668,7 @@ pub const Node = struct {
                 .execution_control = execution_control,
             }, &attempt, Attempt.run) catch |err|
                 {
+                    if (err == error.InferenceCapabilitiesStale) return embeddingRevisionFailureResponse(ctx);
                     if (isInferenceExecutorContractError(err)) return inferenceExecutorContractFailureResponse(ctx, err);
                     return inferenceFailureResponse(ctx, err);
                 };
@@ -13606,6 +13677,7 @@ pub const Node = struct {
                 for (sparse_vecs) |*sv| @constCast(sv).deinit(ctx.allocator);
                 ctx.allocator.free(sparse_vecs);
             }
+            try acknowledgeEmbeddingRevision(ctx, request.model_revision);
 
             var arena = std.heap.ArenaAllocator.init(ctx.allocator);
             defer arena.deinit();
@@ -13713,6 +13785,7 @@ pub const Node = struct {
 
             fn run(attempt_ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(attempt_ctx));
+                try requireLoadedEmbeddingRevision(attempt.request.model_revision, model.resolution_revision);
                 attempt.model_identity = model.embedding_identity;
                 try model.verifyEmbeddingIdentityWithControl(attempt.execution_control);
                 if (attempt.request.model_identity) |expected| {
@@ -13885,6 +13958,7 @@ pub const Node = struct {
             .trace = attempt.trace,
             .execution_control = execution_control,
         }, &attempt, Attempt.run) catch |err| {
+            if (err == error.InferenceCapabilitiesStale) return embeddingRevisionFailureResponse(ctx);
             if (err == error.EmbeddingIdentityMismatch) return ctx.status(409).json(.{ .@"error" = "MODEL_IDENTITY_MISMATCH", .message = "embedding assets or recipe differ from the pinned index identity" });
             if (isInferenceExecutorContractError(err)) return inferenceExecutorContractFailureResponse(ctx, err);
             if (isEmbedRequestOptionError(err)) {
@@ -13919,6 +13993,7 @@ pub const Node = struct {
                     for (embeddings) |e| ctx.allocator.free(e);
                     ctx.allocator.free(embeddings);
                 };
+                try acknowledgeEmbeddingRevision(ctx, request.model_revision);
                 if (httpx.numeric_response.requested(ctx.header("Accept"))) {
                     const frame = buildDenseNumericFrame(ctx.allocator, embeddings, requested_dimensions, attempt.normalize_response) catch |err| switch (err) {
                         error.InvalidEmbeddingDimensions => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "dimensions exceeds the model embedding size" }),
@@ -13948,6 +14023,7 @@ pub const Node = struct {
             .per_item => |partial_value| {
                 var partial = partial_value;
                 defer partial.deinit(ctx.allocator);
+                try acknowledgeEmbeddingRevision(ctx, request.model_revision);
                 var response = buildEmbedDensePartialResponse(arena.allocator(), request.model, &partial, requested_dimensions, attempt.normalize_response, attempt.prompt_tokens) catch |err| switch (err) {
                     error.InvalidEmbeddingDimensions => {
                         return ctx.status(400).json(.{
@@ -24541,13 +24617,14 @@ pub const Node = struct {
         try control.check();
         const admission = requestMediaAdmission(self, denseEmbedRequestMediaShape(input));
         try self.acquireAdmissionUnits(admission.units);
-        defer self.releaseAdmissionUnits(admission.units);
+        var reserved_units = admission.units;
+        defer self.releaseAdmissionUnits(reserved_units);
         const path = try self.resolveModelPath(io, model_name, "embedders");
         defer self.allocator.free(path);
         var manifest = try manifest_mod.loadFromDir(a, path);
         defer manifest.deinit();
         const contract = try resolvedInferenceExecutorContract(self, "embed", &manifest);
-        return self.embedGroupsFromPath(a, io, path, &manifest, contract, input, options, control, admission.byte_cap);
+        return self.embedGroupsFromPath(a, io, path, &manifest, contract, input, options, control, .{ .media = admission, .reserved_units = &reserved_units });
     }
 
     fn tryEmbedGemma4MediaGroups(self: *Node, out: std.mem.Allocator, model: *model_manager_mod.LoadedModel, groups: []const @import("../pipelines/embedding_gemma2.zig").Group, options: @import("../pipelines/embedding_gemma2.zig").Options, control: InferenceExecutionControl, contract: ResolvedInferenceExecutorContract) !?@import("../pipelines/gemma4_image_broker.zig").Result {
@@ -24559,7 +24636,7 @@ pub const Node = struct {
         return @import("../pipelines/gemma4_image_broker.zig").submit(self.executorMicrobatchBroker(), out, io, model.model_dir, @intFromPtr(model), model.session, model.getTokenizer(), model.embeddingExecutionLock(), control, groups, options, self.config.executor_microbatch_max_wait_us, contract.batch.max_encoded_media_bytes, contract.batch.max_decoded_pixels orelse std.math.maxInt(u64), contract.batch.max_items);
     }
 
-    fn embedGroupsFromPath(self: *Node, out: std.mem.Allocator, io: std.Io, path: []const u8, manifest: *const manifest_mod.ModelManifest, contract: ResolvedInferenceExecutorContract, input: std.json.Value, options: @import("../pipelines/embedding_gemma2.zig").Options, control: InferenceExecutionControl, byte_cap: usize) ![][]f32 {
+    fn embedGroupsFromPath(self: *Node, out: std.mem.Allocator, io: std.Io, path: []const u8, manifest: *const manifest_mod.ModelManifest, contract: ResolvedInferenceExecutorContract, input: std.json.Value, options: @import("../pipelines/embedding_gemma2.zig").Options, control: InferenceExecutionControl, admission: GroupedEmbeddingAdmission) ![][]f32 {
         const grouped = @import("../pipelines/embedding_gemma2.zig");
         if (manifest.embedding_style != .embedding_gemma2) return error.UnsupportedEmbeddingProvider;
         const raw_groups = if (input == .object) &.{input} else if (input == .array) input.array.items else return error.InvalidEmbeddingGroup;
@@ -24571,24 +24648,39 @@ pub const Node = struct {
         const groups = try a.alloc(grouped.Group, raw_groups.len);
         var retained = ParsedDenseEmbedInputs{};
         defer retained.deinit(a);
-        var budget = RequestMediaBudget.init(byte_cap);
+        var budget = RequestMediaBudget.init(admission.media.byte_cap);
+        var decoded_budget = ReadDecodedImageBudget.init(admission.media, effectiveRequestContentSecurity(self).max_image_dimension);
         var request_budget: EmbeddingGroupRequestBudget = .{};
         for (raw_groups, groups) |raw, *group| {
             group.* = try parseEmbeddingGroup(self, a, manifest, raw, &retained, &budget, .{ .io = io, .control = control }, &.{});
             try grouped.validateGroup(group.*, options);
             try request_budget.add(try validateEmbeddingGroupContract(self, contract, group.*, groups.len, control));
+            try decoded_budget.addGroup(group.*);
         }
         try request_budget.validate(contract, groups.len);
+        try admission.grow(self, decoded_budget, retained.audio.items.len != 0);
+        var admitted_options = options;
+        admitted_options.max_audio_decode_working_bytes = @min(options.max_audio_decode_working_bytes, audioDecodeAdmission(self, admission.media.resident_byte_cap).max_decode_working_bytes);
         var handle = try self.model_manager.acquireFromDirWithControl(path, control);
         defer handle.release();
         const loaded = handle.get();
+        return self.embedGroupsOnLoadedModel(out, loaded, groups, admitted_options, control);
+    }
+
+    // All frontends execute ordered content against the same acquired model.
+    // Native callers retain their revision-fenced handle through this call.
+    fn embedGroupsOnLoadedModel(self: *Node, out: std.mem.Allocator, loaded: *model_manager_mod.LoadedModel, groups: []const @import("../pipelines/embedding_gemma2.zig").Group, options: @import("../pipelines/embedding_gemma2.zig").Options, control: InferenceExecutionControl) ![][]f32 {
+        const grouped = @import("../pipelines/embedding_gemma2.zig");
+        var request_budget: EmbeddingGroupRequestBudget = .{};
         var frame_cache = grouped.FrameCache{ .allocator = grouped.workspaceBackingAllocator(loaded.session.backend()), .session = loaded.session };
         defer frame_cache.deinit();
         try loaded.verifyEmbeddingIdentityWithControl(control);
         const active_contract = try resolvedInferenceExecutorContract(self, "embed", &loaded.manifest);
         const active_options = try groupedEmbeddingOptions(&loaded.manifest, active_contract, options);
-        request_budget = .{};
-        for (groups) |group| try request_budget.add(try validateEmbeddingGroupContract(self, active_contract, group, groups.len, control));
+        for (groups) |group| {
+            try grouped.validateGroup(group, active_options);
+            try request_budget.add(try validateEmbeddingGroupContract(self, active_contract, group, groups.len, control));
+        }
         try request_budget.validate(active_contract, groups.len);
         const vectors = try out.alloc([]f32, groups.len);
         var count: usize = 0;
@@ -24620,18 +24712,18 @@ pub const Node = struct {
         return vectors;
     }
 
-    fn createGroupedEmbedding(self: *Node, ctx: *httpx.Context, path: []const u8, manifest: *const manifest_mod.ModelManifest, contract: ResolvedInferenceExecutorContract, request: ParsedEmbedRequest, attachments: []const httpx.attachment_envelope.Attachment, byte_cap: usize, control: InferenceExecutionControl) !httpx.Response {
+    fn createGroupedEmbedding(self: *Node, ctx: *httpx.Context, path: []const u8, manifest: *const manifest_mod.ModelManifest, contract: ResolvedInferenceExecutorContract, request: ParsedEmbedRequest, attachments: []const httpx.attachment_envelope.Attachment, admission: GroupedEmbeddingAdmission, control: InferenceExecutionControl) !httpx.Response {
         // The inner call releases frame-cache fences, model handles and arena
         // storage before this scope publishes the completed cleanup outcome.
         var outcome = self.metrics.embedding_groups.begin();
         defer outcome.finish();
-        return self.createGroupedEmbeddingTracked(ctx, path, manifest, contract, request, attachments, byte_cap, control) catch |err| {
+        return self.createGroupedEmbeddingTracked(ctx, path, manifest, contract, request, attachments, admission, control) catch |err| {
             outcome.failure = err;
             return err;
         };
     }
 
-    fn createGroupedEmbeddingTracked(self: *Node, ctx: *httpx.Context, path: []const u8, manifest: *const manifest_mod.ModelManifest, contract: ResolvedInferenceExecutorContract, request: ParsedEmbedRequest, attachments: []const httpx.attachment_envelope.Attachment, byte_cap: usize, control: InferenceExecutionControl) !httpx.Response {
+    fn createGroupedEmbeddingTracked(self: *Node, ctx: *httpx.Context, path: []const u8, manifest: *const manifest_mod.ModelManifest, contract: ResolvedInferenceExecutorContract, request: ParsedEmbedRequest, attachments: []const httpx.attachment_envelope.Attachment, admission: GroupedEmbeddingAdmission, control: InferenceExecutionControl) !httpx.Response {
         const grouped = @import("../pipelines/embedding_gemma2.zig");
         if (request.instruction != null) return error.InstructionNotSupportedForModel;
         if (request.dimensions) |dim| if (dim <= 0 or !@import("../architectures/embedding_gemma2.zig").validDimension(@intCast(dim))) return error.InvalidEmbeddingDimensions;
@@ -24645,39 +24737,56 @@ pub const Node = struct {
         @memset(groups, null);
         var retained = ParsedDenseEmbedInputs{};
         defer retained.deinit(a);
-        var media_budget = RequestMediaBudget.init(byte_cap);
+        var media_budget = RequestMediaBudget.init(admission.media.byte_cap);
+        // The framed payload remains resident alongside inline and fetched
+        // media. Charge it once before parsing, as on the flat request path.
+        for (attachments) |attachment| try media_budget.add(attachment.data.len);
         var errors = std.ArrayListUnmanaged(EmbedItemError).empty;
         var request_budget: EmbeddingGroupRequestBudget = .{};
+        var decoded_budget = ReadDecodedImageBudget.init(admission.media, effectiveRequestContentSecurity(self).max_image_dimension);
         for (raw_groups, 0..) |raw, index| {
             groups[index] = parseEmbeddingGroup(self, a, manifest, raw, &retained, &media_budget, .{ .io = ctx.io, .control = control }, attachments) catch |err| {
-                if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err)) return err;
+                if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err) or err == error.RemoteContentTooLarge or err == error.ImageTooLarge or err == error.ImageBatchTooLarge) return err;
                 try errors.append(a, embedItemFailure(index, err, "input"));
                 continue;
             };
-            const options = grouped.Options{ .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT), .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768 };
+            const options = grouped.Options{ .max_audio_decode_working_bytes = admission.audio_working_bytes, .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT), .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768 };
             preflight: {
                 grouped.validateGroup(groups[index].?, options) catch |err| {
-                    if (request.error_policy == .fail_fast) return err;
+                    if (request.error_policy == .fail_fast or err == error.ImageTooLarge or err == error.ImageBatchTooLarge) return err;
                     try errors.append(a, embedItemFailure(index, err, "input"));
                     groups[index] = null;
                     break :preflight;
                 };
                 const shape = validateEmbeddingGroupContract(self, contract, groups[index].?, groups.len, control) catch |err| {
-                    if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err) or err == error.ResourceTemporarilyUnavailable or err == error.MemoryBudgetExceeded) return err;
+                    if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err) or err == error.ResourceTemporarilyUnavailable or err == error.MemoryBudgetExceeded or err == error.ImageTooLarge) return err;
                     try errors.append(a, embedItemFailure(index, err, "input"));
                     groups[index] = null;
                     break :preflight;
                 };
+                // Security and aggregate capacity limits remain request-wide,
+                // including under per-item provider error handling.
+                try decoded_budget.addGroup(groups[index].?);
                 try request_budget.add(shape);
             }
         }
         try request_budget.validate(contract, raw_groups.len);
+        try admission.grow(self, decoded_budget, retained.audio.items.len != 0);
         const vectors = try a.alloc(?[]f32, groups.len);
         @memset(vectors, null);
+        // All-invalid per-item requests need neither weights nor a session.
+        const any_valid = for (groups) |group| {
+            if (group != null) break true;
+        } else false;
+        if (!any_valid) {
+            const partial = DenseEmbedPartialResult{ .embeddings = vectors, .errors = errors.items };
+            return ctx.json(try buildEmbedDensePartialResponse(a, request.model, &partial, if (request.dimensions) |dim| @intCast(dim) else null, true, 0));
+        }
         var input_tokens: usize = 0;
         var handle = try self.model_manager.acquireFromDirWithControl(path, control);
         defer handle.release();
         const loaded = handle.get();
+        try requireLoadedEmbeddingRevision(request.model_revision, loaded.resolution_revision);
         var frame_cache = grouped.FrameCache{ .allocator = grouped.workspaceBackingAllocator(loaded.session.backend()), .session = loaded.session };
         defer frame_cache.deinit();
         if (request.model_identity) |expected| {
@@ -24687,6 +24796,7 @@ pub const Node = struct {
         try loaded.verifyEmbeddingIdentityWithControl(control);
         const active_contract = try resolvedInferenceExecutorContract(self, "embed", &loaded.manifest);
         const active_options = try groupedEmbeddingOptions(&loaded.manifest, active_contract, .{
+            .max_audio_decode_working_bytes = admission.audio_working_bytes,
             .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT),
             .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768,
         });
@@ -24734,6 +24844,7 @@ pub const Node = struct {
             }
         }
         try loaded.verifyEmbeddingIdentityWithControl(control);
+        try acknowledgeEmbeddingRevision(ctx, request.model_revision);
         if (request.error_policy == .per_item) {
             const partial = DenseEmbedPartialResult{ .embeddings = vectors, .errors = errors.items };
             var response = try buildEmbedDensePartialResponse(a, request.model, &partial, if (request.dimensions) |dim| @intCast(dim) else null, true, input_tokens);
@@ -25113,6 +25224,7 @@ pub const Node = struct {
                 const catalog_allocator = catalog.arena.allocator();
                 try info.object.put(catalog_allocator, "model_revision", .{ .string = &hex });
                 if (std.mem.eql(u8, task, "generate")) return ctx.json(catalog.value);
+                try info.object.put(catalog_allocator, "model_revision_pinning", .{ .bool = true });
                 // Registry-wide listing deliberately skips full geometry parsing.
                 // Scoped discovery already resolved metadata without loading weights.
                 if (dense_output) |shape| {
@@ -37180,6 +37292,7 @@ fn validateQwen3EmbeddingDimensions(manifest: *const manifest_mod.ModelManifest,
 }
 
 const ParsedEmbedRequest = struct {
+    model_revision: ?[32]u8 = null,
     model_identity: ?[]const u8 = null,
     model: []const u8,
     input: std.json.Value,
@@ -37295,6 +37408,37 @@ const ParsedDenseEmbedGroup = struct {
     index: usize,
     parts: []const embedding_mod.EmbeddingContentPart,
 };
+
+const ParsedEmbeddingGroups = struct {
+    arena: std.heap.ArenaAllocator,
+    groups: []const @import("../pipelines/embedding_gemma2.zig").Group,
+
+    fn deinit(self: *@This()) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+fn embeddingGroupsForParsed(allocator: std.mem.Allocator, parsed: *const ParsedDenseEmbedInputs) !ParsedEmbeddingGroups {
+    const grouped = @import("../pipelines/embedding_gemma2.zig");
+    if (parsed.parse_errors.items.len != 0) return error.InvalidEmbeddingGroup;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const content = try denseEmbeddingContentInputs(a, parsed);
+    const groups = try a.alloc(grouped.Group, content.inputs.len);
+    for (content.inputs, groups) |input, *group| {
+        const parts = try a.alloc(grouped.Part, input.content.len);
+        for (input.content, parts) |part, *dest| dest.* = switch (part) {
+            .text => |text| .{ .text = text },
+            .image => |bytes| .{ .image = bytes },
+            .audio => |clip| if (clip.pcm) |pcm| .{ .pcm = pcm } else .{ .audio = .{ .bytes = clip.bytes, .decode_options = clip.decode_options } },
+            .video => |bytes| .{ .video = bytes },
+        };
+        group.* = .{ .content = parts };
+    }
+    return .{ .arena = arena, .groups = groups };
+}
 
 fn recordDenseEmbedImageBudgetFailure(
     allocator: std.mem.Allocator,
@@ -37446,7 +37590,7 @@ test "EmbeddingGemma2 grouped frontend rechecks loaded manifest limits and modal
     try std.testing.expectEqual(@as(usize, 512), options.max_tokens);
     try std.testing.expectEqual(@as(usize, 256), (try groupedEmbeddingOptions(&manifest, contract, .{ .max_tokens = 256 })).max_tokens);
     _ = try validateEmbeddingGroupContract(&node, contract, .{ .content = &.{.{ .text = "document" }} }, 1, .{});
-    try std.testing.expectError(error.UnsupportedInferenceModality, validateEmbeddingGroupContract(&node, contract, .{ .content = &.{.{ .audio = "audio" }} }, 1, .{}));
+    try std.testing.expectError(error.UnsupportedInferenceModality, validateEmbeddingGroupContract(&node, contract, .{ .content = &.{.{ .audio = .{ .bytes = "audio" } }} }, 1, .{}));
     manifest.max_position_embeddings = 128;
     try std.testing.expectEqual(@as(usize, 128), (try groupedEmbeddingOptions(&manifest, contract, .{})).max_tokens);
     manifest.embedding_style = .none;
@@ -37559,6 +37703,11 @@ fn parseEmbedRequest(body: std.json.Value) !ParsedEmbedRequest {
         break :blk v.string;
     } else null;
 
+    const revision: ?[32]u8 = if (obj.get("model_revision")) |value| blk: {
+        if (value != .string) return error.InvalidEmbeddingRevision;
+        break :blk try embedding_revision.parse(value.string);
+    } else null;
+
     const model_value = obj.get("model") orelse return error.ModelRequired;
     if (model_value != .string or model_value.string.len == 0) return error.ModelRequired;
 
@@ -37599,6 +37748,7 @@ fn parseEmbedRequest(body: std.json.Value) !ParsedEmbedRequest {
     } else null;
 
     return .{
+        .model_revision = revision,
         .model_identity = identity,
         .model = model_value.string,
         .input = input_value,
@@ -37613,6 +37763,7 @@ fn parseEmbedRequest(body: std.json.Value) !ParsedEmbedRequest {
 fn embedRequestParseErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.RequestBodyMustBeObject => "request body must be a JSON object",
+        error.InvalidEmbeddingRevision => "model_revision must be a 64-character lowercase hexadecimal revision from model capabilities",
         error.ModelRequired => "model is required",
         error.InputRequired => "input is required",
         error.EncodingFormatMustBeString => "encoding_format must be a string",
@@ -38552,11 +38703,14 @@ fn validateEmbeddingGroupContract(node: *Node, contract: ResolvedInferenceExecut
             media_parts += 1;
             media_bytes = std.math.add(usize, media_bytes, bytes.len) catch return error.InferenceEncodedBytesExceeded;
             has_image = true;
-            const info = try image_pipeline.inspectEncodedForInference(bytes, null);
+            const info = try image_pipeline.inspectEncodedForInference(bytes, effectiveRequestContentSecurity(node).max_image_dimension);
             pixels = std.math.add(u64, pixels, try info.pixels()) catch return error.InferenceDecodedPixelsExceeded;
         },
         .raster => |raster| {
             try raster.validate();
+            if (effectiveRequestContentSecurity(node).max_image_dimension) |limit| {
+                if (raster.width > limit or raster.height > limit) return error.ImageTooLarge;
+            }
             media_parts += 1;
             has_image = true;
             pixels = std.math.add(u64, pixels, try raster.pixels()) catch return error.InferenceDecodedPixelsExceeded;
@@ -38577,9 +38731,9 @@ fn validateEmbeddingGroupContract(node: *Node, contract: ResolvedInferenceExecut
             media_bytes = try std.math.add(usize, media_bytes, try std.math.mul(usize, pcm.samples.len, @sizeOf(f32)));
             has_audio = true;
         },
-        .audio => |bytes| {
+        .audio => |clip| {
             media_parts += 1;
-            media_bytes = std.math.add(usize, media_bytes, bytes.len) catch return error.InferenceEncodedBytesExceeded;
+            media_bytes = std.math.add(usize, media_bytes, clip.bytes.len) catch return error.InferenceEncodedBytesExceeded;
             has_audio = true;
         },
     };
@@ -38637,7 +38791,7 @@ fn parseEmbeddingGroup(self: *Node, a: std.mem.Allocator, manifest: *const manif
         const audio = retained.audio.items.len;
         const videos = retained.videos.items.len;
         try appendDenseEmbedInput(self, a, manifest, retained, part, 0, budget, context, attachments);
-        if (retained.texts.items.len > texts) dest.* = .{ .text = retained.texts.items[texts].text } else if (retained.images.items.len > images) dest.* = .{ .image = retained.images.items[images].bytes } else if (retained.audio.items.len > audio) dest.* = .{ .audio = retained.audio.items[audio].bytes } else if (retained.videos.items.len > videos) dest.* = .{ .video = retained.videos.items[videos].bytes } else return error.InvalidEmbeddingGroup;
+        if (retained.texts.items.len > texts) dest.* = .{ .text = retained.texts.items[texts].text } else if (retained.images.items.len > images) dest.* = .{ .image = retained.images.items[images].bytes } else if (retained.audio.items.len > audio) dest.* = .{ .audio = .{ .bytes = retained.audio.items[audio].bytes, .decode_options = .{ .mime_hint = retained.audio.items[audio].mime_type } } } else if (retained.videos.items.len > videos) dest.* = .{ .video = retained.videos.items[videos].bytes } else return error.InvalidEmbeddingGroup;
         if (part == .object) if (part.object.get("sampling")) |value| {
             if (dest.* != .video) return error.InvalidSamplingPolicy;
             // Read the original payload before assigning the new union tag.
@@ -38781,6 +38935,9 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
 /// Grouped execution uses the same admission failure identities as flat
 /// execution, before interpreting failures as invalid grouped input.
 fn groupedEmbeddingFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (err == error.InferenceCapabilitiesStale) return embeddingRevisionFailureResponse(ctx);
+    if (err == error.QueueFull) return transientCapacityFailureResponse(ctx, "SERVICE_UNAVAILABLE", "server at capacity for expanded request workload, try again later", "inference_admission");
+    if (err == error.ImageTooLarge or err == error.ImageBatchTooLarge) return readImageErrorResponse(ctx, err);
     if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
     if (err == error.MemoryBudgetExceeded or err == error.ResourceLimitExceeded) return inferenceFailureResponse(ctx, err);
     if (err == error.EmbeddingIdentityMismatch) return ctx.status(409).json(.{ .@"error" = "MODEL_IDENTITY_MISMATCH", .message = "embedding assets or recipe differ from the pinned index identity" });
@@ -39230,6 +39387,9 @@ fn embedDenseInputs(
         defer content.deinit(allocator);
         return pipeline.embedContent(content.inputs);
     }
+    // Groups must use the shared grouped executor. Their modality arrays
+    // also describe child parts and cannot be interpreted as independent rows.
+    if (inputs.groups.items.len != 0) return error.OrderedEmbeddingContentNotSupported;
     if (inputs.videos.items.len != 0) return error.UnsupportedVideoBackend;
     const embeddings = try allocator.alloc([]f32, inputs.total_count);
     errdefer allocator.free(embeddings);
@@ -42104,6 +42264,21 @@ fn requestMediaAdmission(self: *const Node, shape: RequestMediaAdmissionShape) R
     );
 }
 
+/// The caller owns the reservation through model execution and releases its
+/// final size on every exit. Group parsing shares flat-image admission limits.
+const GroupedEmbeddingAdmission = struct {
+    media: ReadRequestAdmission,
+    reserved_units: *usize,
+    audio_working_bytes: usize = default_max_audio_decode_working_bytes,
+
+    fn grow(self: @This(), node: *Node, images: ReadDecodedImageBudget, has_audio: bool) !void {
+        var required = @max(self.reserved_units.*, images.requiredUnits());
+        if (has_audio) required = @max(required, audioDecodeAdmission(node, self.media.resident_byte_cap).units);
+        try node.growAdmissionUnits(self.reserved_units.*, required);
+        self.reserved_units.* = required;
+    }
+};
+
 const ReadDecodedImageBudget = struct {
     base_units: usize,
     base_bytes: usize,
@@ -42130,6 +42305,20 @@ const ReadDecodedImageBudget = struct {
         const pixels = std.math.mul(usize, @as(usize, info.width), @as(usize, info.height)) catch
             return error.ImageBatchTooLarge;
         try self.addPixels(pixels);
+    }
+
+    fn addGroup(self: *ReadDecodedImageBudget, group: @import("../pipelines/embedding_gemma2.zig").Group) !void {
+        for (group.content) |part| switch (part) {
+            .image => |bytes| try self.addImage(bytes),
+            .raster => |raster| {
+                try raster.validate();
+                if (self.max_dimension) |limit| {
+                    if (raster.width > limit or raster.height > limit) return error.ImageTooLarge;
+                }
+                try self.addPixels(std.math.cast(usize, try raster.pixels()) orelse return error.ImageBatchTooLarge);
+            },
+            else => {},
+        };
     }
 
     fn requiredUnits(self: *const ReadDecodedImageBudget) usize {
@@ -43095,9 +43284,9 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
     defer a.free(audio_bytes);
     const grouped = @import("../pipelines/embedding_gemma2.zig");
     const cases = [_][]const grouped.Part{
-        &.{.{ .image = image_bytes }},                                                                     &.{.{ .audio = audio_bytes }},
-        &.{ .{ .text = "Describe this image." }, .{ .image = image_bytes } },                              &.{ .{ .image = image_bytes }, .{ .text = "Describe this image." } },
-        &.{ .{ .text = "Describe these inputs." }, .{ .audio = audio_bytes }, .{ .image = image_bytes } },
+        &.{.{ .image = image_bytes }},                                                                                   &.{.{ .audio = .{ .bytes = audio_bytes } }},
+        &.{ .{ .text = "Describe this image." }, .{ .image = image_bytes } },                                            &.{ .{ .image = image_bytes }, .{ .text = "Describe this image." } },
+        &.{ .{ .text = "Describe these inputs." }, .{ .audio = .{ .bytes = audio_bytes } }, .{ .image = image_bytes } },
     };
     for (cases, parsed.value.object.get("cases").?.array.items) |parts, reference| {
         if (platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_CASE")) |name| if (!std.mem.eql(u8, name, reference.object.get("name").?.string)) continue;
@@ -43122,7 +43311,7 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
         const reference = parsed.value.object.get("cases").?.array.items[1];
         for (0..14) |iteration| {
             const start = platform.time.monotonicNs();
-            const result = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{.{ .audio = audio_bytes }} }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+            const result = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{.{ .audio = .{ .bytes = audio_bytes } }} }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
             defer a.free(result.vector);
             const elapsed = platform.time.monotonicNs() -| start;
             for (reference.object.get("embedding").?.array.items, result.vector) |value, actual| try std.testing.expectApproxEqAbs(@as(f32, @floatCast(value.float)), actual, 1e-3);
@@ -43131,7 +43320,7 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
     }
     // Qualify the resident conformer cohort and pooled backbone against the
     // same pretrained audio oracle, including Metal's bounded frame pipeline.
-    const audio_groups: [2]grouped.Group = @splat(.{ .content = &.{.{ .audio = audio_bytes }} });
+    const audio_groups: [2]grouped.Group = @splat(.{ .content = &.{.{ .audio = .{ .bytes = audio_bytes } }} });
     var audio_errors: [2]?anyerror = @splat(null);
     const audio_batch = try grouped.embedGroupCohort(a, loaded.session, loaded.getTokenizer(), &audio_groups, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), &audio_errors);
     defer {
@@ -43291,7 +43480,7 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
                         defer a.free(audio_result.vectors);
                         defer a.free(audio_result.input_tokens);
                         break :resident grouped.Result{ .vector = audio_result.vectors[0], .input_tokens = audio_result.input_tokens[0] };
-                    } else try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{.{ .audio = audio_bytes }} }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+                    } else try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{.{ .audio = .{ .bytes = audio_bytes } }} }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
                     defer a.free(result.vector);
                     const elapsed = platform.time.monotonicNs() -| start;
                     for (result.vector, audio_expected) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
@@ -43461,7 +43650,7 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
         const brokered = (try node.tryEmbedImagesViaBroker(a, std.testing.io, loaded, &.{}, &pages, node.extractionExecutionControl(null), .RETRIEVAL_DOCUMENT, null)) orelse return error.ExpectedImageBroker;
         defer freeDirectDenseVectors(a, brokered);
         for (brokered) |vector| for (vector, batched.vectors[0]) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
-        const mixed_parts = [_]grouped.Part{ .{ .text = "Describe these inputs." }, .{ .audio = audio_bytes }, .{ .raster = rasters[0] } };
+        const mixed_parts = [_]grouped.Part{ .{ .text = "Describe these inputs." }, .{ .audio = .{ .bytes = audio_bytes } }, .{ .raster = rasters[0] } };
         const mixed_groups: [2]grouped.Group = @splat(.{ .content = &mixed_parts });
         var timings = grouped.MediaTimings{};
         var errors: [2]?anyerror = @splat(null);
@@ -48075,6 +48264,7 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     try std.testing.expectEqual(@as(i64, 768), shape.object.get("native_dimensions").?.integer);
     try std.testing.expectEqual(@as(i64, 1), shape.object.get("minimum_dimensions").?.integer);
     try std.testing.expectEqual(@as(usize, 64), model.object.get("model_revision").?.string.len);
+    try std.testing.expect(model.object.get("model_revision_pinning").?.bool);
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
 }
 
@@ -48488,13 +48678,28 @@ test "grouped embedding request rejects aggregate pixels before model loading in
         \\[{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"}}]},{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"}}]}]
     , .{});
     defer input.deinit();
-    try std.testing.expectError(error.InferenceDecodedPixelsExceeded, node.embedGroupsFromPath(a, std.testing.io, "missing-model", &manifest, contract, input.value, .{}, .{}, 4096));
+    const media = requestMediaAdmission(&node, denseEmbedRequestMediaShape(input.value));
+    try node.acquireAdmissionUnits(media.units);
+    var reserved_units = media.units;
+    defer node.releaseAdmissionUnits(reserved_units);
+    const admission = GroupedEmbeddingAdmission{ .media = media, .reserved_units = &reserved_units };
+    try std.testing.expectError(error.InferenceDecodedPixelsExceeded, node.embedGroupsFromPath(a, std.testing.io, "missing-model", &manifest, contract, input.value, .{}, .{}, admission));
     var request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
     defer request.deinit();
     var ctx = httpx.Context.init(a, std.testing.io, &request);
     defer ctx.deinit();
     for ([_]EmbedErrorPolicy{ .fail_fast, .per_item }) |policy| {
-        try std.testing.expectError(error.InferenceDecodedPixelsExceeded, node.createGroupedEmbeddingTracked(&ctx, "missing-model", &manifest, contract, .{ .model = "missing", .input = input.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = policy }, &.{}, 4096, .{}));
+        try std.testing.expectError(error.InferenceDecodedPixelsExceeded, node.createGroupedEmbeddingTracked(&ctx, "missing-model", &manifest, contract, .{ .model = "missing", .input = input.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = policy }, &.{}, admission, .{}));
+    }
+    // Node capacity is independent of a model's advertised pixel ceiling.
+    var unbounded_contract = contract;
+    unbounded_contract.batch.max_decoded_pixels = null;
+    var constrained_media = media;
+    constrained_media.decoded_pixel_cap = 1;
+    const constrained = GroupedEmbeddingAdmission{ .media = constrained_media, .reserved_units = &reserved_units };
+    try std.testing.expectError(error.ImageBatchTooLarge, node.embedGroupsFromPath(a, std.testing.io, "missing-model", &manifest, unbounded_contract, input.value, .{}, .{}, constrained));
+    for ([_]EmbedErrorPolicy{ .fail_fast, .per_item }) |policy| {
+        try std.testing.expectError(error.ImageBatchTooLarge, node.createGroupedEmbeddingTracked(&ctx, "missing-model", &manifest, unbounded_contract, .{ .model = "missing", .input = input.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = policy }, &.{}, constrained, .{}));
     }
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
 }
@@ -49278,6 +49483,48 @@ test "fixed chunk request validates minimum content without changing defaults" {
     try std.testing.expectError(error.InvalidChunkMinChars, applyFixedChunkConfig(&config, .{ .text = .{ .min_chars = 1000001 } }));
     try applyFixedChunkConfig(&config, .{ .text = .{ .min_chars = 0 } });
     try std.testing.expectEqual(@as(usize, 0), config.text.min_chars);
+}
+
+test "EmbeddingGemma2 ordered audio preserves MIME hints through HTTP native and broker admission" {
+    const a = std.testing.allocator;
+    var node: Node = undefined;
+    node.config = .{};
+    var modalities = [_][]const u8{ "text", "audio" };
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .model_type = .embedder, .embedding_style = .embedding_gemma2, .inputs = &modalities };
+    const bytes = "\x00\xff\xfb\x90\x00";
+    const children = [_]Node.DirectDenseEmbedPart{ .{ .text = "speech" }, .{ .media = .{ .mime_type = "audio/mpeg", .data = bytes } }, .{ .media = .{ .mime_type = "audio/aac", .data = bytes } } };
+    var budget = RequestMediaBudget.init(1024);
+    var parsed = try parseDirectDenseEmbedInputsOptionalContext(&node, a, &manifest, &.{.{ .content = &children }}, &budget, null);
+    defer parsed.deinit(a);
+    var groups = try embeddingGroupsForParsed(a, &parsed);
+    defer groups.deinit();
+    for (groups.groups[0].content[1..], [_][]const u8{ "audio/mpeg", "audio/aac" }) |part, mime| {
+        try std.testing.expect(part.audio.bytes.ptr == bytes.ptr);
+        try std.testing.expectEqualStrings(mime, part.audio.decode_options.mime_hint.?);
+    }
+    const broker = @import("../pipelines/gemma4_image_broker.zig");
+    _ = try broker.groupShape(groups.groups[0]);
+    // With no hint these bytes fail sniffing; each part's declaration must
+    // reach admission independently even when the clips share one group.
+    const projector = @import("../architectures/gemma4_projector.zig");
+    try std.testing.expectError(error.UnsupportedAudioFormat, projector.embeddingGemma2EncodedAudioSequenceBound(bytes));
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var json = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"content":[{"type":"text","text":"speech"},{"type":"media","mime_type":"audio/mpeg","data":"AP/7kAA="},{"type":"media","mime_type":"audio/aac","data":"AP/7kAA="}]}
+    , .{});
+    defer json.deinit();
+    var retained: ParsedDenseEmbedInputs = .{};
+    defer retained.deinit(alloc);
+    var http_budget = RequestMediaBudget.init(1024);
+    const http_group = try parseEmbeddingGroup(&node, alloc, &manifest, json.value, &retained, &http_budget, .{ .io = std.testing.io }, &.{});
+    for (http_group.content[1..], groups.groups[0].content[1..]) |http_part, native_part| {
+        try std.testing.expectEqualStrings(native_part.audio.decode_options.mime_hint.?, http_part.audio.decode_options.mime_hint.?);
+        try std.testing.expectEqualSlices(u8, native_part.audio.bytes, http_part.audio.bytes);
+    }
+    try std.testing.expectEqualDeep(try broker.groupShape(groups.groups[0]), try broker.groupShape(http_group));
 }
 
 test "hosted audio document identity canonicalizes default model aliases" {
@@ -50746,4 +50993,187 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
     try std.testing.expectEqual(@as(u64, 0), ordinary.replays);
     const captured = try Harness.run(model_path, true);
     for (ordinary.tokens, captured.tokens) |expected, actual| try std.testing.expectEqualSlices(u32, &expected, &actual);
+}
+
+test "grouped embedding request applies image security before model loading" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .content_security = .{ .max_image_dimension = 1 } });
+    defer node.deinit();
+    var inputs = [_][]const u8{"image"};
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .model_type = .embedder, .embedding_style = .embedding_gemma2, .inputs = &inputs };
+    const contract = try resolvedInferenceExecutorContract(&node, "embed", &manifest);
+    const rgba: [16]u8 = @splat(0);
+    const png = try @import("antfly_image").png.encodeRgba(a, 2, 2, &rgba);
+    defer a.free(png);
+    const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
+    defer a.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, png);
+    const json = try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"image_url\",\"image_url\":{{\"url\":\"data:image/png;base64,{s}\"}}}}]}}", .{encoded});
+    defer a.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    const media = requestMediaAdmission(&node, denseEmbedRequestMediaShape(parsed.value));
+    try node.acquireAdmissionUnits(media.units);
+    var units = media.units;
+    defer node.releaseAdmissionUnits(units);
+    const admission = GroupedEmbeddingAdmission{ .media = media, .reserved_units = &units };
+    try std.testing.expectError(error.ImageTooLarge, node.embedGroupsFromPath(a, std.testing.io, "missing-model", &manifest, contract, parsed.value, .{}, .{}, admission));
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    for ([_]EmbedErrorPolicy{ .fail_fast, .per_item }) |policy| {
+        try std.testing.expectError(error.ImageTooLarge, node.createGroupedEmbeddingTracked(&ctx, "missing-model", &manifest, contract, .{ .model = "missing", .input = parsed.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = policy }, &.{}, admission, .{}));
+    }
+    var response = try groupedEmbeddingFailureResponse(&ctx, error.ImageTooLarge);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 413), response.status.code);
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+}
+
+test "grouped embedding request reserves decoded image memory" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    const rgba: [16]u8 = @splat(0);
+    const png = try @import("antfly_image").png.encodeRgba(a, 2, 2, &rgba);
+    defer a.free(png);
+    const grouped = @import("../pipelines/embedding_gemma2.zig");
+    const parts = [_]grouped.Part{ .{ .image = png }, .{ .image = png } };
+    const media = ReadRequestAdmission{ .units = 1, .byte_cap = 1024, .resident_byte_cap = read_admission_bytes_per_unit, .decoded_pixel_cap = 8 };
+    var budget = ReadDecodedImageBudget.init(media, null);
+    try budget.addGroup(.{ .content = &parts });
+    try node.acquireAdmissionUnits(media.units);
+    var units = media.units;
+    defer node.releaseAdmissionUnits(units);
+    try (GroupedEmbeddingAdmission{ .media = media, .reserved_units = &units }).grow(&node, budget, false);
+    try std.testing.expectEqual(@as(usize, 2), units);
+    try std.testing.expectEqual(units, node.inference_admission.inFlightUnits());
+}
+
+test "grouped embedding request reports all invalid items without model loading" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    var inputs = [_][]const u8{"image"};
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .model_type = .embedder, .embedding_style = .embedding_gemma2, .inputs = &inputs };
+    const contract = try resolvedInferenceExecutorContract(&node, "embed", &manifest);
+    var input = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,d29vZg=="}}]}
+    , .{});
+    defer input.deinit();
+    const media = requestMediaAdmission(&node, denseEmbedRequestMediaShape(input.value));
+    try node.acquireAdmissionUnits(media.units);
+    var units = media.units;
+    defer node.releaseAdmissionUnits(units);
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.createGroupedEmbeddingTracked(&ctx, "missing-model", &manifest, contract, .{ .model = "missing", .input = input.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = .per_item }, &.{}, .{ .media = media, .reserved_units = &units }, .{});
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var body = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer body.deinit();
+    try std.testing.expectEqual(@as(usize, 0), body.value.object.get("data").?.array.items.len);
+    const errors = body.value.object.get("errors").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), errors.len);
+    try std.testing.expectEqual(@as(i64, 0), errors[0].object.get("index").?.integer);
+    try std.testing.expectEqualStrings("INVALID_IMAGE", errors[0].object.get("code").?.string);
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+}
+
+test "grouped embedding request expanded admission capacity failure is retryable" {
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try groupedEmbeddingFailureResponse(&ctx, error.QueueFull);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    var body = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer body.deinit();
+    try std.testing.expect(body.value.object.get("retryable").?.bool);
+    try std.testing.expectEqualStrings("inference_admission", body.value.object.get("reason").?.string);
+}
+
+test "grouped embedding request charges framed attachments before inline media" {
+    const a = std.testing.allocator;
+    const rgba: [4]u8 = @splat(0);
+    const png = try @import("antfly_image").png.encodeRgba(a, 1, 1, &rgba);
+    defer a.free(png);
+    const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
+    defer a.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, png);
+    var node = try Node.init(a, .{ .content_security = .{ .max_download_size_bytes = encoded.len } });
+    defer node.deinit();
+    var inputs = [_][]const u8{"image"};
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .model_type = .embedder, .embedding_style = .embedding_gemma2, .inputs = &inputs };
+    const contract = try resolvedInferenceExecutorContract(&node, "embed", &manifest);
+    const json = try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"attachment\",\"attachment_index\":0}},{{\"type\":\"media\",\"mime_type\":\"image/png\",\"data\":\"{s}\"}}]}}", .{encoded});
+    defer a.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    const attachments = [_]httpx.attachment_envelope.Attachment{.{ .mime_type = "image/png", .data = png }};
+    const media = requestMediaAdmission(&node, denseEmbedRequestMediaShapeWithAttachments(parsed.value, &attachments));
+    // Either input fits alone; their combined charge must fail before weights.
+    try std.testing.expect(png.len <= media.byte_cap and encoded.len <= media.byte_cap);
+    try node.acquireAdmissionUnits(media.units);
+    var units = media.units;
+    defer node.releaseAdmissionUnits(units);
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    for ([_]EmbedErrorPolicy{ .fail_fast, .per_item }) |policy| {
+        try std.testing.expectError(error.RemoteContentTooLarge, node.createGroupedEmbeddingTracked(&ctx, "missing-model", &manifest, contract, .{ .model = "missing", .input = parsed.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = policy }, &attachments, .{ .media = media, .reserved_units = &units }, .{}));
+    }
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+}
+
+test "standalone embedding HTTP revision parser and acknowledgements" {
+    const a = std.testing.allocator;
+    const expected: [32]u8 = @splat(0x11);
+    const hex = std.fmt.bytesToHex(expected, .lower);
+    const body = try std.fmt.allocPrint(a, "{{\"model\":\"alias\",\"input\":\"text\",\"model_revision\":\"{s}\"}}", .{hex});
+    defer a.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    const pin = (try parseEmbedRequest(parsed.value)).model_revision;
+    try std.testing.expectEqual(expected, pin.?);
+    try requireLoadedEmbeddingRevision(pin, expected);
+    try std.testing.expectError(error.InferenceCapabilitiesStale, requireLoadedEmbeddingRevision(pin, @as([32]u8, @splat(0x22))));
+    try std.testing.expectError(error.InferenceCapabilitiesStale, requireLoadedEmbeddingRevision(pin, null));
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+    defer request.deinit();
+    {
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        try ctx.setHeader("Access-Control-Expose-Headers", "X-Request-ID");
+        try acknowledgeEmbeddingRevision(&ctx, pin);
+        // A numeric response carries the same proof without a JSON vector copy.
+        const frame = try httpx.numeric_response.allocFrame(a, .dense, 1, 2);
+        var response = try publishNumericFrame(&ctx, frame);
+        defer response.deinit();
+        try std.testing.expectEqualStrings(&hex, response.headers.get(embedding_revision.response_header).?);
+        try std.testing.expectEqualStrings("X-Request-ID, X-Antfly-Model-Revision", response.headers.get("Access-Control-Expose-Headers").?);
+        try std.testing.expectEqualStrings(httpx.numeric_response.content_type, response.contentType().?);
+    }
+    {
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try groupedEmbeddingFailureResponse(&ctx, error.InferenceCapabilitiesStale);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 409), response.status.code);
+        try std.testing.expectEqualStrings("true", response.headers.get("X-Antfly-Capability-Stale").?);
+        try std.testing.expect(response.headers.get(embedding_revision.response_header) == null);
+    }
+    for ([_][]const u8{ "\"bad\"", "7", "null" }) |value| {
+        const invalid_body = try std.fmt.allocPrint(a, "{{\"model\":\"alias\",\"input\":\"text\",\"model_revision\":{s}}}", .{value});
+        defer a.free(invalid_body);
+        var invalid = try std.json.parseFromSlice(std.json.Value, a, invalid_body, .{});
+        defer invalid.deinit();
+        try std.testing.expectError(error.InvalidEmbeddingRevision, parseEmbedRequest(invalid.value));
+    }
 }

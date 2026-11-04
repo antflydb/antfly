@@ -40,6 +40,10 @@ class InferenceEmbedRequest:
                 - an object with an ordered content array, producing one embedding
                 - an array of ordered content objects, producing one embedding per object
                 Legacy arrays of content parts continue to produce one embedding per part.
+            model_revision (str | Unset): Optional immutable execution revision from model capabilities. Every acquired
+                model, including recovery attempts, must match before inference. A mismatch returns 409 with X-Antfly-
+                Capability-Stale true. Successful execution acknowledges the pin in X-Antfly-Model-Revision for JSON and numeric
+                responses; callers requiring a pin must reject missing or different acknowledgements.
             model_identity (str | Unset): Optional exact asset identity pin. A mismatch returns 409 before inference.
             encoding_format (InferenceEmbedRequestEncodingFormat | Unset): Encoding format for the embeddings (only "float"
                 supported) Default: InferenceEmbedRequestEncodingFormat.FLOAT.
@@ -78,6 +82,7 @@ class InferenceEmbedRequest:
         | list[str]
         | str
     )
+    model_revision: str | Unset = UNSET
     model_identity: str | Unset = UNSET
     encoding_format: InferenceEmbedRequestEncodingFormat | Unset = InferenceEmbedRequestEncodingFormat.FLOAT
     dimensions: int | Unset = UNSET
@@ -117,6 +122,8 @@ class InferenceEmbedRequest:
         else:
             raise TypeError("input must be a string, list, or ordered content input")
 
+        model_revision = self.model_revision
+
         model_identity = self.model_identity
 
         encoding_format: str | Unset = UNSET
@@ -147,6 +154,8 @@ class InferenceEmbedRequest:
                 "input": input_,
             }
         )
+        if model_revision is not UNSET:
+            field_dict["model_revision"] = model_revision
         if model_identity is not UNSET:
             field_dict["model_identity"] = model_identity
         if encoding_format is not UNSET:
@@ -223,6 +232,8 @@ class InferenceEmbedRequest:
 
         input_ = _parse_input_(d.pop("input"))
 
+        model_revision = d.pop("model_revision", UNSET)
+
         model_identity = d.pop("model_identity", UNSET)
 
         _encoding_format = d.pop("encoding_format", UNSET)
@@ -260,6 +271,7 @@ class InferenceEmbedRequest:
         inference_embed_request = cls(
             model=model,
             input_=input_,
+            model_revision=model_revision,
             model_identity=model_identity,
             encoding_format=encoding_format,
             dimensions=dimensions,

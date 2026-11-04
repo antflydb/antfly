@@ -61,6 +61,8 @@ pub const HttpError = struct {
     /// Bytes buffered before the non-success status was classified. Callers
     /// with aggregate budgets must charge these just like successful bodies.
     downloaded_bytes: u64 = 0,
+    /// Retry-After delta or HTTP-date, parsed while response headers are alive.
+    retry_after_ms: ?u64 = null,
 };
 
 pub const DownloadOutcome = union(enum) {
@@ -625,6 +627,7 @@ fn downloadHttpOutcomeAlloc(
 
         return .{ .http_error = .{
             .status = response.status.code,
+            .retry_after_ms = retryAfterMs(response.header("Retry-After"), @intCast(@max(@divFloor(std.Io.Clock.real.now(context.io).nanoseconds, std.time.ns_per_ms), 0))),
             .message = "remote fetch failed",
             .downloaded_bytes = if (response.body) |body| @intCast(body.len) else 0,
         } };
@@ -2529,4 +2532,23 @@ test "remote content snapshot owns borrowed GCS views and rolls back allocation 
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+/// Keep Retry-After as a duration; supervisors persist their own retry clock.
+pub fn retryAfterMs(raw: ?[]const u8, now_ms: u64) ?u64 {
+    const value = std.mem.trim(u8, raw orelse return null, " \t");
+    if (value.len == 0) return null;
+    if (std.fmt.parseUnsigned(u64, value, 10)) |seconds|
+        return std.math.mul(u64, seconds, 1000) catch std.math.maxInt(u64)
+    else |_| {}
+    const timestamp = objectstore.retention_time.httpDate(value) orelse return null;
+    return timestamp -| now_ms;
+}
+
+test "remote fetch retry hints retain delta seconds and validated HTTP dates" {
+    try std.testing.expectEqual(@as(?u64, 3000), retryAfterMs("3", 0));
+    try std.testing.expectEqual(@as(?u64, 1000), retryAfterMs("Thu, 01 Jan 1970 00:00:02 GMT", 1000));
+    try std.testing.expectEqual(@as(?u64, 0), retryAfterMs("Thu, 01 Jan 1970 00:00:02 GMT", 3000));
+    try std.testing.expectEqual(@as(?u64, null), retryAfterMs("garbage", 0));
+    try std.testing.expectEqual(@as(?u64, null), retryAfterMs(null, 0));
 }

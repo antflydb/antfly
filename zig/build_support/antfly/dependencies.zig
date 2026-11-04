@@ -1153,6 +1153,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .optimize = optimize,
     });
     inference_host_mod.addImport("httpx", httpx_mod);
+    inference_host_mod.addImport("antfly_inference_embedding_wire", inference_embedding_wire_mod);
     readers_mod.addImport("apple_reader_options", inference_graph.apple_native_mod.import_table.get("apple_native_options").?);
     readers_mod.addImport("antfly_inference_work", inference_work_mod);
     readers_mod.addImport("antfly_platform", platform_mod);

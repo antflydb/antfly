@@ -721,8 +721,8 @@ pub const EmbeddingPipeline = struct {
             const grouped = @import("embedding_gemma2.zig");
             // Pure audio, like pure image, has no task prefix.
             const result = grouped.embed(allocator, self.session, self.tok, .{
-                .content = &.{.{ .audio = clip.bytes }},
-            }, .{ .max_tokens = self.config.max_length, .audio_decode_options = clip.decode_options, .max_audio_decode_working_bytes = self.config.max_audio_decode_working_bytes }, self.execution_lock, self.execution_control) catch |err| return switch (err) {
+                .content = &.{.{ .audio = .{ .bytes = clip.bytes, .decode_options = clip.decode_options } }},
+            }, .{ .max_tokens = self.config.max_length, .max_audio_decode_working_bytes = self.config.max_audio_decode_working_bytes }, self.execution_lock, self.execution_control) catch |err| return switch (err) {
                 error.EmbeddingInputTooLong => error.EmbeddingSequenceTooLong,
                 else => err,
             };
@@ -2321,14 +2321,11 @@ pub const EmbeddingPipeline = struct {
         if (!self.config.resident_embedding_gemma2 and session_factory.getEmbeddingGemma2Config(self.session) != null) {
             if (self.config.gemma4_audio_batching) {
                 const grouped = @import("embedding_gemma2.zig");
-                const result = try grouped.embedAudios(self.allocator, self.session, self.tok, audio_clips, .{ .max_tokens = @min(self.config.max_length, 8192), .dimensions = self.config.embedding_gemma2_dimensions, .prepare_ahead = self.config.audio_prepare_ahead, .timings = self.audio_timings }, self.execution_lock, self.execution_control, null);
+                const result = try grouped.embedAudios(self.allocator, self.session, self.tok, audio_clips, .{ .max_tokens = @min(self.config.max_length, 8192), .max_audio_decode_working_bytes = self.config.max_audio_decode_working_bytes, .dimensions = self.config.embedding_gemma2_dimensions, .prepare_ahead = self.config.audio_prepare_ahead, .timings = self.audio_timings }, self.execution_lock, self.execution_control, null);
                 self.allocator.free(result.input_tokens);
                 return result.vectors;
             }
-            const bytes = try self.allocator.alloc([]const u8, audio_clips.len);
-            defer self.allocator.free(bytes);
-            for (bytes, audio_clips) |*dest, clip| dest.* = clip.bytes;
-            return self.embedGemma2Media(bytes, false, null);
+            return self.embedGemma2AudioSerial(audio_clips, null);
         }
         if (audio_clips.len == 0) return try self.allocator.alloc([]f32, 0);
         if (self.config.resident_embedding_gemma2) {
@@ -2396,14 +2393,11 @@ pub const EmbeddingPipeline = struct {
         if (clips.len != errors.len) return error.InvalidInputShape;
         if (!self.config.resident_embedding_gemma2 and session_factory.getEmbeddingGemma2Config(self.session) != null) {
             if (self.config.gemma4_audio_batching) {
-                const result = try @import("embedding_gemma2.zig").embedAudios(self.allocator, self.session, self.tok, clips, .{ .max_tokens = @min(self.config.max_length, 8192), .dimensions = self.config.embedding_gemma2_dimensions, .prepare_ahead = self.config.audio_prepare_ahead, .timings = self.audio_timings }, self.execution_lock, self.execution_control, errors);
+                const result = try @import("embedding_gemma2.zig").embedAudios(self.allocator, self.session, self.tok, clips, .{ .max_tokens = @min(self.config.max_length, 8192), .max_audio_decode_working_bytes = self.config.max_audio_decode_working_bytes, .dimensions = self.config.embedding_gemma2_dimensions, .prepare_ahead = self.config.audio_prepare_ahead, .timings = self.audio_timings }, self.execution_lock, self.execution_control, errors);
                 self.allocator.free(result.input_tokens);
                 return .{ .vectors = result.vectors, .execution = result.execution };
             }
-            const bytes = try self.allocator.alloc([]const u8, clips.len);
-            defer self.allocator.free(bytes);
-            for (bytes, clips) |*dest, clip| dest.* = clip.bytes;
-            return .{ .vectors = try self.embedGemma2Media(bytes, false, errors), .execution = .serial };
+            return .{ .vectors = try self.embedGemma2AudioSerial(clips, errors), .execution = .serial };
         }
         @memset(errors, null);
         const prepared_session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
@@ -2598,18 +2592,18 @@ pub const EmbeddingPipeline = struct {
         return .{ .vectors = vectors, .execution = if (fallback) .fallback else observation.execution(observation.native_items + observation.serial_items) };
     }
 
-    fn embedGemma2Media(self: *EmbeddingPipeline, media: []const []const u8, images: bool, item_errors: ?[]?anyerror) ![][]f32 {
+    fn embedGemma2AudioSerial(self: *EmbeddingPipeline, clips: []const EncodedAudioClip, item_errors: ?[]?anyerror) ![][]f32 {
         const grouped = @import("embedding_gemma2.zig");
-        const out = try self.allocator.alloc([]f32, media.len);
+        const out = try self.allocator.alloc([]f32, clips.len);
         var initialized: usize = 0;
         errdefer {
             for (out[0..initialized]) |vector| self.allocator.free(vector);
             self.allocator.free(out);
         }
-        for (media, 0..) |bytes, index| {
+        for (clips, 0..) |clip, index| {
             if (item_errors) |errors| errors[index] = null;
-            const part: grouped.Part = if (images) .{ .image = bytes } else .{ .audio = bytes };
-            const result = grouped.embed(self.allocator, self.session, self.tok, .{ .content = &.{part} }, .{ .max_tokens = @min(self.config.max_length, 8192), .dimensions = self.config.embedding_gemma2_dimensions }, self.execution_lock, self.execution_control) catch |err| {
+            const part: grouped.Part = if (clip.pcm) |pcm| .{ .pcm = pcm } else .{ .audio = .{ .bytes = clip.bytes, .decode_options = clip.decode_options } };
+            const result = grouped.embed(self.allocator, self.session, self.tok, .{ .content = &.{part} }, .{ .max_tokens = @min(self.config.max_length, 8192), .max_audio_decode_working_bytes = self.config.max_audio_decode_working_bytes, .dimensions = self.config.embedding_gemma2_dimensions }, self.execution_lock, self.execution_control) catch |err| {
                 if (item_errors) |errors| {
                     if (err == error.OutOfMemory or err == error.Cancelled or err == error.Canceled or err == error.Timeout or err == error.DeadlineExceeded) return err;
                     errors[index] = err;
@@ -2757,7 +2751,7 @@ pub const EmbeddingPipeline = struct {
                 }
                 dst.* = .{ .pcm = .{ .samples = samples, .sample_rate = clip.sample_rate } };
             }
-            const result = try @import("embedding_gemma2.zig").embedAudios(self.allocator, self.session, self.tok, prepared, .{ .max_tokens = @min(self.config.max_length, 8192), .dimensions = self.config.embedding_gemma2_dimensions, .prepare_ahead = self.config.audio_prepare_ahead, .timings = self.audio_timings }, null, self.execution_control, null);
+            const result = try @import("embedding_gemma2.zig").embedAudios(self.allocator, self.session, self.tok, prepared, .{ .max_tokens = @min(self.config.max_length, 8192), .max_audio_decode_working_bytes = self.config.max_audio_decode_working_bytes, .dimensions = self.config.embedding_gemma2_dimensions, .prepare_ahead = self.config.audio_prepare_ahead, .timings = self.audio_timings }, null, self.execution_control, null);
             self.allocator.free(result.input_tokens);
             return .{ .vectors = result.vectors, .execution = result.execution };
         }
@@ -2776,7 +2770,7 @@ pub const EmbeddingPipeline = struct {
             // bounded decoder, downmix, resample and HF processor as HTTP.
             const encoded = try audio.wav.encodeInterleaved(std.heap.smp_allocator, clip.samples, channels, .{ .audio_format = 3, .sample_rate = clip.sample_rate, .bits_per_sample = 32 });
             defer std.heap.smp_allocator.free(encoded);
-            const result = try @import("embedding_gemma2.zig").embed(self.allocator, self.session, self.tok, .{ .content = &.{.{ .audio = encoded }} }, .{ .max_tokens = @min(self.config.max_length, 8192), .dimensions = self.config.embedding_gemma2_dimensions }, self.execution_lock, self.execution_control);
+            const result = try @import("embedding_gemma2.zig").embed(self.allocator, self.session, self.tok, .{ .content = &.{.{ .audio = .{ .bytes = encoded } }} }, .{ .max_tokens = @min(self.config.max_length, 8192), .max_audio_decode_working_bytes = self.config.max_audio_decode_working_bytes, .dimensions = self.config.embedding_gemma2_dimensions }, self.execution_lock, self.execution_control);
             vector.* = result.vector;
             initialized += 1;
         }
@@ -5508,7 +5502,7 @@ test "embeddinggemma2 CUDA flat audio and mixed batch dispatch fit production ad
     const text = "Group this short audio clip.";
     const expected_text = try pipeline.embed(&.{text});
     defer freeEmbeddingSlices(a, expected_text);
-    const expected_audio = try @import("embedding_gemma2.zig").embed(a, session, hf.tokenizer(), .{ .content = &.{.{ .audio = wav }} }, .{}, null, pipeline.execution_control);
+    const expected_audio = try @import("embedding_gemma2.zig").embed(a, session, hf.tokenizer(), .{ .content = &.{.{ .audio = .{ .bytes = wav } }} }, .{}, null, pipeline.execution_control);
     defer a.free(expected_audio.vector);
 
     // Exercise the public flat-audio entrypoint, not just its budget helper.
