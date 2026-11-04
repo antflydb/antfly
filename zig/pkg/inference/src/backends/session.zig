@@ -679,6 +679,15 @@ pub const OutputCredits = struct {
 
 /// Session represents a loaded model that can run forward passes.
 /// This is the core abstraction all backends implement.
+pub const ExecutionCapabilities = struct {
+    /// A backend declaration, never inferred by the generic scheduler.
+    cooperative_steps: bool = false,
+    max_active_requests: usize = 1,
+    max_batch_rows: usize = 1,
+    /// Eager, immutable weight inventory; excludes KV and retained scratch.
+    measured_resident_weights: ?usize = null,
+};
+
 pub const Session = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -714,6 +723,8 @@ pub const Session = struct {
     }
 
     pub const VTable = struct {
+        executionOwnerStats: ?*const fn (*anyopaque) @import("../ops/execution_scope.zig").OwnerSnapshot = null,
+        executionCapabilities: ?*const fn (*anyopaque) ExecutionCapabilities = null,
         hasLayaDecisions: ?*const fn (ptr: *anyopaque) bool = null,
         runLayaDecisions: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) anyerror!?[]Tensor = null,
         run: *const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror![]Tensor,
@@ -741,6 +752,14 @@ pub const Session = struct {
         runResidentInputsWithControl: ?*const fn (ptr: *anyopaque, inputs: []const ResidentInput, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror!?ResidentOutputs = null,
         runResidentTextEmbeddingWithControl: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, request: ResidentTextEmbeddingRequest, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror!?ResidentOutputs = null,
     };
+
+    pub fn executionOwnerStats(self: Session) @import("../ops/execution_scope.zig").OwnerSnapshot {
+        return if (self.vtable.executionOwnerStats) |query| query(self.ptr) else .{};
+    }
+
+    pub fn executionCapabilities(self: Session) ExecutionCapabilities {
+        return if (self.vtable.executionCapabilities) |query| query(self.ptr) else .{};
+    }
 
     /// Run a forward pass with the given input tensors.
     pub fn run(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {

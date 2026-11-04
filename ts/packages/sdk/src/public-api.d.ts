@@ -30697,7 +30697,21 @@ export interface components {
             content_security?: components["schemas"]["ContentSecurityConfig"];
             /** @description S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail. */
             s3_credentials?: components["schemas"]["Credentials"];
-            /** @description Experimental execution batching; mode on explicitly enables qualified CUDA scheduling. Resource and request ceilings still apply. */
+            /** @description Opt-in interleaving of independently owned requests on backends declaring safe step sharing. Independent of row batching; graph, prefix-cache, speculative and multimodal routes remain exclusive. Currently qualified for at most two active E4B CUDA requests with one row per step. */
+            cooperative_execution?: {
+                /**
+                 * @default off
+                 * @enum {string}
+                 */
+                mode?: "off" | "on";
+                /** @default 2 */
+                max_active_requests?: number;
+                /** @default 8 */
+                short_context_burst?: number;
+                /** @default 5000 */
+                decode_handoff_wait_us?: number;
+            };
+            /** @description Experimental row batching; independent from cooperative_execution. Mode on explicitly enables qualified CUDA row scheduling. Resource and request ceilings still apply. */
             generation_batching?: {
                 /**
                  * @default off

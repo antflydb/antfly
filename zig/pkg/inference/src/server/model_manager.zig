@@ -10988,10 +10988,10 @@ fn loadSessionForPreferredBackends(
             defer loaded.deinit();
             if (control) |active| try active.check();
             if (manager.admission_enabled) {
-                if (session_factory.getEagerCudaMirrorWeightBytes(loaded.session)) |weight_bytes| {
+                if (loaded.session.executionCapabilities().measured_resident_weights) |weight_bytes| {
                     const construction_bytes = resident_amounts.backend_weight_bytes;
                     resident_amounts.backend_weight_bytes = try session_factory.retainedCudaMirrorWeightBytes(construction_bytes, weight_bytes);
-                    std.log.info("cuda_eager_mirror_residency construction_bytes={d} measured_weight_bytes={d} retained_weight_bytes={d}", .{
+                    std.log.info("cuda_eager_weight_residency construction_bytes={d} measured_weight_bytes={d} retained_weight_bytes={d}", .{
                         construction_bytes, weight_bytes, resident_amounts.backend_weight_bytes,
                     });
                 }

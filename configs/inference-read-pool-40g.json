@@ -56,10 +56,16 @@
     },
     "generation_batching": {
       "mode": "off",
-      "max_step_items": 2,
+      "max_step_items": 1,
       "max_step_query_tokens": 512,
       "max_decode_wait_us": 1000,
       "max_idle_prefill_chunk_size": 512
+    },
+    "cooperative_execution": {
+      "mode": "off",
+      "max_active_requests": 2,
+      "short_context_burst": 8,
+      "decode_handoff_wait_us": 5000
     }
   }
 }

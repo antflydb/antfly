@@ -28,6 +28,9 @@ pub const Budget = struct {
     limit: usize = std.math.maxInt(usize),
     live: usize = 0,
     peak: usize = 0,
+    /// Stable identity used by the process allocation ledger across moves of
+    /// a model's CudaContext value. Assigned lazily under the ledger lock.
+    owner_id: u64 = 0,
 
     pub const Snapshot = struct { limit: usize, live: usize, peak: usize };
 

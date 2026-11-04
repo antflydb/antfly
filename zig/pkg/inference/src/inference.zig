@@ -42,16 +42,19 @@ pub const server = if (build_options.skip_openapi) struct {
     pub const model_manager = @import("server/model_manager.zig");
 } else @import("server/server.zig");
 
-/// Apply the standalone worker's explicit device ceiling to actual managed
-/// allocations across model contexts, in addition to logical admission.
-pub fn configureCudaProcessDeviceLimit(bytes: usize) !void {
-    if (build_options.enable_cuda and bytes != 0)
-        try @import("ops/cuda/allocation_budget.zig").process_device_allocations.setLimit(bytes);
-}
+/// Process allocation ownership is common to every executable and engine host.
+pub const cuda_memory = if (build_options.enable_cuda) struct {
+    pub const budget = @import("ops/cuda/allocation_budget.zig");
+    pub const Context = @import("ops/cuda/context.zig").CudaContext;
+    pub const Buffer = @import("ops/cuda/buffer.zig").DeviceBuffer;
+    pub const driver = @import("ops/cuda/driver.zig");
+} else struct {};
 
 test "CUDA process allocation budget declarations compile" {
     _ = @import("ops/cuda/buffer.zig");
     _ = @import("ops/cuda/allocation_budget.zig");
+    _ = @import("ops/cuda/device_budget_owner.zig");
+    _ = @import("ops/cuda/allocation_ledger.zig");
 }
 
 test "generation deadline declarations compile" {

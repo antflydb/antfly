@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Queue before reserving transient generation memory. Shared slots permit
 //! cooperative execution; exclusive owners fence cached/graph/native routes.
@@ -78,6 +90,7 @@ pub const Lane = struct {
     pub const Lease = struct {
         lane: *Lane,
         exclusive: bool,
+        owner_id: u64,
         pub fn release(self: Lease) void {
             self.lane.lock();
             defer self.lane.mutex.unlock();
@@ -143,11 +156,14 @@ pub const Lane = struct {
                 self.remove(&waiter);
                 self.stats.active += 1;
                 self.exclusive = exclusive;
-                self.stats.started +|= 1;
+                // An identity must not wrap while backend metadata can retain it.
+                std.debug.assert(self.stats.started != std.math.maxInt(u64));
+                self.stats.started += 1;
                 self.stats.queue_wait.record(platform.time.monotonicNs() -| started);
+                const owner_id = self.stats.started;
                 self.wake();
                 self.mutex.unlock();
-                return .{ .lane = self, .exclusive = exclusive };
+                return .{ .lane = self, .exclusive = exclusive, .owner_id = owner_id };
             }
             waiter.ready.reset();
             self.mutex.unlock();

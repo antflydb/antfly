@@ -221,6 +221,9 @@ pub const Policy = struct {
     /// Prefer cheaper contexts for this many consecutive turns, then grant
     /// the next round-robin owner. Zero preserves strict round robin.
     short_context_burst: usize = 0,
+    /// Briefly hand the lane back to a cheaper owner sampling its last result.
+    /// Set once at completion; never extended by another owner or CPU progress.
+    decode_handoff_wait_us: u32 = 0,
     /// Optional rollout cap on the active request set. Above this count the
     /// coordinator preserves fairness but emits singleton forward steps.
     max_active_requests_for_batching: ?usize = null,
@@ -318,6 +321,9 @@ const Entry = struct {
     /// A null value means decode work is already pending or the next geometry
     /// is not known yet.
     next_decode_work_total_sequence_len: ?usize = null,
+    decode_handoff_deadline_ns: u64 = 0,
+    /// CPU-prepared direct work, registered only while its owner awaits a turn.
+    manual_turn_ready: ?Phase = null,
 };
 
 const PendingDecode = struct {
@@ -509,6 +515,18 @@ pub const NativeGenerateCoordinator = struct {
         // In-flight work publishes an event after its result, not a periodic
         // request-thread poll. An idle partial cohort still has a timer.
         if (self.in_turn != null) return 1_000_000;
+        const now = platform.time.monotonicNs();
+        if (self.pickNextTurnAt(now)) |id| if (self.indexOf(id)) |idx| {
+            const entry = self.entries.items[idx];
+            if (entry.phase == .decode and entry.decode_handoff_deadline_ns > now) {
+                var queued = false;
+                for (self.pending_decode.items) |pending| if (pending.request_id == id) {
+                    queued = true;
+                    break;
+                };
+                if (!queued) return @intCast(@max(1, @min(10000, (entry.decode_handoff_deadline_ns - now + std.time.ns_per_us - 1) / std.time.ns_per_us)));
+            }
+        };
         if (self.pending_decode.items.len == 0) return 1_000_000;
         var earliest: u64 = std.math.maxInt(u64);
         for (self.pending_decode.items) |item| earliest = @min(earliest, item.enqueued_ns);
@@ -1227,6 +1245,7 @@ pub const NativeGenerateCoordinator = struct {
                         if (self.indexOf(request_id)) |entry_idx| {
                             self.entries.items[entry_idx].next_decode_work_total_sequence_len =
                                 std.math.add(usize, item.total_sequence_len, 1) catch null;
+                            self.entries.items[entry_idx].decode_handoff_deadline_ns = platform.time.monotonicNs() +| (@as(u64, self.policy.decode_handoff_wait_us) * std.time.ns_per_us);
                         }
                     }
                     self.removePendingDecode(item.work_ptr);
@@ -1268,6 +1287,8 @@ pub const NativeGenerateCoordinator = struct {
     /// Optional request control keeps this scheduler independent of its facade.
     pub fn awaitTurnControlled(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase, io: std.Io, control: anytype) !void {
         const events = self.usesStepEvents();
+        self.setManualTurnReady(lease.request_id, phase);
+        defer self.setManualTurnReady(lease.request_id, null);
         var waiter = Waiter{ .io = io, .turn_request_id = lease.request_id };
         if (events) self.attachWaiter(&waiter);
         defer if (events) self.detachWaiter(&waiter);
@@ -1282,7 +1303,7 @@ pub const NativeGenerateCoordinator = struct {
             if (self.tryAcquireTurn(lease, phase)) return;
             self.noteTurnYield();
             if (events) {
-                waiter.event.waitTimeout(io, .{ .duration = .{ .raw = .fromMicroseconds(10_000), .clock = .awake } }) catch |err| switch (err) {
+                waiter.event.waitTimeout(io, .{ .duration = .{ .raw = .fromMicroseconds(@min(10_000, self.eventWaitUs())), .clock = .awake } }) catch |err| switch (err) {
                     error.Timeout => {},
                     else => return err,
                 };
@@ -1296,9 +1317,17 @@ pub const NativeGenerateCoordinator = struct {
         self.stats.turn_yields_total += 1;
     }
 
+    fn setManualTurnReady(self: *NativeGenerateCoordinator, id: RequestId, phase: ?Phase) void {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        defer self.notifyWaitersUnlocked();
+        if (self.indexOf(id)) |idx| self.entries.items[idx].manual_turn_ready = phase;
+    }
+
     pub fn tryAcquireTurn(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase) bool {
         self.lockCoordinator();
         defer self.unlockCoordinator();
+        if (self.indexOf(lease.request_id)) |idx| self.entries.items[idx].manual_turn_ready = phase;
         return self.tryAcquireTurnUnlocked(lease, phase);
     }
 
@@ -1337,6 +1366,10 @@ pub const NativeGenerateCoordinator = struct {
         }
         self.in_turn = null;
         self.in_turn_phase = null;
+        if (self.indexOf(lease.request_id)) |idx| self.entries.items[idx].manual_turn_ready = null;
+        if (phase == .decode) if (self.indexOf(lease.request_id)) |idx| {
+            self.entries.items[idx].decode_handoff_deadline_ns = platform.time.monotonicNs() +| (@as(u64, self.policy.decode_handoff_wait_us) * std.time.ns_per_us);
+        };
         switch (phase) {
             .decode => {
                 self.decode_priority_streak = if (self.last_decode_granted == lease.request_id)
@@ -1384,6 +1417,7 @@ pub const NativeGenerateCoordinator = struct {
         entry.prompt_tokens_processed = total_prompt_tokens;
         entry.total_prompt_tokens = total_prompt_tokens;
         entry.next_decode_work_total_sequence_len = null;
+        entry.decode_handoff_deadline_ns = platform.time.monotonicNs() +| (@as(u64, self.policy.decode_handoff_wait_us) * std.time.ns_per_us);
         if (!lease.prefill_chunk_plan.isAdmitted()) {
             lease.prefill_chunk_size = self.recommendPrefillChunkForUnlocked(lease.request_id);
         }
@@ -1488,20 +1522,41 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     fn pickNextTurn(self: *const NativeGenerateCoordinator) ?RequestId {
+        return self.pickNextTurnAt(platform.time.monotonicNs());
+    }
+
+    fn pickNextTurnAt(self: *const NativeGenerateCoordinator, now: u64) ?RequestId {
         const prefill_candidate = if (self.policy.short_context_burst > 0)
             self.pickShortContextPrefill()
         else
             self.pickPendingPrefillRoundRobin(self.last_prefill_granted) orelse self.pickPhaseRoundRobin(.prefill, self.last_prefill_granted);
-        const decode_candidate = self.pickPendingDecodeRoundRobin(self.last_decode_granted);
-
+        var decode_candidate = if (self.policy.short_context_burst > 0) self.pickReadyDecode() else self.pickPendingDecodeRoundRobin(self.last_decode_granted);
+        // A CPU sampling/publication gap must not automatically give an
+        // expensive peer a whole GPU turn. The grace is bounded and does not
+        // hold a lane/mutex. Backpressure, cancellation and expiry release it.
+        if (self.policy.decode_handoff_wait_us > 0 and self.policy.short_context_burst > 0 and
+            self.decode_priority_streak < self.policy.short_context_burst)
+        {
+            var cheapest: usize = std.math.maxInt(usize);
+            if (decode_candidate) |id| {
+                if (self.indexOf(id)) |idx| cheapest = self.decodeContextCost(self.entries.items[idx]);
+            } else if (prefill_candidate) |id| cheapest = self.prefillContextCost(id);
+            // There must be competing work; a lone request never waits.
+            if (decode_candidate != null or prefill_candidate != null) for (self.entries.items) |entry| {
+                if (entry.phase != .decode or entry.decode_handoff_deadline_ns <= now) continue;
+                const cost = entry.next_decode_work_total_sequence_len orelse (entry.total_prompt_tokens +| entry.generated_tokens);
+                if (cost < cheapest) {
+                    decode_candidate = entry.id;
+                    cheapest = cost;
+                }
+            };
+        }
         if (decode_candidate) |decode_id| {
-            if (prefill_candidate != null and self.consecutive_decode_turns >= self.max_decode_streak_before_prefill) {
+            if (prefill_candidate != null and self.consecutive_decode_turns >= self.max_decode_streak_before_prefill)
                 return prefill_candidate;
-            }
             return decode_id;
         }
-        if (prefill_candidate) |prefill_id| return prefill_id;
-        return null;
+        return prefill_candidate;
     }
 
     fn pickPhaseRoundRobin(self: *const NativeGenerateCoordinator, phase: Phase, last_granted: ?RequestId) ?RequestId {
@@ -1520,6 +1575,31 @@ pub const NativeGenerateCoordinator = struct {
             if (entry.phase == phase) return entry.id;
         }
         return null;
+    }
+
+    fn decodeContextCost(_: *const NativeGenerateCoordinator, entry: Entry) usize {
+        return entry.next_decode_work_total_sequence_len orelse (entry.total_prompt_tokens +| entry.generated_tokens +| 1);
+    }
+
+    fn pickReadyDecode(self: *const NativeGenerateCoordinator) ?RequestId {
+        if (self.entries.items.len == 0) return null;
+        const start = if (self.last_decode_granted) |id| (if (self.indexOf(id)) |idx| (idx + 1) % self.entries.items.len else 0) else 0;
+        var selected: ?RequestId = null;
+        var cheapest: usize = std.math.maxInt(usize);
+        for (0..self.entries.items.len) |offset| {
+            const entry = self.entries.items[(start + offset) % self.entries.items.len];
+            if (entry.phase != .decode or (entry.manual_turn_ready != .decode and self.findPendingDecodeByRequest(entry.id) == null)) continue;
+            const cost = self.decodeContextCost(entry);
+            if (selected == null or (self.decode_priority_streak < self.policy.short_context_burst and cost < cheapest)) {
+                selected = entry.id;
+                cheapest = cost;
+            }
+        }
+        return selected;
+    }
+
+    fn prefillReady(self: *const NativeGenerateCoordinator, entry: Entry) bool {
+        return entry.phase == .prefill and (entry.manual_turn_ready == .prefill or self.findPendingPrefillByRequest(entry.id) != null);
     }
 
     fn pickPendingDecodeRoundRobin(self: *const NativeGenerateCoordinator, last_granted: ?RequestId) ?RequestId {
@@ -1558,17 +1638,15 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     fn pickShortContextPrefill(self: *const NativeGenerateCoordinator) ?RequestId {
-        // Final CUDA prefill/logit work owns a manual turn rather than a
-        // PendingPrefill. Compare all prefill owners, or continuously queued
-        // long chunks can starve a short request's final chunk. A completed
-        // owner will publish its next work/phase before another turn is needed.
-        var selected = self.pickPhaseRoundRobin(.prefill, self.last_prefill_granted) orelse return null;
-        if (self.prefill_priority_streak >= self.policy.short_context_burst) return selected;
-        var cheapest = self.prefillContextCost(selected);
-        for (self.entries.items) |entry| {
-            if (entry.phase != .prefill) continue;
+        if (self.entries.items.len == 0) return null;
+        const start = if (self.last_prefill_granted) |id| (if (self.indexOf(id)) |idx| (idx + 1) % self.entries.items.len else 0) else 0;
+        var selected: ?RequestId = null;
+        var cheapest: usize = std.math.maxInt(usize);
+        for (0..self.entries.items.len) |offset| {
+            const entry = self.entries.items[(start + offset) % self.entries.items.len];
+            if (!self.prefillReady(entry)) continue;
             const cost = self.prefillContextCost(entry.id);
-            if (cost < cheapest) {
+            if (selected == null or (self.prefill_priority_streak < self.policy.short_context_burst and cost < cheapest)) {
                 selected = entry.id;
                 cheapest = cost;
             }
@@ -3983,6 +4061,7 @@ test "short context priority admits a manual final prefill ahead of continuously
     coordinator.notePrefillProgress(&short, 1536, 1911);
     var long_work: u8 = 0;
     try coordinator.enqueuePrefillWork(long, &long_work, 1024, 512, 1024, 0, .{});
+    coordinator.setManualTurnReady(short.request_id, .prefill);
     try std.testing.expectEqual(short.request_id, coordinator.pickNextTurn().?);
     try std.testing.expect(coordinator.tryAcquireTurn(&short, .prefill));
     coordinator.finishTurn(&short, .prefill);
@@ -3990,4 +4069,60 @@ test "short context priority admits a manual final prefill ahead of continuously
     try std.testing.expectEqual(long.request_id, coordinator.pickNextTurn().?);
     try std.testing.expect(coordinator.tryAcquireTurn(&long, .prefill));
     coordinator.finishTurn(&long, .prefill);
+}
+
+test "cooperative handoff expires without rearming and bounds fairness across repeated queue turnover" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.policy.short_context_burst = 3;
+    coordinator.policy.decode_handoff_wait_us = 5000;
+    var long = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 128000, .prompt_tokens = 32000, .max_tokens = 256 });
+    defer coordinator.release(long);
+    coordinator.beginDecode(&long, 32000);
+    var long_work: u8 = 0;
+    try coordinator.enqueueDecodeWork(long, &long_work, 32001, 32000, 0, .{});
+    for (0..16) |_| {
+        var short = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8000, .prompt_tokens = 2000, .max_tokens = 8 });
+        coordinator.beginDecode(&short, 2000);
+        const index = coordinator.indexOf(short.request_id).?;
+        coordinator.entries.items[index].decode_handoff_deadline_ns = 10000;
+        coordinator.decode_priority_streak = 0;
+        try std.testing.expectEqual(short.request_id, coordinator.pickNextTurnAt(9999).?);
+        try std.testing.expectEqual(long.request_id, coordinator.pickNextTurnAt(10000).?);
+        coordinator.noteDecodeProgress(&short, 1);
+        try std.testing.expectEqual(@as(u64, 10000), coordinator.entries.items[index].decode_handoff_deadline_ns);
+        try std.testing.expectEqual(long.request_id, coordinator.pickNextTurnAt(10001).?);
+        // An unready cheap owner cannot use grace to bypass its burst bound.
+        coordinator.decode_priority_streak = 3;
+        try std.testing.expectEqual(long.request_id, coordinator.pickNextTurnAt(9999).?);
+        coordinator.release(short);
+        try std.testing.expectEqual(long.request_id, coordinator.pickNextTurnAt(9999).?);
+        // The remaining owner makes progress between every short admission.
+        try std.testing.expect(coordinator.tryAcquireTurn(&long, .decode));
+        coordinator.finishTurn(&long, .decode);
+    }
+}
+
+test "cooperative manual readiness prevents a paused CPU owner from blocking prepared work" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.policy.short_context_burst = 8;
+    var long = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 128000, .prompt_tokens = 32000, .max_tokens = 32 });
+    defer coordinator.release(long);
+    var short = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8000, .prompt_tokens = 2000, .max_tokens = 32 });
+    defer coordinator.release(short);
+    coordinator.notePrefillProgress(&long, 0, 32000);
+    coordinator.notePrefillProgress(&short, 0, 2000);
+    var work: u8 = 0;
+    try coordinator.enqueuePrefillWork(long, &work, 512, 512, 512, 0, .{});
+    try std.testing.expectEqual(long.request_id, coordinator.pickNextTurn().?);
+    coordinator.setManualTurnReady(short.request_id, .prefill);
+    try std.testing.expectEqual(short.request_id, coordinator.pickNextTurn().?);
+    coordinator.setManualTurnReady(short.request_id, null);
+    try std.testing.expectEqual(long.request_id, coordinator.pickNextTurn().?);
+    coordinator.beginDecode(&short, 2000);
+    coordinator.setManualTurnReady(short.request_id, .decode);
+    try std.testing.expectEqual(short.request_id, coordinator.pickNextTurn().?);
+    coordinator.setManualTurnReady(short.request_id, null);
+    try std.testing.expectEqual(long.request_id, coordinator.pickNextTurn().?);
 }

@@ -75,6 +75,7 @@ const InferenceSettings = struct {
     http_max_body_mb: ?usize = null,
     pool_size: ?usize = null,
     generation_batching: ?platform.inference_settings.GenerationBatching = null,
+    cooperative_execution: ?platform.inference_settings.CooperativeExecution = null,
     kernel_jit: ?inference.graph.kernel_jit.Config = null,
     prompt_cache: ?PromptCacheConfig = null,
 };
@@ -644,6 +645,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
         if (cfg.inference.max_loaded_models) |value| node_cfg.max_loaded_models = value;
         if (cfg.inference.pool_size) |value| node_cfg.pool_size = value;
         if (cfg.inference.http_max_body_mb) |value| node_cfg.http_max_body_bytes = try inference.server.httpBodyLimitBytesFromMib(value);
+        if (cfg.inference.cooperative_execution) |value| node_cfg.cooperative_execution = inference.server.CooperativeExecutionConfig.fromSettings(value);
         if (cfg.inference.generation_batching) |value| node_cfg.generation_batching = inference.server.GenerationBatchingConfig.fromSettings(value);
         if (cfg.inference.prompt_cache) |value| node_cfg.prompt_cache = .{
             .enabled = value.enabled,
@@ -671,7 +673,6 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     if (max_work_units_override) |value| node_cfg.max_work_units = value;
     if (http_max_body_bytes_override) |value| node_cfg.http_max_body_bytes = value;
 
-    try inference.configureCudaProcessDeviceLimit(node_cfg.generation_budget_overrides.backend_limit_bytes);
     var node = try inference.server.Node.init(allocator, node_cfg);
     defer node.deinit();
     try node.attachIo(io);

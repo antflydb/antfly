@@ -4154,9 +4154,13 @@ pub const QwenVisionBatchHook = struct {
     encode_fn: *const fn (*anyopaque, std.mem.Allocator, []const []const u8, qwen3vl_projector.Limits) anyerror!qwen3vl_projector.ProjectedImages,
 };
 
+const ExecutionScope = @import("../ops/execution_scope.zig").Scope;
+
 pub const NativeGenerationPipeline = struct {
     /// Token publication is bounded; GPU steps reuse two frame/logit banks.
     pub const max_gpu_token_burst_width: usize = 8;
+    /// Borrowed during a claimed executor step, including yielded readback.
+    claimed_execution_scope: ?*ExecutionScope = null,
     allocator: std.mem.Allocator,
     io: ?std.Io = null,
     cb: ComputeBackend,
@@ -4267,51 +4271,46 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
-    fn lockExecution(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) !void {
-        const waiters = if (self.execution_lock == mutex) self.execution_phase_waiters else null;
+    fn lockExecution(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) !ExecutionScope {
+        const shared = self.execution_lock == mutex;
+        const waiters = if (shared) self.execution_phase_waiters else null;
         if (waiters) |count| _ = count.fetchAdd(1, .acq_rel);
-        defer if (waiters) |count| {
-            self.finishExecutionPhaseWait(count);
-        };
+        defer if (waiters) |count| self.finishExecutionPhaseWait(count);
         var control = self.execution_control orelse InferenceExecutionControl{};
         if (control.io == null) control.io = self.io;
-        const gate = if (self.execution_lock == mutex) self.execution_gate else null;
-        const queued = if (gate) |lane| try lane.acquireWithPriority(control, waiters != null) else null;
-        errdefer if (queued) |lease| lease.release();
-        try control.lockWithPoll(mutex, self.execution_contention_wait_ns);
-        errdefer mutex.unlock();
-        if (self.execution_lock == mutex) {
-            self.cb.bindExecutionBudget();
-            errdefer self.cb.clearExecutionBudget();
-            // Captured-address and prepared-tail metadata belongs to the
-            // preceding owner, even though immutable weights are shared.
-            if (self.cb.execution_budget_bind != null) try self.cb.beginRequest();
-        }
+        var scope = try ExecutionScope.acquire(control, .{
+            .mutex = mutex,
+            .lane = if (shared) self.execution_gate else null,
+            .interactive = waiters != null,
+            .contention_wait_ns = self.execution_contention_wait_ns,
+        });
+        errdefer scope.deinit();
+        if (shared) try scope.bind(self.cb);
+        return scope;
     }
 
-    fn lockExecutionForCleanup(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) void {
-        const waiters = if (self.execution_lock == mutex) self.execution_phase_waiters else null;
+    fn lockExecutionForCleanup(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) ExecutionScope {
+        return self.lockExecutionNoncancellable(mutex, false);
+    }
+
+    fn lockExecutionForRelease(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) ExecutionScope {
+        return self.lockExecutionNoncancellable(mutex, true);
+    }
+
+    fn lockExecutionNoncancellable(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex, release: bool) ExecutionScope {
+        const shared = self.execution_lock == mutex;
+        const waiters = if (shared) self.execution_phase_waiters else null;
         if (waiters) |count| _ = count.fetchAdd(1, .acq_rel);
-        defer if (waiters) |count| {
-            self.finishExecutionPhaseWait(count);
+        defer if (waiters) |count| self.finishExecutionPhaseWait(count);
+        const options: ExecutionScope.Options = .{
+            .mutex = mutex,
+            .lane = if (shared) self.execution_gate else null,
+            .interactive = waiters != null,
+            .contention_wait_ns = self.execution_contention_wait_ns,
         };
-        // Cleanup ignores request cancellation while retaining an event wait
-        // on the caller's live Io. It must retire borrowed GPU state first.
-        if (self.execution_lock == mutex) if (self.execution_gate) |lane| {
-            _ = lane.acquireForCleanup(self.io, waiters != null);
-        };
-        if (waiters != null) {
-            (InferenceExecutionControl{}).lockWithPoll(mutex, if (self.execution_contention_wait_ns == 0) 100 * std.time.ns_per_us else self.execution_contention_wait_ns) catch unreachable;
-        } else platform.sync.lockYielding(mutex);
-        if (self.execution_lock == mutex) self.cb.bindExecutionBudget();
-    }
-
-    fn unlockExecution(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) void {
-        if (self.execution_lock == mutex) self.cb.clearExecutionBudget();
-        mutex.unlock();
-        if (self.execution_lock == mutex) if (self.execution_gate) |lane| {
-            (execution_control_mod.ExecutionLane.Lease{ .lane = lane }).release();
-        };
+        var scope = if (release) ExecutionScope.acquireRelease(self.io, options) else ExecutionScope.acquireCleanup(self.io, options);
+        if (shared) scope.bindCleanup(self.cb);
+        return scope;
     }
 
     pub const AttentionMatchQueryOptions = struct {
@@ -4449,8 +4448,8 @@ pub const NativeGenerationPipeline = struct {
         const control: runtime.kv.attention_match.Control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork };
         const logits = try self.allocator.dupe(f32, saved.logits);
         errdefer self.allocator.free(logits);
-        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-        defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+        var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
         const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
         const storage = destination.kv_storage orelse return error.UnsupportedAttentionMatchRoute;
         if (storage.sequences.items.len != 0 or storage.storage.config.store_cpu_bytes) return error.UnsupportedAttentionMatchRoute;
@@ -4488,8 +4487,8 @@ pub const NativeGenerationPipeline = struct {
         defer self.allocator.free(ids);
         for (ids, tokens) |*id, token| id.* = std.math.cast(u32, token) orelse return error.InvalidCompactionProbe;
         var saved = blk: {
-            if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-            defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+            var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+            defer if (execution_scope) |*scope| scope.deinit();
             if ((try cuda_compute.installedAttentionMatchActivity(compute, source_storage, source_sequence)) == null) return error.UnsupportedAttentionMatchRoute;
             break :blk try self.snapshotAttentionMatchState(ids, logits, source, identity, limits, 2 * 1024 * 1024 * 1024);
         };
@@ -4619,8 +4618,8 @@ pub const NativeGenerationPipeline = struct {
     ) !runtime.kv.attention_match_engine.Stats {
         if (comptime !build_options.enable_cuda) return error.UnsupportedCompactionQueryRoute;
         if (self.cb.kind() != .cuda or self.kv_dtype != .f16) return error.UnsupportedCompactionQueryDType;
-        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-        defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+        var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
         const checkpoint = runtime.kv.attention_match_checkpoint;
         const engine = runtime.kv.attention_match_engine;
         const storage = @import("../ops/cuda/attention_match_storage.zig");
@@ -4908,8 +4907,8 @@ pub const NativeGenerationPipeline = struct {
             if (self.manager != null or self.storage != null or self.state != null) return error.InvalidCompactionProbe;
             const dtype = pipeline.kv_dtype orelse return error.UnsupportedCompactionQueryDType;
             if (pipeline.cb.kind() != .cuda or dtype != .f16) return error.UnsupportedCompactionQueryRoute;
-            if (pipeline.execution_lock) |mutex| try pipeline.lockExecution(mutex);
-            defer if (pipeline.execution_lock) |mutex| pipeline.unlockExecution(mutex);
+            var execution_scope = if (pipeline.execution_lock) |mutex| try pipeline.lockExecution(mutex) else null;
+            defer if (execution_scope) |*scope| scope.deinit();
             self.manager = runtime.kv.manager.KvManager.init(pipeline.allocator);
             errdefer self.deinit();
             const config = attentionMatchCheckpointPoolConfig(dtype, pipeline.gpt_config);
@@ -4938,8 +4937,8 @@ pub const NativeGenerationPipeline = struct {
                 donors[donor_count] = .{ .layer = @intCast(layer), .heads = geometry.num_kv_heads, .dim = geometry.head_dim };
                 donor_count += 1;
             }
-            if (pipeline.execution_lock) |mutex| try pipeline.lockExecution(mutex);
-            defer if (pipeline.execution_lock) |mutex| pipeline.unlockExecution(mutex);
+            var execution_scope = if (pipeline.execution_lock) |mutex| try pipeline.lockExecution(mutex) else null;
+            defer if (execution_scope) |*scope| scope.deinit();
             self.manager = runtime.kv.manager.KvManager.init(pipeline.allocator);
             errdefer self.deinit();
             var config = kvPoolConfig(.cuda, dtype, pipeline.gpt_config, false);
@@ -4981,8 +4980,8 @@ pub const NativeGenerationPipeline = struct {
     /// avoids graph/replay state shared with the original request.
     fn appendAttentionMatchProbeTokens(self: *NativeGenerationPipeline, state: *NativeDecodeState, tokens: []const i64) ![]f32 {
         if (tokens.len == 0) return error.InvalidCompactionProbe;
-        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-        defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+        var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
         var offset: usize = 0;
         while (offset + 1 < tokens.len) {
             try checkAttentionMatchQueryWork(self);
@@ -5258,8 +5257,8 @@ pub const NativeGenerationPipeline = struct {
         if (options.prefix_mode == .replay and shadow_kv_bytes > options.max_shadow_kv_bytes) return error.CompactionQueryLimit;
         var collector = try queries.Collector.init(self.allocator, consumers[0..count], source_tokens.len, repeat_tokens.len, options.collection);
         errdefer collector.deinit();
-        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-        defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+        var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
         var manager = runtime.kv.manager.KvManager.init(self.allocator);
         defer manager.deinit();
         var pool_config = kvPoolConfig(.cuda, dtype, self.gpt_config, false);
@@ -5719,14 +5718,14 @@ pub const NativeGenerationPipeline = struct {
 
         var prepared_multimodal_prompt: ?gemma3_mm.PreparedPrompt = null;
         defer if (prepared_multimodal_prompt) |*prepared| {
-            if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex);
-            defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+            var execution_scope = if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex) else null;
+            defer if (execution_scope) |*scope| scope.deinit();
             prepared.deinit(&self.cb);
         };
         var prepared_qwen3vl_prompt: ?qwen3vl_projector.PreparedPrompt = null;
         defer if (prepared_qwen3vl_prompt) |*prepared| {
-            if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex);
-            defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+            var execution_scope = if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex) else null;
+            defer if (execution_scope) |*scope| scope.deinit();
             prepared.deinit(&self.cb);
         };
 
@@ -5832,8 +5831,8 @@ pub const NativeGenerationPipeline = struct {
                     decode_state.qwen3vl_mrope_position_delta = prepared_qwen3vl_prompt.?.plan.mrope_position_delta;
                     decode_state.qwen3vl_text_only = false;
                 } else {
-                    if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-                    defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+                    var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+                    defer if (execution_scope) |*scope| scope.deinit();
                     const request_projector = if (self.projector_store == null)
                         try gemma4_projector.ProjectorStore.open(allocator, projector_path)
                     else
@@ -5922,8 +5921,8 @@ pub const NativeGenerationPipeline = struct {
                     if (config.qwen3vl_parity_json_path == null) if (self.qwen_vision_batch) |hook| {
                         batched = try hook.encode_fn(hook.ptr, allocator, images, vision_limits);
                     };
-                    if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-                    defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+                    var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+                    defer if (execution_scope) |*scope| scope.deinit();
                     var projected = if (batched) |value| take: {
                         batched = null;
                         break :take value;
@@ -6480,8 +6479,8 @@ pub const NativeGenerationPipeline = struct {
                     prefill_greedy_token = null;
                     var continued_decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
                     const kv_mutation_mutex = batchKvMutationMutex(self.execution_lock, decode_state.kv_lock);
-                    if (kv_mutation_mutex) |mutex| try self.lockExecution(mutex);
-                    defer if (kv_mutation_mutex) |mutex| self.unlockExecution(mutex);
+                    var execution_scope = if (kv_mutation_mutex) |mutex| try self.lockExecution(mutex) else null;
+                    defer if (execution_scope) |*scope| scope.deinit();
                     _ = try continued_decode_runtime.appendGeneratedToken();
                 }
             }
@@ -7498,8 +7497,8 @@ pub const NativeGenerationPipeline = struct {
             platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_RESERVE_PREFILL_KV", true))
         {
             if (cudaE4bPrefillKvCapacity(self.gpt_config, seq_len, config.max_tokens)) |capacity| {
-                if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-                defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+                var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+                defer if (execution_scope) |*scope| scope.deinit();
                 const limit = std.mem.alignForward(usize, seq_len + @as(usize, @intCast(config.max_tokens)), 16);
                 try decode_state.reserveFreshCudaKvCapacity(capacity, limit);
                 std.log.info("cuda_prefill_kv_reservation prompt_tokens={d} capacity_tokens={d}", .{ seq_len, capacity });
@@ -7788,8 +7787,8 @@ pub const NativeGenerationPipeline = struct {
                     use_metal_prefill_greedy_token,
                     self.execution_lock,
                 );
-                if (direct_execution_mutex) |mutex| try self.lockExecution(mutex);
-                defer if (direct_execution_mutex) |mutex| self.unlockExecution(mutex);
+                var execution_scope = if (direct_execution_mutex) |mutex| try self.lockExecution(mutex) else null;
+                defer if (execution_scope) |*scope| scope.deinit();
                 var exact_scope: if (build_options.enable_cuda) ?cuda_compute.CudaCompute.AttentionMatchRepeatScope else ?void = null;
                 if (comptime build_options.enable_cuda) {
                     if (exact_prefill_probe and chunk.len > 1) {
@@ -8070,8 +8069,8 @@ pub const NativeGenerationPipeline = struct {
         // Match text prefill/decode lock order: scheduler turn, then model.
         // Both stay held until the backend forward and result copy complete.
         const direct_execution_mutex = directPrefillExecutionMutex(true, false, false, self.execution_lock);
-        if (direct_execution_mutex) |mutex| try self.lockExecution(mutex);
-        defer if (direct_execution_mutex) |mutex| self.unlockExecution(mutex);
+        var execution_scope = if (direct_execution_mutex) |mutex| try self.lockExecution(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
         prepared.input_embeddings = null;
         const input_embeddings = try self.cb.ensureDeviceResidentOwned(host_embeddings);
         var owns_input_embeddings = true;
@@ -8348,8 +8347,8 @@ pub const NativeGenerationPipeline = struct {
         const input_embeddings = prepared.input_embeddings orelse return error.InvalidPreparedPrompt;
         prepared.input_embeddings = null;
         const direct_execution_mutex = directPrefillExecutionMutex(true, false, false, self.execution_lock);
-        if (direct_execution_mutex) |mutex| try self.lockExecution(mutex);
-        defer if (direct_execution_mutex) |mutex| self.unlockExecution(mutex);
+        var execution_scope = if (direct_execution_mutex) |mutex| try self.lockExecution(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
         var decode_context = decode_runtime.makeDecodeContext(seq_len, seq_len);
         decode_context.mrope_positions = prepared.plan.mrope_positions;
         decode_context.qwen3vl_visual_mask = prepared.plan.visual_token_mask;
@@ -8723,8 +8722,8 @@ pub const NativeGenerationPipeline = struct {
                                 }
                             }
                         }
-                        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-                        defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+                        var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+                        defer if (execution_scope) |*scope| scope.deinit();
                         break :direct_token_blk try self.forwardGreedyDeviceDecodeToken(
                             token_ids,
                             seq_len.*,
@@ -8863,8 +8862,8 @@ pub const NativeGenerationPipeline = struct {
             if (config.kv_cache_mode == .select_v1) try decode_state.compactSelectedGlobalDonors(self.gpt_config, self.execution_control);
             {
                 const kv_mutation_mutex = batchKvMutationMutex(self.execution_lock, decode_state.kv_lock);
-                if (kv_mutation_mutex) |mutex| try self.lockExecution(mutex);
-                defer if (kv_mutation_mutex) |mutex| self.unlockExecution(mutex);
+                var execution_scope = if (kv_mutation_mutex) |mutex| try self.lockExecution(mutex) else null;
+                defer if (execution_scope) |*scope| scope.deinit();
                 _ = try decode_runtime.appendGeneratedToken();
             }
             try penalty_state.noteToken(allocator, @intCast(next_token));
@@ -9659,16 +9658,16 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn makeDeviceTokenTensor(self: *NativeGenerationPipeline, token_id: usize) !?ops.CT {
-        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-        defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+        var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
         const data = [_]i32{@intCast(token_id)};
         const shape = [_]i32{1};
         return try self.cb.fromInt32Shape(&data, &shape);
     }
 
     fn freeDeviceTokenTensor(self: *NativeGenerationPipeline, tensor: ops.CT) void {
-        if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex);
-        defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+        var execution_scope = if (self.execution_lock) |mutex| self.lockExecutionForRelease(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
         self.cb.free(tensor);
     }
 
@@ -12897,8 +12896,8 @@ pub const NativeGenerationPipeline = struct {
 
     fn retireBatchedProjectedImages(self: *NativeGenerationPipeline, projected: *qwen3vl_projector.ProjectedImages) void {
         const device = projected.device_embeddings != null;
-        if (device) if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex);
-        defer if (device) if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+        var execution_scope: ?ExecutionScope = if (device) (if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex) else null) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
         projected.deinit();
     }
 
@@ -13488,9 +13487,10 @@ pub const NativeGenerationPipeline = struct {
     /// even for cancellation or a CUDA error before retiring any resource.
     fn waitOutsideLightOnExecution(self: *NativeGenerationPipeline, pending: anytype) !void {
         const mutex = self.execution_lock orelse return error.InvalidBatchDecodeState;
-        self.unlockExecution(mutex);
+        const scope = self.claimed_execution_scope orelse return error.InvalidBatchDecodeState;
+        scope.deinit();
         const waited = pending.wait();
-        self.lockExecutionForCleanup(mutex);
+        scope.* = self.lockExecutionForCleanup(mutex);
         try waited;
     }
 
@@ -14431,13 +14431,13 @@ pub const NativeGenerationPipeline = struct {
         lease: *runtime.scheduler.native_generate.Lease,
         claimed: []const runtime.scheduler.native_generate.StepItem,
     ) void {
-        if (self.execution_lock) |mutex| {
-            self.lockExecution(mutex) catch |err| {
-                completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = err });
-                return;
-            };
-        }
-        defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+        var execution_scope = if (self.execution_lock) |mutex| self.lockExecution(mutex) catch |err| {
+            completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = err });
+            return;
+        } else null;
+        defer if (execution_scope) |*scope| scope.deinit();
+        self.claimed_execution_scope = if (execution_scope) |*scope| scope else null;
+        defer self.claimed_execution_scope = null;
 
         // A cohort worker can encode hundreds of steps. Drain Objective-C
         // temporaries at each completed step, while still owning the encoder,
@@ -20219,11 +20219,11 @@ test "LightOnOCR3 phase priority releases its waiter on cancellation and permits
     // A cancelled page still has to retire backend state. This acquisition
     // ignores its cancelled control and clears the priority borrow on success.
     wake.reset();
-    pipeline.lockExecutionForCleanup(&mutex);
+    var cleanup_scope = pipeline.lockExecutionForCleanup(&mutex);
     try std.testing.expect(wake.isSet());
     try std.testing.expectEqual(@as(usize, 0), waiters.load(.acquire));
     try std.testing.expect(!mutex.tryLock());
-    mutex.unlock();
+    cleanup_scope.deinit();
 }
 
 test "LightOnOCR3 event execution gate removes cancelled waiters and drains cleanup" {
@@ -20264,9 +20264,9 @@ test "LightOnOCR3 event execution gate removes cancelled waiters and drains clea
     try std.testing.expect(!gate.owned and mutex.tryLock());
     mutex.unlock();
     // Cleanup cannot abandon borrowed GPU state when the page is cancelled.
-    pipeline.lockExecutionForCleanup(&mutex);
+    var cleanup_scope = pipeline.lockExecutionForCleanup(&mutex);
     try std.testing.expect(gate.owned and !mutex.tryLock());
-    pipeline.unlockExecution(&mutex);
+    cleanup_scope.deinit();
     try std.testing.expect(!gate.owned and gate.head == null);
     try std.testing.expect(mutex.tryLock());
     mutex.unlock();
@@ -20794,8 +20794,9 @@ test "LightOnOCR3 CUDA burst readback releases the execution lane and reacquires
         pipeline.execution_control = null;
         pipeline.execution_contention_wait_ns = 100 * std.time.ns_per_us;
         pipeline.io = std.testing.io;
-        try pipeline.lockExecution(&mutex);
-        defer pipeline.unlockExecution(&mutex);
+        var execution_scope = try pipeline.lockExecution(&mutex);
+        defer execution_scope.deinit();
+        pipeline.claimed_execution_scope = &execution_scope;
         pipeline.execution_control = .{ .check_fn = Fake.cancel };
         var pending = Fake{ .mutex = &mutex, .fail = fail };
         if (fail) {

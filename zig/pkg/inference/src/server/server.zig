@@ -1280,6 +1280,7 @@ pub const NodeConfig = struct {
     generation_budget_overrides: BudgetOverrides = .{},
     request_limits: RequestLimits = .{},
     generation_batching: GenerationBatchingConfig = .{},
+    cooperative_execution: CooperativeExecutionConfig = .{},
     /// Maximum queueing delay used only by resolved native executor batches.
     /// Serial compatibility paths bypass the broker and never pay this delay.
     executor_microbatch_max_wait_us: u64 = 200,
@@ -1337,6 +1338,32 @@ fn cudaDecodeGraphReplayRequested(raw_opt: ?[]const u8) bool {
         std.mem.eql(u8, raw, "no"));
 }
 
+pub const CooperativeExecutionConfig = struct {
+    mode: @FieldType(platform.inference_settings.CooperativeExecution, "mode") = .off,
+    max_active_requests: usize = 2,
+    short_context_burst: usize = 8,
+    decode_handoff_wait_us: u32 = 5000,
+
+    pub fn fromSettings(settings: platform.inference_settings.CooperativeExecution) @This() {
+        var out: @This() = .{};
+        inline for (comptime std.meta.fieldNames(platform.inference_settings.CooperativeExecution)) |field| @field(out, field) = @field(settings, field);
+        return out;
+    }
+
+    pub fn validate(self: @This()) !void {
+        if (self.max_active_requests == 0 or self.max_active_requests > 2 or self.short_context_burst == 0 or self.short_context_burst > 8 or self.decode_handoff_wait_us > 10000)
+            return error.InvalidCooperativeExecutionConfig;
+    }
+
+    pub fn enabledForRequest(self: @This(), capabilities: @import("../backends/session.zig").ExecutionCapabilities, graph: bool, draft: bool, cache: bool, media: bool) bool {
+        return self.mode == .on and capabilities.cooperative_steps and capabilities.max_active_requests >= self.max_active_requests and
+            !graph and !draft and !cache and !media and
+            !platform.env.getenvBool("ANTFLY_INFERENCE_DISABLE_CONTINUOUS_BATCHING") and
+            !platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET") and
+            !cudaDecodeGraphReplayRequested(platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY"));
+    }
+};
+
 pub const GenerationBatchingConfig = struct {
     // Experimental CUDA batching: prefill remains singleton and decode batches
     // homogeneous sequence positions within the bounded row-2 envelope. Keep
@@ -1379,23 +1406,6 @@ pub const GenerationBatchingConfig = struct {
         // the model-wide generation lock until their execution is scheduler-
         // aware, while ordinary decode requests remain batchable.
         return !graph_mode and !speculation_requested and !has_multimodal_input;
-    }
-
-    pub fn cooperativeGemma4(
-        self: @This(),
-        backend: runtime.kv.pool.BackendKind,
-        cfg: gpt_model_mod.Config,
-        graph: bool,
-        draft: bool,
-        cache: bool,
-        media: bool,
-    ) bool {
-        if (backend != .cuda or cache or !self.enabledForRequest(.cuda, graph, draft, media)) return false;
-        // Step-scoped backend state is qualified independently from graph,
-        // prefix-cache, speculative and projector ownership.
-        return cfg.family == .gemma and cfg.usesGemma4Channels() and !cfg.usesMoe() and
-            !cfg.gemma4_mtp_assistant and cfg.hidden_size == 2560 and cfg.num_attention_heads == 8 and
-            cfg.effectiveKVHeads() == 2 and cfg.headDim() == 256 and cfg.global_head_dim == 512;
     }
 
     pub fn schedulerPolicy(self: @This()) runtime.scheduler.native_generate.Policy {
@@ -4212,6 +4222,8 @@ test "raw ModernBERT span listing selects only the qualified decision route" {
 }
 
 pub const Node = struct {
+    /// Every executable/host/engine path acquires this before model loading.
+    cuda_device_budget_owner: ?*@import("../ops/cuda/device_budget_owner.zig").Owner = null,
     native_checkpoint_active: std.atomic.Value(bool) = .init(false),
     config: NodeConfig,
     document_artifacts: @import("../documents/artifacts.zig").Store = .{},
@@ -4348,6 +4360,7 @@ pub const Node = struct {
         var config = supplied_config;
         config.chunking_limits = try config.chunking_limits.environment(allocator);
         try config.request_limits.validate();
+        try config.cooperative_execution.validate();
         if (config.http_max_connections == 0 or config.http_max_request_tasks == 0 or config.http_max_body_bytes == 0)
             return error.InvalidHttpTransportCapacity;
         if (config.kernel_jit.profile_capture_only) {
@@ -4355,6 +4368,11 @@ pub const Node = struct {
         }
         try config.kernel_jit.validate();
         try config.prompt_cache.validate();
+        const cuda_owner: ?*@import("../ops/cuda/device_budget_owner.zig").Owner = if (build_options.enable_cuda)
+            try @import("../ops/cuda/device_budget_owner.zig").process.acquire(allocator, config.generation_budget_overrides.backend_limit_bytes)
+        else
+            null;
+        errdefer if (cuda_owner) |owner| owner.deinit();
         var session_manager = backends_mod.SessionManager.init(allocator);
         session_manager.process_termination_available = config.process_termination_available;
         session_manager.native_call_policy = config.native_call_policy;
@@ -4387,6 +4405,7 @@ pub const Node = struct {
         try fillRandomBytes(&runtime_epoch_bytes);
         const runtime_epoch = std.mem.readInt(u64, &runtime_epoch_bytes, .little);
         var node: Node = .{
+            .cuda_device_budget_owner = cuda_owner,
             .config = config,
             .allocator = allocator,
             .session_manager = session_manager,
@@ -4536,6 +4555,10 @@ pub const Node = struct {
         // guards. Drain those tasks (including guard cleanup) while their
         // hard-cancellation boundary is still alive.
         self.model_manager.deinit();
+        if (self.cuda_device_budget_owner) |owner| {
+            owner.deinit();
+            self.cuda_device_budget_owner = null;
+        }
         if (self.hard_cancellation_watchdog) |watchdog| {
             watchdog.destroy();
             self.hard_cancellation_watchdog = null;
@@ -13150,7 +13173,10 @@ pub const Node = struct {
     ) !runtime.scheduler.native_generate.Lease {
         var policy = self.config.generation_batching.schedulerPolicy();
         policy.allow_mixed_sequence_lengths = true;
-        policy.short_context_burst = 8;
+        policy.max_step_items = 1;
+        policy.short_context_burst = self.config.cooperative_execution.short_context_burst;
+        policy.decode_handoff_wait_us = self.config.cooperative_execution.decode_handoff_wait_us;
+        policy.max_decode_wait_us = 0;
         policy.max_step_prefill_items = 1;
         policy.decode_coalesce_rows = policy.max_step_items;
         policy.decode_coalesce_ready_only = true;
@@ -15883,21 +15909,22 @@ pub const Node = struct {
             gpt_config,
             self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
         );
-        const cooperative_cuda = native_transfer == null and !selected_kv and self.config.generation_batching.cooperativeGemma4(
-            backend_kind,
-            gpt_config,
+        const cooperative_cuda = native_transfer == null and !selected_kv and self.config.cooperative_execution.enabledForRequest(
+            model.session.executionCapabilities(),
             backend_selection.graph_mode_requested or graphModeEnabled() or effective_compiled_partition_backend != null,
             effective_draft_model_name != null or auto_draft_sibling != null or config.speculation_requested,
             config.prompt_cache_enabled,
             generateMessagesHaveMedia(effective_messages),
         );
+        if (cooperative_cuda and self.config.generation_batching.mode == .on and self.config.generation_batching.max_step_items > model.session.executionCapabilities().max_batch_rows)
+            return ctx.status(400).json(.{ .@"error" = "UNQUALIFIED_COOPERATIVE_BATCH", .message = "Cooperative execution currently supports one row per step; disable row batching or set max_step_items to 1" });
         const native_isolated = native_transfer == null and canIsolateGeneration(backend_kind, effective_compiled_partition_backend != null, effective_draft_model_name != null or auto_draft_sibling != null, config.prompt_cache_enabled, want_stream);
         // Queued callers own neither scheduler work nor device KV/scratch.
         // Exclusive requests fence the shared backend's cache/graph lifetime.
         const generation_slot = model.generation_admission.acquire(
             execution_control,
             !cooperative_cuda and !native_isolated,
-            if (cooperative_cuda) 2 else self.config.max_concurrent_requests,
+            if (cooperative_cuda) self.config.cooperative_execution.max_active_requests else self.config.max_concurrent_requests,
             @min(@max(self.config.max_concurrent_requests, 1), 64),
         ) catch |err| {
             if (err == error.GenerationQueueFull) return modelResourceBusyResponse(ctx);
@@ -16457,11 +16484,17 @@ pub const Node = struct {
             else if (first_locked_model == model) draft_model else model
         else
             null;
-        var cooperative_setup_slot: ?execution_control_mod.ExecutionLane.Lease = null;
-        defer if (cooperative_setup_slot) |slot| slot.release();
-        if (cooperative_cuda) cooperative_setup_slot = model.native_generation_step_lane.acquireWithPriority(execution_control, true) catch |err|
-            return inferenceFailureResponse(ctx, err);
-        if (!isolated_generation or cooperative_cuda) {
+        const ExecutionScope = @import("../ops/execution_scope.zig").Scope;
+        var setup_scope: ?ExecutionScope = null;
+        defer if (setup_scope) |*scope| scope.deinit();
+        if (cooperative_cuda) {
+            setup_scope = ExecutionScope.acquire(execution_control, .{
+                .mutex = model.nativeGenerationMutex(),
+                .lane = &model.native_generation_step_lane,
+                .interactive = true,
+                .phase = .setup,
+            }) catch |err| return inferenceFailureResponse(ctx, err);
+        } else if (!isolated_generation) {
             execution_control.lock(first_locked_model.nativeGenerationMutex()) catch |err|
                 return inferenceFailureResponse(ctx, err);
             if (second_locked_model) |second| execution_control.lock(second.nativeGenerationMutex()) catch |err| {
@@ -16469,7 +16502,7 @@ pub const Node = struct {
                 return inferenceFailureResponse(ctx, err);
             };
         }
-        var owns_generation_lock = !isolated_generation or cooperative_cuda;
+        var owns_generation_lock = !isolated_generation;
         defer if (owns_generation_lock) {
             if (second_locked_model) |second| second.unlockNativeGeneration();
             first_locked_model.unlockNativeGeneration();
@@ -16492,7 +16525,7 @@ pub const Node = struct {
         defer if (draft_kv_manager) |*manager| manager.deinit();
 
         var cb = (if (cooperative_cuda)
-            session_factory.getCoordinatedCudaComputeBackend(model.session, &run_budget)
+            session_factory.getCoordinatedCudaComputeBackend(model.session, &run_budget, generation_slot.owner_id)
         else
             session_factory.getComputeBackendWithBudget(model.session, execution_allocator, &run_budget)) catch |err| {
             if (err == error.MemoryBudgetExceeded) {
@@ -16502,9 +16535,9 @@ pub const Node = struct {
         };
         var cb_live = true;
         defer if (cb_live) {
-            if (cooperative_cuda and owns_generation_lock) cb.clearExecutionBudget();
             cb.deinit();
         };
+        if (setup_scope) |*scope| scope.bind(cb) catch |err| return inferenceFailureResponse(ctx, err);
         // Native checkpoint preparation runs direct prefill before its first
         // response write. Bind the request-local wrapper so weight acquisition
         // can observe a disconnected caller between decoder operations, rather
@@ -16580,13 +16613,12 @@ pub const Node = struct {
         else
             null;
         defer if (kv_storage) |*storage| {
-            const lock_cleanup = cooperative_cuda and !owns_generation_lock;
-            const cleanup_slot = if (lock_cleanup) model.native_generation_step_lane.acquireForCleanup(ctx.io, true) else null;
-            defer if (cleanup_slot) |slot| slot.release();
-            if (lock_cleanup) platform.sync.lockYielding(model.nativeGenerationMutex());
-            defer if (lock_cleanup) model.unlockNativeGeneration();
-            if (lock_cleanup) cb.bindExecutionBudget();
-            defer if (lock_cleanup) cb.clearExecutionBudget();
+            var cleanup_scope: ?ExecutionScope = if (cooperative_cuda and setup_scope == null)
+                ExecutionScope.acquireCleanup(ctx.io, .{ .mutex = model.nativeGenerationMutex(), .lane = &model.native_generation_step_lane, .interactive = true })
+            else
+                null;
+            defer if (cleanup_scope) |*scope| scope.deinit();
+            if (cleanup_scope) |*scope| scope.bindCleanup(cb);
             storage.deinit();
         };
         if (kv_storage) |*storage| {
@@ -16601,13 +16633,12 @@ pub const Node = struct {
         }
         var decode_state_live = true;
         defer if (decode_state_live) {
-            const lock_cleanup = cooperative_cuda and !owns_generation_lock;
-            const cleanup_slot = if (lock_cleanup) model.native_generation_step_lane.acquireForCleanup(ctx.io, true) else null;
-            defer if (cleanup_slot) |slot| slot.release();
-            if (lock_cleanup) platform.sync.lockYielding(model.nativeGenerationMutex());
-            defer if (lock_cleanup) model.unlockNativeGeneration();
-            if (lock_cleanup) cb.bindExecutionBudget();
-            defer if (lock_cleanup) cb.clearExecutionBudget();
+            var cleanup_scope: ?ExecutionScope = if (cooperative_cuda and setup_scope == null)
+                ExecutionScope.acquireCleanup(ctx.io, .{ .mutex = model.nativeGenerationMutex(), .lane = &model.native_generation_step_lane, .interactive = true })
+            else
+                null;
+            defer if (cleanup_scope) |*scope| scope.deinit();
+            if (cleanup_scope) |*scope| scope.bindCleanup(cb);
             decode_state.deinit();
         };
 
@@ -16740,12 +16771,9 @@ pub const Node = struct {
                 "direct-eager");
         }
 
-        if (cooperative_cuda) {
-            cb.clearExecutionBudget();
-            first_locked_model.unlockNativeGeneration();
-            owns_generation_lock = false;
-            cooperative_setup_slot.?.release();
-            cooperative_setup_slot = null;
+        if (setup_scope) |*scope| {
+            scope.deinit();
+            setup_scope = null;
         }
 
         if (want_stream) {
@@ -25599,9 +25627,14 @@ pub const Node = struct {
         var loaded_snapshot = try self.model_manager.acquireLoadedModelSnapshot(ctx.allocator);
         defer loaded_snapshot.deinit();
 
+        var execution_owners: @import("../ops/execution_scope.zig").OwnerSnapshot = .{};
+        var cooperative_capable: usize = 0;
         var recurrent_cuda: u64 = 0;
         var recurrent_host: u64 = 0;
         for (loaded_snapshot.handles) |handle| {
+            if (handle.get().session.executionCapabilities().cooperative_steps) cooperative_capable += 1;
+            const owner_stats = handle.get().session.executionOwnerStats();
+            inline for (comptime std.meta.fieldNames(@TypeOf(owner_stats))) |field| @field(execution_owners, field) +|= @field(owner_stats, field);
             if (session_factory.getRecurrentExecution(handle.get().session)) |decision| {
                 switch (decision.placement) {
                     .cuda => recurrent_cuda += 1,
@@ -25609,6 +25642,11 @@ pub const Node = struct {
                 }
             }
         }
+        try appendPromMetric(&writer.writer, "antfly_inference_generation_cooperative_capable_models", "gauge", "Loaded backends declaring cooperative step sharing", cooperative_capable);
+        try appendPromMetric(&writer.writer, "antfly_inference_generation_cooperative_configured", "gauge", "Explicit cooperative interleaving opt-in", @intFromBool(self.config.cooperative_execution.mode == .on));
+        try appendPromMetric(&writer.writer, "antfly_inference_generation_row_batching_configured", "gauge", "Independent experimental row batching opt-in", @intFromBool(self.config.generation_batching.mode == .on));
+        inline for (comptime std.meta.fieldNames(@TypeOf(execution_owners))) |field|
+            try appendPromMetric(&writer.writer, "antfly_inference_generation_owner_" ++ field ++ "_total", "counter", "Backend execution owner transitions and same-owner scope reuse", @field(execution_owners, field));
         try appendPromMetric(&writer.writer, "antfly_inference_recurrent_cuda_models", "gauge", "Loaded CUDA models whose recurrent state executes on device", recurrent_cuda);
         try appendPromMetric(&writer.writer, "antfly_inference_recurrent_host_models", "gauge", "Loaded CUDA models using an explicit host recurrent fallback", recurrent_host);
         // Derive gauges from live owners rather than an increment-only cache.
@@ -35658,26 +35696,18 @@ test "generation batching keeps the experimental CUDA envelope default-off" {
     );
 }
 
-test "generation cooperative CUDA eligibility fences shared backend state" {
-    var cfg: gpt_model_mod.Config = .{
-        .family = .gemma,
-        .gemma4_channel_protocol = true,
-        .hidden_size = 2560,
-        .num_attention_heads = 8,
-        .num_key_value_heads = 2,
-        .attention_head_dim = 256,
-        .global_head_dim = 512,
-    };
-    const enabled = GenerationBatchingConfig{ .mode = .on };
-    try std.testing.expect(enabled.cooperativeGemma4(.cuda, cfg, false, false, false, false));
-    try std.testing.expect(!(GenerationBatchingConfig{}).cooperativeGemma4(.cuda, cfg, false, false, false, false));
-    try std.testing.expect(!enabled.cooperativeGemma4(.metal, cfg, false, false, false, false));
-    try std.testing.expect(!enabled.cooperativeGemma4(.cuda, cfg, true, false, false, false));
-    try std.testing.expect(!enabled.cooperativeGemma4(.cuda, cfg, false, true, false, false));
-    try std.testing.expect(!enabled.cooperativeGemma4(.cuda, cfg, false, false, true, false));
-    try std.testing.expect(!enabled.cooperativeGemma4(.cuda, cfg, false, false, false, true));
-    cfg.num_key_value_heads = 1;
-    try std.testing.expect(!enabled.cooperativeGemma4(.cuda, cfg, false, false, false, false));
+test "generation cooperative execution is independent of row batching and fences backend state" {
+    const Capabilities = @import("../backends/session.zig").ExecutionCapabilities;
+    const enabled = CooperativeExecutionConfig{ .mode = .on };
+    const safe: Capabilities = .{ .cooperative_steps = true, .max_active_requests = 2 };
+    try std.testing.expect(enabled.enabledForRequest(safe, false, false, false, false));
+    try std.testing.expect(!(CooperativeExecutionConfig{}).enabledForRequest(safe, false, false, false, false));
+    try std.testing.expect(!enabled.enabledForRequest(.{}, false, false, false, false));
+    try std.testing.expect(!enabled.enabledForRequest(safe, true, false, false, false));
+    try std.testing.expect(!enabled.enabledForRequest(safe, false, true, false, false));
+    try std.testing.expect(!enabled.enabledForRequest(safe, false, false, true, false));
+    try std.testing.expect(!enabled.enabledForRequest(safe, false, false, false, true));
+    try std.testing.expectError(error.InvalidCooperativeExecutionConfig, (CooperativeExecutionConfig{ .max_active_requests = 3 }).validate());
 }
 
 test "native generation applies scheduler policy before the first lease" {

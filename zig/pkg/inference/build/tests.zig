@@ -255,7 +255,17 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
         media_step.dependOn(&ctx.addRunArtifact(callbacks).step);
     }
     test_step.dependOn(media_step);
-    ctx.step("test-inference-unit", "Run inference unit tests with optional filters, without independent library suites").dependOn(&run_tests.step);
+    const cooperative_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cooperative_admission.zig"), .target = ctx.target, .optimize = ctx.optimize });
+    var cooperative_imports = suite.tests.root_module.import_table.iterator();
+    while (cooperative_imports.next()) |entry| cooperative_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    cooperative_root.link_libc = true;
+    const cooperative_tests = b.addTest(.{ .root_module = cooperative_root, .filters = &.{"cooperative sustained"} });
+    const run_cooperative_tests = ctx.addRunArtifact(cooperative_tests);
+    test_step.dependOn(&run_cooperative_tests.step);
+    ctx.step("test-cooperative-admission", "Verify sustained cooperative/exclusive turnover and queued deadlines").dependOn(&run_cooperative_tests.step);
+    const inference_unit = ctx.step("test-inference-unit", "Run inference unit tests with optional filters, without independent library suites");
+    inference_unit.dependOn(&run_tests.step);
+    inference_unit.dependOn(&run_cooperative_tests.step);
     const cancellation_e2e_step = ctx.step("test-cancellation-e2e", "Run HTTP inference cancellation and worker recovery E2E tests");
     if (ctx.target.result.os.tag == .linux or ctx.target.result.os.tag == .macos) {
         const fixture = b.addExecutable(.{

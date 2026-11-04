@@ -4219,6 +4219,7 @@ pub const CudaCompute = struct {
     decoder_runtime_next_dynamic_slot: usize = 1,
     decoder_runtime_family_state: CudaDecoderRuntimeFamilyState = .{},
     run_budget: ?*run_memory.RunBudget = null,
+    cooperative_owner: @import("../execution_scope.zig").OwnerState = .{},
     dense_stream_entries: std.ArrayListUnmanaged(DenseStreamEntry) = .empty,
     dense_stream_epoch: u64 = 1,
     dense_host_prefetch_entries: std.StringHashMapUnmanaged(*DenseHostPrefetchEntry) = .{},
@@ -5676,8 +5677,23 @@ pub const CudaCompute = struct {
     /// The caller owns the model mutex for setup and every compute/cleanup
     /// step. Unlike a whole-request scoped handle, deinit does not mutate the
     /// shared binding while a different request may be executing.
-    pub fn computeBackendWithStepRunBudget(self: *CudaCompute, budget: *run_memory.RunBudget) ops.ComputeBackend {
-        return .{ .ptr = self, .vtable = &vtable, .execution_budget = budget, .execution_budget_bind = &bindStepRunBudget };
+    pub fn computeBackendWithStepRunBudget(self: *CudaCompute, budget: *run_memory.RunBudget, owner: u64) ops.ComputeBackend {
+        return .{ .ptr = self, .vtable = &vtable, .execution_budget = budget, .execution_budget_bind = &bindStepRunBudget, .execution_owner = owner, .execution_enter = &enterExecutionOwner, .execution_cleanup = &cleanupExecutionOwner, .execution_release = &releaseExecutionOwner };
+    }
+
+    fn enterExecutionOwner(raw: *anyopaque, owner: u64) !void {
+        const self: *CudaCompute = @ptrCast(@alignCast(raw));
+        try self.cooperative_owner.enter(owner, raw, &beginRequest);
+    }
+
+    fn releaseExecutionOwner(raw: *anyopaque, owner: u64) void {
+        const self: *CudaCompute = @ptrCast(@alignCast(raw));
+        self.cooperative_owner.release(owner);
+    }
+
+    fn cleanupExecutionOwner(raw: *anyopaque, _: u64) void {
+        const self: *CudaCompute = @ptrCast(@alignCast(raw));
+        self.cooperative_owner.cleanup();
     }
 
     fn bindStepRunBudget(raw: *anyopaque, budget: ?*run_memory.RunBudget) void {
@@ -8733,6 +8749,7 @@ fn provisionKvDeviceWriteHook(ctx: *anyopaque, storage: *kv_storage_runtime.KvSt
 
 fn beginRequest(ctx: *anyopaque) anyerror!void {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    self.cooperative_owner.reset();
     // A graph launch may still reference its captured temporary addresses.
     // Establish stream completion before destroying execs or recycling any
     // pinned slot at a request boundary. This is normally already satisfied
@@ -30747,8 +30764,8 @@ test "generation cooperative CUDA handles bind budgets per step and retire witho
     compute.lazy_device_budget_bytes = 0;
     var first = run_memory.RunBudget.init(.{ .backend_limit_bytes = 1000 });
     var second = run_memory.RunBudget.init(.{ .backend_limit_bytes = 2000 });
-    var a = compute.computeBackendWithStepRunBudget(&first);
-    var b = compute.computeBackendWithStepRunBudget(&second);
+    var a = compute.computeBackendWithStepRunBudget(&first, 1);
+    var b = compute.computeBackendWithStepRunBudget(&second, 2);
     try std.testing.expect(compute.run_budget == null);
     a.bindExecutionBudget();
     try std.testing.expect(compute.run_budget == &first);

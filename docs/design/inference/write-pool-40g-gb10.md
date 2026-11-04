@@ -160,3 +160,14 @@ recovery checks passed again. `environment-final.json` and
 `live-environment-final.json` pin the final executable/model identities and CUDA
 feature settings. The write service remains running on port 18841; the owned
 read service is stopped. The separate repetitive-audio failure remains open.
+
+
+## Repeat after cooperative ownership changes
+
+The final serving binary passes the 102-request write campaign again, including
+all phase-specific managed-memory and service NVML evidence. See the
+[cooperative execution follow-up](cooperative-execution.md#write-pool-repeat) for
+exact memory, retained-scratch and recovery results. This repeat does not change
+the earlier dense repeated-audio limitation or qualify A100 performance. The
+write service was stopped after qualification and the cooperative read service
+was restored on port 18840.

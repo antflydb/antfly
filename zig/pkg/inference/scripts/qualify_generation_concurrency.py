@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Qualify mixed-context scheduling, bounded queue memory and disconnect cleanup."""
 
 import argparse
@@ -28,13 +41,13 @@ def main():
     parser.add_argument('--queue-records', type=int, default=256)
     parser.add_argument('--disconnect', action='store_true')
     parser.add_argument('--generation-timeout', type=int, default=300)
+    parser.add_argument('--disable-thinking', action='store_true')
     parser.add_argument('--embedding-batch-size', type=int, choices=(1, 4, 8), default=1)
     parser.add_argument('--probe-context-sentences', type=int, choices=range(0, 9), default=0)
     args = parser.parse_args()
     args.pressure = False
     assert 1 <= args.generation_timeout <= 3600
     args.stream_generations = False
-    args.disable_thinking = False
     c = q.Campaign(args)
     embed, decide = c.embed, c.decide
     background = ' Warehouse shelving and shipping records are unrelated background context.' * args.probe_context_sentences
@@ -86,7 +99,7 @@ def main():
         m = read_metrics()
         assert m['antfly_inference_cuda_managed_limit_bytes'] == 38 * (1 << 30)
         assert 'antfly_inference_generation_queued_requests' in m, 'new generation admission is not running'
-        c.phase = 'baseline'
+        c.set_phase('baseline')
         for _ in range(12):
             c.request('embed', c.embed())
             c.request('decide', c.decide())
@@ -94,7 +107,7 @@ def main():
         short_body = c.generate(args.short_records, args.short_output)
         long_reference, short_reference = expected(long_body), expected(short_body)
 
-        c.phase = 'mixed-contexts'
+        c.set_phase('mixed-contexts')
         print(c.phase, flush=True)
         with ThreadPoolExecutor(max_workers=4) as pool:
             long = pool.submit(c.request, 'generate', long_body)
@@ -108,7 +121,7 @@ def main():
         print(details['mixed'], flush=True)
 
         if args.queue_probes:
-            c.phase = 'queue-memory-and-cancellation'
+            c.set_phase('queue-memory-and-cancellation')
             print(c.phase, flush=True)
             body = c.generate(args.queue_records, 32)
             with ThreadPoolExecutor(max_workers=24) as pool:
@@ -148,13 +161,13 @@ def main():
             assert read_metrics()['antfly_inference_admission_backend_kv_bytes'] == 0
             details['queue'] = {'waiting_peak': peak_waiting, 'kv_before_bytes': kv_before, 'kv_peak_with_waiters_bytes': peak_kv, 'statuses': {str(code): sum(r['status'] == code for r in outcomes) for code in (503, 504)}, 'active_outputs_equal': True}
             print(details['queue'], flush=True)
-            c.phase = 'exclusive-cache-recovery'
+            c.set_phase('exclusive-cache-recovery')
             c.request('generate', c.generate(64, 8, 'exclusive-recovered'))
             row = c.request('generate', short_body)
             assert row['response']['choices'] == short_reference
 
         if args.disconnect:
-            c.phase = 'client-disconnect'
+            c.set_phase('client-disconnect')
             print(c.phase, flush=True)
             body = {**c.generate(64, 1024), 'stream': True, 'stream_options': {'include_usage': True}, 'chat_template_kwargs': {'enable_thinking': False}}
             request = urllib.request.Request(args.url + '/ai/v1/generate', data=json.dumps(body).encode(), headers={'Content-Type': 'application/json', 'X-Antfly-Inference-Timeout-Ms': '60000'})
@@ -169,7 +182,7 @@ def main():
             wait_for(lambda m: m['antfly_inference_generation_active_requests'] == 0 and m['antfly_inference_admission_backend_kv_bytes'] == 0, seconds=15)
             details['disconnect'] = {'cancelled_after_first_content': True, 'active_and_kv_recovered': True}
 
-        c.phase = 'recovery'
+        c.set_phase('recovery')
         for _ in range(12):
             c.request('embed', c.embed())
             c.request('decide', c.decide())
@@ -181,16 +194,13 @@ def main():
         m = read_metrics()
         assert m['antfly_inference_generation_active_requests'] == 0 and m['antfly_inference_generation_queued_requests'] == 0
         assert m['antfly_inference_admission_backend_kv_bytes'] == 0 and m['antfly_inference_admission_backend_scratch_bytes'] == 0
-        assert all(s['metrics'].get('antfly_inference_cuda_managed_peak_bytes', 0) <= 38 * (1 << 30) for s in c.samples)
-        assert all(s.get('service_nvml_bytes') is None or s['service_nvml_bytes'] <= 40 * (1 << 30) for s in c.samples)
+        c.require_memory_evidence()
         c.status = 'passed'
     except BaseException as error:
-        c.status, c.error = 'failed', str(error)
+        c.status, c.error = ('incomplete' if isinstance(error, q.EvidenceUnavailable) else 'failed'), str(error)
         raise
     finally:
-        c.stop.set()
-        thread.join(timeout=10)
-        c.save()
+        c.stop_monitor(thread)
         path = args.output / 'report.json'
         report = json.loads(path.read_text())
         report['validation_mode'] = 'mixed contexts, queue memory and cancellation'

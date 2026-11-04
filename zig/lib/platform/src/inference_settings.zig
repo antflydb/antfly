@@ -25,6 +25,14 @@ pub const GenerationBatching = struct {
     max_idle_prefill_chunk_size: usize = 2048,
 };
 
+/// Interleave independently owned requests. Row batching is a separate opt-in.
+pub const CooperativeExecution = struct {
+    mode: enum { off, on } = .off,
+    max_active_requests: usize = 2,
+    short_context_burst: usize = 8,
+    decode_handoff_wait_us: u32 = 5000,
+};
+
 pub fn parseKeepAliveMs(raw: []const u8) !u64 {
     if (std.mem.eql(u8, raw, "0")) return 0;
     if (raw.len == 0) return error.InvalidInferenceModelCacheConfig;
@@ -74,7 +82,7 @@ pub fn replacementPath(key: []const u8, nested: bool) ?[]const u8 {
     if (nested) return null;
     if (std.mem.eql(u8, key, "graph_execution")) return "resources.query.request_limits.graph";
     if (std.mem.eql(u8, key, "process_memory_budget_mb")) return "resources.memory.max_bytes (byte units)";
-    inline for (.{ "models_dir", "ml_dir", "preload", "max_loaded_models", "keep_alive", "prompt_cache", "kernel_jit", "content_security", "s3_credentials", "pool_size", "generation_batching", "http_max_body_mb" }) |model_key| {
+    inline for (.{ "models_dir", "ml_dir", "preload", "max_loaded_models", "keep_alive", "prompt_cache", "kernel_jit", "content_security", "s3_credentials", "pool_size", "generation_batching", "cooperative_execution", "http_max_body_mb" }) |model_key| {
         if (std.mem.eql(u8, key, model_key)) return "inference." ++ model_key;
     }
     return null;

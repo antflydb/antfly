@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Check a pinned CUDA write pool against independent text/audio/OCR fixtures."""
 
 import argparse
@@ -165,16 +178,16 @@ class WriteCampaign(q.Campaign):
             _, raw, _ = q.http(self.args.url, '/metrics', text=True)
             assert q.metrics(raw)['antfly_inference_cuda_managed_limit_bytes'] == 38 * (1 << 30)
             jobs = [('embed', self.embed(), None), ('extract', self.extraction(), None), ('whisper', self.whisper(), None), ('ocr', self.ocr([0]), [0])]
-            self.phase = 'warmup'
+            self.set_phase('warmup')
             for job in jobs:
                 self.request_write(*job)
             warmed_reservations = idle_reservations()
-            self.phase = 'baseline'
+            self.set_phase('baseline')
             for _ in range(self.args.probes):
                 for job in jobs:
                     self.request_write(*job)
             self.save()
-            self.phase = 'mixed-steady'
+            self.set_phase('mixed-steady')
             print(self.phase, flush=True)
             with ThreadPoolExecutor(max_workers=4) as pool:
                 for round in range(self.args.rounds):
@@ -183,14 +196,14 @@ class WriteCampaign(q.Campaign):
                     for future in [pool.submit(self.request_write, *job) for job in current]:
                         future.result()
             self.save()
-            self.phase = 'mixed-burst-and-batches'
+            self.set_phase('mixed-burst-and-batches')
             print(self.phase, flush=True)
             embedding = {**self.embed(), 'input': self.embed()['input'] * 8}
             batch_jobs = [('embed', embedding, None), ('extract', self.extraction(4, padded=True), None), ('whisper', self.whisper(), None), ('ocr', self.ocr([0, 1, 2, 3]), [0, 1, 2, 3])]
             with ThreadPoolExecutor(max_workers=8) as pool:
                 for future in [pool.submit(self.request_write, *batch_jobs[i % 4]) for i in range(self.args.burst)]:
                     future.result()
-            self.phase = 'limits-and-silence'
+            self.set_phase('limits-and-silence')
             request = {'model': OCR, 'images': self.ocr([0])['images'] * 9, 'max_tokens': 128}
             code, response, seconds = q.http(self.args.url, '/read', request)
             assert code in (400, 413), (code, response)
@@ -203,20 +216,20 @@ class WriteCampaign(q.Campaign):
             code, response, seconds = q.http(self.args.url, '/read', body)
             assert code == 200 and all(not item['text'].strip() for item in response['data']), response
             (self.args.output / 'silence.json').write_text(json.dumps({'request': body, 'response': response, 'seconds': seconds}, indent=2) + '\n')
-            self.phase = 'windowed-audio-and-eight-pages'
+            self.set_phase('windowed-audio-and-eight-pages')
             body, copies = self.windowed_whisper()
             self.request_write('whisper', body, copies)
             self.request_write('ocr', self.ocr([0] * 8), [0] * 8)
-            self.phase = 'ocr-deadline'
+            self.set_phase('ocr-deadline')
             body = self.ocr([0] * 8)
             code, response, seconds = q.http(self.args.url, '/read', body, timeout=30, deadline_ms=200)
             (self.args.output / 'deadline.json').write_text(json.dumps({'request': body, 'status': code, 'response': response, 'seconds': seconds}, indent=2) + '\n')
             assert code == 504 and response.get('retryable'), (code, response)
             if self.args.repeated_audio:
-                self.phase = 'repeated-audio-accuracy'
+                self.set_phase('repeated-audio-accuracy')
                 body, copies = self.windowed_whisper(repeated=True)
                 self.request_write('whisper', body, copies)
-            self.phase = 'recovery'
+            self.set_phase('recovery')
             for job in jobs:
                 self.request_write(*job)
             code, inventory, _ = q.http(self.args.url, '/models/instances')
@@ -229,14 +242,13 @@ class WriteCampaign(q.Campaign):
             # every scratch-classified owner to have request lifetime.
             for name in ('antfly_inference_admission_host_scratch_bytes', 'antfly_inference_admission_backend_scratch_bytes'):
                 assert final_reservations[name] <= warmed_reservations[name], (warmed_reservations, final_reservations)
-            assert all(s['metrics'].get('antfly_inference_cuda_managed_peak_bytes', 0) <= 38 * (1 << 30) for s in self.samples)
-            assert all(s.get('service_nvml_bytes') is None or s['service_nvml_bytes'] <= 40 * (1 << 30) for s in self.samples)
+            self.require_memory_evidence()
             self.status = 'passed'
         except BaseException as error:
-            self.status, self.error = 'failed', str(error)
+            self.status, self.error = ('incomplete' if isinstance(error, q.EvidenceUnavailable) else 'failed'), str(error)
             raise
         finally:
-            self.stop.set(); thread.join(timeout=10); self.save()
+            self.stop_monitor(thread)
             path = self.args.output / 'report.json'
             report = json.loads(path.read_text()); report['validation_mode'] = 'write-pool co-residency, mixed traffic, batch activations and recovery'; report['scope'] = 'Spark memory-budget and functional experiment; synthetic fixtures are not a broad accuracy benchmark'
             path.write_text(json.dumps(report, indent=2) + '\n')

@@ -42,7 +42,7 @@ storage. These measurements overlap and must not be added together.
 
 ## Runtime changes used by the experiment
 
-The standalone worker now connects the explicit device budget to a process-wide
+Common `Node.init` now connects the explicit device budget to a process-wide
 `DeviceBuffer` allocation guard. Per-model quotas alone do not enforce the sum
 of three resident contexts. The added metrics expose live, peak and limit bytes.
 A mock-driver regression verifies cross-context rejection and restoration of
@@ -78,12 +78,14 @@ The generic main default and this explicit Flash profile are separate cases.
 The Flash profile is not admitted on A100; retain the separate conservative
 A100 profile until hardware-specific qualification is available.
 
-The canonical config starts with a 32,768-token input ceiling and the default
-`generation_batching.mode: off`. The concurrency experiment explicitly opts in
-to experimental row batching with `mode: on`. Its scheduler can assign a shared
-request a small chunk plan even after its peer finishes. Do not interpret high
-GPU utilization as proof that decode batches formed or that latency is suitable
-for a production SLO.
+The canonical config starts with a 32,768-token input ceiling and both
+`cooperative_execution.mode: off` and `generation_batching.mode: off`.
+Current reproduction enables `cooperative_execution.mode: on` and keeps row
+batching off with `max_step_items: 1`. The historical campaigns below used the
+former combined batching switch. See [cooperative execution ownership](cooperative-execution.md)
+for the current independent controls, recovery contract and validation gates.
+Do not interpret high GPU utilization as proof that decode batches formed or
+that latency is suitable for a production SLO.
 
 With the owned server running, the mixed completed-generation sweep is:
 
@@ -387,7 +389,8 @@ utilization cannot be attributed solely to this pool. No actual A100 timing or
 numerical claim is made.
 
 To reproduce the mixed-context and queue checks, use the bounded read config
-with `generation_batching.mode: on` and `max_step_items: 1`, the Spark Flash
+with `cooperative_execution.mode: on`, `generation_batching.mode: off`,
+`max_step_items: 1`, the Spark Flash
 prefill override, and both generic decode-graph replay settings off:
 
 ```sh
@@ -481,3 +484,17 @@ settings. `make gc`, Zig formatting, Python syntax checks, and the 98 selected
 regression tests passed. The final running service after the sequential
 qualification is the write pool on port 18841; read launch receipts/configs are
 preserved for restarting it.
+
+
+## Explicit cooperative ownership follow-up
+
+The current implementation and final controlled GB10 results are documented in
+[cooperative execution ownership](cooperative-execution.md). This supersedes the
+earlier combined batching switch and running-service note: interleaving now has
+its own opt-in, one-row limit, backend capability declaration and execution
+scope. Common runtime initialization owns the shared allocation cap, and failed
+frees retain durable ownership through confirmed recovery. The controlled
+streaming short request improves from 86.69 to 36.48 seconds; a short request
+arriving during long decoding improves from 31.44 to 6.91 seconds. Both measured
+comparisons pass all predefined gates with valid memory evidence. The final
+cooperative read service runs on port 18840. A100 remains unmeasured.
