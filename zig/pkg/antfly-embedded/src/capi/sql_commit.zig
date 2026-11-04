@@ -216,7 +216,7 @@ fn prepareDecision(handle: *h.Handle, requests: []const contract.TableCommitRequ
     // across every participant, even if the final replay record crosses the
     // ordinary producer high-water mark. Recovery excludes a second producer.
     if (handle.owned_lite_backend) |backend| if (backend.native_docstore) |native_store|
-        try native_store.file.requireReplayProducerCapacity();
+        try native_store.file.requireReplayCoordinatorCapacity();
     if (comptime h.builtin.is_test) if (test_before_store) |hook| try hook.run(hook.ptr);
     try store(handle, record);
     // From here a failure leaves a hint and possibly pending intents; abort

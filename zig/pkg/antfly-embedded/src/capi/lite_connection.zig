@@ -8856,6 +8856,37 @@ test "capi native maintenance text source reuse refreshes primary observations a
     try std.testing.expect(!try owner.text_source_runtime_cache.?.matches(file));
 }
 
+test "capi native retirement selection never materializes primary payload pages" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("retirement-keys-only", 1000, .batch);
+    defer fixture.deinit();
+    var lease = try fixture.connection.acquire();
+    defer {
+        lease.close();
+        fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    }
+    const root = try fixture.connection.owner.refresh();
+    const file = &root.owned_lite_backend.?.native_docstore.?.file;
+    const value = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(value);
+    @memset(value, 'v');
+    try root.db.core.store.put("retirement-payload", value);
+    var txn = try root.db.core.store.beginReadTxn();
+    defer txn.abort();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const pages = @import("../storage/db/group_source_page.zig");
+    const before = file.test_value_read_bytes.load(.monotonic);
+    const retired = try pages.prepare(arena.allocator(), &txn, 7, 3, .retire, "", "retirement-payload");
+    try std.testing.expectEqual(@as(usize, 1), retired.candidates.len);
+    try std.testing.expect(retired.done);
+    try std.testing.expectEqual(before, file.test_value_read_bytes.load(.monotonic));
+    const scanned = try pages.prepare(arena.allocator(), &txn, 7, 3, .scan, "", "retirement-payload");
+    try std.testing.expectEqual(@as(usize, 1), scanned.candidates.len);
+    try std.testing.expectEqual(@import("../storage/db/group_sources.zig").digest(value), scanned.candidates[0].digest);
+    try std.testing.expect(file.test_value_read_bytes.load(.monotonic) - before >= value.len);
+}
+
 test "capi native publication generated consumer uses live reserve at producer quota" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("generated-consumer-live-reserve", 1000, .batch);

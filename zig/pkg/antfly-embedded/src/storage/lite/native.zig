@@ -8598,10 +8598,31 @@ pub const NativeFile = struct {
     }
 
     pub fn requireReplayProducerCapacity(self: *NativeFile) !void {
+        return self.requireReplayCapacity(false);
+    }
+
+    /// A coordinator created by replay/promotion belongs to the consumer
+    /// reserve. It still needs headroom before its durable decision; once
+    /// admitted, the existing decision fence lets all participants finish.
+    pub fn requireReplayCoordinatorCapacity(self: *NativeFile) !void {
+        return self.requireReplayCapacity(self.replay_consumer_admission);
+    }
+
+    fn requireReplayCapacity(self: *NativeFile, consumer: bool) !void {
         if (try self.replayAdmission()) |state| {
-            if (state.records >= state.limits.records or state.bytes >= state.limits.bytes)
+            const limits = replayCapacityLimits(state.limits, consumer);
+            if (state.records >= limits.records or state.bytes >= limits.bytes)
                 return error.LiteReplayBacklogExceeded;
         }
+    }
+
+    fn replayCapacityLimits(base: replay_admission.Limits, consumer: bool) replay_admission.Limits {
+        var limits = base;
+        if (consumer) {
+            limits.bytes +|= limits.bytes / 2;
+            limits.records +|= limits.records / 2;
+        }
+        return limits;
     }
 
     fn stageReplayAdmission(self: *NativeFile, mutations: []const DocumentMutation) !void {
@@ -8637,11 +8658,7 @@ pub const NativeFile = struct {
             found.value_ptr.* = next;
             if (next) |credit| try credit.add(&after);
         }
-        var limits = before.limits;
-        if (self.replay_consumer_admission) {
-            limits.bytes +|= limits.bytes / 2;
-            limits.records +|= limits.records / 2;
-        }
+        const limits = replayCapacityLimits(before.limits, self.replay_consumer_admission);
         replay_admission.State.checkIncrease(before, after, limits) catch |err| {
             // The root coordinator is durable and admitted before preparation.
             // Its participant commits must finish after the decision; rejecting
@@ -22611,8 +22628,13 @@ test "lite native replay admission bootstrap counts legacy lanes and reserves co
     try file.deleteDocument(replay_admission.key);
     try file.putDocument("\x02\x0012345678", "two");
     try std.testing.expectEqual(@as(u64, 2), (try file.replayAdmission()).?.records);
+    try std.testing.expectError(error.LiteReplayBacklogExceeded, file.requireReplayCoordinatorCapacity());
     file.replay_consumer_admission = true;
+    try file.requireReplayCoordinatorCapacity();
+    // Consumer admission never grants an ordinary producer the reserve.
+    try std.testing.expectError(error.LiteReplayBacklogExceeded, file.requireReplayProducerCapacity());
     try file.putDocument("\x02\x0112345678", "consumer reserve");
+    try std.testing.expectError(error.LiteReplayBacklogExceeded, file.requireReplayCoordinatorCapacity());
     try std.testing.expectError(error.LiteReplayBacklogExceeded, file.putDocument("\x02\x0212345678", "reserve exhausted"));
     file.replay_consumer_admission = false;
     try std.testing.expectError(error.LiteReplayBacklogExceeded, file.putDocument("\x02\x0212345678", "producer refused"));

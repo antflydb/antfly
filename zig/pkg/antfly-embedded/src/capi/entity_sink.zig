@@ -809,6 +809,44 @@ test "capi Lite promotion retains writer admission across coordinator and partic
     try std.testing.expect(!handle.sql_commit_recovery_needed);
 }
 
+test "capi native promotion coordinator uses consumer reserve at full producer quota" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("promotion-consumer-reserve");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    defer a.free(path);
+    const handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .hosted, .externally_locked = true }, true, null, null);
+    defer h.closeHandle(handle);
+    try tables.create(handle, "entities", "{}", false);
+    const entities = try tables.get(handle, "entities");
+    try entities.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    // Real participant journals remain until the text consumer catches up.
+    // Leave enough reserve for one bounded cross-table promotion.
+    for (0..16) |i| {
+        const key = try std.fmt.allocPrint(a, "seed/{d}", .{i});
+        defer a.free(key);
+        try handle.db.entity_sink.?.upsertBatch(a, &.{.{ .table = "entities", .key = key, .doc_json = "{\"canonical_name\":\"Seed\"}" }});
+    }
+    const file = &handle.owned_lite_backend.?.native_docstore.?.file;
+    var debt = (try file.replayAdmission()).?;
+    try std.testing.expect(debt.records >= 16);
+    debt.limits.records = debt.records;
+    try file.putDocument(@import("../storage/lite/replay_admission.zig").key, &debt.encode());
+    const batch = &.{callbacks.EntityUpsert{ .table = "entities", .key = "person/ada", .doc_json = "{\"canonical_name\":\"Ada\"}" }};
+    try std.testing.expectError(error.SqlMutationNotAppliedBusy, handle.db.entity_sink.?.upsertBatch(a, batch));
+    try std.testing.expect((try entities.lookup(a, "person/ada", .{})) == null);
+    file.replay_consumer_admission = true;
+    defer file.replay_consumer_admission = false;
+    try handle.db.entity_sink.?.upsertBatch(a, batch);
+    var row = (try entities.lookup(a, "person/ada", .{})) orelse return error.TestUnexpectedResult;
+    defer row.deinit(a);
+    try @import("antfly-json").testing.expectSubsetJsonText(a, "{\"canonical_name\":\"Ada\"}", row.json);
+    try std.testing.expect(!handle.sql_commit_recovery_needed);
+    try std.testing.expectError(error.LiteReplayBacklogExceeded, file.requireReplayProducerCapacity());
+    try std.testing.expect((try file.replayAdmission()).?.records <= debt.records + debt.records / 2);
+}
+
 test "capi Lite promotion atomically merges across tables and survives reopen" {
     const api = @import("db.zig");
     const a = std.testing.allocator;
