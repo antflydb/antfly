@@ -22483,7 +22483,6 @@ test "lite semantic revisions are atomic namespace scoped and survive reopen and
         // marker. A later schema publication establishes a fresh revision.
         try file.putDocumentBatch(&.{
             .{ .key = scope ++ @import("../internal_keys.zig").public_schema_json_key, .is_delete = true },
-            .{ .key = revision_key, .is_delete = true },
         });
         try std.testing.expect((try file.getDocumentAlloc(a, revision_key)) == null);
         try file.putDocument(scope ++ @import("../internal_keys.zig").public_schema_json_key, "{}");
