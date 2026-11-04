@@ -155,7 +155,7 @@ only milliseconds of its 2.8-second total in measured opening/ranking/delivery
 phases; unlisted admission, WAL-cut setup and cleanup still need attribution.
 These observations alone do not establish the cause of the original timeouts.
 
-## Engine corrections under validation
+## Engine corrections and Debug recovery
 
 The follow-up merges main's #1479 writer-admission changes and addresses four
 independently established implementation problems:
@@ -195,8 +195,7 @@ segments also skip empty recent-vector preparation; directory-backed publication
 still resolve their declarations. Incomplete qualification vacuum jobs resume at
 one-second intervals, independently of the interval between new jobs per table.
 
-These changes require a fresh optimized workload and continuation of the retained
-GCS maintenance job. They do not retroactively qualify the original measurements
+These changes require a fresh optimized workload. They do not retroactively qualify the original measurements
 or establish that all publication lag and accepted-search failures are resolved.
 
 Focused validation passes: 45 Python tests, 65 shared runtime contract tests,
@@ -213,8 +212,8 @@ after 19 acknowledged turns and 540.47 seconds. It reported zero deletions; its
 reachability checkpoint ended at snapshot cursor 73 of 104. The accepted row image
 was checked before maintenance; post-maintenance row/deletion checks were not
 reached. A Debug stack sample and object counters identified substantial remote
-reachability/inventory work. The immutable-read probe removal is under separate
-Debug validation; it was not present in that continuation. ReleaseFast
+reachability/inventory work. The immutable-read probe removal was validated in a
+later Debug continuation; it was not present in that attempt. ReleaseFast
 requalification remains outstanding.
 
 The continuation at `e2a67d7103`, with direct trie reads, also reached its bound:
@@ -224,9 +223,26 @@ not reach its post-maintenance checks. The next measured amplification was the
 traversal visited set and parent frames, which still wrote intermediate objects.
 Their checkpoint batching passes 21 focused vacuum tests, including lost frontier
 acknowledgments, cancellation, shared roots and cold recovery through a
-512-level inventory graph. A further Debug continuation is required before
-optimized qualification. Logical operation counters include concurrent artifact
+512-level inventory graph. Logical operation counters include concurrent artifact
 GC and must not be attributed entirely to this vacuum job.
+
+At `e21dbbd624`, the same retained history job completed after 32 further turns,
+at 253.77 seconds, reporting 14 additional deletions. Validation and shutdown
+finished at 325.90 seconds. Accepted and published search both matched all 103
+expected row images. Independent PyIceberg parsing checked current manifest sizes,
+and PyArrow checked the sizes and readable footers of all referenced Parquet
+files: 76 manifests / 274 files for history, and 18 manifests / 18 files for the
+indexed table. A separate read-only check used six previous committed history
+metadata documents to identify four expired history manifest lists; all four
+returned 404. The continuation's own deletion check also found an absent expired
+indexed-table list.
+
+This establishes completion and data preservation for that retained job across
+restarts and engine updates. Each continuation starts at a different traversal
+position, so their durations are not a controlled speedup comparison. The job's
+completion does not process snapshots that became eligible after its original
+plan. It is not a fresh continuous-write or full-archive qualification; optimized
+local/GCS profiles remain outstanding.
 
 Next work should:
 
