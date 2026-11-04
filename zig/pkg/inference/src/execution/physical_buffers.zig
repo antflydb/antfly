@@ -1793,9 +1793,6 @@ pub const Frame = struct {
         };
         for (self.completions) |completion| if (completion) |value| try value.wait();
     }
-    fn deinitAfterWait(self: *Frame) void {
-        self.deinitAfterWaitWithBoundary(null);
-    }
     fn deinitAfterWaitWithBoundary(self: *Frame, boundary: ?*const @import("retirement_sink.zig").Epoch) void {
         self.deinitAfterWaitWithCleanup(.{ .boundary = boundary });
     }

@@ -6642,16 +6642,6 @@ const DenseDequantForSgemm = struct {
     }
 };
 
-fn denseDequantForSgemm(
-    self: *NativeCompute,
-    storage: *const QuantizedStorage,
-    name: []const u8,
-    in_dim: usize,
-    out_dim: usize,
-) !?DenseDequantForSgemm {
-    return denseDequantForSgemmFromStore(self, self.data, storage, name, in_dim, out_dim);
-}
-
 fn denseDequantForSgemmFromStore(
     self: *NativeCompute,
     data: ?*WeightStore,
@@ -6750,59 +6740,6 @@ fn tryLinearQuantizedDequantSgemm(
     out_dim: usize,
 ) !bool {
     return tryLinearQuantizedDequantSgemmGrouped(1, true, self, .{storage}, .{name}, .{bias}, input, .{output}, rows, in_dim, out_dim);
-}
-
-fn tryLinearQuantizedDequantSgemmNoBias(
-    self: *NativeCompute,
-    storage: *const QuantizedStorage,
-    name: []const u8,
-    input: []const f32,
-    output: []f32,
-    rows: usize,
-    in_dim: usize,
-    out_dim: usize,
-) !bool {
-    return tryLinearQuantizedDequantSgemmGrouped(1, false, self, .{storage}, .{name}, .{&.{}}, input, .{output}, rows, in_dim, out_dim);
-}
-
-fn tryLinearQuantizedDequantSgemmPair(
-    self: *NativeCompute,
-    storage_a: *const QuantizedStorage,
-    name_a: []const u8,
-    bias_a: []const f32,
-    storage_b: *const QuantizedStorage,
-    name_b: []const u8,
-    bias_b: []const f32,
-    input: []const f32,
-    output_a: []f32,
-    output_b: []f32,
-    rows: usize,
-    in_dim: usize,
-    out_dim: usize,
-) !bool {
-    return tryLinearQuantizedDequantSgemmGrouped(2, true, self, .{ storage_a, storage_b }, .{ name_a, name_b }, .{ bias_a, bias_b }, input, .{ output_a, output_b }, rows, in_dim, out_dim);
-}
-
-fn tryLinearQuantizedDequantSgemmTriple(
-    self: *NativeCompute,
-    storage_a: *const QuantizedStorage,
-    name_a: []const u8,
-    bias_a: []const f32,
-    storage_b: *const QuantizedStorage,
-    name_b: []const u8,
-    bias_b: []const f32,
-    storage_c: *const QuantizedStorage,
-    name_c: []const u8,
-    bias_c: []const f32,
-    input: []const f32,
-    output_a: []f32,
-    output_b: []f32,
-    output_c: []f32,
-    rows: usize,
-    in_dim: usize,
-    out_dim: usize,
-) !bool {
-    return tryLinearQuantizedDequantSgemmGrouped(3, true, self, .{ storage_a, storage_b, storage_c }, .{ name_a, name_b, name_c }, .{ bias_a, bias_b, bias_c }, input, .{ output_a, output_b, output_c }, rows, in_dim, out_dim);
 }
 
 fn cachedQuantDequantDenseWeight(

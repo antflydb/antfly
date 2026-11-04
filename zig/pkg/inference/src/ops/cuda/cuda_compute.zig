@@ -15434,9 +15434,6 @@ fn noteLearnedTempArenaBoundary(self: *CudaCompute) !void {
     }
 }
 
-fn drainDeferredDeviceFreesAfterSyncUnlocked(self: *CudaCompute) void {
-    drainDeferredDeviceFreesAfterSyncUnlockedUsing(self, false) catch unreachable;
-}
 fn drainDeferredDeviceFreesAfterSyncUnlockedUsing(self: *CudaCompute, comptime checked: bool) !void {
     if (self.deferred_device_frees.items.len == 0) return;
     var reclaimed: usize = 0;
