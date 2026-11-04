@@ -328,18 +328,48 @@ Additional diagnostics distinguish the internal causes mapped to query 503s,
 time public-query binding and dispatch, and include cleanup in the enclosing
 request total around the narrower lake profile.
 Fixed-capacity live-stage tracking also exposes unfinished requests; saturation
-drops diagnostics rather than queuing queries. These changes need new engine
-builds and qualification; the measurements above do not include them.
+drops diagnostics rather than queuing queries. The optimized measurements above
+do not include these changes.
+
+At `c1de2d750e`, the new Debug engine built successfully. Its SHA-256 is
+`ff7b570c2dcd5c4c98d5acbe21b0f8f3486b87ce17080564a207743315b1bda1`.
+The retained fresh GCS history job then completed after 41 further turns, at
+344.15 seconds, reporting 28 additional deletions. Full validation and shutdown
+took 414.01 seconds. Accepted and published queries preserved all 103 expected
+rows. Independent current-source checks verified 78 manifests / 276 Parquet files
+for history and 18 / 18 for the indexed table. A separate read-only check
+authenticated the current metadata and walked 25 committed records, inspecting
+nine distinct metadata documents; four expired history manifest lists returned
+404. The stored hint object was 96,909 bytes, below its 128 KiB bound.
+
+This proves completion and preservation for that retained job. Prior attempts
+had advanced its cursor, so the durations do not establish a controlled speedup.
+It does not qualify a fresh GCS run or clear the query failures above.
+
+Traversal also revealed repeated long child lists in successive snapshot plans.
+New plans group children into shared 16-entry pages; readers still accept the
+previous 256-entry nodes and unchanged cursor format. A Debug control using 128
+successive snapshot roots checks identical, duplicate-free object unions and
+more than halves traversal steps for both append and newest-first orderings.
+Existing published plans keep their original layout. New-plan provider and
+optimized qualification remains required.
+
+The final hint/diagnostic source passed 697 Debug lake tests (one skipped), four
+focused API tests and 46 Python tests with 11 subtests. The plan-sharing change
+passed all 22 focused Debug vacuum tests, including both control orderings, cold
+resume, deep/shared graphs, cancellation and lost responses. Native tests
+reported no leaks.
 
 Next work should:
 
-1. Attribute accepted-search stalls with request-scoped catalog/lease admission,
-   WAL-cut and cleanup timings, preserving failure/cancellation evidence. Repeat
-   the optimized workload under recorded host conditions before changing behavior.
+1. Attribute the remaining accepted-search failures with live public stages,
+   request-scoped catalog/lease/WAL timings and unavailable-cause counters.
+   Repeat the optimized workload under recorded host conditions before changing
+   behavior based on an unproven cause.
 2. Measure WAL-drain and publication queue fairness and construction phases under
    continuous small changes. Qualify batching/compaction and incremental serving
    without weakening accepted visibility or publication proofs.
-3. Drive incomplete maintenance separately from new-job scheduling and expose
+3. Qualify fresh maintenance plans with shared pages and warm trie hints, including
    reachability, retirement and input-cleanup progress. Measure required object
    round trips and conditional deletion throughput before increasing concurrency.
 4. Requalify in the deployment region through Antfly Cloud after the relevant

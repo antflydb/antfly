@@ -22,6 +22,9 @@ const catalog = @import("antfly_local_sources").serverless_external_source_mod.l
 const A = std.mem.Allocator;
 pub const max_node_bytes = 256 * 1024;
 const fanout = 256;
+// Small immutable pages share stable prefixes between successive snapshot
+// inventories. The larger read bound retains existing plans and cursors.
+const build_fanout = 16;
 const Digest = catalog.retirement_index.Digest;
 const max_frontier_bytes = 1024;
 pub const Retired = struct {
@@ -193,11 +196,11 @@ pub const Store = struct {
     }
     pub fn children(self: *Store, roots: []const []const u8) ![]const u8 {
         var level = roots;
-        while (level.len > fanout) {
+        while (level.len > build_fanout) {
             var next: std.ArrayList([]const u8) = .empty;
             var begin: usize = 0;
             while (begin < level.len) {
-                const end = @min(level.len, begin + fanout);
+                const end = @min(level.len, begin + build_fanout);
                 try next.append(self.a, try self.save(.{ .children = level[begin..end] }));
                 begin = end;
             }
@@ -417,6 +420,58 @@ pub const Iterator = struct {
         }
     }
 };
+
+test "external lake vacuum plan shares child prefixes across successive snapshot roots" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var store: Store = .{ .a = a, .client = memory.client(), .bucket = "archive", .prefix = "plans", .context = .{}, .dry_run = false };
+    const leaves = try a.alloc([]const u8, 128);
+    const paths = try a.alloc([]const u8, leaves.len);
+    const flat = try a.alloc(Retired, leaves.len);
+    const shared = try a.alloc(Retired, leaves.len);
+    const flat_prepend = try a.alloc(Retired, leaves.len);
+    const shared_prepend = try a.alloc(Retired, leaves.len);
+    for (leaves, paths, 0..) |*leaf, *path, i| {
+        path.* = try std.fmt.allocPrint(a, "gs://archive/data/{d}.parquet", .{i});
+        leaf.* = try store.objects(try a.dupe([]const u8, &.{path.*}));
+        const snapshot = try std.fmt.allocPrint(a, "{d}", .{i});
+        // Preserve the previous plan shape as a read-compatibility control.
+        flat[i] = .{ .snapshot = snapshot, .object_plan = if (i == 0) leaf.* else try store.save(.{ .children = leaves[0 .. i + 1] }) };
+        shared[i] = .{ .snapshot = snapshot, .object_plan = try store.children(leaves[0 .. i + 1]) };
+        const newest_first = try a.dupe([]const u8, leaves[0 .. i + 1]);
+        std.mem.reverse([]const u8, newest_first);
+        flat_prepend[i] = .{ .snapshot = snapshot, .object_plan = if (i == 0) leaf.* else try store.save(.{ .children = newest_first }) };
+        shared_prepend[i] = .{ .snapshot = snapshot, .object_plan = try store.children(newest_first) };
+    }
+    const Measure = struct {
+        fn run(a_: A, store_: *Store, snapshots: []const Retired, expected: []const []const u8) !usize {
+            var seen = catalog.retirement_index.Index.init(a_, store_.client, store_.bucket, "seen", .{});
+            defer seen.deinit();
+            var walker = try Walker.init(store_, snapshots, &seen, .{});
+            var remaining: usize = 100_000;
+            var count: usize = 0;
+            while (try walker.next(&remaining)) |uri| {
+                try std.testing.expect(count < expected.len);
+                try std.testing.expectEqualStrings(expected[count], uri);
+                count += 1;
+            }
+            try std.testing.expectEqual(expected.len, count);
+            return 100_000 - remaining;
+        }
+    };
+    const old_steps = try Measure.run(a, &store, flat, paths);
+    const shared_steps = try Measure.run(a, &store, shared, paths);
+    // Both shapes return the identical union once, but a bounded maintenance
+    // turn can skip whole shared pages instead of revisiting every child edge.
+    try std.testing.expect(shared_steps * 2 < old_steps);
+    // Native manifest lists may put the newest entry first. Stable older
+    // pages must be reusable in that ordering too.
+    try std.testing.expect((try Measure.run(a, &store, shared_prepend, paths)) * 2 < try Measure.run(a, &store, flat_prepend, paths));
+}
 
 test "external lake vacuum plan chunks a large inventory and shares it across restart and legacy jobs" {
     const alloc = std.testing.allocator;
