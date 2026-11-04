@@ -21,17 +21,13 @@ const objectstore = @import("objectstore");
 const catalog = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog;
 const A = std.mem.Allocator;
 pub const max_node_bytes = 256 * 1024;
-const fanout = 256;
-// Small immutable pages share stable prefixes between successive snapshot
-// inventories. The larger read bound retains existing plans and cursors.
-const build_fanout = 16;
+// Small immutable pages share prefixes between snapshot inventories.
+const fanout = 16;
 const Digest = catalog.retirement_index.Digest;
 const max_frontier_bytes = 1024;
 pub const Retired = struct {
     snapshot: []const u8,
-    // Version-one jobs retain their inline inventory and remain replayable.
-    objects: []const []const u8 = &.{},
-    object_plan: ?[]const u8 = null,
+    object_plan: []const u8,
 };
 const Node = struct { objects: []const []const u8 = &.{}, children: []const []const u8 = &.{} };
 pub const Inline = struct { hash: []const u8, node: Node, durable: bool = false };
@@ -196,11 +192,11 @@ pub const Store = struct {
     }
     pub fn children(self: *Store, roots: []const []const u8) ![]const u8 {
         var level = roots;
-        while (level.len > build_fanout) {
+        while (level.len > fanout) {
             var next: std.ArrayList([]const u8) = .empty;
             var begin: usize = 0;
             while (begin < level.len) {
-                const end = @min(level.len, begin + build_fanout);
+                const end = @min(level.len, begin + fanout);
                 try next.append(self.a, try self.save(.{ .children = level[begin..end] }));
                 begin = end;
             }
@@ -286,7 +282,6 @@ pub const Store = struct {
 /// and selection deduplicates each bounded batch. Shared DAG nodes are read once.
 pub const Cursor = struct {
     snapshot: usize = 0,
-    legacy: usize = 0,
     frame: ?Frame = null,
     visited: ?Digest = null,
     // Parent frames are immutable pages, so checkpoint size and cold-resume
@@ -356,18 +351,8 @@ pub const Walker = struct {
             }
             if (self.cursor.snapshot == self.retired.len) return null;
             const retired = self.retired[self.cursor.snapshot];
-            if (retired.object_plan) |root| {
-                _ = try self.enter(root, null);
-            } else {
-                if (self.cursor.legacy > retired.objects.len) return error.InvalidLakeVacuumPlan;
-                if (self.cursor.legacy < retired.objects.len) {
-                    const uri = retired.objects[self.cursor.legacy];
-                    self.cursor.legacy += 1;
-                    return uri;
-                }
-            }
+            _ = try self.enter(retired.object_plan, null);
             self.cursor.snapshot += 1;
-            self.cursor.legacy = 0;
         }
     }
 };
@@ -411,12 +396,7 @@ pub const Iterator = struct {
             const retired = self.retired[self.index];
             self.index += 1;
             if (self.exclude) |excluded| if (excluded.contains(retired.snapshot)) continue;
-            if (retired.object_plan) |root| {
-                try self.stack.append(a, root);
-            } else {
-                self.pending = retired.objects;
-                self.position = 0;
-            }
+            try self.stack.append(a, retired.object_plan);
         }
     }
 };
@@ -431,20 +411,15 @@ test "external lake vacuum plan shares child prefixes across successive snapshot
     var store: Store = .{ .a = a, .client = memory.client(), .bucket = "archive", .prefix = "plans", .context = .{}, .dry_run = false };
     const leaves = try a.alloc([]const u8, 128);
     const paths = try a.alloc([]const u8, leaves.len);
-    const flat = try a.alloc(Retired, leaves.len);
     const shared = try a.alloc(Retired, leaves.len);
-    const flat_prepend = try a.alloc(Retired, leaves.len);
     const shared_prepend = try a.alloc(Retired, leaves.len);
     for (leaves, paths, 0..) |*leaf, *path, i| {
         path.* = try std.fmt.allocPrint(a, "gs://archive/data/{d}.parquet", .{i});
         leaf.* = try store.objects(try a.dupe([]const u8, &.{path.*}));
         const snapshot = try std.fmt.allocPrint(a, "{d}", .{i});
-        // Preserve the previous plan shape as a read-compatibility control.
-        flat[i] = .{ .snapshot = snapshot, .object_plan = if (i == 0) leaf.* else try store.save(.{ .children = leaves[0 .. i + 1] }) };
         shared[i] = .{ .snapshot = snapshot, .object_plan = try store.children(leaves[0 .. i + 1]) };
         const newest_first = try a.dupe([]const u8, leaves[0 .. i + 1]);
         std.mem.reverse([]const u8, newest_first);
-        flat_prepend[i] = .{ .snapshot = snapshot, .object_plan = if (i == 0) leaf.* else try store.save(.{ .children = newest_first }) };
         shared_prepend[i] = .{ .snapshot = snapshot, .object_plan = try store.children(newest_first) };
     }
     const Measure = struct {
@@ -463,17 +438,16 @@ test "external lake vacuum plan shares child prefixes across successive snapshot
             return 100_000 - remaining;
         }
     };
-    const old_steps = try Measure.run(a, &store, flat, paths);
+    const unshared_edges = leaves.len * (leaves.len + 1) / 2;
     const shared_steps = try Measure.run(a, &store, shared, paths);
-    // Both shapes return the identical union once, but a bounded maintenance
-    // turn can skip whole shared pages instead of revisiting every child edge.
-    try std.testing.expect(shared_steps * 2 < old_steps);
+    // Sharing must avoid most of the edges in the unshared inventory union.
+    try std.testing.expect(shared_steps * 2 < unshared_edges);
     // Native manifest lists may put the newest entry first. Stable older
     // pages must be reusable in that ordering too.
-    try std.testing.expect((try Measure.run(a, &store, shared_prepend, paths)) * 2 < try Measure.run(a, &store, flat_prepend, paths));
+    try std.testing.expect((try Measure.run(a, &store, shared_prepend, paths)) * 2 < unshared_edges);
 }
 
-test "external lake vacuum plan chunks a large inventory and shares it across restart and legacy jobs" {
+test "external lake vacuum plan chunks a large inventory and shares it across restart and shared jobs" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -492,7 +466,6 @@ test "external lake vacuum plan chunks a large inventory and shares it across re
     const retired = [_]Retired{
         .{ .snapshot = "1", .object_plan = root },
         .{ .snapshot = "2", .object_plan = root },
-        .{ .snapshot = "legacy", .objects = &.{ paths[0], "gs://archive/legacy" } },
     };
     const journal = try std.json.Stringify.valueAlloc(a, retired, .{});
     try std.testing.expect(journal.len < 1024);
@@ -500,10 +473,10 @@ test "external lake vacuum plan chunks a large inventory and shares it across re
     var iterator: Iterator = .{ .store = &reopened, .retired = &retired };
     var count: usize = 0;
     while (try iterator.next()) |path| {
-        if (count < paths.len) try std.testing.expectEqualStrings(paths[count], path) else try std.testing.expectEqualStrings("gs://archive/legacy", path);
+        try std.testing.expectEqualStrings(paths[count], path);
         count += 1;
     }
-    try std.testing.expectEqual(paths.len + 1, count);
+    try std.testing.expectEqual(paths.len, count);
     try std.testing.expectEqual(store.nodes.count(), iterator.nodes.count());
     try std.testing.expectEqual(store.nodes.count(), reopened.nodes.count());
     // Each immutable node is read once even when snapshots share ancestors.
@@ -726,7 +699,7 @@ test "external lake vacuum frontier resumes cold chunks with bounded reads and s
     var store: Store = .{ .a = a, .client = memory.client(), .bucket = "archive", .prefix = "plans", .context = .{}, .dry_run = false };
     const root = try store.objects(paths);
     const embedded = try store.inlineFor(&.{root});
-    const retired = [_]Retired{ .{ .snapshot = "old", .object_plan = root }, .{ .snapshot = "shared", .object_plan = root }, .{ .snapshot = "legacy", .objects = &.{"legacy"} } };
+    const retired = [_]Retired{ .{ .snapshot = "old", .object_plan = root }, .{ .snapshot = "shared", .object_plan = root } };
     var saved: []const u8 = "{}";
     var position: usize = 0;
     var turns: usize = 0;
@@ -752,7 +725,7 @@ test "external lake vacuum frontier resumes cold chunks with bounded reads and s
                 complete = true;
                 break;
             };
-            try std.testing.expectEqualStrings(if (position < paths.len) paths[position] else "legacy", uri);
+            try std.testing.expectEqualStrings(paths[position], uri);
             position += 1;
         }
         if (turns == 0) {
@@ -767,7 +740,7 @@ test "external lake vacuum frontier resumes cold chunks with bounded reads and s
         try std.testing.expect(saved.len < 16 * 1024);
     }
     try std.testing.expect(complete and turns > 2);
-    try std.testing.expectEqual(paths.len + 1, position);
+    try std.testing.expectEqual(paths.len, position);
     const terminal = try std.json.parseFromSliceLeaky(Cursor, a, saved, .{});
     var seen = catalog.retirement_index.Index.init(a, memory.client(), "archive", "seen", .{});
     defer seen.deinit();

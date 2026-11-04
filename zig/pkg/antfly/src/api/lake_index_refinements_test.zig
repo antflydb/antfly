@@ -475,7 +475,7 @@ test "external lake overlapping text generations share every physical segment on
     try std.testing.expectEqual(reserved, cache.bytes);
 }
 
-test "external lake inventory reclamation preserves live legacy and unfenced attempts" {
+test "external lake inventory reclamation preserves live and outside-fence attempts" {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("fenced-inventory-reclamation");
     defer directory.cleanup();
@@ -594,12 +594,12 @@ test "external lake global frontier compact coverage survives absent inventory a
     try std.testing.expectEqual(null, try stream.next());
 }
 
-test "external lake global frontier retained compacted roots detect v10 and v11 before serving and GC" {
+test "external lake global frontier retained serving roots reject obsolete versions before serving and GC" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
-    var directory = try local.common_test_directory.TestDirectory.init("legacy-compact-version");
+    var directory = try local.common_test_directory.TestDirectory.init("obsolete-serving-version");
     defer directory.cleanup();
     var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
     defer fs.deinit();
@@ -611,11 +611,10 @@ test "external lake global frontier retained compacted roots detect v10 and v11 
         var upload = try store.putWithCancellation(try std.json.Stringify.valueAlloc(ca, child, .{}), .none);
         defer upload.deinit(a);
         const chunk: @import("lake_index_aggregate_artifact.zig").ChunkRef = .{ .artifact_id = upload.artifact_id, .checksum = upload.checksum, .byte_len = upload.byte_len };
-        const decoded = try text.loadRootDirectoryAuto(ca, store, chunk, .none, null);
-        try std.testing.expectEqual(version, decoded.metadata_version);
+        try std.testing.expectError(error.InvalidNativeLakeTextCorpus, text.loadRootDirectory(ca, store, .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = chunk.artifact_id, .checksum = chunk.checksum, .byte_len = chunk.byte_len }, .none, null));
         child.version = text.metadata_version;
-        child.compacted = chunk;
-        _ = try text.servingRoot(ca, store, child, .none, null);
+        child.serving = chunk;
+        try std.testing.expectError(error.InvalidNativeLakeTextCorpus, text.servingRoot(ca, store, child, .none, null));
         var parent = try store.putWithCancellation(try std.json.Stringify.valueAlloc(ca, child, .{}), .none);
         defer parent.deinit(a);
         var collector: @import("lake_index_gc.zig").Collector = .{ .a = a, .table = 1, .authority = undefined, .store = store, .identity = @splat(1), .context = .{}, .audit_only = true, .token = @splat(1), .remaining_reads = 16 * 1024 * 1024 };
@@ -624,8 +623,7 @@ test "external lake global frontier retained compacted roots detect v10 and v11 
             while (keys.next()) |key| a.free(key.*);
             collector.marked.deinit(a);
         }
-        try collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = parent.artifact_id, .checksum = parent.checksum, .byte_len = parent.byte_len });
-        try std.testing.expect(collector.marked.contains(upload.artifact_id));
+        try std.testing.expectError(error.InvalidNativeLakeTextCorpus, collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = parent.artifact_id, .checksum = parent.checksum, .byte_len = parent.byte_len }));
     }
 }
 

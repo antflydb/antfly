@@ -1,11 +1,11 @@
 # Continuous writable-lake qualification — 2026-11-04 UTC
 
-**Fresh full ReleaseFast filesystem and GCS runs at `eca0684354` passed all
-qualification checks with zero query failures.** Earlier failed runs and their
-recovery attempts remain recorded below. Later text-only reconciliation and
-cancellation changes have separate Debug checks; final-source optimized
-qualification remains outstanding. This 128-row dense-match workload does not
-qualify full-archive performance, DuckDB parity or Antfly Cloud deployment.
+**Final-source provider qualification remains outstanding.** Full filesystem and
+GCS runs at `eca0684354` passed all checks with zero query failures. Subsequent
+`0ac3e0ad86` profiles failed during maintenance recovery, also without query
+failures. Additional correctness fixes and format cleanup have separate Debug
+checks below. This 128-row dense-match workload does not qualify full-archive
+performance, DuckDB parity or Antfly Cloud deployment.
 
 ## Revision and workload
 
@@ -827,8 +827,11 @@ relevant callers: qualification/oracles and evidence handling; immutable object
 reads and manifest budgets; trie batching, optional warming and provider/allocator
 concurrency; reachability and vacuum checkpoint fencing; overlay ancestry and WAL
 coverage; bounded cleanup; scheduler completion; request cancellation; metrics;
-and test/build wiring. This is source review plus the recorded controls, not a
-proof of all workloads or a full-archive performance qualification.
+and test/build wiring. The requested compatibility cleanup expanded the complete
+diff to 91 files, including deletion of a frozen historical producer; its current
+producers, readers and recovery callers were reviewed as well. This is source
+review plus the recorded controls, not a proof of all workloads or a full-archive
+performance qualification.
 
 A native regression reproduced lost traversal in vacuum execution. A valid
 concurrent catalog commit during plan traversal caused the second reference
@@ -862,6 +865,94 @@ separately. Raw reproduction logs and the per-file review ledger remain private.
 
 The `0ac3e0ad86` ReleaseFast build completed and passed its smoke; its executable
 SHA-256 is `f4956db1c3844da328bb333017b9b029ec5c5ea1c13de76be8eb6f99b11d5900`.
-Its separately running full controls exclude both the deadline-classification
-correction and this review's fixes. They must not be presented as final-source
-qualification.
+Its full filesystem control subsequently failed the 300-second restart vacuum
+recovery bound after 1,146.077 seconds. Deletion was still advancing; no query
+failed. The matching GCS control failed after 2,280.887 seconds when a resumed
+maintenance request returned HTTP 504 after 37.337 seconds, also with no query
+failures. Both exclude the deadline-classification correction and later review
+fixes, and neither is a final-source qualification.
+
+
+## Current prerelease contracts and allocator ownership
+
+Lake storage has no released format compatibility requirement. The follow-up
+removes the obsolete readers and conversion work instead of maintaining upgrade
+paths:
+
+- Vacuum has one immutable job format (version 4, with an explicit cleanup-only
+  flag), current execution frontiers, and required content-addressed inventories.
+  Numeric execution cursors, inline retired inventories and unscoped input-cache
+  sweeping are removed. Expiry checkpoints accept version 2; warm hints accept
+  their bounded gzip encoding.
+- Retained reads use lease envelopes and native typed row groups. Monolithic
+  descriptors, JSON row-group decoding, alternate JSON row-ID encoding and JSON
+  ordering-key cache decoding are removed. Canonical row identity is unconditional.
+  Logical fragments retain the current Merkle commitments; iv1/iv2/iv3 input
+  versions and their XOR-era migration path are removed. The collision-resistance
+  regression still verifies incremental row mutation detection.
+- Publications and build attempts require the current reader protocol. Text
+  roots reject historical metadata versions. Packed text supports the current
+  unbundled and bundled directories; term and ordered directories use their
+  current version. The old ordered-directory rebuild and flat cursor are removed.
+  Dense/sparse roots require current v4 metadata. Navigation accepts current
+  v2/v3/v4 modes; row-map roots require v2. Ordered column indexes accept current
+  serving v11 and checkpoint v12 roots, without v5–v10 compatibility readers.
+- Contribution ownership no longer performs an old-generation census to upgrade
+  uncounted records. Aggregate names require unambiguous framed identities.
+  GC no longer sweeps obsolete nonce staging as an upgrade step.
+  GC admits the same formats as serving. Version restamping, unversioned
+  compacted-root dispatch and its resumable work-item variant are removed.
+  Serving and checkpoint child roots carry the current decoder contract.
+- Aggregate readers reject obsolete v1/v3 roots and v7 columnar trees. Current
+  recipe-bound trees retain incremental merges; current packed, partitioned and
+  oversized-record publication modes remain supported. The frozen historical
+  text-compaction producer and its compatibility-only test owner are deleted;
+  the production serving-compaction controls cover current physical coordinates,
+  ties, restart, ownership and failure cleanup.
+- Reader retirement relies on renewable leases, grace periods and publication
+  roots. The rolling-upgrade floor for unleased readers is removed. Recovery
+  controls request explicit repair against current catalog state instead of
+  fabricating obsolete reader protocols.
+
+Current construction representations, required reads under cache pressure,
+cancellation and provider fencing remain part of normal operation. Third-party
+Iceberg format support and actively used native WAL storage are independent of
+these removed lake upgrade paths. New qualification uses fresh state; archived
+results remain attached to their original engine revisions.
+
+The broader Debug integration run also uncovered a real allocator mismatch in
+the object-table publisher. Whole-log WAL reads used the provider client's
+result allocator but freed responses through the operation's quota. The mismatch
+could bypass response admission and corrupt refundable accounting; the later
+manifest free then hit an assertion. Allocation tracing identified foreign
+response frees, and a direct quota regression reproduced the failure. A separate
+store-owner quota reproduced the same mismatch during format initialization.
+
+A borrowed client now uses the store's allocator for constructor-owned responses,
+and each allocated read uses its caller's result allocator. Provider state and
+its construction allocator are not mutated. The regression covers independent
+provider, store and read owners, both read paths, complete quota refund, and
+rejection when the response exceeds a small quota. It failed before the fixes
+and passes afterward. Temporary allocator tracing was removed.
+
+The default embedded-lake test owner now includes retirement-index, bootstrap
+budget and immutable-read controls. GC-progress tests are imported directly by
+the native integration owner, so focused selection discovers them independently
+of other tests reaching the collector.
+
+After the format removals, the Debug native integration run passed 617 of 618
+controls with zero leaks. Its one failure was a retention fixture that explicitly
+constructed obsolete sparse v3 metadata. The fixture now uses the current writer
+version; its focused lease-retention/reclamation control passed with zero skips,
+failures or leaks. The only changes after the broad run were that fixture and its
+direct test-owner import; production code was unchanged. The entire unfiltered
+owner was not repeated after those test-only changes.
+
+The same production source passed all 270 local SQL/lake controls, 35 maintenance
+controls, 59 object-WAL controls, 331 embedded-lake controls and 15 catalog-owner
+controls. The WAL and embedded owners each skipped one opt-in scale/benchmark
+control. All 18 execution-budget controls also passed. The focused Python
+qualification/metrics suite passed 50 tests; Ruff, Zig formatting, documentation
+links and diff checks passed. Earlier interrupted runs, compilation errors and
+obsolete-format fixture failures remain investigation evidence. These local
+controls do not replace final-source provider or full-archive qualification.

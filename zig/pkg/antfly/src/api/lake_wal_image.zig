@@ -189,7 +189,7 @@ pub const Image = struct {
         const sa = scratch.allocator();
         var changed: [256]std.ArrayList(Entry) = @splat(.empty);
         for (delta.changes) |change| {
-            const id = try ingestion.rowId(sa, keys, change.row, .canonical);
+            const id = try ingestion.rowId(sa, keys, change.row);
             try changed[partition(id)].append(sa, .{ .id = id, .change = change });
         }
         for (&self.parts, changed) |*part, changes| if (changes.items.len != 0) {
@@ -405,10 +405,10 @@ test "external lake bounded WAL equivalent numeric keys replace" {
     const second = try Image.update(a, first, .{ .lsn = 2, .key_fields = &.{"id"}, .changes = &.{.{ .op = .upsert, .row = new }} });
     defer second.release();
     try std.testing.expectEqual(@as(usize, 1), second.row_count);
-    const encoded = try std.json.Stringify.valueAlloc(sa, ingestion.Pending{ .lsn = 2, .key_fields = second.key_fields, .key_identity = .canonical, .change_blocks = &second.blocks }, .{});
+    const encoded = try std.json.Stringify.valueAlloc(sa, ingestion.Pending{ .lsn = 2, .key_fields = second.key_fields, .change_blocks = &second.blocks }, .{});
     const recovered = try std.json.parseFromSliceLeaky(ingestion.Pending, sa, encoded, .{});
     const overlay = try @import("lake_search_overlay.zig").Overlay.init(sa, recovered);
-    const key = try ingestion.rowId(sa, &.{"id"}, new, .canonical);
+    const key = try ingestion.rowId(sa, &.{"id"}, new);
     try std.testing.expectEqualStrings("new", overlay.row(key).?.object.get("body").?.string);
     const deleted = try Image.update(a, second, .{ .lsn = 3, .key_fields = &.{"id"}, .changes = &.{.{ .op = .delete, .row = new }} });
     defer deleted.release();

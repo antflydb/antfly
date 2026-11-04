@@ -38,9 +38,7 @@ const Uploads = struct {
     seen: std.AutoHashMapUnmanaged(Digest, void) = .empty,
 };
 fn decodeHint(a: A, bytes: []const u8) ![]const u8 {
-    // Legacy plain JSON remains readable. Older readers safely decline a
-    // compressed optional hint and fall back to canonical hash-checked nodes.
-    if (!std.mem.startsWith(u8, bytes, &.{ 0x1f, 0x8b })) return bytes;
+    if (!std.mem.startsWith(u8, bytes, &.{ 0x1f, 0x8b })) return error.InvalidLakeRetirementIndex;
     var input: std.Io.Reader = .fixed(bytes);
     var history: [std.compress.flate.max_window_len]u8 = undefined;
     var decompress: std.compress.flate.Decompress = .init(&input, .gzip, &history);
@@ -545,7 +543,7 @@ test "external lake retirement hints survive cold turns without becoming authori
     try std.testing.expect(try cold.contains(next, "s3://archive/later.parquet"));
     var client = memory.client();
     const forged = try std.json.Stringify.valueAlloc(ca, Hints{ .nodes = &.{.{ .hash = root.?, .node = .{} }} }, .{});
-    var stored = try client.putObject("archive", "reachable/warm-v1.json", forged, .{});
+    var stored = try client.putObject("archive", "reachable/warm-v1.json", try encodeHint(ca, forged), .{});
     stored.deinit(a);
     var corrupt = Index.init(a, memory.client(), "archive", "reachable", .{});
     defer corrupt.deinit();
@@ -625,7 +623,7 @@ test "external lake retirement hints stay bounded and fall back for uncached nod
     try std.testing.expect(!try cold.contains(root, "s3://archive/missing.parquet"));
 }
 
-test "external lake retirement hints bound decoding and retain legacy fallback" {
+test "external lake retirement hints bound decoding and reject obsolete encodings" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -637,17 +635,17 @@ test "external lake retirement hints bound decoding and retain legacy fallback" 
     defer index.deinit();
     const uri = "gs://archive/live.parquet";
     const root = (try index.insertMany(null, &.{uri})).?;
-    const legacy = try std.json.Stringify.valueAlloc(ca, Hints{ .nodes = &.{.{ .hash = root, .node = index.cache.get(root).?.node }} }, .{});
-    var stored = try client.putObject("archive", "reachable/warm-v1.json", legacy, .{});
+    const plain = try std.json.Stringify.valueAlloc(ca, Hints{ .nodes = &.{.{ .hash = root, .node = index.cache.get(root).?.node }} }, .{});
+    var stored = try client.putObject("archive", "reachable/warm-v1.json", plain, .{});
     stored.deinit(a);
-    var old = Index.init(a, client, "archive", "reachable", .{});
-    defer old.deinit();
-    try old.loadHints();
+    var obsolete = Index.init(a, client, "archive", "reachable", .{});
+    defer obsolete.deinit();
+    try std.testing.expectError(error.InvalidLakeRetirementIndex, obsolete.loadHints());
     memory.resetOperationCount();
-    try std.testing.expect(try old.contains(root, uri));
-    try std.testing.expectEqual(@as(u64, 0), memory.operationCount());
+    try std.testing.expect(try obsolete.contains(root, uri));
+    try std.testing.expect(memory.operationCount() > 0);
 
-    const compressed = try encodeHint(ca, legacy);
+    const compressed = try encodeHint(ca, plain);
     stored = try client.putObject("archive", "reachable/warm-v1.json", compressed[0 .. compressed.len / 2], .{});
     stored.deinit(a);
     var truncated = Index.init(a, client, "archive", "reachable", .{});
@@ -710,7 +708,7 @@ test "external lake retirement hints cannot acknowledge an unpersisted node" {
     const body = try std.json.Stringify.valueAlloc(ca, node, .{});
     const hash = Index.digest(body);
     const hints = try std.json.Stringify.valueAlloc(ca, Hints{ .nodes = &.{.{ .hash = hash, .node = node }} }, .{});
-    var hint = try client.putObject("archive", "reachable/warm-v1.json", hints, .{});
+    var hint = try client.putObject("archive", "reachable/warm-v1.json", try encodeHint(ca, hints), .{});
     hint.deinit(a);
     var vtable = client.vtable.*;
     vtable.put_object = struct {

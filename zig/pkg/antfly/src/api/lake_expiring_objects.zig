@@ -56,8 +56,8 @@ fn collectTurn(a: A, store: *Store, table: u64, kind: []const u8, context: Conte
     var parsed: ?std.json.Parsed(Progress) = if (previous) |value| try std.json.parseFromSlice(Progress, a, value.body, .{}) else null;
     defer if (parsed) |*value| value.deinit();
     const progress: Progress = if (parsed) |value| value.value else .{};
-    if ((progress.version != 1 and progress.version != 2) or (progress.cursor != null and progress.after_key != null)) return error.InvalidExpiringLakeObject;
-    if (progress.after_key) |key| if (progress.version == 1 or !std.mem.startsWith(u8, key, prefix) or key.len > 4096) return error.InvalidExpiringLakeObject;
+    if (progress.version != 2 or (progress.cursor != null and progress.after_key != null)) return error.InvalidExpiringLakeObject;
+    if (progress.after_key) |key| if (!std.mem.startsWith(u8, key, prefix) or key.len > 4096) return error.InvalidExpiringLakeObject;
     var page = client.listObjects(store.opened.bucket, .{ .prefix = prefix, .max_keys = 128, .continuation_token = progress.cursor, .start_after = progress.after_key, .cancellation = token }) catch |err| {
         try context.ensureActive();
         if (workExpired(work, err)) return error.LakeCleanupTurnYield;
@@ -147,23 +147,21 @@ test "external lake expiring cleanup respects active leases and advances beyond 
     defer a.free(bytes);
     var written = try client.putObject(store.opened.bucket, leased, bytes, .{});
     written.deinit(client.allocator);
-    const legacy_key = try std.fmt.allocPrint(a, "{s}{s}expiring-gc/7/recent-search.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/" });
-    defer a.free(legacy_key);
-    var legacy = try client.putObject(store.opened.bucket, legacy_key, "{\"version\":1,\"cursor\":null}", .{});
-    legacy.deinit(client.allocator);
+    const checkpoint_key = try std.fmt.allocPrint(a, "{s}{s}expiring-gc/7/recent-search.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/" });
+    defer a.free(checkpoint_key);
     const context: Context = .{ .io = std.testing.io };
     const metrics = @import("objectstore").operation_metrics;
     const get_index = @backingInt(metrics.Operation.get);
     const before = metrics.runtime.snapshot().calls[get_index];
     try collect(a, &store, 7, "recent-search", context);
     try std.testing.expect(metrics.runtime.snapshot().calls[get_index] - before <= 20);
-    var checkpoint = try client.getObject(store.opened.bucket, legacy_key, .{});
+    var checkpoint = try client.getObject(store.opened.bucket, checkpoint_key, .{});
     defer checkpoint.deinit(client.allocator);
-    var migrated = try std.json.parseFromSlice(Progress, a, checkpoint.body, .{});
-    defer migrated.deinit();
-    try std.testing.expectEqual(@as(u16, 2), migrated.value.version);
-    try std.testing.expect(migrated.value.after_key != null and migrated.value.cursor == null);
-    try std.testing.expect(std.mem.endsWith(u8, migrated.value.after_key.?, "0015.json"));
+    var checkpoint_state = try std.json.parseFromSlice(Progress, a, checkpoint.body, .{});
+    defer checkpoint_state.deinit();
+    try std.testing.expectEqual(@as(u16, 2), checkpoint_state.value.version);
+    try std.testing.expect(checkpoint_state.value.after_key != null and checkpoint_state.value.cursor == null);
+    try std.testing.expect(std.mem.endsWith(u8, checkpoint_state.value.after_key.?, "0015.json"));
     // Small turns must checkpoint past live records, including partial pages,
     // so an active early prefix cannot starve the expired records at its end.
     for (0..15) |_| try collect(a, &store, 7, "recent-search", context);

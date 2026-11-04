@@ -24,7 +24,6 @@ const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 const Ref = artifacts.ChunkRef;
 const block_bytes: usize = 64 * 1024;
-const legacy_block_bytes: usize = 256 * 1024;
 const pack_bytes = 1024 * 1024;
 pub const Piece = struct {
     offset: usize,
@@ -49,7 +48,7 @@ pub const Directory = struct {
     blocks: []const Piece,
     terms: []const Range,
     pub fn validate(self: Directory) !void {
-        if ((self.version < 1 or self.version > 5) or self.bytes == 0 or self.bytes > 32 * 1024 * 1024 or self.metadata.len > 16384 or self.blocks.len > 16384 or self.terms.len > 200000) return error.InvalidNativeLakeTextCorpus;
+        if ((self.version != 4 and self.version != 5) or self.bytes == 0 or self.bytes > 32 * 1024 * 1024 or self.metadata.len > 16384 or self.blocks.len > 16384 or self.terms.len > 200000) return error.InvalidNativeLakeTextCorpus;
         if (self.metadata_bundle) |bundle| {
             if (self.version != 5 or self.metadata.len == 0 or self.metadata_decoded_bytes == 0 or self.metadata_decoded_bytes > pack_bytes or bundle.byte_len == 0 or bundle.byte_len >= self.metadata_decoded_bytes) return error.InvalidNativeLakeTextCorpus;
             try stores.validateSha256ArtifactIdentity(bundle.artifact_id, bundle.checksum);
@@ -64,10 +63,10 @@ pub const Directory = struct {
         while (m < self.metadata.len or b < self.blocks.len) {
             const meta = b == self.blocks.len or (m < self.metadata.len and self.metadata[m].offset < self.blocks[b].offset);
             const piece = if (meta) self.metadata[m] else self.blocks[b];
-            if (piece.offset != position or piece.ref.byte_len == 0 or piece.ref.byte_len > self.bytes - position or (!meta and piece.ref.byte_len > (if (self.version < 4) legacy_block_bytes else block_bytes))) return error.InvalidNativeLakeTextCorpus;
+            if (piece.offset != position or piece.ref.byte_len == 0 or piece.ref.byte_len > self.bytes - position or (!meta and piece.ref.byte_len > block_bytes)) return error.InvalidNativeLakeTextCorpus;
             try stores.validateSha256ArtifactIdentity(piece.ref.artifact_id, piece.ref.checksum);
             if (piece.pack) |pack| {
-                if (self.version < 3 or pack.byte_len == 0 or pack.byte_len > pack_bytes or piece.pack_offset > pack.byte_len or piece.ref.byte_len > pack.byte_len - piece.pack_offset) return error.InvalidNativeLakeTextCorpus;
+                if (pack.byte_len == 0 or pack.byte_len > pack_bytes or piece.pack_offset > pack.byte_len or piece.ref.byte_len > pack.byte_len - piece.pack_offset) return error.InvalidNativeLakeTextCorpus;
                 try stores.validateSha256ArtifactIdentity(pack.artifact_id, pack.checksum);
             } else if (piece.pack_offset != 0) return error.InvalidNativeLakeTextCorpus;
             position += @intCast(piece.ref.byte_len);
@@ -1982,9 +1981,9 @@ test "external lake packed text ranges reduce requests and authenticate sparse r
     try std.testing.expectError(error.InvalidNativeLakeTextCorpus, malformed.validate());
 }
 
-test "external lake packed readers retain legacy directory compatibility and resource pressure fallback" {
+test "external lake packed readers require current directories and retain resource pressure fallback" {
     const a = std.testing.allocator;
-    var directory = try local.common_test_directory.TestDirectory.init("packed-text-legacy");
+    var directory = try local.common_test_directory.TestDirectory.init("packed-text-current");
     defer directory.cleanup();
     var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
     defer fs.deinit();
@@ -1993,9 +1992,14 @@ test "external lake packed readers retain legacy directory compatibility and res
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
-    const leaf = try upload(ca, &store, "legacy-native-bytes", .none);
-    const legacy: Directory = .{ .version = 2, .bytes = leaf.byte_len, .metadata = &.{}, .blocks = &.{.{ .offset = 0, .ref = leaf }}, .terms = &.{} };
-    const ref = try upload(ca, &store, try std.json.Stringify.valueAlloc(ca, legacy, .{}), .none);
+    const leaf = try upload(ca, &store, "native-current-bytes", .none);
+    const current: Directory = .{ .version = 4, .bytes = leaf.byte_len, .metadata = &.{}, .blocks = &.{.{ .offset = 0, .ref = leaf }}, .terms = &.{} };
+    for ([_]u16{ 1, 2, 3, 6 }) |version| {
+        var obsolete = current;
+        obsolete.version = version;
+        try std.testing.expectError(error.InvalidNativeLakeTextCorpus, obsolete.validate());
+    }
+    const ref = try upload(ca, &store, try std.json.Stringify.valueAlloc(ca, current, .{}), .none);
     const Resources = local.storage_resource_manager;
     var budgets = Resources.Options.defaultBudgets();
     budgets[@backingInt(Resources.Slice.lite_native_page_cache)] = .{ .soft_limit_bytes = 1, .hard_limit_bytes = 1 };
@@ -2012,7 +2016,7 @@ test "external lake packed readers retain legacy directory compatibility and res
     defer cache.deinit();
     var sample: [6]u8 = undefined;
     try cache.readInto(0, &sample);
-    try std.testing.expectEqualStrings("legacy", &sample);
+    try std.testing.expectEqualStrings("native", &sample);
     try std.testing.expectEqual(@as(usize, 0), cache.retainedBytes());
 }
 

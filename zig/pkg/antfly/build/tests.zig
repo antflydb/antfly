@@ -2987,7 +2987,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = object_wal_mod,
         // Cache imports reach the archive engine too. Keep this owner focused
         // on shared WAL storage, native admission and captured-cut contracts.
-        .filters = &.{ "serverless indexed", "serverless multiprovider", "external lake shared collector registry", "external lake bounded WAL cuts", "external lake segmented WAL", "external lake WAL collection", "external lake unified WAL" },
+        .filters = selectTestFilters(b, &.{ "serverless indexed", "serverless multiprovider", "external lake shared collector registry", "external lake bounded WAL cuts", "external lake segmented WAL", "external lake WAL collection", "external lake unified WAL", "serverless object WAL whole-log" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-object-wal-test", "Run shared object WAL, lake adaptation and reclamation contracts")

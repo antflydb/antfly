@@ -190,7 +190,7 @@ pub fn open(a: A, server: *@import("http_server.zig").ApiHttpServer, table_id: u
     var state = try local.metadata_lake_index_catalog.parse(a, catalog_json);
     defer state.deinit();
     const publication = state.value.published orelse return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
-    if (publication.reader_protocol < 47 or publication.source_navigation == null)
+    if (publication.source_navigation == null)
         return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
     if ((binding.format != .iceberg or binding.object_mutability != .immutable) and publication.source_navigation.?.metadata_version < 3)
         return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
