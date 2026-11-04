@@ -78,6 +78,8 @@ pub const Record = struct {
     stage: u32 = 0,
     cursor: u32 = 0,
     pending: []const u32 = &.{},
+    /// Last reconciled task ID; absent on legacy records and after a full pass.
+    pending_after: ?u32 = null,
     reduce_boundaries: []const u16 = &.{},
     skew: []const @import("physical.zig").Part = &.{},
     physical: ?Output = null,
@@ -224,6 +226,7 @@ pub const Store = struct {
         return result;
     }
     fn validateRecord(self: Store, value: Record) !void {
+        if (value.pending_after) |after| if (value.pending.len == 0 or after >= value.cursor) return error.InvalidSqlExecutionState;
         if (self.tenant) |scope| if (value.tenant) |admitted| {
             if (!std.meta.eql(scope, admitted)) return error.SqlExecutionUnauthorized;
         };
@@ -299,6 +302,13 @@ pub const Store = struct {
         return self.checkpointResolved(a, path, claim_, stage, cursor, pending, boundaries, skew, null);
     }
     pub fn checkpointResolved(self: Store, a: A, path: []const u8, claim_: Claim, stage: u32, cursor: u32, pending: []const u32, boundaries: ?[]const u16, skew: ?[]const @import("physical.zig").Part, physical_ref: ?Output) !void {
+        return self.checkpointProgress(a, path, claim_, stage, cursor, pending, null, boundaries, skew, physical_ref);
+    }
+    pub fn checkpointTasksProgress(self: Store, a: A, path: []const u8, claim_: Claim, stage: u32, cursor: u32, pending: []const u32, after: ?u32) !void {
+        return self.checkpointProgress(a, path, claim_, stage, cursor, pending, after, null, null, null);
+    }
+    fn checkpointProgress(self: Store, a: A, path: []const u8, claim_: Claim, stage: u32, cursor: u32, pending: []const u32, after: ?u32, boundaries: ?[]const u16, skew: ?[]const @import("physical.zig").Part, physical_ref: ?Output) !void {
+        if (after) |id| if (pending.len == 0 or id >= cursor) return error.InvalidSqlExecutionState;
         if (pending.len > 256) return error.InvalidSqlExecutionState;
         for (pending, 0..) |id, index| {
             if (id >= cursor or (index != 0 and id <= pending[index - 1])) return error.InvalidSqlExecutionState;
@@ -306,10 +316,12 @@ pub const Store = struct {
         var old = try self.owned(a, path, claim_);
         defer old.deinit(a);
         if (stage < old.value.stage or (stage == old.value.stage and cursor < old.value.cursor)) return error.InvalidSqlExecutionState;
+        if (after != null and stage != old.value.stage) return error.InvalidSqlExecutionState;
         var next = old.value;
         next.stage = stage;
         next.cursor = cursor;
         next.pending = pending;
+        next.pending_after = after;
         if (physical_ref) |ref| {
             if (old.value.stage != 0 or stage != 1 or old.value.physical != null) return error.InvalidSqlExecutionState;
             next.physical = ref;
@@ -461,4 +473,36 @@ test "distributed SQL cancellation wins a later result CAS without stealing owne
     try std.testing.expectEqual(Status.cancelled, value.value.status);
     try std.testing.expectEqualStrings("coordinator", value.value.owner);
     try std.testing.expect(value.value.output == null);
+}
+
+test "distributed SQL pending scan checkpoints survive lost ACKs and fence takeover" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var faults = storage.ScriptedFaultClient.init(a, memory.client());
+    defer faults.deinit();
+    var store: Store = .{ .client = faults.client(), .bucket = "queries", .prefix = "tenant", .now_ms = 1000 };
+    const query: Query = .{ .id = @splat('a'), .expires_ms = 1000000 };
+    const key_ = try store.key(scratch, query, null, 0);
+    try store.create(scratch, key_, query.id, query.expires_ms);
+    const first = (try store.claim(scratch, key_, "first", 1000)).?;
+    try store.checkpointTasks(scratch, key_, first, 0, 8, &.{ 0, 2, 7 });
+    faults.next_put = .{ .commit_then_fail = error.ConnectionResetByPeer };
+    try std.testing.expectError(error.ConnectionResetByPeer, store.checkpointTasksProgress(scratch, key_, first, 0, 8, &.{ 0, 7 }, 3));
+    var accepted = (try store.load(scratch, key_)).?;
+    defer accepted.deinit(scratch);
+    try std.testing.expectEqual(@as(?u32, 3), accepted.value.pending_after);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 7 }, accepted.value.pending);
+    store.now_ms = 32001;
+    const second = (try store.claim(scratch, key_, "second", 1000)).?;
+    try std.testing.expectError(error.SqlExecutionFenced, store.checkpointTasksProgress(scratch, key_, first, 0, 8, &.{0}, null));
+    try store.checkpointTasksProgress(scratch, key_, second, 0, 8, &.{0}, null);
+    try store.checkpointTasks(scratch, key_, second, 1, 0, &.{});
+    var next = (try store.load(scratch, key_)).?;
+    defer next.deinit(scratch);
+    try std.testing.expect(next.value.pending_after == null);
+    try std.testing.expectEqual(@as(u32, 1), next.value.stage);
 }

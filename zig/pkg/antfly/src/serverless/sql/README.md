@@ -257,3 +257,20 @@ the coordinator CAS references it alongside the immutable page lists. Each turn
 either reads eight map directories or flushes at most eight tile pages, keeping
 storage operation counts linear in maps plus published pages. Older in-flight
 per-partition checkpoints retain their recovery path during rolling upgrades.
+
+Pending-task reconciliation persists the last examined task ID with the pending
+set and admission cursor in one fenced CAS. Reads overlap in native waves of
+sixteen (eight for hosted batch reads), while serial stores yield between reads.
+The work phase uses at most half of the remaining turn budget, capped at three
+seconds, leaving time for the checkpoint. Unvisited tasks stay pending; partial
+passes resume after takeover and continue without a fresh delivery notification.
+Completed passes wrap to revisit earlier unresolved tasks, and stage changes
+clear the reconciliation cursor. Admission also yields between completed waves.
+
+Native control requests use per-attempt deadlines capped at five seconds and
+share the caller's remaining budget across the bounded failover list. Both the
+HTTP timeout and cancellation guard enforce each attempt's budget. A worker
+504 or transport cancellation can fail over while the parent remains active;
+durable query cancellation, authorization failures and terminal query errors
+remain terminal. Exhausted worker timeouts report worker unavailability rather
+than claiming that an otherwise active statement has expired.

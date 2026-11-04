@@ -66,6 +66,7 @@ pub const Client = struct {
     workers: []const []const u8,
     io: ?std.Io = null,
     discovery: ?Discovery = null,
+    control_attempt_ms: u32 = 5_000,
     pub fn dispatcher(self: *Client) runtime.Dispatcher {
         return .{ .ptr = self, .dispatch = dispatch };
     }
@@ -107,17 +108,38 @@ pub const Client = struct {
         // gateway to that process while another query pod can make progress.
         if (self.workers.len == 0) return error.SqlWorkerUnavailable;
         const first = try firstControlWorker(self.a, self.workers.len, path, body);
-        for (0..@min(@max(self.workers.len, 2), 8)) |attempt| {
-            try context.ensureActive();
-            return self.queryCallAt((first + attempt) % self.workers.len, path, body, context) catch |err| switch (err) {
-                error.SqlExecutionUnauthorized, error.SqlExecutionFailed, error.SqlJoinBudgetExceeded, error.SqlQueryExpired, error.DeadlineExceeded, error.Canceled => return err,
-                else => {
-                    last_error = err;
-                    continue;
-                },
+        const attempts = @min(@max(self.workers.len, 2), 8);
+        for (0..attempts) |attempt| {
+            const scoped = try self.controlContext(context, attempts - attempt);
+            return self.queryCallAt((first + attempt) % self.workers.len, path, body, scoped) catch |err| {
+                // A worker's timeout/cancellation is not the caller's deadline.
+                // Check the parent first, including on the last failed attempt.
+                try context.ensureActive();
+                switch (err) {
+                    error.SqlExecutionCancelled => return error.Canceled,
+                    error.SqlExecutionUnauthorized, error.SqlExecutionFailed, error.SqlJoinBudgetExceeded, error.SqlQueryExpired => return err,
+                    else => {
+                        last_error = err;
+                        continue;
+                    },
+                }
             };
         }
-        return last_error;
+        try context.ensureActive();
+        return switch (last_error) {
+            error.DeadlineExceeded, error.Timeout, error.Canceled, error.Cancelled => error.SqlWorkerUnavailable,
+            else => last_error,
+        };
+    }
+    fn controlContext(self: Client, parent: Context, attempts: usize) !Context {
+        try parent.ensureActive();
+        var scoped = parent;
+        const now = @import("antfly_platform").time.monotonicNs();
+        var budget = @as(u64, @max(@as(u32, 1), @min(self.control_attempt_ms, 60_000))) * std.time.ns_per_ms;
+        if (parent.deadline_ns) |deadline| budget = @min(budget, @max(@as(u64, 1), (deadline -| now) / @max(@as(usize, 1), attempts)));
+        scoped.deadline_ns = now +| budget;
+        if (parent.deadline_ns) |deadline| scoped.deadline_ns = @min(deadline, scoped.deadline_ns.?);
+        return scoped;
     }
     fn firstControlWorker(a: A, count: usize, path: []const u8, body: []const u8) !usize {
         const identity = if (std.mem.eql(u8, path, submit_path))
@@ -142,14 +164,16 @@ pub const Client = struct {
         };
         const guard: Guard = .{ .value = context };
         const cancellation: http.RequestCancellation = .{ .borrowed_context = &guard, .borrowed_is_cancelled = Guard.canceled };
-        var response_ = auth.executeRequest(self.a, self.executor, .{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = 60_000, .max_response_bytes = 4 * 1024 * 1024, .cancellation = &cancellation }, self.authentication) catch |err| {
+        const remaining_ns = context.deadline_ns.? -| @import("antfly_platform").time.monotonicNs();
+        const timeout_ms: u32 = @intCast(@max(@as(u64, 1), @min(@as(u64, 60_000), (remaining_ns +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms)));
+        var response_ = auth.executeRequest(self.a, self.executor, .{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = timeout_ms, .max_response_bytes = 4 * 1024 * 1024, .cancellation = &cancellation }, self.authentication) catch |err| {
             try context.ensureActive();
             return err;
         };
         errdefer response_.deinit(self.a);
         try context.ensureActive();
         if (response_.status == 401 or response_.status == 403) return error.SqlExecutionUnauthorized;
-        if (response_.status == 408) return error.Canceled;
+        if (response_.status == 408) return error.SqlExecutionCancelled;
         if (response_.status == 504) return error.DeadlineExceeded;
         if (response_.status == 409) return error.SqlExecutionFailed;
         if (response_.status == 422) return error.SqlJoinBudgetExceeded;
@@ -257,17 +281,20 @@ pub const Server = struct {
         defer if (lease) |*held| held.release();
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
-        return self.execute(a, arena.allocator(), path, body, context) catch |err| response(a, switch (err) {
-            error.SqlExecutionUnauthorized => 403,
-            error.SqlQueryRoleRequired, error.SqlExecutionFenced, error.PreconditionFailed, error.SqlWorkerUnavailable => 503,
-            error.SqlQueryExpired => 410,
-            error.SqlExecutionFailed => 409,
-            error.SqlExecutionNotFound => 404,
-            error.DeadlineExceeded => 504,
-            error.Canceled => 408,
-            error.SqlJoinBudgetExceeded => 422,
-            else => 500,
-        }, "{}");
+        return self.execute(a, arena.allocator(), path, body, context) catch |err| {
+            if (err == error.Canceled or err == error.Cancelled) context.ensureActive() catch return response(a, 504, "{}");
+            return response(a, switch (err) {
+                error.SqlExecutionUnauthorized => 403,
+                error.SqlQueryRoleRequired, error.SqlExecutionFenced, error.PreconditionFailed, error.SqlWorkerUnavailable => 503,
+                error.SqlQueryExpired => 410,
+                error.SqlExecutionFailed => 409,
+                error.SqlExecutionNotFound => 404,
+                error.DeadlineExceeded => 504,
+                error.Canceled => 408,
+                error.SqlJoinBudgetExceeded => 422,
+                else => 500,
+            }, "{}");
+        };
     }
     fn execute(self: Server, a: A, scratch: A, path: []const u8, body: []const u8, context: Context) !http.HttpResponse {
         try context.ensureActive();

@@ -1820,3 +1820,206 @@ fn slowResultAssembly(parallel: bool) !void {
     }
     for (seen) |present| try std.testing.expect(present);
 }
+
+test "distributed SQL pending reconciliation resumes after takeover and revisits slow early tasks" {
+    try reconcileWindow(false);
+    try reconcileWindow(true);
+}
+fn reconcileWindow(early_running: bool) !void {
+    const a = std.testing.allocator;
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    var service = fixture.service(a, memory.client(), "owner");
+    const column: plan.Column = .{ .name = "id", .type = .integer };
+    const left: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{column}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 256 };
+    var right = left;
+    right.table_id = 2;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    right.splits = 1;
+    const spec = try plan.choose(left, right, service.tenant, 1000000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .concurrency = 256, .task_output_bytes = 4096 }, fixture.now);
+    const query = try service.submit(spec);
+    const claim = (try service.acquire(query)).?;
+    var records = service.state_store;
+    records.tenant = service.tenant;
+    const query_key = try records.key(a, query, null, 0);
+    defer a.free(query_key);
+    var ids: [256]u32 = undefined;
+    var held: ?state.Claim = null;
+    for (&ids, 0..) |*id, index| {
+        id.* = @intCast(index);
+        const key = try records.key(a, query, spec.outputStage(), id.*);
+        defer a.free(key);
+        try records.create(a, key, query.id, query.expires_ms);
+        const task_claim = (try records.claim(a, key, "worker", 60000)).?;
+        if (early_running and index == 0) {
+            held = task_claim;
+            continue;
+        }
+        try records.complete(a, key, task_claim, .{ .key = "accepted", .hash = @splat('c'), .bytes = 0, .rows = 1 });
+    }
+    try records.checkpointTasks(a, query_key, claim, spec.outputStage(), 256, &ids);
+    const Slow = struct {
+        var base_get: @FieldType(storage.Client.VTable, "get_object") = undefined;
+        fn get(raw: *anyopaque, allocator: A, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            if (std.mem.indexOf(u8, key, "/stage/") != null) try std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake);
+            if (options.cancellation) |token| try token.check();
+            return base_get(raw, allocator, bucket, key, options);
+        }
+    };
+    Slow.base_get = service.state_store.client.vtable.get_object;
+    var table = service.state_store.client.vtable.*;
+    table.get_object = Slow.get;
+    service.state_store.client.vtable = &table;
+    service.context.io = std.testing.io;
+    const Scheduler = @import("scheduler.zig");
+    var scheduler: Scheduler.Scheduler = .{ .io = std.testing.io, .delivery = undefined };
+    defer scheduler.stop();
+    const dispatcher = scheduler.dispatcher();
+    const ticket: plan.Ticket = .{ .tenant = service.tenant, .query = query, .stage = spec.outputStage(), .task = 0 };
+    try dispatcher.dispatch(dispatcher.ptr, &.{ticket}, .{});
+    var turns: Scheduler.Turns = .{ .scheduler = &scheduler };
+    const coordination = turns.port();
+    service.coordination = coordination;
+    coordination.retry(coordination.ptr, query);
+    var reached = false;
+    for (0..8) |turn| {
+        service.context.deadline_ns = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s;
+        _ = try service.turn(query, dispatcher);
+        var current = (try records.load(a, query_key)).?;
+        defer current.deinit(a);
+        if (turn == 0) {
+            try std.testing.expect(current.value.pending.len < ids.len and current.value.pending.len > 0);
+            try std.testing.expect(current.value.pending_after != null);
+            if (early_running) try std.testing.expectEqual(@as(u32, 0), current.value.pending[0]);
+            fixture.now += 92001;
+            service = fixture.service(a, service.state_store.client, "replacement");
+            service.context.io = std.testing.io;
+            service.coordination = coordination;
+            _ = (try service.acquire(query)).?;
+            records.now_ms = fixture.now;
+            if (early_running) {
+                const key = try records.key(a, query, spec.outputStage(), 0);
+                defer a.free(key);
+                held = (try records.claim(a, key, "replacement-worker", 60000)).?;
+            }
+            try std.testing.expectError(error.SqlExecutionFenced, records.checkpointTasksProgress(a, query_key, claim, current.value.stage, current.value.cursor, current.value.pending, current.value.pending_after));
+        }
+        if (early_running and current.value.pending.len == 1 and current.value.pending_after == null) {
+            try std.testing.expectEqual(@as(u32, 0), current.value.pending[0]);
+            const key = try records.key(a, query, spec.outputStage(), 0);
+            defer a.free(key);
+            try records.complete(a, key, held.?, .{ .key = "accepted", .hash = @splat('c'), .bytes = 0, .rows = 1 });
+            coordination.retry(coordination.ptr, query);
+            service.context.deadline_ns = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s;
+            _ = try service.turn(query, dispatcher);
+            reached = true;
+            break;
+        }
+        if (current.value.stage == spec.finalStage()) {
+            reached = true;
+            break;
+        }
+        // Simulate a restarted delivery registry with no fresh completion hint.
+        // Durable partial reconciliation must bypass this idle fast path.
+        _ = coordination.delivery_ready(coordination.ptr, query);
+    }
+    try std.testing.expect(reached);
+    var final = (try records.load(a, query_key)).?;
+    defer final.deinit(a);
+    try std.testing.expectEqual(spec.finalStage(), final.value.stage);
+    try std.testing.expectEqual(@as(usize, 0), final.value.pending.len);
+    try std.testing.expect(final.value.pending_after == null);
+}
+
+test "distributed SQL control failover distinguishes worker failures from terminal query errors" {
+    const transport = @import("transport.zig");
+    const Http = local.common_http_http_common;
+    const a = std.testing.allocator;
+    const Fake = struct {
+        calls: usize = 0,
+        status: u16 = 504,
+        failure: ?anyerror = null,
+        always: bool = false,
+        fn execute(raw: *anyopaque, allocator: A, _: Http.HttpRequest) !Http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const fail = self.always or self.calls == 1;
+            if (fail) if (self.failure) |err| return err;
+            return .{ .status = if (fail) self.status else 200, .owner_allocator = allocator, .body = try allocator.dupe(u8, "{\"complete\":false}") };
+        }
+    };
+    var fake: Fake = .{};
+    var client: transport.Client = .{ .a = a, .executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &.{ "http://first", "http://healthy" } };
+    const query: transport.QueryRequest = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 1000000 } };
+    const context: Context = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 60 * std.time.ns_per_s };
+    for ([_]u16{ 504, 503 }) |status| {
+        fake = .{ .status = status };
+        try std.testing.expect(!try client.turn(query, context));
+        try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    }
+    for ([_]anyerror{ error.Canceled, error.Cancelled, error.DeadlineExceeded, error.Timeout }) |err| {
+        fake = .{ .failure = err };
+        try std.testing.expect(!try client.turn(query, context));
+        try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    }
+    const Case = struct { status: u16, failure: anyerror };
+    for ([_]Case{ .{ .status = 408, .failure = error.Canceled }, .{ .status = 409, .failure = error.SqlExecutionFailed }, .{ .status = 410, .failure = error.SqlQueryExpired }, .{ .status = 403, .failure = error.SqlExecutionUnauthorized }, .{ .status = 422, .failure = error.SqlJoinBudgetExceeded } }) |case| {
+        fake = .{ .status = case.status };
+        try std.testing.expectError(case.failure, client.turn(query, context));
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    }
+    for ([_]anyerror{ error.DeadlineExceeded, error.Timeout, error.Canceled }) |err| {
+        fake = .{ .failure = err, .always = true };
+        try std.testing.expectError(error.SqlWorkerUnavailable, client.turn(query, context));
+    }
+    try context.ensureActive();
+    fake = .{};
+    try std.testing.expectError(error.DeadlineExceeded, client.turn(query, .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() - 1 }));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
+test "distributed SQL control attempt deadlines leave time for healthy peers and respect parent cancellation" {
+    const transport = @import("transport.zig");
+    const Http = local.common_http_http_common;
+    const a = std.testing.allocator;
+    const Fake = struct {
+        calls: usize = 0,
+        first_uri: ?[]u8 = null,
+        cancel_parent: bool = false,
+        canceled: bool = false,
+        fn check(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.canceled;
+        }
+        fn execute(raw: *anyopaque, allocator: A, request_: Http.HttpRequest) !Http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(request_.timeout_ms.? <= 20);
+            if (self.calls == 1) {
+                self.first_uri = try allocator.dupe(u8, request_.uri);
+                if (self.cancel_parent) {
+                    self.canceled = true;
+                    return error.Canceled;
+                }
+                while (!request_.cancellation.?.isCancelled()) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+                return error.Canceled;
+            }
+            try std.testing.expect(!std.mem.eql(u8, self.first_uri.?, request_.uri));
+            return .{ .status = 200, .owner_allocator = allocator, .body = try allocator.dupe(u8, "{\"complete\":false}") };
+        }
+    };
+    var fake: Fake = .{};
+    defer if (fake.first_uri) |uri| a.free(uri);
+    var client: transport.Client = .{ .a = a, .executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &.{ "http://first", "http://healthy" }, .control_attempt_ms = 20 };
+    const query: transport.QueryRequest = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 1000000 } };
+    const context: Context = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s, .cancellation = .{ .ptr = &fake, .is_cancelled_fn = Fake.check } };
+    try std.testing.expect(!try client.turn(query, context));
+    try context.ensureActive();
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    a.free(fake.first_uri.?);
+    fake = .{ .cancel_parent = true };
+    try std.testing.expectError(error.Canceled, client.turn(query, context));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}

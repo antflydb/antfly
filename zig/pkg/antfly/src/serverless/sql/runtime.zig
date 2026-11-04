@@ -271,31 +271,77 @@ pub const Service = struct {
         // Only unresolved tasks are revisited. A slow first task cannot pin a
         // sliding window or force repeated GETs of an ever-growing prefix.
         for (current.value.pending) |id| if (id >= count) return error.InvalidSqlExecutionState;
-        const statuses = try self.store().taskStatuses(a, query, current.value.stage, current.value.pending, self.context.io);
-        for (current.value.pending, statuses) |id, status| {
-            const value = .{ .value = status };
-            if (value.value.status == .failed or value.value.status == .cancelled) {
-                try self.store().terminate(a, query_key, claim, .failed, value.value.failure orelse "TaskFailed");
-                return true;
+        var keep: [256]bool = @splat(true);
+        if (current.value.pending.len > keep.len) return error.InvalidSqlExecutionState;
+        var scan: usize = 0;
+        var pending_after = current.value.pending_after;
+        if (pending_after) |after| {
+            while (scan < current.value.pending.len and current.value.pending[scan] <= after) scan += 1;
+            if (scan == current.value.pending.len) {
+                scan = 0;
+                pending_after = null;
             }
-            if (value.value.status == .succeeded) continue;
-            try pending.append(a, id);
-            if (value.value.status != .running or value.value.until_ms +| 30_000 < self.clock.now()) try tickets.append(a, .{ .tenant = self.tenant, .query = query, .stage = current.value.stage, .task = id });
         }
+        const scan_start = scan;
+        var work = self;
+        work.context = self.metadataWorkContext();
+        while (scan < current.value.pending.len) {
+            if (scan != scan_start) work.context.ensureActive() catch break;
+            const width: usize = if (work.context.io != null and !@import("builtin").single_threaded) 16 else if (work.state_store.client.vtable.get_objects != null) 8 else 1;
+            const end = @min(current.value.pending.len, scan + width);
+            const statuses = work.store().taskStatuses(a, query, current.value.stage, current.value.pending[scan..end], work.context.io) catch |err| {
+                if (scan != scan_start and (err == error.DeadlineExceeded or err == error.Canceled or err == error.Cancelled)) {
+                    try self.context.ensureActive();
+                    break;
+                }
+                return err;
+            };
+            for (current.value.pending[scan..end], statuses, scan..) |id, status, index| {
+                if (status.status == .failed or status.status == .cancelled) {
+                    try self.store().terminate(a, query_key, claim, .failed, status.failure orelse "TaskFailed");
+                    return true;
+                }
+                if (status.status == .succeeded) keep[index] = false else if (status.status != .running or status.until_ms +| 30_000 < self.clock.now()) try tickets.append(a, .{ .tenant = self.tenant, .query = query, .stage = current.value.stage, .task = id });
+            }
+            scan = end;
+            pending_after = if (scan == current.value.pending.len) null else current.value.pending[scan - 1];
+        }
+        for (current.value.pending, keep[0..current.value.pending.len]) |id, retain| if (retain) try pending.append(a, id);
+        // Unvisited records remain pending. Progress and dispatch intent share
+        // one fenced CAS, so retries/takeover resume after the durable task ID.
+        if (pending.items.len == 0) pending_after = null;
         const free = spec.limits.concurrency -| pending.items.len;
         const admission_end = @min(count, cursor +| @as(u32, @intCast(@min(free, if (self.coordination != null) @as(usize, 8) else 256))));
         const ids = try a.alloc(u32, admission_end - cursor);
         for (ids, cursor..) |*id, value| id.* = @intCast(value);
-        const admitted = try self.store().admitTasks(a, query, current.value.stage, ids, if (self.coordination != null) self.context.io else null);
-        for (ids, admitted) |id, status| {
-            cursor = id + 1;
-            if (status.status == .failed or status.status == .cancelled) {
-                try self.store().terminate(a, query_key, claim, .failed, status.failure orelse "TaskFailed");
-                return true;
+        // Admission shares the work budget and advances only after each
+        // completed wave. Partial CAS success is replayable from the old cursor.
+        admission: while (cursor < admission_end) {
+            work.context.ensureActive() catch |err| {
+                if (scan != scan_start or cursor != current.value.cursor) break :admission;
+                return err;
+            };
+            const parallel = self.coordination != null and self.context.io != null and !@import("builtin").single_threaded;
+            const width: usize = if (parallel) 8 else 1;
+            const offset = cursor - current.value.cursor;
+            const wave = ids[offset..@min(ids.len, offset + width)];
+            const admitted = work.store().admitTasks(a, query, current.value.stage, wave, if (parallel) self.context.io else null) catch |err| {
+                if ((scan != scan_start or cursor != current.value.cursor) and (err == error.DeadlineExceeded or err == error.Canceled or err == error.Cancelled)) {
+                    try self.context.ensureActive();
+                    break :admission;
+                }
+                return err;
+            };
+            for (wave, admitted) |id, status| {
+                cursor = id + 1;
+                if (status.status == .failed or status.status == .cancelled) {
+                    try self.store().terminate(a, query_key, claim, .failed, status.failure orelse "TaskFailed");
+                    return true;
+                }
+                if (status.status == .succeeded) continue;
+                try pending.append(a, id);
+                if (status.status != .running or status.until_ms +| 30_000 < self.clock.now()) try tickets.append(a, .{ .tenant = self.tenant, .query = query, .stage = current.value.stage, .task = id });
             }
-            if (status.status == .succeeded) continue;
-            try pending.append(a, id);
-            if (status.status != .running or status.until_ms +| 30_000 < self.clock.now()) try tickets.append(a, .{ .tenant = self.tenant, .query = query, .stage = current.value.stage, .task = id });
         }
         // Persist the dispatch intent first. Lost acknowledgements and process
         // loss replay only this bounded set, without relying on queue delivery.
@@ -326,9 +372,9 @@ pub const Service = struct {
                 }
             }
             try self.store().checkpointResolved(a, query_key, claim, current.value.stage + 1, 0, &.{}, null, null, resolved);
-        } else try self.store().checkpointTasks(a, query_key, claim, current.value.stage, cursor, pending.items);
+        } else try self.store().checkpointTasksProgress(a, query_key, claim, current.value.stage, cursor, pending.items, pending_after);
         if (tickets.items.len != 0) try dispatcher.dispatch(dispatcher.ptr, tickets.items, self.context);
-        if (cursor < count and pending.items.len < spec.limits.concurrency) if (self.coordination) |coordination| coordination.retry(coordination.ptr, query);
+        if (pending_after != null or (cursor < count and pending.items.len < spec.limits.concurrency)) if (self.coordination) |coordination| coordination.retry(coordination.ptr, query);
         return false;
     }
     /// Invoke only after authenticating the internal caller. Tickets contain no
@@ -940,7 +986,7 @@ pub const Service = struct {
         // dispatch window is outstanding, avoid rereading every task on each
         // foreground poll. Keep twenty seconds of lease margin and always let
         // durable cancellation through. Hosted dispatch has no local registry.
-        if (!current.value.cancel_requested and current.value.pending.len != 0 and current.value.status == .running and std.mem.eql(u8, current.value.owner, self.owner) and current.value.until_ms > self.clock.now() +| 20_000) {
+        if (current.value.pending_after == null and !current.value.cancel_requested and current.value.pending.len != 0 and current.value.status == .running and std.mem.eql(u8, current.value.owner, self.owner) and current.value.until_ms > self.clock.now() +| 20_000) {
             if (self.coordination) |coordination| if (!coordination.delivery_ready(coordination.ptr, query)) return false;
         }
         const claim: state.Claim = if (current.value.status == .running and std.mem.eql(u8, current.value.owner, self.owner) and current.value.until_ms > self.clock.now()) .{ .owner = self.owner, .epoch = current.value.epoch } else (try self.store().claim(self.a, key, self.owner, 60_000)) orelse return false;
