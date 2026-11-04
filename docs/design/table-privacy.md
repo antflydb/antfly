@@ -350,8 +350,10 @@ cohort. Physical batches retain only normalized, source-bound field evidence;
 provider envelopes and arbitrary extra response fields are released per batch.
 Composition uses the same inspector for serial and batched execution. The host
 memory plan covers logical output retention plus the largest physical field
-batch, including configuration and field-control overhead. A scratch allocator
-unwraps arenas while preserving every nested invocation quota; temporary frees
+batch, including configuration and field-control overhead. Admission parses
+one document at a time in reclaimable scratch rather than retaining a DOM for
+every document within its resolution budget. A scratch allocator unwraps arenas
+while preserving every nested invocation quota; temporary frees
 therefore release actual backing memory even when results are interleaved.
 
 Checkpoint reclamation shares eight chunks (at most 2 MiB), 32 CAS operations,
@@ -376,7 +378,43 @@ partial reclamation progress survive snapshots and restart.
 
 ## Validation
 
-### Latest preview and listener fixes (2026-11-04)
+### Latest detector memory and checkpoint retention fixes (2026-11-04)
+
+- Merged main at `7bc16af5383a8be6e9f95877f4bd443487d06fc4`, retaining privacy
+  dependency batching and failure markers alongside durable scoped retries and
+  shared source preparation. Regenerated the combined Go API client; Go SDK
+  tests and all 13 host allocator tests pass.
+- The focused regressions cover the maximum 50-document/64-field memory plan,
+  preservation of both inner and outer invocation quotas, atomic retained-byte
+  admission, snapshot restoration, multi-manifest GC budgets and fairness, and
+  capacity backoff without cursor advancement.
+- Integrated server/focused build: 106/106 steps, 53 API/metadata tests,
+  147 native storage/privacy tests and two ABI checks pass. The two durable
+  scoped-retry regressions pass after the merge. The ordered-artifact target
+  passes 218 native tests and 10 owner/ABI checks, including the merged
+  execution-identity and protocol-floor cases. Formatting and license checks
+  pass. Qualified server SHA-256:
+  `63d02912ec3dde876ef3b2503c2b70509a0b5d15a6775e543a9087cb9bd1a9dc`.
+- Standalone and Raft upgrade probes start protocol-80 binary SHA-256
+  `c4faece05bee12a4f234fabed47df2f900043fe460bddc3243ca133aaf7a0c80`,
+  persist an out-of-line legacy checkpoint, switch to the integrated server,
+  finish that scan, update the policy with its exact ETag, then persist an
+  accounted checkpoint and restart again. Both pass (13.49/10.36 seconds).
+- Complete integrated HTTP suites each pass 20 cases with one optional
+  model-weight skip: standalone 405.12 seconds and Raft 708.42 seconds.
+  They run concurrently; these are qualification durations, not isolated
+  throughput benchmarks. The oversized-preview regression
+  waits for full publication of its 9 MiB identifier before testing sample
+  admission, so a concurrent Raft read-fence timeout does not replace the
+  intended 422 assertion.
+- A synthetic HTTP memory probe uses 32 KiB of provider padding per field.
+  The maximum 50-document/64-field cohort completes in 400 native batches of
+  eight, discards padding, and returns 1,191,657 bytes. On the integrated
+  server it takes 3.75 seconds; sampled warm-process RSS grows by 32,912 KiB.
+  This measures host orchestration with a synthetic detector, not model/GPU
+  throughput. Model weights, Metal and CUDA are not requalified in this fix.
+
+### Previous preview and listener fixes (2026-11-04)
 
 - Main remains incorporated through `ab58a77e243983386345e86969f5f8ddee8811e7`.
   Final server SHA-256:
