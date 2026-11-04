@@ -50,6 +50,7 @@ pub const HeadRecord = records.Record(Head, "SRHD", 2048);
 pub const Lease = struct {
     lookup: Lookup,
     metadata_incarnation: [16]u8,
+    intent: @FieldType(contract.Dependency, "action") = .retire,
     pub fn validate(self: Lease) !void {
         try self.lookup.validate();
         if (std.mem.allEqual(u8, &self.metadata_incarnation, 0)) return error.InvalidScopeRetirement;
@@ -152,6 +153,19 @@ pub fn nextWork(reader: anytype, group: u64, after: u64) !?Head {
 fn rootKind(value: contract.Manifest) local.system_catalog_domain.Kind {
     return if (value.scope.kind == .database) .database else .namespace;
 }
+fn requireDefinitionVacant(reader: anytype, group: u64, kind: local.system_catalog_domain.Kind, id: u64) !void {
+    switch (kind) {
+        .view => try @import("../system_catalog/view_leases.zig").requireUnleased(reader, group, id),
+        .sequence => {
+            try @import("../system_catalog/sequence_leases.zig").requireUnleased(reader, group, id);
+            if (try @import("schema_validation_ledger.zig").activeSequence(reader, group, id) != null) return error.CatalogPublicationProofPending;
+        },
+        .named_type => if (try @import("../system_catalog/named_type_dependencies.zig").retirementLock(reader, group, id) != null or
+            try @import("schema_validation_ledger.zig").activeType(reader, group, id) != null) return error.CatalogPublicationProofPending,
+        else => {},
+    }
+}
+
 pub fn requireVacant(reader: anytype, prepared: *const Prepared) !void {
     const group = prepared.lookup.group;
     // Distinct namespaces can retire concurrently. A database retirement
@@ -159,6 +173,9 @@ pub fn requireVacant(reader: anytype, prepared: *const Prepared) !void {
     if (try member(reader, group, .database, prepared.manifest.scope.database.id) != null) return error.TableTransitionActive;
     if (try member(reader, group, rootKind(prepared.manifest), prepared.manifest.scope.root().id) != null) return error.TableTransitionActive;
     for (prepared.manifest.resources) |resource| if (try member(reader, group, resource.kind, resource.id) != null) return error.TableTransitionActive;
+    for (prepared.manifest.dependencies) |dependency| if (try member(reader, group, dependency.kind, dependency.id) != null) return error.TableTransitionActive;
+    for (prepared.manifest.resources) |resource| try requireDefinitionVacant(reader, group, resource.kind, resource.id);
+    for (prepared.manifest.dependencies) |dependency| try requireDefinitionVacant(reader, group, dependency.kind, dependency.id);
     // Admission and competing lifecycle jobs use the same native transaction.
     // Check both directions: a scope cannot capture an existing job or a parent
     // leased by FK validation, and later jobs cannot pass a scope's member key.
@@ -169,6 +186,13 @@ pub fn requireVacant(reader: anytype, prepared: *const Prepared) !void {
             else => return err,
         };
     }
+    for (prepared.manifest.dependencies) |dependency| if (dependency.table) |table| {
+        if (try @import("table_lifecycle_lock.zig").read(reader, group, table.id) != null) return error.TableTransitionActive;
+        @import("schema_validation_dependencies.zig").requireUnleased(reader, group, table.id) catch |err| switch (err) {
+            error.GenerationPublicationChanged => return error.TableTransitionActive,
+            else => return err,
+        };
+    };
 }
 /// Exact replay is observed before checking current vacancy. A completed or
 /// canceled operation cannot reacquire reservations or replace its manifest.
@@ -211,6 +235,10 @@ pub fn stageBegin(txn: anytype, prepared: *const Prepared) !Head {
     try txn.put(try queueKey(&buffer, prepared.lookup.group, sequence), encoded_queue.slice());
     try txn.put(try memberKey(&buffer, prepared.lookup.group, rootKind(prepared.manifest), prepared.manifest.scope.root().id), lease.slice());
     for (prepared.manifest.resources) |resource| try txn.put(try memberKey(&buffer, prepared.lookup.group, resource.kind, resource.id), lease.slice());
+    for (prepared.manifest.dependencies) |dependency| {
+        const participant = try LeaseRecord.init(.{ .lookup = prepared.lookup, .metadata_incarnation = value.metadata_incarnation, .intent = dependency.action });
+        try txn.put(try memberKey(&buffer, prepared.lookup.group, dependency.kind, dependency.id), participant.slice());
+    }
     return value;
 }
 pub fn requireMembers(reader: anytype, prepared: *const Prepared, value: Head) !void {
@@ -221,6 +249,12 @@ pub fn requireMembers(reader: anytype, prepared: *const Prepared, value: Head) !
     for (prepared.manifest.resources) |resource| {
         const lease = (try member(reader, value.lookup.group, resource.kind, resource.id)) orelse return error.InvalidScopeRetirement;
         if (!std.meta.eql(lease, expected)) return error.InvalidScopeRetirement;
+    }
+    for (prepared.manifest.dependencies) |dependency| {
+        var participant = expected;
+        participant.intent = dependency.action;
+        const lease = (try member(reader, value.lookup.group, dependency.kind, dependency.id)) orelse return error.InvalidScopeRetirement;
+        if (!std.meta.eql(lease, participant)) return error.InvalidScopeRetirement;
     }
     var buffer: [256]u8 = undefined;
     const queued = (try optional(reader, try queueKey(&buffer, value.lookup.group, value.sequence))) orelse return error.InvalidScopeRetirement;
@@ -247,6 +281,7 @@ pub fn stageAdvance(txn: anytype, prepared: *const Prepared, before: Head, next:
     if (!result.active()) {
         try txn.delete(try memberKey(&buffer, result.lookup.group, rootKind(prepared.manifest), prepared.manifest.scope.root().id));
         for (prepared.manifest.resources) |resource| try txn.delete(try memberKey(&buffer, result.lookup.group, resource.kind, resource.id));
+        for (prepared.manifest.dependencies) |dependency| try txn.delete(try memberKey(&buffer, result.lookup.group, dependency.kind, dependency.id));
         try txn.delete(try queueKey(&buffer, result.lookup.group, result.sequence));
         try txn.delete(try key(&buffer, result.lookup, .manifest));
     }

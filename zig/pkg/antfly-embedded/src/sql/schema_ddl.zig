@@ -552,7 +552,14 @@ pub fn applyCandidateWithLimits(alloc: std.mem.Allocator, schema: *Value, ddl: a
             if (constraintExists(schema.*, constraint.name)) return error.SqlConstraintAlreadyExists;
             const constraints = try list(schema, alloc, "foreign_keys");
             if (named(constraints.items, constraint.name, "name") != null) return error.SqlConstraintAlreadyExists;
-            var declaration = try value(alloc, .{ .name = constraint.name, .child_columns = constraint.columns, .parent_table = constraint.parent, .parent_columns = constraint.parent_columns, .on_delete = constraint.on_delete, .on_update = constraint.on_update, .match = constraint.match, .timing = constraint.timing, .deferrable = constraint.deferrable });
+            // Preserve components in the request-owned candidate. The public
+            // SQL adapter resolves these before native schema admission; only
+            // physical table identities may reach the durable constraint.
+            const parent: Value = if (constraint.parent.namespace != null or constraint.parent.database != null)
+                try value(alloc, constraint.parent)
+            else
+                .{ .string = constraint.parent.table };
+            var declaration = try value(alloc, .{ .name = constraint.name, .child_columns = constraint.columns, .parent_table = parent, .parent_columns = constraint.parent_columns, .on_delete = constraint.on_delete, .on_update = constraint.on_update, .match = constraint.match, .timing = constraint.timing, .deferrable = constraint.deferrable });
             if (constraint.not_valid) try declaration.object.put(alloc, "not_valid", .{ .bool = true });
             try constraints.append(declaration);
         },

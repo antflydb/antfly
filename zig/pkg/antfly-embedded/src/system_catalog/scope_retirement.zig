@@ -24,6 +24,7 @@ pub const Id = [16]u8;
 pub const Digest = [32]u8;
 pub const max_resources = 4096;
 pub const max_tables = 128;
+pub const max_participants = 3 * max_tables;
 pub const max_manifest_bytes = 16 * 1024 * 1024;
 
 pub const Scope = struct {
@@ -88,6 +89,84 @@ fn resourceLess(_: void, left: domain.Resource, right: domain.Resource) bool {
     return if (left.kind == right.kind) left.id < right.id else @backingInt(left.kind) < @backingInt(right.kind);
 }
 
+/// Effects outside direct scope containment. Physical-only table participants
+/// have no invented logical catalog binding. Their immutable native identity
+/// and preimage still own a table fence, including materialized-view backings.
+pub const Dependency = struct {
+    kind: domain.Kind,
+    id: u64,
+    action: enum { retire, rewrite, hold },
+    resource: ?domain.Resource = null,
+    table: ?Table = null,
+    schema_after: ?[]const u8 = null,
+    view_owner: ?u64 = null,
+
+    fn validate(self: Dependency, a: A) !void {
+        if (self.id == 0 or (self.resource == null and self.kind != .table) or
+            (self.kind == .table) != (self.table != null) or
+            (self.action == .rewrite) != (self.schema_after != null)) return error.InvalidScopeRetirement;
+        if (self.resource) |resource| {
+            if (resource.id != self.id or resource.kind != self.kind or
+                (resource.native_service != null and self.action != .hold)) return error.InvalidScopeRetirement;
+            try domain.validateResourceName(resource.kind, resource.name);
+        }
+        if (self.table) |table| {
+            try table.validate(a);
+            if (table.id != self.id or (self.action == .retire) != (self.view_owner != null)) return error.InvalidScopeRetirement;
+            if (self.resource) |resource| if (!std.mem.eql(u8, resource.storage_name, table.physical_name)) return error.InvalidScopeRetirement;
+            if (self.view_owner) |view| {
+                if (view == 0 or self.resource != null) return error.InvalidScopeRetirement;
+                var header = try std.json.parseFromSlice(struct { sql_materialized_view_id: ?u64 = null }, a, table.preimage, .{ .ignore_unknown_fields = true });
+                defer header.deinit();
+                if (header.value.sql_materialized_view_id != view) return error.InvalidScopeRetirement;
+            }
+        } else if (self.view_owner != null or self.action == .rewrite) return error.InvalidScopeRetirement;
+        switch (self.kind) {
+            .table => {},
+            .view => if (self.action == .rewrite) return error.InvalidScopeRetirement,
+            .sequence => if (self.action != .retire) return error.InvalidScopeRetirement,
+            .named_type => if (self.action != .hold) return error.InvalidScopeRetirement,
+            else => return error.InvalidScopeRetirement,
+        }
+        if (self.schema_after) |schema| {
+            if (self.kind != .table or schema.len == 0 or schema.len > max_manifest_bytes) return error.InvalidScopeRetirement;
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, schema, .{});
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidScopeRetirement;
+        }
+    }
+    pub fn less(_: void, left: Dependency, right: Dependency) bool {
+        return if (left.kind == right.kind) left.id < right.id else @backingInt(left.kind) < @backingInt(right.kind);
+    }
+};
+
+/// Indexed incoming sets are part of admission, including references between
+/// selected members that need no surviving-table rewrite. The native capture
+/// binds each directory's generation/count fingerprint at the same read cut.
+pub const Stamp = struct {
+    kind: enum { foreign_key, sequence_default },
+    id: u64,
+    digest: Digest,
+    pub fn less(_: void, left: Stamp, right: Stamp) bool {
+        return if (left.kind == right.kind) left.id < right.id else @backingInt(left.kind) < @backingInt(right.kind);
+    }
+};
+
+pub const ViewEdge = struct {
+    source_kind: enum { table, view },
+    source: u64,
+    /// Zero binds relation existence (for example COUNT(*)), as in the shared
+    /// native view directory. Positive values bind immutable column IDs.
+    column: u64,
+    view: u64,
+    pub fn less(_: void, left: ViewEdge, right: ViewEdge) bool {
+        if (left.source_kind != right.source_kind) return @backingInt(left.source_kind) < @backingInt(right.source_kind);
+        if (left.source != right.source) return left.source < right.source;
+        if (left.column != right.column) return left.column < right.column;
+        return left.view < right.view;
+    }
+};
+
 pub const Manifest = struct {
     version: u8 = 1,
     metadata_group_id: u64,
@@ -103,12 +182,59 @@ pub const Manifest = struct {
     /// Canonically sorted by immutable table ID. No mutable-name lookup may
     /// replace these members after the operation's admission.
     tables: []const Table,
+    dependencies: []const Dependency = &.{},
+    stamps: []const Stamp = &.{},
+    view_edges: []const ViewEdge = &.{},
+
+    pub fn retirementCount(self: Manifest) usize {
+        var count = self.tables.len;
+        for (self.dependencies) |dependency| if (dependency.kind == .table and dependency.action == .retire) {
+            count += 1;
+        };
+        return count;
+    }
+
+    pub fn contains(self: Manifest, kind: domain.Kind, id: u64) bool {
+        if (self.scope.root().kind == kind and self.scope.root().id == id) return true;
+        inline for (.{ self.resources, self.dependencies }) |items| {
+            var first: usize = 0;
+            var last = items.len;
+            while (first < last) {
+                const mid = first + (last - first) / 2;
+                const item = items[mid];
+                if (item.kind == kind and item.id == id) return true;
+                if (@backingInt(item.kind) < @backingInt(kind) or (item.kind == kind and item.id < id)) first = mid + 1 else last = mid;
+            }
+        }
+        return false;
+    }
+
+    pub fn tableById(self: Manifest, id: u64) ?Table {
+        var first: usize = 0;
+        var last = self.tables.len;
+        while (first < last) {
+            const mid = first + (last - first) / 2;
+            if (self.tables[mid].id == id) return self.tables[mid];
+            if (self.tables[mid].id < id) first = mid + 1 else last = mid;
+        }
+        first = 0;
+        last = self.dependencies.len;
+        while (first < last) {
+            const mid = first + (last - first) / 2;
+            const dependency = self.dependencies[mid];
+            if (dependency.kind == .table and dependency.id == id) return dependency.table;
+            if (@backingInt(dependency.kind) < @backingInt(domain.Kind.table) or (dependency.kind == .table and dependency.id < id)) first = mid + 1 else last = mid;
+        }
+        return null;
+    }
 
     pub fn validate(self: Manifest, backing: A) !void {
         try self.scope.validate();
         try self.creator.validate();
         if (self.version != 1 or self.metadata_group_id == 0 or self.catalog_revision == 0 or self.creator.kind == .public or
             std.mem.allEqual(u8, &self.metadata_incarnation, 0) or self.resources.len > max_resources or self.tables.len > max_tables or
+            self.dependencies.len > max_resources - self.resources.len or self.retirementCount() > max_tables or
+            self.stamps.len > max_resources + max_tables or self.view_edges.len > 16384 or
             (self.force and self.scope.kind != .database) or (!self.cascade and self.scope.kind == .namespace and self.resources.len != 0)) return error.InvalidScopeRetirement;
         var arena: std.heap.ArenaAllocator = .init(backing);
         defer arena.deinit();
@@ -157,6 +283,51 @@ pub const Manifest = struct {
             const resource = members.get(.{ .kind = .table, .id = table.id }) orelse return error.InvalidScopeRetirement;
             if (!std.mem.eql(u8, resource.storage_name, table.physical_name)) return error.InvalidScopeRetirement;
         }
+        var participants = self.tables.len;
+        var retired_views: std.AutoHashMapUnmanaged(u64, domain.Resource) = .empty;
+        var extras: std.AutoHashMapUnmanaged(Key, void) = .empty;
+        for (self.resources) |resource| if (resource.kind == .view) try retired_views.put(a, resource.id, resource);
+        for (self.dependencies, 0..) |dependency, i| {
+            if (dependency.resource) |resource| {
+                for ([_][]const u8{ resource.name, resource.storage_name, resource.source_json, resource.location_json, resource.signature orelse "", resource.description orelse "" }) |text| {
+                    bytes = std.math.add(usize, bytes, text.len) catch return error.InvalidScopeRetirement;
+                }
+            }
+            if (dependency.table) |table| bytes = std.math.add(usize, bytes, table.preimage.len) catch return error.InvalidScopeRetirement;
+            if (dependency.schema_after) |schema| bytes = std.math.add(usize, bytes, schema.len) catch return error.InvalidScopeRetirement;
+            if (bytes > max_manifest_bytes) return error.InvalidScopeRetirement;
+            try dependency.validate(a);
+            const identity: Key = .{ .kind = dependency.kind, .id = dependency.id };
+            if ((i != 0 and !Dependency.less({}, self.dependencies[i - 1], dependency)) or
+                (dependency.kind == self.scope.root().kind and dependency.id == self.scope.root().id) or
+                members.contains(identity) or (try extras.getOrPut(a, identity)).found_existing) return error.InvalidScopeRetirement;
+            if (dependency.kind == .view and dependency.action == .retire) try retired_views.put(a, dependency.id, dependency.resource.?);
+            if (dependency.table) |table| {
+                participants += 1;
+                if (participants > max_participants or (try physical.getOrPut(a, table.physical_name)).found_existing) return error.InvalidScopeRetirement;
+            }
+        }
+        for (self.dependencies) |dependency| if (dependency.view_owner) |view| {
+            const resource = retired_views.get(view) orelse return error.InvalidScopeRetirement;
+            const Header = struct { materialization: ?struct { table_id: u64, storage_name: []const u8 } = null };
+            var header = try std.json.parseFromSlice(Header, a, resource.source_json, .{ .ignore_unknown_fields = true });
+            defer header.deinit();
+            const generation = header.value.materialization orelse return error.InvalidScopeRetirement;
+            if (generation.table_id != dependency.id or !std.mem.eql(u8, generation.storage_name, dependency.table.?.physical_name)) return error.InvalidScopeRetirement;
+        };
+        for (self.stamps, 0..) |stamp, i| {
+            if (stamp.id == 0 or std.mem.allEqual(u8, &stamp.digest, 0) or
+                (i != 0 and !Stamp.less({}, self.stamps[i - 1], stamp))) return error.InvalidScopeRetirement;
+            const kind: domain.Kind = if (stamp.kind == .foreign_key) .table else .sequence;
+            const identity: Key = .{ .kind = kind, .id = stamp.id };
+            if (!members.contains(identity) and !extras.contains(identity)) return error.InvalidScopeRetirement;
+        }
+        for (self.view_edges, 0..) |edge, i| {
+            if (edge.source == 0 or edge.view == 0 or !retired_views.contains(edge.view) or
+                (i != 0 and !ViewEdge.less({}, self.view_edges[i - 1], edge)) or
+                (!members.contains(.{ .kind = if (edge.source_kind == .table) .table else .view, .id = edge.source }) and
+                    !extras.contains(.{ .kind = if (edge.source_kind == .table) .table else .view, .id = edge.source }))) return error.InvalidScopeRetirement;
+        }
     }
 
     pub fn digest(self: Manifest, a: A) !Digest {
@@ -175,7 +346,7 @@ pub const Manifest = struct {
     }
 
     pub fn reference(self: Manifest, a: A, id: Id) !Reference {
-        const result: Reference = .{ .id = id, .digest = try self.digest(a), .database = self.scope.database.id, .root = self.scope.root().id, .kind = self.scope.kind, .tables = @intCast(self.tables.len), .resources = @intCast(self.resources.len) };
+        const result: Reference = .{ .id = id, .digest = try self.digest(a), .database = self.scope.database.id, .root = self.scope.root().id, .kind = self.scope.kind, .tables = @intCast(self.retirementCount()), .resources = @intCast(self.resources.len + self.dependencies.len) };
         try result.validate();
         return result;
     }
@@ -460,4 +631,69 @@ test "SQL scope retirement definition images cannot replace admitted physical id
     table.definition = Table.definitionDigest(changed);
     table.preimage = changed;
     try std.testing.expectError(error.InvalidScopeRetirement, table.validate(a));
+}
+
+fn exerciseDependencyFootprint(a: A) !void {
+    const primary = "{\"table_id\":111,\"name\":\"table:111\"}";
+    const backing = "{\"table_id\":112,\"name\":\"table:112\",\"sql_materialized_view_id\":90}";
+    const survivor = "{\"table_id\":211,\"name\":\"table:211\"}";
+    const held = "{\"table_id\":212,\"name\":\"table:212\"}";
+    const tables = [_]Table{.{ .id = 111, .physical_name = "table:111", .preimage = primary, .definition = Table.definitionDigest(primary), .ranges = @splat(4) }};
+    var dependencies = [_]Dependency{
+        .{ .kind = .table, .id = 112, .action = .retire, .view_owner = 90, .table = .{ .id = 112, .physical_name = "table:112", .preimage = backing, .definition = Table.definitionDigest(backing), .ranges = @splat(4) } },
+        .{ .kind = .table, .id = 211, .action = .rewrite, .schema_after = "{\"version\":2}", .table = .{ .id = 211, .physical_name = "table:211", .preimage = survivor, .definition = Table.definitionDigest(survivor), .ranges = @splat(4) } },
+        .{ .kind = .table, .id = 212, .action = .hold, .table = .{ .id = 212, .physical_name = "table:212", .preimage = held, .definition = Table.definitionDigest(held), .ranges = @splat(4) } },
+        .{ .kind = .view, .id = 90, .action = .retire, .resource = .{ .kind = .view, .id = 90, .parent_id = 2, .name = "external_view", .storage_name = "table:112", .source_json = "{\"materialization\":{\"table_id\":112,\"storage_name\":\"table:112\"}}" } },
+    };
+    var edges = [_]ViewEdge{
+        .{ .source_kind = .table, .source = 111, .column = 0, .view = 90 },
+        .{ .source_kind = .table, .source = 212, .column = 1, .view = 90 },
+    };
+    const stamps = [_]Stamp{.{ .kind = .foreign_key, .id = 111, .digest = @splat(8) }};
+    const manifest: Manifest = .{
+        .metadata_group_id = 7,
+        .scope = .{ .kind = .namespace, .database = .{ .kind = .database, .id = 9, .name = "tenant_ops" }, .namespace = .{ .kind = .namespace, .id = 10, .parent_id = 9, .name = "retired" } },
+        .metadata_incarnation = @splat(1),
+        .catalog_revision = 17,
+        .creator = .bootstrap,
+        .cascade = true,
+        .resources = &.{.{ .kind = .table, .id = 111, .parent_id = 10, .name = "events", .storage_name = "table:111" }},
+        .tables = &tables,
+        .dependencies = &dependencies,
+        .view_edges = &edges,
+        .stamps = &stamps,
+    };
+    const reference = try manifest.reference(a, @splat(5));
+    try std.testing.expectEqual(@as(u16, 2), reference.tables);
+    try std.testing.expectEqual(@as(u16, 5), reference.resources);
+    try std.testing.expect(manifest.contains(.view, 90));
+    try std.testing.expect(manifest.contains(.table, 212));
+    try std.testing.expect(!manifest.contains(.table, 999));
+    try std.testing.expectEqualStrings("table:112", manifest.tableById(112).?.physical_name);
+    try std.testing.expectEqualStrings("table:211", manifest.tableById(211).?.physical_name);
+    try std.testing.expect(manifest.tableById(999) == null);
+    const encoded = try std.json.Stringify.valueAlloc(a, manifest, .{});
+    defer a.free(encoded);
+    var cold = try std.json.parseFromSlice(Manifest, a, encoded, .{});
+    defer cold.deinit();
+    try std.testing.expectEqualDeep(reference.digest, try cold.value.digest(a));
+    dependencies[1].action = .hold;
+    try std.testing.expectError(error.InvalidScopeRetirement, manifest.validate(std.testing.allocator));
+    dependencies[1].action = .rewrite;
+    edges[0].source = 999;
+    try std.testing.expectError(error.InvalidScopeRetirement, manifest.validate(std.testing.allocator));
+    edges[0].source = 111;
+    dependencies[0].view_owner = 91;
+    try std.testing.expectError(error.InvalidScopeRetirement, manifest.validate(std.testing.allocator));
+    dependencies[0].view_owner = 90;
+    dependencies[1].schema_after = "{\"version\":3}";
+    try std.testing.expect(!std.mem.eql(u8, &reference.digest, &try manifest.digest(a)));
+}
+
+test "SQL scope retirement dependency footprint binds physical owners survivor rewrites and view closure" {
+    try exerciseDependencyFootprint(std.testing.allocator);
+}
+
+test "SQL scope retirement dependency footprint unwinds every allocation failure" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseDependencyFootprint, .{});
 }

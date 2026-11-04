@@ -44,6 +44,13 @@ const Campaign = struct {
         defer response.deinit(ctx.alloc);
         if (response.status != 200 and response.status != 202) std.debug.print("scope capture setup sql={s} status={d} body={s}\n", .{ sql, response.status, response.body });
         try std.testing.expect(response.status == 200 or response.status == 202);
+        if (response.status == 202) {
+            var parsed = try std.json.parseFromSlice(@import("antfly_metadata_openapi").types.SQLResponse, ctx.alloc, response.body, .{});
+            defer parsed.deinit();
+            const receipt = parsed.value.ddl_receipt orelse return error.MissingScopeSetupReceipt;
+            const serving = try fixture.waitServingSchemaInScope(ctx, receipt.database, receipt.namespace, receipt.table, 0);
+            try std.testing.expectEqual(try std.fmt.parseInt(u64, receipt.table_id, 10), serving.table_id);
+        }
     }
     fn observe(self: *@This(), ctx: *fixture.Context) !void {
         var arena: std.heap.ArenaAllocator = .init(ctx.alloc);
@@ -60,13 +67,45 @@ const Campaign = struct {
         const manifest = try std.json.parseFromSliceLeaky(contract.Manifest, a, bytes, .{});
         try manifest.validate(a);
         try std.testing.expectEqualStrings("tenant_ops", manifest.scope.root().name);
-        try std.testing.expectEqual(@as(usize, 1), manifest.tables.len);
-        try std.testing.expectEqual(@as(usize, 3), manifest.resources.len);
+        try std.testing.expectEqual(@as(usize, 2), manifest.tables.len);
+        try std.testing.expectEqual(@as(usize, 5), manifest.resources.len);
         var routines: usize = 0;
         for (manifest.resources) |resource| if (resource.kind == .routine) {
             routines += 1;
         };
         try std.testing.expectEqual(@as(usize, 2), routines);
+        try std.testing.expectEqual(@as(usize, 4), manifest.dependencies.len);
+        try std.testing.expectEqual(@as(usize, 3), manifest.stamps.len);
+        try std.testing.expect(manifest.view_edges.len >= 6);
+        var rewrites: usize = 0;
+        var held: usize = 0;
+        var retired_views: usize = 0;
+        for (manifest.dependencies) |dependency| switch (dependency.action) {
+            .rewrite => {
+                rewrites += 1;
+                try std.testing.expectEqualStrings("scope_borrower", dependency.resource.?.name);
+                const header = try std.json.parseFromSliceLeaky(struct { schema_json: []const u8 }, a, dependency.table.?.preimage, .{ .ignore_unknown_fields = true });
+                const before = try std.json.parseFromSliceLeaky(std.json.Value, a, header.schema_json, .{});
+                const after = try std.json.parseFromSliceLeaky(std.json.Value, a, dependency.schema_after.?, .{});
+                try std.testing.expectEqual(before.object.get("version").?.integer + 1, after.object.get("version").?.integer);
+                try std.testing.expectEqual(@as(usize, 3), before.object.get("foreign_keys").?.array.items.len);
+                try std.testing.expectEqual(@as(usize, 1), after.object.get("foreign_keys").?.array.items.len);
+                try std.testing.expectEqual(@as(usize, 2), before.object.get("column_defaults").?.array.items.len);
+                try std.testing.expectEqual(@as(usize, 1), after.object.get("column_defaults").?.array.items.len);
+            },
+            .hold => {
+                held += 1;
+                try std.testing.expectEqualStrings("scope_unchanged_parent", dependency.resource.?.name);
+                try std.testing.expect(dependency.schema_after == null);
+            },
+            .retire => {
+                retired_views += 1;
+                try std.testing.expectEqual(@as(@TypeOf(dependency.kind), .view), dependency.kind);
+            },
+        };
+        try std.testing.expectEqual(@as(usize, 1), rewrites);
+        try std.testing.expectEqual(@as(usize, 1), held);
+        try std.testing.expectEqual(@as(usize, 2), retired_views);
         const identity = try manifest.digest(a);
         if (self.identity) |expected| {
             try std.testing.expectEqual(self.table_id, manifest.tables[0].id);
@@ -108,6 +147,15 @@ const Campaign = struct {
             defer dependent.deinit(ctx.alloc);
             errdefer std.debug.print("reserved scope dependent status={d} body={s}\n", .{ dependent.status, dependent.body });
             try std.testing.expect(dependent.status >= 400);
+            for ([_][]const u8{
+                "ALTER TABLE public.scope_borrower ADD COLUMN scope_after text",
+                "ALTER TABLE public.scope_unchanged_parent ADD COLUMN scope_after text",
+            }) |statement| {
+                var blocked = try client.execute(ctx, statement, .never);
+                defer blocked.deinit(ctx.alloc);
+                errdefer std.debug.print("scope participant mutation SQL={s} status={d} body={s}\n", .{ statement, blocked.status, blocked.body });
+                try std.testing.expect(blocked.status >= 400);
+            }
         } else {
             const original = self.admitted.?;
             const prior = try std.json.parseFromSliceLeaky(wire.Observation, a, try http.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc).systemCatalog(a, context, .{ .scope_retirement_observation = original.query }), .{});
@@ -126,6 +174,8 @@ const Campaign = struct {
             // Identical dependency admission succeeds after native cancellation;
             // a parser/permission failure cannot satisfy the reservation test.
             try execute(ctx, "CREATE VIEW scope_new_dependent AS SELECT id FROM tenant_ops.events");
+            try execute(ctx, "ALTER TABLE public.scope_borrower ADD COLUMN scope_after text");
+            try execute(ctx, "ALTER TABLE public.scope_unchanged_parent ADD COLUMN scope_after text");
             try execute(ctx, "CREATE TABLE tenant_ops.resumed(id bigint PRIMARY KEY)");
         }
     }
@@ -146,13 +196,31 @@ const Campaign = struct {
         try std.testing.expectEqual(expected.len, result.rows.len);
         const nulls = result.sql_nulls orelse return error.MissingSqlNullBitmap;
         for (expected, result.rows, nulls) |want, row, flags| try std.testing.expect(try compare.rowMatchesWithNulls(ctx.alloc, result.columns, row, flags, want, &.{ false, false }));
+        var borrower = try client.execute(ctx, "SELECT id,event_id,other_id,parent_id,token,status FROM public.scope_borrower", .read);
+        defer borrower.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), borrower.status);
+        var parsed_borrower = try std.json.parseFromSlice(@import("antfly_metadata_openapi").types.SQLResponse, ctx.alloc, borrower.body, .{});
+        defer parsed_borrower.deinit();
+        const borrowed = parsed_borrower.value;
+        try std.testing.expectEqual(@as(usize, 1), borrowed.rows.len);
+        const values = [_]std.json.Value{ .{ .integer = 7 }, .{ .integer = 1 }, .{ .integer = 1 }, .{ .integer = 9 }, .{ .integer = 100 }, .{ .string = "kept" } };
+        try std.testing.expect(try compare.rowMatchesWithNulls(ctx.alloc, borrowed.columns, borrowed.rows[0], borrowed.sql_nulls.?[0], &values, &.{ false, false, false, false, false, false }));
     }
     pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
         try self.credentials.activateWithCatalog(ctx, true);
         ctx.headers = ctx.admin_headers;
+        try execute(ctx, "CREATE TABLE public.scope_unchanged_parent(id bigint PRIMARY KEY)");
+        try execute(ctx, "INSERT INTO public.scope_unchanged_parent VALUES (9)");
         try execute(ctx, "CREATE SCHEMA tenant_ops");
-        try execute(ctx, "CREATE TABLE tenant_ops.events(id bigint PRIMARY KEY, payload text)");
-        try execute(ctx, "INSERT INTO tenant_ops.events VALUES (1,'kept'),(2,'durable')");
+        try execute(ctx, "CREATE TABLE tenant_ops.events(id bigint PRIMARY KEY, payload text, outside_id bigint REFERENCES public.scope_unchanged_parent(id), token BIGSERIAL)");
+        try execute(ctx, "INSERT INTO tenant_ops.events(id,payload,outside_id,token) VALUES (1,'kept',9,1000),(2,'durable',9,1001)");
+        try execute(ctx, "CREATE TABLE tenant_ops.parent2(id bigint PRIMARY KEY)");
+        try execute(ctx, "INSERT INTO tenant_ops.parent2 VALUES (1)");
+        try execute(ctx, "ALTER SEQUENCE tenant_ops.events_token_seq RESTART WITH 100");
+        try execute(ctx, "CREATE TABLE public.scope_borrower(LIKE tenant_ops.events INCLUDING DEFAULTS, PRIMARY KEY(id), event_id bigint REFERENCES tenant_ops.events(id), other_id bigint REFERENCES tenant_ops.parent2(id), parent_id bigint REFERENCES public.scope_unchanged_parent(id), status text DEFAULT 'kept')");
+        try execute(ctx, "INSERT INTO public.scope_borrower(id,event_id,other_id,parent_id) VALUES (7,1,1,9)");
+        try execute(ctx, "CREATE VIEW public.scope_v1 AS SELECT id FROM tenant_ops.events");
+        try execute(ctx, "CREATE VIEW public.scope_v2 AS SELECT v.id FROM public.scope_v1 v JOIN tenant_ops.parent2 p ON v.id=p.id");
         try execute(ctx, "CREATE FUNCTION tenant_ops.audit(text) RETURNS text LANGUAGE SQL AS 'SELECT $1'");
         try execute(ctx, "CREATE FUNCTION tenant_ops.audit(bigint) RETURNS bigint LANGUAGE SQL AS 'SELECT $1'");
         try self.observe(ctx);

@@ -102,6 +102,18 @@ pub const SessionRef = struct {
     }
 };
 
+/// Feature requirements compose: a notification or connection contract may
+/// never weaken the decoder needed to own/release native lock custody.
+fn decoderFloor(connection: bool, locks: bool, handoff: bool, notifications: bool) u16 {
+    const protocol = @import("../metadata/topology_protocol.zig");
+    var minimum = protocol.sql_prepared_transactions_version;
+    if (connection) minimum = @max(minimum, protocol.sql_connection_transactions_version);
+    if (locks) minimum = @max(minimum, protocol.sql_native_lock_custody_version);
+    if (handoff) minimum = @max(minimum, protocol.sql_prepared_lock_handoff_version);
+    if (notifications) minimum = @max(minimum, protocol.sql_notifications_version);
+    return minimum;
+}
+
 pub const Identity = struct {
     notification_plan: ?local.sql_ast.notifications.Plan = null,
     kind: Kind = .named,
@@ -121,9 +133,7 @@ pub const Identity = struct {
     manifest_digest: [32]u8,
 
     pub fn minimumDecoderVersion(self: Identity) u16 {
-        const protocol = @import("../metadata/topology_protocol.zig");
-        if (self.notification_plan != null) return protocol.sql_notifications_version;
-        return if (self.lock_scope != null and self.kind == .named) protocol.sql_prepared_lock_handoff_version else if (self.lock_scope != null) protocol.sql_lock_authority_version else if (self.requiresConnectionDecoder()) protocol.sql_connection_transactions_version else protocol.sql_prepared_transactions_version;
+        return decoderFloor(self.requiresConnectionDecoder(), self.lock_scope != null, self.lock_scope != null and self.kind == .named, self.notification_plan != null);
     }
     pub fn preparedLockLease(self: Identity, a: A, group: u64) !local.storage_pessimistic_lock_ledger.Lease {
         if (self.kind != .named or self.lock_scope == null or self.session == null) return error.InvalidCatalogMutation;
@@ -786,6 +796,9 @@ pub const Receipt = struct {
     /// contract after the metadata job and native coordinator are retired.
     decision: ?Decision = null,
     progress: CommitProgress = .ready,
+    pub fn minimumDecoderVersion(self: Receipt) u16 {
+        return decoderFloor(self.kind == .session_commit or self.session.standalone, self.lock_scope != null, self.lock_scope != null and self.kind == .named, false);
+    }
     pub fn jsonStringify(self: Receipt, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Receipt).@"struct".field_names) |field| {

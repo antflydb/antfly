@@ -4089,7 +4089,7 @@ const Parser = struct {
 
     fn foreignKeyDefinition(self: *Parser, constraint_name: []const u8, columns: []const []const u8) Error!ast.SchemaChange {
         if (!self.ddlWord("REFERENCES")) return self.fail(error.InvalidSqlSyntax, "expected REFERENCES");
-        const parent = try self.identifier();
+        const parent = try self.name();
         var foreign: @FieldType(ast.SchemaChange, "add_foreign_key") = .{ .name = constraint_name, .columns = columns, .parent = parent, .parent_columns = try self.ddlColumnList() };
         var on_delete = false;
         var on_update = false;

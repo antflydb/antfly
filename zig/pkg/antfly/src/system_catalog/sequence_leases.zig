@@ -66,6 +66,7 @@ pub fn parse(group: u64, raw: []const u8, value: []const u8) !Key {
     return .{ .counter = counter, .table = table, .publication = id };
 }
 pub fn acquire(txn: anytype, group: u64, counter: u64, owner: Owner) !void {
+    if (try @import("../metadata/scope_retirement_fence.zig").occupied(txn, group, "sequence", counter)) return error.CatalogPublicationProofPending;
     var buf: [256]u8 = undefined;
     const storage_key = try key(&buf, group, counter, owner);
     if (txn.get(storage_key)) |_| return error.InvalidSequenceState else |err| if (err != error.NotFound) return err;

@@ -343,7 +343,8 @@ pub const ForeignKey = struct {
     name: []const u8,
     name_generated: bool = false,
     columns: []const []const u8,
-    parent: []const u8,
+    /// Unbound SQL identity. Qualification survives until native catalog binding.
+    parent: Name,
     parent_columns: []const []const u8,
     on_delete: []const u8 = "no_action",
     on_update: []const u8 = "no_action",

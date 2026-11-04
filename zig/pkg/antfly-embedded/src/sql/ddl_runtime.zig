@@ -1779,3 +1779,41 @@ test "SQL DDL bound callbacks preserve type and expression owners through backen
     try std.testing.expectEqual(@as(usize, 1), decorator.dispatches);
     try std.testing.expectEqual(@as(usize, 2), decorator.checkpoints);
 }
+
+fn qualifiedForeignKeyCandidates(a: std.mem.Allocator) !void {
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    const cases = [_]struct { sql: []const u8, database: ?[]const u8 = null, namespace: ?[]const u8 = null, table: []const u8 }{
+        .{ .sql = "CREATE TABLE child(id bigint REFERENCES parent(id))", .table = "parent" },
+        .{ .sql = "CREATE TABLE child(id bigint REFERENCES public.parent(id))", .namespace = "public", .table = "parent" },
+        .{ .sql = "CREATE TABLE child(id bigint REFERENCES \"Other.Scope\".\"Parent.With.Dot\"(id))", .namespace = "Other.Scope", .table = "Parent.With.Dot" },
+        .{ .sql = "CREATE TABLE child(id bigint, CONSTRAINT fk FOREIGN KEY(id) REFERENCES warehouse.public.parent(id))", .database = "warehouse", .namespace = "public", .table = "parent" },
+    };
+    for (cases) |case| {
+        var compiled = try @import("compiler.zig").compile(a, case.sql, .{});
+        defer compiled.deinit();
+        const fk = compiled.statement.create_table.constraints[0].add_foreign_key;
+        try std.testing.expectEqualDeep(case.database, fk.parent.database);
+        try std.testing.expectEqualDeep(case.namespace, fk.parent.namespace);
+        try std.testing.expectEqualStrings(case.table, fk.parent.table);
+        const schema = try std.json.parseFromSliceLeaky(std.json.Value, scratch, try createSchemaAlloc(scratch, compiled.statement.create_table), .{});
+        const parent = schema.object.get("foreign_keys").?.array.items[0].object.get("parent_table").?;
+        if (case.namespace == null) {
+            try std.testing.expectEqualStrings(case.table, parent.string);
+        } else {
+            const name = try std.json.parseFromValueLeaky(ast.Name, scratch, parent, .{});
+            try std.testing.expectEqualDeep(case.database, name.database);
+            try std.testing.expectEqualDeep(case.namespace, name.namespace);
+            try std.testing.expectEqualStrings(case.table, name.table);
+        }
+    }
+    var alter = try @import("compiler.zig").compile(a, "ALTER TABLE child ADD CONSTRAINT fk FOREIGN KEY(id) REFERENCES \"Other.Scope\".parent(id)", .{});
+    defer alter.deinit();
+    try std.testing.expectEqualStrings("Other.Scope", alter.statement.catalog_ddl.schema_change.?.add_foreign_key.parent.namespace.?);
+}
+
+test "SQL qualified foreign key candidates retain components and quoted identity through allocation faults" {
+    try qualifiedForeignKeyCandidates(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, qualifiedForeignKeyCandidates, .{});
+}

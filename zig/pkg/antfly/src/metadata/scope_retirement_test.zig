@@ -622,3 +622,152 @@ test "SQL scope retirement admission excludes every lifecycle kind and FK parent
         try dependencies.acquire(scratch, &txn, child, source);
     }
 }
+
+test "SQL scope retirement dependency intents abort every journal write and survive cold custody until atomic cancellation" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/scope-dependency-intents", .{tmp.sub_path});
+    var encoded: []const u8 = undefined;
+    var admitted: ledger.Head = undefined;
+    for (0..2) |pass| {
+        var store = try native.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer store.deinit();
+        if (pass == 0) {
+            try seed(&store, scratch);
+            try store.applyStandaloneCommand(group, .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(scratch, native.SystemCatalogCommand{ .expected_revision = 3, .mutation = .{ .action = .create, .kind = .database, .name = "outside" } }, .{}) });
+            for (0..2) |i| {
+                const id: u64 = 303 + i;
+                const name = try std.fmt.allocPrint(scratch, "table:{d}", .{id});
+                const table: @import("domain.zig").TableRecord = .{ .table_id = id, .name = name, .min_ranges = 1, .schema_json = "{\"version\":1}" };
+                const ranges = [_]@import("domain.zig").RangeRecord{.{ .table_id = id, .group_id = 503 + i, .range_id = 503 + i, .start_key = "" }};
+                try store.applyStandaloneCommand(group, .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(scratch, native.SystemCatalogCommand{ .expected_revision = 4 + i, .mutation = .{ .action = .create, .kind = .table, .database = "outside", .name = if (i == 0) "survivor" else "held_parent", .table_id = id, .storage_name = name }, .topology = .{ .create = .{ .expected_transition_generation = 0, .table = table, .ranges = &ranges } } }, .{}) });
+            }
+            var selected = try std.json.parseFromSliceLeaky(contract.Manifest, scratch, try store.prepareScopeRetirementManifestJsonWithContext(scratch, group, .{ .kind = .database, .name = "tenant_ops", .creator = .bootstrap }, .{}), .{});
+            const outside = try std.json.parseFromSliceLeaky(contract.Manifest, scratch, try store.prepareScopeRetirementManifestJsonWithContext(scratch, group, .{ .kind = .database, .name = "outside", .creator = .bootstrap }, .{}), .{});
+            var footprint_dependencies: [2]contract.Dependency = undefined;
+            var found: usize = 0;
+            for (outside.resources) |resource| if (resource.kind == .table) {
+                footprint_dependencies[found] = .{ .kind = .table, .id = resource.id, .resource = resource, .table = outside.tableById(resource.id).?, .action = if (found == 0) .rewrite else .hold, .schema_after = if (found == 0) "{\"version\":2}" else null };
+                found += 1;
+            };
+            try std.testing.expectEqual(@as(usize, 2), found);
+            selected.dependencies = &footprint_dependencies;
+            // Exercise journal custody independently of dependency discovery.
+            // Both immutable preimages are captured from actual native owners;
+            // this test does not manufacture physical publication authority.
+            try selected.validate(scratch);
+            encoded = try std.json.Stringify.valueAlloc(scratch, selected, .{});
+        }
+        var prepared = try ledger.prepare(a, group, @splat(93), encoded);
+        defer prepared.deinit();
+        if (pass == 0) {
+            const writes = 5 + prepared.manifest.resources.len + prepared.manifest.dependencies.len;
+            for (0..writes) |fail_at| {
+                var txn = try store.store.beginWriteTxn();
+                var fault: Fault = .{ .txn = &txn, .remaining = fail_at };
+                const result = ledger.stageBegin(&fault, &prepared);
+                txn.abort();
+                try std.testing.expectError(error.InjectedFailure, result);
+                try absent(&store, prepared.lookup);
+                var read = try store.store.beginReadTxn();
+                defer read.abort();
+                for (prepared.manifest.dependencies) |dependency| try std.testing.expect(try ledger.member(&read, group, dependency.kind, dependency.id) == null);
+            }
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            admitted = try ledger.stageBegin(&txn, &prepared);
+            try txn.commit();
+        } else {
+            {
+                var txn = try store.store.beginWriteTxn();
+                defer txn.abort();
+                try ledger.requireMembers(&txn, &prepared, admitted);
+                for (prepared.manifest.dependencies) |dependency| {
+                    var lease = (try ledger.member(&txn, group, dependency.kind, dependency.id)).?;
+                    try std.testing.expectEqual(dependency.action, lease.intent);
+                    try std.testing.expectError(error.GenerationPublicationChanged, lifecycle.acquire(&txn, group, dependency.id, .{ .kind = .index_build, .id = @splat(8) }));
+                    lease.intent = .retire;
+                    const altered = try ledger.LeaseRecord.init(lease);
+                    var buffer: [256]u8 = undefined;
+                    try txn.put(try ledger.memberKey(&buffer, group, dependency.kind, dependency.id), altered.slice());
+                    try std.testing.expectError(error.InvalidScopeRetirement, ledger.requireMembers(&txn, &prepared, admitted));
+                    lease.intent = dependency.action;
+                    const restored = try ledger.LeaseRecord.init(lease);
+                    try txn.put(try ledger.memberKey(&buffer, group, dependency.kind, dependency.id), restored.slice());
+                }
+            }
+            const canceled = try admitted.progress.cancelBeforeEffects();
+            const writes = 4 + prepared.manifest.resources.len + prepared.manifest.dependencies.len;
+            for (0..writes) |fail_at| {
+                var txn = try store.store.beginWriteTxn();
+                var fault: Fault = .{ .txn = &txn, .remaining = fail_at };
+                const result = ledger.stageAdvance(&fault, &prepared, admitted, canceled);
+                txn.abort();
+                try std.testing.expectError(error.InjectedFailure, result);
+                var read = try store.store.beginReadTxn();
+                defer read.abort();
+                try ledger.requireMembers(&read, &prepared, admitted);
+            }
+            var txn = try store.store.beginWriteTxn();
+            var committed = false;
+            defer if (!committed) txn.abort();
+            const terminal = try ledger.stageAdvance(&txn, &prepared, admitted, canceled);
+            try txn.commit();
+            committed = true;
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqualDeep(terminal, (try ledger.existing(&read, &prepared)).?);
+            for (prepared.manifest.dependencies) |dependency| try std.testing.expect(try ledger.member(&read, group, dependency.kind, dependency.id) == null);
+        }
+    }
+}
+
+test "SQL scope retirement raced committed definition and topology commands preserve custody without blocking later entries" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/scope-committed-noop", .{tmp.sub_path});
+    var store = try native.RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    try seed(&store, scratch);
+    const before = (try store.getTable(scratch, group, 101)).?;
+    const range_before = (try store.getRange(scratch, group, 301)).?;
+    const admitted = (try AdmissionHarness.apply(&store, scratch, try AdmissionHarness.request(&store, scratch, 94), 1, true)).outcome.?;
+    var changed = before;
+    changed.schema_json = "{\"version\":2}";
+    var range_changed = range_before;
+    range_changed.start_key = "late-stale-boundary";
+    // Admission remains a precise refusal. A proposal that raced admission
+    // is already in the log and must instead be an effect-free applied entry.
+    try std.testing.expectError(error.TableTransitionActive, store.applyStandaloneCommand(group, .{ .upsert_table = changed }));
+    try std.testing.expectError(error.TableTransitionActive, store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = before, .replacement = changed } }));
+    const commands = [_]native.TransitionCommand{
+        .{ .upsert_table = changed },
+        .{ .compare_and_replace_table = .{ .expected = before, .replacement = changed } },
+        .{ .upsert_range = range_changed },
+        .{ .remove_range = .{ .group_id = 301 } },
+        .{ .upsert_table = .{ .table_id = 999, .name = "unscoped", .min_ranges = 1 } },
+    };
+    const raft = @import("../raft/state_machine/mod.zig");
+    var entries: [commands.len]@import("raft_engine").core.Entry = undefined;
+    for (commands, &entries, 0..) |command, *entry, i| entry.* = .{ .term = 1, .index = 2 + i, .entry_type = .normal, .data = try native.encodeTransitionCommand(scratch, command) };
+    try store.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = 1 + commands.len, .entries_bytes = try raft.encodeCommittedEntries(scratch, &entries) });
+    try std.testing.expectEqualDeep(before, (try store.getTable(scratch, group, 101)).?);
+    try std.testing.expectEqualDeep(range_before, (try store.getRange(scratch, group, 301)).?);
+    try std.testing.expectEqualStrings("unscoped", (try store.getTable(scratch, group, 999)).?.name);
+    const custody = try std.json.parseFromSliceLeaky(wire.Observation, scratch, try store.scopeRetirementObservationJson(scratch, group, admitted.query), .{});
+    try std.testing.expectEqualDeep(admitted.result.accepted, custody.current.?);
+    const snapshot = try store.snapshotBuilder().buildSnapshot(scratch, group);
+    try std.testing.expect(snapshot.len != 0);
+    _ = try AdmissionHarness.apply(&store, scratch, AdmissionHarness.cancel(admitted.query.lookup, 95), 2 + commands.len, true);
+    const encoded = try native.encodeTransitionCommand(scratch, .{ .upsert_table = changed });
+    try store.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = 3 + commands.len, .entries_bytes = try raft.encodeCommittedEntries(scratch, &.{.{ .term = 1, .index = 3 + commands.len, .entry_type = .normal, .data = encoded }}) });
+    try std.testing.expectEqualStrings(changed.schema_json, (try store.getTable(scratch, group, 101)).?.schema_json);
+}

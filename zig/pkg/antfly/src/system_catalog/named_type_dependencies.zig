@@ -166,6 +166,7 @@ pub fn retirementLock(txn: anytype, group: u64, type_id: u64) !?RetirementLock {
 }
 pub fn acquireRetirement(txn: anytype, group: u64, type_id: u64, lock: RetirementLock) !void {
     const bytes = try lock.encode();
+    if (try @import("../metadata/scope_retirement_fence.zig").occupied(txn, group, "named_type", type_id)) return error.CatalogPublicationProofPending;
     if (try retirementLock(txn, group, type_id) != null) return error.CatalogPublicationProofPending;
     var buffer: [192]u8 = undefined;
     try txn.put(try retirementKey(&buffer, group, type_id), &bytes);

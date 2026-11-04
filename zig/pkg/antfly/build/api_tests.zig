@@ -2386,6 +2386,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners",
             "mounted SQL original server COPY",
             "mounted SQL scope retirement capture",
+            "system catalog binds foreign keys once and authorizes cascades by current logical names",
             "SQL pgwire retained mutation preparation",
             "mounted SQL temporal originals and mutation assignments preserve diagnostics precise kinds and cold postimages",
             "mounted SQL temporal view domains survive nested replacement and cold owners",
@@ -2678,7 +2679,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const copy_input_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners", "SQL pgwire retained mutation preparation", "SQL schema cache COPY validator leases" });
     copy_input_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-copy-input-lifecycle-test", "Verify atomic COPY input through authenticated native transactions and cold owners").dependOn(&copy_input_run.step);
-    const scope_retirement_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL scope retirement capture"});
+    const scope_retirement_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL scope retirement capture", "system catalog binds foreign keys once and authorizes cascades by current logical names" });
     scope_retirement_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-scope-retirement-test", "Verify ancestor retirement capture across the native metadata and storage owner boundary").dependOn(&scope_retirement_run.step);
     const server_copy_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original server COPY"});

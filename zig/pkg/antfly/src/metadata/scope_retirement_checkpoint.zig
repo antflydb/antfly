@@ -27,18 +27,14 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
     const base = try ledger.prefix(&base_buffer, group);
     // The sibling member/queue/counter namespaces share this exact stem.
     const stem = base[0 .. base.len - 1];
-    var expected: [5]u64 = @splat(0); // body, member, queue, cancellation outcome/link
-    var received: [5]u64 = @splat(0);
+    var expected: [6]u64 = @splat(0); // body, member, queue, cancellation outcome/link, view edges
+    var received: [6]u64 = @splat(0);
     var heads: u64 = 0;
     var maximum_sequence: u64 = 0;
     var counter: ?u64 = null;
     try rows.reset();
     while (try rows.next()) |row| {
         if (canceled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
-        if (try @import("schema_validation_dependencies.zig").Key.parse(row.key)) |dependency| {
-            if (dependency.group == group and dependency.parent != null and
-                try @import("scope_retirement_fence.zig").occupied(reader, group, "table", dependency.parent.?)) return error.InvalidScopeRetirement;
-        }
         if (!std.mem.startsWith(u8, row.key, stem)) continue;
         const suffix = row.key[stem.len..];
         if (std.mem.eql(u8, suffix, "-sequence")) {
@@ -126,9 +122,14 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
                     !prepared.manifest.creator.eql(head.creator)) return error.InvalidScopeRetirement;
                 try ledger.requireMembers(reader, &prepared, head);
                 try context.verifyManifest(reader, head, prepared.manifest);
+                for (prepared.manifest.view_edges) |edge| {
+                    const selected = try @import("../system_catalog/views.zig").dependencyKey(&buffer, group, .{ .kind = if (edge.source_kind == .table) .table else .view, .id = edge.source, .column = edge.column }, edge.view);
+                    if (!std.mem.eql(u8, try reader.get(selected), &.{1})) return error.InvalidScopeRetirement;
+                }
                 try increment(&expected[0], 1);
-                try increment(&expected[1], 1 + prepared.manifest.resources.len);
+                try increment(&expected[1], 1 + prepared.manifest.resources.len + prepared.manifest.dependencies.len);
                 try increment(&expected[2], 1);
+                try increment(&expected[5], prepared.manifest.view_edges.len);
             } else {
                 if (body != null) return error.InvalidScopeRetirement;
                 if ((reader.get(try ledger.queueKey(&buffer, group, head.sequence)) catch |err| switch (err) {
@@ -137,6 +138,41 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
                 }) != null) return error.InvalidScopeRetirement;
             }
         } else return error.InvalidScopeRetirement;
+    }
+    // Inactive catalogs pay no lease lookup per unrelated FK/view edge. While
+    // a scope is active, one reverse pass proves no dependent escaped its cut.
+    if (expected[1] != 0) {
+        var view_buffer: [128]u8 = undefined;
+        const view_leases = @import("../system_catalog/view_leases.zig");
+        const view_prefix = try view_leases.prefix(&view_buffer, group);
+        var sequence_buffer: [128]u8 = undefined;
+        const sequence_leases = @import("../system_catalog/sequence_leases.zig");
+        const sequence_prefix = try sequence_leases.prefix(&sequence_buffer, group);
+        try rows.reset();
+        while (try rows.next()) |row| {
+            if (canceled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+            if (try @import("schema_validation_dependencies.zig").Key.parse(row.key)) |dependency| {
+                if (dependency.group == group and dependency.parent != null and
+                    try @import("scope_retirement_fence.zig").occupied(reader, group, "table", dependency.parent.?)) return error.InvalidScopeRetirement;
+            }
+            if (std.mem.startsWith(u8, row.key, view_prefix)) {
+                const selected = try view_leases.parse(group, row.key, row.value);
+                if (try ledger.member(reader, group, .view, selected.view) != null) return error.InvalidScopeRetirement;
+            }
+            if (std.mem.startsWith(u8, row.key, sequence_prefix)) {
+                const selected = try sequence_leases.parse(group, row.key, row.value);
+                if (try ledger.member(reader, group, .sequence, selected.counter) != null) return error.InvalidScopeRetirement;
+            }
+            const edge = (try @import("../system_catalog/views.zig").dependencyFromKey(row.key, group)) orelse continue;
+            const source = try ledger.member(reader, group, if (edge.dependency.kind == .table) .table else .view, edge.dependency.id);
+            const owner = try ledger.member(reader, group, .view, edge.view);
+            if (source != null and source.?.intent == .retire and
+                (owner == null or owner.?.intent != .retire or !std.meta.eql(owner.?.lookup, source.?.lookup))) return error.InvalidScopeRetirement;
+            if (owner != null and owner.?.intent == .retire) {
+                if (source == null or !std.meta.eql(owner.?.lookup, source.?.lookup)) return error.InvalidScopeRetirement;
+                try increment(&received[5], 1);
+            }
+        }
     }
     if (!std.meta.eql(expected, received)) return error.InvalidScopeRetirement;
     // Heads and outcomes are retained until a coordinated retention protocol is

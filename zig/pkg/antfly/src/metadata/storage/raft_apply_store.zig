@@ -19296,6 +19296,8 @@ pub const RaftApplyStore = struct {
         var committed = false;
         defer if (!committed) txn.abort();
         if (self.hasHotStandbyMirror()) txn.mutation_capture = &capture;
+        if (scopeDefinitionCommandOwner(command)) |owner|
+            if (try scope_retirement.member(&txn, group_id, .table, owner) != null) return error.TableTransitionActive;
         if (command == .comment_column) {
             const candidate = try self.prepareColumnDescriptionTxn(&txn, group_id, command.comment_column);
             self.alloc.free(candidate);
@@ -20976,6 +20978,16 @@ pub const RaftApplyStore = struct {
         defer if (publication) |*value| value.deinit();
         const value = publication orelse return true;
         return value.value.phase == .disabled and !system_catalog_storage.policyPublicationNeedsWork(value.value);
+    }
+
+    /// A raced topology proposal is already committed. Preserve the immutable
+    /// owner cut as a deterministic no-op instead of poisoning Raft apply;
+    /// actual storage/corruption errors still fail the command.
+    fn committedTopologyMutationAllowedTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !bool {
+        return self.relationTopologyMutationAllowedTxn(txn, group_id, table_id) catch |err| switch (err) {
+            error.TableTransitionActive => false,
+            else => return err,
+        };
     }
 
     /// Admission gives callers a useful conflict before proposing a command;
@@ -23119,34 +23131,272 @@ pub const RaftApplyStore = struct {
             pub fn table(reader: *@This(), resource: system_catalog.Resource) !contract.Table {
                 try reader.context.ensureActive();
                 if (resource.native_service != null) return error.ProtectedCatalogResource;
-                var region: std.heap.ArenaAllocator = .init(reader.store.alloc);
-                defer region.deinit();
-                const scratch = region.allocator();
-                const record = (try reader.store.getTableTxn(scratch, reader.view.txn, reader.view.group_id, resource.id)) orelse return error.CatalogGenerationChanged;
-                if (!std.mem.eql(u8, record.name, resource.storage_name)) return error.CatalogGenerationChanged;
-                if (record.read_schema_json.len != 0 or record.storage_migration != null or record.restore_backup_id.len != 0 or record.relational_retirement_json.len != 0 or
-                    try reader.store.fkGenerationTableLockedTxn(reader.view.txn, reader.view.group_id, record.table_id) or
-                    try backupCohortLocksTableTxn(reader.view.txn, reader.view.group_id, record.table_id) or
-                    try restoreStagingLocksTableTxn(reader.view.txn, reader.view.group_id, record.table_id) or
-                    (try reader.store.loadTableTransitionFenceTxn(reader.view.txn, reader.view.group_id, record.table_id)).active()) return error.TableTransitionActive;
-                if (try reader.store.extensionOwnsTableTxn(reader.view.txn, reader.view.group_id, record.name)) return error.ExtensionOwnedObject;
-                try reader.budget.add(record);
-                const ranges = try reader.store.tableRetirementRangesTxn(scratch, reader.view.txn, reader.view.group_id, record.table_id, &reader.budget);
-                const preimage = try std.json.Stringify.valueAlloc(reader.view.alloc, record, .{});
-                return .{ .id = resource.id, .physical_name = resource.storage_name, .definition = contract.Table.definitionDigest(preimage), .ranges = try hashValue(ranges, "antfly/scope-retirement-ranges/v1\x00"), .preimage = preimage };
-            }
-            fn hashValue(value: anytype, label: []const u8) !contract.Digest {
-                var writer = std.Io.Writer.Hashing(std.crypto.hash.Blake3).initHasher(std.crypto.hash.Blake3.init(.{}), &.{});
-                try writer.writer.writeAll(label);
-                try std.json.Stringify.value(value, .{}, &writer.writer);
-                var digest: contract.Digest = undefined;
-                writer.hasher.final(&digest);
-                return digest;
+                const captured = try reader.store.captureScopeTableTxn(reader.view.alloc, reader.view.txn, reader.view.group_id, resource.id, .retire, &reader.budget, reader.context);
+                if (!std.mem.eql(u8, captured.physical_name, resource.storage_name)) return error.CatalogGenerationChanged;
+                return captured;
             }
         };
         var reader: Reader = .{ .store = self, .view = view, .context = context };
         const manifest = try contract.capture(a, &reader, group, scope, try catalogIncarnationTxn(read, group), meta.revision, request);
-        return manifest;
+        return self.captureScopeDependenciesTxn(a, read, group, manifest, &reader.budget, context);
+    }
+
+    fn scopeFingerprint(value: anytype, label: []const u8) !system_catalog.scope_retirement.Digest {
+        var writer = std.Io.Writer.Hashing(std.crypto.hash.Blake3).initHasher(std.crypto.hash.Blake3.init(.{}), &.{});
+        try writer.writer.writeAll(label);
+        try std.json.Stringify.value(value, .{}, &writer.writer);
+        var digest: system_catalog.scope_retirement.Digest = undefined;
+        writer.hasher.final(&digest);
+        return digest;
+    }
+
+    const ScopeTableIntent = enum { retire, reference };
+    fn requireScopeTableAvailableTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, record: metadata.TableRecord, intent: ScopeTableIntent) !void {
+        const id = record.table_id;
+        if (record.read_schema_json.len != 0 or record.storage_migration != null or record.restore_backup_id.len != 0 or record.relational_retirement_json.len != 0 or
+            try self.fkGenerationTableLockedTxn(txn, group, id) or try backupCohortLocksTableTxn(txn, group, id) or
+            try restoreStagingLocksTableTxn(txn, group, id) or (try self.loadTableTransitionFenceTxn(txn, group, id)).active()) return error.TableTransitionActive;
+        if (intent == .retire and try self.extensionOwnsTableTxn(txn, group, record.name)) return error.ExtensionOwnedObject;
+    }
+    fn scopeTableFromCut(a: std.mem.Allocator, record: metadata.TableRecord, ranges: []const metadata.RangeRecord) !system_catalog.scope_retirement.Table {
+        const contract = system_catalog.scope_retirement;
+        const preimage = try std.json.Stringify.valueAlloc(a, record, .{});
+        return .{ .id = record.table_id, .physical_name = try a.dupe(u8, record.name), .definition = contract.Table.definitionDigest(preimage), .ranges = try scopeFingerprint(ranges, "antfly/scope-retirement-ranges/v1\x00"), .preimage = preimage };
+    }
+    fn captureScopeTableTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, id: u64, intent: ScopeTableIntent, budget: *RetirementCaptureBudget, context: @import("antfly_local_sources").api_operation.RequestContext) !system_catalog.scope_retirement.Table {
+        try context.ensureActive();
+        var region: std.heap.ArenaAllocator = .init(self.alloc);
+        defer region.deinit();
+        const scratch = region.allocator();
+        const record = (try self.getTableTxn(scratch, txn, group, id)) orelse return error.CatalogGenerationChanged;
+        try self.requireScopeTableAvailableTxn(txn, group, record, intent);
+        try budget.add(record);
+        const ranges = try self.tableRetirementRangesTxn(scratch, txn, group, id, budget);
+        return scopeTableFromCut(a, record, ranges);
+    }
+
+    const ScopeDependencyCapture = struct {
+        const contract = system_catalog.scope_retirement;
+        const Key = struct { kind: system_catalog.Kind, id: u64 };
+        const Header = struct { schema_json: []const u8 = "{}" };
+        const Declarations = struct {
+            storage_mode: enum { document, relational } = .document,
+            foreign_keys: ?[]const struct { parent_table: []const u8 } = null,
+        };
+        store: *RaftApplyStore,
+        a: std.mem.Allocator,
+        txn: *docstore.DocStore.Txn,
+        group: u64,
+        base: contract.Manifest,
+        budget: *RetirementCaptureBudget,
+        context: @import("antfly_local_sources").api_operation.RequestContext,
+        dependencies: std.ArrayList(contract.Dependency) = .empty,
+        slots: std.AutoHashMapUnmanaged(Key, usize) = .empty,
+        retired: std.ArrayList(contract.Table) = .empty,
+        retired_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
+        sequences: std.AutoHashMapUnmanaged(u64, system_catalog.Resource) = .empty,
+        rewrites: std.AutoHashMapUnmanaged(u64, void) = .empty,
+        stamps: std.ArrayList(contract.Stamp) = .empty,
+        participants: usize = 0,
+
+        fn resource(self: *@This(), kind: system_catalog.Kind, id: u64) !?system_catalog.Resource {
+            try self.context.ensureActive();
+            if (self.slots.get(.{ .kind = kind, .id = id })) |position| return self.dependencies.items[position].resource;
+            var first: usize = 0;
+            var last = self.base.resources.len;
+            while (first < last) {
+                const mid = first + (last - first) / 2;
+                const value = self.base.resources[mid];
+                if (value.kind == kind and value.id == id) return value;
+                if (@backingInt(value.kind) < @backingInt(kind) or (value.kind == kind and value.id < id)) first = mid + 1 else last = mid;
+            }
+            if (self.base.resources.len + self.dependencies.items.len == contract.max_resources) return error.SqlProgramLimitExceeded;
+            const parsed = (try system_catalog_storage.getById(self.a, self.txn, self.group, kind, id)) orelse return null;
+            try self.budget.add(parsed.value);
+            return parsed.value;
+        }
+        fn append(self: *@This(), dependency: contract.Dependency) !usize {
+            if (self.base.resources.len + self.dependencies.items.len == contract.max_resources) return error.SqlProgramLimitExceeded;
+            const position = self.dependencies.items.len;
+            const slot = try self.slots.getOrPut(self.a, .{ .kind = dependency.kind, .id = dependency.id });
+            if (slot.found_existing) return error.InvalidScopeRetirement;
+            if (dependency.table != null) {
+                if (self.participants == contract.max_participants) return error.SqlProgramLimitExceeded;
+                self.participants += 1;
+            }
+            slot.value_ptr.* = position;
+            try self.dependencies.append(self.a, dependency);
+            return position;
+        }
+        fn catalog(self: *@This(), value: system_catalog.Resource, action: @FieldType(contract.Dependency, "action")) !void {
+            if (self.base.contains(value.kind, value.id)) return;
+            if (self.slots.get(.{ .kind = value.kind, .id = value.id })) |position| {
+                if (action == .retire) self.dependencies.items[position].action = .retire;
+                return;
+            }
+            _ = try self.append(.{ .kind = value.kind, .id = value.id, .action = action, .resource = value });
+        }
+        fn table(self: *@This(), id: u64) !void {
+            if (self.retired_ids.contains(id) or self.slots.contains(.{ .kind = .table, .id = id })) return;
+            if (self.participants == contract.max_participants) return error.SqlProgramLimitExceeded;
+            const captured = try self.store.captureScopeTableTxn(self.a, self.txn, self.group, id, .reference, self.budget, self.context);
+            _ = try self.append(.{ .kind = .table, .id = id, .action = .hold, .resource = try self.resource(.table, id), .table = captured });
+        }
+        fn rewrite(self: *@This(), id: u64) !void {
+            if (self.retired_ids.contains(id)) return;
+            try self.table(id);
+            try self.rewrites.put(self.a, id, {});
+        }
+        fn sequence(self: *@This(), value: system_catalog.Resource) !void {
+            if (self.sequences.contains(value.id)) return;
+            if (self.sequences.count() == @import("antfly_local_sources").system_catalog_column_sequences.DefaultRetirementSet.max_members) return error.SqlProgramLimitExceeded;
+            if ((try self.sequences.getOrPut(self.a, value.id)).found_existing) return;
+            self.sequences.getPtr(value.id).?.* = value;
+            try self.catalog(value, .retire);
+        }
+        fn ownedSequences(self: *@This(), table_id: u64) !void {
+            var buffer: [192]u8 = undefined;
+            const prefix = try sql_sequences.ownerPrefix(&buffer, self.group, table_id);
+            var cursor = try self.txn.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(prefix);
+            var state: ?std.json.Parsed(column_identities.State) = null;
+            defer if (state) |*value| value.deinit();
+            const attributes: column_identities.Store(docstore.DocStore.Txn) = .{ .txn = self.txn, .group_id = self.group };
+            while (row) |entry| : (row = try cursor.next()) {
+                try self.context.ensureActive();
+                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                const owned = try sql_sequences.ownershipFromKey(entry.key, self.group, table_id);
+                if (!std.mem.eql(u8, entry.value, &.{1})) return error.InvalidSequenceState;
+                if (state == null) state = (try attributes.load(self.a, table_id)) orelse return error.InvalidColumnIdentityState;
+                if (state.?.value.columnById(owned.owner.column_id) == null) return error.InvalidColumnIdentityState;
+                const value = (try self.resource(.sequence, owned.sequence_id)) orelse return error.InvalidSequenceState;
+                const descriptor = try sql_sequences.sequence.Descriptor.decode(self.a, value.source_json);
+                if (!std.meta.eql(descriptor.owned_by, @as(?sql_sequences.sequence.OwnedBy, owned.owner))) return error.InvalidSequenceState;
+                try self.sequence(value);
+            }
+        }
+        fn references(self: *@This(), table_value: contract.Table, retiring: bool, directory_ready: bool) !void {
+            var region: std.heap.ArenaAllocator = .init(self.store.alloc);
+            defer region.deinit();
+            const scratch = region.allocator();
+            const header = try std.json.parseFromSliceLeaky(Header, scratch, table_value.preimage, .{ .ignore_unknown_fields = true });
+            const schema = try std.json.parseFromSliceLeaky(Declarations, scratch, if (header.schema_json.len == 0) "{}" else header.schema_json, .{ .ignore_unknown_fields = true });
+            if (schema.storage_mode == .relational and !directory_ready) return error.CatalogOccupancyNotReady;
+            if (retiring) {
+                const incoming = try sql_fk_uses.captureSelectedWithContext(scratch, self.txn, self.group, table_value.physical_name, contract.max_tables, table_value.id, .both, self.context);
+                try self.stamps.append(self.a, .{ .kind = .foreign_key, .id = table_value.id, .digest = try scopeFingerprint(incoming.stamp, "antfly/scope-retirement-fk/v1\x00") });
+                for (incoming.tables) |id| try self.rewrite(id);
+                try self.ownedSequences(table_value.id);
+            }
+            for (schema.foreign_keys orelse &.{}) |fk| {
+                if (std.mem.eql(u8, fk.parent_table, table_value.physical_name)) continue;
+                const parent = (try self.store.getTableByNameResultTxn(system_catalog.ResolvedTable, scratch, self.txn, self.group, fk.parent_table)) orelse return error.ForeignKeyParentTableNotFound;
+                try self.table(parent.table_id);
+            }
+            for (try sql_type_uses.loadAlloc(scratch, self.txn, self.group, table_value.id)) |id| {
+                if (try sql_type_uses.retirementLock(self.txn, self.group, id) != null or try schema_validation.activeType(self.txn, self.group, id) != null) return error.CatalogPublicationProofPending;
+                const value = (try self.resource(.named_type, id)) orelse return error.CatalogGenerationChanged;
+                try self.catalog(value, .hold);
+            }
+        }
+    };
+
+    fn captureScopeDependenciesTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, base: system_catalog.scope_retirement.Manifest, budget: *RetirementCaptureBudget, context: @import("antfly_local_sources").api_operation.RequestContext) !system_catalog.scope_retirement.Manifest {
+        const contract = system_catalog.scope_retirement;
+        var capture: ScopeDependencyCapture = .{ .store = self, .a = a, .txn = txn, .group = group, .base = base, .budget = budget, .context = context, .participants = base.tables.len };
+        var sources: std.ArrayList(RetirementViewSource) = .empty;
+        for (base.tables) |table| {
+            try capture.retired.append(a, table);
+            try capture.retired_ids.put(a, table.id, {});
+            try sources.append(a, .{ .kind = .table, .id = table.id });
+        }
+        for (base.resources) |resource| switch (resource.kind) {
+            .view => try sources.append(a, .{ .kind = .view, .id = resource.id }),
+            .sequence => try capture.sequence(resource),
+            else => {},
+        };
+        const closure = try self.captureRetirementViewsFromSourcesTxn(a, self.alloc, txn, group, sources.items, budget, context);
+        for (closure.views) |resource| {
+            try view_leases.requireUnleased(txn, group, resource.id);
+            try capture.catalog(resource, .retire);
+        }
+        for (closure.backings) |backing| {
+            if (capture.retired.items.len == contract.max_tables) return error.SqlProgramLimitExceeded;
+            try self.requireScopeTableAvailableTxn(txn, group, backing.table, .retire);
+            const table = try scopeTableFromCut(a, backing.table, backing.ranges);
+            if (try capture.resource(.table, table.id) != null) return error.InvalidSqlViewRecord;
+            _ = try capture.append(.{ .kind = .table, .id = table.id, .action = .retire, .table = table, .view_owner = backing.table.sql_materialized_view_id orelse return error.InvalidSqlViewRecord });
+            try capture.retired.append(a, table);
+            try capture.retired_ids.put(a, table.id, {});
+        }
+        const ready = (try sql_fk_uses.progress(txn, group)).complete;
+        for (capture.retired.items) |table| try capture.references(table, true, ready);
+        var sequence_iterator = capture.sequences.iterator();
+        var sequence_selection: std.ArrayList(@import("antfly_local_sources").system_catalog_column_sequences.DefaultRetirement) = .empty;
+        while (sequence_iterator.next()) |entry| {
+            try context.ensureActive();
+            const resource = entry.value_ptr.*;
+            const descriptor = try sql_sequences.sequence.Descriptor.decode(a, resource.source_json);
+            if (descriptor.id != resource.id) return error.InvalidSequenceState;
+            try sequence_leases.requireUnleased(txn, group, resource.id);
+            if (try schema_validation.activeSequence(txn, group, resource.id) != null) return error.CatalogPublicationProofPending;
+            const counter: sql_sequences.journal.Store(docstore.DocStore.Txn) = .{ .txn = txn, .key = .{ .group = group, .sequence_id = resource.id } };
+            _ = (try counter.load(a, try descriptor.definition())) orelse return error.InvalidSequenceState;
+            const dependents = try sql_sequence_uses.captureExcluding(a, txn, group, resource.id, contract.max_tables, null, context);
+            try capture.stamps.append(a, .{ .kind = .sequence_default, .id = resource.id, .digest = try scopeFingerprint(dependents.stamp, "antfly/scope-retirement-sequence/v1\x00") });
+            for (dependents.tables) |id| try capture.rewrite(id);
+            try sequence_selection.append(a, .{ .sequence_id = resource.id, .namespace_id = resource.parent_id, .incarnation = base.metadata_incarnation });
+        }
+        const selection_domain = @import("antfly_local_sources").system_catalog_dependency_retirement;
+        std.mem.sort(contract.Table, capture.retired.items, {}, struct {
+            fn less(_: void, left: contract.Table, right: contract.Table) bool {
+                return left.id < right.id;
+            }
+        }.less);
+        const relations = try a.alloc(selection_domain.Relation, capture.retired.items.len);
+        for (relations, capture.retired.items) |*relation, table| relation.* = .{ .table_id = table.id, .physical_name = table.physical_name };
+        std.mem.sort(@import("antfly_local_sources").system_catalog_column_sequences.DefaultRetirement, sequence_selection.items, {}, struct {
+            fn less(_: void, left: @import("antfly_local_sources").system_catalog_column_sequences.DefaultRetirement, right: @import("antfly_local_sources").system_catalog_column_sequences.DefaultRetirement) bool {
+                return left.sequence_id < right.sequence_id;
+            }
+        }.less);
+        const selection: selection_domain.Selection = .{ .relations = relations, .sequences = sequence_selection.items };
+        // Rewrites may discover unchanged outgoing parents/type owners. Iterate
+        // stable IDs, since appending those holds may grow the participant list.
+        var survivor_iterator = capture.rewrites.keyIterator();
+        while (survivor_iterator.next()) |id| {
+            const position = capture.slots.get(.{ .kind = .table, .id = id.* }).?;
+            const before = capture.dependencies.items[position].table.?;
+            try capture.references(before, false, ready);
+            var region: std.heap.ArenaAllocator = .init(self.alloc);
+            defer region.deinit();
+            const header = try std.json.parseFromSliceLeaky(ScopeDependencyCapture.Header, region.allocator(), before.preimage, .{ .ignore_unknown_fields = true });
+            const after = try selection.schemaAlloc(self.alloc, id.*, header.schema_json);
+            defer self.alloc.free(after);
+            try budget.add(after);
+            capture.dependencies.items[position].action = .rewrite;
+            capture.dependencies.items[position].schema_after = try a.dupe(u8, after);
+        }
+        const edges = try a.alloc(contract.ViewEdge, closure.edges.len);
+        for (closure.edges, edges) |edge, *output| {
+            if (edge.dependency.kind == .table) try capture.table(edge.dependency.id) else {
+                const resource = (try capture.resource(.view, edge.dependency.id)) orelse return error.InvalidSqlViewRecord;
+                try view_leases.requireUnleased(txn, group, resource.id);
+                try capture.catalog(resource, .hold);
+            }
+            output.* = .{ .source_kind = if (edge.dependency.kind == .table) .table else .view, .source = edge.dependency.id, .column = edge.dependency.column, .view = edge.view };
+        }
+        std.mem.sort(contract.Dependency, capture.dependencies.items, {}, contract.Dependency.less);
+        std.mem.sort(contract.Stamp, capture.stamps.items, {}, contract.Stamp.less);
+        std.mem.sort(contract.ViewEdge, edges, {}, contract.ViewEdge.less);
+        var result = base;
+        result.dependencies = capture.dependencies.items;
+        result.stamps = capture.stamps.items;
+        result.view_edges = edges;
+        try result.validate(self.alloc);
+        _ = try result.digest(self.alloc);
+        return result;
     }
 
     pub fn prepareTableRetirementManifestJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, guard: system_catalog.RelationMutationGuard, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
@@ -23617,23 +23867,44 @@ pub const RaftApplyStore = struct {
     }
     const RetirementViews = struct { views: []system_catalog.Resource, backings: []@import("../table_retirement_manifest.zig").Backing, edges: []@import("../table_retirement_manifest.zig").ViewEdge };
     fn captureTableRetirementViewsTxn(self: *RaftApplyStore, a: std.mem.Allocator, backing: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, root: u64, budget: *RetirementCaptureBudget, context: @import("antfly_local_sources").api_operation.RequestContext) !RetirementViews {
+        return self.captureRetirementViewsFromSourcesTxn(a, backing, txn, group, &.{.{ .kind = .table, .id = root }}, budget, context);
+    }
+    const RetirementViewSource = struct { kind: @import("antfly_local_sources").sql_view_definition.SourceKind, id: u64 };
+    fn captureRetirementViewsFromSourcesTxn(self: *RaftApplyStore, a: std.mem.Allocator, backing: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, sources: []const RetirementViewSource, budget: *RetirementCaptureBudget, context: @import("antfly_local_sources").api_operation.RequestContext) !RetirementViews {
         const manifest = @import("../table_retirement_manifest.zig");
         var resources: std.ArrayList(system_catalog.Resource) = .empty;
         var backings: std.ArrayList(manifest.Backing) = .empty;
         var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        var roots: std.ArrayList(u64) = .empty;
+        var seen_roots: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        for (sources) |source| {
+            try context.ensureActive();
+            if (source.id == 0) return error.InvalidSqlViewRecord;
+            if (source.kind == .table) {
+                if ((try seen_roots.getOrPut(a, source.id)).found_existing) continue;
+                if (roots.items.len == system_catalog.scope_retirement.max_tables) return error.SqlProgramLimitExceeded;
+                try roots.append(a, source.id);
+            } else {
+                if ((try seen.getOrPut(a, source.id)).found_existing) continue;
+                if (resources.items.len == manifest.max_views) return error.SqlProgramLimitExceeded;
+                const resource = (try system_catalog_storage.getById(a, txn, group, .view, source.id)) orelse return error.InvalidSqlViewRecord;
+                try budget.add(resource.value);
+                try resources.append(a, resource.value);
+            }
+        }
         var actual_edges: std.StringHashMapUnmanaged(void) = .empty;
         var incoming: std.ArrayList([]const u8) = .empty;
         var edges: std.ArrayList(manifest.ViewEdge) = .empty;
         var position: usize = 0;
         var bytes: usize = 0;
-        // The synthetic first node is the physical root relation, not a
-        // caller-supplied view. Every later node comes from a native edge.
-        while (position <= resources.items.len) : (position += 1) {
+        // All selected physical relations and catalog views share one walk.
+        // A view reached from multiple roots is decoded once, not once/root.
+        while (position < roots.items.len + resources.items.len) : (position += 1) {
             try context.ensureActive();
-            const id = if (position == 0) root else resources.items[position - 1].id;
-            const kind: @import("antfly_local_sources").sql_view_definition.SourceKind = if (position == 0) .table else .view;
-            if (position != 0) {
-                const resource = resources.items[position - 1];
+            const id = if (position < roots.items.len) roots.items[position] else resources.items[position - roots.items.len].id;
+            const kind: @import("antfly_local_sources").sql_view_definition.SourceKind = if (position < roots.items.len) .table else .view;
+            if (kind == .view) {
+                const resource = resources.items[position - roots.items.len];
                 var record_region = std.heap.ArenaAllocator.init(backing);
                 defer record_region.deinit();
                 const scratch = record_region.allocator();
@@ -32072,6 +32343,10 @@ pub const RaftApplyStore = struct {
                 // storage and buffered outcome. A losing committed proposal
                 // is a no-op, not a permanently failing metadata log entry.
                 if (relationCommand(command) and try relationWriterEnabledTxn(txn, group_id)) switch (err) {
+                    // Scope custody may win after preflight. Only this adopted
+                    // path has restored every command effect via the relation
+                    // journal before consuming that expected losing guard.
+                    error.TableTransitionActive,
                     error.CatalogAlreadyExists,
                     error.InvalidSchemaUpdateRequest,
                     error.CatalogCommandTooLarge,
@@ -32086,6 +32361,7 @@ pub const RaftApplyStore = struct {
                     => continue,
                     else => {},
                 };
+                if (comptime builtin.is_test) std.debug.print("metadata committed command failed tag={s} err={s}\n", .{ @tagName(command), @errorName(err) });
                 return err;
             };
         }
@@ -32116,7 +32392,22 @@ pub const RaftApplyStore = struct {
         };
     }
 
+    /// Definition commands have a fixed owner before any journal/projection
+    /// mutation. Standalone reports the admission conflict; committed replay
+    /// retains the pinned definition and proceeds to the next Raft entry.
+    fn scopeDefinitionCommandOwner(command: TransitionCommand) ?u64 {
+        return switch (command) {
+            .upsert_table => |record| record.table_id,
+            .compare_and_replace_table => |replacement| replacement.expected.table_id,
+            .comment_object => |annotation| annotation.request.guard.owner.table_id,
+            .comment_column => |annotation| annotation.guard.owner.table_id,
+            else => null,
+        };
+    }
+
     fn applyTransitionCommandTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, command: TransitionCommand) anyerror!void {
+        if (scopeDefinitionCommandOwner(command)) |owner|
+            if (try scope_retirement.member(txn, group_id, .table, owner) != null) return;
         if (!relationCommand(command) or !try relationWriterEnabledTxn(txn, group_id)) return self.applyTransitionCommandRawTxn(txn, group_id, command);
         const outcome = self.active_outcome orelse return error.InvalidMetadataCommandJournal;
         const checkpoint = outcome.checkpointCommand();
@@ -34725,7 +35016,7 @@ pub const RaftApplyStore = struct {
                     if (metadata_table_manager.rangeRecordsEqual(existing, record)) return;
                 }
                 if (try self.fkGenerationTableLockedTxn(txn, group_id, record.table_id)) return;
-                if (!try self.relationTopologyMutationAllowedTxn(txn, group_id, record.table_id)) return;
+                if (!try self.committedTopologyMutationAllowedTxn(txn, group_id, record.table_id)) return;
                 const value = try encodeRangeRecord(self.alloc, record);
                 defer self.alloc.free(value);
                 try txn.put(key, value);
@@ -34762,7 +35053,7 @@ pub const RaftApplyStore = struct {
                 defer metadata_table_manager.freeRange(self.alloc, current);
                 if (!metadata_table_manager.restoreIntentMatchesRange(expected, current)) break :complete;
                 if (try self.fkGenerationTableLockedTxn(txn, group_id, current.table_id)) break :complete;
-                if (!try self.relationTopologyMutationAllowedTxn(txn, group_id, current.table_id)) break :complete;
+                if (!try self.committedTopologyMutationAllowedTxn(txn, group_id, current.table_id)) break :complete;
 
                 const table_name = try self.lookupTableNameTxn(txn, group_id, current.table_id);
                 defer if (table_name) |name| self.alloc.free(name);
@@ -34807,7 +35098,7 @@ pub const RaftApplyStore = struct {
                 var key_buf: [160]u8 = undefined;
                 const key = try rangeKeyForGroup(&key_buf, group_id, record.group_id);
                 if (existing == null) return;
-                if (!try self.relationTopologyMutationAllowedTxn(txn, group_id, existing_table_id)) return;
+                if (!try self.committedTopologyMutationAllowedTxn(txn, group_id, existing_table_id)) return;
                 try txn.delete(key);
                 try self.deleteTableRangeIndexTxn(txn, group_id, existing_table_id, record.group_id);
                 try self.deleteActiveRestoreRangeIndexTxn(txn, group_id, record.group_id);
@@ -36306,8 +36597,8 @@ pub const RaftApplyStore = struct {
             // Check every collision before writing anything. All names and
             // fresh IDs are reserved together, including interdependent FKs.
             for (plan.targets) |target| {
-                if (!try self.relationTopologyMutationAllowedTxn(txn, group_id, target.table.table_id)) return;
-                if (target.replace) |old| if (!try self.relationTopologyMutationAllowedTxn(txn, group_id, old.table.table_id)) return;
+                if (!try self.committedTopologyMutationAllowedTxn(txn, group_id, target.table.table_id)) return;
+                if (target.replace) |old| if (!try self.committedTopologyMutationAllowedTxn(txn, group_id, old.table.table_id)) return;
                 var key_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
                 if (try stagingGet(txn, try tableKeyForGroup(&key_buf, group_id, target.table.table_id)) != null or
                     try stagingGet(txn, try restore_staging.nameKey(&key_buf, group_id, target.table.name)) != null or
@@ -41141,7 +41432,7 @@ pub const RaftApplyStore = struct {
                 var scratch = std.heap.ArenaAllocator.init(self.alloc);
                 defer scratch.deinit();
                 const receipt = (try PreparedTransactions.readReceipt(scratch.allocator(), txn, group, ack.owner.operation_id)) orelse break :blk topology_protocol.sql_prepared_transactions_version;
-                break :blk if (receipt.lock_scope != null and receipt.kind == .named) topology_protocol.sql_prepared_lock_handoff_version else if (receipt.lock_scope != null) topology_protocol.sql_lock_authority_version else if (receipt.kind == .session_commit or receipt.session.standalone) topology_protocol.sql_connection_transactions_version else topology_protocol.sql_prepared_transactions_version;
+                break :blk receipt.minimumDecoderVersion();
             },
         };
         const required = if (request.notification_control != null) @max(minimum_decoder, topology_protocol.sql_notifications_version) else minimum_decoder;
@@ -43418,7 +43709,7 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         record: metadata.SplitTransitionRecord,
     ) !void {
-        if (!try self.relationTopologyMutationAllowedTxn(txn, group_id, record.table_contract.table_id)) return;
+        if (!try self.committedTopologyMutationAllowedTxn(txn, group_id, record.table_contract.table_id)) return;
         var key_buf: [160]u8 = undefined;
         const key = try splitTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
         const encoded_existing = txn.get(key) catch |err| switch (err) {
@@ -43496,7 +43787,7 @@ pub const RaftApplyStore = struct {
         if (!std.mem.eql(u8, &OnlineMergeAdmission.digestEncoded(bytes), &admission.expected_record_digest)) return;
         const current = try decodeMergeTransitionRecord(self.alloc, bytes);
         defer metadata_table_manager.freeMergeTransitionRecord(self.alloc, current);
-        if (!try self.relationTopologyMutationAllowedTxn(txn, group_id, current.table_contract.table_id)) return;
+        if (!try self.committedTopologyMutationAllowedTxn(txn, group_id, current.table_contract.table_id)) return;
         if (current.online != null or current.phase != .prepare or current.rollback_reason != null) return;
         // The catalog flag authorizes rebuilding source identities in the
         // receiver namespace. Online row preparation performs that rebuild;
@@ -43531,7 +43822,7 @@ pub const RaftApplyStore = struct {
         const bytes = (try stagingGet(txn, key)) orelse return;
         const current = try decodeMergeTransitionRecord(self.alloc, bytes);
         defer metadata_table_manager.freeMergeTransitionRecord(self.alloc, current);
-        if (!try self.relationTopologyMutationAllowedTxn(txn, group_id, current.table_contract.table_id)) return;
+        if (!try self.committedTopologyMutationAllowedTxn(txn, group_id, current.table_contract.table_id)) return;
         const online = current.online orelse return;
         if (!online.eql(update.expected) or (current.rollback_reason != null) != update.expected_cancel) return;
         var lease_buf: [160]u8 = undefined;
@@ -43572,7 +43863,7 @@ pub const RaftApplyStore = struct {
     }
 
     fn applyMergeTransitionUpsertAuthorizedTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.MergeTransitionRecord, allow_online_change: bool) !void {
-        if (!try self.relationTopologyMutationAllowedTxn(txn, group_id, record.table_contract.table_id)) return;
+        if (!try self.committedTopologyMutationAllowedTxn(txn, group_id, record.table_contract.table_id)) return;
         if (record.online) |online| try online.validateRecord(record);
         var key_buf: [160]u8 = undefined;
         const key = try mergeTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
@@ -43651,7 +43942,7 @@ pub const RaftApplyStore = struct {
         expected_source_epoch: u64,
         record: metadata.SplitTransitionRecord,
     ) !void {
-        if (!try self.relationTopologyMutationAllowedTxn(txn, group_id, record.table_contract.table_id)) return;
+        if (!try self.committedTopologyMutationAllowedTxn(txn, group_id, record.table_contract.table_id)) return;
         const split_key = record.split_key orelse return error.InvalidSplitAdmission;
 
         var transition_key_buf: [160]u8 = undefined;
@@ -51013,6 +51304,22 @@ const ScopeRetirementCheckpoint = struct {
         const before = try std.json.Stringify.valueAlloc(a, resource, .{});
         const current = try std.json.Stringify.valueAlloc(a, actual.value, .{});
         if (!std.mem.eql(u8, before, current)) return error.InvalidScopeRetirement;
+        switch (resource.kind) {
+            .sequence => if (try schema_validation.activeSequence(reader, self.group, resource.id) != null) return error.InvalidScopeRetirement,
+            .named_type => if (try sql_type_uses.retirementLock(reader, self.group, resource.id) != null or
+                try schema_validation.activeType(reader, self.group, resource.id) != null) return error.InvalidScopeRetirement,
+            else => {},
+        }
+    }
+    fn requireTable(self: @This(), reader: anytype, table: system_catalog.scope_retirement.Table) !void {
+        var region: std.heap.ArenaAllocator = .init(self.alloc);
+        defer region.deinit();
+        const a = region.allocator();
+        var buffer: [256]u8 = undefined;
+        const actual = try decodeTableRecord(a, try reader.get(try tableKeyForGroup(&buffer, self.group, table.id)));
+        const canonical = try std.json.Stringify.valueAlloc(a, actual, .{});
+        if (!std.mem.eql(u8, canonical, table.preimage) or
+            try @import("../table_lifecycle_lock.zig").read(reader, self.group, table.id) != null) return error.InvalidScopeRetirement;
     }
     pub fn verifyManifest(self: @This(), reader: anytype, head: scope_retirement.Head, manifest: system_catalog.scope_retirement.Manifest) !void {
         _ = head;
@@ -51020,8 +51327,23 @@ const ScopeRetirementCheckpoint = struct {
         if (meta.revision < manifest.catalog_revision) return error.InvalidScopeRetirement;
         try self.requireResource(reader, manifest.scope.root());
         for (manifest.resources) |resource| try self.requireResource(reader, resource);
-        for (manifest.tables) |table| {
-            if (try @import("../table_lifecycle_lock.zig").read(reader, self.group, table.id) != null) return error.InvalidScopeRetirement;
+        for (manifest.tables) |table| try self.requireTable(reader, table);
+        for (manifest.dependencies) |dependency| {
+            if (dependency.resource) |resource| try self.requireResource(reader, resource) else {
+                var region: std.heap.ArenaAllocator = .init(self.alloc);
+                defer region.deinit();
+                var binding = try system_catalog_storage.getById(region.allocator(), reader, self.group, dependency.kind, dependency.id);
+                defer if (binding) |*value| value.deinit();
+                if (binding != null) return error.InvalidScopeRetirement;
+            }
+            if (dependency.table) |table| try self.requireTable(reader, table);
+        }
+        for (manifest.stamps) |stamp| {
+            const digest = switch (stamp.kind) {
+                .foreign_key => try RaftApplyStore.scopeFingerprint(try sql_fk_uses.stamp(reader, self.group, (manifest.tableById(stamp.id) orelse return error.InvalidScopeRetirement).physical_name), "antfly/scope-retirement-fk/v1\x00"),
+                .sequence_default => try RaftApplyStore.scopeFingerprint(try sql_sequence_uses.stamp(reader, self.group, stamp.id), "antfly/scope-retirement-sequence/v1\x00"),
+            };
+            if (!std.mem.eql(u8, &digest, &stamp.digest)) return error.InvalidScopeRetirement;
         }
     }
 };

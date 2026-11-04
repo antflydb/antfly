@@ -18136,20 +18136,31 @@ pub const ApiHttpServer = struct {
             if (fk.* != .object) return error.InvalidSchemaUpdateRequest;
             const parent = fk.object.getPtr("parent_table") orelse return error.InvalidSchemaUpdateRequest;
             const name = fk.object.get("name") orelse return error.InvalidSchemaUpdateRequest;
-            if (parent.* != .string or name != .string) return error.InvalidSchemaUpdateRequest;
-            if (inherited.get(name.string)) |bound| if (std.mem.eql(u8, bound, parent.string)) {
+            if (name != .string) return error.InvalidSchemaUpdateRequest;
+            if (parent.* == .string) if (inherited.get(name.string)) |bound| if (std.mem.eql(u8, bound, parent.string)) {
                 try retained.append(a, bound);
                 continue;
             };
-            const target: system_catalog.Target = .{ .database = scope.database, .namespace = scope.namespace, .table = parent.string };
+            const target: system_catalog.Target = if (parent.* == .string)
+                .{ .database = scope.database, .namespace = scope.namespace, .table = parent.string }
+            else if (parent.* == .object) qualified: {
+                const reference = std.json.parseFromValueLeaky(@import("antfly_local_sources").sql_ast.Name, a, parent.*, .{}) catch return error.InvalidSchemaUpdateRequest;
+                break :qualified .{ .database = reference.database orelse scope.database, .namespace = reference.namespace orelse scope.namespace, .table = reference.table };
+            } else return error.InvalidSchemaUpdateRequest;
             const logical = try target.resourceNameAlloc(a);
             if (!try tablePermissionCurrentlyAllowed(identity, logical, .admin)) return error.Forbidden;
-            if (std.mem.eql(u8, target.table, scope.table)) {
+            if (std.mem.eql(u8, target.database, scope.database) and
+                std.mem.eql(u8, target.namespace, scope.namespace) and
+                std.mem.eql(u8, target.table, scope.table))
+            {
                 // Initial CREATE has no physical identity until metadata
                 // reserves the hidden owner. Preserve the logical self name
                 // only in the unpublished candidate; the initial-plan
                 // builder replaces it with that exact reserved identity.
-                if (before.len == 0) continue;
+                if (before.len == 0) {
+                    parent.* = .{ .string = scope.table };
+                    continue;
+                }
                 parent.* = .{ .string = child };
                 continue;
             }
@@ -59145,6 +59156,8 @@ test "system catalog binds foreign keys once and authorizes cascades by current 
     const alloc = std.testing.allocator;
     const Fake = struct {
         renamed: bool = false,
+        namespace: []const u8 = "public",
+        parent_name: []const u8 = "parents",
         const physical = "table:11111111111111111111111111111111";
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
@@ -59157,8 +59170,8 @@ test "system catalog binds foreign keys once and authorizes cascades by current 
             defer a.free(tables);
             for (request.targets, tables) |target, *table| {
                 try std.testing.expectEqualStrings("analytics", target.database);
-                try std.testing.expectEqualStrings("public", target.namespace);
-                table.* = if (std.mem.eql(u8, target.table, if (self.renamed) "renamed" else "parents")) .{ .table_id = 7, .name = physical } else null;
+                try std.testing.expectEqualStrings(self.namespace, target.namespace);
+                table.* = if (std.mem.eql(u8, target.table, if (self.renamed) "renamed" else self.parent_name)) .{ .table_id = 7, .name = physical } else null;
             }
             const logical = try (system_catalog.Target{ .database = "analytics", .table = if (self.renamed) "renamed" else "parents" }).resourceNameAlloc(a);
             defer a.free(logical);
@@ -59188,6 +59201,20 @@ test "system catalog binds foreign keys once and authorizes cascades by current 
     const bound = try server.bindForeignKeySchema(alloc, scope, "table:child", schema, "", null, .{});
     defer alloc.free(bound);
     try std.testing.expect(std.mem.indexOf(u8, bound, Fake.physical) != null);
+    const qualified = "{\"foreign_keys\":[{\"name\":\"fk_qualified\",\"parent_table\":{\"namespace\":\"OtherScope\",\"table\":\"children\"}}]}";
+    fake.namespace = "OtherScope";
+    fake.parent_name = "children";
+    const external_same_name = try server.bindForeignKeySchema(alloc, scope, "table:child", qualified, "", null, .{});
+    defer alloc.free(external_same_name);
+    try std.testing.expect(std.mem.indexOf(u8, external_same_name, Fake.physical) != null);
+    try std.testing.expect(std.mem.indexOf(u8, external_same_name, "OtherScope") == null);
+    const qualified_self = "{\"foreign_keys\":[{\"name\":\"fk_self\",\"parent_table\":{\"namespace\":\"public\",\"table\":\"children\"}}]}";
+    const initial_self = try server.bindForeignKeySchema(alloc, scope, "table:provisional", qualified_self, "", null, .{});
+    defer alloc.free(initial_self);
+    try std.testing.expect(std.mem.indexOf(u8, initial_self, "\"parent_table\":\"children\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, initial_self, "provisional") == null);
+    fake.namespace = "public";
+    fake.parent_name = "parents";
     fake.renamed = true;
     const retained = try server.bindForeignKeySchema(alloc, scope, "table:child", bound, bound, null, .{});
     defer alloc.free(retained);

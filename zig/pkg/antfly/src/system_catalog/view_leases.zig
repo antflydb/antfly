@@ -53,6 +53,7 @@ pub fn parse(group: u64, raw: []const u8, value: []const u8) !Key {
     return .{ .view = view, .table = table, .publication = id };
 }
 pub fn acquire(txn: anytype, group: u64, view: u64, owner: Owner) !void {
+    if (try @import("../metadata/scope_retirement_fence.zig").occupied(txn, group, "view", view)) return error.CatalogPublicationProofPending;
     var buf: [256]u8 = undefined;
     const selected = try key(&buf, group, view, owner);
     if (txn.get(selected)) |_| return invalid else |err| if (err != error.NotFound) return err;

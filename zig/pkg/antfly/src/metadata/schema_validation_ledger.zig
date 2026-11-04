@@ -684,18 +684,25 @@ pub fn checkBegin(alloc: A, txn: anytype, prepared: *const plan_mod.Prepared, pr
     if (decoded.value.sequence_change) |change| {
         if (try optional(txn, try sequenceOutcomeKey(lookup.group, change.before.id, change.request.admission.nonce).encode(&buf)) != null) return error.GenerationPublicationChanged;
     }
+    const scope_fence = @import("scope_retirement_fence.zig");
+    if (prepared.head.type_id != 0 and try scope_fence.occupied(txn, lookup.group, "named_type", prepared.head.type_id)) return error.GenerationPublicationChanged;
+    if (prepared.head.sequence_retirement) |retirement| if (try scope_fence.occupied(txn, lookup.group, "sequence", retirement.id)) return error.GenerationPublicationChanged;
     try context.admit(txn, decoded.value, preparations);
     if (prepared.head.type_id != 0 and try activeType(txn, lookup.group, prepared.head.type_id) != null) return error.GenerationPublicationChanged;
     if (prepared.head.sequence_retirement) |retirement| if (try activeSequence(txn, lookup.group, retirement.id) != null) return error.GenerationPublicationChanged;
     if (prepared.participants) |directory| {
         for (directory.tables[0..directory.len]) |table| {
+            try scope_fence.requireTableWritable(txn, lookup.group, table);
             const lock = try lifecycle.read(txn, lookup.group, table);
             if (prepared.head.retirement_root) |root| {
                 const selected = (try @import("table_retirement_ledger.zig").member(txn, lookup.group, table)) orelse return error.GenerationPublicationChanged;
                 if (!std.meta.eql(selected.root, root.root) or lock == null or lock.?.kind != .table_retirement or !std.mem.eql(u8, &lock.?.id, &root.root.id)) return error.GenerationPublicationChanged;
             } else if (lock != null) return error.GenerationPublicationChanged;
         }
-    } else if (try lifecycle.read(txn, lookup.group, lookup.table) != null) return error.GenerationPublicationChanged;
+    } else {
+        try scope_fence.requireTableWritable(txn, lookup.group, lookup.table);
+        if (try lifecycle.read(txn, lookup.group, lookup.table) != null) return error.GenerationPublicationChanged;
+    }
     return true;
 }
 

@@ -73,8 +73,14 @@ cd zig
 zig build antfly-api-sql-locking-test \
   antfly-pessimistic-lock-contract-test \
   antfly-pessimistic-lock-authority-test \
-  antfly-pessimistic-lock-ledger-test -Doptimize=Debug -j1
+  antfly-pessimistic-lock-ledger-test \
+  antfly-metadata-sql-prepared-test -Doptimize=Debug -j1
 ```
+
+Prepared identity admission and terminal receipt acknowledgement require the
+strongest included decoder capability. A lock scope requires native lock custody
+support even when its initial participant list is empty; connection or
+notification capabilities cannot weaken that floor.
 
 Independent PostgreSQL oracles qualify the conflict matrices and MVCC rules,
 advisory overloads/void values and lifetimes, and queued-wait/deadlock/cancellation
