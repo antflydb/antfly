@@ -117,6 +117,7 @@ comptime {
     _ = @import("serverless/sql/expression.zig");
     _ = @import("serverless/sql/state.zig");
     _ = @import("serverless/sql/plan.zig");
+    _ = @import("serverless/sql/bridge.zig");
     _ = @import("serverless/sql/runner.zig");
     _ = @import("serverless/sql/runtime.zig");
     _ = @import("serverless/sql/runtime_test.zig");

@@ -130,9 +130,9 @@ pub const Bridge = struct {
             const original = try table.column(name);
             column.* = .{ .name = name, .type = original.type, .element_type = original.element_type };
         }
-        const rows = @min(cut.max_split_rows orelse std.math.maxInt(u32), @max(@as(u64, 1), self.limits.task_scan_rows / 2));
+        const rows = @max(@as(u64, 1), self.limits.task_scan_rows / 2);
         const bytes = @max(@as(u64, 1), self.limits.task_output_bytes / 8);
-        const splits = @max(@as(u64, 1), @max((cut.estimated_rows +| rows - 1) / rows, (@max(cut.estimated_bytes, plan.estimatedRetained(.{ .table_id = table.id, .schema = cut.schema, .snapshot = cut.snapshot, .wal_cut = cut.wal_cut, .cut = cut.token, .columns = columns, .estimated_bytes = cut.estimated_bytes, .estimated_rows = cut.estimated_rows, .splits = 1 })) +| bytes - 1) / bytes));
+        const splits = @max(@as(u64, cut.min_splits), @max((cut.estimated_rows +| rows - 1) / rows, (@max(cut.estimated_bytes, plan.estimatedRetained(.{ .table_id = table.id, .schema = cut.schema, .snapshot = cut.snapshot, .wal_cut = cut.wal_cut, .cut = cut.token, .columns = columns, .estimated_bytes = cut.estimated_bytes, .estimated_rows = cut.estimated_rows, .splits = 1 })) +| bytes - 1) / bytes));
         if (splits > 65536) return error.SqlJoinBudgetExceeded;
         return .{ .table_id = table.id, .schema = cut.schema, .snapshot = cut.snapshot, .wal_cut = cut.wal_cut, .cut = cut.token, .columns = columns, .estimated_bytes = cut.estimated_bytes, .estimated_rows = cut.estimated_rows, .splits = @intCast(splits), .filter = filter, .bucket = if (cut.bucket) |layout| blk: {
             for (names, 0..) |name, index| if (std.mem.eql(u8, name, layout.column)) break :blk plan.Bucket{ .column = @intCast(index), .count = layout.count };
@@ -255,3 +255,27 @@ const Owner = struct {
         self.a.destroy(self);
     }
 };
+
+test "distributed SQL paged WAL parallelism is independent of base scan rows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bridge: Bridge = .{ .service = undefined, .dispatcher = undefined };
+    const table: catalog.Table = .{ .id = 1, .physical_name = "t", .schema_version = 1, .columns = &.{.{ .name = "id", .path = "id", .type = .integer }} };
+    var cap: catalog.ReadCapability = .{ .token = "retained", .schema = @splat('a'), .snapshot = "1", .wal_cut = 1, .expires_ms = 10000, .estimated_bytes = 10 * 1024 * 1024, .estimated_rows = 100000 };
+    const ordinary = try bridge.input(a, table, &.{"id"}, cap, null);
+    var small = ordinary;
+    small.estimated_rows = 1;
+    small.estimated_bytes = 64;
+    small.splits = 1;
+    const join: plan.Join = .{ .left_keys = &.{0}, .right_keys = &.{0} };
+    const normal = try plan.choose(ordinary, small, @splat('a'), 10000, join, .{}, 1);
+    // Paging 385 WAL images requires four image intervals, not 782 base scans.
+    cap.min_splits = 4;
+    const paged = try bridge.input(a, table, &.{"id"}, cap, null);
+    try std.testing.expectEqual(ordinary.splits, paged.splits);
+    const selected = try plan.choose(paged, small, @splat('a'), 10000, join, .{}, 1);
+    try std.testing.expectEqual(try normal.taskCount(), try selected.taskCount());
+    cap.min_splits = 1000;
+    try std.testing.expectEqual(@as(u32, 1000), (try bridge.input(a, table, &.{"id"}, cap, null)).splits);
+}

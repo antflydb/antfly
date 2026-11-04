@@ -173,7 +173,11 @@ page caches are bounded and invocation-private; all child references bind the
 same table/store domain and expiry as the parent capability. Small cuts remain
 inline. Existing local cut readers can materialize paged capabilities normally.
 
-Paged cuts include WAL bytes/rows in planning and advertise a 128-row scan
-fragment ceiling to bound worst-case key-index I/O in hosted invocations.
+Paged cuts include WAL bytes/rows in planning and advertise minimum parallelism
+that assigns at most 128 recent WAL images to each fragment. Committed base rows
+retain their normal scan and byte budgets, independently of the image limit.
+Workers enforce the image bound against the authenticated cut, rather than
+trusting estimated base row counts. Key-index caches and object I/O budgets
+remain bounded.
 Bucket execution falls back to shuffle for these cuts. Pages target 32 KiB;
 individual larger rows remain subject to the existing task/query budgets.

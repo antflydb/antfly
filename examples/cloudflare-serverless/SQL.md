@@ -146,8 +146,11 @@ and output reservations include these stages.
 Large retained WAL cuts use immutable image pages plus a Bloom filter and exact
 sorted key pages. Workers load only their assigned image interval and bounded
 key/image caches. All base splits still suppress the complete changed-key set.
-The gateway includes WAL bytes and rows in its estimates, uses scan fragments of
-at most 128 rows for paged cuts, and falls back from bucket execution to shuffle.
+The gateway includes WAL bytes and rows in its estimates and ensures each
+fragment owns at most 128 recent WAL images. Committed base scan sizing remains
+independent, avoiding tiny base fragments for a small paged WAL. Workers validate
+that image bound against the cut, and keep bounded caches and object I/O budgets.
+Paged cuts fall back from bucket execution to shuffle.
 The cut's domain, expiry and content hashes authenticate every child page.
 
 Hosted regressions cover 320-fragment ordinary shuffle and broadcast builds

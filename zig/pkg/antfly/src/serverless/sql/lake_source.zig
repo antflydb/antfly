@@ -121,7 +121,9 @@ pub const Host = struct {
             const admitted_ = try self.admitted(scratch, spec.tenant, input, context);
             const table = admitted_.table;
             const cut = admitted_.cut;
-            if (cut.paged != null and (spec.strategy == .bucket or (input.estimated_rows +| (input.splits - 1)) / input.splits > retained.distributed_rows)) return error.SqlJoinBudgetExceeded;
+            if (cut.paged) |index| {
+                if (spec.strategy == .bucket or (@as(u64, index.count) + input.splits - 1) / input.splits > retained.distributed_rows) return error.SqlJoinBudgetExceeded;
+            }
             if (cut.expires_ms < spec.expires_ms) return error.SqlQueryExpired;
             try self.pin(scratch, table, cut, context);
         }
@@ -155,7 +157,7 @@ pub const Host = struct {
             }
             break :blk serving.ServingSource.Estimates{ .bytes = bytes, .rows = rows };
         };
-        const selected_splits = if (token.paged) @max(splits, (estimates.rows +| token.rows +| (retained.distributed_rows - 1)) / retained.distributed_rows) else splits;
+        const selected_splits = @max(splits, token.minimumSplits());
         if (selected_splits > 65536) return error.SqlJoinBudgetExceeded;
         return .{ .table_id = table.id, .schema = try fingerprint(a, table), .snapshot = try a.dupe(u8, cut.snapshot_id), .wal_cut = pending.lsn, .cut = token.token, .columns = columns, .estimated_bytes = estimates.bytes +| token.bytes, .estimated_rows = estimates.rows +| token.rows, .splits = @intCast(selected_splits), .bucket = if (token.paged) null else if (try bucketLayout(a, &pinned_source, context)) |layout| blk: {
             for (columns, 0..) |column, index| if (std.mem.eql(u8, column.name, layout.column)) break :blk plan.Bucket{ .column = @intCast(index), .count = layout.count };
@@ -344,6 +346,7 @@ const PagedReader = struct {
     fn init(a: A, artifacts: *@import("../artifacts/store.zig").ArtifactStore, identity_: [32]u8, descriptor: retained.Descriptor, cut: *const overlay.Cut, input: plan.Input, split: u32, context: Context) !PagedReader {
         const index = descriptor.paged.?;
         if (input.bucket_group != null) return error.SqlDistributedJoinUnsupported;
+        if ((@as(u64, index.count) + input.splits - 1) / input.splits > retained.distributed_rows) return error.SqlJoinBudgetExceeded;
         const bloom = try retained.readPage(a, artifacts, identity_, descriptor, index.bloom, requestToken(&context));
         errdefer a.free(bloom);
         if (bloom.len == 0) return error.InvalidSqlExchange;

@@ -635,7 +635,9 @@ pub const StatisticsSketch = struct {
 pub const BucketLayout = struct { column: []const u8, count: u32 };
 pub const ReadCapability = struct {
     bucket: ?BucketLayout = null,
-    max_split_rows: ?u32 = null,
+    /// Minimum parallelism for bounded retained WAL images, independent of
+    /// the committed base scan row budget.
+    min_splits: u32 = 1,
     token: []const u8,
     schema: [64]u8,
     snapshot: []const u8,

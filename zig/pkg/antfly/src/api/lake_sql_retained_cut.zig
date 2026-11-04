@@ -84,7 +84,15 @@ pub const ChangePage = struct { begin: u32, count: u32, token: []const u8 };
 pub const KeyPage = struct { first: [64]u8, last: [64]u8, token: []const u8 };
 pub const Paged = struct { count: u32, bytes: u64, changes: []const ChangePage, keys: []const KeyPage, bloom: []const u8 };
 pub const distributed_rows = 128;
-pub const Saved = struct { token: []const u8, rows: u64 = 0, bytes: u64 = 0, paged: bool = false };
+pub const Saved = struct {
+    token: []const u8,
+    rows: u64 = 0,
+    bytes: u64 = 0,
+    paged: bool = false,
+    pub fn minimumSplits(self: Saved) u32 {
+        return if (self.paged) @intCast(@max(1, (self.rows + distributed_rows - 1) / distributed_rows)) else 1;
+    }
+};
 fn savePage(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, io: std.Io, descriptor: Descriptor, bytes: []const u8, cancellation: @import("antfly_cancellation").CancellationToken) ![]const u8 {
     const scope = try artifacts.UploadScope.forPublication(domain(descriptor.table_id, identity), descriptor.expires_ms, io);
     var object = try store.putScoped(scope, bytes, cancellation);

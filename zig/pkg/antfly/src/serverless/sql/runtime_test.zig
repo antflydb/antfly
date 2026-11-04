@@ -762,6 +762,7 @@ fn hostedLakeSource(bucketed: bool, large: bool, paged: bool) !void {
     // Only the capability survives publication, including for a 9 MB WAL.
     try std.testing.expect(publication_budget.live < 64 * 1024);
     try std.testing.expectEqual(paged, saved.paged);
+    try std.testing.expectEqual(if (paged) @as(u32, 71) else 1, saved.minimumSplits());
     const cut = saved.token;
     if (paged) {
         const loaded = try @import("../../api/lake_sql_retained_cut.zig").load(sa, &artifacts, identity, cut, table, expires - 1000, .none);
@@ -769,7 +770,7 @@ fn hostedLakeSource(bucketed: bool, large: bool, paged: bool) !void {
         try std.testing.expectEqual(@as(usize, 9000), loaded.pending.changes.len);
         try std.testing.expectEqual(@as(usize, 64 * 1024), loaded.pending.changes[0].row.object.get("payload").?.string.len);
     }
-    const input: plan.Input = .{ .table_id = 7, .schema = try @import("lake_source.zig").Host.fingerprint(sa, table), .snapshot = snapshot, .wal_cut = 2, .cut = cut, .columns = if (large) &.{ .{ .name = "id", .type = .integer }, .{ .name = "payload", .type = .string } } else &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = if (large) 4 * 1024 * 1024 else 100, .estimated_rows = if (paged) 25384 else if (large) 16384 else 2, .splits = if (paged) 200 else if (large) 8 else 2, .bucket = if (bucketed) .{ .column = 0, .count = 4 } else null };
+    const input: plan.Input = .{ .table_id = 7, .schema = try @import("lake_source.zig").Host.fingerprint(sa, table), .snapshot = snapshot, .wal_cut = 2, .cut = cut, .columns = if (large) &.{ .{ .name = "id", .type = .integer }, .{ .name = "payload", .type = .string } } else &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = if (large) 4 * 1024 * 1024 else 100, .estimated_rows = if (paged) 25384 else if (large) 16384 else 2, .splits = if (paged) saved.minimumSplits() else if (large) 8 else 2, .bucket = if (bucketed) .{ .column = 0, .count = 4 } else null };
     const spec: plan.Plan = .{ .tenant = @splat('a'), .expires_ms = expires, .left = input, .right = input, .join = .{ .left_keys = &.{0}, .right_keys = &.{0}, .projection = if (large) &.{0} else &.{} }, .strategy = if (bucketed) .bucket else .shuffle, .partitions = if (paged) 64 else if (large) 16 else 4, .limits = .{ .query_requests = if (paged) 1000000 else 100000, .query_exchange_bytes = if (paged) 16 * 1024 * 1024 * 1024 else 8 * 1024 * 1024 * 1024, .task_memory = config.task_memory, .task_output_bytes = if (large) 2 * 1024 * 1024 else 16 * 1024 * 1024 } };
     const raw_plan = try spec.encode(sa);
     if (std.testing.environ.getPosix(if (paged) "ANTFLY_SQL_HOSTED_WAL_FIXTURE" else if (large) "ANTFLY_SQL_HOSTED_RANGE_FIXTURE" else if (bucketed) "ANTFLY_SQL_HOSTED_BUCKET_FIXTURE" else "ANTFLY_SQL_HOSTED_FIXTURE")) |path| {
@@ -789,6 +790,13 @@ fn hostedLakeSource(bucketed: bool, large: bool, paged: bool) !void {
         try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = encoded });
     }
     var request: hosted.Request = .{ .op = .sql_submit, .config = config, .tenant = spec.tenant, .owner = "hosted-coordinator", .raw_plan = raw_plan };
+    if (paged) {
+        var undersized = spec;
+        undersized.left.splits = saved.minimumSplits() - 1;
+        var rejected = request;
+        rejected.raw_plan = try undersized.encode(sa);
+        try std.testing.expectError(error.SqlJoinBudgetExceeded, hosted.execute(sa, memory.client(), std.testing.io, .{ .io = std.testing.io }, try std.json.Stringify.valueAlloc(sa, rejected, .{})));
+    }
     const submit = try hosted.execute(sa, memory.client(), std.testing.io, .{ .io = std.testing.io }, try std.json.Stringify.valueAlloc(sa, request, .{}));
     request.query = (try std.json.parseFromSliceLeaky(struct { query: state.Query }, sa, submit, .{})).query;
     request.raw_plan = null;
