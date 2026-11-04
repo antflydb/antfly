@@ -1384,3 +1384,86 @@ test "distributed SQL notifications interrupt idle waits and retain durable canc
     }
     try std.testing.expect(recovered);
 }
+
+test "distributed SQL asynchronous delivery isolates short queries and renews leases during slow RPCs" {
+    const a = std.testing.allocator;
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    var service = fixture.service(a, memory.client(), "query-pod");
+    service.context.io = std.testing.io;
+    const Delivery = struct {
+        slow: state.Query = undefined,
+        slow_entered: std.Io.Event = .unset,
+        short_entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        calls: std.atomic.Value(u32) = .init(0),
+        fn run(raw: *anyopaque, tickets: []const plan.Ticket, context: Context) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            if (std.meta.eql(tickets[0].query, self.slow)) {
+                self.slow_entered.set(context.io.?);
+                try self.release.wait(context.io.?);
+            } else self.short_entered.set(context.io.?);
+        }
+    };
+    var delivery: Delivery = .{};
+    const scheduler_mod = @import("scheduler.zig");
+    var turns: scheduler_mod.Turns = .{};
+    service.coordination = turns.port();
+    var scheduler: scheduler_mod.Scheduler = .{ .io = std.testing.io, .delivery = .{ .ptr = &delivery, .dispatch = Delivery.run } };
+    turns.scheduler = &scheduler;
+    var driver: @import("driver.zig").Driver = .{ .service = service, .dispatcher = scheduler.dispatcher(), .io = std.testing.io };
+    defer driver.stop();
+    scheduler.notification = driver.notification();
+    service.notification = driver.notification();
+    try scheduler.start(2);
+    defer scheduler.stop();
+    const column: plan.Column = .{ .name = "id", .type = .integer };
+    const left: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{column}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 1 };
+    var right = left;
+    right.table_id = 2;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    var spec = try plan.choose(left, right, service.tenant, fixture.now + 120000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{}, fixture.now);
+    delivery.slow = try service.submit(spec);
+    const coordination = service.coordination.?;
+    try std.testing.expect(coordination.enter(coordination.ptr, delivery.slow));
+    try std.testing.expect(!try service.turn(delivery.slow, scheduler.dispatcher()));
+    coordination.leave(coordination.ptr, delivery.slow);
+    _ = try driver.tick();
+    try delivery.slow_entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    // Polls while delivery is outstanding do not renew/rewrite the query.
+    const slow_key = try service.state_store.key(a, delivery.slow, null, 0);
+    defer a.free(slow_key);
+    var before = (try service.state_store.load(a, slow_key)).?;
+    defer before.deinit(a);
+    fixture.now += 1000;
+    for (0..10) |_| {
+        _ = try driver.tick();
+        _ = try service.turn(delivery.slow, scheduler.dispatcher());
+    }
+    var after = (try service.state_store.load(a, slow_key)).?;
+    defer after.deinit(a);
+    try std.testing.expectEqual(before.value.until_ms, after.value.until_ms);
+    // The first task remains parked throughout every following coordinator turn.
+    spec.expires_ms = fixture.now + 15000;
+    const short = try service.submit(spec);
+    _ = try driver.tick();
+    try delivery.short_entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try std.testing.expect(fixture.now < short.expires_ms);
+    fixture.now += 45000;
+    _ = try driver.tick();
+    const key = try service.state_store.key(a, delivery.slow, null, 0);
+    defer a.free(key);
+    var current = (try service.state_store.load(a, key)).?;
+    defer current.deinit(a);
+    try std.testing.expectEqual(fixture.now + 60000, current.value.until_ms);
+    // Replayed pending tickets must not launch a duplicate while RPC is parked.
+    _ = try driver.tick();
+    try std.testing.expectEqual(@as(u32, 2), delivery.calls.load(.acquire));
+    try service.requestCancel(delivery.slow);
+    _ = try driver.tick();
+    try std.testing.expectError(error.Canceled, service.pollResult(a, delivery.slow));
+    // stop joins/cancels the parked delivery; no request contexts are borrowed.
+}

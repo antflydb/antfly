@@ -63,6 +63,16 @@ pub const Notification = struct {
     ptr: *anyopaque,
     notify: *const fn (*anyopaque, state.Digest, state.Query) void,
 };
+/// Process-local exclusion supplements durable epoch fencing: foreground and
+/// recovery turns must not race using the same boot owner and lease epoch.
+pub const Coordination = struct {
+    ptr: *anyopaque,
+    enter: *const fn (*anyopaque, state.Query) bool,
+    leave: *const fn (*anyopaque, state.Query) void,
+    delivery_pending: *const fn (*anyopaque, state.Query) bool,
+    delivery_ready: *const fn (*anyopaque, state.Query) bool,
+    retry: *const fn (*anyopaque, state.Query) void,
+};
 pub const Service = struct {
     a: A,
     state_store: state.Store,
@@ -77,6 +87,7 @@ pub const Service = struct {
     spill: ?*local.sql_spill.Manager = null,
     task_memory_ceiling: u64 = 1024 * 1024 * 1024,
     notification: ?Notification = null,
+    coordination: ?Coordination = null,
     fn notify(self: Service, query: state.Query) void {
         if (self.notification) |notification| notification.notify(notification.ptr, self.tenant, query);
     }
@@ -680,12 +691,22 @@ pub const Service = struct {
         return dependencies.items;
     }
     pub fn turn(self: Service, query: state.Query, dispatcher: Dispatcher) !bool {
+        if (self.coordination) |coordination| if (!coordination.enter(coordination.ptr, query)) return false;
+        defer if (self.coordination) |coordination| coordination.leave(coordination.ptr, query);
+        errdefer if (self.coordination) |coordination| coordination.retry(coordination.ptr, query);
         const key = try self.store().key(self.a, query, null, 0);
         defer self.a.free(key);
         var current = (try self.store().load(self.a, key)) orelse return error.SqlExecutionNotFound;
         defer current.deinit(self.a);
         if (current.value.status == .succeeded) return true;
         if (current.value.status == .failed or current.value.status == .cancelled) return error.SqlExecutionFailed;
+        // Native delivery completion wakes orchestration. While a bounded
+        // dispatch window is outstanding, avoid rereading every task on each
+        // foreground poll. Keep twenty seconds of lease margin and always let
+        // durable cancellation through. Hosted dispatch has no local registry.
+        if (!current.value.cancel_requested and current.value.pending.len != 0 and current.value.status == .running and std.mem.eql(u8, current.value.owner, self.owner) and current.value.until_ms > self.clock.now() +| 20_000) {
+            if (self.coordination) |coordination| if (!coordination.delivery_ready(coordination.ptr, query)) return false;
+        }
         const claim: state.Claim = if (current.value.status == .running and std.mem.eql(u8, current.value.owner, self.owner) and current.value.until_ms > self.clock.now()) .{ .owner = self.owner, .epoch = current.value.epoch } else (try self.acquire(query)) orelse return false;
         self.notify(query);
         return self.tick(query, claim, dispatcher);

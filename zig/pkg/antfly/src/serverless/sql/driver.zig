@@ -20,7 +20,7 @@ const runtime = @import("runtime.zig");
 const state = @import("state.zig");
 const A = std.mem.Allocator;
 pub const Driver = struct {
-    const Hint = struct { tenant: state.Digest, query: state.Query };
+    const Hint = struct { tenant: state.Digest, query: state.Query, not_before_ms: u64 = 0 };
     service: runtime.Service,
     dispatcher: runtime.Dispatcher,
     interval_ms: u32 = 100,
@@ -50,8 +50,13 @@ pub const Driver = struct {
         if (self.stopping.load(.acquire)) return;
         while (!self.hint_mutex.tryLock()) std.atomic.spinLoopHint();
         const duplicate = for (0..self.hint_count) |i| {
-            const queued = self.hints[(self.hint_head + i) % self.hints.len];
-            if (std.meta.eql(queued.query, hint.query) and std.meta.eql(queued.tenant, hint.tenant)) break true;
+            const queued = &self.hints[(self.hint_head + i) % self.hints.len];
+            if (std.meta.eql(queued.query, hint.query) and std.meta.eql(queued.tenant, hint.tenant)) {
+                // External progress/cancellation wins over a heartbeat delay,
+                // including a notification racing this turn's requeue.
+                queued.not_before_ms = @min(queued.not_before_ms, hint.not_before_ms);
+                break true;
+            }
         } else false;
         if (!duplicate and self.hint_count < self.hints.len) {
             self.hints[(self.hint_head + self.hint_count) % self.hints.len] = hint;
@@ -70,6 +75,14 @@ pub const Driver = struct {
         self.hint_head = (self.hint_head + count) % self.hints.len;
         self.hint_count -= count;
         return count;
+    }
+    fn hasHint(self: *Driver, query: state.Query) bool {
+        while (!self.hint_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.hint_mutex.unlock();
+        for (0..self.hint_count) |i| {
+            if (std.meta.eql(self.hints[(self.hint_head + i) % self.hints.len].query, query)) return true;
+        }
+        return false;
     }
     pub fn start(self: *Driver, io: std.Io) !void {
         if (self.started) return;
@@ -138,6 +151,10 @@ pub const Driver = struct {
             consumed += 1;
             errdefer self.enqueue(hint, false);
             if (hint.query.expires_ms <= service.clock.now()) continue;
+            if (hint.not_before_ms > service.clock.now()) {
+                self.enqueue(hint, false);
+                continue;
+            }
             var records = service.state_store;
             records.context = service.context;
             const key = try records.key(a, hint.query, null, 0);
@@ -154,7 +171,14 @@ pub const Driver = struct {
                     continue;
                 },
             };
-            if (!complete) self.enqueue(hint, false);
+            if (!complete) {
+                var next_hint = hint;
+                next_hint.not_before_ms = 0;
+                if (service.coordination) |coordination| if (coordination.delivery_pending(coordination.ptr, hint.query)) {
+                    next_hint.not_before_ms = service.clock.now() +| 10_000;
+                };
+                self.enqueue(next_hint, false);
+            }
             turns += 1;
         }
         var client = self.service.state_store.client;
@@ -170,7 +194,7 @@ pub const Driver = struct {
             const just_processed = for (hinted[0..hinted_count]) |hint| {
                 if (std.meta.eql(hint.query, query)) break true;
             } else false;
-            if (just_processed) continue;
+            if (just_processed or self.hasHint(query)) continue;
             const key = try self.service.state_store.key(a, query, null, 0);
             var records = self.service.state_store;
             records.context = service.context;

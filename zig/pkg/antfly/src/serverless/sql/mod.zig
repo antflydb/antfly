@@ -22,6 +22,7 @@ pub const runner = @import("runner.zig");
 pub const runtime = @import("runtime.zig");
 pub const lake_source = @import("lake_source.zig");
 pub const transport = @import("transport.zig");
+pub const scheduler = @import("scheduler.zig");
 pub const driver = @import("driver.zig");
 pub const collector = @import("collector.zig");
 

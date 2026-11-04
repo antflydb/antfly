@@ -118,6 +118,8 @@ pub const Owned = struct {
     service: runtime.Service,
     bridge: @import("bridge.zig").Bridge,
     driver: @import("driver.zig").Driver,
+    scheduler: @import("scheduler.zig").Scheduler,
+    turns: @import("scheduler.zig").Turns,
     admission: local.common_request_admission.RequestAdmission,
     config: Config,
     cache: local.serverless_query_lake_serving_cache.Cache,
@@ -159,9 +161,13 @@ pub const Owned = struct {
         const owner = try scratch.dupe(u8, &std.fmt.bytesToHex(nonce, .lower));
         const seed = local.serverless_external_source_mod.lake_catalog.types.digestHex(try std.fmt.allocPrint(scratch, "{s}\x00{s}\x00{s}", .{ cfg.state_uri, cfg.exchange_uri, cfg.authentication.issuer }));
         self.service = .{ .a = a, .state_store = .{ .client = self.state.client, .bucket = self.state.bucket, .prefix = if (self.state.prefix.len == 0) "sql" else self.state.prefix, .now_ms = 0 }, .exchange_store = .{ .client = self.exchange.client, .bucket = self.exchange.bucket, .prefix = if (self.exchange.prefix.len == 0) "sql" else self.exchange.prefix }, .tenant = seed, .owner = owner, .role = role, .source = if (self.host) |*host| host.source() else .{ .ptr = self, .open = noSource }, .retention = if (self.host) |*host| host.retention() else .{ .ptr = self, .ensure = noRetention }, .context = .{ .io = io }, .task_memory_ceiling = cfg.task_memory, .spill = if (cfg.spill_dir != null) &self.spill else null };
-        self.bridge = .{ .service = self.service, .dispatcher = self.client.dispatcher(), .gateway = &self.client, .principal_scopes = true, .limits = cfg.limits() };
-        self.driver = .{ .service = self.service, .dispatcher = self.client.dispatcher(), .principal_scopes = true };
+        self.turns = .{ .scheduler = &self.scheduler };
+        self.service.coordination = self.turns.port();
+        self.scheduler = .{ .io = io, .delivery = self.client.dispatcher() };
+        self.bridge = .{ .service = self.service, .dispatcher = self.scheduler.dispatcher(), .gateway = &self.client, .principal_scopes = true, .limits = cfg.limits() };
+        self.driver = .{ .service = self.service, .dispatcher = self.scheduler.dispatcher(), .principal_scopes = true };
         if (role == .query_only or role == .combined) {
+            self.scheduler.notification = self.driver.notification();
             self.service.notification = self.driver.notification();
             self.bridge.service.notification = self.service.notification;
         }
@@ -183,7 +189,7 @@ pub const Owned = struct {
         return service;
     }
     pub fn factory(self: *Owned) runtime.Factory {
-        return .{ .ptr = self, .open = open, .dispatcher = self.client.dispatcher() };
+        return .{ .ptr = self, .open = open, .dispatcher = self.scheduler.dispatcher() };
     }
     pub fn collector(self: *Owned) @import("collector.zig").Collector {
         return .{ .state_store = self.service.state_store, .exchange_store = self.service.exchange_store };
@@ -209,6 +215,7 @@ pub const Owned = struct {
     }
     pub fn deinit(self: *Owned) void {
         self.driver.stop();
+        self.scheduler.stop();
         self.executor.deinit();
         self.spill.deinit();
         self.cache.deinit();

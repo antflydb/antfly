@@ -57,6 +57,23 @@ round-robin discovery. Embeddings wire `Driver.notification()` into their
 `Service.notification` when they use the native recovery driver. Maintenance
 pools collect expired execution records and exchange objects. API gateways never execute worker tasks.
 
+Native coordinator turns enqueue task tickets without waiting for task RPCs.
+A fixed 1,024-ticket queue includes in-flight tickets for deduplication and
+rotates across up to 256 query queues. The process-wide delivery pool is bounded
+by `ANTFLY_SQL_QUERY_CONCURRENCY`; worker task admission remains independently
+bounded by `ANTFLY_SQL_CONCURRENCY`. Queue saturation never blocks coordinator
+progress: persisted pending tasks replay omitted hints. Delivery completion wakes
+the owning driver, and slow RPCs do not delay new admissions, cancellation, or
+lease renewal. While delivery is pending, hints use ten-second heartbeats;
+completion/cancellation notifications override that delay. Foreground polling
+skips task enumeration until progress or the lease's twenty-second renewal
+margin, avoiding repeated task GETs during slow RPCs. A process-local turn registry prevents foreground/recovery turns
+from overlapping under the same owner/epoch. Shutdown joins delivery before
+releasing the transport and stores. Transient delivery failures retain deduplication
+identity and retry with jittered exponential backoff (250 ms through 5 seconds,
+at most eight deliveries before returning to durable recovery). Embedders using native HTTP dispatch should
+wire `Scheduler.dispatcher()` and `Turns.port()` as the deployment owner does.
+
 The companion Colony operator adds `AntflyCluster.spec.serverlessSQL` and
 owns long-lived query and maintenance Deployments, ready-pod DNS discovery,
 admission budgets, spill volumes, probes, optional HPA, disruption budgets,
