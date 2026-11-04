@@ -669,6 +669,14 @@ test "lite path allocator cache alternates wrappers without full reloads or dige
     try std.testing.expect(foreground.ledger == null);
     const ledger = cache.holder.?.ledger.?;
     const before = foreground.allocatorWorkSnapshot();
+    var canceled: maintenance.CancelToken = .{};
+    canceled.requested.store(true, .release);
+    foreground.allocator_cancel_token = &canceled;
+    try std.testing.expectError(error.MaintenanceCanceled, foreground.beginTransactionWithRetirementPressure());
+    foreground.allocator_cancel_token = null;
+    try std.testing.expect(foreground.transaction_header == null);
+    try std.testing.expect(cache.borrower == null);
+    try std.testing.expectEqual(ledger, cache.holder.?.ledger.?);
     var maintenance_file = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true, .no_sync = true });
     defer maintenance_file.close();
     maintenance_file.writer_allocator_cache = &cache;
@@ -682,6 +690,11 @@ test "lite path allocator cache alternates wrappers without full reloads or dige
     for (0..24) |i| {
         const writer = if (i % 2 == 0) &maintenance_file else &foreground;
         try writer.adoptIndexPublicationHeader(cache.holder.?.header);
+        // DocStore performs this admission check before beginTransaction.
+        // It must borrow and return the same verified ledger too.
+        try writer.reclaimRetirementPressure();
+        try std.testing.expect(writer.ledger == null);
+        try std.testing.expectEqual(ledger, cache.holder.?.ledger.?);
         try writer.beginTransaction();
         try std.testing.expectEqual(ledger, writer.ledger.?);
         try std.testing.expectError(error.FileBusy, cache.enter(if (writer == &foreground) &maintenance_file else &foreground));
@@ -6580,6 +6593,8 @@ pub const NativeFile = struct {
     /// Called by the serialized owner before starting the caller's transaction.
     pub fn reclaimRetirementPressure(self: *NativeFile) !void {
         if (!self.header.indexed_reclamation or self.read_only) return;
+        const loan = try self.enterWriterAllocator();
+        defer self.leaveWriterAllocator(loan);
         for (0..16) |_| {
             const state = try self.loadLedger(self.activeCheckpoint());
             if (state.pending.count() <= state.pending_limit / 2) return;
@@ -12215,6 +12230,20 @@ pub const NativeFile = struct {
         self.replay_wait_hint = null;
         self.artifact_lease_transaction = false;
         self.allocator_certificate_staged = false;
+    }
+
+    /// One serialized allocator loan covers pre-transaction pressure service
+    /// and the caller's mutation. Nested reclamation transactions borrow that
+    /// same state; ownership moves to the caller transaction only on success.
+    pub fn beginTransactionWithRetirementPressure(self: *NativeFile) !void {
+        if (self.read_only) return error.ReadOnly;
+        if (self.transaction_header != null) return error.TransactionAlreadyActive;
+        if (self.checkpoint_publication_uncertain) return error.OutcomeReconciliationRequired;
+        const loan = try self.enterWriterAllocator();
+        errdefer self.leaveWriterAllocator(loan);
+        try self.reclaimRetirementPressure();
+        try self.beginTransaction();
+        self.transaction_allocator_loan = self.transaction_allocator_loan or loan;
     }
 
     /// Internal publication of durable immutable-source aliases. These groups

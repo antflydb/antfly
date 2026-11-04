@@ -9,7 +9,7 @@
     },
     {
       "component": "Writer allocator ownership",
-      "implementation": "A path-owned cache exclusively loans checked ledger/digest state to native transactions, page allocation and admitted inspection. Clean state returns after publication; dirty or uncertain state never becomes authority. Existing inode/header/certificate/rebase checks remain. Detached proof capture and publication serialize mutable wrapper bookkeeping under the Store mutex. Generation publication rejects active loans and immediately closes any cached retired descriptor, preserving cumulative work counters."
+      "implementation": "A path-owned cache exclusively loans checked ledger/digest state to native transactions, page allocation and admitted inspection. Clean state returns after publication; dirty or uncertain state never becomes authority. Existing inode/header/certificate/rebase checks remain. Detached proof capture and publication serialize mutable wrapper bookkeeping under the Store mutex. Generation publication rejects active loans and immediately closes any cached retired descriptor, preserving cumulative work counters. Mutation groups hold that same loan across pre-transaction retirement-pressure service and the caller transaction; standalone pressure checks also borrow it, preventing an allocator-wide load immediately before entering a cached transaction."
     },
     {
       "component": "Resumable full-text replay",
@@ -252,6 +252,17 @@
       "targeted_corrected_fixture_passed": 1,
       "targeted_seconds": 0.43,
       "correction": "A refused writer may create its persistent queue directory before acquiring the safety sidecar. Fixture now permits only that directory, requires the sidecar absent, and requires the second reader to create nothing. Two Busy mutations, snapshot/cursor preservation, post-close write and reopen remain checked. Runtime library unchanged; no recompile or repeated reference run."
+    },
+    {
+      "suite": "Retirement-pressure allocator-loan complete native Debug gate",
+      "whole_build_returncode": 0,
+      "passed": 771,
+      "skipped_benchmarks": 5,
+      "failed": 0,
+      "leaked": 0,
+      "backup_checks_passed": 2,
+      "runtime_anchors_passed": 11,
+      "seconds": 430.023
     }
   ],
   "remaining": [
@@ -937,5 +948,117 @@
         }
       }
     ]
+  },
+  "current_083_original_importer_diagnostic": {
+    "qualification": false,
+    "runtime_source": "08316e366a9fd3c8c5117c1c63573b783369450c",
+    "library_sha256": "09b426e45d16cca46308b51d0f35aa52d3fa5e8f44a4b1977a920fa447def07c",
+    "original_importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+    "input_index": 7,
+    "success": false,
+    "public_errors": [
+      "LiteReplayBacklogExceeded"
+    ],
+    "seconds": 662.6719411669765,
+    "peak_native_builds": 21,
+    "metrics_enabled": true,
+    "two_second_process_stack_sample": true,
+    "scope": "Diagnostic only: unrelated compilation and task-owned focused native tests overlapped; instrumented wall time is not a throughput comparison. No baseline or reference was rebuilt or executed.",
+    "primary_batch_profiles": 77,
+    "replay_profiles": 95,
+    "allocator_work": {
+      "full_loads": 5883,
+      "full_load_ns": 351248149742,
+      "digest_rebuilds": 0,
+      "digest_rebuild_ns": 0,
+      "journal_rebases": 0,
+      "journal_rebase_ns": 0,
+      "cache_transfers": 30293
+    },
+    "owner_counters": {
+      "source_turns": 161,
+      "capture_ns": 19996936000,
+      "replay_ns": 364457643000,
+      "artifacts_ns": 149339115000,
+      "storage_ns": 61051550000,
+      "runtime_refreshes": 581,
+      "maintenance_errors": 160,
+      "maintenance_timeouts": 0,
+      "merge_started": 33,
+      "merge_applied": 33,
+      "merge_discarded": 0,
+      "merge_prepare_ns": 29205034000,
+      "merge_staging_ns": 9740924000,
+      "merge_staged_bytes": 49653092,
+      "merge_publication_ns": 48941658000,
+      "sql_overlay_hits": 789,
+      "sql_overlay_scope_extensions": 105,
+      "sql_overlay_rebuilds": 154,
+      "sql_overlay_rebuild_entries": 0,
+      "sql_overlay_evictions": 0,
+      "sql_staged_statements": 524,
+      "replay_waits": 2,
+      "replay_refused_prepare_ns": 1367829417
+    },
+    "runtime_counters": {
+      "maintenance_opens": 192,
+      "namespace_opens": 219,
+      "source_reuses": 33
+    },
+    "service_counters": {
+      "refresh_ns": 5710286000,
+      "replay_publication_overhead_ns": 312029307695,
+      "index_admission_ns": 40397146000,
+      "metadata_admission_ns": 63677046000,
+      "publication_hold_ns": 127260541193
+    },
+    "cache_counters": {
+      "capture_attempts": 161,
+      "captured": 141,
+      "miss_no_cache": 30,
+      "miss_closed": 158,
+      "not_retained_settled": 83,
+      "not_retained_failed": 25,
+      "retained_storage_yield": 16,
+      "blocked_enrichment": 19,
+      "blocked_nontext_indexes": 1
+    }
+  },
+  "retirement_pressure_ownership_gap": {
+    "qualification": false,
+    "sampled_call_path": "Store.applyMutationGroup -> NativeFile.reclaimRetirementPressure -> loadLedger/loadLedgerForDigest -> State.load and prepareDigest",
+    "cause": "DocStore checked pressure before beginTransaction borrowed the verified path cache. Each warm mutation group loaded a separate full ledger and initial digest, then discarded it when taking the cached ledger at transaction start.",
+    "before_fix_causal_regressions": {
+      "passed": 2,
+      "failed": 2,
+      "skipped": 0,
+      "leaked": 0,
+      "warm_initial_full_loads": 1,
+      "full_loads_after_16_docstore_commits": 17,
+      "wrapper_pretransaction_pressure_retained_local_ledger": true
+    },
+    "fix": "Standalone pressure checks borrow the path cache. beginTransactionWithRetirementPressure holds one outer loan across pressure service and the caller transaction, preserving it across nested reclamation and transferring ownership only on successful caller start. DocStore uses this combined boundary. Cancellation/error returns the loan; ordinary transaction commit/abort releases it once.",
+    "focused_after_fix": {
+      "whole_build_returncode": 0,
+      "passed": 5,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "runtime_anchors_passed": 11,
+      "no_additional_warm_full_loads": true,
+      "no_additional_explicit_digest_rebuilds": true
+    },
+    "full_native_after_fix": {
+      "whole_build_returncode": 0,
+      "passed": 771,
+      "skipped_benchmarks": 5,
+      "failed": 0,
+      "leaked": 0,
+      "backup_checks_passed": 2,
+      "runtime_anchors_passed": 11,
+      "seconds": 430.023
+    },
+    "counter_scope": "full_load_ns includes preparing the initial digest of a newly loaded State. The separate explicit digest_rebuilds counter does not count that initial work; its zero is not evidence that loading avoided hashing. Nested service counters are not additive wall time.",
+    "pending": "Fresh Debug API/ABI/smoke/SDK and unchanged-importer run on this fix; final optimized qualification remains pending."
   }
 }

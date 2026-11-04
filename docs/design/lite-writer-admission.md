@@ -130,6 +130,16 @@ uncertain publication still retries the identical control record once and then
 requires reopen. Sinks without phase information remain conservative; error
 names alone never certify that a publication did not occur.
 
+Retirement-pressure admission and the caller's mutation share one exclusive
+path-allocator loan. Pressure service runs before the caller transaction, but
+nested reclamation transactions retain the outer loan; ownership transfers to
+the caller transaction only when it starts successfully. Commit, abort and
+cancellation return the loan once. A standalone pressure check also borrows
+this cache. Without that boundary, each mutation group rebuilt a separate
+ledger before immediately replacing it with the cached one at transaction start.
+The DocStore regression covers complete warm mutation groups, not only writes
+after `beginTransaction`, and requires no new full-ledger loads.
+
 ## Replay preparation and runtime ownership
 
 Text replay projects one source-byte-bounded window, including document

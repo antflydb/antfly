@@ -1199,6 +1199,46 @@ test "lite reclamation staged generation joins maintenance before owner adoption
     try std.testing.expect((try live.checkWithCancel(null)).valid);
 }
 
+test "lite docstore mutation groups reuse the path allocator during pressure admission" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "mutation-pressure-allocator-loan.aflite");
+    defer a.free(path);
+    var cache: native.WriterAllocatorCache = .{};
+    defer cache.deinit();
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .externally_locked = true });
+    defer store.close();
+    store.file.writer_allocator_cache = &cache;
+    store.file.allocator_certificate_on_commit = true;
+    store.file.incremental_checkpoints = true;
+    {
+        var warm = try store.beginWrite();
+        errdefer warm.abort();
+        try warm.put("document", "warm allocator");
+        try warm.commit();
+    }
+    const ledger = cache.holder.?.ledger.?;
+    const before = store.file.allocatorWorkSnapshot();
+    for (0..16) |_| {
+        {
+            var write = try store.beginWrite();
+            errdefer write.abort();
+            try write.put("document", "updated");
+            try write.commit();
+        }
+        try std.testing.expect(store.file.ledger == null);
+        try std.testing.expectEqual(ledger, cache.holder.?.ledger.?);
+    }
+    const after = store.file.allocatorWorkSnapshot();
+    try std.testing.expectEqual(before.full_loads, after.full_loads);
+    try std.testing.expectEqual(before.digest_rebuilds, after.digest_rebuilds);
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("updated", try read.get("document"));
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
 test "lite allocator v4 owner pins readers and reuses pages with shrinking disabled" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3094,8 +3134,7 @@ pub const Store = struct {
         if (artifact_lease_only) {
             try self.file.beginArtifactLeaseTransaction();
         } else {
-            try self.file.reclaimRetirementPressure();
-            try self.file.beginTransaction();
+            try self.file.beginTransactionWithRetirementPressure();
         }
         errdefer self.file.abortTransaction();
         const coordinator = self.file.reader_coordinator;
