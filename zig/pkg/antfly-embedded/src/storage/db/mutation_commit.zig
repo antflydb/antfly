@@ -2344,7 +2344,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const ready = if (active) |value| status.ready and status.ordered != null and value.epoch == status.ordered.?.epoch and std.mem.eql(u8, &value.catalog_digest, &catalogs.digest()) else false;
                     if (!ready) {
                         try @import("artifact_catalog_mutability.zig").requireMutable(group_alloc, &group_overlay, namespace, null);
-                        const ordered = if (status.ready and status.ordered.?.effect_protocol == 16) blk: {
+                        const ordered = if (status.ready and status.ordered.?.effect_protocol >= 16) blk: {
                             var installed = (try inventory.load(group_alloc, &group_overlay)).?;
                             defer installed.deinit();
                             var current = installed.value.command;

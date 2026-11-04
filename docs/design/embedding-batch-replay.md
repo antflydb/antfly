@@ -5,6 +5,61 @@ Compare the same model revision, backend, task type, instruction, and exact
 batch contents. A chunker's target token count is not necessarily the model's
 token count; a mixed-length batch is padded to its longest encoded row.
 
+## Backfill batch formation
+
+The enrichment worker batches rendered text across documents, including text
+produced by index templates such as `passage: {{embedding_text}}`. It inspects
+the rendered content parts: one text part can use the text API only when the
+provider explicitly guarantees equivalent results. Managed text-only adapters
+provide that guarantee; custom and declared multimodal adapters retain their
+content-parts route by default. Backfill, synchronous embedding and LEANN
+re-embedding share the same preparation rule. Media parts stay together in one
+invocation, and empty output produces no vector.
+
+Text invocations obey the provider's advertised item ceiling as well as the
+execution policy's item and byte limits. Known adapters publish their existing
+request/model limits; unknown Antfly endpoints retain a conservative one-item
+ceiling. Provider quota pacing still applies. No Ollama-specific batching switch
+is needed.
+
+Capability discovery and generation revalidation receive the original request
+cancellation token and deadline. Custom providers may retain a synchronous,
+non-blocking capability snapshot; I/O-backed discovery must implement the
+controlled capability callback or lease resolver. Providers executing an
+immutable lease pin the model revision. Legacy callbacks instead revalidate
+that revision after each completed partition, before returning vectors or
+starting another partition. A stale plan is replanned after yielding rather
+than retried inline against the same obsolete lease.
+
+Ordered generated text vectors bind their receipt input to the resolved model
+revision. A revision change replaces the old generated result only if the
+physical output still matches the pre-inference observation. Duplicate work for
+the same revision retains its canonical accepted output, and explicit authored
+vectors remain authoritative. Catalog effect protocol 17 and Raft batch protocol
+26 gate the new execution identity; older publication/proof bytes retain their
+existing digests and decoders.
+
+Downloaded media sources are shared across consumers within a preparation
+window. Synchronous consumers release idle source bodies at the document
+boundary and reuse the empty cache handle; deferred assets take ownership until
+execution completes. The preparation
+window dispatches at `ANTFLY_ENRICHMENT_PREPARATION_SOURCE_BYTES` (64 MiB by
+default), independently of request count. A document's individually bounded
+downloads may cross that soft threshold; dispatch occurs before preparing the
+next document. Existing resource budgets still bound actual memory admission.
+
+Publication failures remain pipeline-owned for the entire execution quantum.
+They stop that lane before later document work and cannot consume another
+document's inference retry budget, even when both failures have the same name.
+
+`ANTFLY_ENRICHMENT_EMBED_BATCH_ITEMS` and
+`ANTFLY_ENRICHMENT_EMBED_BATCH_BYTES` bound text batches (defaults: 32 items and
+256 KiB). Per-enrichment execution limits can override these defaults. Batch
+counters in `enrichment_runtime` describe logical worker batches; a provider may
+split one logical batch into multiple HTTP requests. The worker fills complete
+provider batches before scheduling parallel invocations, rather than dividing a
+single full batch into smaller equal slices.
+
 ## Opt-in capture
 
 `ANTFLY_EMBED_TRACE_DIR` enables text-only captures at the inference boundary.
@@ -96,3 +151,23 @@ If padded-token work explains the gap, investigate bounded length-aware
 batching while preserving source/vector association. If lock/acquisition time
 dominates, investigate contention or reloads. Do not increase concurrency
 before identifying which stage limits throughput.
+
+Background text execution retains the request context through capability discovery and revision fences even when its execution callback is synchronous. The shared text boundary permits that fallback explicitly for background replay; foreground calls continue to require an interruptible executor.
+
+Grouped media execution has an explicit provider callback and wire flag. One ordered text/media group is admitted as one item and produces one vector; independent media batches retain one row per item. Linked inference borrows binary payloads and wraps descriptors in the native ordered-content input, preserving retrieval task, instruction, dimensions, identity, and request controls.
+
+Index admission and local installation share named-media-output validation. Enrichment installation uses a deterministic topological order (kind/name only breaks independent ties), supporting chunk -> media-output asset -> transcript chunks without kind-order assumptions. The planner runs in O((V + E) log V) time and rejects cycles before publishing the reordered plan.
+
+Remote source preparation propagates unexpected renderer/transport errors into the durable request retry budget instead of reporting an empty source. Template directives distinguish permanent 4xx rejection from 408/425/429 and transient transport/server failures. HTTP fetch outcomes retain Retry-After (delta seconds or validated HTTP-date); document extraction forwards it to the existing bounded worker backoff.
+
+The opt-in `linked embedding large image parity across public and grouped inputs` qualification uses `ANTFLY_MEDIA_PARITY_IMAGE` and `ANTFLY_EMBEDDINGGEMMA2_MODEL`. Its pinned NASA fixture is documented in `zig/pkg/inference/src/testdata/large-image-parity.json` and cached under `~/.cache/antfly/conformance-fixtures/multimodal/`. The test verifies its checksum and 6000×4000 dimensions, adds valid JPEG comment segments to reach 16 MiB without changing pixels, serves the image through a local HTTP origin, and compares the public embed vector with the grouped local vector using the same retrieval task. It does not alter model preprocessing or increase inference budgets to obtain parity.
+
+Restore fault injection takes the same catalog pin and per-index apply guard as replay and projection-checkpoint publication. The index-only vector injector must not bypass this writer boundary: doing so can invalidate a posting delta base while a checkpoint worker still holds it. A coordinated regression holds checkpoint admission, observes the injector’s catalog pin, verifies that no vector is added until the writer releases, then completes the insertion. Restore coverage tests retain their ordinary background workers.
+
+Synchronous target-coverage rebuilds acquire external dense admission before taking each index’s catalog/apply guard for the complete capture. This drains streaming replay sessions and excludes checkpoint writers until the capture finishes or aborts. Snapshot runtime repair opens its temporary unpublished destination without replay or optional background runtimes; the eventual serving owner starts them normally.
+
+Text-template artifact reuse resolves one provider generation per batch key before reading cached vectors and includes that revision in the persisted source hash. Both inferred and cache-only publication windows revalidate the generation. Providers without revision metadata retain their existing hashes.
+
+Model-pass chunk preparation and named-output projection share one budgeted source owner and metadata probe. The scanner transfers the heap-owned cache to the deferred asset lane after preparation, retaining the independent batching lanes and retiring source leases only after output consumers finish. Standalone source replay uses an owned instance of the same budgeted cache. HTTP status retry classification is shared with document extraction, including 408 and 425. Ordinary asset chains may terminate at an already validated media-output asset.
+
+The native inference-host gate always executes its tests, so changing opt-in fixture/model environment variables cannot reuse a cached skip. A missing fixture therefore fails even after a preceding run without qualification inputs.

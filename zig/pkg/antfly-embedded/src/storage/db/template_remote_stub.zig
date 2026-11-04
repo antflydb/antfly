@@ -30,12 +30,15 @@ pub const RenderError = error{
     TransientPromptFailure,
 };
 
+pub const RetryHintObserver = @import("../../template_inspection.zig").RetryHintObserver;
+
 pub const RenderConfig = struct {
     remote_content: ?*const scraping.RemoteContentConfig = null,
     secret_store: ?*common_secrets.FileStore = null,
     io: ?std.Io = null,
     deadline_ns: ?u64 = null,
     max_media_parts: ?usize = null,
+    retry_hint: ?RetryHintObserver = null,
 };
 
 pub const default_remote_fetch_max_download_size_bytes: u64 = 100 * 1024 * 1024;
@@ -210,13 +213,20 @@ pub fn downloadRemoteContentOutcomeAllocWithRenderConfig(
 ) !scraping.DownloadOutcome {
     _ = config.io;
     _ = config.deadline_ns;
-    return try downloadRemoteContentOutcomeAllocWithConfig(
+    const outcome = try downloadRemoteContentOutcomeAllocWithConfig(
         alloc,
         config.remote_content,
         config.secret_store,
         url,
         credential_name,
     );
+    if (outcome == .http_error) {
+        const failure = outcome.http_error;
+        if (failure.status == 408 or failure.status == 425 or failure.status == 429 or (failure.status >= 500 and failure.status <= 599)) {
+            if (config.retry_hint) |observer| if (failure.retry_after_ms) |milliseconds| observer.note(milliseconds);
+        }
+    }
+    return outcome;
 }
 
 fn effectiveRemoteContentSecurity(remote_content: ?*const scraping.RemoteContentConfig) !scraping.ContentSecurityConfig {

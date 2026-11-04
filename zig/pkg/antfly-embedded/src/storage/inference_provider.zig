@@ -534,6 +534,7 @@ pub fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) i
         .embed_sparse_texts_with_context = inferenceProviderEmbedSparseTextsWithContext,
         .embed_dense_parts = inferenceProviderEmbedDenseParts,
         .embed_dense_parts_with_context = inferenceProviderEmbedDensePartsWithContext,
+        .embed_dense_group_with_context = inferenceProviderEmbedDenseGroupWithContext,
         .embed_dense_rasters = inferenceProviderEmbedDenseRasters,
         .rerank_texts = inferenceProviderRerankTexts,
         .rerank_texts_with_context = inferenceProviderRerankTextsWithContext,
@@ -1078,6 +1079,15 @@ pub fn inferenceProviderEmbedDensePartsBorrowed(
     deadline_ns: ?u64,
     cancellation: CancellationToken,
 ) ![][]f32 {
+    return embedDensePartsMode(handle, alloc, model, parts, operation, task_type, instruction, model_identity, dimensions, deadline_ns, cancellation, false);
+}
+
+pub fn inferenceProviderEmbedDenseGroupWithContext(handle: *anyopaque, alloc: std.mem.Allocator, model: []const u8, parts: []const template.ContentPart, context: inference.managed_embedder.EmbeddingRequestContext) anyerror![][]f32 {
+    try context.check();
+    return embedDensePartsMode(handle, alloc, model, parts, .embed_dense_parts_with_context, context.task_type.canonical(), context.instruction, context.model_identity, context.dimensions, context.request.deadline_ns, context.request.cancellation orelse .none, true);
+}
+
+fn embedDensePartsMode(handle: *anyopaque, alloc: std.mem.Allocator, model: []const u8, parts: []const template.ContentPart, operation: inference_bridge.ProviderOperation, task_type: ?[]const u8, instruction: ?[]const u8, model_identity: ?[]const u8, dimensions: ?u32, deadline_ns: ?u64, cancellation: CancellationToken, grouped: bool) ![][]f32 {
     const embedding_wire = @import("antfly_inference_embedding_wire");
     const wire_parts = try alloc.alloc(template.ContentPart, parts.len);
     defer alloc.free(wire_parts);
@@ -1106,6 +1116,7 @@ pub fn inferenceProviderEmbedDensePartsBorrowed(
         embedding_wire.Request(template.ContentPart){
             .model = model,
             .parts = wire_parts,
+            .grouped = grouped,
             .attachment_count = payload_count,
             .task_type = task_type,
             .instruction = instruction,

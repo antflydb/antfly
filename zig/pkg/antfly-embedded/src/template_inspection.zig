@@ -20,6 +20,15 @@ const hbs = @import("handlebars");
 const Value = hbs.Value;
 const HelperContext = hbs.HelperContext;
 const ContentPart = @import("antfly_template_content").ContentPart;
+/// Borrowed request-lifetime observer; durable owners decide scheduling.
+pub const RetryHintObserver = struct {
+    ptr: *anyopaque,
+    note_fn: *const fn (*anyopaque, u64) void,
+    pub fn note(self: @This(), milliseconds: u64) void {
+        self.note_fn(self.ptr, milliseconds);
+    }
+};
+
 pub const remote_credentials_argument = "credentials";
 
 pub fn mediaHelper(ctx: HelperContext) anyerror!Value {
@@ -131,8 +140,10 @@ pub const ErrorDirective = struct {
     /// Returns true if the status indicates the resource is permanently
     /// unavailable and should not be retried.
     pub fn isPermanent(self: ErrorDirective) bool {
-        return self.status == 401 or self.status == 403 or
-            self.status == 404 or self.status == 410 or self.status == 413;
+        return switch (self.status) {
+            400...407, 409...424, 426...428, 430...499 => true,
+            else => false,
+        };
     }
 };
 

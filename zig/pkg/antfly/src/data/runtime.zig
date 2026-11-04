@@ -12584,6 +12584,15 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        const execution = @import("../common/data_raft_protocol.zig").batch_execution_identity_protocol_version;
+        if (req.artifact_publication) |command| if (command.execution_identity != null) return execution;
+        if (req.artifact_catalog) |command| if (command.binding.effect_protocol >= 17) return execution;
+        if (req.online_source) |command| if (command == .admit) {
+            if (command.admit.artifact_catalog) |binding| if (binding.effect_protocol >= 17) return execution;
+        };
+        if (req.merge_page) |page| if (page.source.artifact_catalog) |binding| if (binding.effect_protocol >= 17) return execution;
+        if (req.merge_checkpoint) |checkpoint| if (checkpoint.page_source) |source| if (source.artifact_catalog) |binding| if (binding.effect_protocol >= 17) return execution;
+
         if (req.leann_record != null) return @import("../common/data_raft_protocol.zig").batch_leann_record_protocol_version;
         if (req.artifact_publication) |command| if (command.completion) |page| if (page.group_producers) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
         if (req.artifact_catalog) |command| if (command.binding.effect_protocol == 16) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
@@ -56747,10 +56756,12 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
 
 test "grouped source protocol dominates coexisting graph envelope features" {
     const protocol = @import("../common/data_raft_protocol.zig");
-    const request: antfly.db.types.BatchRequest = .{ .artifact_catalog = .{
+    var request: antfly.db.types.BatchRequest = .{ .artifact_catalog = .{
         .namespace = @splat(1),
         .catalogs = .{},
         .binding = .{ .epoch = 1, .digest = @splat(2), .semantic_digest = @splat(3), .effect_protocol = 16 },
     }, .graph_endpoint_cleanup = true };
     try std.testing.expectEqual(protocol.batch_group_source_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    request.artifact_catalog.?.binding.effect_protocol = 17;
+    try std.testing.expectEqual(protocol.batch_execution_identity_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
 }

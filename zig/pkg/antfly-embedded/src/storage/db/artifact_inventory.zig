@@ -33,7 +33,7 @@ pub const Binding = struct {
     effect_protocol: u16 = 14,
 
     pub fn valid(self: Binding) bool {
-        return self.epoch != 0 and (self.effect_protocol >= 14 and self.effect_protocol <= 16);
+        return self.epoch != 0 and (self.effect_protocol >= 14 and self.effect_protocol <= 17);
     }
 
     /// Protocol 16 extends protocol 15's receipt-backed stream witnesses.
@@ -53,24 +53,35 @@ pub const Catalogs = struct {
     /// Select capabilities from this immutable definition cut, independently
     /// of the database's monotonic reader floor. Resolver/producer receipts
     /// need protocol 15; grouped producer ownership needs protocol 16.
+    /// Generated base dense vectors need protocol 17 for execution-aware refresh.
     pub fn requiredEffectProtocol(self: Catalogs, alloc: std.mem.Allocator) !u16 {
-        var required: u16 = 14;
+        const enrichments = @import("catalog/enrichment_catalog.zig");
+        const producers = if (self.enrichments.len != 0)
+            try enrichments.deserializeCatalog(alloc, self.enrichments)
+        else
+            try alloc.alloc(enrichments.EnrichmentConfig, 0);
+        defer {
+            for (producers) |*cfg| cfg.deinit(alloc);
+            alloc.free(producers);
+        }
+        var required: u16 = if (producers.len != 0) 15 else 14;
+        for (producers) |cfg| if (cfg.group_source_json.len != 0 or cfg.prior_context_json.len != 0) {
+            required = 16;
+        };
+        if (self.indexes.len != 0) {
+            const indexes = @import("catalog/index_manager.zig");
+            const configs = try indexes.deserializeCatalog(alloc, self.indexes);
+            defer @import("types.zig").freeIndexConfigs(alloc, configs);
+            for (configs) |cfg| if (cfg.kind == .dense_vector and
+                try indexes.onlineBaseGeneratedVectorConfig(alloc, cfg, producers)) return 17;
+        }
         if (self.resolvers.len != 0) {
             const configs = try @import("catalog/resolver_catalog.zig").deserializeCatalog(alloc, self.resolvers);
             defer {
                 for (configs) |*cfg| cfg.deinit(alloc);
                 alloc.free(configs);
             }
-            if (configs.len != 0) required = 15;
-        }
-        if (self.enrichments.len != 0) {
-            const configs = try @import("catalog/enrichment_catalog.zig").deserializeCatalog(alloc, self.enrichments);
-            defer {
-                for (configs) |*cfg| cfg.deinit(alloc);
-                alloc.free(configs);
-            }
-            if (configs.len != 0) required = 15;
-            for (configs) |cfg| if (cfg.group_source_json.len != 0 or cfg.prior_context_json.len != 0) return 16;
+            if (configs.len != 0) required = @max(required, 15);
         }
         return required;
     }
@@ -142,6 +153,8 @@ test "grouped sources production ordered artifact inventory compatibility binds 
     try std.testing.expect(extended.supportsProducerWitnesses());
     try std.testing.expect(!direct.compatible(extended));
     extended.effect_protocol = 17;
+    try std.testing.expect(extended.supportsProducerWitnesses());
+    extended.effect_protocol = 18;
     try std.testing.expect(!extended.supportsProducerWitnesses());
     try std.testing.expect(!extended.valid() and !extended.compatible(extended));
 }

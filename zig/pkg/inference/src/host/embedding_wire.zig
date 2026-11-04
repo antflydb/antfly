@@ -24,6 +24,7 @@ pub const Options = struct {
     dimensions: ?u32 = null,
     task_type: ?[]const u8 = null,
     instruction: ?[]const u8 = null,
+    grouped: bool = false,
 };
 
 pub fn Request(comptime Part: type) type {
@@ -35,6 +36,7 @@ pub fn Request(comptime Part: type) type {
         instruction: ?[]const u8,
         model_identity: ?[]const u8 = null,
         dimensions: ?u32 = null,
+        grouped: bool = false,
     };
 }
 
@@ -63,6 +65,7 @@ pub const Sizer = struct {
     pub fn init(comptime Part: type, options: Options) !Sizer {
         return .{ .base_bytes = try jsonSize(Request(Part){
             .model = options.model,
+            .grouped = options.grouped,
             .model_identity = options.model_identity,
             .dimensions = options.dimensions,
             .parts = &.{},

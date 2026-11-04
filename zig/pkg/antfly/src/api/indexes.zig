@@ -386,7 +386,7 @@ pub fn encodeArtifactEnrichmentList(
         alloc.free(enrichments);
     }
 
-    sortArtifactEnrichmentsByDependency(enrichments);
+    try sortArtifactEnrichmentsByDependency(alloc, enrichments);
     for (enrichments, 0..) |*cfg, i| {
         var duplicate = false;
         for (enrichments[0..unique_len]) |prior| {
@@ -5092,6 +5092,56 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "public media pass admits named outputs from model chunks (#1210)" {
+            const a = std.testing.allocator;
+            const recipe =
+                \\{"enrichments":[{"name":"windows","kind":"chunk","field":"recording","chunker":{"provider":"antfly","embedding":{"model":"model","dimensions":2},"outputs":{"boundary_model":"embedding","targets":[{"name":"embedding","kind":"embedding","model":"model","dimensions":2},{"name":"speech","kind":"transcribe","model":"whisper"}]}}},{"name":"transcript","kind":"asset","source_artifact_name":"windows","producer":{"type":"media_output","config":{"output_name":"speech"}}},{"name":"transcript_chunks","kind":"chunk","field":"text","source_artifact_name":"transcript","chunk_size":512},{"name":"media_vectors","kind":"embedding","source_artifact_name":"windows","expected_dims":2}]}
+            ;
+            const body = try std.fmt.allocPrint(a, "{{\"type\":\"full_text\",\"field\":\"body\",{s}", .{recipe[1..]});
+            defer a.free(body);
+            const normalized = try parseCreateIndexRequest(a, body);
+            defer a.free(normalized);
+            try validateArtifactEnrichmentsForIndexRequestJson(a, normalized);
+            try validateArtifactEnrichmentsForTableIndexesJson(a, normalized);
+            try validateArtifactEnrichmentsForTableIndexesJson(a, recipe);
+            const configs = try collectArtifactEnrichmentsFromTableIndexesJson(a, recipe);
+            defer db_mod.types.freeEnrichmentConfigs(a, configs);
+            try sortArtifactEnrichmentsByDependency(a, configs);
+            try std.testing.expectEqualStrings("windows", configs[0].name);
+            try std.testing.expectEqualStrings("transcript", configs[1].name);
+            try std.testing.expectEqualStrings("transcript_chunks", configs[2].name);
+            try std.testing.expectEqualStrings("media_vectors", configs[3].name);
+            // A model output is also a valid root for ordinary asset chains.
+            var chained = [_]db_mod.types.EnrichmentConfig{ configs[0], configs[1], .{ .name = "transcript_copy", .kind = .asset, .source_artifact_name = "transcript", .producer_json = "{\"type\":\"copy\"}" } };
+            try validateArtifactEnrichmentConfigs(a, &chained);
+            try sortArtifactEnrichmentsByDependency(a, &chained);
+            try std.testing.expectEqualStrings("transcript_copy", chained[2].name);
+
+            const Sort = struct {
+                fn qualify(allocator: std.mem.Allocator) !void {
+                    var entries = [_]db_mod.types.EnrichmentConfig{
+                        .{ .name = "result", .kind = .asset, .source_artifact_name = "chunks" },
+                        .{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 10 },
+                    };
+                    try sortArtifactEnrichmentsByDependency(allocator, &entries);
+                    try std.testing.expectEqualStrings("chunks", entries[0].name);
+                }
+            };
+            try std.testing.checkAllAllocationFailures(a, Sort.qualify, .{});
+            var cyclic = [_]db_mod.types.EnrichmentConfig{
+                .{ .name = "a", .kind = .asset, .source_artifact_name = "b" },
+                .{ .name = "b", .kind = .chunk, .source_artifact_name = "a", .chunk_size = 10 },
+            };
+            try std.testing.expectError(error.InvalidEnrichmentConfig, sortArtifactEnrichmentsByDependency(a, &cyclic));
+
+            for (configs) |*config| if (config.kind == .asset) {
+                const original = config.producer_json;
+                config.producer_json = @constCast("{\"type\":\"media_output\",\"config\":{\"output_name\":\"missing\"}}");
+                defer config.producer_json = original;
+                try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentConfigs(a, configs));
+            };
+        }
+
         test "artifact source admission recognizes canonical and v0.2 request forms" {
             const alloc = std.testing.allocator;
             try std.testing.expect(try indexConfigUsesArtifactSources(alloc, "{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"chunks\"}]}"));

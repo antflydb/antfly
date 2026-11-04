@@ -28,8 +28,8 @@ pub const Materializer = struct {
     materialize: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror![]u8,
 };
 
-pub const DocumentAuthority = struct { authority: publication.Authority, generation: u64, requirement: publication.Digest };
-pub const TemplateAuthority = struct { authority: publication.Authority, requirement: *const @import("artifact_completion_plan.zig").Node };
+pub const DocumentAuthority = struct { authority: publication.Authority, generation: u64, effect_protocol: u16, requirement: publication.Digest };
+pub const TemplateAuthority = struct { effect_protocol: u16, authority: publication.Authority, requirement: *const @import("artifact_completion_plan.zig").Node };
 
 /// Exact immutable provider definition shared by execution and completion.
 /// Scope-specific callers must still establish that their scope set is closed.
@@ -57,7 +57,7 @@ fn bindTemplate(alloc: std.mem.Allocator, txn: anytype, request: requests.Genera
     // Preserve pending debt until an ordered protocol upgrade; this is not
     // evidence of catalog corruption and never authorizes legacy outputs.
     if (!binding.supportsProducerWitnesses()) return error.OnlineMergeArtifactTailsUnsupported;
-    return .{ .authority = authority, .requirement = requirement };
+    return .{ .authority = authority, .effect_protocol = binding.effect_protocol, .requirement = requirement };
 }
 
 /// Shared authorization for document-wide provider execution and completion.
@@ -72,7 +72,7 @@ pub fn authorizeDocument(alloc: std.mem.Allocator, txn: anytype, request: reques
     const requirement = bound.requirement;
     const generation = plan.coverageGeneration(request.index_name) orelse return error.ArtifactCatalogDrift;
     if (generation == 0 or requirement.scope != .document) return error.ArtifactCatalogDrift;
-    return .{ .authority = authority, .generation = generation, .requirement = requirement.id };
+    return .{ .authority = authority, .generation = generation, .effect_protocol = bound.effect_protocol, .requirement = requirement.id };
 }
 
 pub const Token = struct {
@@ -85,12 +85,36 @@ pub const Token = struct {
     producer_generation: u64,
     artifact_name: []u8,
     source: publication.Source,
+    execution_identity: ?publication.Digest = null,
+    output_guard: ?publication.ArtifactSource = null,
+    effect_protocol: u16 = 14,
 
     pub fn deinit(self: *@This()) void {
+        if (self.output_guard) |guard| self.alloc.free(@constCast(guard.key));
         self.alloc.free(self.producer_name);
         self.alloc.free(self.artifact_name);
         self.alloc.free(@constCast(self.source.document_key));
         self.* = undefined;
+    }
+
+    /// Bind the resolved execution and the exact output observed before work.
+    /// A late result from an old revision cannot overwrite a newer publication.
+    pub fn bindExecution(self: *@This(), txn: anytype, revision: ?publication.Digest) !void {
+        const resolved = revision orelse return;
+        if (self.effect_protocol < 17) return error.OnlineMergeArtifactTailsUnsupported;
+        const key = try keys.embeddingArtifactKeyForDocumentAlloc(self.alloc, self.source.document_key, self.artifact_name);
+        errdefer self.alloc.free(key);
+        const raw = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const digest: ?publication.Digest = if (raw) |value| blk: {
+            var result: publication.Digest = undefined;
+            std.crypto.hash.sha2.Sha256.hash(value, &result, .{});
+            break :blk result;
+        } else null;
+        self.output_guard = .{ .key = key, .content_digest = digest, .input_position = try publication.artifactRevision(txn, self.namespace, key), .source_index = 0 };
+        self.execution_identity = resolved;
     }
 
     /// Values are immutable authored output; the caller retains them until
@@ -103,6 +127,8 @@ pub const Token = struct {
             .producer_name = self.producer_name,
             .producer_generation = self.producer_generation,
             .producer_artifact_name = self.artifact_name,
+            .execution_identity = self.execution_identity,
+            .mutation_preconditions = if (self.output_guard) |*guard| guard[0..1] else &.{},
             .sources = (&self.source)[0..1],
             .mutations = mutations,
             .publication_digest = @splat(0),
@@ -114,7 +140,7 @@ pub const Token = struct {
     /// An accepted result is canonical for this exact producer/input even if
     /// a duplicate provider invocation returned different floating values.
     /// The input recheck prevents an old receipt from crediting new work.
-    pub fn accepted(self: *const Token, txn: anytype) !bool {
+    pub fn authoredAccepted(self: *const Token, txn: anytype) !bool {
         const active = (try publication.authority(txn)) orelse return error.ArtifactCatalogDrift;
         if (active.epoch != self.authority_epoch or !std.mem.eql(u8, &active.namespace, &self.namespace) or
             !std.mem.eql(u8, &active.catalog_digest, &self.catalog_digest)) return error.ArtifactCatalogDrift;
@@ -128,11 +154,16 @@ pub const Token = struct {
                 return true;
             }
         }
+        return false;
+    }
+
+    pub fn accepted(self: *const Token, txn: anytype) !bool {
+        if (try self.authoredAccepted(txn)) return true;
         // Receipts survive output replacement. Only current causal/output
         // provenance can suppress execution for a generated result.
         var generated = (try @import("artifact_producer_provenance.zig").readCurrentForSource(self.alloc, txn, self.command(&.{}), self.source)) orelse return false;
         defer generated.deinit();
-        return true;
+        return std.meta.eql(self.execution_identity, generated.owned.proof.execution_identity);
     }
 };
 
@@ -266,7 +297,7 @@ pub fn capture(
     errdefer alloc.free(doc_key);
     var source: publication.Source = .{ .document_key = doc_key, .content_digest = undefined, .timestamp = timestamp, .input_position = try publication.inputRevision(txn, authority.namespace, request.doc_key) };
     std.crypto.hash.sha2.Sha256.hash(raw, &source.content_digest, .{});
-    return .{ .alloc = alloc, .root = root, .namespace = authority.namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = producer_name, .producer_generation = producer_generation, .artifact_name = artifact_name, .source = source };
+    return .{ .effect_protocol = authorized.effect_protocol, .alloc = alloc, .root = root, .namespace = authority.namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = producer_name, .producer_generation = producer_generation, .artifact_name = artifact_name, .source = source };
 }
 
 test "ordered artifact inventory producer template binds every inference field" {
@@ -285,4 +316,89 @@ test "ordered artifact inventory producer template binds every inference field" 
     request = template;
     request.expected_dims = 4;
     try std.testing.expect(!sameDefinition(template, request));
+}
+
+test "ordered artifact inventory resolved execution refreshes vectors and fences late results" {
+    const a = std.testing.allocator;
+    const DB = @import("selected_root.zig").db.DB;
+    const codec = @import("enrichment/artifact_codec.zig");
+    var tmp = try @import("../../common/test_directory.zig").TestDirectory.init("execution-revision");
+    defer tmp.cleanup();
+    var db = try DB.open(a, tmp.path(), .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .online_source_authority = .raft, .executor = .{ .backend = .manual }, .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "semantic", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"model\"}}" });
+    try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"same\"}" }}, .sync_level = .write }, .{ .term = 1, .index = 1 }, false);
+    var catalog = try db.artifactInventoryCommand(a);
+    defer catalog.catalogs.deinit(a);
+    try std.testing.expectEqual(@as(u16, 17), catalog.binding.effect_protocol);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try inventory.stageOrdered(a, &txn, catalog, 1);
+        try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+        try txn.commit();
+    }
+    var pin = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer pin.release();
+    const Factory = struct {
+        fn make(alloc: std.mem.Allocator, owner: *DB, command: inventory.Command, generation: u64, revision: u8) !Token {
+            var read = try owner.core.store.beginReadTxn();
+            defer read.abort();
+            const source = try publication.capturePrimarySource(alloc, &read, command.namespace, "doc");
+            var token: Token = .{ .effect_protocol = command.binding.effect_protocol, .alloc = alloc, .root = owner.root_incarnation, .namespace = command.namespace, .authority_epoch = command.binding.epoch, .catalog_digest = command.binding.digest, .producer_name = try alloc.dupe(u8, "semantic"), .producer_generation = generation, .artifact_name = try alloc.dupe(u8, "model"), .source = source };
+            errdefer token.deinit();
+            try token.bindExecution(&read, @splat(revision));
+            return token;
+        }
+        fn accepted(owner: *DB, token: *Token) !bool {
+            var read = try owner.core.store.beginReadTxn();
+            defer read.abort();
+            return token.accepted(&read);
+        }
+    };
+    const generation = pin.plan().coverageGeneration("semantic").?;
+    var first = try Factory.make(a, &db, catalog, generation, 1);
+    defer first.deinit();
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(a, "doc", "model");
+    defer a.free(key);
+    const one = try codec.encodeDenseEmbeddingAlloc(a, null, &.{ 1, 0 });
+    defer a.free(one);
+    const two = try codec.encodeDenseEmbeddingAlloc(a, null, &.{ 0, 1 });
+    defer a.free(two);
+    const first_effect = publication.Mutation{ .family = .base_vector, .key = key, .value = one, .source_index = 0 };
+    const second_effect = publication.Mutation{ .family = .base_vector, .key = key, .value = two, .source_index = 0 };
+    const first_command = first.command((&first_effect)[0..1]);
+    try db.applyOrderedCommittedMutation(.{ .artifact_publication = first_command }, .{ .term = 1, .index = 2 }, false);
+    try std.testing.expect(try Factory.accepted(&db, &first));
+    var second = try Factory.make(a, &db, catalog, generation, 2);
+    defer second.deinit();
+    try std.testing.expect(!try Factory.accepted(&db, &second));
+    const second_command = second.command((&second_effect)[0..1]);
+    try std.testing.expect(!std.mem.eql(u8, &first_command.inputDigest(), &second_command.inputDigest()));
+    try db.applyOrderedCommittedMutation(.{ .artifact_publication = second_command }, .{ .term = 1, .index = 3 }, false);
+    try std.testing.expect(try Factory.accepted(&db, &second));
+    try std.testing.expect(!try Factory.accepted(&db, &first));
+    // Old execution observes the same immutable document, but its output CAS
+    // cannot replace the vector accepted for the new model revision.
+    try db.applyOrderedCommittedMutation(.{ .artifact_publication = first_command }, .{ .term = 1, .index = 4 }, false);
+    const current = try db.core.store.get(a, key);
+    defer a.free(current);
+    try std.testing.expectEqualSlices(u8, two, current);
+    var retry = try Factory.make(a, &db, catalog, generation, 2);
+    defer retry.deinit();
+    try std.testing.expect(try Factory.accepted(&db, &retry));
+    try db.applyOrderedCommittedMutation(.{ .artifact_publication = retry.command((&first_effect)[0..1]) }, .{ .term = 1, .index = 5 }, false);
+    const canonical = try db.core.store.get(a, key);
+    defer a.free(canonical);
+    try std.testing.expectEqualSlices(u8, two, canonical);
+    // Explicit ingress stays canonical even when model resolution changes.
+    try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"same\",\"_embeddings\":{\"model\":[1,0]}}" }}, .sync_level = .write }, .{ .term = 1, .index = 6 }, false);
+    var authored = try Factory.make(a, &db, catalog, generation, 3);
+    defer authored.deinit();
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try authored.authoredAccepted(&read));
+    }
+    try std.testing.expect(try Factory.accepted(&db, &authored));
 }

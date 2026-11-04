@@ -240,6 +240,7 @@ const ModelPartsRequest = struct {
     dimensions: ?u32 = null,
     model: []const u8,
     parts: []const template_content.ContentPart,
+    grouped: bool = false,
     attachment_count: usize = 0,
     task_type: ?[]const u8 = null,
     instruction: ?[]const u8 = null,
@@ -1100,6 +1101,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 alloc,
                 parsed.value.model,
                 parts,
+                parsed.value.grouped,
                 state.io,
                 execution_control,
                 if (operation == .embed_dense_parts_with_context) parsed.value.task_type else null,
@@ -2527,6 +2529,7 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
     alloc: std.mem.Allocator,
     model: []const u8,
     parts: []const template_content.ContentPart,
+    grouped: bool,
     io: std.Io,
     control: inference.InferenceExecutionControl,
     task_type: ?[]const u8,
@@ -2534,7 +2537,7 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     const capabilities = try localModelCapabilities(node, io, model, .embed);
-    var shape = inference_work.InvocationShape{ .item_count = parts.len };
+    var shape = inference_work.InvocationShape{ .item_count = if (grouped) 1 else parts.len };
     for (parts) |part| switch (part) {
         .text => |text| {
             shape.modalities.text = true;
@@ -2583,18 +2586,67 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
             shape.max_media_parts_per_item = @max(shape.max_media_parts_per_item, 1);
         },
     };
+    if (grouped) {
+        shape.max_text_bytes_per_item = shape.text_bytes;
+        var media_count: usize = 0;
+        for (parts) |part| if (part != .text) {
+            media_count += 1;
+        };
+        shape.max_media_parts_per_item = media_count;
+    }
     try capabilities.validateInvocation(.embed, shape);
-    const direct_parts = try localAntflyDirectDenseParts(alloc, parts);
-    defer alloc.free(direct_parts);
+    var direct = try LocalDenseParts.init(alloc, parts, grouped);
+    defer direct.deinit(alloc);
     return try node.embedDensePartsDirectWithExecutionControlAndTask(
         alloc,
         io,
         control,
         model,
-        direct_parts,
+        direct.inputs(),
         task_type,
         instruction,
     );
+}
+
+// Own only descriptors; encoded media remains borrowed across the ABI call.
+// A group is one model input, whereas an item batch retains its full row count.
+const LocalDenseParts = struct {
+    parts: []inference.server.Node.DirectDenseEmbedPart,
+    group: [1]inference.server.Node.DirectDenseEmbedPart,
+    grouped: bool,
+
+    fn init(a: std.mem.Allocator, parts: []const template_content.ContentPart, grouped: bool) !LocalDenseParts {
+        const direct = try localAntflyDirectDenseParts(a, parts);
+        return .{ .parts = direct, .group = .{.{ .content = direct }}, .grouped = grouped and direct.len > 1 };
+    }
+    fn inputs(self: *@This()) []const inference.server.Node.DirectDenseEmbedPart {
+        return if (self.grouped) &self.group else self.parts;
+    }
+    fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        a.free(self.parts);
+    }
+};
+
+test "linked embedding groups retain one ordered input and borrowed media" {
+    const a = std.testing.allocator;
+    const parts = [_]template_content.ContentPart{ .{ .text = "astronaut" }, .{ .binary = .{ .mime_type = "image/png", .data = "borrowed image" } } };
+    var group = try LocalDenseParts.init(a, &parts, true);
+    defer group.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), group.inputs().len);
+    const children = group.inputs()[0].content;
+    try std.testing.expectEqualStrings("astronaut", children[0].text);
+    try std.testing.expect(children[1].media.data.ptr == parts[1].binary.data.ptr);
+    var batch = try LocalDenseParts.init(a, &parts, false);
+    defer batch.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), batch.inputs().len);
+    // A single image retains compatibility with unimodal model executors.
+    var single = try LocalDenseParts.init(a, parts[1..], true);
+    defer single.deinit(a);
+    try std.testing.expect(single.inputs()[0] == .media);
+    var request = try std.json.parseFromSlice(ModelPartsRequest, a, "{\"model\":\"m\",\"parts\":[],\"grouped\":true,\"task_type\":\"RETRIEVAL_QUERY\"}", .{});
+    defer request.deinit();
+    try std.testing.expect(request.value.grouped);
+    try std.testing.expectEqualStrings("RETRIEVAL_QUERY", request.value.task_type.?);
 }
 
 pub fn localAntflyDirectDenseParts(
@@ -2626,6 +2678,7 @@ fn localAntflyEmbedDensePartsWithContext(
         alloc,
         model,
         parts,
+        false,
         context.request.io,
         adapter.control(),
         context.task_type.canonical(),
@@ -3887,4 +3940,118 @@ test "native checkpoint route manifest preserves binary upload and export stream
         try std.testing.expectEqual(http_abi.RequestBodyMode.buffered, resume_request.request_body);
         try std.testing.expect(resume_request.streaming_response);
     }
+}
+
+test "linked embedding large image parity across public and grouped inputs" {
+    const image_path = @import("antfly_platform").env.getenv("ANTFLY_MEDIA_PARITY_IMAGE") orelse return error.SkipZigTest;
+    const model = @import("antfly_platform").env.getenv("ANTFLY_EMBEDDINGGEMMA2_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, image_path, a, .limited(32 * 1024 * 1024));
+    defer a.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const fingerprint = std.fmt.bytesToHex(digest, .lower);
+    try std.testing.expectEqualStrings("df9ac37cc26e9d72a25017709c1b2b20d9bb0dc54206b6b5df178e9a7de72323", &fingerprint);
+    const info = try inference.pipelines.image.inspectEncodedForInference(bytes, null);
+    try std.testing.expectEqual(@as(u32, 6000), info.width);
+    try std.testing.expectEqual(@as(u32, 4000), info.height);
+    // Exercise the reported encoded size as well as source resolution. JPEG
+    // COM segments do not change decoded pixels or model preprocessing.
+    const padded = try a.alloc(u8, 16 * 1024 * 1024);
+    defer a.free(padded);
+    @memset(padded, 0);
+    @memcpy(padded[0..2], bytes[0..2]);
+    var position: usize = 2;
+    var remaining = padded.len - bytes.len;
+    while (remaining != 0) {
+        var segment = @min(remaining, 65537);
+        if (remaining > segment and remaining - segment < 4) segment -= 4;
+        padded[position] = 0xff;
+        padded[position + 1] = 0xfe;
+        std.mem.writeInt(u16, padded[position + 2 ..][0..2], @intCast(segment - 2), .big);
+        position += segment;
+        remaining -= segment;
+    }
+    @memcpy(padded[position..], bytes[2..]);
+
+    var node = try inference.server.Node.init(a, .{ .models_dir = std.fs.path.dirname(model).?, .allow_unknown_models = true, .process_termination_available = true, .content_security = .{ .allowed_hosts = &.{@constCast("127.0.0.1")}, .block_private_ips = false } });
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+    node.session_manager.required_backend = if (@import("builtin").os.tag == .macos) .metal else .native;
+    node.model_manager.session_manager.required_backend = node.session_manager.required_backend;
+    const name = std.fs.path.basename(model);
+    const Fixture = struct {
+        server: *std.Io.net.Server,
+        bytes: []const u8,
+        failure: ?anyerror = null,
+        fn serve(self: *@This()) void {
+            var stream = self.server.accept(std.testing.io) catch |err| {
+                self.failure = err;
+                return;
+            };
+            defer stream.close(std.testing.io);
+            var read_buffer: [4096]u8 = undefined;
+            var reader = stream.reader(std.testing.io, &read_buffer);
+            while (true) {
+                const line = reader.interface.takeDelimiterInclusive('\n') catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                if (std.mem.eql(u8, line, "\r\n")) break;
+            }
+            var buffer: [4096]u8 = undefined;
+            var writer = stream.writer(std.testing.io, &buffer);
+            writer.interface.print("HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{self.bytes.len}) catch |err| {
+                self.failure = err;
+                return;
+            };
+            writer.interface.writeAll(self.bytes) catch |err| {
+                self.failure = err;
+                return;
+            };
+            writer.interface.flush() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var server = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    var fixture = Fixture{ .server = &server, .bytes = padded };
+    var serving = try std.testing.io.concurrent(Fixture.serve, .{&fixture});
+    defer serving.cancel(std.testing.io);
+    const url = try std.fmt.allocPrint(a, "http://{f}/large.jpg", .{server.socket.address});
+    defer a.free(url);
+    const body = try std.json.Stringify.valueAlloc(a, .{ .model = name, .task_type = "RETRIEVAL_QUERY", .input = &.{.{ .type = "image_url", .image_url = url }} }, .{});
+    defer a.free(body);
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.createEmbedding(&ctx);
+    defer response.deinit();
+    if (response.status.code != 200) std.debug.print("large image public status={d} body={s}\n", .{ response.status.code, response.body orelse "" });
+    const vectors = localAntflyEmbedDensePartsWithExecutionContext(&node, a, name, &.{.{ .binary = .{ .mime_type = "image/jpeg", .data = padded } }}, true, std.testing.io, .{ .deadline_ns = platform_time.monotonicNs() + 120 * std.time.ns_per_s }, "RETRIEVAL_QUERY", null) catch |err| {
+        std.debug.print("large image grouped failure={s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer {
+        for (vectors) |vector| a.free(vector);
+        a.free(vectors);
+    }
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer parsed.deinit();
+    const values = parsed.value.object.get("data").?.array.items[0].object.get("embedding").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), vectors.len);
+    try std.testing.expectEqual(values.len, vectors[0].len);
+    for (values, vectors[0]) |value, vector| {
+        const number: f32 = switch (value) {
+            .float => @floatCast(value.float),
+            .integer => @floatFromInt(value.integer),
+            else => return error.InvalidEmbeddingResponse,
+        };
+        try std.testing.expectApproxEqAbs(number, vector, 0.001);
+    }
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
 }

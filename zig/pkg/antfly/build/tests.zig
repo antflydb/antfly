@@ -5478,6 +5478,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone data directory does not change the default models directory",
             "standalone linked inference ABI validates the supported function-table prefix",
             "linked rerank documents become server content parts with attachment references",
+            "linked embedding groups retain one ordered input and borrowed media",
+            "linked embedding large image parity across public and grouped inputs",
             "document execution manifests retain raw duplex body mode",
             "native checkpoint route manifest preserves binary upload and export streaming",
             "native checkpoint worker upload honors cancellation counts and cumulative ceiling",
@@ -5485,6 +5487,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
     });
     const run_inference_host_tests = b.addRunArtifact(inference_host_tests);
+    // Qualification reads external fixture/model paths at execution time.
+    // A prior opt-out must never cache a skip over a later live invocation.
+    run_inference_host_tests.has_side_effects = true;
     lib_standalone_runtime_test_step.dependOn(&run_inference_host_tests.step);
     inference_host_test_step.dependOn(&run_inference_host_tests.step);
     // Keep the complete API worker fixture out of the inference-heavy runtime
