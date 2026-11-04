@@ -37,21 +37,26 @@
     "cabi_smoke_and_c_consumer_linkage_passed": true,
     "c_header_copies_match": true,
     "all_changed_zig_ast_files_passed": 16,
-    "sdk_suite_source_commit": "aa0610f69a8f7c43c41f3ee43ffb9a367ff3fa7a",
-    "sdk_suite_library_sha256": "8305a4cbeb2faefa92eb9d3217b873855db6dd48afc95a231192312636c2807e",
-    "sdk_scope_note": "SDK sources are unchanged by the subsequent publication-timing/controller-feedback fix. Native 180-test suite and ABI/linkage were revalidated on the corrected runtime.",
+    "sdk_suite_source_commit": "e243c0ad9cd2fb612dfae09a660daabed50e7489",
+    "sdk_suite_library_sha256": "fe873a5c740011177fc498f765e14d896780d58afcce93ceda40f85e5d70e97b",
+    "sdk_scope_note": "Final SDK suites used the same corrected frozen artifact as both final importer runs. Test checkout 1305f246a1 adds only the diagnostic receipt to runtime source e243c0ad9c.",
     "python_selected_passed": 209,
-    "python_note": "208 passed in the initial run; one loopback-only HTTP mock was denied by the sandbox, then passed with loopback access.",
+    "python_note": "All 209 selected cases pass in one final run, including the loopback-only HTTP provider mock.",
     "typescript_selected_passed": 177,
     "typescript_native_library_required": true,
     "rust_selected_passed": 23,
     "go_database_selected_passed": 55,
     "go_database_skipped": 2,
-    "go_note": "Database suite with libantfly and loopback access. An unscoped attempt entered unrelated local-model inference and only its owned executable was terminated; that attempt does not qualify model behavior.",
+    "go_note": "Selected database suite with libantfly and loopback access. Unrelated inference-model tests are explicitly excluded; no full model qualification is claimed.",
     "python_pure_passed": 24,
     "benchmark_reporting_passed": 24,
     "typescript_typecheck_passed": true,
-    "rust_default_feature_check_passed": true
+    "rust_default_feature_check_passed": true,
+    "sdk_test_checkout_commit": "1305f246a1c98d946aa519808d8816fa34b34daf",
+    "go_skipped_tests": [
+      "TestBundledCABIHeaderMatchesSourceTree",
+      "TestLiteLocalResolverEmbedsMentionsAndMatchesStoredCanonicalEntity"
+    ]
   },
   "unchanged_importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
   "fresh_input7": {
