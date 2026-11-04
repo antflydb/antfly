@@ -59,6 +59,7 @@ def _vectors(response, count):
     body = response.json()
     assert body["usage"]["prompt_tokens"] > 0
     assert len(body["data"]) == count
+    assert [item["index"] for item in body["data"]] == list(range(count))
     vectors = [item["embedding"] for item in body["data"]]
     for vector in vectors:
         assert len(vector) == 768
@@ -73,14 +74,32 @@ def test_cpu_admission_text_lengths(api, words, grouped):
     _vectors(_post(api, _input(words, grouped)), 1)
 
 
-def test_cpu_admission_retains_outputs_between_cohorts(api):
+@pytest.mark.parametrize("grouped", [False, True])
+def test_cpu_admission_retains_outputs_between_cohorts(api, grouped):
     words = ["hello", "world", "good", "bad", "yes", "no", "one", "two"]
-    texts = [(word + " ") * 256 for word in words]
-    vectors = _vectors(_post(api, texts), len(texts))
-    # Distinct rows catch aliasing/overwrites by later cohorts and verify that
-    # length bucketing restores input order. Compare with independent calls.
-    for text, vector in zip(texts, vectors):
-        reference = _vectors(_post(api, [text]), 1)[0]
+    # Deliberately shuffled lengths force flat execution to reorder length
+    # buckets and restore input positions across multiple encoder cohorts.
+    lengths = [256, 16, 192, 48, 128, 8, 224, 80]
+    texts = [(word + " ") * length for word, length in zip(words, lengths)]
+    inputs = texts
+    if grouped:
+        # The public grouped HTTP route dispatches to embedCached directly.
+        # Multiple text parts keep this regression explicit about that path,
+        # including its incremental preparation and exact-token run admission.
+        inputs = [
+            {
+                "content": [
+                    {"type": "text", "text": text[: len(text) // 2]},
+                    {"type": "text", "text": text[len(text) // 2 :]},
+                ]
+            }
+            for text in texts
+        ]
+    vectors = _vectors(_post(api, inputs), len(inputs))
+    # Independent calls catch aliasing, later-cohort overwrites and misplaced
+    # rows. Grouped references preserve the same multipart rendering semantics.
+    for item, vector in zip(inputs, vectors):
+        reference = _vectors(_post(api, [item]), 1)[0]
         assert max(abs(a - b) for a, b in zip(reference, vector)) < 1e-5
 
 

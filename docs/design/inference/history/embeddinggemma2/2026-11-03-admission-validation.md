@@ -170,3 +170,18 @@ This strengthened case passed on the qualified server binaries under Linux
 complete production database build above predate the final main refresh; a
 complete database rebuild of that final merge was not repeated locally.
 Repository-wide integration CI remains subject to the repository approval gate.
+
+Final review coverage extends the retention case to both flat inputs and
+multipart text groups, with deliberately shuffled lengths
+`[256, 16, 192, 48, 128, 8, 224, 80]`. Every response index must match its input
+position, and every vector must match an independent request within `1e-5`.
+The complete updated suite passed 13/13 cases in each of the Linux 8 GiB,
+Linux 14 GiB, and macOS native 8 GiB envelopes (39 passing cases). Only test
+and qualification documentation changed after the preceding review.
+
+The earlier review's claimed grouped-path coverage gap was incorrect: public
+grouped HTTP execution calls `grouped.embedCached` directly from
+`Node.createGroupedEmbeddingTracked`; the text-only flattening helper belongs
+to a different pipeline dispatch. Existing grouped cases already exercised
+the native grouped allocator. The additional multipart batch case makes that
+coverage explicit and verifies retained output order across multiple groups.
