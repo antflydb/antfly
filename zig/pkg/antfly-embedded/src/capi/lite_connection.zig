@@ -8229,7 +8229,10 @@ test "capi native maintenance namespace working set reuses and evicts bounded in
     // Reading the working set never alters the complete durable name catalog.
     try std.testing.expectEqual(TextSourceRuntimeCache.max_namespaces + 1, root.embedded_table_records.count());
     owner.text_source_runtime_cache = (try TextSourceRuntimeCache.capture(root)) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(root, try owner.refreshMaintenanceSnapshot(foreground, .source));
+    // Opening immutable readers publishes lease metadata. Production admission
+    // refreshes the serving checkpoint before each capture; do the same here
+    // instead of rebinding to the foreground's now unretained old page roots.
+    try std.testing.expectEqual(root, try owner.refreshMaintenanceSnapshot(try owner.refresh(), .source));
 
     // Protect the first resident with a recent selection; the second is now
     // the oldest. Eviction drops only that DB and its artifact readers.
@@ -8243,7 +8246,7 @@ test "capi native maintenance namespace working set reuses and evicts bounded in
     try std.testing.expect(owner.text_source_runtime_cache == null);
     // Recapture covers every resident's catalog and mutable control witnesses.
     owner.text_source_runtime_cache = (try TextSourceRuntimeCache.capture(root)) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(root, try owner.refreshMaintenanceSnapshot(foreground, .source));
+    try std.testing.expectEqual(root, try owner.refreshMaintenanceSnapshot(try owner.refresh(), .source));
 }
 
 test "capi native maintenance keeps settled text inputs warm across artifact turns" {
