@@ -60,24 +60,20 @@ pub fn afterIdentityTransition(alloc: Allocator, store: *docstore_mod.DocStore, 
 /// a missing counter unknown, including legacy documents without identity
 /// metadata and orphaned artifacts; never count a populated corpus here.
 pub fn loadOrProveEmpty(alloc: Allocator, store: *docstore_mod.DocStore) !?u64 {
-    if (try load(alloc, store)) |count| return count;
-    const Probe = struct {
-        found: bool = false,
-        fn visit(ctx: ?*anyopaque, _: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
-            const probe: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            probe.found = true;
-            return .stop;
-        }
-    };
-    var probe = Probe{};
-    try store.scanWithContext(
-        &.{internal_keys.user_namespace},
-        &.{internal_keys.user_namespace + 1},
-        .{},
-        &probe,
-        Probe.visit,
-    );
-    return if (probe.found) null else 0;
+    _ = alloc;
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    return loadOrProveEmptyFromTxn(&txn);
+}
+
+/// Keep absence and the durable range counter on one exact read revision.
+pub fn loadOrProveEmptyFromTxn(txn: *docstore_mod.DocStore.Txn) !?u64 {
+    if (try loadFromTxn(txn)) |count| return count;
+    var cursor = try txn.openPhysicalCursorAdapter();
+    defer cursor.close();
+    const row = try cursor.seekAtOrAfter(&.{internal_keys.user_namespace});
+    const populated = if (row) |entry| entry.key.len != 0 and entry.key[0] == internal_keys.user_namespace else false;
+    return if (populated) null else 0;
 }
 
 /// Same-cut bounded empty-store proof for publication/readiness checks.

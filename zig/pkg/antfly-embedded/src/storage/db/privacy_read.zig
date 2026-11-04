@@ -213,12 +213,16 @@ pub fn requirePublished(db: anytype, a: A, req: @import("types.zig").SearchReque
     defer plan.release();
     const requirements = if (plan.plan().completion_plan) |*value| value else return error.IndexRebuilding;
     const local = policy.native and try @import("../source_authority.zig").maintenanceMode(&read) == .local and try @import("artifact_publication.zig").authority(&read) == null;
+    const inputs_empty = if (local) false else blk: {
+        const count = try @import("range_cardinality.zig").loadOrProveEmptyFromTxn(&read);
+        break :blk count != null and count.? == 0;
+    };
     var root_found = false;
     for (requirements.nodes) |node| {
         if (node.kind != .generated and node.kind != .unit_children) continue;
         if (std.mem.eql(u8, node.artifact, policy.artifact_name)) root_found = true;
-        if (!local and node.artifact.len != 0 and !try @import("artifact_producer_readiness.zig").sourceComplete(scratch, &read, plan.plan(), db.root_incarnation, node.artifact)) return error.IndexRebuilding;
-        if (!local and node.embedding.len != 0 and !try @import("artifact_producer_readiness.zig").sourceComplete(scratch, &read, plan.plan(), db.root_incarnation, node.embedding)) return error.IndexRebuilding;
+        if (!local and node.artifact.len != 0 and !try @import("artifact_producer_readiness.zig").sourceComplete(scratch, &read, plan.plan(), db.root_incarnation, node.artifact, inputs_empty)) return error.IndexRebuilding;
+        if (!local and node.embedding.len != 0 and !try @import("artifact_producer_readiness.zig").sourceComplete(scratch, &read, plan.plan(), db.root_incarnation, node.embedding, inputs_empty)) return error.IndexRebuilding;
     }
     if (!root_found) return error.IndexRebuilding;
     inline for (.{ "text_indexes", "dense_indexes", "sparse_indexes" }) |collection| {

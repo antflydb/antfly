@@ -656,6 +656,8 @@ pub const ArtifactRef = struct {
     window_index: ?u32 = null,
     unit_id: ?[]u8 = null,
     source: ?ArtifactSourceRef = null,
+    revision: ?[]u8 = null,
+    derivation_revision: ?[]u8 = null,
 
     pub fn clone(self: ArtifactRef, alloc: Allocator) !ArtifactRef {
         const document_id = try alloc.dupe(u8, self.document_id);
@@ -664,7 +666,13 @@ pub const ArtifactRef = struct {
         errdefer alloc.free(name);
         const unit_id = if (self.unit_id) |id| try alloc.dupe(u8, id) else null;
         errdefer if (unit_id) |id| alloc.free(id);
+        const revision = if (self.revision) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (revision) |value| alloc.free(value);
+        const derivation_revision = if (self.derivation_revision) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (derivation_revision) |value| alloc.free(value);
         return .{
+            .revision = revision,
+            .derivation_revision = derivation_revision,
             .document_id = document_id,
             .name = name,
             .kind = self.kind,
@@ -678,6 +686,8 @@ pub const ArtifactRef = struct {
     pub fn deinit(self: *ArtifactRef, alloc: Allocator) void {
         alloc.free(self.document_id);
         alloc.free(self.name);
+        if (self.revision) |value| alloc.free(value);
+        if (self.derivation_revision) |value| alloc.free(value);
         if (self.unit_id) |unit_id| alloc.free(unit_id);
         if (self.source) |*source| source.deinit(alloc);
         self.* = undefined;
@@ -1961,6 +1971,9 @@ pub const SearchRequest = struct {
     graph_work_budget: ?*@import("../../graph/work_budget.zig").WorkBudget = null,
     /// Trusted request-local preparation, never decoded from public input.
     value_search_execution: @import("../../search/value_query.zig").Policy = .{},
+    /// Borrowed, request-local proof of an already selected bounded key set.
+    /// Retained after native filters are consumed; never encoded on the wire.
+    value_search_candidate_keys: []const []const u8 = &.{},
     value_search_work: ?*@import("../../search/value_query.zig").Work = null,
     value_search_scope: ?@import("../../search/value_membership.zig").Scope = null,
     native_text_tie_rank: ?@import("../../search/scorer.zig").TieRank = null,
@@ -2091,6 +2104,9 @@ pub const SearchRequest = struct {
     /// Internal distributed-planning control. Parent-owned navigation and
     /// globally merged unit groups may return identity-only hits for payloads
     /// routed elsewhere; direct callers fail closed when payload is absent.
+    /// Private coordinator proof: source predicates were evaluated on the
+    /// same retained table cut before fanout to independent member owners.
+    hierarchy_parent_admitted: bool = false,
     defer_hierarchy_child_hydration: bool = false,
     hierarchy_source_fields: []const []const u8 = &.{},
     hierarchy_source_include_all_fields: bool = true,
@@ -2177,6 +2193,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "field_projection_json",
     "field_projection_plan",
     "field_projection_transport",
+    "value_search_candidate_keys",
     "value_search_work",
     "value_search_scope",
     "document_authority_mode",
@@ -2193,6 +2210,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "filter_query_json",
     "exclusion_query_json",
     "authorization_filter_query_json",
+    "hierarchy_parent_admitted",
     "defer_hierarchy_child_hydration",
     "defer_stored_projection",
     "filter_doc_ids",
@@ -2301,9 +2319,17 @@ fn auditHierarchyChildrenSearchRequestFields() void {
 pub fn canonicalHierarchyChildrenRequestIsValid(req: SearchRequest) bool {
     @setEvalBranchQuota(100_000);
     comptime auditHierarchyChildrenSearchRequestFields();
-    const children = req.hierarchy_children orelse return true;
-    if (children.parent_id.len == 0 or children.parent_level != .source or children.level != .unit) return false;
-    if (req.return_mode != .unit or req.hierarchy_grouped_matches or req.max_chunks_per_parent != 0) return false;
+    const children = req.hierarchy_children orelse return !req.hierarchy_parent_admitted;
+    if (req.hierarchy_parent_admitted and children.artifact_name == null) return false;
+    if (children.parent_level != .source or children.level != .unit) return false;
+    if (children.parent_ids.len != 0) {
+        if (children.parent_id.len != 0 or children.artifact_name == null or children.parent_ids.len > 100) return false;
+        for (children.parent_ids, 0..) |id, i| {
+            if (id.len == 0) return false;
+            for (children.parent_ids[0..i]) |prior| if (std.mem.eql(u8, id, prior)) return false;
+        }
+    } else if (children.parent_id.len == 0) return false;
+    if (req.return_mode != (if (children.artifact_name != null) ReturnMode.member else ReturnMode.unit) or req.hierarchy_grouped_matches or req.max_chunks_per_parent != 0) return false;
     // Traversal is deliberately not a retrieval operation. Reject every
     // scoring, ranking, or transform control at this final typed boundary so
     // embedded callers and worker envelopes cannot receive plausible-looking
@@ -2315,7 +2341,7 @@ pub fn canonicalHierarchyChildrenRequestIsValid(req: SearchRequest) bool {
     }
     if (req.limit == 0 or req.limit > max_canonical_hierarchy_groups) return false;
     if (req.offset != 0 or req.count_only or req.aggregations_json.len > 0) return false;
-    if (req.search_before.len > 0 or req.include_all_fields) return false;
+    if (req.search_before.len > 0 or (req.include_all_fields and children.artifact_name == null)) return false;
     if (req.order_by.len != 2 or
         !std.mem.eql(u8, req.order_by[0].field, "_hierarchy.position") or
         req.order_by[0].desc or
@@ -2483,7 +2509,9 @@ pub const HierarchyGroupLevel = enum {
 };
 
 pub const HierarchyChildrenRequest = struct {
-    parent_id: []const u8,
+    artifact_name: ?[]const u8 = null,
+    parent_id: []const u8 = "",
+    parent_ids: []const []const u8 = &.{},
     parent_level: HierarchyGroupLevel = .source,
     level: HierarchyGroupLevel = .unit,
 };

@@ -25,6 +25,10 @@ class HierarchyArtifact:
         window_index (int | Unset): Independent media output sub-window within the parent chunk; omitted for an unsplit
             vector.
         unit_id (str | Unset):
+        revision (str | Unset): Opaque fingerprint of this member's native content and captured producer/input state;
+            independent of hierarchy traversal cursors.
+        derivation_revision (str | Unset): Opaque fingerprint of the captured producer/input state, when available.
+            Changes to producer configuration or acquired input reopen this identity.
         source (HierarchyArtifactSource | Unset):
     """
 
@@ -33,6 +37,8 @@ class HierarchyArtifact:
     chunk_id: int | Unset = UNSET
     window_index: int | Unset = UNSET
     unit_id: str | Unset = UNSET
+    revision: str | Unset = UNSET
+    derivation_revision: str | Unset = UNSET
     source: HierarchyArtifactSource | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
@@ -45,6 +51,10 @@ class HierarchyArtifact:
         window_index = self.window_index
 
         unit_id = self.unit_id
+
+        revision = self.revision
+
+        derivation_revision = self.derivation_revision
 
         source: dict[str, Any] | Unset = UNSET
         if not isinstance(self.source, Unset):
@@ -64,6 +74,10 @@ class HierarchyArtifact:
             field_dict["window_index"] = window_index
         if unit_id is not UNSET:
             field_dict["unit_id"] = unit_id
+        if revision is not UNSET:
+            field_dict["revision"] = revision
+        if derivation_revision is not UNSET:
+            field_dict["derivation_revision"] = derivation_revision
         if source is not UNSET:
             field_dict["source"] = source
 
@@ -84,6 +98,10 @@ class HierarchyArtifact:
 
         unit_id = d.pop("unit_id", UNSET)
 
+        revision = d.pop("revision", UNSET)
+
+        derivation_revision = d.pop("derivation_revision", UNSET)
+
         _source = d.pop("source", UNSET)
         source: HierarchyArtifactSource | Unset
         if isinstance(_source, Unset):
@@ -97,6 +115,8 @@ class HierarchyArtifact:
             chunk_id=chunk_id,
             window_index=window_index,
             unit_id=unit_id,
+            revision=revision,
+            derivation_revision=derivation_revision,
             source=source,
         )
 

@@ -15891,9 +15891,9 @@ pub const ApiHttpServer = struct {
         // Hierarchy traversal owns its source-revision cursor. Capturing a
         // whole-table native cut here both bypasses its stale-revision check
         // and rejects Lite, whose storage cannot publish a directory snapshot.
-        // Explicit retained tokens from existing callers still follow their
-        // normal validation path; ordinary sorted search continues to pin.
-        if (query_req.req.hierarchy_children == null and query_req.req.remote_snapshot == null and (query_req.req.order_by.len != 0 or query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0)) {
+        // Producer member traversal has no unit-revision cursor: it pins a
+        // native cut from its first page, just like ordinary sorted search.
+        if ((query_req.req.hierarchy_children == null or query_req.req.hierarchy_children.?.artifact_name != null) and query_req.req.remote_snapshot == null and (query_req.req.order_by.len != 0 or query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0)) {
             if (query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0) return error.CatalogGenerationChanged;
             const context: api_operation.RequestContext = .{ .deadline_ns = request_deadline_ns, .cancellation = cancellation orelse .none };
             if (try self.queryTableDefinition(resolver.arena, resolver, table_name, context)) |table| {

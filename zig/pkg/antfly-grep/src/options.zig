@@ -36,6 +36,8 @@ pub const Options = struct {
     source_principals: std.ArrayList([]const u8) = .empty,
     cloud_cli: []const u8 = "antfly-cloud",
     cloud_session: ?*@import("cloud.zig").Session = null,
+    artifacts: std.ArrayList([]const u8) = .empty,
+    all_artifacts: bool = false,
     sources: std.ArrayList([]const u8) = .empty,
     tables: std.ArrayList([]const u8) = .empty,
     table_token: ?[]const u8 = null,
@@ -281,7 +283,7 @@ pub const Options = struct {
         self.paths.deinit(a);
         self.globs.deinit(a);
         self.glob_order.deinit(a);
-        inline for (.{ "sources", "source_principals", "tables", "filters", "colors", "type_clear", "pre_globs", "pattern_files", "ignore_files", "types", "types_not", "type_add", "iglobs", "queries", "exclude", "only", "not" }) |field| @field(self, field).deinit(a);
+        inline for (.{ "artifacts", "sources", "source_principals", "tables", "filters", "colors", "type_clear", "pre_globs", "pattern_files", "ignore_files", "types", "types_not", "type_add", "iglobs", "queries", "exclude", "only", "not" }) |field| @field(self, field).deinit(a);
     }
 
     pub fn sourced(self: *const Options) bool {
@@ -336,6 +338,10 @@ pub const Options = struct {
                 const eq = std.mem.indexOfScalar(u8, arg, '=');
                 const name = arg[0 .. eq orelse arg.len];
                 const inline_value = if (eq) |j| arg[j + 1 ..] else null;
+                if (std.mem.eql(u8, name, "--all-artifacts")) {
+                    self.all_artifacts = true;
+                    continue;
+                }
                 if (std.mem.eql(u8, name, "--cloud")) {
                     self.cloud = true;
                     continue;
@@ -692,6 +698,8 @@ pub const Options = struct {
                 } else if (std.mem.eql(u8, name, "--max-filesize")) {
                     self.max_file_bytes = try size(value);
                     self.skip_oversize = true;
+                } else if (std.mem.eql(u8, name, "--artifact")) {
+                    try self.artifacts.append(a, value);
                 } else if (std.mem.eql(u8, name, "--source")) {
                     try self.sources.append(a, value);
                 } else if (std.mem.eql(u8, name, "--source-endpoint")) {
@@ -877,7 +885,8 @@ pub const Options = struct {
         if (self.source_catalog != null and self.source_endpoint != null) return error.ConflictingCloudSourceOptions;
         if ((self.source_catalog != null or self.source_endpoint != null) and (self.cloud or self.table_config != null or self.tables.items.len > 0 or self.paths.items.len > 0)) return error.ConflictingCloudSourceOptions;
         if (self.cloud and (self.table_config != null or self.table_token != null or self.tables.items.len > 0 or self.paths.items.len > 0)) return error.ConflictingCloudSourceOptions;
-        if (self.tables.items.len > 0 and !self.indexed()) return error.TableConfigRequired;
+        if ((self.tables.items.len > 0 or self.artifacts.items.len > 0 or self.all_artifacts) and !self.indexed()) return error.TableConfigRequired;
+        if (self.artifacts.items.len > 0 and self.all_artifacts) return error.ConflictingArtifactOptions;
         if (self.max_index_documents == 0 or self.max_pending_output == 0) return error.InvalidNumber;
         if (self.indexed() and self.inventory) return error.UnsupportedIndexedInventory;
         if (self.jobs > 256 or self.decision_concurrency > 256 or (self.max_requests == 0 and !self.cached_only)) return error.InvalidNumber;

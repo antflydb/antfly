@@ -81,7 +81,7 @@ func mediaFromBackend(t *testing.T, backend *publicationFixture) MediaReference 
 	defer backend.mu.Unlock()
 	require.Len(t, backend.records, 1)
 	for _, row := range backend.records {
-		raw, _ := json.Marshal(row["grep"])
+		raw, _ := json.Marshal(row)
 		var doc Document
 		require.NoError(t, json.Unmarshal(raw, &doc))
 		require.NotNil(t, doc.Media)

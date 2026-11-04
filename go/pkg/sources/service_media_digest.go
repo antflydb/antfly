@@ -48,10 +48,10 @@ func (s *Service) contentIdentity(connection Connection, item Item) string {
 	// is rechecked before reuse; rotating a key or changing a reader must not hash
 	// a multi-gigabyte immutable object again.
 	raw, _ := json.Marshal(struct {
-		Provider, Endpoint, URI, Revision, VersionID string
-		Insecure                                     bool
-		Length                                       int64
-	}{connection.Provider, connection.S3Endpoint, item.URL, item.Revision, configString(item.Metadata, "version_id"), connection.S3Insecure, item.Size})
+		Provider, Endpoint, URI, Revision, VersionID, Representation string
+		Insecure                                                     bool
+		Length                                                       int64
+	}{connection.Provider, connection.S3Endpoint, item.URL, item.Revision, configString(item.Metadata, "version_id"), configString(item.Metadata, "representation_sha256"), connection.S3Insecure, item.Size})
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }
@@ -106,6 +106,7 @@ func (s *Service) verifiedMediaDigest(ctx context.Context, source Source, connec
 }
 func sourceMediaBinding(source Source) string {
 	source.Alias = ""
+	source.Streams = nil // Producer/search bindings do not revoke original bytes.
 	source.PermissionTTLSeconds = 0
 	raw, _ := json.Marshal(source)
 	sum := sha256.Sum256(raw)

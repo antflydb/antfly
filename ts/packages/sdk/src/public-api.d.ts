@@ -12970,16 +12970,26 @@ export interface components {
         HierarchyChildParent: {
             /** @enum {string} */
             level: "source";
-            id: string;
+            id?: string;
+            /** @description Bounded source selection for member traversal; unit traversal requires id. */
+            ids?: string[];
         };
         HierarchyChildren: {
             parent: components["schemas"]["HierarchyChildParent"];
             /**
              * @description Child level to enumerate. Unit traversal reads the versioned extraction
              *     hierarchy rather than a relevance index, so empty and failed units are included.
+             *     Member traversal requires artifact and seeks that producer's native storage
+             *     prefixes within the selected source or parent.ids batch (up to 100).
+             *     One global cursor orders the selected members; it includes generic assets and chunks.
+             *     Scalar member payloads are returned as {"$": value} in _source so
+             *     every query hit retains an object-shaped projection. Continuation
+             *     requires the remote_snapshot returned with the first page.
              * @enum {string}
              */
-            level: "unit";
+            level: "unit" | "member";
+            /** @description Producer name; required for member traversal and omitted for unit traversal. */
+            artifact?: string;
         };
         /**
          * @description The required public order for sequential hierarchy traversal. Specify
@@ -13009,7 +13019,9 @@ export interface components {
          *
          *     `children` is a separate sequential-browsing operation. It enumerates every unit
          *     in the selected source revision, including units with no searchable chunk, and uses
-         *     the top-level `_sort`/`search_after` cursor contract.
+         *     the top-level `_sort`/`search_after` cursor contract. For member traversal,
+         *     `filter_query` applies to source parents before any artifact enumeration;
+         *     it never filters member payloads or changes the member pagination order.
          *
          *     Ancestor and nested-match field projections are always explicit to keep response
          *     size predictable. The presence of this object selects the canonical contract:
@@ -14290,6 +14302,10 @@ export interface components {
              */
             window_index?: number;
             unit_id?: string;
+            /** @description Opaque fingerprint of this member's native content and captured producer/input state; independent of hierarchy traversal cursors. */
+            revision?: string;
+            /** @description Opaque fingerprint of the captured producer/input state, when available. Changes to producer configuration or acquired input reopen this identity. */
+            derivation_revision?: string;
             source?: components["schemas"]["HierarchyArtifactSource"];
         };
         HierarchyAncestor: {

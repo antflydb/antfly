@@ -3918,7 +3918,7 @@ pub const Runtime = struct {
         cfg_parsed.value.max_response_bytes = self.responseLimitForTask(.transcriber, 1);
         if (request.media.len > 0) {
             if (!request.inline_media_trusted) return error.UntrustedInlineMedia;
-            if ((cfg_parsed.value.provider != .apple and cfg_parsed.value.provider != .cloudflare) or request.media.len != 1) return error.UnsupportedTranscriptionMedia;
+            if (!cfg_parsed.value.provider.supportsResolvedAudio() or request.media.len != 1) return error.UnsupportedTranscriptionMedia;
         }
         const antfly_model = if (cfg_parsed.value.provider == .antfly)
             try requiredAntflyTranscriberModel(cfg_parsed.value)
