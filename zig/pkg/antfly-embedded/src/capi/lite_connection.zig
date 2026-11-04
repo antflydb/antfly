@@ -2160,6 +2160,20 @@ pub const Owner = struct {
         self.text_source_runtime_cache = null;
     }
 
+    /// The owner gate and background turn make the cache quiescent. A merge
+    /// owns its own reference, so retiring this cache cannot close its inputs.
+    fn discardTextSourceRuntime(self: *Owner) void {
+        const cache = self.text_source_runtime_cache orelse return;
+        const root = cache.root;
+        self.clearTextSourceRuntimeCache();
+        self.maintenance_retained_logical = null;
+        if (self.maintenance_snapshot == root) {
+            self.maintenance_snapshot = null;
+            closeMaintenanceSnapshot(root);
+            if (self.reader_coordinator.hasArtifactReleases()) self.maintenance_storage_pending = true;
+        }
+    }
+
     /// Caller owns the path gate and writer lease. Mutable allocator state is
     /// moved from a quiescent wrapper, including the retained merge owner. The
     /// merge thread only reads independently leased immutable artifact sources.
@@ -2694,8 +2708,19 @@ pub const Owner = struct {
         var lease_held = true;
         defer if (lease_held) lease.close();
         const foreground = try self.refresh();
-        if (needsOutcomeReconciliation(foreground)) return false;
+        if (needsOutcomeReconciliation(foreground)) {
+            self.discardTextSourceRuntime();
+            return false;
+        }
         const foreground_file = &foreground.owned_lite_backend.?.native_docstore.?.file;
+        // Settled caches own only immutable artifact inputs, never a primary
+        // epoch. Check even idle audit turns before their readiness fast path:
+        // a peer publication must release stale leases without needing another
+        // source mutation or waiting for the periodic database audit.
+        if (self.text_source_runtime_cache) |cache| {
+            if (!try cache.matchesObserved(foreground_file, &self.publication_stats.text_runtime_cache))
+                self.discardTextSourceRuntime();
+        }
         // Marker service is directory-bounded and needs no allocator proof.
         // Reap crash/normal-exit leftovers even if this short-lived owner is
         // canceled before its detached graph walk can finish.
@@ -3011,7 +3036,10 @@ pub const Owner = struct {
         defer if (source_read) |*read| read.abort();
         var catalog = if (run_database) try PublicationCatalog.captureForStoragePublication(turn_alloc, root, database, publication_name) else null;
         defer if (catalog) |*proof| proof.deinit();
-        var source_runtime_cache = if (independent and run_source and shadow_scopes.items.len == 0) try TextSourceRuntimeCache.captureObserved(root, &self.publication_stats.text_runtime_cache) else null;
+        // Artifact/control turns may continue a previously validated source
+        // runtime. They cannot promote an artifact-only runtime into one.
+        const had_source_runtime = if (self.text_source_runtime_cache) |cache| cache.root == root else false;
+        var source_runtime_cache = if (independent and root.db_live and (run_source or had_source_runtime) and shadow_scopes.items.len == 0) try TextSourceRuntimeCache.captureObserved(root, &self.publication_stats.text_runtime_cache) else null;
         defer if (source_runtime_cache) |cache| cache.destroy();
         var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (catalog) |*proof| proof else null, .index_prefix = index_prefix, .shadow_scopes = shadow_scopes.items, .snapshot_root = root, .snapshot_database = database, .publication_overhead_ns = &group_state.publication_overhead_ns, .source_read = if (source_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
         const managed = try database.core.index_manager.managedIndexes(turn_alloc);
@@ -3196,7 +3224,10 @@ pub const Owner = struct {
         // an obsolete reader fence throughout its own reuse/vacuum attempt.
         if (catalog) |*proof| proof.deinit();
         catalog = null;
-        const retain_source_runtime = source_runtime_cache != null and source_more and maintenance_error == null and !publication.index_inputs_changed;
+        // Catching the captured target is not a lifetime boundary for parsed
+        // immutable inputs. Later primary batches can reuse them after taking
+        // a fresh primary epoch. Idle turns above evict any stale witnesses.
+        const retain_source_runtime = source_runtime_cache != null and maintenance_error == null and !publication.index_inputs_changed;
         if (retain_source_runtime) {
             // This witness belongs to the runtime we just serviced. Physical
             // service may adopt a foreign index checkpoint without rebinding
@@ -8113,6 +8144,67 @@ test "capi native maintenance namespaces artifact continuation does not restart 
     try std.testing.expectEqual(sources, owner.publication_stats.maintenance_source_turns);
     try std.testing.expectEqual(artifacts + 1, owner.publication_stats.maintenance_artifact_only_turns);
     try std.testing.expect(!owner.maintenance_schedules.getPtr(key).?.database_pending);
+}
+
+test "capi native maintenance keeps settled text inputs warm across artifact turns" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("settled-text-runtime-reuse", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
+    const owner = fixture.connection.owner;
+    const key: Owner.MaintenanceKey = .{ .table_id = owner.current.?.db.core.identity_namespace.table_id, .incarnation = owner.current.?.db.root_incarnation };
+    var settled = false;
+    for (0..64) |_| {
+        _ = try owner.maintenanceTurnForTest();
+        if (owner.maintenance_schedules.getPtr(key)) |schedule| {
+            if (!schedule.database_pending and schedule.next_database_audit_ns != 0 and !owner.maintenance_storage_pending) {
+                settled = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(settled);
+    const cache = owner.text_source_runtime_cache orelse return error.TestUnexpectedResult;
+    const root = cache.root;
+    const opens = owner.publication_stats.maintenance_runtime_opens;
+    const schedule = owner.maintenance_schedules.getPtr(key).?;
+    schedule.next_database_audit_ns = std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds + std.time.ns_per_hour;
+    schedule.artifact_pending = true;
+    schedule.next_artifact_ns = 0;
+    const source_turns = owner.publication_stats.maintenance_source_turns;
+    _ = try owner.maintenanceTurnForTest();
+    try std.testing.expectEqual(source_turns, owner.publication_stats.maintenance_source_turns);
+    try std.testing.expectEqual(root, (owner.text_source_runtime_cache orelse return error.TestUnexpectedResult).root);
+    try std.testing.expectEqual(opens, owner.publication_stats.maintenance_runtime_opens);
+
+    var output: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&output);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice("{\"inserts\":{\"next\":{\"text\":\"warm café 東京\"}},\"sync_level\":\"write\"}"), &output));
+    const reuses = owner.publication_stats.maintenance_source_runtime_reuses;
+    for (0..16) |_| {
+        _ = try owner.maintenanceTurnForTest();
+        if (owner.publication_stats.maintenance_source_runtime_reuses != reuses) break;
+    }
+    try std.testing.expect(owner.publication_stats.maintenance_source_runtime_reuses > reuses);
+    try std.testing.expectEqual(opens, owner.publication_stats.maintenance_runtime_opens);
+
+    // A settled reader must not retain an old generation's artifact leases
+    // until the next source write. Even a storage/idle turn evicts it.
+    {
+        var lease = try fixture.connection.acquire();
+        defer {
+            lease.close();
+            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        const live = try owner.refresh();
+        const current_cache = owner.text_source_runtime_cache orelse return error.TestUnexpectedResult;
+        try std.testing.expect(try current_cache.matches(&live.owned_lite_backend.?.native_docstore.?.file));
+        try live.owned_lite_backend.?.native_docstore.?.file.putIndexCatalogRecord("/outside/settled-runtime", "changed");
+        try std.testing.expect(!try current_cache.matches(&live.owned_lite_backend.?.native_docstore.?.file));
+    }
+    _ = try owner.maintenanceTurnForTest();
+    try std.testing.expect(owner.text_source_runtime_cache == null);
 }
 
 test "capi native maintenance namespaces source capture does not borrow an artifact runtime" {

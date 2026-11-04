@@ -158,7 +158,12 @@ SQL decisions, and exact schema/index/provider configuration fingerprints.
 Before using the new primary cut, replay invalidates source certificates without
 reusing their generations, resets replay-head and retention observations, and
 reloads shard and identity visibility state. The cache retains at most root plus
-one named namespace and expires when source and artifact work settle. Other
+one named namespace, including after catching the current source target and
+through compatible artifact/control turns. Every admitted background turn checks
+its witnesses before idle readiness can skip the namespace. Changed inputs retire
+the cache and promptly schedule released artifact leases for storage cleanup;
+uncertain outcomes discard it. Thus an idle cache retains no primary epoch and
+cannot indefinitely hold a peer's superseded index generation. Other
 index/provider runtimes reopen until they define an equivalent rebinding
 contract. Selecting a named namespace uses the detached runtime directly,
 avoiding a duplicate serving-table open solely for maintenance discovery.

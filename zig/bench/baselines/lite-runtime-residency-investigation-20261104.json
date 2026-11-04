@@ -1,0 +1,35 @@
+{
+  "qualified": false,
+  "diagnostic_source_commit": "d3ea7d70e5aa89523db77adc8ef2b33d186ea203",
+  "diagnostic_library_sha256": "b8974a2c5765d5c4e118c699ac8c34b29d66eecf77c0c3954196bf248b94f8e9",
+  "original_importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+  "local_reproduction": {
+    "metrics_enabled": true,
+    "successful_preceding_inputs": 7,
+    "failed_input_index": 7,
+    "failed_input_seconds": 224.69432733394206,
+    "failure": "ANTFLY_BUSY/FileBusy",
+    "admission_refusal_phase": "local_gate",
+    "allocator_full_loads": 1,
+    "sql_prior_entries_rebuilt": 0,
+    "replay_capacity_waits": 30,
+    "maintenance_source_turns": 346,
+    "maintenance_runtime_opens": 405,
+    "maintenance_namespace_opens": 467,
+    "source_runtime_reuses": 72,
+    "cache_not_retained_settled": 212,
+    "cache_miss_no_cache": 244,
+    "cache_miss_closed": 158,
+    "scope": "Mechanism diagnosis using the frozen optimized candidate, counters and a short local process sample. Not a clean timing comparison."
+  },
+  "regression_before_fix": {
+    "test": "capi native maintenance keeps settled text inputs warm across artifact turns",
+    "passed": 0,
+    "failed": 1,
+    "leaked": 0,
+    "failure": "Source cache absent after replay settled."
+  },
+  "change": "Keep an eligible source-origin runtime after its target settles and through compatible artifact/control turns. Recheck its inode/index/catalog/control witnesses even on idle background turns, discard on uncertainty or changed inputs, and schedule released artifact leases for cleanup. Reuse still resets primary observations and takes a new primary epoch. Artifact-only runtimes cannot gain source authority. Residency remains bounded to root plus one named namespace; merge jobs retain independent references.",
+  "validation": "Full Debug C API/ABI/SDK gates and a seeded unchanged-importer run pending. This closes a reproduced lifetime gap; it does not yet establish that populated-database replay capacity is fixed.",
+  "reference_policy": "No reference rebuild or execution. Wolfspider is reserved for final qualification after local validation."
+}
