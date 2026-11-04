@@ -656,6 +656,29 @@ pub const SegmentEntry = struct {
         return result;
     }
 
+    /// Owns exactly one physical reader, without its inventory's global
+    /// statistics or any query capability. Range use and reader ownership
+    /// must both survive a runtime teardown during immutable-source handoff.
+    pub const ImmutableLease = struct {
+        entry: SegmentEntry,
+        source: SegmentSource,
+
+        pub fn deinit(self: *ImmutableLease) void {
+            self.source.releaseUse();
+            self.entry.releaseRef();
+            self.* = undefined;
+        }
+    };
+
+    pub fn retainImmutable(self: *const SegmentEntry) ?ImmutableLease {
+        if (self.query_base_reader != null or self.query_source != null) return null;
+        const source = self.reader.immutableSource();
+        if (source != .ranges or source.ranges.immutable_identity == null or source.ranges.check_read_context != null) return null;
+        if (!source.acquireUse()) return null;
+        self.retain();
+        return .{ .entry = self.*, .source = source };
+    }
+
     fn retain(self: *const SegmentEntry) void {
         _ = @atomicRmw(u32, &self.shared.ref_count, .Add, 1, .monotonic);
     }

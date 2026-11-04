@@ -1286,8 +1286,11 @@ through the inode/root-fenced source pool, so fresh mutable replay actors do not
 require fresh durable leases for every unchanged segment. Failed construction
 leaves the predecessor owned; an active merge keeps its independent reference.
 When providers require ending the old runtime before replacement, a separate
-handoff pins only immutable text readers, with one file-wide limit of 256 MiB
-and 1,024 segments. It retains no primary epoch or provider/query capability.
+handoff pins individual immutable text readers, with one file-wide limit of
+256 MiB and 1,024 segment visits. Oversized ranges are skipped, so a large
+inventory can still share its smaller inputs. It retains no entire inventory,
+primary epoch or provider/query capability. The reader's accounting owner stays
+alive until its decoder metadata is released, even across pooled generations.
 The successor consumes the pins after opening the same namespace; unused pins
 expire after five seconds and are released by the maintenance audit or close.
 This optional bridge grants no runtime reuse or publication authority: new

@@ -371,7 +371,7 @@ const TextSourceRuntimeCache = struct {
 };
 
 const ImmutableTextHandoff = struct {
-    const Pins = @import("immutable_text_handoff.zig").Handoff(@import("../index.zig").IndexSnapshot, segment_mod.SegmentSource);
+    const Pins = @import("immutable_text_handoff.zig").Handoff(@import("../index.zig").IndexSnapshot, @import("../index.zig").SegmentEntry.ImmutableLease);
     const max_bytes = 256 * 1024 * 1024;
     const max_segments = 1024;
     const lifetime_ns = 5 * std.time.ns_per_s;
@@ -400,10 +400,10 @@ const ImmutableTextHandoff = struct {
         indexes.catalog_mutex.lockShared();
         defer indexes.catalog_mutex.unlockShared();
         for (indexes.text_indexes.items, 0..) |*entry, ordinal| {
-            if (ordinal == 128 or result.pins.segments == max_segments or result.pins.bytes == max_bytes) break;
+            if (ordinal == 128 or result.pins.visited == max_segments or result.pins.bytes == max_bytes) break;
             _ = try result.pins.append(entry.persistent.acquireSnapshot(), max_bytes, max_segments);
         }
-        if (result.pins.uses.items.len == 0) {
+        if (result.pins.leases.items.len == 0) {
             result.deinit();
             return null;
         }
@@ -8686,6 +8686,10 @@ test "capi native named runtime replacement hands off immutable artifact sources
     const live = try owner.refresh();
     try live.owned_lite_backend.?.native_docstore.?.file.putDocument("handoff-primary-tip", "fresh");
     const selected = try tables.get(first, "active");
+    const first_inventory = selected.core.index_manager.text_indexes.items[0].persistent.acquireSnapshot();
+    const original_source = first_inventory.segments[0].reader.immutableSource();
+    first_inventory.release();
+    try std.testing.expect(original_source == .ranges);
     var rejected: ImmutableTextHandoff.Pins = .{ .allocator = alloc };
     defer rejected.deinit();
     try std.testing.expect(!try rejected.append(selected.core.index_manager.text_indexes.items[0].persistent.acquireSnapshot(), 0, 0));
@@ -8703,8 +8707,14 @@ test "capi native named runtime replacement hands off immutable artifact sources
     const second = try owner.refreshMaintenanceSnapshotNamed(live, .source, "active");
     try std.testing.expect(second != first);
     const file = &second.owned_lite_backend.?.native_docstore.?.file;
-    try std.testing.expectEqual(@as(u64, 0), file.allocator_work.artifact_source_opens);
-    try std.testing.expect(file.allocator_work.artifact_source_reuses != 0);
+    const replacement_table = try tables.get(second, "active");
+    const replacement_inventory = replacement_table.core.index_manager.text_indexes.items[0].persistent.acquireSnapshot();
+    const replacement_source = replacement_inventory.segments[0].reader.immutableSource();
+    replacement_inventory.release();
+    try std.testing.expect(replacement_source == .ranges);
+    // Compare the backing range itself. LSM/control files may legitimately
+    // open fresh sources, and allocator-work counters move between wrappers.
+    try std.testing.expectEqual(original_source.ranges.ptr, replacement_source.ranges.ptr);
     try std.testing.expect(owner.immutable_text_handoff == null);
     {
         var row = (try (try tables.get(second, "active")).lookup(std.testing.allocator, "one", .{})) orelse return error.TestUnexpectedResult;
