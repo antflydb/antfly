@@ -223,6 +223,25 @@ def test_privacy_preview_policy_cas_backfill_and_findings(
         assert not preview["complete_table_scan"]
         assert preview["external_processing"]
         assert not stateful_api.get(path)["configured"]
+        if mode == "monitor" and num_shards == 1:
+            # The sample fits, but repeating its identifier in each finding
+            # would produce a response above the preview output budget.
+            large_id = "p" * (2 * 1024 * 1024)
+            fields = ["body", "extra1", "extra2", "extra3", "extra4"]
+            stateful_api.batch_write(
+                table, inserts={large_id: {name: "a@b.co" for name in fields}}
+            )
+            oversized = stateful_api.s.post(
+                f"{stateful_api.url}{path}/preview",
+                json={
+                    "policy": dict(policy, fields=fields),
+                    "sample": {"keys": [large_id]},
+                },
+                timeout=60,
+            )
+            assert oversized.status_code == 422, oversized.text[:500]
+            assert oversized.json()["code"] == "privacy_sample_too_large"
+            stateful_api.batch_write(table, deletes=[large_id])
         behavior["malformed"] = True
         invalid = stateful_api.s.post(
             f"{stateful_api.url}{path}/preview",
@@ -1257,3 +1276,57 @@ def test_privacy_large_scan_boundary_is_private_durable_and_keeps_policy_mutable
         response.text[:1000],
         stateful_api.debug_logs(),
     )
+
+
+def test_internal_read_admits_legal_large_key(stateful_api):
+    import base64
+    from conftest import internal_service_headers
+
+    table = "privacy_large_read_" + uuid4().hex[:8]
+    stateful_api.create_table(table)
+    owner = stateful_api.get("/cluster")["data"]["ranges"][0]
+    root = stateful_api.url.split("/db/v1")[0]
+    uri = (
+        root + f"/internal/v1/groups/{owner['group_id']}"
+        f"/tables/{quote(owner['table_name'], safe='')}/document-read"
+    )
+    body = {
+        "operation": "manifest",
+        "key_base64": base64.urlsafe_b64encode(b"x" * (50 * 1024 * 1024))
+        .decode()
+        .rstrip("="),
+        "artifact_name": "_privacy_document",
+    }
+    response = stateful_api.s.post(
+        uri, json=body, headers=internal_service_headers(), timeout=90
+    )
+    assert response.status_code == 404, response.text[:500]
+
+
+def test_preview_identifier_and_streaming_sample_budgets(stateful_api):
+    table = "privacy_preview_budget_" + uuid4().hex[:8]
+    stateful_api.create_table(table)
+    key = "x" * (9 * 1024 * 1024)
+    stateful_api.batch_write(table, inserts={key: {"ordinal": 1}})
+    policy = {
+        "mode": "monitor",
+        "fields": ["body"],
+        "category_groups": ["contact_details"],
+    }
+    for sample in ({"keys": [key]}, {"limit": 1}):
+        response = stateful_api.s.post(
+            stateful_api.url + f"/tables/{table}/privacy/preview",
+            json={"policy": policy, "sample": sample},
+            timeout=120,
+        )
+        assert response.status_code == 422, response.text[:500]
+        assert response.json()["code"] == "privacy_sample_too_large"
+    stateful_api.batch_write(
+        table, deletes=[key], inserts={"small": {"ordinal": 1}, "tail": {"ordinal": 2}}
+    )
+    for limit in (1, 10):
+        response = stateful_api.post(
+            f"/tables/{table}/privacy/preview",
+            {"policy": policy, "sample": {"limit": limit}},
+        )
+        assert response["sampled"] == min(limit, 2)

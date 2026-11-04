@@ -29,6 +29,7 @@ test "privacy API and transport contracts" {
     _ = @import("metadata/storage/raft_apply_store.zig");
     _ = @import("metadata/service.zig");
     _ = @import("api/privacy_transport_test.zig");
+    _ = @import("api/privacy_checkpoint_gc_test.zig");
     _ = @import("api/http_client.zig");
     _ = @import("storage/hot_standby/mutation_inventory.zig");
     _ = @import("storage/artifact_publication_dispatch.zig");

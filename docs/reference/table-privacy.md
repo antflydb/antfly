@@ -169,3 +169,9 @@ when a page contains no findings; missing or stale receipts count as pending.
 Full-table scan jobs share the background coverage census. Completion requires a
 fresh pass started after that job entered verification, plus protected serving
 readiness where applicable. Range scans verify their own bounds in adaptive pages.
+
+Preview accepts at most 50 documents. Samples, including JSON-escaped document
+identifiers, have an 8 MiB budget; preview responses also have an 8 MiB budget.
+Exceeding either returns HTTP 422 (`privacy_sample_too_large`); request fewer or
+smaller documents. Automatic sampling streams rows and stops before retaining
+an oversized sample. A rejected preview does not install a policy.

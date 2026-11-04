@@ -17839,13 +17839,18 @@ pub const RaftApplyStore = struct {
         if (value.length == 0 or value.length > privacy_keys.max_bytes or value.created_at_millis < 0 or value.deleted_chunks > value.chunks()) return error.InvalidDocumentCheckpoint;
         return value;
     }
-    fn privacyReferenced(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: u64, ref: privacy_keys.Ref) !bool {
+    fn privacyIndexes(txn: *docstore.DocStore.Txn, group: u64, table: u64) ![]const u8 {
         var buffer: [160]u8 = undefined;
-        const raw = txn.get(try tableKeyForGroup(&buffer, group, table)) catch |err| if (err == error.NotFound) return false else return err;
-        const record = try decodeTableRecord(a, raw);
+        const raw = txn.get(try tableKeyForGroup(&buffer, group, table)) catch |err| if (err == error.NotFound) return "" else return err;
+        const record = try borrowTableProjection(raw, .query);
+        // Borrow the pinned transaction bytes: GC must not duplicate the table
+        // schema and catalog for every checkpoint examined.
+        return record.query_definition.?.indexes_json;
+    }
+    fn privacyReferenced(txn: *docstore.DocStore.Txn, group: u64, table: u64, ref: privacy_keys.Ref) !bool {
         // Tokens are printable and escape-free. A conservative substring hit
         // can retain extra data, but can never reclaim a live reference.
-        return std.mem.indexOf(u8, record.indexes_json, &ref.token()) != null;
+        return std.mem.indexOf(u8, try privacyIndexes(txn, group, table), &ref.token()) != null;
     }
     fn privacyQuota(txn: *docstore.DocStore.Txn, group: u64, table: u64, bytes: usize, increase: bool) !void {
         var logical_buffer: [64]u8 = undefined;
@@ -17913,7 +17918,7 @@ pub const RaftApplyStore = struct {
             return .store;
         }
         if (next.state != .deleting or (previous.state == .deleting and next.deleted_chunks < previous.deleted_chunks) or next.deleted_chunks > previous.deleted_chunks + privacy_keys.gc_chunks) return error.InvalidDocumentCheckpoint;
-        if (try privacyReferenced(a, txn, group, selected.table, ref)) return .skip;
+        if (try privacyReferenced(txn, group, selected.table, ref)) return .skip;
         if (previous.state != .deleting and !previous.attached) try privacyQuota(txn, group, selected.table, previous.length, false);
         for (previous.deleted_chunks..next.deleted_chunks) |index| {
             txn.delete(try jobStateKeyForGroup(&buffer, group, try ref.storageKey(&logical_buffer, selected.table, index))) catch |err| if (err != error.NotFound) return err;
@@ -17983,12 +17988,24 @@ pub const RaftApplyStore = struct {
             var selected: std.ArrayList(contract.Row) = .empty;
             var txn = try self.store.beginReadTxn();
             defer txn.abort();
+            // Manifest keys are ordered by table. Reuse the pinned catalog
+            // even on read backends that allocate a value for each get call.
+            var cached_table: ?u64 = null;
+            var cached_indexes: []const u8 = "";
             for (rows) |row| {
                 const logical = row.key[prefix.len - "privacy/m/".len ..];
                 const key = try privacy_keys.parseKey(logical);
                 const header = try privacyHeader(work, row.value);
                 const expired = @as(i64, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_ms))) -| header.created_at_millis >= privacy_keys.lease_ms;
-                if (header.state == .deleting or ((header.attached or expired) and !try privacyReferenced(work, &txn, group, key.table, key.ref.?))) try selected.append(work, .{ .key = logical, .value = row.value });
+                if (header.state != .deleting) {
+                    if (!header.attached and !expired) continue;
+                    if (cached_table == null or cached_table.? != key.table) {
+                        cached_indexes = try privacyIndexes(&txn, group, key.table);
+                        cached_table = key.table;
+                    }
+                    if (std.mem.indexOf(u8, cached_indexes, &key.ref.?.token()) != null) continue;
+                }
+                try selected.append(work, .{ .key = logical, .value = row.value });
             }
             return std.json.Stringify.valueAlloc(a, contract.Page{ .rows = selected.items, .next = if (rows.len == contract.max_page_rows) rows[rows.len - 1].key[prefix.len - "privacy/m/".len ..] else null }, .{});
         };
@@ -44418,4 +44435,23 @@ test "privacy key attachment and incremental reclamation are atomic and survive 
     // A late uploader cannot recreate chunks after the manifest was erased.
     try restored.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = try ref.storageKey(&buffer, 1, 9), .expected_hash = "", .value = "Vxxx" } });
     try std.testing.expect(try restored.getJobState(a, group, try ref.storageKey(&buffer, 1, 9)) == null);
+}
+
+test "privacy checkpoint ownership borrows large table records without allocator growth" {
+    const a = std.testing.allocator;
+    const schema = try a.alloc(u8, 8 * 1024 * 1024);
+    defer a.free(schema);
+    @memset(schema, ' ');
+    const record = try encodeTableRecord(a, .{ .table_id = 7, .name = "privacy", .schema_json = schema, .indexes_json = "{\"_privacy\":{}}" });
+    defer a.free(record);
+    // A complete GC page can examine the same large record without creating
+    // any schema/catalog copies. The projection retains the pinned row.
+    for (0..32) |_| {
+        const view = try borrowTableProjection(record, .query);
+        const indexes = view.query_definition.?.indexes_json;
+        try std.testing.expectEqualStrings("{\"_privacy\":{}}", indexes);
+        try std.testing.expect(@intFromPtr(indexes.ptr) >= @intFromPtr(record.ptr));
+        try std.testing.expect(@intFromPtr(indexes.ptr) + indexes.len <= @intFromPtr(record.ptr) + record.len);
+    }
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, borrowTableProjection(record[0 .. record.len - 1], .query));
 }

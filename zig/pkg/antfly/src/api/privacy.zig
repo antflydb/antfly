@@ -59,6 +59,7 @@ pub fn handle(server: anytype, a: A, table: []const u8, action: Action, args: Ar
     return execute(server, a, table, action, args, try request.platformDeadline()) catch |err| switch (err) {
         error.PrivacyPreconditionRequired => failure(a, 428, "privacy_precondition_required", "Replacing a policy requires its exact If-Match ETag."),
         error.PrivacyPreconditionFailed => failure(a, 412, "privacy_precondition_failed", "The policy changed; reload it before saving."),
+        error.PrivacySampleTooLarge => failure(a, 422, "privacy_sample_too_large", "Preview samples (including identifiers) and responses are limited to 8 MiB each; request fewer or smaller documents."),
         error.PrivacyScanLimitExceeded => failure(a, 409, "privacy_scan_limit_exceeded", "Sixteen scans are active; wait for one to finish before requesting another."),
         error.PrivacyInternalAuthRequired => failure(a, 422, "privacy_internal_auth_required", "Distributed privacy inspection requires internal-service credentials."),
         error.PrivacyProtocolUpgradeRequired => failure(a, 422, "privacy_upgrade_required", "Upgrade every metadata and data node before installing a privacy policy."),
@@ -417,39 +418,115 @@ const Sample = struct { keys: ?[]const []const u8 = null, limit: u32 = 10 };
 const Preview = struct { policy: contract.Policy, sample: Sample = .{} };
 const Document = struct { key: []const u8, value: std.json.Value };
 
+const preview_sample_bytes = @import("antfly_public_limits").privacy_preview_sample_bytes;
+
+// Count escaped JSON without materializing it. Stop at the budget even when a
+// single string is repeated by many findings.
+const PreviewSize = struct {
+    remaining: usize,
+    writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *PreviewSize = @alignCast(@fieldParentPtr("writer", w));
+        var count: usize = 0;
+        for (data, 0..) |part, i| {
+            const size = std.math.mul(usize, part.len, if (i + 1 == data.len) splat else 1) catch return error.WriteFailed;
+            if (size > self.remaining) return error.WriteFailed;
+            self.remaining -= size;
+            count += size;
+        }
+        return count;
+    }
+    fn add(self: *PreviewSize, value: anytype) !void {
+        std.json.Stringify.value(value, .{}, &self.writer) catch return error.PrivacySampleTooLarge;
+        self.writer.flush() catch return error.PrivacySampleTooLarge;
+    }
+};
+
+const PreviewSamples = struct {
+    a: A,
+    transient: A,
+    documents: std.ArrayList(Document) = .empty,
+    buffer: std.ArrayListUnmanaged(u8) = .empty,
+    remaining: usize = preview_sample_bytes,
+    limit: usize,
+    stopped: bool = false,
+    failure: ?anyerror = null,
+
+    fn deinit(self: *PreviewSamples) void {
+        self.buffer.deinit(self.transient);
+    }
+    fn start(_: ?*anyopaque) !void {}
+    fn row(self: *PreviewSamples) !void {
+        if (self.buffer.items.len == 0) return;
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, self.a, self.buffer.items, .{ .allocate = .alloc_always });
+        if (value != .object) return error.InvalidPrivacySample;
+        const id = value.object.get("_id") orelse return error.InvalidPrivacySample;
+        if (id != .string) return error.InvalidPrivacySample;
+        try self.documents.append(self.a, .{ .key = id.string, .value = value });
+        self.buffer.clearRetainingCapacity();
+        if (self.documents.items.len == self.limit) {
+            self.stopped = true;
+            return error.Canceled;
+        }
+    }
+    fn append(self: *PreviewSamples, bytes: []const u8) !void {
+        var rest = bytes;
+        while (rest.len != 0) {
+            const end = std.mem.indexOfScalar(u8, rest, '\n');
+            const size = if (end) |n| n + 1 else rest.len;
+            if (size > self.remaining) return error.PrivacySampleTooLarge;
+            self.remaining -= size;
+            try self.buffer.appendSlice(self.transient, rest[0 .. size - @intFromBool(end != null)]);
+            rest = rest[size..];
+            if (end != null) try self.row();
+        }
+    }
+    fn write(raw: ?*anyopaque, bytes: []const u8) !void {
+        const self: *PreviewSamples = @ptrCast(@alignCast(raw.?));
+        self.append(bytes) catch |err| {
+            if (!self.stopped) self.failure = err;
+            return error.Canceled;
+        };
+    }
+};
+
 fn sampleDocuments(server: anytype, a: A, table: []const u8, sample: Sample, request: operation.RequestContext, missing_ok: bool) ![]Document {
     if (sample.limit == 0 or sample.limit > 50) return error.InvalidPrivacySample;
     const source = server.table_reads orelse return error.PrivacyReadUnavailable;
     var documents: std.ArrayList(Document) = .empty;
     if (sample.keys) |keys| {
         if (keys.len == 0 or keys.len > 50) return error.InvalidPrivacySample;
-        var total: usize = 0;
+        var size = PreviewSize{ .remaining = preview_sample_bytes };
         for (keys, 0..) |key, i| {
             for (keys[0..i]) |prior| if (std.mem.eql(u8, prior, key)) return error.InvalidPrivacySample;
             try request.ensureActive();
+            try size.add(key);
             var found = (try source.lookup(a, table, key, .{ .privacy_original = true, .execution_deadline_ns = request.deadline_ns, .cancellation = request.cancellation }, .read_index)) orelse {
                 if (missing_ok) continue;
                 return error.PrivacySampleDocumentMissing;
             };
             defer found.deinit(a);
-            total += found.json.len;
-            if (total > 8 * 1024 * 1024) return error.PrivacySampleTooLarge;
+            if (found.json.len > size.remaining) return error.PrivacySampleTooLarge;
+            size.remaining -= found.json.len;
             const value = (try std.json.parseFromSlice(std.json.Value, a, found.json, .{ .allocate = .alloc_always })).value;
             try documents.append(a, .{ .key = key, .value = value });
         }
     } else {
-        var page = (try source.scan(a, table, "", "", .{ .privacy_original = true, .limit = sample.limit, .include_documents = true, .execution_deadline_ns = request.deadline_ns, .cancellation = request.cancellation }, .read_index)) orelse return error.PrivacyReadUnavailable;
-        defer page.deinit(a);
-        if (page.ndjson.len > 8 * 1024 * 1024) return error.PrivacySampleTooLarge;
-        var lines = std.mem.splitScalar(u8, page.ndjson, '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            const value = (try std.json.parseFromSlice(std.json.Value, a, line, .{ .allocate = .alloc_always })).value;
-            if (value != .object) return error.InvalidPrivacySample;
-            const id = value.object.get("_id") orelse return error.InvalidPrivacySample;
-            if (id != .string) return error.InvalidPrivacySample;
-            try documents.append(a, .{ .key = id.string, .value = value });
-        }
+        var samples = PreviewSamples{ .a = a, .transient = platform_allocator.reclaimingScratch(a), .limit = sample.limit };
+        defer samples.deinit();
+        const complete = source.scanStream(a, table, "", "", .{ .privacy_original = true, .limit = sample.limit, .include_documents = true, .execution_deadline_ns = request.deadline_ns, .cancellation = request.cancellation }, .read_index, .{ .context = &samples, .start_fn = PreviewSamples.start, .write_fn = PreviewSamples.write }) catch |err| blk: {
+            if (samples.stopped or samples.failure != null) {
+                if (err == error.Canceled or err == error.Cancelled) break :blk false;
+            }
+            return err;
+        };
+        try request.ensureActive();
+        if (samples.failure) |err| return err;
+        if (!complete and !samples.stopped) return error.PrivacyReadUnavailable;
+        if (!samples.stopped) samples.row() catch |err| {
+            if (!samples.stopped) return err;
+        };
+        documents = samples.documents;
     }
     return documents.items;
 }
@@ -499,7 +576,10 @@ fn preview(server: anytype, a: A, table: []const u8, body: []const u8, request: 
         try row.object.put(scratch, "fields", fields);
         try output.array.append(row);
     }
-    return json(a, 200, .{ .policy_version = (try input.value.policy.identity(scratch))[0..], .sampled = documents.len, .complete_table_scan = false, .external_processing = external(producer), .documents = output });
+    const result = .{ .policy_version = (try input.value.policy.identity(scratch))[0..], .sampled = documents.len, .complete_table_scan = false, .external_processing = external(producer), .documents = output };
+    var size = PreviewSize{ .remaining = @import("antfly_public_limits").privacy_preview_response_bytes };
+    try size.add(result);
+    return json(a, 200, result);
 }
 
 const FindingsRequest = struct {
@@ -1396,4 +1476,38 @@ test "privacy scan polling omits large private shard checkpoints without mutatin
         try std.testing.expect(!parsed.value.object.contains(name));
     }
     try std.testing.expectEqualStrings("running", parsed.value.object.get("phase").?.string);
+}
+
+test "privacy preview counts escaped and repeated identifiers without output allocation" {
+    var size = PreviewSize{ .remaining = 8 };
+    try size.add("\x01");
+    try std.testing.expectEqual(@as(usize, 0), size.remaining);
+    try std.testing.expectError(error.PrivacySampleTooLarge, size.add(""));
+    var repeated = PreviewSize{ .remaining = 20 };
+    try std.testing.expectError(error.PrivacySampleTooLarge, repeated.add(.{ "12345678", "12345678" }));
+}
+
+test "privacy preview streaming bounds partial rows and stops at the row limit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var samples = PreviewSamples{ .a = arena.allocator(), .transient = std.testing.allocator, .limit = 2, .remaining = 100 };
+    defer samples.deinit();
+    try PreviewSamples.write(&samples, "{\"_id\":\"one");
+    try PreviewSamples.write(&samples, "\",\"body\":1}\n");
+    try std.testing.expectError(error.Canceled, PreviewSamples.write(&samples, "{\"_id\":\"two\"}\nignored"));
+    try std.testing.expect(samples.stopped);
+    try std.testing.expectEqual(@as(usize, 2), samples.documents.items.len);
+    try std.testing.expect(samples.failure == null);
+    try std.testing.expectEqualStrings("one", samples.documents.items[0].key);
+    var oversized = PreviewSamples{ .a = arena.allocator(), .transient = std.testing.allocator, .limit = 2, .remaining = 4 };
+    defer oversized.deinit();
+    try PreviewSamples.write(&oversized, "1234");
+    try std.testing.expectError(error.Canceled, PreviewSamples.write(&oversized, "5"));
+    try std.testing.expectEqual(error.PrivacySampleTooLarge, oversized.failure.?);
+    try std.testing.expectEqual(@as(usize, 4), oversized.buffer.items.len);
+    var final = PreviewSamples{ .a = arena.allocator(), .transient = std.testing.allocator, .limit = 2 };
+    defer final.deinit();
+    try PreviewSamples.write(&final, "{\"_id\":\"tail\"}");
+    try final.row();
+    try std.testing.expectEqualStrings("tail", final.documents.items[0].key);
 }

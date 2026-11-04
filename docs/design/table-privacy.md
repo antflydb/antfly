@@ -347,7 +347,35 @@ allocation accounting and failure injection beneath request arenas.
 
 ## Validation
 
-### Latest checkpoint and findings fixes (2026-11-04)
+### Latest preview and listener fixes (2026-11-04)
+
+- Main remains incorporated through `ab58a77e243983386345e86969f5f8ddee8811e7`.
+  Final server SHA-256:
+  `c4faece05bee12a4f234fabed47df2f900043fe460bddc3243ca133aaf7a0c80`.
+- Data, standalone and metadata listeners admit the existing explicit document-read
+  and findings body budgets. Ordinary routes retain their existing limits and
+  aggregate transport admission still bounds buffered bodies.
+- Preview includes escaped identifiers in its 8 MiB input budget, streams
+  automatic samples, and counts serialized output before allocating its response.
+  Responses above 8 MiB return `privacy_sample_too_large` rather than exceeding
+  SDK limits. Native inference batching remains unchanged.
+- Checkpoint GC borrows validated catalog slices and reuses the pinned table row
+  within a page instead of repeatedly copying schemas and catalogs. The regression
+  exercises 32 projections of an 8 MiB schema with borrowed catalog ownership.
+  A real-store GC page with 32 headers and an 8 MiB table description also
+  stays below 32 MiB of measured allocations.
+- Final focused gate: 49 API/metadata tests, 145 storage/runtime tests and two ABI
+  checks pass. Server build recheck passes all 71 steps; HTTP parser/server tests
+  execute directly with 173/173 passing. Formatting and license checks pass.
+- Full privacy lifecycles each pass 19 cases with one optional model-weight skip:
+  standalone 403.55 seconds and Raft 741.54 seconds. These include preview
+  response expansion from repeated IDs and run concurrently, so their durations
+  are qualification times rather than isolated throughput benchmarks.
+- The two new HTTP boundaries pass in standalone (31.88 s) and Raft (26.75 s),
+  including absent 50 MiB key reads, explicit/automatic oversized preview rejection,
+  and successful automatic sampling at a row limit and at end of stream.
+
+### Previous checkpoint and findings fixes (2026-11-04)
 
 - Main is incorporated through `ab58a77e243983386345e86969f5f8ddee8811e7`.
   The qualified final binary is SHA-256

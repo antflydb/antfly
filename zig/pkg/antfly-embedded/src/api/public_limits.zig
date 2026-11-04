@@ -23,6 +23,8 @@ pub const max_privacy_cursor_payload_bytes: usize = max_request_body_bytes + pri
 pub const max_privacy_cursor_encoded_bytes: usize = 3 + std.base64.url_safe_no_pad.Encoder.calcSize(max_privacy_cursor_payload_bytes);
 /// One status envelope plus the JSON-escaped maximum raw document key.
 pub const max_privacy_status_row_bytes: usize = 6 * max_request_body_bytes + 1024 * 1024;
+pub const privacy_preview_sample_bytes: usize = 8 * 1024 * 1024;
+pub const privacy_preview_response_bytes: usize = 8 * 1024 * 1024;
 pub const privacy_findings_page_bytes: usize = 8 * 1024 * 1024;
 /// A page may contain one oversized finding (escaped key and producer revision)
 /// plus its continuation. Subsequent findings remain under the ordinary page cap.
@@ -36,6 +38,8 @@ pub const max_document_read_body_bytes: usize = std.base64.url_safe_no_pad.Encod
 /// Carry a maximum-size identifier in the cursor and document/field filters
 /// without imposing a smaller key limit than ordinary document/policy writes.
 pub const max_privacy_findings_body_bytes: usize = max_privacy_cursor_encoded_bytes + 6 * max_request_body_bytes + 8192;
+/// Only explicitly registered routes may exceed the ordinary body limit.
+pub const max_route_body_bytes: usize = @max(max_document_read_body_bytes, max_privacy_findings_body_bytes);
 /// Named document filters may be referenced repeatedly. Bound only the growth
 /// introduced by normalization so named and inline forms retain the same
 /// transport allowance while expansion amplification remains controlled.
