@@ -25,8 +25,7 @@ class InferenceDictateRequest:
         audio (str): Base64-encoded audio clip (WAV, Opus, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in
             windows.
         language (str | Unset): Force the transcript language (ISO 639-1). Omit for automatic detection. Example: en.
-        timestamps (bool | Unset): Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for
-            transcribe, on for dictate).
+        timestamps (bool | Unset): Enable timestamp-aware decoding. Omitted preserves the dictation default (on).
         cleanup_model (str | Unset): Generator model from models_dir/generators/ that rewrites the transcript. Omit to
             return the raw transcript. Example: ggml-org/gemma-4-E4B-it-GGUF.
         style (InferenceDictationStyle | Unset): How the cleanup pass rewrites the transcript. `clean` removes fillers

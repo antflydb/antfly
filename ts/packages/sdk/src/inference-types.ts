@@ -72,9 +72,6 @@ export type RewriteResponse = components["schemas"]["InferenceRewriteResponse"];
 
 export type ModelsResponse = components["schemas"]["InferenceModelsResponse"];
 
-export type TranscribeRequest = components["schemas"]["InferenceTranscribeRequest"];
-export type TranscribeResponse = components["schemas"]["InferenceTranscribeResponse"];
-
 export type InferenceChatMessage = components["schemas"]["InferenceChatMessage"];
 export type GenerateRequest = components["schemas"]["InferenceGenerateRequest"];
 export type GenerateResponse = components["schemas"]["InferenceGenerateResponse"];
@@ -138,3 +135,7 @@ export interface RequestOptions {
   /** AbortSignal to cancel the request */
   signal?: AbortSignal;
 }
+
+export type AudioReadOptions = components["schemas"]["InferenceAudioReadOptions"];
+export type AudioReadMetadata = components["schemas"]["InferenceAudioReadMetadata"];
+export type AudioReadSegment = components["schemas"]["InferenceAudioReadSegment"];

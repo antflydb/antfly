@@ -106,9 +106,7 @@ def multipart(audio, language, timestamps):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--antfly-url", default="http://127.0.0.1:18081/ai/v1/transcribe"
-    )
+    parser.add_argument("--antfly-url", default="http://127.0.0.1:18081/ai/v1/read")
     parser.add_argument("--whisper-url", default="http://127.0.0.1:18082/inference")
     parser.add_argument("--model", default="openai/whisper-small")
     parser.add_argument("--audio", required=True, type=Path)
@@ -130,8 +128,7 @@ def main():
         {
             "model": args.model,
             "audio": "data:audio/wav;base64," + base64.b64encode(audio).decode(),
-            "language": args.language,
-            "timestamps": args.timestamps,
+            "audio_options": {"language": args.language, "timestamps": args.timestamps},
         }
     ).encode()
     whisper, whisper_type = multipart(audio, args.language, args.timestamps)
@@ -147,6 +144,10 @@ def main():
                 item = result["data"][0]
                 if item.get("error"):
                     raise RuntimeError(str(item["error"]))
+                if item.get("status") != "complete":
+                    raise RuntimeError(
+                        f"incomplete Antfly recognition: {item.get('status')}"
+                    )
                 text = item["text"]
             else:
                 text = result["text"]

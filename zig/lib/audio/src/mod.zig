@@ -393,71 +393,71 @@ pub fn detectFormatFromMime(mime: []const u8) ?EncodedFormat {
     const normalized = normalizeMime(mime);
     if (normalized.len == 0) return null;
 
-    if (std.mem.eql(u8, normalized, "audio/wav") or
-        std.mem.eql(u8, normalized, "audio/x-wav") or
-        std.mem.eql(u8, normalized, "audio/wave"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/wav") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-wav") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/wave"))
         return .wav;
 
-    if (std.mem.eql(u8, normalized, "audio/mpeg") or
-        std.mem.eql(u8, normalized, "audio/mp3"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/mpeg") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/mp3"))
         return .mp3;
 
-    if (std.mem.eql(u8, normalized, "audio/aac") or
-        std.mem.eql(u8, normalized, "audio/x-aac") or
-        std.mem.eql(u8, normalized, "audio/mp4a-latm"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/aac") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-aac") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/mp4a-latm"))
         return .aac;
 
-    if (std.mem.eql(u8, normalized, "audio/mp4") or
-        std.mem.eql(u8, normalized, "audio/m4a") or
-        std.mem.eql(u8, normalized, "audio/x-m4a") or
-        std.mem.eql(u8, normalized, "audio/x-m4b") or
-        std.mem.eql(u8, normalized, "audio/x-m4p") or
-        std.mem.eql(u8, normalized, "audio/quicktime") or
-        std.mem.eql(u8, normalized, "video/quicktime") or
-        std.mem.eql(u8, normalized, "application/mp4") or
-        std.mem.eql(u8, normalized, "video/mp4"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/mp4") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/m4a") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-m4a") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-m4b") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-m4p") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/quicktime") or
+        std.ascii.eqlIgnoreCase(normalized, "video/quicktime") or
+        std.ascii.eqlIgnoreCase(normalized, "application/mp4") or
+        std.ascii.eqlIgnoreCase(normalized, "video/mp4"))
         return .mp4;
 
-    if (std.mem.eql(u8, normalized, "audio/flac") or
-        std.mem.eql(u8, normalized, "audio/x-flac"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/flac") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-flac"))
         return .flac;
 
-    if (std.mem.eql(u8, normalized, "audio/aiff") or
-        std.mem.eql(u8, normalized, "audio/x-aiff") or
-        std.mem.eql(u8, normalized, "audio/aif") or
-        std.mem.eql(u8, normalized, "audio/x-aif") or
-        std.mem.eql(u8, normalized, "audio/aifc") or
-        std.mem.eql(u8, normalized, "audio/x-aifc"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/aiff") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-aiff") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/aif") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-aif") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/aifc") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-aifc"))
         return .aiff;
 
-    if (std.mem.eql(u8, normalized, "audio/caf") or
-        std.mem.eql(u8, normalized, "audio/x-caf"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/caf") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-caf"))
         return .caf;
 
-    if (std.mem.eql(u8, normalized, "audio/basic") or
-        std.mem.eql(u8, normalized, "audio/au") or
-        std.mem.eql(u8, normalized, "audio/x-au") or
-        std.mem.eql(u8, normalized, "audio/snd") or
-        std.mem.eql(u8, normalized, "audio/x-snd"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/basic") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/au") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-au") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/snd") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-snd"))
         return .au;
 
-    if (std.mem.eql(u8, normalized, "audio/opus"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/opus"))
         return .opus;
 
-    if (std.mem.eql(u8, normalized, "audio/ogg") or
-        std.mem.eql(u8, normalized, "application/ogg"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/ogg") or
+        std.ascii.eqlIgnoreCase(normalized, "application/ogg"))
     {
         if (std.mem.indexOf(u8, mime, "opus") != null) return .opus;
         return .ogg;
     }
 
-    if (std.mem.eql(u8, normalized, "audio/vorbis")) return .ogg;
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/vorbis")) return .ogg;
 
-    if (std.mem.eql(u8, normalized, "audio/webm") or
-        std.mem.eql(u8, normalized, "video/webm") or
-        std.mem.eql(u8, normalized, "audio/x-matroska") or
-        std.mem.eql(u8, normalized, "video/x-matroska") or
-        std.mem.eql(u8, normalized, "video/matroska"))
+    if (std.ascii.eqlIgnoreCase(normalized, "audio/webm") or
+        std.ascii.eqlIgnoreCase(normalized, "video/webm") or
+        std.ascii.eqlIgnoreCase(normalized, "audio/x-matroska") or
+        std.ascii.eqlIgnoreCase(normalized, "video/x-matroska") or
+        std.ascii.eqlIgnoreCase(normalized, "video/matroska"))
         return .webm;
 
     return null;
@@ -3669,4 +3669,24 @@ test "Whisper implicit silence padding matches explicit PCM padding" {
         defer alloc.free(explicit);
         try std.testing.expectEqualSlices(f32, explicit, implicit);
     }
+}
+
+test "detect format from mime ignores type case without allocating" {
+    const a = std.testing.allocator;
+    const cases = [_][]const u8{
+        "audio/wav",       "audio/x-wav",     "audio/mpeg",       "audio/aac",    "audio/mp4",
+        "application/mp4", "video/quicktime", "audio/flac",       "audio/aiff",   "audio/x-caf",
+        "audio/basic",     "audio/opus",      "audio/ogg",        "audio/vorbis", "application/ogg",
+        "audio/webm",      "video/webm",      "audio/x-matroska",
+    };
+    for (cases) |mime| {
+        const upper = try std.ascii.allocUpperString(a, mime);
+        defer a.free(upper);
+        try std.testing.expectEqual(detectFormatFromMime(mime), detectFormatFromMime(upper));
+        const padded = try std.fmt.allocPrint(a, " \t{s}; charset=binary", .{upper});
+        defer a.free(padded);
+        try std.testing.expectEqual(detectFormatFromMime(mime), detectFormatFromMime(padded));
+    }
+    try std.testing.expectEqual(EncodedFormat.opus, detectFormatFromMime("Audio/Ogg; codecs=opus").?);
+    try std.testing.expect(detectFormatFromMime("Image/Wav") == null);
 }

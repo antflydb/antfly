@@ -46,6 +46,18 @@ pub const resample = generic.resample;
 pub const copyOrResample = generic.copyOrResample;
 pub const logMelSpectrogramWithConfig = generic.logMelSpectrogramWithConfig;
 
+/// Only exact decoded zero establishes silence; quiet nonzero samples must
+/// remain available to recognition. Reject non-finite PCM at this boundary.
+pub fn digitalSilence(samples: []const f32) !bool {
+    if (samples.len == 0) return false;
+    var silent = true;
+    for (samples) |sample| {
+        if (!std.math.isFinite(sample)) return error.InvalidAudioSamples;
+        if (sample != 0) silent = false;
+    }
+    return silent;
+}
+
 pub const WHISPER_SAMPLE_RATE: u32 = 16000;
 pub const WHISPER_N_FFT: u32 = 400;
 pub const WHISPER_HOP_LENGTH: u32 = 160;
