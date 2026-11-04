@@ -29,5 +29,5 @@ export function sqlDeployment(env){
 }
 export async function runSQL(env,input){
  const deployment=sqlDeployment(env);
- return pool.withHost(host=>host.request({...input,config:deployment.config,working_set_bytes:20*1024*1024},{transport:deployment.transport,storageScope:env,deadlineMs:Date.now()+55000,maxOperations:900,maxTransferBytes:32*1024*1024}),{deadlineMs:Date.now()+55000,fairKey:input.tenant?digestText(input.tenant):'maintenance'});
+ return pool.withHost(host=>host.request({...input,config:deployment.config,working_set_bytes:20*1024*1024},{transport:deployment.transport,storageScope:env,deadlineMs:Date.now()+55000,maxOperations:900,maxTransferBytes:64*1024*1024}),{deadlineMs:Date.now()+55000,fairKey:input.tenant?digestText(input.tenant):'maintenance'});
 }

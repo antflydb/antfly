@@ -245,12 +245,18 @@ const Owner = struct {
     base_done: bool = false,
     recent_at: usize = 0,
     paged: ?PagedReader = null,
+    base_arena: ?std.heap.ArenaAllocator = null,
+    base_rows: []const []const Datum = &.{},
+    base_suppressed: []const bool = &.{},
+    base_at: usize = 0,
+    base_prepared: bool = false,
     fn recentEnd(self: *const Owner) usize {
         return if (self.paged) |paged| paged.end else self.cut.pending.changes.len;
     }
     fn next(raw: *anyopaque, a: A, maximum: usize) !?[]const []const Datum {
         const self: *Owner = @ptrCast(@alignCast(raw));
         if (maximum == 0) return error.InvalidSqlBackendResponse;
+        if (self.paged != null) return self.nextPaged(a, maximum);
         while (!self.base_done or self.recent_at < self.recentEnd()) {
             try self.context.ensureActive();
             // Scratch is reclaimed on every pull, including entirely filtered
@@ -276,7 +282,7 @@ const Owner = struct {
                     if (self.cut.changed.count() != 0 or self.paged != null) {
                         var key_row: std.json.Value = .{ .object = .empty };
                         for (self.cut.pending.key_fields) |key| try key_row.object.put(scratch, key, (try page.?.cell(scratch, index, (try self.table.column(key)).path)).value);
-                        if (if (self.paged) |*paged| try paged.suppresses(scratch, key_row) else try overlay.suppressesBase(scratch, self.cut, key_row)) continue;
+                        if (try overlay.suppressesBase(scratch, self.cut, key_row)) continue;
                     }
                     for (self.input.columns, cells) |column, *cell| cell.* = try column.datum(scratch, try page.?.typedCell(scratch, index, (try self.table.column(column.name)).path, column.element_type == .numeric));
                 } else {
@@ -316,8 +322,88 @@ const Owner = struct {
         }
         return null;
     }
+    fn prepareBase(self: *Owner) !void {
+        self.base_arena = .init(self.a);
+        const owned = self.base_arena.?.allocator();
+        var rows: std.ArrayList([]const Datum) = .empty;
+        var work = std.heap.ArenaAllocator.init(self.a);
+        defer work.deinit();
+        var lookups: std.ArrayList(PagedReader.Lookup) = .empty;
+        var page_arena = std.heap.ArenaAllocator.init(self.a);
+        defer page_arena.deinit();
+        while (!self.base_done) {
+            try self.context.ensureActive();
+            _ = page_arena.reset(.free_all);
+            const scratch = page_arena.allocator();
+            const page = try self.cursor.next_columns.?(self.cursor.ptr, scratch, 256);
+            try page.validate();
+            if (page.selection.len > 256) return error.InvalidSqlBackendResponse;
+            self.base_done = page.after == null;
+            for (0..page.selection.len) |index| {
+                var key_row: std.json.Value = .{ .object = .empty };
+                for (self.cut.pending.key_fields) |key| try key_row.object.put(scratch, key, (try page.cell(scratch, index, (try self.table.column(key)).path)).value);
+                const key = lake.types.digestHex(try overlay.baseIdentity(scratch, self.cut.pending.key_fields, key_row, self.cut.kinds));
+                try lookups.append(work.allocator(), .{ .key = key, .row = rows.items.len });
+                const cells = try owned.alloc(Datum, self.input.columns.len);
+                for (self.input.columns, cells) |column, *cell| cell.* = try local.sql_operators.cloneDatum(owned, try page.typedCell(scratch, index, (try self.table.column(column.name)).path, column.element_type == .numeric));
+                try rows.append(owned, cells);
+            }
+        }
+        const suppressed = try owned.alloc(bool, rows.items.len);
+        @memset(suppressed, false);
+        try self.paged.?.suppressBatch(lookups.items, suppressed);
+        self.base_rows = rows.items;
+        self.base_suppressed = suppressed;
+        self.base_prepared = true;
+    }
+    fn nextPaged(self: *Owner, a: A, maximum: usize) !?[]const []const Datum {
+        if (!self.base_prepared) try self.prepareBase();
+        var scratch_arena = std.heap.ArenaAllocator.init(self.a);
+        defer scratch_arena.deinit();
+        var result: std.ArrayList([]const Datum) = .empty;
+        while (result.items.len < maximum) {
+            try self.context.ensureActive();
+            _ = scratch_arena.reset(.free_all);
+            const scratch = scratch_arena.allocator();
+            const cells = if (self.base_at < self.base_rows.len) base: {
+                const index = self.base_at;
+                self.base_at += 1;
+                if (self.base_suppressed[index]) continue;
+                const values = try scratch.alloc(Datum, self.input.columns.len);
+                for (self.input.columns, self.base_rows[index], values) |column, raw, *value| value.* = try column.datum(scratch, raw);
+                break :base values;
+            } else recent: {
+                if (self.base_arena) |*arena| arena.deinit();
+                self.base_arena = null;
+                self.base_rows = &.{};
+                self.base_suppressed = &.{};
+                if (self.recent_at == self.recentEnd()) break;
+                const position = self.recent_at;
+                self.recent_at += 1;
+                const row = (try self.paged.?.recent(scratch, position)) orelse continue;
+                const values = try scratch.alloc(Datum, self.input.columns.len);
+                for (self.input.columns, values) |column, *cell| cell.* = try column.datum(scratch, try row.cell(column.name));
+                break :recent values;
+            };
+            if (self.filter) |filter| {
+                var keys: [32]Datum = undefined;
+                for (filter.columns, 0..) |column, index| {
+                    const ordinal = for (self.input.columns, 0..) |candidate, i| {
+                        if (std.mem.eql(u8, candidate.name, column.name)) break i;
+                    } else return error.InvalidSqlDistributedPlan;
+                    keys[index] = cells[ordinal];
+                }
+                if (!try filter.contains(keys[0..filter.columns.len])) continue;
+            }
+            const values = try a.alloc(Datum, cells.len);
+            for (cells, values) |cell, *value| value.* = try local.sql_operators.cloneDatum(a, cell);
+            try result.append(a, values);
+        }
+        return if (result.items.len == 0) null else result.items;
+    }
     fn close(raw: *anyopaque) void {
         const self: *Owner = @ptrCast(@alignCast(raw));
+        if (self.base_arena) |*arena| arena.deinit();
         if (self.paged) |*paged| paged.deinit();
         self.cursor.close(self.cursor.ptr);
         self.source.deinit();
@@ -327,18 +413,16 @@ const Owner = struct {
 };
 
 const PagedReader = struct {
-    const KeyCache = struct { arena: std.heap.ArenaAllocator, page: ?usize = null, bytes: []const u8 = &.{}, used: u64 = 0 };
+    const Lookup = struct { key: [64]u8, row: usize };
     a: A,
     artifacts: *@import("../artifacts/store.zig").ArtifactStore,
     identity: [32]u8,
     descriptor: retained.Descriptor,
     cut: *const overlay.Cut,
     context: Context,
-    key_cache: [8]KeyCache,
-    key_clock: u64 = 0,
+
     change_arena: std.heap.ArenaAllocator,
     bloom: []const u8,
-    keys: []const u8 = &.{},
     changes: []const ingestion.Batch.Change = &.{},
     change_page: ?usize = null,
     begin: usize,
@@ -350,11 +434,7 @@ const PagedReader = struct {
         const bloom = try retained.readPage(a, artifacts, identity_, descriptor, index.bloom, requestToken(&context));
         errdefer a.free(bloom);
         if (bloom.len == 0) return error.InvalidSqlExchange;
-        return .{ .a = a, .artifacts = artifacts, .identity = identity_, .descriptor = descriptor, .cut = cut, .context = context, .key_cache = blk: {
-            var slots: [8]KeyCache = undefined;
-            for (&slots) |*slot| slot.* = .{ .arena = .init(a) };
-            break :blk slots;
-        }, .change_arena = .init(a), .bloom = bloom, .begin = @intCast(@as(u64, index.count) * split / input.splits), .end = @intCast(@as(u64, index.count) * (split + 1) / input.splits) };
+        return .{ .a = a, .artifacts = artifacts, .identity = identity_, .descriptor = descriptor, .cut = cut, .context = context, .change_arena = .init(a), .bloom = bloom, .begin = @intCast(@as(u64, index.count) * split / input.splits), .end = @intCast(@as(u64, index.count) * (split + 1) / input.splits) };
     }
     fn requestToken(context: *const Context) @import("antfly_cancellation").CancellationToken {
         return .{ .ptr = context, .is_cancelled_fn = struct {
@@ -365,53 +445,62 @@ const PagedReader = struct {
             }
         }.canceled };
     }
-    fn suppresses(self: *PagedReader, a: A, row: std.json.Value) !bool {
-        const key = lake.types.digestHex(try overlay.baseIdentity(a, self.cut.pending.key_fields, row, self.cut.kinds));
-        for (0..4) |seed| {
-            const bit = retained.bloomBit(key, self.bloom.len * 8, seed);
-            if (self.bloom[bit / 8] & (@as(u8, 1) << @as(u3, @intCast(bit % 8))) == 0) return false;
-        }
-        const pages = self.descriptor.paged.?.keys;
-        var low: usize = 0;
-        var high = pages.len;
-        while (low < high) {
-            const middle = low + (high - low) / 2;
-            if (std.mem.order(u8, &pages[middle].last, &key) == .lt) low = middle + 1 else high = middle;
-        }
-        if (low == pages.len or std.mem.order(u8, &key, &pages[low].first) == .lt) return false;
-        const cached = for (&self.key_cache) |*slot| {
-            if (slot.page == low) break slot;
-        } else null;
-        const slot = cached orelse blk: {
-            var victim = &self.key_cache[0];
-            for (&self.key_cache) |*candidate| {
-                if (candidate.page == null) {
-                    victim = candidate;
+    /// Sort one split's candidate keys so every relevant immutable page is
+    /// fetched once, independently of physical row order or key skew.
+    fn suppressBatch(self: *PagedReader, lookups: []Lookup, suppressed: []bool) !void {
+        std.mem.sort(Lookup, lookups, {}, struct {
+            fn less(_: void, l: Lookup, r: Lookup) bool {
+                return std.mem.order(u8, &l.key, &r.key) == .lt;
+            }
+        }.less);
+        const index = self.descriptor.paged.?;
+        const width: usize = index.key_bytes;
+        if (width != 32 and width != 64) return error.InvalidSqlExchange;
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        var cached: ?usize = null;
+        var bytes: []const u8 = &.{};
+        for (lookups) |lookup| {
+            try self.context.ensureActive();
+            if (lookup.row >= suppressed.len) return error.InvalidSqlExchange;
+            var possible = true;
+            for (0..4) |seed| {
+                const bit = retained.bloomBit(lookup.key, self.bloom.len * 8, seed);
+                if (self.bloom[bit / 8] & (@as(u8, 1) << @as(u3, @intCast(bit % 8))) == 0) {
+                    possible = false;
                     break;
                 }
-                if (candidate.used < victim.used) victim = candidate;
             }
-            _ = victim.arena.reset(.free_all);
-            victim.page = null;
-            victim.bytes = try retained.readPage(victim.arena.allocator(), self.artifacts, self.identity, self.descriptor, pages[low].token, requestToken(&self.context));
-            if (victim.bytes.len % 64 != 0) return error.InvalidSqlExchange;
-            victim.page = low;
-            break :blk victim;
-        };
-        self.key_clock += 1;
-        slot.used = self.key_clock;
-        self.keys = slot.bytes;
-        var begin: usize = 0;
-        var end = self.keys.len / 64;
-        while (begin < end) {
-            const middle = begin + (end - begin) / 2;
-            switch (std.mem.order(u8, self.keys[middle * 64 ..][0..64], &key)) {
-                .eq => return true,
-                .lt => begin = middle + 1,
-                .gt => end = middle,
+            if (!possible) continue;
+            var low: usize = 0;
+            var high = index.keys.len;
+            while (low < high) {
+                const middle = low + (high - low) / 2;
+                if (std.mem.order(u8, &index.keys[middle].last, &lookup.key) == .lt) low = middle + 1 else high = middle;
+            }
+            if (low == index.keys.len or std.mem.order(u8, &lookup.key, &index.keys[low].first) == .lt) continue;
+            if (cached != low) {
+                _ = arena.reset(.free_all);
+                bytes = try retained.readPage(arena.allocator(), self.artifacts, self.identity, self.descriptor, index.keys[low].token, requestToken(&self.context));
+                if (bytes.len == 0 or bytes.len % width != 0) return error.InvalidSqlExchange;
+                cached = low;
+            }
+            var binary: [32]u8 = undefined;
+            const key: []const u8 = if (width == 32) try std.fmt.hexToBytes(&binary, &lookup.key) else &lookup.key;
+            var begin: usize = 0;
+            var end = bytes.len / width;
+            while (begin < end) {
+                const middle = begin + (end - begin) / 2;
+                switch (std.mem.order(u8, bytes[middle * width ..][0..width], key)) {
+                    .eq => {
+                        suppressed[lookup.row] = true;
+                        break;
+                    },
+                    .lt => begin = middle + 1,
+                    .gt => end = middle,
+                }
             }
         }
-        return false;
     }
     fn recent(self: *PagedReader, a: A, position: usize) !?catalog.Row {
         const pages = self.descriptor.paged.?.changes;
@@ -437,7 +526,71 @@ const PagedReader = struct {
     }
     fn deinit(self: *PagedReader) void {
         self.a.free(self.bloom);
-        for (&self.key_cache) |*slot| slot.arena.deinit();
         self.change_arena.deinit();
     }
 };
+
+test "distributed SQL clustered WAL keys read each exact page once" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    var objects = try @import("../artifacts/object_store.zig").ObjectStore.initWithClientOptions(a, memory.client(), "source", "artifacts", .{ .skip_bucket_probe = true });
+    var artifacts = objects.artifactStore();
+    defer artifacts.deinit();
+    const binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(sa, "{\"base_source\":{\"kind\":\"external\",\"table_id\":\"t\",\"format\":\"iceberg\",\"uri\":\"s3://source/table\",\"schema_fingerprint\":\"auto\",\"write_policy\":\"iceberg_writer\",\"catalog\":{\"type\":\"managed\"}}}")).?;
+    const table: catalog.Table = .{ .id = 7, .physical_name = "t", .schema_version = 1, .external_base_source = binding, .columns = &.{.{ .name = "id", .path = "id", .type = .integer }} };
+    const changes = try sa.alloc(ingestion.Batch.Change, 100000);
+    for (changes, 1..) |*change, id| {
+        var row: std.json.Value = .{ .object = .empty };
+        try row.object.put(sa, "id", .{ .integer = @intCast(id) });
+        change.* = .{ .op = .upsert, .row = row };
+    }
+    const descriptor: retained.Descriptor = .{ .table_id = 7, .schema_version = 1, .object_generation = 0, .expires_ms = 1000000, .metadata_location = "s3://source/table/meta.json", .metadata_json = "{}", .table_uuid = "u", .snapshot_id = "42", .pending = .{ .lsn = 1, .key_fields = &.{"id"}, .changes = changes }, .authorization = .{ .scope = @splat('a'), .table = retained.ReadTable.from(table) } };
+    const identity_: [32]u8 = @splat(1);
+    const saved = try retained.saveDistributed(sa, &artifacts, identity_, std.testing.io, descriptor, .none);
+    const loaded = try retained.loadDescriptor(sa, &artifacts, identity_, saved.token, 7, 1, .none);
+    const cut = try overlay.Cut.initForTable(sa, loaded.pending, table);
+    const input: plan.Input = .{ .table_id = 7, .schema = @splat('a'), .snapshot = "42", .wal_cut = 1, .cut = saved.token, .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 20 * 1024 * 1024, .estimated_rows = 1200000, .splits = saved.minimumSplits() };
+    var reader = try PagedReader.init(a, &artifacts, identity_, loaded, &cut, input, 0, .{});
+    defer reader.deinit();
+    const count = 1601;
+    const lookups = try sa.alloc(PagedReader.Lookup, count);
+    const suppressed = try sa.alloc(bool, count);
+    for (lookups, 0..) |*lookup, index| {
+        var row: std.json.Value = .{ .object = .empty };
+        try row.object.put(sa, "id", .{ .integer = if (index < 1500) @intCast(index + 1) else if (index == 1600) 1 else @intCast(index + 100000) });
+        lookup.* = .{ .key = lake.types.digestHex(try overlay.baseIdentity(sa, cut.pending.key_fields, row, cut.kinds)), .row = index };
+    }
+    @memset(suppressed, false);
+    const metrics = @import("objectstore").operation_metrics;
+    const before = metrics.runtime.snapshot();
+    try reader.suppressBatch(lookups, suppressed);
+    const after = metrics.runtime.snapshot();
+    const gets = after.calls[@backingInt(metrics.Operation.get)] - before.calls[@backingInt(metrics.Operation.get)];
+    try std.testing.expectEqual(@as(usize, 25), loaded.paged.?.keys.len);
+    try std.testing.expect(gets <= loaded.paged.?.keys.len);
+    for (suppressed, 0..) |value, index| try std.testing.expectEqual(index < 1500 or index == 1600, value);
+    // Retained capabilities from older writers contain ASCII digest pages.
+    var legacy = loaded;
+    const legacy_pages = try sa.dupe(retained.KeyPage, loaded.paged.?.keys);
+    for (legacy_pages) |*page| {
+        const binary = try retained.readPage(sa, &artifacts, identity_, loaded, page.token, .none);
+        const hex = try sa.alloc(u8, binary.len * 2);
+        for (0..binary.len / 32) |i| @memcpy(hex[i * 64 ..][0..64], &std.fmt.bytesToHex(binary[i * 32 ..][0..32].*, .lower));
+        const envelope = try @import("../../api/lake_generation_envelope.zig").decode(sa, "sql-page1:", page.token, retained.max_bytes);
+        const scope = (try @import("../artifacts/store.zig").uploadScopeFromArtifactId(envelope.id)).?;
+        var object = try artifacts.putScoped(scope, hex, .none);
+        defer object.deinit(artifacts.allocator);
+        page.token = try @import("../../api/lake_generation_envelope.zig").encode(sa, "sql-page1:", object);
+    }
+    legacy.paged.?.keys = legacy_pages;
+    legacy.paged.?.key_bytes = 64;
+    var legacy_reader = try PagedReader.init(a, &artifacts, identity_, legacy, &cut, input, 0, .{});
+    defer legacy_reader.deinit();
+    @memset(suppressed, false);
+    try legacy_reader.suppressBatch(lookups, suppressed);
+    for (suppressed, 0..) |value, index| try std.testing.expectEqual(index < 1500 or index == 1600, value);
+}

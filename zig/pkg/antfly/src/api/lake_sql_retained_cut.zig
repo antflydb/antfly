@@ -82,7 +82,7 @@ pub const Descriptor = struct {
 };
 pub const ChangePage = struct { begin: u32, count: u32, token: []const u8 };
 pub const KeyPage = struct { first: [64]u8, last: [64]u8, token: []const u8 };
-pub const Paged = struct { count: u32, bytes: u64, changes: []const ChangePage, keys: []const KeyPage, bloom: []const u8 };
+pub const Paged = struct { count: u32, bytes: u64, changes: []const ChangePage, keys: []const KeyPage, bloom: []const u8, key_bytes: u8 = 64 };
 pub const distributed_rows = 128;
 pub const Saved = struct {
     token: []const u8,
@@ -155,8 +155,11 @@ fn publishDistributed(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, i
     var keys: std.ArrayList(KeyPage) = .empty;
     var begin: usize = 0;
     while (begin < digests.len) {
-        const end = @min(digests.len, begin + 1024);
-        const bytes = std.mem.sliceAsBytes(digests[begin..end]);
+        const end = @min(digests.len, begin + 4096);
+        const page_allocator = local.sql_memory_budget.reclaimingAllocator(a);
+        const bytes = try page_allocator.alloc(u8, (end - begin) * 32);
+        defer page_allocator.free(bytes);
+        for (digests[begin..end], 0..) |key, index| _ = try std.fmt.hexToBytes(bytes[index * 32 ..][0..32], &key);
         try keys.append(a, .{ .first = digests[begin], .last = digests[end - 1], .token = try savePage(a, store, identity, io, descriptor, bytes, cancellation) });
         begin = end;
     }
@@ -181,7 +184,7 @@ fn publishDistributed(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, i
     var root = descriptor;
     root.pending = normalized.pending;
     root.pending.changes = &.{};
-    root.paged = .{ .count = @intCast(normalized.pending.changes.len), .bytes = encoded_len, .changes = changes.items, .keys = keys.items, .bloom = try savePage(a, store, identity, io, descriptor, bloom, cancellation) };
+    root.paged = .{ .count = @intCast(normalized.pending.changes.len), .bytes = encoded_len, .changes = changes.items, .keys = keys.items, .key_bytes = 32, .bloom = try savePage(a, store, identity, io, descriptor, bloom, cancellation) };
     return .{ .token = try save(a, store, identity, io, root, cancellation), .rows = normalized.pending.changes.len, .bytes = encoded_len, .paged = true };
 }
 fn domain(table: u64, identity: [32]u8) [32]u8 {
