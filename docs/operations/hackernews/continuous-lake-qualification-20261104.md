@@ -735,6 +735,26 @@ regression failed before this change and both focused API controls pass after it
 710 lake tests passed with one skip and no leaks. Provider validation is still
 needed to measure whether removing this competing work improves cold serving.
 
+The ingress query cancellation adapter also dropped the application deadline
+when there was no listener cancellation signal. A simulated-clock regression
+reproduced this independently of the GCS timing: an expired ingress deadline
+still passed the token checkpoint. The adapter now carries a clock-aware
+semantic cancellation token, and the HTTP forwarding adapter preserves its
+fallible checkpoint and error-domain dispatcher instead of retaining only its
+boolean probe. Boolean probes remain separate from arbitrary fallible
+checkpoints. All 15 execution-budget tests passed without skips or leaks,
+including listener cancellation, simulated-clock deadlines and a foreign-domain
+checkpoint that must not run during boolean probing. This closes a cancellation
+propagation gap; it does not establish the cause of the earlier cold-search
+latency or qualify the final engine against GCS.
+
+The frozen bounded-cleanup ReleaseFast build also passed its smoke test. Fresh
+filesystem and GCS default-workload controls are running against that exact
+`eca0684354` source; they do not include the subsequent text-only reconciliation
+or ingress cancellation fixes. An initial filesystem launch was prevented from
+binding local ports by the sandbox, before engine work; the host-permitted run
+uses a separate evidence directory and preserves that failed launch record.
+
 Next work should:
 
 1. Monitor accepted searches with live public stages,
