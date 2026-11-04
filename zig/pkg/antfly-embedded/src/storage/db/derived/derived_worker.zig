@@ -1972,12 +1972,12 @@ test "catchUpIndex ignores a resume point for a record it did not collect" {
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
     defer journal.close();
     try appendChangeJournalRecord(&journal, alloc, .{
-        .sequence = 2,
+        .sequence = 1,
         .changed_doc_keys = &.{ "doc:a", "doc:b", "doc:c" },
         .target_hints = &.{.full_text},
     });
-    // A stale point for sequence 1 must not skip items of sequence 2.
-    var store: TestPartialStore = .{ .cursor = .{ .sequence = 1, .offset = 2 } };
+    // A resume point for another record must not skip items of record 1.
+    var store: TestPartialStore = .{ .cursor = .{ .sequence = 5, .offset = 2 } };
     var capture = TestApplyCapture{ .alloc = alloc };
     defer capture.deinit();
     _ = try catchUpIndexWithOptions(alloc, replay_source_mod.Source.fromJournal(&journal), .{ .name = "text", .kind = .full_text }, 0, &capture, testApplyCapture, .{
@@ -1990,7 +1990,7 @@ test "catchUpIndex ignores a resume point for a record it did not collect" {
         .save_partial_fn = TestPartialStore.save,
     });
     try std.testing.expectEqual(@as(usize, 3), capture.applied_documents);
-    try std.testing.expectEqual(@as(?u64, 2), store.persisted);
+    try std.testing.expectEqual(@as(?u64, 1), store.persisted);
 }
 
 test "catchUpIndex chunks dense replay by estimated vector byte budget" {
