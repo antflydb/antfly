@@ -9026,6 +9026,90 @@ test "capi native cooperative replay separates raw text from generated artifact 
     }
 }
 
+test "capi native registered replay fragments oversized batches across maintenance runtime replacement" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const fragments = @import("../storage/db/derived/apply_state.zig");
+    var fixture = try AdmissionFollowupFixture.init("registered-replay-fragments", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
+    var keys_buffer: [1024][32]u8 = undefined;
+    var writes: [1024]h.capi.WriteIntent = undefined;
+    for (&writes, 0..) |*write, i| write.* = .{
+        .key = .fromSlice(try std.fmt.bufPrint(&keys_buffer[i], "source-{d}", .{i})),
+        .value = .fromSlice("{\"text\":\"native fragment canary\"}"),
+        .is_delete = false,
+    };
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch(fixture.id, &writes, writes.len, null, 0, 0, 0));
+    const owner = fixture.connection.owner;
+    var target: u64 = 0;
+    {
+        var lease = try fixture.connection.acquire();
+        defer {
+            lease.close();
+            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        const live = try owner.refresh();
+        target = live.db.core.nextDerivedSequence();
+        const state = try owner.groupSourceStateNamed(&live.db, "default");
+        state.replay_budget.max_records = 8;
+        state.replay_budget.lanes[0].records = 8;
+    }
+    const Probe = struct {
+        captures: usize = 0,
+        registered: bool = true,
+        fn notify(ptr: *anyopaque, root: *h.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (root.maintenance_publication) |publication| if (publication.source_read != null) {
+                self.captures += 1;
+                self.registered = self.registered and root.db.executor.hasWorkers();
+            };
+        }
+    };
+    var probe: Probe = .{};
+    owner.test_after_capture = .{ .ptr = &probe, .notify = Probe.notify };
+    defer owner.test_after_capture = null;
+    for ([_]u64{ 8, 16 }) |expected| {
+        var observed: u64 = 0;
+        for (0..8) |_| {
+            _ = try owner.maintenanceTurnForTest();
+            var lease = try fixture.connection.acquire();
+            defer {
+                lease.close();
+                fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            }
+            const live = try owner.refresh();
+            const cfg = live.db.core.index_manager.get("text").?;
+            const identity: fragments.replay_fragment.Identity = .{ .generation = cfg.coverage_generation, .config_hash = h.db_mod.types.indexConfigHash(cfg.*), .incarnation = live.db.root_incarnation };
+            const position = (try fragments.loadReplayFragment(a, live.db.core.store, "text", identity)) orelse continue;
+            try std.testing.expectEqual(target, position.sequence);
+            try std.testing.expectEqual(@as(u64, 1024), position.total_items);
+            try std.testing.expect(try live.db.core.loadAppliedSequence(a, "text") < target);
+            observed = position.next_item;
+            if (observed == expected) {
+                // Close the actual actor; the next registered worker must
+                // resume from durable fragment state rather than RAM.
+                owner.discardMaintenanceRuntime();
+                break;
+            }
+        }
+        try std.testing.expectEqual(expected, observed);
+    }
+    try std.testing.expect(probe.captures >= 2 and probe.registered);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(fixture.id));
+    var lease = try fixture.connection.acquire();
+    defer {
+        lease.close();
+        fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    }
+    const live = try owner.refresh();
+    try std.testing.expect(try live.db.core.loadAppliedSequence(a, "text") >= target);
+    const snapshot = live.db.core.index_manager.textIndex("text").?.persistent.acquireSnapshot();
+    defer snapshot.release();
+    try std.testing.expectEqual(@as(u32, 1024), snapshot.liveDocCount());
+    try std.testing.expect((try live.owned_lite_backend.?.native_docstore.?.file.check()).valid);
+}
+
 test "capi native maintenance partial text replay earns another source turn without advancing coverage" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("fragment-source-priority", 5000, .batch);

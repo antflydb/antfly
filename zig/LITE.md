@@ -1316,6 +1316,11 @@ charging a provider retry. The direct replay fallback without registered workers
 obeys the same dependency cuts and document-fan-out bounds as the registered
 manual executor.
 Explicit idle drains continue to inspect and complete all relevant work.
+Registered manual workers receive the same generation-bound fragment callbacks
+as workerless replay. Their budgets bound complete document families within a
+large journal record. A replacement worker loads the durable continuation;
+neither partial index output nor a failed continuation write advances the
+complete-record watermark or releases that record's retention credits.
 Promotion's SQL coordinator uses the same bounded consumer reserve as its
 replay caller. A full producer quota still refuses new foreground decisions,
 but cannot refuse a consumer decision while that reserve has headroom. Once

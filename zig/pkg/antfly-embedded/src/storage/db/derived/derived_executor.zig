@@ -403,6 +403,10 @@ const ManualRuntime = struct {
         };
         var budget = if (wait.replay_budget) |controller| controller.budget(lane) else @import("replay_budget.zig").Budget{};
         budget.records = @min(budget.records, wait.replay_record_cap);
+        const fragments = if (wait.replay_budget != null and worker.kind.kind == .full_text) enabled: {
+            const port = wait.fragments orelse break :enabled null;
+            break :enabled if (try port.supports(port.ptr, worker.name)) port else null;
+        } else null;
         const started = @import("antfly_platform").time.monotonicNs();
         const waited_before = if (wait.publication_overhead_ns) |counter| counter.load(.monotonic) else 0;
         var pressure_failure = false;
@@ -417,6 +421,10 @@ const ManualRuntime = struct {
             ApplySession.apply,
             .{
                 .resource_manager = self.backlog.resource_manager,
+                .max_fragment_families = if (fragments != null) budget.records else 0,
+                .fragment_ctx = if (fragments) |port| port.ptr else null,
+                .load_fragment_fn = if (fragments) |port| port.load else null,
+                .save_fragment_fn = if (fragments) |port| port.save else null,
                 .max_records_per_window = if (wait.replay_budget != null) budget.records else derived_worker.catch_up_max_records_per_window_default,
                 .max_collected_items_per_window = if (wait.replay_budget != null) budget.records else 0,
                 .max_chunk_bytes = if (wait.replay_budget != null) budget.bytes else derived_worker.catch_up_max_chunk_bytes_default,
@@ -976,4 +984,96 @@ test "manual replay background budget bounds document fanout rather than only jo
     try std.testing.expect(executor.appliedSequence("ft").? < 64);
     try executor.waitForAll(64);
     try std.testing.expectEqual(@as(u64, 64), executor.appliedSequence("ft").?);
+}
+
+test "manual replay fragments one oversized record and resumes after replacement and checkpoint failure" {
+    @import("antfly_test_error_logs").expectErrorLogs(1);
+    const a = std.testing.allocator;
+    const fragment = @import("replay_fragment.zig");
+    var backend = @import("../../mem_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    var store = try @import("../../docstore.zig").DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var keys: [1024][]const u8 = undefined;
+    for (&keys, 0..) |*key, i| key.* = try std.fmt.allocPrint(arena.allocator(), "doc-{d}", .{i});
+    const payload = try @import("change_journal.zig").encodeRecord(a, .{
+        .sequence = 1,
+        .changed_doc_keys = &keys,
+        .target_hints = &.{.full_text},
+    });
+    defer a.free(payload);
+    try store.appendReplayOpaque(a, 1, payload);
+    const Probe = struct {
+        seen: [1024]bool = @splat(false),
+        max_documents: usize = 0,
+        encoded: ?[fragment.encoded_size]u8 = null,
+        scalar: u64 = 0,
+        retired: u64 = 0,
+        fail_save: bool = false,
+
+        fn supports(_: *anyopaque, _: []const u8) !bool {
+            return true;
+        }
+        fn apply(ptr: *anyopaque, batch: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.max_documents = @max(self.max_documents, batch.documents.len);
+            for (batch.documents) |doc| self.seen[try std.fmt.parseInt(usize, doc.key[4..], 10)] = true;
+            return true;
+        }
+        fn load(ptr: *anyopaque, _: []const u8) !?fragment.Position {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return if (self.encoded) |raw| (try fragment.decode(&raw)).position else null;
+        }
+        fn save(ptr: *anyopaque, _: []const u8, position: fragment.Position) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail_save) {
+                self.fail_save = false;
+                return error.TestFragmentPersistFailure;
+            }
+            self.encoded = fragment.encode(.{ .position = position, .identity = .{ .generation = 1, .config_hash = 2, .incarnation = 3 } });
+        }
+        fn persist(ptr: *anyopaque, _: []const u8, sequence: u64, _: bool) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const position = (try fragment.decode(&self.encoded.?)).position;
+            try std.testing.expectEqual(position.total_items, position.next_item);
+            for (self.seen) |seen| try std.testing.expect(seen);
+            self.scalar = sequence;
+            return true;
+        }
+        fn truncate(ptr: *anyopaque, sequence: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.retired = sequence;
+        }
+    };
+    var probe: Probe = .{};
+    var budget: @import("replay_budget.zig").Controller = .{};
+    const wait: VisibilityWait = .{
+        .replay_budget = &budget,
+        .replay_record_cap = 8,
+        .fragments = .{ .ptr = &probe, .supports = Probe.supports, .load = Probe.load, .save = Probe.save },
+    };
+    const source = replay_source_mod.Source.fromPrimaryStore(&store, null, null);
+    {
+        var executor = try initManual(a, source, &probe, Probe.apply, Probe.persist, Probe.truncate, null, null, null, null, null);
+        defer executor.deinit(a);
+        try executor.addWorker("ft", .{ .name = "ft", .kind = .full_text }, 0);
+        try executor.waitForAllWithVisibilityWait(1, wait);
+        try std.testing.expectEqual(@as(u64, 0), executor.appliedSequence("ft").?);
+        try std.testing.expectEqual(@as(u64, 8), (try fragment.decode(&probe.encoded.?)).position.next_item);
+        try std.testing.expectEqual(@as(u64, 0), probe.retired);
+    }
+    var replacement = try initManual(a, source, &probe, Probe.apply, Probe.persist, Probe.truncate, null, null, null, null, null);
+    defer replacement.deinit(a);
+    try replacement.addWorker("ft", .{ .name = "ft", .kind = .full_text }, probe.scalar);
+    probe.fail_save = true;
+    try std.testing.expectError(error.TestFragmentPersistFailure, replacement.waitForIndexesWithVisibilityWait(1, &.{"ft"}, wait));
+    try std.testing.expectEqual(@as(u64, 0), replacement.appliedSequence("ft").?);
+    try std.testing.expectEqual(@as(u64, 8), (try fragment.decode(&probe.encoded.?)).position.next_item);
+    var turns: usize = 0;
+    while (probe.scalar == 0 and turns < 128) : (turns += 1) try replacement.waitForIndexesWithVisibilityWait(1, &.{"ft"}, wait);
+    try std.testing.expectEqual(@as(usize, 8), probe.max_documents);
+    try std.testing.expectEqual(@as(u64, 1), probe.scalar);
+    try std.testing.expectEqual(@as(u64, 1), probe.retired);
 }

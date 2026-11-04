@@ -1,0 +1,39 @@
+{
+  "qualified": false,
+  "source_commit": "ae9df036b34c188695aa2f40b6178c0e2088af52",
+  "mode": "Debug",
+  "scope": "Local diagnosis with metrics, one three-second stack sample and two overlapping unrelated native builds; not a controlled throughput comparison.",
+  "compiler_sha256": "1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523",
+  "library_sha256": "c7218fd1eb1cedf6d8bddca3ad7b6bf6989a09d8b0154acf90df2a29924521aa",
+  "original_importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+  "seed_sha256": "27ea0ac6beecde2ca727132143e214c17ef5f38010db3762f605551806673519",
+  "validation": {
+    "selected_capi_and_sql_tests_passed": 159,
+    "skipped": 0,
+    "leaks": 0,
+    "abi_exports_smoke_and_linkage": "passed",
+    "sdk_sql_and_concurrency_tests_passed": 209
+  },
+  "populated_database_import": {
+    "input_index": 7,
+    "exit_code": 1,
+    "seconds": 306.0624889159808,
+    "successful_primary_batches": 51,
+    "successful_primary_writes": 52224,
+    "public_errors": ["LiteReplayBacklogExceeded"],
+    "invalid_manifest_errors": 0,
+    "peak_unrelated_native_builds": 2,
+    "owned_build_or_sdk_overlap": false,
+    "censored": false,
+    "artifact_source_opens": 2522,
+    "artifact_source_reuses": 5812,
+    "source_turns": 194,
+    "maintenance_errors": 47,
+    "maintenance_timeouts": 0,
+    "path_lease_hold_ns": 236652463235,
+    "path_lease_hold_max_ns": 1763142042
+  },
+  "active_path_observation": "The stack sample confirms registered ManualRuntime.catchUpWorker execution. This revision supplies record/document and byte budgets but no durable fragment callbacks on that path. One 1024-document record therefore remains indivisible even when the desired family budget is smaller. The workerless path already supplies those callbacks.",
+  "reference_policy": "Preserved reference artifacts and results only; no baseline build or execution.",
+  "conclusion": "Dependency-specific scheduling passes its correctness regression, but the original importer still fills replay capacity. Missing fragment wiring on the active executor is a concrete bounded-work gap to address next, not proof of a complete root cause. Final optimized qualification remains outstanding; wolfspider was not used for this diagnostic."
+}
