@@ -19388,7 +19388,10 @@ pub const DB = struct {
                 const catalogs = try @import("artifact_inventory.zig").catalogs(&read);
                 const inventory = @import("artifact_inventory.zig");
                 const status = try inventory.status(owned, &read, command_namespace);
-                const ready = if (active) |value| status.ready and status.ordered != null and value.epoch == status.ordered.?.epoch and std.mem.eql(u8, &value.catalog_digest, &catalogs.digest()) else false;
+                // A publication authority with the right bytes/epoch can
+                // still lack the protocol needed by a newly admitted producer.
+                const required_protocol = try catalogs.effectProtocolFor(owned, status.ordered, 16);
+                const ready = if (active) |value| status.ready and status.ordered != null and status.ordered.?.effect_protocol >= required_protocol and value.epoch == status.ordered.?.epoch and std.mem.eql(u8, &value.catalog_digest, &catalogs.digest()) else false;
                 break :blk try std.json.Stringify.valueAlloc(a, ready, .{});
             },
             .retirement => try std.json.Stringify.valueAlloc(a, try @import("group_source_retirement.zig").load(owned, &read, baseline.retirementGeneration(baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation), try self.core.index_manager.artifact_semantic_cache.get(owned, try @import("artifact_inventory.zig").catalogs(&read)))), .{}),
@@ -26484,15 +26487,7 @@ pub const DB = struct {
             var owned = catalogs;
             owned.deinit(alloc);
         }
-        const effect_protocol = @max(try catalogs.requiredEffectProtocol(alloc), if (observed.ordered) |binding| binding.effect_protocol else 14);
-        if (observed.ready and observed.ordered.?.effect_protocol == effect_protocol) {
-            var installed = (try inventory.load(alloc, &txn)).?;
-            defer installed.deinit();
-            var command = installed.value.command;
-            command.catalogs = catalogs;
-            return command;
-        }
-        return .{ .namespace = namespace, .previous = observed.ordered, .binding = .{ .epoch = try std.math.add(u64, if (observed.ordered) |value| value.epoch else 0, 1), .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(alloc), .effect_protocol = effect_protocol }, .catalogs = catalogs };
+        return inventory.desiredCommand(alloc, &txn, namespace, catalogs, observed, 14);
     }
 
     fn completeArtifactUpload(txn: anytype, finalization: ?@import("artifact_publication_transport.zig").Finalization, entry: OrderedApplyReceipt) !void {

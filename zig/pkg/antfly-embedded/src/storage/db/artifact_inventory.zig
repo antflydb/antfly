@@ -24,6 +24,8 @@ pub const resolver_key = "\x00\x00__metadata__:resolvers";
 pub const ordered_key = "\x00\x00__metadata__:ordered_artifact_catalog";
 pub const local_key = "\x00\x00__metadata__:artifact_inventory";
 
+pub const max_effect_protocol: u16 = 17;
+
 pub const Binding = struct {
     epoch: u64,
     digest: [32]u8,
@@ -33,7 +35,7 @@ pub const Binding = struct {
     effect_protocol: u16 = 14,
 
     pub fn valid(self: Binding) bool {
-        return self.epoch != 0 and (self.effect_protocol >= 14 and self.effect_protocol <= 17);
+        return self.epoch != 0 and (self.effect_protocol >= 14 and self.effect_protocol <= max_effect_protocol);
     }
 
     /// Protocol 16 extends protocol 15's receipt-backed stream witnesses.
@@ -84,6 +86,18 @@ pub const Catalogs = struct {
             if (configs.len != 0) required = @max(required, 15);
         }
         return required;
+    }
+
+    /// Protocol requirements and the installed reader floor are independent.
+    /// An activation may raise either, but must never lower an installed floor.
+    pub fn effectProtocolFor(self: Catalogs, alloc: std.mem.Allocator, previous: ?Binding, minimum: u16) !u16 {
+        const floor = @max(minimum, if (previous) |binding| binding.effect_protocol else 14);
+        // The highest supported floor already covers every catalog feature.
+        // Ordinary readiness polling must not deserialize all index/producer
+        // definitions once that floor is installed. Catalog validation remains
+        // owned by admission, semantic binding and materialization.
+        if (floor == max_effect_protocol) return floor;
+        return @max(try self.requiredEffectProtocol(alloc), floor);
     }
 
     pub fn jsonStringify(self: Catalogs, stream: anytype) @TypeOf(stream.*).Error!void {
@@ -139,6 +153,25 @@ pub const Command = struct {
 pub const Ordered = struct { command: Command, applied_index: u64 };
 pub const LocalBinding = struct { epoch: u64, digest: [32]u8 };
 pub const Status = struct { ordered: ?Binding, applied_index: u64, local: LocalBinding, ready: bool };
+
+/// Plan against one immutable catalog observation. Catalog bytes are borrowed
+/// from the caller; this function never changes their ownership.
+pub fn desiredCommand(alloc: std.mem.Allocator, txn: anytype, namespace: [24]u8, catalogs_value: Catalogs, observed: Status, minimum: u16) !Command {
+    const effect_protocol = try catalogs_value.effectProtocolFor(alloc, observed.ordered, minimum);
+    if (observed.ready and observed.ordered.?.effect_protocol == effect_protocol) {
+        var installed = (try load(alloc, txn)).?;
+        defer installed.deinit();
+        var command = installed.value.command;
+        command.catalogs = catalogs_value;
+        return command;
+    }
+    return .{ .namespace = namespace, .previous = observed.ordered, .binding = .{
+        .epoch = try std.math.add(u64, if (observed.ordered) |binding| binding.epoch else 0, 1),
+        .digest = catalogs_value.digest(),
+        .semantic_digest = try catalogs_value.semanticDigest(alloc),
+        .effect_protocol = effect_protocol,
+    }, .catalogs = catalogs_value };
+}
 
 test "grouped sources production ordered artifact inventory compatibility binds the complete effect protocol" {
     const direct: Binding = .{ .epoch = 1, .digest = @splat(2), .semantic_digest = @splat(3) };

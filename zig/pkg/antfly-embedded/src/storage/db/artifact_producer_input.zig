@@ -428,3 +428,102 @@ test "ordered artifact inventory resolved execution refreshes vectors and fences
     }
     try std.testing.expect(try Factory.accepted(&db, &authored));
 }
+
+test "ordered artifact inventory grouped sources production catalog activation upgrades and preserves protocol floors" {
+    const a = std.testing.allocator;
+    const DB = @import("selected_root.zig").db.DB;
+    const groups = @import("group_source_contract.zig");
+    const Observe = struct {
+        fn binding(db: *DB) !inventory.Binding {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            var installed = (try inventory.load(std.testing.allocator, &read)).?;
+            defer installed.deinit();
+            return installed.value.command.binding;
+        }
+        fn ready(db: *DB, definition: @import("group_source_worker.zig").Definition) !bool {
+            const query = try std.json.Stringify.valueAlloc(std.testing.allocator, groups.Query{ .action = .activation, .artifact = definition.artifact, .definition = definition.definition }, .{});
+            defer std.testing.allocator.free(query);
+            const response = (try db.lookup(std.testing.allocator, "", .{ .group_source_query_json = query })).?;
+            defer std.testing.allocator.free(response.json);
+            return std.mem.eql(u8, response.json, "true");
+        }
+    };
+    for ([_]bool{ false, true }) |legacy_first| {
+        var tmp = try @import("../../common/test_directory.zig").TestDirectory.init("group-catalog-protocol");
+        defer tmp.cleanup();
+        var db = try DB.open(a, tmp.path(), .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .online_source_authority = .raft, .executor = .{ .backend = .manual }, .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "semantic", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"model\"}}" });
+        try db.addEnrichment(.{ .name = "turns", .kind = .group, .source = .{ .group_by = "thread_id", .order_by = "ordinal", .segment_by = "turn_id", .field = "text" } });
+        const definitions = (try db.lookup(a, "", .{ .group_source_query_json = "{\"action\":\"definitions\"}" })).?;
+        defer a.free(definitions.json);
+        var decoded = try std.json.parseFromSlice([]@import("group_source_worker.zig").Definition, a, definitions.json, .{ .allocate = .alloc_always });
+        defer decoded.deinit();
+        const definition = decoded.value[0];
+        var desired = try db.artifactInventoryCommand(a);
+        defer desired.catalogs.deinit(a);
+        try std.testing.expectEqual(@as(u16, 17), desired.binding.effect_protocol);
+        const command = groups.Command{ .action = .activate_catalog, .artifact = definition.artifact, .definition = definition.definition, .namespace = desired.namespace, .backfill = .{ .route = definition.route } };
+        var index: u64 = 1;
+        if (legacy_first) {
+            // Old log entries still reproduce protocol 16. New readiness must
+            // detect the missing producer capability despite matching bytes.
+            var legacy = command;
+            legacy.action = .activate;
+            for (0..2) |_| {
+                try db.applyOrderedCommittedMutation(.{ .group_source = legacy, .sync_level = .write }, .{ .term = 1, .index = index }, false);
+                index += 1;
+                try std.testing.expectEqual(@as(u16, 16), (try Observe.binding(&db)).effect_protocol);
+                try std.testing.expect(!try Observe.ready(&db, definition));
+            }
+        }
+        try db.applyOrderedCommittedMutation(.{ .group_source = command, .sync_level = .write }, .{ .term = 1, .index = index }, false);
+        index += 1;
+        const activated = try Observe.binding(&db);
+        try std.testing.expectEqual(@as(u16, 17), activated.effect_protocol);
+        try std.testing.expect(try Observe.ready(&db, definition));
+        // Duplicate controls must not advance the catalog epoch or invalidate
+        // in-flight producer leases and authored-vector certificates.
+        try db.applyOrderedCommittedMutation(.{ .group_source = command, .sync_level = .write }, .{ .term = 1, .index = index }, false);
+        index += 1;
+        try std.testing.expectEqual(activated, try Observe.binding(&db));
+        try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"same\"}" }}, .sync_level = .write }, .{ .term = 1, .index = index }, false);
+        index += 1;
+        {
+            var pin = try db.core.index_manager.acquireWritePlanSnapshot();
+            defer pin.release();
+            var token = blk: {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                const source = try publication.capturePrimarySource(a, &read, desired.namespace, "doc");
+                var result = Token{ .effect_protocol = activated.effect_protocol, .alloc = a, .root = db.root_incarnation, .namespace = desired.namespace, .authority_epoch = activated.epoch, .catalog_digest = activated.digest, .producer_name = try a.dupe(u8, "semantic"), .producer_generation = pin.plan().coverageGeneration("semantic").?, .artifact_name = try a.dupe(u8, "model"), .source = source };
+                errdefer result.deinit();
+                try result.bindExecution(&read, @splat(1));
+                break :blk result;
+            };
+            defer token.deinit();
+            const key = try keys.embeddingArtifactKeyForDocumentAlloc(a, "doc", "model");
+            defer a.free(key);
+            const vector = try @import("enrichment/artifact_codec.zig").encodeDenseEmbeddingAlloc(a, null, &.{ 1, 0 });
+            defer a.free(vector);
+            try db.applyOrderedCommittedMutation(.{ .artifact_publication = token.command(&.{.{ .family = .base_vector, .key = key, .value = vector, .source_index = 0 }}) }, .{ .term = 1, .index = index }, false);
+            index += 1;
+            const stored = try db.core.store.get(a, key);
+            defer a.free(stored);
+            try std.testing.expectEqualSlices(u8, vector, stored);
+        }
+        // Removing the protocol-17 consumer leaves a group-only catalog, but
+        // neither normal inventory planning nor grouped activation may lower
+        // the installed floor while reconciling the changed catalog.
+        try std.testing.expect(try db.deleteIndex("semantic"));
+        try std.testing.expect(!try Observe.ready(&db, definition));
+        var next = try db.artifactInventoryCommand(a);
+        defer next.catalogs.deinit(a);
+        try std.testing.expectEqual(@as(u16, 16), try next.catalogs.requiredEffectProtocol(a));
+        try std.testing.expectEqual(@as(u16, 17), next.binding.effect_protocol);
+        try db.applyOrderedCommittedMutation(.{ .group_source = command, .sync_level = .write }, .{ .term = 1, .index = index }, false);
+        try std.testing.expectEqual(next.binding, try Observe.binding(&db));
+        try std.testing.expect(try Observe.ready(&db, definition));
+    }
+}

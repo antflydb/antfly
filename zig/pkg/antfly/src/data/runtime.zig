@@ -12586,6 +12586,7 @@ pub const DataServer = struct {
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
         const execution = @import("../common/data_raft_protocol.zig").batch_execution_identity_protocol_version;
+        if (req.group_source) |command| if (command.action == .activate_catalog) return execution;
         if (req.artifact_publication) |command| if (command.execution_identity != null) return execution;
         if (req.artifact_catalog) |command| if (command.binding.effect_protocol >= 17) return execution;
         if (req.online_source) |command| if (command == .admit) {
@@ -56765,4 +56766,13 @@ test "grouped source protocol dominates coexisting graph envelope features" {
     try std.testing.expectEqual(protocol.batch_group_source_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
     request.artifact_catalog.?.binding.effect_protocol = 17;
     try std.testing.expectEqual(protocol.batch_execution_identity_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    request = .{ .group_source = .{ .action = .activate, .artifact = "turns", .definition = .{ .table_incarnation = 1, .configuration = @splat(2) }, .namespace = @splat(1), .backfill = .{ .route = .{ .value = "" } } } };
+    try std.testing.expectEqual(protocol.batch_group_source_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    request.group_source.?.action = .activate_catalog;
+    try std.testing.expectEqual(protocol.batch_execution_identity_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    const encoded = try data_raft_batch.encode(std.testing.allocator, "docs", request);
+    defer std.testing.allocator.free(encoded);
+    var decoded = try data_raft_batch.decode(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@TypeOf(request.group_source.?.action).activate_catalog, decoded.batch.req.group_source.?.action);
 }

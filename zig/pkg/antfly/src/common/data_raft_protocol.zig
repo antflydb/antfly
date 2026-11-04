@@ -41,7 +41,8 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
 pub const batch_protocol_version: u16 = 26;
-/// Version 26 binds generated vector publications to resolved model revisions.
+/// Version 26 binds generated vector publications to resolved model revisions
+/// and admits catalog-aware grouped-source activation.
 pub const batch_execution_identity_protocol_version: u16 = 26;
 /// Version 25 carries leader-planned LEANN records (`_leann_record`), which
 /// replicas persist and apply verbatim in log order. Older peers cannot

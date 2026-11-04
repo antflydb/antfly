@@ -207,3 +207,11 @@ exponential backoff cap. The supervisor persists the absolute retry deadline,
 yields its execution slot while waiting, and restores the same deadline after
 restart. Saturating deadline arithmetic prevents oversized server durations from
 wrapping into an immediate retry.
+
+Grouped-source activation uses the same catalog protocol planner as normal
+inventory publication: it meets current producer requirements and preserves the
+installed protocol floor across catalog changes. New `activate_catalog` controls
+require the protocol-26 membership barrier. Historical `activate` controls retain
+their original replay behavior; readiness detects an insufficient legacy binding
+and causes the worker to submit an upgrade. Duplicate current activations retain
+the existing epoch and do not invalidate in-flight work.
