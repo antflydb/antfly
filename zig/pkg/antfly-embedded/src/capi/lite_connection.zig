@@ -266,14 +266,16 @@ const TextRuntimeCacheDiagnostics = struct {
 
 /// Owns only configuration witnesses and immutable text runtimes. A source
 /// read is acquired separately for each bounded turn and released before this
-/// cache becomes idle. At most root plus one selected namespace is retained.
+/// cache becomes idle. A bounded namespace working set avoids reopening every
+/// index whenever source tickets or control audits rotate between tables.
 const TextSourceRuntimeCache = struct {
+    const max_namespaces = 8;
     const Control = struct { path: []const u8, fingerprint: ?[32]u8 };
     arena: std.heap.ArenaAllocator,
     root: *h.Handle,
     indexes: [16]u8,
     proofs: []PublicationCatalog,
-    table_name: ?[]const u8 = null,
+    table_names: []const []const u8 = &.{},
     controls: []Control = &.{},
 
     fn capture(root: *h.Handle) !?*TextSourceRuntimeCache {
@@ -284,7 +286,7 @@ const TextSourceRuntimeCache = struct {
     fn captureObserved(root: *h.Handle, stats: *TextRuntimeCacheDiagnostics) !?*TextSourceRuntimeCache {
         stats.capture_attempts +|= 1;
         if (!stats.eligible(&root.db)) return null;
-        if (root.embedded_tables.count() > 1) {
+        if (root.embedded_tables.count() > max_namespaces) {
             _ = stats.reject("capture_namespace_limit");
             return null;
         }
@@ -295,6 +297,8 @@ const TextSourceRuntimeCache = struct {
         errdefer self.destroy();
         const a = self.arena.allocator();
         self.proofs = try a.alloc(PublicationCatalog, 1 + root.embedded_tables.count());
+        const table_names = try a.alloc([]const u8, root.embedded_tables.count());
+        self.table_names = table_names;
         self.proofs[0] = try PublicationCatalog.captureForStoragePublication(a, root, &root.db, "default");
         var controls: std.ArrayList(Control) = .empty;
         if (!try self.captureControls(a, &root.db, &controls)) {
@@ -305,7 +309,7 @@ const TextSourceRuntimeCache = struct {
         tables = root.embedded_tables.valueIterator();
         var i: usize = 1;
         while (tables.next()) |table| : (i += 1) {
-            self.table_name = try a.dupe(u8, table.*.name);
+            table_names[i - 1] = try a.dupe(u8, table.*.name);
             self.proofs[i] = try PublicationCatalog.captureForStoragePublication(a, root, &table.*.db, table.*.name);
             if (!try self.captureControls(a, &table.*.db, &controls)) {
                 _ = stats.reject("capture_control");
@@ -349,7 +353,8 @@ const TextSourceRuntimeCache = struct {
         if (!self.root.db_live) return stats.reject("miss_closed");
         if (self.root.maintenance_references != 0 or self.root.query_borrows != 0 or self.root.sql_cursors.count() != 0) return stats.reject("miss_borrow");
         if (!file.header.indexed_reclamation or std.mem.allEqual(u8, &self.indexes, 0) or !std.mem.eql(u8, &self.indexes, &file.activeCheckpoint().logical.indexes)) return stats.reject("miss_indexes");
-        if (self.root.embedded_tables.count() + 1 != self.proofs.len or (self.table_name != null and !self.root.embedded_tables.contains(self.table_name.?))) return stats.reject("miss_namespace");
+        if (self.root.embedded_tables.count() + 1 != self.proofs.len) return stats.reject("miss_namespace");
+        for (self.table_names) |name| if (!self.root.embedded_tables.contains(name)) return stats.reject("miss_namespace");
         if (!stats.eligible(&self.root.db)) return false;
         var tables = self.root.embedded_tables.valueIterator();
         while (tables.next()) |table| if (!stats.eligible(&table.*.db)) return false;
@@ -2187,6 +2192,30 @@ pub const Owner = struct {
         if (self.reader_coordinator.hasArtifactReleases()) self.maintenance_storage_pending = true;
     }
 
+    fn openMaintenanceNamespace(self: *Owner, root: *h.Handle, name: []const u8) !*h.db_mod.DB {
+        if (!root.embedded_tables.contains(name)) {
+            self.publication_stats.maintenance_namespace_opens +|= 1;
+            self.clearTextSourceRuntimeCache();
+            // Rotation is not an invalidation. Retain a small working set,
+            // evicting its least recently selected runtime only at capacity.
+            // No source epoch survives between turns. A merge borrowing this
+            // root must have been retired by the selection path first.
+            if (self.pending_text_merge) |job| std.debug.assert(job.root != root);
+            if (root.embedded_tables.count() >= TextSourceRuntimeCache.max_namespaces) {
+                var oldest: ?*@import("tables.zig").Table = null;
+                var resident = root.embedded_tables.valueIterator();
+                while (resident.next()) |table| {
+                    if (oldest == null or table.*.maintenance_last_use < oldest.?.maintenance_last_use)
+                        oldest = table.*;
+                }
+                @import("tables.zig").evictMaintenanceRuntime(root, oldest.?);
+            }
+        }
+        const database = try @import("tables.zig").get(root, name);
+        root.embedded_tables.get(name).?.maintenance_last_use = @import("antfly_platform").time.monotonicNs();
+        return database;
+    }
+
     /// Caller owns the path gate and writer lease. Mutable allocator state is
     /// moved from a quiescent wrapper, including the retained merge owner. The
     /// merge thread only reads independently leased immutable artifact sources.
@@ -2871,18 +2900,11 @@ pub const Owner = struct {
                 const selected_store = selected_root.?.owned_lite_backend.?.native_docstore.?;
                 selected_store.writer_admission = null;
                 selected_store.file.replay_consumer_admission = false;
-                if (!selected_root.?.embedded_tables.contains(name)) {
-                    self.publication_stats.maintenance_namespace_opens +|= 1;
-                    self.clearTextSourceRuntimeCache();
-                    // Bound immutable residency to root plus this namespace.
-                    // Reloading the name directory does not open its indexes.
-                    @import("tables.zig").closeAll(selected_root.?);
-                }
                 // The outer admission already owns this writer. Detached
                 // callbacks are installed only after control work is captured.
                 break :blk selected_root.?;
             } else foreground;
-            database = @import("tables.zig").get(namespace_root, name) catch return true;
+            database = (if (self.options.profile == .native) self.openMaintenanceNamespace(namespace_root, name) else @import("tables.zig").get(namespace_root, name)) catch return true;
             selected = namespace_root.embedded_tables.get(name).?;
         };
         const selection_root = selected_root orelse foreground;
@@ -8168,6 +8190,60 @@ test "capi native maintenance namespaces artifact continuation does not restart 
     try std.testing.expectEqual(sources, owner.publication_stats.maintenance_source_turns);
     try std.testing.expectEqual(artifacts + 1, owner.publication_stats.maintenance_artifact_only_turns);
     try std.testing.expect(!owner.maintenance_schedules.getPtr(key).?.database_pending);
+}
+
+test "capi native maintenance namespace working set reuses and evicts bounded inputs" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("namespace-runtime-working-set", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    const owner = fixture.connection.owner;
+    var lease = try fixture.connection.acquire();
+    defer {
+        lease.close();
+        fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    }
+    const foreground = try owner.refresh();
+    for (0..TextSourceRuntimeCache.max_namespaces + 1) |i| {
+        var buffer: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buffer, "working-{d}", .{i});
+        try @import("tables.zig").create(foreground, name, "{}", false);
+        const database = try @import("tables.zig").get(foreground, name);
+        try database.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    }
+    const root = try owner.refreshMaintenanceSnapshot(foreground, .source);
+    const opens = owner.publication_stats.maintenance_namespace_opens;
+    var first: ?*h.db_mod.DB = null;
+    for (0..2) |pass| {
+        for (0..TextSourceRuntimeCache.max_namespaces) |i| {
+            var buffer: [32]u8 = undefined;
+            const name = try std.fmt.bufPrint(&buffer, "working-{d}", .{i});
+            const database = try owner.openMaintenanceNamespace(root, name);
+            if (i == 0) {
+                if (pass == 0) first = database else try std.testing.expectEqual(first.?, database);
+            }
+        }
+    }
+    try std.testing.expectEqual(opens + TextSourceRuntimeCache.max_namespaces, owner.publication_stats.maintenance_namespace_opens);
+    try std.testing.expectEqual(TextSourceRuntimeCache.max_namespaces, root.embedded_tables.count());
+    // Reading the working set never alters the complete durable name catalog.
+    try std.testing.expectEqual(TextSourceRuntimeCache.max_namespaces + 1, root.embedded_table_records.count());
+    owner.text_source_runtime_cache = (try TextSourceRuntimeCache.capture(root)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(root, try owner.refreshMaintenanceSnapshot(foreground, .source));
+
+    // Protect the first resident with a recent selection; the second is now
+    // the oldest. Eviction drops only that DB and its artifact readers.
+    _ = try owner.openMaintenanceNamespace(root, "working-0");
+    var overflow_name: [32]u8 = undefined;
+    _ = try owner.openMaintenanceNamespace(root, try std.fmt.bufPrint(&overflow_name, "working-{d}", .{TextSourceRuntimeCache.max_namespaces}));
+    try std.testing.expectEqual(first.?, &root.embedded_tables.get("working-0").?.db);
+    try std.testing.expect(!root.embedded_tables.contains("working-1"));
+    try std.testing.expectEqual(TextSourceRuntimeCache.max_namespaces, root.embedded_tables.count());
+    try std.testing.expectEqual(TextSourceRuntimeCache.max_namespaces + 1, root.embedded_table_records.count());
+    try std.testing.expect(owner.text_source_runtime_cache == null);
+    // Recapture covers every resident's catalog and mutable control witnesses.
+    owner.text_source_runtime_cache = (try TextSourceRuntimeCache.capture(root)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(root, try owner.refreshMaintenanceSnapshot(foreground, .source));
 }
 
 test "capi native maintenance keeps settled text inputs warm across artifact turns" {

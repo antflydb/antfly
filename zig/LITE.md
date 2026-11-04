@@ -1272,8 +1272,18 @@ Artifact continuations have a separate pending flag and deadline. Running an LSM
 slice or retiring journal rows does not restart providers, replay or source
 status publication. Artifact-only turns retain the catalog publication fence,
 but acquire no primary source epoch; future LSM work respects its wake deadline.
-Source replay constructs a fresh runtime at its captured checkpoint rather than
-borrowing an artifact continuation's source caches. Producer replay services one
+Source replay can retain eligible immutable text inputs after catching its
+target and across namespace rotation. Residency is bounded to the root and eight
+named namespaces; selecting a ninth evicts the least recently selected runtime.
+Every reuse checks inode, logical index identity, all resident catalog witnesses
+and replay control records, resets mutable primary observations, and acquires a
+fresh source epoch. Idle visits retire invalidated inputs as well. Active merge
+borrows retain independent ownership, and unsupported provider/index runtimes
+still reopen. An artifact-only continuation cannot grant source reuse authority.
+Text planning owns one bounded projection window through capacity admission;
+preparation builds segments from that projection without parsing/projecting its
+documents again. Configuration changes replan only the unpublished suffix.
+Producer replay services one
 adaptive prefix per background turn, initially eight document groups and 256 KiB,
 with ceilings of 128 groups and 4 MiB. Managed indexes consume only the completed
 producer prefix, and retain later targets for subsequent turns. Replay-capacity
