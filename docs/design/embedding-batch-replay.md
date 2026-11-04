@@ -201,3 +201,9 @@ fallback. The limit is distinct from the preparation allocator ceiling. Broker
 cohorts include this limit for encoded audio; image and PCM-only cohorts do not
 split on an unused decoder policy. Public and direct JSON grouped requests reserve
 the same resident-media-plus-decoder admission as flat audio requests.
+
+Fetch retry scheduling treats `Retry-After` as a minimum delay independent of the
+exponential backoff cap. The supervisor persists the absolute retry deadline,
+yields its execution slot while waiting, and restores the same deadline after
+restart. Saturating deadline arithmetic prevents oversized server durations from
+wrapping into an immediate retry.

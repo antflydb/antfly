@@ -2913,15 +2913,18 @@ fn workerRetryDelayMs(consecutive_retry_count: u32) u64 {
 }
 
 fn workerRetryDelayWithHintMs(consecutive_retry_count: u32, retry_after_hint_ms: u64) u64 {
-    return @max(
-        workerRetryDelayMs(consecutive_retry_count),
-        @min(retry_after_hint_ms, transient_worker_retry_max_sleep_ms),
-    );
+    // The exponential cap bounds our own backoff, not the origin's minimum
+    // retry delay. The supervisor persists a saturating absolute deadline and
+    // yields its worker slot, so long server delays need no sleeping worker.
+    return @max(workerRetryDelayMs(consecutive_retry_count), retry_after_hint_ms);
 }
 
-test "provider retry guidance extends bounded worker backoff" {
+test "provider retry guidance preserves server minimum beyond bounded worker backoff" {
     try std.testing.expectEqual(@as(u64, 1_250), workerRetryDelayWithHintMs(1, 1_250));
-    try std.testing.expectEqual(transient_worker_retry_max_sleep_ms, workerRetryDelayWithHintMs(1, 60_000));
+    try std.testing.expectEqual(@as(u64, 60_000), workerRetryDelayWithHintMs(1, 60_000));
+    try std.testing.expectEqual(@as(u64, 3_600_000), workerRetryDelayWithHintMs(100, 3_600_000));
+    try std.testing.expectEqual(std.math.maxInt(u64), workerRetryDelayWithHintMs(1, std.math.maxInt(u64)));
+    try std.testing.expectEqual(transient_worker_retry_max_sleep_ms, workerRetryDelayWithHintMs(100, 1));
     try std.testing.expectEqual(@as(u64, 1_000), workerRetryDelayWithHintMs(2, 0));
 }
 
@@ -34996,6 +34999,67 @@ test "enrichment applied checkpoint stays degraded until runtime status clears" 
     const clean_checkpoint = try enrichment_state.loadProjectionCheckpoint(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u64, 5), clean_checkpoint.applied_sequence);
     try std.testing.expectEqual(enrichment_state.ProjectionStatus.clean, clean_checkpoint.status);
+}
+
+test "durable enrichment server retry deadline survives restart without early execution" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/indexes", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+    var clock: platform_clock.ManualClock = .{};
+    clock.setRealtimeNs(1_000 * std.time.ns_per_ms);
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+        .clock = clock.clock(),
+        .target_sequence = 7,
+        .active_failure_fingerprint = 42,
+    };
+    // Exercise the supervisor's real persistence boundary, including hints
+    // longer than its exponential cap and an overflow-sized server duration.
+    for ([_]u64{ 60_000, 3_600_000, std.math.maxInt(u64) }) |hint| {
+        const before = clock.clock().nowRealtimeMs();
+        setRetryAfterHint(&runtime, hint);
+        runtime.recordRetryableError(std.testing.io, error.RemoteDocumentFetchFailed, .request);
+        const deadline = runtime.next_retry_at_ms;
+        try std.testing.expectEqual(before +| hint, deadline);
+        try std.testing.expectEqual(@as(u64, 0), runtime.retry_after_hint_ms);
+        const persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
+        try std.testing.expectEqual(deadline, persisted.next_retry_at_ms);
+        try std.testing.expect(persisted.retrying and !persisted.worker_failed);
+        // Simulate loss of volatile state and restore from the serialized
+        // status after part of the wait has already elapsed.
+        clock.advanceMs(30_000);
+        runtime.next_retry_at_ms = 0;
+        runtime.retrying = false;
+        restorePersistedRuntimeStatus(&runtime, persisted);
+        try std.testing.expectEqual(deadline, runtime.next_retry_at_ms);
+        try std.testing.expectEqual(ForegroundCatchUpDecision.retry_in_progress, foregroundCatchUpDecision(runtime.applied_sequence, 7, runtime.target_sequence, runtime.worker_failed, runtime.retrying, clock.clock().nowRealtimeMs() >= runtime.next_retry_at_ms));
+        if (hint != std.math.maxInt(u64)) {
+            clock.advanceMs(hint - 30_000);
+            try std.testing.expectEqual(ForegroundCatchUpDecision.run_pass, foregroundCatchUpDecision(runtime.applied_sequence, 7, runtime.target_sequence, runtime.worker_failed, runtime.retrying, clock.clock().nowRealtimeMs() >= runtime.next_retry_at_ms));
+        }
+    }
 }
 
 test "durable enrichment retry progress preserves unrelated request debt across restart" {
