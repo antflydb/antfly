@@ -155,7 +155,9 @@ def queue_cases(args):
 
 def sdk(library: str):
     os.environ["ANTFLY_LIBRARY"] = library
-    sys.path.insert(0, str(SDK))
+    # A baseline library is driven through its own revision's SDK, which
+    # binds exactly the functions that library exports.
+    sys.path.insert(0, os.environ.get("ANTFLY_BENCH_SDK_PATH", str(SDK)))
     import antfly_embedded as af
 
     return af
