@@ -79,7 +79,7 @@ func (c *GoogleConnector) StableMediaRanges() bool { return c.ProviderName == Pr
 // while promoting the native CheckMedia method.
 func checkMediaAccess(ctx context.Context, connector Connector, media MediaConnector, request Request, item Item) error {
 	switch connector.(type) {
-	case *S3Connector, *GoogleConnector, *driveMediaConnector:
+	case *S3Connector, *GoogleConnector, *driveMediaConnector, *CollaborationConnector:
 	default:
 		if err := connector.CheckAccess(ctx, request, item); err != nil {
 			return err

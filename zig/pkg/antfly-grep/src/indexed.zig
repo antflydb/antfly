@@ -280,17 +280,40 @@ fn streamReadiness(search: anytype, http: *httpx.Client, config: Config, table: 
     var arena = std.heap.ArenaAllocator.init(search.a);
     defer arena.deinit();
     const a = arena.allocator();
-    if (!Limits.reserve(&search.limits.requests, 1, search.options.max_requests)) return error.RequestBudgetExceeded;
-    search.summary.index_requests += 1;
     const url = try std.fmt.allocPrint(a, "{s}/tables/{s}/indexes/{s}", .{ std.mem.trimEnd(u8, config.endpoint, "/"), try escape(a, table.table orelse table.name), try escape(a, stream.index orelse return error.InvalidArtifactStream) });
-    var headers: std.ArrayList([2][]const u8) = .empty;
-    const credential = if (search.options.cloud_session) |session| session.token() else search.options.table_token;
-    if (credential) |token| try headers.append(a, .{ "Authorization", try std.fmt.allocPrint(a, "Bearer {s}", .{token}) });
-    if (table.source_id) |id| try headers.append(a, .{ "X-Antfly-Source-ID", id });
-    var response = try http.get(url, .{ .headers = headers.items, .timeout_ms = search.options.timeout_ms, .max_response_size = config.max_response_bytes, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false });
+    var refreshed = false;
+    var response = retry: while (true) {
+        if (!Limits.reserve(&search.limits.requests, 1, search.options.max_requests)) return error.RequestBudgetExceeded;
+        search.summary.index_requests += 1;
+        var headers: std.ArrayList([2][]const u8) = .empty;
+        const credential = if (search.options.cloud_session) |session| session.token() else search.options.table_token;
+        if (credential) |token| try headers.append(a, .{ "Authorization", try std.fmt.allocPrint(a, "Bearer {s}", .{token}) });
+        if (table.source_id) |id| {
+            try headers.append(a, .{ "X-Antfly-Source-ID", id });
+            const proof = if (search.options.cloud_session) |session| session.sourceProof(id) else table.access_id;
+            if (proof) |value| try headers.append(a, .{ "X-Antfly-Source-Access", value });
+            if (search.options.cloud_session) |session| if (session.sourcePublication(id)) |fence| try headers.append(a, .{ "X-Antfly-Source-Publication", fence });
+        }
+        var result = try http.get(url, .{ .headers = headers.items, .timeout_ms = search.options.timeout_ms, .max_response_size = config.max_response_bytes, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false });
+        if (result.status.code == 401 and !refreshed) if (search.options.cloud_session) |session| {
+            result.deinit();
+            refreshed = true;
+            try session.refresh(credential.?);
+            continue :retry;
+        };
+        break :retry result;
+    };
     defer response.deinit();
     if (response.status.code == 401 or response.status.code == 403) return error.IndexAuthorizationFailed;
+    if (response.status.code == 409) {
+        if (response.header("x-antfly-source-publication")) |fence| if (std.mem.eql(u8, fence, "changed")) return error.SourcePublicationChanged;
+        if (response.header("x-antfly-source-access")) |proof| if (std.mem.eql(u8, proof, "changed")) return error.CloudSourceAccessChanged;
+        if (response.header("x-antfly-source-state") != null) return error.SourceNotSearchable;
+    }
     if (!response.ok()) return error.ArtifactReadinessUnavailable;
+    if (search.options.cloud_session) |session| {
+        try session.checkSource(table.source_id orelse return error.InvalidCloudSourcePolicy, response.header("x-antfly-subject"), response.header("x-antfly-source-access"), response.header("x-antfly-source-publication"));
+    }
     const parsed = try std.json.parseFromSlice(std.json.Value, a, response.body orelse return error.InvalidIndexResponse, .{});
     const index_config = document.field(parsed.value, "config") orelse return error.ArtifactIndexBindingChanged;
     const index_type = try document.string(index_config, "type");
@@ -1212,7 +1235,7 @@ const Fetch = struct {
                 var headers: std.ArrayList([2][]const u8) = .empty;
                 try headers.append(a, .{ "Content-Type", "application/json" });
                 if (auth) |value| try headers.append(a, .{ "Authorization", value });
-                if (self.options.sourced()) {
+                if (self.source_id != null) {
                     if (self.source_id) |id| try headers.append(a, .{ "X-Antfly-Source-ID", id });
                     const proof = if (self.options.cloud_session) |session| (if (self.source_id) |id| session.sourceProof(id) else null) else self.access_id;
                     if (proof) |id| try headers.append(a, .{ "X-Antfly-Source-Access", id });

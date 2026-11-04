@@ -27,33 +27,92 @@ import (
 // Collaboration attachments are bounded during acquisition. Reacquire their
 // original bytes and check the complete parent/attachment revision for each
 // HTTP delivery. Native Antfly producers perform interpretation afterwards.
-func (c *CollaborationConnector) CheckMedia(ctx context.Context, r Request, item Item) error {
+// nativeAttachment resolves current object metadata, selection and parent
+// revision without downloading any attachment bodies. Do not use the retained
+// text authorization shortcut here: HEAD and conditional delivery must observe
+// deleted messages, removed files and changed parent revisions too.
+func (c *CollaborationConnector) nativeAttachment(ctx context.Context, r Request, item Item) (collaborationFile, error) {
 	if !c.NativeAttachments {
-		return fmt.Errorf("native attachment acquisition is not enabled")
+		return collaborationFile{}, fmt.Errorf("native attachment acquisition is not enabled")
 	}
 	if err := c.Validate(ctx, r); err != nil {
-		return err
+		return collaborationFile{}, err
 	}
 	config, err := decodeSourceConfig[CollaborationConfig](r.Config)
 	if err != nil {
-		return err
+		return collaborationFile{}, err
 	}
 	var ref collaborationRef
-	if err := json.Unmarshal([]byte(configString(item.Metadata, "acquisition")), &ref); err != nil {
-		return ErrInvalidInput
+	if json.Unmarshal([]byte(configString(item.Metadata, "acquisition")), &ref) != nil || ref.Attachment == "" {
+		return collaborationFile{}, ErrInvalidInput
 	}
-	return c.authorizeRetained(ctx, config, ref, item)
+	defer c.beginDiscordReadPass()()
+	if err := c.validateRef(ctx, config, ref); err != nil {
+		return collaborationFile{}, err
+	}
+	if ref.Resource == "gmail" {
+		if err := c.checkGmailContentAccess(ctx); err != nil {
+			return collaborationFile{}, err
+		}
+	}
+	attachment := ref.Attachment
+	ref.Attachment = ""
+	material, err := c.load(ctx, config, ref)
+	if err != nil {
+		return collaborationFile{}, err
+	}
+	if len(material.Files) > 1000 || len(material.Text) > maxImportSourceObjectBytes {
+		return collaborationFile{}, ErrInvalidInput
+	}
+	metadata := collaborationMetadata(ref, material)
+	parent := c.collaborationInput(r, ref, material, material.Text, metadata)
+	if parent.Revision != configString(item.Metadata, "parent_revision") || parent.ID != configString(item.Metadata, "parent_identity") {
+		return collaborationFile{}, &RevisionChangedError{Expected: configString(item.Metadata, "parent_revision"), Actual: parent.Revision}
+	}
+	for _, file := range material.Files {
+		if file.ID != attachment {
+			continue
+		}
+		if file.driveFile {
+			if err := c.checkDriveContentAccess(ctx, file.ID, configString(item.Metadata, "drive_revision")); err != nil {
+				return collaborationFile{}, err
+			}
+		}
+		return file, nil
+	}
+	return collaborationFile{}, fmt.Errorf("%w: attachment no longer selected or accessible", ErrInvalidInput)
+}
+func (c *CollaborationConnector) CheckMedia(ctx context.Context, r Request, item Item) error {
+	_, err := c.nativeAttachment(ctx, r, item)
+	return err
 }
 func (c *CollaborationConnector) nativeMediaBytes(ctx context.Context, r Request, item Item) ([]byte, error) {
-	if !c.NativeAttachments {
-		return nil, fmt.Errorf("native attachment acquisition is not enabled")
-	}
-	data, err := c.Read(ctx, r, item)
+	file, err := c.nativeAttachment(ctx, r, item)
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(data)) != item.Size {
-		return nil, &RevisionChangedError{Expected: item.Revision, Actual: "attachment length changed"}
+	if file.driveFile {
+		file, err = c.workspaceDriveFile(ctx, file.ID, maxImportSourceObjectBytes)
+		if err != nil {
+			return nil, err
+		}
+		if file.Revision != configString(item.Metadata, "drive_revision") {
+			return nil, &RevisionChangedError{Expected: configString(item.Metadata, "drive_revision"), Actual: file.Revision}
+		}
+	}
+	data := file.Data
+	if file.gmailMessageID != "" {
+		data, err = c.readGmailAttachment(ctx, file, maxImportSourceObjectBytes)
+	}
+	if err == nil && file.URL != "" {
+		data, err = c.downloadAttachment(ctx, file.URL)
+	}
+	if err != nil {
+		return nil, err
+	}
+	digest := sha256.Sum256(data)
+	if int64(len(data)) != item.Size || fmt.Sprintf("%x", digest) != configString(item.Metadata, "attachment_sha256") {
+		return nil, &RevisionChangedError{Expected: item.Revision, Actual: "attachment bytes changed"}
 	}
 	return data, nil
 }

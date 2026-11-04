@@ -94,6 +94,39 @@ func TestNativeMemberNavigationIntegration(t *testing.T) {
 			require.Contains(t, string(output), `"document_id":"doc-00"`)
 		})
 	}
+
+	// Source predicates admit only matching parents before cross-shard member
+	// enumeration; they never run against generated scalar/chunk payloads.
+	for _, artifact := range []string{"copied", "pieces"} {
+		for _, source := range []string{"selected", "absent"} {
+			query := map[string]any{"filter_query": map[string]any{"equals": source, "field": "source_id"}, "hierarchy": map[string]any{"children": map[string]any{"parent": map[string]any{"level": "source", "ids": []string{"doc-00", "doc-01"}}, "level": "member", "artifact": artifact}}, "order_by": []any{map[string]any{"field": "_hierarchy.position"}}, "limit": 100}
+			raw, err := publisher.call(t.Context(), "POST", tablePath(table)+"/query", query)
+			require.NoError(t, err)
+			var result struct {
+				Responses []struct {
+					Status int `json:"status"`
+					Hits   struct {
+						Hits []struct {
+							Hierarchy struct {
+								Parent string `json:"parent_doc_key"`
+							} `json:"hierarchy"`
+						} `json:"hits"`
+					} `json:"hits"`
+				} `json:"responses"`
+			}
+			require.NoError(t, json.Unmarshal(raw, &result))
+			require.Len(t, result.Responses, 1)
+			require.Equal(t, 200, result.Responses[0].Status, string(raw))
+			if source == "absent" {
+				require.Empty(t, result.Responses[0].Hits.Hits)
+			} else {
+				require.NotEmpty(t, result.Responses[0].Hits.Hits)
+				for _, hit := range result.Responses[0].Hits.Hits {
+					require.Equal(t, "doc-00", hit.Hierarchy.Parent, string(raw))
+				}
+			}
+		}
+	}
 	// A cursor without its retained capability must not capture a newer cut.
 	query := map[string]any{"hierarchy": map[string]any{"children": map[string]any{"parent": map[string]any{"level": "source", "id": "doc-00"}, "level": "member", "artifact": "copied"}}, "order_by": []any{map[string]any{"field": "_hierarchy.position"}}, "limit": 1}
 	raw, err := publisher.call(t.Context(), "POST", tablePath(table)+"/query", query)

@@ -12898,6 +12898,8 @@ fn applyPublicHierarchyControls(
                     // The retained cut is required to resume child traversal;
                     // it is capability metadata, not a relevance/filter knob.
                     !std.mem.eql(u8, root_key, "remote_snapshot") and
+                    // A member filter admits source parents before paging their artifacts.
+                    !(std.mem.eql(u8, root_key, "filter_query") and req.hierarchy_children.?.artifact_name != null) and
                     !isInternalShardFieldName(root_key))
                 {
                     // Sequential traversal has no relevance/filter execution
@@ -20780,6 +20782,12 @@ test "native member traversal requires producer and private parent admission" {
     try std.testing.expectEqualStrings("summary", parsed.req.hierarchy_children.?.artifact_name.?);
     try std.testing.expectEqual(db_mod.types.ReturnMode.member, parsed.req.return_mode);
     try std.testing.expect(!parsed.req.hierarchy_parent_admitted);
+    const filtered_body = try std.mem.concat(alloc, u8, &.{ "{\"filter_query\":{\"equals\":\"selected\",\"field\":\"source_id\"},", body[1..] });
+    defer alloc.free(filtered_body);
+    var filtered = try parseQueryRequest(alloc, null, "docs", filtered_body);
+    defer filtered.deinit(alloc);
+    try std.testing.expect(filtered.req.filter_query_json.len != 0);
+    try std.testing.expect(db_mod.types.canonicalHierarchyExecutionWithinBudget(filtered.req));
     var json = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer json.deinit();
     try json.value.object.put("_hierarchy_parent_admitted", .{ .bool = true });

@@ -738,7 +738,12 @@ exports on demand and acquires each representation once per HTTP request. It
 checks current access, provider revision, size, and the pinned representation
 hash before exposing bytes, then serves request-local ranges without a durable
 copy or staging bucket. Changed export bytes require resynchronization even when
-the provider revision is unchanged. Exports and collaboration bundles retain
+the provider revision is unchanged. Collaboration delivery checks the current
+parent object, attachment membership and pinned parent revision using metadata;
+HEAD and matching conditional responses acquire no attachment bodies. A GET
+fetches only the selected attachment and checks its pinned byte digest. Deleted
+or edited parents fail closed, and an unavailable sibling cannot block delivery.
+Exports and collaboration attachments retain
 bounded acquisition limits; large S3/GCS originals use streaming. Unsupported
 whole-workbook export is rejected. Explicit `publication: text` retains the optional text-extractor path;
 it is not required by native indexing. Standalone binary publication requires

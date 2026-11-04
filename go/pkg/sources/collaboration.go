@@ -452,16 +452,10 @@ func (c *CollaborationConnector) Enumerate(ctx context.Context, r Request) (Inve
 	inv.SourceRevision = hex.EncodeToString(digest[:])
 	return inv, nil
 }
-func (c *CollaborationConnector) materialItems(ctx context.Context, r Request, config CollaborationConfig, ref collaborationRef, m collaborationMaterial) ([]Input, error) {
-	if config.preview && len(m.Files) > PreviewItemLimit-1 {
-		m.Files = m.Files[:PreviewItemLimit-1]
-	}
-	if len(m.Files) > 1000 {
-		return nil, fmt.Errorf("%w: too many attachments in one parent", ErrInventoryIncomplete)
-	}
-	if len(m.Text) > maxImportSourceObjectBytes || !utf8.Valid(m.Text) {
-		return nil, fmt.Errorf("resource text exceeds byte limit")
-	}
+
+// Parent metadata and identity are shared by discovery and metadata-only media
+// authorization. They never acquire attachment bodies.
+func collaborationMetadata(ref collaborationRef, m collaborationMaterial) map[string]any {
 	metadata := cloneSourceMetadata(m.Metadata)
 	metadata["resource"] = ref.Resource
 	metadata["container_id"] = ref.Container
@@ -472,23 +466,39 @@ func (c *CollaborationConnector) materialItems(ctx context.Context, r Request, c
 		attachments = append(attachments, map[string]string{"id": file.ID, "filename": file.Name, "mime_type": file.MIME})
 	}
 	metadata["attachments"] = attachments
+	return metadata
+}
+func (c *CollaborationConnector) collaborationInput(r Request, ref collaborationRef, m collaborationMaterial, text []byte, meta map[string]any) Input {
+	raw, _ := json.Marshal(ref)
+	meta["acquisition"] = string(raw)
+	key := ref.Resource + "/" + url.PathEscape(ref.Container) + "/" + url.PathEscape(ref.ID)
+	if ref.Attachment != "" {
+		key += "/attachments/" + url.PathEscape(ref.Attachment)
+	}
+	// Include canonical metadata so edits to links/sharing context are revisions.
+	h := sha256.New()
+	h.Write(text)
+	b, _ := json.Marshal(meta)
+	h.Write(b)
+	scheme := c.ProviderName
+	if scheme == ProviderGoogleWorkspace {
+		scheme = "workspace"
+	}
+	return Input{Item: Item{ID: scheme + "://" + r.SourceNamespace + "/" + key, Path: key, Filename: m.Title, URL: m.URL, Revision: hex.EncodeToString(h.Sum(nil)), Size: int64(len(text)), SourceKind: c.ProviderName, ReadMode: sourceReadBytes, Metadata: meta}, Bytes: text}
+}
+func (c *CollaborationConnector) materialItems(ctx context.Context, r Request, config CollaborationConfig, ref collaborationRef, m collaborationMaterial) ([]Input, error) {
+	if config.preview && len(m.Files) > PreviewItemLimit-1 {
+		m.Files = m.Files[:PreviewItemLimit-1]
+	}
+	if len(m.Files) > 1000 {
+		return nil, fmt.Errorf("%w: too many attachments in one parent", ErrInventoryIncomplete)
+	}
+	if len(m.Text) > maxImportSourceObjectBytes || !utf8.Valid(m.Text) {
+		return nil, fmt.Errorf("resource text exceeds byte limit")
+	}
+	metadata := collaborationMetadata(ref, m)
 	makeInput := func(ref collaborationRef, text []byte, meta map[string]any) Input {
-		raw, _ := json.Marshal(ref)
-		meta["acquisition"] = string(raw)
-		key := ref.Resource + "/" + url.PathEscape(ref.Container) + "/" + url.PathEscape(ref.ID)
-		if ref.Attachment != "" {
-			key += "/attachments/" + url.PathEscape(ref.Attachment)
-		}
-		// Include canonical metadata so edits to links/sharing context are revisions.
-		h := sha256.New()
-		h.Write(text)
-		b, _ := json.Marshal(meta)
-		h.Write(b)
-		scheme := c.ProviderName
-		if scheme == ProviderGoogleWorkspace {
-			scheme = "workspace"
-		}
-		return Input{Item: Item{ID: scheme + "://" + r.SourceNamespace + "/" + key, Path: key, Filename: m.Title, URL: m.URL, Revision: hex.EncodeToString(h.Sum(nil)), Size: int64(len(text)), SourceKind: c.ProviderName, ReadMode: sourceReadBytes, Metadata: meta}, Bytes: text}
+		return c.collaborationInput(r, ref, m, text, meta)
 	}
 	parent := makeInput(ref, m.Text, metadata)
 	items := []Input{parent}
@@ -549,6 +559,9 @@ func (c *CollaborationConnector) materialItems(ctx context.Context, r Request, c
 			}
 			meta := cloneSourceMetadata(metadata)
 			meta["parent_identity"] = parent.ID
+			if c.NativeAttachments {
+				meta["parent_revision"] = parent.Revision
+			}
 			meta["attachment_id"] = file.ID
 			if file.Revision != "" {
 				meta["drive_revision"] = file.Revision
@@ -628,6 +641,9 @@ func (c *CollaborationConnector) Read(ctx context.Context, r Request, item Item)
 	}
 	if err := c.validateRef(ctx, config, ref); err != nil {
 		return nil, err
+	}
+	if c.NativeAttachments && ref.Attachment != "" {
+		return c.nativeMediaBytes(ctx, r, item)
 	}
 	attachment := ref.Attachment
 	ref.Attachment = ""

@@ -31641,7 +31641,11 @@ components:
 
         in the selected source revision, including units with no searchable chunk, and uses
 
-        the top-level `_sort`/`search_after` cursor contract.
+        the top-level `_sort`/`search_after` cursor contract. For member traversal,
+
+        `filter_query` applies to source parents before any artifact enumeration;
+
+        it never filters member payloads or changes the member pagination order.
 
 
         Ancestor and nested-match field projections are always explicit to keep response
@@ -32037,8 +32041,23 @@ components:
                       - search_after
                   - required:
                       - search_before
-          - description: Relevance, filtering, backward/offset pagination, and result transforms do not
-              apply to sequential child traversal.
+          - description: Unit traversal has no public source-filter admission contract.
+            allOf:
+              - required:
+                  - filter_query
+                  - hierarchy
+                properties:
+                  hierarchy:
+                    required:
+                      - children
+                    properties:
+                      children:
+                        properties:
+                          level:
+                            enum:
+                              - unit
+          - description: Relevance, backward/offset pagination, and result transforms do not apply to
+              sequential child traversal.
             allOf:
               - required:
                   - hierarchy
@@ -32053,8 +32072,6 @@ components:
                       - full_text_search
                   - required:
                       - full_text_index
-                  - required:
-                      - filter_query
                   - required:
                       - exclusion_query
                   - required:
