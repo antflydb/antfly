@@ -208,12 +208,16 @@ fn planningTurn(a: A, client_value: @import("objectstore").Client, bucket: []con
     return if (!progress.spilling and (progress.candidate == progress.candidates.len or progress.retired.len == progress.max_expired)) progress else null;
 }
 const Execution = struct {
-    version: u8 = 2,
+    version: u8 = 3,
     job: []const u8,
     pinned: usize = 0,
     // Legacy numeric positions are retained only to decode version-one jobs.
     scan: usize = 0,
     cursor: plan.Cursor = .{},
+    // A traversal window can outlive its smaller catalog retirement batch.
+    // These unfenced candidates must be checked against current authority on
+    // every resume; the cursor's durable closure owns their inventory.
+    pending: []const []const u8 = &.{},
     approved: []const []const u8 = &.{},
     approved_index: usize = 0,
     next_scan: usize = 0,
@@ -233,17 +237,19 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
     };
     defer if (saved) |*value| value.deinit(client.allocator);
     var progress: Execution = if (saved) |value| try std.json.parseFromSliceLeaky(Execution, a, value.body, .{ .allocate = .alloc_always }) else .{ .job = job_hash };
-    if ((progress.version != 1 and progress.version != 2) or !std.mem.eql(u8, progress.job, job_hash) or progress.pinned > job.retired.len or progress.approved_index > progress.approved.len) return error.InvalidLakeVacuumPlan;
+    if ((progress.version != 1 and progress.version != 2 and progress.version != 3) or !std.mem.eql(u8, progress.job, job_hash) or progress.pinned > job.retired.len or progress.approved_index > progress.approved.len or progress.pending.len > catalog.types.max_reference_steps) return error.InvalidLakeVacuumPlan;
+    if (progress.version < 3 and progress.pending.len != 0) return error.InvalidLakeVacuumPlan;
+    if (progress.complete and progress.pending.len != 0) return error.InvalidLakeVacuumPlan;
     if (progress.version == 1) {
         // Restart traversal once for legacy numeric cursors, then checkpoint
         // bounded frontier progress. Already deleted objects stay harmless;
         // preserve any pending batch's existing catalog retirement proof.
-        progress.version = 2;
         progress.scan = 0;
         progress.next_scan = 0;
         progress.cursor = .{};
         if (!progress.complete) progress.exhausted = false;
     }
+    progress.version = 3;
     const input_store = try inputs.Store.init(a, client, plans.bucket, plans.prefix, request.operation_id, context);
     var result: Result = .{ .expired_snapshots = job.retired.len };
     var latest = try configured.executeLakeCatalogAlloc(a, binding, options, context, .load);
@@ -273,30 +279,44 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
                 var ready = try configured.executeLakeCatalogAlloc(a, binding, options, context, .{ .references = .{ .objects = &.{} } });
                 defer ready.deinit(a);
                 if (!ready.references.ready) break :selection;
-                var candidates: std.ArrayList([]const u8) = .empty;
                 var selected: std.ArrayList([]const u8) = .empty;
-                visits = catalog.retirement_index.Index.init(a, client, plans.bucket, try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-traversal", .{plans.prefix}), context);
-                const seen = &visits.?;
-                if (progress.cursor.visited != null) seen.loadHints() catch {};
-                try context.ensureActive();
-                var walker = try plan.Walker.init(plans, job.retired, seen, progress.cursor);
-                var steps = catalog.types.max_reference_steps - ready.references.steps;
-                if (steps == 0) break :selection;
-                var exhausted = false;
-                while (candidates.items.len < @min(16, request.max_deleted)) {
-                    const uri = (walker.next(&steps) catch |err| switch (err) {
-                        error.LakeVacuumPlanYield => break,
-                        else => return err,
-                    }) orelse {
-                        exhausted = true;
-                        break;
-                    };
-                    if (!has(candidates.items, uri)) try candidates.append(a, uri);
+                var candidates = progress.pending;
+                var walker: ?plan.Walker = null;
+                var exhausted = progress.exhausted;
+                if (candidates.len == 0) {
+                    var collected: std.ArrayList([]const u8) = .empty;
+                    visits = catalog.retirement_index.Index.init(a, client, plans.bucket, try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-traversal", .{plans.prefix}), context);
+                    const seen = &visits.?;
+                    if (progress.cursor.visited != null) seen.loadHints() catch {};
+                    try context.ensureActive();
+                    walker = try plan.Walker.init(plans, job.retired, seen, progress.cursor);
+                    var steps = catalog.types.max_reference_steps - ready.references.steps;
+                    if (steps == 0) break :selection;
+                    exhausted = false;
+                    // Retained objects consume traversal work, not deletion
+                    // slots. Keep the existing 64-step bound and buffer any
+                    // candidates beyond the smaller fenced retirement batch.
+                    while (collected.items.len < catalog.types.max_reference_steps) {
+                        const uri = (walker.?.next(&steps) catch |err| switch (err) {
+                            error.LakeVacuumPlanYield => break,
+                            else => return err,
+                        }) orelse {
+                            exhausted = true;
+                            break;
+                        };
+                        if (!has(collected.items, uri)) try collected.append(a, uri);
+                    }
+                    candidates = collected.items;
                 }
-                var references = try configured.executeLakeCatalogAlloc(a, binding, options, context, .{ .references = .{ .objects = candidates.items, .max_steps = 0 } });
+                var references = try configured.executeLakeCatalogAlloc(a, binding, options, context, .{ .references = .{ .objects = candidates, .max_steps = 0 } });
                 defer references.deinit(a);
                 if (!references.references.ready) break :selection;
-                for (candidates.items, references.references.referenced) |uri, referenced| {
+                var consumed: usize = 0;
+                for (candidates, references.references.referenced) |uri, referenced| {
+                    if (selected.items.len == 16) break;
+                    try context.ensureActive();
+                    if (context.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s >= deadline) break;
+                    consumed += 1;
                     if (referenced) {
                         result.retained_objects += 1;
                         continue;
@@ -319,7 +339,8 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
                 }
                 progress.approved = selected.items;
                 progress.approved_index = 0;
-                progress.cursor = try walker.checkpoint();
+                if (walker) |*value| progress.cursor = try value.checkpoint();
+                progress.pending = candidates[consumed..];
                 progress.exhausted = exhausted;
             }
             // Save the fenced deletion batch before any physical deletion.
@@ -339,7 +360,7 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
         if (progress.approved_index == progress.approved.len) {
             progress.approved = &.{};
             progress.approved_index = 0;
-            progress.complete = progress.exhausted;
+            progress.complete = progress.exhausted and progress.pending.len == 0;
         }
     }
     const bytes = try std.json.Stringify.valueAlloc(a, progress, .{});
@@ -1275,4 +1296,78 @@ test "external lake vacuum no-op jobs reclaim inputs and replay without catalog 
     defer registration.deinit(client.allocator);
     const admission = try std.json.parseFromSliceLeaky(V, a, registration.body, .{});
     try std.testing.expectEqual(@as(usize, 1), (try catalog.metadata.get(admission, "leases")).array.items.len);
+}
+
+test "external lake vacuum selection crosses retained objects without spending the delete allowance" {
+    try verifyBufferedSelection(4);
+}
+
+test "external lake vacuum selection retains excess candidates across cold deletion limited turns" {
+    try verifyBufferedSelection(22);
+}
+
+fn verifyBufferedSelection(owned_count: usize) !void {
+    const alloc = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-vacuum-selection");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = try std.json.Stringify.valueAlloc(a, .{ .deployment_mode = "standalone", .storage = .{ .engine = "local", .local = .{ .base_dir = directory.path() } } }, .{});
+    var config = try local.common_config.Config.parseFromSlice(alloc, json);
+    defer config.deinit();
+    const binding: local.serverless_external_source_catalog_binding.Binding = .{ .table_id = "events", .format = .iceberg, .source_uri = try std.fmt.allocPrint(a, "file://{s}/warehouse", .{directory.path()}), .schema_fingerprint = "schema", .write_policy = .iceberg_writer, .catalog = .{ .type = .managed } };
+    const options: configured.BindingObjectStoreOpenOptions = .{ .node_config = &config, .catalog_table_id = 11 };
+    var opened = try configured.openBindingObjectStoreAlloc(alloc, binding, options);
+    defer opened.deinit();
+    const authority: catalog.managed.Managed = .{ .client = opened.client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = binding.source_uri };
+    const table = try authority.create(a, "create", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+    const files = try ingestion.destinationFiles(a, opened, binding.source_uri, .{});
+    const base = try ingestion.prefix(a, opened.prefix, binding, options);
+    const request: Options = .{ .operation_id = "selection", .dry_run = false, .exclusive_ownership = true, .retain_ms = 600000, .keep_latest = 1, .max_deleted = 1 };
+    const input_store = try inputs.Store.init(a, opened.client, opened.bucket, base, request.operation_id, .{});
+    try input_store.close(a);
+    var objects: std.ArrayList([]const u8) = .empty;
+    // Retained, externally owned files precede the expired native files in an
+    // already committed job. Finding them must consume traversal work, rather
+    // than the physical-deletion allowance or an entire maintenance turn.
+    for (0..24) |i| {
+        const name = try std.fmt.allocPrint(a, "data/external-{d}.parquet", .{i});
+        var stored = try opened.client.putObject(opened.bucket, try std.fmt.allocPrint(a, "{s}{s}{s}", .{ files.prefix, if (files.prefix.len == 0) "" else "/", name }), "external", .{});
+        stored.deinit(opened.client.allocator);
+        try objects.append(a, try std.fmt.allocPrint(a, "{s}/{s}", .{ files.uri, name }));
+    }
+    for (0..owned_count) |i| try objects.append(a, try catalog.row_commit.upload(a, files, try std.fmt.allocPrint(a, "data/expired-{d}.parquet", .{i}), "expired"));
+    const job: Job = .{ .id = "retired-job", .expected = table.metadata_location, .body = "{}", .timestamp_ms = 2, .retired = &.{.{ .snapshot = "2", .objects = objects.items }} };
+    const pin_store: pins.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = try std.fmt.allocPrint(a, "{s}/selection-pins", .{base}) };
+    const execution_key = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-execution/{s}.json", .{ base, catalog.types.digestHex(request.operation_id) });
+    var deleted: usize = 0;
+    const turns = owned_count + try std.math.divCeil(usize, owned_count, 16);
+    for (0..turns) |turn| {
+        // Reopen every turn, including the deletion-limited approved batch.
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        var plans: plan.Store = .{ .a = scratch.allocator(), .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = .{}, .dry_run = false };
+        const result = try executeJob(scratch.allocator(), binding, options, request, &.{}, pin_store, files, &plans, job);
+        try std.testing.expect(result.deleted_objects <= request.max_deleted);
+        deleted += result.deleted_objects;
+        if (turn == 0) {
+            try std.testing.expectEqual(@as(usize, 0), result.deleted_objects);
+            try std.testing.expectEqual(@as(usize, 24), result.retained_objects);
+            var saved = try opened.client.getObject(opened.bucket, execution_key, .{});
+            defer saved.deinit(opened.client.allocator);
+            const progress = try std.json.parseFromSliceLeaky(Execution, scratch.allocator(), saved.body, .{});
+            try std.testing.expectEqual(@min(16, owned_count), progress.approved.len);
+            try std.testing.expectEqual(owned_count - @min(16, owned_count), progress.pending.len);
+            try std.testing.expectEqual(@as(u8, 3), progress.version);
+            try std.testing.expectEqual(@as(usize, 0), progress.approved_index);
+        }
+        try std.testing.expectEqual(turn + 1 == turns, result.complete);
+    }
+    try std.testing.expectEqual(owned_count, deleted);
+    for (0..24) |i| {
+        var preserved = try opened.client.getObject(opened.bucket, try std.fmt.allocPrint(a, "{s}{s}data/external-{d}.parquet", .{ files.prefix, if (files.prefix.len == 0) "" else "/", i }), .{});
+        defer preserved.deinit(opened.client.allocator);
+        try std.testing.expectEqualStrings("external", preserved.body);
+    }
 }

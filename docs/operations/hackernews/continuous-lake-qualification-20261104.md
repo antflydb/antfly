@@ -634,6 +634,49 @@ and malformed headers, yielding and resuming without partial receipts, and
 rejecting expanded budgets before I/O. This is a bounded-work regression fix;
 fresh production-engine/provider qualification remains required.
 
+
+The production Debug engine at `e7fc61d1d0` built in 608.12 seconds and passed
+its bounded functional smoke. Its SHA-256 is
+`eb5e51c88e1be4dce20efdb84b6edbd9400fda5d76b658724a9f887e0591ae82`.
+A continuation of the saved 31-snapshot GCS operation completed at 155.08 seconds;
+independent validation and shutdown finished at 229.14 seconds. All 103 expected
+accepted/published row images survived, all 94 current manifests and 292 Parquet
+files were verified, and two expired manifest lists independently returned 404.
+This continuation does not clear the original failed fresh qualification.
+The fresh full Debug GCS run subsequently failed after 1,558.12 seconds: the
+history producer exceeded its unchanged 300-second catalog-coverage allowance,
+with acknowledged LSN 160 while observed coverage remained 159. Its continuous
+phase lasted 728.41 seconds with 244 successful searches and no search failures;
+vacuum reported 29 deletions during writes. The indexed table had acknowledged
+LSN 169 while observed catalog coverage was 136. This is a failed qualification,
+not a passing recovery bound. A bounded restart diagnosis is checking coverage
+and current source files; the matching ReleaseFast build remains in progress.
+
+Concurrent inspection identified another retirement throughput problem: raw
+candidates were limited by `min(16, max_deleted)` before reference and ownership
+filtering. Retained files could therefore spend an entire turn's selection
+allowance without using its traversal budget. A regression reproduced the old
+behavior with 24 retained files before four expired native files and
+`max_deleted: 1`: the turn examined only one retained file.
+
+Selection now uses the existing 64-step traversal budget independently of the
+physical deletion allowance. Catalog retirement stays bounded to 16 objects;
+excess candidates are retained in a bounded execution checkpoint and rechecked
+against current catalog authority before fencing. Physical deletion remains a
+separate, durably approved phase with its original per-turn cap. New version-three
+execution checkpoints read and migrate version-one and version-two progress;
+older binaries cannot resume the new execution-checkpoint format.
+
+All 26 focused Debug vacuum tests passed with no skips or leaks. This includes
+the reproduced underfill, buffered overflow through cold one-deletion turns,
+200-snapshot operation budgets, advancing authority, interrupted deletion and
+legacy replay. The broader integration target also exposed a stale extra address
+in a native-cursor configuration test after the repository began owning a config
+pointer; its corrected contract test passed with no leaks. `zig build lake-vacuum-test -Doptimize=Debug` provides a focused
+gate for these contracts. These concurrent changes were isolated from the frozen
+`e7fc61d1d0` engine; its running provider qualification does not qualify the newer
+candidate-buffer implementation.
+
 Next work should:
 
 1. Monitor accepted searches with live public stages,
