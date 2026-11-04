@@ -388,8 +388,22 @@ def test_short_smoke_still_exits_nonzero_after_search_failures(tmp_path, monkeyp
         lake.main()
 
 
-@pytest.mark.parametrize("workers", [0, 9])
-def test_query_fanout_is_bounded(tmp_path, monkeypatch, workers):
+@pytest.mark.parametrize(
+    "option,value",
+    [("--query-workers", "0"), ("--query-workers", "9")]
+    + [
+        (option, value)
+        for option in (
+            "--update-interval",
+            "--query-interval",
+            "--maintenance-interval",
+        )
+        for value in ("nan", "inf", "-inf")
+    ],
+)
+def test_workload_pacing_is_finite_and_query_fanout_is_bounded(
+    tmp_path, monkeypatch, option, value
+):
     monkeypatch.setattr(
         sys,
         "argv",
@@ -403,8 +417,7 @@ def test_query_fanout_is_bounded(tmp_path, monkeypatch, workers):
             "seed.parquet",
             "--state",
             str(tmp_path / "state"),
-            "--query-workers",
-            str(workers),
+            option + "=" + value,
         ],
     )
     with pytest.raises(SystemExit):
@@ -565,3 +578,10 @@ def test_seed_reader_projects_columns_and_stops_at_the_row_budget(monkeypatch):
     )
     assert len(lake.fixture(Path("archive.parquet"), 2)) == 2
     assert closed == [True]
+
+
+@pytest.mark.parametrize("duplicate_version", [3, 4])
+def test_final_accepted_sql_oracle_rejects_duplicate_keys(duplicate_version):
+    with pytest.raises(AssertionError, match="duplicate HN keys"):
+        lake.accepted_sql_versions([[7, 3], [7, duplicate_version]])
+    assert lake.accepted_sql_versions([[7, 3], [8, 4]]) == {7: 3, 8: 4}

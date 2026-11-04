@@ -86,6 +86,13 @@ def distribution(values):
     }
 
 
+def accepted_sql_versions(rows):
+    actual = {int(row[0]): int(row[1]) for row in rows}
+    if len(actual) != len(rows):
+        raise AssertionError("accepted SQL returned duplicate HN keys")
+    return actual
+
+
 def manifest_entries(payload):
     from pyiceberg.io import InputFile
     from pyiceberg.manifest import read_manifest_list
@@ -1025,7 +1032,7 @@ class Run:
                     "read_requirements": {"visibility": "accepted"},
                 },
             )
-            actual = {int(row[0]): int(row[1]) for row in final["rows"]}
+            actual = accepted_sql_versions(final["rows"])
             expected = {key: row["qual_version"] for key, row in self.expected.items()}
             if actual != expected:
                 raise AssertionError(
@@ -1305,8 +1312,14 @@ def arguments():
         or not 1 <= args.duration_seconds <= args.max_seconds - 120
         or not 1 <= args.max_objects <= 50000
         or not 1 <= args.max_storage_bytes <= 1024**3
-        or min(args.update_interval, args.query_interval, args.maintenance_interval)
-        <= 0
+        or any(
+            not math.isfinite(interval) or interval <= 0
+            for interval in (
+                args.update_interval,
+                args.query_interval,
+                args.maintenance_interval,
+            )
+        )
     ):
         parser.error("invalid qualification bounds")
     return args

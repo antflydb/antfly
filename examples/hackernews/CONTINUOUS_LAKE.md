@@ -115,5 +115,7 @@ label. Do not compare these timings directly to earlier static fixtures or claim
 an isolated speedup without a matched control run.
 
 The [2026-11-04 UTC baseline](../../docs/operations/hackernews/continuous-lake-qualification-20261104.md)
-records the successful catalog checks and remaining availability/maintenance gaps.
-Both full provider profiles failed the strict qualification criteria.
+records the initial failures, their diagnosis, and subsequent full filesystem/GCS
+passes at the explicitly identified bounded-cleanup revision. Later engine changes
+have separate checks; a pass at an earlier revision does not qualify the final
+source or full-archive performance.

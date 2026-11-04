@@ -236,6 +236,10 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
         else => return err,
     };
     defer if (saved) |*value| value.deinit(client.allocator);
+    var queued: ?@import("objectstore").PutResult = null;
+    defer if (queued) |*value| value.deinit(client.allocator);
+    var queued_bytes: ?[]u8 = null;
+    defer if (queued_bytes) |bytes| a.free(bytes);
     var progress: Execution = if (saved) |value| try std.json.parseFromSliceLeaky(Execution, a, value.body, .{ .allocate = .alloc_always }) else .{ .job = job_hash };
     if ((progress.version != 1 and progress.version != 2 and progress.version != 3) or !std.mem.eql(u8, progress.job, job_hash) or progress.pinned > job.retired.len or progress.approved_index > progress.approved.len or progress.pending.len > catalog.types.max_reference_steps) return error.InvalidLakeVacuumPlan;
     if (progress.version < 3 and progress.pending.len != 0) return error.InvalidLakeVacuumPlan;
@@ -281,7 +285,6 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
                 if (!ready.references.ready) break :selection;
                 var selected: std.ArrayList([]const u8) = .empty;
                 var candidates = progress.pending;
-                var walker: ?plan.Walker = null;
                 var exhausted = progress.exhausted;
                 if (candidates.len == 0) {
                     var collected: std.ArrayList([]const u8) = .empty;
@@ -289,7 +292,7 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
                     const seen = &visits.?;
                     if (progress.cursor.visited != null) seen.loadHints() catch {};
                     try context.ensureActive();
-                    walker = try plan.Walker.init(plans, job.retired, seen, progress.cursor);
+                    var walker = try plan.Walker.init(plans, job.retired, seen, progress.cursor);
                     var steps = catalog.types.max_reference_steps - ready.references.steps;
                     if (steps == 0) break :selection;
                     exhausted = false;
@@ -297,7 +300,7 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
                     // slots. Keep the existing 64-step bound and buffer any
                     // candidates beyond the smaller fenced retirement batch.
                     while (collected.items.len < catalog.types.max_reference_steps) {
-                        const uri = (walker.?.next(&steps) catch |err| switch (err) {
+                        const uri = (walker.next(&steps) catch |err| switch (err) {
                             error.LakeVacuumPlanYield => break,
                             else => return err,
                         }) orelse {
@@ -307,6 +310,15 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
                         if (!has(collected.items, uri)) try collected.append(a, uri);
                     }
                     candidates = collected.items;
+                    // Discovery is independent of commit authority. Persist
+                    // the durable frontier and unfenced queue before any
+                    // reference lookup or retirement can yield/conflict.
+                    progress.cursor = try walker.checkpoint();
+                    progress.pending = candidates;
+                    progress.exhausted = exhausted;
+                    queued_bytes = try std.json.Stringify.valueAlloc(a, progress, .{});
+                    queued = try storeExecution(&client, plans.bucket, key, queued_bytes.?, if (saved) |value| value.metadata.writeRevision() orelse return error.MissingObjectRevision else null, context);
+                    _ = queued.?.writeRevision() orelse return error.MissingObjectRevision;
                 }
                 var references = try configured.executeLakeCatalogAlloc(a, binding, options, context, .{ .references = .{ .objects = candidates, .max_steps = 0 } });
                 defer references.deinit(a);
@@ -339,7 +351,6 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
                 }
                 progress.approved = selected.items;
                 progress.approved_index = 0;
-                if (walker) |*value| progress.cursor = try value.checkpoint();
                 progress.pending = candidates[consumed..];
                 progress.exhausted = exhausted;
             }
@@ -364,11 +375,14 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
         }
     }
     const bytes = try std.json.Stringify.valueAlloc(a, progress, .{});
-    var stored = if (saved) |value|
-        try client.compareAndPut(plans.bucket, key, bytes, value.metadata.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = catalog.types.contextCancellation(&context) })
-    else
-        try client.putObject(plans.bucket, key, bytes, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&context) });
-    stored.deinit(client.allocator);
+    defer a.free(bytes);
+    // A proof miss leaves the newly checkpointed queue unchanged. Avoid a
+    // second CAS in that case; approval/deletion updates use its new revision.
+    if (queued_bytes == null or !std.mem.eql(u8, queued_bytes.?, bytes)) {
+        const previous = if (queued) |value| value.writeRevision() orelse return error.MissingObjectRevision else if (saved) |value| value.metadata.writeRevision() orelse return error.MissingObjectRevision else null;
+        var stored = try storeExecution(&client, plans.bucket, key, bytes, previous, context);
+        stored.deinit(client.allocator);
+    }
     // Only the saved cursor admits traversal. Reuse authenticated visited nodes
     // across cold turns, publishing this optional cache after the progress CAS.
     if (visits) |*index| {
@@ -377,6 +391,10 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
     }
     result.complete = progress.complete and try input_store.finish(a);
     return result;
+}
+fn storeExecution(client: *@import("objectstore").Client, bucket: []const u8, key: []const u8, bytes: []const u8, previous: ?@import("objectstore").ObjectRevision, context: catalog.types.Context) !@import("objectstore").PutResult {
+    if (previous) |revision| return client.compareAndPut(bucket, key, bytes, revision, .{ .cancellation = catalog.types.contextCancellation(&context) });
+    return client.putObject(bucket, key, bytes, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&context) });
 }
 const Marker = struct { uri: []const u8, sha256: []const u8, revision: @import("objectstore").ObjectRevision, owner: []const u8 };
 fn has(values: []const []const u8, value: []const u8) bool {
@@ -1370,4 +1388,117 @@ fn verifyBufferedSelection(owned_count: usize) !void {
         defer preserved.deinit(opened.client.allocator);
         try std.testing.expectEqualStrings("external", preserved.body);
     }
+}
+
+test "external lake vacuum checkpoints unfenced traversal when HEAD advances during the walk" {
+    try verifyUnfencedTraversal(.walk);
+}
+test "external lake vacuum checkpoints unfenced traversal before a retirement conflict" {
+    try verifyUnfencedTraversal(.retirement);
+}
+test "external lake vacuum unfenced checkpoint survives a lost acknowledgment" {
+    try verifyUnfencedTraversal(.checkpoint_ack);
+}
+const TraversalInterleave = enum { walk, retirement, checkpoint_ack };
+fn verifyUnfencedTraversal(interleave: TraversalInterleave) !void {
+    const alloc = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("vacuum-walk-advance");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = try std.json.Stringify.valueAlloc(a, .{ .deployment_mode = "standalone", .storage = .{ .engine = "local", .local = .{ .base_dir = directory.path() } } }, .{});
+    var config = try local.common_config.Config.parseFromSlice(alloc, json);
+    defer config.deinit();
+    const binding: local.serverless_external_source_catalog_binding.Binding = .{ .table_id = "events", .format = .iceberg, .source_uri = try std.fmt.allocPrint(a, "file://{s}/warehouse", .{directory.path()}), .schema_fingerprint = "schema", .write_policy = .iceberg_writer, .catalog = .{ .type = .managed } };
+    const options: configured.BindingObjectStoreOpenOptions = .{ .node_config = &config, .catalog_table_id = 11 };
+    var opened = try configured.openBindingObjectStoreAlloc(alloc, binding, options);
+    defer opened.deinit();
+    var managed: catalog.managed.Managed = .{ .client = opened.client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = binding.source_uri };
+    const table = try managed.create(a, "create", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+    const files = try ingestion.destinationFiles(a, opened, binding.source_uri, .{});
+    const base = try ingestion.prefix(a, opened.prefix, binding, options);
+    const obsolete = try catalog.row_commit.upload(a, files, "data/obsolete.parquet", "obsolete");
+    const row = try std.json.parseFromSliceLeaky(V, a, "{\"id\":1}", .{});
+    const prepared = try catalog.row_commit.prepare(a, table, files, .{ .batch_id = "new-head", .source = "s", .epoch = "1", .checkpoint = "1", .key_fields = &.{"id"}, .changes = &.{.{ .op = .upsert, .row = row }} }, 1, 2);
+    const commit = try std.json.parseFromSliceLeaky(V, a, prepared.body, .{});
+    const live_list = for ((try catalog.metadata.get(commit, "updates")).array.items) |update| {
+        if (update.object.get("snapshot")) |snapshot| break try catalog.metadata.str(try catalog.metadata.get(snapshot, "manifest-list"));
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(prepared.snapshot_id != 2);
+    const request: Options = .{ .operation_id = "walk-advance", .dry_run = false, .exclusive_ownership = true, .retain_ms = 600000, .keep_latest = 1, .max_deleted = 1 };
+    const input_store = try inputs.Store.init(a, opened.client, opened.bucket, base, request.operation_id, .{});
+    try input_store.close(a);
+    var writer: plan.Store = .{ .a = a, .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = .{}, .dry_run = false };
+    const root = try writer.objects(&.{ obsolete, live_list });
+    const job: Job = .{ .id = "retired", .expected = table.metadata_location, .body = "{}", .timestamp_ms = 3, .retired = &.{.{ .snapshot = "2", .object_plan = root }} };
+    const Advance = struct {
+        a: A,
+        managed: *catalog.managed.Managed,
+        table: catalog.types.Table,
+        prepared: catalog.row_commit.Prepared,
+        interleave: TraversalInterleave,
+        fired: bool = false,
+        failure: ?anyerror = null,
+        fn matches(raw: *anyopaque, _: []const u8, key: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return std.mem.indexOf(u8, key, if (self.interleave == .retirement) ".antfly-owned/" else "/maintenance/vacuum-plans/") != null;
+        }
+        fn run(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.fired = true;
+            var next = self.managed.commit(self.a, .{ .id = "new-head", .expected_metadata_location = self.table.metadata_location, .body = self.prepared.body, .timestamp_ms = 2 }) catch |err| {
+                self.failure = err;
+                return;
+            };
+            next.deinit(self.a);
+        }
+    };
+    var advance: Advance = .{ .a = a, .managed = &managed, .table = table, .prepared = prepared, .interleave = interleave };
+    var faults = @import("objectstore").ScriptedFaultClient.init(alloc, opened.client);
+    defer faults.deinit();
+    faults.get_filter = .{ .ptr = &advance, .matches = Advance.matches };
+    faults.next_get = .{ .complete_then_callback = .{ .ptr = &advance, .run = Advance.run } };
+    if (interleave == .checkpoint_ack) {
+        faults.put_filter = .{ .ptr = &advance, .matches = struct {
+            fn matches(_: *anyopaque, _: []const u8, key_: []const u8, _: []const u8) bool {
+                return std.mem.indexOf(u8, key_, "/maintenance/vacuum-execution/") != null;
+            }
+        }.matches };
+        faults.commitNextPutThenFail(error.InjectedCheckpointAckLoss);
+    }
+    const pin_store: pins.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = try std.fmt.allocPrint(a, "{s}/selection-pins", .{base}) };
+    var cold: plan.Store = .{ .a = a, .client = faults.client(), .bucket = opened.bucket, .prefix = base, .context = .{}, .dry_run = false };
+    var checked_files = files;
+    if (interleave == .retirement) checked_files.client = faults.client();
+    const first = executeJob(a, binding, options, request, &.{}, pin_store, checked_files, &cold, job) catch |err| interrupted: {
+        try std.testing.expectEqual(@as(anyerror, if (interleave == .retirement) error.LakeCommitConflict else if (interleave == .checkpoint_ack) error.InjectedCheckpointAckLoss else error.TestUnexpectedResult), err);
+        break :interrupted Result{};
+    };
+    try std.testing.expect(advance.fired);
+    if (advance.failure) |err| return err;
+    try std.testing.expect(!first.complete and first.deleted_objects == 0);
+    const key = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-execution/{s}.json", .{ base, catalog.types.digestHex(request.operation_id) });
+    var saved = try opened.client.getObject(opened.bucket, key, .{});
+    defer saved.deinit(opened.client.allocator);
+    const progress = try std.json.parseFromSliceLeaky(Execution, a, saved.body, .{});
+    try std.testing.expectEqual(@as(usize, 2), progress.pending.len);
+    try std.testing.expectEqual(@as(usize, 1), progress.cursor.snapshot);
+    try std.testing.expect(progress.exhausted and progress.approved.len == 0);
+    // Reopen without warm process state. The new HEAD now references one of
+    // the queued candidates, which must be revalidated rather than deleted.
+    var result = first;
+    var deleted: usize = 0;
+    for (0..16) |_| {
+        if (result.complete) break;
+        var next: plan.Store = .{ .a = a, .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = .{}, .dry_run = false };
+        result = try executeJob(a, binding, options, request, &.{}, pin_store, files, &next, job);
+        deleted += result.deleted_objects;
+    }
+    try std.testing.expect(result.complete);
+    try std.testing.expectEqual(@as(usize, 1), deleted);
+    try std.testing.expectError(error.FileNotFound, catalog.row_commit.read(a, files, obsolete));
+    var list = try iceberg.parseManifestListAlloc(alloc, try catalog.row_commit.read(a, files, live_list));
+    defer list.deinit(alloc);
+    try std.testing.expect(list.entries.len != 0);
 }

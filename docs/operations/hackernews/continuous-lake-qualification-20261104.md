@@ -788,8 +788,10 @@ an object-runtime read response. Boolean transport probes stay separate, and
 admitted mutation outcomes retain their existing handling. Public single-table,
 global, NDJSON and composed-union route controls cover expiry versus real listener cancellation;
 the route regression failed before the correction. All 18 execution-budget tests passed with no skips or leaks, including foreign
-deadline dispatch and operation/transport probe separation. The broader lake and metadata-admission checks are still running. Their results
-are separate from earlier optimized runs, which exclude this correction.
+deadline dispatch and operation/transport probe separation. Both metadata-admission controls subsequently passed, including callbacks outside
+the catalog mutex and cancellation while queued/after granting shared admission.
+These results are separate from earlier optimized runs, which exclude this
+correction.
 
 Next work should:
 
@@ -816,3 +818,50 @@ Baseline validation: both native engine builds succeeded; 44 relevant Python tes
 and documentation-link checks passed. Final ReleaseFast smoke tests passed
 through changes, published/accepted search, row checks and restart. Raw full-run
 failures remain qualification failures despite those successful checks.
+
+
+## Comprehensive review follow-up
+
+The review covered all 52 changed files against `2c0905501d`, including their
+relevant callers: qualification/oracles and evidence handling; immutable object
+reads and manifest budgets; trie batching, optional warming and provider/allocator
+concurrency; reachability and vacuum checkpoint fencing; overlay ancestry and WAL
+coverage; bounded cleanup; scheduler completion; request cancellation; metrics;
+and test/build wiring. This is source review plus the recorded controls, not a
+proof of all workloads or a full-archive performance qualification.
+
+A native regression reproduced lost traversal in vacuum execution. A valid
+concurrent catalog commit during plan traversal caused the second reference
+lookup to yield before saving the newly walked candidate window. The saved job
+had zero pending candidates instead of two. Retirement conflicts could discard
+the same work after validation.
+
+Execution now conditionally checkpoints the durable traversal frontier and its
+bounded **unfenced** candidate queue before reference validation or retirement.
+The subsequent approval checkpoint uses that new revision. A fresh authority
+check and catalog retirement fence still authorize each deletion batch; queue
+membership alone grants no deletion authority. An unchanged queue needs no
+second write when the reference proof is unavailable. Lost checkpoint responses
+can be recovered from durable state without rewalking the inventory.
+
+The regression controls interleave real managed-catalog commits during traversal
+and ownership validation, inject a successful checkpoint write with a lost
+acknowledgment, then reopen the job without warm state. They require the obsolete
+owned file to be deleted exactly once and a candidate that became live to remain
+readable. All 35 focused native Debug maintenance tests passed without skips,
+failures or leaks. The shared SQL scheduler controls also passed all 22 selected
+contracts, including notification races, cancellation and bounded admission.
+The broader lake integration run is tracked separately.
+
+The qualification driver also rejects non-finite pacing values and duplicate
+keys in its final accepted SQL result. Previously NaN/infinity could bypass the
+positive-interval check, and constructing a dictionary could silently collapse
+duplicate SQL rows. Both defects reproduced before their corrections. The full
+Python suite passes 51 tests and 11 subtests; Ruff and formatting are checked
+separately. Raw reproduction logs and the per-file review ledger remain private.
+
+The `0ac3e0ad86` ReleaseFast build completed and passed its smoke; its executable
+SHA-256 is `f4956db1c3844da328bb333017b9b029ec5c5ea1c13de76be8eb6f99b11d5900`.
+Its separately running full controls exclude both the deadline-classification
+correction and this review's fixes. They must not be presented as final-source
+qualification.
