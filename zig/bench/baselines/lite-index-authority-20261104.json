@@ -1,0 +1,235 @@
+{
+  "qualified": false,
+  "source_commit": "7e3a1bbb9a95ff501aa63b65b4404ee0e0d5299d",
+  "library_sha256": "4ee5cb44dcced6c92e84ed89094c961339e3bb037d612064782a18d6305af0e0",
+  "fixes": [
+    "Private merge staging preserves original runtime logical witnesses after allocator adoption; no per-chunk validation scan is added.",
+    "Nested writer admission preserves changed-index and uncertain-outcome fences while allowing completed primary progress to record its watermark."
+  ],
+  "regressions": [
+    "Private-only staging retains reuse; two foreign LSM publications require a replacement runtime, followed by another publication and cold reopen.",
+    "Nested index/index-read refusals preserve reference counts; uncertain outcomes refuse all nested scopes."
+  ],
+  "validation": {
+    "api": {
+      "passed": 155,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "log_sha256": "474fcf7877ad8e8ce91800fd62be9f40fddb3fa31344f5b55c10677c6cd813e8"
+    },
+    "sdk": {
+      "passed": 209,
+      "failed": 0,
+      "seconds": 76.47,
+      "log_sha256": "8f4ccc388c55341a0bab17d8b872d7c52b36c85cc855f527f7a8e33e064719d7"
+    },
+    "build": {
+      "exit_code": 0,
+      "seconds": 426.0886360829463,
+      "public_exports": 134,
+      "abi_linkage_smoke": "passed",
+      "log_sha256": "f010f7ee5f1bf4e9a77bc8560c3c252165c525c72fd28c3525269ca211f5f046"
+    },
+    "release_sdk": {
+      "passed": 209,
+      "failed": 0,
+      "seconds": 33.63,
+      "library_sha256": "50513ae6b73f229373af17f7b615e6b27909cad24602a5e4b518573c18c8bed7",
+      "log_sha256": "ead727c4cecdd41664a938a51429a4aeae85c48593dfcb852ccdd553b372245a"
+    }
+  },
+  "debug_importer": {
+    "input_index": 7,
+    "importer_exit_code": 1,
+    "censored": false,
+    "importer_succeeded": false,
+    "summary": [
+      0,
+      0,
+      1
+    ],
+    "seconds": 238.36315866699442,
+    "peak_native_builds": 4,
+    "metrics_enabled": true,
+    "library_sha256": "4ee5cb44dcced6c92e84ed89094c961339e3bb037d612064782a18d6305af0e0",
+    "public_errors": [
+      "LiteReplayBacklogExceeded"
+    ],
+    "seed_sha256": "27ea0ac6beecde2ca727132143e214c17ef5f38010db3762f605551806673519",
+    "seed_copy_method": "native_stable_snapshot",
+    "scope": "Local diagnosis only. Metrics and any overlapping compilation prevent clean performance attribution.",
+    "primary_batches": 42,
+    "primary_writes": 43008,
+    "profiled_replay_documents": 35093,
+    "manifest_errors_during_run": 0,
+    "cold_namespaces": 45,
+    "cold_manifest_errors": 0,
+    "physical_integrity_valid": true,
+    "source_turns": 150,
+    "namespace_opens": 186,
+    "source_reuses": 148,
+    "allocator_full_loads": 1,
+    "active_replay_bytes": 16455198,
+    "cold_namespaces_with_index_debt": 2,
+    "log_sha256": "35ed6b8bb66c3fe5b65dcb49e2b7a6115354db7decd81821e7b74bc729301cc3",
+    "sample_sha256": "efc24fd907b66e135e95d07c9bc4a4ca9fb6b1c2c3f842afc491ca48fd28d8f2",
+    "cold_report_sha256": "0fcdf4d933ba230a6698b5884575443a510bae0f88d647e483e65f8fb45f1527"
+  },
+  "starting_debt": {
+    "seed_target": 78,
+    "seed_full_text_applied": 33,
+    "seed_producer_applied": 35,
+    "final_target": 120,
+    "final_full_text_applied": 54,
+    "final_producer_applied": 56
+  },
+  "preceding_manifest_failure": {
+    "source_commit": "ae7265a9210c7f738c5cb0cb30e5aa1cfbf5a49d",
+    "descriptor_checkpoint": 2,
+    "validated_journal_sequences": 8,
+    "next_frame_actual_sequence": 7,
+    "next_frame_expected_sequence": 9,
+    "frame_header_crc_valid": true,
+    "header_offset": 1560,
+    "active_segment_bytes": 1673,
+    "scope": "Numeric inspection of the persisted failure; the staging regression exposes a matching unsafe authority transition. No corrupt journal is ignored or discarded."
+  },
+  "publication": {
+    "pushed": true,
+    "pull_request": 1454,
+    "draft": true,
+    "ci": "Draft PR: test runners remain idle. Controller requires non-draft PR and human approval."
+  },
+  "reference_policy": "No reference build or workload execution. Existing seed inspected read-only with the current candidate and its content hash verified unchanged. Wolfspider used only for final candidate qualification; full factory belongs to Beads.",
+  "optimized_qualification": {
+    "qualified": false,
+    "source_commit": "7e3a1bbb9a95ff501aa63b65b4404ee0e0d5299d",
+    "library_sha256": "50513ae6b73f229373af17f7b615e6b27909cad24602a5e4b518573c18c8bed7",
+    "original_importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+    "frozen_input_tree_sha256": "1a54a15e5b957c39807adb41b321bafa74ca2177124238a42c9247b70953f276",
+    "build": {
+      "engine_and_unused_cli_attempt_exit": 241,
+      "engine_and_unused_cli_attempt_seconds": 1002.8158197500743,
+      "explanation": "Stopped the unneeded CLI/serverless compilation after the optimized shared engine completed. The final gates use the library. Library-only continuation reused the complete engine and passed every requested target.",
+      "library_only_exit": 0,
+      "library_only_seconds": 7.0385389579460025,
+      "cli_produced": false,
+      "abi_exports_and_smoke": "passed",
+      "public_exports": 134,
+      "compiler_sha256": "1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523",
+      "report_sha256": "3e332bef8271806a0a1d22bb996b8394e7863a80ad3f891f6707807cc776bdeb"
+    },
+    "phases": [
+      {
+        "phase": "input7-candidate",
+        "started_utc": "2026-11-04T11:52:57Z",
+        "initial_load": [
+          1.865234375,
+          1.8740234375,
+          1.7958984375
+        ],
+        "overlapping_build_samples": [],
+        "censored": false,
+        "exit_code": 0,
+        "seconds": 219.54532174998894,
+        "final_load": [
+          2.3955078125,
+          2.08642578125,
+          1.8955078125
+        ],
+        "inputs_unchanged": true,
+        "input_tree_sha256": "1a54a15e5b957c39807adb41b321bafa74ca2177124238a42c9247b70953f276"
+      },
+      {
+        "phase": "first-imports",
+        "started_utc": "2026-11-04T11:56:37Z",
+        "initial_load": [
+          2.3955078125,
+          2.08642578125,
+          1.8955078125
+        ],
+        "overlapping_build_samples": [],
+        "censored": false,
+        "exit_code": 0,
+        "seconds": 15.27995820902288,
+        "final_load": [
+          2.15966796875,
+          2.048828125,
+          1.88525390625
+        ],
+        "inputs_unchanged": true,
+        "input_tree_sha256": "1a54a15e5b957c39807adb41b321bafa74ca2177124238a42c9247b70953f276"
+      },
+      {
+        "phase": "full-imports",
+        "started_utc": "2026-11-04T11:56:52Z",
+        "initial_load": [
+          2.15966796875,
+          2.048828125,
+          1.88525390625
+        ],
+        "overlapping_build_samples": [],
+        "censored": false,
+        "exit_code": 1,
+        "seconds": 278.5292033748701,
+        "final_load": [
+          2.24072265625,
+          2.2216796875,
+          2.0078125
+        ],
+        "inputs_unchanged": true,
+        "input_tree_sha256": "1a54a15e5b957c39807adb41b321bafa74ca2177124238a42c9247b70953f276"
+      }
+    ],
+    "fresh_input_7": {
+      "passed": true,
+      "seconds": 218.27809704188257,
+      "child_user_seconds": 179.420055,
+      "child_system_seconds": 63.18207
+    },
+    "full_corpus": {
+      "planned_inputs": 15,
+      "attempted_inputs": 8,
+      "successful_inputs": 7,
+      "failed_input_index": 7,
+      "failed_input_seconds": 221.0961026661098,
+      "error": "LiteReplayBacklogExceeded",
+      "invalid_manifest_mentions": 0,
+      "final_file_bytes": 3548684288
+    },
+    "failed_snapshot_sha256": "b2c01c685f42d6139bae0babf4c184779093d8bde43251c474b36054a6039a10",
+    "unrun_after_failure": [
+      "Full-corpus primary and logical-field verification",
+      "Drain, accounting, compaction and semantic canary",
+      "Original-importer contention",
+      "Short churn and append",
+      "Large graph",
+      "Ten-minute active-write stable vocabulary soak",
+      "Ten-minute active-write changing vocabulary soak"
+    ],
+    "conclusion": "Fresh-database success does not qualify accumulated replay debt. Investigation continues locally. No reference build or workload execution."
+  },
+  "input_fidelity": {
+    "matching_files": 37,
+    "missing_files": 0,
+    "changed_files": 0,
+    "purpose": "Verified local diagnostic inputs against final qualification manifest; no new reference execution."
+  },
+  "local_optimized_diagnostic": {
+    "qualified": false,
+    "seconds": 126.56271266599651,
+    "primary_batches": 87,
+    "primary_writes": 89088,
+    "profiled_replay_documents": 98148,
+    "full_text_prepare_ms": 10150,
+    "replay_publication_overhead_ns": 36029167382,
+    "path_lease_hold_ns": 99335384429,
+    "namespace_opens": 482,
+    "source_reuses": 329,
+    "allocator_full_loads": 1,
+    "peak_overlapping_native_builds": 6,
+    "error": "LiteReplayBacklogExceeded",
+    "scope": "Diagnostic counters overlap and exclude failed operations; not additive wall time or a clean throughput comparison."
+  }
+}

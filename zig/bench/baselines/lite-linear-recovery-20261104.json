@@ -87,7 +87,16 @@
     "peak_overlapping_native_builds": 8,
     "scope": "Local diagnostic with metrics and sampling, not a clean throughput comparison. The bounded runtime working set did not materially reduce this mixed-workload reopen count."
   },
-  "current_seeded_importer": "Running using the exact frozen Debug artifact; outcome pending. No replay-capacity or optimized performance pass is claimed.",
+  "current_seeded_importer": {
+    "source_commit": "ae7265a9210c7f738c5cb0cb30e5aa1cfbf5a49d",
+    "result": "LiteReplayBacklogExceeded",
+    "seconds": 289.6538944160566,
+    "primary_batches": 48,
+    "manifest_error_mentions": 201,
+    "physical_integrity_valid": true,
+    "qualified": false,
+    "followup_receipt": "lite-index-authority-20261104.json"
+  },
   "reference_policy": "No reference compilation or execution. Existing artifacts and observations retained. Wolfspider reserved for final qualification. Full factory belongs to Beads.",
-  "publication_status": "Two HTTPS pushes and one SSH push were rejected by GitHub server errors; retry pending. Remote head last confirmed at 26439e67a0."
+  "publication_status": "Source and validation commits through 7e3a1bbb9a are pushed to draft PR #1454. Earlier GitHub push errors resolved. Follow-up qualification remains failed; see lite-index-authority-20261104.json."
 }
