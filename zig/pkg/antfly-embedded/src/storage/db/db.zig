@@ -36900,7 +36900,7 @@ pub const DB = struct {
             const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, index, source, plan);
             defer alloc.free(scope);
             const counts = try DerivedCoverageCounters.load(alloc, read, if (kind == .dense_vector or kind == .sparse_vector) index else scope, generation);
-            const total = counts.source_total orelse (try range_cardinality.loadOrProveEmptyFromTxn(alloc, self.core.store, read)) orelse return false;
+            const total = counts.source_total orelse (try range_cardinality.loadOrProveEmptyFromTxn(read)) orelse return false;
             if (total == 0) continue;
             if (counts.produced == null or counts.skipped == null or counts.terminal_failed != 0 or counts.produced.? +| counts.skipped.? != total) return false;
         }
