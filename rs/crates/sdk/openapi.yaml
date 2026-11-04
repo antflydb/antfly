@@ -22896,6 +22896,8 @@ components:
         next_key:
           type: string
           nullable: true
+          deprecated: true
+          description: Reserved internal checkpoint; omitted from public scan status.
         skipped:
           type: integer
           format: uint64
@@ -22914,6 +22916,8 @@ components:
         verification_cursor:
           type: string
           nullable: true
+          deprecated: true
+          description: Reserved internal checkpoint; omitted from public scan status.
         verification_current:
           type: integer
           format: uint64

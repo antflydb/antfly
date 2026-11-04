@@ -1453,6 +1453,14 @@ pub const AntflyApiHandler = struct {
         include_contextual: bool,
         include_probes: bool,
     ) !void {
+        // Metadata omits data-node contextual routes, but owns privacy control
+        // admission and checkpoint staging for every API issuer.
+        if (comptime @hasDecl(@TypeOf(root_server.*), "routeWithBodyLimit")) {
+            try root_server.routeWithBodyLimit(.PUT, routes.privacy_control_pattern, @import("antfly_public_limits").max_request_body_bytes, httpx.Handler.bind(self, internalPrivacyMutation));
+        } else try root_server.put(routes.privacy_control_pattern, httpx.Handler.bind(self, internalPrivacyMutation));
+        if (comptime @hasDecl(@TypeOf(root_server.*), "postWithBodyLimit")) {
+            try root_server.postWithBodyLimit(routes.privacy_scan_control_pattern, @import("antfly_public_limits").max_request_body_bytes, httpx.Handler.bind(self, internalPrivacyMutation));
+        } else try root_server.post(routes.privacy_scan_control_pattern, httpx.Handler.bind(self, internalPrivacyMutation));
         try root_server.get("/ai/v1/models", httpx.Handler.bind(self, gatewayModels));
         try root_server.postResponseStreaming("/ai/v1/chat/completions", httpx.Handler.bind(self, gatewayChat));
         try root_server.postResponseStreaming("/ai/v1/embeddings", httpx.Handler.bind(self, gatewayEmbeddings));
@@ -10523,6 +10531,21 @@ pub const AntflyApiHandler = struct {
         return respondOwnedApiResponse(ctx, &resp);
     }
 
+    fn internalPrivacyMutation(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        if (try self.internalServiceAuthRejection(ctx)) |response| return response;
+        if (!self.api_server.cfg.privacy_scan_coordinator) return textResponse(ctx, 503, "privacy metadata owner required");
+        const encoded = ctx.param("table_name") orelse return textResponse(ctx, 400, "invalid table");
+        const table = (try decodePathParamOrBadRequest(ctx, encoded)) orelse return ctx.response.build();
+        defer ctx.allocator.free(table);
+        var result = try @import("privacy.zig").handle(self.api_server, ctx.allocator, table, if (ctx.request.method == .PUT) .put else .start_scan, .{
+            .body = (try ctx.body()) orelse "",
+            .if_match = ctx.header("if-match"),
+        }, operationContext(ctx, null));
+        defer if (result.etag) |etag| ctx.allocator.free(etag);
+        if (result.etag) |etag| try ctx.setHeader("ETag", etag);
+        return respondOwnedApiResponse(ctx, &result.response);
+    }
+
     fn privacyRequest(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, action: @import("privacy.zig").Action, scan_id: []const u8) !httpx.Response {
         var identity: ?AuthenticatedIdentity = null;
         defer if (identity) |*value| value.deinit(self.api_server.alloc);
@@ -11265,6 +11288,7 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
         }
 
         pub fn put(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
+            if (@import("http_routes.zig").privacyMutationBodyLimit(prefix ++ path)) |limit| return self.inner.routeWithBodyLimit(.PUT, prefix ++ path, limit, handler_fn);
             try self.inner.put(prefix ++ path, handler_fn);
         }
 

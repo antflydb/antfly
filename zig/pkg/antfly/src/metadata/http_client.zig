@@ -1495,6 +1495,35 @@ pub const MetadataHttpClient = struct {
         };
     }
 
+    /// Privacy admission and checkpoint staging belong to the metadata owner.
+    /// A remote API issuer forwards one mutation, never stages local blobs.
+    pub fn forwardPrivacyMutation(self: *MetadataHttpClient, base_uri: []const u8, table: []const u8, body: []const u8, if_match: ?[]const u8, scan: bool, request: @import("antfly_local_sources").api_operation.RequestContext) !@import("../api/privacy.zig").Response {
+        try request.ensureActive();
+        const encoded = try percentEncodePathComponent(self.alloc, table);
+        defer self.alloc.free(encoded);
+        const path = try std.fmt.allocPrint(self.alloc, "/internal/v1/tables/{s}/privacy{s}", .{ encoded, if (scan) "/scans" else "" });
+        defer self.alloc.free(path);
+        const uri = try join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+        const timeout = (try request.remainingTimeoutMs()) orelse @as(u32, @intCast(@import("antfly_public_limits").Execution.max_timeout_ms));
+        var signal = http_common.RequestCancellation.fromToken(request.cancellation);
+        var timeout_buffer: [20]u8 = undefined;
+        const budget_header = try std.fmt.bufPrint(&timeout_buffer, "{d}", .{@min(timeout, @import("antfly_public_limits").Execution.max_timeout_ms)});
+        const headers = [_]http_common.RequestHeader{
+            .{ .name = @import("antfly_public_limits").Execution.timeout_header, .value = budget_header },
+            .{ .name = "If-Match", .value = if_match orelse "" },
+        };
+        var response = self.executeWithRetryPolicy(.{ .method = if (scan) .POST else .PUT, .uri = uri, .body = body, .content_type = "application/json", .headers = if (if_match != null) &headers else headers[0..1], .timeout_ms = timeout, .cancellation = &signal }, if (request.deadline_ns) |deadline| .{ .deadline_ns = deadline, .cancellation = &signal } else null, .at_most_once) catch |err| switch (err) {
+            error.ReallocationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
+            else => return err,
+        };
+        defer response.deinit(self.alloc);
+        var result: @import("../api/privacy.zig").Response = .{ .response = .{ .status = response.status, .body = try self.alloc.dupe(u8, response.body), .json = true } };
+        errdefer result.deinit(self.alloc);
+        result.etag = if (responseHeader(response, "ETag")) |etag| try self.alloc.dupe(u8, etag) else null;
+        return result;
+    }
+
     pub fn replaceTableDefinition(
         self: *MetadataHttpClient,
         base_uri: []const u8,

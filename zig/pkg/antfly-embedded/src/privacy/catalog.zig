@@ -53,6 +53,7 @@ pub const Scan = struct {
 };
 pub const coverage = @import("coverage.zig");
 pub const Resource = struct {
+    checkpoint_encoding: u8 = 0,
     coverage: coverage.State = .{},
     policy: contract.Policy,
     artifact_name: []const u8 = projection.artifact_name,
@@ -79,6 +80,100 @@ fn writeResource(value: anytype, writer: anytype) !void {
     }
     try writer.endObject();
 }
+
+/// Immutable, generation-qualified key blobs use the existing term-fenced job
+/// state store. Only references enter the table catalog or its configuration CAS.
+pub const checkpoints = struct {
+    pub const prefix = "pk1:";
+    pub const chunk_bytes = 256 * 1024;
+    pub const max_bytes = 65 * 1024 * 1024;
+    pub const max_pending_bytes = 256 * 1024 * 1024;
+    pub const gc_chunks = 8;
+    pub const lease_ms = std.time.ms_per_hour;
+    pub const erase = "\x00";
+    pub const Header = struct {
+        state: enum { staged, ready, deleting } = .staged,
+        length: u32,
+        created_at_millis: i64,
+        attached: bool = false,
+        deleted_chunks: u32 = 0,
+        pub fn chunks(self: @This()) usize {
+            return std.math.divCeil(usize, self.length, chunk_bytes) catch unreachable;
+        }
+    };
+    pub const Ref = struct {
+        digest: [64]u8,
+        generation: [32]u8,
+        pub fn token(self: @This()) [101]u8 {
+            var out: [101]u8 = undefined;
+            @memcpy(out[0..4], prefix);
+            @memcpy(out[4..68], &self.digest);
+            out[68] = ':';
+            @memcpy(out[69..], &self.generation);
+            return out;
+        }
+        pub fn storageKey(self: @This(), buffer: []u8, table: u64, chunk: ?usize) ![]const u8 {
+            const base = try std.fmt.bufPrint(buffer, "privacy/{s}/{x:0>16}/{s}{s}", .{ if (chunk == null) "m" else "c", table, self.digest, self.generation });
+            if (chunk) |index| {
+                const suffix = try std.fmt.bufPrint(buffer[base.len..], "/{x:0>3}", .{index});
+                return buffer[0 .. base.len + suffix.len];
+            }
+            return base;
+        }
+    };
+    pub fn reference(value: []const u8) ?Ref {
+        if (value.len != 101 or !std.mem.startsWith(u8, value, prefix) or value[68] != ':') return null;
+        for (value[4..68]) |byte| if (!std.ascii.isHex(byte)) return null;
+        for (value[69..]) |byte| if (!std.ascii.isHex(byte)) return null;
+        return .{ .digest = value[4..68].*, .generation = value[69..101].* };
+    }
+    pub const Key = struct { table: u64, kind: enum { manifest, chunk, gc, quota }, ref: ?Ref = null, index: usize = 0 };
+    pub fn parseKey(value: []const u8) !Key {
+        var parts = std.mem.splitScalar(u8, value, '/');
+        if (!std.mem.eql(u8, parts.next() orelse "", "privacy")) return error.InvalidDocumentCheckpoint;
+        const kind = parts.next() orelse return error.InvalidDocumentCheckpoint;
+        if (std.mem.eql(u8, kind, "g")) {
+            if (parts.next() != null) return error.InvalidDocumentCheckpoint;
+            return .{ .table = 0, .kind = .gc };
+        }
+        const table = parts.next() orelse return error.InvalidDocumentCheckpoint;
+        if (table.len != 16) return error.InvalidDocumentCheckpoint;
+        var result: Key = .{ .table = std.fmt.parseUnsigned(u64, table, 16) catch return error.InvalidDocumentCheckpoint, .kind = undefined };
+        if (std.mem.eql(u8, kind, "q")) {
+            result.kind = .quota;
+        } else {
+            result.kind = if (std.mem.eql(u8, kind, "m")) .manifest else if (std.mem.eql(u8, kind, "c")) .chunk else return error.InvalidDocumentCheckpoint;
+            const id = parts.next() orelse return error.InvalidDocumentCheckpoint;
+            if (id.len != 96) return error.InvalidDocumentCheckpoint;
+            for (id) |byte| if (!std.ascii.isHex(byte)) return error.InvalidDocumentCheckpoint;
+            result.ref = .{ .digest = id[0..64].*, .generation = id[64..96].* };
+            if (result.kind == .chunk) {
+                const index = parts.next() orelse return error.InvalidDocumentCheckpoint;
+                if (index.len != 3) return error.InvalidDocumentCheckpoint;
+                result.index = std.fmt.parseUnsigned(usize, index, 16) catch return error.InvalidDocumentCheckpoint;
+            }
+        }
+        if (parts.next() != null) return error.InvalidDocumentCheckpoint;
+        return result;
+    }
+    pub fn refs(a: A, resource: Resource) ![]Ref {
+        var result: std.ArrayList(Ref) = .empty;
+        if (resource.checkpoint_encoding == 0) return result.toOwnedSlice(a);
+        if (resource.checkpoint_encoding != 1) return error.InvalidPrivacyCatalog;
+        if (resource.coverage.cursor) |value| if (reference(value)) |ref| try result.append(a, ref);
+        for (resource.scans) |scan| {
+            for ([_][]const u8{ scan.from_key, scan.to_key, scan.next_key orelse "", scan.verification_cursor orelse "" }) |value| {
+                if (reference(value)) |ref| try result.append(a, ref);
+            }
+            if (scan.shard_cursors == .array) for (scan.shard_cursors.array.items) |row| {
+                if (row == .object) if (row.object.get("next_key")) |value| if (value == .string) {
+                    if (reference(value.string)) |ref| try result.append(a, ref);
+                };
+            };
+        }
+        return result.toOwnedSlice(a);
+    }
+};
 
 /// Scheduling hints are derived from durable job state, never serving evidence.
 /// Skip unrelated catalog definitions without constructing their JSON trees.
@@ -204,7 +299,7 @@ pub fn progressOnly(a: A, before: []const u8, after: []const u8) !bool {
     var next_resource = (try current(scratch, rhs)) orelse return false;
     defer next_resource.deinit();
     for ([_]*std.json.Value{ lhs.object.getPtr(key).?, rhs.object.getPtr(key).? }) |value| {
-        inline for (.{ "coverage", "scans", "scan_id", "scan_sequence" }) |name| {
+        inline for (.{ "coverage", "scans", "scan_id", "scan_sequence", "checkpoint_encoding" }) |name| {
             _ = value.object.swapRemove(name);
         }
     }
@@ -225,7 +320,7 @@ pub fn reconcileIndexes(a: A, durable: []const u8, desired: []const u8) !?[]u8 {
     const saved = try std.json.Stringify.valueAlloc(scratch, old.object.get(key).?, .{});
     for ([_]*std.json.Value{ old.object.getPtr(key).?, next_value.object.getPtr(key).? }) |value| {
         if (value.* != .object) return null;
-        inline for (.{ "coverage", "scans", "scan_id", "scan_sequence" }) |name| _ = value.object.swapRemove(name);
+        inline for (.{ "coverage", "scans", "scan_id", "scan_sequence", "checkpoint_encoding" }) |name| _ = value.object.swapRemove(name);
     }
     if (!std.mem.eql(u8, try std.json.Stringify.valueAlloc(scratch, old.object.get(key).?, .{}), try std.json.Stringify.valueAlloc(scratch, next_value.object.get(key).?, .{}))) return null;
     try next_value.object.put(scratch, key, try std.json.parseFromSliceLeaky(std.json.Value, scratch, saved, .{}));
@@ -276,7 +371,7 @@ pub fn next(a: A, before: ?Resource, policy: contract.Policy, if_match: ?[]const
         defer a.free(raw);
         break :scan contract.fingerprint(raw);
     };
-    return .{ .coverage = if (!changed) before.?.coverage else .{}, .policy = policy, .artifact_name = if (policy.mode == .redact_for_search_and_ai) try projection.protectedArtifactName(a, version) else projection.artifact_name, .policy_version = version, .resource_version = if (before) |prior| try std.math.add(u64, prior.resource_version, 1) else 1, .generation = generation, .scan_id = scan_id, .scan_sequence = if (before) |prior| prior.scan_sequence else 0, .scans = if (before) |prior| prior.scans else &.{}, .unprotected_indexes_json = if (before) |prior| prior.unprotected_indexes_json else "" };
+    return .{ .checkpoint_encoding = if (before) |prior| prior.checkpoint_encoding else 0, .coverage = if (!changed) before.?.coverage else .{}, .policy = policy, .artifact_name = if (policy.mode == .redact_for_search_and_ai) try projection.protectedArtifactName(a, version) else projection.artifact_name, .policy_version = version, .resource_version = if (before) |prior| try std.math.add(u64, prior.resource_version, 1) else 1, .generation = generation, .scan_id = scan_id, .scan_sequence = if (before) |prior| prior.scan_sequence else 0, .scans = if (before) |prior| prior.scans else &.{}, .unprotected_indexes_json = if (before) |prior| prior.unprotected_indexes_json else "" };
 }
 
 /// Preserve ordinary catalog entries and replace exactly the managed producer.

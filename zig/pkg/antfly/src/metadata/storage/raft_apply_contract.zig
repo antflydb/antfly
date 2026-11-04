@@ -96,6 +96,8 @@ pub const CatalogCursor = struct {
 /// Replacement/import is reserved for bootstrap; normal DDL sends touched rows.
 pub const StandaloneCatalogUpdate = struct {
     pub const TableReplacement = struct {
+        /// A compact exact-CAS proof avoids duplicating large legacy indexes.
+        expected_indexes_digest: ?[32]u8 = null,
         expected: metadata.TableRecord,
         replacement: metadata.TableRecord,
     };

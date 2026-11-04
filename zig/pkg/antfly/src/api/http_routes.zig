@@ -22,7 +22,28 @@ pub const sql_max_request_body_bytes: usize = 4 << 20;
 pub fn publicPostBodyLimit(path: []const u8) ?usize {
     if (isInternalDocumentReadPath(path)) return @import("antfly_public_limits").max_document_read_body_bytes;
     if (isPrivacyFindingsPath(path)) return @import("antfly_public_limits").max_privacy_findings_body_bytes;
+    if (privacyMutationBodyLimit(path)) |limit| return limit;
     return if (std.mem.eql(u8, path, "/db/v1/sql") or std.mem.startsWith(u8, path, "/db/v1/sql/prepared")) sql_max_request_body_bytes else null;
+}
+
+/// Metadata's ordinary listener cap is smaller than document admission. Keep
+/// privacy control parity with the public API without widening other routes.
+pub fn privacyMutationBodyLimit(raw_path: []const u8) ?usize {
+    const path = if (std.mem.startsWith(u8, raw_path, "/db/v1/")) raw_path[6..] else raw_path;
+    const prefix = if (std.mem.startsWith(u8, path, "/internal/v1/tables/")) "/internal/v1/tables/" else "/tables/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const suffix = if (std.mem.endsWith(u8, path, "/privacy/scans")) "/privacy/scans" else "/privacy";
+    if (!std.mem.endsWith(u8, path, suffix) or path.len <= prefix.len + suffix.len) return null;
+    const table = path[prefix.len .. path.len - suffix.len];
+    if (std.mem.indexOfScalar(u8, table, '/') != null) return null;
+    return @import("antfly_public_limits").max_request_body_bytes;
+}
+
+test "privacy mutation body budgets are shared by public and internal registrars" {
+    const limit = @import("antfly_public_limits").max_request_body_bytes;
+    for ([_][]const u8{ "/db/v1/tables/:tableName/privacy/scans", "/internal/v1/tables/:table_name/privacy/scans" }) |path| try std.testing.expectEqual(@as(?usize, limit), publicPostBodyLimit(path));
+    for ([_][]const u8{ "/db/v1/tables/docs/privacy", "/internal/v1/tables/table%3A123/privacy" }) |path| try std.testing.expectEqual(@as(?usize, limit), privacyMutationBodyLimit(path));
+    for ([_][]const u8{ "/internal/v1/tables/docs/other", "/internal/v1/tables/docs/extra/privacy/scans", "/tables/docs/privacy/findings" }) |path| try std.testing.expect(privacyMutationBodyLimit(path) == null);
 }
 
 /// Internal keys remain in JSON bodies; only group/table identities enter URLs.
@@ -134,6 +155,8 @@ pub const Routes = struct {
     pub const backups = "/backups";
     pub const tables = "/tables";
     pub const tables_prefix = "/tables/";
+    pub const privacy_control_pattern = "/internal/v1/tables/:table_name/privacy";
+    pub const privacy_scan_control_pattern = privacy_control_pattern ++ "/scans";
     pub const transactions = "/transactions";
     pub const transactions_begin = "/transactions/begin";
     pub const transactions_commit = "/transactions/commit";

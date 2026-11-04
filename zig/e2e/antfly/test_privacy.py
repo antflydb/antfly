@@ -1201,3 +1201,59 @@ def test_privacy_large_id_coverage_and_internal_reads(stateful_api, key_bytes):
         timeout=30,
     )
     assert denied.status_code in (401, 403), denied.text[:1000]
+
+
+def test_privacy_large_scan_boundary_is_private_durable_and_keeps_policy_mutable(
+    stateful_api,
+):
+    table = f"privacy_scan_boundary_{uuid4().hex[:8]}"
+    stateful_api.create_table(table)
+    path = f"/tables/{table}/privacy"
+    policy = {"mode": "monitor", "fields": ["body"]}
+    stateful_api.put(path, policy)
+    # The old catalog CAS serialized this boundary twice and could acknowledge
+    # the job, then permanently reject every progress and policy update.
+    response = stateful_api.s.post(
+        stateful_api.url + path + "/scans",
+        json={"from_key": "x" * (33 * 1024 * 1024)},
+        timeout=120,
+    )
+    assert response.status_code == 202, (
+        response.text[:1000],
+        stateful_api.debug_logs(),
+    )
+    assert len(response.content) < 4096
+    scan_id = response.json()["scan_id"]
+    del response
+    if stateful_api.supports_restart:
+        stateful_api.restart_server()
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        scan = stateful_api.get(path + "/scans/" + scan_id)
+        assert len(json.dumps(scan)) < 4096
+        assert all(
+            key not in scan
+            for key in (
+                "from_key",
+                "to_key",
+                "next_key",
+                "shard_cursors",
+                "verification_cursor",
+            )
+        )
+        assert scan["phase"] not in ("failed", "superseded"), scan
+        if scan["phase"] == "succeeded":
+            break
+        time.sleep(0.25)
+    assert scan["phase"] == "succeeded", (scan, stateful_api.debug_logs())
+    current = stateful_api.get(path)
+    response = stateful_api.s.put(
+        stateful_api.url + path,
+        json=policy,
+        headers={"If-Match": current["etag"]},
+        timeout=30,
+    )
+    assert response.status_code == 202, (
+        response.text[:1000],
+        stateful_api.debug_logs(),
+    )

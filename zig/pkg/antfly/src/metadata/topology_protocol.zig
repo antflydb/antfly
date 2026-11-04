@@ -110,11 +110,12 @@ const std = @import("std");
 /// Version 77 isolates issuer outboxes in shared transaction stores.
 /// Version 78 requires backend-wide coordination of shared session mutations.
 /// Version 79 admits privacy-owned consumer graphs and serving fences.
-pub const current_version: u16 = 79;
+/// Version 80 stores private range checkpoints as immutable, owner-fenced blobs.
+pub const current_version: u16 = 80;
 pub const sql_completion_admission_version: u16 = 78;
 pub const sql_completion_owner_version: u16 = 71;
 pub const sql_completion_reference_version: u16 = 69;
-pub const privacy_version: u16 = 79;
+pub const privacy_version: u16 = 80;
 pub fn usesPrivacy(indexes_json: []const u8) bool {
     return std.mem.indexOf(u8, indexes_json, "\"_privacy\"") != null or std.mem.indexOf(u8, indexes_json, "_privacy_document") != null;
 }

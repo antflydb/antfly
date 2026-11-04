@@ -26427,6 +26427,7 @@ const RemoteMetadataSource = struct {
                 .linearizable_routing_snapshot = remoteLinearizableRoutingSnapshot,
                 .free_routing_snapshot = remoteFreeRoutingSnapshot,
                 .create_table = remoteCreateTable,
+                .privacy_mutation = remotePrivacyMutation,
                 .replace_table_definition = remoteReplaceTableDefinition,
                 .replace_table_definition_stamped = remoteReplaceTableDefinitionStamped,
                 .get_lake_index_lifecycle = remoteGetLakeIndexLifecycle,
@@ -26598,8 +26599,23 @@ const RemoteMetadataSource = struct {
         comptime callFn: anytype,
         ctx: anytype,
     ) !T {
-        const deadline_ns = self.awakeNs() +|
+        return self.withMetadataMutationApiClientControlled(T, callFn, ctx, null);
+    }
+
+    fn withMetadataMutationApiClientControlled(
+        self: *RemoteMetadataSource,
+        comptime T: type,
+        comptime callFn: anytype,
+        ctx: anytype,
+        request: ?antfly.public_api.operation.RequestContext,
+    ) !T {
+        var deadline_ns = self.awakeNs() +|
             @as(u64, antfly.public_api.raft_mutation_forwarding.max_remaining_ms) * std.time.ns_per_ms;
+        var signal = if (request) |control| antfly.raft.transport.http_common.RequestCancellation.fromToken(control.cancellation) else antfly.raft.transport.http_common.RequestCancellation{};
+        if (request) |control| {
+            const normalized = try control.platformDeadline();
+            if (normalized.deadline_ns) |deadline| deadline_ns = @min(deadline_ns, self.awakeNs() +| (deadline -| @import("antfly_platform").time.monotonicNs()));
+        }
         var mutation_driver = antfly.public_api.raft_mutation_forwarding.AbsoluteDriver.init(deadline_ns);
         var replay_proof_error: anyerror = error.NotLeader;
         var last_pre_admission_err: anyerror = error.MissingMetadataApi;
@@ -26611,6 +26627,7 @@ const RemoteMetadataSource = struct {
         // make it skip an endpoint or probe the same endpoint twice.
         const start_index = self.metadataApiIndexForAttempt(0);
         for (0..self.base_uris.len) |attempt| {
+            if (request) |control| try control.ensureActive();
             const now_ns = self.awakeNs();
             if (now_ns >= deadline_ns)
                 return replay_proof_error;
@@ -26621,6 +26638,7 @@ const RemoteMetadataSource = struct {
             const discovery_budget = antfly.metadata_http_client.RequestBudget{
                 .deadline_ns = catalogRoutingAttemptDeadline(now_ns, deadline_ns, self.base_uris.len - attempt + 1),
                 .io = self.io,
+                .cancellation = if (request != null) &signal else null,
             };
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
@@ -26666,6 +26684,7 @@ const RemoteMetadataSource = struct {
             return result;
         }
         for (endpoint_discovery.fallbacks()) |index| {
+            if (request) |control| try control.ensureActive();
             if (self.awakeNs() >= deadline_ns)
                 return replay_proof_error;
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -28244,6 +28263,21 @@ const RemoteMetadataSource = struct {
             }
         }.call, .{ .table_name = table_name, .body = body });
         self.invalidateCache();
+    }
+
+    fn remotePrivacyMutation(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, body: []const u8, if_match: ?[]const u8, scan: bool, request: antfly.public_api.operation.RequestContext) !@import("../api/privacy.zig").Response {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        defer self.invalidateCache();
+        return self.withMetadataMutationApiClientControlled(@import("../api/privacy.zig").Response, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, _: antfly.public_api.raft_mutation_forwarding.Context, ctx: anytype) !@import("../api/privacy.zig").Response {
+                var result = try client.forwardPrivacyMutation(base_uri, ctx.table, ctx.body, ctx.if_match, ctx.scan, ctx.request);
+                defer result.deinit(client.alloc);
+                var owned: @import("../api/privacy.zig").Response = .{ .response = .{ .status = result.response.status, .body = try ctx.a.dupe(u8, result.response.body), .json = true } };
+                errdefer owned.deinit(ctx.a);
+                owned.etag = if (result.etag) |etag| try ctx.a.dupe(u8, etag) else null;
+                return owned;
+            }
+        }.call, .{ .a = a, .table = table, .body = body, .if_match = if_match, .scan = scan, .request = request }, request);
     }
 
     fn remoteReplaceTableDefinition(ptr: *anyopaque, expected: antfly.metadata.TableRecord, replacement: antfly.metadata.TableRecord) !void {

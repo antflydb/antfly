@@ -1088,8 +1088,11 @@ const LocalStandaloneMetadata = struct {
         };
     }
 
-    fn privacyAuthorityTerm(_: *anyopaque) !?u64 {
-        return 0;
+    fn privacyAuthorityTerm(ptr: *anyopaque) !?u64 {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return if (self.hot_standby_mirror) |mirror| mirror.publisher.identity().epoch else @as(u64, 1);
     }
     fn nextPrivacyWork(ptr: *anyopaque, a: std.mem.Allocator, now: i64) !?antfly.metadata.table_manager.PrivacyWork {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
@@ -1097,7 +1100,7 @@ const LocalStandaloneMetadata = struct {
         defer self.mutex.unlock();
         const id = self.manager.privacy_work.first(now) orelse return null;
         const table = self.manager.tables.get(id) orelse return error.InvalidPrivacyCatalog;
-        return .{ .term = 0, .table = try antfly.metadata.table_manager.cloneTable(a, table) };
+        return .{ .term = if (self.hot_standby_mirror) |mirror| mirror.publisher.identity().epoch else @as(u64, 1), .table = try antfly.metadata.table_manager.cloneTable(a, table) };
     }
     fn tableRecord(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8) !?antfly.metadata.TableRecord {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
@@ -1393,7 +1396,7 @@ const LocalStandaloneMetadata = struct {
             if (existing == null and (parsed.value.state == .queued or parsed.value.state == .running) and try self.lifecycle_store.?.getJobOwnerCount(self.alloc, group_ids.main_metadata_group_id, parsed.value.owner) >= 16) return error.TooManyActiveJobs;
         }
         try self.applyJobCommandLocked(.{ .compare_and_set_job_state = .{ .key = key, .expected_hash = expected orelse "", .value = value } });
-        const current = (try self.lifecycle_store.?.getJobState(self.alloc, group_ids.main_metadata_group_id, key)) orelse return false;
+        const current = (try self.lifecycle_store.?.getJobState(self.alloc, group_ids.main_metadata_group_id, key)) orelse return std.mem.startsWith(u8, key, "privacy/") and std.mem.eql(u8, value, "\x00");
         defer self.alloc.free(current);
         return std.mem.eql(u8, current, value);
     }
@@ -5017,8 +5020,12 @@ const LocalStandaloneMetadata = struct {
         var changed_tables = mutation.previous_tables.keyIterator();
         while (changed_tables.next()) |id| {
             if (mutation.compare_and_replace_table == id.*) {
+                var expected = mutation.previous_tables.get(id.*).? orelse return error.InvalidStandaloneCatalog;
+                const digest = @import("../metadata/job_state.zig").digest(expected.indexes_json);
+                expected.indexes_json = "";
                 try replacements.append(a, .{
-                    .expected = mutation.previous_tables.get(id.*).? orelse return error.InvalidStandaloneCatalog,
+                    .expected = expected,
+                    .expected_indexes_digest = digest,
                     .replacement = self.manager.tables.get(id.*) orelse return error.InvalidStandaloneCatalog,
                 });
                 continue;

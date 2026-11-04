@@ -27,13 +27,13 @@ class PrivacyScan:
         reprocessed (int | Unset): Documents scheduled for inspection; processing verifies current receipts and
             publication before success.
         failed (int | Unset):
-        next_key (None | str | Unset):
+        next_key (None | str | Unset): Reserved internal checkpoint; omitted from public scan status.
         skipped (int | Unset):
         last_error (None | str | Unset):
         consecutive_errors (int | Unset):
         retry_after_millis (int | Unset):
         updated_at_millis (int | Unset):
-        verification_cursor (None | str | Unset):
+        verification_cursor (None | str | Unset): Reserved internal checkpoint; omitted from public scan status.
         verification_current (int | Unset):
         verification_pending (int | Unset):
         verification_failed (int | Unset):

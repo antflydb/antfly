@@ -7129,6 +7129,10 @@ export interface components {
             reprocessed?: number;
             /** Format: uint64 */
             failed?: number;
+            /**
+             * @deprecated
+             * @description Reserved internal checkpoint; omitted from public scan status.
+             */
             next_key?: string | null;
             /** Format: uint64 */
             skipped?: number;
@@ -7138,6 +7142,10 @@ export interface components {
             retry_after_millis?: number;
             /** Format: int64 */
             updated_at_millis?: number;
+            /**
+             * @deprecated
+             * @description Reserved internal checkpoint; omitted from public scan status.
+             */
             verification_cursor?: string | null;
             /** Format: uint64 */
             verification_current?: number;

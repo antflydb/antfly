@@ -4,7 +4,7 @@ Implements the table-scoped **Privacy** design in
 [issue #1401](https://github.com/antflydb/antfly/issues/1401). The user-facing
 contract and examples are in [Table privacy](../reference/table-privacy.md).
 The branch starts at `f2b3baaee1cb508005451843c17fa07f2e069d4b`.
-Main was merged at `6817ccb184`; privacy uses metadata protocol version 79.
+Main is merged through `ab58a77e243983386345e86969f5f8ddee8811e7`; privacy uses metadata protocol version 80.
 
 ## Policy and user experience
 
@@ -186,9 +186,33 @@ unit jobs and chunk scan/retirement cursors use that same limit; producer and
 child names retain their separate smaller budget. Scan progress stores either
 the shard resumes or a legacy global cursor, avoiding duplicate large keys;
 an empty shard list correctly falls back to the legacy cursor. Public scan
-status omits the private shard checkpoints, keeping polling responses small
-while those native continuations remain durable. Ordinary pages keep their small work
-quantum; one oversized identity can advance a page without starving forever.
+status omits range bounds and every cursor, keeping polling responses small
+while native continuations remain durable. Keys over 4 KiB, and literal keys
+with the reserved reference prefix, are stored as immutable, SHA-256-verified
+generations in metadata job state. The catalog contains only small references;
+workers hydrate only the selected scan or census cursor. Existing raw-key
+catalogs migrate on their next write. A standalone definition CAS sends an
+exact digest of the previous indexes instead of duplicating the legacy payload.
+
+Checkpoint uploads use 256 KiB chunks and a per-table 256 MiB staging quota.
+Completed uploads are reused across catalog CAS retries, so contention cannot
+repeatedly upload the same range key or consume staging quota for each attempt.
+The metadata writer verifies all chunks before marking a generation ready, then
+atomically attaches references with the table update and releases staging quota.
+Unattached generations expire after one hour. The leader collects unreferenced
+generations, including those left by deleted tables or failed uploads, in
+transactions deleting at most eight chunks. Every deletion rechecks current
+catalog references in the same writer transaction; generation identities are
+never reused. Snapshot recovery includes chunks, manifests and deletion progress.
+Protocol version 80 is required on metadata and data nodes. Data coordinators
+forward policy and scan mutations to the metadata owner, preserving preconditions,
+request controls and ambiguous outcomes without replaying scan admission.
+The compiled metadata registrar exposes exactly the two authenticated privacy
+control routes. They opt into the public 64 MiB request allowance through a
+separate route ceiling in the HTTP parser; ordinary metadata routes retain their
+32 MiB fallback limit. Buffered-body accounting covers one full opted-in request.
+Ordinary pages keep their small work quantum; one oversized identity can advance
+a page without starving forever.
 Large control commands borrow bounded shared staging capacity while small
 controls retain reserved headroom. Upload chunks remain 1 MiB. Progress records
 preserve APP1 encoding through 128 chunks and use APP2 above that boundary.
@@ -303,8 +327,13 @@ so authored and canonical executable policies obey the same admission limit.
 Finding deduplication uses a hash index preserving first-seen order and maximum
 confidence across repeated field/window evidence, with expected linear cost.
 
-Findings enumeration reads identifiers only. A per-document arena holds the
-manifest, authoritative source and validation scratch; only accepted findings
+Findings enumeration streams identifiers and stops at 50 IDs or 8 MiB of
+encoded ID rows, allowing one oversized ID. Independent line scratch is released
+before manifest/source reads; enumeration never materializes an entire large-ID
+page before applying its budget. Manifest reads propagate request deadlines and
+cancellation through routing, compiled owners, read-index admission and the
+private HTTP POST, whose remaining budget is enforced again at the receiver.
+A per-document arena holds the manifest, authoritative source and validation scratch; only accepted findings
 survive into the response arena. Inspection and output each have an 8 MiB page
 budget, with one complete document admitted before inspection yields. The
 continuation includes the next unexamined document or finding ordinal, bound
@@ -318,7 +347,32 @@ allocation accounting and failure injection beneath request arenas.
 
 ## Validation
 
-### Current boundary and performance fixes (2026-11-04)
+### Latest checkpoint and findings fixes (2026-11-04)
+
+- Main is incorporated through `ab58a77e243983386345e86969f5f8ddee8811e7`.
+  The qualified final binary is SHA-256
+  `a1cb6458db1f4e211591f928a62fc8060cb82a2e2c3b9cbbeba7701e40bf078d`.
+- Server/focused gate: 109/109 build steps and 45 API/metadata checks passed,
+  plus 145 storage/runtime tests and two active ABI checks. HTTP server and
+  parser regressions passed 173/173, including explicit route opt-in and the
+  unchanged ordinary-body limit.
+- The 33 MiB empty-table boundary lifecycle passes in standalone and Raft,
+  including restart, completion, polling bodies below 4 KiB and another policy
+  update. Calls took 18.54/21.87 seconds respectively, including restart.
+- Upgrade qualification starts the preserved pre-fix binary, persists a raw
+  boundary, switches binaries and verifies completion and another policy update.
+  Standalone covers 33 MiB (77.08-second call); Raft covers 17 MiB
+  (19.93-second call), within the old metadata listener's 32 MiB admission cap.
+- Full lifecycle cohorts on the final binary each passed 16 cases with one
+  optional model skip: standalone 366.27 seconds and Raft 694.88 seconds.
+  Boundary cases are recorded separately above. The final lifecycle suites ran
+  concurrently; these durations are qualification times, not isolated throughput
+  benchmarks. Raft's 5,000,000-byte ID case took 105.64 seconds.
+- TypeScript SDK: 543 passed with one unrelated skip; typecheck and Go SDK tests
+  pass. API/SDK generation, formatting and license checks pass. Inference/model
+  execution is unchanged; these fixes do not add a new GPU qualification run.
+
+### Earlier boundary and performance fixes (2026-11-04)
 
 - Merged main at `ab58a77e24` and regenerated the API, SDKs and dashboard types.
 - Focused contracts pass 145 native tests without leaks, 37 API tests and two

@@ -19,6 +19,7 @@
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const catalog = local.privacy_catalog;
+const key_checkpoints = @import("privacy_checkpoints.zig");
 const contract = local.privacy_contract;
 const projection = local.privacy_document;
 const metadata = @import("../metadata/table_manager.zig");
@@ -63,6 +64,11 @@ pub fn handle(server: anytype, a: A, table: []const u8, action: Action, args: Ar
         error.PrivacyProtocolUpgradeRequired => failure(a, 422, "privacy_upgrade_required", "Upgrade every metadata and data node before installing a privacy policy."),
         error.PrivacyProtectiveInstallationRequired => failure(a, 422, "privacy_protection_unavailable", "Protected consumers and serving fences must be available before enabling redaction."),
         error.PrivacySynchronousIngestionRequired => failure(a, 422, "privacy_synchronous_ingestion_required", "Pre-storage redaction requires a synchronous pre-persistence transformation path."),
+        error.MetadataMutationOutcomeUnknown => blk: {
+            var response = try failure(a, 409, "privacy_mutation_outcome_unknown", "The mutation outcome is unknown; inspect policy and scan status before retrying.");
+            response.response.metadata_mutation_outcome = .unknown;
+            break :blk response;
+        },
         error.TableGenerationChanged, error.TableTransitionActive => failure(a, 409, "privacy_catalog_changed", "The table changed; reload and retry."),
         error.StorageBusy, error.IndexRebuilding, error.StorageReadTemporarilyUnavailable => failure(a, 503, "privacy_storage_unavailable", "Privacy storage is rebuilding or busy; retry."),
         error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => failure(a, 503, "privacy_leader_unavailable", "The metadata leader is unavailable; retry."),
@@ -168,11 +174,26 @@ const CoverageCensus = struct {
 };
 
 fn scanResponse(a: A, code: u16, scan: catalog.Scan) !Response {
-    // Shard checkpoints are private native continuation state. Polling a
-    // public job must not copy every retained document key into its response.
-    var summary = scan;
-    summary.shard_cursors = .null;
-    return json(a, code, summary);
+    // Public progress is a bounded DTO. Keys and owner continuation state
+    // remain durable implementation details, never polling response payload.
+    return json(a, code, .{
+        .scan_id = scan.scan_id[0..],
+        .policy_version = scan.policy_version[0..],
+        .phase = scan.phase,
+        .scanned = scan.scanned,
+        .reprocessed = scan.reprocessed,
+        .skipped = scan.skipped,
+        .failed = scan.failed,
+        .failures = scan.failures,
+        .last_error = scan.last_error,
+        .consecutive_errors = scan.consecutive_errors,
+        .retry_after_millis = scan.retry_after_millis,
+        .updated_at_millis = scan.updated_at_millis,
+        .verification_current = scan.verification_current,
+        .verification_pending = scan.verification_pending,
+        .verification_failed = scan.verification_failed,
+        .verification_blocked = scan.verification_blocked,
+    });
 }
 
 fn coverageForRange(server: anytype, a: A, table: []const u8, resource: catalog.Resource, collect: bool, request: operation.RequestContext, from_key: []const u8, to_key: []const u8, limit: u32) ![]const u8 {
@@ -251,14 +272,16 @@ fn coverageForRange(server: anytype, a: A, table: []const u8, resource: catalog.
 }
 
 fn execute(server: anytype, a: A, table: []const u8, action: Action, args: Arguments, request: operation.RequestContext) !Response {
-    if (action != .put and action != .start_scan) return executeAttempt(server, a, table, action, args, request);
+    if (action != .put and action != .start_scan) return executeAttempt(server, a, table, action, args, request, null);
+    var uploads: key_checkpoints.RetryCache = .{ .a = a };
+    defer uploads.deinit();
     for (0..8) |attempt| {
         // The request allocator may itself be an arena. Independent backing
         // ensures contention releases each attempt before loading another cut.
         var arena = std.heap.ArenaAllocator.init(platform_allocator.reclaimingScratch(a));
         defer arena.deinit();
         const scratch = arena.allocator();
-        var result = executeAttempt(server, scratch, table, action, args, request) catch |err| {
+        var result = executeAttempt(server, scratch, table, action, args, request, &uploads) catch |err| {
             if (err != error.PrivacyCatalogRetry) return err;
             if (attempt == 7) return error.TableGenerationChanged;
             continue;
@@ -273,8 +296,11 @@ fn execute(server: anytype, a: A, table: []const u8, action: Action, args: Argum
     unreachable;
 }
 
-fn executeAttempt(server: anytype, a: A, table: []const u8, action: Action, args: Arguments, request: operation.RequestContext) !Response {
+fn executeAttempt(server: anytype, a: A, table: []const u8, action: Action, args: Arguments, request: operation.RequestContext, uploads: ?*key_checkpoints.RetryCache) !Response {
     try request.ensureActive();
+    if (comptime @hasDecl(@TypeOf(server.source), "forwardPrivacyMutation")) {
+        if (action == .put or action == .start_scan) if (try server.source.forwardPrivacyMutation(a, table, args.body, args.if_match, action == .start_scan, request)) |response| return response;
+    }
     const before = (try server.loadOwnedTableRecord(a, table)) orelse return failure(a, 404, "table_not_found", "Table not found.");
     defer metadata.freeTable(a, before);
     var stored = try load(a, before.indexes_json);
@@ -298,6 +324,10 @@ fn executeAttempt(server: anytype, a: A, table: []const u8, action: Action, args
         if (stored == null or !std.mem.eql(u8, &stored.?.value.policy_version, &resource.policy_version)) {
             _ = try catalog.startScan(arena.allocator(), &resource, "", "", 100);
         }
+        const term = (try server.source.privacyAuthorityTerm()) orelse return error.NotLeader;
+        var checkpoint = try key_checkpoints.Context.init(server, a, before.table_id, term, if (stored) |value| value.value else resource, request);
+        if (uploads) |cache| checkpoint.reuseUploads(cache);
+        try checkpoint.encodeResource(&resource);
         const raw = try catalog.install(a, before.indexes_json, resource);
         defer a.free(raw);
         try @import("indexes.zig").validateArtifactEnrichmentsForTableIndexesJson(a, raw);
@@ -329,6 +359,10 @@ fn executeAttempt(server: anytype, a: A, table: []const u8, action: Action, args
         defer arena.deinit();
         var resource = current;
         const scan = try catalog.startScan(arena.allocator(), &resource, input.value.from_key, input.value.to_key, input.value.limit);
+        const term = (try server.source.privacyAuthorityTerm()) orelse return error.NotLeader;
+        var checkpoint = try key_checkpoints.Context.init(server, a, before.table_id, term, current, request);
+        if (uploads) |cache| checkpoint.reuseUploads(cache);
+        try checkpoint.encodeResource(&resource);
         const raw = try catalog.replaceResource(a, before.indexes_json, resource);
         defer a.free(raw);
         var replacement = before;
@@ -558,6 +592,73 @@ test "privacy cursors round trip large escaped keys and reject malformed payload
     try std.testing.expectEqualDeep(cursor, legacy_decoded);
 }
 
+/// Collect only a bounded identifier prefix. The independent line scratch is
+/// released before any source/manifest read, including for an oversized ID.
+const FindingsIDs = struct {
+    a: A,
+    transient: A,
+    keys: std.ArrayList([]const u8) = .empty,
+    buffer: std.ArrayListUnmanaged(u8) = .empty,
+    arena: std.heap.ArenaAllocator,
+    bytes: usize = 0,
+    budget: usize = @import("antfly_public_limits").privacy_findings_page_bytes,
+    stopped: bool = false,
+
+    fn init(a: A) FindingsIDs {
+        const transient = platform_allocator.reclaimingScratch(a);
+        return .{ .a = a, .transient = transient, .arena = std.heap.ArenaAllocator.init(transient) };
+    }
+    fn deinit(self: *FindingsIDs) void {
+        self.buffer.deinit(self.transient);
+        self.arena.deinit();
+    }
+    fn start(_: ?*anyopaque) !void {}
+    fn write(raw: ?*anyopaque, bytes: []const u8) !void {
+        const self: *FindingsIDs = @ptrCast(@alignCast(raw.?));
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        while (lines.next()) |part| {
+            if (part.len > 6 * cursor_max_key_bytes + 64 -| self.buffer.items.len) return error.InvalidPrivacyCursor;
+            try self.buffer.appendSlice(self.transient, part);
+            if (lines.index == null) break;
+            if (self.buffer.items.len == 0) continue;
+            defer self.buffer.clearRetainingCapacity();
+            if (self.keys.items.len != 0 and self.buffer.items.len > self.budget -| self.bytes) {
+                self.stopped = true;
+                return error.Canceled;
+            }
+            defer _ = self.arena.reset(.retain_capacity);
+            const row = try std.json.parseFromSliceLeaky(struct { _id: []const u8 }, self.arena.allocator(), self.buffer.items, .{ .ignore_unknown_fields = true });
+            if (row._id.len > cursor_max_key_bytes) return error.InvalidPrivacyCursor;
+            try self.keys.append(self.a, try self.a.dupe(u8, row._id));
+            self.bytes +|= self.buffer.items.len + 1;
+            if (self.keys.items.len == 50 or self.bytes >= self.budget) {
+                self.stopped = true;
+                return error.Canceled;
+            }
+        }
+    }
+};
+
+test "privacy findings ID enumeration budgets wire bytes and admits one oversized ID" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ids = FindingsIDs.init(a);
+    defer ids.deinit();
+    ids.budget = 30;
+    try std.testing.expectError(error.Canceled, FindingsIDs.write(&ids, "{\"_id\":\"first\"}\n{\"_id\":\"second\"}\n"));
+    try std.testing.expect(ids.stopped);
+    try std.testing.expectEqual(@as(usize, 1), ids.keys.items.len);
+    try std.testing.expectEqualStrings("first", ids.keys.items[0]);
+    var oversized = FindingsIDs.init(a);
+    defer oversized.deinit();
+    oversized.budget = 1;
+    try FindingsIDs.write(&oversized, "{\"_id\":");
+    try std.testing.expectError(error.Canceled, FindingsIDs.write(&oversized, "\"large\"}\n"));
+    try std.testing.expectEqualStrings("large", oversized.keys.items[0]);
+    try std.testing.expect(oversized.stopped);
+}
+
 fn findings(server: anytype, a: A, table: []const u8, resource: catalog.Resource, args: Arguments, request: operation.RequestContext) !Response {
     if (args.limit == 0 or args.limit > 1000) return error.InvalidPrivacyPage;
     if (args.policy_version) |version| if (!std.mem.eql(u8, version, &resource.policy_version)) return failure(a, 410, "privacy_policy_superseded", "Findings for this policy version are no longer current.");
@@ -569,21 +670,22 @@ fn findings(server: anytype, a: A, table: []const u8, resource: catalog.Resource
     const cursor = if (args.cursor) |value| try cursorDecode(scratch, value) else Cursor{ .policy_version = resource.policy_version, .filter = filter };
     if (!std.mem.eql(u8, &cursor.policy_version, &resource.policy_version) or !std.mem.eql(u8, &filter, &cursor.filter)) return error.InvalidPrivacyCursor;
     const source = server.table_reads orelse return error.PrivacyReadUnavailable;
-    // Enumerate identifiers only. Each source and manifest lives in a separate
-    // arena, released before advancing to the next document.
     var documents: std.ArrayList([]const u8) = .empty;
+    var more_ids = false;
     if (args.document) |key| {
         try documents.append(scratch, key);
     } else {
-        var page = (try source.scan(scratch, table, cursor.document, "", .{ .privacy_original = true, .inclusive_from = cursor.inclusive, .limit = 50, .include_documents = false, .execution_deadline_ns = request.deadline_ns, .cancellation = request.cancellation }, .read_index)) orelse return error.PrivacyReadUnavailable;
-        defer page.deinit(scratch);
-        var lines = std.mem.splitScalar(u8, page.ndjson, '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            const Row = struct { _id: []const u8 };
-            const row = try std.json.parseFromSlice(Row, scratch, line, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
-            try documents.append(scratch, row.value._id);
-        }
+        var ids = FindingsIDs.init(scratch);
+        defer ids.deinit();
+        const complete = source.scanStream(scratch, table, cursor.document, "", .{ .privacy_original = true, .inclusive_from = cursor.inclusive, .limit = 50, .include_documents = false, .execution_deadline_ns = request.deadline_ns, .cancellation = request.cancellation }, .read_index, .{ .context = &ids, .start_fn = FindingsIDs.start, .write_fn = FindingsIDs.write }) catch |err| blk: {
+            if (ids.stopped and (err == error.Canceled or err == error.Cancelled)) break :blk false;
+            return err;
+        };
+        try request.ensureActive();
+        if (!complete and !ids.stopped) return error.PrivacyReadUnavailable;
+        if (ids.buffer.items.len != 0) return error.InvalidPrivacyReceipt;
+        documents = ids.keys;
+        more_ids = ids.stopped or documents.items.len == 50;
     }
     var output: std.json.Value = .{ .array = std.array_list.Managed(std.json.Value).init(scratch) };
     var examined: usize = 0;
@@ -604,7 +706,7 @@ fn findings(server: anytype, a: A, table: []const u8, resource: catalog.Resource
         const doc = document_arena.allocator();
         try request.ensureActive();
         examined += 1;
-        var manifest = (try source.documentArtifactManifest(doc, table, key, resource.artifact_name, .read_index)) orelse {
+        var manifest = (try source.documentArtifactManifestControlled(doc, table, key, resource.artifact_name, .read_index, .{ .execution_deadline_ns = request.deadline_ns, .cancellation = request.cancellation })) orelse {
             pending += 1;
             continue;
         };
@@ -673,7 +775,7 @@ fn findings(server: anytype, a: A, table: []const u8, resource: catalog.Resource
         }
         if (continuation != null) break;
     }
-    if (continuation == null and args.document == null and documents.items.len == 50) continuation = try cursorEncode(scratch, .{ .policy_version = resource.policy_version, .filter = filter, .document = documents.items[documents.items.len - 1] });
+    if (continuation == null and args.document == null and more_ids and documents.items.len != 0) continuation = try cursorEncode(scratch, .{ .policy_version = resource.policy_version, .filter = filter, .document = documents.items[documents.items.len - 1] });
     return json(a, 200, .{ .policy_version = resource.policy_version[0..], .findings = output, .next_cursor = continuation, .examined_documents = examined, .pending_documents = pending });
 }
 
@@ -742,6 +844,7 @@ test "privacy scans schedule the oldest runnable job within a table" {
 pub fn advanceOnce(server: anytype, a: A) !void {
     if (!server.cfg.catalog_publication_authority_available) return;
     if (server.cfg.deployment_mode != .standalone and !server.cfg.privacy_scan_coordinator) return;
+    try key_checkpoints.collect(server, a);
     const writes = server.table_writes orelse return;
     const now: i64 = @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_ms));
     const work = (server.source.nextPrivacyWork(a, now) catch |err| {
@@ -756,25 +859,30 @@ pub fn advanceOnce(server: anytype, a: A) !void {
     }) orelse return error.InvalidPrivacyCatalog;
     defer current.deinit();
     var resource = current.value;
+    var checkpoint = try key_checkpoints.Context.init(server, a, table.table_id, work.term, resource, .{});
     var chosen = .{ .scan = nextRunnableScan(resource.scans, now) };
     if (resource.coverage.retry_after_millis <= now and
         (chosen.scan == null or resource.coverage.updated_at_millis < resource.scans[chosen.scan.?].updated_at_millis)) chosen.scan = null;
     {
         if (chosen.scan == null) {
             if (resource.coverage.started_at_millis == 0) resource.coverage.started_at_millis = now;
-            const page = try coverageForRange(server, a, table.name, resource, true, .{}, resource.coverage.cursor orelse "", "", resource.coverage.page_size);
+            const cursor = try checkpoint.decode(resource.coverage.cursor orelse "");
+            const page = try coverageForRange(server, a, table.name, resource, true, .{}, cursor, "", resource.coverage.page_size);
             const completed_at: i64 = @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_ms));
             try catalog.coverage.accept(a, &resource.coverage, page, completed_at);
+            try checkpoint.encodeResource(&resource);
             try persistScan(server, a, table, resource, work.term);
             return;
         }
-        for (resource.scans[chosen.scan.?..][0..1], chosen.scan.?..) |scan, index| {
+        for (resource.scans[chosen.scan.?..][0..1], chosen.scan.?..) |stored_scan, index| {
+            const scan = try checkpoint.decodeScan(stored_scan);
             if (scan.phase != .queued and scan.phase != .running and scan.phase != .processing) continue;
             if (scan.retry_after_millis > now) continue;
             const scans = try a.dupe(catalog.Scan, resource.scans);
             defer a.free(scans);
             resource.scans = scans;
             const updated = &scans[index];
+            updated.* = scan;
             updated.updated_at_millis = now;
             if (!std.mem.eql(u8, &scan.policy_version, &resource.policy_version)) {
                 updated.phase = .superseded;
@@ -811,6 +919,7 @@ pub fn advanceOnce(server: anytype, a: A) !void {
                         }
                     }
                 }
+                try checkpoint.encodeResource(&resource);
                 try persistScan(server, a, table, resource, work.term);
                 return;
             } else {
@@ -831,17 +940,20 @@ pub fn advanceOnce(server: anytype, a: A) !void {
                             // worker's authority. Yield its queue position;
                             // persistScan independently fences our own term.
                             verificationUnavailable(updated, now, @errorName(err));
+                            try checkpoint.encodeResource(&resource);
                             try persistScan(server, a, table, resource, work.term);
                             return;
                         },
                         else => {},
                     }
                     scanError(updated, now, @errorName(err));
+                    try checkpoint.encodeResource(&resource);
                     try persistScan(server, a, table, resource, work.term);
                     return;
                 };
                 if (result == null) {
                     scanError(updated, now, "PrivacyReadUnavailable");
+                    try checkpoint.encodeResource(&resource);
                     try persistScan(server, a, table, resource, work.term);
                     return;
                 }
@@ -868,9 +980,11 @@ pub fn advanceOnce(server: anytype, a: A) !void {
                 defer failures.deinit();
                 updated.failures = try catalog.coverage.appendFailures(a, updated.failures, failures.value);
                 updated.phase = if (pass.next_key != null or pass.shard_cursors.len != 0) .running else if (updated.failed != 0) .failed else .processing;
+                try checkpoint.encodeResource(&resource);
                 try persistScan(server, a, table, resource, work.term);
                 return;
             }
+            try checkpoint.encodeResource(&resource);
             try persistScan(server, a, table, resource, work.term);
             return;
         }
@@ -1090,6 +1204,16 @@ test "privacy findings enumerate IDs and release document arenas before byte-bud
             for (0..50) |i| try rows.appendSlice(a, try std.fmt.allocPrint(a, "{{\"_id\":\"doc-{d}\"}}\n", .{i}));
             return .{ .ndjson = try rows.toOwnedSlice(a) };
         }
+        fn scanStream(self: *@This(), a: A, table: []const u8, from: []const u8, to: []const u8, opts: local.storage_db_types.ScanOptions, consistency: local.storage_read_consistency.ReadConsistency, sink: local.api_table_read_source.ScanStreamSink) !bool {
+            var page = (try self.scan(a, table, from, to, opts, consistency)).?;
+            defer page.deinit(a);
+            try sink.start();
+            try sink.write(page.ndjson);
+            return true;
+        }
+        fn documentArtifactManifestControlled(self: *@This(), a: A, table: []const u8, key: []const u8, artifact: []const u8, consistency: local.storage_read_consistency.ReadConsistency, _: local.storage_db_types.LookupOptions) !?local.storage_db_types.DocumentArtifactManifest {
+            return self.documentArtifactManifest(a, table, key, artifact, consistency);
+        }
         fn documentArtifactManifest(self: *@This(), a: A, _: []const u8, key: []const u8, artifact: []const u8, _: local.storage_read_consistency.ReadConsistency) !?local.storage_db_types.DocumentArtifactManifest {
             // The previous document's complete JSON trees must be gone.
             try std.testing.expect(self.tracker.allocated_bytes - self.tracker.freed_bytes < 256 * 1024);
@@ -1263,11 +1387,13 @@ test "privacy scan polling omits large private shard checkpoints without mutatin
     try checkpoint.object.put(a, "next_key", .{ .string = key });
     var checkpoints: std.json.Value = .{ .array = std.array_list.Managed(std.json.Value).init(a) };
     try checkpoints.array.append(checkpoint);
-    const scan: catalog.Scan = .{ .scan_id = @splat('a'), .policy_version = @splat('b'), .phase = .running, .shard_cursors = checkpoints };
+    const scan: catalog.Scan = .{ .scan_id = @splat('a'), .policy_version = @splat('b'), .phase = .running, .from_key = key, .to_key = key, .next_key = key, .verification_cursor = key, .shard_cursors = checkpoints };
     const result = try scanResponse(a, 200, scan);
     try std.testing.expect(result.response.body.len < 4096);
     try std.testing.expectEqual(@as(usize, 1_100_000), scan.shard_cursors.array.items[0].object.get("next_key").?.string.len);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, result.response.body, .{});
-    try std.testing.expect(parsed.value.object.get("shard_cursors").? == .null);
+    inline for (.{ "shard_cursors", "from_key", "to_key", "next_key", "verification_cursor" }) |name| {
+        try std.testing.expect(!parsed.value.object.contains(name));
+    }
     try std.testing.expectEqualStrings("running", parsed.value.object.get("phase").?.string);
 }

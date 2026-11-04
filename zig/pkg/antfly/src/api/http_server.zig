@@ -2033,6 +2033,7 @@ pub const StatusSource = struct {
         tracks_sql_submission: bool = false,
         system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 = null,
 
+        privacy_mutation: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, ?[]const u8, bool, api_operation.RequestContext) anyerror!@import("privacy.zig").Response = null,
         privacy_authority_term: ?*const fn (*anyopaque) anyerror!?u64 = null,
         privacy_work: ?*const fn (*anyopaque, std.mem.Allocator, i64) anyerror!?metadata_table_manager.PrivacyWork = null,
         table_record: ?*const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!?metadata_table_manager.TableRecord = null,
@@ -2111,6 +2112,11 @@ pub const StatusSource = struct {
 
     /// The shared public data-admission boundary. Ownership is captured with
     /// catalog identity, so every HTTP/MCP/SQL resolver gets the same decision.
+    pub fn forwardPrivacyMutation(self: StatusSource, a: std.mem.Allocator, table: []const u8, body: []const u8, if_match: ?[]const u8, scan: bool, request: api_operation.RequestContext) !?@import("privacy.zig").Response {
+        const call = self.vtable.privacy_mutation orelse return null;
+        return try BoundaryAbi.call("privacy_mutation", self.boundary_dispatch, call, .{ self.ptr, a, table, body, if_match, scan, request });
+    }
+
     pub fn privacyAuthorityTerm(self: StatusSource) !?u64 {
         const call = self.vtable.privacy_authority_term orelse return null;
         return BoundaryAbi.call("privacy_authority_term", self.boundary_dispatch, call, .{self.ptr});
@@ -4129,6 +4135,7 @@ pub const ApiHttpServer = struct {
     index_installation_owner_id: u64 = 0,
     index_installation_closing: std.atomic.Value(bool) = .init(false),
     privacy_scan_in_flight: std.atomic.Value(bool) = .init(false),
+    privacy_checkpoint_gc: @import("privacy_checkpoints.zig").GC = .{},
     index_installation_worker_in_flight: std.atomic.Value(bool) = .init(false),
     index_installation_mutex: std.atomic.Mutex = .unlocked,
     index_installation_apply_mutex: std.atomic.Mutex = .unlocked,

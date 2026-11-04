@@ -43671,12 +43671,14 @@ pub const PrivacyScan = struct {
     /// Documents scheduled for inspection; processing verifies current receipts and publication before success.
     reprocessed: ?u64 = null,
     failed: ?u64 = null,
+    /// Reserved internal checkpoint; omitted from public scan status.
     next_key: OpenApiOptionalNullable([]const u8) = .absent,
     skipped: ?u64 = null,
     last_error: OpenApiOptionalNullable([]const u8) = .absent,
     consecutive_errors: ?i64 = null,
     retry_after_millis: ?i64 = null,
     updated_at_millis: ?i64 = null,
+    /// Reserved internal checkpoint; omitted from public scan status.
     verification_cursor: OpenApiOptionalNullable([]const u8) = .absent,
     verification_current: ?u64 = null,
     verification_pending: ?u64 = null,

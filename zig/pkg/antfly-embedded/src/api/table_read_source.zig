@@ -562,6 +562,15 @@ pub const TableReadSource = struct {
             artifact_name: []const u8,
             consistency: read_gate.ReadConsistency,
         ) anyerror!?db_types.DocumentArtifactManifest = null,
+        document_artifact_manifest_controlled: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            consistency: read_gate.ReadConsistency,
+            opts: db_types.LookupOptions,
+        ) anyerror!?db_types.DocumentArtifactManifest = null,
         document_artifact_manifests: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -578,7 +587,18 @@ pub const TableReadSource = struct {
             artifact_name: []const u8,
             consistency: read_gate.ReadConsistency,
         ) anyerror!?db_types.DocumentArtifactManifest = null,
+        document_artifact_manifest_group_local_controlled: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            consistency: read_gate.ReadConsistency,
+            opts: db_types.LookupOptions,
+        ) anyerror!?db_types.DocumentArtifactManifest = null,
         document_artifact_manifest_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8, []const u8, read_gate.ReadConsistency) anyerror!?db_types.DocumentArtifactManifest = null,
+        document_artifact_manifest_group_local_routed_controlled: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8, []const u8, read_gate.ReadConsistency, db_types.LookupOptions) anyerror!?db_types.DocumentArtifactManifest = null,
         document_artifact_manifests_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -792,6 +812,40 @@ pub const TableReadSource = struct {
             });
         }
         return .{ .entries = try entries.toOwnedSlice(alloc) };
+    }
+
+    fn checkManifestControl(opts: db_types.LookupOptions) !void {
+        if (opts.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        if (opts.execution_deadline_ns) |deadline| if (opts.executionNowNs() >= deadline) return error.DeadlineExceeded;
+    }
+
+    pub fn documentArtifactManifestControlled(self: TableReadSource, alloc: std.mem.Allocator, table: []const u8, key: []const u8, artifact: []const u8, consistency: read_gate.ReadConsistency, opts: db_types.LookupOptions) !?db_types.DocumentArtifactManifest {
+        try checkManifestControl(opts);
+        const call = self.vtable.document_artifact_manifest_controlled orelse {
+            if (opts.execution_deadline_ns != null or opts.cancellation != null) return error.StorageReadTemporarilyUnavailable;
+            return self.documentArtifactManifest(alloc, table, key, artifact, consistency);
+        };
+        var result = try BoundaryAbi.call("document_artifact_manifest_controlled", self.boundary_dispatch, call, .{ self.ptr, alloc, table, key, artifact, consistency, opts });
+        errdefer if (result) |*value| value.deinit(alloc);
+        try checkManifestControl(opts);
+        return result;
+    }
+
+    pub fn documentArtifactManifestGroupLocalControlled(self: TableReadSource, alloc: std.mem.Allocator, group: u64, table: []const u8, key: []const u8, artifact: []const u8, consistency: read_gate.ReadConsistency, opts: db_types.LookupOptions) !?db_types.DocumentArtifactManifest {
+        try checkManifestControl(opts);
+        var result = if (self.route_fence) |fence| blk: {
+            const call = self.vtable.document_artifact_manifest_group_local_routed_controlled orelse return error.CatalogRouteFenceUnsupported;
+            break :blk try BoundaryAbi.call("document_artifact_manifest_group_local_routed_controlled", self.boundary_dispatch, call, .{ self.ptr, alloc, fence, group, table, key, artifact, consistency, opts });
+        } else blk: {
+            const call = self.vtable.document_artifact_manifest_group_local_controlled orelse {
+                if (opts.execution_deadline_ns != null or opts.cancellation != null) return error.StorageReadTemporarilyUnavailable;
+                return self.documentArtifactManifestGroupLocal(alloc, group, table, key, artifact, consistency);
+            };
+            break :blk try BoundaryAbi.call("document_artifact_manifest_group_local_controlled", self.boundary_dispatch, call, .{ self.ptr, alloc, group, table, key, artifact, consistency, opts });
+        };
+        errdefer if (result) |*value| value.deinit(alloc);
+        try checkManifestControl(opts);
+        return result;
     }
 
     pub fn documentArtifactManifest(

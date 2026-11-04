@@ -2862,6 +2862,37 @@ pub const ApiHttpClient = struct {
         }
     }
 
+    pub fn fetchGroupDocumentArtifactManifestControlled(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table: []const u8, key: []const u8, artifact: []const u8, opts: db_mod.types.LookupOptions) !QueryResponse {
+        if (opts.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        const now = opts.executionNowNs();
+        const timeout: ?u32 = if (opts.execution_deadline_ns) |deadline| blk: {
+            if (now >= deadline) return error.Timeout;
+            break :blk @intCast(@min(@as(u64, std.math.maxInt(u32)), @max(@as(u64, 1), std.math.divCeil(u64, deadline - now, std.time.ns_per_ms) catch 1)));
+        } else null;
+        const encoded_table = try percentEncodePathComponent(self.alloc, table);
+        defer self.alloc.free(encoded_table);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}/document-read", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_table });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try @import("http_routes.zig").DocumentReadRequest.encode(self.alloc, .manifest, key, "", artifact);
+        defer self.alloc.free(body);
+        var cancellation = if (opts.cancellation) |token| http_common.RequestCancellation.fromToken(token) else http_common.RequestCancellation{};
+        var buffer: [20]u8 = undefined;
+        const budget = if (timeout) |milliseconds| try std.fmt.bufPrint(&buffer, "{d}", .{@min(milliseconds, @import("antfly_public_limits").Execution.max_timeout_ms)}) else "";
+        const headers = [_]http_common.RequestHeader{.{ .name = @import("antfly_public_limits").Execution.timeout_header, .value = budget }};
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .headers = if (timeout != null) &headers else &.{}, .timeout_ms = timeout, .cancellation = if (opts.cancellation != null) &cancellation else null });
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200 => return .{ .body = try self.alloc.dupe(u8, response.body) },
+            404 => return error.NotFound,
+            408, 504 => return error.Timeout,
+            409 => return remoteGroupConflictError(response.body),
+            503 => return remoteStorageReadUnavailableError(response.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+    }
+
     pub fn fetchGroupDocumentArtifactManifest(
         self: *ApiHttpClient,
         base_uri: []const u8,

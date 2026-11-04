@@ -165,13 +165,13 @@ components:
         scanned: {type: integer, format: uint64}
         reprocessed: {type: integer, format: uint64, description: Documents scheduled for inspection; processing verifies current receipts and publication before success.}
         failed: {type: integer, format: uint64}
-        next_key: {type: string, nullable: true}
+        next_key: {type: string, nullable: true, deprecated: true, description: Reserved internal checkpoint; omitted from public scan status.}
         skipped: {type: integer, format: uint64}
         last_error: {type: string, nullable: true}
         consecutive_errors: {type: integer, minimum: 0}
         retry_after_millis: {type: integer, format: int64}
         updated_at_millis: {type: integer, format: int64}
-        verification_cursor: {type: string, nullable: true}
+        verification_cursor: {type: string, nullable: true, deprecated: true, description: Reserved internal checkpoint; omitted from public scan status.}
         verification_current: {type: integer, format: uint64}
         verification_pending: {type: integer, format: uint64}
         verification_failed: {type: integer, format: uint64}

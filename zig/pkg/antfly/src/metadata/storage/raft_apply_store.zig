@@ -11594,11 +11594,16 @@ pub const RaftApplyStore = struct {
             const key = try tableKeyForGroup(&key_buf, group_id, change.expected.table_id);
             const before = try decodeTableRecord(self.alloc, (try stagingGet(&txn, key)) orelse return error.TableGenerationChanged);
             defer metadata_table_manager.freeTable(self.alloc, before);
-            if (!metadata_table_manager.tableDefinitionsEqual(before, change.expected)) return error.TableGenerationChanged;
+            var expected = change.expected;
+            if (change.expected_indexes_digest) |digest| {
+                if (expected.indexes_json.len != 0 or !std.mem.eql(u8, &digest, &@import("../job_state.zig").digest(before.indexes_json))) return error.TableGenerationChanged;
+                expected.indexes_json = before.indexes_json;
+            }
+            if (!metadata_table_manager.tableDefinitionsEqual(before, expected)) return error.TableGenerationChanged;
             // Reuse replicated lifecycle admission, including owner coverage,
             // dependencies and topology fences. A rejected CAS aborts the whole
             // local transaction, including its logical delta and standby record.
-            try self.applyTableCompareAndReplaceTxn(&txn, group_id, change.expected, change.replacement);
+            try self.applyTableCompareAndReplaceTxn(&txn, group_id, expected, change.replacement);
             const actual = try decodeTableRecord(self.alloc, (try stagingGet(&txn, key)) orelse return error.TableLifecycleConflict);
             defer metadata_table_manager.freeTable(self.alloc, actual);
             var projection_arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -14805,6 +14810,7 @@ pub const RaftApplyStore = struct {
         }
     }
     fn putPrivacyWork(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: metadata.TableRecord) !void {
+        try attachPrivacyKeys(a, txn, group, table);
         try removePrivacyWork(txn, group, table.table_id);
         const due = (try @import("antfly_local_sources").privacy_catalog.workDue(a, table.indexes_json)) orelse return;
         var prefix_buf: [128]u8 = undefined;
@@ -17824,6 +17830,138 @@ pub const RaftApplyStore = struct {
         if (value.len != 8) return error.InvalidDocumentCheckpoint;
         return std.mem.readInt(u64, value[0..8], .big);
     }
+    const privacy_keys = @import("antfly_local_sources").privacy_catalog.checkpoints;
+
+    fn privacyHeader(a: std.mem.Allocator, raw: []const u8) !privacy_keys.Header {
+        const parsed = try std.json.parseFromSlice(privacy_keys.Header, a, raw, .{});
+        defer parsed.deinit();
+        const value = parsed.value;
+        if (value.length == 0 or value.length > privacy_keys.max_bytes or value.created_at_millis < 0 or value.deleted_chunks > value.chunks()) return error.InvalidDocumentCheckpoint;
+        return value;
+    }
+    fn privacyReferenced(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: u64, ref: privacy_keys.Ref) !bool {
+        var buffer: [160]u8 = undefined;
+        const raw = txn.get(try tableKeyForGroup(&buffer, group, table)) catch |err| if (err == error.NotFound) return false else return err;
+        const record = try decodeTableRecord(a, raw);
+        // Tokens are printable and escape-free. A conservative substring hit
+        // can retain extra data, but can never reclaim a live reference.
+        return std.mem.indexOf(u8, record.indexes_json, &ref.token()) != null;
+    }
+    fn privacyQuota(txn: *docstore.DocStore.Txn, group: u64, table: u64, bytes: usize, increase: bool) !void {
+        var logical_buffer: [64]u8 = undefined;
+        const logical = try std.fmt.bufPrint(&logical_buffer, "privacy/q/{x:0>16}", .{table});
+        var buffer: [256]u8 = undefined;
+        const selected = try jobStateKeyForGroup(&buffer, group, logical);
+        const raw = txn.get(selected) catch |err| if (err == error.NotFound) null else return err;
+        if (raw != null and raw.?.len != 8) return error.InvalidDocumentCheckpoint;
+        const previous = if (raw) |value| std.mem.readInt(u64, value[0..8], .little) else 0;
+        const charge = @max(bytes, 4096);
+        const next = if (increase) std.math.add(u64, previous, charge) catch return error.ResourceBudgetExceeded else std.math.sub(u64, previous, charge) catch return error.InvalidDocumentCheckpoint;
+        if (next > privacy_keys.max_pending_bytes) return error.ResourceBudgetExceeded;
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, next, .little);
+        if (next == 0) {
+            txn.delete(selected) catch |err| if (err != error.NotFound) return err;
+        } else try txn.put(selected, &encoded);
+    }
+    const PrivacyWrite = enum { store, skip, erase };
+    fn privacyWrite(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, logical: []const u8, current: ?[]const u8, value: []const u8) !PrivacyWrite {
+        _ = self;
+        const selected = try privacy_keys.parseKey(logical);
+        if (selected.kind == .quota) return error.InvalidDocumentCheckpoint;
+        if (selected.kind == .gc) {
+            if (value.len > 256) return error.InvalidDocumentCheckpoint;
+            return .store;
+        }
+        const ref = selected.ref.?;
+        var logical_buffer: [128]u8 = undefined;
+        var buffer: [256]u8 = undefined;
+        if (selected.kind == .chunk) {
+            const raw_header = txn.get(try jobStateKeyForGroup(&buffer, group, try ref.storageKey(&logical_buffer, selected.table, null))) catch |err| if (err == error.NotFound) return .skip else return err;
+            const header = try privacyHeader(a, raw_header);
+            if (header.state != .staged) return .skip;
+            if (selected.index >= header.chunks() or value.len != @min(privacy_keys.chunk_bytes, @as(usize, header.length) - selected.index * privacy_keys.chunk_bytes) + 1 or value[0] != 'V') return error.InvalidDocumentCheckpoint;
+            return .store;
+        }
+        const old: ?privacy_keys.Header = if (current) |raw| try privacyHeader(a, raw) else null;
+        if (std.mem.eql(u8, value, privacy_keys.erase)) {
+            const header = old orelse return .skip;
+            if (header.state != .deleting or header.deleted_chunks != header.chunks()) return error.InvalidDocumentCheckpoint;
+            return .erase;
+        }
+        const next = try privacyHeader(a, value);
+        if (old == null) {
+            if (next.state != .staged or next.attached or next.deleted_chunks != 0) return error.InvalidDocumentCheckpoint;
+            _ = txn.get(try tableKeyForGroup(&buffer, group, selected.table)) catch |err| if (err == error.NotFound) return .skip else return err;
+            privacyQuota(txn, group, selected.table, next.length, true) catch |err| if (err == error.ResourceBudgetExceeded) return .skip else return err;
+            return .store;
+        }
+        const previous = old.?;
+        if (next.length != previous.length or next.created_at_millis != previous.created_at_millis or next.attached != previous.attached) return error.InvalidDocumentCheckpoint;
+        if (next.state == .ready) {
+            if (previous.state != .staged) return .skip;
+            if (next.deleted_chunks != 0) return error.InvalidDocumentCheckpoint;
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            for (0..next.chunks()) |index| {
+                const raw = txn.get(try jobStateKeyForGroup(&buffer, group, try ref.storageKey(&logical_buffer, selected.table, index))) catch |err| if (err == error.NotFound) return .skip else return err;
+                if (raw.len != @min(privacy_keys.chunk_bytes, @as(usize, next.length) - index * privacy_keys.chunk_bytes) + 1 or raw[0] != 'V') return error.InvalidDocumentCheckpoint;
+                hash.update(raw[1..]);
+            }
+            var digest: [32]u8 = undefined;
+            hash.final(&digest);
+            if (!std.mem.eql(u8, &std.fmt.bytesToHex(digest, .lower), &ref.digest)) return error.InvalidDocumentCheckpoint;
+            return .store;
+        }
+        if (next.state != .deleting or (previous.state == .deleting and next.deleted_chunks < previous.deleted_chunks) or next.deleted_chunks > previous.deleted_chunks + privacy_keys.gc_chunks) return error.InvalidDocumentCheckpoint;
+        if (try privacyReferenced(a, txn, group, selected.table, ref)) return .skip;
+        if (previous.state != .deleting and !previous.attached) try privacyQuota(txn, group, selected.table, previous.length, false);
+        for (previous.deleted_chunks..next.deleted_chunks) |index| {
+            txn.delete(try jobStateKeyForGroup(&buffer, group, try ref.storageKey(&logical_buffer, selected.table, index))) catch |err| if (err != error.NotFound) return err;
+        }
+        return .store;
+    }
+    fn privacyKeysReady(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: metadata.TableRecord) !bool {
+        if (std.mem.indexOf(u8, table.indexes_json, "\"_privacy\"") == null) return true;
+        const catalog = @import("antfly_local_sources").privacy_catalog;
+        const tree = try std.json.parseFromSlice(std.json.Value, a, table.indexes_json, .{});
+        defer tree.deinit();
+        var resource = (try catalog.current(a, tree.value)) orelse return true;
+        defer resource.deinit();
+        const refs = try privacy_keys.refs(a, resource.value);
+        defer a.free(refs);
+        for (refs) |ref| {
+            var logical_buffer: [128]u8 = undefined;
+            var buffer: [256]u8 = undefined;
+            const raw = txn.get(try jobStateKeyForGroup(&buffer, group, try ref.storageKey(&logical_buffer, table.table_id, null))) catch |err| if (err == error.NotFound) return false else return err;
+            if ((try privacyHeader(a, raw)).state != .ready) return false;
+        }
+        return true;
+    }
+
+    fn attachPrivacyKeys(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: metadata.TableRecord) !void {
+        const catalog = @import("antfly_local_sources").privacy_catalog;
+        const tree = try std.json.parseFromSlice(std.json.Value, a, table.indexes_json, .{});
+        defer tree.deinit();
+        var resource = (try catalog.current(a, tree.value)) orelse return;
+        defer resource.deinit();
+        const refs = try privacy_keys.refs(a, resource.value);
+        defer a.free(refs);
+        for (refs) |ref| {
+            var logical_buffer: [128]u8 = undefined;
+            var buffer: [256]u8 = undefined;
+            const selected = try jobStateKeyForGroup(&buffer, group, try ref.storageKey(&logical_buffer, table.table_id, null));
+            var header = try privacyHeader(a, try txn.get(selected));
+            if (header.state != .ready) return error.InvalidDocumentCheckpoint;
+            if (!header.attached) {
+                header.attached = true;
+                const raw = try std.json.Stringify.valueAlloc(a, header, .{});
+                defer a.free(raw);
+                try txn.put(selected, raw);
+                try privacyQuota(txn, group, table.table_id, header.length, false);
+            }
+        }
+    }
+
     pub fn getJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, logical_key: []const u8) !?[]u8 {
         var buf: [256]u8 = undefined;
         return self.store.get(alloc, try jobStateKeyForGroup(&buf, group_id, logical_key)) catch |err| switch (err) {
@@ -17836,6 +17974,24 @@ pub const RaftApplyStore = struct {
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
         const work = scratch.allocator();
+        if (after) |cursor| if (std.mem.startsWith(u8, cursor, "privacy/m/")) {
+            try @import("../job_state.zig").validateKey(cursor);
+            var prefix_buffer: [128]u8 = undefined;
+            const prefix = try jobStateKeyForGroup(&prefix_buffer, group, "privacy/m/");
+            var after_buffer: [256]u8 = undefined;
+            const rows = try self.store.scanPrefixPage(work, prefix, try jobStateKeyForGroup(&after_buffer, group, cursor), contract.max_page_rows);
+            var selected: std.ArrayList(contract.Row) = .empty;
+            var txn = try self.store.beginReadTxn();
+            defer txn.abort();
+            for (rows) |row| {
+                const logical = row.key[prefix.len - "privacy/m/".len ..];
+                const key = try privacy_keys.parseKey(logical);
+                const header = try privacyHeader(work, row.value);
+                const expired = @as(i64, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_ms))) -| header.created_at_millis >= privacy_keys.lease_ms;
+                if (header.state == .deleting or ((header.attached or expired) and !try privacyReferenced(work, &txn, group, key.table, key.ref.?))) try selected.append(work, .{ .key = logical, .value = row.value });
+            }
+            return std.json.Stringify.valueAlloc(a, contract.Page{ .rows = selected.items, .next = if (rows.len == contract.max_page_rows) rows[rows.len - 1].key[prefix.len - "privacy/m/".len ..] else null }, .{});
+        };
         var base_buf: [128]u8 = undefined;
         const base = try jobSchedulePrefixForGroup(&base_buf, group);
         if (after) |cursor| if (cursor.len < 19 or cursor.len > 160 or (cursor[0] != '0' and cursor[0] != '1') or cursor[1] != ':') return error.InvalidDocumentCheckpoint;
@@ -21193,6 +21349,16 @@ pub const RaftApplyStore = struct {
                     const hash = @import("../job_state.zig").digest(bytes);
                     if (!std.mem.eql(u8, &hash, record.expected_hash)) return;
                 } else if (record.expected_hash.len != 0) return;
+                var erase_privacy = false;
+                if (std.mem.startsWith(u8, record.key, "privacy/")) {
+                    var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                    defer scratch.deinit();
+                    switch (try self.privacyWrite(scratch.allocator(), txn, group_id, record.key, current, record.value)) {
+                        .skip => return,
+                        .erase => erase_privacy = true,
+                        .store => {},
+                    }
+                }
                 if (std.mem.startsWith(u8, record.key, "documents/")) {
                     const contract = @import("../job_state.zig");
                     var scratch = std.heap.ArenaAllocator.init(self.alloc);
@@ -21234,7 +21400,7 @@ pub const RaftApplyStore = struct {
                     try txn.put(quota_key, &encoded_count);
                     self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = quota_key });
                 }
-                try txn.put(key, record.value);
+                if (erase_privacy) try txn.delete(key) else try txn.put(key, record.value);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{ .kind = .restore_job, .metadata_group_id = group_id });
             },
@@ -23171,6 +23337,11 @@ pub const RaftApplyStore = struct {
             // Runtime-only contenders must not overwrite a pending authored
             // command's rejection receipt.
             if (!try metadata_table_manager.privacyProgressOnly(self.alloc, expected, replacement))
+                try self.recordTableDefinitionRejectionTxn(txn, group_id, expected, replacement);
+            return;
+        }
+        if (!try privacyKeysReady(self.alloc, txn, group_id, replacement)) {
+            if (!try metadata_table_manager.privacyProgressOnly(self.alloc, current, replacement))
                 try self.recordTableDefinitionRejectionTxn(txn, group_id, expected, replacement);
             return;
         }
@@ -44164,4 +44335,87 @@ test "system catalog relation namespace transaction prepared table and FK consum
         defer complete.deinit();
         try std.testing.expect(complete.value.record.?.complete);
     }
+}
+
+test "privacy key attachment and incremental reclamation are atomic and survive snapshots" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/privacy-keys", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    const keys = privacy.checkpoints;
+    const jobs = @import("../job_state.zig");
+    const group = 7302;
+    var resource = try privacy.next(a, null, .{ .mode = .monitor, .fields = &.{"body"} }, null);
+    const table: metadata.TableRecord = .{ .table_id = 1, .name = "private", .indexes_json = try privacy.install(a, "{}", resource) };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    const content = try a.alloc(u8, keys.chunk_bytes * 9 + 3);
+    @memset(content, 'x');
+    const ref: keys.Ref = .{ .digest = std.fmt.bytesToHex(jobs.digest(content), .lower), .generation = @splat('a') };
+    var buffer: [128]u8 = undefined;
+    const manifest = try a.dupe(u8, try ref.storageKey(&buffer, 1, null));
+    var header: keys.Header = .{ .length = @intCast(content.len), .created_at_millis = 1 };
+    const initial = try std.json.Stringify.valueAlloc(a, header, .{});
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = "", .value = initial } });
+    resource.checkpoint_encoding = 1;
+    resource.coverage.cursor = try a.dupe(u8, &ref.token());
+    var attached = table;
+    attached.indexes_json = try privacy.replaceResource(a, table.indexes_json, resource);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = table, .replacement = attached } });
+    try std.testing.expectEqualStrings(table.indexes_json, (try store.tableByName(a, group, "private")).?.indexes_json);
+    header.state = .ready;
+    const ready = try std.json.Stringify.valueAlloc(a, header, .{});
+    const initial_hash = jobs.digest(initial);
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &initial_hash, .value = ready } });
+    try std.testing.expectEqualStrings(initial, (try store.getJobState(a, group, manifest)).?);
+    for (0..header.chunks()) |index| {
+        const start = index * keys.chunk_bytes;
+        const part = content[start..@min(content.len, start + keys.chunk_bytes)];
+        try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = try ref.storageKey(&buffer, 1, index), .expected_hash = "", .value = try std.mem.concat(a, u8, &.{ "V", part }) } });
+    }
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &initial_hash, .value = ready } });
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = table, .replacement = attached } });
+    const attached_header = (try store.getJobState(a, group, manifest)).?;
+    var parsed_header = try std.json.parseFromSlice(keys.Header, a, attached_header, .{});
+    defer parsed_header.deinit();
+    try std.testing.expect(parsed_header.value.attached);
+    // Reclamation and table attachment serialize through the same transaction.
+    header = parsed_header.value;
+    header.state = .deleting;
+    header.deleted_chunks = 8;
+    const deleting = try std.json.Stringify.valueAlloc(a, header, .{});
+    const attached_hash = jobs.digest(attached_header);
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &attached_hash, .value = deleting } });
+    try std.testing.expectEqualStrings(attached_header, (try store.getJobState(a, group, manifest)).?);
+    const live = try store.scanJobState(a, group, "privacy/m/");
+    var live_page = try std.json.parseFromSlice(jobs.Page, a, live, .{});
+    defer live_page.deinit();
+    try std.testing.expectEqual(@as(usize, 0), live_page.value.rows.len);
+    resource.coverage.cursor = null;
+    var detached = attached;
+    detached.indexes_json = try privacy.replaceResource(a, attached.indexes_json, resource);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = attached, .replacement = detached } });
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &attached_hash, .value = deleting } });
+    try std.testing.expect(try store.getJobState(a, group, try ref.storageKey(&buffer, 1, 0)) == null);
+    try std.testing.expect(try store.getJobState(a, group, try ref.storageKey(&buffer, 1, 8)) != null);
+    // Snapshot restores both remaining chunks and the deletion checkpoint.
+    const snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
+    var restored = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = try std.fmt.allocPrint(a, "{s}-restored", .{root}) });
+    defer restored.deinit();
+    try std.testing.expect(try restored.snapshotBuilder().installSnapshot(a, group, 100, snapshot));
+    const deleting_hash = jobs.digest(deleting);
+    header.deleted_chunks = @intCast(header.chunks());
+    const final = try std.json.Stringify.valueAlloc(a, header, .{});
+    try restored.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &deleting_hash, .value = final } });
+    const final_hash = jobs.digest(final);
+    try restored.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &final_hash, .value = keys.erase } });
+    try std.testing.expect(try restored.getJobState(a, group, manifest) == null);
+    try std.testing.expect(try restored.getJobState(a, group, try ref.storageKey(&buffer, 1, 9)) == null);
+    // A late uploader cannot recreate chunks after the manifest was erased.
+    try restored.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = try ref.storageKey(&buffer, 1, 9), .expected_hash = "", .value = "Vxxx" } });
+    try std.testing.expect(try restored.getJobState(a, group, try ref.storageKey(&buffer, 1, 9)) == null);
 }
