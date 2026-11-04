@@ -67,6 +67,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const test_imports = @import("../../../build_support/antfly/test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
     const antfly_test_mod = options.antfly_test_mod;
     const run_lib_usermgr_tests = options.run_lib_usermgr_tests;
+    const privacy_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/privacy_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, privacy_mod, true, true);
+    const privacy_tests = b.addTest(.{ .root_module = privacy_mod, .filters = &.{"privacy"} });
+    b.step("antfly-privacy-test", "Run privacy scan, evidence and transport fence contracts").dependOn(&b.addRunArtifact(privacy_tests).step);
     const public_api_parity_default_filters = [_][]const u8{
         "empty activation page validates source catalog without probing external parents",
         "SQL API cross-table MERGE retains both source and target range proofs",
@@ -1153,6 +1161,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "retained read owner",
             "retained read RPC",
             "retained read client",
+            "privacy source vtables retain static lifetime",
             "api http client preserves public batch retry safety classifications",
             "relational row query response budget",
             "relational statement retries unavailable capture and releases fences before pages or deadline",

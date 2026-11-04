@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const abi = @import("runtime_failure_abi");
+pub const Status = abi.Status;
 
 const Mapping = struct {
     status: abi.Status,

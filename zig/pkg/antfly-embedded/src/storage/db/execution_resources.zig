@@ -175,6 +175,7 @@ pub const ReplayPublication = struct {
 };
 
 pub const AsyncContext = struct {
+    apply_exclusive_held: bool = false,
     replay_publication: ?ReplayPublication = null,
     alloc: Allocator,
     io: ?std.Io = null,
@@ -632,6 +633,7 @@ pub const ProfiledLock = struct {
 };
 
 pub const BatchExecutionContext = struct {
+    apply_exclusive_held: bool = false,
     alloc: Allocator,
     io: ?std.Io = null,
     store: *docstore_mod.DocStore,

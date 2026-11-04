@@ -1097,6 +1097,10 @@ pub fn parseStorageKernelDocumentArtifactTableReprocessResult(alloc: std.mem.All
         limit: u32 = 0,
     };
     const RemoteResult = struct {
+        reprocess: ?[]const u8 = null,
+        reprocess_status: ?[]const u8 = null,
+        artifact_name: ?[]const u8 = null,
+        pending_shards: usize = 0,
         scanned: usize = 0,
         reprocessed: usize = 0,
         skipped: usize = 0,

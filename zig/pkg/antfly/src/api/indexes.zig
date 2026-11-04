@@ -81,6 +81,8 @@ pub fn addIndexToTableIndexesJsonWithIo(
     index_name: []const u8,
     index_json: []const u8,
 ) ![]u8 {
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, index_name);
+    try @import("antfly_local_sources").privacy_catalog.validateUserConfiguration(alloc, index_json);
     if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.InvalidCreateIndexRequest;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
@@ -195,6 +197,7 @@ pub fn removeIndexFromTableIndexesJson(
     current_indexes_json: []const u8,
     index_name: []const u8,
 ) !?[]u8 {
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, index_name);
     if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.ExtensionOwnedObject;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
@@ -264,6 +267,8 @@ pub fn addEnrichmentToTableIndexesJson(
     enrichment_name: []const u8,
     enrichment_json: []const u8,
 ) ![]u8 {
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, enrichment_name);
+    try @import("antfly_local_sources").privacy_catalog.validateUserConfiguration(alloc, enrichment_json);
     try validateEnrichmentConfigName(alloc, enrichment_name, enrichment_json);
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
@@ -321,6 +326,7 @@ pub fn removeEnrichmentFromTableIndexesJson(
     current_indexes_json: []const u8,
     enrichment_name: []const u8,
 ) !?[]u8 {
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, enrichment_name);
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
 

@@ -145,8 +145,15 @@ pub const Prepared = struct {
 pub fn prepare(alloc: std.mem.Allocator, txn: anytype, root: u128, request: Request, plan: *const Plan, unit: ?[]const u8, limits: reconstruction.Limits, claim: ?Claim) !?Prepared {
     if (limits.rows == 0 or limits.rows > 128 or limits.bytes == 0 or limits.bytes > 64 * 1024) return error.InvalidBatchRequest;
     if (root == 0) return error.DurableRootIncarnationUnavailable;
-    if (request.kind != .chunk_text or (unit != null) != (request.upstream_artifact_name.len != 0)) return error.OnlineMergeArtifactTailsUnsupported;
+    if (request.kind != .chunk_text or (unit != null and request.upstream_artifact_name.len == 0)) return error.OnlineMergeArtifactTailsUnsupported;
     const producer = if (request.artifact_name.len != 0) request.artifact_name else request.index_name;
+    if (unit == null and request.upstream_artifact_name.len != 0) {
+        // An upstream asset can be one closed document projection. Only an
+        // extraction-unit producer requires a unit inventory; prove this from
+        // the immutable catalog rather than from the presence of an edge.
+        const completion = if (plan.completion_plan) |*value| value else return error.ArtifactCatalogDrift;
+        if (!try completion.rootChunkScopeClosed(producer)) return error.OnlineMergeArtifactTailsUnsupported;
+    }
     const authority = if (unit != null) blk: {
         // Unit chunks are children of the extraction worker, not separate
         // generated templates. Bind its exact immutable parent and catalog

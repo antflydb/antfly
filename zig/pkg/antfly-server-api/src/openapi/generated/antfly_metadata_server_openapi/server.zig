@@ -6,6 +6,7 @@ const httpx = @import("httpx");
 const types = @import("antfly_metadata_openapi");
 const antfly_eval_openapi = @import("antfly_eval_openapi");
 const antfly_indexes_openapi = @import("antfly_indexes_openapi");
+const antfly_privacy_openapi = @import("antfly_privacy_openapi");
 const antfly_resolvers_openapi = @import("antfly_resolvers_openapi");
 const antfly_schema_openapi = @import("antfly_schema_openapi");
 
@@ -1500,6 +1501,61 @@ pub fn parseLinearMergeBody(allocator: std.mem.Allocator, body: []const u8) !std
     return std.json.parseFromSlice(types.LinearMergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Read table privacy policy and coverage
+pub const GetTablePrivacyPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Apply table privacy policy
+pub const PutTablePrivacyPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for putTablePrivacy.
+pub fn parsePutTablePrivacyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_privacy_openapi.PrivacyPolicy) {
+    return std.json.parseFromSlice(antfly_privacy_openapi.PrivacyPolicy, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// List current privacy findings
+pub const ListTablePrivacyFindingsPathParams = struct {
+    table_name: []const u8,
+};
+
+pub const ListTablePrivacyFindingsParams = struct {
+    cursor: ?[]const u8 = null,
+    document: ?[]const u8 = null,
+    field: ?[]const u8 = null,
+    category: ?[]const u8 = null,
+    policy_version: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
+/// Inspect a bounded sample without saving the policy
+pub const PreviewTablePrivacyPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for previewTablePrivacy.
+pub fn parsePreviewTablePrivacyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_privacy_openapi.PrivacyPreviewRequest) {
+    return std.json.parseFromSlice(antfly_privacy_openapi.PrivacyPreviewRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Start a durable privacy rescan
+pub const StartTablePrivacyScanPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for startTablePrivacyScan.
+pub fn parseStartTablePrivacyScanBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_privacy_openapi.PrivacyScanRequest) {
+    return std.json.parseFromSlice(antfly_privacy_openapi.PrivacyScanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Read privacy scan progress
+pub const GetTablePrivacyScanPathParams = struct {
+    table_name: []const u8,
+    scan_id: []const u8,
+};
+
 /// Query a specific table
 pub const QueryTablePathParams = struct {
     /// Name of the table to query
@@ -2091,6 +2147,12 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/lake/commits/{commitId}", .operation_id = "getLakeCommitOutcome", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/lake/maintenance", .operation_id = "maintainLakeTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/merge", .operation_id = "linearMerge", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/privacy", .operation_id = "getTablePrivacy", .request_body = .none, .streaming_response = false },
+    .{ .method = "PUT", .path = "/tables/{tableName}/privacy", .operation_id = "putTablePrivacy", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/privacy/findings", .operation_id = "listTablePrivacyFindings", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/privacy/preview", .operation_id = "previewTablePrivacy", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/privacy/scans", .operation_id = "startTablePrivacyScan", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/privacy/scans/{scanId}", .operation_id = "getTablePrivacyScan", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/query", .operation_id = "queryTable", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/control-jobs", .operation_id = "startTableRepairControlJob", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/issues", .operation_id = "listTableRepairIssues", .request_body = .buffered, .streaming_response = false },
@@ -2309,6 +2371,12 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "getLakeCommitOutcome")) @compileError("ServerRouter: Impl missing required method 'getLakeCommitOutcome'");
         if (!@hasDecl(Impl, "maintainLakeTable")) @compileError("ServerRouter: Impl missing required method 'maintainLakeTable'");
         if (!@hasDecl(Impl, "linearMerge")) @compileError("ServerRouter: Impl missing required method 'linearMerge'");
+        if (!@hasDecl(Impl, "getTablePrivacy")) @compileError("ServerRouter: Impl missing required method 'getTablePrivacy'");
+        if (!@hasDecl(Impl, "putTablePrivacy")) @compileError("ServerRouter: Impl missing required method 'putTablePrivacy'");
+        if (!@hasDecl(Impl, "listTablePrivacyFindings")) @compileError("ServerRouter: Impl missing required method 'listTablePrivacyFindings'");
+        if (!@hasDecl(Impl, "previewTablePrivacy")) @compileError("ServerRouter: Impl missing required method 'previewTablePrivacy'");
+        if (!@hasDecl(Impl, "startTablePrivacyScan")) @compileError("ServerRouter: Impl missing required method 'startTablePrivacyScan'");
+        if (!@hasDecl(Impl, "getTablePrivacyScan")) @compileError("ServerRouter: Impl missing required method 'getTablePrivacyScan'");
         if (!@hasDecl(Impl, "queryTable")) @compileError("ServerRouter: Impl missing required method 'queryTable'");
         if (!@hasDecl(Impl, "startTableRepairControlJob")) @compileError("ServerRouter: Impl missing required method 'startTableRepairControlJob'");
         if (!@hasDecl(Impl, "listTableRepairIssues")) @compileError("ServerRouter: Impl missing required method 'listTableRepairIssues'");
@@ -2525,6 +2593,12 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.get("/tables/:tableName/lake/commits/:commitId", httpx.Handler.bind(self.impl, getLakeCommitOutcome));
             try server.post("/tables/:tableName/lake/maintenance", httpx.Handler.bind(self.impl, maintainLakeTable));
             try server.post("/tables/:tableName/merge", httpx.Handler.bind(self.impl, linearMerge));
+            try server.get("/tables/:tableName/privacy", httpx.Handler.bind(self.impl, getTablePrivacy));
+            try server.put("/tables/:tableName/privacy", httpx.Handler.bind(self.impl, putTablePrivacy));
+            try server.get("/tables/:tableName/privacy/findings", httpx.Handler.bind(self.impl, listTablePrivacyFindings));
+            try server.post("/tables/:tableName/privacy/preview", httpx.Handler.bind(self.impl, previewTablePrivacy));
+            try server.post("/tables/:tableName/privacy/scans", httpx.Handler.bind(self.impl, startTablePrivacyScan));
+            try server.get("/tables/:tableName/privacy/scans/:scanId", httpx.Handler.bind(self.impl, getTablePrivacyScan));
             try server.post("/tables/:tableName/query", httpx.Handler.bind(self.impl, queryTable));
             try server.post("/tables/:tableName/repair/control-jobs", httpx.Handler.bind(self.impl, startTableRepairControlJob));
             try server.post("/tables/:tableName/repair/issues", httpx.Handler.bind(self.impl, listTableRepairIssues));
@@ -3901,6 +3975,57 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.linearMerge(ctx, table_name);
         }
 
+        /// Read table privacy policy and coverage
+        /// GET /tables/{tableName}/privacy
+        fn getTablePrivacy(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.getTablePrivacy(ctx, table_name);
+        }
+
+        /// Apply table privacy policy
+        /// PUT /tables/{tableName}/privacy
+        fn putTablePrivacy(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.putTablePrivacy(ctx, table_name);
+        }
+
+        /// List current privacy findings
+        /// GET /tables/{tableName}/privacy/findings
+        fn listTablePrivacyFindings(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const query_params = ListTablePrivacyFindingsParams{
+                .cursor = try ctx.queryDecoded("cursor"),
+                .document = try ctx.queryDecoded("document"),
+                .field = try ctx.queryDecoded("field"),
+                .category = try ctx.queryDecoded("category"),
+                .policy_version = try ctx.queryDecoded("policy_version"),
+                .limit = try ctx.queryDecoded("limit"),
+            };
+            return impl.listTablePrivacyFindings(ctx, table_name, query_params);
+        }
+
+        /// Inspect a bounded sample without saving the policy
+        /// POST /tables/{tableName}/privacy/preview
+        fn previewTablePrivacy(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.previewTablePrivacy(ctx, table_name);
+        }
+
+        /// Start a durable privacy rescan
+        /// POST /tables/{tableName}/privacy/scans
+        fn startTablePrivacyScan(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.startTablePrivacyScan(ctx, table_name);
+        }
+
+        /// Read privacy scan progress
+        /// GET /tables/{tableName}/privacy/scans/{scanId}
+        fn getTablePrivacyScan(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const scan_id = ctx.param("scanId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: scanId" });
+            return impl.getTablePrivacyScan(ctx, table_name, scan_id);
+        }
+
         /// Query a specific table
         /// POST /tables/{tableName}/query
         fn queryTable(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -4431,6 +4556,12 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn getLakeCommitOutcome(self: *Impl, ctx: *httpx.Context, table_name: []const u8, commit_id: []const u8, params: GetLakeCommitOutcomeParams) !httpx.Response
 //   fn maintainLakeTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn linearMerge(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn getTablePrivacy(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn putTablePrivacy(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn listTablePrivacyFindings(self: *Impl, ctx: *httpx.Context, table_name: []const u8, params: ListTablePrivacyFindingsParams) !httpx.Response
+//   fn previewTablePrivacy(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn startTablePrivacyScan(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn getTablePrivacyScan(self: *Impl, ctx: *httpx.Context, table_name: []const u8, scan_id: []const u8) !httpx.Response
 //   fn queryTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn startTableRepairControlJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn listTableRepairIssues(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

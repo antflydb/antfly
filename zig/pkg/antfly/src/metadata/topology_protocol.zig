@@ -99,7 +99,12 @@ const std = @import("std");
 /// Version 66 indexes routing sources for dependency-validated canonical proofs.
 /// Version 67 qualifies legacy resolver content before native cache admission.
 /// Version 68 tracks bounded edits during resumable resolver qualification.
-pub const current_version: u16 = 68;
+// Version 69 admits privacy-owned consumer graphs and serving fences.
+pub const current_version: u16 = 69;
+pub const privacy_version: u16 = 69;
+pub fn usesPrivacy(indexes_json: []const u8) bool {
+    return std.mem.indexOf(u8, indexes_json, "\"_privacy\"") != null or std.mem.indexOf(u8, indexes_json, "_privacy_document") != null;
+}
 pub const job_state_version: u16 = 59;
 pub const resolver_records_version: u16 = 58;
 pub const native_service_tables_version: u16 = 38;

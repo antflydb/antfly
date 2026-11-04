@@ -1638,6 +1638,7 @@ pub fn applySchemaMutationRecord(
     mode: SchemaMutationMode,
     body: []const u8,
 ) !metadata_table_manager.TableRecord {
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, table.indexes_json, "");
     const schema_json = switch (mode) {
         .replace => try parseSchemaUpdateRequest(alloc, body),
         .merge_patch => try mergeSchemaPatchRequest(alloc, table.schema_json, body),
@@ -1665,6 +1666,7 @@ pub fn applySchemaUpdateRecord(
     table: *const metadata_table_manager.TableRecord,
     schema_json: []const u8,
 ) !metadata_table_manager.TableRecord {
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, table.indexes_json, "");
     return applySchemaRecord(alloc, table, schema_json, false, false, null);
 }
 
@@ -1677,6 +1679,7 @@ pub fn applySchemaUpdateRecordWithIncarnation(
     schema_json: []const u8,
     incarnation: u64,
 ) !metadata_table_manager.TableRecord {
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, table.indexes_json, "");
     if (!@import("antfly_local_sources").storage_coverage_identity.isValid(incarnation)) return error.InvalidIndexConfig;
     return applySchemaRecord(alloc, table, schema_json, false, false, incarnation);
 }

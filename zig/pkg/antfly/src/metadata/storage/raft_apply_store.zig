@@ -5815,7 +5815,7 @@ pub const ExtensionLifecycleTablePrecondition = struct {
 pub const TableRestoreAdmission = apply_contract.TableRestoreAdmission;
 pub const TableDropProjection = apply_contract.TableDropProjection;
 
-const derived_catalog_index_version = "9";
+const derived_catalog_index_version = "10";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -14569,6 +14569,64 @@ pub const RaftApplyStore = struct {
         }
     }
 
+    fn privacyPrefix(buf: []u8, group: u64) ![]const u8 {
+        return std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:privacy_due:{d}:", .{group});
+    }
+    fn privacyReverseKey(buf: []u8, group: u64, id: u64) ![]const u8 {
+        return std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:privacy_table:{d}:{d}", .{ group, id });
+    }
+    fn removePrivacyWork(txn: *docstore.DocStore.Txn, group: u64, id: u64) !void {
+        var buf: [160]u8 = undefined;
+        const reverse = try privacyReverseKey(&buf, group, id);
+        if (try stagingGet(txn, reverse)) |due_key| {
+            try txn.delete(due_key);
+            try txn.delete(reverse);
+        }
+    }
+    fn putPrivacyWork(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: metadata.TableRecord) !void {
+        try removePrivacyWork(txn, group, table.table_id);
+        const due = (try @import("antfly_local_sources").privacy_catalog.workDue(a, table.indexes_json)) orelse return;
+        var prefix_buf: [128]u8 = undefined;
+        var key_buf: [192]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "{s}{x:0>16}:{x:0>16}", .{ try privacyPrefix(&prefix_buf, group), @as(u64, @intCast(due)), table.table_id });
+        var id: [8]u8 = undefined;
+        std.mem.writeInt(u64, &id, table.table_id, .little);
+        try txn.put(key, &id);
+        var reverse_buf: [160]u8 = undefined;
+        try txn.put(try privacyReverseKey(&reverse_buf, group, table.table_id), key);
+    }
+
+    /// One indexed due lookup and one primary table read. The derived index is
+    /// rebuilt on open/restore by the ordinary catalog-index migration path.
+    pub fn nextPrivacyTable(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, now: i64) !?metadata.TableRecord {
+        var read = try self.beginQueryCatalogReadTxn(group);
+        defer read.abort();
+        var buf: [128]u8 = undefined;
+        const prefix = try privacyPrefix(&buf, group);
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        const row = (try cursor.seekAtOrAfter(prefix)) orelse return null;
+        if (!std.mem.startsWith(u8, row.key, prefix)) return null;
+        if (row.key.len != prefix.len + 33 or row.value.len != 8) return error.InvalidDerivedCatalogIndex;
+        const due = std.fmt.parseInt(u64, row.key[prefix.len..][0..16], 16) catch return error.InvalidDerivedCatalogIndex;
+        if (due > std.math.maxInt(i64) or row.key[prefix.len + 16] != ':') return error.InvalidDerivedCatalogIndex;
+        if (due > @as(u64, @intCast(@max(0, now)))) return null;
+        const id = std.mem.readInt(u64, row.value[0..8], .little);
+        const indexed_id = std.fmt.parseInt(u64, row.key[prefix.len + 17 ..], 16) catch return error.InvalidDerivedCatalogIndex;
+        if (id != indexed_id) return error.InvalidDerivedCatalogIndex;
+        var table_buf: [160]u8 = undefined;
+        const raw = (try stagingGet(&read, try tableKeyForGroup(&table_buf, group, id))) orelse return error.InvalidDerivedCatalogIndex;
+        const table = try decodeTableRecord(a, raw);
+        errdefer metadata_table_manager.freeTable(a, table);
+        if ((try @import("antfly_local_sources").privacy_catalog.workDue(a, table.indexes_json)) != @as(?i64, @intCast(due))) return error.InvalidDerivedCatalogIndex;
+        return table;
+    }
+    pub fn tableByName(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, name: []const u8) !?metadata.TableRecord {
+        var read = try self.beginQueryCatalogReadTxn(group);
+        defer read.abort();
+        return self.getTableByNameTxn(a, &read, group, name);
+    }
+
     pub fn listTables(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.TableRecord {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
@@ -17182,6 +17240,10 @@ pub const RaftApplyStore = struct {
     ) !void {
         var key_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
         const key = try tableNameIndexKey(&key_buf, group_id, table_name);
+        if (try stagingGet(txn, key)) |raw| {
+            if (raw.len != 8) return error.InvalidDerivedCatalogIndex;
+            try removePrivacyWork(txn, group_id, std.mem.readInt(u64, raw[0..8], .little));
+        }
         try self.deleteLegacyListingTxn(txn, group_id, table_name);
         txn.delete(key) catch |err| switch (err) {
             error.NotFound => {},
@@ -17360,6 +17422,9 @@ pub const RaftApplyStore = struct {
             try putRestoreProgressRangeIndexTxn(txn, group_id, record);
         }
 
+        var privacy_buf: [160]u8 = undefined;
+        try self.deleteDerivedPrefixTxn(txn, try privacyPrefix(&privacy_buf, group_id));
+        try self.deleteDerivedPrefixTxn(txn, try std.fmt.bufPrint(&privacy_buf, "\x00\x00__metadata_derived__:privacy_table:{d}:", .{group_id}));
         const tables = try listPhysicalTableIdentities(self.alloc, txn, group_id);
         defer freePhysicalTableIdentities(self.alloc, tables);
         for (tables) |table| {
@@ -17368,6 +17433,13 @@ pub const RaftApplyStore = struct {
                 return error.InvalidDerivedCatalogIndex;
             } else |err| if (err != error.NotFound) return err;
             try self.putTableNameIndexTxn(txn, group_id, table.name, table.id);
+            var privacy_row_arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer privacy_row_arena.deinit();
+            const privacy_alloc = privacy_row_arena.allocator();
+            var privacy_table_buf: [160]u8 = undefined;
+            const privacy_raw = try txn.get(try tableKeyForGroup(&privacy_table_buf, group_id, table.id));
+            try putPrivacyWork(privacy_alloc, txn, group_id, try decodeTableRecord(privacy_alloc, privacy_raw));
+
             var fence = try self.loadTableTransitionFenceTxn(txn, group_id, table.id);
             fence.range_membership = .{};
             var fence_key_buf: [192]u8 = undefined;
@@ -25309,6 +25381,7 @@ pub const RaftApplyStore = struct {
             const digest = relationTableSourceDigest(record.table_id, record.name, record.schema_json);
             if (previous_digest == null or !std.mem.eql(u8, &previous_digest.?, &digest)) try relation_reconciliation.advanceSource(txn, group_id);
         }
+        try putPrivacyWork(self.alloc, txn, group_id, record);
         try txn.put(key, value);
         const fingerprint = policyTableSchemaRecordDigest(record);
         var fingerprint_key_buf: [192]u8 = undefined;
@@ -43366,4 +43439,48 @@ test "metadata durable job state snapshot retains scheduling quotas and group is
     defer page.deinit();
     try std.testing.expectEqual(@as(usize, 1), page.value.rows.len);
     try std.testing.expectEqualStrings("documents/finished", page.value.rows[0].key);
+}
+
+test "privacy work index follows atomic table updates deletion and derived index rebuild" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/privacy-work", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    const group = 7301;
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    var resource = try privacy.next(a, null, .{ .mode = .monitor, .fields = &.{"body"} }, null);
+    resource.coverage.updated_at_millis = 10;
+    resource.coverage.retry_after_millis = 20;
+    for (1..33) |id| try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = id, .name = try std.fmt.allocPrint(a, "unrelated-{d}", .{id}) } });
+    try std.testing.expect(try store.nextPrivacyTable(a, group, 100) == null);
+    const table = metadata.TableRecord{ .table_id = 50, .name = "private", .indexes_json = try privacy.install(a, "{}", resource) };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    try std.testing.expect(try store.nextPrivacyTable(a, group, 19) == null);
+    try std.testing.expectEqual(@as(u64, 50), (try store.nextPrivacyTable(a, group, 20)).?.table_id);
+    const before = (try store.tableByName(a, group, "private")).?;
+    resource.coverage.retry_after_millis = 200;
+    var replacement = before;
+    replacement.indexes_json = try privacy.replaceResource(a, before.indexes_json, resource);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = before, .replacement = replacement } });
+    try std.testing.expect(try store.nextPrivacyTable(a, group, 100) == null);
+    try store.rebuildDerivedCatalogIndexes(group);
+    try std.testing.expectEqual(@as(u64, 50), (try store.nextPrivacyTable(a, group, 200)).?.table_id);
+    // Derived hints are omitted from the replicated snapshot and rebuilt from
+    // durable policy/job state in the destination store.
+    const snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
+    const rows = try decodeMetadataSnapshotAlloc(a, snapshot);
+    for (rows) |row| try std.testing.expect(!std.mem.startsWith(u8, row.key, "\x00\x00__metadata_derived__:"));
+    var restored = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = try std.fmt.allocPrint(a, "{s}-restored", .{root}) });
+    defer restored.deinit();
+    try std.testing.expect(try restored.snapshotBuilder().installSnapshot(a, group, 100, snapshot));
+    try std.testing.expect(try restored.nextPrivacyTable(a, group, 100) == null);
+    try std.testing.expectEqual(@as(u64, 50), (try restored.nextPrivacyTable(a, group, 200)).?.table_id);
+    const fence = try store.getTableTransitionFence(group, 50);
+    try store.applyStandaloneCommand(group, .{ .remove_table = .{ .table_id = 50, .expected_transition_generation = fence.generation } });
+    try std.testing.expect(try store.nextPrivacyTable(a, group, 999) == null);
+    try std.testing.expect(try store.tableByName(a, group, "private") == null);
 }

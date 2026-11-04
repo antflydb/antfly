@@ -320,6 +320,7 @@ pub const MetadataServer = struct {
 
             var api_server_cfg = cfg.api_server_cfg;
             api_server_cfg.restore_owner_progress_generation = &svc.restore_owner_progress_generation;
+            api_server_cfg.privacy_scan_coordinator = true;
             api_server_cfg.configureRemoteCatalogPublicationAuthority();
             // Restore-owner and durable-session RPCs share the same owned
             // data-bearing routes and transport as ordinary hosted reads and

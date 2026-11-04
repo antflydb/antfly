@@ -3242,7 +3242,7 @@ pub const DB = struct {
     artifact_footprint_pending: std.atomic.Value(bool) = .init(true),
     artifact_producer_baseline_pending: std.atomic.Value(bool) = .init(true),
     artifact_producer_scheduler: @import("artifact_producer_scheduler.zig").Scheduler = .{},
-    local_source_completion_audit_pending: bool = true,
+    local_source_completion_audit_generation: ?u64 = null,
     local_source_recovery_pending: bool = false,
     /// Bounded no-progress guard for `runUntilIdle` (see `OpenOptions.
     /// run_until_idle_no_progress_timeout_ms` and `ReplayDrainOptions.
@@ -3653,6 +3653,10 @@ pub const DB = struct {
     }
 
     fn beginRelationalRowsAtSnapshot(self: *DB, alloc: Allocator, request: RelationalRows.Request, statement: ?*RelationalStatementSnapshot) !RelationalRows.Reader {
+        var privacy_arena = std.heap.ArenaAllocator.init(alloc);
+        defer privacy_arena.deinit();
+        const policy = try @import("privacy_read.zig").capture(self, privacy_arena.allocator());
+        if (policy != null and policy.?.policy.mode != .monitor) return error.PrivacyRelationalStorageUnsupported;
         // A delayed scan may use only the primary path. READY index state and
         // auto-index plans can change after the original visibility cut.
         if (statement != null and (request.index != null or request.auto_index)) return error.SqlStatementSnapshotRequired;
@@ -9932,7 +9936,21 @@ pub const DB = struct {
         defer row_policy_lease.release();
         var artifact = (try self.getArtifact(alloc, artifact_id)) orelse return null;
         errdefer artifact.deinit(alloc);
-        const public_value = try hierarchy_navigation.publicArtifactPayloadAlloc(alloc, artifact.value);
+        if (@import("../../privacy/document.zig").isManagedArtifactName(artifact.artifact_ref.name)) {
+            artifact.deinit(alloc);
+            return null;
+        }
+        var privacy_arena = std.heap.ArenaAllocator.init(alloc);
+        defer privacy_arena.deinit();
+        const privacy = @import("privacy_read.zig");
+        const policy = try privacy.capture(self, privacy_arena.allocator());
+        const safe = if (policy != null and policy.?.policy.mode != .monitor) blk: {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            const physical = try artifact_ids.internalKeyForArtifactRefAlloc(privacy_arena.allocator(), artifact.artifact_ref);
+            break :blk try privacy.projectArtifact(privacy_arena.allocator(), policy.?, physical, &read);
+        } else artifact.value;
+        const public_value = try hierarchy_navigation.publicArtifactPayloadAlloc(alloc, safe);
         alloc.free(artifact.value);
         artifact.value = public_value;
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
@@ -10001,7 +10019,7 @@ pub const DB = struct {
         for (rows) |row| {
             var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, row.key)) orelse continue;
             defer artifact_ref.deinit(alloc);
-            if (artifact_ref.kind != .asset) continue;
+            if (artifact_ref.kind != .asset or @import("../../privacy/document.zig").isManagedArtifactName(artifact_ref.name)) continue;
             if (artifact_ref.unit_id != null) continue;
             if (!std.mem.eql(u8, artifact_ref.document_id, doc_key)) continue;
 
@@ -18731,6 +18749,26 @@ pub const DB = struct {
         req: types.DocumentArtifactTableReprocessRequest,
     ) !types.DocumentArtifactTableReprocessResult {
         if (comptime storage_engine.enabled) return storage_engine.call("reprocessDocumentArtifactRange", .{ self, alloc, artifact_name, req });
+        if (@import("../../privacy/document.zig").isArtifactName(artifact_name) and try self.maintenanceRequiresOrderedApply()) {
+            var catalog = try self.artifactInventoryCommand(alloc);
+            defer catalog.catalogs.deinit(alloc);
+            const active = blk: {
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                break :blk try @import("artifact_publication.zig").authority(&read);
+            };
+            if (active == null or active.?.epoch != catalog.binding.epoch or !std.mem.eql(u8, &active.?.catalog_digest, &catalog.binding.digest)) {
+                const dispatcher = self.local_execution.artifact_publication_dispatcher orelse return error.ArtifactPublicationPending;
+                const body = try std.json.Stringify.valueAlloc(alloc, catalog, .{});
+                defer alloc.free(body);
+                const encoded = try std.mem.concat(alloc, u8, &.{ "ACP1", body });
+                defer alloc.free(encoded);
+                try dispatcher.submit(catalog.namespace, encoded);
+                // Retain the exact page cursor while ordered admission
+                // progresses. Waiting for a catalog is not a failed scan.
+                return .{ .limit = req.limit, .next_key = try alloc.dupe(u8, req.from_key) };
+            }
+        }
         var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse
             (try self.getEnrichment(alloc, .embedding, artifact_name)) orelse return error.NotFound;
         defer cfg.deinit(alloc);
@@ -18750,6 +18788,7 @@ pub const DB = struct {
         const limit = if (effective_req.limit == 0) @as(u32, 100) else effective_req.limit;
         const scan_limit = if (limit == std.math.maxInt(u32)) limit else limit + 1;
         var scanned = try self.scan(alloc, effective_req.from_key, effective_req.to_key, .{
+            .privacy_original = @import("../../privacy/document.zig").isArtifactName(artifact_name),
             .include_documents = true,
             .limit = scan_limit,
         });
@@ -18767,6 +18806,38 @@ pub const DB = struct {
         errdefer result.deinit(alloc);
 
         const process_len = @min(scanned.documents.len, @as(usize, @intCast(limit)));
+        if (@import("../../privacy/document.zig").isArtifactName(artifact_name)) {
+            if (process_len != 0 and self.enrichment_runtime == null) return error.PrivacyReadUnavailable;
+            // Queue native producer references without rewriting originals or
+            // their TTLs. Accepted current receipts may be reused; failed and
+            // stale inputs enter the ordinary batched producer/retry lane.
+            var inputs = std.ArrayListUnmanaged(types.BatchWrite).empty;
+            defer inputs.deinit(alloc);
+            var mapped = std.ArrayListUnmanaged(mapper.ExtractedWrite).empty;
+            defer {
+                for (mapped.items) |*value| value.deinit(alloc);
+                mapped.deinit(alloc);
+            }
+            for (scanned.documents[0..process_len]) |doc| {
+                try inputs.append(alloc, .{ .key = doc.id, .value = doc.json });
+                var extracted = try mapper.extractWrite(alloc, doc.id, doc.json);
+                errdefer extracted.deinit(alloc);
+                try mapped.append(alloc, extracted);
+            }
+            var pending: derived_types.DerivedBatch = .{};
+            defer derived_types.deinitDerivedBatch(self.alloc, &pending);
+            try appendGeneratedEnrichments(self, &pending, .{ .writes = inputs.items, .sync_level = .write }, mapped.items, &.{artifact_name}, false);
+            if (pending.generated_enrichment_refs.len != 0) {
+                const sequence = try appendDerivedBatchRecord(self, pending);
+                self.executor.notifySequence(sequence);
+                self.enrichment_runtime.?.notifySequence(sequence);
+                self.notifyResolverReplayRuntimes(sequence);
+            }
+            result.scanned = process_len;
+            result.reprocessed = process_len;
+            if (scanned.documents.len > process_len and process_len > 0) result.next_key = try alloc.dupe(u8, scanned.documents[process_len - 1].id);
+            return result;
+        }
         for (scanned.documents[0..process_len]) |doc| {
             result.scanned += 1;
             const handled = self.reprocessDocumentArtifact(alloc, doc.id, artifact_name) catch |err| switch (err) {
@@ -19489,7 +19560,23 @@ pub const DB = struct {
             error.NotFound => return null,
             else => return err,
         });
+        var privacy_arena = std.heap.ArenaAllocator.init(alloc);
+        defer privacy_arena.deinit();
+        const privacy = @import("privacy_read.zig");
+        const policy = if (opts.privacy_original) null else try privacy.capture(self, privacy_arena.allocator());
+        if (!opts.privacy_original) try privacy.requireExpected(privacy_arena.allocator(), opts.privacy_policy_version, policy);
+        const protected = policy != null and policy.?.policy.mode != .monitor;
+        if (protected) {
+            if (opts.include_primary_digest) return error.PrivacyUnsupportedMutation;
+            const special = db_query_projection.buildLookupFieldSelectionPlan(opts).special;
+            if (special.all_artifacts or special.all_chunks or special.all_embeddings) return error.PrivacyUnsupportedProjection;
+        }
+        const safe_raw = if (protected and internal_keys.isInternalUserKey(key)) try privacy.projectArtifact(privacy_arena.allocator(), policy.?, store_key, probe) else if (protected) privacy.project(privacy_arena.allocator(), policy.?, key, raw, probe) catch |err| {
+            if (privacy.pending(err)) return null;
+            return err;
+        } else raw;
         const relational = internal_keys.isRelationalRowKey(store_key);
+        if (protected and relational) return error.PrivacyRelationalStorageUnsupported;
         var historical_schema_view: ?schema_registry_mod.SchemaView = null;
         defer if (historical_schema_view) |*view| view.release();
         const ordinal_row = if (relational) blk: {
@@ -19561,11 +19648,11 @@ pub const DB = struct {
                     defer alloc.free(bytes);
                     break :blk try output.dupe(u8, bytes);
                 }
-                break :blk try output.dupe(u8, raw);
+                break :blk try output.dupe(u8, safe_raw);
             }
             const materialized = if (ordinal_row) |row| try row.reconstructValueAlloc(alloc) else null;
             defer if (materialized) |bytes| alloc.free(bytes);
-            break :blk try db_query_projection.projectLookupStoredBytesWithPlanAndOutput(alloc, output, key, materialized orelse raw, opts, .{
+            break :blk try db_query_projection.projectLookupStoredBytesWithPlanAndOutput(alloc, output, key, materialized orelse safe_raw, opts, .{
                 .ctx = self,
                 .load_chunks = loadChunkFieldValueCallback,
                 .load_embeddings = loadEmbeddingFieldValueCallback,
@@ -26760,7 +26847,7 @@ pub const DB = struct {
         // Keep accepted provenance intact and commit the rejection with the
         // applied watermark, so retries cannot wedge a committed Raft entry.
         if (command.completion) |page| if (page.group_producers) std.log.debug("group producer completion deferred reason={s}", .{@tagName(reason)});
-        if (command.mode == .publish and command.producer_kind == .enrichment) std.log.debug("producer publication deferred producer={s} reason={s}", .{ command.producer_name, @tagName(reason) });
+        if (command.mode == .publish) std.log.debug("producer publication deferred producer={s} kind={s} reason={s}", .{ command.producer_name, @tagName(command.producer_kind), @tagName(reason) });
         const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
@@ -27291,7 +27378,7 @@ pub const DB = struct {
             prepared_value.batch.sequence = sequence;
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
-            try applyDerivedBatchContext(&batch_ctx, prepared_value.batch);
+            try applyDerivedBatchInlineAssumeApply(&batch_ctx, prepared_value.batch);
         }
     }
 
@@ -31251,6 +31338,8 @@ pub const DB = struct {
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
 
+        _ = try @import("privacy_read.zig").requirePublished(self, alloc, .{});
+
         const entry = self.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
         entry.lockAnalysisShared();
         defer entry.unlockAnalysisShared();
@@ -33099,9 +33188,17 @@ pub const DB = struct {
             break :blk try @import("artifact_publication.zig").authority(&read) != null;
         };
         if (!has_ordered_authority) {
-            if (self.local_source_completion_audit_pending) {
+            // A consumer admitted after its producer published needs the same
+            // bounded receipt recovery as startup. Wait for active replay;
+            // audit each catalog generation only after its producer is idle.
+            const generation = self.core.index_manager.writePlanGeneration();
+            if (self.enrichment_runtime) |runtime| {
+                const replay = runtime.stats();
+                if (replay.applied_sequence < replay.target_sequence) return false;
+            }
+            if (self.local_source_completion_audit_generation != generation) {
                 _ = try self.ensureGeneratedCoverageRecoveryIntents(scratch);
-                self.local_source_completion_audit_pending = false;
+                self.local_source_completion_audit_generation = generation;
             }
             return false;
         }
@@ -33368,7 +33465,7 @@ pub const DB = struct {
                 };
                 const encoded = try @import("artifact_publication_transport_codec.zig").encodeAlloc(scratch, validation.command);
                 defer scratch.free(encoded);
-                try dispatcher.enqueue(dispatcher.ptr, validation.command.namespace, encoded);
+                try dispatcher.enqueueCommand(validation.command.namespace, encoded);
                 self.artifact_producer_baseline_pending.store(true, .release);
                 return false;
             };
@@ -33379,7 +33476,7 @@ pub const DB = struct {
             };
             const encoded = try @import("artifact_publication_transport_codec.zig").encodeAlloc(scratch, prepared.command);
             defer scratch.free(encoded);
-            try dispatcher.enqueue(dispatcher.ptr, prepared.command.namespace, encoded);
+            try dispatcher.enqueueCommand(prepared.command.namespace, encoded);
             // Queue admission is not a baseline certificate. The next pass
             // observes only progress installed by the replicated transaction.
             self.artifact_producer_baseline_pending.store(true, .release);
@@ -36668,6 +36765,26 @@ pub const DB = struct {
         defer alloc.free(raw);
         if (raw.len != @sizeOf(u64)) return error.InvalidArtifactSourceRevision;
         return @max(published_sequence, std.mem.readInt(u64, raw[0..8], .big));
+    }
+
+    /// Same-cut standalone producer counters; never usable by ordered owners.
+    pub fn privacyLocalIndexSourcesComplete(self: *DB, alloc: Allocator, read: *docstore_mod.DocStore.Txn, index: []const u8, kind: @FieldType(types.IndexConfig, "kind"), plan: *const index_manager_mod.IndexManager.WritePlanSnapshot) !bool {
+        if (try @import("../source_authority.zig").maintenanceMode(read) != .local) return false;
+        const generation = self.core.index_manager.coverageGenerationForIndex(index) orelse return false;
+        const sources = try self.core.index_manager.artifactSourceNamesForIndexAlloc(alloc, index);
+        defer {
+            for (sources) |source| alloc.free(source);
+            alloc.free(sources);
+        }
+        for (sources) |source| {
+            const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, index, source, plan);
+            defer alloc.free(scope);
+            const counts = try DerivedCoverageCounters.load(alloc, read, if (kind == .dense_vector or kind == .sparse_vector) index else scope, generation);
+            const total = counts.source_total orelse (try range_cardinality.loadOrProveEmptyFromTxn(alloc, self.core.store, read)) orelse return false;
+            if (total == 0) continue;
+            if (counts.produced == null or counts.skipped == null or counts.terminal_failed != 0 or counts.produced.? +| counts.skipped.? != total) return false;
+        }
+        return true;
     }
 
     fn populateIndexSourceReplayStats(self: *DB, alloc: Allocator, index_name: []const u8, published_sequence: u64, aggregate_target_sequence: u64, item: *types.DBIndexStats) !void {
@@ -40962,6 +41079,10 @@ pub const DB = struct {
         self.core.unlockApplyShared();
         locked = false;
         const session = try DocumentReadSession.openSnapshot(alloc, self.core.store, txn, schema, .{ .start = start, .end = end }, from_key, to_key, opts, now);
+        errdefer session.deinit();
+        session.privacy = try @import("privacy_read.zig").capture(self, session.arena.allocator());
+        try @import("privacy_read.zig").requireExpected(session.arena.allocator(), opts.privacy_policy_version, session.privacy);
+        if (session.privacy) |policy| if (policy.policy.mode != .monitor and (opts.sql_document_preimage or opts.include_content_hashes)) return error.UnsupportedSqlExecution;
         session.row_policy_lease = row_policy_lease;
         return session;
     }
@@ -41196,6 +41317,23 @@ pub const DB = struct {
     ) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("scanVisit", .{ self, alloc, from_key, to_key, opts, visitor });
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        var privacy_arena = std.heap.ArenaAllocator.init(alloc);
+        defer privacy_arena.deinit();
+        const privacy = @import("privacy_read.zig");
+        const policy = if (opts.privacy_original and !opts.privacy_status) null else try privacy.capture(self, privacy_arena.allocator());
+        if (!opts.privacy_original) try privacy.requireExpected(privacy_arena.allocator(), opts.privacy_policy_version, policy);
+        if (opts.privacy_status) {
+            const installed = policy orelse return error.IndexRebuilding;
+            const expected = opts.privacy_policy_version orelse return error.InvalidPrivacyReceipt;
+            if (!std.mem.eql(u8, &(try installed.policy.identity(privacy_arena.allocator())), &expected)) return error.IndexRebuilding;
+        }
+        const protected = !opts.privacy_status and policy != null and policy.?.policy.mode != .monitor;
+        if (protected and opts.isRelational()) return error.PrivacyRelationalStorageUnsupported;
+        if (protected and opts.sql_document_preimage) return error.PrivacyUnsupportedMutation;
+        if (protected) {
+            const special = db_query_projection.buildLookupFieldSelectionPlan(.{ .fields = opts.fields, .include_all_fields = opts.include_all_fields }).special;
+            if (special.all_artifacts or special.all_chunks or special.all_embeddings) return error.PrivacyUnsupportedProjection;
+        }
         if (opts.isRelational()) return self.scanRelationalRowsVisit(alloc, from_key, to_key, opts, visitor);
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
@@ -41210,6 +41348,10 @@ pub const DB = struct {
         lockApplyShared(self);
         var apply_shared_held = true;
         errdefer if (apply_shared_held) self.core.unlockApplyShared();
+        const privacy_status_published = if (opts.privacy_status) privacy.requirePublished(self, alloc, .{}) catch |err| switch (err) {
+            error.IndexRebuilding => false,
+            else => return err,
+        } else false;
         var schema_view = self.core.acquireSchemaView();
         defer if (schema_view) |*view| view.release();
         const ttl_duration_ns = if (schema_view) |view| view.visibilityTtlDurationNs() else 0;
@@ -41217,9 +41359,9 @@ pub const DB = struct {
 
         const borrowed_range = self.core.byteRange();
         const range_start = try alloc.dupe(u8, borrowed_range.start);
-        errdefer alloc.free(range_start);
+        defer alloc.free(range_start);
         const range_end = try alloc.dupe(u8, borrowed_range.end);
-        errdefer alloc.free(range_end);
+        defer alloc.free(range_end);
         var artifact_catalog = if (needs_catalog_projection)
             try self.core.index_manager.assetContentTypeSnapshotAlloc(alloc)
         else
@@ -41227,8 +41369,6 @@ pub const DB = struct {
         defer if (artifact_catalog) |*artifact_snapshot| artifact_snapshot.deinit();
         self.core.unlockApplyShared();
         apply_shared_held = false;
-        defer alloc.free(range_start);
-        defer alloc.free(range_end);
         const byte_range = types.ByteRange{ .start = range_start, .end = range_end };
         const lower_raw = if (from_key.len == 0 or std.mem.order(u8, from_key, byte_range.start) == .lt) byte_range.start else from_key;
         const upper_raw = blk: {
@@ -41261,7 +41401,7 @@ pub const DB = struct {
         var columnar_progress: relational_columns.Progress = .{};
         defer columnar_progress.last_key.deinit(alloc);
         var column_materializer = ColumnScanMaterializer{ .context = &projection_context, .opts = opts };
-        const accelerated = if (schema_view != null and schema_view.?.storageMode() == .relational) relational_columns.scan(self, alloc, &read_txn, from_key, to_key, byte_range, opts, visitor, ttl_duration_ns, scan_now_ns, &columnar_progress, if (prepared_filter) |*filter| filter else null, .{ .context = &column_materializer, .project = ColumnScanMaterializer.project }) catch |err| switch (err) {
+        const accelerated = if (!protected and schema_view != null and schema_view.?.storageMode() == .relational) relational_columns.scan(self, alloc, &read_txn, from_key, to_key, byte_range, opts, visitor, ttl_duration_ns, scan_now_ns, &columnar_progress, if (prepared_filter) |*filter| filter else null, .{ .context = &column_materializer, .project = ColumnScanMaterializer.project }) catch |err| switch (err) {
             error.InvalidColumnSegment, error.InvalidData, error.NotFound => blk: {
                 if (columnar_progress.callback_failed) return err;
                 // Disposable derived corruption never makes valid primary rows
@@ -41311,6 +41451,8 @@ pub const DB = struct {
             stream_plan: ?*const @import("document_query.zig").SpanProjectionPlan,
             read_txn: *docstore_mod.DocStore.Txn,
             projection_context: *TransactionProjectionContext,
+            privacy_policy: ?privacy.PolicySnapshot,
+            privacy_status_published: bool,
             values_authenticated: bool,
             ttl_key_scratch: std.ArrayListUnmanaged(u8) = .empty,
             document_key_scratch: std.ArrayListUnmanaged(u8) = .empty,
@@ -41445,7 +41587,15 @@ pub const DB = struct {
                     if ((state.opts.exclusive_to and order != .lt) or (!state.opts.exclusive_to and order == .gt))
                         return .stop;
                 }
+                var privacy_row_arena = std.heap.ArenaAllocator.init(state.alloc);
+                defer privacy_row_arena.deinit();
+                const protected_row = !state.opts.privacy_status and if (state.privacy_policy) |configured| configured.policy.mode != .monitor else false;
+                const safe_stored = if (protected_row) privacy.project(privacy_row_arena.allocator(), state.privacy_policy.?, raw_key, stored_value, state.read_txn) catch |err| {
+                    if (privacy.pending(err)) return .@"continue";
+                    return err;
+                } else stored_value;
                 const relational = internal_keys.isRelationalRowKey(store_key);
+                if (protected_row and relational) return error.PrivacyRelationalStorageUnsupported;
                 const row_plan = if (relational)
                     try state.schemaPlan(try relational_store.rowSchemaVersion(stored_value))
                 else
@@ -41489,6 +41639,19 @@ pub const DB = struct {
                         return .@"continue";
                 }
 
+                if (state.opts.privacy_status) {
+                    var observed = privacy.observation(privacy_row_arena.allocator(), state.privacy_policy.?, raw_key, stored_value, state.read_txn) catch |err| switch (err) {
+                        error.ArtifactPublicationPending, error.EnrichmentSourceChanged, error.ArtifactCatalogDrift => @import("../../privacy/status.zig").Observation{},
+                        else => return err,
+                    };
+                    defer observed.deinit(privacy_row_arena.allocator());
+                    observed.protected_ready = observed.current and state.privacy_status_published;
+                    const json_status = try @import("../../privacy/status.zig").encode(privacy_row_arena.allocator(), try state.privacy_policy.?.policy.identity(privacy_row_arena.allocator()), observed);
+                    try state.visitor.visitEntry(.{ .id = raw_key, .hash = 0, .document_json = json_status });
+                    state.count += 1;
+                    return if (state.opts.limit > 0 and state.count >= state.opts.limit) .stop else .@"continue";
+                }
+
                 const semantic_hash = if (ordinal_row) |row| row.semanticHash() else null;
                 var ordinal_filter_match: ?bool = null;
                 if (row_plan) |plan| if (plan.filter) |*filter| {
@@ -41507,9 +41670,9 @@ pub const DB = struct {
                     if (ordinal_row) |row|
                         try row.reconstructValueAlloc(state.alloc)
                     else if (borrow_plain)
-                        stored_value
+                        safe_stored
                     else
-                        try state.alloc.dupe(u8, stored_value)
+                        try state.alloc.dupe(u8, safe_stored)
                 else
                     null;
                 defer if (logical_value) |value| if (!borrow_plain) state.alloc.free(value);
@@ -41587,6 +41750,8 @@ pub const DB = struct {
             .stream_plan = if (stream_plan) |*plan| plan else null,
             .read_txn = &read_txn,
             .projection_context = &projection_context,
+            .privacy_policy = policy,
+            .privacy_status_published = privacy_status_published,
             .values_authenticated = self.core.store.valuesAreAuthenticated(),
             .visitor = visitor,
             .count = columnar_progress.delivered,
@@ -41753,6 +41918,14 @@ pub const DB = struct {
             if (documents.len == 0 or documents.len > 64 or max_bytes == 0) return error.InvalidBatch;
             self.window.retire();
             errdefer self.window.retire();
+            var privacy_arena = std.heap.ArenaAllocator.init(self.window.arena.child_allocator);
+            defer privacy_arena.deinit();
+            const policy = try @import("privacy_read.zig").capture(self.db, privacy_arena.allocator());
+            if (policy != null and policy.?.policy.mode != .monitor) {
+                self.values[0] = try self.lookup(documents[0]);
+                self.sources[0] = .{ .bytes = self.values[0].? };
+                return .{ .values = self.sources[0..1], .consumed = 1 };
+            }
             if (documents.len == 1 and fields.len == 0) {
                 self.values[0] = try self.lookup(documents[0]);
                 self.sources[0] = .{ .bytes = self.values[0].? };
@@ -41919,10 +42092,13 @@ pub const DB = struct {
             const physical = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self.db, a, key, self.schema);
             // Ranking already applied visibility/TTL at the captured cut.
             // Never fall back to a fresh read if the captured row is absent.
-            return self.window.get(&self.read, physical, 0) catch |err| switch (err) {
-                error.NotFound => error.StorageReadTemporarilyUnavailable,
-                else => err,
+            const raw = self.window.get(&self.read, physical, 0) catch |err| switch (err) {
+                error.NotFound => return error.StorageReadTemporarilyUnavailable,
+                else => return err,
             };
+            const privacy = @import("privacy_read.zig");
+            const policy = try privacy.capture(self.db, a) orelse return raw;
+            return privacy.project(a, policy, key, raw, &self.read);
         }
         /// Page cells already own their selected payloads. Retire the last
         /// source scope before a portal suspends, keeping only the snapshot.
@@ -42042,6 +42218,17 @@ pub const DB = struct {
         // Keep degraded requests out of catalog/apply lock queues. Revalidate
         // after admission below to close publication's check-to-use race.
         try self.enforcePortableRuntimeGate();
+        var privacy_arena = std.heap.ArenaAllocator.init(alloc);
+        defer privacy_arena.deinit();
+        const privacy_policy = try @import("privacy_read.zig").capture(self, privacy_arena.allocator());
+        try @import("privacy_read.zig").requireExpected(privacy_arena.allocator(), req.privacy_policy_version, privacy_policy);
+        if (privacy_policy != null and privacy_policy.?.policy.mode != .monitor) {
+            try self.lockApplySharedForPortableRuntime();
+            defer self.core.unlockApplyShared();
+            _ = try @import("privacy_read.zig").requirePublished(self, alloc, req);
+            const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
+            return .{ .request = snapshot_req, .result = try self.searchLockedWithExecutionContext(alloc, snapshot_req, exec_ctx) };
+        }
         if (std.meta.eql(exec_ctx, types.ExecutionContext{})) {
             const snapshot_input = directSingleVectorRequest(req) orelse req;
             const dense = snapshot_input.dense orelse if (snapshot_input.query == .dense_knn) snapshot_input.query.dense_knn else null;
@@ -44007,6 +44194,7 @@ pub const DB = struct {
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        _ = try @import("privacy_read.zig").requirePublished(self, alloc, req);
         return try self.collectPlanningStatsLocked(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), max_work, exec_ctx);
     }
 
@@ -44057,6 +44245,7 @@ pub const DB = struct {
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        _ = try @import("privacy_read.zig").requirePublished(self, alloc, .{});
         return try db_query_search.collectExplicitTextStats(alloc, requests, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
@@ -44073,6 +44262,7 @@ pub const DB = struct {
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        _ = try @import("privacy_read.zig").requirePublished(self, alloc, .{});
         return try db_query_search.collectExplicitBackgroundTextStats(alloc, requests, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
@@ -45712,6 +45902,10 @@ pub const DB = struct {
 
     pub fn trySnapshotDenseSearch(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery, include_profile: bool) !?SearchWithDenseProfileResult {
         if (comptime storage_engine.enabled) return storage_engine.call("trySnapshotDenseSearch", .{ self, alloc, req, dense, include_profile });
+        var privacy_arena = std.heap.ArenaAllocator.init(alloc);
+        defer privacy_arena.deinit();
+        const privacy_policy = try @import("privacy_read.zig").capture(self, privacy_arena.allocator());
+        if (privacy_policy != null and privacy_policy.?.policy.mode != .monitor) return null;
         const manager = self.async_context.resource_manager orelse return null;
         if (!manager.dense_query_snapshot) return null;
         if (!snapshotDenseRequestEligible(req)) {
@@ -47420,6 +47614,21 @@ pub const DB = struct {
         var txn = try self.core.store.beginProbeTxn();
         defer txn.abort();
         const raw = (try @import("artifact_chunk_generation.zig").readMember(alloc, &txn, store_key)) orelse return null;
+        var privacy_arena = std.heap.ArenaAllocator.init(alloc);
+        defer privacy_arena.deinit();
+        const privacy = @import("privacy_read.zig");
+        const policy = try privacy.capture(self, privacy_arena.allocator());
+        if (policy != null and policy.?.policy.mode != .monitor) {
+            if (internal_keys.isInternalUserKey(key)) {
+                const safe = try privacy.projectArtifact(privacy_arena.allocator(), policy.?, store_key, &txn);
+                return try alloc.dupe(u8, safe);
+            }
+            const safe = privacy.project(privacy_arena.allocator(), policy.?, key, raw, &txn) catch |err| {
+                if (privacy.pending(err)) return null;
+                return err;
+            };
+            return try alloc.dupe(u8, safe);
+        }
         if (internal_keys.mediaWindowIndex(store_key)) |index| return try @import("../../chunking/chunk.zig").mediaWindowPayloadAlloc(alloc, raw, index);
         return try self.core.index_manager.materializeStoredValueAlloc(alloc, store_key, raw);
     }
@@ -48020,8 +48229,29 @@ fn loadStoredSearchDocumentsMany(
         .pinned = if (schema_view) |*view| view else null,
     };
     defer schema_plans.deinit();
+    var privacy_arena = std.heap.ArenaAllocator.init(alloc);
+    defer privacy_arena.deinit();
+    const privacy = @import("privacy_read.zig");
+    const policy = try privacy.capture(self, privacy_arena.allocator());
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse continue;
+        if (policy != null and policy.?.policy.mode != .monitor) {
+            const id = keys[item.original_index];
+            if (internal_keys.isInternalUserKey(id)) {
+                const safe = privacy.projectArtifact(privacy_arena.allocator(), policy.?, item.store_key, &txn) catch |err| {
+                    if (privacy.pending(err)) continue;
+                    return err;
+                };
+                loaded[item.original_index] = try alloc.dupe(u8, safe);
+                continue;
+            }
+            const safe = privacy.project(privacy_arena.allocator(), policy.?, id, value, &txn) catch |err| {
+                if (privacy.pending(err)) continue;
+                return err;
+            };
+            loaded[item.original_index] = try alloc.dupe(u8, safe);
+            continue;
+        }
         loaded[item.original_index] = try schema_plans.materialize(
             item.store_key,
             value,
@@ -51467,7 +51697,7 @@ fn patternNodeFilterEvaluator(ctx: ?*anyopaque, node: graph_node_identity.Ref, f
 
 fn matchesPatternNodeFilter(active: *DB.PatternNodeFilterContext, key: []const u8, filter: graph_pattern_mod.NodeFilter) !bool {
     if (filter.filter_query_json == null) return true;
-    const stored = (try active.db.get(active.db.alloc, key)) orelse return false;
+    const stored = (try active.db.loadStoredSearchDocumentProbe(active.db.alloc, key)) orelse return false;
     defer active.db.alloc.free(stored);
     const prepared = try active.cache.getOrPrepare(filter.filter_query_json.?);
     return try prepared.matchesStored(active.db.alloc, key, stored);
@@ -52789,7 +53019,7 @@ fn appendDerivedBatchRecordContextWithAdmissions(ctx: *const BatchExecutionConte
         };
         var guard: Guard = .{ .required = required };
         _ = try ctx.store.putBatchWithPromotionsReplayAndBuiltWrite(ctx.io, &.{}, &.{}, &.{}, .{ .sequence = sequence, .payload = payload }, null, .{ .ptr = &guard, .validate = Guard.validate });
-    } else try appendReplayWithArtifactSourceRevisionsContext(ctx, payload, sequence);
+    } else try appendReplayWithArtifactSourceRevisionsContext(ctx, payload, sequence, batch.generated_enrichment_refs);
     ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
     var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(ctx));
     defer deferred_replication_gates.releaseTransition();
@@ -52926,7 +53156,7 @@ fn appendReplicatedDerivedEffectContext(ctx: *const BatchExecutionContext, chang
     return sequence;
 }
 
-fn appendReplayWithArtifactSourceRevisionsContext(ctx: *const BatchExecutionContext, payload: []const u8, sequence: u64) !void {
+fn appendReplayWithArtifactSourceRevisionsContext(ctx: *const BatchExecutionContext, payload: []const u8, sequence: u64, requests: []const enrichment_types.GeneratedEnrichmentRef) !void {
     var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer writes.deinit(ctx.alloc);
     var owned_keys = std.ArrayListUnmanaged([]u8).empty;
@@ -52947,6 +53177,22 @@ fn appendReplayWithArtifactSourceRevisionsContext(ctx: *const BatchExecutionCont
         &owned_keys,
         &owned_values,
     );
+    const retry = @import("../../privacy/retry.zig");
+    const floor = retry.encode(sequence);
+    for (requests) |request| {
+        if (request.kind != .asset or !@import("../../privacy/document.zig").isArtifactName(request.artifact_name)) continue;
+        var state_key: std.ArrayListUnmanaged(u8) = .empty;
+        defer state_key.deinit(ctx.alloc);
+        try internal_keys.appendDocumentPrefix(&state_key, ctx.alloc, request.doc_key);
+        try state_key.append(ctx.alloc, internal_keys.asset_state_kind);
+        try internal_keys.appendEncodedComponent(&state_key, ctx.alloc, request.artifact_name);
+        const selected = try retry.key(ctx.alloc, state_key.items);
+        owned_keys.append(ctx.alloc, selected) catch |err| {
+            ctx.alloc.free(selected);
+            return err;
+        };
+        try writes.append(ctx.alloc, .{ .key = selected, .value = &floor });
+    }
     try ctx.store.putBatchWithReplay(
         ctx.io,
         writes.items,
@@ -54175,7 +54421,7 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
     applied_batch.sequence = sequence;
     try lockApplyForPortableRuntimeContext(&batch_ctx);
     defer batch_ctx.apply_mutex.unlockExclusive();
-    try applyDerivedBatchContext(&batch_ctx, applied_batch);
+    try applyDerivedBatchInlineAssumeApply(&batch_ctx, applied_batch);
     return sequence;
 }
 
@@ -54477,7 +54723,7 @@ fn appendResolutionRecordWithProjection(
     applied_batch.sequence = sequence;
     try lockApplyForPortableRuntimeContext(&batch_ctx);
     defer batch_ctx.apply_mutex.unlockExclusive();
-    try applyDerivedBatchContext(&batch_ctx, applied_batch);
+    try applyDerivedBatchInlineAssumeApply(&batch_ctx, applied_batch);
     return sequence;
 }
 
@@ -55170,7 +55416,7 @@ fn appendGeneratedBatchFromEnrichment(
     applied_batch.sequence = sequence;
     try lockApplyForPortableRuntimeContext(&batch_ctx);
     defer batch_ctx.apply_mutex.unlockExclusive();
-    try applyDerivedBatchContext(&batch_ctx, applied_batch);
+    try applyDerivedBatchInlineAssumeApply(&batch_ctx, applied_batch);
     return .{ .sequence = sequence, .promoted_artifact_bytes = promoted_artifact_bytes };
 }
 
@@ -55337,6 +55583,12 @@ fn applyDerivedBatch(self: *DB, batch: derived_types.DerivedBatch) !void {
 const applyDerivedBatchProfiled = local_mutation.applyDerivedBatchProfiled;
 
 const applyDerivedBatchTargetsProfiled = local_mutation.applyDerivedBatchTargetsProfiled;
+
+fn applyDerivedBatchInlineAssumeApply(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch) !void {
+    var owned = ctx.*;
+    owned.apply_exclusive_held = true;
+    try applyDerivedBatchContext(&owned, batch);
+}
 
 fn applyDerivedBatchContext(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch) !void {
     try applyDerivedBatchContextProfiled(ctx, batch, null);
@@ -134348,6 +134600,9 @@ test "db scan releases its snapshot promptly on cancellation and deadline" {
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
+    // Nonempty shard bounds own allocations. Error unwinding after the scan
+    // releases the apply lock must free each bound exactly once.
+    try db.updateRange(.{ .start = "doc:", .end = "doc;" });
     try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"v\":1}" }} });
 
     var cancelled = std.atomic.Value(bool).init(true);
@@ -134581,6 +134836,12 @@ const StoredLogicalSources = struct {
 };
 fn openStoredLogicalSourcesCallback(ctx: ?*anyopaque, a: Allocator) anyerror!?db_query_search.LogicalSourceReader {
     const db: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    var privacy_arena = std.heap.ArenaAllocator.init(a);
+    defer privacy_arena.deinit();
+    const policy = try @import("privacy_read.zig").capture(db, privacy_arena.allocator());
+    // Byte-range projection certificates describe original primary bytes.
+    // Protected logical values must use the receipt-bound whole-source path.
+    if (policy != null and policy.?.policy.mode != .monitor) return null;
     if (getenv("ANTFLY_BENCH_VALUE_SOURCE_FULL_READ")) |v| if (std.mem.eql(u8, v, "1")) return null;
     // Ordinal rows retain their existing schema-versioned decoding path.
     var view = db.core.acquireSchemaView();

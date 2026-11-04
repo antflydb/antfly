@@ -272,6 +272,8 @@ pub const CatalogProjectionRequest = union(enum) {
     catalog_export: void,
     catalog_export_standalone_portable: void,
     catalog_list_tables: system_catalog.TableList,
+    privacy_due_table: i64,
+    table_by_name: []const u8,
     catalog_meta: void,
     catalog_admission: system_catalog.Mutation,
     catalog_prepare: SystemCatalogCommand,

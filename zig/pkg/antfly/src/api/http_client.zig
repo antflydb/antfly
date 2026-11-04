@@ -505,7 +505,7 @@ pub const ApiHttpClient = struct {
         timeout_ms: ?u32,
         cancellation: ?*const http_common.RequestCancellation,
     ) !LookupResponse {
-        return self.fetchGroupLookupWithMode(base_uri, group_id, table_name, key, fields, read_consistency, timeout_ms, cancellation, false, false, "", "", "", "", "", null, null, false);
+        return self.fetchGroupLookupWithMode(base_uri, group_id, table_name, key, fields, read_consistency, timeout_ms, cancellation, false, false, "", "", "", "", "", null, null, false, false, null);
     }
 
     pub fn fetchGroupLookupWithMode(
@@ -528,6 +528,8 @@ pub const ApiHttpClient = struct {
         restore_staging_scope: ?[32]u8,
         restore_staging_plan_id: ?[16]u8,
         include_primary_digest: bool,
+        privacy_original: bool,
+        privacy_policy_version: ?[64]u8,
     ) !LookupResponse {
         // Group lookups are also used for routed derived-artifact hydration.
         // Those storage keys are binary and contain namespace bytes and NUL
@@ -594,7 +596,12 @@ pub const ApiHttpClient = struct {
         defer if (group_source.len != 0) self.alloc.free(group_source);
         const group_path = if (group_source.len != 0) try std.fmt.allocPrint(self.alloc, "{s}&_group_source={s}", .{ index_path orelse observation_path orelse path, group_source }) else null;
         defer if (group_path) |value| self.alloc.free(value);
-        const uri = try self.joinRoute(base_uri, group_path orelse index_path orelse observation_path orelse path);
+        const ordinary_path = group_path orelse index_path orelse observation_path orelse path;
+        const privacy_path = if (privacy_original) try std.fmt.allocPrint(self.alloc, "{s}&_privacy_original=true", .{ordinary_path}) else null;
+        defer if (privacy_path) |value| self.alloc.free(value);
+        const policy_path = if (privacy_policy_version) |version| try std.fmt.allocPrint(self.alloc, "{s}&_privacy_policy_version={s}", .{ privacy_path orelse ordinary_path, if (std.mem.allEqual(u8, &version, 0)) "none" else &version }) else null;
+        defer if (policy_path) |value| self.alloc.free(value);
+        const uri = try self.joinRoute(base_uri, policy_path orelse privacy_path orelse ordinary_path);
         defer self.alloc.free(uri);
 
         var resp = try self.executeRequest(.{
@@ -605,7 +612,7 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
-            200 => {},
+            200 => try requirePrivacyAck(resp, privacy_policy_version),
             404 => {
                 if (std.mem.eql(u8, read_consistency, "read_index") and
                     std.mem.eql(u8, resp.header(route_metadata_api.catalog_route_fence_ack_header) orelse "", route_metadata_api.catalog_route_fence_ack_value) and
@@ -1165,6 +1172,18 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: ?[]const u8,
     ) !ScanResponse {
+        return self.fetchGroupScanControlled(base_uri, group_id, table_name, body, null, null);
+    }
+
+    pub fn fetchGroupScanControlled(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: ?[]const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !ScanResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -1181,11 +1200,13 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = if (body != null) "application/json" else null,
             .body = body orelse "",
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
         if (remoteRelationalRowError(resp.status, resp.body)) |err| return err;
         switch (resp.status) {
-            200 => {},
+            200 => try requirePrivacyAck(resp, try privacyVersionFromBody(self.alloc, body)),
             409 => return remoteGroupConflictError(resp.body),
             503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
@@ -1218,6 +1239,7 @@ pub const ApiHttpClient = struct {
             alloc: std.mem.Allocator,
             downstream: http_common.StreamWriter,
             status: u16 = 0,
+            privacy_version: ?[64]u8 = null,
             error_body: std.ArrayListUnmanaged(u8) = .empty,
 
             pub fn deinit(adapter: *@This()) void {
@@ -1227,7 +1249,10 @@ pub const ApiHttpClient = struct {
             fn start(raw: *anyopaque, response_alloc: std.mem.Allocator, response: http_common.StreamingResponse) anyerror!void {
                 const adapter: *@This() = @ptrCast(@alignCast(raw));
                 adapter.status = response.status;
-                if (response.status == 200) try adapter.downstream.start(response_alloc, response);
+                if (response.status == 200) {
+                    try requirePrivacyAck(response, adapter.privacy_version);
+                    try adapter.downstream.start(response_alloc, response);
+                }
             }
 
             fn writeAll(raw: *anyopaque, bytes: []const u8) anyerror!void {
@@ -1251,7 +1276,7 @@ pub const ApiHttpClient = struct {
                 } };
             }
         };
-        var status_writer = StatusWriter{ .alloc = self.alloc, .downstream = downstream };
+        var status_writer = StatusWriter{ .alloc = self.alloc, .downstream = downstream, .privacy_version = try privacyVersionFromBody(self.alloc, body) };
         defer status_writer.deinit();
         const handled = (try self.executeRequestStream(.{
             .method = .POST,
@@ -1413,7 +1438,7 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
-            200 => {},
+            200 => try requirePrivacyAck(resp, try privacyVersionFromBody(self.alloc, body)),
             408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return remoteStorageReadUnavailableError(resp.body),
@@ -1482,7 +1507,7 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
-            200 => {},
+            200 => try requirePrivacyAck(resp, try privacyVersionFromBody(self.alloc, body)),
             408 => return error.Timeout,
             400 => return remotePreflightError(resp.body),
             404 => return remotePreflightError(resp.body),
@@ -1746,7 +1771,7 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
-            200 => {},
+            200 => try requirePrivacyAck(resp, try privacyVersionFromBody(self.alloc, body)),
             408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return remoteStorageReadUnavailableError(resp.body),
@@ -4297,6 +4322,32 @@ fn remoteStorageReadUnavailableError(body: []const u8) anyerror {
         return error.StorageReadTemporarilyUnavailable;
     }
     return error.UnexpectedHttpStatus;
+}
+
+const privacy_ack_header = "X-Antfly-Privacy-Fence";
+
+pub fn privacyVersionFromBody(a: std.mem.Allocator, body: ?[]const u8) !?[64]u8 {
+    const bytes = body orelse return null;
+    if (bytes.len == 0) return null;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const envelope = parsed.value.object.get("query_request") orelse parsed.value;
+    if (envelope != .object) return null;
+    const value = parsed.value.object.get("_privacy_policy_version") orelse envelope.object.get("_privacy_policy_version") orelse return null;
+    if (value != .string) return error.InvalidResponse;
+    if (std.mem.eql(u8, value.string, "none")) return null;
+    if (value.string.len != 64) return error.InvalidResponse;
+    return value.string[0..64].*;
+}
+
+fn requirePrivacyAck(response: anytype, expected: ?[64]u8) !void {
+    const version = expected orelse return;
+    if (std.mem.allEqual(u8, &version, 0)) return;
+    for (response.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, privacy_ack_header) and std.mem.eql(u8, header.value, &version)) return;
+    }
+    return error.StorageReadTemporarilyUnavailable;
 }
 
 fn parseIdentityReadGenerationHeader(resp: http_common.HttpResponse) !?u64 {

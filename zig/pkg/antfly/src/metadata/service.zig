@@ -3168,6 +3168,13 @@ fn storesHaveDenseNativeAuthority(stores: []const metadata_table_manager.StoreRe
     return false;
 }
 
+fn requirePrivacyStoreAdmission(service: anytype, record: metadata_table_manager.StoreRecord) !void {
+    if (!metadata_table_manager.storeServesTableData(record.role) or metadata_table_manager.privacyProtocolSupported(record.reporter_incarnation, record.artifact_sources_protocol_version)) return;
+    const tables = try service.listProjectedTables(service.alloc);
+    defer service.freeProjectedTables(service.alloc, tables);
+    for (tables) |table| if (metadata_topology_protocol.usesPrivacy(table.indexes_json)) return error.PrivacyProtocolUpgradeRequired;
+}
+
 fn validateDenseNativeStoreAdmission(
     stores: []const metadata_table_manager.StoreRecord,
     activated_version: u16,
@@ -3441,6 +3448,7 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
         },
         else => "",
     };
+    if (metadata_topology_protocol.usesPrivacy(namespace_indexes)) return metadata_topology_protocol.privacy_version;
     if (metadata_topology_protocol.usesResolverRecords(namespace_indexes)) return metadata_topology_protocol.resolver_records_version;
     if (metadata_topology_protocol.usesResolverNamespaces(namespace_indexes)) return metadata_topology_protocol.resolver_namespaces_version;
     switch (command) {
@@ -6811,6 +6819,7 @@ pub const MetadataService = struct {
         else
             0;
         try validateDenseNativeStoreAdmission(stores, activated_version, record);
+        try requirePrivacyStoreAdmission(self, record);
         const topology_floor = if (self.projectedStore()) |store| try store.getRelationalTopologyProtocolActivationVersion(self.metadata_group_id) else 0;
         try @import("relational_topology_admission.zig").requireStoreAtFloor(topology_floor, record);
         try self.proposeTransitionCommand(.{ .register_store = record });
@@ -7556,6 +7565,28 @@ pub const MetadataService = struct {
         });
         current_status.metadata_epoch = self.lifecycle_signal.currentEpoch();
         return current_status;
+    }
+
+    pub fn privacyAuthorityTerm(self: *MetadataService) !?u64 {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const observation = serviceGroupRaftTopologyObservation(self, self.metadata_group_id);
+        if (!std.mem.eql(u8, observation.role, "leader")) return null;
+        return observation.term;
+    }
+    pub fn nextPrivacyWork(self: *MetadataService, a: std.mem.Allocator, now: i64) !?metadata_table_manager.PrivacyWork {
+        const term = (try self.privacyAuthorityTerm()) orelse return null;
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const table = (store.nextPrivacyTable(a, self.metadata_group_id, now) catch |err| blk: {
+            if (err != error.InvalidDerivedCatalogIndex) return err;
+            try store.rebuildDerivedCatalogIndexes(self.metadata_group_id);
+            break :blk try store.nextPrivacyTable(a, self.metadata_group_id, now);
+        }) orelse return null;
+        return .{ .table = table, .term = term };
+    }
+    pub fn tableRecord(self: *MetadataService, a: std.mem.Allocator, name: []const u8) !?metadata_table_manager.TableRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return store.tableByName(a, self.metadata_group_id, name);
     }
 
     pub fn adminSnapshot(self: *MetadataService) !metadata_api.AdminSnapshot {
@@ -9630,6 +9661,7 @@ pub const MetadataHttpService = struct {
         else
             0;
         try validateDenseNativeStoreAdmission(stores, activated_version, record);
+        try requirePrivacyStoreAdmission(self, record);
         const topology_floor = if (self.projectedStore()) |store| try store.getRelationalTopologyProtocolActivationVersion(self.metadata_group_id) else 0;
         try @import("relational_topology_admission.zig").requireStoreAtFloor(topology_floor, record);
         try self.proposeTransitionCommand(.{ .register_store = record });
@@ -11590,6 +11622,28 @@ pub const MetadataHttpService = struct {
                 ready.has_more_ready,
             },
         );
+    }
+
+    pub fn privacyAuthorityTerm(self: *MetadataHttpService) !?u64 {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const observation = serviceGroupRaftTopologyObservation(self, self.metadata_group_id);
+        if (!std.mem.eql(u8, observation.role, "leader")) return null;
+        return observation.term;
+    }
+    pub fn nextPrivacyWork(self: *MetadataHttpService, a: std.mem.Allocator, now: i64) !?metadata_table_manager.PrivacyWork {
+        const term = (try self.privacyAuthorityTerm()) orelse return null;
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const table = (store.nextPrivacyTable(a, self.metadata_group_id, now) catch |err| blk: {
+            if (err != error.InvalidDerivedCatalogIndex) return err;
+            try store.rebuildDerivedCatalogIndexes(self.metadata_group_id);
+            break :blk try store.nextPrivacyTable(a, self.metadata_group_id, now);
+        }) orelse return null;
+        return .{ .table = table, .term = term };
+    }
+    pub fn tableRecord(self: *MetadataHttpService, a: std.mem.Allocator, name: []const u8) !?metadata_table_manager.TableRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return store.tableByName(a, self.metadata_group_id, name);
     }
 
     pub fn adminSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {

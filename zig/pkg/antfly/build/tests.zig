@@ -224,7 +224,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const batch_contract_tests = b.addTest(.{
         .name = "storage-batch-contract-tests",
         .root_module = batch_contract_mod,
-        .filters = selectTestFilters(b, &.{ "result collectors", "bounded dense legacy providers", "parallel dense inference preserves order", "ordered artifact inventory chunk vector callback publishes and retires without reinference after acceptance" }),
+        .filters = selectTestFilters(b, &.{ "result collectors", "bounded dense legacy providers", "parallel dense inference preserves order", "ordered artifact inventory chunk vector", "privacy ordered artifact tombstone", "privacy base vectors", "privacy local source audit", "privacy base vector source updates", "privacy publication callback", "privacy independent roots" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("storage-batch-contract-test", "Verify collector OOM ownership and bounded provider batches without HTTP discovery")

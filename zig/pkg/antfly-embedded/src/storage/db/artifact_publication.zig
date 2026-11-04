@@ -965,14 +965,24 @@ pub const Dispatcher = struct {
     upload_recovery: ?UploadRecovery = null,
     /// No storage/apply lock may be held here. Success means bounded queue
     /// admission only; output remains pending until the local durable receipt.
-    enqueue: *const fn (*anyopaque, Namespace, []const u8) anyerror!void,
+    enqueue: ?*const fn (*anyopaque, Namespace, []const u8) anyerror!void = null,
+    /// Compiled owner callbacks must transport stable semantic statuses.
+    /// Zig's process-local error integers cannot cross compilation units.
+    enqueue_status: ?*const fn (*anyopaque, *const Namespace, [*]const u8, usize) callconv(.c) @import("kernel_error_identity").Status = null,
+
+    pub fn enqueueCommand(self: Dispatcher, namespace: Namespace, command: []const u8) !void {
+        if (self.enqueue_status) |enqueue|
+            return @import("kernel_error_identity").statusToError(enqueue(self.ptr, &namespace, command.ptr, command.len));
+        const enqueue = self.enqueue orelse return error.ArtifactCatalogDrift;
+        return enqueue(self.ptr, namespace, command);
+    }
 
     /// Submit an already validated, bounded producer command. Queue/resource
     /// admission and leadership are transient control state, never evidence
     /// that inference failed or that this stream completed. Keep that boundary
     /// shared across asset, vector, graph and resolver callbacks.
     pub fn submit(self: Dispatcher, namespace: Namespace, command: []const u8) !void {
-        self.enqueue(self.ptr, namespace, command) catch |err| switch (err) {
+        self.enqueueCommand(namespace, command) catch |err| switch (err) {
             error.ResourceLimitExceeded, error.ResourceBudgetExceeded, error.ResourceTemporarilyUnavailable, error.NotLeader => return error.ArtifactPublicationPending,
             error.Canceled => return error.EnrichmentRetryAborted,
             else => return err,
@@ -1000,6 +1010,30 @@ test "ordered artifact inventory producer dispatch backpressure is not terminal 
     try std.testing.expectError(error.OutOfMemory, dispatcher.submit(@splat(1), "bounded command"));
     harness.failure = error.InvalidBatchRequest;
     try std.testing.expectError(error.InvalidBatchRequest, dispatcher.submit(@splat(1), "bounded command"));
+}
+
+test "privacy publication callback carries stable backpressure statuses" {
+    const Identity = @import("kernel_error_identity");
+    const Capture = struct {
+        status: Identity.Status = .resource_limit_exceeded,
+        fn raw(_: *anyopaque, _: Namespace, _: []const u8) anyerror!void {
+            return error.TestUnexpectedResult;
+        }
+        fn stable(ptr: *anyopaque, _: *const Namespace, _: [*]const u8, _: usize) callconv(.c) Identity.Status {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.status;
+        }
+    };
+    var capture: Capture = .{};
+    const dispatcher: Dispatcher = .{ .ptr = &capture, .enqueue = Capture.raw, .enqueue_status = Capture.stable };
+    try std.testing.expectError(error.ResourceLimitExceeded, dispatcher.enqueueCommand(@splat(1), "bounded"));
+    try std.testing.expectError(error.ArtifactPublicationPending, dispatcher.submit(@splat(1), "bounded"));
+    capture.status = .not_leader;
+    try std.testing.expectError(error.ArtifactPublicationPending, dispatcher.submit(@splat(1), "bounded"));
+    capture.status = .canceled;
+    try std.testing.expectError(error.EnrichmentRetryAborted, dispatcher.submit(@splat(1), "bounded"));
+    capture.status = .ok;
+    try dispatcher.submit(@splat(1), "bounded");
 }
 
 pub const PreparedEffects = struct {
@@ -1336,11 +1370,11 @@ test "ordered artifact inventory graph tombstones retain only exact empty owners
     try std.testing.expectError(error.InvalidBatchRequest, command.validate(alloc));
 }
 
-test "ordered artifact inventory publication projects every shared consumer and rejects another producer stream" {
+test "ordered artifact inventory publication projects every shared consumer and rejects another producer stream including privacy base vectors" {
     const alloc = std.testing.allocator;
     const Config = @import("types.zig").IndexConfig;
     const configs = [_]Config{
-        .{ .name = "first", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"model\"}", .coverage_generation = 7 },
+        .{ .name = "first", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"model\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"model\"}}", .coverage_generation = 7 },
         .{ .name = "second", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"model\"}", .coverage_generation = 9 },
         .{ .name = "other", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"other-model\"}", .coverage_generation = 11 },
     };
@@ -1364,6 +1398,12 @@ test "ordered artifact inventory publication projects every shared consumer and 
         .indexes = catalog.items,
         .enrichments = "[{\"name\":\"model\",\"kind\":\"embedding\",\"source_field\":\"body\",\"expected_dims\":2},{\"name\":\"other-model\",\"kind\":\"embedding\",\"source_field\":\"other\",\"expected_dims\":2}]",
     };
+    // The public managed dense translator names its own output both on the
+    // index and its generator. That redundant name is not an external source;
+    // a genuinely different name must still fail admission.
+    var conflicting = configs[0];
+    conflicting.config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"other-model\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"model\"}}";
+    try std.testing.expect(!try @import("catalog/index_manager.zig").onlineBaseGeneratedVectorConfig(alloc, conflicting, &.{}));
     const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
     defer alloc.free(key);
     const payload = try @import("enrichment/artifact_codec.zig").encodeDenseEmbeddingAlloc(alloc, 3, &.{ 1, 2 });

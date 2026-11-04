@@ -673,6 +673,20 @@ pub const RaftApplyStore = struct {
         return self.projectionWithAllocator(?metadata.MergeTransitionRecord, alloc, .{ .kind = .merge_transition, .group_id = group_id, .arg0 = transition_id });
     }
 
+    pub fn nextPrivacyTable(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, now: i64) !?metadata.TableRecord {
+        return self.catalogProjection(?metadata.TableRecord, alloc, group_id, .{ .privacy_due_table = now }) catch |err| switch (err) {
+            error.InvalidArgument => error.InvalidDerivedCatalogIndex,
+            else => err,
+        };
+    }
+
+    pub fn tableByName(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, name: []const u8) !?metadata.TableRecord {
+        return self.catalogProjection(?metadata.TableRecord, alloc, group_id, .{ .table_by_name = name }) catch |err| switch (err) {
+            error.InvalidArgument => error.InvalidDerivedCatalogIndex,
+            else => err,
+        };
+    }
+
     pub fn listTables(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.TableRecord {
         return try self.projectionWithAllocator([]metadata.TableRecord, alloc, .{ .kind = .tables, .group_id = group_id });
     }

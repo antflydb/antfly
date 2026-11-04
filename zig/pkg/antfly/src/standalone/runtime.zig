@@ -1074,6 +1074,25 @@ const LocalStandaloneMetadata = struct {
         };
     }
 
+    fn privacyAuthorityTerm(_: *anyopaque) !?u64 {
+        return 0;
+    }
+    fn nextPrivacyWork(ptr: *anyopaque, a: std.mem.Allocator, now: i64) !?antfly.metadata.table_manager.PrivacyWork {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const id = self.manager.privacy_work.first(now) orelse return null;
+        const table = self.manager.tables.get(id) orelse return error.InvalidPrivacyCatalog;
+        return .{ .term = 0, .table = try antfly.metadata.table_manager.cloneTable(a, table) };
+    }
+    fn tableRecord(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8) !?antfly.metadata.TableRecord {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const table = self.manager.findTableByName(name) orelse return null;
+        return try antfly.metadata.table_manager.cloneTable(a, table.*);
+    }
+
     fn statusSource(self: *LocalStandaloneMetadata) antfly.public_api.http_server.StatusSource {
         return if (self.lifecycle_store != null) self.statusSourceForLifecycle(true) else self.statusSourceForLifecycle(false);
     }
@@ -1085,6 +1104,9 @@ const LocalStandaloneMetadata = struct {
             .routing = self.catalogSource().routingSource() catch unreachable,
             .vtable = &.{
                 .status = status,
+                .privacy_authority_term = privacyAuthorityTerm,
+                .privacy_work = nextPrivacyWork,
+                .table_record = tableRecord,
                 .system_catalog = systemCatalog,
                 .supports_query_definitions = true,
                 .supports_resolver_catalog_read = true,

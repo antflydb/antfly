@@ -290,7 +290,6 @@ pub fn prepareExtractionClosure(alloc: std.mem.Allocator, txn: anytype, root: u1
 pub fn prepareEnrichmentClosure(alloc: std.mem.Allocator, txn: anytype, root: u128, request: Request, plan: *const Plan) !DocumentClosure {
     if (root == 0) return error.DurableRootIncarnationUnavailable;
     if (request.doc_key.len == 0 or request.doc_key.len > checkpoints.max_cursor_bytes) return error.InvalidBatchRequest;
-    if (request.kind == .chunk_text and request.upstream_artifact_name.len != 0) return error.OnlineMergeArtifactTailsUnsupported;
     const authorized = (try @import("artifact_asset_publication.zig").authorize(alloc, txn, request, plan)) orelse return error.ArtifactCatalogDrift;
     if (authorized.requirement.scope != .document) return error.ArtifactCatalogDrift;
     const name = if (request.artifact_name.len != 0) request.artifact_name else request.index_name;

@@ -554,3 +554,16 @@ export type {
   RenameCatalogResourceRequest,
   TablespaceCatalogRecord,
 } from "./types.js";
+
+export type {
+  PrivacyProducer,
+  PrivacyCategory,
+  PrivacyPolicy,
+  PrivacyFinding,
+  PrivacyStatus,
+  PrivacyPreviewRequest,
+  PrivacyPreview,
+  PrivacyScanRequest,
+  PrivacyScan,
+  PrivacyFindingsPage,
+} from "./types.js";

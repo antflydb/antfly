@@ -744,6 +744,144 @@ export class AntflyClient {
       ),
   };
 
+  /** Table-scoped privacy administration, sharing this client's authentication. */
+  readonly privacy = {
+    get: (table: string, signal?: AbortSignal) =>
+      this.privacyRequest<components["schemas"]["PrivacyStatus"]>(
+        table,
+        "",
+        "GET",
+        undefined,
+        undefined,
+        signal
+      ),
+    put: (
+      table: string,
+      policy: components["schemas"]["PrivacyPolicy"],
+      options?: { ifMatch?: string; signal?: AbortSignal }
+    ) =>
+      this.privacyRequest<components["schemas"]["PrivacyStatus"]>(
+        table,
+        "",
+        "PUT",
+        policy,
+        options?.ifMatch,
+        options?.signal
+      ),
+    preview: (
+      table: string,
+      request: components["schemas"]["PrivacyPreviewRequest"],
+      signal?: AbortSignal
+    ) =>
+      this.privacyRequest<components["schemas"]["PrivacyPreview"]>(
+        table,
+        "/preview",
+        "POST",
+        request,
+        undefined,
+        signal
+      ),
+    startScan: (
+      table: string,
+      request: components["schemas"]["PrivacyScanRequest"] = {},
+      signal?: AbortSignal
+    ) =>
+      this.privacyRequest<components["schemas"]["PrivacyScan"]>(
+        table,
+        "/scans",
+        "POST",
+        request,
+        undefined,
+        signal
+      ),
+    getScan: (table: string, scan: string, signal?: AbortSignal) =>
+      this.privacyRequest<components["schemas"]["PrivacyScan"]>(
+        table,
+        `/scans/${encodeURIComponent(scan)}`,
+        "GET",
+        undefined,
+        undefined,
+        signal
+      ),
+    findings: (
+      table: string,
+      options?: {
+        cursor?: string;
+        document?: string;
+        field?: string;
+        category?: string;
+        policy_version?: string;
+        limit?: number;
+        signal?: AbortSignal;
+      }
+    ) => {
+      const query = new URLSearchParams();
+      for (const name of [
+        "cursor",
+        "document",
+        "field",
+        "category",
+        "policy_version",
+        "limit",
+      ] as const) {
+        const value = options?.[name];
+        if (value !== undefined) query.set(name, String(value));
+      }
+      return this.privacyRequest<components["schemas"]["PrivacyFindingsPage"]>(
+        table,
+        `/findings?${query}`,
+        "GET",
+        undefined,
+        undefined,
+        options?.signal
+      );
+    },
+  };
+
+  private async privacyRequest<T>(
+    table: string,
+    suffix: string,
+    method: "GET" | "POST" | "PUT",
+    body?: unknown,
+    ifMatch?: string,
+    signal?: AbortSignal
+  ): Promise<{ data: T; etag?: string }> {
+    const response = await fetch(
+      this.url(`/db/v1/tables/${encodeURIComponent(table)}/privacy${suffix}`),
+      {
+        method,
+        headers: this.requestHeaders(ifMatch === undefined ? undefined : { "If-Match": ifMatch }),
+        ...(body === undefined
+          ? {}
+          : { body: encodeBoundedJSON(body, DEFAULT_WRITE_MAX_REQUEST_BYTES, false) }),
+        signal,
+        credentials: "same-origin",
+        redirect: "error",
+      }
+    );
+    const result = await readLimitedResponseText(
+      response,
+      response.ok ? 32 * 1024 * 1024 : MAX_ERROR_RESPONSE_BYTES
+    );
+    let parsed: unknown;
+    try {
+      parsed = parseJSON<unknown>(result.text);
+    } catch {
+      if (!response.ok)
+        throw new AntflyHTTPError("Privacy request failed", response.status, result.text);
+      throw new AntflyResponseError("Privacy response was not valid JSON");
+    }
+    if (!response.ok)
+      throw new AntflyHTTPError(
+        apiErrorMessage(parsed, "Privacy request failed"),
+        response.status,
+        parsed
+      );
+    if (result.truncated)
+      throw new AntflyResponseError("Privacy response exceeded the response limit");
+    return { data: parsed as T, etag: response.headers.get("ETag") ?? undefined };
+  }
+
   private async personalRequest<T>(
     path: string,
     method: "GET" | "POST",

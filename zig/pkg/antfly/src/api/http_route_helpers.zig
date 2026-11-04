@@ -202,6 +202,19 @@ pub fn parseInternalLookupOptions(alloc: std.mem.Allocator, query: []const u8) !
             if (seen or !std.mem.eql(u8, part, "_relational_integrity_catalog=true")) return error.InvalidQueryRequest;
             seen = true;
             result.opts.relational_integrity_catalog = true;
+        } else if (std.mem.startsWith(u8, part, "_privacy_policy_version=")) {
+            if (result.opts.privacy_policy_version != null) return error.InvalidQueryRequest;
+            const value = part["_privacy_policy_version=".len..];
+            var version: [64]u8 = @splat(0);
+            if (!std.mem.eql(u8, value, "none")) {
+                if (value.len != 64) return error.InvalidQueryRequest;
+                for (value) |byte| if (!std.ascii.isHex(byte)) return error.InvalidQueryRequest;
+                @memcpy(&version, value);
+            }
+            result.opts.privacy_policy_version = version;
+        } else if (std.mem.startsWith(u8, part, "_privacy_original=")) {
+            if (result.opts.privacy_original or !std.mem.eql(u8, part, "_privacy_original=true")) return error.InvalidQueryRequest;
+            result.opts.privacy_original = true;
         } else if (std.mem.startsWith(u8, part, "_primary_digest=")) {
             if (result.opts.include_primary_digest or !std.mem.eql(u8, part, "_primary_digest=true")) return error.InvalidQueryRequest;
             result.opts.include_primary_digest = true;
@@ -466,6 +479,38 @@ fn parseScanKeysRequestImpl(alloc: std.mem.Allocator, body: []const u8, allow_in
     } else "";
     errdefer if (relational_query_json.len != 0) alloc.free(relational_query_json);
 
+    const privacy_version: ?[64]u8 = if (allow_internal_options) blk: {
+        var raw = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer raw.deinit();
+        if (raw.value != .object) return error.InvalidQueryRequest;
+        const value = raw.value.object.get("_privacy_policy_version") orelse break :blk null;
+        if (value != .string) return error.InvalidQueryRequest;
+        var version: [64]u8 = @splat(0);
+        if (!std.mem.eql(u8, value.string, "none")) {
+            if (value.string.len != 64) return error.InvalidQueryRequest;
+            for (value.string) |byte| if (!std.ascii.isHex(byte)) return error.InvalidQueryRequest;
+            @memcpy(&version, value.string);
+        }
+        break :blk version;
+    } else null;
+
+    const privacy_status = if (allow_internal_options) blk: {
+        var raw = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer raw.deinit();
+        if (raw.value != .object) break :blk false;
+        const flag = raw.value.object.get("_privacy_status") orelse break :blk false;
+        if (flag != .bool) return error.InvalidQueryRequest;
+        break :blk flag.bool;
+    } else false;
+    const privacy_original = if (allow_internal_options) blk: {
+        var raw = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer raw.deinit();
+        if (raw.value != .object) return error.InvalidQueryRequest;
+        const flag = raw.value.object.get("_privacy_original") orelse break :blk false;
+        if (flag != .bool) return error.InvalidQueryRequest;
+        break :blk flag.bool;
+    } else false;
+
     const include_content_hashes = if (allow_internal_options) blk: {
         var raw = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -518,6 +563,9 @@ fn parseScanKeysRequestImpl(alloc: std.mem.Allocator, body: []const u8, allow_in
             .fields = fields,
             .include_all_fields = false,
             .filter_query_json = filter_query_json,
+            .privacy_policy_version = privacy_version,
+            .privacy_original = privacy_original,
+            .privacy_status = privacy_status,
             .include_content_hashes = include_content_hashes,
             .relational_query_json = relational_query_json,
         },

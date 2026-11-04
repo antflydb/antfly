@@ -1673,6 +1673,8 @@ pub const ApiHttpServerConfig = struct {
     /// grant. Distributed runtimes explicitly clear this when their distinct
     /// trusted authority is unconfigured; internal RPC identity is not a substitute.
     catalog_publication_authority_available: bool = true,
+    /// Only the metadata leader and standalone local authority advance scans.
+    privacy_scan_coordinator: bool = false,
     /// Dedicated node-to-node signing identity. Distributed runtimes validate
     /// both values before opening a listener; they must never share the public
     /// trusted-principal signing domain.
@@ -2025,6 +2027,9 @@ pub const StatusSource = struct {
         acquire_join_planning: ?*const fn (*anyopaque, table_router.RouteBudget) anyerror!?*join_planning.Generation = null,
         system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 = null,
 
+        privacy_authority_term: ?*const fn (*anyopaque) anyerror!?u64 = null,
+        privacy_work: ?*const fn (*anyopaque, std.mem.Allocator, i64) anyerror!?metadata_table_manager.PrivacyWork = null,
+        table_record: ?*const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!?metadata_table_manager.TableRecord = null,
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
         /// Complete catalog and store capabilities without detailed inventories.
@@ -2100,6 +2105,22 @@ pub const StatusSource = struct {
 
     /// The shared public data-admission boundary. Ownership is captured with
     /// catalog identity, so every HTTP/MCP/SQL resolver gets the same decision.
+    pub fn privacyAuthorityTerm(self: StatusSource) !?u64 {
+        const call = self.vtable.privacy_authority_term orelse return null;
+        return BoundaryAbi.call("privacy_authority_term", self.boundary_dispatch, call, .{self.ptr});
+    }
+    pub fn nextPrivacyWork(self: StatusSource, a: std.mem.Allocator, now: i64) !?metadata_table_manager.PrivacyWork {
+        const call = self.vtable.privacy_work orelse return null;
+        return BoundaryAbi.call("privacy_work", self.boundary_dispatch, call, .{ self.ptr, a, now });
+    }
+    pub fn tableRecord(self: StatusSource, a: std.mem.Allocator, name: []const u8) !?metadata_table_manager.TableRecord {
+        if (self.vtable.table_record) |call| return BoundaryAbi.call("table_record", self.boundary_dispatch, call, .{ self.ptr, a, name });
+        var snapshot = (try self.adminSnapshot()) orelse return null;
+        defer self.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, name) orelse return null;
+        return try metadata_table_manager.cloneTable(a, table.*);
+    }
+
     pub fn systemCatalog(self: StatusSource, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         switch (input) {
             .native_memory_create => |request| {
@@ -2730,6 +2751,16 @@ pub const StatusSource = struct {
                 });
             }
 
+            fn privacyAuthorityTerm(ptr: *anyopaque) anyerror!?u64 {
+                return cast(ptr).privacyAuthorityTerm();
+            }
+            fn nextPrivacyWork(ptr: *anyopaque, a: std.mem.Allocator, now: i64) anyerror!?metadata_table_manager.PrivacyWork {
+                return cast(ptr).nextPrivacyWork(a, now);
+            }
+            fn tableRecord(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8) anyerror!?metadata_table_manager.TableRecord {
+                return cast(ptr).tableRecord(a, name);
+            }
+
             fn waitTableProjection(ptr: *anyopaque, table_name: []const u8, schema_json: ?[]const u8, indexes_json: ?[]const u8) anyerror!void {
                 return try cast(ptr).waitForTableProjection(table_name, .{
                     .schema_json = schema_json,
@@ -2830,6 +2861,9 @@ pub const StatusSource = struct {
             .put_artifact_enrichment = Gen.putArtifactEnrichment,
             .delete_artifact_enrichment = Gen.deleteArtifactEnrichment,
             .wait_table_lifecycle = Gen.waitTableLifecycle,
+            .privacy_authority_term = if (@hasDecl(T, "privacyAuthorityTerm")) Gen.privacyAuthorityTerm else null,
+            .privacy_work = if (@hasDecl(T, "nextPrivacyWork")) Gen.nextPrivacyWork else null,
+            .table_record = if (@hasDecl(T, "tableRecord")) Gen.tableRecord else null,
             .wait_table_projection = Gen.waitTableProjection,
             .run_round = Gen.runRound,
             .get_join_shuffle_lease = Gen.getJoinShuffleLease,
@@ -4027,6 +4061,7 @@ pub const ApiHttpServer = struct {
     backup_maintenance_owner_id: u64 = 0,
     index_installation_owner_id: u64 = 0,
     index_installation_closing: std.atomic.Value(bool) = .init(false),
+    privacy_scan_in_flight: std.atomic.Value(bool) = .init(false),
     index_installation_worker_in_flight: std.atomic.Value(bool) = .init(false),
     index_installation_mutex: std.atomic.Mutex = .unlocked,
     index_installation_apply_mutex: std.atomic.Mutex = .unlocked,
@@ -4559,6 +4594,22 @@ pub const ApiHttpServer = struct {
         defer self.source.freeAdminSnapshot(&snapshot);
         if (!artifactSourcesSupportedBySnapshot(&snapshot))
             return error.ArtifactIndexSourcesTemporarilyUnavailable;
+    }
+
+    pub fn ensurePrivacyAdmission(self: *ApiHttpServer, request: api_operation.RequestContext) !void {
+        const reads = self.table_reads orelse return error.PrivacyProtectiveInstallationRequired;
+        if (reads.vtable.privacy_policy_version == null or self.cfg.deployment_mode == .serverless) return error.PrivacyProtectiveInstallationRequired;
+        if (self.cfg.deployment_mode != .distributed) return;
+        if (self.cfg.internal_service_secret == null) return error.PrivacyInternalAuthRequired;
+        var snapshot = (try self.source.linearizableSnapshot(request)) orelse return error.PrivacyProtocolUpgradeRequired;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        var found = false;
+        for (snapshot.stores) |store| {
+            if (!store.live or !metadata_table_manager.storeServesTableData(store.role)) continue;
+            found = true;
+            if (!metadata_table_manager.privacyProtocolSupported(store.reporter_incarnation, store.artifact_sources_protocol_version)) return error.PrivacyProtocolUpgradeRequired;
+        }
+        if (!found) return error.PrivacyProtocolUpgradeRequired;
     }
 
     fn loadClusterStatusWithSnapshot(
@@ -5459,6 +5510,9 @@ pub const ApiHttpServer = struct {
         // to retry admission.
         self.resumeNativeLakeIndexPublication() catch |err| {
             std.log.warn("failed to resume native lake index publication err={s}", .{@errorName(err)});
+        };
+        self.schedulePrivacyScans() catch |err| {
+            std.log.warn("privacy scan admission deferred err={s}", .{@errorName(err)});
         };
         self.ensurePendingIndexInstallationWorker() catch |err| {
             std.log.warn("failed to resume pending index installation reconciliation err={s}", .{@errorName(err)});
@@ -10359,10 +10413,7 @@ pub const ApiHttpServer = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
     ) !?metadata_table_manager.TableRecord {
-        var snapshot = (try self.source.adminSnapshot()) orelse return null;
-        defer self.source.freeAdminSnapshot(&snapshot);
-        const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
-        return try metadata_table_manager.cloneTable(alloc, table.*);
+        return self.source.tableRecord(alloc, table_name);
     }
 
     pub fn docMatchesRowFilter(
@@ -16865,6 +16916,34 @@ pub const ApiHttpServer = struct {
             .run = IndexInstallationWorker.run,
             .deinit = IndexInstallationWorker.deinit,
         }) catch |err| return err;
+    }
+
+    pub fn schedulePrivacyScans(self: *ApiHttpServer) !void {
+        if (self.cfg.deployment_mode != .standalone and !self.cfg.privacy_scan_coordinator) return;
+        if (!self.cfg.catalog_publication_authority_available or self.index_installation_closing.load(.acquire)) return;
+        const runtime = self.cfg.backend_runtime orelse return;
+        if (runtime.threaded_jobs == null or self.index_installation_owner_id == 0) return;
+        if (self.privacy_scan_in_flight.swap(true, .acq_rel)) return;
+        errdefer self.privacy_scan_in_flight.store(false, .release);
+        const Work = struct {
+            server: *ApiHttpServer,
+            fn run(ptr: *anyopaque) !void {
+                const work: *@This() = @ptrCast(@alignCast(ptr));
+                defer work.server.privacy_scan_in_flight.store(false, .release);
+                if (work.server.index_installation_closing.load(.acquire)) return;
+                var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer arena.deinit();
+                try @import("privacy.zig").advanceOnce(work.server, arena.allocator());
+            }
+            fn deinit(ptr: *anyopaque) void {
+                const work: *@This() = @ptrCast(@alignCast(ptr));
+                std.heap.page_allocator.destroy(work);
+            }
+        };
+        const work = try std.heap.page_allocator.create(Work);
+        errdefer std.heap.page_allocator.destroy(work);
+        work.* = .{ .server = self };
+        try runtime.durable_jobs.submit(.{ .owner_id = self.index_installation_owner_id, .class = .maintenance, .ptr = work, .run = Work.run, .deinit = Work.deinit });
     }
 
     fn ensurePendingIndexInstallationWorker(self: *ApiHttpServer) !void {
@@ -24456,6 +24535,9 @@ pub const ApiHttpServer = struct {
     /// not O(retained history). It retries transient dispatch failures without
     /// requiring another client request.
     pub fn pollRestoreJobsOnce(self: *ApiHttpServer) !void {
+        // The metadata supervisor invokes this only on its current leader.
+        // Data coordinators have privacy_scan_coordinator disabled.
+        try self.schedulePrivacyScans();
         if (self.cfg.restore_owner_progress_generation) |generation| {
             const current = generation.load(.acquire);
             if (self.observed_restore_owner_progress_generation.swap(current, .acq_rel) != current) {

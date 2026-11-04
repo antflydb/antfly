@@ -80,6 +80,24 @@ pub fn loadOrProveEmpty(alloc: Allocator, store: *docstore_mod.DocStore) !?u64 {
     return if (probe.found) null else 0;
 }
 
+/// Same-cut bounded empty-store proof for publication/readiness checks.
+/// A missing count on any populated user namespace remains unknown.
+pub fn loadOrProveEmptyFromTxn(alloc: Allocator, store: *docstore_mod.DocStore, txn: *docstore_mod.DocStore.Txn) !?u64 {
+    _ = alloc;
+    if (try loadFromTxn(txn)) |count| return count;
+    const Probe = struct {
+        found: bool = false,
+        fn visit(ctx: ?*anyopaque, _: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.found = true;
+            return .stop;
+        }
+    };
+    var probe = Probe{};
+    try store.scanReadTxnWithContext(txn, &.{internal_keys.user_namespace}, &.{internal_keys.user_namespace + 1}, .{}, &probe, Probe.visit);
+    return if (probe.found) null else 0;
+}
+
 pub fn countPrimaryDocuments(
     alloc: Allocator,
     store: *docstore_mod.DocStore,

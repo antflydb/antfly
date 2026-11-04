@@ -529,7 +529,7 @@ pub const StorageOwnerRuntimeHooks = struct {
 
     pub fn artifactPublicationDispatcher(self: *StorageOwnerRuntimeHooks) ?db_mod.ArtifactPublicationDispatcher {
         if (self.config.artifact_publication_enqueue_fn == null) return null;
-        return .{ .ptr = self, .enqueue = enqueueArtifactPublication, .upload_recovery = .{ .recover = recoverArtifactUploads, .should_poll = shouldRecoverArtifactUploads } };
+        return .{ .ptr = self, .enqueue_status = enqueueArtifactPublicationStatus, .upload_recovery = .{ .recover = recoverArtifactUploads, .should_poll = shouldRecoverArtifactUploads } };
     }
 
     fn shouldRecoverArtifactUploads(ptr: *anyopaque, tick: @import("antfly_local_sources").storage_db_artifact_publication.UploadRecoveryTick) bool {
@@ -543,9 +543,13 @@ pub const StorageOwnerRuntimeHooks = struct {
     }
 
     pub fn enqueueArtifactPublication(ptr: *anyopaque, namespace: [24]u8, command: []const u8) !void {
+        try kernel_error_identity.statusToError(enqueueArtifactPublicationStatus(ptr, &namespace, command.ptr, command.len));
+    }
+
+    pub fn enqueueArtifactPublicationStatus(ptr: *anyopaque, namespace: *const [24]u8, command: [*]const u8, command_len: usize) callconv(.c) kernel_owner_abi.Status {
         const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
-        const enqueue = self.config.artifact_publication_enqueue_fn orelse return error.ArtifactCatalogDrift;
-        try kernel_error_identity.statusToError(enqueue(self.config.artifact_publication_ctx, self.group_id, &namespace, .fromSlice(command)));
+        const enqueue = self.config.artifact_publication_enqueue_fn orelse return .artifact_catalog_drift;
+        return enqueue(self.config.artifact_publication_ctx, self.group_id, namespace, .fromSlice(command[0..command_len]));
     }
 
     const CandidateCapture = struct {
@@ -1922,6 +1926,14 @@ pub fn metadataApplyStoreProjection(
                 },
                 .catalog_list_tables => |input| {
                     const value = handle.store.listSystemCatalogTables(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .privacy_due_table => |now| {
+                    const value = handle.store.nextPrivacyTable(a, group_id, now) catch |err| break :blk metadataProjectionStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .table_by_name => |name| {
+                    const value = handle.store.tableByName(a, group_id, name) catch |err| break :blk metadataProjectionStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .catalog_meta => {
