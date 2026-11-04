@@ -41,7 +41,7 @@ pub const Result = struct {
 pub fn shape(group: grouped.Group) !?micro.Shape {
     if (group.title != null or group.content.len != 1) return null;
     const part = group.content[0];
-    if (part == .audio) return .{ .bytes = part.audio.len, .tokens = 1024 };
+    if (part == .audio) return .{ .bytes = part.audio.bytes.len, .tokens = 1024 };
     const dimensions = switch (part) {
         .image => |bytes| try @import("image.zig").inspectEncodedForInference(bytes, null),
         .raster => |raster| blk: {
@@ -79,9 +79,9 @@ pub fn groupShape(group: grouped.Group) !micro.Shape {
             result.pixels = try std.math.add(u64, result.pixels, item.pixels);
             result.tokens = @min(@as(usize, 8192), try std.math.add(usize, result.tokens, item.tokens));
         },
-        .audio => |bytes| {
-            result.bytes = try std.math.add(usize, result.bytes, bytes.len);
-            result.tokens = @min(@as(usize, 8192), try std.math.add(usize, result.tokens, try projector.embeddingGemma2EncodedAudioSequenceBound(bytes)));
+        .audio => |clip| {
+            result.bytes = try std.math.add(usize, result.bytes, clip.bytes.len);
+            result.tokens = @min(@as(usize, 8192), try std.math.add(usize, result.tokens, try projector.embeddingGemma2EncodedAudioSequenceBoundWithOptions(clip.bytes, clip.decode_options)));
         },
         .pcm => |pcm| {
             result.bytes = try std.math.add(usize, result.bytes, try std.math.mul(usize, pcm.samples.len, @sizeOf(f32)));
@@ -319,7 +319,7 @@ fn executeChecked(items: []const micro.ExecuteItem) !void {
         break :blk .{ .vectors = result.vectors, .execution = execution };
     } else if (first.part == .audio) blk: {
         var clips: [4]@import("audio_preparation.zig").Clip = undefined;
-        for (items, 0..) |item, index| clips[index] = .{ .bytes = item.payloadAs(Ticket).part.audio };
+        for (items, 0..) |item, index| clips[index] = .{ .bytes = item.payloadAs(Ticket).part.audio.bytes, .decode_options = item.payloadAs(Ticket).part.audio.decode_options };
         const result = try grouped.embedAudios(shared, first.session, first.tokenizer, clips[0..items.len], first.options, first.gate, control, errors[0..items.len]);
         defer shared.free(result.input_tokens);
         @memcpy(counts[0..items.len], result.input_tokens);
@@ -398,10 +398,10 @@ test "embeddinggemma2 image broker shares bounded plan without source staging in
 }
 
 test "gemma4 audio broker bounds unknown lengths and rejects mixed modalities" {
-    const value = (try shape(.{ .content = &.{.{ .audio = "encoded" }} })).?;
+    const value = (try shape(.{ .content = &.{.{ .audio = .{ .bytes = "encoded" } }} })).?;
     try std.testing.expectEqual(@as(usize, 1024), value.tokens);
     try std.testing.expectEqual(@as(usize, 7), value.bytes);
-    try std.testing.expect(try shape(.{ .content = &.{ .{ .text = "query" }, .{ .audio = "encoded" } } }) == null);
+    try std.testing.expect(try shape(.{ .content = &.{ .{ .text = "query" }, .{ .audio = .{ .bytes = "encoded" } } } }) == null);
 }
 
 fn imageOptionsKey(options: grouped.Options) u64 {

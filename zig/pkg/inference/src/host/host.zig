@@ -4249,3 +4249,57 @@ test "standalone chunk minimum content survives the real provider ABI" {
         }
     }
 }
+
+test "linked embedding audio MIME hints match public and native grouped vectors" {
+    const env = @import("antfly_platform").env;
+    const fixture_path = env.getenv("ANTFLY_AUDIO_PARITY_MP3") orelse return error.SkipZigTest;
+    const model = env.getenv("ANTFLY_EMBEDDINGGEMMA2_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, fixture_path, a, .limited(1024 * 1024));
+    defer a.free(source);
+    const padded = try a.alloc(u8, source.len + 1);
+    defer a.free(padded);
+    padded[0] = 0;
+    @memcpy(padded[1..], source);
+    try std.testing.expect(inference.pipelines.audio.detectFormat(padded) == null);
+    var node = try inference.server.Node.init(a, .{ .models_dir = std.fs.path.dirname(model).?, .allow_unknown_models = true, .process_termination_available = true });
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+    node.session_manager.required_backend = if (@import("builtin").os.tag == .macos) .metal else .native;
+    node.model_manager.session_manager.required_backend = node.session_manager.required_backend;
+    const name = std.fs.path.basename(model);
+    const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(padded.len));
+    defer a.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, padded);
+    const body = try std.json.Stringify.valueAlloc(a, .{ .model = name, .task_type = "RETRIEVAL_QUERY", .input = .{.{ .content = .{ .{ .type = "text", .text = "Describe this tone" }, .{ .type = "media", .mime_type = "audio/mpeg", .data = encoded } } }} }, .{});
+    defer a.free(body);
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.createEmbedding(&ctx);
+    defer response.deinit();
+    if (response.status.code != 200) std.debug.print("audio MIME parity status={d} body={s}\n", .{ response.status.code, response.body orelse "" });
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer parsed.deinit();
+    const values = parsed.value.object.get("data").?.array.items[0].object.get("embedding").?.array.items;
+    const revision = (try localModelCapabilities(&node, std.testing.io, name, .embed)).model_revision;
+    const vectors = try localAntflyEmbedDensePartsWithExecutionContext(&node, a, name, &.{ .{ .text = "Describe this tone" }, .{ .binary = .{ .mime_type = "audio/mpeg", .data = padded } } }, true, revision, std.testing.io, .{ .deadline_ns = platform_time.monotonicNs() + 120 * std.time.ns_per_s }, "RETRIEVAL_QUERY", null);
+    defer {
+        for (vectors) |vector| a.free(vector);
+        a.free(vectors);
+    }
+    try std.testing.expectEqual(@as(usize, 1), vectors.len);
+    try std.testing.expectEqual(values.len, vectors[0].len);
+    for (values, vectors[0]) |value, actual| {
+        const expected: f32 = switch (value) {
+            .float => @floatCast(value.float),
+            .integer => @floatFromInt(value.integer),
+            else => return error.InvalidEmbeddingResponse,
+        };
+        try std.testing.expectApproxEqAbs(expected, actual, 0.001);
+    }
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}

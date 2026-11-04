@@ -320,7 +320,7 @@ fn admitReclaimingResources(comptime host_only: bool, session: Session, request:
     };
 }
 pub const SampledVideo = struct { webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8 = &.{}, reader: ?*const @import("antfly_media").mp4.Reader = null, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, sampling: @import("embedding_gemma2_video.zig").Sampling };
-pub const Part = union(enum) { text: []const u8, image: []const u8, audio: []const u8, pcm: @import("audio.zig").PcmAudio, video: []const u8, sampled_video: SampledVideo, raster: @import("antfly_image").BorrowedRasterAttachment };
+pub const Part = union(enum) { text: []const u8, image: []const u8, audio: @import("audio.zig").EncodedClip, pcm: @import("audio.zig").PcmAudio, video: []const u8, sampled_video: SampledVideo, raster: @import("antfly_image").BorrowedRasterAttachment };
 
 /// Final response materialization; normalization already completed on device.
 fn readNormalizedVector(cb: *const @import("../ops/ops.zig").ComputeBackend, a: std.mem.Allocator, pooled: @import("../ops/ops.zig").CT, dimensions: usize) ![]f32 {
@@ -338,6 +338,7 @@ fn readNormalizedVector(cb: *const @import("../ops/ops.zig").ComputeBackend, a: 
 
 fn partBytes(part: Part) []const u8 {
     return switch (part) {
+        .audio => |clip| clip.bytes,
         .raster => |raster| raster.bytes,
         .pcm => |pcm| std.mem.sliceAsBytes(pcm.samples),
         .sampled_video => |value| if (value.reader != null) &.{} else value.bytes,
@@ -389,7 +390,6 @@ pub const Options = struct {
     video_encoded: ?*@import("embedding_gemma2_video.zig").Encoded = null,
     /// Request-owned storage allocated outside a recyclable embedding stage.
     video_composition: ?*VideoComposition = null,
-    audio_decode_options: @import("audio.zig").DecodeOptions = .{},
     max_audio_decode_working_bytes: usize = 64 * 1024 * 1024,
     task_type: []const u8 = "RETRIEVAL_DOCUMENT",
     dimensions: usize = 768,
@@ -863,7 +863,7 @@ fn inspectGroup(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAll
                 shape_known = false;
                 continue;
             }
-            const audio_tokens = if (part == .pcm) try projector.embeddingGemma2PcmSequenceLength(part.pcm.samples.len, part.pcm.sample_rate) else try projector.embeddingGemma2EncodedAudioSequenceBound(part.audio);
+            const audio_tokens = if (part == .pcm) try projector.embeddingGemma2PcmSequenceLength(part.pcm.samples.len, part.pcm.sample_rate) else try projector.embeddingGemma2EncodedAudioSequenceBoundWithOptions(part.audio.bytes, part.audio.decode_options);
             sequence_bound = try std.math.add(usize, sequence_bound, audio_tokens);
             // Encoded codecs retain their full bounded decoder allowance even
             // when a trustworthy header supplies a shorter sequence bound.
@@ -1473,7 +1473,7 @@ fn cohortGroupReady(group: Group, parts: []const ?SoftTokens, options: Options) 
 }
 
 test "embeddinggemma2 cohort readiness respects every required modality and execution policy" {
-    const parts = [_]Part{ .{ .text = "query" }, .{ .image = "image" }, .{ .audio = "audio" } };
+    const parts = [_]Part{ .{ .text = "query" }, .{ .image = "image" }, .{ .audio = .{ .bytes = "audio" } } };
     const group = Group{ .content = &parts };
     var projected: [3]?SoftTokens = @splat(null);
     try std.testing.expect(!cohortGroupReady(group, &projected, .{}));
@@ -1823,7 +1823,7 @@ const MixedWave = struct {
                     continue;
                 };
             } else {
-                self.audio[self.count] = (if (part == .pcm) projector.prepareEmbeddingGemma2AudioPcmWithPacking(a, part.pcm, self.session.backend() != .native) else projector.prepareEmbeddingGemma2AudioForBackend(a, part.audio, .{}, self.session.backend())) catch |err| {
+                self.audio[self.count] = (if (part == .pcm) projector.prepareEmbeddingGemma2AudioPcmWithPacking(a, part.pcm, self.session.backend() != .native) else projector.prepareEmbeddingGemma2AudioForBackend(a, part.audio.bytes, part.audio.decode_options, self.session.backend())) catch |err| {
                     if (@import("audio_preparation.zig").abort(err)) return err;
                     self.errors[index] = err;
                     continue;
@@ -2000,7 +2000,7 @@ fn prepareCudaProjectedGroup(a: std.mem.Allocator, cb: *const ComputeBackend, to
         dest.* = switch (part) {
             .text => |text| .{ .text = text },
             .image => |image| .{ .image = image },
-            .audio => |audio| .{ .audio = .{ .bytes = audio } },
+            .audio => |clip| .{ .audio = clip },
             else => return error.BatchIncompatible,
         };
         row.* = if (soft) |value| .{ .tensor = value.tensor orelse return error.BatchIncompatible, .tokens = value.tokens } else null;
@@ -2299,8 +2299,8 @@ fn cudaGroupRequest(group: Group, options: Options) !@import("../backends/sessio
                 host = @max(host, try std.math.add(usize, 64 * 1024 * 1024, decoded));
                 tower = @max(tower, try projector.embeddingGemma2ImageScratch(info.width, info.height, 2 * 1024 * 1024 * 1024));
             },
-            .audio => |bytes| {
-                const audio_tokens = try projector.embeddingGemma2EncodedAudioSequenceBoundWithOptions(bytes, options.audio_decode_options);
+            .audio => |clip| {
+                const audio_tokens = try projector.embeddingGemma2EncodedAudioSequenceBoundWithOptions(clip.bytes, clip.decode_options);
                 tokens = try std.math.add(usize, tokens, audio_tokens);
                 host = @max(host, try std.math.add(usize, options.max_audio_decode_working_bytes, 64 * 1024 * 1024 + audio_tokens * 32 * 1024));
                 tower = @max(tower, 512 * 1024 * 1024);
@@ -2320,7 +2320,7 @@ fn embedCudaGroup(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, 
     for (group.content, parts) |part, *dest| dest.* = switch (part) {
         .text => |text| .{ .text = text },
         .image => |image| .{ .image = image },
-        .audio => |audio| .{ .audio = .{ .bytes = audio, .decode_options = options.audio_decode_options } },
+        .audio => |clip| .{ .audio = clip },
         .raster, .video, .sampled_video, .pcm => return error.UnsupportedInput,
     };
     const prefix = if (group.title) |title| try std.fmt.allocPrint(a, "title: {s} | text: ", .{title}) else try a.dupe(u8, try encoder.taskPrefix(options.task_type));
@@ -2521,7 +2521,7 @@ fn prepareGroupCombined(a: std.mem.Allocator, cb: *const ComputeBackend, tokeniz
                     var prepared = if (part == .pcm)
                         try projector.prepareEmbeddingGemma2AudioPcmWithPacking(a, part.pcm, device)
                     else
-                        try projector.prepareEmbeddingGemma2AudioWithPacking(a, bytes, .{}, device);
+                        try projector.prepareEmbeddingGemma2AudioWithPacking(a, bytes, part.audio.decode_options, device);
                     defer prepared.deinit();
                     const p = try projector.encodePreparedEmbeddingGemma2AudioResident(cb, a, &prepared);
                     if (device) break :blk SoftTokens{ .id = 258881, .embeddings = &.{}, .tokens = p.tokens, .tensor = p.embeddings };
@@ -2936,7 +2936,7 @@ pub fn embedAudios(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     errdefer out.free(token_counts);
     if (!options.resident_audio) {
         for (clips, 0..) |clip, index| {
-            const part: Part = if (clip.pcm) |pcm| .{ .pcm = pcm } else .{ .audio = clip.bytes };
+            const part: Part = if (clip.pcm) |pcm| .{ .pcm = pcm } else .{ .audio = .{ .bytes = clip.bytes, .decode_options = clip.decode_options } };
             const result = embed(out, session, tokenizer, .{ .content = &.{part} }, options, lock, control) catch |err| {
                 if (errors) |items| {
                     if (prep.abort(err)) return err;
@@ -4172,10 +4172,10 @@ fn validateGroupContent(group: Group, options: Options, allow_manual_markers: bo
 
 test "embeddinggemma2 CUDA groups admit complete manual media layouts and reject malformed ones" {
     try validateGroupContent(.{ .content = &.{ .{ .text = "before <|image|> after" }, .{ .image = "image" } } }, .{}, true);
-    try validateGroupContent(.{ .content = &.{ .{ .text = "<|audio|> then <|image|>" }, .{ .image = "image" }, .{ .audio = "audio" } } }, .{}, true);
+    try validateGroupContent(.{ .content = &.{ .{ .text = "<|audio|> then <|image|>" }, .{ .image = "image" }, .{ .audio = .{ .bytes = "audio" } } } }, .{}, true);
     try std.testing.expectError(error.MediaPlaceholderMismatch, validateGroupContent(.{ .content = &.{.{ .text = "<|image|>" }} }, .{}, true));
     try std.testing.expectError(error.MediaPlaceholderMismatch, validateGroupContent(.{ .content = &.{ .{ .text = "<|image|><|image|>" }, .{ .image = "image" } } }, .{}, true));
-    try std.testing.expectError(error.MediaPlaceholderMismatch, validateGroupContent(.{ .content = &.{ .{ .text = "<|image|>" }, .{ .image = "image" }, .{ .audio = "audio" } } }, .{}, true));
+    try std.testing.expectError(error.MediaPlaceholderMismatch, validateGroupContent(.{ .content = &.{ .{ .text = "<|image|>" }, .{ .image = "image" }, .{ .audio = .{ .bytes = "audio" } } } }, .{}, true));
     for ([_][]const u8{ "<|image>", "<image|>", "<|audio>", "<audio|>", "<|video|>" }) |marker|
         try std.testing.expectError(error.InvalidEmbeddingGroup, validateGroupContent(.{ .content = &.{ .{ .text = marker }, .{ .image = "image" } } }, .{}, true));
     try validateGroup(.{ .content = &.{ .{ .text = "<|image|>" }, .{ .image = "image" } } }, .{});
@@ -4939,6 +4939,9 @@ test "embeddinggemma2 mixed preparation drains cancellation partial errors and d
             return .native;
         }
         fn close(_: *anyopaque) void {}
+        fn clipCanceled(_: ?*const anyopaque) anyerror!void {
+            return error.Cancelled;
+        }
         fn canceled(_: ?*anyopaque) anyerror!void {
             return error.Cancelled;
         }
@@ -4969,6 +4972,14 @@ test "embeddinggemma2 mixed preparation drains cancellation partial errors and d
     denied.join();
     try std.testing.expectEqual(error.MemoryBudgetExceeded, denied.failure.?);
     denied.deinit();
+    const audio_groups = [_]Group{.{ .content = &.{.{ .audio = .{ .bytes = "RIFFxxxxWAVE", .decode_options = .{ .control = .{ .check_fn = Mock.clipCanceled } } } }} }};
+    var audio_wave = MixedWave{ .session = session, .groups = &audio_groups, .refs = &.{.{ .group = 0, .part = 0, .image = false }}, .control = .{}, .image = false };
+    audio_wave.budget.backing = std.testing.allocator;
+    _ = audio_wave.start();
+    audio_wave.join();
+    try std.testing.expectEqual(error.Cancelled, audio_wave.failure.?);
+    try std.testing.expectEqual(@as(usize, 0), audio_wave.count);
+    audio_wave.deinit();
 }
 
 test "embeddinggemma2 CUDA video inspected admission fits constrained scratch and retains encoder phase" {
@@ -5030,7 +5041,7 @@ test "embeddinggemma2 CUDA one second WAV stays within production scratch admiss
     const samples: [16000]f32 = @splat(0);
     const wav = try @import("audio.zig").wav.encodeInterleaved(a, &samples, 1, .{ .audio_format = 1, .sample_rate = 16000, .bits_per_sample = 16 });
     defer a.free(wav);
-    const request = try cudaGroupRequest(.{ .content = &.{.{ .audio = wav }} }, .{ .max_audio_decode_working_bytes = @import("audio.zig").default_decode_working_bytes });
+    const request = try cudaGroupRequest(.{ .content = &.{.{ .audio = .{ .bytes = wav } }} }, .{ .max_audio_decode_working_bytes = @import("audio.zig").default_decode_working_bytes });
     try std.testing.expect(request.sequence < 512);
     try std.testing.expect(request.workspace_bytes < 768 * 1024 * 1024);
     // Resident weights plus this request also fit the 4608 MiB device bucket.
@@ -5054,7 +5065,7 @@ test "embeddinggemma2 CUDA audio admission preserves decode hint precedence" {
     // MP3 decoders can scan past leading padding; admission cannot require a
     // byte-zero signature when the caller supplies the encoded format.
     const padded = "\x00\xff\xfb\x90\x00";
-    const group = Group{ .content = &.{.{ .audio = padded }} };
+    const group = Group{ .content = &.{.{ .audio = .{ .bytes = padded } }} };
     try std.testing.expectError(error.UnsupportedAudioFormat, cudaGroupRequest(group, .{}));
     const hints = [_]@import("audio.zig").DecodeOptions{
         .{ .format_hint = .mp3 },
@@ -5062,15 +5073,15 @@ test "embeddinggemma2 CUDA audio admission preserves decode hint precedence" {
         .{ .file_name_hint = "padded.mp3" },
     };
     for (hints) |hint| {
-        const request = try cudaGroupRequest(group, .{ .audio_decode_options = hint });
+        const request = try cudaGroupRequest(.{ .content = &.{.{ .audio = .{ .bytes = padded, .decode_options = hint } }} }, .{});
         // Unknown duration keeps the full sequence and tower envelope.
         try std.testing.expectEqual(@as(usize, 8192), request.sequence);
         try std.testing.expect(request.workspace_bytes >= 512 * 1024 * 1024);
     }
     // A format hint must also override a misleading signature. Parsing this
     // as WAV would fail before the hinted MP3 decoder could inspect it.
-    const misleading = Group{ .content = &.{.{ .audio = "RIFFxxxxWAVE" }} };
-    const request = try cudaGroupRequest(misleading, .{ .audio_decode_options = .{ .format_hint = .mp3 } });
+    const misleading = Group{ .content = &.{.{ .audio = .{ .bytes = "RIFFxxxxWAVE", .decode_options = .{ .format_hint = .mp3 } } }} };
+    const request = try cudaGroupRequest(misleading, .{});
     try std.testing.expectEqual(@as(usize, 8192), request.sequence);
 }
 
@@ -5105,10 +5116,10 @@ test "embeddinggemma2 CUDA prepared mixed cohorts preserve singleton vectors and
         compute.embedding_gemma2_policy.media_batch = true;
     }
     const groups = [_]Group{
-        .{ .content = &.{ .{ .audio = audio_bytes }, .{ .text = "first <|image|> then <|audio|> last" }, .{ .image = image_bytes } } },
+        .{ .content = &.{ .{ .audio = .{ .bytes = audio_bytes } }, .{ .text = "first <|image|> then <|audio|> last" }, .{ .image = image_bytes } } },
         .{ .content = &.{.{ .text = "A short query" }} },
-        .{ .content = &.{.{ .audio = audio_bytes }} },
-        .{ .content = &.{ .{ .text = "Describe these inputs." }, .{ .audio = audio_bytes }, .{ .image = image_bytes } } },
+        .{ .content = &.{.{ .audio = .{ .bytes = audio_bytes } }} },
+        .{ .content = &.{ .{ .text = "Describe these inputs." }, .{ .audio = .{ .bytes = audio_bytes } }, .{ .image = image_bytes } } },
     };
     const Abort = struct {
         fn check(_: ?*anyopaque) anyerror!void {
@@ -5619,7 +5630,7 @@ test "embeddinggemma2 mixed header bounds scale images and audio without maximum
     const a = std.testing.allocator;
     const wav = try @import("audio.zig").wav.encodeInterleaved(a, &samples, 1, .{ .audio_format = 3, .sample_rate = 16000, .bits_per_sample = 32 });
     defer a.free(wav);
-    const encoded = try inspectGroup(&bounded, session, cfg, .{ .content = &.{.{ .audio = wav }} }, .{}, .{});
+    const encoded = try inspectGroup(&bounded, session, cfg, .{ .content = &.{.{ .audio = .{ .bytes = wav } }} }, .{}, .{});
     try std.testing.expect(encoded.bounds.sequence < 512);
     try std.testing.expect(encoded.bounds.host < 320 * 1024 * 1024);
     try std.testing.expect(encoded.bounds.host >= @import("audio.zig").default_decode_working_bytes);

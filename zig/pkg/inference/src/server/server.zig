@@ -7060,9 +7060,7 @@ pub const Node = struct {
             const groups = try allocator.alloc(grouped.Group, parsed.total_count);
             defer allocator.free(groups);
             for (parsed.audio.items, parts, groups, 0..) |input, *part, *group, index| {
-                // Ambiguous codecs retain the MIME-aware pipeline executor.
-                if (@import("../pipelines/audio.zig").detectFormat(input.bytes) == null) return null;
-                part.* = .{ .audio = input.bytes };
+                part.* = .{ .audio = .{ .bytes = input.bytes, .decode_options = .{ .mime_hint = input.mime_type } } };
                 group.* = .{ .content = parts[index..][0..1] };
             }
             const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
@@ -36943,7 +36941,7 @@ fn embeddingGroupsForParsed(allocator: std.mem.Allocator, parsed: *const ParsedD
         for (input.content, parts) |part, *dest| dest.* = switch (part) {
             .text => |text| .{ .text = text },
             .image => |bytes| .{ .image = bytes },
-            .audio => |clip| .{ .audio = clip.bytes },
+            .audio => |clip| if (clip.pcm) |pcm| .{ .pcm = pcm } else .{ .audio = .{ .bytes = clip.bytes, .decode_options = clip.decode_options } },
             .video => |bytes| .{ .video = bytes },
         };
         group.* = .{ .content = parts };
@@ -37101,7 +37099,7 @@ test "EmbeddingGemma2 grouped frontend rechecks loaded manifest limits and modal
     try std.testing.expectEqual(@as(usize, 512), options.max_tokens);
     try std.testing.expectEqual(@as(usize, 256), (try groupedEmbeddingOptions(&manifest, contract, .{ .max_tokens = 256 })).max_tokens);
     _ = try validateEmbeddingGroupContract(&node, contract, .{ .content = &.{.{ .text = "document" }} }, 1, .{});
-    try std.testing.expectError(error.UnsupportedInferenceModality, validateEmbeddingGroupContract(&node, contract, .{ .content = &.{.{ .audio = "audio" }} }, 1, .{}));
+    try std.testing.expectError(error.UnsupportedInferenceModality, validateEmbeddingGroupContract(&node, contract, .{ .content = &.{.{ .audio = .{ .bytes = "audio" } }} }, 1, .{}));
     manifest.max_position_embeddings = 128;
     try std.testing.expectEqual(@as(usize, 128), (try groupedEmbeddingOptions(&manifest, contract, .{})).max_tokens);
     manifest.embedding_style = .none;
@@ -38232,9 +38230,9 @@ fn validateEmbeddingGroupContract(node: *Node, contract: ResolvedInferenceExecut
             media_bytes = try std.math.add(usize, media_bytes, try std.math.mul(usize, pcm.samples.len, @sizeOf(f32)));
             has_audio = true;
         },
-        .audio => |bytes| {
+        .audio => |clip| {
             media_parts += 1;
-            media_bytes = std.math.add(usize, media_bytes, bytes.len) catch return error.InferenceEncodedBytesExceeded;
+            media_bytes = std.math.add(usize, media_bytes, clip.bytes.len) catch return error.InferenceEncodedBytesExceeded;
             has_audio = true;
         },
     };
@@ -38292,7 +38290,7 @@ fn parseEmbeddingGroup(self: *Node, a: std.mem.Allocator, manifest: *const manif
         const audio = retained.audio.items.len;
         const videos = retained.videos.items.len;
         try appendDenseEmbedInput(self, a, manifest, retained, part, 0, budget, context, attachments);
-        if (retained.texts.items.len > texts) dest.* = .{ .text = retained.texts.items[texts].text } else if (retained.images.items.len > images) dest.* = .{ .image = retained.images.items[images].bytes } else if (retained.audio.items.len > audio) dest.* = .{ .audio = retained.audio.items[audio].bytes } else if (retained.videos.items.len > videos) dest.* = .{ .video = retained.videos.items[videos].bytes } else return error.InvalidEmbeddingGroup;
+        if (retained.texts.items.len > texts) dest.* = .{ .text = retained.texts.items[texts].text } else if (retained.images.items.len > images) dest.* = .{ .image = retained.images.items[images].bytes } else if (retained.audio.items.len > audio) dest.* = .{ .audio = .{ .bytes = retained.audio.items[audio].bytes, .decode_options = .{ .mime_hint = retained.audio.items[audio].mime_type } } } else if (retained.videos.items.len > videos) dest.* = .{ .video = retained.videos.items[videos].bytes } else return error.InvalidEmbeddingGroup;
         if (part == .object) if (part.object.get("sampling")) |value| {
             if (dest.* != .video) return error.InvalidSamplingPolicy;
             // Read the original payload before assigning the new union tag.
@@ -42719,9 +42717,9 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
     defer a.free(audio_bytes);
     const grouped = @import("../pipelines/embedding_gemma2.zig");
     const cases = [_][]const grouped.Part{
-        &.{.{ .image = image_bytes }},                                                                     &.{.{ .audio = audio_bytes }},
-        &.{ .{ .text = "Describe this image." }, .{ .image = image_bytes } },                              &.{ .{ .image = image_bytes }, .{ .text = "Describe this image." } },
-        &.{ .{ .text = "Describe these inputs." }, .{ .audio = audio_bytes }, .{ .image = image_bytes } },
+        &.{.{ .image = image_bytes }},                                                                                   &.{.{ .audio = .{ .bytes = audio_bytes } }},
+        &.{ .{ .text = "Describe this image." }, .{ .image = image_bytes } },                                            &.{ .{ .image = image_bytes }, .{ .text = "Describe this image." } },
+        &.{ .{ .text = "Describe these inputs." }, .{ .audio = .{ .bytes = audio_bytes } }, .{ .image = image_bytes } },
     };
     for (cases, parsed.value.object.get("cases").?.array.items) |parts, reference| {
         if (platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_CASE")) |name| if (!std.mem.eql(u8, name, reference.object.get("name").?.string)) continue;
@@ -42746,7 +42744,7 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
         const reference = parsed.value.object.get("cases").?.array.items[1];
         for (0..14) |iteration| {
             const start = platform.time.monotonicNs();
-            const result = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{.{ .audio = audio_bytes }} }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+            const result = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{.{ .audio = .{ .bytes = audio_bytes } }} }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
             defer a.free(result.vector);
             const elapsed = platform.time.monotonicNs() -| start;
             for (reference.object.get("embedding").?.array.items, result.vector) |value, actual| try std.testing.expectApproxEqAbs(@as(f32, @floatCast(value.float)), actual, 1e-3);
@@ -42755,7 +42753,7 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
     }
     // Qualify the resident conformer cohort and pooled backbone against the
     // same pretrained audio oracle, including Metal's bounded frame pipeline.
-    const audio_groups: [2]grouped.Group = @splat(.{ .content = &.{.{ .audio = audio_bytes }} });
+    const audio_groups: [2]grouped.Group = @splat(.{ .content = &.{.{ .audio = .{ .bytes = audio_bytes } }} });
     var audio_errors: [2]?anyerror = @splat(null);
     const audio_batch = try grouped.embedGroupCohort(a, loaded.session, loaded.getTokenizer(), &audio_groups, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), &audio_errors);
     defer {
@@ -42915,7 +42913,7 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
                         defer a.free(audio_result.vectors);
                         defer a.free(audio_result.input_tokens);
                         break :resident grouped.Result{ .vector = audio_result.vectors[0], .input_tokens = audio_result.input_tokens[0] };
-                    } else try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{.{ .audio = audio_bytes }} }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+                    } else try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{.{ .audio = .{ .bytes = audio_bytes } }} }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
                     defer a.free(result.vector);
                     const elapsed = platform.time.monotonicNs() -| start;
                     for (result.vector, audio_expected) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
@@ -43085,7 +43083,7 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
         const brokered = (try node.tryEmbedImagesViaBroker(a, std.testing.io, loaded, &.{}, &pages, node.extractionExecutionControl(null), .RETRIEVAL_DOCUMENT, null)) orelse return error.ExpectedImageBroker;
         defer freeDirectDenseVectors(a, brokered);
         for (brokered) |vector| for (vector, batched.vectors[0]) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
-        const mixed_parts = [_]grouped.Part{ .{ .text = "Describe these inputs." }, .{ .audio = audio_bytes }, .{ .raster = rasters[0] } };
+        const mixed_parts = [_]grouped.Part{ .{ .text = "Describe these inputs." }, .{ .audio = .{ .bytes = audio_bytes } }, .{ .raster = rasters[0] } };
         const mixed_groups: [2]grouped.Group = @splat(.{ .content = &mixed_parts });
         var timings = grouped.MediaTimings{};
         var errors: [2]?anyerror = @splat(null);
@@ -48265,4 +48263,46 @@ test "fixed chunk request validates minimum content without changing defaults" {
     try std.testing.expectError(error.InvalidChunkMinChars, applyFixedChunkConfig(&config, .{ .text = .{ .min_chars = 1000001 } }));
     try applyFixedChunkConfig(&config, .{ .text = .{ .min_chars = 0 } });
     try std.testing.expectEqual(@as(usize, 0), config.text.min_chars);
+}
+
+test "EmbeddingGemma2 ordered audio preserves MIME hints through HTTP native and broker admission" {
+    const a = std.testing.allocator;
+    var node: Node = undefined;
+    node.config = .{};
+    var modalities = [_][]const u8{ "text", "audio" };
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .model_type = .embedder, .embedding_style = .embedding_gemma2, .inputs = &modalities };
+    const bytes = "\x00\xff\xfb\x90\x00";
+    const children = [_]Node.DirectDenseEmbedPart{ .{ .text = "speech" }, .{ .media = .{ .mime_type = "audio/mpeg", .data = bytes } }, .{ .media = .{ .mime_type = "audio/aac", .data = bytes } } };
+    var budget = RequestMediaBudget.init(1024);
+    var parsed = try parseDirectDenseEmbedInputsOptionalContext(&node, a, &manifest, &.{.{ .content = &children }}, &budget, null);
+    defer parsed.deinit(a);
+    var groups = try embeddingGroupsForParsed(a, &parsed);
+    defer groups.deinit();
+    for (groups.groups[0].content[1..], [_][]const u8{ "audio/mpeg", "audio/aac" }) |part, mime| {
+        try std.testing.expect(part.audio.bytes.ptr == bytes.ptr);
+        try std.testing.expectEqualStrings(mime, part.audio.decode_options.mime_hint.?);
+    }
+    const broker = @import("../pipelines/gemma4_image_broker.zig");
+    _ = try broker.groupShape(groups.groups[0]);
+    // With no hint these bytes fail sniffing; each part's declaration must
+    // reach admission independently even when the clips share one group.
+    const projector = @import("../architectures/gemma4_projector.zig");
+    try std.testing.expectError(error.UnsupportedAudioFormat, projector.embeddingGemma2EncodedAudioSequenceBound(bytes));
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var json = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"content":[{"type":"text","text":"speech"},{"type":"media","mime_type":"audio/mpeg","data":"AP/7kAA="},{"type":"media","mime_type":"audio/aac","data":"AP/7kAA="}]}
+    , .{});
+    defer json.deinit();
+    var retained: ParsedDenseEmbedInputs = .{};
+    defer retained.deinit(alloc);
+    var http_budget = RequestMediaBudget.init(1024);
+    const http_group = try parseEmbeddingGroup(&node, alloc, &manifest, json.value, &retained, &http_budget, .{ .io = std.testing.io }, &.{});
+    for (http_group.content[1..], groups.groups[0].content[1..]) |http_part, native_part| {
+        try std.testing.expectEqualStrings(native_part.audio.decode_options.mime_hint.?, http_part.audio.decode_options.mime_hint.?);
+        try std.testing.expectEqualSlices(u8, native_part.audio.bytes, http_part.audio.bytes);
+    }
+    try std.testing.expectEqualDeep(try broker.groupShape(groups.groups[0]), try broker.groupShape(http_group));
 }

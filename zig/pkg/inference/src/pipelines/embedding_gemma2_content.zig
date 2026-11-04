@@ -54,10 +54,7 @@ const end_audio_token = "<audio|>";
 pub const Part = union(enum) {
     text: []const u8,
     image: []const u8,
-    audio: struct {
-        bytes: []const u8,
-        decode_options: audio.DecodeOptions = .{},
-    },
+    audio: audio.EncodedClip,
 };
 
 pub const Prepared = struct {

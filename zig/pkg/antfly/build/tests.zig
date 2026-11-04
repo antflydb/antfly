@@ -5511,6 +5511,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "linked rerank documents become server content parts with attachment references",
             "linked embedding groups retain one ordered input and borrowed media",
             "linked embedding large image parity across public and grouped inputs",
+            "linked embedding audio MIME hints match public and native grouped vectors",
             "document execution manifests retain raw duplex body mode",
             "native checkpoint route manifest preserves binary upload and export streaming",
             "native checkpoint worker upload honors cancellation counts and cumulative ceiling",

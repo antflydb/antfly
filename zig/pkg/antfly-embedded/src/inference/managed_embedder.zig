@@ -6365,7 +6365,7 @@ fn embedWithEntryPartsForTaskOnce(
                 try checkEntryDispatchDeadline(entry);
                 const context = embeddingRequestContext(entry, task_type);
                 try context.check();
-                if (context.model_identity != null and local.embed_dense_parts_with_context == null and local.embed_dense_group_with_context == null) return error.InvalidEmbeddingIdentity;
+                if ((context.model_identity != null or context.model_revision != null) and local.embed_dense_parts_with_context == null and local.embed_dense_group_with_context == null) return error.InvalidEmbeddingIdentity;
                 const vectors = (if (local.embed_dense_group_with_context) |embed_group|
                     AntflyProviderBoundary.call("embed_dense_group_with_context", local.boundary_dispatch, embed_group, .{ local.ptr, alloc, entry.model, parts, context })
                 else if (local.embed_dense_parts_with_context) |embed_parts_with_context|
@@ -6859,7 +6859,7 @@ fn embedPartItemsWithEntry(
         try checkEntryDispatchDeadline(entry);
         const context = embeddingRequestContext(entry, .retrieval_document);
         try context.check();
-        if (context.model_identity != null and local.embed_dense_parts_with_context == null) return error.InvalidEmbeddingIdentity;
+        if ((context.model_identity != null or context.model_revision != null) and local.embed_dense_parts_with_context == null) return error.InvalidEmbeddingIdentity;
         const vectors = (if (local.embed_dense_parts_with_context) |with_context|
             AntflyProviderBoundary.call("embed_dense_parts_with_context", local.boundary_dispatch, with_context, .{ local.ptr, alloc, entry.model, items, context })
         else
@@ -12398,4 +12398,40 @@ test "managed embedder remote grouped query uses one HTTP input and one vector" 
     defer a.free(vector);
     try std.testing.expectEqualSlices(f32, &.{ 1, 0 }, vector);
     try std.testing.expectEqual(@as(usize, 1), app.calls.load(.monotonic));
+}
+
+test "managed embedder legacy parts reject revision bound groups and independent items" {
+    const Local = struct {
+        revision: u8 = 1,
+        calls: usize = 0,
+        fn capabilities(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: inference_work.Task) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .task = .embed, .input_modalities = .{ .text = true, .image = true }, .accepted_mime_types = .{ .text_plain = true, .image_png = true }, .input_granularity = .page, .output = .embedding, .batch = .{ .mode = .serial_compatibility, .max_items = 1 }, .model_revision = @as([32]u8, @splat(self.revision)) };
+        }
+        fn texts(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn sparse(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]db_embedder.SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+        fn parts(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const template_mod.ContentPart) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.TestUnexpectedResult;
+        }
+    };
+    const a = std.testing.allocator;
+    var local = Local{};
+    var entries = [_]ManagedEmbeddingEntry{.{ .alloc = a, .index_name = @constCast("visual"), .provider = .antfly, .model = @constCast("model"), .base_url = @constCast("antfly:embedded"), .dimensions = 2, .io = std.testing.io, .declared_inputs = .{ .text = true, .image = true }, .antfly_provider = .{ .ptr = &local, .owns_invocation_admission = true, .embed_dense_texts = Local.texts, .embed_sparse_texts = Local.sparse, .embed_dense_parts = Local.parts, .model_capabilities = Local.capabilities } }};
+    var managed = ManagedEmbedder{ .alloc = a, .entries = &entries };
+    const dense = managed.denseInterface();
+    const context = RequestContext{ .io = std.testing.io, .deadline_ns = null };
+    const generation = try dense.captureTextGenerationWithContext(a, "visual", context);
+    const lease = try dense.resolvePartLease(a, "visual");
+    for ([_]u8{ 1, 2, 1 }) |revision| {
+        local.revision = revision;
+        try std.testing.expectError(error.InvalidEmbeddingIdentity, dense.withTextGeneration(generation).embedDensePartsWithContext(a, "visual", &.{.{ .text = "input" }}, 2, context));
+        try std.testing.expectError(error.InvalidEmbeddingIdentity, dense.withPartLease(lease).embedDensePartItems(a, "visual", &.{.{ .text = "input" }}, 2));
+    }
+    try std.testing.expectEqual(@as(usize, 0), local.calls);
 }
