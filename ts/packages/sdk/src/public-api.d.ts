@@ -7385,6 +7385,8 @@ export interface components {
             error: string;
             /** @description Human-readable error description when supplied by the endpoint. */
             message?: string;
+            /** @description Optional RFC 6901 JSON Pointer identifying the invalid request field. */
+            pointer?: string;
             /** @description Whether retrying the operation may succeed without changing the request. */
             retryable?: boolean;
             /**

@@ -3153,7 +3153,8 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
         }),
         error.ResourceLimitExceeded => ctx.status(400).json(.{
             .@"error" = "MODEL_RESOURCE_LIMIT",
-            .message = "model resource plan exceeds the configured inference budget",
+            .message = "model resource plan exceeds the configured inference budget; inspect admission logs for requested bytes and host, backend, combined, KV and scratch limits",
+            .retryable = false,
         }),
         error.ModelArtifactsChanging,
         error.IncompleteManagedDownload,
@@ -3191,7 +3192,8 @@ fn inferenceFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
         }),
         error.ResourceLimitExceeded => ctx.status(400).json(.{
             .@"error" = "MODEL_RESOURCE_LIMIT",
-            .message = "request resource plan exceeds the configured inference budget",
+            .message = "request resource plan exceeds the configured inference budget; inspect admission logs for requested bytes and host, backend, combined, KV and scratch limits",
+            .retryable = false,
         }),
         error.ProcessIsolationRequired => ctx.status(503).json(.{
             .@"error" = "PROCESS_ISOLATION_REQUIRED",
@@ -13333,17 +13335,7 @@ pub const Node = struct {
             if (admission_manifest.embedding_style != .embedding_gemma2) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "ordered content groups require an EmbeddingGemma 2 model" });
             if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
             return self.createGroupedEmbedding(ctx, model_path, admission_manifest, executor_contract, request, borrowed_attachments, media_admission.byte_cap, execution_control) catch |err| {
-                if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
-                if (err == error.MemoryBudgetExceeded) return inferenceFailureResponse(ctx, err);
-                if (err == error.EmbeddingIdentityMismatch) return ctx.status(409).json(.{ .@"error" = "MODEL_IDENTITY_MISMATCH", .message = "embedding assets or recipe differ from the pinned index identity" });
-                if (isRemoteContentRequestError(err)) return remoteContentErrorResponse(ctx, err);
-                if (isDenseEmbedRequestAbort(err)) return inferenceFailureResponse(ctx, err);
-                if (isInferenceExecutorContractError(err)) return inferenceExecutorContractFailureResponse(ctx, err);
-                if (err == error.EmbeddingInputTooLong) return ctx.status(413).json(.{ .@"error" = "INPUT_TOO_LONG", .message = embedRequestOptionErrorMessage(err) });
-                if (groupedEmbeddingInputFailure(err)) |failure| {
-                    return ctx.status(failure.status).json(.{ .@"error" = failure.code, .message = failure.message });
-                }
-                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) });
+                return groupedEmbeddingFailureResponse(ctx, err);
             };
         }
 
@@ -38364,6 +38356,43 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
     };
 }
 
+/// Grouped execution uses the same admission failure identities as flat
+/// execution, before interpreting failures as invalid grouped input.
+fn groupedEmbeddingFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
+    if (err == error.MemoryBudgetExceeded or err == error.ResourceLimitExceeded) return inferenceFailureResponse(ctx, err);
+    if (err == error.EmbeddingIdentityMismatch) return ctx.status(409).json(.{ .@"error" = "MODEL_IDENTITY_MISMATCH", .message = "embedding assets or recipe differ from the pinned index identity" });
+    if (isRemoteContentRequestError(err)) return remoteContentErrorResponse(ctx, err);
+    if (isDenseEmbedRequestAbort(err)) return inferenceFailureResponse(ctx, err);
+    if (isInferenceExecutorContractError(err)) return inferenceExecutorContractFailureResponse(ctx, err);
+    if (err == error.EmbeddingInputTooLong) return ctx.status(413).json(.{ .@"error" = "INPUT_TOO_LONG", .message = embedRequestOptionErrorMessage(err) });
+    if (groupedEmbeddingInputFailure(err)) |failure| {
+        return ctx.status(failure.status).json(.{ .@"error" = failure.code, .message = failure.message });
+    }
+    return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) });
+}
+
+test "admission grouped and flat embedding responses preserve resource identity" {
+    const a = std.testing.allocator;
+    inline for (.{ groupedEmbeddingFailureResponse, embedDenseInputFailureResponse }) |respond| {
+        for ([_]anyerror{ error.ResourceLimitExceeded, error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable }) |err| {
+            var request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+            defer request.deinit();
+            var ctx = httpx.Context.init(a, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try respond(&ctx, err);
+            defer response.deinit();
+            const busy = err == error.ResourceTemporarilyUnavailable;
+            const memory = err == error.MemoryBudgetExceeded;
+            try std.testing.expectEqual(@as(u16, if (busy) 503 else if (memory) 507 else 400), response.status.code);
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings(if (busy) "MODEL_RESOURCE_BUSY" else if (memory) "MEMORY_BUDGET_EXCEEDED" else "MODEL_RESOURCE_LIMIT", parsed.value.object.get("error").?.string);
+            try std.testing.expectEqual(busy, parsed.value.object.get("retryable").?.bool);
+        }
+    }
+}
+
 /// Ordered groups can reject corrupt image headers during parsing, before
 /// inference. Preserve the same permanent image error as the execution path.
 fn groupedEmbeddingInputFailure(err: anyerror) ?EmbedDenseInputFailure {
@@ -38404,7 +38433,7 @@ fn embedDenseInputFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Res
     // Execution can expire after model acquisition (including the native
     // broker path). Preserve request lifetime semantics at this boundary too.
     switch (err) {
-        error.Timeout, error.Canceled, error.Cancelled => return inferenceFailureResponse(ctx, err),
+        error.Timeout, error.Canceled, error.Cancelled, error.ResourceLimitExceeded, error.MemoryBudgetExceeded => return inferenceFailureResponse(ctx, err),
         else => {},
     }
     if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
