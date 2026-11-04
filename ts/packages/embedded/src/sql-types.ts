@@ -22,10 +22,15 @@ export interface SqlDiagnostic {
 export type CommitOutcome = "applied" | "not_applied" | "unknown";
 export class SqlError extends Error {
   readonly sqlstate: string;
+  /**
+   * @param outcomeReceipt Set when an autocommit write ended with an unknown
+   *   outcome; resolve it later with `Database.outcomeReceiptStatus()`.
+   */
   constructor(
     readonly diagnostic: SqlDiagnostic,
     readonly transactionId?: string,
-    readonly commitOutcome?: CommitOutcome
+    readonly commitOutcome?: CommitOutcome,
+    readonly outcomeReceipt?: string
   ) {
     super(`${diagnostic.code}: ${diagnostic.message}`);
     this.name = "SqlError";

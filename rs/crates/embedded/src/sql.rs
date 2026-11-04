@@ -74,6 +74,14 @@ impl SqlError {
         self
     }
 }
+impl SqlError {
+    /// The outcome receipt of an autocommit write that ended with
+    /// `OutcomeUnknown`, when the database issued one; resolve it with
+    /// `Database::outcome_receipt_status`.
+    pub fn outcome_receipt(&self) -> Option<&str> {
+        self.native.outcome_receipt()
+    }
+}
 impl std::error::Error for SqlError {}
 impl From<Error> for SqlError {
     fn from(native: Error) -> Self {
@@ -89,13 +97,20 @@ impl From<Error> for SqlError {
     }
 }
 pub type Result<T> = std::result::Result<T, SqlError>;
-fn output(code: i32, body: Vec<u8>) -> Result<Vec<u8>> {
+fn output(code: i32, native: Option<Error>, body: Vec<u8>) -> Result<Vec<u8>> {
     if code == sys::ANTFLY_OK {
         return Ok(body);
     }
     let envelope = serde_json::from_slice::<serde_json::Value>(&body).ok();
     let diagnostic = envelope.as_ref().and_then(|v| v.get("error"));
-    let native = Error::from_native(code);
+    let mut native = native.unwrap_or_else(|| Error::from_code(code));
+    if native.outcome_receipt().is_none() {
+        let receipt = envelope
+            .as_ref()
+            .and_then(|v| v["outcome_receipt"].as_str())
+            .map(str::to_owned);
+        native = native.with_outcome_receipt(receipt);
+    }
     let message = diagnostic
         .as_ref()
         .and_then(|value| value["message"].as_str())
@@ -124,12 +139,14 @@ impl Database {
         &self,
         f: impl FnOnce(*mut sys::antfly_db, *mut sys::antfly_buffer) -> i32,
     ) -> Result<Vec<u8>> {
-        let (code, body) = self.with_handle(|handle| {
+        let (code, native, body) = self.with_handle(|handle| {
             let mut out = sys::antfly_buffer::default();
             let code = f(handle, &mut out);
-            Ok((code, unsafe { take_buffer(out) }))
+            // Read diagnostics (and any outcome receipt) before freeing the buffer.
+            let native = (code != sys::ANTFLY_OK).then(|| Error::from_native_with_receipt(code));
+            Ok((code, native, unsafe { take_buffer(out) }))
         })?;
-        output(code, body)
+        output(code, native, body)
     }
     pub fn sql_json(&self, request: impl AsRef<[u8]>) -> Result<Vec<u8>> {
         let request = request.as_ref();

@@ -53,6 +53,12 @@ export enum TxnStatus {
   Aborted = 2,
 }
 
+/**
+ * Resolved outcome of a write that ended with ANTFLY_OUTCOME_UNKNOWN
+ * (ANTFLY_OUTCOME_RECEIPT_APPLIED / ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED).
+ */
+export type OutcomeReceiptStatus = "applied" | "not_applied";
+
 /** Inference mode strings returned by Lite status and capabilities JSON. */
 export const InferenceMode = {
   CallerSuppliedOrDisabled: "caller_supplied_or_disabled",

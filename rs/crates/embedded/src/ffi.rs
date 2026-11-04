@@ -100,6 +100,17 @@ pub(crate) fn check(code: antfly_error_code) -> Result<()> {
     }
 }
 
+/// [`check`] for calls that issue outcome receipts (batch exports and
+/// autocommit SQL): an `OutcomeUnknown` failure carries its receipt. Must run
+/// on the calling thread right after the native call.
+pub(crate) fn check_outcome(code: antfly_error_code) -> Result<()> {
+    if code == ANTFLY_OK {
+        Ok(())
+    } else {
+        Err(Error::from_native_with_receipt(code))
+    }
+}
+
 /// Converts a byte-oriented path to raw bytes for an `antfly_slice` (not a
 /// NUL-terminated `CString` -- some C ABI fields, like
 /// `antfly_inference_options.models_dir`, take a path as a borrowed slice

@@ -155,7 +155,9 @@ def queue_cases(args):
 
 def sdk(library: str):
     os.environ["ANTFLY_LIBRARY"] = library
-    sys.path.insert(0, str(SDK))
+    # A baseline library is driven through its own revision's SDK, which
+    # binds exactly the functions that library exports.
+    sys.path.insert(0, os.environ.get("ANTFLY_BENCH_SDK_PATH", str(SDK)))
     import antfly_embedded as af
 
     return af
@@ -348,7 +350,13 @@ def native_worker(config, index, ready, start, results, finish=None):
                 )
                 try:
                     while time.monotonic() < deadline:
-                        key = f"{prefix}-{sequence if config['workload'] == 'append' else sequence % 128}"
+                        batch_docs = config.get("batch_docs", 1)
+                        keyspace = max(128, batch_docs)
+                        keys = [
+                            f"{prefix}-{(sequence * batch_docs + j) if config['workload'] == 'append' else (sequence * batch_docs + j) % keyspace}"
+                            for j in range(batch_docs)
+                        ]
+                        key = keys[-1]
                         token = (
                             f"churnworker{index}thread{thread_index}sequence{sequence}"
                             if config.get("text_payload") == "changing-words"
@@ -356,12 +364,13 @@ def native_worker(config, index, ready, start, results, finish=None):
                         )
                         payload = {
                             "inserts": {
-                                key: {
+                                k: {
                                     "text": f"{token} {text_payload}"
                                     if token
                                     else text_payload,
                                     "sequence": sequence,
                                 }
+                                for k in keys
                             }
                         }
                         began_call = time.perf_counter_ns()
@@ -379,16 +388,19 @@ def native_worker(config, index, ready, start, results, finish=None):
                                 success_windows[window] += 1
                                 thread_windows[thread_index][window] += 1
                                 thread_successes[thread_index] += 1
-                                if token:
-                                    write["text_token"] = token
-                                    previous = latest_churn_writes.get(key)
-                                    if previous is not None:
-                                        write["replaced_text_token"] = previous[
-                                            "text_token"
-                                        ]
-                                last_write = write
-                                if config["workload"] == "churn":
-                                    latest_churn_writes[key] = write
+                                for k in keys:
+                                    item = {"key": k, "sequence": sequence}
+                                    if token:
+                                        item["text_token"] = token
+                                        previous = latest_churn_writes.get(k)
+                                        if previous is not None:
+                                            item["replaced_text_token"] = previous[
+                                                "text_token"
+                                            ]
+                                    if config["workload"] == "churn":
+                                        latest_churn_writes[k] = item
+                                    if k == key:
+                                        last_write = item
                             max_gap = max(max_gap, elapsed - last_progress)
                             last_progress = elapsed
                         except af.BusyError:
@@ -930,6 +942,7 @@ def native_cases(args):
                 "progress_window_seconds": args.progress_window,
                 "status_interval": args.status_interval,
                 "threads_per_worker": args.threads_per_worker,
+                "batch_docs": args.batch_docs,
             }
             reader_stop, reader_results = context.Event(), context.Queue()
             reader = (
@@ -1285,6 +1298,12 @@ def main():
         help="native: seconds per per-worker progress window (a zero window marks a stall)",
     )
     parser.add_argument(
+        "--batch-docs",
+        type=int,
+        default=1,
+        help="native: documents per batch call (one journal record each)",
+    )
+    parser.add_argument(
         "--threads-per-worker",
         type=int,
         default=1,
@@ -1309,6 +1328,7 @@ def main():
         or args.progress_window <= 0
         or args.status_interval < 0
         or not 1 <= args.threads_per_worker <= 64
+        or not 1 <= args.batch_docs <= 4096
     ):
         parser.error(
             "counts/durations must be positive; concurrency <= 128; timeout >= 0"

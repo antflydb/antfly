@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from . import _ffi, errors
-from ._database import Database, GraphDirection, TxnID, TxnStatus, WriteIntent
+from ._database import Database, GraphDirection, OutcomeReceiptStatus, TxnID, TxnStatus, WriteIntent
 from ._inference import Inference, PullProgress
 from ._json import decode_json_response, encode_text
 from ._library import LibraryNotFoundError
@@ -68,6 +68,7 @@ __all__ = [
     "TxnID",
     "TxnStatus",
     "GraphDirection",
+    "OutcomeReceiptStatus",
     "OpenMode",
     "Profile",
     "Storage",

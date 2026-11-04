@@ -61,6 +61,8 @@ __all__ = [
     "ReplacementConfigurationMismatchError",
     "InternalError",
     "raise_for_code",
+    "raise_for_outcome_code",
+    "last_outcome_receipt",
     "error_class_for_code",
 ]
 
@@ -188,7 +190,25 @@ class BusyError(AntflyError):
 
 
 class OutcomeUnknownError(AntflyError):
+    """The operation may have taken effect; do not retry it automatically.
+
+    Attributes:
+        outcome_receipt: for a failed batch or autocommit SQL write, the
+            receipt the database issued for it (resolve it later with
+            Database.outcome_receipt_status), else None.
+    """
+
     CODE = OUTCOME_UNKNOWN
+
+    def __init__(
+        self,
+        code: int | None = None,
+        message: str | None = None,
+        *,
+        outcome_receipt: str | None = None,
+    ) -> None:
+        super().__init__(code, message)
+        self.outcome_receipt = outcome_receipt
 
 
 class UnsupportedError(AntflyError):
@@ -263,3 +283,35 @@ def raise_for_code(code: int) -> None:
         detail = lib.antfly_last_error_detail()
     message = detail.decode("utf-8", errors="replace") if detail else None
     raise error_class_for_code(code)(code, message)
+
+
+def last_outcome_receipt() -> str | None:
+    """This thread's most recent outcome receipt, or None when the failed
+    call issued none. Call right after a batch or autocommit SQL write
+    returned ANTFLY_OUTCOME_UNKNOWN, before any other native call."""
+    import ctypes
+
+    from . import _ffi
+
+    lib = _ffi._lib
+    if lib is None:
+        return None
+    buffer = _ffi.AntflyBuffer()
+    if lib.antfly_last_error_outcome_receipt(ctypes.byref(buffer)) != OK:
+        return None
+    receipt = _ffi.take_buffer(buffer)
+    return receipt.decode("ascii", errors="replace") if receipt else None
+
+
+def raise_for_outcome_code(code: int) -> None:
+    """raise_for_code for calls that issue outcome receipts: an
+    OutcomeUnknownError carries the call's receipt, if any."""
+    if code != OUTCOME_UNKNOWN:
+        raise_for_code(code)
+        return
+    receipt = last_outcome_receipt()
+    try:
+        raise_for_code(code)
+    except OutcomeUnknownError as err:
+        err.outcome_receipt = receipt
+        raise

@@ -687,6 +687,12 @@ Antfly Lite should match the familiar embedded database model:
 - Serialized threading within a process: one handle may be shared by any
   number of threads, with reads running in parallel and alongside writes. See
   `CAPI.md` "Thread Safety" for the per-call access classes.
+- Background full-text replay splits oversized journal records into durable
+  document-family fragments. Deletions, overwrites and asset keys for a primary
+  document stay in the same fragment. The adaptive preparation budget targets
+  25 ms per turn; it is not a latency guarantee for storage publication. Resume
+  state is bound to the index generation, configuration and table incarnation,
+  and the record's applied sequence advances only after every fragment is durable.
 
 The CLI should expose this plainly:
 
