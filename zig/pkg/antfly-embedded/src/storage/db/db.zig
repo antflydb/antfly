@@ -1286,6 +1286,7 @@ fn addBatchProfile(total: *BatchProfile, delta: BatchProfile) void {
     total.derived_apply_ns += delta.derived_apply_ns;
     total.sync_wait_ns += delta.sync_wait_ns;
     total.full_text_apply_ns += delta.full_text_apply_ns;
+    total.full_text_collect_ns += delta.full_text_collect_ns;
     total.full_text_plan_ns += delta.full_text_plan_ns;
     total.full_text_prepare_ns += delta.full_text_prepare_ns;
     total.full_text_apply_lock_wait_ns += delta.full_text_apply_lock_wait_ns;
@@ -1502,12 +1503,13 @@ fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
         },
     );
     std.log.info(
-        "antfly_bench_batch_derived writes={d} total_ms={d} derived_apply_ms={d} full_text_apply_ms={d} full_text_plan_ms={d} full_text_prepare_ms={d} full_text_apply_lock_wait_ms={d} full_text_apply_lock_held_ms={d} dense_apply_ms={d} dense_delete_ms={d} dense_doc_index_ms={d} dense_embedding_apply_ms={d} sparse_apply_ms={d} graph_apply_ms={d} index_sync_ms={d} applied_sequence_save_ms={d} replay_journal_truncate_ms={d}",
+        "antfly_bench_batch_derived writes={d} total_ms={d} derived_apply_ms={d} full_text_apply_ms={d} full_text_collect_ms={d} full_text_plan_ms={d} full_text_prepare_ms={d} full_text_apply_lock_wait_ms={d} full_text_apply_lock_held_ms={d} dense_apply_ms={d} dense_delete_ms={d} dense_doc_index_ms={d} dense_embedding_apply_ms={d} sparse_apply_ms={d} graph_apply_ms={d} index_sync_ms={d} applied_sequence_save_ms={d} replay_journal_truncate_ms={d}",
         .{
             req.writes.len,
             nsToMs(profile.total_ns),
             nsToMs(profile.derived_apply_ns),
             nsToMs(profile.full_text_apply_ns),
+            nsToMs(profile.full_text_collect_ns),
             nsToMs(profile.full_text_plan_ns),
             nsToMs(profile.full_text_prepare_ns),
             nsToMs(profile.full_text_apply_lock_wait_ns),
@@ -1645,7 +1647,7 @@ fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
 
 fn logDerivedWorkerProfile(index_ref: index_manager_mod.ManagedIndexRef, batch: derived_types.DerivedBatch, profile: BatchProfile) void {
     std.log.info(
-        "antfly_bench_derived_worker index={s} kind={s} sequence={d} documents={d} deletes={d} overwritten={d} dense_embeddings={d} sparse_embeddings={d} graph_writes={d} graph_deletes={d} total_ms={d} full_text_apply_ms={d} full_text_plan_ms={d} full_text_prepare_ms={d} full_text_apply_lock_wait_ms={d} full_text_apply_lock_held_ms={d} dense_apply_ms={d} dense_delete_ms={d} dense_doc_index_ms={d} dense_embedding_apply_ms={d} sparse_apply_ms={d} graph_apply_ms={d} index_sync_ms={d}",
+        "antfly_bench_derived_worker index={s} kind={s} sequence={d} documents={d} deletes={d} overwritten={d} dense_embeddings={d} sparse_embeddings={d} graph_writes={d} graph_deletes={d} total_ms={d} full_text_apply_ms={d} full_text_collect_ms={d} full_text_plan_ms={d} full_text_prepare_ms={d} full_text_apply_lock_wait_ms={d} full_text_apply_lock_held_ms={d} dense_apply_ms={d} dense_delete_ms={d} dense_doc_index_ms={d} dense_embedding_apply_ms={d} sparse_apply_ms={d} graph_apply_ms={d} index_sync_ms={d}",
         .{
             index_ref.name,
             @tagName(index_ref.kind),
@@ -1659,6 +1661,7 @@ fn logDerivedWorkerProfile(index_ref: index_manager_mod.ManagedIndexRef, batch: 
             batch.graph_deletes.len,
             nsToMs(profile.total_ns),
             nsToMs(profile.full_text_apply_ns),
+            nsToMs(profile.full_text_collect_ns),
             nsToMs(profile.full_text_plan_ns),
             nsToMs(profile.full_text_prepare_ns),
             nsToMs(profile.full_text_apply_lock_wait_ns),
@@ -32181,6 +32184,7 @@ pub const DB = struct {
         if (options.bounded_replay) {
             const state = options.group_source_state orelse self.borrowed_group_source_state orelse &self.group_source_owner.state;
             const wait: derived_executor_mod.VisibilityWait = .{
+                .full_text_preparation_ns = if (self.core.store.runtime_store.capabilities().bounded_replay_admission) &self.async_context.full_text_preparation_ns else null,
                 .fragments = if (self.core.store.runtime_store.capabilities().bounded_replay_admission) .{
                     .ptr = self.async_context,
                     .supports = supportsReplayFragmentsAsync,
@@ -56083,10 +56087,14 @@ fn replayPendingDerivedBatches(
             self.core.store.runtime_store.capabilities().bounded_replay_admission and
             (self.core.index_manager.get(index_ref.name) orelse return error.IndexNotFound).coverage_generation != 0;
         const replay_started = monotonicTimeNs();
+        const preparation_before = self.async_context.full_text_preparation_ns.load(.monotonic);
         const publication_before = replay_state.publication_overhead_ns.load(.monotonic);
         var replay_completed = false;
         defer if (options.bounded_replay and !replay_completed)
-            replay_state.replay_budget.observePreparation(replay_lane, adaptive_budget, monotonicTimeNs() -| replay_started, replay_state.publication_overhead_ns.load(.monotonic) -| publication_before, 0, true);
+            replay_state.replay_budget.observe(replay_lane, adaptive_budget, if (fragment_replay)
+                self.async_context.full_text_preparation_ns.load(.monotonic) -| preparation_before
+            else
+                (monotonicTimeNs() -| replay_started) -| (replay_state.publication_overhead_ns.load(.monotonic) -| publication_before), 0, true);
         const stats = try derived_worker.catchUpIndexWithOptions(
             self.alloc,
             resources.replay_source,
@@ -56152,7 +56160,10 @@ fn replayPendingDerivedBatches(
             try self.core.saveAppliedSequence(index_ref.name, target_sequence);
         } else try abortReplayCapture(&replay_ctx, index_ref);
         if (options.bounded_replay)
-            replay_state.replay_budget.observePreparation(replay_lane, adaptive_budget, monotonicTimeNs() -| replay_started, replay_state.publication_overhead_ns.load(.monotonic) -| publication_before, @max(stats.scanned_entries, stats.collected_items), false);
+            replay_state.replay_budget.observe(replay_lane, adaptive_budget, if (fragment_replay)
+                self.async_context.full_text_preparation_ns.load(.monotonic) -| preparation_before
+            else
+                (monotonicTimeNs() -| replay_started) -| (replay_state.publication_overhead_ns.load(.monotonic) -| publication_before), @max(stats.scanned_entries, stats.collected_items), false);
         replay_completed = true;
     }
     if (options.truncate_replay) try truncateReplayJournalIfSafe(self);
@@ -57431,7 +57442,12 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
         .require_graph_resolution_contract = true,
     };
-    applyDerivedBatchToIndexContextProfiled(&ctx, batch, index_ref, null, true, null) catch |err| switch (err) {
+    const measure_preparation = index_ref.kind == .full_text and resources.store.runtime_store.capabilities().bounded_replay_admission;
+    var profile: BatchProfile = .{};
+    defer if (measure_preparation) {
+        _ = self.async_context.full_text_preparation_ns.fetchAdd(profile.full_text_collect_ns + profile.full_text_plan_ns + profile.full_text_prepare_ns, .monotonic);
+    };
+    applyDerivedBatchToIndexContextProfiled(&ctx, batch, index_ref, if (measure_preparation) &profile else null, true, null) catch |err| switch (err) {
         // External-vector dense indexes can discover a missing artifact while
         // replaying an otherwise valid journal window. Existing generations
         // turn that into durable repair debt; initial materialization keeps it
@@ -60018,12 +60034,19 @@ pub fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.D
     // beginDerivedCatchUpSessionAsync; this callback alone owns the right to
     // append to it. Foreground/enrichment callers use the non-borrowing path
     // and yield if this window is still active.
-    if (benchMetricsEnabled()) {
+    const metrics_enabled = benchMetricsEnabled();
+    const measure_preparation = index_ref.kind == .full_text and ctx.store.runtime_store.capabilities().bounded_replay_admission;
+    if (metrics_enabled or measure_preparation) {
         var profile = BatchProfile{};
+        defer if (measure_preparation) {
+            _ = ctx.full_text_preparation_ns.fetchAdd(profile.full_text_collect_ns + profile.full_text_plan_ns + profile.full_text_prepare_ns, .monotonic);
+        };
         const start = monotonicTimeNs();
         try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, &profile, true, admission);
-        profile.total_ns = monotonicTimeNs() - start;
-        logDerivedWorkerProfile(index_ref, batch, profile);
+        if (metrics_enabled) {
+            profile.total_ns = monotonicTimeNs() - start;
+            logDerivedWorkerProfile(index_ref, batch, profile);
+        }
     } else {
         try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null, true, admission);
     }

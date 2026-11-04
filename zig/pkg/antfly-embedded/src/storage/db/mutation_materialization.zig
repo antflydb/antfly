@@ -3497,7 +3497,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     manager.shouldEscalateReplayDocumentNotVisible(replay_owner, index_ref.name, batch.sequence)
                 else
                     false;
-                var collected = try collectTextDocumentWritesForIndex(
+                const collect_started = if (profile != null) monotonicTimeNs() else 0;
+                var collected = collectTextDocumentWritesForIndex(
                     ctx.alloc,
                     ctx.store,
                     ctx.index_manager,
@@ -3510,7 +3511,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .relational_base_rows = ctx.relational_base_rows,
                         .tolerate_missing_replay_documents = tolerate_missing_replay_documents,
                     },
-                );
+                ) catch |err| {
+                    if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_collect_ns, collect_started);
+                    return err;
+                };
+                if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_collect_ns, collect_started);
                 defer collected.deinit();
                 if (collected.missing_required != 0) return error.ReplayDocumentNotVisible;
                 if (ctx.index_manager.resource_manager) |manager|

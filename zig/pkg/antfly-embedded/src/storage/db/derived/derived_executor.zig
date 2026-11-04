@@ -221,7 +221,9 @@ const ManualWorker = struct {
     paused: bool = false,
 };
 
-fn replayWorkElapsedNs(wait: VisibilityWait, started: u64, waited_before: u64) u64 {
+fn replayWorkElapsedNs(wait: VisibilityWait, kind: types.IndexKind, started: u64, waited_before: u64, preparation_before: u64) u64 {
+    if (kind == .full_text) if (wait.full_text_preparation_ns) |counter|
+        return counter.load(.monotonic) -| preparation_before;
     const elapsed = @import("antfly_platform").time.monotonicNs() -| started;
     const publication_wait = if (wait.publication_overhead_ns) |counter| counter.load(.monotonic) -| waited_before else 0;
     // Queueing, validation and the bounded prepared-publication hold are
@@ -409,9 +411,10 @@ const ManualRuntime = struct {
         } else null;
         const started = @import("antfly_platform").time.monotonicNs();
         const waited_before = if (wait.publication_overhead_ns) |counter| counter.load(.monotonic) else 0;
+        const preparation_before = if (wait.full_text_preparation_ns) |counter| counter.load(.monotonic) else 0;
         var pressure_failure = false;
         var completed = false;
-        defer if (!completed) if (wait.replay_budget) |controller| controller.observe(lane, budget, replayWorkElapsedNs(wait, started, waited_before), 0, pressure_failure);
+        defer if (!completed) if (wait.replay_budget) |controller| controller.observe(lane, budget, replayWorkElapsedNs(wait, worker.kind.kind, started, waited_before, preparation_before), 0, pressure_failure);
         const stats = derived_worker.catchUpIndexWithOptions(
             self.alloc,
             self.replay_source,
@@ -439,7 +442,7 @@ const ManualRuntime = struct {
             return err;
         };
         completed = true;
-        if (wait.replay_budget) |controller| controller.observe(lane, budget, replayWorkElapsedNs(wait, started, waited_before), @max(stats.scanned_entries, stats.collected_items), false);
+        if (wait.replay_budget) |controller| controller.observe(lane, budget, replayWorkElapsedNs(wait, worker.kind.kind, started, waited_before, preparation_before), @max(stats.scanned_entries, stats.collected_items), false);
         catch_up_open = false;
         return .{ .stats = stats, .token = token };
     }
@@ -1012,6 +1015,8 @@ test "manual replay fragments one oversized record and resumes after replacement
         scalar: u64 = 0,
         retired: u64 = 0,
         fail_save: bool = false,
+        delay_once: bool = true,
+        preparation_ns: std.atomic.Value(u64) = .init(0),
 
         fn supports(_: *anyopaque, _: []const u8) !bool {
             return true;
@@ -1019,6 +1024,7 @@ test "manual replay fragments one oversized record and resumes after replacement
         fn apply(ptr: *anyopaque, batch: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.max_documents = @max(self.max_documents, batch.documents.len);
+            _ = self.preparation_ns.fetchAdd(1, .monotonic);
             for (batch.documents) |doc| self.seen[try std.fmt.parseInt(usize, doc.key[4..], 10)] = true;
             return true;
         }
@@ -1028,6 +1034,10 @@ test "manual replay fragments one oversized record and resumes after replacement
         }
         fn save(ptr: *anyopaque, _: []const u8, position: fragment.Position) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.delay_once) {
+                self.delay_once = false;
+                try std.testing.io.sleep(.fromNanoseconds(2 * @import("replay_budget.zig").Controller.quantum_ns), .awake);
+            }
             if (self.fail_save) {
                 self.fail_save = false;
                 return error.TestFragmentPersistFailure;
@@ -1052,6 +1062,7 @@ test "manual replay fragments one oversized record and resumes after replacement
     const wait: VisibilityWait = .{
         .replay_budget = &budget,
         .replay_record_cap = 8,
+        .full_text_preparation_ns = &probe.preparation_ns,
         .fragments = .{ .ptr = &probe, .supports = Probe.supports, .load = Probe.load, .save = Probe.save },
     };
     const source = replay_source_mod.Source.fromPrimaryStore(&store, null, null);
@@ -1060,6 +1071,9 @@ test "manual replay fragments one oversized record and resumes after replacement
         defer executor.deinit(a);
         try executor.addWorker("ft", .{ .name = "ft", .kind = .full_text }, 0);
         try executor.waitForAllWithVisibilityWait(1, wait);
+        // A slow continuation checkpoint must not shrink a cheap preparation
+        // window. The fixed record cap still bounds this test to eight families.
+        try std.testing.expectEqual(@as(usize, 16), budget.budget(0).records);
         try std.testing.expectEqual(@as(u64, 0), executor.appliedSequence("ft").?);
         try std.testing.expectEqual(@as(u64, 8), (try fragment.decode(&probe.encoded.?)).position.next_item);
         try std.testing.expectEqual(@as(u64, 0), probe.retired);

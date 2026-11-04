@@ -183,6 +183,9 @@ pub const ReplayMetadataPublication = struct {
 };
 
 pub const AsyncContext = struct {
+    /// Work proportional to prepared text families, excluding cursor setup,
+    /// capacity waits, durable publication and continuation checkpoints.
+    full_text_preparation_ns: std.atomic.Value(u64) = .init(0),
     replay_index_publication: ?ReplayMetadataPublication = null,
     replay_metadata_publication: ?ReplayMetadataPublication = null,
     replay_publication: ?ReplayPublication = null,
@@ -757,6 +760,7 @@ pub const BatchProfile = struct {
     derived_apply_ns: u64 = 0,
     sync_wait_ns: u64 = 0,
     full_text_apply_ns: u64 = 0,
+    full_text_collect_ns: u64 = 0,
     full_text_plan_ns: u64 = 0,
     full_text_prepare_ns: u64 = 0,
     full_text_apply_lock_wait_ns: u64 = 0,

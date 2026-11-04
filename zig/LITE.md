@@ -1321,6 +1321,11 @@ as workerless replay. Their budgets bound complete document families within a
 large journal record. A replacement worker loads the durable continuation;
 neither partial index output nor a failed continuation write advances the
 complete-record watermark or releases that record's retention credits.
+Native text-window sizing measures document collection, projection and segment
+preparation directly. Cursor setup, capacity waits, publication and continuation
+sync remain fixed service costs, rather than reasons to shrink cheap preparation
+windows. The call still obeys its wall-clock yield and cancellation checks, and
+memory failures and allocator-retention pressure retain their existing bounds.
 Promotion's SQL coordinator uses the same bounded consumer reserve as its
 replay caller. A full producer quota still refuses new foreground decisions,
 but cannot refuse a consumer decision while that reserve has headroom. Once
