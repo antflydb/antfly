@@ -5257,8 +5257,15 @@ pub fn parseRemoteHierarchyArtifactRefAlloc(
     errdefer alloc.free(owned_name);
     const owned_unit_id = if (artifact.unit_id) |unit_id| try alloc.dupe(u8, unit_id) else null;
     errdefer if (owned_unit_id) |unit_id| alloc.free(unit_id);
-    const source = if (artifact.source) |source| try parseRemoteArtifactSourceRefAlloc(alloc, source) else null;
+    var source = if (artifact.source) |source| try parseRemoteArtifactSourceRefAlloc(alloc, source) else null;
+    errdefer if (source) |*value| value.deinit(alloc);
+    const revision = if (artifact.revision) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (revision) |value| alloc.free(value);
+    const derivation_revision = if (artifact.derivation_revision) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (derivation_revision) |value| alloc.free(value);
     return db_mod.types.ArtifactRef{
+        .revision = revision,
+        .derivation_revision = derivation_revision,
         .document_id = owned_document_id,
         .name = owned_name,
         .kind = kind,

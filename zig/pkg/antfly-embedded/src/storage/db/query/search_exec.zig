@@ -13566,7 +13566,11 @@ pub fn searchTextQuery(
     const unresolved_stored_filters =
         (effective_req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
         (effective_req.exclusion_query_json.len > 0 and !native_constraints.exclusion_query_json_resolved);
-    try rejectSortedQueryWithUnresolvedStoredFilters(
+    // Artifact-member predicates run against their source parent. They cannot
+    // be translated to the member index's document numbers. The exact bounded
+    // collector below exhausts its admitted candidate population, applies the
+    // parent predicates, and only then sorts/pages; excess work is rejected.
+    if (!(chunk_backed and member_mode_for_filter)) try rejectSortedQueryWithUnresolvedStoredFilters(
         effective_req,
         native_constraints.filter_query_json_resolved,
         native_constraints.exclusion_query_json_resolved,

@@ -49,6 +49,7 @@ type GoogleConnector struct {
 	ProviderName string
 	HTTPClient   *http.Client
 	APIBase      string
+	ContentStore AcquisitionContentStore
 }
 
 func (c *GoogleConnector) Provider() string { return c.ProviderName }

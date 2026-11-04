@@ -63,6 +63,8 @@ const help =
     \\      --dictionary PATH     Brotli/LZ4/Zstandard external dictionary
     \\      --source-endpoint URL Discover sources from an ordinary Antfly catalog table
     \\      --source-table TABLE  Catalog table (default: antfly_sources)
+    \\      --artifact NAME       Select a source text/artifact stream (repeatable)
+    \\      --all-artifacts       Search every configured text/artifact stream
     \\      --source-principal ID Additional local reader identity (repeatable)
     \\      --source-catalog FILE Portable source profile (no Cloud dependency)
     \\      --cloud              Search authorized sources from antfly-cloud login

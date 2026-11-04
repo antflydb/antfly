@@ -13980,6 +13980,10 @@ export interface components {
              */
             window_index?: number;
             unit_id?: string;
+            /** @description Opaque fingerprint of this member's native content and captured producer/input state; independent of hierarchy traversal cursors. */
+            revision?: string;
+            /** @description Opaque fingerprint of the captured producer/input state, when available. Changes to producer configuration or acquired input reopen this identity. */
+            derivation_revision?: string;
             source?: components["schemas"]["HierarchyArtifactSource"];
         };
         HierarchyAncestor: {

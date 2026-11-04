@@ -39,7 +39,7 @@ func mediaDocument(t *testing.T) Document {
 }
 func TestMediaNormalizationRejectsAmbiguousOrUnpinnedContent(t *testing.T) {
 	doc := mediaDocument(t)
-	require.Equal(t, 2, doc.Version)
+	require.Equal(t, SourceRecordVersion, doc.Version)
 	require.Empty(t, doc.Content)
 	require.True(t, validContentSHA(configString(doc.Metadata, "sha256")))
 	cases := map[string]func(*Document){
@@ -56,7 +56,7 @@ func TestMediaNormalizationRejectsAmbiguousOrUnpinnedContent(t *testing.T) {
 }
 func TestMediaReadinessIncludesCompleteDescriptor(t *testing.T) {
 	doc := mediaDocument(t)
-	require.Contains(t, QueryDocumentFields(), "grep.media")
+	require.Contains(t, QueryDocumentFields(), "content.resource")
 	require.NoError(t, WaitForDocuments(t.Context(), func(context.Context, string, []byte) ([]byte, error) { return readinessResponse(doc), nil }, "docs", map[string]Document{"item": doc}))
 	before, _ := projectionDigest(doc)
 	changed := mediaDocument(t)
@@ -80,11 +80,11 @@ func TestRunnerMediaRetainsOwnershipReadinessAndDeletion(t *testing.T) {
 	backend.mu.Lock()
 	require.Len(t, backend.records, 1)
 	for _, row := range backend.records {
-		raw, _ := json.Marshal(row["grep"])
+		raw, _ := json.Marshal(row)
 		var doc Document
 		require.NoError(t, json.Unmarshal(raw, &doc))
 		require.Equal(t, "media", doc.Kind)
-		require.Equal(t, 2, doc.Version)
+		require.Equal(t, SourceRecordVersion, doc.Version)
 		require.True(t, validContentSHA(configString(doc.Metadata, "sha256")))
 	}
 	backend.mu.Unlock()
@@ -157,4 +157,52 @@ func TestMediaContentScopePinsProviderEndpoint(t *testing.T) {
 	before := gcs.MediaContentScope()
 	gcs.APIBase = "https://second.example"
 	require.NotEqual(t, before, gcs.MediaContentScope())
+}
+
+func TestNativeDocsAndSlidesExportPDFWithRevisionFence(t *testing.T) {
+	for _, kind := range []string{"document", "presentation"} {
+		t.Run(kind, func(t *testing.T) {
+			revision := "7"
+			pdf := integrationPDF()
+			client := withDriveScopes(&http.Client{Transport: collaborationTransport(func(r *http.Request) (*http.Response, error) {
+				var payload []byte
+				switch r.URL.Path {
+				case "/files/folder":
+					payload = []byte(`{"id":"folder","mimeType":"application/vnd.google-apps.folder","capabilities":{"canListChildren":true}}`)
+				case "/files":
+					payload = []byte(fmt.Sprintf(`{"files":[{"id":"doc","name":"Original","mimeType":"application/vnd.google-apps.%s","version":"7"}]}`, kind))
+				case "/files/doc":
+					payload = []byte(fmt.Sprintf(`{"id":"doc","version":%q,"capabilities":{"canDownload":true}}`, revision))
+				case "/files/doc/export":
+					require.Equal(t, "application/pdf", r.URL.Query().Get("mimeType"))
+					payload = pdf
+				default:
+					t.Fatalf("unexpected request %s", r.URL)
+				}
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(payload)), Request: r}, nil
+			})}, "https://www.googleapis.com/auth/drive.readonly")
+			source := Source{Publication: "native", Config: json.RawMessage(`{"resource":"drive","folder_id":"folder"}`)}
+			connector, err := publicationConnector(&CollaborationConnector{ProviderName: ProviderGoogleWorkspace, HTTPClient: client, DriveBase: "https://fixture.test"}, source)
+			require.NoError(t, err)
+			connector = WithAcquisitionContentStore(connector, &FileAcquisitionContentStore{Directory: t.TempDir()})
+			request := Request{SourceNamespace: "job/" + testSourceID, Mode: ImportModeSource, Config: source.Config}
+			inventory, err := connector.Enumerate(t.Context(), request)
+			require.NoError(t, err)
+			require.Len(t, inventory.Objects, 1)
+			item := inventory.Objects[0]
+			require.Equal(t, "7", item.Revision)
+			require.Equal(t, "Original", item.Path)
+			require.Equal(t, "application/pdf", MediaMIME(item))
+			require.Equal(t, int64(len(pdf)), item.Size)
+			originalDigest := fmt.Sprintf("%x", sha256.Sum256(pdf))
+			pdf = append(append([]byte{}, pdf...), []byte("\n% regenerated representation")...)
+			digest, err := VerifyMediaDigest(t.Context(), connector.(MediaConnector), request, item)
+			require.NoError(t, err)
+			require.Equal(t, originalDigest, digest)
+			revision = "8"
+			_, err = connector.(MediaConnector).OpenMedia(t.Context(), request, item, MediaRange{0, item.Size})
+			var changed *RevisionChangedError
+			require.ErrorAs(t, err, &changed)
+		})
+	}
 }

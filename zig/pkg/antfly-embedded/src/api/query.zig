@@ -1406,6 +1406,8 @@ fn artifactRefRetainedBytes(artifact: db_mod.types.ArtifactRef) usize {
     var total: usize = @sizeOf(db_mod.types.ArtifactRef);
     retainedAdd(&total, artifact.document_id.len);
     retainedAdd(&total, artifact.name.len);
+    if (artifact.revision) |value| retainedAdd(&total, value.len);
+    if (artifact.derivation_revision) |value| retainedAdd(&total, value.len);
     if (artifact.unit_id) |unit_id| retainedAdd(&total, unit_id.len);
     if (artifact.source) |source| {
         retainedAdd(&total, @sizeOf(db_mod.types.ArtifactSourceRef));

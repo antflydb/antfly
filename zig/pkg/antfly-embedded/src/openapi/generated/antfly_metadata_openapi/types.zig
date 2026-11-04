@@ -5301,6 +5301,10 @@ pub const HierarchyArtifact = struct {
     /// Independent media output sub-window within the parent chunk; omitted for an unsplit vector.
     window_index: ?u32 = null,
     unit_id: ?[]const u8 = null,
+    /// Opaque fingerprint of this member's native content and captured producer/input state; independent of hierarchy traversal cursors.
+    revision: ?[]const u8 = null,
+    /// Opaque fingerprint of the captured producer/input state, when available. Changes to producer configuration or acquired input reopen this identity.
+    derivation_revision: ?[]const u8 = null,
     source: ?HierarchyArtifactSource = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -5310,6 +5314,8 @@ pub const HierarchyArtifact = struct {
         .{ "chunk_id", "chunk_id", true },
         .{ "window_index", "window_index", true },
         .{ "unit_id", "unit_id", true },
+        .{ "revision", "revision", true },
+        .{ "derivation_revision", "derivation_revision", true },
         .{ "source", "source", true },
     };
 
@@ -5337,6 +5343,14 @@ pub const HierarchyArtifact = struct {
         }
         if (self.unit_id) |value| {
             try jw.objectField("unit_id");
+            try jw.write(value);
+        }
+        if (self.revision) |value| {
+            try jw.objectField("revision");
+            try jw.write(value);
+        }
+        if (self.derivation_revision) |value| {
+            try jw.objectField("derivation_revision");
             try jw.write(value);
         }
         if (self.source) |value| {

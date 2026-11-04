@@ -16,6 +16,7 @@
 package sources
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"crypto/sha256"
@@ -204,6 +205,28 @@ func (c *GoogleConnector) CheckMedia(ctx context.Context, r Request, item Item) 
 }
 
 func (c *GoogleConnector) OpenMedia(ctx context.Context, r Request, item Item, span MediaRange) (io.ReadCloser, error) {
+	if configString(item.Metadata, "export_mime_type") != "" {
+		if err := span.validate(item.Size); err != nil {
+			return nil, err
+		}
+		if err := c.CheckMedia(ctx, r, item); err != nil {
+			return nil, err
+		}
+		if c.ContentStore == nil || !ValidContentRef(item.ContentRef) {
+			return nil, fmt.Errorf("native Drive export content storage unavailable")
+		}
+		data, found, err := c.ContentStore.Load(ctx, item.ContentRef)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			return nil, fmt.Errorf("pinned Drive export is unavailable; synchronize this source again")
+		}
+		if int64(len(data)) != item.Size || fmt.Sprintf("%x", sha256.Sum256(data)) != configString(item.Metadata, "representation_sha256") {
+			return nil, &RevisionChangedError{Expected: item.Revision, Actual: "export bytes changed"}
+		}
+		return io.NopCloser(bytes.NewReader(data[span.Offset : span.Offset+span.Length])), nil
+	}
 	if err := span.validate(item.Size); err != nil {
 		return nil, err
 	}
@@ -345,7 +368,7 @@ func VerifyMediaDigest(ctx context.Context, media MediaConnector, request Reques
 	if media == nil || item.Size < 1 {
 		return "", fmt.Errorf("%w: invalid media representation", ErrInvalidInput)
 	}
-	if upper, _ := item.Metadata["size_is_upper_bound"].(bool); upper || configString(item.Metadata, "export_mime_type") != "" {
+	if upper, _ := item.Metadata["size_is_upper_bound"].(bool); upper || (configString(item.Metadata, "export_mime_type") != "" && !validContentSHA(configString(item.Metadata, "representation_sha256"))) {
 		return "", fmt.Errorf("%w: original binary representation required", ErrInvalidInput)
 	}
 	if err := media.CheckMedia(ctx, request, item); err != nil {

@@ -74,6 +74,7 @@ type CollaborationConnector struct {
 	AccessToken                                 func(context.Context) (string, error)
 	Services                                    []string
 	APIBase, GmailBase, CalendarBase, DriveBase string
+	NativeAttachments                           bool
 	Extractor                                   AttachmentExtractor
 	DownloadTransport                           http.RoundTripper
 }
@@ -531,12 +532,19 @@ func (c *CollaborationConnector) materialItems(ctx context.Context, r Request, c
 				metadata["calendar_invitation"] = true
 				metadata["calendar_uids"] = calendarInvitationUIDs(data)
 			}
-			text, err := extract(ctx, file.Name, file.MIME, data)
+			text := data
+			var err error
+			if !c.NativeAttachments {
+				text, err = extract(ctx, file.Name, file.MIME, data)
+			}
 			if err != nil {
 				return nil, fmt.Errorf("attachment %s: %w", file.Name, err)
 			}
-			totalBytes += len(data) + len(text)
-			if len(text) > maxImportSourceObjectBytes || totalBytes > maxImportSourceObjectBytes || !utf8.Valid(text) {
+			totalBytes += len(data)
+			if !c.NativeAttachments {
+				totalBytes += len(text)
+			}
+			if len(text) > maxImportSourceObjectBytes || totalBytes > maxImportSourceObjectBytes || (!c.NativeAttachments && !utf8.Valid(text)) {
 				return nil, fmt.Errorf("extracted attachment exceeds byte limit")
 			}
 			meta := cloneSourceMetadata(metadata)
@@ -547,7 +555,9 @@ func (c *CollaborationConnector) materialItems(ctx context.Context, r Request, c
 			}
 			meta["filename"] = file.Name
 			meta["mime_type"] = file.MIME
-			meta["links"] = SourceLinks(text)
+			if !c.NativeAttachments {
+				meta["links"] = SourceLinks(text)
+			}
 			digest := sha256.Sum256(data)
 			meta["attachment_sha256"] = hex.EncodeToString(digest[:])
 			attachmentRef := ref

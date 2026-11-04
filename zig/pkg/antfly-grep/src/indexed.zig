@@ -17,6 +17,7 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const document = @import("document.zig");
+const record_view = @import("record_view.zig");
 const Limits = @import("budget.zig").Limits;
 const A = std.mem.Allocator;
 const descriptors = @import("image_descriptor.zig");
@@ -25,7 +26,7 @@ const MediaField = struct { field: []const u8, mode: ?enum { identity } = null, 
 const MediaSelection = struct { fields: []const MediaField };
 const Seen = std.AutoHashMap([32]u8, void);
 pub const CandidateIndex = struct { version: u32, field: []const u8, version_field: []const u8 = "grep_trigrams_version" };
-pub const Table = struct { published_revision: ?[]const u8 = null, table: ?[]const u8 = null, source_id: ?[]const u8 = null, source_filter: ?std.json.Value = null, valid_until: ?i64 = null, access_id: ?[]const u8 = null, status: ?[]const u8 = null, name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
+pub const Table = struct { fields: ?record_view.Fields = null, streams: []const record_view.Stream = &.{}, selected_stream: ?record_view.Stream = null, published_revision: ?[]const u8 = null, table: ?[]const u8 = null, source_id: ?[]const u8 = null, source_filter: ?std.json.Value = null, valid_until: ?i64 = null, access_id: ?[]const u8 = null, status: ?[]const u8 = null, name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
 pub const ValueVerification = struct {
     allow_scan: bool = true,
     max_documents: u64 = 100_000,
@@ -66,7 +67,9 @@ pub fn run(search: anytype) !void {
         if (!std.ascii.eqlIgnoreCase(tables.scheme, inference.scheme) or !std.ascii.eqlIgnoreCase(table_host.percent_encoded, inference_host.percent_encoded) or table_port != inference_port) return error.ConflictingMediaOptions;
     }
     for (config.tables, 0..) |table, i| {
-        if (table.name.len == 0 or table.document_field.len == 0 or std.mem.eql(u8, table.name, ".") or std.mem.eql(u8, table.name, "..") or std.mem.indexOfScalar(u8, table.name, 0) != null) return error.InvalidTableConfig;
+        if (table.fields) |fields| try record_view.validate(fields, table.streams);
+        if (table.fields == null and table.streams.len > 0) return error.InvalidSourceFields;
+        if (table.name.len == 0 or (table.fields == null and table.document_field.len == 0) or std.mem.eql(u8, table.name, ".") or std.mem.eql(u8, table.name, "..") or std.mem.indexOfScalar(u8, table.name, 0) != null) return error.InvalidTableConfig;
         if (table.candidate_index) |index| if (index.version != 1 or index.field.len == 0 or index.version_field.len == 0 or std.mem.indexOfScalar(u8, index.field, 0) != null or std.mem.indexOfScalar(u8, index.version_field, 0) != null) return error.InvalidCandidateIndex;
         if (table.alias) |alias| if (alias.len == 0) return error.InvalidTableConfig;
         for (config.tables[0..i]) |prior| {
@@ -77,6 +80,17 @@ pub fn run(search: anytype) !void {
     const selectors = if (search.options.sourced()) search.options.sources.items else search.options.tables.items;
     const selected_tables = try resolveTableSelection(search.a, config.tables, selectors, search.options.sourced());
     defer search.a.free(selected_tables);
+    for (search.options.artifacts.items) |requested| {
+        var found = false;
+        for (config.tables, selected_tables) |table, selected| {
+            if (!selected) continue;
+            for (table.streams) |stream| if (record_view.selected(stream, &.{requested}, false)) {
+                found = true;
+                break;
+            };
+        }
+        if (!found) return error.UnknownArtifactStream;
+    }
     const original_source = search.provenance;
     defer search.provenance = original_source;
     search.provenance = .{ .backend = .antfly, .freshness = .indexed };
@@ -89,10 +103,81 @@ pub fn run(search: anytype) !void {
     for (config.tables, selected_tables) |table, selected| {
         if (search.stopped()) break;
         if (!selected) continue;
-        scan(search, &http, config, table, &count, &seen) catch |err| {
-            try search.reportError(table.alias orelse table.name, err);
-        };
+        if (table.fields != null and !metadataListing(search.options)) {
+            var selected_count: usize = 0;
+            for (table.streams) |stream| {
+                if (!record_view.selected(stream, search.options.artifacts.items, search.options.all_artifacts)) continue;
+                selected_count += 1;
+                var bound = table;
+                bound.selected_stream = stream;
+                scanStream(search, &http, config, bound, &count, &seen) catch |err| try search.reportError(table.alias orelse table.name, err);
+                if (search.stopped()) break;
+            }
+            if (selected_count == 0 and search.options.artifacts.items.len == 0) try search.reportError(table.alias orelse table.name, error.NoSearchableTextStreams);
+        } else {
+            scan(search, &http, config, table, &count, &seen) catch |err| try search.reportError(table.alias orelse table.name, err);
+        }
     }
+}
+// A readable index can still contain only a prefix of an extraction. Check
+// convergence on both sides of a retained scan, including its catalog identity.
+fn scanStream(search: anytype, http: *httpx.Client, config: Config, table: Table, count: *usize, seen: *Seen) !void {
+    const stream = table.selected_stream orelse return error.InvalidArtifactStream;
+    if (stream.artifact == null) return scan(search, http, config, table, count, seen);
+    const before = try streamReadiness(search, http, config, table, stream);
+    defer search.a.free(before);
+    try scan(search, http, config, table, count, seen);
+    const after = try streamReadiness(search, http, config, table, stream);
+    defer search.a.free(after);
+    if (!std.mem.eql(u8, before, after)) return error.ArtifactDefinitionChanged;
+}
+fn streamReadiness(search: anytype, http: *httpx.Client, config: Config, table: Table, stream: record_view.Stream) ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(search.a);
+    defer arena.deinit();
+    const a = arena.allocator();
+    if (!Limits.reserve(&search.limits.requests, 1, search.options.max_requests)) return error.RequestBudgetExceeded;
+    search.summary.index_requests += 1;
+    const url = try std.fmt.allocPrint(a, "{s}/tables/{s}/indexes/{s}", .{ std.mem.trimEnd(u8, config.endpoint, "/"), try escape(a, table.table orelse table.name), try escape(a, stream.index orelse return error.InvalidArtifactStream) });
+    var headers: std.ArrayList([2][]const u8) = .empty;
+    const credential = if (search.options.cloud_session) |session| session.token() else search.options.table_token;
+    if (credential) |token| try headers.append(a, .{ "Authorization", try std.fmt.allocPrint(a, "Bearer {s}", .{token}) });
+    if (table.source_id) |id| try headers.append(a, .{ "X-Antfly-Source-ID", id });
+    var response = try http.get(url, .{ .headers = headers.items, .timeout_ms = search.options.timeout_ms, .max_response_size = config.max_response_bytes, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false });
+    defer response.deinit();
+    if (response.status.code == 401 or response.status.code == 403) return error.IndexAuthorizationFailed;
+    if (!response.ok()) return error.ArtifactReadinessUnavailable;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, response.body orelse return error.InvalidIndexResponse, .{});
+    const index_config = document.field(parsed.value, "config") orelse return error.ArtifactIndexBindingChanged;
+    const index_type = try document.string(index_config, "type");
+    if (!std.mem.eql(u8, index_type, "full_text")) return error.ArtifactIndexBindingChanged;
+    const configured_sources = document.field(index_config, "sources") orelse return error.ArtifactIndexBindingChanged;
+    if (configured_sources != .array) return error.ArtifactIndexBindingChanged;
+    var matching_field = false;
+    for (configured_sources.array.items) |binding| {
+        if (!std.mem.eql(u8, try document.string(binding, "artifact"), stream.artifact.?)) continue;
+        const field = document.field(binding, "field") orelse document.field(index_config, "field");
+        if (field) |value| {
+            if (value == .string and std.mem.eql(u8, value.string, stream.field)) matching_field = true;
+            if (value == .null and std.mem.eql(u8, stream.field, "$")) matching_field = true;
+        } else if (std.mem.eql(u8, stream.field, "$")) matching_field = true;
+    }
+    if (!matching_field) return error.ArtifactIndexBindingChanged;
+    const readiness = document.at(parsed.value, "status.readiness") orelse return error.ArtifactReadinessUnavailable;
+    const queryable = document.field(readiness, "queryable") orelse return error.ArtifactStreamIncomplete;
+    if (queryable != .bool or !queryable.bool) return error.ArtifactStreamIncomplete;
+    const sources = document.field(readiness, "sources") orelse return error.ArtifactReadinessUnavailable;
+    if (sources != .array) return error.InvalidIndexResponse;
+    var found = false;
+    for (sources.array.items) |source| {
+        const name = try document.string(source, "artifact");
+        if (!std.mem.eql(u8, name, stream.artifact.?)) continue;
+        found = true;
+        const complete = document.field(source, "complete") orelse return error.ArtifactStreamIncomplete;
+        if (complete != .bool or !complete.bool) return error.ArtifactStreamIncomplete;
+    }
+    if (!found) return error.ArtifactIndexBindingChanged;
+    const incarnation = document.field(readiness, "incarnation") orelse return error.ArtifactReadinessUnavailable;
+    return std.json.Stringify.valueAlloc(search.a, incarnation, .{});
 }
 // Resolve user-facing selectors once to a set of physical source identities.
 // Cloud IDs take precedence over aliases. Manual configs select alias-or-name
@@ -162,7 +247,7 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
     const user_filter: ?std.json.Value = if (table.source_filter) |source_filter| (if (extra_filter) |extra| try std.json.parseFromSliceLeaky(std.json.Value, filter_arena, try std.json.Stringify.valueAlloc(filter_arena, .{ .conjuncts = .{ source_filter, extra } }, .{}), .{}) else source_filter) else extra_filter;
     const text_query = try contentQuery(filter_arena, search, table);
     const filter = try candidateFilter(filter_arena, search, table, user_filter);
-    var fetcher = Fetch{ .table = table, .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .access_id = table.access_id, .source_id = table.source_id, .valid_until = table.valid_until, .document_field = table.document_field, .filter = filter, .text_query = text_query, .http = http, .fields = try projectionFields(filter_arena, search.options, table.document_field) };
+    var fetcher = Fetch{ .table = table, .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .access_id = table.access_id, .source_id = table.source_id, .valid_until = table.valid_until, .document_field = table.document_field, .filter = filter, .text_query = text_query, .http = http, .fields = try tableProjectionFields(filter_arena, search.options, table) };
     defer search.summary.index_requests += fetcher.summary.index_requests;
     // Finite decision budgets preserve foreground order: speculative page
     // requests must not consume the budget reserved by the user for evidence.
@@ -409,11 +494,46 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             count.* += 1;
             const id = try document.string(hit, "_id");
             const source = document.field(hit, "_source") orelse return error.InvalidIndexResponse;
-            const value = document.at(source, table.document_field) orelse return error.MissingGrepDocument;
+            if (table.selected_stream) |stream| if (stream.artifact == null and document.at(source, stream.field) == null and document.at(source, "content.resource") != null) {
+                if (search.options.artifacts.items.len == 0 and table.streams.len == 1) return error.NativeArtifactStreamRequired;
+                continue;
+            };
+            if (table.selected_stream) |stream| if (stream.artifact) |expected| {
+                const actual = document.at(hit, "hierarchy.artifact.name") orelse return error.MissingArtifactIdentity;
+                if (actual != .string) return error.MissingArtifactIdentity;
+                if (!std.mem.eql(u8, actual.string, expected)) continue;
+            };
+            const value = if (table.fields) |fields| mapped: {
+                var parent = source;
+                if (table.selected_stream) |stream| if (stream.artifact != null) {
+                    parent = document.at(hit, "hierarchy.ancestors.source.document") orelse return error.MissingArtifactSource;
+                };
+                const content = if (metadataListing(search.options)) "" else if (table.selected_stream) |stream| try record_view.text(source, stream.field) else "";
+                break :mapped try record_view.view(a, parent, fields, content);
+            } else document.at(source, table.document_field) orelse return error.MissingGrepDocument;
             var doc = if (metadataListing(search.options))
                 try document.Document.parseListing(value, table.table orelse table.name, id, current_snapshot, std.Io.Clock.real.now(search.io).toSeconds())
             else
                 try document.Document.parse(value, table.table orelse table.name, id, current_snapshot, std.Io.Clock.real.now(search.io).toSeconds());
+            if (table.selected_stream) |stream| {
+                doc.provenance.purpose = stream.purpose;
+                doc.provenance.generated = stream.generated;
+                doc.provenance.text_field = stream.field;
+                doc.provenance.boundary = stream.boundary;
+                if (stream.artifact != null) {
+                    const hierarchy = document.field(hit, "hierarchy") orelse return error.MissingArtifactSource;
+                    doc.provenance.artifact_key = id;
+                    doc.provenance.artifact = document.field(hierarchy, "artifact");
+                    if (doc.provenance.artifact == null) return error.MissingArtifactIdentity;
+                    const revision = document.at(hierarchy, "artifact.revision") orelse return error.MissingArtifactRevision;
+                    if (revision != .string or revision.string.len == 0) return error.MissingArtifactRevision;
+                    doc.provenance.artifact_revision = revision.string;
+                    if (document.field(hierarchy, "parent_doc_key")) |parent| if (parent == .string) {
+                        doc.provenance.document_id = parent.string;
+                    };
+                    doc.provenance.location = document.at(source, stream.location_field orelse "provenance");
+                }
+            }
             if (search.options.cloud_session == null and !document.allowed(value, config.principals)) {
                 search.skipped();
                 continue;
@@ -433,6 +553,10 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                     identity.update(&length);
                     identity.update(part);
                 }
+                if (table.selected_stream) |stream| if (stream.artifact != null) {
+                    identity.update(stream.name);
+                    identity.update(id);
+                };
                 if (document.field(value, "evidence")) |units| identity.update(try std.json.Stringify.valueAlloc(a, units, .{}));
                 var key: [32]u8 = undefined;
                 identity.final(&key);
@@ -448,6 +572,9 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                 if (units) |raw| doc.evidence = try @import("antfly_source_evidence").parseUnits(a, raw);
                 doc.evidence_loader = .{ .ctx = &resolver, .load = AssetResolver(@TypeOf(search)).load, .load_many = AssetResolver(@TypeOf(search)).loadMany, .materialize_many = AssetResolver(@TypeOf(search)).materializeMany, .release_wave = AssetResolver(@TypeOf(search)).releaseWave };
             }
+            if (table.selected_stream) |stream| if (stream.artifact != null) {
+                doc.path = try std.fmt.allocPrint(a, "{s}::{s}{s}/{s}", .{ doc.path, stream.name, if (stream.generated) "[generated]" else "", id });
+            };
             if (lane_count > 1) {
                 const slot = try scheduler.vacant(lane_count);
                 const job = &scheduler.jobs[slot];
@@ -920,7 +1047,11 @@ const Fetch = struct {
                 } else false else false;
                 if (!computed) try source_fields.append(a, field);
             }
-            const body = try std.json.Stringify.valueAlloc(a, .{ .select = selected, .query = self.text_query orelse try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}), .execution = if (self.ordered and self.text_query != null) @as(?Execution, self.config.execution) else null, .filter_query = self.filter, .fields = source_fields.items, .order_by = if (self.ordered) @as(?[1]struct { field: []const u8, desc: bool }, .{.{ .field = "_id", .desc = false }}) else null, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
+            const artifact = if (self.table.selected_stream) |stream| stream.artifact != null else false;
+            const full_text_index = if (self.table.selected_stream) |stream| stream.index else null;
+            const root_text = if (self.table.selected_stream) |stream| artifact and std.mem.eql(u8, stream.field, "$") else false;
+            const hierarchy = if (artifact) try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .ancestors = .{ .source = .{ .fields = try record_view.parentFields(a, self.table.fields.?) } } }, .{}), .{}) else null;
+            const body = try std.json.Stringify.valueAlloc(a, .{ .full_text_index = full_text_index, .hierarchy = hierarchy, .full_text_search = if (artifact) try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}) else null, .select = selected, .query = if (artifact) @as(?std.json.Value, null) else self.text_query orelse try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}), .execution = if (self.ordered and (artifact or self.text_query != null)) @as(?Execution, self.config.execution) else null, .filter_query = self.filter, .fields = if (root_text) @as(?[]const []const u8, null) else source_fields.items, .order_by = if (self.ordered) @as(?[1]struct { field: []const u8, desc: bool }, .{.{ .field = "_id", .desc = false }}) else null, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
             var refreshed = false;
             var attempt: usize = 0;
             const parsed = retry: while (true) {
@@ -1071,10 +1202,11 @@ fn backoff(search: anytype, attempt: usize, requested: u64) !void {
 /// Representation selection and exact containment verification belong to Antfly.
 /// The complete CLI matcher still owns final grep/PCRE semantics.
 fn contentQuery(a: A, search: anytype, table: Table) !?std.json.Value {
+    if (table.selected_stream) |stream| if (stream.artifact != null) return null;
     if (!canPrune(search.options)) return null;
     const literals = (try search.matcher.requiredLiterals(a)) orelse return null;
     if (literals.len == 0) return null;
-    const field = try std.fmt.allocPrint(a, "{s}.content", .{table.document_field});
+    const field = if (table.selected_stream) |stream| stream.field else try std.fmt.allocPrint(a, "{s}.content", .{table.document_field});
     var alternatives: std.ArrayList(std.json.Value) = .empty;
     for (literals) |literal| {
         const encoded = try std.json.Stringify.valueAlloc(a, .{ .contains = literal, .field = field, .case_sensitive = true }, .{});
@@ -1135,6 +1267,20 @@ fn candidateFilter(a: A, search: anytype, table: Table, user_filter: ?std.json.V
 fn metadataListing(o: *const @import("options.zig").Options) bool {
     return o.media == .images or (o.files and !o.json and !o.stats and o.max_file_bytes == std.math.maxInt(usize) and !o.skip_oversize);
 }
+fn tableProjectionFields(a: A, o: *const @import("options.zig").Options, table: Table) ![]const []const u8 {
+    const fields = table.fields orelse return projectionFields(a, o, table.document_field);
+    if (table.selected_stream) |stream| if (stream.artifact != null) {
+        var result: std.ArrayList([]const u8) = .empty;
+        try result.append(a, stream.field);
+        try result.append(a, stream.location_field orelse "provenance");
+        return result.toOwnedSlice(a);
+    };
+    var result: std.ArrayList([]const u8) = .empty;
+    try result.appendSlice(a, try record_view.parentFields(a, fields));
+    if (!metadataListing(o)) if (table.selected_stream) |stream| try result.append(a, stream.field);
+    return result.toOwnedSlice(a);
+}
+
 fn projectionFields(a: A, o: *const @import("options.zig").Options, field: []const u8) ![]const []const u8 {
     // Project the complete v1 contract, not arbitrary sibling payloads. Keep
     // all logical input/validation/provenance fields for JSON and decision

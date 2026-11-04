@@ -11038,6 +11038,12 @@ components:
           x-go-type-skip-optional-pointer: false
         unit_id:
           type: string
+        revision:
+          type: string
+          description: Opaque fingerprint of this member's native content and captured producer/input state; independent of hierarchy traversal cursors.
+        derivation_revision:
+          type: string
+          description: Opaque fingerprint of the captured producer/input state, when available. Changes to producer configuration or acquired input reopen this identity.
         source:
           $ref: "#/components/schemas/HierarchyArtifactSource"
 

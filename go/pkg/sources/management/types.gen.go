@@ -140,8 +140,9 @@ func (e RunInputOperation) Valid() bool {
 
 // Defines values for SourcePublication.
 const (
-	Media SourcePublication = "media"
-	Text  SourcePublication = "text"
+	Media  SourcePublication = "media"
+	Native SourcePublication = "native"
+	Text   SourcePublication = "text"
 )
 
 // Valid indicates whether the value is a known member of the SourcePublication enum.
@@ -149,7 +150,27 @@ func (e SourcePublication) Valid() bool {
 	switch e {
 	case Media:
 		return true
+	case Native:
+		return true
 	case Text:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for TextStreamBoundary.
+const (
+	Record TextStreamBoundary = "record"
+	Unit   TextStreamBoundary = "unit"
+)
+
+// Valid indicates whether the value is a known member of the TextStreamBoundary enum.
+func (e TextStreamBoundary) Valid() bool {
+	switch e {
+	case Record:
+		return true
+	case Unit:
 		return true
 	default:
 		return false
@@ -238,14 +259,19 @@ type Source struct {
 	Name                 string                 `json:"name"`
 	PermissionTtlSeconds int                    `json:"permission_ttl_seconds,omitempty,omitzero"`
 	Permissions          Permissions            `json:"permissions"`
-	Publication          SourcePublication      `json:"publication"`
+
+	// Publication Native acquisition is the default: text stays inline and binary originals are revision-pinned for native artifact producers.
+	Publication SourcePublication `json:"publication"`
 
 	// State Runtime lifecycle state. PUT configures a source; retirement and purge use explicit operations.
 	State string `json:"state"`
-	Table string `json:"table"`
+
+	// Streams Searchable source-text and native artifact bindings; credentials and producer execution remain separate.
+	Streams []TextStream `json:"streams,omitempty,omitzero"`
+	Table   string       `json:"table"`
 }
 
-// SourcePublication defines model for Source.Publication.
+// SourcePublication Native acquisition is the default: text stays inline and binary originals are revision-pinned for native artifact producers.
 type SourcePublication string
 
 // SourcePage defines model for SourcePage.
@@ -253,6 +279,22 @@ type SourcePage struct {
 	Data       []Source `json:"data"`
 	NextCursor string   `json:"next_cursor,omitempty,omitzero"`
 }
+
+// TextStream defines model for TextStream.
+type TextStream struct {
+	Artifact      string             `json:"artifact,omitempty,omitzero"`
+	Boundary      TextStreamBoundary `json:"boundary,omitempty,omitzero"`
+	Default       bool               `json:"default"`
+	Field         string             `json:"field"`
+	Generated     bool               `json:"generated,omitempty,omitzero"`
+	Index         string             `json:"index,omitempty,omitzero"`
+	LocationField string             `json:"location_field,omitempty,omitzero"`
+	Name          string             `json:"name"`
+	Purpose       string             `json:"purpose,omitempty,omitzero"`
+}
+
+// TextStreamBoundary defines model for TextStream.Boundary.
+type TextStreamBoundary string
 
 // ListSourcesParams defines parameters for ListSources.
 type ListSourcesParams struct {

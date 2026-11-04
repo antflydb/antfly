@@ -5113,6 +5113,8 @@ fn artifactRefJsonValue(alloc: std.mem.Allocator, artifact_ref: db_mod.types.Art
 
     try putJsonString(alloc, &obj, "name", artifact_ref.name);
     try putJsonString(alloc, &obj, "kind", artifactKindString(artifact_ref.kind));
+    if (artifact_ref.revision) |revision| try putJsonString(alloc, &obj, "revision", revision);
+    if (artifact_ref.derivation_revision) |revision| try putJsonString(alloc, &obj, "derivation_revision", revision);
     if (artifact_ref.chunk_id) |chunk_id| {
         try obj.put(alloc, try alloc.dupe(u8, "chunk_id"), .{ .integer = @intCast(chunk_id) });
     }

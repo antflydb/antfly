@@ -43629,6 +43629,11 @@ pub const DB = struct {
         return switch (query) {
             .match_all => try storedPatternEmptyPredicate(alloc, "match_all"),
             .match_none => try storedPatternEmptyPredicate(alloc, "match_none"),
+            .value => |spec| blk: {
+                const raw = try std.json.Stringify.valueAlloc(alloc, spec, .{});
+                const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .allocate = .alloc_always });
+                break :blk try storedPatternWrappedPredicate(alloc, "value", parsed.value);
+            },
             .term => |term| blk: {
                 var body = std.json.ObjectMap.empty;
                 try body.put(alloc, term.field, .{ .string = term.term });
@@ -43909,6 +43914,10 @@ pub const DB = struct {
         const start_ns = platform_time.monotonicNs();
         errdefer observeSearchFailureMetric(metric_name, .search, platform_time.monotonicNs() -| start_ns);
         const result = try db_query_search.searchTextQuery(alloc, execution_req, text_query, .{
+            // Native artifact IDs are binary storage keys. Public sort/cursor
+            // identity must be projected before comparing and selecting a page.
+            .project_key = if (chunk_backed_for_filter and member_mode_for_filter) publicArtifactSearchKeyCallback else null,
+            .native_key = if (chunk_backed_for_filter and member_mode_for_filter) nativeArtifactSearchKeyCallback else null,
             .filter_candidate_presence = true,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
@@ -43934,6 +43943,17 @@ pub const DB = struct {
         });
         db_query_metrics.observeSortProfile(metric_name, .search, platform_time.monotonicNs() -| start_ns, result.sort_profile);
         return result;
+    }
+
+    fn publicArtifactSearchKeyCallback(_: ?*anyopaque, alloc: Allocator, key: []const u8) ![]u8 {
+        var identity = try artifact_ids.resolvePublicHitIdentityAlloc(alloc, key);
+        defer identity.deinit(alloc);
+        return alloc.dupe(u8, identity.id);
+    }
+    fn nativeArtifactSearchKeyCallback(_: ?*anyopaque, alloc: Allocator, key: []const u8) ![]u8 {
+        var ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, key)) orelse return alloc.dupe(u8, key);
+        defer ref.deinit(alloc);
+        return artifact_ids.internalKeyForArtifactRefAlloc(alloc, ref);
     }
 
     fn proveTextQueryAccessPaths(self: *DB, index_name: ?[]const u8, text_query: types.TextQuery) !void {

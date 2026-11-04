@@ -73,7 +73,7 @@ func (s *FileAcquisitionContentStore) Save(ctx context.Context, ref string, data
 	if !ValidContentRef(ref) || hex.EncodeToString(sum[:]) != ref || len(data) > MaxAcquisitionContentBytes {
 		return ErrInvalidInput
 	}
-	return (&FileAcquisitionCache{Directory: s.Directory, maxBytes: MaxAcquisitionContentBytes}).Save(ctx, ref, data)
+	return writeAcquisitionBytes(s.Directory, ref, data)
 }
 func (s *FileAcquisitionContentStore) Prune(items []Item) error {
 	keep := map[string]bool{}
@@ -111,6 +111,9 @@ type hydrationCheckpoint struct {
 
 func (c *CollaborationConnector) hydrationSelection(r Request) string {
 	version := c.ExtractorVersion
+	if c.NativeAttachments {
+		version = "native-attachments-v1"
+	}
 	if version == "" {
 		version = "attachment-text-v3"
 	}

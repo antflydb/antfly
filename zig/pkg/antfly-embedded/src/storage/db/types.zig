@@ -656,6 +656,8 @@ pub const ArtifactRef = struct {
     window_index: ?u32 = null,
     unit_id: ?[]u8 = null,
     source: ?ArtifactSourceRef = null,
+    revision: ?[]u8 = null,
+    derivation_revision: ?[]u8 = null,
 
     pub fn clone(self: ArtifactRef, alloc: Allocator) !ArtifactRef {
         const document_id = try alloc.dupe(u8, self.document_id);
@@ -664,7 +666,13 @@ pub const ArtifactRef = struct {
         errdefer alloc.free(name);
         const unit_id = if (self.unit_id) |id| try alloc.dupe(u8, id) else null;
         errdefer if (unit_id) |id| alloc.free(id);
+        const revision = if (self.revision) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (revision) |value| alloc.free(value);
+        const derivation_revision = if (self.derivation_revision) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (derivation_revision) |value| alloc.free(value);
         return .{
+            .revision = revision,
+            .derivation_revision = derivation_revision,
             .document_id = document_id,
             .name = name,
             .kind = self.kind,
@@ -678,6 +686,8 @@ pub const ArtifactRef = struct {
     pub fn deinit(self: *ArtifactRef, alloc: Allocator) void {
         alloc.free(self.document_id);
         alloc.free(self.name);
+        if (self.revision) |value| alloc.free(value);
+        if (self.derivation_revision) |value| alloc.free(value);
         if (self.unit_id) |unit_id| alloc.free(unit_id);
         if (self.source) |*source| source.deinit(alloc);
         self.* = undefined;
