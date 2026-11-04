@@ -22,14 +22,19 @@ const types = @import("types.zig");
 const A = std.mem.Allocator;
 pub const Digest = [32]u8;
 const Node = struct { version: u8 = 1, items: []const []const u8 = &.{}, children: ?[16]?Digest = null };
+const Hint = struct { hash: Digest, node: Node };
+const Hints = struct { version: u8 = 1, nodes: []const Hint };
+const Cached = struct { node: Node, durable: bool };
+pub const hint_bytes = 128 * 1024;
 pub const Index = struct {
     arena: std.heap.ArenaAllocator,
     client: storage.Client,
     bucket: []const u8,
     prefix: []const u8,
     context: types.Context,
-    cache: std.AutoHashMapUnmanaged(Digest, Node) = .empty,
+    cache: std.AutoHashMapUnmanaged(Digest, Cached) = .empty,
     cached_bytes: usize = 0,
+    hint_digest: ?Digest = null,
     pub fn init(a: A, client: storage.Client, bucket: []const u8, prefix: []const u8, context: types.Context) Index {
         return .{ .arena = std.heap.ArenaAllocator.init(a), .client = client, .bucket = bucket, .prefix = prefix, .context = context };
     }
@@ -56,9 +61,89 @@ pub const Index = struct {
             if (i != 0 and std.mem.order(u8, node.items[i - 1], item) != .lt) return error.InvalidLakeRetirementIndex;
         }
     }
+    fn hintContext(self: *Index) types.Context {
+        var context = self.context;
+        // Optional warming must leave time for the required read/checkpoint.
+        const deadline = @import("antfly_platform").time.monotonicNs() +| std.time.ns_per_s;
+        context.deadline_ns = @min(context.deadline_ns orelse deadline, deadline);
+        return context;
+    }
+    /// One bounded, replaceable hint object survives worker restarts. Every
+    /// node is independently authenticated; missing/stale hints are harmless.
+    /// Callers fall back to read() on any hint failure. No catalog wire format
+    /// or deletion authority depends on the cache.
+    pub fn loadHints(self: *Index) !void {
+        try self.context.ensureActive();
+        const a = self.arena.allocator();
+        const path = try std.fmt.allocPrint(a, "{s}/warm-v1.json", .{self.prefix});
+        var context = self.hintContext();
+        var object = try self.client.getObject(self.bucket, path, .{ .skip_metadata_probe = true, .max_response_bytes = hint_bytes, .cancellation = types.contextCancellation(&context) });
+        defer object.deinit(self.client.allocator);
+        const hints = try std.json.parseFromSliceLeaky(Hints, a, object.body, .{ .allocate = .alloc_always });
+        if (hints.version != 1 or hints.nodes.len > 256) return error.InvalidLakeRetirementIndex;
+        // Validate the entire hint before making any of it available.
+        for (hints.nodes) |hint| {
+            try self.context.ensureActive();
+            try validate(hint.node);
+            const bytes = try std.json.Stringify.valueAlloc(a, hint.node, .{});
+            defer a.free(bytes);
+            if (!std.mem.eql(u8, &digest(bytes), &hint.hash)) return error.InvalidLakeRetirementIndex;
+        }
+        for (hints.nodes) |hint| {
+            if (self.cache.contains(hint.hash)) continue;
+            const bytes = try std.json.Stringify.valueAlloc(a, hint.node, .{});
+            defer a.free(bytes);
+            if (self.cached_bytes + bytes.len > 32 * 1024 * 1024) return error.LakeRetirementIndexBudgetExceeded;
+            try self.cache.put(a, hint.hash, .{ .node = hint.node, .durable = false });
+            self.cached_bytes += bytes.len;
+        }
+        self.hint_digest = digest(object.body);
+    }
+    pub fn saveHints(self: *Index, roots: []const ?Digest) !void {
+        try self.context.ensureActive();
+        const a = self.arena.allocator();
+        var queue: std.ArrayList(Digest) = .empty;
+        for (roots) |root| if (root) |hash| try queue.append(a, hash);
+        var seen: std.AutoHashMapUnmanaged(Digest, void) = .empty;
+        var hints: std.ArrayList(Hint) = .empty;
+        var bytes_used: usize = 256;
+        var position: usize = 0;
+        // Breadth-first selection keeps the shared upper levels hot. Export
+        // cached nodes only; warming never fetches more source objects.
+        while (position < queue.items.len and hints.items.len < 256) : (position += 1) {
+            try self.context.ensureActive();
+            const hash = queue.items[position];
+            if ((try seen.getOrPut(a, hash)).found_existing) continue;
+            const node = (self.cache.get(hash) orelse continue).node;
+            const bytes = try std.json.Stringify.valueAlloc(a, node, .{});
+            defer a.free(bytes);
+            // Digest-array framing is bounded by 256 bytes per entry.
+            if (bytes.len + 256 > hint_bytes - bytes_used) continue;
+            bytes_used += bytes.len + 256;
+            try hints.append(a, .{ .hash = hash, .node = node });
+            if (node.children) |children| for (children) |child| if (child) |next| try queue.append(a, next);
+        }
+        if (hints.items.len == 0) return;
+        const bytes = try std.json.Stringify.valueAlloc(a, Hints{ .nodes = hints.items }, .{});
+        if (bytes.len > hint_bytes) return error.LakeRetirementIndexBudgetExceeded;
+        const hash = digest(bytes);
+        if (self.hint_digest) |previous| if (std.mem.eql(u8, &hash, &previous)) return;
+        var context = self.hintContext();
+        const path = try std.fmt.allocPrint(a, "{s}/warm-v1.json", .{self.prefix});
+        // Last-writer-wins is intentional: this bounded cache owns no progress,
+        // roots or authority, and all restored nodes retain their hash checks.
+        var stored = try self.client.putObject(self.bucket, path, bytes, .{ .cancellation = types.contextCancellation(&context) });
+        stored.deinit(self.client.allocator);
+        self.hint_digest = hash;
+    }
     fn read(self: *Index, hash: Digest) !Node {
         try self.context.ensureActive();
-        if (self.cache.get(hash)) |node| return node;
+        if (self.cache.get(hash)) |cached| return cached.node;
+        return self.readCanonical(hash);
+    }
+    fn readCanonical(self: *Index, hash: Digest) !Node {
+        try self.context.ensureActive();
+        if (self.cache.get(hash)) |cached| if (cached.durable) return cached.node;
         const a = self.arena.allocator();
         const path = try self.key(a, hash);
         var client = self.client;
@@ -67,11 +152,12 @@ pub const Index = struct {
         var object = try client.getObject(self.bucket, path, .{ .skip_metadata_probe = true, .max_response_bytes = 64 * 1024, .cancellation = types.contextCancellation(&self.context) });
         defer object.deinit(client.allocator);
         if (!std.mem.eql(u8, &digest(object.body), &hash)) return error.InvalidLakeRetirementIndex;
-        if (self.cached_bytes + object.body.len > 32 * 1024 * 1024) return error.LakeRetirementIndexBudgetExceeded;
+        const added_bytes = if (self.cache.contains(hash)) 0 else object.body.len;
+        if (self.cached_bytes + added_bytes > 32 * 1024 * 1024) return error.LakeRetirementIndexBudgetExceeded;
         const node = try std.json.parseFromSliceLeaky(Node, a, object.body, .{ .allocate = .alloc_always });
         try validate(node);
-        try self.cache.put(a, hash, node);
-        self.cached_bytes += object.body.len;
+        try self.cache.put(a, hash, .{ .node = node, .durable = true });
+        self.cached_bytes += added_bytes;
         return node;
     }
     fn write(self: *Index, node: Node) !Digest {
@@ -80,20 +166,22 @@ pub const Index = struct {
         const a = self.arena.allocator();
         const bytes = try std.json.Stringify.valueAlloc(a, node, .{});
         const hash = digest(bytes);
-        if (self.cache.contains(hash)) return hash;
+        // A hint authenticates content, never a successful durable upload.
+        if (self.cache.get(hash)) |cached| if (cached.durable) return hash;
         const path = try self.key(a, hash);
         var client = self.client;
         var result = client.putObject(self.bucket, path, bytes, .{ .if_none_match = true, .cancellation = types.contextCancellation(&self.context) }) catch |err| {
             // Resolve both preexisting nodes and lost successful responses.
-            _ = self.read(hash) catch return err;
+            _ = self.readCanonical(hash) catch return err;
             return hash;
         };
         result.deinit(client.allocator);
-        if (self.cached_bytes + bytes.len > 32 * 1024 * 1024) return error.LakeRetirementIndexBudgetExceeded;
+        const added_bytes = if (self.cache.contains(hash)) 0 else bytes.len;
+        if (self.cached_bytes + added_bytes > 32 * 1024 * 1024) return error.LakeRetirementIndexBudgetExceeded;
         // Nodes written by a caller may borrow a short-lived URI slice.
         const owned = try std.json.parseFromSliceLeaky(Node, a, bytes, .{ .allocate = .alloc_always });
-        try self.cache.put(a, hash, owned);
-        self.cached_bytes += bytes.len;
+        try self.cache.put(a, hash, .{ .node = owned, .durable = true });
+        self.cached_bytes += added_bytes;
         return hash;
     }
     pub fn contains(self: *Index, root: ?Digest, uri: []const u8) !bool {
@@ -267,4 +355,120 @@ test "external lake retirement batch preserves canonical roots with bounded obje
     var cold = Index.init(a, memory.client(), "archive", "batch", .{});
     defer cold.deinit();
     try std.testing.expectError(error.InvalidLakeRetirementIndex, cold.contains(root, uris[0]));
+}
+
+test "external lake retirement hints survive cold turns without becoming authority" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var index = Index.init(a, memory.client(), "archive", "reachable", .{});
+    defer index.deinit();
+    var uris: [64][]const u8 = undefined;
+    for (&uris, 0..) |*uri, i| uri.* = try std.fmt.allocPrint(ca, "s3://archive/{d}.parquet", .{i});
+    const root = try index.insertMany(null, &uris);
+    try index.saveHints(&.{root});
+    var cold = Index.init(a, memory.client(), "archive", "reachable", .{});
+    defer cold.deinit();
+    memory.resetOperationCount();
+    try cold.loadHints();
+    const reads = memory.operationCount();
+    try std.testing.expectEqual(@as(u64, 1), reads);
+    for (uris) |uri| try std.testing.expect(try cold.contains(root, uri));
+    try std.testing.expectEqual(reads, memory.operationCount());
+    // An unchanged turn need not rewrite the mutable hint object.
+    try cold.saveHints(&.{root});
+    try std.testing.expectEqual(reads, memory.operationCount());
+
+    const next = try index.insertMany(root, &.{"s3://archive/later.parquet"});
+    try std.testing.expect(!try cold.contains(root, "s3://archive/later.parquet"));
+    try std.testing.expect(try cold.contains(next, "s3://archive/later.parquet"));
+    var client = memory.client();
+    const forged = try std.json.Stringify.valueAlloc(ca, Hints{ .nodes = &.{.{ .hash = root.?, .node = .{} }} }, .{});
+    var stored = try client.putObject("archive", "reachable/warm-v1.json", forged, .{});
+    stored.deinit(a);
+    var corrupt = Index.init(a, memory.client(), "archive", "reachable", .{});
+    defer corrupt.deinit();
+    try std.testing.expectError(error.InvalidLakeRetirementIndex, corrupt.loadHints());
+    try std.testing.expectEqual(@as(usize, 0), corrupt.cache.count());
+    // A corrupt optional cache cannot turn a present member into a negative.
+    try std.testing.expect(try corrupt.contains(root, uris[0]));
+    try client.deleteObject("archive", "reachable/warm-v1.json", .{});
+    var missing = Index.init(a, memory.client(), "archive", "reachable", .{});
+    defer missing.deinit();
+    missing.loadHints() catch {};
+    try std.testing.expect(try missing.contains(root, uris[0]));
+    index.context.deadline_ns = 0;
+    memory.resetOperationCount();
+    try std.testing.expectError(error.DeadlineExceeded, index.loadHints());
+    try std.testing.expectError(error.DeadlineExceeded, index.saveHints(&.{root}));
+    try std.testing.expectEqual(@as(u64, 0), memory.operationCount());
+}
+
+test "external lake retirement hints stay bounded and fall back for uncached nodes" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var index = Index.init(a, memory.client(), "archive", "reachable", .{});
+    defer index.deinit();
+    var uris: [512][]const u8 = undefined;
+    const padding: [512]u8 = @splat('x');
+    for (&uris, 0..) |*uri, i| uri.* = try std.fmt.allocPrint(ca, "s3://archive/{s}/{d}.parquet", .{ padding, i });
+    const root = try index.insertMany(null, &uris);
+    try index.saveHints(&.{root});
+    var client = memory.client();
+    var object = try client.getObject("archive", "reachable/warm-v1.json", .{});
+    defer object.deinit(a);
+    try std.testing.expect(object.body.len <= hint_bytes);
+    var cold = Index.init(a, memory.client(), "archive", "reachable", .{});
+    defer cold.deinit();
+    try cold.loadHints();
+    try std.testing.expect(cold.cache.count() < index.cache.count());
+    memory.resetOperationCount();
+    for (uris) |uri| try std.testing.expect(try cold.contains(root, uri));
+    try std.testing.expect(memory.operationCount() > 0);
+    try std.testing.expect(!try cold.contains(root, "s3://archive/missing.parquet"));
+}
+
+test "external lake retirement hints cannot acknowledge an unpersisted node" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    const node: Node = .{ .items = &.{"s3://archive/future.parquet"} };
+    const body = try std.json.Stringify.valueAlloc(ca, node, .{});
+    const hash = Index.digest(body);
+    const hints = try std.json.Stringify.valueAlloc(ca, Hints{ .nodes = &.{.{ .hash = hash, .node = node }} }, .{});
+    var hint = try client.putObject("archive", "reachable/warm-v1.json", hints, .{});
+    hint.deinit(a);
+    var vtable = client.vtable.*;
+    vtable.put_object = struct {
+        fn put(_: *anyopaque, _: A, _: []const u8, _: []const u8, _: []const u8, _: storage.PutOptions) anyerror!storage.PutResult {
+            return error.InjectedHintUploadFailure;
+        }
+    }.put;
+    var failing_client = client;
+    failing_client.vtable = &vtable;
+    var failed = Index.init(a, failing_client, "archive", "reachable", .{});
+    defer failed.deinit();
+    try failed.loadHints();
+    try std.testing.expectError(error.InjectedHintUploadFailure, failed.insertMany(null, node.items));
+    var writer = Index.init(a, client, "archive", "reachable", .{});
+    defer writer.deinit();
+    try writer.loadHints();
+    try std.testing.expectEqual(hash, (try writer.insertMany(null, node.items)).?);
+    var cold = Index.init(a, client, "archive", "reachable", .{});
+    defer cold.deinit();
+    try std.testing.expect(try cold.contains(hash, node.items[0]));
+    // A failed response is acceptable only after a real canonical read proves
+    // the object exists. The optional hint can never resolve the lost ACK.
+    try std.testing.expectEqual(hash, (try failed.insertMany(null, node.items)).?);
 }

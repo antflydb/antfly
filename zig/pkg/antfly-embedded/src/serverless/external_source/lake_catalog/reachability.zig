@@ -148,6 +148,8 @@ pub const Builder = struct {
             defer object.deinit(a);
             const proof = try std.json.parseFromSliceLeaky(Proof, a, object.body, .{});
             if (proof.version != 1 or !std.mem.eql(u8, &proof.metadata_hash, &hash)) return error.InvalidLakeReachability;
+            self.index.loadHints() catch {};
+            try self.files.context.ensureActive();
             return .{ .ready = true, .members = proof.members };
         }
         if (max_steps == 0) return .{ .ready = false };
@@ -159,6 +161,8 @@ pub const Builder = struct {
         else
             .{ .metadata_hash = hash, .roots = try roots(a, table.metadata_json) };
         if (progress.version != 1 or progress.snapshot > progress.roots.snapshots.len or progress.statistic > progress.roots.statistics.len) return error.InvalidLakeReachability;
+        self.index.loadHints() catch {};
+        try self.files.context.ensureActive();
         if (!std.mem.eql(u8, &progress.metadata_hash, &hash)) {
             // A newer worker may have saved its checkpoint after this caller
             // selected the table but before it read build.json. Do not rebase
@@ -247,6 +251,10 @@ pub const Builder = struct {
             else => return err,
         };
         stored.deinit(a);
+        // Persist progress first. Warming is bounded and optional, so a lost
+        // cache write never discards completed work or weakens proof checks.
+        self.index.saveHints(&.{ progress.manifests, progress.members }) catch {};
+        try self.files.context.ensureActive();
         // The caller charges these mutations against traversal's remaining
         // work. A complete exact-metadata proof is usable immediately, even
         // when the next maintenance turn will observe another catalog commit.

@@ -52,7 +52,10 @@ pub fn executeWithDelivery(a: A, server: *server_api.ApiHttpServer, table: local
             try server.requestLakePublication(table.name);
             break :changed error.CatalogGenerationChanged;
         },
-        error.LakeIndexReaderLeaseExpired, error.NativeLakeTextCacheBusy, error.NativeLakeRuntimeCacheBusy, error.LakeSnapshotReadLeaseExpired, error.LakeSnapshotRetired, error.LakeOverlayCoverageUnavailable => error.StorageReadTemporarilyUnavailable,
+        error.LakeIndexReaderLeaseExpired, error.NativeLakeTextCacheBusy, error.NativeLakeRuntimeCacheBusy, error.LakeSnapshotReadLeaseExpired, error.LakeSnapshotRetired, error.LakeOverlayCoverageUnavailable => unavailable: {
+            server.lake_query_metrics.recordUnavailable(err);
+            break :unavailable error.StorageReadTemporarilyUnavailable;
+        },
         error.NativeLakeTextCorpusTooLarge, error.LakeOverlayTooLarge, error.ArtifactReadBudgetExceeded => error.QueryCandidateBudgetExceeded,
         error.IndexNotFound => error.InvalidQueryRequest,
         error.Canceled => canceled: {

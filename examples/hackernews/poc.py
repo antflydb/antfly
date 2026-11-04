@@ -67,6 +67,18 @@ class RequestFailure(RuntimeError):
             "too_many_requests",
             "temporarily_unavailable",
             "metadata_leader_unavailable",
+            # Stable QueryTemporarilyUnavailableReason values from the public
+            # query contract. Preserve the reason, never the provider message.
+            "decision_provider_unavailable",
+            "doc_identity_unavailable",
+            "read_requires_primary",
+            "standby_read_unavailable",
+            "distributed_query_unavailable",
+            "storage_read_temporarily_unavailable",
+            "metric_not_ready",
+            "metric_stale",
+            "query_embedding_temporarily_unavailable",
+            "reranker_temporarily_unavailable",
             "invalid_request",
             "unsupported_exact_sort",
             "unsupported_query",

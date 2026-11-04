@@ -22712,6 +22712,13 @@ pub const ApiHttpServer = struct {
         delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
     ) !contextual_operations.OwnedResponse {
         if (isNdjsonContentType(content_type)) return self.handlePublicTableMultiQueryWithCancellation(table_name, body, borrowed_identity, cancellation, null, null);
+        const public_started = platform_time.monotonicNs();
+        const public_active = self.lake_query_metrics.beginPublic(public_started);
+        defer public_active.deinit();
+        var public_profile: @import("lake_query_metrics.zig").ComposedProfile = .{};
+        // Enclose catalog binding and all request-owned cleanup, including
+        // failures before the lake executor can create its narrower profile.
+        defer public_profile.finishPublic(&self.lake_query_metrics, public_started);
         var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
         defer if (identity) |*owned| owned.deinit(self.alloc);
         const deadline = query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body) catch return self.publicQueryOperationErrorResponse(table_name, body, error.InvalidQueryRequest);
@@ -22739,9 +22746,17 @@ pub const ApiHttpServer = struct {
         };
         var bridge: ?Bridge = if (delivery) |target| .{ .server = self, .table_name = table_name, .target = target } else null;
         var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .delivery = if (bridge) |*value| .{ .ptr = value, .typed_result = if (value.target.typed_result != null) .{ .ptr = value, .consume = Bridge.consume } else null, .start_fn = Bridge.start, .write_fn = Bridge.write, .max_bytes = value.target.max_bytes, .preparation_bytes = value.target.preparation_bytes, .spill_io = self.embedding_provider_runtime.io, .consume_columns = value.target.typed_result == null } else null };
-        var binding = self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none }, table_name, body, &identity, &resolver) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
+        var binding = bind: {
+            const started = platform_time.monotonicNs();
+            defer public_profile.record(&self.lake_query_metrics, .public_binding, started);
+            break :bind self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none }, table_name, body, &identity, &resolver) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
+        };
         defer binding.deinit();
+        defer public_active.enter(.cleanup);
         if (bridge) |*value| value.table_name = binding.physical;
+        const dispatch_started = platform_time.monotonicNs();
+        public_active.enter(.dispatch);
+        defer public_profile.record(&self.lake_query_metrics, .public_dispatch, dispatch_started);
         return self.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, binding.bound_body orelse body, content_type, identity, cancellation, binding.label, if (binding.join) |*value| value else null, &resolver, binding.dispatch);
     }
 

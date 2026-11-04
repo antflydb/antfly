@@ -1,6 +1,7 @@
 # Continuous writable-lake qualification — 2026-11-04 UTC
 
-**The full profile did not qualify on either provider.** The catalog-history
+**Both the baseline and first follow-up optimized runs failed qualification on
+each provider.** The catalog-history
 changes in #1480 work in this workload, and indexed acknowledged rows survived
 searchable publication and restart. Accepted-search availability and maintenance completion
 remain release/deployment qualification gaps.
@@ -241,8 +242,94 @@ This establishes completion and data preservation for that retained job across
 restarts and engine updates. Each continuation starts at a different traversal
 position, so their durations are not a controlled speedup comparison. The job's
 completion does not process snapshots that became eligible after its original
-plan. It is not a fresh continuous-write or full-archive qualification; optimized
-local/GCS profiles remain outstanding.
+plan. It is not a fresh continuous-write or full-archive qualification. The next
+section records the fresh optimized profiles separately.
+
+## Fresh profiles at `e21dbbd624`
+
+The optimized executable built successfully with the same ReleaseFast/stripped,
+Metal/CUDA-disabled configuration. Its SHA-256 is
+`f317f09206382b23a4b7f1a8ecf6d1a094fd867cb1f652bec24b406ff3c0254c`.
+The harness was at `8534c3ea79`. A short eight-row smoke passed first; its ten
+successful searches and restart checks do not qualify retention. Both fresh full
+profiles ran on the contended developer host. Later Debug probes and unrelated
+builds overlapped parts of them. No fixed-throughput or isolated speedup claim is
+supported.
+
+Successful-query latencies, in milliseconds:
+
+| Provider / visibility | Successes | Median | p95 | Maximum |
+|---|---:|---:|---:|---:|
+| Filesystem / published | 318 | 31 | 772 | 4,274 |
+| Filesystem / accepted | 317 | 64 | 236 | 3,400 |
+| GCS / published | 141 | 1,345 | 2,249 | 5,295 |
+| GCS / accepted | 139 | 1,935 | 2,474 | 5,016 |
+
+Additional failures remain: **one 60-second filesystem accepted-search timeout
+and two retryable GCS accepted-search HTTP 503 responses**, lasting 5.06 and
+5.43 seconds. The public 503 reasons were still redacted to `http_error`; they
+cannot be reconstructed from these records. The follow-up allowlist preserves
+the public API's stable unavailable reason codes, without retaining provider
+messages or unknown values. It does not retroactively identify these failures.
+
+The filesystem run completed in 977.05 seconds and verified all 103 final row
+images through publication, restart and maintenance. It reported one deletion
+during writes and 40 overall; nine independently checked expired manifest lists
+were absent. All checks except search availability passed. Initial published
+search took 38.38 ms; post-restart accepted search took 71.66 ms. Indexed
+publication lag was median 14.54 s / p95 48.16 s, with 30.84 s final catch-up.
+
+The GCS run acknowledged 161 history and 184 indexed transactions and verified
+103 final rows and the initial restart image. It reported two deletions during
+writes but again exceeded the 300-second restart-maintenance allowance, ending
+incomplete after 2,177.74 seconds. Final post-maintenance row checks and independent
+deletion checks were not reached. Indexed publication lag remained median
+205.56 s / p95 375.52 s; final catch-up took 214.46 s. Initial published search
+took 4.50 s; post-restart accepted search took 9.83 s. This does not establish
+acceptable GCS serving or maintenance performance.
+
+The new Debug stress profile used eight readers, one-second updates and the full
+retention window. It passed every check, with 2,753 successful queries per
+visibility, no failures, 24 deletions during writes and exact preservation of
+102 final rows. A separate Debug profile with the original pacing completed 330
+queries per visibility without a failure, but did not finish maintenance within
+its 300-second recovery allowance. Neither Debug result clears the optimized
+timeout or qualifies an optimized performance comparison.
+
+The local timeout occurred while other catalog reads and writes continued. A
+different roughly 3-second local lake profile attributed 2.69 s to cursor
+retention, with microsecond reader admission and millisecond WAL preparation.
+The Debug stress profile similarly attributed 3.45 s of a 3.92-second request to
+cursor retention. Those profiles explain those completed requests, not the
+60-second failure. A Debug sample observed retained-capability single-flight
+waits and scoped upload inventory work. A separate three-query GCS diagnostic
+after writes stopped succeeded; it is outside the qualification counts and does
+not reproduce or explain the 503s.
+
+## Remaining maintenance and request attribution
+
+A Debug continuation reopened the fresh GCS jobs, verified all 103 accepted rows
+and kept the saved operation IDs. It still had a pending history job after an
+additional 540.20 seconds, so its post-maintenance checks were not reached. A
+symbolic sample spent substantial time fetching immutable completed-manifest
+trie nodes during reachability marking. Existing per-turn RAM caching did not
+survive the next worker turn.
+
+The next change adds one replaceable, bounded 128 KiB trie-hint key per catalog.
+Nodes retain their SHA-256 checks; missing, corrupt, stale or partial hints fall
+back to required canonical reads. Hint bytes never establish a successful
+upload, resolve a lost upload response or alter an exact-metadata proof, progress
+CAS or retirement HEAD CAS. Optional cache I/O has a one-second sub-deadline and
+progress is saved before warming. Provider retention of older object versions
+is independent of this current-object size bound. Existing checkpoint formats
+remain unchanged.
+
+Additional diagnostics distinguish the internal causes mapped to query 503s,
+time public-query binding and dispatch, and include cleanup in the enclosing
+request total around the narrower lake profile.
+Fixed-capacity live-stage tracking also exposes unfinished requests; saturation
+drops diagnostics rather than queuing queries. These changes need new engine
+builds and qualification; the measurements above do not include them.
 
 Next work should:
 
