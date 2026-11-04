@@ -177,6 +177,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api query contract serializes derived hierarchy ancestry",
         "api query contract serializes mention evidence hierarchy",
         "api query contract validates canonical hierarchy controls",
+        "native member traversal requires producer and private parent admission",
         "query max score preserves negative relevance scores",
         "query hit exposes relevance score and raw vector distance separately",
         "query merge orders pure dense results by descending relevance score",

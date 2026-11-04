@@ -3160,6 +3160,22 @@ fn parseQueryRequestWithDeadlineCore(
     errdefer normalized_query.deinit(alloc);
     try ensureQueryDeadline(execution_deadline_ns);
 
+    // Navigation admits a bounded set of source rows, without a text-index
+    // retrieval relation. Lower logical field predicates into the existing
+    // stored-value matcher rather than leaving a text-filter carrier behind.
+    if (req.hierarchy_children != null) if (normalized_query.filter_text) |predicate| {
+        var encoded: std.ArrayListUnmanaged(u8) = .empty;
+        defer encoded.deinit(alloc);
+        try appendPatternFilterQueryValue(alloc, &encoded, predicate, true);
+        const value = try std.json.parseFromSlice(std.json.Value, alloc, encoded.items, .{});
+        defer value.deinit();
+        try db_mod.validateStructuredFilterValueAlloc(alloc, value.value);
+        const owned = try encoded.toOwnedSlice(alloc);
+        normalized_query.filter_query_json = try mergeInternalFilterJsonAlloc(alloc, normalized_query.filter_query_json, owned, .all);
+        freeTextQuery(alloc, predicate);
+        normalized_query.filter_text = null;
+    };
+
     if (req.reranker != null) {
         req.reranker_query_text = try buildRerankerQueryText(alloc, request);
     }
@@ -3173,10 +3189,10 @@ fn parseQueryRequestWithDeadlineCore(
         normalized_query.full_text = null;
     } else if (request.full_text_index != null) {
         return error.InvalidQueryRequest;
-    } else if (normalized_query.filter_text != null or
+    } else if (req.hierarchy_children == null and (normalized_query.filter_text != null or
         normalized_query.exclusion_text != null or
         normalized_query.filter_query_json.len > 0 or
-        normalized_query.exclusion_query_json.len > 0)
+        normalized_query.exclusion_query_json.len > 0))
     {
         req.full_text = .{ .match_all = {} };
     }
@@ -8961,7 +8977,7 @@ fn normalizeGeneratedBleveQuery(alloc: std.mem.Allocator, query: std.json.Value)
 fn encodePatternFilterQuery(alloc: std.mem.Allocator, query: db_mod.types.TextQuery) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    try appendPatternFilterQueryValue(alloc, &out, query);
+    try appendPatternFilterQueryValue(alloc, &out, query, false);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -9009,8 +9025,15 @@ fn appendPatternFilterQueryValue(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     query: db_mod.types.TextQuery,
+    allow_logical_values: bool,
 ) !void {
     switch (query) {
+        .value => |spec| {
+            if (!allow_logical_values) return error.UnsupportedQueryRequest;
+            const encoded = try std.json.Stringify.valueAlloc(alloc, .{ .value = spec }, .{});
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        },
         .match_all => try out.appendSlice(alloc, "{\"match_all\":{}}"),
         .match_none => try out.appendSlice(alloc, "{\"match_none\":{}}"),
         .term => |term| {
@@ -9146,7 +9169,7 @@ fn appendPatternFilterQueryValue(
                 try out.append(alloc, '[');
                 for (bool_query.must, 0..) |item, i| {
                     if (i > 0) try out.append(alloc, ',');
-                    try appendPatternFilterQueryValue(alloc, out, item);
+                    try appendPatternFilterQueryValue(alloc, out, item, allow_logical_values);
                 }
                 try out.append(alloc, ']');
             }
@@ -9155,7 +9178,7 @@ fn appendPatternFilterQueryValue(
                 try out.append(alloc, '[');
                 for (bool_query.should, 0..) |item, i| {
                     if (i > 0) try out.append(alloc, ',');
-                    try appendPatternFilterQueryValue(alloc, out, item);
+                    try appendPatternFilterQueryValue(alloc, out, item, allow_logical_values);
                 }
                 try out.append(alloc, ']');
             }
@@ -9164,7 +9187,7 @@ fn appendPatternFilterQueryValue(
                 try out.append(alloc, '[');
                 for (bool_query.must_not, 0..) |item, i| {
                     if (i > 0) try out.append(alloc, ',');
-                    try appendPatternFilterQueryValue(alloc, out, item);
+                    try appendPatternFilterQueryValue(alloc, out, item, allow_logical_values);
                 }
                 try out.append(alloc, ']');
             }
@@ -20782,14 +20805,28 @@ test "native member traversal requires producer and private parent admission" {
     try std.testing.expectEqualStrings("summary", parsed.req.hierarchy_children.?.artifact_name.?);
     try std.testing.expectEqual(db_mod.types.ReturnMode.member, parsed.req.return_mode);
     try std.testing.expect(!parsed.req.hierarchy_parent_admitted);
-    const filtered_body = try std.mem.concat(alloc, u8, &.{ "{\"filter_query\":{\"equals\":\"selected\",\"field\":\"source_id\"},", body[1..] });
-    defer alloc.free(filtered_body);
-    var filtered = try parseQueryRequest(alloc, null, "docs", filtered_body);
-    defer filtered.deinit(alloc);
-    try std.testing.expect(filtered.req.filter_query_json.len != 0);
-    try std.testing.expect(db_mod.types.canonicalHierarchyExecutionWithinBudget(filtered.req));
+    for ([_][]const u8{
+        "{\"equals\":\"selected\",\"field\":\"source_id\"}",
+        "{\"bool\":{\"must\":[{\"equals\":\"selected\",\"field\":\"source_id\"},{\"bool\":{\"should\":[{\"bool\":true,\"field\":\"permissions.public\"},{\"equals\":\"user:alice\",\"field\":\"permissions.readers\"}],\"minimum_should_match\":1}}]}}",
+        "{\"bool\":true,\"field\":\"permissions.public\"}",
+    }) |predicate| {
+        const filtered_body = try std.mem.concat(alloc, u8, &.{ "{\"filter_query\":", predicate, ",", body[1..] });
+        defer alloc.free(filtered_body);
+        var filtered = try parseQueryRequest(alloc, null, "docs", filtered_body);
+        defer filtered.deinit(alloc);
+        try std.testing.expect(filtered.req.filter_query_json.len != 0);
+        try std.testing.expect(filtered.req.full_text == null and filtered.req.filter_text == null);
+        try std.testing.expect(db_mod.types.canonicalHierarchyExecutionWithinBudget(filtered.req));
+        const wire = try @import("query_execution_contract.zig").encodeQueryRequest(alloc, filtered.req);
+        defer alloc.free(wire);
+        var worker = try parseQueryRequest(alloc, null, "docs", wire);
+        defer worker.deinit(alloc);
+        try std.testing.expect(worker.req.filter_query_json.len != 0);
+        try std.testing.expect(worker.req.full_text == null and worker.req.filter_text == null);
+        try std.testing.expect(db_mod.types.canonicalHierarchyExecutionWithinBudget(worker.req));
+    }
     var json = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer json.deinit();
-    try json.value.object.put("_hierarchy_parent_admitted", .{ .bool = true });
+    try json.value.object.put(json.arena.allocator(), "_hierarchy_parent_admitted", .{ .bool = true });
     try std.testing.expect(objectHasInternalShardField(json.value.object));
 }

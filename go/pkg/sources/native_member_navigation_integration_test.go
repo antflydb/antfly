@@ -308,6 +308,33 @@ func TestNativeMemberBatchIntegration(t *testing.T) {
 	require.Equal(t, 1000, summary.Stats.Files)
 	require.LessOrEqual(t, summary.Stats.Requests, 40)
 	t.Logf("searched %d native members using %d index requests", summary.Stats.Files, summary.Stats.Requests)
+	// The maximum parent batch must apply predicates to the source values,
+	// including when every generated member contains different text.
+	parentIDs := make([]string, 100)
+	for i := range parentIDs {
+		parentIDs[i] = fmt.Sprintf("doc-%04d", i)
+	}
+	for _, text := range []string{"Monday", "absent"} {
+		request := map[string]any{"filter_query": map[string]any{"equals": text, "field": "content.text"}, "hierarchy": map[string]any{"children": map[string]any{"parent": map[string]any{"level": "source", "ids": parentIDs}, "level": "member", "artifact": "summary"}}, "order_by": []any{map[string]any{"field": "_hierarchy.position"}}, "limit": 100}
+		raw, err := publisher.call(t.Context(), "POST", tablePath(table)+"/query", request)
+		require.NoError(t, err)
+		var result struct {
+			Responses []struct {
+				Status int `json:"status"`
+				Hits   struct {
+					Hits []json.RawMessage `json:"hits"`
+				} `json:"hits"`
+			} `json:"responses"`
+		}
+		require.NoError(t, json.Unmarshal(raw, &result))
+		require.Len(t, result.Responses, 1)
+		require.Equal(t, 200, result.Responses[0].Status, string(raw))
+		expected := 0
+		if text == "Monday" {
+			expected = 100
+		}
+		require.Len(t, result.Responses[0].Hits.Hits, expected)
+	}
 	// A direct public traversal establishes its own retained snapshot, and its
 	// continuation resumes across two independent source prefixes.
 	query := map[string]any{"hierarchy": map[string]any{"children": map[string]any{"parent": map[string]any{"level": "source", "ids": []string{"doc-0000", "doc-0001"}}, "level": "member", "artifact": "summary"}}, "order_by": []any{map[string]any{"field": "_hierarchy.position"}}, "limit": 1}
