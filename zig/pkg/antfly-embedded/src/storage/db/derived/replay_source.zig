@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const replay_reference = @import("replay_reference.zig");
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("../../backend_erased.zig");
 const change_journal_mod = @import("change_journal.zig");
@@ -395,7 +396,9 @@ fn primaryStoreMatchingCursorForEachNext(
             continue;
         }
 
-        consume(ctx, sequence, entry.value) catch |err| switch (err) {
+        const resolved = try replay_reference.resolve(cursor.store.alloc, &cursor.scan_txn.?, sequence, cursor.scan_lane_ordinal, entry.value);
+        defer if (resolved) |owned| cursor.store.alloc.free(owned);
+        consume(ctx, sequence, resolved orelse entry.value) catch |err| switch (err) {
             // Keep this entry current: the builder rejected it before taking
             // ownership, so the following replay window must retry it.
             StopReplayChunk.StopReplayChunk => return stats,

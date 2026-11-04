@@ -4763,6 +4763,8 @@ pub const Cursor = struct {
     }
 };
 
+const replay_reference = @import("../db/derived/replay_reference.zig");
+
 const replay_hints = [_]change_journal_mod.TargetHint{
     .enrichment,
     .full_text,
@@ -4784,68 +4786,6 @@ fn encodeReplaySequence(sequence: u64) [8]u8 {
     return raw;
 }
 
-fn isEmbeddingReplayArtifactKey(key: []const u8) bool {
-    return internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key);
-}
-
-fn appendReplayArtifactsForHint(
-    alloc: Allocator,
-    out: *std.ArrayListUnmanaged([]const u8),
-    artifact_keys: []const []const u8,
-    hint: change_journal_mod.TargetHint,
-) !void {
-    for (artifact_keys) |key| {
-        const keep = switch (hint) {
-            .dense_vector, .sparse_vector => isEmbeddingReplayArtifactKey(key),
-            .graph => internal_keys.isGraphEdgeArtifactKey(key) or
-                internal_keys.isAssetArtifactKey(key) or
-                internal_keys.isResolutionArtifactKey(key),
-            .resolution => internal_keys.isAssetArtifactKey(key),
-            .promotion => internal_keys.isResolutionArtifactKey(key),
-            .enrichment, .full_text, .algebraic => false,
-        };
-        if (keep) try out.append(alloc, key);
-    }
-}
-
-fn encodeReplayPayloadForHint(
-    alloc: Allocator,
-    record: change_journal_mod.Record,
-    hint: change_journal_mod.TargetHint,
-) ![]u8 {
-    var target_hints = [_]change_journal_mod.TargetHint{hint};
-    var artifact_keys = std.ArrayListUnmanaged([]const u8).empty;
-    defer artifact_keys.deinit(alloc);
-    try appendReplayArtifactsForHint(alloc, &artifact_keys, record.changed_artifact_keys, hint);
-
-    var filtered = change_journal_mod.Record{
-        .version = record.version,
-        .sequence = record.sequence,
-        .target_hints = target_hints[0..],
-    };
-    switch (hint) {
-        .enrichment => {
-            filtered.changed_doc_keys = record.changed_doc_keys;
-        },
-        .full_text, .algebraic => {
-            filtered.changed_doc_keys = record.changed_doc_keys;
-            filtered.deleted_doc_keys = record.deleted_doc_keys;
-            filtered.overwritten_doc_keys = record.overwritten_doc_keys;
-        },
-        .dense_vector, .sparse_vector => {
-            filtered.changed_doc_keys = record.changed_doc_keys;
-            filtered.deleted_doc_keys = record.deleted_doc_keys;
-            filtered.overwritten_doc_keys = record.overwritten_doc_keys;
-            filtered.changed_artifact_keys = artifact_keys.items;
-        },
-        .graph, .resolution, .promotion => {
-            filtered.deleted_doc_keys = record.deleted_doc_keys;
-            filtered.changed_artifact_keys = artifact_keys.items;
-        },
-    }
-    return try change_journal_mod.encodeRecord(alloc, filtered);
-}
-
 fn writeOriginalReplayHintEntries(txn: anytype, sequence: u64, mask: u8, payload: []const u8) !void {
     const latest_raw = encodeReplaySequence(sequence);
     for (replay_hints) |hint| {
@@ -4858,6 +4798,15 @@ fn writeOriginalReplayHintEntries(txn: anytype, sequence: u64, mask: u8, payload
 }
 
 fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []const u8) !void {
+    if (sequence == std.math.maxInt(u64)) return error.InvalidBatchRequest;
+    const previous = txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (previous) |raw| {
+        if (raw.len != 8) return error.CorruptReplayMetadata;
+        if (sequence < std.mem.readInt(u64, raw[0..8], .little)) return error.InvalidBatchRequest;
+    }
     try txn.put(internal_keys.replay_meta_init_key[0..], "");
     const next_raw = encodeReplaySequence(sequence + 1);
     try txn.put(internal_keys.replay_meta_next_sequence_key[0..], next_raw[0..]);
@@ -4879,10 +4828,15 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
 
     for (replay_hints) |hint| {
         if ((mask & change_journal_mod.singleHintMask(hint)) == 0) continue;
-        const lane_payload = try encodeReplayPayloadForHint(alloc, decoded.record, hint);
-        defer alloc.free(lane_payload);
         const key = internal_keys.replayEntryKey(replayHintOrdinal(hint), sequence);
-        try txn.put(key[0..], lane_payload);
+        if (txn.store.?.file.header.indexed_reclamation and txn.store.?.file.header.indexed_revision >= 10) {
+            const reference = replay_reference.encodeReference(sequence, hint);
+            try txn.put(&key, &reference);
+        } else {
+            const lane_payload = try replay_reference.encodeForHint(alloc, decoded.record, hint);
+            defer alloc.free(lane_payload);
+            try txn.put(&key, lane_payload);
+        }
         const latest_key = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
         try txn.put(latest_key[0..], latest_raw[0..]);
     }
@@ -4917,7 +4871,9 @@ fn forEachReplayLane(
     };
     while (true) {
         const sequence = internal_keys.parseReplayEntrySequence(entry.key, kind) orelse return error.InvalidReplayEntryKey;
-        try callback(context, sequence, entry.value);
+        const resolved = try replay_reference.resolve(store.allocator, &read, sequence, kind, entry.value);
+        defer if (resolved) |owned| store.allocator.free(owned);
+        try callback(context, sequence, resolved orelse entry.value);
         stats.scanned_entries += 1;
         stats.matched_entries += 1;
         stats.last_sequence = sequence;
@@ -4961,9 +4917,11 @@ const replay_cleanup_max_key_bytes = 256 * 1024;
 /// can be deleted using an older read snapshot. Release it between chunks.
 fn truncateReplay(store: *Store, prefix: []const u8, yielding: bool, up_to_sequence: u64) !void {
     if (up_to_sequence == 0) return;
-    try truncateReplayLane(store, prefix, yielding, internal_keys.replay_all_kind, up_to_sequence);
+    // A reader opening between these bounded commits must never find a
+    // reference whose canonical payload has already been retired.
     for (replay_hints) |hint|
         try truncateReplayLane(store, prefix, yielding, replayHintOrdinal(hint), up_to_sequence);
+    try truncateReplayLane(store, prefix, yielding, internal_keys.replay_all_kind, up_to_sequence);
 }
 
 fn truncateReplayLane(store: *Store, prefix: []const u8, yielding: bool, kind: u8, up_to_sequence: u64) !void {
@@ -5293,6 +5251,109 @@ test "lite native write cursors merge pending writes and deletes in order" {
     entry = try cursor.next();
     try std.testing.expectEqualStrings("doc:d", entry.key);
     try std.testing.expectError(error.NotFound, cursor.next());
+}
+
+test "lite canonical replay facade resolves cursors and protects rotating retirement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "canonical-replay-facade.aflite");
+    defer a.free(path);
+    var native_store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    defer native_store.close();
+    var runtime = try native_store.runtimeStore(a);
+    defer runtime.deinit();
+    const facade = @import("../docstore.zig");
+    var store = try facade.DocStore.openRuntime(a, &runtime);
+    defer store.close();
+    const payload = try change_journal_mod.encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{ "你好", "one\x00two" }, .target_hints = &.{ .full_text, .algebraic } });
+    defer a.free(payload);
+    // Exercise the actual foreground facade, not just native appendReplay.
+    {
+        var write = try store.beginWriteBatch();
+        errdefer write.abort();
+        try write.setReplayOpaque(1, payload);
+        try write.commit();
+    }
+    const lane = internal_keys.replayEntryKey(1, 1);
+    {
+        var read = try native_store.beginRead();
+        defer read.abort();
+        try std.testing.expect(replay_reference.isReference(try read.get(&lane)));
+    }
+    var source = @import("../db/derived/replay_source.zig").Source.fromPrimaryStore(&store, null, null);
+    var cursor = try source.openMatchingCursor(a, 0, .full_text);
+    defer cursor.deinit(a);
+    const Context = struct {
+        alloc: Allocator,
+        count: usize = 0,
+        fn consume(raw: *anyopaque, sequence: u64, bytes: []const u8) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u64, 1), sequence);
+            var decoded = try change_journal_mod.decodeRecord(ctx.alloc, bytes);
+            defer decoded.deinit();
+            try std.testing.expectEqualStrings("one\x00two", decoded.record.changed_doc_keys[1]);
+            ctx.count += 1;
+        }
+    };
+    var context: Context = .{ .alloc = a };
+    _ = try cursor.forEachNext(1, &context, Context.consume);
+    try std.testing.expectEqual(@as(usize, 1), context.count);
+    cursor.releaseReadSnapshot();
+    // Start at the canonical lane as if an earlier turn stopped on another
+    // lane's key budget. It must not retire bytes still referenced on disk.
+    var retirement: facade.ReplayRetirement = .{ .lane = 8, .watermark = 1 };
+    store.deferred_replay_retirement = &retirement;
+    store.bounded_replay_retirement = true;
+    try store.truncateReplayUpTo(a, 1);
+    const canonical = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    {
+        var read = try native_store.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings(payload, try read.get(&canonical));
+    }
+    try store.truncateReplayUpTo(a, 1);
+    try std.testing.expectEqual(@as(u64, 0), (try native_store.file.replayAdmission()).?.bytes);
+}
+
+test "lite native replay canonical references preserve snapshots and exact quota" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "canonical-replay.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    defer store.close();
+    const payload = try change_journal_mod.encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{ "你好", "one\x00two" }, .target_hints = &.{ .full_text, .algebraic } });
+    defer a.free(payload);
+    {
+        var writer = try store.beginWrite();
+        errdefer writer.abort();
+        try writer.setReplayOpaque(1, payload);
+        try writer.commit();
+    }
+    var read = try store.beginRead();
+    defer read.abort();
+    const lane = internal_keys.replayEntryKey(1, 1);
+    const raw = try read.get(&lane);
+    try std.testing.expectEqual(@as(usize, replay_reference.reference_size), raw.len);
+    const resolved = (try replay_reference.resolve(a, &read, 1, 1, raw)).?;
+    defer a.free(resolved);
+    var decoded = try change_journal_mod.decodeRecord(a, resolved);
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("one\x00two", decoded.record.changed_doc_keys[1]);
+    const canonical = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    var before = (try store.file.replayAdmission()).?;
+    const expected = (try native.replay_admission.charge(&canonical, payload.len)) + 2 * (try native.replay_admission.charge(&lane, raw.len));
+    try std.testing.expectEqual(expected, before.bytes);
+    try store.truncateReplayUpTo(a, 2);
+    // The old checkpoint still owns both rows while the current generation
+    // has returned exactly the physical charge of all three records.
+    const old_resolved = (try replay_reference.resolve(a, &read, 1, 1, raw)).?;
+    defer a.free(old_resolved);
+    before = (try store.file.replayAdmission()).?;
+    try std.testing.expectEqual(@as(u64, 0), before.bytes);
+    try std.testing.expectEqual(@as(u64, 0), before.records);
 }
 
 test "lite native docstore persists replay lanes across reopen and truncation" {

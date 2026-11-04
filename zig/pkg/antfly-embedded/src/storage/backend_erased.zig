@@ -725,12 +725,20 @@ pub const CurrentScanTxn = struct {
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         open_cursor: *const fn (Allocator, *anyopaque) anyerror!Cursor,
+        /// Optional point reads from this same captured generation. Native
+        /// replay references must not resolve through a newer transaction.
+        get: ?*const fn (*anyopaque, []const u8) anyerror![]const u8 = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn abort(self: *CurrentScanTxn) void {
         self.vtable.abort(self.allocator, self.ptr);
         self.* = undefined;
+    }
+
+    pub fn get(self: *CurrentScanTxn, key: []const u8) ![]const u8 {
+        const read = self.vtable.get orelse return error.Unsupported;
+        return try BoundaryAbi.call("get", self.boundary_dispatch, read, .{ self.ptr, key });
     }
 
     pub fn openCursor(self: *CurrentScanTxn) !Cursor {
@@ -1789,6 +1797,10 @@ pub fn currentScanTxnFrom(allocator: Allocator, handle: anytype) !CurrentScanTxn
             unbox(ptr).requestAbort();
         }
 
+        pub fn get(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
+            return try unbox(ptr).handle.get(key);
+        }
+
         pub fn openCursor(alloc: Allocator, ptr: *anyopaque) anyerror!Cursor {
             const parent = unbox(ptr);
             try parent.retainChild();
@@ -1805,6 +1817,7 @@ pub fn currentScanTxnFrom(allocator: Allocator, handle: anytype) !CurrentScanTxn
         .vtable = &.{
             .abort = vt.abort,
             .open_cursor = vt.openCursor,
+            .get = if (@hasDecl(Handle, "get")) vt.get else null,
         },
     };
 }

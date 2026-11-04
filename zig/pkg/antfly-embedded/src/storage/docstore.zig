@@ -699,7 +699,7 @@ pub const DocStore = struct {
         fn getPhysical(self: *Txn, key: []const u8) ![]const u8 {
             if (self.write) |*write| return try write.get(key);
             if (self.probe) |*probe| return try probe.get(key);
-            if (self.current_scan != null) return error.Unsupported;
+            if (self.current_scan) |*captured_scan| return try captured_scan.get(key);
             return try self.read.?.get(key);
         }
 
@@ -1104,6 +1104,10 @@ pub const DocStore = struct {
             }
 
             pub fn setReplayOpaque(self: @This(), sequence: u64, payload: []const u8) !void {
+                // Native storage owns the physical replay representation and
+                // its file-wide quota. Keep source and journal in this batch.
+                if (self.runtime.?.vtable.set_replay_opaque != null)
+                    return self.runtime.?.setReplayOpaque(sequence, payload);
                 try writeReplayEntries(self.alloc, self, sequence, payload);
             }
         };
@@ -2940,6 +2944,8 @@ pub const DocStore = struct {
                     if (std.mem.order(u8, kv.key, &upper) != .lt) break;
                     const sequence = internal_keys.parseReplayEntrySequence(kv.key, ordinal) orelse break;
                     if (sequence > up_to_sequence) break;
+                    if (ordinal == internal_keys.replay_all_kind and txn.current_scan.?.vtable.get != null and
+                        !try @import("db/derived/replay_reference.zig").canonicalMayRetire(&txn, sequence)) continue;
                     const key = try alloc.dupe(u8, kv.key);
                     errdefer alloc.free(key);
                     try deletes.append(alloc, key);

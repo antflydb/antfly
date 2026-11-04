@@ -1166,16 +1166,22 @@ The naming recommendation is:
 
 ## Native throughput and online compaction
 
-Native owners create revision-9 files (`AFLITE\x09P`) with packed records and
+Native owners create revision-10 files (`AFLITE\x0aP`) with packed records and
 durable page ownership. Existing revision-3 signatures (`AFLITE\x03N` for
 unpacked records and `AFLITE\x03P` for packed records) remain readable. Writable
-owners migrate revisions 3, 7 and 8 through an atomic compact-generation replacement;
+owners migrate revisions 3, 7, 8 and 9 through an atomic compact-generation replacement;
 read-only opens preserve the existing encoding. The Zig `page_reuse = false`
 option preserves revision-3 creation/open behavior. Raw native primitives also
 retain their revision-3 default for compatibility. Revision 2 remains unsupported,
-and older binaries reject the revision-9 signature before checkpoint selection.
+and older binaries reject the revision-10 signature before checkpoint selection.
 Unreleased revision-4/5/6 prototypes are rejected rather than mixing reader,
-logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-9 image.
+logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-10 image.
+
+Revision 10 stores one canonical replay payload with checksummed hint-lane
+references. Readers resolve each reference in the same captured checkpoint.
+Retirement removes references before their canonical payload and returns quota
+only for physically removed bytes. Older inline hint lanes remain readable;
+read-only revision-9 opens preserve their representation.
 
 Revision 9 maintains a semantic revision for each schema-bearing native document namespace in
 the same transaction as its row, identity or relational-constraint changes.

@@ -15,7 +15,7 @@
 
 //! Native single-file Antfly Lite format primitives.
 //!
-//! This module owns revision-3 compatibility and the revision-9 indexed `.aflite`
+//! This module owns revision-3 compatibility and the revision-10 indexed `.aflite`
 //! format, checkpoint publication, ownership retirement, and physical page reuse.
 
 const std = @import("std");
@@ -1130,9 +1130,10 @@ pub const magic = "AFLITE\x03P";
 const unpacked_v3_magic = "AFLITE\x03N";
 const previous_indexed_magic = "AFLITE\x07P";
 const revision8_magic = "AFLITE\x08P";
-const indexed_magic = "AFLITE\x09P";
+const revision9_magic = "AFLITE\x09P";
+const indexed_magic = "AFLITE\x0aP";
 pub const format_version: u32 = 3;
-pub const indexed_format_version: u32 = 9;
+pub const indexed_format_version: u32 = 10;
 pub const default_page_size: u32 = 4096;
 
 test "lite reclamation catalog snapshots visit live indexes rather than history" {
@@ -13369,7 +13370,7 @@ pub fn inspectBytes(raw: []const u8) InspectReport {
 
 pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
     @memset(out, 0);
-    @memcpy(out[magic_offset..][0..magic.len], if (header.indexed_reclamation) (if (header.indexed_revision == 7) previous_indexed_magic else if (header.indexed_revision == 8) revision8_magic else indexed_magic) else if (header.packed_records) magic else unpacked_v3_magic);
+    @memcpy(out[magic_offset..][0..magic.len], if (header.indexed_reclamation) (if (header.indexed_revision == 7) previous_indexed_magic else if (header.indexed_revision == 8) revision8_magic else if (header.indexed_revision == 9) revision9_magic else indexed_magic) else if (header.packed_records) magic else unpacked_v3_magic);
     std.mem.writeInt(u32, out[version_offset..][0..4], if (header.indexed_reclamation) header.indexed_revision else format_version, .little);
     std.mem.writeInt(u32, out[page_size_offset..][0..4], header.page_size, .little);
     std.mem.writeInt(u32, out[header_size_offset..][0..4], header_size, .little);
@@ -13390,12 +13391,13 @@ pub fn decodeHeader(raw: []const u8) !Header {
     const header_raw = raw[0..header_size];
     const previous_indexed = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], previous_indexed_magic);
     const revision8 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision8_magic);
-    const indexed_reclamation = previous_indexed or revision8 or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_magic);
+    const revision9 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision9_magic);
+    const indexed_reclamation = previous_indexed or revision8 or revision9 or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_magic);
     const has_packed_records = indexed_reclamation or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], magic);
     if (!has_packed_records and !std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], unpacked_v3_magic)) return error.InvalidNativeMagic;
 
     const version = std.mem.readInt(u32, header_raw[version_offset..][0..4], .little);
-    if (version != (if (previous_indexed) @as(u32, 7) else if (revision8) @as(u32, 8) else if (indexed_reclamation) indexed_format_version else format_version)) return error.UnsupportedNativeFormatVersion;
+    if (version != (if (previous_indexed) @as(u32, 7) else if (revision8) @as(u32, 8) else if (revision9) @as(u32, 9) else if (indexed_reclamation) indexed_format_version else format_version)) return error.UnsupportedNativeFormatVersion;
 
     const encoded_header_size = std.mem.readInt(u32, header_raw[header_size_offset..][0..4], .little);
     if (encoded_header_size != header_size) return error.InvalidNativeHeaderSize;
@@ -14030,7 +14032,7 @@ fn headerChecksum(raw: []const u8) u32 {
     var crc = Crc32.init();
     crc.update(raw[0..active_checkpoint_offset]);
     crc.update(raw[active_checkpoint_offset + 1 .. checkpoint_slots_offset]);
-    const end = if (std.mem.eql(u8, raw[0..indexed_magic.len], indexed_magic) or std.mem.eql(u8, raw[0..revision8_magic.len], revision8_magic)) logical_generations_end else checkpoint_slots_end;
+    const end = if (std.mem.eql(u8, raw[0..indexed_magic.len], indexed_magic) or std.mem.eql(u8, raw[0..revision8_magic.len], revision8_magic) or std.mem.eql(u8, raw[0..revision9_magic.len], revision9_magic)) logical_generations_end else checkpoint_slots_end;
     crc.update(raw[end..header_checksum_offset]);
     return crc.final();
 }
