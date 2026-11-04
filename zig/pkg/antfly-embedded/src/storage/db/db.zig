@@ -146718,7 +146718,7 @@ test "db scoped retry workset processes healthy batches across restart before a 
     try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(bad_target));
     try std.testing.expectEqual(@as(usize, 1), mock.bad_calls);
     const deadline = db.enrichment_runtime.?.next_retry_at_ms;
-    try std.testing.expectEqual(@as(u64, 3_601_000), deadline);
+    try std.testing.expect(deadline >= 3_601_000 and deadline <= 3_601_250);
     db.close();
     opened = false;
     clock.advanceMs(30_000);

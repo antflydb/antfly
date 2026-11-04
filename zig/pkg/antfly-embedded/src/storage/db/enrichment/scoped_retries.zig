@@ -85,16 +85,57 @@ pub const Due = struct {
     }
 };
 pub const PreparedDocument = struct { delayed: []u64, changed: bool };
+const BudgetKey = struct { logical: u64, digest: ?[32]u8 };
+const BudgetCounts = struct { failures: u32 = 0, waits: u32 = 0 };
 pub const State = struct {
     config_hash: u64 = 0,
     scanned_sequence: u64 = 0,
     scan_document: []const u8 = "",
     tickets: std.ArrayListUnmanaged(Ticket) = .empty,
     persisted_slots: std.StaticBitSet(max_documents) = .empty,
+    logical_budgets: std.AutoHashMapUnmanaged(BudgetKey, BudgetCounts) = .empty,
+    logical_present: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    budget_index_valid: bool = false,
+
+    /// Derived metadata only: rebuilt once after decode/removal, then updated
+    /// incrementally as failures are parked. Never serialized or pointer-based.
+    fn invalidateBudgetIndex(self: *State) void {
+        self.budget_index_valid = false;
+    }
+    pub fn removeTicket(self: *State, a: A, index: usize) void {
+        self.invalidateBudgetIndex();
+        self.tickets.items[index].deinit(a);
+        _ = self.tickets.swapRemove(index);
+    }
+    fn mergeBudget(self: *State, digest: ?[32]u8, budget: Budget) void {
+        const key = BudgetKey{ .logical = budget.logical_fingerprint, .digest = digest };
+        const entry = self.logical_budgets.getOrPutAssumeCapacity(key);
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        entry.value_ptr.failures = @max(entry.value_ptr.failures, budget.failures);
+        entry.value_ptr.waits = @max(entry.value_ptr.waits, budget.waits);
+        self.logical_present.putAssumeCapacity(key.logical, {});
+    }
+    fn ensureBudgetIndex(self: *State, a: A) !void {
+        if (self.budget_index_valid) return;
+        self.logical_budgets.clearRetainingCapacity();
+        self.logical_present.clearRetainingCapacity();
+        var count: usize = 0;
+        for (self.tickets.items) |ticket| count += ticket.budgets.items.len;
+        try self.logical_budgets.ensureTotalCapacity(a, @intCast(count));
+        try self.logical_present.ensureTotalCapacity(a, @intCast(count));
+        for (self.tickets.items) |ticket| for (ticket.budgets.items) |budget| self.mergeBudget(ticket.source_digest, budget);
+        self.budget_index_valid = true;
+    }
+    pub fn hasLogical(self: *State, a: A, logical: u64) !bool {
+        try self.ensureBudgetIndex(a);
+        return self.logical_present.contains(logical);
+    }
 
     pub fn deinit(self: *State, a: A) void {
         for (self.tickets.items) |*ticket| ticket.deinit(a);
         self.tickets.deinit(a);
+        self.logical_budgets.deinit(a);
+        self.logical_present.deinit(a);
         if (self.scan_document.len != 0) a.free(self.scan_document);
         self.* = .{};
     }
@@ -343,6 +384,10 @@ pub const State = struct {
     }
     pub fn parkStamped(self: *State, a: A, group: Group, deadline_ms: u64, budget: Budget, source_digest: ?[32]u8, stamp: ?SourceStamp) !void {
         if (group.doc_key.len == 0 or group.doc_key.len > max_document_key_bytes) return error.InvalidEnrichmentState;
+        if (self.budget_index_valid) {
+            try self.logical_budgets.ensureUnusedCapacity(a, 1);
+            try self.logical_present.ensureUnusedCapacity(a, 1);
+        }
         const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(group.doc_key.len));
         defer a.free(encoded);
         _ = std.base64.standard.Encoder.encode(encoded, group.doc_key);
@@ -366,6 +411,7 @@ pub const State = struct {
             next.revision = 1;
             try ticket.budgets.append(a, next);
             try self.tickets.append(a, ticket);
+            if (self.budget_index_valid) self.mergeBudget(source_digest, next);
             return;
         }
         const ticket = selected.?;
@@ -385,7 +431,10 @@ pub const State = struct {
             try ticket.budgets.ensureUnusedCapacity(a, 1);
         }
         // Every allocation precedes mutation, including source replacement.
-        if (changed) ticket.budgets.clearRetainingCapacity();
+        if (changed) {
+            ticket.budgets.clearRetainingCapacity();
+            self.invalidateBudgetIndex();
+        }
         ticket.source_digest = source_digest;
         ticket.source_stamp = stamp;
         ticket.dirty = true;
@@ -394,21 +443,19 @@ pub const State = struct {
         next.deadline_ms = deadline_ms;
         next.revision = revision;
         if (old) |i| {
+            if (next.logical_fingerprint != ticket.budgets.items[i].logical_fingerprint) self.invalidateBudgetIndex();
             next.deadline_ms = @max(next.deadline_ms, ticket.budgets.items[i].deadline_ms);
             next.failures = @max(next.failures, ticket.budgets.items[i].failures);
             next.waits = @max(next.waits, ticket.budgets.items[i].waits);
             ticket.budgets.items[i] = next;
         } else ticket.budgets.appendAssumeCapacity(next);
         ticket.refreshDeadline();
+        if (self.budget_index_valid) self.mergeBudget(source_digest, next);
     }
-    pub fn priorLogical(self: State, logical: u64, source_digest: ?[32]u8) Budget {
-        var result = Budget{ .fingerprint = 0, .logical_fingerprint = logical };
-        for (self.tickets.items) |ticket| for (ticket.budgets.items) |budget| {
-            if (!std.meta.eql(ticket.source_digest, source_digest) or budget.logical_fingerprint != logical) continue;
-            result.failures = @max(result.failures, budget.failures);
-            result.waits = @max(result.waits, budget.waits);
-        };
-        return result;
+    pub fn priorLogical(self: *State, a: A, logical: u64, source_digest: ?[32]u8) !Budget {
+        try self.ensureBudgetIndex(a);
+        const counts = self.logical_budgets.get(.{ .logical = logical, .digest = source_digest }) orelse BudgetCounts{};
+        return .{ .fingerprint = 0, .logical_fingerprint = logical, .failures = counts.failures, .waits = counts.waits };
     }
     pub fn deadline(self: State) u64 {
         var result: u64 = std.math.maxInt(u64);
@@ -492,6 +539,7 @@ pub const State = struct {
             while (j < ticket.budgets.items.len) {
                 const budget = ticket.budgets.items[j];
                 if (budget.logical_fingerprint != 0 and std.mem.indexOfScalar(u64, definitions, budget.logical_fingerprint) == null) {
+                    self.invalidateBudgetIndex();
                     _ = ticket.budgets.swapRemove(j);
                     ticket.dirty = true;
                     changed = true;
@@ -503,8 +551,7 @@ pub const State = struct {
                 j += 1;
             }
             if (ticket.budgets.items.len == 0) {
-                ticket.deinit(a);
-                _ = self.tickets.swapRemove(i);
+                self.removeTicket(a, i);
             } else {
                 ticket.refreshDeadline();
                 i += 1;
@@ -517,8 +564,8 @@ pub const State = struct {
         while (i < self.tickets.items.len) {
             const ticket = &self.tickets.items[i];
             if (ticket.sequence < group.sequence and std.mem.eql(u8, ticket.document, encoded) and !std.meta.eql(ticket.source_digest, source_digest)) {
-                ticket.deinit(a);
-                _ = self.tickets.swapRemove(i);
+                self.invalidateBudgetIndex();
+                self.removeTicket(a, i);
             } else i += 1;
         }
     }
@@ -528,14 +575,14 @@ pub const State = struct {
                 if (ticket.sequence != token.sequence or !std.mem.eql(u8, ticket.document, token.document)) continue;
                 for (ticket.budgets.items, 0..) |budget, j| {
                     if (budget.fingerprint == token.fingerprint and budget.logical_fingerprint == token.logical_fingerprint and budget.revision == token.revision) {
+                        self.invalidateBudgetIndex();
                         _ = ticket.budgets.swapRemove(j);
                         ticket.dirty = true;
                         break;
                     }
                 }
                 if (ticket.budgets.items.len == 0) {
-                    ticket.deinit(a);
-                    _ = self.tickets.swapRemove(i);
+                    self.removeTicket(a, i);
                 } else ticket.refreshDeadline();
                 break;
             }
@@ -589,8 +636,8 @@ test "scoped retry workset keeps independent producer clocks and logical budgets
     try std.testing.expectEqual(@as(u64, 3_600_000), state.deadline());
     // A different physical provider batch still consumes the logical budget.
     try state.park(a, group, 3_000, .{ .fingerprint = 33, .logical_fingerprint = 2, .failures = 2 }, source);
-    try std.testing.expectEqual(@as(u32, 2), state.priorLogical(2, source).failures);
-    try std.testing.expectEqual(@as(u32, 0), state.priorLogical(2, @as([32]u8, @splat(9))).failures);
+    try std.testing.expectEqual(@as(u32, 2), (try state.priorLogical(a, 2, source)).failures);
+    try std.testing.expectEqual(@as(u32, 0), (try state.priorLogical(a, 2, @as([32]u8, @splat(9)))).failures);
     // Retiring an obsolete definition cannot shorten the surviving clock.
     const after_change = try state.prepareDocument(a, ready.documents[0], source, &.{2}, 2_000);
     defer a.free(after_change.delayed);
@@ -637,6 +684,14 @@ test "scoped retry workset maximum metadata fits binary and incremental persiste
         }
     }
     try std.testing.expectEqual(@as(usize, 128), state.tickets.items.len);
+    try std.testing.expect(try state.hasLogical(a, 10_000_000_000_000_000_000));
+    // Warm lookups need no allocation, rebuild, or traversal of other budgets.
+    var denied = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    for (0..128 * 1024) |i| {
+        const fp = 10_000_000_000_000_000_000 + i;
+        try std.testing.expect(try state.hasLogical(denied.allocator(), fp));
+        try std.testing.expectEqual(@as(u32, 1), (try state.priorLogical(denied.allocator(), fp, null)).failures);
+    }
 
     const initial = try state.preparePersistence(a, false);
     defer initial.deinit(a);
@@ -667,4 +722,40 @@ test "scoped retry workset maximum metadata fits binary and incremental persiste
     defer restored.deinit(a);
     try std.testing.expectEqual(@as(usize, 128), restored.tickets.items.len);
     try std.testing.expectEqual(@as(usize, 1024), restored.tickets.items[127].budgets.items.len);
+}
+
+test "scoped retry workset indexed budgets survive replacement retirement and allocation failure" {
+    const Harness = struct {
+        fn run(a: A) !void {
+            var state = State{};
+            defer state.deinit(a);
+            const source: [32]u8 = @splat(1);
+            try state.park(a, .{ .doc_key = "doc", .sequence = 1 }, 100, .{ .fingerprint = 1, .logical_fingerprint = 7, .failures = 2 }, source);
+            try std.testing.expect(try state.hasLogical(a, 7));
+            try std.testing.expectEqual(@as(u32, 2), (try state.priorLogical(a, 7, source)).failures);
+            // Duplicate journal notifications aggregate maxima across tickets.
+            try state.park(a, .{ .doc_key = "doc", .sequence = 2 }, 200, .{ .fingerprint = 2, .logical_fingerprint = 7, .failures = 1 }, source);
+            try std.testing.expectEqual(@as(u32, 2), (try state.priorLogical(a, 7, source)).failures);
+            const due = try state.due(a, 100);
+            defer due.deinit(a);
+            state.retire(a, due.tokens);
+            try std.testing.expectEqual(@as(u32, 1), (try state.priorLogical(a, 7, source)).failures);
+            // A lower counter cannot forgive the same producer's old clock.
+            try state.park(a, .{ .doc_key = "doc", .sequence = 2 }, 300, .{ .fingerprint = 3, .logical_fingerprint = 7 }, source);
+            try std.testing.expectEqual(@as(u32, 1), (try state.priorLogical(a, 7, source)).failures);
+            try state.park(a, .{ .doc_key = "doc", .sequence = 2 }, 400, .{ .fingerprint = 4, .logical_fingerprint = 8, .waits = 3 }, @splat(2));
+            try std.testing.expect(!try state.hasLogical(a, 7));
+            try std.testing.expectEqual(@as(u32, 0), (try state.priorLogical(a, 7, source)).failures);
+            try std.testing.expectEqual(@as(u32, 3), (try state.priorLogical(a, 8, @splat(2))).waits);
+            const encoded = try state.encode(a);
+            defer a.free(encoded);
+            var restored = try State.decode(a, encoded);
+            defer restored.deinit(a);
+            try std.testing.expectEqual(@as(u32, 3), (try restored.priorLogical(a, 8, @splat(2))).waits);
+            const definitions = try restored.prepareDocument(a, restored.tickets.items[0].document, @splat(2), &.{9}, 0);
+            defer a.free(definitions.delayed);
+            try std.testing.expect(!try restored.hasLogical(a, 8));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }

@@ -227,3 +227,20 @@ and yield a stale-plan error for bounded replanning. Catalogs without advertised
 pinning remain usable as unversioned routes; an observed catalog revision alone
 never qualifies their output as belonging to an immutable generation. Explicit
 pins fail closed when an endpoint cannot acknowledge them.
+
+
+Retry-budget compatibility uses a derived hash index keyed by logical producer
+and source digest, plus an indexed membership check. Initial discovery after
+load or retirement scans the bounded durable workset once; parking additional
+failures updates maxima incrementally. Source replacement and producer/ticket
+retirement invalidate the aggregate so removed attempts cannot leak into later
+work. Index allocation failures leave durable tickets intact. The index does not alter the persistence
+format.
+
+Failed invocations use equal jitter for exponential backoff. One random sample
+and one clock observation are shared by a compatible failed cohort. A server
+Retry-After minimum retains a bounded spreading window after that minimum;
+ordinary backoff remains within its exponential ceiling. Absolute deadlines
+are persisted, so restart, inspection, and unattempted sibling deferral preserve
+the selected clock rather than drawing again. Ordered publication polling keeps
+its existing fixed cadence.

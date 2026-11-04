@@ -2886,25 +2886,21 @@ const ScopedReplay = struct {
         const logical = logicalRequestFingerprint(request);
         const io = concurrencyIo(runtime);
         self.mutex.lockUncancelable(io);
-        const present = outer: for (self.state.tickets.items) |ticket| {
-            for (ticket.budgets.items) |budget| if (budget.logical_fingerprint == logical) break :outer true;
-        } else false;
+        const present = self.state.hasLogical(runtime.alloc, logical) catch |err| {
+            self.mutex.unlock(io);
+            return err;
+        };
         self.mutex.unlock(io);
         // Healthy batching does no extra primary read or source hashing.
         if (!present) return .{ .fingerprint = 0, .logical_fingerprint = logical };
         const digest = observed orelse if (raw) |bytes| sourceRecordDigest(bytes) else try sourceDigest(runtime, request.doc_key);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        return self.state.priorLogical(logical, digest);
+        return try self.state.priorLogical(runtime.alloc, logical, digest);
     }
     fn sameInputBudget(self: *@This(), runtime: *EnrichmentRuntime, left: enrichment_types.GeneratedEnrichmentRequest, left_digest: ?[32]u8, right: enrichment_types.GeneratedEnrichmentRequest, right_digest: ?[32]u8) !bool {
         const lhs = try self.inputBudget(runtime, left, left_digest, null);
         const rhs = try self.inputBudget(runtime, right, right_digest, null);
-        return lhs.failures == rhs.failures and lhs.waits == rhs.waits;
-    }
-    fn sameAssetBudget(self: *@This(), runtime: *EnrichmentRuntime, left: AssetProducerBatchItem, right: AssetProducerBatchItem) !bool {
-        const lhs = try self.inputBudget(runtime, left.request, null, if (left.raw_doc.len != 0) left.raw_doc else null);
-        const rhs = try self.inputBudget(runtime, right.request, null, if (right.raw_doc.len != 0) right.raw_doc else null);
         return lhs.failures == rhs.failures and lhs.waits == rhs.waits;
     }
     fn ownerBudget(self: *@This(), runtime: *EnrichmentRuntime, owner: FailureOwner, fingerprint: u64) !scoped_retries.Budget {
@@ -2921,7 +2917,10 @@ const ScopedReplay = struct {
             const digest = try self.ownerSource(runtime, owner, request);
             const io = concurrencyIo(runtime);
             self.mutex.lockUncancelable(io);
-            const prior_budget = self.state.priorLogical(logicalRequestFingerprint(request), digest);
+            const prior_budget = self.state.priorLogical(runtime.alloc, logicalRequestFingerprint(request), digest) catch |err| {
+                self.mutex.unlock(io);
+                return err;
+            };
             self.mutex.unlock(io);
             result.failures = @max(result.failures, prior_budget.failures);
             result.waits = @max(result.waits, prior_budget.waits);
@@ -3006,8 +3005,7 @@ const ScopedReplay = struct {
             if (std.mem.eql(u8, ticket.document, key) and
                 (observed.stamp == null or observed.stamp.?.incarnation > ticket.sequence))
             {
-                ticket.deinit(runtime.alloc);
-                _ = self.state.tickets.swapRemove(index);
+                self.state.removeTicket(runtime.alloc, index);
                 self.unsaved = true;
                 removed = true;
             } else index += 1;
@@ -3034,8 +3032,7 @@ const ScopedReplay = struct {
                 (if (ticket.source_stamp) |old| old.sameInput(current) else std.meta.eql(ticket.source_digest, observed.logical_digest)) else false;
             if (!same) {
                 self.unsaved = true;
-                ticket.deinit(runtime.alloc);
-                _ = self.state.tickets.swapRemove(i);
+                self.state.removeTicket(runtime.alloc, i);
             } else {
                 // Migrate v1 tickets once. Cache a fallback observation as well
                 // so unchanged old rows do not require repeated primary reads.
@@ -3080,15 +3077,17 @@ const ScopedReplay = struct {
         if (self.hint_failed) return error.OutOfMemory;
         self.unsaved = true;
         const batch_hint = self.hints.get(fingerprint) orelse 0;
+        const jitter = retryJitterSample(runtime);
+        const now_ms = runtime.clock.nowRealtimeMs();
         for (requests, digests, stamps) |request, digest, stamp| {
             const logical = logicalRequestFingerprint(request);
-            var budget = self.state.priorLogical(logical, digest);
+            var budget = try self.state.priorLogical(runtime.alloc, logical, digest);
             budget.fingerprint = fingerprint;
             budget.failures = @max(budget.failures, legacy.failures);
             budget.waits = @max(budget.waits, legacy.waits);
             if (enrichmentFailureSparesAttemptBudget(err)) budget.waits +|= 1 else budget.failures +|= 1;
             const hint_ms = @max(batch_hint, self.ownerHint(request));
-            const deadline = runtime.clock.nowRealtimeMs() +| workerRetryDelayWithHintMs(budget.failures +| budget.waits, hint_ms);
+            const deadline = now_ms +| workerRetryDelayJitterMs(budget.failures +| budget.waits, hint_ms, jitter);
             try self.state.parkStamped(runtime.alloc, .{ .doc_key = request.doc_key, .sequence = request.sequence }, deadline, budget, digest, stamp);
         }
         try self.saveAssumeLocked(runtime, publication.store(runtime).*, publication.retry_fence);
@@ -3128,7 +3127,7 @@ const ScopedReplay = struct {
             if (digest == null or !same_key(seed, request)) continue;
             const request_fp = requestFailureFingerprint(request);
             if (self.recorded_requests.contains(request_fp)) continue;
-            var budget = self.state.priorLogical(logicalRequestFingerprint(request), digest);
+            var budget = try self.state.priorLogical(runtime.alloc, logicalRequestFingerprint(request), digest);
             budget.fingerprint = request_fp;
             self.unsaved = true;
             try self.state.parkStamped(runtime.alloc, .{ .doc_key = request.doc_key, .sequence = request.sequence }, deadline, budget, digest, stamp);
@@ -3451,20 +3450,42 @@ fn workerRetryDelayMs(consecutive_retry_count: u32) u64 {
     return @min(transient_worker_retry_base_sleep_ms << exponent, transient_worker_retry_max_sleep_ms);
 }
 
-fn workerRetryDelayWithHintMs(consecutive_retry_count: u32, retry_after_hint_ms: u64) u64 {
-    // The exponential cap bounds our own backoff, not the origin's minimum
-    // retry delay. The supervisor persists a saturating absolute deadline and
-    // yields its worker slot, so long server delays need no sleeping worker.
-    return @max(workerRetryDelayMs(consecutive_retry_count), retry_after_hint_ms);
+// One sample per failed invocation, shared by its compatible members. The
+// persisted deadline is authoritative across restart; no randomness is needed
+// when restoring or inspecting pending work.
+fn retryJitterSample(runtime: *EnrichmentRuntime) u64 {
+    var bytes: [8]u8 = undefined;
+    concurrencyIo(runtime).random(&bytes);
+    return std.mem.readInt(u64, &bytes, .little);
+}
+
+fn workerRetryDelayJitterMs(ordinal: u32, hint_ms: u64, sample: u64) u64 {
+    const base = workerRetryDelayMs(ordinal);
+    const window = base / 2;
+    // Equal jitter bounds ordinary backoff by the existing exponential cap.
+    // A server minimum is followed by the same bounded spreading window,
+    // rather than collapsing every client onto Retry-After's exact boundary.
+    return @max(base - window, hint_ms) +| (sample % (window + 1));
 }
 
 test "provider retry guidance preserves server minimum beyond bounded worker backoff" {
-    try std.testing.expectEqual(@as(u64, 1_250), workerRetryDelayWithHintMs(1, 1_250));
-    try std.testing.expectEqual(@as(u64, 60_000), workerRetryDelayWithHintMs(1, 60_000));
-    try std.testing.expectEqual(@as(u64, 3_600_000), workerRetryDelayWithHintMs(100, 3_600_000));
-    try std.testing.expectEqual(std.math.maxInt(u64), workerRetryDelayWithHintMs(1, std.math.maxInt(u64)));
-    try std.testing.expectEqual(transient_worker_retry_max_sleep_ms, workerRetryDelayWithHintMs(100, 1));
-    try std.testing.expectEqual(@as(u64, 1_000), workerRetryDelayWithHintMs(2, 0));
+    const cap = transient_worker_retry_max_sleep_ms;
+    for ([_]u32{ 0, 1, 2, 6, 100, std.math.maxInt(u32) }) |ordinal| {
+        const base = workerRetryDelayMs(ordinal);
+        try std.testing.expectEqual(base - base / 2, workerRetryDelayJitterMs(ordinal, 0, 0));
+        try std.testing.expectEqual(base, workerRetryDelayJitterMs(ordinal, 0, base / 2));
+        for ([_]u64{ 0, 1, 1250, 60_000, 3_600_000, std.math.maxInt(u64) }) |hint| {
+            for ([_]u64{ 0, 1, 53, std.math.maxInt(u64) }) |sample| {
+                const delay = workerRetryDelayJitterMs(ordinal, hint, sample);
+                try std.testing.expect(delay >= hint);
+                try std.testing.expect(delay <= @max(hint, cap) +| (base / 2));
+            }
+        }
+    }
+    // Equal Retry-After values retain a spreading window; peers do not all
+    // collapse onto the minimum's boundary. The same cohort sample is stable.
+    try std.testing.expect(workerRetryDelayJitterMs(1, 60_000, 1) != workerRetryDelayJitterMs(1, 60_000, 2));
+    try std.testing.expectEqual(@as(u64, 60_053), workerRetryDelayJitterMs(1, 60_000, 53));
 }
 
 fn isGraphRecoveryPending(err: anyerror) bool {
@@ -4023,8 +4044,7 @@ fn restoreScopedRetryCache(runtime: anytype) !void {
     var stale: usize = 0;
     while (stale < state.tickets.items.len) {
         if (state.tickets.items[stale].sequence <= runtime.applied_sequence) {
-            state.tickets.items[stale].deinit(runtime.alloc);
-            _ = state.tickets.swapRemove(stale);
+            state.removeTicket(runtime.alloc, stale);
         } else stale += 1;
     }
     const config_changed = state.config_hash != 0 and state.config_hash != try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
@@ -8332,7 +8352,7 @@ const PlatformEnrichmentRuntime = struct {
             self.retry_failure_count +| self.transient_retry_count
         else
             self.consecutive_retry_count;
-        const delay_ms = workerRetryDelayWithHintMs(retry_ordinal, if (awaiting_publication) 0 else self.retry_after_hint_ms);
+        const delay_ms = if (awaiting_publication) workerRetryDelayMs(0) else workerRetryDelayJitterMs(retry_ordinal, self.retry_after_hint_ms, retryJitterSample(self));
         self.retry_after_hint_ms = 0;
         self.next_retry_at_ms = self.clock.nowRealtimeMs() +| delay_ms;
         self.scoped_retry_wait = false;
@@ -9891,8 +9911,7 @@ fn runForegroundCatchUpPassOwned(
     var stale: usize = 0;
     while (stale < scheduler.state.tickets.items.len) {
         if (scheduler.state.tickets.items[stale].sequence <= runtime.applied_sequence) {
-            scheduler.state.tickets.items[stale].deinit(runtime.alloc);
-            _ = scheduler.state.tickets.swapRemove(stale);
+            scheduler.state.removeTicket(runtime.alloc, stale);
         } else stale += 1;
     }
     runtime.retry_scheduler = &scheduler;
@@ -15803,13 +15822,19 @@ fn flushAssetProducerBatch(
     var start: usize = 0;
     while (start < items.items.len) {
         const policy = requestGeneratedTextBatchPolicy(runtime.alloc, items.items[start].request);
+        const seed_budget = if (runtime.retry_scheduler) |scheduler|
+            try scheduler.inputBudget(runtime, items.items[start].request, null, if (items.items[start].raw_doc.len != 0) items.items[start].raw_doc else null)
+        else
+            null;
         var end = start;
         var batch_bytes: usize = 0;
         while (end < items.items.len) : (end += 1) {
             const item = items.items[end];
             if (end > start and !sameAssetProducerBatchKey(items.items[start], item)) break;
-            if (runtime.retry_scheduler) |scheduler| if (end > start and
-                !try scheduler.sameAssetBudget(runtime, items.items[start], item)) break;
+            if (runtime.retry_scheduler) |scheduler| if (end > start) {
+                const budget = try scheduler.inputBudget(runtime, item.request, null, if (item.raw_doc.len != 0) item.raw_doc else null);
+                if (seed_budget.?.failures != budget.failures or seed_budget.?.waits != budget.waits) break;
+            };
             const item_bytes = assetProducerBatchItemBytes(item);
             if (end > start and
                 (end - start >= policy.max_items or
@@ -29045,6 +29070,7 @@ fn processPlainDenseWindow(
         }
         var batch_source_bytes: usize = 0;
         var generation_cache: ?embedder_mod.DenseEmbedder.TextGeneration = null;
+        var seed_retry_budget: ?scoped_retries.Budget = null;
 
         var j: usize = i;
         while (j < requests.len) : (j += 1) {
@@ -29069,14 +29095,23 @@ fn processPlainDenseWindow(
                 continue;
             };
             if (collected) |item| {
-                if (runtime.retry_scheduler) |scheduler| if (items.items.len > 0 and
-                    !try scheduler.sameInputBudget(runtime, items.items[0].request, items.items[0].source_record_digest, item.request, item.source_record_digest))
-                {
+                const compatible = if (runtime.retry_scheduler) |scheduler| blk: {
+                    const budget = scheduler.inputBudget(runtime, item.request, item.source_record_digest, null) catch |err| {
+                        var orphan = [_]PlainDenseBatchItem{item};
+                        freePlainDenseBatchItems(runtime.alloc, &orphan);
+                        return err;
+                    };
+                    if (seed_retry_budget) |seed_budget|
+                        break :blk seed_budget.failures == budget.failures and seed_budget.waits == budget.waits;
+                    seed_retry_budget = budget;
+                    break :blk true;
+                } else true;
+                if (!compatible) {
                     var single = [_]PlainDenseBatchItem{item};
                     freePlainDenseBatchItems(runtime.alloc, &single);
                     processed[j] = false;
                     continue;
-                };
+                }
                 if (items.items.len > 0 and batch_source_bytes + item.source_text.len > max_batch_bytes) {
                     var single = [_]PlainDenseBatchItem{item};
                     freePlainDenseBatchItems(runtime.alloc, &single);
@@ -43429,7 +43464,7 @@ test "durable enrichment scoped retry permits healthy targets and restores exact
     try (LaneOutcome.of(&scope, error.RemoteDocumentFetchFailed)).result;
     try std.testing.expectEqual(@as(u64, 1), scheduler.state.appliedThrough(100));
     const deadline = runtime.next_retry_at_ms;
-    try std.testing.expectEqual(@as(u64, 3_601_000), deadline);
+    try std.testing.expect(deadline >= 3_601_000 and deadline <= 3_601_250);
     try std.testing.expectError(RuntimeError.EnrichmentRetryInProgress, beginReplayPass(&runtime, std.testing.io, 100, .{}));
     runtime.scoped_retry_full = true;
     try std.testing.expect(try beginReplayPass(&runtime, std.testing.io, 101, .{}));
@@ -43492,6 +43527,37 @@ test "durable enrichment scoped retry permits healthy targets and restores exact
     try std.testing.expect(!runtime.scoped_retry_wait);
     try std.testing.expect(!runtime.retrying);
     try std.testing.expectEqual(@as(u64, 0), runtime.next_retry_at_ms);
+    // Compatible members of one failed invocation share a jittered deadline,
+    // and durable restore never redraws it or admits the cohort early.
+    var cohort = ScopedReplay{ .state = .{} };
+    defer cohort.deinit(a);
+    runtime.retry_scheduler = &cohort;
+    var first = request;
+    first.doc_key = "cohort-a";
+    first.sequence = 101;
+    var second = first;
+    second.doc_key = "cohort-b";
+    second.sequence = 102;
+    const batch = [_]PlainDenseBatchItem{
+        .{ .request = first, .source_text = "a", .source_hash = 1, .artifact_key = @constCast("a"), .source_record_digest = @splat(1) },
+        .{ .request = second, .source_text = "b", .source_hash = 2, .artifact_key = @constCast("b"), .source_record_digest = @splat(2) },
+    };
+    const batch_fp = plainDenseBatchFailureFingerprint(&batch);
+    cohort.hint(&runtime, batch_fp, 60_000);
+    try cohort.park(&runtime, .{ .plain = &batch }, batch_fp, error.RemoteDocumentFetchFailed);
+    try std.testing.expectEqual(@as(usize, 2), cohort.state.tickets.items.len);
+    const cohort_deadline = cohort.state.tickets.items[0].deadline_ms;
+    try std.testing.expect(cohort_deadline >= 61_000 and cohort_deadline <= 61_250);
+    try std.testing.expectEqual(cohort_deadline, cohort.state.tickets.items[1].deadline_ms);
+    var restored_cohort = try enrichment_state.loadScopedRetries(a, erased);
+    defer restored_cohort.deinit(a);
+    for (restored_cohort.tickets.items) |ticket| try std.testing.expectEqual(cohort_deadline, ticket.deadline_ms);
+    const before = try restored_cohort.due(a, cohort_deadline - 1);
+    defer before.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), before.groups.len);
+    const after = try restored_cohort.due(a, cohort_deadline);
+    defer after.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), after.groups.len);
 }
 
 test "durable enrichment scoped retry fences superseded metadata writers" {
