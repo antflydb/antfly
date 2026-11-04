@@ -2422,6 +2422,10 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.tableRetirementWorkJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionBytes(alloc, out_json, value);
                 },
+                .scope_retirement_prepare => |input| {
+                    const value = handle.store.prepareScopeRetirementManifestJsonWithContext(a, group_id, input.request, .{ .deadline_ns = input.deadline_ns }) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionBytes(alloc, out_json, value);
+                },
                 .table_retirement_prepare => |input| {
                     const value = handle.store.prepareTableRetirementManifestJsonWithContext(a, group_id, input.guard, .{ .deadline_ns = input.deadline_ns }) catch |err| break :blk storageOwnerStatusFromError(if (err == error.InvalidTableRetirementManifest) error.InvalidGenerationPublication else err);
                     break :blk metadataProjectionBytes(alloc, out_json, value);

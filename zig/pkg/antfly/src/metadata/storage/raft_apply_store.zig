@@ -22940,6 +22940,64 @@ pub const RaftApplyStore = struct {
         return std.json.Stringify.valueAlloc(a, table_retirement.Work{ .head = value, .owner = owner, .root_name = root.name, .owner_name = if (table) |selected| selected.name else "" }, .{});
     }
 
+    /// Complete ancestor membership from a single native read cut. No physical
+    /// owner effect, connection termination or catalog mutation occurs here.
+    pub fn prepareScopeRetirementManifestJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: system_catalog.scope_retirement.Prepare, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        const contract = system_catalog.scope_retirement;
+        try context.ensureActive();
+        try request.validate();
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var read = try self.store.beginReadTxn();
+        defer read.abort();
+        const meta = try system_catalog_storage.readMeta(a, &read, group);
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = &read, .group_id = group, .meta = meta };
+        const database = (try view.lookup(.database, 0, if (request.kind == .database) request.name else request.database)) orelse return error.DatabaseNotFound;
+        const scope: contract.Scope = .{ .kind = request.kind, .database = database, .namespace = if (request.kind == .namespace) (try view.lookup(.namespace, database.id, request.name)) orelse return error.NamespaceNotFound else null };
+        try scope.validate();
+        const Reader = struct {
+            store: *RaftApplyStore,
+            view: system_catalog_storage.View,
+            context: @import("antfly_local_sources").api_operation.RequestContext,
+            budget: RetirementCaptureBudget = .{},
+            pub fn children(reader: *@This(), kind: system_catalog.Kind, parent: u64, count: usize, bytes: usize) ![]const system_catalog.Resource {
+                try reader.context.ensureActive();
+                return reader.view.childrenBounded(kind, parent, count, bytes);
+            }
+            pub fn table(reader: *@This(), resource: system_catalog.Resource) !contract.Table {
+                try reader.context.ensureActive();
+                if (resource.native_service != null) return error.ProtectedCatalogResource;
+                var region: std.heap.ArenaAllocator = .init(reader.view.alloc);
+                defer region.deinit();
+                const scratch = region.allocator();
+                const record = (try reader.store.getTableTxn(scratch, reader.view.txn, reader.view.group_id, resource.id)) orelse return error.CatalogGenerationChanged;
+                if (!std.mem.eql(u8, record.name, resource.storage_name)) return error.CatalogGenerationChanged;
+                if (record.read_schema_json.len != 0 or record.storage_migration != null or record.restore_backup_id.len != 0 or record.relational_retirement_json.len != 0 or
+                    try reader.store.fkGenerationTableLockedTxn(reader.view.txn, reader.view.group_id, record.table_id) or
+                    try backupCohortLocksTableTxn(reader.view.txn, reader.view.group_id, record.table_id) or
+                    try restoreStagingLocksTableTxn(reader.view.txn, reader.view.group_id, record.table_id) or
+                    (try reader.store.loadTableTransitionFenceTxn(reader.view.txn, reader.view.group_id, record.table_id)).active()) return error.TableTransitionActive;
+                if (try reader.store.extensionOwnsTableTxn(reader.view.txn, reader.view.group_id, record.name)) return error.ExtensionOwnedObject;
+                try reader.budget.add(record);
+                const ranges = try reader.store.tableRetirementRangesTxn(scratch, reader.view.txn, reader.view.group_id, record.table_id, &reader.budget);
+                const preimage = try std.json.Stringify.valueAlloc(reader.view.alloc, record, .{});
+                return .{ .id = resource.id, .physical_name = resource.storage_name, .definition = contract.Table.definitionDigest(preimage), .ranges = try hashValue(ranges, "antfly/scope-retirement-ranges/v1\x00"), .preimage = preimage };
+            }
+            fn hashValue(value: anytype, label: []const u8) !contract.Digest {
+                var writer = std.Io.Writer.Hashing(std.crypto.hash.Blake3).initHasher(std.crypto.hash.Blake3.init(.{}), &.{});
+                try writer.writer.writeAll(label);
+                try std.json.Stringify.value(value, .{}, &writer.writer);
+                var digest: contract.Digest = undefined;
+                writer.hasher.final(&digest);
+                return digest;
+            }
+        };
+        var reader: Reader = .{ .store = self, .view = view, .context = context };
+        const manifest = try contract.capture(a, &reader, group, scope, try catalogIncarnationTxn(&read, group), meta.revision, request);
+        return std.json.Stringify.valueAlloc(alloc, manifest, .{});
+    }
+
     pub fn prepareTableRetirementManifestJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, guard: system_catalog.RelationMutationGuard, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         var captured = try self.prepareTableRetirementManifest(alloc, group, guard, context);
         defer captured.deinit();
@@ -69756,4 +69814,71 @@ test "SQL database defaults decoder retains implicit default identities on first
     defer row.deinit();
     try std.testing.expectEqualStrings(system_catalog.default_database_name, row.value.name);
     try std.testing.expectEqual(system_catalog.default_database_id, row.value.id);
+}
+
+test "SQL scope retirement capture pins native scoped membership overloads ranges and cold replay" {
+    const a = std.testing.allocator;
+    const group = 21;
+    const contract = system_catalog.scope_retirement;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/scope-retirement-capture", .{tmp.sub_path});
+    defer a.free(path);
+    var first: ?contract.Digest = null;
+    for (0..2) |pass| {
+        var region: std.heap.ArenaAllocator = .init(a);
+        defer region.deinit();
+        const scratch = region.allocator();
+        var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+        defer store.deinit();
+        if (pass == 0) {
+            try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = @splat('1') });
+            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(scratch, topology_protocol.Activation{ .version = topology_protocol.current_version, .incarnation = @splat('1'), .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+            try applySystemCatalogTestCommand(&store, 1, .{ .expected_revision = 0, .mutation = .{ .action = .create, .kind = .database, .name = "tenant_ops" } });
+            try applySystemCatalogTestCommand(&store, 2, .{ .expected_revision = 1, .mutation = .{ .action = .create, .kind = .namespace, .database = "tenant_ops", .name = "serving" } });
+            const table: metadata.TableRecord = .{ .table_id = 42, .name = "table:42", .min_ranges = 1 };
+            const ranges = [_]metadata.RangeRecord{.{ .table_id = 42, .group_id = 301, .range_id = 301, .start_key = "" }};
+            try applySystemCatalogTestCommand(&store, 3, .{ .expected_revision = 2, .mutation = .{ .action = .create, .kind = .table, .database = "tenant_ops", .namespace = "serving", .name = "events", .table_id = 42, .storage_name = "table:42" }, .topology = .{ .create = .{ .expected_transition_generation = 0, .table = table, .ranges = &ranges } } });
+            // Create both overloads through real routine admission, rather
+            // than seeding synthetic resources which no native owner accepts.
+            for ([_]sql_routines.records.Type{ .{ .scalar = .text }, .{ .scalar = .numeric } }, 0..) |argument, i| {
+                const target: system_catalog.Target = .{ .database = "tenant_ops", .namespace = "serving", .table = "audit" };
+                const before = try std.json.parseFromSliceLeaky(sql_routines.Snapshot, scratch, try store.sqlRoutineSnapshot(scratch, group, .{ .targets = &.{target}, .arguments = &.{.{ .type = argument }} }, .{}), .{});
+                const request: sql_routines.Mutation = .{ .admission = .{ .nonce = @splat(@as(u8, @intCast(10 + i))), .head = before.head }, .target = target, .namespace_id = before.scopes[0].namespace_id.?, .incarnation = before.incarnation, .operation = .{ .publish = .{ .definition = .{ .arguments = &.{.{ .type = argument }}, .result = argument, .body = "SELECT $1", .owner = .auth_disabled } } } };
+                const encoded = try std.json.Stringify.valueAlloc(scratch, sql_routines.command(request), .{});
+                try store.applyStandaloneCommand(group, .{ .apply_system_catalog = encoded });
+                const outcome = (try std.json.parseFromSliceLeaky(?sql_routines.Outcome, scratch, try store.sqlRoutineOutcome(scratch, group, try sql_routines.observation(scratch, request)), .{})).?;
+                try std.testing.expect(outcome == .success);
+            }
+        }
+        const bytes = try store.prepareScopeRetirementManifestJsonWithContext(scratch, group, .{ .kind = .database, .name = "tenant_ops", .creator = .bootstrap }, .{});
+        const captured = try std.json.parseFromSliceLeaky(contract.Manifest, scratch, bytes, .{});
+        try captured.validate(scratch);
+        try std.testing.expectEqual(@as(usize, 1), captured.tables.len);
+        try std.testing.expectEqual(@as(u64, 42), captured.tables[0].id);
+        var overloads: usize = 0;
+        for (captured.resources) |resource| if (resource.kind == .routine) {
+            overloads += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 2), overloads);
+        const digest = try captured.digest(scratch);
+        if (first) |expected| try std.testing.expectEqualDeep(expected, digest) else first = digest;
+        try std.testing.expectError(error.NamespaceNotEmpty, store.prepareScopeRetirementManifestJsonWithContext(scratch, group, .{ .kind = .namespace, .database = "tenant_ops", .name = "serving", .creator = .bootstrap }, .{}));
+        const selected = try std.json.parseFromSliceLeaky(contract.Manifest, scratch, try store.prepareScopeRetirementManifestJsonWithContext(scratch, group, .{ .kind = .namespace, .database = "tenant_ops", .name = "serving", .creator = .bootstrap, .cascade = true }, .{}), .{});
+        try std.testing.expectEqual(@as(usize, 3), selected.resources.len);
+        try std.testing.expectEqual(@as(usize, 1), selected.tables.len);
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        const meta = try system_catalog_storage.readMeta(scratch, &read, group);
+        const view: system_catalog_storage.View = .{ .alloc = scratch, .txn = &read, .group_id = group, .meta = meta };
+        try std.testing.expectError(error.SqlProgramLimitExceeded, view.childrenBounded(.routine, selected.scope.namespace.?.id, 1, contract.max_manifest_bytes));
+        try std.testing.expectError(error.SqlProgramLimitExceeded, view.childrenBounded(.routine, selected.scope.namespace.?.id, 2, 0));
+        try std.testing.expectEqual(@as(usize, 2), (try view.childrenBounded(.routine, selected.scope.namespace.?.id, 2, contract.max_manifest_bytes)).len);
+    }
+}
+
+comptime {
+    if (builtin.is_test and !@import("storage_source_options").control_only) {
+        _ = @import("../scope_retirement_test.zig");
+    }
 }

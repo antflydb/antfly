@@ -89,6 +89,15 @@ python3 scripts/check_sql_advisory_wait_postgres.py
 This closes the original locking cohort; it does not imply that every remaining
 SQL feature or every PostgreSQL lock-bearing query shape is implemented.
 
+## Ancestor retirement
+
+Schema/database DROP activation is in progress in
+[scope retirement](scope-retirement.md). Native capture pins scoped membership,
+physical definition images and range identities, and the reservation journal
+qualifies exact replay, native write faults and cold custody. Public coordinator,
+complete dependency fences and final publication remain unfinished; the three
+original ancestor-drop cases retain unresolved dispositions.
+
 ## Concurrent index DDL
 
 Nonunique `CREATE INDEX CONCURRENTLY` installs the ordinary live native index

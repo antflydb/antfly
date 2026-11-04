@@ -451,6 +451,7 @@ pub const CatalogProjectionRequest = union(enum) {
     table_retirement_preflight: []const u8,
     table_retirement_publication_projection: @import("../table_retirement_ledger.zig").Lookup,
     table_retirement_receipt: @import("../table_retirement_receipt.zig").Request,
+    scope_retirement_prepare: struct { request: system_catalog.scope_retirement.Prepare, deadline_ns: ?u64 = null },
     table_retirement_prepare: struct { guard: system_catalog.RelationMutationGuard, deadline_ns: ?u64 = null },
     relation_create_prepare: struct { request: @import("../relation_create.zig").Request, purpose: @import("../relation_create.zig").Purpose, deadline_ns: ?u64 = null },
     fk_initial_create_prepare_with_deadline: struct { request: @import("../fk_generation_publication.zig").InitialCreatePrepareRequest, deadline_ns: ?u64 = null },

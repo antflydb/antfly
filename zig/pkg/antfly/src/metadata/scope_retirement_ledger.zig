@@ -1,0 +1,223 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Native ancestor-retirement reservations. Membership bodies are written once;
+//! progress and queue rows stay compact. The caller must revalidate the captured
+//! catalog cut and physical proof inside the same writer before staging effects.
+const std = @import("std");
+const local = @import("antfly_local_sources");
+const contract = local.system_catalog_domain.scope_retirement;
+const records = @import("schema_validation_publication.zig");
+const A = std.mem.Allocator;
+pub const Lookup = struct {
+    group: u64,
+    reference: contract.Reference,
+    pub fn validate(self: Lookup) !void {
+        if (self.group == 0) return error.InvalidScopeRetirement;
+        try self.reference.validate();
+    }
+};
+pub const Head = struct {
+    lookup: Lookup,
+    metadata_incarnation: [16]u8,
+    creator: local.system_catalog_privileges.Principal,
+    sequence: u64,
+    progress: contract.Progress,
+    pub fn validate(self: Head) !void {
+        try self.lookup.validate();
+        try self.creator.validate();
+        try self.progress.validate();
+        if (self.creator.kind == .public or self.sequence == 0 or std.mem.allEqual(u8, &self.metadata_incarnation, 0) or
+            !std.meta.eql(self.lookup.reference, self.progress.reference)) return error.InvalidScopeRetirement;
+    }
+    pub fn active(self: Head) bool {
+        return self.progress.phase != .published and self.progress.phase != .canceled;
+    }
+};
+pub const HeadRecord = records.Record(Head, "SRHD", 2048);
+pub const Lease = struct {
+    lookup: Lookup,
+    metadata_incarnation: [16]u8,
+    pub fn validate(self: Lease) !void {
+        try self.lookup.validate();
+        if (std.mem.allEqual(u8, &self.metadata_incarnation, 0)) return error.InvalidScopeRetirement;
+    }
+};
+pub const LeaseRecord = records.Record(Lease, "SRLS", 1024);
+pub const QueueRecord = records.Record(Lookup, "SRQU", 1024);
+pub const Prepared = struct {
+    arena: std.heap.ArenaAllocator,
+    manifest: contract.Manifest,
+    lookup: Lookup,
+    encoded: []const u8,
+    pub fn deinit(self: *Prepared) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+pub fn prepare(backing: A, group: u64, id: contract.Id, bytes: []const u8) !Prepared {
+    if (bytes.len == 0 or bytes.len > contract.max_manifest_bytes) return error.InvalidScopeRetirement;
+    var arena: std.heap.ArenaAllocator = .init(backing);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const manifest = try std.json.parseFromSliceLeaky(contract.Manifest, a, bytes, .{ .allocate = .alloc_always });
+    if (manifest.metadata_group_id != group) return error.InvalidScopeRetirement;
+    const lookup: Lookup = .{ .group = group, .reference = try manifest.reference(a, id) };
+    try lookup.validate();
+    const encoded = try std.json.Stringify.valueAlloc(a, manifest, .{});
+    return .{ .arena = arena, .manifest = manifest, .lookup = lookup, .encoded = encoded };
+}
+const Kind = enum { head, manifest };
+pub fn prefix(buffer: []u8, group: u64) ![]const u8 {
+    if (group == 0) return error.InvalidScopeRetirement;
+    return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:system_catalog:{d}:scope-retirement:", .{group});
+}
+pub fn key(buffer: []u8, lookup: Lookup, kind: Kind) ![]const u8 {
+    try lookup.validate();
+    var base: [128]u8 = undefined;
+    return std.fmt.bufPrint(buffer, "{s}{s}:{x:0>16}:{s}:{s}", .{ try prefix(&base, lookup.group), @tagName(lookup.reference.kind), lookup.reference.root, std.fmt.bytesToHex(lookup.reference.id, .lower), @tagName(kind) });
+}
+pub fn memberKey(buffer: []u8, group: u64, kind: local.system_catalog_domain.Kind, id: u64) ![]const u8 {
+    if (group == 0 or id == 0) return error.InvalidScopeRetirement;
+    return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:system_catalog:{d}:scope-retirement-member:{s}:{x:0>16}", .{ group, @tagName(kind), id });
+}
+pub fn queuePrefix(buffer: []u8, group: u64) ![]const u8 {
+    if (group == 0) return error.InvalidScopeRetirement;
+    return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:system_catalog:{d}:scope-retirement-queue:", .{group});
+}
+pub fn queueKey(buffer: []u8, group: u64, sequence: u64) ![]const u8 {
+    if (sequence == 0) return error.InvalidScopeRetirement;
+    var base: [128]u8 = undefined;
+    return std.fmt.bufPrint(buffer, "{s}{x:0>16}", .{ try queuePrefix(&base, group), sequence });
+}
+pub fn counterKey(buffer: []u8, group: u64) ![]const u8 {
+    if (group == 0) return error.InvalidScopeRetirement;
+    return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:system_catalog:{d}:scope-retirement-sequence", .{group});
+}
+fn optional(reader: anytype, name: []const u8) !?[]const u8 {
+    return reader.get(name) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+}
+pub fn head(reader: anytype, lookup: Lookup) !?Head {
+    var buffer: [256]u8 = undefined;
+    const bytes = (try optional(reader, try key(&buffer, lookup, .head))) orelse return null;
+    const value = try HeadRecord.decode(bytes);
+    try value.validate();
+    if (!std.meta.eql(value.lookup, lookup)) return error.CatalogGenerationChanged;
+    return value;
+}
+pub fn member(reader: anytype, group: u64, kind: local.system_catalog_domain.Kind, id: u64) !?Lease {
+    var buffer: [256]u8 = undefined;
+    const bytes = (try optional(reader, try memberKey(&buffer, group, kind, id))) orelse return null;
+    const lease = try LeaseRecord.decode(bytes);
+    try lease.validate();
+    if (lease.lookup.group != group) return error.InvalidScopeRetirement;
+    return lease;
+}
+fn rootKind(value: contract.Manifest) local.system_catalog_domain.Kind {
+    return if (value.scope.kind == .database) .database else .namespace;
+}
+fn requireVacant(reader: anytype, prepared: *const Prepared) !void {
+    const group = prepared.lookup.group;
+    // Distinct namespaces can retire concurrently. A database retirement
+    // intersects every namespace reservation, and blocks new namespace jobs.
+    if (try member(reader, group, .database, prepared.manifest.scope.database.id) != null) return error.TableTransitionActive;
+    if (try member(reader, group, rootKind(prepared.manifest), prepared.manifest.scope.root().id) != null) return error.TableTransitionActive;
+    for (prepared.manifest.resources) |resource| if (try member(reader, group, resource.kind, resource.id) != null) return error.TableTransitionActive;
+}
+/// Exact replay is observed before checking current vacancy. A completed or
+/// canceled operation cannot reacquire reservations or replace its manifest.
+pub fn existing(reader: anytype, prepared: *const Prepared) !?Head {
+    const previous = (try head(reader, prepared.lookup)) orelse return null;
+    if (!std.mem.eql(u8, &previous.metadata_incarnation, &prepared.manifest.metadata_incarnation) or !previous.creator.eql(prepared.manifest.creator)) return error.CatalogGenerationChanged;
+    var buffer: [256]u8 = undefined;
+    const body = try optional(reader, try key(&buffer, prepared.lookup, .manifest));
+    if (previous.active()) {
+        if (body == null or !std.mem.eql(u8, body.?, prepared.encoded)) return error.InvalidScopeRetirement;
+        try requireMembers(reader, prepared, previous);
+    } else if (body != null) return error.InvalidScopeRetirement;
+    return previous;
+}
+/// This stages native reservations only. Independent transaction-local scope,
+/// catalog, decoder, SQL command and physical-preimage checks precede it.
+pub fn stageBegin(txn: anytype, prepared: *const Prepared) !Head {
+    if (try existing(txn, prepared)) |previous| return previous;
+    try requireVacant(txn, prepared);
+    var buffer: [256]u8 = undefined;
+    if (try optional(txn, try key(&buffer, prepared.lookup, .manifest)) != null) return error.InvalidScopeRetirement;
+    const previous = if (try optional(txn, try counterKey(&buffer, prepared.lookup.group))) |bytes| blk: {
+        if (bytes.len != 8) return error.InvalidScopeRetirement;
+        break :blk std.mem.readInt(u64, bytes[0..8], .little);
+    } else 0;
+    const sequence = std.math.add(u64, previous, 1) catch return error.SqlProgramLimitExceeded;
+    if (try optional(txn, try queueKey(&buffer, prepared.lookup.group, sequence)) != null) return error.InvalidScopeRetirement;
+    const value: Head = .{ .lookup = prepared.lookup, .metadata_incarnation = prepared.manifest.metadata_incarnation, .creator = prepared.manifest.creator, .sequence = sequence, .progress = .{ .reference = prepared.lookup.reference } };
+    try value.validate();
+    const encoded_head = try HeadRecord.init(value);
+    const encoded_queue = try QueueRecord.init(prepared.lookup);
+    const lease = try LeaseRecord.init(.{ .lookup = prepared.lookup, .metadata_incarnation = value.metadata_incarnation });
+    var count: [8]u8 = undefined;
+    std.mem.writeInt(u64, &count, sequence, .little);
+    // A caller aborts the entire native transaction on any staged-write error.
+    try txn.put(try counterKey(&buffer, prepared.lookup.group), &count);
+    try txn.put(try key(&buffer, prepared.lookup, .manifest), prepared.encoded);
+    try txn.put(try key(&buffer, prepared.lookup, .head), encoded_head.slice());
+    try txn.put(try queueKey(&buffer, prepared.lookup.group, sequence), encoded_queue.slice());
+    try txn.put(try memberKey(&buffer, prepared.lookup.group, rootKind(prepared.manifest), prepared.manifest.scope.root().id), lease.slice());
+    for (prepared.manifest.resources) |resource| try txn.put(try memberKey(&buffer, prepared.lookup.group, resource.kind, resource.id), lease.slice());
+    return value;
+}
+pub fn requireMembers(reader: anytype, prepared: *const Prepared, value: Head) !void {
+    try value.validate();
+    const expected: Lease = .{ .lookup = value.lookup, .metadata_incarnation = value.metadata_incarnation };
+    const root = (try member(reader, value.lookup.group, rootKind(prepared.manifest), prepared.manifest.scope.root().id)) orelse return error.InvalidScopeRetirement;
+    if (!std.meta.eql(root, expected)) return error.InvalidScopeRetirement;
+    for (prepared.manifest.resources) |resource| {
+        const lease = (try member(reader, value.lookup.group, resource.kind, resource.id)) orelse return error.InvalidScopeRetirement;
+        if (!std.meta.eql(lease, expected)) return error.InvalidScopeRetirement;
+    }
+    var buffer: [256]u8 = undefined;
+    const queued = (try optional(reader, try queueKey(&buffer, value.lookup.group, value.sequence))) orelse return error.InvalidScopeRetirement;
+    if (!std.meta.eql(try QueueRecord.decode(queued), value.lookup)) return error.InvalidScopeRetirement;
+}
+/// The native apply owner verifies connection drainage, physical child receipts
+/// or the final catalog publication independently before advancing this CAS.
+pub fn stageAdvance(txn: anytype, prepared: *const Prepared, before: Head, next: contract.Progress) !Head {
+    const current = (try existing(txn, prepared)) orelse return error.CatalogGenerationChanged;
+    if (!std.meta.eql(current, before) or !before.active() or !std.meta.eql(next.reference, before.lookup.reference)) return error.CatalogGenerationChanged;
+    const expected = switch (next.phase) {
+        .draining_connections => return error.ScopeRetirementChanged,
+        .retiring_tables => if (before.progress.phase == .draining_connections) try before.progress.drained() else try before.progress.tablePublished(before.progress.completed_tables),
+        .publishing_catalog => if (before.progress.phase == .draining_connections) try before.progress.drained() else try before.progress.tablePublished(before.progress.completed_tables),
+        .published => try before.progress.published(next.catalog_revision, prepared.manifest.catalog_revision),
+        .canceled => try before.progress.cancelBeforeEffects(),
+    };
+    if (!std.meta.eql(next, expected)) return error.ScopeRetirementChanged;
+    var result = before;
+    result.progress = next;
+    try result.validate();
+    const encoded = try HeadRecord.init(result);
+    var buffer: [256]u8 = undefined;
+    if (!result.active()) {
+        try txn.delete(try memberKey(&buffer, result.lookup.group, rootKind(prepared.manifest), prepared.manifest.scope.root().id));
+        for (prepared.manifest.resources) |resource| try txn.delete(try memberKey(&buffer, result.lookup.group, resource.kind, resource.id));
+        try txn.delete(try queueKey(&buffer, result.lookup.group, result.sequence));
+        try txn.delete(try key(&buffer, result.lookup, .manifest));
+    }
+    try txn.put(try key(&buffer, result.lookup, .head), encoded.slice());
+    return result;
+}

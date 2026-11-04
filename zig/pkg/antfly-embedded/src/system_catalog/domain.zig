@@ -25,11 +25,24 @@ pub const default_namespace_id: u64 = 2;
 pub const max_name_bytes = 128;
 pub const max_command_bytes = 3 * 1024 * 1024;
 pub const RoutineHeader = @import("routines.zig").Header;
+pub const scope_retirement = @import("scope_retirement.zig");
 pub const object_annotations = @import("object_annotations.zig");
 pub const object_definitions = @import("object_definitions.zig");
 pub const object_annotation_store = @import("object_annotation_store.zig");
 pub const ServiceOwner = @import("../common/service_ownership.zig").Owner;
 pub const Kind = enum { database, namespace, tablespace, table, query_source, view, sequence, routine, cast, named_type, role };
+
+/// One parent directory policy for admission, listing and ancestor retirement.
+/// New catalog kinds must choose a scope here instead of silently escaping
+/// a schema/database's complete membership capture.
+pub const ParentScope = enum { global, database, namespace };
+pub fn parentScope(kind: Kind) ParentScope {
+    return switch (kind) {
+        .database, .tablespace, .query_source, .role => .global,
+        .namespace, .cast => .database,
+        .table, .view, .sequence, .routine, .named_type => .namespace,
+    };
+}
 
 pub fn namespaceRelation(kind: Kind) bool {
     return kind == .table or kind == .view or kind == .sequence;
@@ -926,11 +939,10 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
     defer location.deinit();
     if (request.kind != .tablespace and (!std.mem.eql(u8, request.location_json, "null") or
         request.placement_policy.placement_role != null or request.placement_policy.desired_replica_count != null or request.placement_policy.min_ranges != null)) return error.InvalidCatalogMutation;
-    const parent_id: u64 = switch (request.kind) {
-        .database, .tablespace, .query_source, .role => 0,
-        .namespace => ((try reader.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id,
-        .cast => ((try reader.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id,
-        .table, .view, .sequence, .routine, .named_type => (try reader.namespaceFor(request.database, request.namespace)).id,
+    const parent_id: u64 = switch (parentScope(request.kind)) {
+        .global => 0,
+        .database => ((try reader.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id,
+        .namespace => (try reader.namespaceFor(request.database, request.namespace)).id,
     };
     if (request.action == .create and (request.kind == .table or request.kind == .view)) {
         if (try reader.lookup(.named_type, parent_id, request.name) != null) return error.SqlDuplicateType;

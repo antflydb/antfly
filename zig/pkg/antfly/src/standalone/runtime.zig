@@ -2966,6 +2966,11 @@ const LocalStandaloneMetadata = struct {
         }
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
+        if (call == .scope_retirement_prepare) {
+            if (!context.setting_admin) return error.Forbidden;
+            const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+            return store.prepareScopeRetirementManifestJsonWithContext(alloc, group_ids.main_metadata_group_id, call.scope_retirement_prepare, context);
+        }
         if (call == .table_retirement_prepare) {
             if (!context.setting_admin) return error.Forbidden;
             const store = self.lifecycle_store orelse return error.UnsupportedOperation;
@@ -3025,7 +3030,7 @@ const LocalStandaloneMetadata = struct {
             return std.json.Stringify.valueAlloc(alloc, capture.value, .{});
         }
         switch (call) {
-            .table_retirement_prepare => unreachable,
+            .scope_retirement_prepare, .table_retirement_prepare => unreachable,
             .sql_snapshot_cohort => |request| {
                 const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
                 return store.sqlSnapshotCohort(alloc, group_ids.main_metadata_group_id, request.database);

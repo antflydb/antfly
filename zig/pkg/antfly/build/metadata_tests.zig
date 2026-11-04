@@ -40,6 +40,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const lib_metadata_runtime_filters = selectTestFilters(b, &.{"metadata."});
     const lib_metadata_test_step = b.step("antfly-metadata-test", "Run root-module metadata tests only");
+    const scope_retirement_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "SQL scope retirement", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const scope_retirement_run = addFilteredTestRunArtifact(b, scope_retirement_tests);
+    scope_retirement_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-scope-retirement-test", "Verify exact ancestor retirement membership and native cold capture").dependOn(&scope_retirement_run.step);
     const presentation_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "SQL COMMENT table descriptions", "SQL COMMENT column", "system catalog resource comments", "system catalog merged service ownership", "system catalog definite naming diagnostics", "system catalog USING rewrite decoder", "system catalog schema reader publication", "schema validation publication text binding", "catalog projection schema reader facts", "relational topology admission rejects lifecycle proposals before encoding on mixed metadata versions", "metadata module compiles", "metadata storage module compiles", "presentation SQL domain", "presentation control decoder", "presentation malformed restore" },

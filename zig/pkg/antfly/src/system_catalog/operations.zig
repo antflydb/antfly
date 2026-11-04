@@ -2568,6 +2568,13 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .policy_publication_mutate => |command| mutatePolicyPublication(svc, alloc, context, command),
         .table_retirement_submit => |command| submitTableRetirement(svc, alloc, context, command),
         .table_retirement_receipt, .table_retirement_queue, .table_retirement_effects, .table_retirement_owner_work => readTableRetirement(svc, alloc, context, input),
+        .scope_retirement_prepare => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.foreign_key_directory_version);
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.prepareScopeRetirementManifestJsonWithContext(alloc, svc.metadata_group_id, request, context);
+        },
         .table_retirement_prepare => |guard| blk: {
             if (!context.setting_admin) return error.Forbidden;
             _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.foreign_key_directory_version);

@@ -49,6 +49,7 @@ pub const local_test_sources = if (@import("builtin").is_test) @import("local_te
 // Focused filters must discover these contracts without executing the unnamed
 // reachability test, just as the pgwire test root discovers its codec modules.
 comptime {
+    _ = @import("antfly_local_sources").system_catalog_domain.scope_retirement;
     _ = @import("system_catalog/native_indexes.zig");
     _ = @import("antfly_local_sources").storage_db_text_analysis_config;
     _ = @import("metadata/column_sequence_handoff.zig");

@@ -1062,6 +1062,14 @@ pub const RaftApplyStore = struct {
     pub fn tableRetirementWorkJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, lookup: @import("../metadata/table_retirement_ledger.zig").Lookup) ![]u8 {
         return self.rawCatalogProjection(a, group, .{ .table_retirement_work = lookup }, 32768);
     }
+    pub fn prepareScopeRetirementManifestJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("antfly_local_sources").system_catalog_domain.scope_retirement.Prepare, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        try request.validate();
+        const normalized = try context.platformDeadline();
+        const bytes = try self.rawCatalogProjection(alloc, group_id, .{ .scope_retirement_prepare = .{ .request = request, .deadline_ns = normalized.deadline_ns } }, @import("antfly_local_sources").system_catalog_domain.scope_retirement.max_manifest_bytes);
+        errdefer alloc.free(bytes);
+        try context.ensureActive();
+        return bytes;
+    }
     pub fn prepareTableRetirementManifestJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, guard: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         const normalized = try context.platformDeadline();
         const bytes = try self.rawCatalogProjection(alloc, group_id, .{ .table_retirement_prepare = .{ .guard = guard, .deadline_ns = normalized.deadline_ns } }, @import("../metadata/table_retirement_manifest.zig").max_bytes);
