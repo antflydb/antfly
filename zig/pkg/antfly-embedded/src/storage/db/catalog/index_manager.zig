@@ -42220,10 +42220,15 @@ test "text publication retains bounded mapper windows with custom analyzers and 
     const snapshot = manager.textIndex(config.name).?.snapshot();
     try std.testing.expectEqual(@as(u32, 3), snapshot.liveDocCount());
     try std.testing.expectEqual(@as(u32, 1), try snapshot.termDocFreq(a, "body", "résumé 日本語"));
+    try std.testing.expect(try manager.remove(&store, config.name));
+    try manager.addAllNoBackfill(&store, &.{config});
+    context = try manager.acquireTextPublicationContext(a, config.name);
     var stale = try manager.planTextMapperDocsPublication(&store, config.name, &context, &docs, 1);
     defer stale.deinit();
-    const observed = [_]mapper.ObservedFieldAnalyzer{.{ .field_name = @constCast("new_field"), .analyzer_name = @constCast("whitespace") }};
-    try mergeObservedTextFieldAnalyzers(&manager, &store, manager.textIndexEntry(config.name).?, &observed);
+    const fields = [_]schema_mod.FullTextField{.{ .path = "body", .emitted_name = "body", .analyzer = "keyword" }};
+    const documents = [_]schema_mod.FullTextDocument{.{ .name = "message", .fields = &fields }};
+    try std.testing.expect(try schema_mod.saveSchema(&store, a, .{ .version = 0, .default_type = "message", .full_text_documents = &documents }));
+    try manager.refreshEmptyTextIndexSchemas(&store);
     try std.testing.expectError(error.TextProjectionChanged, manager.preparePlannedTextMapperPublication(a, config.name, &context, &stale, 0, stale.input_end));
     try std.testing.expect(try manager.remove(&store, config.name));
     try manager.addAllNoBackfill(&store, &.{config});

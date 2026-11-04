@@ -2487,7 +2487,7 @@ pub const Owner = struct {
             // Selection and detached replay use one namespace runtime. Opening
             // it on the serving wrapper first duplicated all index/provider
             // startup merely to discover this turn's work.
-            const selection_root = if (self.options.profile == .native) blk: {
+            const namespace_root = if (self.options.profile == .native) blk: {
                 selected_root = try self.refreshMaintenanceSnapshot(foreground, .source);
                 const selected_store = selected_root.?.owned_lite_backend.?.native_docstore.?;
                 selected_store.writer_admission = null;
@@ -2503,8 +2503,8 @@ pub const Owner = struct {
                 // callbacks are installed only after control work is captured.
                 break :blk selected_root.?;
             } else foreground;
-            database = @import("tables.zig").get(selection_root, name) catch return true;
-            selected = selection_root.embedded_tables.get(name).?;
+            database = @import("tables.zig").get(namespace_root, name) catch return true;
+            selected = namespace_root.embedded_tables.get(name).?;
         };
         const selection_root = selected_root orelse foreground;
         const selection_file = &selection_root.owned_lite_backend.?.native_docstore.?.file;
@@ -7552,6 +7552,49 @@ test "capi native maintenance namespaces source capture does not borrow an artif
     try std.testing.expectEqual(opened + 1, owner.test_runtime_snapshot_opens);
 }
 
+test "capi native maintenance named selection opens only its detached table runtime" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("single-maintenance-table-runtime", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    const owner = fixture.connection.owner;
+    {
+        var lease = try fixture.connection.acquire();
+        defer {
+            lease.close();
+            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        const root = owner.current.?;
+        try @import("tables.zig").create(root, "active", "{}", false);
+        const table = try @import("tables.zig").get(root, "active");
+        try table.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+        @import("tables.zig").closeAll(root);
+    }
+    const Probe = struct {
+        owner: *Owner,
+        entered: bool = false,
+        serving_open: bool = false,
+        detached_open: bool = false,
+        fn captured(ptr: *anyopaque, root: *h.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered = true;
+            self.serving_open = self.owner.current.?.embedded_tables.contains("active");
+            self.detached_open = root != self.owner.current.? and root.embedded_tables.contains("active");
+        }
+    };
+    var probe: Probe = .{ .owner = owner };
+    owner.test_after_capture = .{ .ptr = &probe, .notify = Probe.captured };
+    defer owner.test_after_capture = null;
+    for (0..16) |_| {
+        owner.maintenance_table_cursor = 1;
+        owner.maintenance_storage_pending = false;
+        _ = try owner.maintenanceTurnForTest();
+        if (probe.entered) break;
+    }
+    try std.testing.expect(probe.entered and probe.detached_open);
+    try std.testing.expect(!probe.serving_open);
+}
+
 test "capi native maintenance partial text replay earns another source turn without advancing coverage" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("fragment-source-priority", 5000, .batch);
@@ -7588,6 +7631,7 @@ test "capi native maintenance text source reuse refreshes primary observations a
     var fixture = try AdmissionFollowupFixture.init("text-source-runtime-reuse", 5000, .batch);
     defer fixture.deinit();
     try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
     const owner = fixture.connection.owner;
     var lease = try fixture.connection.acquire();
     defer {

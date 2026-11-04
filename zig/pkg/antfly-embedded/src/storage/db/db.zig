@@ -5012,6 +5012,8 @@ pub const DB = struct {
     pub fn canRefreshDetachedTextSource(self: *DB) bool {
         const indexes = self.core.index_manager;
         return !indexes.relational_base_rows and self.enrichment_runtime == null and
+            !self.hasConfiguredResolvers() and !self.core.hasGeneratedEnrichmentTargets() and
+            self.core.shard_manager.getSplitState() == null and
             !indexes.hasGroupSources() and indexes.dense_indexes.items.len == 0 and
             indexes.sparse_indexes.items.len == 0 and indexes.graph_indexes.items.len == 0 and
             indexes.algebraic_indexes.items.len == 0 and self.shadow == null and
@@ -5030,6 +5032,9 @@ pub const DB = struct {
         defer range_state_mod.freeRange(self.alloc, range);
         var shard = try shard_mod.ShardManager.init(self.alloc, self.core.store, range);
         errdefer shard.deinit();
+        const previous_range = self.core.shard_manager.getByteRange();
+        if (shard.getSplitState() != null or !std.mem.eql(u8, previous_range.start, range.start) or
+            !std.mem.eql(u8, previous_range.end, range.end)) return error.UnsupportedOperation;
         const summary = try doc_identity.visibilitySummaryFromStore(self.core.store);
         self.core.shard_manager.deinit();
         self.core.shard_manager.* = shard;
