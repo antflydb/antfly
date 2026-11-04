@@ -244,3 +244,19 @@ ordinary backoff remains within its exponential ceiling. Absolute deadlines
 are persisted, so restart, inspection, and unattempted sibling deferral preserve
 the selected clock rather than drawing again. Ordered publication polling keeps
 its existing fixed cadence.
+
+
+Shared PDF consumers retain typed failures containing the cause and the digest
+of the primary input they actually consumed. Window jobs borrow that immutable
+primary through their joined lifetime and hash it lazily, once per failed
+window. Deferred errors retain only the digest after the raw input is released.
+Asset input capture also records the primary on errors from producer-context
+capture and prior-context rendering, before those errors reach retry admission.
+
+Captured scanner failures are checked against current primary content and
+incarnation before retry-budget or terminal-error decisions, and checked again
+before parking. Replacement and deletion trigger source replanning without
+inheriting the obsolete input's attempts or Retry-After. Source invalidation is
+paced like other coordinator progress waits, not a provider or pipeline failure;
+its replan does not exhaust the no-progress failure budget. Existing publication
+and durable ownership fences remain authoritative across subsequent races.

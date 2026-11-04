@@ -2882,6 +2882,19 @@ const ScopedReplay = struct {
         if (captured) |digest| return digest;
         return sourceDigest(runtime, request.doc_key);
     }
+    fn requireCurrentCapturedRequest(self: *@This(), runtime: *EnrichmentRuntime, owner: FailureOwner) !void {
+        if (owner != .request) return;
+        const request = owner.request;
+        const io = concurrencyIo(runtime);
+        self.mutex.lockUncancelable(io);
+        const digest = self.sources.get(requestFailureFingerprint(request));
+        const failed = self.hint_failed;
+        self.mutex.unlock(io);
+        if (failed) return error.OutOfMemory;
+        if (digest) |captured| if (try stampFor(runtime, request, captured) == null)
+            return error.EnrichmentSourceChanged;
+    }
+
     fn inputBudget(self: *@This(), runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, observed: ?[32]u8, raw: ?[]const u8) !scoped_retries.Budget {
         const logical = logicalRequestFingerprint(request);
         const io = concurrencyIo(runtime);
@@ -3063,6 +3076,13 @@ const ScopedReplay = struct {
         const stamps = try runtime.alloc.alloc(?scoped_retries.SourceStamp, requests.len);
         defer runtime.alloc.free(stamps);
         for (requests, digests, stamps) |request, digest, *stamp| stamp.* = try stampFor(runtime, request, digest);
+        if (owner == .request) {
+            const io = concurrencyIo(runtime);
+            self.mutex.lockUncancelable(io);
+            const captured = self.sources.contains(requestFailureFingerprint(owner.request));
+            self.mutex.unlock(io);
+            if (captured and stamps[0] == null) return error.EnrichmentSourceChanged;
+        }
         const prior_io = lockRuntime(runtime);
         const legacy = if (runtime.retry_failure_fingerprint == fingerprint)
             scoped_retries.Budget{ .fingerprint = fingerprint, .failures = runtime.retry_failure_count, .waits = runtime.transient_retry_count }
@@ -3281,6 +3301,7 @@ const FailureScope = struct {
         if (enrichmentErrorDisposition(err) == .fatal_worker) return true;
         if (self.scheduled_invocation == self.invocation) return true;
         if (runtime.retry_scheduler) |scheduler| if (self.owner) |owner| {
+            try scheduler.requireCurrentCapturedRequest(runtime, owner);
             if (try scheduler.ownerScheduled(runtime, owner)) {
                 self.scheduled_invocation = self.invocation;
                 if (self.first_scheduled_fingerprint == 0) self.first_scheduled_fingerprint = self.fingerprint;
@@ -3360,7 +3381,7 @@ const WorkerRetryScope = enum {
 fn workerLoopRetryScopeIfAllowed(runtime: *EnrichmentRuntime, err: anyerror) ?WorkerRetryScope {
     // Queue admission is not a failed provider invocation. Keep the replay
     // cursor durable and pending until the replicated receipt arrives.
-    if (err == error.ArtifactPublicationPending or isGraphRecoveryPending(err)) return .request;
+    if (isEnrichmentProgressPending(err)) return .request;
     const maybe_io = lockRuntime(runtime);
     defer unlockRuntime(runtime, maybe_io);
 
@@ -3492,8 +3513,12 @@ fn isGraphRecoveryPending(err: anyerror) bool {
     return err == error.GraphSourceRefreshPending or err == error.GraphStageRecoveryPending;
 }
 
+fn isEnrichmentProgressPending(err: anyerror) bool {
+    return err == error.EnrichmentSourceChanged or err == error.ArtifactPublicationPending or isGraphRecoveryPending(err);
+}
+
 fn isEnrichmentControlError(err: anyerror) bool {
-    return err == error.EnrichmentRetryAborted or err == error.ArtifactPublicationPending or isGraphRecoveryPending(err);
+    return err == error.EnrichmentRetryAborted or isEnrichmentProgressPending(err);
 }
 
 test "enrichment distinguishes transient capacity from permanent resource limits" {
@@ -8324,11 +8349,12 @@ const PlatformEnrichmentRuntime = struct {
     }
 
     fn recordRetryableError(self: *EnrichmentRuntime, io: Io, err: anyerror, scope: WorkerRetryScope) void {
-        const awaiting_publication = err == error.ArtifactPublicationPending or isGraphRecoveryPending(err);
-        if (!awaiting_publication) std.log.warn("enrichment {s} transient failure, will retry: {s}", .{ @tagName(scope), @errorName(err) });
+        const awaiting_progress = isEnrichmentProgressPending(err);
+        if (!awaiting_progress) std.log.warn("enrichment {s} transient failure, will retry: {s}", .{ @tagName(scope), @errorName(err) });
         var status: enrichment_state.RuntimeStatus = .{};
         self.mutex.lockUncancelable(io);
-        if (!awaiting_publication) {
+        if (err == error.EnrichmentSourceChanged) self.active_failure_fingerprint = 0;
+        if (!awaiting_progress) {
             self.last_error_code = types.RuntimeErrorName.init(@errorName(err));
             self.error_count += 1;
             self.retryable_error_count += 1;
@@ -8341,18 +8367,18 @@ const PlatformEnrichmentRuntime = struct {
         }
         // Admission refusals never ran the request: back off, but keep the
         // document's attempt budget for work that actually failed.
-        const transient = !awaiting_publication and enrichmentFailureSparesAttemptBudget(err);
-        if (!awaiting_publication) {
+        const transient = !awaiting_progress and enrichmentFailureSparesAttemptBudget(err);
+        if (!awaiting_progress) {
             if (transient) self.transient_retry_count +|= 1 else self.retry_failure_count +|= 1;
         }
         // A normal ordered acknowledgement wait is not a provider failure.
         // In particular, many census pages must not exponentially delay one
         // another or inherit an earlier provider's backoff hint.
-        const retry_ordinal = if (awaiting_publication) 0 else if (scope == .request)
+        const retry_ordinal = if (awaiting_progress) 0 else if (scope == .request)
             self.retry_failure_count +| self.transient_retry_count
         else
             self.consecutive_retry_count;
-        const delay_ms = if (awaiting_publication) workerRetryDelayMs(0) else workerRetryDelayJitterMs(retry_ordinal, self.retry_after_hint_ms, retryJitterSample(self));
+        const delay_ms = if (awaiting_progress) workerRetryDelayMs(0) else workerRetryDelayJitterMs(retry_ordinal, self.retry_after_hint_ms, retryJitterSample(self));
         self.retry_after_hint_ms = 0;
         self.next_retry_at_ms = self.clock.nowRealtimeMs() +| delay_ms;
         self.scoped_retry_wait = false;
@@ -10028,6 +10054,12 @@ fn runForegroundCatchUpPassOwned(
     runtime.notifyStatusHook();
 }
 
+/// Owned failure metadata survives input buffers and speculative worker jobs.
+const CapturedInputFailure = struct {
+    cause: anyerror,
+    primary_digest: [32]u8,
+};
+
 /// Task-neutral identity of the physical page transformation. Provider names,
 /// prompts and output types deliberately do not participate in render sharing.
 const SharedPdfTransform = struct {
@@ -10360,7 +10392,7 @@ const SharedPdfWindowScheduler = struct {
         prepared: bool = false,
         enabled: bool = false,
         completed: bool = false,
-        err: ?anyerror = null,
+        err: ?CapturedInputFailure = null,
         source_identity: ?[32]u8 = null,
         text: bool = false,
         staged_text_min: usize = std.math.maxInt(usize),
@@ -10398,7 +10430,7 @@ const SharedPdfWindowScheduler = struct {
         }
     }
 
-    fn failure(self: *@This(), index: usize) ?anyerror {
+    fn failure(self: *@This(), index: usize) ?CapturedInputFailure {
         return if (self.consumers) |consumers| consumers[index].err else null;
     }
 
@@ -10559,7 +10591,7 @@ const SharedPdfWindowScheduler = struct {
         if (self.current + 1 >= self.requests.len) return null;
         try self.ensureConsumers();
         const work = try self.runtime.alloc.create(WindowWork);
-        work.* = .{ .jobs = .{ .scheduler = self } };
+        work.* = .{ .jobs = .{ .scheduler = self, .primary = raw } };
         var owned: ?*WindowWork = work;
         errdefer WindowWork.cancel(&owned);
         const previous_fingerprint = self.runtime.active_failure_fingerprint;
@@ -10622,7 +10654,7 @@ const SharedPdfWindowScheduler = struct {
                     const demand = self.pendingPngPages(consumer, index, request, source_sha, rendered, text_source) catch |err| {
                         if (err == error.OutOfMemory or err == error.DocumentExtractionWorkingSetTooLarge) continue;
                         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
-                        consumer.err = err;
+                        consumer.err = work.jobs.captureFailure(err);
                         continue;
                     };
                     pending_mask = demand;
@@ -10659,7 +10691,7 @@ const SharedPdfWindowScheduler = struct {
                         continue;
                     }
                     if (WindowJobs.isGroupAbort(err)) return err;
-                    consumer.err = err;
+                    consumer.err = work.jobs.captureFailure(err);
                 };
             }
         }
@@ -10688,11 +10720,20 @@ const SharedPdfWindowScheduler = struct {
     /// attribution and fenced publication remain on the replay coordinator.
     const WindowJobs = struct {
         scheduler: *SharedPdfWindowScheduler,
+        // Same joined lifetime as rendered attachments. Hash only on failure;
+        // the deferred error retains just the digest after this borrow ends.
+        primary: []const u8,
+        primary_digest: ?[32]u8 = null,
         lane: ?background_runtime_mod.BackendRuntime.InferenceLaneLease = null,
         jobs: [4]?*Job = @splat(null),
         count: usize = 0,
         completed: Io.Event = .unset,
         serial: bool = false,
+
+        fn captureFailure(self: *@This(), cause: anyerror) CapturedInputFailure {
+            if (self.primary_digest == null) self.primary_digest = sourceRecordDigest(self.primary);
+            return .{ .cause = cause, .primary_digest = self.primary_digest.? };
+        }
 
         const Job = struct {
             embedder: embedder_mod.DenseEmbedder,
@@ -10904,7 +10945,7 @@ const SharedPdfWindowScheduler = struct {
             // A preceding wave may have disabled this consumer. Its ordinary
             // replay path owns retry; do not enqueue another speculative call.
             if (!consumer.enabled) return error.DocumentExtractionWorkingSetTooLarge;
-            if (consumer.err) |err| return err;
+            if (consumer.err) |captured| return captured.cause;
             const job = try runtime.alloc.create(Job);
             var owns_job = true;
             errdefer if (owns_job) runtime.alloc.destroy(job);
@@ -10949,7 +10990,7 @@ const SharedPdfWindowScheduler = struct {
             const runtime = self.scheduler.runtime;
             while (true) {
                 if (!consumer.enabled) return error.DocumentExtractionWorkingSetTooLarge;
-                if (consumer.err) |err| return err;
+                if (consumer.err) |captured| return captured.cause;
                 return PdfWindowConsumerLease.initIndependent(@import("antfly_platform").allocator.concurrentFallback(), runtime.config.resource_manager orelse runtime.index_manager.resource_manager, required) catch |err| {
                     if (err != error.ResourceTemporarilyUnavailable or self.count == 0) return err;
                     try self.retireOne();
@@ -11036,7 +11077,7 @@ const SharedPdfWindowScheduler = struct {
             };
             if (job.err) |err| {
                 if (isGroupAbort(err)) return err;
-                if (err == error.DocumentExtractionWorkingSetTooLarge or err == error.OutOfMemory) job.consumer.enabled = false else job.consumer.err = err;
+                if (err == error.DocumentExtractionWorkingSetTooLarge or err == error.OutOfMemory) job.consumer.enabled = false else job.consumer.err = self.captureFailure(err);
             }
         }
 
@@ -12456,8 +12497,39 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     try std.testing.expectEqual(@as(usize, 4), harness.text_calls);
     try std.testing.expectEqual(@as(usize, 2), harness.embed_calls);
     try std.testing.expectEqual(@as(usize, 1), harness.failed_calls);
-    try std.testing.expectEqual(error.EmbedRateLimited, scheduler.failure(3).?);
+    try std.testing.expectEqual(error.EmbedRateLimited, scheduler.failure(3).?.cause);
     try std.testing.expect(scheduler.failure(4) == null);
+    {
+        // The deferred failure outlives the shared window's primary borrow.
+        // Replacement before the scanner observes it cannot acquire old debt.
+        const failed = scheduler.failure(3).?;
+        try std.testing.expectEqual(sourceRecordDigest("{}"), failed.primary_digest);
+        var replay = ScopedReplay{ .state = .{} };
+        defer replay.deinit(alloc);
+        runtime.retry_scheduler = &replay;
+        defer runtime.retry_scheduler = null;
+        const request = requests[3];
+        const source_key = try documentSourceStoreKeyAlloc(&runtime, request.doc_key);
+        defer alloc.free(source_key);
+        defer storePutBatchWithRetry(&runtime, &.{}, &.{source_key}) catch {};
+        replay.rememberSource(&runtime, requestFailureFingerprint(request), failed.primary_digest);
+        try storePutWithRetry(&runtime, source_key, "{\"url\":\"replacement\"}");
+        for ([_]anyerror{ failed.cause, error.PermanentPromptFailure }) |cause|
+            try std.testing.expectError(error.EnrichmentSourceChanged, scheduleScannerRetry(&runtime, request, cause));
+        try std.testing.expectEqual(@as(usize, 0), replay.state.tickets.items.len);
+        try std.testing.expectEqual(@as(u64, 0), runtime.error_count);
+        // The identical failure for the unchanged input still parks normally,
+        // survives restore, and retains an authoritative primary stamp.
+        try storePutWithRetry(&runtime, source_key, "{}");
+        try std.testing.expect(try scheduleScannerRetry(&runtime, request, failed.cause));
+        try std.testing.expectEqual(@as(usize, 1), replay.state.tickets.items.len);
+        var restored = try enrichment_state.loadScopedRetries(alloc, erased);
+        defer restored.deinit(alloc);
+        try std.testing.expectEqual(failed.primary_digest, restored.tickets.items[0].source_digest.?);
+        try std.testing.expect(restored.tickets.items[0].source_stamp != null);
+        try std.testing.expectEqual(@as(u32, 1), restored.tickets.items[0].budgets.items[0].failures);
+    }
+
     try std.testing.expectEqual(before, resources.sliceStats(.document_extraction_working_set).used_bytes);
     // Retry/repeated delivery consumes existing typed stages, not media again.
     try scheduler.emit(PreparedDocumentSourceCache.sourceIdentity("https://example.test/source.pdf"), &digest, "{}", 2, transform, .{ .encoded = batch }, "", source, window_lease);
@@ -12536,6 +12608,26 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         try std.testing.expect(!harness.active.load(.acquire));
         try std.testing.expectEqual(before, resources.sliceStats(.document_extraction_working_set).used_bytes);
         try std.testing.expectEqual(@as(usize, 0), backend_handle.ptr().laneStats().inference_active_leases);
+        {
+            // Exercise the asynchronous retirement boundary with an actual
+            // provider failure, not only the coordinator's serial path.
+            const raw = "{\"body\":\"async-input\"}";
+            var jobs = SharedPdfWindowScheduler.WindowJobs{ .scheduler = &scheduler, .primary = raw };
+            defer jobs.deinit();
+            harness.worker_failure = error.EmbedRateLimited;
+            defer harness.worker_failure = null;
+            defer scheduler.consumers.?[4].err = null;
+            const failed_digest: [32]u8 = @splat(55);
+            scheduler.consumeEmbedding(&scheduler.consumers.?[4], requests[4], &failed_digest, .{ .encoded = batch }, 2, window_lease, null, &jobs) catch |err| {
+                if (err != error.EmbedRateLimited) return err;
+            };
+            try jobs.flush();
+            const captured = scheduler.failure(4).?;
+            try std.testing.expectEqual(error.EmbedRateLimited, captured.cause);
+            try std.testing.expectEqual(sourceRecordDigest(raw), captured.primary_digest);
+            try std.testing.expectEqual(captured.primary_digest, jobs.primary_digest.?);
+            try std.testing.expectEqual(before, resources.sliceStats(.document_extraction_working_set).used_bytes);
+        }
         // Leaving a window before publication cancels and joins borrowed-media
         // jobs, including jobs that have not started on the executor yet.
         const calls_before_cancel = harness.embed_calls;
@@ -12543,7 +12635,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         defer harness.wait_for_cancel = false;
         const canceled_digest = @as([32]u8, @splat(9));
         {
-            var jobs = SharedPdfWindowScheduler.WindowJobs{ .scheduler = &scheduler };
+            var jobs = SharedPdfWindowScheduler.WindowJobs{ .scheduler = &scheduler, .primary = "{}" };
             defer jobs.deinit();
             try scheduler.consumeEmbedding(&scheduler.consumers.?[4], requests[4], &canceled_digest, .{ .encoded = batch }, 2, window_lease, null, &jobs);
             try std.testing.expect(jobs.count > 0);
@@ -12555,7 +12647,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             // A completed second slot can retire while the first slot remains
             // unfinished. No model call or publication is needed for this
             // deterministic completion-order test.
-            var jobs = SharedPdfWindowScheduler.WindowJobs{ .scheduler = &scheduler };
+            var jobs = SharedPdfWindowScheduler.WindowJobs{ .scheduler = &scheduler, .primary = "{}" };
             defer jobs.deinit();
             jobs.lane = try backend_handle.ptr().acquireInferenceLane();
             var empty = batch;
@@ -12609,7 +12701,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             const previous_backend = runtime.backend_runtime;
             if (!parallel_encoding) runtime.backend_runtime = null;
             defer runtime.backend_runtime = previous_backend;
-            var jobs = SharedPdfWindowScheduler.WindowJobs{ .scheduler = &scheduler };
+            var jobs = SharedPdfWindowScheduler.WindowJobs{ .scheduler = &scheduler, .primary = "{}" };
             defer jobs.deinit();
             jobs.lane = try backend_handle.ptr().acquireInferenceLane();
             var png = SharedPdfPngWindow{};
@@ -12657,7 +12749,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             // before flush can return a fatal error. It must not free twice.
             harness.worker_failure = error.Canceled;
             defer harness.worker_failure = null;
-            var jobs = SharedPdfWindowScheduler.WindowJobs{ .scheduler = &scheduler, .serial = true };
+            var jobs = SharedPdfWindowScheduler.WindowJobs{ .scheduler = &scheduler, .primary = "{}", .serial = true };
             defer jobs.deinit();
             const failed_digest = @as([32]u8, @splat(11));
             try std.testing.expectError(error.Canceled, scheduler.consumeEmbedding(&scheduler.consumers.?[4], requests[4], &failed_digest, .{ .encoded = batch }, 2, window_lease, null, &jobs));
@@ -12674,7 +12766,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             const previous_manager = runtime.config.resource_manager;
             runtime.config.resource_manager = &tight;
             defer runtime.config.resource_manager = previous_manager;
-            var jobs = SharedPdfWindowScheduler.WindowJobs{ .scheduler = &scheduler };
+            var jobs = SharedPdfWindowScheduler.WindowJobs{ .scheduler = &scheduler, .primary = "{}" };
             defer jobs.deinit();
             jobs.lane = try backend_handle.ptr().acquireInferenceLane();
             var empty = batch;
@@ -12822,7 +12914,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
                 try std.testing.expect(try scheduler.drainOwnerAdmission(error.QueueFull));
                 try std.testing.expect(!try scheduler.drainOwnerAdmission(error.QueueFull));
                 try SharedPdfWindowScheduler.WindowWork.finish(&work);
-                try std.testing.expectEqual(@as(?anyerror, null), consumer.err);
+                try std.testing.expect(consumer.err == null);
                 try std.testing.expect(scheduler.consumers.?[4].err == null);
                 try std.testing.expectEqual(text_before + 2, harness.text_calls);
                 try std.testing.expectEqual(embed_before + 1, harness.embed_calls);
@@ -14449,7 +14541,14 @@ pub fn servicePendingArtifactUnitJobs(runtime: *EnrichmentRuntime, document: []c
 }
 
 fn scheduleScannerRetry(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, err: anyerror) !bool {
-    if (runtime.retry_scheduler == null or isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request) return false;
+    const scheduler = runtime.retry_scheduler orelse return false;
+    if (isEnrichmentControlError(err)) return false;
+    if (enrichmentErrorDisposition(err) != .retryable_request) {
+        // Terminal classifications are also input-specific: an obsolete error
+        // must not publish a failure marker against a replacement document.
+        try scheduler.requireCurrentCapturedRequest(runtime, .{ .request = request });
+        return false;
+    }
     var scope = FailureScope{};
     scope.enterRequest(request);
     return try scope.shouldYield(runtime, err);
@@ -14528,7 +14627,10 @@ fn processPendingDocumentGroup(
             continue;
         }
         if (shared_windows.completed(request_index)) continue;
-        if (shared_windows.failure(request_index)) |err| {
+        if (shared_windows.failure(request_index)) |failure| {
+            const err = failure.cause;
+            if (runtime.retry_scheduler) |scheduler|
+                scheduler.rememberSource(runtime, requestFailureFingerprint(request), failure.primary_digest);
             setActiveFailureFingerprint(runtime, requestFailureFingerprint(request));
             if (try scheduleScannerRetry(runtime, request, err)) {
                 try delayed_artifacts.put(runtime.alloc, if (request.kind == .dense_embedding or request.kind == .sparse_embedding) requestEmbeddingName(request) else requestArtifactName(request), {});
@@ -15168,14 +15270,13 @@ fn processAsset(
     const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
     const observed = try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key);
-    var context = captureAssetProducerContext(runtime, request, doc_store_key, observed) catch |err| {
-        if (observed) |value| runtime.alloc.free(value);
-        return err;
-    };
-    var context_owned = true;
-    defer if (context_owned) if (context) |*value| value.deinit();
     var raw_owned = true;
     defer if (raw_owned) if (observed) |value| runtime.alloc.free(value);
+    errdefer if (observed) |raw| if (runtime.retry_scheduler) |scheduler|
+        scheduler.rememberSource(runtime, requestFailureFingerprint(request), sourceRecordDigest(raw));
+    var context = try captureAssetProducerContext(runtime, request, doc_store_key, observed);
+    var context_owned = true;
+    defer if (context_owned) if (context) |*value| value.deinit();
     var prior_input: ?@import("group_prior_input.zig").Input = null;
     defer if (prior_input) |*value| value.deinit();
     const accepted = if (context) |*value| accepted: {
@@ -15224,7 +15325,6 @@ fn processAsset(
         }
         return;
     };
-    errdefer if (runtime.retry_scheduler) |scheduler| scheduler.rememberSource(runtime, requestFailureFingerprint(request), sourceRecordDigest(raw));
     var producer_cfg = try asset_producer_mod.parseProducerConfig(runtime.alloc, request.producer_json);
     defer producer_cfg.deinit(runtime.alloc);
 
@@ -43656,4 +43756,101 @@ test "durable enrichment scoped retry fences superseded metadata writers" {
     try std.testing.expect(final_state.hasDocument("c3VjY2Vzc29y"));
     try std.testing.expectEqual(@as(u32, 3), final_state.prior(2).failures);
     try std.testing.expectEqual(@as(u32, 1), final_state.prior(3).failures);
+}
+
+test "durable enrichment scoped retry captures prior context failures before rendering" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "prior-failure-input" });
+    defer store.deinit();
+    var document_store = try docstore_mod.DocStore.openRuntime(a, &store);
+    defer document_store.close();
+    var erased = try backend_erased.storeFrom(a, store);
+    defer erased.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/prior-failure-indexes", .{tmp.sub_path});
+    defer a.free(path);
+    var manager = try index_manager_mod.IndexManager.init(a, path);
+    defer manager.deinit();
+    var clock: platform_clock.ManualClock = .{};
+    clock.setRealtimeNs(1_000 * std.time.ns_per_ms);
+    var runtime = EnrichmentRuntime{
+        .alloc = a,
+        .io_impl = .{ .borrowed = std.testing.io },
+        .store = erased,
+        .artifact_store = &document_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .ownership = undefined,
+        .clock = clock.clock(),
+        .config = .{ .worker_retry_max_attempts = 1 },
+    };
+    var replay = ScopedReplay{ .state = .{} };
+    defer replay.deinit(a);
+    runtime.retry_scheduler = &replay;
+    const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .asset, .index_name = "claims", .artifact_name = "claims", .doc_key = "unit", .source_field = "body", .prior_context_json = "{", .sequence = 7 };
+    const fingerprint = requestFailureFingerprint(request);
+    const primary = try documentSourceStoreKeyAlloc(&runtime, request.doc_key);
+    defer a.free(primary);
+    const raw = "{\"body\":\"original\"}";
+    try storePutWithRetry(&runtime, primary, raw);
+    const identities = @import("../doc_identity.zig");
+    {
+        var txn = try document_store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try identities.ensureOrdinalTxn(a, &txn, 1, 2, 1, request.doc_key);
+        try txn.commit();
+    }
+    var batch = PreparedAssetBatch{};
+    defer batch.deinit(a);
+    var prepared = PreparedDocumentSourceCache.init(&runtime);
+    defer prepared.deinit();
+    var window = GeneratedReplayWindow{ .alloc = a };
+    defer window.deinit();
+    var scope = FailureScope{};
+    scope.enterRequest(request);
+    try std.testing.expectError(error.UnexpectedEndOfInput, processAsset(&runtime, request, &batch, &prepared, &window, &scope));
+    try std.testing.expectEqual(sourceRecordDigest(raw), replay.sources.get(fingerprint).?);
+    // Exhausted old budgets cannot turn the stale failure into a terminal
+    // marker for the replacement: input validation precedes budget decisions.
+    runtime.retry_failure_fingerprint = fingerprint;
+    runtime.active_failure_fingerprint = fingerprint;
+    runtime.retry_failure_count = 10;
+    runtime.transient_retry_count = 11;
+    runtime.consecutive_retry_count = 12;
+    runtime.retry_after_hint_ms = 3_600_000;
+    try storePutWithRetry(&runtime, primary, "{\"body\":\"replacement\"}");
+    try std.testing.expectError(error.EnrichmentSourceChanged, scope.shouldYield(&runtime, error.TransientPromptFailure));
+    try std.testing.expectError(error.EnrichmentSourceChanged, scheduleScannerRetry(&runtime, request, error.PermanentPromptFailure));
+    try std.testing.expectError(error.EnrichmentSourceChanged, replay.park(&runtime, .{ .request = request }, fingerprint, error.TransientPromptFailure));
+    try std.testing.expectEqual(@as(usize, 0), replay.state.tickets.items.len);
+    try std.testing.expectEqual(@as(u64, 0), runtime.error_count);
+    handleWorkerLoopError(&runtime, std.testing.io, error.EnrichmentSourceChanged);
+    try std.testing.expect(!runtime.worker_failed);
+    try std.testing.expectEqual(@as(u64, 0), runtime.error_count);
+    try std.testing.expectEqual(@as(u32, 0), runtime.retry_failure_count);
+    try std.testing.expectEqual(@as(u32, 0), runtime.transient_retry_count);
+    try std.testing.expectEqual(@as(u32, 12), runtime.consecutive_retry_count);
+    try std.testing.expectEqual(@as(u64, 1500), runtime.next_retry_at_ms);
+    // Deletion is also obsolete input, never a failure of an absent source.
+    try storePutBatchWithRetry(&runtime, &.{}, &.{primary});
+    try std.testing.expectError(error.EnrichmentSourceChanged, replay.requireCurrentCapturedRequest(&runtime, .{ .request = request }));
+    {
+        var txn = try document_store.beginWriteTxn();
+        errdefer txn.abort();
+        try identities.markDeletedTxn(a, &txn, 8, request.doc_key);
+        _ = try identities.ensureOrdinalTxn(a, &txn, 1, 2, 9, request.doc_key);
+        try txn.put(primary, raw);
+        try txn.commit();
+    }
+    // Content equality cannot revive a failure of an older incarnation.
+    try std.testing.expectError(error.EnrichmentSourceChanged, replay.requireCurrentCapturedRequest(&runtime, .{ .request = request }));
 }
