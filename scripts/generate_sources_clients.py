@@ -91,6 +91,8 @@ def render(language):
         ],
     }[language]
     for name, schema in SCHEMAS.items():
+        if language == "py":
+            lines.append("")
         required = set(schema.get("required", []))
         lines.extend(
             {
