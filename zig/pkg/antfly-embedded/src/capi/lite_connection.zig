@@ -205,6 +205,8 @@ pub const PreparedPublication = struct {
             self.owner.publication_stats.generated_refused +|= 1;
         }
         var lease = try self.owner.acquireMaintenancePathLeaseAssumeLocked();
+        const held_from = nowNs();
+        defer MaintenanceHoldSites.record(&self.owner.publication_stats.maintenance_hold_sites.generated_commit, held_from);
         defer lease.close();
         const database = try self.current();
         // Namespace and catalog are stable under the owner fence. The native
@@ -223,12 +225,14 @@ pub const PreparedPublication = struct {
         path_lease: native.PathWriterLock,
         database: *h.db_mod.DB,
         refusal_recorded: bool = false,
+        held_from: i96 = 0,
 
         fn release(ptr: *anyopaque) void {
             const held: *@This() = @ptrCast(@alignCast(ptr));
             const p = held.publication;
             p.refreshSnapshotCheckpoint();
             held.path_lease.close();
+            MaintenanceHoldSites.record(&p.owner.publication_stats.maintenance_hold_sites.generated_store, held.held_from);
             p.owner.gate.mutex.unlock(h.handleLockIo());
             alloc.destroy(held);
         }
@@ -340,6 +344,8 @@ pub const PreparedPublication = struct {
             self.owner.publication_stats.replay_refused +|= 1;
         }
         var lease = try self.owner.acquireMaintenancePathLeaseAssumeLocked();
+        const held_from = nowNs();
+        defer MaintenanceHoldSites.record(&self.owner.publication_stats.maintenance_hold_sites.publish_replay, held_from);
         defer lease.close();
         const database = try self.current();
         // Computed resolver effects must explicitly carry their read set.
@@ -404,7 +410,7 @@ pub const PreparedPublication = struct {
         }
         if (database.enrichment_runtime == null) try database.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
         const held = try alloc.create(HeldStore);
-        held.* = .{ .publication = self, .path_lease = lease, .database = database };
+        held.* = .{ .publication = self, .path_lease = lease, .database = database, .held_from = nowNs() };
         return .{ .store = database.enrichment_runtime.?.store, .ptr = held, .release = HeldStore.release, .guard_key = HeldStore.guardKey };
     }
 
@@ -415,6 +421,8 @@ pub const PreparedPublication = struct {
         defer self.owner.gate.mutex.unlock(io);
         if (self.owner.stopping.load(.acquire)) return error.Canceled;
         var path_lease = try self.owner.acquireMaintenancePathLeaseAssumeLocked();
+        const held_from = nowNs();
+        defer MaintenanceHoldSites.record(&self.owner.publication_stats.maintenance_hold_sites.heartbeat, held_from);
         defer path_lease.close();
         const database = try self.current();
         var lease = try ProducerLease.init(alloc, database.core.store, fence.lease_key);
@@ -797,6 +805,68 @@ fn releaseGate(gate: *PathGate) void {
 
 // Compatible connections borrow one persistent generation and one maintenance
 // worker. SQL sessions, cursor IDs, and child handles remain connection-local.
+/// Where a background turn holds the writer lease.
+pub const MaintenanceHoldSites = struct {
+    pub const Site = struct { count: u64 = 0, ns: u64 = 0, max_ns: u64 = 0 };
+    writer_primary: Site = .{},
+    writer_index: Site = .{},
+    writer_reclamation: Site = .{},
+    writer_artifact_lease: Site = .{},
+    writer_allocator_service: Site = .{},
+    publish_replay: Site = .{},
+    generated_commit: Site = .{},
+    generated_store: Site = .{},
+    heartbeat: Site = .{},
+    /// A maintenance turn's capture under the lease, until it is released.
+    turn_capture: Site = .{},
+    /// Time inside `turn_capture`, by step (total ns).
+    capture_steps: CaptureSteps = .{},
+    storage_turn: Site = .{},
+    idle_adopt: Site = .{},
+
+    pub fn record(site: *Site, started_ns: i96) void {
+        const elapsed: u64 = @intCast(@max(0, std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds - started_ns));
+        site.count +|= 1;
+        site.ns +|= elapsed;
+        site.max_ns = @max(site.max_ns, elapsed);
+    }
+
+    pub fn writer(self: *MaintenanceHoldSites, scope: PublicationScope) *Site {
+        return switch (scope) {
+            .primary => &self.writer_primary,
+            .index => &self.writer_index,
+            .reclamation => &self.writer_reclamation,
+            .artifact_lease => &self.writer_artifact_lease,
+            .allocator_service => &self.writer_allocator_service,
+        };
+    }
+};
+
+pub const CaptureSteps = struct {
+    refresh_ns: u64 = 0,
+    marker_sweep_ns: u64 = 0,
+    recover_ns: u64 = 0,
+    catalog_ns: u64 = 0,
+    debt_checks_ns: u64 = 0,
+    schedule_ns: u64 = 0,
+    snapshot_ns: u64 = 0,
+    publication_catalog_ns: u64 = 0,
+};
+
+/// Splits one held interval into consecutive steps.
+const StepClock = struct {
+    last: i96,
+    fn mark(self: *StepClock, total: *u64) void {
+        const now = nowNs();
+        total.* +|= @intCast(@max(0, now - self.last));
+        self.last = now;
+    }
+};
+
+fn nowNs() i96 {
+    return std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds;
+}
+
 pub const Owner = struct {
     // Only bootstrap small files at close. Large files must finish their
     // existing worker proof; shutdown never starts another whole-file walk.
@@ -929,6 +999,9 @@ pub const Owner = struct {
         // Time foreground calls spent queued on this process's path gate.
         gate_wait_ns: u64 = 0,
         gate_wait_max_ns: u64 = 0,
+        /// Background writer-lease holds by site (count, total and max ns),
+        /// to attribute `maintenance_lease` hold time.
+        maintenance_hold_sites: MaintenanceHoldSites = .{},
         last_maintenance_error: ?[]const u8 = null,
     } = .{},
     test_runtime_snapshot_opens: if (h.builtin.is_test) u64 else void = if (h.builtin.is_test) 0 else {},
@@ -1431,6 +1504,8 @@ pub const Owner = struct {
         if (scope == .allocator_service) self.publication_stats.allocator_service_admissions +|= 1;
         root.maintenance_writer_lease = lease;
         root.maintenance_writer_references = 1;
+        root.maintenance_writer_scope = @backingInt(scope);
+        root.maintenance_writer_held_from = nowNs();
     }
 
     fn leaveMaintenanceWriter(ptr: *anyopaque) void {
@@ -1443,6 +1518,7 @@ pub const Owner = struct {
         if (root.maintenance_writer_references != 0) return;
         var lease = root.maintenance_writer_lease.?;
         root.maintenance_writer_lease = null;
+        defer MaintenanceHoldSites.record(self.publication_stats.maintenance_hold_sites.writer(@fromBackingInt(@intCast(root.maintenance_writer_scope))), root.maintenance_writer_held_from);
         // Admission alone is not a mutation. Reclamation probes also take
         // this lease; waking replay here makes each idle turn schedule itself.
         // Generated and replay publications notify at their commit boundary.
@@ -1560,6 +1636,8 @@ pub const Owner = struct {
             error.FileBusy, error.WouldBlock => return,
             else => return err,
         };
+        const held_from = nowNs();
+        defer MaintenanceHoldSites.record(&self.publication_stats.maintenance_hold_sites.idle_adopt, held_from);
         defer lease.close();
         var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
         defer probe.close();
@@ -1676,9 +1754,15 @@ pub const Owner = struct {
         // a runtime. The gate protects this flag through the capture boundary.
         if (self.allocator_verification_active) return true;
         var lease = try self.acquireMaintenancePathLeaseAssumeLocked();
+        const turn_held_from = nowNs();
+        var clock: StepClock = .{ .last = turn_held_from };
         var lease_held = true;
-        defer if (lease_held) lease.close();
+        defer if (lease_held) {
+            lease.close();
+            MaintenanceHoldSites.record(&self.publication_stats.maintenance_hold_sites.turn_capture, turn_held_from);
+        };
         const foreground = try self.refresh();
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.refresh_ns);
         if (needsOutcomeReconciliation(foreground)) return false;
         const foreground_file = &foreground.owned_lite_backend.?.native_docstore.?.file;
         // Marker service is directory-bounded and needs no allocator proof.
@@ -1686,6 +1770,7 @@ pub const Owner = struct {
         // canceled before its detached graph walk can finish.
         if (self.options.open_mode == .writer)
             try self.artifact_marker_sweep.run(foreground_file);
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.marker_sweep_ns);
         if (self.options.open_mode == .writer and !foreground_file.free_pages_verified) {
             if (!self.allocator_proof_mutex.tryLock()) return true;
             defer self.allocator_proof_mutex.unlock(io);
@@ -1697,6 +1782,7 @@ pub const Owner = struct {
         }
         try @import("sql_commit.zig").recover(foreground);
         try @import("sql_ddl.zig").recover(foreground);
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.recover_ns);
         // Catalog identities suffice for rotation and dropped-table pruning.
         // Opening every runtime here makes each bounded turn O(all indexes),
         // delaying the next group lease observation behind unrelated opens.
@@ -1728,11 +1814,13 @@ pub const Owner = struct {
             database = @import("tables.zig").get(foreground, name) catch return true;
             selected = foreground.embedded_tables.get(name).?;
         }
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.catalog_ns);
         if (self.options.open_mode == .writer and try hasPendingReplay(database)) self.maintenance_pending = true;
         var authority_arena = std.heap.ArenaAllocator.init(alloc);
         defer authority_arena.deinit();
         if (self.options.open_mode == .writer and try @import("resolver_authority.zig").hasProjectionDebt(foreground, database, authority_arena.allocator())) self.maintenance_pending = true;
         const group_state = try self.groupSourceState(database);
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.debt_checks_ns);
         if (foreground_file.ledger) |ledger| {
             group_state.replay_budget.updatePressure(ledger.data_pending, ledger.free_pages, foreground_file.allocator_work.reuse_blocked_append_pages);
             // Bound each service publication independently, increasing useful
@@ -1846,6 +1934,7 @@ pub const Owner = struct {
         // merely because inference or segment construction is still running.
         // Hosted/manual runtimes retain their caller-supplied provider borrow.
         const independent = self.options.profile == .native;
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.schedule_ns);
         const root = if (independent) try self.refreshMaintenanceSnapshot(foreground, run_database) else foreground;
         if (independent and run_database) {
             database = if (selected) |table| try @import("tables.zig").get(root, table.name) else &root.db;
@@ -1862,8 +1951,10 @@ pub const Owner = struct {
         // leases and catalog fingerprints do not protect these primary roots.
         var source_read = if (run_database) try database.core.store.runtime_store.beginRead() else null;
         defer if (source_read) |*read| read.abort();
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.snapshot_ns);
         var catalog = if (run_database) try PublicationCatalog.capture(turn_alloc, root, database) else null;
         defer if (catalog) |*proof| proof.deinit();
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.publication_catalog_ns);
         var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (catalog) |*proof| proof else null, .index_prefix = index_prefix, .shadow_scopes = shadow_scopes.items, .snapshot_root = root, .snapshot_database = database, .source_read = if (source_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
         root.maintenance_references += 1;
         root.maintenance_owner = self;
@@ -1880,6 +1971,7 @@ pub const Owner = struct {
         if (run_database) database.async_context.replay_publication = .{ .ptr = &publication, .publish = PreparedPublication.publishReplay };
         store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
         lease.close();
+        MaintenanceHoldSites.record(&self.publication_stats.maintenance_hold_sites.turn_capture, turn_held_from);
         lease_held = false;
         self.gate.mutex.unlock(io);
         gate_locked = false;
@@ -1993,8 +2085,12 @@ pub const Owner = struct {
         // proves the tip; even its runtime refresh can publish index leases.
         if (self.allocator_verification_active) return false;
         var lease = try self.acquireMaintenancePathLeaseAssumeLocked();
+        const turn_held_from = nowNs();
         var lease_held = true;
-        defer if (lease_held) lease.close();
+        defer if (lease_held) {
+            lease.close();
+            MaintenanceHoldSites.record(&self.publication_stats.maintenance_hold_sites.storage_turn, turn_held_from);
+        };
         const foreground = try self.refresh();
         if (needsOutcomeReconciliation(foreground)) return true;
         // A changed tip can invalidate a previously scheduled storage turn.
@@ -2010,6 +2106,7 @@ pub const Owner = struct {
         root.maintenance_publication = null;
         store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
         lease.close();
+        MaintenanceHoldSites.record(&self.publication_stats.maintenance_hold_sites.storage_turn, turn_held_from);
         lease_held = false;
         self.gate.mutex.unlock(io);
         gate_locked = false;

@@ -83,6 +83,9 @@ pub const Handle = struct {
     /// Live coordinator only; detached provider snapshots never drive groups.
     lite_scheduling_owner: ?*@import("lite_connection.zig").Owner = null,
     maintenance_writer_lease: ?lite_backend.native.PathWriterLock = null,
+    /// Scope and start of the current maintenance writer hold (statistics).
+    maintenance_writer_scope: u8 = 0,
+    maintenance_writer_held_from: i96 = 0,
     maintenance_writer_references: usize = 0,
     maintenance_admission_mutex: std.Io.Mutex = .init,
     embedded_path: ?[]u8 = null,
