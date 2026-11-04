@@ -33898,6 +33898,7 @@ test "embeddinggemma2 CUDA model constants keep independent admission through bo
             copies = 0;
             var controller = @import("../../runtime/tier/memory.zig").AdmissionController{};
             var compute: CudaCompute = undefined;
+            compute.ctx.prepared_cache_funding = null;
             compute.ctx.observation.store(null, .release);
             compute.ctx.observation_enable_failed.store(false, .release);
 

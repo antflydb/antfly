@@ -815,6 +815,10 @@ const SharedExternalAdmission = struct {
     amounts: AdmissionAmounts,
     references: usize = 1,
     mutex: std.atomic.Mutex = .unlocked,
+    /// One inline callback owns a metadata/provider lifetime pin even if the
+    /// final logical member releases reentrantly. No worker/queue/allocation.
+    callback_active: bool = false,
+    pending_refund: bool = false,
 
     fn create(requested_allocator: std.mem.Allocator, controller: *AdmissionController, token: usize, amounts: AdmissionAmounts) !*@This() {
         const allocator = controller.metadata_allocator orelse requested_allocator;
@@ -851,7 +855,7 @@ const SharedExternalAdmission = struct {
     /// The original lease still owns its unchanged external token. Discard
     /// unpublished split metadata WITHOUT reducing or releasing that token.
     fn destroyUnpublished(self: *@This()) void {
-        std.debug.assert(self.references == 2);
+        std.debug.assert(self.references == 2 and !self.callback_active);
         const controller = self.controller;
         const budget = self.budget;
         const allocator = self.allocator;
@@ -866,44 +870,116 @@ const SharedExternalAdmission = struct {
     fn addReference(self: *@This()) !void {
         spinLockAdmission(&self.mutex);
         defer self.mutex.unlock();
+        if (self.references == 0) return error.InvalidAdmissionLeasePartition;
         self.references = std.math.add(usize, self.references, 1) catch return error.ResourceLimitExceeded;
     }
 
-    /// Failure is atomic for both the member and the aggregate reservation.
+    /// A member is exclusively borrowed by its caller. Other members may
+    /// release from the callback; those monotonic refunds never mutate this
+    /// member's reduction until the supplier has actually accepted it.
     fn reduce(self: *@This(), released: AdmissionAmounts) !void {
         spinLockAdmission(&self.mutex);
-        defer self.mutex.unlock();
-        const remaining = subtractAdmissionAmounts(self.amounts, released) orelse return error.InvalidAdmissionLeaseReduction;
-        try self.budget.retain(self.budget.context, self.token, remaining);
-        self.amounts = remaining;
+        const remaining = subtractAdmissionAmounts(self.amounts, released) orelse {
+            self.mutex.unlock();
+            return error.InvalidAdmissionLeaseReduction;
+        };
+        if (self.callback_active) {
+            self.mutex.unlock();
+            return error.ResourceTemporarilyUnavailable;
+        }
+        std.debug.assert(self.references != 0);
+        self.callback_active = true; // in-flight owner/provider lifetime pin
+        self.pending_refund = false;
+        const budget = self.budget;
+        const token = self.token;
+        self.mutex.unlock();
+
+        const result = budget.retain(budget.context, token, remaining);
+
+        spinLockAdmission(&self.mutex);
+        if (result) |_| {
+            // Only releases of OTHER members can have changed the aggregate.
+            // This member's exclusive borrow still owns every released byte.
+            std.debug.assert(self.references != 0);
+            self.amounts = subtractAdmissionAmounts(self.amounts, released) orelse
+                @panic("partition member changed during its exclusive reduction");
+        } else |_| {}
+        const drain = self.pending_refund;
+        if (!drain) self.callback_active = false;
+        self.mutex.unlock();
+        if (drain) self.drainRefundsOutsideMutex();
+        // No self access after draining: the in-flight pin may have performed
+        // the last token release. Preserve the ORIGINAL fallible outcome.
+        return result;
     }
 
     fn releaseMember(self: *@This(), amounts: AdmissionAmounts) void {
         spinLockAdmission(&self.mutex);
         std.debug.assert(self.references > 0);
-        const remaining = subtractAdmissionAmounts(self.amounts, amounts) orelse @panic("partitioned admission released unowned amounts");
+        self.amounts = subtractAdmissionAmounts(self.amounts, amounts) orelse
+            @panic("partitioned admission released unowned amounts");
         self.references -= 1;
-        if (self.references != 0) {
-            // Release is infallible. A provider refusing a shrink keeps its
-            // larger external reservation until a later shrink/final release;
-            // it can never authorize more memory than the remaining token.
-            self.budget.retain(self.budget.context, self.token, remaining) catch {};
-            self.amounts = remaining;
+        if (self.callback_active) {
+            // Aggregate refunds are monotonic. A zero-byte member only needs
+            // work if it is the final reference; no redundant shrink loop.
+            if (self.references == 0 or !std.meta.eql(amounts, AdmissionAmounts{})) self.pending_refund = true;
             self.mutex.unlock();
             return;
         }
-        std.debug.assert(std.meta.eql(remaining, AdmissionAmounts{}));
+        self.callback_active = true; // exact one draining callback lifetime pin
+        self.pending_refund = false;
+        self.mutex.unlock();
+        self.drainRefundsOutsideMutex();
+    }
+
+    /// Serialize supplier calls while leaving metadata unlocked. Reentrant
+    /// member releases only coalesce a lower target; they never wait for this
+    /// callback. Fallible reductions instead report busy without mutation.
+    fn drainRefundsOutsideMutex(self: *@This()) void {
+        while (true) {
+            spinLockAdmission(&self.mutex);
+            std.debug.assert(self.callback_active);
+            if (self.references == 0) {
+                std.debug.assert(std.meta.eql(self.amounts, AdmissionAmounts{}));
+                self.mutex.unlock();
+                self.releaseLastOutsideMutex();
+                return;
+            }
+            const remaining = self.amounts;
+            const budget = self.budget;
+            const token = self.token;
+            self.pending_refund = false;
+            self.mutex.unlock();
+            // Infallible release preserves the old refusal semantics: supplier
+            // may retain a larger reservation until a later shrink/final free.
+            budget.retain(budget.context, token, remaining) catch {};
+            spinLockAdmission(&self.mutex);
+            if (self.pending_refund) {
+                self.mutex.unlock();
+                continue;
+            }
+            self.callback_active = false;
+            self.mutex.unlock();
+            return;
+        }
+    }
+
+    fn releaseLastOutsideMutex(self: *@This()) void {
         const controller = self.controller;
         const budget = self.budget;
-        // Keep exclusion active through the producer's release callback, even
-        // when zero-byte members outlive all actual storage.
-        budget.release(budget.context, self.token);
+        const token = self.token;
+        const allocator = self.allocator;
+        // Keep controller/provider exclusion THROUGH the exact final release
+        // callback, including when zero-byte members outlive physical storage.
+        budget.release(budget.context, token);
+        spinLockAdmission(&self.mutex);
+        std.debug.assert(self.references == 0 and self.callback_active);
+        self.callback_active = false;
+        self.mutex.unlock();
         spinLockAdmission(&controller.mutex);
         std.debug.assert(controller.shared_external_owners > 0);
         controller.shared_external_owners -= 1;
         controller.mutex.unlock();
-        self.mutex.unlock();
-        const allocator = self.allocator;
         allocator.destroy(self);
         budget.releaseContext();
     }
@@ -1039,21 +1115,23 @@ pub const AdmissionLease = struct {
 
     pub fn release(self: *AdmissionLease) void {
         const controller = self.controller orelse return;
-        controller.releaseLiveReservation(self.live_reserved_bytes);
-        controller.releaseSettledResidency(self.live_settled_epoch, self.live_settled_bytes);
-        if (self.shared_external) |owner| {
-            owner.releaseMember(self.amounts);
-            controller.releaseLocal(self.amounts_by_backend, self.amounts);
-        } else controller.release(self.amounts_by_backend, self.amounts, self.external_lease);
-        self.controller = null;
-        self.amounts = .{};
-        self.amounts_by_backend = emptyAdmissionAmountsByBackend();
-        self.retain_backend_class = null;
-        self.external_lease = null;
-        self.shared_external = null;
-        self.live_reserved_bytes = 0;
-        self.live_settled_bytes = 0;
-        self.live_settled_epoch = 0;
+        // Detach the complete caller handle before any arbitrary provider
+        // callback. Reentrant release is now idempotent, and a context finalizer
+        // cannot leave us writing into its already-destroyed lease storage.
+        const owned = self.*;
+        self.* = .{
+            .controller = null,
+            .amounts = .{},
+            .amounts_by_backend = emptyAdmissionAmountsByBackend(),
+            .retain_backend_class = null,
+            .live_reserved_bytes = 0,
+        };
+        controller.releaseLiveReservation(owned.live_reserved_bytes);
+        controller.releaseSettledResidency(owned.live_settled_epoch, owned.live_settled_bytes);
+        if (owned.shared_external) |owner| {
+            owner.releaseMember(owned.amounts);
+            controller.releaseLocal(owned.amounts_by_backend, owned.amounts);
+        } else controller.release(owned.amounts_by_backend, owned.amounts, owned.external_lease);
     }
 };
 
@@ -5237,4 +5315,246 @@ test "permanent admission limits win over unrelated host contention" {
     var recovered = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 30 }, false);
     recovered.release();
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+}
+
+const ReentrantPartitionBudgetProbe = struct {
+    base: PartitionBudgetRecorder = .{},
+    owner: ?*SharedExternalAdmission = null,
+    release_first: ?*AdmissionLease = null,
+    release_second: ?*AdmissionLease = null,
+    busy_member: ?*AdmissionLease = null,
+    armed: bool = false,
+    fail_armed: bool = false,
+    lock_violation: bool = false,
+    busy_seen: bool = false,
+    busy_atomic: bool = true,
+    retain_calls: usize = 0,
+    release_observed_inside_retain: bool = false,
+    pause: bool = false,
+    paused_once: bool = false,
+    entered: std.atomic.Value(bool) = .init(false),
+    proceed: std.atomic.Value(bool) = .init(false),
+
+    fn capability(self: *@This()) AdmissionResourceBudget {
+        return .{ .context = self, .retain_context = retainContext, .release_context = releaseContext, .try_reserve = reserve, .retain = retain, .release = release };
+    }
+    fn retainContext(raw: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return PartitionBudgetRecorder.retainContext(&self.base);
+    }
+    fn releaseContext(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        PartitionBudgetRecorder.releaseContext(&self.base);
+    }
+    fn reserve(raw: *anyopaque, amounts: AdmissionAmounts) AdmissionResourceError!usize {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return PartitionBudgetRecorder.reserve(&self.base, amounts);
+    }
+    fn checkUnlocked(self: *@This()) bool {
+        if (self.owner) |owner| {
+            if (owner.mutex.tryLock()) owner.mutex.unlock() else {
+                self.lock_violation = true;
+                return false; // old implementation fails without a test hang
+            }
+        }
+        if (self.base.controller) |controller| {
+            if (controller.mutex.tryLock()) controller.mutex.unlock() else {
+                self.lock_violation = true;
+                return false;
+            }
+        }
+        return true;
+    }
+    fn retain(raw: *anyopaque, token: usize, amounts: AdmissionAmounts) AdmissionResourceError!void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (!self.checkUnlocked()) return error.ResourceTemporarilyUnavailable;
+        self.retain_calls += 1;
+        if (self.pause and !self.paused_once) {
+            self.paused_once = true;
+            self.entered.store(true, .release);
+            while (!self.proceed.load(.acquire)) std.atomic.spinLoopHint();
+        }
+        if (self.armed) {
+            self.armed = false;
+            if (self.busy_member) |member| {
+                const before = member.amounts;
+                member.retain(.{}) catch |err| {
+                    self.busy_seen = err == error.ResourceTemporarilyUnavailable;
+                };
+                self.busy_atomic = std.meta.eql(before, member.amounts);
+            }
+            if (self.release_first) |member| member.release();
+            if (self.release_second) |member| member.release();
+            self.release_observed_inside_retain = self.base.releases != 0;
+            if (self.fail_armed) {
+                self.fail_armed = false;
+                return error.ResourceTemporarilyUnavailable;
+            }
+        }
+        return PartitionBudgetRecorder.retain(&self.base, token, amounts);
+    }
+    fn release(raw: *anyopaque, token: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        _ = self.checkUnlocked();
+        PartitionBudgetRecorder.release(&self.base, token);
+        self.owner = null; // metadata may die before provider context unpin
+    }
+};
+
+fn reentrantSharedReductionCase(fail: bool, refuse_drain: bool) !void {
+    const a = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(a, .{});
+    var probe: ReentrantPartitionBudgetProbe = .{};
+    var controller: AdmissionController = .{ .metadata_allocator = failing.allocator() };
+    defer controller.deinit();
+    probe.base.controller = &controller;
+    try controller.configureResourceBudget(probe.capability());
+    var source = try controller.tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = 80 }, false);
+    defer source.release();
+    var child = try source.partition(a, .{ .backend_scratch_bytes = 20 });
+    defer child.release();
+    var sibling = try source.partition(a, .{ .backend_scratch_bytes = 20 });
+    defer sibling.release();
+    probe.owner = source.shared_external.?;
+    probe.release_first = &child;
+    probe.busy_member = &sibling;
+    probe.fail_armed = fail;
+    probe.base.reject_retain = refuse_drain;
+    probe.armed = true;
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    if (fail) {
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, source.retain(.{ .backend_scratch_bytes = 20 }));
+    } else try source.retain(.{ .backend_scratch_bytes = 20 });
+    try std.testing.expect(probe.busy_seen and probe.busy_atomic);
+    try std.testing.expect(!probe.lock_violation);
+    try std.testing.expect(child.controller == null);
+    try std.testing.expectEqual(@as(usize, if (fail) 40 else 20), source.amounts.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 20), sibling.amounts.backend_scratch_bytes);
+    const expected: usize = if (fail) 60 else 40;
+    try std.testing.expectEqual(expected, controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(if (refuse_drain) @as(usize, 80) else expected, probe.base.current.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 2), probe.retain_calls); // initial+coalesced
+    try std.testing.expectEqual(@as(usize, 0), probe.base.releases);
+    source.release();
+    sibling.release();
+    try std.testing.expectEqual(@as(usize, 1), probe.base.reserves);
+    try std.testing.expectEqual(@as(usize, 1), probe.base.releases);
+    try std.testing.expect(probe.base.reconfiguration_blocked);
+    try std.testing.expectEqualDeep(AdmissionAmounts{}, controller.snapshot());
+    try std.testing.expect(!failing.has_induced_failure);
+    try controller.configureResourceBudget(null);
+    try std.testing.expectEqual(@as(usize, 1), probe.base.references);
+}
+
+test "shared external callbacks reenter another partition without mutex or failure atomicity violations" {
+    try reentrantSharedReductionCase(false, false);
+    try reentrantSharedReductionCase(true, false);
+    try reentrantSharedReductionCase(true, true);
+}
+
+test "shared external final zero members remain pinned through reentrant callback and release same token once" {
+    const a = std.testing.allocator;
+    var probe: ReentrantPartitionBudgetProbe = .{};
+    var controller: AdmissionController = .{};
+    defer controller.deinit();
+    probe.base.controller = &controller;
+    try controller.configureResourceBudget(probe.capability());
+    var source = try controller.tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = 80 }, false);
+    defer source.release();
+    var child = try source.partition(a, .{ .backend_scratch_bytes = 20 });
+    defer child.release();
+    var sibling = try source.partition(a, .{ .backend_scratch_bytes = 20 });
+    defer sibling.release();
+    probe.owner = source.shared_external.?;
+    try source.retain(.{});
+    try child.retain(.{});
+    try sibling.retain(.{});
+    try std.testing.expectEqualDeep(AdmissionAmounts{}, controller.snapshot());
+    probe.release_first = &child;
+    probe.release_second = &sibling;
+    probe.armed = true;
+    source.release();
+    try std.testing.expect(!probe.release_observed_inside_retain);
+    try std.testing.expect(!probe.lock_violation);
+    try std.testing.expectEqual(@as(usize, 1), probe.base.reserves);
+    try std.testing.expectEqual(@as(usize, 1), probe.base.releases);
+    try std.testing.expect(probe.base.reconfiguration_blocked); // count-only exclusion
+    try std.testing.expectEqual(@as(usize, 2), probe.base.references); // provider pin now dropped
+    try controller.configureResourceBudget(null);
+    try std.testing.expectEqual(@as(usize, 1), probe.base.references);
+}
+
+test "shared external callback pin survives other threads releasing every remaining member" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var probe: ReentrantPartitionBudgetProbe = .{};
+    var controller: AdmissionController = .{};
+    defer controller.deinit();
+    probe.base.controller = &controller;
+    try controller.configureResourceBudget(probe.capability());
+    var source = try controller.tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = 80 }, false);
+    defer source.release();
+    var child = try source.partition(a, .{ .backend_scratch_bytes = 20 });
+    defer child.release();
+    var sibling = try source.partition(a, .{ .backend_scratch_bytes = 20 });
+    defer sibling.release();
+    probe.owner = source.shared_external.?;
+    probe.pause = true;
+    const Worker = struct {
+        fn run(lease: *AdmissionLease) void {
+            lease.release();
+        }
+    };
+    const worker = try std.Thread.spawn(.{}, Worker.run, .{&source});
+    var joined = false;
+    defer if (!joined) {
+        probe.proceed.store(true, .release);
+        worker.join();
+    };
+    const deadline = platform.time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!probe.entered.load(.acquire) and platform.time.monotonicNs() < deadline) std.atomic.spinLoopHint();
+    try std.testing.expect(probe.entered.load(.acquire));
+    child.release();
+    sibling.release();
+    try std.testing.expectEqual(@as(usize, 0), probe.base.releases);
+    try std.testing.expectEqual(@as(usize, 3), probe.base.references);
+    try std.testing.expectEqual(@as(usize, 1), controller.shared_external_owners);
+    probe.proceed.store(true, .release);
+    worker.join();
+    joined = true;
+    try std.testing.expectEqual(@as(usize, 1), probe.base.reserves);
+    try std.testing.expectEqual(@as(usize, 1), probe.base.releases);
+    try std.testing.expect(!probe.lock_violation);
+    try std.testing.expectEqualDeep(AdmissionAmounts{}, controller.snapshot());
+    try controller.configureResourceBudget(null);
+    try std.testing.expectEqual(@as(usize, 1), probe.base.references);
+}
+
+test "shared external callback can release its already detached caller handle idempotently" {
+    const a = std.testing.allocator;
+    var probe: ReentrantPartitionBudgetProbe = .{};
+    var controller: AdmissionController = .{};
+    defer controller.deinit();
+    probe.base.controller = &controller;
+    try controller.configureResourceBudget(probe.capability());
+    var source = try controller.tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = 80 }, false);
+    defer source.release();
+    var child = try source.partition(a, .{ .backend_scratch_bytes = 20 });
+    defer child.release();
+    probe.owner = source.shared_external.?;
+    probe.release_first = &source;
+    probe.release_second = &child;
+    probe.armed = true;
+    source.release();
+    try std.testing.expect(source.controller == null and source.shared_external == null);
+    try std.testing.expectEqualDeep(AdmissionAmounts{}, source.amounts);
+    try std.testing.expect(child.controller == null);
+    try std.testing.expect(!probe.lock_violation);
+    try std.testing.expect(!probe.release_observed_inside_retain);
+    try std.testing.expectEqual(@as(usize, 1), probe.base.reserves);
+    try std.testing.expectEqual(@as(usize, 1), probe.base.releases);
+    try std.testing.expectEqualDeep(AdmissionAmounts{}, controller.snapshot());
+    try controller.configureResourceBudget(null);
+    try std.testing.expectEqual(@as(usize, 1), probe.base.references);
 }
