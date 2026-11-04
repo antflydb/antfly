@@ -18,6 +18,11 @@ ReleaseFast executable SHA-256:
 Debug executable SHA-256:
 `9cf6aa12be574fceba2c540449a41ded3482155465be75ae41d914b67fd57454`.
 
+Later main at `2c0905501d` includes #1479 (`270057158c`), changing Lite/LSM
+writer admission and commit outcomes, and #1386's inference work. Neither was in
+the frozen engine baseline. Their effects on these observations have not been
+measured; retest that newer revision before attributing the stalls to current main.
+
 The input was an existing 10,000-row HN Parquet export, SHA-256
 `e23a8fe4215d3a8c66cd79b98314225211c8396cb5ff827365835bf6bce4947a`.
 Only 128 normalized rows were used. Bodies were truncated and given a common
