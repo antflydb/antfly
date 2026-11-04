@@ -33,7 +33,12 @@ pub const Diagnostic = struct {
         if (std.mem.eql(u8, self.code, "42501")) return 403;
         if (std.mem.eql(u8, self.code, "53300") or std.mem.eql(u8, self.code, "55P03")) return 503;
         if (std.mem.startsWith(u8, self.code, "40")) return 409;
-        if (std.mem.eql(u8, self.code, "XX000") or std.mem.eql(u8, self.code, "53200")) return 500;
+        if (std.mem.eql(u8, self.code, "XX000") or std.mem.eql(u8, self.code, "53200") or std.mem.eql(u8, self.code, "58000")) return 500;
+        if (std.mem.eql(u8, self.code, "53100")) return 507;
+        // Refused until an earlier unknown outcome is reconciled.
+        if (std.mem.eql(u8, self.code, "55000")) return 409;
+        // Committed; derived visibility still pending. Not a client error.
+        if (std.mem.eql(u8, self.code, "AF001")) return 202;
         return 400;
     }
 };
@@ -84,6 +89,32 @@ pub fn notNull(context: ?*Context, name: []const u8) anyerror {
 pub fn isRowEvaluationError(err: anyerror) bool {
     const code = describe(err).code;
     return std.mem.startsWith(u8, code, "22") or std.mem.startsWith(u8, code, "21") or err == error.SqlTypeMismatch;
+}
+
+/// Errors whose identity already means "the outcome is unknown".
+pub fn isUnknownOutcome(err: anyerror) bool {
+    return switch (err) {
+        error.SqlTransactionOutcomeUnknown, error.SqlMutationOutcomeUnknown, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.CommitDecisionUnknown, error.DurabilityOutcomeUnknown => true,
+        else => false,
+    };
+}
+
+/// Classifies a failure that a commit boundary has proved happened before its
+/// decision, so the statement was not applied. Call it only with that proof:
+/// the boundary's state (for example, the primary write not committed and no
+/// checkpoint publication uncertain), never on an error name alone.
+/// Errors that already have a specific diagnostic keep it; their messages
+/// describe a refused statement. An unknown-outcome identity reaching a
+/// proven pre-decision step can only be a refusal caused by an earlier
+/// unresolved commit (sticky publication uncertainty), never this statement's.
+pub fn notApplied(err: anyerror) anyerror {
+    if (isUnknownOutcome(err)) return error.SqlReconciliationRequired;
+    if (!std.mem.eql(u8, describe(err).code, "XX000")) return err;
+    return switch (err) {
+        error.Busy, error.WriterLocked, error.ConcurrencyUnavailable, error.CapacityUnavailable, error.CapacityObservationStale, error.LiteRetirementBacklogExceeded, error.TextMergeBackpressureTimeout, error.SourceFileChanged, error.GenerationTransitionActive, error.IndexArtifactCleanupPending, error.EmbeddingProbeUnavailable, error.InferenceProviderCallCapacityExhausted, error.IntegrityCatalogUnavailable, error.ResourceTemporarilyUnavailable, error.StorageReadTemporarilyUnavailable => error.SqlMutationNotAppliedBusy,
+        error.LiteStorageBudgetExceeded, error.LiteInsufficientDiskSpace, error.NoSpaceLeft, error.DiskQuota => error.SqlMutationNotAppliedNoSpace,
+        else => error.SqlMutationNotApplied,
+    };
 }
 
 pub fn describe(err: anyerror) Diagnostic {
@@ -354,11 +385,19 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlWriteConflict, error.PreparedReadSetChanged, error.VersionConflict, error.IntentConflict => .{ .code = "40001", .message = "The mutation conflicted with a concurrent change and was not committed.", .hint = "Read the current rows before retrying the complete statement.", .retryable = true },
         error.SqlLockNotAvailable => .{ .code = "55P03", .message = "The requested SQL lock is held by another transaction.", .hint = "Wait for the competing transaction or use SKIP LOCKED where appropriate.", .retryable = false },
         error.FileBusy, error.WouldBlock => .{ .code = "55P03", .message = "The database resource is temporarily locked.", .hint = "Retry the complete statement after the competing operation finishes.", .retryable = true },
+        // These identities are assigned only at a commit boundary that has
+        // proved the statement was not applied (see `notApplied`).
+        error.SqlMutationNotAppliedBusy => .{ .code = "55P03", .message = "The database was busy with competing work; the statement was not applied.", .hint = "Retry the complete statement after a bounded delay.", .retryable = true },
+        error.SqlMutationNotAppliedNoSpace => .{ .code = "53100", .message = "The database has no storage capacity left for this statement; it was not applied.", .hint = "Free disk space or raise the storage budget, then retry.", .retryable = false },
+        error.SqlMutationNotApplied => .{ .code = "58000", .message = "The statement failed before it committed; it was not applied.", .hint = "It is safe to retry; if the failure repeats, contact the operator.", .retryable = true },
+        error.PreDecisionDeadlineExceeded => .{ .code = "57014", .message = "The statement's deadline expired before it committed; nothing was applied.", .hint = "Retry with a longer deadline.", .retryable = true },
+        error.OutcomeReconciliationRequired, error.SqlReconciliationRequired => .{ .code = "55000", .message = "An earlier commit's outcome is unresolved; this statement was not applied.", .hint = "Reconcile the earlier receipt. Lite connections recover on their next call; other handles must reopen the database.", .retryable = false },
+        error.CommitVisibilityNotSatisfied, error.CommitPropagationIncomplete => .{ .code = "AF001", .message = "The mutation committed, but its derived visibility is still pending.", .hint = "Do not replay the statement.", .retryable = false },
         error.SqlWriteCapacityUnavailable, error.SqlPlanCacheBusy, error.Backpressured, error.DenseRepairBackpressure => .{ .code = "53300", .message = "SQL execution capacity is temporarily exhausted.", .hint = "Retry after a bounded delay; reduce concurrent requests.", .retryable = true },
         error.SqlStatementReadUnavailable, error.CatalogRoutingUnavailable, error.CatalogRoutingSnapshotTimeout => .{ .code = "53300", .message = "A consistent SQL statement read is temporarily unavailable.", .hint = "Retry the complete statement after a bounded delay.", .retryable = true },
         error.RestoreValidationPending => .{ .code = "53300", .message = "The source owner is not ready to admit a schema rewrite.", .hint = "No rewrite job was admitted; wait for the table owner to become ready before retrying the DDL.", .retryable = true },
         error.HAReadOnlyStandby, error.HAPromotedStandbyRequiresPrimaryOpen, error.HAFencedPrimary => .{ .code = "25006", .message = "This server is not accepting writes in its current standby or fencing state.", .hint = "Send the mutation to an active writable primary.", .retryable = false },
-        error.SqlTransactionOutcomeUnknown, error.SqlMutationOutcomeUnknown, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.CommitDecisionUnknown => .{ .code = "40003", .message = "The mutation outcome is unknown; it may already have committed.", .hint = "Do not replay the statement. Use its transaction receipt to reconcile the outcome.", .retryable = false },
+        error.SqlTransactionOutcomeUnknown, error.SqlMutationOutcomeUnknown, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.CommitDecisionUnknown, error.DurabilityOutcomeUnknown => .{ .code = "40003", .message = "The mutation outcome is unknown; it may already have committed.", .hint = "Do not replay the statement. Use its transaction receipt to reconcile the outcome.", .retryable = false },
         error.OutOfMemory => .{ .code = "53200", .message = "The server could not reserve enough memory for this SQL operation.", .hint = "Reduce result size or concurrent load." },
         else => .{ .code = "XX000", .message = "The SQL operation could not be completed because of an internal error.", .hint = "Contact the operator with the request or transaction receipt; do not assume a failed mutation was rolled back." },
     };

@@ -797,6 +797,11 @@ pub const HandleGuard = struct {
     entry_sequence: u64 = 0,
     pinned_store_readonly: ?bool = null,
     suspended_query_root: ?*Handle = null,
+    /// Busy-wait budget left for this export call. The busy timeout bounds
+    /// total admission waiting across every re-entry of one call (for
+    /// example after inference), not each admission separately. Null means
+    /// the connection has no busy timeout.
+    admission_budget_ns: ?i96 = null,
 
     /// Keep registry references and the provider snapshot alive, releasing both
     /// process and file locks while inference runs on an owned request plan.
@@ -826,7 +831,8 @@ pub const HandleGuard = struct {
     pub fn resumeAccess(self: *HandleGuard, ptr: ?*anyopaque, access: HandleAccess) bool {
         if (self.suspended_query_root == null) return true;
         // Original registry references keep the connection/owner alive.
-        const next = enterHandle(ptr, access) orelse return false;
+        const entry = HandleEntry.capture(ptr) orelse return false;
+        const next = enterWithAdmissionBudget(entry, ptr, access, if (access == .read) .read_only else .mutation, false, self.admission_budget_ns) orelse return false;
         const connection = self.connection.?;
         if (!next.connection_gate_held) connection.gate.mutex.lockUncancelable(handleLockIo());
         self.suspended_query_root.?.query_borrows -= 1;
@@ -879,7 +885,9 @@ pub const HandleGuard = struct {
             }
             if (self.path_lease) |lease| {
                 var owned = lease;
-                owned.close();
+                // A thread of this process queued for the gate takes the
+                // lease as is, unless another process is waiting for it.
+                if (!(self.connection_gate_held and connection.gate.mutex.retainForWaiter(io, &owned))) owned.close();
             }
             if (self.connection_gate_held) connection.gate.mutex.unlock(io);
             connection.mutex.unlock(io);
@@ -935,14 +943,32 @@ pub fn enterHandleWithIntent(ptr: ?*anyopaque, access: HandleAccess, intent: Sto
 /// refresh can proceed; close waits until preparation is freed as for any call.
 /// Ordinary exports release and recapture their pins between attempts.
 fn enterWithAdmissionRetry(initial: HandleEntry, ptr: ?*anyopaque, access: HandleAccess, intent: StorageIntent, comptime retain_entry: bool) ?HandleGuard {
+    return enterWithAdmissionBudget(initial, ptr, access, intent, retain_entry, null);
+}
+
+/// `budget_ns` is what is left of the call's busy timeout (null: the full
+/// timeout). The guard records what remains after this admission.
+fn enterWithAdmissionBudget(initial: HandleEntry, ptr: ?*anyopaque, access: HandleAccess, intent: StorageIntent, comptime retain_entry: bool, budget_ns: ?i96) ?HandleGuard {
     const connection = initial.lock_handle.lite_connection orelse return enterCapturedHandle(initial, access, intent, false);
     const timeout_ms = connection.options.busy_timeout_ms;
     if (timeout_ms == 0) return enterCapturedHandle(initial, access, intent, false);
     const io = handleLockIo();
+    const deadline = std.Io.Clock.awake.now(io).nanoseconds + @max(0, budget_ns orelse @as(i96, timeout_ms) * std.time.ns_per_ms);
+    // This call's own proof work, credited only through its own admission
+    // scope, so work by other calls on the connection is never counted.
+    var active_ns: u64 = 0;
+    var guard = enterBeforeDeadline(initial, ptr, access, intent, retain_entry, connection, deadline, &active_ns) orelse return null;
+    // Only waiting consumes the budget: add back this call's own proof work.
+    const active: i96 = @intCast(active_ns);
+    guard.admission_budget_ns = @max(0, deadline - std.Io.Clock.awake.now(io).nanoseconds + active);
+    return guard;
+}
+
+fn enterBeforeDeadline(initial: HandleEntry, ptr: ?*anyopaque, access: HandleAccess, intent: StorageIntent, comptime retain_entry: bool, connection: *@import("lite_connection.zig").Connection, deadline: i96, active_ns: *u64) ?HandleGuard {
+    const io = handleLockIo();
     const started = std.Io.Clock.awake.now(io).nanoseconds;
-    const deadline = started + @as(i96, timeout_ms) * std.time.ns_per_ms;
     var entry = initial;
-    var guard = enterCapturedHandleWithDeadline(entry, access, intent, false, deadline);
+    var guard = enterCapturedHandleWithDeadline(entry, access, intent, false, deadline, active_ns);
     defer if (intent == .mutation and guard.entry_error == null) {
         // Successful admission still owns the path gate. Count this admission,
         // including retries and proof work. Resuming a suspended operation is
@@ -959,8 +985,14 @@ fn enterWithAdmissionRetry(initial: HandleEntry, ptr: ?*anyopaque, access: Handl
     const test_sleep = if (builtin.is_test) connection.test_admission_sleep else {};
     // Capacity-limited reads can also need a proof. Only admission is retried:
     // the exported operation has not executed yet.
+    // The call's own proof work extends its deadline; only waiting counts.
+    const Effective = struct {
+        fn at(base: i96, active: *const u64) i96 {
+            return base + @as(i96, @intCast(active.*));
+        }
+    };
     while (guard.entry_error == .busy) {
-        const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+        const remaining = Effective.at(deadline, active_ns) - std.Io.Clock.awake.now(io).nanoseconds;
         if (remaining <= 0) return guard;
         guard.leaveWithRegistry(!retain_entry);
         const delay = std.Io.Duration.fromNanoseconds(@min(backoff, remaining));
@@ -971,11 +1003,11 @@ fn enterWithAdmissionRetry(initial: HandleEntry, ptr: ?*anyopaque, access: Handl
         if (!retain_entry) entry = HandleEntry.capture(ptr) orelse return null;
         // Cancellation must not reacquire a path lease or begin another proof.
         slept catch |err| return entry.failedGuard(access, capi.mapErrorContext(err, @src().fn_name));
-        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline)
+        if (std.Io.Clock.awake.now(io).nanoseconds >= Effective.at(deadline, active_ns))
             return entry.failedGuard(access, capi.mapError(error.FileBusy));
         // An expired backoff cannot start a new admission attempt. A proof
         // already in progress may still finish and take an uncontended lease.
-        guard = enterCapturedHandleWithDeadline(entry, access, intent, false, deadline);
+        guard = enterCapturedHandleWithDeadline(entry, access, intent, false, Effective.at(deadline, active_ns), active_ns);
         if (guard.entry_error == null) capi.clearLastError();
         backoff = @min(backoff * 2, 50 * std.time.ns_per_ms);
     }
@@ -1028,10 +1060,10 @@ fn enterHandleInternal(ptr: ?*anyopaque, access: HandleAccess, intent: StorageIn
 }
 
 fn enterCapturedHandle(entry: HandleEntry, access: HandleAccess, intent: StorageIntent, pinned: bool) HandleGuard {
-    return enterCapturedHandleWithDeadline(entry, access, intent, pinned, null);
+    return enterCapturedHandleWithDeadline(entry, access, intent, pinned, null, null);
 }
 
-fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, intent: StorageIntent, pinned: bool, deadline: ?i96) HandleGuard {
+fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, intent: StorageIntent, pinned: bool, deadline: ?i96, active_ns: ?*u64) HandleGuard {
     const handle = entry.handle;
     const slot = entry.slot;
     const lock_handle = entry.lock_handle;
@@ -1041,6 +1073,8 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
         var guard: HandleGuard = .{ .handle = handle, .lock_handle = lock_handle, .parent_slot = parent_slot, .slot = slot, .access = access, .connection = connection };
         connection.admission_deadline_ns = deadline;
         defer connection.admission_deadline_ns = null;
+        connection.admission_active_sink = active_ns;
+        defer connection.admission_active_sink = null;
         // An attempt already in progress may spend time queued locally or
         // proving the allocator. Its first lease try must still be allowed;
         // only contention waits consult the deadline. The retry loop checks
@@ -1197,7 +1231,9 @@ pub fn batchInternal(
     predicate_count: usize,
     timestamp_ns: u64,
     sync_level: u8,
+    primary_committed: *bool,
 ) !void {
+    primary_committed.* = false;
     var writes = std.ArrayListUnmanaged(db_mod.types.BatchWrite).empty;
     defer writes.deinit(handle.alloc);
     var deletes = std.ArrayListUnmanaged([]const u8).empty;
@@ -1229,13 +1265,27 @@ pub fn batchInternal(
         else => return error.InvalidArgument,
     };
 
-    try handle.database().*.batch(.{
+    try handle.database().*.batchTracked(.{
         .writes = writes.items,
         .deletes = deletes.items,
         .predicates = predicates,
         .timestamp_ns = timestamp_ns,
         .sync_level = level,
-    });
+    }, primary_committed);
+}
+
+/// C result for a failed batch, classified by the batch's own state: an
+/// unknown outcome stays unknown; after the primary write became durable it
+/// is committed (`ANTFLY_STALLED`, never a retryable code); before that the
+/// batch was not applied and its error maps normally.
+fn batchFailureCode(err: anyerror, primary_committed: bool) capi.ErrorCode {
+    // A confirmed primary write wins over later uncertainty in derived or
+    // control publication: the batch is committed, not of unknown outcome.
+    if (primary_committed) return capi.recordError(.stalled, if (err == error.EnrichmentWorkerFailed)
+        "batch primary write committed; enrichment failed and needs repair; do not retry the batch"
+    else
+        "batch primary write committed; derived visibility is pending; do not retry the batch");
+    return capi.mapError(err);
 }
 
 pub fn stringifyJson(value: anytype) !capi.Buffer {
@@ -4705,10 +4755,8 @@ pub fn antfly_db_batch(
     defer guard.leave();
     const handle = guard.handle;
     if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": write and predicate pointers must not be null when their counts are nonzero");
-    batchInternal(handle, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level) catch |err| return if (err == error.CommitVisibilityNotSatisfied)
-        capi.mapErrorContext(err, "batch primary write committed; derived visibility is pending; do not retry the batch")
-    else
-        capi.mapError(err);
+    var primary_committed = false;
+    batchInternal(handle, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level, &primary_committed) catch |err| return batchFailureCode(err, primary_committed);
     return .ok;
 }
 
@@ -4730,11 +4778,11 @@ pub fn antfly_db_batch_json(
     var owned = batch_api.parseBatchRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
     defer owned.deinit(handle.alloc);
 
-    handle.database().*.batch(owned.req) catch |err| return if (err == error.CommitVisibilityNotSatisfied)
-        capi.mapErrorContext(err, "batch primary write committed; derived visibility is pending; do not retry the batch")
-    else
-        capi.mapError(err);
-    const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch |err| return capi.mapError(err);
+    var primary_committed = false;
+    handle.database().*.batchTracked(owned.req, &primary_committed) catch |err| return batchFailureCode(err, primary_committed);
+    // Committed: a response failure must not read as a failed batch.
+    const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch
+        return capi.recordError(.stalled, "batch committed; its response could not be encoded; do not retry the batch");
     out_buf.* = .{
         .ptr = response.ptr,
         .len = response.len,
@@ -11398,4 +11446,54 @@ test "capi native memory supersession uses filtered lexical indexes and durable 
     try std.testing.expectEqual(t.Lifecycle.superseded, record.lifecycle);
     const detail = try std.json.parseFromSliceLeaky(t.SupersessionProposalDetail, a, try nativeMemoryTestCall(handle, a, "alice", .supersession_proposal, .{}, "", "pair"), .{});
     try std.testing.expectEqual(t.SupersessionRelation.supersedes, detail.proposal.verdict.?);
+}
+
+test "issue1015 issue1431 busy budget is shared across resumed admissions of one call" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const native = lite_backend.native;
+    var directory = try TestDirectory.init("resumed-busy-budget");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{directory.path()}, 0);
+    defer alloc.free(path);
+    const timeout_ms = 2000;
+    const wrapper = try openLiteHandleAlloc(path, .{ .no_sync = true, .profile = .hosted, .busy_timeout_ms = timeout_ms }, true);
+    const id = try publishHandle(wrapper);
+    defer antfly_db_close(id);
+    const io = handleLockIo();
+    const owner = wrapper.lite_connection.?.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    if (owner.worker) |worker| worker.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+
+    // Another process holds the writer lease for `hold_ms`, then releases.
+    const Foreign = struct {
+        lease: lite_backend.native.PathWriterLock,
+        hold_ms: u64,
+        fn run(self: *@This()) void {
+            handleLockIo().sleep(.fromMilliseconds(@intCast(self.hold_ms)), .awake) catch {};
+            self.lease.close();
+        }
+    };
+    var first: Foreign = .{ .lease = try native.lockWriterPathWithIo(alloc, io, path), .hold_ms = 1000 };
+    const first_thread = try std.Thread.spawn(.{}, Foreign.run, .{&first});
+    var guard = enterHandle(id, .write) orelse return error.TestUnexpectedResult;
+    first_thread.join();
+    try std.testing.expect(guard.entry_error == null);
+    // About a second of waiting was spent; at most the rest remains.
+    const remaining = guard.admission_budget_ns.?;
+    try std.testing.expect(remaining <= (timeout_ms - 800) * std.time.ns_per_ms);
+    guard.suspendQuery();
+    // A holder that outlasts the remaining budget, but not a full timeout,
+    // must make the resumed admission give up: it gets no fresh budget.
+    var second: Foreign = .{ .lease = try native.lockWriterPathWithIo(alloc, io, path), .hold_ms = 1600 };
+    const second_thread = try std.Thread.spawn(.{}, Foreign.run, .{&second});
+    try std.testing.expect(guard.resumeAccess(id, .write));
+    const resumed_error = guard.entry_error;
+    guard.leave();
+    second_thread.join();
+    try std.testing.expectEqual(@as(?capi.ErrorCode, .busy), resumed_error);
 }

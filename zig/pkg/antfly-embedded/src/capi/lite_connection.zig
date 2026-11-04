@@ -430,6 +430,63 @@ const QueuedMutex = struct {
     ready: @import("antfly_platform").sync.BroadcastCondition = .init,
     next: u64 = 0,
     serving: u64 = 0,
+    /// A writer lease handed from one holder to the next queued thread so
+    /// back-to-back calls skip the release/reacquire and the queue round trip.
+    /// Owned by the current holder. `unlock` closes it once nobody is
+    /// waiting, so it can never outlive the threads it was kept for.
+    retained: ?native.PathWriterLock = null,
+    /// Tickets of queued threads that will take the path lease as soon as
+    /// they hold the gate (see `lockForLease`). Bounded; overflow only means
+    /// a handoff is skipped.
+    lease_tickets: [16]u64 = undefined,
+    lease_ticket_count: usize = 0,
+
+    /// Upper bound on one chain of handoffs. Readers in other processes are
+    /// not queued, so this is what bounds their wait behind a busy process.
+    pub const retain_quantum_ns: i96 = 50 * std.time.ns_per_ms;
+    /// Turn length when a writer in another process is queued. Each handoff
+    /// between processes makes the next holder refresh its runtime, so a short
+    /// turn amortizes that cost while keeping every queued wait bounded.
+    pub const contended_quantum_ns: i96 = 20 * std.time.ns_per_ms;
+
+    /// Caller holds the mutex. Keeps `lease` for the next queued thread when
+    /// that is cheaper and fair; otherwise returns false and the caller closes.
+    pub fn retainForWaiter(self: *QueuedMutex, io: std.Io, lease: *native.PathWriterLock) bool {
+        if (self.retained != null) return false;
+        const age = std.Io.Clock.awake.now(io).nanoseconds - lease.acquired_ns;
+        if (age >= retain_quantum_ns) return false;
+        {
+            self.state.lockUncancelable(io);
+            defer self.state.unlock(io);
+            // Hand off only to the very next holder, and only if it is about
+            // to take the lease. Anyone else might need the kernel lock free.
+            const next_holder = self.serving +% 1;
+            if (self.next == next_holder) return false;
+            if (std.mem.indexOfScalar(u64, self.lease_tickets[0..self.lease_ticket_count], next_holder) == null) return false;
+        }
+        if (age >= contended_quantum_ns and lease.othersWaiting()) return false;
+        if (lease.reader_registration_batch) |batch| batch.end();
+        lease.reader_registration_batch = null;
+        lease.endHold();
+        self.retained = lease.*;
+        return true;
+    }
+
+    /// Caller holds the mutex.
+    pub fn takeRetained(self: *QueuedMutex) ?native.PathWriterLock {
+        const lease = self.retained orelse return null;
+        self.retained = null;
+        return lease;
+    }
+
+    /// Caller holds the mutex and needs the kernel lease free for itself
+    /// (for example a reader or a nonblocking writer attempt).
+    pub fn dropRetained(self: *QueuedMutex) void {
+        if (self.takeRetained()) |lease| {
+            var owned = lease;
+            owned.close();
+        }
+    }
 
     pub fn lockUncancelable(self: *QueuedMutex, io: std.Io) void {
         self.state.lockUncancelable(io);
@@ -437,6 +494,27 @@ const QueuedMutex = struct {
         const ticket = self.next;
         self.next +%= 1;
         while (ticket != self.serving) self.ready.waitUncancelable(io, &self.state);
+    }
+
+    /// Like `lockUncancelable`, for a caller that takes the path lease next,
+    /// so the current holder may hand its lease over directly.
+    pub fn lockForLease(self: *QueuedMutex, io: std.Io) void {
+        self.state.lockUncancelable(io);
+        defer self.state.unlock(io);
+        const ticket = self.next;
+        self.next +%= 1;
+        const marked = self.lease_ticket_count < self.lease_tickets.len;
+        if (marked) {
+            self.lease_tickets[self.lease_ticket_count] = ticket;
+            self.lease_ticket_count += 1;
+        }
+        while (ticket != self.serving) self.ready.waitUncancelable(io, &self.state);
+        if (marked) {
+            const tickets = self.lease_tickets[0..self.lease_ticket_count];
+            const at = std.mem.indexOfScalar(u64, tickets, ticket).?;
+            tickets[at] = tickets[tickets.len - 1];
+            self.lease_ticket_count -= 1;
+        }
     }
 
     pub fn tryLock(self: *QueuedMutex) bool {
@@ -450,6 +528,8 @@ const QueuedMutex = struct {
     pub fn unlock(self: *QueuedMutex, io: std.Io) void {
         self.state.lockUncancelable(io);
         self.serving +%= 1;
+        // Close before any new holder can run, so it finds the sidecar free.
+        if (self.next == self.serving) self.dropRetained();
         self.ready.broadcast(io);
         self.state.unlock(io);
     }
@@ -505,6 +585,89 @@ pub fn testMaintenanceCaptureAdmission() !void {
     try std.testing.expectEqual(@as(u8, 0), misses);
 }
 
+test "capi path gate hands a writer lease to the next queued thread and drops it when idle" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
+    defer threaded.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/handoff.aflite", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const io = h.handleLockIo();
+    var gate: QueuedMutex = .{};
+
+    // Nobody queued: the lease is not kept.
+    gate.lockUncancelable(io);
+    var lone = try native.fairWriterLockWithIo(alloc, io, threaded.io(), path, std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s);
+    try std.testing.expect(!gate.retainForWaiter(io, &lone));
+    lone.close();
+    gate.unlock(io);
+
+    const Plain = struct {
+        fn run(g: *QueuedMutex) void {
+            const wio = h.handleLockIo();
+            g.lockUncancelable(wio);
+            g.unlock(wio);
+        }
+    };
+    {
+        // The next holder will not take a lease: no handoff.
+        gate.lockUncancelable(io);
+        var lease = try native.fairWriterLockWithIo(alloc, io, threaded.io(), path, std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s);
+        const plain = try std.Thread.spawn(.{}, Plain.run, .{&gate});
+        while (true) {
+            gate.state.lockUncancelable(io);
+            const queued = gate.next -% gate.serving;
+            gate.state.unlock(io);
+            if (queued > 1) break;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(!gate.retainForWaiter(io, &lease));
+        lease.close();
+        gate.unlock(io);
+        plain.join();
+    }
+
+    const Waiter = struct {
+        gate: *QueuedMutex,
+        took: bool = false,
+        fn run(self: *@This()) void {
+            const wio = h.handleLockIo();
+            self.gate.lockForLease(wio);
+            defer self.gate.unlock(wio);
+            if (self.gate.takeRetained()) |kept| {
+                var lease = kept;
+                self.took = true;
+                lease.close();
+            }
+        }
+    };
+    gate.lockUncancelable(io);
+    var lease = try native.fairWriterLockWithIo(alloc, io, threaded.io(), path, std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s);
+    var waiter: Waiter = .{ .gate = &gate };
+    const thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    while (true) {
+        gate.state.lockUncancelable(io);
+        const queued = gate.next -% gate.serving;
+        gate.state.unlock(io);
+        if (queued > 1) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(gate.retainForWaiter(io, &lease));
+    gate.unlock(io);
+    thread.join();
+    try std.testing.expect(waiter.took);
+    try std.testing.expect(gate.retained == null);
+
+    // A kept lease nobody claims is closed by the last unlock.
+    gate.lockUncancelable(io);
+    gate.retained = try native.fairWriterLockWithIo(alloc, io, threaded.io(), path, std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s);
+    gate.unlock(io);
+    try std.testing.expect(gate.retained == null);
+    var probe = try native.tryFairWriterLockWithIo(alloc, io, path);
+    probe.close();
+}
+
 // Connections in one process queue on a canonical file gate. The kernel
 // sidecar remains the authority between processes and with CLI/server owners.
 const PathGate = struct {
@@ -542,6 +705,9 @@ pub fn acquirePathReplacement(path: []const u8) !PathReplacementGuard {
     defer alloc.free(canonical);
     const gate = try retainGate(canonical);
     gate.mutex.lockUncancelable(io);
+    // Replacement takes the kernel lease itself; a lease kept for this
+    // thread would otherwise block it.
+    gate.mutex.dropRetained();
     return .{ .gate = gate };
 }
 
@@ -683,6 +849,9 @@ pub const Owner = struct {
     // One graph walk per owner. Admission waits without the foreground gate;
     // the worker only try-locks under that gate and yields to an active proof.
     allocator_proof_mutex: std.Io.Mutex = .init,
+    /// A proof that completed but could not be transferred because the
+    /// writer lease was busy. Guarded by the proof mutex.
+    allocator_proof_receipt: ?native.NativeFile.AllocatorProofReceipt = null,
     verification_cancel: @FieldType(NativeStore, "maintenance_cancel") = .{},
     allocator_certificate_pending: bool = false,
     // Historical attempts suppress close-time retries; only active work is
@@ -738,6 +907,9 @@ pub const Owner = struct {
         // Detached graph-walk totals, including foreground and maintenance.
         // These survive runtime refresh and exclude lease/queue wait time.
         allocator_proof_walks: u64 = 0,
+        /// Proofs completed on an earlier attempt that yielded busy, reused
+        /// without repeating the walk.
+        allocator_proof_receipt_reuses: u64 = 0,
         allocator_proof_failures: u64 = 0,
         allocator_proof_ns: u64 = 0,
         allocator_proof_max_ns: u64 = 0,
@@ -748,6 +920,15 @@ pub const Owner = struct {
         mutation_admission_ns: u64 = 0,
         mutation_admission_max_ns: u64 = 0,
         mutation_admission_log2_ns: [64]u64 = @splat(0),
+        // Cross-process writer lease: wait from the start of acquisition
+        // (FIFO queue plus kernel lock, excluding the in-process gate) and
+        // hold until release or handoff. Foreground covers exported calls;
+        // maintenance covers background publication, replay and reclamation.
+        foreground_lease: native.LeaseTiming = .{},
+        maintenance_lease: native.LeaseTiming = .{},
+        // Time foreground calls spent queued on this process's path gate.
+        gate_wait_ns: u64 = 0,
+        gate_wait_max_ns: u64 = 0,
         last_maintenance_error: ?[]const u8 = null,
     } = .{},
     test_runtime_snapshot_opens: if (h.builtin.is_test) u64 else void = if (h.builtin.is_test) 0 else {},
@@ -776,7 +957,10 @@ pub const Owner = struct {
             // Existing readers of an unknown peer publication remain poisoned.
             self.reader_coordinator.observeCurrent(probe_inode, probe.headerFingerprint());
             const same_inode = probe_inode == (try file.file.stat(file.runtime())).inode;
-            if (current.maintenance_references == 0 and same_inode and std.meta.eql(probe.header, file.header)) {
+            // An uncertain publication can fail before writing anything, so an
+            // unchanged header does not prove the runtime is reusable: reopen
+            // to reconcile from durable state.
+            if (current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and std.meta.eql(probe.header, file.header)) {
                 if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
                     try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
                 return current;
@@ -1072,25 +1256,48 @@ pub const Owner = struct {
     fn acquireMaintenancePathLeaseAssumeLocked(self: *Owner) !native.PathWriterLock {
         if (self.stopping.load(.acquire)) return error.Canceled;
         const io = h.handleLockIo();
-        if (native.lockWriterPathWithIo(alloc, io, self.path)) |held| return self.withReadRegistrationBatch(held) else |err| {
-            if (err != error.WouldBlock and err != error.FileBusy) return err;
-            // A full foreground queue can exceed one second while each caller
-            // remains inside its normal admission budget. Give publications
-            // the same default window, while bounding close-time gate waits.
-            const default_budget = 5 * std.time.ns_per_s;
-            const budget = if (h.builtin.is_test) self.test_maintenance_wait_ns orelse default_budget else default_budget;
-            var held = native.waitPathLockWithIo(alloc, self.path_lock_io.io(), self.path, true, std.Io.Clock.awake.now(io).nanoseconds + budget) catch |wait_err| switch (wait_err) {
-                error.FileBusy => {
-                    self.publication_stats.maintenance_queue_timeouts +|= 1;
-                    return wait_err;
-                },
-                error.FileNotFound, error.ConcurrencyUnavailable => return err,
-                else => return wait_err,
-            };
-            errdefer held.close();
-            if (self.stopping.load(.acquire)) return error.Canceled;
-            return self.withReadRegistrationBatch(held);
+        const stats = &self.publication_stats.maintenance_lease;
+        if (self.gate.mutex.takeRetained()) |held| {
+            var lease = held;
+            stats.recordAcquired(.handoff, 0);
+            lease.startHold(stats);
+            return self.withReadRegistrationBatch(lease);
         }
+        const started = std.Io.Clock.awake.now(io).nanoseconds;
+        // Maintenance joins the same FIFO as foreground writers, so a
+        // continuously busy foreground can delay it by at most one round of
+        // queued turns instead of starving it.
+        const default_budget = 5 * std.time.ns_per_s;
+        const budget = if (h.builtin.is_test) self.test_maintenance_wait_ns orelse default_budget else default_budget;
+        var held = native.fairWriterLockWithIo(alloc, io, self.path_lock_io.io(), self.path, std.Io.Clock.awake.now(io).nanoseconds + budget) catch |err| switch (err) {
+            error.FileBusy => {
+                self.publication_stats.maintenance_queue_timeouts +|= 1;
+                stats.recordBusy(@intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
+                return err;
+            },
+            else => return err,
+        };
+        errdefer held.close();
+        stats.recordAcquired(if (held.queue_turn != null) .queued else .uncontended, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
+        held.startHold(stats);
+        if (self.stopping.load(.acquire)) return error.Canceled;
+        return self.withReadRegistrationBatch(held);
+    }
+
+    /// Caller holds the gate. Nonblocking: reuses a lease kept for a queued
+    /// thread, otherwise refuses while another process is queued.
+    fn tryWriterLeaseAssumeLocked(self: *Owner) !native.PathWriterLock {
+        const stats = &self.publication_stats.maintenance_lease;
+        var lease = if (self.gate.mutex.takeRetained()) |held| blk: {
+            stats.recordAcquired(.handoff, 0);
+            break :blk held;
+        } else blk: {
+            const held = try native.tryFairWriterLockWithIo(alloc, h.handleLockIo(), self.path);
+            stats.recordAcquired(.uncontended, 0);
+            break :blk held;
+        };
+        lease.startHold(stats);
+        return lease;
     }
 
     fn hasPendingReplay(database: *h.db_mod.DB) !bool {
@@ -1172,7 +1379,7 @@ pub const Owner = struct {
             return error.EnrichmentWaitCanceled;
         };
         if (self.current) |current| if (needsOutcomeReconciliation(current)) return error.EnrichmentWaitCanceled;
-        var lease = (if (scope == .reclamation) native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.path) else self.acquireMaintenancePathLeaseAssumeLocked()) catch |err| switch (err) {
+        var lease = (if (scope == .reclamation) self.tryWriterLeaseAssumeLocked() else self.acquireMaintenancePathLeaseAssumeLocked()) catch |err| switch (err) {
             error.FileBusy, error.WouldBlock => return error.EnrichmentWaitCanceled,
             else => return err,
         };
@@ -1349,7 +1556,7 @@ pub const Owner = struct {
         if (self.current != foreground or foreground.maintenance_references != 0 or needsOutcomeReconciliation(foreground)) return;
         const store = foreground.owned_lite_backend.?.native_docstore.?;
         if (!std.meta.eql(store.file.header, entry_header)) return;
-        var lease = native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.path) catch |err| switch (err) {
+        var lease = self.tryWriterLeaseAssumeLocked() catch |err| switch (err) {
             error.FileBusy, error.WouldBlock => return,
             else => return err,
         };
@@ -1882,9 +2089,25 @@ pub const Owner = struct {
         defer self.releaseMaintenanceTurnAssumeLocked();
         const foreground = try self.refresh();
         const file = &foreground.owned_lite_backend.?.native_docstore.?.file;
-        if (needsOutcomeReconciliation(foreground)) return error.OutcomeUnknown;
+        if (needsOutcomeReconciliation(foreground)) return error.OutcomeReconciliationRequired;
         if (file.transaction_header != null or file.durable_header != null) return error.FileBusy;
         if (file.free_pages_verified) return;
+        if (self.allocator_proof_receipt) |receipt| {
+            self.allocator_proof_receipt = null;
+            // The same fence as the transfer below: under the writer lease,
+            // the on-disk header and inode must still be the live ones.
+            var probe = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
+            defer probe.close();
+            if (std.meta.eql(file.header, probe.header) and
+                (try file.file.stat(file.runtime())).inode == (try probe.file.stat(probe.runtime())).inode)
+            {
+                try file.inheritAllocatorProofReceipt(receipt);
+                if (file.free_pages_verified) {
+                    self.publication_stats.allocator_proof_receipt_reuses +|= 1;
+                    return;
+                }
+            }
+        }
         foreground.allocator_verification_references += 1;
         defer {
             foreground.allocator_verification_references -= 1;
@@ -1919,27 +2142,39 @@ pub const Owner = struct {
         self.publication_stats.allocator_proof_walks +|= 1;
         self.publication_stats.allocator_proof_ns +|= proof_ns;
         self.publication_stats.allocator_proof_max_ns = @max(self.publication_stats.allocator_proof_max_ns, proof_ns);
+        // The proof is this call's own work, not waiting: it does not use up
+        // the busy budget carried to later re-entries of the same call.
+        if (connection) |caller| {
+            if (caller.admission_active_sink) |sink| sink.* +|= proof_ns;
+            // Credit it now, before reacquiring the lease below, so the walk
+            // does not shorten this attempt's own wait either.
+            if (caller.admission_deadline_ns) |*deadline| deadline.* +|= proof_ns;
+        }
         if (verified) |_| {} else |_| {
             self.publication_stats.allocator_proof_failures +|= 1;
         }
         try verified;
+        // If reacquiring the lease below yields busy, the next attempt reuses
+        // this proof instead of repeating the walk.
+        self.allocator_proof_receipt = try reader.allocatorProofReceipt();
         // A foreground operation has not started its mutation yet. Preserve
         // its connection-local busy policy when another process wins the
         // writer lease during the detached proof. Background turns stay
         // nonblocking and yield to that writer instead of consuming its budget.
-        lease.* = if (connection) |caller| try caller.acquirePathLeaseAssumeLocked() else self.withReadRegistrationBatch(try native.lockWriterPathWithIo(alloc, io, self.path));
+        lease.* = if (connection) |caller| try caller.acquirePathLeaseAssumeLocked() else self.withReadRegistrationBatch(try self.tryWriterLeaseAssumeLocked());
         var probe = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
         defer probe.close();
         if (self.current) |current| {
             // A foreground publication may have failed while the walk ran.
             // Retrying the same immutable proof cannot reconcile that outcome.
-            if (needsOutcomeReconciliation(current)) return error.OutcomeUnknown;
+            if (needsOutcomeReconciliation(current)) return error.OutcomeReconciliationRequired;
             const live = &current.owned_lite_backend.?.native_docstore.?.file;
             if (live.transaction_header != null or live.durable_header != null) return error.FileBusy;
             if (std.meta.eql(live.header, probe.header) and
                 (try live.file.stat(live.runtime())).inode == (try probe.file.stat(probe.runtime())).inode)
                 try live.inheritAllocatorVerification(reader);
         }
+        self.allocator_proof_receipt = null;
     }
 
     fn deinitMaintenanceSchedules(self: *Owner) void {
@@ -1956,7 +2191,7 @@ pub const Owner = struct {
         const io = h.handleLockIo();
         self.gate.mutex.lockUncancelable(io);
         defer self.gate.mutex.unlock(io);
-        var lease: ?native.PathWriterLock = try native.lockWriterPathWithIo(alloc, io, self.path);
+        var lease: ?native.PathWriterLock = try self.tryWriterLeaseAssumeLocked();
         defer if (lease) |*held| held.close();
         for (0..2) |attempt| {
             var proof_bytes: u64 = 0;
@@ -2001,7 +2236,7 @@ pub const Owner = struct {
             self.allocator_proof_mutex.lockUncancelable(io);
             defer self.allocator_proof_mutex.unlock(io);
             try self.verifyAllocatorAssumeLocked(&lease, null);
-            if (lease == null) lease = try native.lockWriterPathWithIo(alloc, io, self.path);
+            if (lease == null) lease = try self.tryWriterLeaseAssumeLocked();
         }
     }
 
@@ -2064,6 +2299,11 @@ pub const Connection = struct {
     // Scoped to C API admission while mutex is held. Reacquisition after a
     // detached allocator proof consumes the same request budget.
     admission_deadline_ns: ?i96 = null,
+    /// Where the admitting call accumulates its own active work (allocator
+    /// proof), excluded from the waiting budget carried to re-entries. Set
+    /// only while that call holds `mutex`, like `admission_deadline_ns`, so
+    /// one call's work is never credited to another.
+    admission_active_sink: ?*u64 = null,
     current: ?*h.Handle = null,
     attached: bool = false,
     sql_sessions: @FieldType(h.Handle, "sql_sessions") = .empty,
@@ -2077,24 +2317,76 @@ pub const Connection = struct {
 
     pub fn acquire(self: *Connection) !native.PathWriterLock {
         const io = h.handleLockIo();
-        self.gate.mutex.lockUncancelable(io);
+        const gate_started = std.Io.Clock.awake.now(io).nanoseconds;
+        self.gate.mutex.lockForLease(io);
+        {
+            const waited: u64 = @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - gate_started));
+            const stats = &self.owner.publication_stats;
+            stats.gate_wait_ns +|= waited;
+            stats.gate_wait_max_ns = @max(stats.gate_wait_max_ns, waited);
+        }
         errdefer self.gate.mutex.unlock(io);
         return self.acquirePathLeaseAssumeLocked();
     }
 
+    fn admissionDeadline(self: *const Connection) i96 {
+        return self.admission_deadline_ns orelse (std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds + @as(i96, self.options.busy_timeout_ms) * std.time.ns_per_ms);
+    }
+
+    /// Polls rather than blocking so the wait honors the deadline. Proofs
+    /// run for seconds, so a millisecond poll costs nothing measurable.
+    fn lockAllocatorProofBefore(self: *Connection, deadline: i96) bool {
+        const io = h.handleLockIo();
+        var backoff_ns: i96 = 100 * std.time.ns_per_us;
+        while (!self.owner.allocator_proof_mutex.tryLock()) {
+            const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+            if (remaining <= 0) return false;
+            io.sleep(.fromNanoseconds(@min(backoff_ns, remaining)), .awake) catch return false;
+            backoff_ns = @min(backoff_ns * 2, 5 * std.time.ns_per_ms);
+        }
+        return true;
+    }
+
     fn acquirePathLeaseAssumeLocked(self: *Connection) !native.PathWriterLock {
         const io = h.handleLockIo();
-        const deadline = self.admission_deadline_ns orelse (std.Io.Clock.awake.now(io).nanoseconds + @as(i96, self.options.busy_timeout_ms) * std.time.ns_per_ms);
+        const deadline = self.admissionDeadline();
+        // Writers take FIFO turns across processes. An expired budget still
+        // permits an immediate acquisition when nobody is queued.
+        if (h.liteOpenModeCanWrite(self.options.open_mode)) {
+            const stats = &self.owner.publication_stats.foreground_lease;
+            if (self.gate.mutex.takeRetained()) |held| {
+                var lease = held;
+                stats.recordAcquired(.handoff, 0);
+                lease.startHold(stats);
+                return self.owner.withReadRegistrationBatch(lease);
+            }
+            const started = std.Io.Clock.awake.now(io).nanoseconds;
+            if (comptime h.builtin.is_test) if (self.test_path_lease_busy) |hook| {
+                // Tests observe the point where admission would start waiting:
+                // only after a failed attempt with budget left.
+                if (native.lockWriterPathWithIo(alloc, io, self.path)) |held| return self.owner.withReadRegistrationBatch(held) else |err| {
+                    if (err != error.WouldBlock and err != error.FileBusy) return err;
+                    if (deadline - std.Io.Clock.awake.now(io).nanoseconds <= 0) return error.FileBusy;
+                    hook.notify(hook.ptr);
+                }
+            };
+            var lease = native.fairWriterLockWithIo(alloc, io, self.owner.path_lock_io.io(), self.path, deadline) catch |err| {
+                if (err == error.FileBusy) stats.recordBusy(@intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
+                return err;
+            };
+            stats.recordAcquired(if (lease.queue_turn != null) .queued else .uncontended, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
+            lease.startHold(stats);
+            return self.owner.withReadRegistrationBatch(lease);
+        }
+        // Our own retained exclusive lease would block this shared lock.
+        self.gate.mutex.dropRetained();
         var backoff: i96 = std.time.ns_per_ms;
         while (true) {
             // A slow detached proof may outlast the retry budget. Always try
             // the lease once: a stable verified tip must still be admitted if
             // no contention wait is needed. An expired budget forbids waiting,
             // not an uncontended acquisition.
-            const lease = if (h.liteOpenModeCanWrite(self.options.open_mode))
-                native.lockWriterPathWithIo(alloc, io, self.path)
-            else
-                native.lockReaderPathWithIo(alloc, io, self.path);
+            const lease = native.lockReaderPathWithIo(alloc, io, self.path);
             if (lease) |held| return self.owner.withReadRegistrationBatch(held) else |err| {
                 if (err != error.WouldBlock and err != error.FileBusy) return err;
                 const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
@@ -2141,7 +2433,15 @@ pub const Connection = struct {
                 lease.* = null;
                 self.gate.mutex.unlock(io);
                 if (comptime h.builtin.is_test) if (self.owner.test_allocator_wait) |hook| hook.notify(hook.ptr);
-                self.owner.allocator_proof_mutex.lockUncancelable(io);
+                // Another thread's proof can take far longer than this call's
+                // busy timeout. Waiting for it counts against that budget.
+                if (self.admission_deadline_ns == null and self.options.busy_timeout_ms == 0) {
+                    // No busy timeout configured: keep waiting for the proof.
+                    self.owner.allocator_proof_mutex.lockUncancelable(io);
+                } else if (!self.lockAllocatorProofBefore(self.admissionDeadline())) {
+                    self.gate.mutex.lockUncancelable(io);
+                    return error.FileBusy;
+                }
                 self.gate.mutex.lockUncancelable(io);
             }
             defer self.owner.allocator_proof_mutex.unlock(io);
@@ -2372,8 +2672,9 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
     if (existing == null) {
         try gate.owners.ensureUnusedCapacity(alloc, 1);
         if (!create) {
+            if (!h.liteOpenModeCanWrite(options.open_mode)) gate.mutex.dropRetained();
             const attempt = if (h.liteOpenModeCanWrite(options.open_mode))
-                native.lockWriterPathWithIo(alloc, io, gate.path)
+                (if (gate.mutex.takeRetained()) |kept| kept else native.tryFairWriterLockWithIo(alloc, io, gate.path))
             else
                 native.lockReaderPathWithIo(alloc, io, gate.path);
             if (attempt) |held| {
@@ -2638,13 +2939,21 @@ test "capi native unbounded writer admits reusable pool before a large request" 
                 const file = &owner.current.?.owned_lite_backend.?.native_docstore.?.file;
                 try std.testing.expectEqual(@as(u64, 0), (try file.allocatorStats()).?.reusable_pages);
             }
-            if (scenario == .uncertain or scenario == .uncertain_during) {
+            if (scenario == .uncertain) {
+                // An uncertain runtime is never reused: refresh reopens and
+                // reconciles from durable state before admitting the request.
+                const poisoned = owner.current.?;
+                poisoned.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain = true;
+                const reconciled = try connection.refresh(&lease, .mutation);
+                try std.testing.expect(reconciled != poisoned);
+                try std.testing.expect(!reconciled.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain);
+                try std.testing.expect(!owner.allocator_verification_active);
+                continue;
+            }
+            if (scenario == .uncertain_during) {
                 owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
-                if (scenario == .uncertain) {
-                    owner.current.?.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain = true;
-                }
-                try std.testing.expectError(error.OutcomeUnknown, connection.refresh(&lease, .mutation));
-                try std.testing.expectEqual(@as(usize, if (scenario == .uncertain) 0 else 1), probe.captures);
+                try std.testing.expectError(error.OutcomeReconciliationRequired, connection.refresh(&lease, .mutation));
+                try std.testing.expectEqual(@as(usize, 1), probe.captures);
                 try std.testing.expect(!owner.allocator_verification_active);
                 try std.testing.expect(!owner.verification_cancel.requested.load(.acquire));
                 continue;
@@ -2882,6 +3191,18 @@ test "capi native allocator proof reacquisition honors per-connection busy admis
                 try std.testing.expectError(error.WouldBlock, result);
                 try std.testing.expectEqual(@as(usize, 0), probe.retries);
             },
+        }
+        if (scenario != .foreground) {
+            // The proof completed before the busy yield. The next attempt
+            // transfers it under the lease instead of walking again.
+            probe.release();
+            owner.test_after_allocator_capture = null;
+            if (lease == null) lease = try owner.tryWriterLeaseAssumeLocked();
+            const walks = owner.publication_stats.allocator_proof_walks;
+            try owner.verifyAllocatorAssumeLocked(&lease, if (scenario == .background) null else connection);
+            try std.testing.expectEqual(walks, owner.publication_stats.allocator_proof_walks);
+            try std.testing.expectEqual(@as(u64, 1), owner.publication_stats.allocator_proof_receipt_reuses);
+            try std.testing.expect(owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
         }
     }
 }

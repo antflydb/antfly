@@ -2,6 +2,7 @@ from enum import StrEnum
 
 
 class InferenceReadResultKind(StrEnum):
+    AUDIO = "audio"
     IMAGE = "image"
     PAGE = "page"
     SLIDE = "slide"

@@ -5362,26 +5362,20 @@ fn validateSparseEmbeddingForManagedConfig(
     };
     defer managed.deinit(alloc);
     try attachProviderQuota(&managed, options);
-    try validateSparseEmbeddingForEntry(alloc, &managed);
+    try validateSparseEmbeddingForEntry(alloc, &managed, options.probe_retry_budget_ns);
 }
 
 fn validateSparseEmbeddingForEntry(
     alloc: std.mem.Allocator,
     entry: *const ManagedEmbeddingEntry,
+    probe_retry_budget_ns: ?u64,
 ) !void {
-    var embedding = embedSparseWithEntry(alloc, entry, dimension_probe_text) catch |err| switch (err) {
-        error.EmptyEmbeddingResponse,
-        error.InvalidEmbeddingResponse,
-        error.EmbedRateLimited,
-        error.EmbedTransientFailure,
-        error.EmbedAdmissionRefused,
-        error.QueueFull,
-        error.EmbedRequestFailed,
-        => return error.InvalidCreateTableRequest,
-        error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
-        else => return err,
-    };
-    embedding.deinit(alloc);
+    _ = try probeEmbeddingRetryingTransient(void, validateSparseEmbeddingOnce, .{}, alloc, entry, .strict, probe_retry_budget_ns);
+}
+
+fn validateSparseEmbeddingOnce(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry) !void {
+    var embedding = try embedSparseWithEntry(alloc, entry, dimension_probe_text);
+    defer embedding.deinit(alloc);
 }
 
 fn resolveEmbeddingDimensionsForEntry(
@@ -5472,6 +5466,21 @@ fn probeEmbeddingDimensionsRetryingTransient(
     validation: DimensionProbeValidation,
     probe_retry_budget_ns: ?u64,
 ) !?u32 {
+    return probeEmbeddingRetryingTransient(u32, inferEmbeddingDimensionsFromEntry, .{declared orelse 0}, alloc, entry, validation, probe_retry_budget_ns);
+}
+
+/// Dense and sparse validation share deadline, cancellation, error identity,
+/// quota and retry semantics. The result stays typed; sparse probes own and
+/// release their output and return void instead of inventing dimensions.
+fn probeEmbeddingRetryingTransient(
+    comptime Result: type,
+    comptime invoke: anytype,
+    args: anytype,
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    validation: DimensionProbeValidation,
+    probe_retry_budget_ns: ?u64,
+) !?Result {
     // An already-expired caller deadline or cancellation can't be fixed by
     // retrying at all; surface it before spending a single attempt on it.
     try ensureEntryDeadline(entry);
@@ -5506,7 +5515,7 @@ fn probeEmbeddingDimensionsRetryingTransient(
 
     var attempt: u32 = 1;
     while (true) {
-        if (inferEmbeddingDimensionsFromEntry(alloc, &probing, declared orelse 0)) |dims| return dims else |err| {
+        if (@call(.auto, invoke, .{ alloc, &probing } ++ args)) |result| return result else |err| {
             const transient = switch (err) {
                 error.InvalidEmbeddingDimensions,
                 error.EmptyEmbeddingResponse,
@@ -12036,8 +12045,60 @@ test "managed embedder forwards dense quantization settings" {
     }
 }
 
-test "managed embedder review retains admission refusal classification" {
+test "managed embedder retains normalized admission refusal classification" {
     const normalized = normalizeLocalEmbeddingError(error.ResourceTemporarilyUnavailable);
-    std.debug.print("review embedding admission becomes {s}, exempt={}\n", .{ @errorName(normalized), repair_failure.isAdmissionRefusal(normalized) });
     try std.testing.expect(repair_failure.isAdmissionRefusal(normalized));
+}
+
+test "managed embedder sparse validation shares bounded admission retry and caller authority" {
+    const Local = struct {
+        failure: ?anyerror = error.ResourceTemporarilyUnavailable,
+        failures_left: usize = 1,
+        calls: usize = 0,
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn sparse(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.failure) |failure| if (self.failures_left > 0) {
+                self.failures_left -= 1;
+                return failure;
+            };
+            const batch = try alloc.alloc(db_embedder.SparseEmbedding, 1);
+            errdefer alloc.free(batch);
+            const indices = try alloc.dupe(u32, &.{1});
+            errdefer alloc.free(indices);
+            batch[0] = .{ .indices = indices, .values = try alloc.dupe(f32, &.{0.5}) };
+            return batch;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var local = Local{};
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(alloc,
+        \\{"sparse_idx":{"type":"embeddings","field":"body","sparse":true,"embedder":{"provider":"antfly","model":"local-model"}}}
+    , .{ .ptr = &local, .owns_invocation_admission = true, .embed_dense_texts = Local.dense, .embed_sparse_texts = Local.sparse });
+    defer managed.deinit();
+    const entry = managed.findEntry("sparse_idx").?;
+    try validateSparseEmbeddingForEntry(alloc, entry, 2 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, 2), local.calls);
+    local = .{};
+    try std.testing.expectError(error.EmbeddingProbeUnavailable, validateSparseEmbeddingForEntry(alloc, entry, 0));
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
+    for ([_]anyerror{ error.ResourceLimitExceeded, error.MemoryBudgetExceeded }) |failure| {
+        local = .{ .failure = failure };
+        try std.testing.expectError(failure, validateSparseEmbeddingForEntry(alloc, entry, 2 * std.time.ns_per_s));
+        try std.testing.expectEqual(@as(usize, 1), local.calls);
+    }
+    local = .{};
+    var overlay = entry.requestOverlay(alloc);
+    defer overlay.auth_header_cache.deinit(alloc);
+    overlay.deadline_ns = monotonicNowNs() -| 1;
+    try std.testing.expectError(error.Timeout, validateSparseEmbeddingForEntry(alloc, &overlay, 2 * std.time.ns_per_s));
+    try std.testing.expectEqual(@as(usize, 0), local.calls);
+    var cancelled = std.atomic.Value(bool).init(true);
+    overlay.deadline_ns = null;
+    overlay.cancellation = CancellationToken.fromAtomic(&cancelled);
+    try std.testing.expectError(error.Cancelled, validateSparseEmbeddingForEntry(alloc, &overlay, 2 * std.time.ns_per_s));
+    try std.testing.expectEqual(@as(usize, 0), local.calls);
 }

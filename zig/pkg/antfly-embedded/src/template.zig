@@ -519,6 +519,10 @@ fn transcribeAudioHelper(ctx: HelperContext) anyerror!Value {
     };
     defer transcribing.deinitResponse(ctx.arena, &response);
 
+    transcribing.requireComplete(response) catch |err| {
+        return .{ .safe_string = try formatErrorDirective(ctx.arena, 0, @errorName(err)) };
+    };
+
     return .{ .string = try ctx.arena.dupe(u8, response.text orelse "") };
 }
 

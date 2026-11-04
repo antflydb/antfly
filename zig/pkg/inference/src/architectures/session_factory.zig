@@ -97,6 +97,7 @@ const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.Ca
     gliner25_boundary,
     gliner25_modern_bert,
     florence2,
+    whisper,
     gemma4,
     gemma4_training,
     qwen3_embedding,
@@ -2333,6 +2334,11 @@ fn cudaProfileForArch(
         .gliner_modern_bert => |cfg| if (cfg.num_attention_heads > 0 and cfg.max_position_embeddings <= 8192 and
             (cfg.hidden_size / cfg.num_attention_heads == 64 or cfg.hidden_size / cfg.num_attention_heads == 128)) .gliner25_modern_bert else null,
         .florence => .florence2,
+        .whisper => |cfg| if (cfg.encoder_attention_heads > 0 and cfg.decoder_attention_heads > 0 and
+            cfg.d_model % cfg.encoder_attention_heads == 0 and cfg.d_model % cfg.decoder_attention_heads == 0 and
+            cfg.encoderHeadDim() == 64 and cfg.decoderHeadDim() == 64 and cfg.max_source_positions == 1500 and
+            cfg.max_target_positions > 0 and cfg.max_target_positions <= 2048 and
+            (cfg.num_mel_bins == 80 or cfg.num_mel_bins == 128)) .whisper else null,
         .gpt => |cfg| switch (cfg.family) {
             .gemma => .gemma4,
             .qwen3 => if (task == .generic and model_manifest.isLastTokenDecoderEmbedder()) .qwen3_embedding else null,
@@ -2382,6 +2388,9 @@ test "cuda support gate admits only supported model roles" {
     try std.testing.expect(cudaSupportsArch(.{ .deberta = .{} }, &generic_manifest));
     try std.testing.expect(cudaSupportsArch(.{ .gliner = .{} }, &generic_manifest));
     try std.testing.expect(cudaSupportsArch(.{ .florence = .{} }, &generic_manifest));
+    try std.testing.expect(cudaSupportsArch(.{ .whisper = .{} }, &generic_manifest));
+    try std.testing.expect(!cudaSupportsArch(.{ .whisper = .{ .encoder_attention_heads = 0 } }, &generic_manifest));
+    try std.testing.expect(!cudaSupportsArch(.{ .whisper = .{ .d_model = 192 } }, &generic_manifest));
     const span_modern_manifest = manifest_mod.ModelManifest{
         .allocator = std.testing.allocator,
         .model_type = .extractor,
@@ -8696,12 +8705,14 @@ pub fn getMetalExactJitDispatchStats(session: Session) ?MetalExactJitDispatchSta
 pub fn recommendedKvDTypeForGptConfig(config: gpt_mod.Config, backend_kind: runtime.kv.pool.BackendKind) runtime.kv.pool.KvDType {
     return switch (backend_kind) {
         .native => .f32,
-        .cuda => if (shouldDefaultGemmaCudaKvDTypeToPolar4(config)) .polar4 else if (config.family == .gemma) .f32 else .f16,
+        // Gemma 4's compressed KV default loses speech detail and bypasses
+        // the F16 attention kernels used by the qualified decode profile.
+        .cuda => if (config.family == .gemma and !isGemma4KvArchitecture(config)) .f32 else .f16,
         .metal => if (config.family == .gemma) metalGemmaKvDTypeOverride() orelse .f16 else .f16,
     };
 }
 
-fn shouldDefaultGemmaCudaKvDTypeToPolar4(config: gpt_mod.Config) bool {
+fn isGemma4KvArchitecture(config: gpt_mod.Config) bool {
     if (config.family != .gemma) return false;
     return config.num_kv_shared_layers > 0 or
         config.global_head_dim > 0 or
@@ -8731,8 +8742,23 @@ test "recommendedKvDTypeForGptConfig keeps backend defaults without a session" {
     const llama = gpt_mod.Config{ .family = .llama };
     try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, recommendedKvDTypeForGptConfig(gemma, .native));
     try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, recommendedKvDTypeForGptConfig(gemma, .cuda));
-    try std.testing.expectEqual(runtime.kv.pool.KvDType.polar4, recommendedKvDTypeForGptConfig(gemma4, .cuda));
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, recommendedKvDTypeForGptConfig(gemma4, .cuda));
     try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, recommendedKvDTypeForGptConfig(llama, .metal));
+}
+
+test "Gemma 4 CUDA KV defaults preserve full precision across architecture variants" {
+    const configs = [_]gpt_mod.Config{
+        .{ .family = .gemma, .num_kv_shared_layers = 20 },
+        .{ .family = .gemma, .global_head_dim = 512 },
+        .{ .family = .gemma, .ple_hidden_size = 256 },
+        .{ .family = .gemma, .gemma4_mtp_assistant = true },
+        .{ .family = .gemma, .attention_k_eq_v = true },
+        .{ .family = .gemma, .rope_dim_override = 128 },
+    };
+    for (configs) |config| {
+        try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, recommendedKvDTypeForGptConfig(config, .cuda));
+        try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, recommendedKvDTypeForGptConfig(config, .native));
+    }
 }
 
 pub fn getClipConfig(session: Session) ?clip_mod.Config {

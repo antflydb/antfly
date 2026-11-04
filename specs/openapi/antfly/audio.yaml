@@ -384,6 +384,11 @@ components:
         - properties:
             provider:
               $ref: '#/components/schemas/STTProvider'
+            max_total_tokens:
+              type: integer
+              x-go-type-skip-optional-pointer: false
+              minimum: 1
+              description: Provider-declared hard per-call token bound. Required for hosted document reading when measurements are unavailable; the full allowance is charged against the document budget, never as measured usage.
           required:
             - provider
       example:
@@ -467,8 +472,11 @@ components:
 
     STTResponse:
       type: object
-      description: "Response from speech transcription."
+      description: "Response from speech recognition used by internal providers and streaming workflows."
       properties:
+        status:
+          type: string
+          enum: [complete, unresolved, truncated]
         text:
           type: string
           description: "Full transcribed text."

@@ -151,8 +151,6 @@ export type {
   RewriteResponse,
   Style,
   TextContentPart,
-  TranscribeRequest,
-  TranscribeResponse,
   TransientCapacityError,
 } from "./inference-types.js";
 export { logLevels, logStyles } from "./inference-types.js";
@@ -565,3 +563,5 @@ export type {
   RenameCatalogResourceRequest,
   TablespaceCatalogRecord,
 } from "./types.js";
+
+export type { AudioReadOptions, AudioReadMetadata, AudioReadSegment } from "./inference-types.js";

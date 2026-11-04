@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const hasMinimumContent = types.hasMinimumTextContent;
 const HfTokenizer = @import("inference_hf_tokenizer").HfTokenizer;
 
 const tokenizer_json = @import("inference_fixed_tokenizer_data").tokenizer_json;
@@ -26,17 +27,98 @@ const PositionedSection = struct {
     tokens: usize = 0,
 };
 
+/// One immutable fixed WordPiece vocabulary per owner. Initialization is
+/// synchronized; encoding uses caller-owned scratch and can run concurrently.
+/// Call deinit only after the owner's requests have joined.
+pub const Runtime = struct {
+    mutex: std.Io.Mutex = .init,
+    tokenizer: ?*HfTokenizer = null,
+
+    pub fn deinit(self: *Runtime) void {
+        if (self.tokenizer) |tokenizer| tokenizer.deinitSelf();
+        self.* = .{};
+    }
+
+    fn getTokenizer(self: *Runtime, allocator: Allocator, io: std.Io) !*HfTokenizer {
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        if (self.tokenizer) |tokenizer| return tokenizer;
+        const tokenizer = try HfTokenizer.loadFromBytes(allocator, tokenizer_json);
+        errdefer tokenizer.deinitSelf();
+        // Sharing relies on this fixed asset's immutable WordPiece encoder.
+        // Reject a future asset change to an encoder with mutable workspaces.
+        if (tokenizer.model_type != .word_piece) return error.InvalidTokenizerJson;
+        self.tokenizer = tokenizer;
+        return tokenizer;
+    }
+
+    pub fn chunkText(
+        self: *Runtime,
+        cache_allocator: Allocator,
+        allocator: Allocator,
+        io: std.Io,
+        text: []const u8,
+        cfg: types.FixedTextConfig,
+    ) ![]types.Chunk {
+        try cfg.validate();
+        if (sourceBelowMinimum(text, cfg.min_chars)) return try allocator.alloc(types.Chunk, 0);
+        const tokenizer = try self.getTokenizer(cache_allocator, io);
+        return chunkTextWithTokenizer(allocator, text, cfg, tokenizer);
+    }
+
+    pub const Result = struct {
+        chunks: []types.Chunk,
+        /// Null preserves the caller's usage fallback if accounting fails.
+        prompt_tokens: ?usize,
+    };
+
+    /// Exact usage includes filtered input. Reuse the same vocabulary for both
+    /// chunk construction and accounting, including wholly rejected sources.
+    pub fn chunkTextWithUsage(
+        self: *Runtime,
+        cache_allocator: Allocator,
+        allocator: Allocator,
+        io: std.Io,
+        text: []const u8,
+        cfg: types.FixedTextConfig,
+    ) !Result {
+        try cfg.validate();
+        if (text.len == 0) return .{ .chunks = try allocator.alloc(types.Chunk, 0), .prompt_tokens = 0 };
+        const tokenizer = self.getTokenizer(cache_allocator, io) catch |err| {
+            if (sourceBelowMinimum(text, cfg.min_chars)) return .{
+                .chunks = try allocator.alloc(types.Chunk, 0),
+                .prompt_tokens = null,
+            };
+            return err;
+        };
+        const chunks = if (sourceBelowMinimum(text, cfg.min_chars))
+            try allocator.alloc(types.Chunk, 0)
+        else
+            try chunkTextWithTokenizer(allocator, text, cfg, tokenizer);
+        return .{ .chunks = chunks, .prompt_tokens = countTokens(allocator, tokenizer, text) catch null };
+    }
+};
+
+fn sourceBelowMinimum(text: []const u8, minimum: usize) bool {
+    // Invalid UTF-8 cannot prove valid slices are too short. Preserve the
+    // tokenizer and per-candidate validation path for those inputs.
+    return text.len == 0 or text.len < minimum or
+        (!hasMinimumContent(text, minimum) and std.unicode.utf8ValidateSlice(text));
+}
+
 pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig) ![]types.Chunk {
     try cfg.validate();
-    if (text.len == 0) return try alloc.alloc(types.Chunk, 0);
-
-    const target_tokens = if (cfg.target_tokens > 0) cfg.target_tokens else 500;
-    const overlap_tokens = cfg.overlap_tokens;
-    const max_chunks = cfg.max_chunks; // 0 = unlimited (chunk the whole unit)
-    const separator = if (cfg.separator.len > 0) cfg.separator else "\n\n";
-
+    if (sourceBelowMinimum(text, cfg.min_chars)) return try alloc.alloc(types.Chunk, 0);
     var tokenizer = try HfTokenizer.loadFromBytes(alloc, tokenizer_json);
     defer tokenizer.deinitSelf();
+    return chunkTextWithTokenizer(alloc, text, cfg, tokenizer);
+}
+
+fn chunkTextWithTokenizer(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig, tokenizer: *HfTokenizer) ![]types.Chunk {
+    const target_tokens = if (cfg.target_tokens > 0) cfg.target_tokens else 500;
+    const overlap_tokens = cfg.overlap_tokens;
+    const max_chunks = cfg.max_chunks;
+    const separator = if (cfg.separator.len > 0) cfg.separator else "\n\n";
 
     const initial_sections = try splitSections(alloc, text, separator);
     defer alloc.free(initial_sections);
@@ -63,12 +145,15 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
         else
             section_tokens;
         if (current.items.len > 0 and candidate_tokens > target_tokens) {
-            try chunks.append(alloc, buildChunk(text, current.items, chunk_id));
+            const chunk = buildChunk(text, current.items, chunk_id);
+            if (hasMinimumContent(chunk.text.?, cfg.min_chars)) {
+                try chunks.append(alloc, chunk);
+                chunk_id += 1;
+            }
             previous_start = current.items[0].start;
-            chunk_id += 1;
             if (max_chunks != 0 and chunks.items.len >= max_chunks) return try chunks.toOwnedSlice(alloc);
 
-            previous_text = chunks.items[chunks.items.len - 1].text.?;
+            previous_text = chunk.text.?;
             current.clearRetainingCapacity();
 
             if (overlap_tokens > 0 and previous_text.len > 0) {
@@ -96,7 +181,8 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
     }
 
     if (current.items.len > 0 and (max_chunks == 0 or chunks.items.len < max_chunks)) {
-        try chunks.append(alloc, buildChunk(text, current.items, chunk_id));
+        const chunk = buildChunk(text, current.items, chunk_id);
+        if (hasMinimumContent(chunk.text.?, cfg.min_chars)) try chunks.append(alloc, chunk);
     }
 
     return try chunks.toOwnedSlice(alloc);
@@ -595,4 +681,110 @@ test "fixed text chunker counts unspaced CJK paragraphs per character" {
     for (chunks) |chunk| {
         try std.testing.expect(try countTokens(alloc, tokenizer, chunk.text.?) <= 256);
     }
+}
+
+test "fixed text minimum content omits page scraps without truncating later passages" {
+    const alloc = std.testing.allocator;
+    const source = "C-8\n\nreal searchable passage\n\n)\n\nsecond readable passage\n\nC-9";
+    const chunks = try chunkText(alloc, source, .{
+        .target_tokens = 5,
+        .overlap_tokens = 0,
+        .min_chars = 16,
+        .max_chunks = 2,
+    });
+    defer types.freeChunks(alloc, chunks);
+    try std.testing.expectEqual(@as(usize, 2), chunks.len);
+    try std.testing.expect(std.mem.indexOf(u8, chunks[0].text.?, "real searchable passage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chunks[1].text.?, "second readable passage") != null);
+    for (chunks, 0..) |chunk, i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i)), chunk.id);
+        try std.testing.expectEqualStrings(chunk.text.?, source[chunk.start_char.?..chunk.end_char.?]);
+    }
+    // Filtering every candidate must publish an empty replacement inventory.
+    const empty = try chunkText(alloc, "C-8\n\n)\n\n\n", .{ .min_chars = 16 });
+    defer types.freeChunks(alloc, empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "fixed text minimum content counts Unicode scalars and ignores whitespace" {
+    try std.testing.expect(!hasMinimumContent(" C-8\n\t\u{a0}\u{3000}", 4));
+    try std.testing.expect(hasMinimumContent("東京 café", 6));
+    try std.testing.expect(!hasMinimumContent("東京 café", 7));
+    try std.testing.expect(!hasMinimumContent("\u{2003}\u{202f}\u{85}", 1));
+    try std.testing.expect(hasMinimumContent("x", 0));
+    const alloc = std.testing.allocator;
+    const legacy = try chunkText(alloc, "C-8", .{});
+    defer types.freeChunks(alloc, legacy);
+    try std.testing.expectEqual(@as(usize, 1), legacy.len);
+}
+
+test "fixed text minimum content rejects scraps before allocating a tokenizer" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const alloc = failing.allocator();
+    const chunks = try chunkText(alloc, "C-8 \u{3000}\u{3000}\u{3000}\u{3000}\u{3000}", .{ .min_chars = 16 });
+    defer types.freeChunks(alloc, chunks);
+    try std.testing.expectEqual(@as(usize, 0), chunks.len);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
+}
+
+test "fixed text runtime reuses vocabulary and preserves exact usage for rejected scraps" {
+    const a = std.testing.allocator;
+    var runtime = Runtime{};
+    defer runtime.deinit();
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    const cfg = types.FixedTextConfig{ .target_tokens = 128, .min_chars = 16 };
+    const rejected = try runtime.chunkText(failing.allocator(), a, std.testing.io, "C-8", cfg);
+    defer types.freeChunks(a, rejected);
+    try std.testing.expectEqual(@as(usize, 0), rejected.len);
+    try std.testing.expect(runtime.tokenizer == null);
+    const fallback = try runtime.chunkTextWithUsage(failing.allocator(), a, std.testing.io, "C-8", cfg);
+    defer types.freeChunks(a, fallback.chunks);
+    try std.testing.expectEqual(@as(usize, 0), fallback.chunks.len);
+    try std.testing.expect(fallback.prompt_tokens == null);
+    try std.testing.expect(runtime.tokenizer == null);
+    try std.testing.expectError(error.OutOfMemory, runtime.chunkTextWithUsage(failing.allocator(), a, std.testing.io, "replace all six gyroscopes", cfg));
+    const expected = try countTextTokens(a, "C-8");
+    const warm = try runtime.chunkTextWithUsage(a, a, std.testing.io, "C-8", cfg);
+    defer types.freeChunks(a, warm.chunks);
+    try std.testing.expectEqual(expected, warm.prompt_tokens.?);
+    try std.testing.expectEqual(@as(usize, 0), warm.chunks.len);
+    for ([_][]const u8{ "C-8", "replace all six gyroscopes", "東京 café" }) |text| {
+        const result = try runtime.chunkTextWithUsage(failing.allocator(), a, std.testing.io, text, cfg);
+        defer types.freeChunks(a, result.chunks);
+        try std.testing.expectEqual(try countTextTokens(a, text), result.prompt_tokens.?);
+        const direct = try runtime.chunkText(failing.allocator(), a, std.testing.io, text, cfg);
+        defer types.freeChunks(a, direct);
+        try std.testing.expectEqual(result.chunks.len, direct.len);
+    }
+    try std.testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
+}
+
+test "fixed text runtime shares lazy vocabulary across concurrent encoders" {
+    const Job = struct {
+        runtime: *Runtime,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.encode() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn encode(self: *@This()) !void {
+            const a = std.testing.allocator;
+            for (0..3) |_| {
+                const result = try self.runtime.chunkTextWithUsage(a, a, std.testing.io, "replace all six gyroscopes", .{ .target_tokens = 128, .min_chars = 16 });
+                defer types.freeChunks(a, result.chunks);
+                try std.testing.expectEqual(@as(usize, 1), result.chunks.len);
+                try std.testing.expect(result.prompt_tokens.? > 0);
+                try std.testing.expectEqualStrings("replace all six gyroscopes", result.chunks[0].text.?);
+            }
+        }
+    };
+    var runtime = Runtime{};
+    defer runtime.deinit();
+    var jobs = [_]Job{ .{ .runtime = &runtime }, .{ .runtime = &runtime }, .{ .runtime = &runtime }, .{ .runtime = &runtime } };
+    var group: std.Io.Group = .init;
+    defer group.cancel(std.testing.io);
+    for (&jobs) |*job| group.async(std.testing.io, Job.run, .{job});
+    try group.await(std.testing.io);
+    for (jobs) |job| if (job.failure) |err| return err;
 }

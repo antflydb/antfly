@@ -31,6 +31,7 @@ const std = @import("std");
 /// Forced prompt tokens are excluded; generated timestamps and EOS are included.
 pub const OutputTokenBudget = struct {
     remaining: ?usize = null,
+    consumed: usize = 0,
 
     pub fn check(self: @This()) !void {
         if (self.remaining == 0) return error.InferenceOutputTokensExceeded;
@@ -38,6 +39,7 @@ pub const OutputTokenBudget = struct {
 
     pub fn consume(self: *@This()) !void {
         try self.check();
+        self.consumed = std.math.add(usize, self.consumed, 1) catch return error.InferenceOutputTokensExceeded;
         if (self.remaining) |*remaining| remaining.* -= 1;
     }
 
@@ -60,6 +62,11 @@ test "transcription output budget persists across windows and retries" {
     try std.testing.expectError(error.InferenceOutputTokensExceeded, budget.check());
     try std.testing.expectError(error.InferenceOutputTokensExceeded, budget.consume());
     try std.testing.expectError(error.InferenceOutputTokensExceeded, budget.decodeEnd(104, 448));
+    try std.testing.expectEqual(@as(usize, 4), budget.consumed);
+    var unbounded = OutputTokenBudget{};
+    // Accounting survives retries even when deployment capacity is unbounded.
+    for (0..12) |_| try unbounded.consume();
+    try std.testing.expectEqual(@as(usize, 12), unbounded.consumed);
 }
 
 test "transcription lookahead respects the last token and model context" {

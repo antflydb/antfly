@@ -1,0 +1,222 @@
+CUDA artifact source policy passes: /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.cu (15 compiler-managed dev-only runtime-wired candidates included)
+quant kernel generated sources check: 69 files + Metal/CUDA runtime regions
+inference-test
++- run test failure
+1/39 architectures.deberta.test.DeBERTa native bucketed relative projections preserve values and clean up allocation failures...
+fail_index: 4/105
+allocated bytes: 5104
+freed bytes: 0
+allocations: 4
+deallocations: 0
+allocation that was made to fail: 
+/Users/ajroetker/bin/zig-0.17.0/lib/std/hash_map.zig:1480:53: 0x10371cddf in allocate (test)
+            const slice = try allocator.alignedAlloc(u8, max_align, total_size);
+                                                    ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/hash_map.zig:1437:29: 0x10371c68b in grow (test)
+            try map.allocate(allocator, new_cap);
+                            ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/hash_map.zig:1298:30: 0x10371c4cf in growIfNeeded (test)
+                try self.grow(allocator, capacityForSize(self.load() + new_count), ctx);
+                             ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/hash_map.zig:752:38: 0x10371c32f in ensureTotalCapacityContext (test)
+                try self.growIfNeeded(allocator, new_size - self.size, ctx);
+                                     ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/hash_map.zig:761:46: 0x10371c1bf in ensureUnusedCapacityContext (test)
+            return ensureTotalCapacityContext(self, allocator, self.count() + additional_size, ctx);
+                                             ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/hash_map.zig:758:47: 0x10371be0b in ensureUnusedCapacity (test)
+            return ensureUnusedCapacityContext(self, allocator, additional_size, undefined);
+                                              ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/native_compute.zig:5526:49: 0x10371b813 in getWeight (test)
+    try self.weight_handles.ensureUnusedCapacity(self.allocator, 1);
+                                                ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/ops.zig:3438:37: 0x102346e4f in getWeight (test)
+        return self.vtable.getWeight(self.ptr, name);
+                                    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:842:40: 0x102347b23 in buildRelativePositionEmbInfoWithLayout (test)
+    const rel_weight = try cb.getWeight("encoder.rel_embeddings.weight");
+                                       ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:827:50: 0x102348ddb in buildRelativePositionEmbInfo (test)
+    return buildRelativePositionEmbInfoWithLayout(cb, allocator, config, seq_len, compact_relative);
+                                                 ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:728:53: 0x102354e6b in forwardFromHiddenRange (test)
+    const rel_emb = try buildRelativePositionEmbInfo(cb, allocator, config, seq_len);
+                                                    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:1467:54: 0x10235541b in run (test)
+            const states = try forwardFromHiddenRange(&cb, allocator, cfg, &hidden, &mask, 1, 300, 0, 1);
+                                                     ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/testing.zig:1163:69: 0x1023557df in checkAllAllocationFailures__func_1007 (test)
+        if (@call(.auto, test_fn, .{failing_allocator_inst.allocator()} ++ extra_args)) |_| {
+                                                                    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/lib/platform/src/allocator.zig:109:47: 0x102355a4f in checkAllAllocationFailures__func_1006 (test)
+    try std.testing.checkAllAllocationFailures(stable.allocator(), test_fn, extra_args);
+                                              ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:1471:54: 0x10235dc23 in test.DeBERTa native bucketed relative projections preserve values and clean up allocation failures (test)
+    try platform.allocator.checkAllAllocationFailures(a, HiddenRangeCheck.run, .{ &store, config });
+                                                     ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/test_runner_filter.zig:131:25: 0x102329e47 in main (test)
+        if (test_fn.func()) |_| {
+                        ^
+(additional stack frames may have been skipped...)
+FAIL (MemoryLeakDetected)
+/Users/ajroetker/bin/zig-0.17.0/lib/std/mem/Allocator.zig:325:82: 0x102243e03 in allocBytesAligned__func_173 (test)
+    const byte_ptr = self.rawAlloc(byte_count, alignment, return_address) orelse return error.OutOfMemory;
+                                                                                 ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/mem/Allocator.zig:311:5: 0x10224b19f in allocWithSizeAndAlignment__func_216 (test)
+    return self.allocBytesAligned(alignment, byte_count, return_address);
+    ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/mem/Allocator.zig:299:55: 0x10224af97 in allocAdvancedWithRetAddr (test)
+    const ptr: [*]align(a.toByteUnits()) T = @ptrCast(try self.allocWithSizeAndAlignment(@sizeOf(T), a, n, return_address));
+                                                      ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/mem/Allocator.zig:287:5: 0x10224b00b in alignedAlloc__func_213 (test)
+    return self.allocAdvancedWithRetAddr(T, alignment, n, @returnAddress());
+    ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/hash_map.zig:1480:27: 0x10371ce7b in allocate (test)
+            const slice = try allocator.alignedAlloc(u8, max_align, total_size);
+                          ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/hash_map.zig:1437:13: 0x10371c72b in grow (test)
+            try map.allocate(allocator, new_cap);
+            ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/hash_map.zig:1298:17: 0x10371c52b in growIfNeeded (test)
+                try self.grow(allocator, capacityForSize(self.load() + new_count), ctx);
+                ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/hash_map.zig:752:17: 0x10371c37f in ensureTotalCapacityContext (test)
+                try self.growIfNeeded(allocator, new_size - self.size, ctx);
+                ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/hash_map.zig:761:13: 0x10371c20b in ensureUnusedCapacityContext (test)
+            return ensureTotalCapacityContext(self, allocator, self.count() + additional_size, ctx);
+            ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/hash_map.zig:758:13: 0x10371be37 in ensureUnusedCapacity (test)
+            return ensureUnusedCapacityContext(self, allocator, additional_size, undefined);
+            ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/native_compute.zig:5526:5: 0x10371b957 in getWeight (test)
+    try self.weight_handles.ensureUnusedCapacity(self.allocator, 1);
+    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/ops.zig:3438:9: 0x102346ee3 in getWeight (test)
+        return self.vtable.getWeight(self.ptr, name);
+        ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:842:24: 0x102347bc7 in buildRelativePositionEmbInfoWithLayout (test)
+    const rel_weight = try cb.getWeight("encoder.rel_embeddings.weight");
+                       ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:827:5: 0x102348e97 in buildRelativePositionEmbInfo (test)
+    return buildRelativePositionEmbInfoWithLayout(cb, allocator, config, seq_len, compact_relative);
+    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:728:21: 0x102354fb3 in forwardFromHiddenRange (test)
+    const rel_emb = try buildRelativePositionEmbInfo(cb, allocator, config, seq_len);
+                    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:1467:28: 0x1023554eb in run (test)
+            const states = try forwardFromHiddenRange(&cb, allocator, cfg, &hidden, &mask, 1, 300, 0, 1);
+                           ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/testing.zig:1186:21: 0x102355963 in checkAllAllocationFailures__func_1007 (test)
+                    return error.MemoryLeakDetected;
+                    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/lib/platform/src/allocator.zig:109:5: 0x102355ad7 in checkAllAllocationFailures__func_1006 (test)
+    try std.testing.checkAllAllocationFailures(stable.allocator(), test_fn, extra_args);
+    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:1471:5: 0x10235dcff in test.DeBERTa native bucketed relative projections preserve values and clean up allocation failures (test)
+    try platform.allocator.checkAllAllocationFailures(a, HiddenRangeCheck.run, .{ &store, config });
+    ^
+[SafeAllocator] (err): leaked [addr: 103a11590, len: 8 (0x8) align: 8] allocated at: 
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/native_compute.zig:4492:61: 0x10237bceb in makeBufWithEntry (test)
+            shared_data_refcount = try self.allocator.create(usize);
+                                                            ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/native_compute.zig:4470:37: 0x10237bea7 in makeBuf (test)
+        return self.makeBufWithEntry(data, owned, "", null, null, null);
+                                    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/native_compute.zig:42140:33: 0x1024a03df in fromFloat32ShapeOp (test)
+    const buf = try self.makeBuf(owned, true);
+                                ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/ops.zig:5199:44: 0x10234733f in fromFloat32Shape (test)
+        return self.vtable.fromFloat32Shape(self.ptr, data, shape);
+                                           ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:727:41: 0x102354e27 in forwardFromHiddenRange (test)
+    var hidden = try cb.fromFloat32Shape(hidden_in, &shape);
+                                        ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:1467:54: 0x10235541b in run (test)
+            const states = try forwardFromHiddenRange(&cb, allocator, cfg, &hidden, &mask, 1, 300, 0, 1);
+                                                     ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/testing.zig:1163:69: 0x1023557df in checkAllAllocationFailures__func_1007 (test)
+        if (@call(.auto, test_fn, .{failing_allocator_inst.allocator()} ++ extra_args)) |_| {
+                                                                    ^
+(additional stack frames may have been skipped...)
+
+[SafeAllocator] (err): leaked [addr: 103a113f0, len: 280 (0x118) align: 8] allocated at: 
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/native_compute.zig:4487:44: 0x10237bb6f in makeBufWithEntry (test)
+        const b = try self.allocator.create(Buf);
+                                           ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/native_compute.zig:4470:37: 0x10237bea7 in makeBuf (test)
+        return self.makeBufWithEntry(data, owned, "", null, null, null);
+                                    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/native_compute.zig:42140:33: 0x1024a03df in fromFloat32ShapeOp (test)
+    const buf = try self.makeBuf(owned, true);
+                                ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/ops.zig:5199:44: 0x10234733f in fromFloat32Shape (test)
+        return self.vtable.fromFloat32Shape(self.ptr, data, shape);
+                                           ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:727:41: 0x102354e27 in forwardFromHiddenRange (test)
+    var hidden = try cb.fromFloat32Shape(hidden_in, &shape);
+                                        ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:1467:54: 0x10235541b in run (test)
+            const states = try forwardFromHiddenRange(&cb, allocator, cfg, &hidden, &mask, 1, 300, 0, 1);
+                                                     ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/testing.zig:1163:69: 0x1023557df in checkAllAllocationFailures__func_1007 (test)
+        if (@call(.auto, test_fn, .{failing_allocator_inst.allocator()} ++ extra_args)) |_| {
+                                                                    ^
+(additional stack frames may have been skipped...)
+
+[SafeAllocator] (err): leaked [addr: 103a11358, len: 16 (0x10) align: 8] allocated at: 
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/native_compute.zig:42136:51: 0x1024a02bb in fromFloat32ShapeOp (test)
+    const logical_shape = try self.allocator.alloc(i64, shape.len);
+                                                  ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/ops.zig:5199:44: 0x10234733f in fromFloat32Shape (test)
+        return self.vtable.fromFloat32Shape(self.ptr, data, shape);
+                                           ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:727:41: 0x102354e27 in forwardFromHiddenRange (test)
+    var hidden = try cb.fromFloat32Shape(hidden_in, &shape);
+                                        ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:1467:54: 0x10235541b in run (test)
+            const states = try forwardFromHiddenRange(&cb, allocator, cfg, &hidden, &mask, 1, 300, 0, 1);
+                                                     ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/testing.zig:1163:69: 0x1023557df in checkAllAllocationFailures__func_1007 (test)
+        if (@call(.auto, test_fn, .{failing_allocator_inst.allocator()} ++ extra_args)) |_| {
+                                                                    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/lib/platform/src/allocator.zig:109:47: 0x102355a4f in checkAllAllocationFailures__func_1006 (test)
+    try std.testing.checkAllAllocationFailures(stable.allocator(), test_fn, extra_args);
+                                              ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:1471:54: 0x10235dc23 in test.DeBERTa native bucketed relative projections preserve values and clean up allocation failures (test)
+    try platform.allocator.checkAllAllocationFailures(a, HiddenRangeCheck.run, .{ &store, config });
+                                                     ^
+(additional stack frames may have been skipped...)
+
+[SafeAllocator] (err): leaked [addr: 103a10010, len: 4800 (0x12c0) align: 4] allocated at: 
+/Users/ajroetker/bin/zig-0.17.0/lib/std/mem/Allocator.zig:481:40: 0x1037223db in dupe__func_990 (test)
+    const new_buf = try allocator.alloc(T, m.len);
+                                       ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/native_compute.zig:42134:42: 0x1024a0257 in fromFloat32ShapeOp (test)
+    const owned = try self.allocator.dupe(f32, data);
+                                         ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/ops.zig:5199:44: 0x10234733f in fromFloat32Shape (test)
+        return self.vtable.fromFloat32Shape(self.ptr, data, shape);
+                                           ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:727:41: 0x102354e27 in forwardFromHiddenRange (test)
+    var hidden = try cb.fromFloat32Shape(hidden_in, &shape);
+                                        ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:1467:54: 0x10235541b in run (test)
+            const states = try forwardFromHiddenRange(&cb, allocator, cfg, &hidden, &mask, 1, 300, 0, 1);
+                                                     ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/testing.zig:1163:69: 0x1023557df in checkAllAllocationFailures__func_1007 (test)
+        if (@call(.auto, test_fn, .{failing_allocator_inst.allocator()} ++ extra_args)) |_| {
+                                                                    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/lib/platform/src/allocator.zig:109:47: 0x102355a4f in checkAllAllocationFailures__func_1006 (test)
+    try std.testing.checkAllAllocationFailures(stable.allocator(), test_fn, extra_args);
+                                              ^
+(additional stack frames may have been skipped...)
+
+1 selected; 0 passed; 0 skipped; 2 failed; 1 leaked.
+error: process exited with code 1 (expected exited with code 0)
+failed command: cd pkg/inference/. && /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/.zig-cache/o/fabd1b4de78211ff6e9b8ca732bf01a8/test --test-filter "DeBERTa native bucketed relative projections"
+
+Build Summary: 29/31 steps succeeded (1 failed); 23/23 tests passed
+inference-test transitive failure
++- run test failure
+
