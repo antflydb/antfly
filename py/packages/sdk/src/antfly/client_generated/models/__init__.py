@@ -351,6 +351,8 @@ from .document_artifact_table_reprocess_response_reprocess_status import (
 )
 from .document_extraction_config import DocumentExtractionConfig
 from .document_extraction_config_route_preset import DocumentExtractionConfigRoutePreset
+from .document_extraction_native_text_config import DocumentExtractionNativeTextConfig
+from .document_extraction_native_text_config_policy import DocumentExtractionNativeTextConfigPolicy
 from .document_extraction_ocr_config import DocumentExtractionOcrConfig
 from .document_extraction_ocr_config_mode import DocumentExtractionOcrConfigMode
 from .document_extraction_ocr_quality_config import DocumentExtractionOcrQualityConfig
@@ -2886,6 +2888,8 @@ __all__ = (
     "DocumentArtifactTableReprocessResponseReprocessStatus",
     "DocumentExtractionConfig",
     "DocumentExtractionConfigRoutePreset",
+    "DocumentExtractionNativeTextConfig",
+    "DocumentExtractionNativeTextConfigPolicy",
     "DocumentExtractionOcrConfig",
     "DocumentExtractionOcrConfigMode",
     "DocumentExtractionOcrQualityConfig",

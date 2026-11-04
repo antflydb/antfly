@@ -237,6 +237,8 @@ components:
           x-go-type-skip-optional-pointer: false
           default: true
           description: Strip HTML markup from HTML sources before storing their text.
+        native_text:
+          $ref: '#/components/schemas/DocumentExtractionNativeTextConfig'
         ocr:
           $ref: '#/components/schemas/DocumentExtractionOcrConfig'
         transcription:
@@ -252,6 +254,18 @@ components:
           description: Routes evaluated in order before the preset. The first route whose match applies selects the extractor.
           items:
             $ref: '#/components/schemas/DocumentExtractionRoute'
+    DocumentExtractionNativeTextConfig:
+      type: object
+      description: Native PDF text policy and quality assessment. No OCR model is required. Native quality diagnostics are recorded independently of extraction completion and OCR availability.
+      properties:
+        policy:
+          type: string
+          enum: [source, page, visible]
+          default: page
+          description: |-
+            `source` retains decoded source text, including off-page runs, for auditing. `page` excludes runs wholly outside the page or a known clipping box while retaining hidden OCR/accessibility text. `visible` additionally excludes nonpainting and fully transparent text. These policies do not claim pixel-perfect occlusion analysis. All policies honor semantic ActualText replacements.
+        quality:
+          $ref: '#/components/schemas/DocumentExtractionOcrQualityConfig'
     DocumentExtractionSourceConfig:
       type: object
       description: Names of row fields that carry source metadata. Each overrides the matching static field.
@@ -330,7 +344,7 @@ components:
           type: string
           enum: [auto, always]
           default: auto
-          description: "`auto` reads PDF pages whose native text fails the `quality` checks, and images. `always` reads every page."
+          description: "`auto` reads PDF pages whose native text fails `native_text.quality`, and images. `always` reads every page."
         prompt:
           type: string
           description: Overrides the OCR prompt. Omit it to let the reader run its own OCR task. Apple readers reject prompts.
@@ -439,14 +453,14 @@ components:
           description: Maximum width or height of a rendered page.
     DocumentExtractionOcrQualityConfig:
       type: object
-      description: Thresholds that decide when a PDF page's native text is too poor to keep, in `auto` mode.
+      description: Text-quality thresholds. `native_text.quality` assesses native PDF text and selects fallback independently of whether OCR is configured; `ocr.quality` assesses OCR output. Quality flags are not guarantees of correct reading order or complete document semantics.
       properties:
         min_content_chars:
           type: integer
           x-go-type-skip-optional-pointer: false
           minimum: 0
           default: 50
-          description: Pages with fewer meaningful characters are read with OCR.
+          description: Minimum trimmed UTF-8 byte length before text counts as too short.
         garbled_min_words:
           type: integer
           x-go-type-skip-optional-pointer: false
@@ -470,7 +484,7 @@ components:
           type: integer
           minimum: 1
           default: 15
-          description: Minimum characters for a line to count in the corrupted-line check.
+          description: Minimum trimmed UTF-8 byte length for a line to count in the corrupted-line check.
         max_corrupted_line_ratio:
           type: number
           x-go-type-skip-optional-pointer: false
@@ -486,7 +500,7 @@ components:
           minimum: 0
           maximum: 1
           default: 0.5
-          description: Font corruption score at which text is replaced by OCR.
+          description: Font corruption score above which a substantial line counts as corrupted.
         max_replacement_char_ratio:
           type: number
           x-go-type-skip-optional-pointer: false

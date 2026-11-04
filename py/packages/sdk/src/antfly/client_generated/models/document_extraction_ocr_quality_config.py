@@ -13,20 +13,22 @@ T = TypeVar("T", bound="DocumentExtractionOcrQualityConfig")
 
 @_attrs_define
 class DocumentExtractionOcrQualityConfig:
-    """Thresholds that decide when a PDF page's native text is too poor to keep, in `auto` mode.
+    """Text-quality thresholds. `native_text.quality` assesses native PDF text and selects fallback independently of
+    whether OCR is configured; `ocr.quality` assesses OCR output. Quality flags are not guarantees of correct reading
+    order or complete document semantics.
 
-    Attributes:
-        min_content_chars (int | Unset): Pages with fewer meaningful characters are read with OCR. Default: 50.
-        garbled_min_words (int | Unset): Minimum words before the garbled-text check applies. Default: 20.
-        garbled_sample_words (int | Unset): Words sampled by the garbled-text check. Default: 50.
-        max_single_char_word_ratio (float | Unset): Maximum ratio of single-character words before text counts as
-            garbled. Default: 0.4.
-        substantial_line_min_chars (int | Unset): Minimum characters for a line to count in the corrupted-line check.
-            Default: 15.
-        max_corrupted_line_ratio (float | Unset): Maximum ratio of corrupted lines. Default: 0.2.
-        font_corruption_score_threshold (float | Unset): Font corruption score at which text is replaced by OCR.
-            Default: 0.5.
-        max_replacement_char_ratio (float | Unset): Maximum ratio of Unicode replacement characters. Default: 0.05.
+        Attributes:
+            min_content_chars (int | Unset): Minimum trimmed UTF-8 byte length before text counts as too short. Default: 50.
+            garbled_min_words (int | Unset): Minimum words before the garbled-text check applies. Default: 20.
+            garbled_sample_words (int | Unset): Words sampled by the garbled-text check. Default: 50.
+            max_single_char_word_ratio (float | Unset): Maximum ratio of single-character words before text counts as
+                garbled. Default: 0.4.
+            substantial_line_min_chars (int | Unset): Minimum trimmed UTF-8 byte length for a line to count in the
+                corrupted-line check. Default: 15.
+            max_corrupted_line_ratio (float | Unset): Maximum ratio of corrupted lines. Default: 0.2.
+            font_corruption_score_threshold (float | Unset): Font corruption score above which a substantial line counts as
+                corrupted. Default: 0.5.
+            max_replacement_char_ratio (float | Unset): Maximum ratio of Unicode replacement characters. Default: 0.05.
     """
 
     min_content_chars: int | Unset = 50

@@ -38,6 +38,7 @@ pub const DerivedCoverageStatus = types.DerivedCoverageStatus;
 pub const DerivedCoverageStatusPolicy = types.DerivedCoverageStatusPolicy;
 pub const DistanceMetric = types.DistanceMetric;
 pub const DocumentExtractionConfig = types.DocumentExtractionConfig;
+pub const DocumentExtractionNativeTextConfig = types.DocumentExtractionNativeTextConfig;
 pub const DocumentExtractionOcrConfig = types.DocumentExtractionOcrConfig;
 pub const DocumentExtractionOcrQualityConfig = types.DocumentExtractionOcrQualityConfig;
 pub const DocumentExtractionReaderConfig = types.DocumentExtractionReaderConfig;

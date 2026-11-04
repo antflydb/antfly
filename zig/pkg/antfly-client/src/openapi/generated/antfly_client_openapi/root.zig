@@ -235,6 +235,7 @@ pub const DocumentArtifactReprocessShardCursor = types.DocumentArtifactReprocess
 pub const DocumentArtifactTableReprocessRequest = types.DocumentArtifactTableReprocessRequest;
 pub const DocumentArtifactTableReprocessResponse = types.DocumentArtifactTableReprocessResponse;
 pub const DocumentExtractionConfig = types.DocumentExtractionConfig;
+pub const DocumentExtractionNativeTextConfig = types.DocumentExtractionNativeTextConfig;
 pub const DocumentExtractionOcrConfig = types.DocumentExtractionOcrConfig;
 pub const DocumentExtractionOcrQualityConfig = types.DocumentExtractionOcrQualityConfig;
 pub const DocumentExtractionReaderConfig = types.DocumentExtractionReaderConfig;

@@ -79,6 +79,7 @@ fn matches(comptime T: type, expected: T, actual: std.json.Value) bool {
             .number_string => |value| expected == (std.fmt.parseFloat(T, value) catch return false),
             else => false,
         },
+        .@"enum" => actual == .string and std.mem.eql(u8, @tagName(expected), actual.string),
         .pointer => |pointer| blk: {
             if (pointer.size != .slice) @compileError("unit field must be a slice");
             if (pointer.child == u8) break :blk actual == .string and std.mem.eql(u8, expected, actual.string);
@@ -188,6 +189,13 @@ fn validateCoordinates(unit: extraction.Unit) !void {
     for (unit.text_regions) |region| {
         if (region.span[1] < region.span[0] or region.span[1] > unit.text.len) return error.InvalidDocumentExtractionManifest;
         try finiteBox(region.bbox);
+        if (region.font_size) |font_size| if (!std.math.isFinite(font_size) or font_size <= 0) return error.InvalidDocumentExtractionManifest;
+    }
+    for (unit.text_blocks, 0..) |block, index| {
+        const reading_order = std.math.cast(u32, index) orelse return error.InvalidDocumentExtractionManifest;
+        if (block.span[1] < block.span[0] or block.span[1] > unit.text.len or block.reading_order != reading_order) return error.InvalidDocumentExtractionManifest;
+        try finiteBox(block.bbox);
+        if (block.font_size) |font_size| if (!std.math.isFinite(font_size) or font_size <= 0) return error.InvalidDocumentExtractionManifest;
     }
     if (unit.ocr_bbox) |box| try finiteBox(box);
     if (unit.page_bbox) |box| try finiteBox(box);
@@ -217,6 +225,8 @@ pub fn encodeAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const
         .source_sha256 = unit.source_sha256,
         .byte_length = unit.byte_length,
         .confidence = confidence,
+        .native_text_quality = unit.native_text_quality,
+        .native_text_diagnostics = unit.native_text_diagnostics,
         .ocr_attempted = unit.ocr_attempted,
         .ocr_render_dpi = unit.ocr_render_dpi,
         .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
@@ -232,6 +242,7 @@ pub fn encodeAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const
         .ocr_bbox = unit.ocr_bbox,
         .transcript_confidence = unit.transcript_confidence,
         .extraction_warning = unit.extraction_warning,
+        .text_blocks = unit.text_blocks,
         .provenance = .{
             .source_url = source_url,
             .source_path = unit.source_path,
@@ -240,6 +251,8 @@ pub fn encodeAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const
             .source_sha256 = unit.source_sha256,
             .byte_length = unit.byte_length,
             .confidence = confidence,
+            .native_text_quality = unit.native_text_quality,
+            .native_text_diagnostics = unit.native_text_diagnostics,
             .ocr_used = unit.ocr_used,
             .ocr_attempted = unit.ocr_attempted,
             .ocr_render_dpi = unit.ocr_render_dpi,
@@ -263,6 +276,7 @@ pub fn encodeAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const
             .page_bbox = unit.page_bbox,
             .page_rotation = unit.page_rotation,
             .text_regions = unit.text_regions,
+            .text_blocks = unit.text_blocks,
             .char_start = unit.char_start,
             .char_end = unit.char_end,
             .source_content_type = content_type,
@@ -276,6 +290,8 @@ pub fn encodeAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const
                 .source_sha256 = unit.source_sha256,
                 .byte_length = unit.byte_length,
                 .confidence = confidence,
+                .native_text_quality = unit.native_text_quality,
+                .native_text_diagnostics = unit.native_text_diagnostics,
                 .ocr_used = unit.ocr_used,
                 .ocr_attempted = unit.ocr_attempted,
                 .ocr_render_dpi = unit.ocr_render_dpi,
@@ -298,6 +314,7 @@ pub fn encodeAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const
                 .page_bbox = unit.page_bbox,
                 .page_rotation = unit.page_rotation,
                 .text_regions = unit.text_regions,
+                .text_blocks = unit.text_blocks,
             },
         },
     }, .{});
@@ -306,7 +323,8 @@ pub fn encodeAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const
 test "ordered artifact inventory typed unit payload owns fields and authenticates identity metadata and fingerprint" {
     const alloc = std.testing.allocator;
     var spans = [_]extraction.TranscriptSpan{.{ .char_start = 0, .char_end = 5, .start_ms = 10, .end_ms = 20, .speaker_index = 2 }};
-    var regions = [_]extraction.TextRegion{.{ .span = .{ 0, 5 }, .bbox = .{ 1, 2, 3, 4 } }};
+    var regions = [_]extraction.TextRegion{.{ .span = .{ 0, 5 }, .bbox = .{ 1, 2, 3, 4 }, .font_size = 11, .bold = true, .italic = false }};
+    var blocks = [_]extraction.TextBlock{.{ .span = .{ 0, 5 }, .bbox = .{ 1, 2, 3, 4 }, .reading_order = 0, .font_size = 11, .bold = true, .italic = false }};
     const unit: extraction.Unit = .{
         .unit_id = @constCast("unit\x00x"),
         .unit_type = @constCast("page"),
@@ -314,6 +332,16 @@ test "ordered artifact inventory typed unit payload owns fields and authenticate
         .method = @constCast("text"),
         .source_path = @constCast("page/1"),
         .byte_length = 512,
+        .native_text_quality = .{ .too_short = true, .trimmed_len = 5, .non_whitespace_chars = 5 },
+        .native_text_diagnostics = .{
+            .policy = .page,
+            .semantic_coverage = .partial,
+            .actual_text_replacements = 1,
+            .unaligned_runs = 1,
+            .source_run_count = 2,
+            .emitted_run_count = 1,
+            .has_nontext_visual = true,
+        },
         .page_number = 7,
         .page_rotation = 90,
         .ocr_attempted = true,
@@ -326,6 +354,7 @@ test "ordered artifact inventory typed unit payload owns fields and authenticate
         .transcript_spans = &spans,
         .page_bbox = .{ 0, 0, 4, 8 },
         .text_regions = &regions,
+        .text_blocks = &blocks,
         .char_start = 30,
         .char_end = 35,
     };

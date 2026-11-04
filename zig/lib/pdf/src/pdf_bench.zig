@@ -85,7 +85,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (std.mem.eql(u8, subcommand, "dump-text")) {
+    if (std.mem.eql(u8, subcommand, "dump-text") or std.mem.eql(u8, subcommand, "dump-analysis")) {
         const path = args.next() orelse {
             printUsage(argv0);
             return BenchError.InvalidArguments;
@@ -94,7 +94,12 @@ pub fn main(init: std.process.Init) !void {
             printUsage(argv0);
             return BenchError.InvalidArguments;
         };
-        try dumpText(alloc, path, output_path);
+        const policy = if (args.next()) |name|
+            std.meta.stringToEnum(pdf.reader.TextExtractionPolicy, name) orelse return BenchError.InvalidArguments
+        else
+            .page;
+        if (args.next() != null) return BenchError.InvalidArguments;
+        try dumpExtraction(alloc, path, output_path, policy, std.mem.eql(u8, subcommand, "dump-analysis"));
         return;
     }
 
@@ -110,9 +115,10 @@ fn printUsage(argv0: []const u8) void {
         \\  {s} render-first-page <pdf-path> [iterations]
         \\  {s} render-pages <pdf-path> [dpi]
         \\  {s} render-window <pdf-path> [model-image-dimension (0=requested DPI)] [scratch-bytes (0=estimate)]
-        \\  {s} dump-text <pdf-path> <output-path>
+        \\  {s} dump-text <pdf-path> <output-path> [source|page|visible]
+        \\  {s} dump-analysis <pdf-path> <output-json-path> [source|page|visible]
         \\
-    , .{ argv0, argv0, argv0, argv0, argv0, argv0 });
+    , .{ argv0, argv0, argv0, argv0, argv0, argv0, argv0 });
 }
 
 /// Exercise one prepared, directly retained raster using the same estimated
@@ -234,27 +240,71 @@ fn renderAllPages(alloc: std.mem.Allocator, path: []const u8, dpi: u16) !void {
 /// here the first per-page error propagates so a corrupt page surfaces as a
 /// nonzero exit and no output file instead of silently missing text. Uses the
 /// production page-text/region API, with no OCR or raster rendering.
-fn dumpText(alloc: std.mem.Allocator, path: []const u8, output_path: []const u8) !void {
+fn dumpExtraction(alloc: std.mem.Allocator, path: []const u8, output_path: []const u8, policy: pdf.reader.TextExtractionPolicy, structured: bool) !void {
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_pdf_input_bytes));
     defer alloc.free(bytes);
-
     var parsed = try pdf.reader.Reader.init(alloc, bytes);
     defer parsed.deinit();
-
+    parsed.text_extraction_policy = policy;
     const page_count = try parsed.pageCount();
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(alloc);
-
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    if (structured) {
+        try out.writer.writeAll("{\"policy\":");
+        try std.json.Stringify.value(policy, .{}, &out.writer);
+        try out.writer.writeAll(",\"pages\":[");
+    }
     for (1..page_count + 1) |page_num| {
         var analysis = try parsed.extractPageTextAnalysisAlloc(page_num);
         defer analysis.deinit(alloc);
-        try out.appendSlice(alloc, analysis.text);
+        if (structured) {
+            if (page_num > 1) try out.writer.writeByte(',');
+            try dumpPageAnalysis(alloc, &out.writer, page_num, &analysis);
+        } else try out.writer.writeAll(analysis.text);
     }
+    if (structured) try out.writer.writeAll("]}\n");
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{ .sub_path = output_path, .data = out.written() });
+}
 
-    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{ .sub_path = output_path, .data = out.items });
+fn dumpPageAnalysis(alloc: std.mem.Allocator, writer: *std.Io.Writer, page_num: usize, analysis: *const pdf.reader.PageTextAnalysis) !void {
+    const blocks = try pdf.text_structure.blocksFromRunsAlloc(alloc, analysis.text, analysis.runs);
+    defer alloc.free(blocks);
+    try writer.writeAll("{\"page\":");
+    try std.json.Stringify.value(page_num, .{}, writer);
+    try writer.writeAll(",\"text\":");
+    try std.json.Stringify.value(analysis.text, .{}, writer);
+    try writer.writeAll(",\"diagnostics\":");
+    try std.json.Stringify.value(analysis.diagnostics, .{}, writer);
+    try writer.writeAll(",\"outline_fallback\":");
+    try std.json.Stringify.value(analysis.outline_fallback, .{}, writer);
+    try writer.writeAll(",\"has_nontext_visual\":");
+    try std.json.Stringify.value(analysis.has_nontext_visual, .{}, writer);
+    try writer.writeAll(",\"has_unrendered_annotations\":");
+    try std.json.Stringify.value(analysis.has_unrendered_annotations, .{}, writer);
+    try writer.writeAll(",\"blocks\":");
+    try std.json.Stringify.value(blocks, .{}, writer);
+    try writer.writeAll(",\"runs\":[");
+    for (analysis.runs, 0..) |run, index| {
+        if (index > 0) try writer.writeByte(',');
+        const box = run.bounds();
+        try std.json.Stringify.value(.{
+            .text = run.text,
+            .span = run.output_span,
+            .raw_text = run.raw_text,
+            .render_mode = run.render_mode,
+            .fill_alpha = run.alpha,
+            .stroke_alpha = run.stroke_alpha,
+            .bbox = if (box) |b| @as(?[4]f64, .{ b.min_x, b.min_y, b.max_x, b.max_y }) else null,
+            .font_size = @abs(run.font_size) * @sqrt(run.c * run.c + run.d * run.d),
+            .source_font_size = run.font_size,
+            .bold = run.bold,
+            .italic = run.italic,
+            .paint_order = run.paint_order,
+        }, .{}, writer);
+    }
+    try writer.writeAll("]}");
 }
 
 fn timeExtractText(

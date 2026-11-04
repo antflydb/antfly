@@ -23,6 +23,7 @@ pub const text_encoding = @import("text_encoding.zig");
 pub const reader = @import("reader.zig");
 pub const syntax = @import("syntax.zig");
 pub const render = @import("render.zig");
+pub const text_structure = @import("text_structure.zig");
 /// Native layout producers use the same immutable faces and metrics as the
 /// rasterizer, avoiding platform font dependencies and layout/render drift.
 pub const native_fonts = struct {
@@ -4878,6 +4879,7 @@ test {
     _ = reader;
     _ = syntax;
     _ = render;
+    _ = text_structure;
 }
 
 /// Test allocator that records page-sized allocations while serializing an

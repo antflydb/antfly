@@ -29,13 +29,14 @@ class DocumentExtractionOcrConfig:
                 `model`; Apple uses Vision text recognition and accepts no model, credentials, or prompt.
             generator (GeneratorConfig | Unset): A unified configuration for a generative AI provider.
                  Example: {'provider': 'openai', 'model': 'gpt-4.1', 'temperature': 0.7, 'max_tokens': 2048}.
-            mode (DocumentExtractionOcrConfigMode | Unset): `auto` reads PDF pages whose native text fails the `quality`
-                checks, and images. `always` reads every page. Default: DocumentExtractionOcrConfigMode.AUTO.
+            mode (DocumentExtractionOcrConfigMode | Unset): `auto` reads PDF pages whose native text fails
+                `native_text.quality`, and images. `always` reads every page. Default: DocumentExtractionOcrConfigMode.AUTO.
             prompt (str | Unset): Overrides the OCR prompt. Omit it to let the reader run its own OCR task. Apple readers
                 reject prompts.
             render (DocumentExtractionRenderConfig | Unset): How PDF pages are rasterized for OCR.
-            quality (DocumentExtractionOcrQualityConfig | Unset): Thresholds that decide when a PDF page's native text is
-                too poor to keep, in `auto` mode.
+            quality (DocumentExtractionOcrQualityConfig | Unset): Text-quality thresholds. `native_text.quality` assesses
+                native PDF text and selects fallback independently of whether OCR is configured; `ocr.quality` assesses OCR
+                output. Quality flags are not guarantees of correct reading order or complete document semantics.
     """
 
     reader: DocumentExtractionReaderConfig | Unset = UNSET

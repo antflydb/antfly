@@ -49232,6 +49232,10 @@ fn applyGeneratedUnitText(
             unit.ocr_used = true;
             unit.ocr_confidence = parsed.confidence;
             unit.ocr_bbox = parsed.bbox;
+            if (unit.text_regions.len > 0) alloc.free(unit.text_regions);
+            unit.text_regions = &.{};
+            if (unit.text_blocks.len > 0) alloc.free(unit.text_blocks);
+            unit.text_blocks = &.{};
         },
         .transcript => {
             unit.transcript_used = true;
@@ -49295,6 +49299,10 @@ fn markGeneratedUnitTextFailureNamed(
             unit.ocr_used = false;
             unit.ocr_confidence = null;
             unit.ocr_bbox = null;
+            if (unit.text_regions.len > 0) alloc.free(unit.text_regions);
+            unit.text_regions = &.{};
+            if (unit.text_blocks.len > 0) alloc.free(unit.text_blocks);
+            unit.text_blocks = &.{};
         },
         .transcript => {
             unit.transcript_used = false;
@@ -49429,6 +49437,9 @@ fn documentGeneratedTextPartsJsonAlloc(
         .page_bbox = unit.page_bbox,
         .page_rotation = unit.page_rotation,
         .text_regions = unit.text_regions,
+        .text_blocks = unit.text_blocks,
+        .native_text_quality = unit.native_text_quality,
+        .native_text_diagnostics = unit.native_text_diagnostics,
         .byte_length = unit.byte_length,
         .source_sha256 = unit.source_sha256,
         .ocr_confidence = unit.ocr_confidence,

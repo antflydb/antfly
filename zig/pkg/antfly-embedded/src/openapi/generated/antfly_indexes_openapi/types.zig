@@ -2953,6 +2953,7 @@ pub const DocumentExtractionConfig = struct {
     credentials: ?[]const u8 = null,
     /// Strip HTML markup from HTML sources before storing their text.
     html_strip_tags: ?bool = null,
+    native_text: ?DocumentExtractionNativeTextConfig = null,
     ocr: ?DocumentExtractionOcrConfig = null,
     transcription: ?DocumentExtractionTranscriptionConfig = null,
     /// How sources that match no explicit route are handled. `mixed_files` (alias `default`) detects PDFs, HTML, email, Office documents, ZIP archives, images, audio, and text. `explicit_only` (alias `none`) records unmatched sources as unsupported. Detection never requests a producer: detected images and audio without a configured producer report `ocr_not_configured` or `transcription_not_configured`.
@@ -2971,6 +2972,7 @@ pub const DocumentExtractionConfig = struct {
         .{ "last_modified", "last_modified", true },
         .{ "credentials", "credentials", true },
         .{ "html_strip_tags", "html_strip_tags", true },
+        .{ "native_text", "native_text", true },
         .{ "ocr", "ocr", true },
         .{ "transcription", "transcription", true },
         .{ "route_preset", "route_preset", true },
@@ -3023,6 +3025,10 @@ pub const DocumentExtractionConfig = struct {
             try jw.objectField("html_strip_tags");
             try jw.write(value);
         }
+        if (self.native_text) |value| {
+            try jw.objectField("native_text");
+            try jw.write(value);
+        }
         if (self.ocr) |value| {
             try jw.objectField("ocr");
             try jw.write(value);
@@ -3043,11 +3049,45 @@ pub const DocumentExtractionConfig = struct {
     }
 };
 
+/// Native PDF text policy and quality assessment. No OCR model is required. Native quality diagnostics are recorded independently of extraction completion and OCR availability.
+pub const DocumentExtractionNativeTextConfig = struct {
+    /// `source` retains decoded source text, including off-page runs, for auditing. `page` excludes runs wholly outside the page or a known clipping box while retaining hidden OCR/accessibility text. `visible` additionally excludes nonpainting and fully transparent text. These policies do not claim pixel-perfect occlusion analysis. All policies honor semantic ActualText replacements.
+    policy: ?[]const u8 = null,
+    quality: ?DocumentExtractionOcrQualityConfig = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "policy", "policy", true },
+        .{ "quality", "quality", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.policy) |value| {
+            try jw.objectField("policy");
+            try jw.write(value);
+        }
+        if (self.quality) |value| {
+            try jw.objectField("quality");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Reads scanned pages and images. Name exactly one of `reader` or `generator`. Readers run their own OCR task; generators receive a transcription instruction.
 pub const DocumentExtractionOcrConfig = struct {
     reader: ?DocumentExtractionReaderConfig = null,
     generator: ?antfly_generating_openapi.GeneratorConfig = null,
-    /// `auto` reads PDF pages whose native text fails the `quality` checks, and images. `always` reads every page.
+    /// `auto` reads PDF pages whose native text fails `native_text.quality`, and images. `always` reads every page.
     mode: ?[]const u8 = null,
     /// Overrides the OCR prompt. Omit it to let the reader run its own OCR task. Apple readers reject prompts.
     prompt: ?[]const u8 = null,
@@ -3105,9 +3145,9 @@ pub const DocumentExtractionOcrConfig = struct {
     }
 };
 
-/// Thresholds that decide when a PDF page's native text is too poor to keep, in `auto` mode.
+/// Text-quality thresholds. `native_text.quality` assesses native PDF text and selects fallback independently of whether OCR is configured; `ocr.quality` assesses OCR output. Quality flags are not guarantees of correct reading order or complete document semantics.
 pub const DocumentExtractionOcrQualityConfig = struct {
-    /// Pages with fewer meaningful characters are read with OCR.
+    /// Minimum trimmed UTF-8 byte length before text counts as too short.
     min_content_chars: ?i64 = null,
     /// Minimum words before the garbled-text check applies.
     garbled_min_words: ?i64 = null,
@@ -3115,11 +3155,11 @@ pub const DocumentExtractionOcrQualityConfig = struct {
     garbled_sample_words: ?i64 = null,
     /// Maximum ratio of single-character words before text counts as garbled.
     max_single_char_word_ratio: ?f64 = null,
-    /// Minimum characters for a line to count in the corrupted-line check.
+    /// Minimum trimmed UTF-8 byte length for a line to count in the corrupted-line check.
     substantial_line_min_chars: ?i64 = null,
     /// Maximum ratio of corrupted lines.
     max_corrupted_line_ratio: ?f64 = null,
-    /// Font corruption score at which text is replaced by OCR.
+    /// Font corruption score above which a substantial line counts as corrupted.
     font_corruption_score_threshold: ?f64 = null,
     /// Maximum ratio of Unicode replacement characters.
     max_replacement_char_ratio: ?f64 = null,

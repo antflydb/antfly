@@ -25,7 +25,63 @@ const reader_config = @import("antfly_reader_config");
 // E2E binary still use the full implementation.
 const pdf = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     struct {
+        pub const text_structure = struct {
+            pub const Block = struct {
+                span: [2]u32,
+                bbox: [4]f64,
+                reading_order: u32,
+                font_size: ?f64 = null,
+                bold: ?bool = null,
+                italic: ?bool = null,
+            };
+
+            pub fn blocksFromRunsAlloc(alloc: Allocator, text: []const u8, runs: []const reader.TextRun) ![]Block {
+                var blocks = std.ArrayListUnmanaged(Block).empty;
+                defer blocks.deinit(alloc);
+                for (runs) |run| {
+                    const span = run.output_span orelse continue;
+                    if (span.start >= span.end or span.end > text.len) continue;
+                    const start = std.math.cast(u32, span.start) orelse return error.Overflow;
+                    const end = std.math.cast(u32, span.end) orelse return error.Overflow;
+                    const bounds = render.textRunBounds(run);
+                    const font_size = @abs(run.font_size) * std.math.sqrt(run.c * run.c + run.d * run.d);
+                    try blocks.append(alloc, .{
+                        .span = .{ start, end },
+                        .bbox = .{ bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y },
+                        .reading_order = std.math.cast(u32, blocks.items.len) orelse return error.Overflow,
+                        .font_size = if (std.math.isFinite(font_size) and font_size > 0) font_size else null,
+                        .bold = run.bold,
+                        .italic = run.italic,
+                    });
+                }
+                return blocks.toOwnedSlice(alloc);
+            }
+        };
+
+        pub const render = struct {
+            pub fn textRunBounds(run: reader.TextRun) struct { min_x: f64, max_x: f64, min_y: f64, max_y: f64 } {
+                return .{
+                    .min_x = run.x,
+                    .max_x = run.x + run.advance_width,
+                    .min_y = run.y - run.descent,
+                    .max_y = run.y + run.ascent,
+                };
+            }
+        };
+
         pub const reader = struct {
+            pub const TextExtractionPolicy = enum { source, page, visible };
+
+            pub const NativeTextDiagnostics = struct {
+                actual_text_replacements: usize = 0,
+                outside_page_runs: usize = 0,
+                invisible_runs: usize = 0,
+                unaligned_runs: usize = 0,
+                unsupported_ordering_runs: usize = 0,
+                source_run_count: usize = 0,
+                emitted_run_count: usize = 0,
+            };
+
             pub const DecodeLimits = struct {
                 max_decoded_stream_bytes: usize = 64 * 1024 * 1024,
                 max_working_set_bytes: usize = 128 * 1024 * 1024,
@@ -42,7 +98,7 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or bu
 
             pub const RenderForkTemplate = struct {
                 pub fn instantiate(_: *const RenderForkTemplate, _: Allocator, _: CancellationProbe) anyerror!Reader {
-                    return error.PdfExtractionUnavailable;
+                    return .{};
                 }
 
                 pub fn deinit(_: *RenderForkTemplate) void {}
@@ -51,6 +107,7 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or bu
             };
 
             pub const Reader = struct {
+                text_extraction_policy: TextExtractionPolicy = .source,
                 pub fn allocator(_: *const Reader) Allocator {
                     return std.heap.page_allocator;
                 }
@@ -78,6 +135,9 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or bu
                 pub fn deinit(_: *Reader) void {}
 
                 pub fn setCancellationProbe(_: *Reader, _: CancellationProbe) void {}
+                pub fn setTextExtractionPolicy(self: *Reader, policy: TextExtractionPolicy) void {
+                    self.text_extraction_policy = policy;
+                }
 
                 pub fn setDecodeLimits(_: *Reader, _: DecodeLimits) anyerror!void {}
 
@@ -126,6 +186,8 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or bu
                 ascent: f64 = 0,
                 descent: f64 = 0,
                 output_span: ?TextOutputSpan = null,
+                bold: ?bool = null,
+                italic: ?bool = null,
 
                 pub fn deinit(_: *TextRun, _: Allocator) void {}
             };
@@ -134,23 +196,15 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or bu
                 text: []u8,
                 runs: []TextRun,
                 outline_fallback: bool = false,
+                has_nontext_visual: bool = false,
+                has_unrendered_annotations: bool = false,
+                diagnostics: NativeTextDiagnostics = .{},
 
                 pub fn deinit(self: *PageTextAnalysis, alloc: Allocator) void {
                     alloc.free(self.text);
                     alloc.free(self.runs);
                 }
             };
-        };
-
-        pub const render = struct {
-            pub fn textRunBounds(run: reader.TextRun) struct { min_x: f64, max_x: f64, min_y: f64, max_y: f64 } {
-                return .{
-                    .min_x = run.x,
-                    .max_x = run.x + run.advance_width,
-                    .min_y = run.y - run.descent,
-                    .max_y = run.y + run.ascent,
-                };
-            }
         };
 
         pub fn renderPagePngAlloc(_: Allocator, _: []const u8, _: usize, _: u16, _: u64) anyerror![]u8 {
@@ -761,6 +815,36 @@ pub fn rebaseUnitCharOffsets(units: []Unit) void {
 pub const TextRegion = struct {
     span: [2]u32,
     bbox: [4]f64,
+    font_size: ?f64 = null,
+    bold: ?bool = null,
+    italic: ?bool = null,
+};
+
+pub const TextBlock = pdf.text_structure.Block;
+pub const NativeTextPolicy = pdf.reader.TextExtractionPolicy;
+
+pub const NativeTextSemanticCoverage = enum {
+    text_only,
+    partial,
+    unknown,
+};
+
+/// Native extraction completion is independent of semantic alignment and
+/// content heuristics. Policy-excluded runs remain reflected in the counters.
+pub const NativeTextDiagnostics = struct {
+    policy: NativeTextPolicy = .page,
+    extraction_complete: bool = true,
+    semantic_coverage: NativeTextSemanticCoverage = .text_only,
+    actual_text_replacements: usize = 0,
+    outside_page_runs: usize = 0,
+    invisible_runs: usize = 0,
+    unaligned_runs: usize = 0,
+    unsupported_ordering_runs: usize = 0,
+    source_run_count: usize = 0,
+    emitted_run_count: usize = 0,
+    outline_fallback: bool = false,
+    has_nontext_visual: bool = false,
+    has_unrendered_annotations: bool = false,
 };
 
 pub const OcrRegionCoordinateSpace = enum {
@@ -1048,6 +1132,8 @@ pub const Unit = struct {
     extraction_status: ?[]u8 = null,
     source_sha256: ?[]u8 = null,
     byte_length: ?u64 = null,
+    native_text_quality: ?OcrQuality = null,
+    native_text_diagnostics: ?NativeTextDiagnostics = null,
     ocr_used: bool = false,
     ocr_attempted: bool = false,
     ocr_render_dpi: ?u16 = null,
@@ -1072,6 +1158,7 @@ pub const Unit = struct {
     page_bbox: ?[4]f64 = null,
     page_rotation: ?i32 = null,
     text_regions: []TextRegion = &.{},
+    text_blocks: []TextBlock = &.{},
     char_start: ?u32 = null,
     char_end: ?u32 = null,
 
@@ -1090,6 +1177,7 @@ pub const Unit = struct {
         if (self.ocr_failure_stage) |value| alloc.free(value);
         if (self.page_label) |value| alloc.free(value);
         if (self.text_regions.len > 0) alloc.free(self.text_regions);
+        if (self.text_blocks.len > 0) alloc.free(self.text_blocks);
         if (self.transcript_spans.len > 0) alloc.free(self.transcript_spans);
         self.* = undefined;
     }
@@ -1209,6 +1297,11 @@ pub const UnitSink = struct {
     on_end: *const fn (ptr: *anyopaque) anyerror!void,
 };
 
+pub const NativeTextConfig = struct {
+    policy: NativeTextPolicy = .page,
+    quality: OcrQualityConfig = .{},
+};
+
 pub const Config = struct {
     filename: []const u8 = "",
     content_type: []const u8 = "",
@@ -1224,6 +1317,7 @@ pub const Config = struct {
     version_field: []const u8 = "",
     last_modified_field: []const u8 = "",
     html_strip_tags: bool = true,
+    native_text: NativeTextConfig = .{},
     /// True when an `ocr` block names a reader or generator.
     ocr_enabled: bool = false,
     ocr_mode: OcrMode = .auto,
@@ -1283,6 +1377,38 @@ test "document extraction parses explicit render resolution policy" {
     try std.testing.expectEqual(pdf.RenderResolutionPolicy.model_input, adaptive.ocr_render_resolution);
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(std.testing.allocator, "{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"r\"},\"render\":{\"resolution\":\"automatic\"}}}"));
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(std.testing.allocator, "{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"r\"},\"render\":{\"resolution\":123}}}"));
+}
+test "document extraction parses independent native text policy and quality" {
+    const alloc = std.testing.allocator;
+    var defaults = try parseConfig(alloc, "{}");
+    defer defaults.deinit(alloc);
+    try std.testing.expectEqual(NativeTextPolicy.page, defaults.native_text.policy);
+    try std.testing.expectEqual(@as(usize, 50), defaults.native_text.quality.min_content_chars);
+    try std.testing.expect(!defaults.ocr_enabled);
+    const native_pass = assessOcrQuality("This native PDF page contains enough readable words to pass its independent quality policy without enabling optical character recognition.", defaults.native_text.quality);
+    const native_fail = assessOcrQuality("", defaults.native_text.quality);
+    try std.testing.expect(!native_pass.needsFallback());
+    try std.testing.expect(native_fail.needsFallback());
+
+    var tuned = try parseConfig(alloc,
+        \\{"native_text":{"policy":"visible","quality":{"min_content_chars":7,"max_replacement_char_ratio":0.2}},"ocr":{"reader":{"provider":"antfly","model":"reader"},"quality":{"min_content_chars":91}}}
+    );
+    defer tuned.deinit(alloc);
+    try std.testing.expectEqual(NativeTextPolicy.visible, tuned.native_text.policy);
+    try std.testing.expectEqual(@as(usize, 7), tuned.native_text.quality.min_content_chars);
+    try std.testing.expectEqual(@as(f64, 0.2), tuned.native_text.quality.max_replacement_char_ratio);
+    try std.testing.expectEqual(@as(usize, 91), tuned.ocr_quality.min_content_chars);
+
+    inline for (.{
+        "{\"native_text\":true}",
+        "{\"native_text\":{\"policy\":\"automatic\"}}",
+        "{\"native_text\":{\"policy\":1}}",
+        "{\"native_text\":{\"quality\":false}}",
+        "{\"native_text\":{\"quality\":{\"min_content_chars\":-1}}}",
+        "{\"native_text\":{\"quality\":{\"unknown\":1}}}",
+        "{\"native_text\":{\"quality\":{\"max_corrupted_line_ratio\":1.1}}}",
+        "{\"native_text\":{\"unknown\":1}}",
+    }) |invalid| try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc, invalid));
 }
 
 pub const OcrMode = enum {
@@ -1992,6 +2118,7 @@ pub fn parseConfig(alloc: Allocator, raw: []const u8) !Config {
     inline for (.{ "ocr_fallback", "transcribe_audio" }) |removed| {
         if (object.get(removed) != null) return error.InvalidDocumentExtractionConfig;
     }
+    try parseNativeTextOptions(object, &config);
     try parseOcrOptions(alloc, object, &config);
     if (config.ocr_enabled) switch (config.ocr_executor) {
         .reader => try validateReaderConfigJson(alloc, config.ocr_config_json, effectiveOcrPrompt(config)),
@@ -2050,6 +2177,22 @@ fn parseTranscriptionOptions(alloc: Allocator, object: std.json.ObjectMap, confi
     config.transcription_enabled = true;
 }
 
+fn parseNativeTextOptions(object: std.json.ObjectMap, config: *Config) !void {
+    const value = object.get("native_text") orelse return;
+    if (value != .object) return error.InvalidDocumentExtractionConfig;
+    const native_text = value.object;
+    try rejectUnknownFields(native_text, &.{ "policy", "quality" });
+    if (native_text.get("policy")) |policy| {
+        if (policy != .string) return error.InvalidDocumentExtractionConfig;
+        config.native_text.policy = std.meta.stringToEnum(NativeTextPolicy, policy.string) orelse
+            return error.InvalidDocumentExtractionConfig;
+    }
+    if (native_text.get("quality")) |quality| {
+        if (quality != .object) return error.InvalidDocumentExtractionConfig;
+        try parseQualityOptions(quality.object, &config.native_text.quality);
+    }
+}
+
 fn parseOcrOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config) !void {
     const value = object.get("ocr") orelse return;
     if (value != .object) return error.InvalidDocumentExtractionConfig;
@@ -2080,30 +2223,34 @@ fn parseOcrOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config
         if (prompt != .string) return error.InvalidDocumentExtractionConfig;
         config.ocr_prompt = try alloc.dupe(u8, prompt.string);
     }
-    const quality_value = ocr.get("quality") orelse return;
-    if (quality_value != .object) return error.InvalidDocumentExtractionConfig;
-    const quality = quality_value.object;
+    if (ocr.get("quality")) |quality| {
+        if (quality != .object) return error.InvalidDocumentExtractionConfig;
+        try parseQualityOptions(quality.object, &config.ocr_quality);
+    }
+}
+
+fn parseQualityOptions(quality: std.json.ObjectMap, config: *OcrQualityConfig) !void {
     try rejectUnknownFields(quality, &.{ "min_content_chars", "garbled_min_words", "garbled_sample_words", "max_single_char_word_ratio", "substantial_line_min_chars", "max_corrupted_line_ratio", "font_corruption_score_threshold", "max_replacement_char_ratio" });
     if (try intField(quality, "min_content_chars")) |v| {
         if (v < 0) return error.InvalidDocumentExtractionConfig;
-        config.ocr_quality.min_content_chars = @intCast(v);
+        config.min_content_chars = @intCast(v);
     }
     if (try intField(quality, "garbled_min_words")) |v| {
         if (v < 0) return error.InvalidDocumentExtractionConfig;
-        config.ocr_quality.garbled_min_words = @intCast(v);
+        config.garbled_min_words = @intCast(v);
     }
     if (try intField(quality, "garbled_sample_words")) |v| {
         if (v < 1) return error.InvalidDocumentExtractionConfig;
-        config.ocr_quality.garbled_sample_words = @intCast(v);
+        config.garbled_sample_words = @intCast(v);
     }
-    if (try floatField(quality, "max_single_char_word_ratio")) |v| config.ocr_quality.max_single_char_word_ratio = try ratio(v);
+    if (try floatField(quality, "max_single_char_word_ratio")) |v| config.max_single_char_word_ratio = try ratio(v);
     if (try intField(quality, "substantial_line_min_chars")) |v| {
         if (v < 1) return error.InvalidDocumentExtractionConfig;
-        config.ocr_quality.substantial_line_min_chars = @intCast(v);
+        config.substantial_line_min_chars = @intCast(v);
     }
-    if (try floatField(quality, "max_corrupted_line_ratio")) |v| config.ocr_quality.max_corrupted_line_ratio = try ratio(v);
-    if (try floatField(quality, "font_corruption_score_threshold")) |v| config.ocr_quality.font_corruption_score_threshold = try ratio(v);
-    if (try floatField(quality, "max_replacement_char_ratio")) |v| config.ocr_quality.max_replacement_char_ratio = try ratio(v);
+    if (try floatField(quality, "max_corrupted_line_ratio")) |v| config.max_corrupted_line_ratio = try ratio(v);
+    if (try floatField(quality, "font_corruption_score_threshold")) |v| config.font_corruption_score_threshold = try ratio(v);
+    if (try floatField(quality, "max_replacement_char_ratio")) |v| config.max_replacement_char_ratio = try ratio(v);
 }
 
 fn parseOcrRenderOptions(render: std.json.ObjectMap, config: *Config) !void {
@@ -2379,6 +2526,8 @@ fn dupeOptionalStringField(alloc: Allocator, object: std.json.ObjectMap, field: 
     return try alloc.dupe(u8, value.string);
 }
 
+pub const native_text_extraction_identity = "native-text-v1";
+
 pub fn metadataFingerprintAlloc(
     alloc: Allocator,
     source_url: []const u8,
@@ -2391,7 +2540,8 @@ pub fn metadataFingerprintAlloc(
         config.last_modified.len == 0) return null;
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hashField(&hasher, "kind", "document_extraction_metadata_fingerprint_v2");
+    hashField(&hasher, "kind", "document_extraction_metadata_fingerprint_v3");
+    hashNativeTextConfig(&hasher, config.native_text);
     hashField(&hasher, "source_url", source_url);
     hashField(&hasher, "config_json", config_json);
     hashField(&hasher, "filename", config.filename);
@@ -2403,6 +2553,25 @@ pub fn metadataFingerprintAlloc(
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
     return try hexBytesAlloc(alloc, &digest);
+}
+
+fn hashNativeTextConfig(hasher: *std.crypto.hash.sha2.Sha256, native_text: NativeTextConfig) void {
+    hashField(hasher, "native_text_extraction_identity", native_text_extraction_identity);
+    hashField(hasher, "native_text_policy", @tagName(native_text.policy));
+    hashU64Field(hasher, "native_text_min_content_chars", @intCast(native_text.quality.min_content_chars));
+    hashU64Field(hasher, "native_text_garbled_min_words", @intCast(native_text.quality.garbled_min_words));
+    hashU64Field(hasher, "native_text_garbled_sample_words", @intCast(native_text.quality.garbled_sample_words));
+    hashU64Field(hasher, "native_text_max_single_char_word_ratio", @bitCast(native_text.quality.max_single_char_word_ratio));
+    hashU64Field(hasher, "native_text_substantial_line_min_chars", @intCast(native_text.quality.substantial_line_min_chars));
+    hashU64Field(hasher, "native_text_max_corrupted_line_ratio", @bitCast(native_text.quality.max_corrupted_line_ratio));
+    hashU64Field(hasher, "native_text_font_corruption_score_threshold", @bitCast(native_text.quality.font_corruption_score_threshold));
+    hashU64Field(hasher, "native_text_max_replacement_char_ratio", @bitCast(native_text.quality.max_replacement_char_ratio));
+}
+
+fn hashU64Field(hasher: *std.crypto.hash.sha2.Sha256, name: []const u8, value: u64) void {
+    var encoded: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, value, .big);
+    hashField(hasher, name, &encoded);
 }
 
 fn hashField(hasher: *std.crypto.hash.sha2.Sha256, name: []const u8, value: []const u8) void {
@@ -2445,13 +2614,13 @@ fn extractDownloadedUnmarkedAlloc(
     const content_type = if (config.content_type.len > 0) config.content_type else downloaded.content_type;
     for (config.routes) |route| {
         if (!routeMatches(route.match, content_type, config.filename, source_url, downloaded.data)) continue;
-        return try extractWithRouteAlloc(alloc, downloaded.data, content_type, route, config.html_strip_tags, config.ocr_mode, config.ocr_quality, config.pdf_decode_limits);
+        return try extractWithRouteAlloc(alloc, downloaded.data, content_type, route, config.html_strip_tags, config.native_text, config.ocr_mode, config.ocr_quality, config.pdf_decode_limits);
     }
     if (config.route_preset == .explicit_only) {
         return try unsupportedResultAlloc(alloc, content_type, "no_configured_route_matched");
     }
     if (isPdfContent(content_type, config.filename, source_url, downloaded.data)) {
-        return try extractPdfAlloc(alloc, downloaded.data, content_type, config.ocr_mode, config.ocr_quality, config.pdf_decode_limits);
+        return try extractPdfAlloc(alloc, downloaded.data, content_type, config.native_text, config.ocr_mode, config.ocr_quality, config.pdf_decode_limits);
     }
     if (isHtmlContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractSingleTextUnitAlloc(alloc, downloaded.data, content_type, "article:000001", "article", "html_text", config.html_strip_tags);
@@ -2504,14 +2673,14 @@ fn extractDownloadedStreamingUnmarked(
     const content_type = if (config.content_type.len > 0) config.content_type else downloaded.content_type;
     for (config.routes) |route| {
         if (!routeMatches(route.match, content_type, config.filename, source_url, downloaded.data)) continue;
-        return try extractWithRouteStreaming(alloc, downloaded.data, content_type, route, config.html_strip_tags, config.ocr_mode, config.ocr_quality, config.pdf_decode_limits, sink);
+        return try extractWithRouteStreaming(alloc, downloaded.data, content_type, route, config.html_strip_tags, config.native_text, config.ocr_mode, config.ocr_quality, config.pdf_decode_limits, sink);
     }
     if (config.route_preset == .explicit_only) {
         try streamUnsupportedResult(sink, content_type, "no_configured_route_matched");
         return;
     }
     if (isPdfContent(content_type, config.filename, source_url, downloaded.data)) {
-        return try extractPdfStreaming(alloc, downloaded.data, content_type, config.ocr_mode, config.ocr_quality, config.pdf_decode_limits, sink);
+        return try extractPdfStreaming(alloc, downloaded.data, content_type, config.native_text, config.ocr_mode, config.ocr_quality, config.pdf_decode_limits, sink);
     }
     if (isHtmlContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractSingleTextUnitStreaming(alloc, downloaded.data, content_type, "article:000001", "article", "html_text", config.html_strip_tags, sink);
@@ -2549,13 +2718,14 @@ fn extractWithRouteStreaming(
     content_type: []const u8,
     route: Route,
     html_strip_tags: bool,
+    native_text: NativeTextConfig,
     ocr_mode: OcrMode,
     ocr_quality: OcrQualityConfig,
     pdf_decode_limits: pdf.reader.DecodeLimits,
     sink: UnitSink,
 ) !void {
     switch (route.extractor_type) {
-        .pdf => return try extractPdfStreaming(alloc, bytes, content_type, ocr_mode, ocr_quality, pdf_decode_limits, sink),
+        .pdf => return try extractPdfStreaming(alloc, bytes, content_type, native_text, ocr_mode, ocr_quality, pdf_decode_limits, sink),
         .html => return try extractSingleConfiguredUnitStreaming(alloc, bytes, content_type, route.unit, "article", "html_text", html_strip_tags, sink),
         .text => return try extractSingleConfiguredUnitStreaming(alloc, bytes, content_type, route.unit, "document", "text", false, sink),
         .email => return try streamBufferedExtraction(alloc, try extractEmailAlloc(alloc, bytes, content_type, if (route.unit.len > 0) route.unit else "email"), sink),
@@ -2653,12 +2823,13 @@ fn extractWithRouteAlloc(
     content_type: []const u8,
     route: Route,
     html_strip_tags: bool,
+    native_text: NativeTextConfig,
     ocr_mode: OcrMode,
     ocr_quality: OcrQualityConfig,
     pdf_decode_limits: pdf.reader.DecodeLimits,
 ) !Result {
     return switch (route.extractor_type) {
-        .pdf => try extractPdfAlloc(alloc, bytes, content_type, ocr_mode, ocr_quality, pdf_decode_limits),
+        .pdf => try extractPdfAlloc(alloc, bytes, content_type, native_text, ocr_mode, ocr_quality, pdf_decode_limits),
         .html => try extractSingleConfiguredUnitAlloc(alloc, bytes, content_type, route.unit, "article", "html_text", html_strip_tags),
         .text => try extractSingleConfiguredUnitAlloc(alloc, bytes, content_type, route.unit, "document", "text", false),
         .email => try extractEmailAlloc(alloc, bytes, content_type, if (route.unit.len > 0) route.unit else "email"),
@@ -2710,6 +2881,7 @@ fn sha256HexAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
 const PdfPageTextCandidate = struct {
     analysis: pdf.reader.PageTextAnalysis,
     warning: ?[]u8 = null,
+    extraction_complete: bool = true,
 };
 
 fn extractPdfPageTextBestEffort(alloc: Allocator, parsed: *pdf.reader.Reader, page_num: usize) !PdfPageTextCandidate {
@@ -2729,6 +2901,7 @@ fn extractPdfPageTextBestEffort(alloc: Allocator, parsed: *pdf.reader.Reader, pa
         return .{
             .analysis = empty_analysis,
             .warning = try std.fmt.allocPrint(alloc, "pdf_text_decode_failed:{s}", .{@errorName(err)}),
+            .extraction_complete = false,
         };
     };
     errdefer analysis.deinit(alloc);
@@ -2741,6 +2914,38 @@ fn extractPdfPageTextBestEffort(alloc: Allocator, parsed: *pdf.reader.Reader, pa
     };
 }
 
+fn nativeTextDiagnostics(
+    policy: NativeTextPolicy,
+    analysis: pdf.reader.PageTextAnalysis,
+    extraction_complete: bool,
+) NativeTextDiagnostics {
+    const diagnostics = analysis.diagnostics;
+    return .{
+        .policy = policy,
+        .extraction_complete = extraction_complete,
+        .semantic_coverage = if (!extraction_complete)
+            .unknown
+        else if (diagnostics.unaligned_runs > 0 or
+            diagnostics.unsupported_ordering_runs > 0 or
+            analysis.outline_fallback or
+            analysis.has_nontext_visual or
+            analysis.has_unrendered_annotations)
+            .partial
+        else
+            .text_only,
+        .actual_text_replacements = diagnostics.actual_text_replacements,
+        .outside_page_runs = diagnostics.outside_page_runs,
+        .invisible_runs = diagnostics.invisible_runs,
+        .unaligned_runs = diagnostics.unaligned_runs,
+        .unsupported_ordering_runs = diagnostics.unsupported_ordering_runs,
+        .source_run_count = diagnostics.source_run_count,
+        .emitted_run_count = diagnostics.emitted_run_count,
+        .outline_fallback = analysis.outline_fallback,
+        .has_nontext_visual = analysis.has_nontext_visual,
+        .has_unrendered_annotations = analysis.has_unrendered_annotations,
+    };
+}
+
 pub fn resolvesToPdf(config: Config, source_url: []const u8, content_type: []const u8, bytes: []const u8) bool {
     for (config.routes) |route| {
         if (!routeMatches(route.match, content_type, config.filename, source_url, bytes)) continue;
@@ -2750,10 +2955,10 @@ pub fn resolvesToPdf(config: Config, source_url: []const u8, content_type: []con
     return isPdfContent(content_type, config.filename, source_url, bytes);
 }
 
-fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig, decode_limits: pdf.reader.DecodeLimits) !Result {
+fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, quality_config: OcrQualityConfig, decode_limits: pdf.reader.DecodeLimits) !Result {
     var parsed = try pdf.reader.Reader.initWithDecodeLimits(alloc, bytes, decode_limits);
     defer parsed.deinit();
-
+    parsed.setTextExtractionPolicy(native_text.policy);
     const page_count = try parsed.pageCount();
     var units = try alloc.alloc(Unit, page_count);
     var initialized: usize = 0;
@@ -2778,6 +2983,10 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
         errdefer alloc.free(text);
         const text_regions: []TextRegion = try extractPdfTextRegionsFromRunsAlloc(alloc, analysis.runs, text);
         errdefer if (text_regions.len > 0) alloc.free(text_regions);
+        const text_blocks = try pdf.text_structure.blocksFromRunsAlloc(alloc, text, analysis.runs);
+        errdefer if (text_blocks.len > 0) alloc.free(text_blocks);
+        const native_diagnostics = nativeTextDiagnostics(native_text.policy, analysis, candidate.extraction_complete);
+        const native_quality = assessOcrQuality(text, native_text.quality);
         const extraction_warning: ?[]u8 = candidate.warning;
         errdefer if (extraction_warning) |value| alloc.free(value);
         const page_box = parsed.extractPageBox(page_num) catch null;
@@ -2803,6 +3012,8 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
             .unit_type = unit_type.?,
             .text = text,
             .method = method.?,
+            .native_text_quality = native_quality,
+            .native_text_diagnostics = native_diagnostics,
             .extraction_status = extraction_status,
             .ocr_used = false,
             .ocr_trigger_reasons = ocr_metadata.trigger_reasons,
@@ -2813,6 +3024,7 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
             .page_bbox = if (page_box) |box| .{ box.min_x, box.min_y, box.max_x, box.max_y } else null,
             .page_rotation = page_rotation,
             .text_regions = text_regions,
+            .text_blocks = text_blocks,
             .char_start = char_start,
             .char_end = char_end,
         };
@@ -2833,18 +3045,21 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
     };
 }
 
-fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig, decode_limits: pdf.reader.DecodeLimits, sink: UnitSink) !void {
+fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, quality_config: OcrQualityConfig, decode_limits: pdf.reader.DecodeLimits, sink: UnitSink) !void {
     var parsed = try pdf.reader.Reader.initWithDecodeLimits(alloc, bytes, decode_limits);
     defer parsed.deinit();
+    parsed.setTextExtractionPolicy(native_text.policy);
 
-    return extractParsedPdfStreaming(alloc, &parsed, content_type, ocr_mode, quality_config, sink);
+    return extractParsedPdfStreaming(alloc, &parsed, content_type, native_text, ocr_mode, quality_config, sink);
 }
 
-/// Stream units from an already prepared PDF. This is the task-neutral bridge
-/// used when text inspection and page rendering share one immutable document
-/// index inside a bounded operation.
-pub fn extractPreparedPdfStreaming(alloc: Allocator, session: *PdfRenderSession, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink) !void {
-    return extractParsedPdfStreaming(alloc, &session.parsed, content_type, ocr_mode, quality_config, sink);
+/// Stream text through a task-local read fork. The prepared session may be
+/// shared by render work and is never mutated with a consumer's text policy.
+pub fn extractPreparedPdfStreaming(alloc: Allocator, session: *PdfRenderSession, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink) !void {
+    var text_session = try PdfRenderSession.initFromPrepared(alloc, session, session.parsed.cancellationProbe());
+    defer text_session.deinit();
+    text_session.parsed.setTextExtractionPolicy(native_text.policy);
+    return extractParsedPdfStreaming(alloc, &text_session.parsed, content_type, native_text, ocr_mode, quality_config, sink);
 }
 
 /// Task-neutral text inspection. OCR selection, offsets, prompts and output
@@ -2852,6 +3067,8 @@ pub fn extractPreparedPdfStreaming(alloc: Allocator, session: *PdfRenderSession,
 pub const PdfPageText = struct {
     text: []u8,
     text_regions: []TextRegion = &.{},
+    text_blocks: []TextBlock = &.{},
+    native_text_diagnostics: NativeTextDiagnostics = .{},
     warning: ?[]u8 = null,
     bbox: @FieldType(Unit, "page_bbox") = null,
     rotation: @FieldType(Unit, "page_rotation") = null,
@@ -2859,6 +3076,7 @@ pub const PdfPageText = struct {
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.text);
         alloc.free(self.text_regions);
+        alloc.free(self.text_blocks);
         if (self.warning) |warning| alloc.free(warning);
         self.* = undefined;
     }
@@ -2868,7 +3086,17 @@ pub const PdfPageText = struct {
         errdefer alloc.free(text);
         const regions = try alloc.dupe(TextRegion, self.text_regions);
         errdefer alloc.free(regions);
-        return .{ .text = text, .text_regions = regions, .warning = if (self.warning) |w| try alloc.dupe(u8, w) else null, .bbox = self.bbox, .rotation = self.rotation };
+        const blocks = try alloc.dupe(TextBlock, self.text_blocks);
+        errdefer alloc.free(blocks);
+        return .{
+            .text = text,
+            .text_regions = regions,
+            .text_blocks = blocks,
+            .native_text_diagnostics = self.native_text_diagnostics,
+            .warning = if (self.warning) |w| try alloc.dupe(u8, w) else null,
+            .bbox = self.bbox,
+            .rotation = self.rotation,
+        };
     }
 };
 
@@ -2878,11 +3106,14 @@ pub const PdfPageTextCache = struct {
     store_fn: *const fn (*anyopaque, usize, PdfPageText) anyerror!void,
 };
 
-pub fn extractPreparedPdfStreamingWithTextCache(alloc: Allocator, session: *PdfRenderSession, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink, cache: ?PdfPageTextCache) !void {
-    return extractParsedPdfStreamingWithTextCache(alloc, &session.parsed, content_type, ocr_mode, quality_config, sink, cache);
+pub fn extractPreparedPdfStreamingWithTextCache(alloc: Allocator, session: *PdfRenderSession, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink, cache: ?PdfPageTextCache) !void {
+    var text_session = try PdfRenderSession.initFromPrepared(alloc, session, session.parsed.cancellationProbe());
+    defer text_session.deinit();
+    text_session.parsed.setTextExtractionPolicy(native_text.policy);
+    return extractParsedPdfStreamingWithTextCache(alloc, &text_session.parsed, content_type, native_text, ocr_mode, quality_config, sink, cache);
 }
 
-fn inspectPdfPageText(alloc: Allocator, parsed: *pdf.reader.Reader, page_num: usize, cache: ?PdfPageTextCache) !PdfPageText {
+fn inspectPdfPageText(alloc: Allocator, parsed: *pdf.reader.Reader, page_num: usize, policy: NativeTextPolicy, cache: ?PdfPageTextCache) !PdfPageText {
     if (cache) |c| if (try c.load_fn(c.ptr, alloc, page_num)) |page| return page;
     const candidate = try extractPdfPageTextBestEffort(alloc, parsed, page_num);
     const analysis = candidate.analysis;
@@ -2890,9 +3121,14 @@ fn inspectPdfPageText(alloc: Allocator, parsed: *pdf.reader.Reader, page_num: us
         for (analysis.runs) |*run| run.deinit(alloc);
         if (analysis.runs.len > 0) alloc.free(analysis.runs);
     }
-    var result = PdfPageText{ .text = analysis.text, .warning = candidate.warning };
+    var result = PdfPageText{
+        .text = analysis.text,
+        .warning = candidate.warning,
+        .native_text_diagnostics = nativeTextDiagnostics(policy, analysis, candidate.extraction_complete),
+    };
     errdefer result.deinit(alloc);
     result.text_regions = try extractPdfTextRegionsFromRunsAlloc(alloc, analysis.runs, result.text);
+    result.text_blocks = try pdf.text_structure.blocksFromRunsAlloc(alloc, result.text, analysis.runs);
     const box = parsed.extractPageBox(page_num) catch null;
     result.bbox = if (box) |b| .{ b.min_x, b.min_y, b.max_x, b.max_y } else null;
     result.rotation = parsed.extractPageRotation(page_num) catch null;
@@ -2900,11 +3136,11 @@ fn inspectPdfPageText(alloc: Allocator, parsed: *pdf.reader.Reader, page_num: us
     return result;
 }
 
-fn extractParsedPdfStreaming(alloc: Allocator, parsed: *pdf.reader.Reader, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink) !void {
-    return extractParsedPdfStreamingWithTextCache(alloc, parsed, content_type, ocr_mode, quality_config, sink, null);
+fn extractParsedPdfStreaming(alloc: Allocator, parsed: *pdf.reader.Reader, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink) !void {
+    return extractParsedPdfStreamingWithTextCache(alloc, parsed, content_type, native_text, ocr_mode, quality_config, sink, null);
 }
 
-fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.Reader, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink, cache: ?PdfPageTextCache) !void {
+fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.Reader, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink, cache: ?PdfPageTextCache) !void {
     const page_count = try parsed.pageCount();
     try sink.on_begin(sink.ptr, .{ .content_type = content_type, .route_type = "pdf" });
 
@@ -2914,7 +3150,7 @@ fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.
         const force_ocr = ocr_mode == .always;
         // Keep embedded text even in forced mode so OCR is not a blind
         // replacement for usable born-digital content.
-        var page = try inspectPdfPageText(alloc, parsed, page_num, cache);
+        var page = try inspectPdfPageText(alloc, parsed, page_num, native_text.policy, cache);
         defer page.deinit(alloc);
         var text = page.text;
         page.text = &.{};
@@ -2922,12 +3158,16 @@ fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.
         var text_regions = page.text_regions;
         page.text_regions = &.{};
         errdefer if (text_regions.len > 0) alloc.free(text_regions);
+        var text_blocks = page.text_blocks;
+        page.text_blocks = &.{};
+        errdefer if (text_blocks.len > 0) alloc.free(text_blocks);
         var extraction_warning = page.warning;
         page.warning = null;
         errdefer if (extraction_warning) |value| alloc.free(value);
         const page_text_len = text.len;
         const char_start = std.math.cast(u32, cursor);
         const char_end = std.math.cast(u32, cursor + page_text_len);
+        const native_quality = assessOcrQuality(text, native_text.quality);
         const quality = assessOcrQuality(text, quality_config);
         const scanned_page = force_ocr or quality.needsFallback();
         var unit_id: ?[]u8 = try std.fmt.allocPrint(alloc, "page:{d:0>6}", .{page_num});
@@ -2947,6 +3187,8 @@ fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.
             .unit_type = unit_type.?,
             .text = text,
             .method = method.?,
+            .native_text_quality = native_quality,
+            .native_text_diagnostics = page.native_text_diagnostics,
             .extraction_status = extraction_status,
             .ocr_used = false,
             .ocr_trigger_reasons = ocr_metadata.trigger_reasons,
@@ -2957,6 +3199,7 @@ fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.
             .page_bbox = page.bbox,
             .page_rotation = page.rotation,
             .text_regions = text_regions,
+            .text_blocks = text_blocks,
             .char_start = char_start,
             .char_end = char_end,
         };
@@ -2968,6 +3211,7 @@ fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.
         ocr_metadata = .{};
         text = &.{};
         text_regions = &.{};
+        text_blocks = &.{};
         extraction_warning = null;
         errdefer unit.deinit(alloc);
         try sink.on_unit(sink.ptr, &unit);
@@ -3002,9 +3246,17 @@ fn extractPdfTextRegionsFromRunsAlloc(
         try regions.append(alloc, .{
             .span = .{ span_start, span_end },
             .bbox = .{ bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y },
+            .font_size = transformedFontSize(run),
+            .bold = run.bold,
+            .italic = run.italic,
         });
     }
     return try regions.toOwnedSlice(alloc);
+}
+
+fn transformedFontSize(run: pdf.reader.TextRun) ?f64 {
+    const font_size = @abs(run.font_size) * std.math.sqrt(run.c * run.c + run.d * run.d);
+    return if (std.math.isFinite(font_size) and font_size > 0) font_size else null;
 }
 
 test "PDF text regions use reconstructed output spans" {
@@ -3013,7 +3265,9 @@ test "PDF text regions use reconstructed output spans" {
         fn run(a: Allocator) !void {
             const page = PdfPageText{
                 .text = @constCast("Text"),
-                .text_regions = @constCast(&[_]TextRegion{.{ .span = .{ 0, 4 }, .bbox = .{ 1, 2, 3, 4 } }}),
+                .text_regions = @constCast(&[_]TextRegion{.{ .span = .{ 0, 4 }, .bbox = .{ 1, 2, 3, 4 }, .font_size = 12, .bold = true, .italic = false }}),
+                .text_blocks = @constCast(&[_]TextBlock{.{ .span = .{ 0, 4 }, .bbox = .{ 1, 2, 3, 4 }, .reading_order = 0, .font_size = 12, .bold = true, .italic = false }}),
+                .native_text_diagnostics = .{ .policy = .visible, .actual_text_replacements = 2, .source_run_count = 3, .emitted_run_count = 1 },
                 .warning = @constCast("partial extraction"),
                 .bbox = .{ 0, 0, 400, 500 },
                 .rotation = 90,
@@ -3023,6 +3277,8 @@ test "PDF text regions use reconstructed output spans" {
             try std.testing.expectEqualStrings(page.text, cloned.text);
             try std.testing.expectEqualStrings(page.warning.?, cloned.warning.?);
             try std.testing.expectEqualSlices(TextRegion, page.text_regions, cloned.text_regions);
+            try std.testing.expectEqualSlices(TextBlock, page.text_blocks, cloned.text_blocks);
+            try std.testing.expectEqualDeep(page.native_text_diagnostics, cloned.native_text_diagnostics);
             try std.testing.expectEqual(page.bbox, cloned.bbox);
             try std.testing.expectEqual(page.rotation, cloned.rotation);
         }
@@ -3034,10 +3290,13 @@ test "PDF text regions use reconstructed output spans" {
             .x = 10,
             .y = 20,
             .font_size = 10,
+            .d = 0.7,
             .advance_width = 40,
             .ascent = 8,
             .descent = 2,
             .output_span = .{ .start = 0, .end = 7 },
+            .bold = true,
+            .italic = false,
         },
         .{
             .text = "Body",
@@ -3060,6 +3319,9 @@ test "PDF text regions use reconstructed output spans" {
     const second_bounds = pdf.render.textRunBounds(runs[1]);
     try std.testing.expectEqual([4]f64{ first_bounds.min_x, first_bounds.min_y, first_bounds.max_x, first_bounds.max_y }, regions[0].bbox);
     try std.testing.expectEqual([4]f64{ second_bounds.min_x, second_bounds.min_y, second_bounds.max_x, second_bounds.max_y }, regions[1].bbox);
+    try std.testing.expectApproxEqAbs(@as(f64, 7), regions[0].font_size.?, 0.000001);
+    try std.testing.expectEqual(@as(?bool, true), regions[0].bold);
+    try std.testing.expectEqual(@as(?bool, false), regions[0].italic);
     try std.testing.expect(!std.mem.eql(f64, &regions[0].bbox, &regions[1].bbox));
 
     const unaligned_runs = [_]pdf.reader.TextRun{.{
@@ -3078,6 +3340,38 @@ test "PDF text regions use reconstructed output spans" {
     const unaligned_regions = try extractPdfTextRegionsFromRunsAlloc(alloc, &unaligned_runs, "FOURTH EDITION FR");
     defer if (unaligned_regions.len > 0) alloc.free(unaligned_regions);
     try std.testing.expectEqual(@as(usize, 0), unaligned_regions.len);
+}
+test "native text diagnostics distinguish extraction completion and semantic coverage" {
+    const analysis = pdf.reader.PageTextAnalysis{
+        .text = @constCast("text"),
+        .runs = @constCast(&[_]pdf.reader.TextRun{}),
+        .outline_fallback = true,
+        .has_nontext_visual = true,
+        .has_unrendered_annotations = true,
+        .diagnostics = .{
+            .actual_text_replacements = 2,
+            .outside_page_runs = 3,
+            .invisible_runs = 4,
+            .unaligned_runs = 1,
+            .unsupported_ordering_runs = 5,
+            .source_run_count = 9,
+            .emitted_run_count = 6,
+        },
+    };
+    const partial = nativeTextDiagnostics(.page, analysis, true);
+    try std.testing.expect(partial.extraction_complete);
+    try std.testing.expectEqual(NativeTextSemanticCoverage.partial, partial.semantic_coverage);
+    try std.testing.expect(partial.outline_fallback and partial.has_nontext_visual and partial.has_unrendered_annotations);
+    try std.testing.expectEqual(@as(usize, 3), partial.outside_page_runs);
+    const failed = nativeTextDiagnostics(.visible, analysis, false);
+    try std.testing.expect(!failed.extraction_complete);
+    try std.testing.expectEqual(NativeTextSemanticCoverage.unknown, failed.semantic_coverage);
+    try std.testing.expectEqual(NativeTextPolicy.visible, failed.policy);
+    const text_only = nativeTextDiagnostics(.page, .{
+        .text = @constCast("text"),
+        .runs = @constCast(&[_]pdf.reader.TextRun{}),
+    }, true);
+    try std.testing.expectEqual(NativeTextSemanticCoverage.text_only, text_only.semantic_coverage);
 }
 
 test "OCR Reader regions align repeated UTF-8 text monotonically and require native pixel geometry" {
@@ -5114,6 +5408,15 @@ test "document extraction metadata fingerprint requires version metadata" {
     defer alloc.free(second);
 
     try std.testing.expect(!std.mem.eql(u8, first, second));
+    config.native_text.policy = .visible;
+    const visible = (try metadataFingerprintAlloc(alloc, "data:application/pdf;base64,AA==", "{}", config)).?;
+    defer alloc.free(visible);
+    try std.testing.expect(!std.mem.eql(u8, second, visible));
+
+    config.native_text.quality.min_content_chars += 1;
+    const tuned = (try metadataFingerprintAlloc(alloc, "data:application/pdf;base64,AA==", "{}", config)).?;
+    defer alloc.free(tuned);
+    try std.testing.expect(!std.mem.eql(u8, visible, tuned));
 }
 
 test "document extraction route matching normalizes content type parameters" {

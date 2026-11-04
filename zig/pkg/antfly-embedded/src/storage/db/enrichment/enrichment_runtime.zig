@@ -10642,9 +10642,11 @@ const SharedPdfWindowScheduler = struct {
                 }
                 if (consumer.text) {
                     const source = text_source orelse continue;
-                    // Sharing images must not change which pages auto-OCR selects
-                    // or which embedded text is retained by its quality policy.
-                    if (source.config.ocr_mode != consumer.config.ocr_mode or
+                    // Sharing text units must not change native policy or its
+                    // persisted quality assessment, nor which pages auto-OCR
+                    // selects or which embedded text OCR retains.
+                    if (!std.meta.eql(source.config.native_text, consumer.config.native_text) or
+                        source.config.ocr_mode != consumer.config.ocr_mode or
                         !std.meta.eql(source.config.ocr_quality, consumer.config.ocr_quality) or
                         (consumer.config.content_type.len > 0 and !std.mem.eql(u8, source.content_type, consumer.config.content_type))) continue;
                 }
@@ -11229,7 +11231,7 @@ const SharedPdfWindowScheduler = struct {
             var borrowed = try cache.lookup(source_url, if (config.credentials.len > 0) config.credentials else null) orelse return false;
             defer borrowed.deinit();
             const downloaded = borrowed.entry().content;
-            break :blk try documentExtractionFingerprintFromDigestAlloc(alloc, &borrowed.entry().source_identity, config_json, config.content_type, config.filename, downloaded.content_type, &borrowed.entry().content_sha256);
+            break :blk try documentExtractionFingerprintFromDigestAlloc(alloc, &borrowed.entry().source_identity, config_json, config.native_text, config.content_type, config.filename, downloaded.content_type, &borrowed.entry().content_sha256);
         };
         defer alloc.free(fingerprint);
         return skipRuntimeDocumentExtractionByFingerprint(self.runtime, request.doc_key, artifact, fingerprint, state, manifest, try documentExtractionManifestGeneration(alloc, manifest), request.producer_json);
@@ -11251,8 +11253,8 @@ const SharedPdfWindowScheduler = struct {
         return internal_keys.documentExtractionUnitSpoolKeyAlloc(alloc, prefix, page);
     }
 
-    // Text inspection is shared even when executors/prompts/quality policies
-    // differ. Enrollment is source/decoder-only and never discovers a model.
+    // Neutral inspection can cross task-specific quality and OCR settings,
+    // but only consumers with the same native text policy can reuse its text.
     fn hasPageTextPeer(self: *@This(), raw: []const u8, source_url: []const u8, config: document_extraction_mod.Config) !bool {
         if (config.routes.len != 0 or config.route_preset != .mixed_files) return false;
         for (self.requests, 0..) |request, index| {
@@ -11266,6 +11268,7 @@ const SharedPdfWindowScheduler = struct {
             try document_extraction_mod.applySourceMetadataFromJson(self.runtime.alloc, &other, raw);
             if (other.routes.len != 0 or other.route_preset != .mixed_files or
                 !std.mem.eql(u8, config.credentials, other.credentials) or
+                other.native_text.policy != config.native_text.policy or
                 !std.meta.eql(config.pdf_decode_limits, other.pdf_decode_limits)) continue;
             const url = try extractAssetSourceValue(self.runtime.alloc, self.runtime.config, raw, request) orelse continue;
             defer self.runtime.alloc.free(url);
@@ -11793,12 +11796,14 @@ fn compactPendingPdfResults(alloc: Allocator, results: anytype, pending: []const
 }
 
 /// Attempt-private, bounded transport for neutral PDF page inspection. Only
-/// serialized text/regions survive a callback; no Reader or page image does.
+/// serialized text, regions, blocks, and native diagnostics survive a
+/// callback; no Reader or page image does.
 /// The shared attempt registry covers both these rows and typed OCR rows.
 const RuntimePdfPageTextSpool = struct {
     scheduler: *SharedPdfWindowScheduler,
     digest: [32]u8,
     limits: document_extraction_mod.PdfDecodeLimits,
+    policy: document_extraction_mod.NativeTextPolicy,
     enabled: bool = true,
     hits: usize = 0,
     stores: usize = 0,
@@ -11870,7 +11875,14 @@ const RuntimePdfPageTextSpool = struct {
 
     fn keyAlloc(self: *@This(), alloc: Allocator, page: usize) ![]u8 {
         try self.scheduler.ensureSpool();
-        return std.fmt.allocPrint(alloc, "{s}page-text-v1:{x}:{d}:{d}:{d}", .{ self.scheduler.spool_root.?, self.digest, self.limits.max_decoded_stream_bytes, self.limits.max_working_set_bytes, page });
+        return std.fmt.allocPrint(alloc, "{s}page-text-v2:{x}:{s}:{d}:{d}:{d}", .{
+            self.scheduler.spool_root.?,
+            self.digest,
+            @tagName(self.policy),
+            self.limits.max_decoded_stream_bytes,
+            self.limits.max_working_set_bytes,
+            page,
+        });
     }
 
     fn optionalError(self: *@This(), err: anyerror) !void {
@@ -12104,7 +12116,7 @@ test "shared PDF enrollment skips completed metadata and byte fingerprints befor
         defer scheduler.deinit();
         var config = try document_extraction_mod.parseConfig(alloc, config_json);
         defer config.deinit(alloc);
-        const fingerprint = try document_extraction_mod.metadataFingerprintAlloc(alloc, url, config_json, config) orelse try documentExtractionFingerprintAlloc(alloc, url, config_json, config.content_type, config.filename, "application/pdf", source);
+        const fingerprint = try document_extraction_mod.metadataFingerprintAlloc(alloc, url, config_json, config) orelse try documentExtractionFingerprintAlloc(alloc, url, config_json, config.native_text, config.content_type, config.filename, "application/pdf", source);
         defer alloc.free(fingerprint);
         const state = try documentExtractionStateValueAlloc(alloc, fingerprint, &.{}, &.{}, &.{}, "", 0, true);
         defer alloc.free(state);
@@ -13011,10 +13023,17 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     try scavengeSharedPdfConsumerAttempts(&runtime);
 
     // Neutral page inspection is independently namespaced from OCR results.
-    var neutral = RuntimePdfPageTextSpool{ .scheduler = &scheduler, .digest = digest, .limits = .{} };
+    var neutral = RuntimePdfPageTextSpool{ .scheduler = &scheduler, .digest = digest, .limits = .{}, .policy = .page };
     defer neutral.deinit();
     const cached_text = neutral.cache();
-    const sample = document_extraction_mod.PdfPageText{ .text = @constCast("Embedded page text"), .text_regions = @constCast(&[_]document_extraction_mod.TextRegion{.{ .span = .{ 0, 8 }, .bbox = .{ 1, 2, 3, 4 } }}), .bbox = .{ 0, 0, 400, 500 }, .rotation = 90 };
+    const sample = document_extraction_mod.PdfPageText{
+        .text = @constCast("Embedded page text"),
+        .text_regions = @constCast(&[_]document_extraction_mod.TextRegion{.{ .span = .{ 0, 8 }, .bbox = .{ 1, 2, 3, 4 }, .font_size = 12, .bold = true }}),
+        .text_blocks = @constCast(&[_]document_extraction_mod.TextBlock{.{ .span = .{ 0, 8 }, .bbox = .{ 1, 2, 3, 4 }, .reading_order = 0, .font_size = 12, .bold = true }}),
+        .native_text_diagnostics = .{ .policy = .page, .actual_text_replacements = 1, .source_run_count = 2, .emitted_run_count = 1 },
+        .bbox = .{ 0, 0, 400, 500 },
+        .rotation = 90,
+    };
     try cached_text.store_fn(cached_text.ptr, 1, sample);
     try std.testing.expectEqual(@as(usize, 1), neutral.writes.items.len);
     try std.testing.expect(!scheduler.spool_registered);
@@ -13023,9 +13042,19 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     defer loaded.deinit(alloc);
     try std.testing.expectEqualStrings(sample.text, loaded.text);
     try std.testing.expectEqualSlices(document_extraction_mod.TextRegion, sample.text_regions, loaded.text_regions);
+    try std.testing.expectEqualSlices(document_extraction_mod.TextBlock, sample.text_blocks, loaded.text_blocks);
+    try std.testing.expectEqualDeep(sample.native_text_diagnostics, loaded.native_text_diagnostics);
     try std.testing.expectEqual(sample.bbox, loaded.bbox);
     try std.testing.expectEqual(sample.rotation, loaded.rotation);
     try std.testing.expect(loaded.text.ptr != sample.text.ptr);
+    const page_policy_key = try neutral.keyAlloc(alloc, 1);
+    defer alloc.free(page_policy_key);
+    neutral.policy = .visible;
+    const visible_policy_key = try neutral.keyAlloc(alloc, 1);
+    try std.testing.expect(try cached_text.load_fn(cached_text.ptr, alloc, 1) == null);
+    defer alloc.free(visible_policy_key);
+    try std.testing.expect(!std.mem.eql(u8, page_policy_key, visible_policy_key));
+    neutral.policy = .page;
     neutral.limits.max_working_set_bytes -= 1;
     try std.testing.expect(try cached_text.load_fn(cached_text.ptr, alloc, 1) == null);
     neutral.limits = .{};
@@ -13044,7 +13073,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         const previous_manager = runtime.config.resource_manager;
         runtime.config.resource_manager = &cache_resources;
         defer runtime.config.resource_manager = previous_manager;
-        var optional = RuntimePdfPageTextSpool{ .scheduler = &scheduler, .digest = digest, .limits = .{}, .flush_items = 8 };
+        var optional = RuntimePdfPageTextSpool{ .scheduler = &scheduler, .digest = digest, .limits = .{}, .policy = .page, .flush_items = 8 };
         defer optional.deinit();
         const cache = optional.cache();
         try cache.store_fn(cache.ptr, 1, sample);
@@ -13064,7 +13093,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         mandatory.release();
         try std.testing.expectEqual(@as(u64, 0), cache_resources.sliceStats(.document_extraction_working_set).used_bytes);
 
-        var tail = RuntimePdfPageTextSpool{ .scheduler = &scheduler, .digest = digest, .limits = .{}, .flush_items = 8 };
+        var tail = RuntimePdfPageTextSpool{ .scheduler = &scheduler, .digest = digest, .limits = .{}, .policy = .page, .flush_items = 8 };
         defer tail.deinit();
         const tail_cache = tail.cache();
         try std.testing.expect(try tail_cache.load_fn(tail_cache.ptr, alloc, 1) == null);
@@ -13235,16 +13264,16 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             }
         };
         var first_sink = Sink{ .alloc = alloc };
-        var first_text = RuntimePdfPageTextSpool{ .scheduler = &scheduler, .digest = digest, .limits = .{} };
+        var first_text = RuntimePdfPageTextSpool{ .scheduler = &scheduler, .digest = digest, .limits = .{}, .policy = .page };
         defer first_text.deinit();
-        try document_extraction_mod.extractPreparedPdfStreamingWithTextCache(alloc, session, "application/pdf", .auto, .{}, first_sink.sink(), first_text.cache());
+        try document_extraction_mod.extractPreparedPdfStreamingWithTextCache(alloc, session, "application/pdf", .{}, .auto, .{}, first_sink.sink(), first_text.cache());
         try first_text.finish();
         try std.testing.expectEqual(@as(usize, 2), first_text.stores);
         try std.testing.expectEqual(@as(usize, 0), first_text.hits);
         var second_sink = Sink{ .alloc = alloc };
-        var second_text = RuntimePdfPageTextSpool{ .scheduler = &scheduler, .digest = digest, .limits = .{} };
+        var second_text = RuntimePdfPageTextSpool{ .scheduler = &scheduler, .digest = digest, .limits = .{}, .policy = .page };
         defer second_text.deinit();
-        try document_extraction_mod.extractPreparedPdfStreamingWithTextCache(alloc, session, "application/pdf", .always, .{}, second_sink.sink(), second_text.cache());
+        try document_extraction_mod.extractPreparedPdfStreamingWithTextCache(alloc, session, "application/pdf", .{}, .always, .{}, second_sink.sink(), second_text.cache());
         try second_text.finish();
         try std.testing.expectEqual(@as(usize, 0), second_text.stores);
         try std.testing.expectEqual(@as(usize, 2), second_text.hits);
@@ -17283,7 +17312,7 @@ fn processDocumentExtractionAsset(
     const downloaded = &prepared_source.content;
     resource_tracker.setExternallyAccountedDownloadedBytes(downloaded.data.len);
     const byte_source_fingerprint = if (metadata_fingerprint == null)
-        try documentExtractionFingerprintFromDigestAlloc(runtime.alloc, &prepared_source.source_identity, config_json, config.content_type, config.filename, downloaded.content_type, &prepared_source.content_sha256)
+        try documentExtractionFingerprintFromDigestAlloc(runtime.alloc, &prepared_source.source_identity, config_json, config.native_text, config.content_type, config.filename, downloaded.content_type, &prepared_source.content_sha256)
     else
         null;
     defer if (byte_source_fingerprint) |fingerprint| runtime.alloc.free(fingerprint);
@@ -17334,6 +17363,7 @@ fn processDocumentExtractionAsset(
             .scheduler = shared,
             .digest = prepared_source.content_sha256,
             .limits = configured_pdf_decode_limits,
+            .policy = config.native_text.policy,
             .flush_items = @max(1, @min(32, batch_policy.max_items)),
         };
     };
@@ -17477,6 +17507,7 @@ fn processDocumentExtractionAsset(
             document_extraction_alloc,
             session,
             if (extraction_config.content_type.len > 0) extraction_config.content_type else downloaded.content_type,
+            extraction_config.native_text,
             extraction_config.ocr_mode,
             extraction_config.ocr_quality,
             prepared_marking.sink(),
@@ -22823,6 +22854,8 @@ fn applyRuntimeGeneratedUnitTextInPlace(
             unit.ocr_bbox = parsed.bbox;
             if (unit.text_regions.len > 0) alloc.free(unit.text_regions);
             unit.text_regions = mapped_regions;
+            if (unit.text_blocks.len > 0) alloc.free(unit.text_blocks);
+            unit.text_blocks = &.{};
             mapped_regions = &.{};
         },
         .transcript => {
@@ -22932,6 +22965,10 @@ fn markRuntimeGeneratedUnitTextFailureNamed(
             if (std.mem.eql(u8, unit.unit_type, "image")) {
                 alloc.free(unit.text);
                 unit.text = try alloc.dupe(u8, "");
+                if (unit.text_regions.len > 0) alloc.free(unit.text_regions);
+                unit.text_regions = &.{};
+                if (unit.text_blocks.len > 0) alloc.free(unit.text_blocks);
+                unit.text_blocks = &.{};
             }
         },
         .transcript => {
@@ -23177,6 +23214,9 @@ fn runtimeDocumentGeneratedTextPartsJsonAlloc(
         .page_bbox = unit.page_bbox,
         .page_rotation = unit.page_rotation,
         .text_regions = unit.text_regions,
+        .text_blocks = unit.text_blocks,
+        .native_text_quality = unit.native_text_quality,
+        .native_text_diagnostics = unit.native_text_diagnostics,
         .byte_length = unit.byte_length,
         .source_sha256 = unit.source_sha256,
         .ocr_attempted = unit.ocr_attempted,
@@ -23392,7 +23432,9 @@ fn runtimeDocumentExtractionUnitOwnedBytes(unit: document_extraction_mod.Unit) u
     if (unit.ocr_output_quality) |value| total = addUsizeSaturating(total, value.len);
     if (unit.ocr_failure_stage) |value| total = addUsizeSaturating(total, value.len);
     if (unit.page_label) |value| total = addUsizeSaturating(total, value.len);
+    total = addUsizeSaturating(total, unit.transcript_spans.len * @sizeOf(document_extraction_mod.TranscriptSpan));
     total = addUsizeSaturating(total, unit.text_regions.len * @sizeOf(document_extraction_mod.TextRegion));
+    total = addUsizeSaturating(total, unit.text_blocks.len * @sizeOf(document_extraction_mod.TextBlock));
     return total;
 }
 
@@ -23429,6 +23471,8 @@ fn cloneDocumentExtractionUnit(alloc: Allocator, unit: document_extraction_mod.U
     errdefer if (page_label) |value| alloc.free(value);
     var text_regions: []document_extraction_mod.TextRegion = if (unit.text_regions.len > 0) try alloc.dupe(document_extraction_mod.TextRegion, unit.text_regions) else &.{};
     errdefer if (text_regions.len > 0) alloc.free(text_regions);
+    var text_blocks: []document_extraction_mod.TextBlock = if (unit.text_blocks.len > 0) try alloc.dupe(document_extraction_mod.TextBlock, unit.text_blocks) else &.{};
+    errdefer if (text_blocks.len > 0) alloc.free(text_blocks);
     var transcript_spans: []document_extraction_mod.TranscriptSpan = if (unit.transcript_spans.len > 0) try alloc.dupe(document_extraction_mod.TranscriptSpan, unit.transcript_spans) else &.{};
     errdefer if (transcript_spans.len > 0) alloc.free(transcript_spans);
 
@@ -23441,6 +23485,8 @@ fn cloneDocumentExtractionUnit(alloc: Allocator, unit: document_extraction_mod.U
         .extraction_status = extraction_status,
         .source_sha256 = source_sha256,
         .byte_length = unit.byte_length,
+        .native_text_quality = unit.native_text_quality,
+        .native_text_diagnostics = unit.native_text_diagnostics,
         .ocr_used = unit.ocr_used,
         .ocr_attempted = unit.ocr_attempted,
         .ocr_render_dpi = unit.ocr_render_dpi,
@@ -23463,6 +23509,7 @@ fn cloneDocumentExtractionUnit(alloc: Allocator, unit: document_extraction_mod.U
         .page_bbox = unit.page_bbox,
         .page_rotation = unit.page_rotation,
         .text_regions = text_regions,
+        .text_blocks = text_blocks,
         .transcript_spans = transcript_spans,
         .char_start = unit.char_start,
         .char_end = unit.char_end,
@@ -23481,6 +23528,7 @@ fn cloneDocumentExtractionUnit(alloc: Allocator, unit: document_extraction_mod.U
     ocr_failure_stage = null;
     page_label = null;
     text_regions = &.{};
+    text_blocks = &.{};
     transcript_spans = &.{};
     return cloned;
 }
@@ -25876,6 +25924,32 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .extraction_method = unit.method,
         .extraction_status = unit.extraction_status,
         .confidence = documentUnitConfidence(unit),
+        .native_text_quality = if (unit.native_text_quality) |quality| .{
+            .too_short = quality.too_short,
+            .garbled = quality.garbled,
+            .font_corrupted = quality.font_corrupted,
+            .replacement_corrupted = quality.replacement_corrupted,
+            .single_char_word_ratio = quality.single_char_word_ratio,
+            .corrupted_line_ratio = quality.corrupted_line_ratio,
+            .replacement_char_ratio = quality.replacement_char_ratio,
+            .trimmed_len = quality.trimmed_len,
+            .non_whitespace_chars = quality.non_whitespace_chars,
+        } else null,
+        .native_text_diagnostics = if (unit.native_text_diagnostics) |diagnostics| .{
+            .policy = @tagName(diagnostics.policy),
+            .extraction_complete = diagnostics.extraction_complete,
+            .semantic_coverage = @tagName(diagnostics.semantic_coverage),
+            .actual_text_replacements = diagnostics.actual_text_replacements,
+            .outside_page_runs = diagnostics.outside_page_runs,
+            .invisible_runs = diagnostics.invisible_runs,
+            .unaligned_runs = diagnostics.unaligned_runs,
+            .unsupported_ordering_runs = diagnostics.unsupported_ordering_runs,
+            .source_run_count = diagnostics.source_run_count,
+            .emitted_run_count = diagnostics.emitted_run_count,
+            .outline_fallback = diagnostics.outline_fallback,
+            .has_nontext_visual = diagnostics.has_nontext_visual,
+            .has_unrendered_annotations = diagnostics.has_unrendered_annotations,
+        } else null,
         .ocr_used = unit.ocr_used,
         .ocr_attempted = unit.ocr_attempted,
         .ocr_render_dpi = unit.ocr_render_dpi,
@@ -32693,6 +32767,7 @@ fn documentExtractionFingerprintAlloc(
     alloc: Allocator,
     source_url: []const u8,
     config_json: []const u8,
+    native_text: document_extraction_mod.NativeTextConfig,
     configured_content_type: []const u8,
     configured_filename: []const u8,
     downloaded_content_type: []const u8,
@@ -32701,27 +32776,43 @@ fn documentExtractionFingerprintAlloc(
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
     const identity = PreparedDocumentSourceCache.sourceIdentity(source_url);
-    return documentExtractionFingerprintFromDigestAlloc(alloc, &identity, config_json, configured_content_type, configured_filename, downloaded_content_type, &digest);
+    return documentExtractionFingerprintFromDigestAlloc(alloc, &identity, config_json, native_text, configured_content_type, configured_filename, downloaded_content_type, &digest);
 }
 
-test "shared PDF consumer fingerprints reuse a framed content digest" {
+test "document extraction runtime fingerprints independent native quality and policy without OCR" {
     const alloc = std.testing.allocator;
+    var native_only = try document_extraction_mod.parseConfig(alloc,
+        \\{"native_text":{"policy":"page","quality":{"min_content_chars":1}}}
+    );
+    defer native_only.deinit(alloc);
+    try std.testing.expect(!native_only.ocr_enabled);
+    try std.testing.expect(!document_extraction_mod.assessOcrQuality("native text", native_only.native_text.quality).too_short);
     const source = "%PDF-test-content";
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
     const identity = PreparedDocumentSourceCache.sourceIdentity("url");
-    const direct = try documentExtractionFingerprintAlloc(alloc, "url", "{}", "application/pdf", "file.pdf", "application/pdf", source);
+    const direct = try documentExtractionFingerprintAlloc(alloc, "url", "{}", .{}, "application/pdf", "file.pdf", "application/pdf", source);
     defer alloc.free(direct);
-    const prepared = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", "application/pdf", "file.pdf", "application/pdf", &digest);
+    const prepared = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", .{}, "application/pdf", "file.pdf", "application/pdf", &digest);
     defer alloc.free(prepared);
     try std.testing.expectEqualStrings(direct, prepared);
-    const left = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", "ab", "c", "pdf", &digest);
+    const left = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", .{}, "ab", "c", "pdf", &digest);
     defer alloc.free(left);
-    const right = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", "a", "bc", "pdf", &digest);
+    const right = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", .{}, "a", "bc", "pdf", &digest);
     defer alloc.free(right);
     try std.testing.expect(!std.mem.eql(u8, left, right));
+    var visible_native = document_extraction_mod.NativeTextConfig{};
+    visible_native.policy = .visible;
+    const visible = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", visible_native, "application/pdf", "file.pdf", "application/pdf", &digest);
+    defer alloc.free(visible);
+    try std.testing.expect(!std.mem.eql(u8, prepared, visible));
+    var tuned_native = document_extraction_mod.NativeTextConfig{};
+    tuned_native.quality.min_content_chars += 1;
+    const tuned = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", tuned_native, "application/pdf", "file.pdf", "application/pdf", &digest);
+    defer alloc.free(tuned);
+    try std.testing.expect(!std.mem.eql(u8, prepared, tuned));
     digest[0] ^= 1;
-    const changed = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", "application/pdf", "file.pdf", "application/pdf", &digest);
+    const changed = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", .{}, "application/pdf", "file.pdf", "application/pdf", &digest);
     defer alloc.free(changed);
     try std.testing.expect(!std.mem.eql(u8, prepared, changed));
     var legacy_hash: [32]u8 = undefined;
@@ -32739,19 +32830,34 @@ fn documentExtractionFingerprintFromDigestAlloc(
     alloc: Allocator,
     source_identity: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
     config_json: []const u8,
+    native_text: document_extraction_mod.NativeTextConfig,
     configured_content_type: []const u8,
     configured_filename: []const u8,
     downloaded_content_type: []const u8,
     content_digest: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
 ) ![]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("antfly.document-extraction.fingerprint.v3\x00");
+    hasher.update("antfly.document-extraction.fingerprint.v4\x00");
     hasher.update(source_identity);
-    for ([_][]const u8{ config_json, configured_content_type, configured_filename, downloaded_content_type }) |field| {
+    for ([_][]const u8{ config_json, document_extraction_mod.native_text_extraction_identity, @tagName(native_text.policy), configured_content_type, configured_filename, downloaded_content_type }) |field| {
         var size: [8]u8 = undefined;
         std.mem.writeInt(u64, &size, @intCast(field.len), .little);
         hasher.update(&size);
         hasher.update(field);
+    }
+    for ([_]u64{
+        @intCast(native_text.quality.min_content_chars),
+        @intCast(native_text.quality.garbled_min_words),
+        @intCast(native_text.quality.garbled_sample_words),
+        @bitCast(native_text.quality.max_single_char_word_ratio),
+        @intCast(native_text.quality.substantial_line_min_chars),
+        @bitCast(native_text.quality.max_corrupted_line_ratio),
+        @bitCast(native_text.quality.font_corruption_score_threshold),
+        @bitCast(native_text.quality.max_replacement_char_ratio),
+    }) |value| {
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, value, .little);
+        hasher.update(&encoded);
     }
     hasher.update(content_digest);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
@@ -37118,6 +37224,19 @@ test "document extraction generated OCR rejects malformed envelopes before apply
 
 test "document extraction generated OCR applies unit updates transactionally" {
     const Runner = struct {
+        const regions = [_]document_extraction_mod.TextRegion{.{
+            .span = .{ 0, 5 },
+            .bbox = .{ 1, 2, 3, 4 },
+            .font_size = 10,
+            .bold = true,
+        }};
+        const blocks = [_]document_extraction_mod.TextBlock{.{
+            .span = .{ 0, 10 },
+            .bbox = .{ 1, 2, 20, 12 },
+            .reading_order = 0,
+            .font_size = 10,
+            .bold = true,
+        }};
         fn run(alloc: Allocator) !void {
             const unit_fixture = document_extraction_mod.Unit{
                 .unit_id = @constCast("page-1"),
@@ -37127,6 +37246,17 @@ test "document extraction generated OCR applies unit updates transactionally" {
                 .extraction_status = @constCast("pending_ocr"),
                 .ocr_failure_stage = @constCast("render"),
                 .page_number = 1,
+                .native_text_quality = document_extraction_mod.assessOcrQuality("prior text", .{ .min_content_chars = 1 }),
+                .native_text_diagnostics = .{
+                    .policy = .page,
+                    .semantic_coverage = .partial,
+                    .actual_text_replacements = 1,
+                    .source_run_count = 2,
+                    .emitted_run_count = 2,
+                    .has_nontext_visual = true,
+                },
+                .text_regions = @constCast(&regions),
+                .text_blocks = @constCast(&blocks),
             };
             var unit = try cloneDocumentExtractionUnit(alloc, unit_fixture);
             defer unit.deinit(alloc);
@@ -37149,12 +37279,20 @@ test "document extraction generated OCR applies unit updates transactionally" {
                 try std.testing.expectEqualStrings("pending", unit.method);
                 try std.testing.expectEqualStrings("pending_ocr", unit.extraction_status.?);
                 try std.testing.expectEqualStrings("render", unit.ocr_failure_stage.?);
+                try std.testing.expectEqual(@as(usize, 1), unit.text_regions.len);
+                try std.testing.expectEqual(@as(usize, 1), unit.text_blocks.len);
+                try std.testing.expectEqual(@as(usize, 1), unit.native_text_diagnostics.?.actual_text_replacements);
                 return err;
             };
             try std.testing.expectEqualStrings("replacement text with meaningful words", unit.text);
             try std.testing.expectEqualStrings("reader", unit.method);
             try std.testing.expectEqualStrings("completed", unit.extraction_status.?);
             try std.testing.expect(unit.ocr_failure_stage == null);
+            try std.testing.expectEqual(@as(usize, 0), unit.text_regions.len);
+            try std.testing.expectEqual(@as(usize, 0), unit.text_blocks.len);
+            try std.testing.expect(unit.native_text_quality != null);
+            try std.testing.expectEqual(document_extraction_mod.NativeTextSemanticCoverage.partial, unit.native_text_diagnostics.?.semantic_coverage);
+            try std.testing.expectEqual(@as(usize, 1), unit.native_text_diagnostics.?.actual_text_replacements);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
@@ -37320,11 +37458,19 @@ test "OCR text selection retains only exactly mapped region spans" {
         .span = .{ 0, 4 },
         .bbox = .{ 1, 2, 3, 4 },
     }};
+    const original_blocks = [_]document_extraction_mod.TextBlock{.{
+        .span = .{ 0, 4 },
+        .bbox = .{ 1, 2, 3, 4 },
+        .reading_order = 0,
+        .font_size = 11,
+    }};
     var embedded = try cloneDocumentExtractionUnit(alloc, .{
         .unit_id = @constCast("page:000002"),
         .unit_type = @constCast("page"),
         .text = @constCast("This substantial embedded document text remains preferable to a short OCR response with weak coverage."),
         .text_regions = @constCast(&original_regions),
+        .text_blocks = @constCast(&original_blocks),
+        .native_text_diagnostics = .{ .policy = .page, .source_run_count = 1, .emitted_run_count = 1 },
         .method = @constCast("pdf_text"),
         .extraction_status = @constCast("pending_ocr"),
         .page_number = 2,
@@ -37336,6 +37482,9 @@ test "OCR text selection retains only exactly mapped region spans" {
     try std.testing.expect(!embedded.ocr_used);
     try std.testing.expectEqual(@as(usize, 1), embedded.text_regions.len);
     try std.testing.expectEqual(original_regions[0], embedded.text_regions[0]);
+    try std.testing.expectEqual(@as(usize, 1), embedded.text_blocks.len);
+    try std.testing.expectEqual(original_blocks[0], embedded.text_blocks[0]);
+    try std.testing.expectEqual(@as(usize, 1), embedded.native_text_diagnostics.?.source_run_count);
 }
 
 test "document extraction generated OCR preserves short scan text and quality warnings transactionally" {
