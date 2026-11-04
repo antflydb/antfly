@@ -39,6 +39,16 @@ vectors remain authoritative. Catalog effect protocol 17 and Raft batch protocol
 26 gate the new execution identity; older publication/proof bytes retain their
 existing digests and decoders.
 
+Grouped multimodal requests preserve ordered parts as one logical input across
+native and remote execution. Remote multipart requests use
+`input: [{"content": [...]}]` and expect one vector in JSON or numeric responses.
+Independent media batches keep their existing one-vector-per-item contract;
+a singleton group retains the unimodal wire shape. Framed groups borrow raw
+attachments, and JSON groups encode directly into one pre-sized body.
+The native provider wire carries the captured model revision. Each acquired
+model, including a recovery attempt, must match it before inference dispatch;
+post-execution alias observations alone cannot protect against A→B→A changes.
+
 Downloaded media sources are shared across consumers within a preparation
 window. Synchronous consumers release idle source bodies at the document
 boundary and reuse the empty cache handle; deferred assets take ownership until
@@ -171,3 +181,7 @@ Text-template artifact reuse resolves one provider generation per batch key befo
 Model-pass chunk preparation and named-output projection share one budgeted source owner and metadata probe. The scanner transfers the heap-owned cache to the deferred asset lane after preparation, retaining the independent batching lanes and retiring source leases only after output consumers finish. Standalone source replay uses an owned instance of the same budgeted cache. HTTP status retry classification is shared with document extraction, including 408 and 425. Ordinary asset chains may terminate at an already validated media-output asset.
 
 The native inference-host gate always executes its tests, so changing opt-in fixture/model environment variables cannot reuse a cached skip. A missing fixture therefore fails even after a preceding run without qualification inputs.
+
+Public HTTP and linked native ordered groups now execute through the same acquired-model grouped pipeline on every backend. The native wire carries the captured model revision, which is checked before dispatch on every recovery attempt. Remote groups use one nested ordered `content` input and require exactly one vector; independent item batches retain their original cardinality. Singleton groups preserve the unimodal wire shape.
+
+Source image decode planning and background preparation waves share the same checked working-memory estimate, including decoder and color-conversion buffers before model resizing. The large-image qualification also compares joint text/image vectors through HTTP and the real native provider bridge, rejects stale revisions, and verifies released request admission.

@@ -1894,17 +1894,17 @@ pub const ManagedEmbedder = struct {
             for (vectors[0..initialized]) |vector| alloc.free(vector);
             alloc.free(vectors);
         }
+        entry.planned_embedding_lease = lease;
+        const wire_options = if (entry.antfly_provider) |local|
+            if (local.embed_dense_parts_with_context != null)
+                embedding_wire.Options.fromEmbeddingContext(entry.model, embeddingRequestContext(entry, .retrieval_document), false)
+            else
+                embedding_wire.Options{ .model = entry.model }
+        else
+            embedding_wire.Options{ .model = entry.model };
         var offset: usize = 0;
         while (offset < items.len) {
-            const end = try densePartBatchEnd(alloc, capabilities, attachment_transport, items, offset, .{
-                .model = entry.model,
-                .model_identity = if (entry.model_identity.len > 0) entry.model_identity else null,
-                .dimensions = if (dims > 0) dims else null,
-                .task_type = if (entry.antfly_provider) |local|
-                    if (local.embed_dense_parts_with_context != null) EmbeddingTaskType.retrieval_document.canonical() else null
-                else
-                    null,
-            });
+            const end = try densePartBatchEnd(alloc, capabilities, attachment_transport, items, offset, wire_options);
             const chunk = items[offset..end];
             try validateDensePartItemInvocation(alloc, capabilities, attachment_transport, chunk);
             const chunk_vectors = try embedPartItemsWithEntry(alloc, entry, chunk, dims, lease);
@@ -5411,26 +5411,20 @@ fn validateSparseEmbeddingForManagedConfig(
     };
     defer managed.deinit(alloc);
     try attachProviderQuota(&managed, options);
-    try validateSparseEmbeddingForEntry(alloc, &managed);
+    try validateSparseEmbeddingForEntry(alloc, &managed, options.probe_retry_budget_ns);
 }
 
 fn validateSparseEmbeddingForEntry(
     alloc: std.mem.Allocator,
     entry: *const ManagedEmbeddingEntry,
+    probe_retry_budget_ns: ?u64,
 ) !void {
-    var embedding = embedSparseWithEntry(alloc, entry, dimension_probe_text) catch |err| switch (err) {
-        error.EmptyEmbeddingResponse,
-        error.InvalidEmbeddingResponse,
-        error.EmbedRateLimited,
-        error.EmbedTransientFailure,
-        error.EmbedAdmissionRefused,
-        error.QueueFull,
-        error.EmbedRequestFailed,
-        => return error.InvalidCreateTableRequest,
-        error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
-        else => return err,
-    };
-    embedding.deinit(alloc);
+    _ = try probeEmbeddingRetryingTransient(void, validateSparseEmbeddingOnce, .{}, alloc, entry, .strict, probe_retry_budget_ns);
+}
+
+fn validateSparseEmbeddingOnce(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry) !void {
+    var embedding = try embedSparseWithEntry(alloc, entry, dimension_probe_text);
+    defer embedding.deinit(alloc);
 }
 
 fn resolveEmbeddingDimensionsForEntry(
@@ -5521,6 +5515,21 @@ fn probeEmbeddingDimensionsRetryingTransient(
     validation: DimensionProbeValidation,
     probe_retry_budget_ns: ?u64,
 ) !?u32 {
+    return probeEmbeddingRetryingTransient(u32, inferEmbeddingDimensionsFromEntry, .{declared orelse 0}, alloc, entry, validation, probe_retry_budget_ns);
+}
+
+/// Dense and sparse validation share deadline, cancellation, error identity,
+/// quota and retry semantics. The result stays typed; sparse probes own and
+/// release their output and return void instead of inventing dimensions.
+fn probeEmbeddingRetryingTransient(
+    comptime Result: type,
+    comptime invoke: anytype,
+    args: anytype,
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    validation: DimensionProbeValidation,
+    probe_retry_budget_ns: ?u64,
+) !?Result {
     // An already-expired caller deadline or cancellation can't be fixed by
     // retrying at all; surface it before spending a single attempt on it.
     try ensureEntryDeadline(entry);
@@ -5555,7 +5564,7 @@ fn probeEmbeddingDimensionsRetryingTransient(
 
     var attempt: u32 = 1;
     while (true) {
-        if (inferEmbeddingDimensionsFromEntry(alloc, &probing, declared orelse 0)) |dims| return dims else |err| {
+        if (@call(.auto, invoke, .{ alloc, &probing } ++ args)) |result| return result else |err| {
             const transient = switch (err) {
                 error.InvalidEmbeddingDimensions,
                 error.EmptyEmbeddingResponse,
@@ -6405,7 +6414,7 @@ fn embedWithEntryPartsForTaskOnce(
         const operation_deadline_ns = embeddingOperationDeadline(entry);
         try applyAntflyEmbeddingRequestControls(entry, &provider, operation_deadline_ns);
 
-        var result = provider.embedPartsWithTask(
+        var result = provider.embedGroupWithTask(
             alloc,
             entry.model,
             parts,
@@ -6599,7 +6608,7 @@ fn densePartBatchEnd(
 
 test "managed embedder metadata sizing matches wire JSON at every prefix" {
     const alloc = std.testing.allocator;
-    const options = embedding_wire.Options{ .dimensions = 128, .model = "model\"\\\nλ", .task_type = "RETRIEVAL_DOCUMENT", .instruction = "\x00instruction" };
+    const options = embedding_wire.Options{ .model_revision = @splat(9), .dimensions = 128, .model = "model\"\\\nλ", .task_type = "RETRIEVAL_DOCUMENT", .instruction = "\x00instruction" };
     var parts: [105]template_mod.ContentPart = undefined;
     var wire_parts: [105]template_mod.ContentPart = undefined;
     var payloads: [105]httpx.attachment_envelope.Attachment = undefined;
@@ -6618,6 +6627,7 @@ test "managed embedder metadata sizing matches wire JSON at every prefix" {
         const json = try std.json.Stringify.valueAlloc(alloc, .{
             .model = options.model,
             .model_identity = options.model_identity,
+            .model_revision = options.model_revision,
             .dimensions = options.dimensions,
             .grouped = options.grouped,
             .parts = wire_parts[0 .. i + 1],
@@ -12118,9 +12128,8 @@ test "managed embedder forwards dense quantization settings" {
     }
 }
 
-test "managed embedder review retains admission refusal classification" {
+test "managed embedder retains normalized admission refusal classification" {
     const normalized = normalizeLocalEmbeddingError(error.ResourceTemporarilyUnavailable);
-    std.debug.print("review embedding admission becomes {s}, exempt={}\n", .{ @errorName(normalized), repair_failure.isAdmissionRefusal(normalized) });
     try std.testing.expect(repair_failure.isAdmissionRefusal(normalized));
 }
 
@@ -12234,6 +12243,18 @@ test "managed embedder grouped queries preserve ordered parts task and single ou
         fn items(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const template_mod.ContentPart) ![][]f32 {
             return error.UnexpectedIndependentItems;
         }
+        fn itemWithContext(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, parts: []const template_mod.ContentPart, context: EmbeddingRequestContext) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.check();
+            try std.testing.expectEqual(@as([32]u8, @splat(1)), context.model_revision.?);
+            try std.testing.expectEqual(EmbeddingTaskType.retrieval_document, context.task_type);
+            try std.testing.expectEqual(@as(usize, 1), parts.len);
+            self.calls += 1;
+            const rows = try a.alloc([]f32, 1);
+            errdefer a.free(rows);
+            rows[0] = try a.dupe(f32, &.{ 1, 0 });
+            return rows;
+        }
         fn group(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, parts: []const template_mod.ContentPart, context: EmbeddingRequestContext) ![][]f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try context.check();
@@ -12258,7 +12279,7 @@ test "managed embedder grouped queries preserve ordered parts task and single ou
     };
     const a = std.testing.allocator;
     var p = P{};
-    var entries = [_]ManagedEmbeddingEntry{.{ .alloc = a, .index_name = @constCast("visual"), .provider = .antfly, .model = @constCast("model"), .base_url = @constCast("antfly:embedded"), .dimensions = 2, .io = std.testing.io, .declared_inputs = .{ .text = true, .image = true }, .antfly_provider = .{ .ptr = &p, .embed_dense_texts = P.texts, .embed_sparse_texts = P.sparse, .embed_dense_parts = P.items, .embed_dense_group_with_context = P.group, .model_capabilities = P.capabilities } }};
+    var entries = [_]ManagedEmbeddingEntry{.{ .alloc = a, .index_name = @constCast("visual"), .provider = .antfly, .model = @constCast("model"), .base_url = @constCast("antfly:embedded"), .dimensions = 2, .io = std.testing.io, .declared_inputs = .{ .text = true, .image = true }, .antfly_provider = .{ .ptr = &p, .owns_invocation_admission = true, .embed_dense_texts = P.texts, .embed_sparse_texts = P.sparse, .embed_dense_parts = P.items, .embed_dense_parts_with_context = P.itemWithContext, .embed_dense_group_with_context = P.group, .model_capabilities = P.capabilities } }};
     var managed = ManagedEmbedder{ .alloc = a, .entries = &entries };
     const vector = try managed.embedQueryWithTemplate(a, "visual", "data:image/png;base64,AA==", "astronaut {{media url=this}}");
     defer a.free(vector);
@@ -12267,6 +12288,7 @@ test "managed embedder grouped queries preserve ordered parts task and single ou
     const dense = managed.denseInterface();
     const context = RequestContext{ .io = std.testing.io, .deadline_ns = null };
     const generation = try dense.captureTextGenerationWithContext(a, "visual", context);
+    const item_lease = try dense.resolvePartLease(a, "visual");
     p.revision = 2;
     p.task = .retrieval_document;
     const parts = [_]template_mod.ContentPart{ .{ .text = "astronaut" }, .{ .media_url = "data:image/png;base64,AA==" } };
@@ -12274,4 +12296,106 @@ test "managed embedder grouped queries preserve ordered parts task and single ou
     defer a.free(document_vector);
     try std.testing.expectError(error.EnrichmentSourceChanged, dense.requireTextGenerationWithContext(a, "visual", generation, context));
     try std.testing.expectEqual(@as(usize, 2), p.calls);
+    const item_vectors = try dense.withPartLease(item_lease).embedDensePartItems(a, "visual", parts[0..1], 2);
+    defer {
+        for (item_vectors) |item| a.free(item);
+        a.free(item_vectors);
+    }
+    try std.testing.expectEqual(@as(usize, 3), p.calls);
+}
+
+test "managed embedder sparse validation shares bounded admission retry and caller authority" {
+    const Local = struct {
+        failure: ?anyerror = error.ResourceTemporarilyUnavailable,
+        failures_left: usize = 1,
+        calls: usize = 0,
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn sparse(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.failure) |failure| if (self.failures_left > 0) {
+                self.failures_left -= 1;
+                return failure;
+            };
+            const batch = try alloc.alloc(db_embedder.SparseEmbedding, 1);
+            errdefer alloc.free(batch);
+            const indices = try alloc.dupe(u32, &.{1});
+            errdefer alloc.free(indices);
+            batch[0] = .{ .indices = indices, .values = try alloc.dupe(f32, &.{0.5}) };
+            return batch;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var local = Local{};
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(alloc,
+        \\{"sparse_idx":{"type":"embeddings","field":"body","sparse":true,"embedder":{"provider":"antfly","model":"local-model"}}}
+    , .{ .ptr = &local, .owns_invocation_admission = true, .embed_dense_texts = Local.dense, .embed_sparse_texts = Local.sparse });
+    defer managed.deinit();
+    const entry = managed.findEntry("sparse_idx").?;
+    try validateSparseEmbeddingForEntry(alloc, entry, 2 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, 2), local.calls);
+    local = .{};
+    try std.testing.expectError(error.EmbeddingProbeUnavailable, validateSparseEmbeddingForEntry(alloc, entry, 0));
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
+    for ([_]anyerror{ error.ResourceLimitExceeded, error.MemoryBudgetExceeded }) |failure| {
+        local = .{ .failure = failure };
+        try std.testing.expectError(failure, validateSparseEmbeddingForEntry(alloc, entry, 2 * std.time.ns_per_s));
+        try std.testing.expectEqual(@as(usize, 1), local.calls);
+    }
+    local = .{};
+    var overlay = entry.requestOverlay(alloc);
+    defer overlay.auth_header_cache.deinit(alloc);
+    overlay.deadline_ns = monotonicNowNs() -| 1;
+    try std.testing.expectError(error.Timeout, validateSparseEmbeddingForEntry(alloc, &overlay, 2 * std.time.ns_per_s));
+    try std.testing.expectEqual(@as(usize, 0), local.calls);
+    var cancelled = std.atomic.Value(bool).init(true);
+    overlay.deadline_ns = null;
+    overlay.cancellation = CancellationToken.fromAtomic(&cancelled);
+    try std.testing.expectError(error.Cancelled, validateSparseEmbeddingForEntry(alloc, &overlay, 2 * std.time.ns_per_s));
+    try std.testing.expectEqual(@as(usize, 0), local.calls);
+}
+
+test "managed embedder remote grouped query uses one HTTP input and one vector" {
+    const App = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.method == .GET) return .{ .status = 200, .content_type = try a.dupe(u8, "application/json"), .body = try a.dupe(u8, "{\"embedders\":{\"model\":{}}}") };
+            try std.testing.expectEqual(http_common.Method.POST, request.method);
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, request.body, .{});
+            defer parsed.deinit();
+            const root = parsed.value.object;
+            try std.testing.expectEqualStrings("RETRIEVAL_QUERY", root.get("task_type").?.string);
+            const inputs = root.get("input").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), inputs.len);
+            const parts = inputs[0].object.get("content").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), parts.len);
+            try std.testing.expectEqualStrings("astronaut", std.mem.trim(u8, parts[0].object.get("text").?.string, " \r\n\t"));
+            if (parts[1].object.get("image_url")) |url| {
+                try std.testing.expectEqualStrings("data:image/png;base64,AA==", url.object.get("url").?.string);
+            } else {
+                try std.testing.expectEqualStrings("image/png", parts[1].object.get("mime_type").?.string);
+                try std.testing.expectEqualStrings("AA==", parts[1].object.get("data").?.string);
+            }
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return .{ .status = 200, .content_type = try a.dupe(u8, "application/json"), .body = try a.dupe(u8, "{\"data\":[{\"embedding\":[1,0]}]}") };
+        }
+    };
+    const a = std.testing.allocator;
+    var app = App{};
+    var listener = std_http_listener.StdHttpListener.init(a, .{}, .{ .ptr = &app, .vtable = &.{ .execute = App.execute } });
+    defer listener.deinit();
+    try listener.start();
+    const base = try listener.baseUri(a);
+    defer a.free(base);
+    const indexes = try std.fmt.allocPrint(a, "{{\"visual\":{{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":2,\"embedder\":{{\"provider\":\"antfly\",\"model\":\"model\",\"api_url\":\"{s}\",\"inputs\":[\"text\",\"image\"]}}}}}}", .{base});
+    defer a.free(indexes);
+    var managed = try ManagedEmbedder.initFromIndexesJson(a, indexes);
+    defer managed.deinit();
+    const vector = try managed.embedQueryWithTemplate(a, "visual", "data:image/png;base64,AA==", "astronaut {{media url=this}}");
+    defer a.free(vector);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0 }, vector);
+    try std.testing.expectEqual(@as(usize, 1), app.calls.load(.monotonic));
 }

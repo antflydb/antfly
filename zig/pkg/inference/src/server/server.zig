@@ -1932,6 +1932,15 @@ fn runEmbeddingRuntimeRecoveryLoop(adapter: anytype) !void {
     }
 }
 
+// Check the acquired generation on every recovery attempt, before broker or
+// pipeline dispatch. Observing the alias before/after execution cannot fence ABA.
+fn requireLoadedEmbeddingRevision(expected: ?[32]u8, actual: ?[32]u8) !void {
+    if (expected) |revision| {
+        const loaded = actual orelse return error.InferenceCapabilitiesStale;
+        if (!std.mem.eql(u8, &revision, &loaded)) return error.InferenceCapabilitiesStale;
+    }
+}
+
 fn runLoadedEmbeddingRuntimeWithRecovery(
     node: *Node,
     model_path: []const u8,
@@ -3153,7 +3162,8 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
         }),
         error.ResourceLimitExceeded => ctx.status(400).json(.{
             .@"error" = "MODEL_RESOURCE_LIMIT",
-            .message = "model resource plan exceeds the configured inference budget",
+            .message = "model resource plan exceeds the configured inference budget; inspect admission logs for requested bytes and host, backend, combined, KV and scratch limits",
+            .retryable = false,
         }),
         error.ModelArtifactsChanging,
         error.IncompleteManagedDownload,
@@ -3191,7 +3201,8 @@ fn inferenceFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
         }),
         error.ResourceLimitExceeded => ctx.status(400).json(.{
             .@"error" = "MODEL_RESOURCE_LIMIT",
-            .message = "request resource plan exceeds the configured inference budget",
+            .message = "request resource plan exceeds the configured inference budget; inspect admission logs for requested bytes and host, backend, combined, KV and scratch limits",
+            .retryable = false,
         }),
         error.ProcessIsolationRequired => ctx.status(503).json(.{
             .@"error" = "PROCESS_ISOLATION_REQUIRED",
@@ -4966,10 +4977,7 @@ pub const Node = struct {
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
-                if (attempt.expected_revision) |expected| {
-                    const actual = model.resolution_revision orelse return error.InferenceCapabilitiesStale;
-                    if (!std.mem.eql(u8, &expected, &actual)) return error.InferenceCapabilitiesStale;
-                }
+                try requireLoadedEmbeddingRevision(attempt.expected_revision, model.resolution_revision);
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
                 const input_tokens = try maxTokenizerTextTokens(
                     attempt.allocator,
@@ -6775,6 +6783,7 @@ pub const Node = struct {
             executor_contract,
             .RETRIEVAL_DOCUMENT,
             null,
+            null,
         );
     }
 
@@ -6851,6 +6860,20 @@ pub const Node = struct {
         task_type_raw: ?[]const u8,
         instruction: ?[]const u8,
     ) ![][]f32 {
+        return self.embedDensePartsDirectWithExecutionControlAndTaskRevision(allocator, io, supplied_control, model_name, parts, task_type_raw, instruction, null);
+    }
+
+    pub fn embedDensePartsDirectWithExecutionControlAndTaskRevision(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        supplied_control: InferenceExecutionControl,
+        model_name: []const u8,
+        parts: []const DirectDenseEmbedPart,
+        task_type_raw: ?[]const u8,
+        instruction: ?[]const u8,
+        expected_revision: ?[32]u8,
+    ) ![][]f32 {
         const control = self.bindExecutionControl(io, supplied_control);
         if (parts.len == 0) return try allocator.alloc([]f32, 0);
         try control.check();
@@ -6915,6 +6938,7 @@ pub const Node = struct {
             executor_contract,
             task_type,
             instruction,
+            expected_revision,
         );
     }
 
@@ -7724,6 +7748,7 @@ pub const Node = struct {
         executor_contract: ResolvedInferenceExecutorContract,
         task_type: EmbeddingTaskType,
         instruction: ?[]const u8,
+        expected_revision: ?[32]u8,
     ) ![][]f32 {
         if (parsed.total_count == 0) return try allocator.alloc([]f32, 0);
         try control.check();
@@ -7760,12 +7785,24 @@ pub const Node = struct {
             control: InferenceExecutionControl,
             task_type: EmbeddingTaskType,
             instruction: ?[]const u8,
+            expected_revision: ?[32]u8,
             vectors: ?[][]f32 = null,
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
+                try requireLoadedEmbeddingRevision(attempt.expected_revision, model.resolution_revision);
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
                 try model.verifyEmbeddingIdentityWithControl(attempt.control);
+                if (attempt.parsed.groups.items.len != 0) {
+                    if (attempt.instruction != null) return error.InstructionNotSupportedForModel;
+                    var groups = try embeddingGroupsForParsed(attempt.allocator, attempt.parsed);
+                    defer groups.deinit();
+                    attempt.vectors = try attempt.node.embedGroupsOnLoadedModel(attempt.allocator, model, groups.groups, .{
+                        .task_type = @tagName(attempt.task_type),
+                        .max_audio_decode_working_bytes = attempt.audio_decode_working_bytes,
+                    }, attempt.control);
+                    return;
+                }
                 const resident_embedding_gemma2 = model.manifest.embedding_style == .embedding_gemma2 and model.session.backend() == .cuda;
                 const request_prefix = try denseEmbeddingTextPrefix(attempt.allocator, model, attempt.task_type, attempt.instruction);
                 defer if (request_prefix.owned) |owned| attempt.allocator.free(owned);
@@ -7834,6 +7871,7 @@ pub const Node = struct {
             .control = control,
             .task_type = task_type,
             .instruction = instruction,
+            .expected_revision = expected_revision,
         };
         try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{ .execution_control = control }, &attempt, Attempt.run);
         return attempt.vectors.?;
@@ -13333,17 +13371,7 @@ pub const Node = struct {
             if (admission_manifest.embedding_style != .embedding_gemma2) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "ordered content groups require an EmbeddingGemma 2 model" });
             if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
             return self.createGroupedEmbedding(ctx, model_path, admission_manifest, executor_contract, request, borrowed_attachments, media_admission.byte_cap, execution_control) catch |err| {
-                if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
-                if (err == error.MemoryBudgetExceeded) return inferenceFailureResponse(ctx, err);
-                if (err == error.EmbeddingIdentityMismatch) return ctx.status(409).json(.{ .@"error" = "MODEL_IDENTITY_MISMATCH", .message = "embedding assets or recipe differ from the pinned index identity" });
-                if (isRemoteContentRequestError(err)) return remoteContentErrorResponse(ctx, err);
-                if (isDenseEmbedRequestAbort(err)) return inferenceFailureResponse(ctx, err);
-                if (isInferenceExecutorContractError(err)) return inferenceExecutorContractFailureResponse(ctx, err);
-                if (err == error.EmbeddingInputTooLong) return ctx.status(413).json(.{ .@"error" = "INPUT_TOO_LONG", .message = embedRequestOptionErrorMessage(err) });
-                if (groupedEmbeddingInputFailure(err)) |failure| {
-                    return ctx.status(failure.status).json(.{ .@"error" = failure.code, .message = failure.message });
-                }
-                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) });
+                return groupedEmbeddingFailureResponse(ctx, err);
             };
         }
 
@@ -24118,13 +24146,23 @@ pub const Node = struct {
         var handle = try self.model_manager.acquireFromDirWithControl(path, control);
         defer handle.release();
         const loaded = handle.get();
+        return self.embedGroupsOnLoadedModel(out, loaded, groups, options, control);
+    }
+
+    // All frontends execute ordered content against the same acquired model.
+    // Native callers retain their revision-fenced handle through this call.
+    fn embedGroupsOnLoadedModel(self: *Node, out: std.mem.Allocator, loaded: *model_manager_mod.LoadedModel, groups: []const @import("../pipelines/embedding_gemma2.zig").Group, options: @import("../pipelines/embedding_gemma2.zig").Options, control: InferenceExecutionControl) ![][]f32 {
+        const grouped = @import("../pipelines/embedding_gemma2.zig");
+        var request_budget: EmbeddingGroupRequestBudget = .{};
         var frame_cache = grouped.FrameCache{ .allocator = grouped.workspaceBackingAllocator(loaded.session.backend()), .session = loaded.session };
         defer frame_cache.deinit();
         try loaded.verifyEmbeddingIdentityWithControl(control);
         const active_contract = try resolvedInferenceExecutorContract(self, "embed", &loaded.manifest);
         const active_options = try groupedEmbeddingOptions(&loaded.manifest, active_contract, options);
-        request_budget = .{};
-        for (groups) |group| try request_budget.add(try validateEmbeddingGroupContract(self, active_contract, group, groups.len, control));
+        for (groups) |group| {
+            try grouped.validateGroup(group, active_options);
+            try request_budget.add(try validateEmbeddingGroupContract(self, active_contract, group, groups.len, control));
+        }
         try request_budget.validate(active_contract, groups.len);
         const vectors = try out.alloc([]f32, groups.len);
         var count: usize = 0;
@@ -36882,6 +36920,37 @@ const ParsedDenseEmbedGroup = struct {
     parts: []const embedding_mod.EmbeddingContentPart,
 };
 
+const ParsedEmbeddingGroups = struct {
+    arena: std.heap.ArenaAllocator,
+    groups: []const @import("../pipelines/embedding_gemma2.zig").Group,
+
+    fn deinit(self: *@This()) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+fn embeddingGroupsForParsed(allocator: std.mem.Allocator, parsed: *const ParsedDenseEmbedInputs) !ParsedEmbeddingGroups {
+    const grouped = @import("../pipelines/embedding_gemma2.zig");
+    if (parsed.parse_errors.items.len != 0) return error.InvalidEmbeddingGroup;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const content = try denseEmbeddingContentInputs(a, parsed);
+    const groups = try a.alloc(grouped.Group, content.inputs.len);
+    for (content.inputs, groups) |input, *group| {
+        const parts = try a.alloc(grouped.Part, input.content.len);
+        for (input.content, parts) |part, *dest| dest.* = switch (part) {
+            .text => |text| .{ .text = text },
+            .image => |bytes| .{ .image = bytes },
+            .audio => |clip| .{ .audio = clip.bytes },
+            .video => |bytes| .{ .video = bytes },
+        };
+        group.* = .{ .content = parts };
+    }
+    return .{ .arena = arena, .groups = groups };
+}
+
 fn recordDenseEmbedImageBudgetFailure(
     allocator: std.mem.Allocator,
     inputs: *ParsedDenseEmbedInputs,
@@ -38364,6 +38433,43 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
     };
 }
 
+/// Grouped execution uses the same admission failure identities as flat
+/// execution, before interpreting failures as invalid grouped input.
+fn groupedEmbeddingFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
+    if (err == error.MemoryBudgetExceeded or err == error.ResourceLimitExceeded) return inferenceFailureResponse(ctx, err);
+    if (err == error.EmbeddingIdentityMismatch) return ctx.status(409).json(.{ .@"error" = "MODEL_IDENTITY_MISMATCH", .message = "embedding assets or recipe differ from the pinned index identity" });
+    if (isRemoteContentRequestError(err)) return remoteContentErrorResponse(ctx, err);
+    if (isDenseEmbedRequestAbort(err)) return inferenceFailureResponse(ctx, err);
+    if (isInferenceExecutorContractError(err)) return inferenceExecutorContractFailureResponse(ctx, err);
+    if (err == error.EmbeddingInputTooLong) return ctx.status(413).json(.{ .@"error" = "INPUT_TOO_LONG", .message = embedRequestOptionErrorMessage(err) });
+    if (groupedEmbeddingInputFailure(err)) |failure| {
+        return ctx.status(failure.status).json(.{ .@"error" = failure.code, .message = failure.message });
+    }
+    return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) });
+}
+
+test "admission grouped and flat embedding responses preserve resource identity" {
+    const a = std.testing.allocator;
+    inline for (.{ groupedEmbeddingFailureResponse, embedDenseInputFailureResponse }) |respond| {
+        for ([_]anyerror{ error.ResourceLimitExceeded, error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable }) |err| {
+            var request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+            defer request.deinit();
+            var ctx = httpx.Context.init(a, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try respond(&ctx, err);
+            defer response.deinit();
+            const busy = err == error.ResourceTemporarilyUnavailable;
+            const memory = err == error.MemoryBudgetExceeded;
+            try std.testing.expectEqual(@as(u16, if (busy) 503 else if (memory) 507 else 400), response.status.code);
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings(if (busy) "MODEL_RESOURCE_BUSY" else if (memory) "MEMORY_BUDGET_EXCEEDED" else "MODEL_RESOURCE_LIMIT", parsed.value.object.get("error").?.string);
+            try std.testing.expectEqual(busy, parsed.value.object.get("retryable").?.bool);
+        }
+    }
+}
+
 /// Ordered groups can reject corrupt image headers during parsing, before
 /// inference. Preserve the same permanent image error as the execution path.
 fn groupedEmbeddingInputFailure(err: anyerror) ?EmbedDenseInputFailure {
@@ -38404,7 +38510,7 @@ fn embedDenseInputFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Res
     // Execution can expire after model acquisition (including the native
     // broker path). Preserve request lifetime semantics at this boundary too.
     switch (err) {
-        error.Timeout, error.Canceled, error.Cancelled => return inferenceFailureResponse(ctx, err),
+        error.Timeout, error.Canceled, error.Cancelled, error.ResourceLimitExceeded, error.MemoryBudgetExceeded => return inferenceFailureResponse(ctx, err),
         else => {},
     }
     if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
@@ -38779,6 +38885,9 @@ fn embedDenseInputs(
         defer content.deinit(allocator);
         return pipeline.embedContent(content.inputs);
     }
+    // Groups must use the shared grouped executor. Their modality arrays
+    // also describe child parts and cannot be interpreted as independent rows.
+    if (inputs.groups.items.len != 0) return error.OrderedEmbeddingContentNotSupported;
     if (inputs.videos.items.len != 0) return error.UnsupportedVideoBackend;
     const embeddings = try allocator.alloc([]f32, inputs.total_count);
     errdefer allocator.free(embeddings);

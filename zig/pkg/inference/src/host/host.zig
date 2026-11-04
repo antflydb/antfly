@@ -235,16 +235,7 @@ const ModelTextsRequest = struct {
     instruction: ?[]const u8 = null,
 };
 
-const ModelPartsRequest = struct {
-    model_identity: ?[]const u8 = null,
-    dimensions: ?u32 = null,
-    model: []const u8,
-    parts: []const template_content.ContentPart,
-    grouped: bool = false,
-    attachment_count: usize = 0,
-    task_type: ?[]const u8 = null,
-    instruction: ?[]const u8 = null,
-};
+const ModelPartsRequest = @import("antfly_inference_embedding_wire").Request(template_content.ContentPart);
 
 fn validateProviderAttachmentRefs(
     payload_len: usize,
@@ -1102,6 +1093,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 parsed.value.model,
                 parts,
                 parsed.value.grouped,
+                parsed.value.model_revision,
                 state.io,
                 execution_control,
                 if (operation == .embed_dense_parts_with_context) parsed.value.task_type else null,
@@ -2531,6 +2523,7 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
     model: []const u8,
     parts: []const template_content.ContentPart,
     grouped: bool,
+    expected_revision: ?[32]u8,
     io: std.Io,
     control: inference.InferenceExecutionControl,
     task_type: ?[]const u8,
@@ -2598,7 +2591,7 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
     try capabilities.validateInvocation(.embed, shape);
     var direct = try LocalDenseParts.init(alloc, parts, grouped);
     defer direct.deinit(alloc);
-    return try node.embedDensePartsDirectWithExecutionControlAndTask(
+    return try node.embedDensePartsDirectWithExecutionControlAndTaskRevision(
         alloc,
         io,
         control,
@@ -2606,6 +2599,7 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
         direct.inputs(),
         task_type,
         instruction,
+        expected_revision,
     );
 }
 
@@ -2648,6 +2642,24 @@ test "linked embedding groups retain one ordered input and borrowed media" {
     defer request.deinit();
     try std.testing.expect(request.value.grouped);
     try std.testing.expectEqualStrings("RETRIEVAL_QUERY", request.value.task_type.?);
+    // Production consumers and the host decoder share this schema. Preserve
+    // an immutable generation through serialization, including binary refs.
+    const Wire = @import("antfly_inference_embedding_wire");
+    const expected: [32]u8 = @splat(11);
+    const context = request_types.EmbeddingRequestContext{
+        .request = .{ .io = std.testing.io, .deadline_ns = null },
+        .task_type = .retrieval_document,
+        .model_revision = expected,
+    };
+    const options = Wire.Options.fromEmbeddingContext("model", context, true);
+    const metadata = try std.json.Stringify.valueAlloc(a, Wire.Request(template_content.ContentPart).init(options, &.{ .{ .text = "astronaut" }, .{ .binary = .{ .mime_type = "image/png", .data = &.{} } } }, 1), .{});
+    defer a.free(metadata);
+    var recovered = try std.json.parseFromSlice(ModelPartsRequest, a, metadata, .{});
+    defer recovered.deinit();
+    try std.testing.expectEqual(expected, recovered.value.model_revision.?);
+    try std.testing.expectEqual(@as(usize, 2), recovered.value.parts.len);
+    try std.testing.expect(recovered.value.grouped);
+    try std.testing.expectEqual(@as(usize, 1), recovered.value.attachment_count);
 }
 
 pub fn localAntflyDirectDenseParts(
@@ -2680,6 +2692,7 @@ fn localAntflyEmbedDensePartsWithContext(
         model,
         parts,
         false,
+        context.model_revision,
         context.request.io,
         adapter.control(),
         context.task_type.canonical(),
@@ -3975,7 +3988,12 @@ test "linked embedding large image parity across public and grouped inputs" {
     }
     @memcpy(padded[position..], bytes[2..]);
 
-    var node = try inference.server.Node.init(a, .{ .models_dir = std.fs.path.dirname(model).?, .allow_unknown_models = true, .process_termination_available = true, .content_security = .{ .allowed_hosts = &.{@constCast("127.0.0.1")}, .block_private_ips = false } });
+    var state: LinkedInferenceState = undefined;
+    state.alloc = a;
+    state.io = std.testing.io;
+    state.worker = null;
+    state.node = try inference.server.Node.init(a, .{ .models_dir = std.fs.path.dirname(model).?, .allow_unknown_models = true, .process_termination_available = true, .content_security = .{ .allowed_hosts = &.{@constCast("127.0.0.1")}, .block_private_ips = false } });
+    const node = &state.node;
     defer node.deinit();
     try node.attachIo(std.testing.io);
     node.session_manager.required_backend = if (@import("builtin").os.tag == .macos) .metal else .native;
@@ -3986,6 +4004,9 @@ test "linked embedding large image parity across public and grouped inputs" {
         bytes: []const u8,
         failure: ?anyerror = null,
         fn serve(self: *@This()) void {
+            for (0..2) |_| self.serveOne();
+        }
+        fn serveOne(self: *@This()) void {
             var stream = self.server.accept(std.testing.io) catch |err| {
                 self.failure = err;
                 return;
@@ -4032,7 +4053,7 @@ test "linked embedding large image parity across public and grouped inputs" {
     var response = try node.createEmbedding(&ctx);
     defer response.deinit();
     if (response.status.code != 200) std.debug.print("large image public status={d} body={s}\n", .{ response.status.code, response.body orelse "" });
-    const vectors = localAntflyEmbedDensePartsWithExecutionContext(&node, a, name, &.{.{ .binary = .{ .mime_type = "image/jpeg", .data = padded } }}, true, std.testing.io, .{ .deadline_ns = platform_time.monotonicNs() + 120 * std.time.ns_per_s }, "RETRIEVAL_QUERY", null) catch |err| {
+    const vectors = localAntflyEmbedDensePartsWithExecutionContext(node, a, name, &.{.{ .binary = .{ .mime_type = "image/jpeg", .data = padded } }}, true, null, std.testing.io, .{ .deadline_ns = platform_time.monotonicNs() + 120 * std.time.ns_per_s }, "RETRIEVAL_QUERY", null) catch |err| {
         std.debug.print("large image grouped failure={s}\n", .{@errorName(err)});
         return err;
     };
@@ -4055,6 +4076,70 @@ test "linked embedding large image parity across public and grouped inputs" {
         try std.testing.expectApproxEqAbs(number, vector, 0.001);
     }
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    const grouped_body = try std.json.Stringify.valueAlloc(a, .{ .model = name, .task_type = "RETRIEVAL_QUERY", .input = .{.{ .content = .{ .{ .type = "text", .text = "NASA launch pad" }, .{ .type = "image_url", .image_url = url } } }} }, .{});
+    defer a.free(grouped_body);
+    var grouped_request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+    defer grouped_request.deinit();
+    grouped_request.body = grouped_body;
+    var grouped_ctx = httpx.Context.init(a, std.testing.io, &grouped_request);
+    defer grouped_ctx.deinit();
+    var grouped_response = try node.createEmbedding(&grouped_ctx);
+    defer grouped_response.deinit();
+    if (grouped_response.status.code != 200) std.debug.print("large image public group status={d} body={s}\n", .{ grouped_response.status.code, grouped_response.body orelse "" });
+    try std.testing.expectEqual(@as(u16, 200), grouped_response.status.code);
+    var grouped_public = try std.json.parseFromSlice(std.json.Value, a, grouped_response.body.?, .{});
+    defer grouped_public.deinit();
+    const grouped_values = grouped_public.value.object.get("data").?.array.items[0].object.get("embedding").?.array.items;
+
+    // Run the real provider bridge: ordered text+binary, borrowed attachment
+    // bytes, and both matching/stale generations reach the actual loaded model.
+    const revision = (try localModelCapabilities(node, std.testing.io, name, .embed)).model_revision orelse return error.CheckpointRevisionUnavailable;
+    const Wire = @import("antfly_inference_embedding_wire");
+    const wire_parts = [_]template_content.ContentPart{ .{ .text = "NASA launch pad" }, .{ .binary = .{ .mime_type = "image/jpeg", .data = &.{} } } };
+    const payloads = [_]inference_bridge.ProviderBinaryPayload{.{ .bytes = .init(padded), .content_type = .init("image/jpeg") }};
+    const refs = [_]inference_bridge.ProviderAttachmentRef{.{ .attachment_index = 0, .item_index = 1 }};
+    for ([_]bool{ true, false }) |stale| {
+        var expected = revision;
+        if (stale) expected[0] ^= 1;
+        const metadata = try std.json.Stringify.valueAlloc(a, Wire.Request(template_content.ContentPart).init(.{ .model = name, .model_revision = expected, .grouped = true, .task_type = "RETRIEVAL_QUERY" }, &wire_parts, 1), .{});
+        defer a.free(metadata);
+        var response_handle: ?*anyopaque = null;
+        var response_json: inference_bridge.String = undefined;
+        const invoke = inference_bridge.ProviderInvokeContext{
+            .abi_version = inference_bridge.abi_version,
+            .handle = &state,
+            .operation = @backingInt(inference_bridge.ProviderOperation.embed_dense_parts_with_context),
+            .request_json = .init(metadata),
+            .deadline_ns = platform_time.monotonicNs() + 120 * std.time.ns_per_s,
+            .has_deadline = 1,
+            .out_response_handle = &response_handle,
+            .out_response_json = &response_json,
+            .binary_payloads = &payloads,
+            .binary_payloads_len = payloads.len,
+            .attachment_refs = &refs,
+            .attachment_refs_len = refs.len,
+        };
+        if (stale) {
+            try std.testing.expectError(error.InferenceCapabilitiesStale, linkedInferenceInvokeProvider(&invoke));
+            try std.testing.expect(response_handle == null);
+        } else {
+            try linkedInferenceInvokeProvider(&invoke);
+            defer linkedInferenceDestroyProviderResponse(response_handle.?);
+            var result = try std.json.parseFromSlice([][]f32, a, response_json.slice(), .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.value.len);
+            try std.testing.expectEqual(grouped_values.len, result.value[0].len);
+            for (grouped_values, result.value[0]) |value, actual| {
+                const expected_value: f32 = switch (value) {
+                    .float => @floatCast(value.float),
+                    .integer => @floatFromInt(value.integer),
+                    else => return error.InvalidEmbeddingResponse,
+                };
+                try std.testing.expectApproxEqAbs(expected_value, actual, 0.001);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    }
 }
 
 test "standalone chunk minimum content survives the real provider ABI" {
