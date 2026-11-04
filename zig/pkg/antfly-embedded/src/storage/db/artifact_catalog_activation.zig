@@ -29,6 +29,7 @@ pub fn stage(a: std.mem.Allocator, txn: anytype, command: inventory.Command) !vo
     var layout = try @import("artifact_coverage_layout.zig").Layout.prepare(a, command.catalogs, @import("artifact_coverage_epoch.zig").forCommand(activation));
     defer layout.deinit();
     _ = try layout.initializeEmpty(txn);
+    try @import("artifact_authored_acceptance.zig").stageCatalogTransition(txn, command, active);
     try publication.stageAuthority(txn, activation);
     const authority = (try publication.authority(txn)).?;
     try @import("artifact_producer_obligations.zig").begin(a, txn, authority);

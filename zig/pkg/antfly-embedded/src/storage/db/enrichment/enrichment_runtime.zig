@@ -4765,12 +4765,13 @@ fn embedDensePartsWithRetry(
         const vector = (if (foregroundProviderRequestContext(runtime)) |context|
             dense_embedder.embedDensePartsWithContext(runtime.alloc, embedding_name, parts, dims, context)
         else
-            dense_embedder.embedDenseParts(runtime.alloc, embedding_name, parts, dims)) catch |err| {
+            dense_embedder.embedDensePartsBackgroundWithContext(runtime.alloc, embedding_name, parts, dims, assetProviderRequestContext(runtime))) catch |err| {
             try checkProviderFailureGuardRecording(runtime, recovery_key, 1);
             if (inferenceControlFailure(err)) {
                 noteInferenceControlFailure(runtime, recovery_key, err, 1);
                 return err;
             }
+            if (err == error.EnrichmentSourceChanged or err == error.InferenceCapabilitiesStale) return err;
             if (!isRetryableEnrichmentError(err)) return err;
             switch (transientEmbedRetryDecision(runtime, attempt)) {
                 .retry_inline => {},
@@ -27900,13 +27901,6 @@ fn collectPlainDenseBatchItem(
     const source_text = switch (prepared) {
         .text => |text| text,
         .parts => |parts| {
-            if (input) |*token| {
-                if (producerInputAccepted(runtime, token) catch |err| return scope.publicationFailure(err)) {
-                    token.deinit();
-                    return null;
-                }
-            }
-
             try processDenseTemplateParts(runtime, request, dense_embedder, consumer_indexes, parts, sourceRecordDigest(raw), if (input) |*token| token else null, window, scope);
             if (input) |*token| token.deinit();
             return null;
@@ -30986,8 +30980,31 @@ fn processDenseTemplateParts(
     scope: ?*FailureScope,
 ) !void {
     const embedding_artifact_name = requestEmbeddingName(request);
-    const vector = try embedDensePartsWithRetry(dense_embedder, runtime, embedding_artifact_name, parts, request.expected_dims);
+    const context = assetProviderRequestContext(runtime);
+    const generation = try dense_embedder.captureTextGenerationWithContext(runtime.alloc, embedding_artifact_name, context);
+    // Bind before consulting generated acceptance: an alias change invalidates
+    // the previous receipt even when the document and ordered parts are equal.
+    if (input) |token| {
+        var read = runtime.store.beginProbe() catch |err| {
+            if (scope) |identity| return identity.publicationFailure(err);
+            return err;
+        };
+        defer read.abort();
+        token.bindExecution(&read, generation.revision) catch |err| {
+            if (scope) |identity| return identity.publicationFailure(err);
+            return err;
+        };
+    }
+    if (input) |token| {
+        const accepted = producerInputAccepted(runtime, token) catch |err| {
+            if (scope) |identity| return identity.publicationFailure(err);
+            return err;
+        };
+        if (accepted) return;
+    }
+    const vector = try embedDensePartsWithRetry(dense_embedder.withTextGeneration(generation), runtime, embedding_artifact_name, parts, request.expected_dims);
     defer runtime.alloc.free(vector);
+    try dense_embedder.requireTextGenerationWithContext(runtime.alloc, embedding_artifact_name, generation, context);
     // Inference succeeded. Errors while publishing its result belong to the
     // pipeline and must not consume this document's provider retry budget.
     errdefer {
@@ -31072,7 +31089,6 @@ fn processDenseEmbedding(
     const source_text = switch (prepared) {
         .text => |text| text,
         .parts => |parts| {
-            if (input) |*token| if (try producerInputAccepted(runtime, token)) return;
             return processDenseTemplateParts(runtime, request, dense_embedder, consumer_indexes, parts, sourceRecordDigest(raw), if (input) |*token| token else null, window, null);
         },
         .empty => {

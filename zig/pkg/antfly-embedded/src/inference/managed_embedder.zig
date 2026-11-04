@@ -679,7 +679,7 @@ pub const ManagedEmbeddingEntry = struct {
     document_input_type: []u8 = "",
     query_instruction: []u8 = "",
     model_identity: []u8 = "",
-    planned_text_lease: ?inference_work.CapabilityLease = null,
+    planned_embedding_lease: ?inference_work.CapabilityLease = null,
     truncate: []u8 = "",
     /// Borrowed from the service ProviderRuntime, or from the owning
     /// ManagedEmbedder's standalone fallback. Service-scoped managers keep
@@ -1349,6 +1349,7 @@ pub const ManagedEmbedder = struct {
             .dense_embed_batch_fn = embedDenseBatch,
             .dense_embed_batch_planned_fn = embedDenseBatchPlanned,
             .dense_embed_parts_fn = embedDenseParts,
+            .dense_embed_parts_planned_fn = embedDensePartsPlanned,
             .text_parts_equivalent_fn = textPartsEquivalent,
             .dense_embed_part_items_fn = embedDensePartItems,
             .dense_embed_raster_items_fn = embedDenseRasterItems,
@@ -1800,7 +1801,7 @@ pub const ManagedEmbedder = struct {
             try value.check();
             applyRequestContext(&entry, value, &cancellation);
         }
-        entry.planned_text_lease = lease;
+        entry.planned_embedding_lease = lease;
         return embedBatchWithEntry(alloc, &entry, texts, dims);
     }
 
@@ -1973,6 +1974,21 @@ pub const ManagedEmbedder = struct {
         try invocation_context.check();
         try validateDenseBatch(vectors, items.len, dims);
         return vectors;
+    }
+
+    fn embedDensePartsPlanned(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, parts: []const template_mod.ContentPart, dims: u32, context: ?RequestContext, lease: inference_work.CapabilityLease) ![]f32 {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
+        if (configured.sparse) return error.UnsupportedEmbeddingProvider;
+        var cancellation = CombinedCancellation.init(configured.cancellation, if (context) |value| value.cancellation else null);
+        var entry = configured.requestOverlay(alloc);
+        defer entry.auth_header_cache.deinit(alloc);
+        if (context) |value| {
+            try value.check();
+            applyRequestContext(&entry, value, &cancellation);
+        }
+        entry.planned_embedding_lease = lease;
+        return embedWithEntryParts(alloc, &entry, parts, dims);
     }
 
     fn embedDensePartsWithContext(
@@ -2217,7 +2233,7 @@ pub const ManagedEmbedder = struct {
         // Unknown remote capability is deliberately conservative. It remains
         // usable, but the document planner cannot assume fused batching or a
         // provider-specific memory ceiling, and media needs declared inputs.
-        return .{ .capabilities = .{
+        return .{ .planning_only = true, .capabilities = .{
             .task = .embed,
             .input_modalities = .{ .text = true },
             .accepted_mime_types = .{ .text_plain = true },
@@ -2390,7 +2406,7 @@ fn embeddingRequestContext(entry: *const ManagedEmbeddingEntry, task_type: Embed
         },
         .task_type = task_type,
         .model_identity = if (entry.model_identity.len > 0) entry.model_identity else null,
-        .model_revision = if (entry.planned_text_lease) |lease| if (lease.capabilities) |caps| caps.model_revision else null else null,
+        .model_revision = if (entry.planned_embedding_lease) |lease| if (lease.capabilities) |caps| caps.model_revision else null else null,
         .dimensions = if (entry.dimensions > 0) entry.dimensions else null,
         .instruction = if (task_type == .retrieval_query and entry.query_instruction.len > 0) entry.query_instruction else null,
     };
@@ -6202,7 +6218,7 @@ fn acquireRemoteEmbeddingLease(
     provider: *antfly_provider_mod.Provider,
     headers: []const [2][]const u8,
 ) !remote_capabilities.CapabilityLease {
-    if (entry.planned_text_lease) |planned| {
+    if (entry.planned_embedding_lease) |planned| {
         if (planned.scope_digest) |scope| {
             const actual = try remote_capabilities.scopeDigest(provider.allocator, entry.base_url, entry.model, .embed, headers);
             if (!std.mem.eql(u8, &scope, &actual)) return error.InferenceCapabilitiesStale;
@@ -6210,10 +6226,12 @@ fn acquireRemoteEmbeddingLease(
         // Keep the coordinator's route and descriptor through every retry.
         // Discovering another lease here could stamp its vectors with the old
         // generation captured before execution.
-        provider.setFramedAttachments(if (planned.capabilities) |caps| caps.framed_attachments else false);
+        var execution = planned;
+        if (execution.planning_only) execution.capabilities = null;
+        provider.setFramedAttachments(if (execution.capabilities) |caps| caps.framed_attachments else false);
         if (planned.routing_token) |token| try provider.setCapabilityToken(token.slice());
         if (planned.descriptor_revision) |revision| try provider.setCapabilityRevision(revision.slice());
-        return planned;
+        return execution;
     }
     const lease = try discoverRemoteEmbeddingLease(entry, http, headers);
     // Providers are reused across invocations, but transport support belongs
@@ -7332,7 +7350,7 @@ fn embedBatchWithEntryForTask(
 // A query retry budget covers inference, not scale-from-zero preparation.
 // Reuse the normal capability cache before establishing the default query clock.
 fn prepareRemoteQueryEmbedding(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry) !void {
-    if (!isAntflyProvider(entry.provider) or entry.antfly_provider != null or entry.planned_text_lease != null) return;
+    if (!isAntflyProvider(entry.provider) or entry.antfly_provider != null or entry.planned_embedding_lease != null) return;
     var fallback_http: ?httpx.Client = null;
     defer if (fallback_http) |*client| client.deinit();
     const http = try entry.httpClient(alloc, &fallback_http);
@@ -9487,6 +9505,15 @@ pub fn testRemoteEmbeddingCancellation() !void {
         release: std.atomic.Value(bool) = .init(false),
         completed: std.atomic.Value(bool) = .init(false),
 
+        fn waitEntered(self: *@This(), done: *const std.atomic.Value(bool)) !void {
+            const deadline = monotonicNowNs() + 5 * std.time.ns_per_s;
+            while (!self.entered.load(.acquire)) {
+                if (done.load(.acquire)) return error.InferenceFinishedBeforeDispatch;
+                if (monotonicNowNs() >= deadline) return error.Timeout;
+                std.atomic.spinLoopHint();
+            }
+        }
+
         fn executor(self: *@This()) http_common.RequestExecutor {
             return .{ .ptr = self, .vtable = &.{ .execute = execute } };
         }
@@ -9541,7 +9568,8 @@ pub fn testRemoteEmbeddingCancellation() !void {
     defer managed.deinit();
 
     const Worker = struct {
-        fn run(target: *ManagedEmbedder, err_out: *?anyerror) void {
+        fn run(target: *ManagedEmbedder, err_out: *?anyerror, done: *std.atomic.Value(bool)) void {
+            defer done.store(true, .release);
             const vector = target.embedQuery(alloc, "semantic_idx", "alpha concept") catch |err| {
                 err_out.* = err;
                 return;
@@ -9551,8 +9579,13 @@ pub fn testRemoteEmbeddingCancellation() !void {
         }
     };
     var err_out: ?anyerror = null;
-    var worker = try std.testing.io.concurrent(Worker.run, .{ &managed, &err_out });
-    while (!app.entered.load(.acquire)) std.atomic.spinLoopHint();
+    var done = std.atomic.Value(bool).init(false);
+    var worker = try std.testing.io.concurrent(Worker.run, .{ &managed, &err_out, &done });
+    app.waitEntered(&done) catch |err| {
+        app.release.store(true, .release);
+        worker.await(std.testing.io);
+        return err_out orelse err;
+    };
 
     const started_ns = monotonicNowNs();
     cancellation.store(true, .release);
@@ -9583,7 +9616,8 @@ pub fn testRemoteEmbeddingCancellation() !void {
     defer multimodal.deinit();
 
     const PartsWorker = struct {
-        fn run(target: *ManagedEmbedder, err_out_ptr: *?anyerror) void {
+        fn run(target: *ManagedEmbedder, err_out_ptr: *?anyerror, finished: *std.atomic.Value(bool)) void {
+            defer finished.store(true, .release);
             const parts = [_]template_mod.ContentPart{.{
                 .media_url = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD",
             }};
@@ -9601,8 +9635,13 @@ pub fn testRemoteEmbeddingCancellation() !void {
         }
     };
     err_out = null;
-    var parts_worker = try std.testing.io.concurrent(PartsWorker.run, .{ &multimodal, &err_out });
-    while (!app.entered.load(.acquire)) std.atomic.spinLoopHint();
+    done.store(false, .release);
+    var parts_worker = try std.testing.io.concurrent(PartsWorker.run, .{ &multimodal, &err_out, &done });
+    app.waitEntered(&done) catch |err| {
+        app.release.store(true, .release);
+        parts_worker.await(std.testing.io);
+        return err_out orelse err;
+    };
 
     const parts_started_ns = monotonicNowNs();
     parts_cancellation.store(true, .release);
@@ -12180,6 +12219,12 @@ test "managed embedder Ollama text batches preserve full HTTP arrays and result 
 test "managed embedder grouped queries preserve ordered parts task and single output" {
     const P = struct {
         calls: usize = 0,
+        revision: u8 = 1,
+        task: EmbeddingTaskType = .retrieval_query,
+        fn capabilities(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: inference_work.Task) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .task = .embed, .input_modalities = .{ .text = true, .image = true }, .accepted_mime_types = .{ .text_plain = true, .image_png = true }, .input_granularity = .page, .output = .embedding, .batch = .{ .mode = .serial_compatibility, .max_items = 1 }, .model_revision = @as([32]u8, @splat(self.revision)) };
+        }
         fn texts(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
             return error.UnexpectedTextCall;
         }
@@ -12192,7 +12237,8 @@ test "managed embedder grouped queries preserve ordered parts task and single ou
         fn group(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, parts: []const template_mod.ContentPart, context: EmbeddingRequestContext) ![][]f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try context.check();
-            try std.testing.expectEqual(.retrieval_query, context.task_type);
+            try std.testing.expectEqual(self.task, context.task_type);
+            if (self.task == .retrieval_document) try std.testing.expectEqual(@as([32]u8, @splat(1)), context.model_revision.?);
             try std.testing.expectEqual(@as(usize, 2), parts.len);
             try std.testing.expectEqualStrings("astronaut", parts[0].text);
             switch (parts[1]) {
@@ -12212,10 +12258,20 @@ test "managed embedder grouped queries preserve ordered parts task and single ou
     };
     const a = std.testing.allocator;
     var p = P{};
-    var entries = [_]ManagedEmbeddingEntry{.{ .alloc = a, .index_name = @constCast("visual"), .provider = .antfly, .model = @constCast("model"), .base_url = @constCast("antfly:embedded"), .dimensions = 2, .io = std.testing.io, .declared_inputs = .{ .text = true, .image = true }, .antfly_provider = .{ .ptr = &p, .embed_dense_texts = P.texts, .embed_sparse_texts = P.sparse, .embed_dense_parts = P.items, .embed_dense_group_with_context = P.group } }};
-    const managed = ManagedEmbedder{ .alloc = a, .entries = &entries };
+    var entries = [_]ManagedEmbeddingEntry{.{ .alloc = a, .index_name = @constCast("visual"), .provider = .antfly, .model = @constCast("model"), .base_url = @constCast("antfly:embedded"), .dimensions = 2, .io = std.testing.io, .declared_inputs = .{ .text = true, .image = true }, .antfly_provider = .{ .ptr = &p, .embed_dense_texts = P.texts, .embed_sparse_texts = P.sparse, .embed_dense_parts = P.items, .embed_dense_group_with_context = P.group, .model_capabilities = P.capabilities } }};
+    var managed = ManagedEmbedder{ .alloc = a, .entries = &entries };
     const vector = try managed.embedQueryWithTemplate(a, "visual", "data:image/png;base64,AA==", "astronaut {{media url=this}}");
     defer a.free(vector);
     try std.testing.expectEqual(@as(usize, 1), p.calls);
     try std.testing.expectEqualSlices(f32, &.{ 1, 0 }, vector);
+    const dense = managed.denseInterface();
+    const context = RequestContext{ .io = std.testing.io, .deadline_ns = null };
+    const generation = try dense.captureTextGenerationWithContext(a, "visual", context);
+    p.revision = 2;
+    p.task = .retrieval_document;
+    const parts = [_]template_mod.ContentPart{ .{ .text = "astronaut" }, .{ .media_url = "data:image/png;base64,AA==" } };
+    const document_vector = try dense.withTextGeneration(generation).embedDensePartsWithContext(a, "visual", &parts, 2, context);
+    defer a.free(document_vector);
+    try std.testing.expectError(error.EnrichmentSourceChanged, dense.requireTextGenerationWithContext(a, "visual", generation, context));
+    try std.testing.expectEqual(@as(usize, 2), p.calls);
 }

@@ -528,6 +528,9 @@ pub const CapabilityRevision = struct {
 
 pub const CapabilityLease = struct {
     capabilities: ?InferenceCapabilities,
+    /// Conservative planner defaults are not an advertised provider contract.
+    /// Executors must not reject legacy invocations using these estimates.
+    planning_only: bool = false,
     routing_token: ?RoutingToken = null,
     descriptor_revision: ?CapabilityRevision = null,
     /// Digest of URL, model, task and authorization/source headers at planning.

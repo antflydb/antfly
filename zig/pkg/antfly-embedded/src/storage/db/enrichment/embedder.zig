@@ -102,6 +102,7 @@ pub const DenseEmbedder = struct {
     dense_embed_batch_fn: ?DenseEmbedBatchFn = null,
     /// Execute against the supplied immutable model generation/route, or reject
     /// it as stale. Legacy callbacks are fenced by revision checks instead.
+    dense_embed_parts_planned_fn: ?*const fn (*anyopaque, Allocator, []const u8, []const template_mod.ContentPart, u32, ?RequestContext, inference_work.CapabilityLease) anyerror![]f32 = null,
     dense_embed_batch_planned_fn: ?*const fn (*anyopaque, Allocator, []const u8, []const []const u8, u32, ?RequestContext, inference_work.CapabilityLease) anyerror![]const []const f32 = null,
     dense_embed_parts_fn: ?DenseEmbedPartsFn = null,
     /// Opt-in semantic guarantee: one rendered text part has exactly the same
@@ -452,10 +453,30 @@ pub const DenseEmbedder = struct {
             const vectors = try self.embedDenseBatch(alloc, embedding_name, &.{parts[0].text}, dims);
             return takeSingleDenseVector(alloc, vectors);
         }
-        const dense_embed_parts_fn = self.dense_embed_parts_fn orelse return error.UnsupportedEmbeddingProvider;
+        return self.dispatchGroupedParts(alloc, embedding_name, parts, dims, self.part_request_context, true);
+    }
+
+    fn dispatchGroupedParts(self: DenseEmbedder, alloc: Allocator, name: []const u8, parts: []const template_mod.ContentPart, dims: u32, context: ?RequestContext, allow_synchronous: bool) ![]f32 {
+        var controlled = self;
+        controlled.part_request_context = context;
+        const generation = try controlled.captureTextGeneration(alloc, name);
         var sanitized = try sanitizeContentPartsForEmbeddingAlloc(alloc, parts);
         defer sanitized.deinit(alloc);
-        return try dense_embed_parts_fn(self.ptr, alloc, embedding_name, sanitized.partsSlice(), dims);
+        if (context) |value| try value.check();
+        if (self.dense_embed_parts_planned_fn == null and generation.revision != null)
+            try controlled.requireTextGeneration(alloc, name, generation);
+        const vector = if (generation.lease != null and self.dense_embed_parts_planned_fn != null)
+            try self.dense_embed_parts_planned_fn.?(self.ptr, alloc, name, sanitized.partsSlice(), dims, context, generation.lease.?)
+        else if (context != null and self.dense_embed_parts_with_context_fn != null)
+            try self.dense_embed_parts_with_context_fn.?(self.ptr, alloc, name, sanitized.partsSlice(), dims, context.?)
+        else if (allow_synchronous)
+            try (self.dense_embed_parts_fn orelse return error.UnsupportedEmbeddingProvider)(self.ptr, alloc, name, sanitized.partsSlice(), dims)
+        else
+            return error.UncancellableInferenceProvider;
+        errdefer alloc.free(vector);
+        if (context) |value| try value.check();
+        if (self.dense_embed_parts_planned_fn == null and generation.revision != null) try controlled.requireTextGeneration(alloc, name, generation);
+        return vector;
     }
 
     pub fn embedDensePartItems(
@@ -597,6 +618,17 @@ pub const DenseEmbedder = struct {
         return vectors;
     }
 
+    /// Background discovery and fences retain cancellation even for legacy
+    /// synchronous executors. Foreground execution still requires control.
+    pub fn embedDensePartsBackgroundWithContext(self: DenseEmbedder, a: Allocator, name: []const u8, parts: []const template_mod.ContentPart, dims: u32, context: RequestContext) ![]f32 {
+        try context.check();
+        if (parts.len == 1 and parts[0] == .text and self.textPartsEquivalent(name)) {
+            const vectors = try self.embedDenseBatchBackgroundWithContext(a, name, &.{parts[0].text}, dims, context);
+            return takeSingleDenseVector(a, vectors);
+        }
+        return self.dispatchGroupedParts(a, name, parts, dims, context, true);
+    }
+
     pub fn embedDensePartsWithContext(
         self: DenseEmbedder,
         alloc: Allocator,
@@ -610,15 +642,7 @@ pub const DenseEmbedder = struct {
             const vectors = try self.embedDenseBatchWithContext(alloc, embedding_name, &.{parts[0].text}, dims, context);
             return takeSingleDenseVector(alloc, vectors);
         }
-        const embed = self.dense_embed_parts_with_context_fn orelse return error.UncancellableInferenceProvider;
-        var sanitized = try sanitizeContentPartsForEmbeddingAlloc(alloc, parts);
-        defer sanitized.deinit(alloc);
-        const vector = try embed(self.ptr, alloc, embedding_name, sanitized.partsSlice(), dims, context);
-        context.check() catch |err| {
-            alloc.free(vector);
-            return err;
-        };
-        return vector;
+        return self.dispatchGroupedParts(alloc, embedding_name, parts, dims, context, false);
     }
 
     pub fn deinit(self: DenseEmbedder, alloc: Allocator) void {
@@ -1787,4 +1811,55 @@ test "dense capability snapshots prefer controlled leases over legacy discovery"
     const provider = DenseEmbedder{ .ptr = &p, .dense_embed_fn = P.single, .capabilities_fn = P.legacy, .resolve_part_lease_fn = P.resolve, .part_request_context = .{ .io = std.testing.io, .deadline_ns = null } };
     _ = try provider.capabilities(std.testing.allocator, "model");
     try std.testing.expectEqual(@as(usize, 1), p.calls);
+}
+
+test "dense grouped parts fence revisions and consume the captured lease" {
+    const P = struct {
+        revision: u8 = 1,
+        planned: bool = false,
+        fn single(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedSingle;
+        }
+        fn caps(ptr: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .chunk, .output = .embedding, .batch = .{ .mode = .serial_compatibility, .max_items = 1 }, .model_revision = @as([32]u8, @splat(self.revision)) };
+        }
+        fn parts(ptr: *anyopaque, a: Allocator, _: []const u8, items: []const template_mod.ContentPart, _: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 2), items.len);
+            try std.testing.expectEqualStrings("first", items[0].text);
+            try std.testing.expectEqualStrings("second", items[1].text);
+            self.revision += 1;
+            return a.dupe(f32, &.{1});
+        }
+        fn controlledParts(ptr: *anyopaque, a: Allocator, name: []const u8, items: []const template_mod.ContentPart, dims: u32, context: RequestContext) ![]f32 {
+            try context.check();
+            return parts(ptr, a, name, items, dims);
+        }
+        fn plannedParts(ptr: *anyopaque, a: Allocator, name: []const u8, items: []const template_mod.ContentPart, dims: u32, context: ?RequestContext, lease: inference_work.CapabilityLease) ![]f32 {
+            if (context) |value| try value.check();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.planned = true;
+            try std.testing.expectEqual(@as([32]u8, @splat(1)), lease.capabilities.?.model_revision.?);
+            return parts(ptr, a, name, items, dims);
+        }
+    };
+    for ([_]bool{ false, true }) |planned| {
+        for (0..3) |mode| {
+            var state = P{};
+            const provider = DenseEmbedder{ .ptr = &state, .dense_embed_fn = P.single, .dense_embed_parts_fn = P.parts, .dense_embed_parts_with_context_fn = if (mode == 2) null else P.controlledParts, .dense_embed_parts_planned_fn = if (planned) P.plannedParts else null, .capabilities_fn = P.caps };
+            const items = [_]template_mod.ContentPart{ .{ .text = "first" }, .{ .text = "second" } };
+            const result = switch (mode) {
+                0 => provider.embedDenseParts(std.testing.allocator, "model", &items, 1),
+                1 => provider.embedDensePartsWithContext(std.testing.allocator, "model", &items, 1, .{ .io = std.testing.io, .deadline_ns = null }),
+                else => provider.embedDensePartsBackgroundWithContext(std.testing.allocator, "model", &items, 1, .{ .io = std.testing.io, .deadline_ns = null }),
+            };
+            if (planned) {
+                const vector = try result;
+                std.testing.allocator.free(vector);
+                try std.testing.expectError(error.EnrichmentSourceChanged, provider.requireTextGeneration(std.testing.allocator, "model", .{ .revision = @splat(1) }));
+            } else try std.testing.expectError(error.EnrichmentSourceChanged, result);
+            try std.testing.expectEqual(planned, state.planned);
+        }
+    }
 }
