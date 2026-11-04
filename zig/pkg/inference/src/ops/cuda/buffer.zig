@@ -16,6 +16,7 @@
 const std = @import("std");
 const context_mod = @import("context.zig");
 const driver_mod = @import("driver.zig");
+const allocation_budget = @import("allocation_budget.zig");
 
 pub const HostBuffer = struct {
     ptr: ?*anyopaque = null,
@@ -87,6 +88,8 @@ pub const DeviceBuffer = struct {
         try ctx.makeCurrent();
         try ctx.device_allocations.reserve(len);
         errdefer ctx.device_allocations.release(len);
+        try allocation_budget.process_device_allocations.reserve(len);
+        errdefer allocation_budget.process_device_allocations.release(len);
         var ptr: driver_mod.CUdeviceptr = 0;
         const result = ctx.driver.fns.cuMemAlloc(&ptr, len);
         if (result != driver_mod.CUDA_SUCCESS) {
@@ -114,6 +117,7 @@ pub const DeviceBuffer = struct {
             const result = ctx.driver.fns.cuMemFree(self.ptr);
             if (result == driver_mod.CUDA_SUCCESS) {
                 ctx.device_allocations.release(self.allocation_bytes);
+                allocation_budget.process_device_allocations.release(self.allocation_bytes);
             } else {
                 // Keep the failed free charged; it cannot authorize a later
                 // allocation. Context teardown remains the final cleanup.
@@ -198,4 +202,48 @@ test "embeddinggemma2 CUDA graph suballocation error cleanup never frees its are
     borrowed.free(undefined);
     try std.testing.expectEqual(@as(usize, 0), borrowed.len);
     try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), borrowed.ptr);
+}
+
+test "CUDA process allocation budget bounds multiple model contexts and restores failed reservations" {
+    const Mock = struct {
+        var oom = false;
+        fn setCurrent(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn alloc(ptr: *driver_mod.CUdeviceptr, _: usize) callconv(.c) driver_mod.CUresult {
+            if (oom) return driver_mod.CUDA_ERROR_OUT_OF_MEMORY;
+            ptr.* = 1;
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn free(_: driver_mod.CUdeviceptr) callconv(.c) driver_mod.CUresult {
+            return driver_mod.CUDA_SUCCESS;
+        }
+    };
+    const shared = &allocation_budget.process_device_allocations;
+    const before = shared.snapshot();
+    try shared.setLimit(before.live + 32);
+    defer shared.setLimit(before.limit) catch unreachable;
+    var contexts: [2]context_mod.CudaContext = undefined;
+    for (&contexts) |*ctx| {
+        ctx.ctx = @ptrFromInt(1);
+        ctx.device_allocations = .{ .limit = 32 };
+        ctx.driver.fns.cuCtxSetCurrent = Mock.setCurrent;
+        ctx.driver.fns.cuMemAlloc = Mock.alloc;
+        ctx.driver.fns.cuMemFree = Mock.free;
+    }
+    Mock.oom = false;
+    var first = try DeviceBuffer.alloc(&contexts[0], 24);
+    defer first.free(&contexts[0]);
+    try std.testing.expectError(error.CudaMemoryLimitExceeded, DeviceBuffer.alloc(&contexts[1], 16));
+    try std.testing.expectEqual(@as(usize, 0), contexts[1].device_allocations.snapshot().live);
+    try std.testing.expectEqual(before.live + 24, shared.snapshot().live);
+    first.free(&contexts[0]);
+    Mock.oom = true;
+    try std.testing.expectError(error.CudaMemoryLimitExceeded, DeviceBuffer.alloc(&contexts[1], 16));
+    try std.testing.expectEqual(before.live, shared.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 0), contexts[1].device_allocations.snapshot().live);
+    Mock.oom = false;
+    var second = try DeviceBuffer.alloc(&contexts[1], 32);
+    second.free(&contexts[1]);
+    try std.testing.expectEqual(before.live, shared.snapshot().live);
 }

@@ -8569,6 +8569,26 @@ pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {
     };
 }
 
+/// Dense Gemma 4 mirrors are created during eager upload, before the native
+/// source session is destroyed. This inventory excludes scratch/KV caches.
+/// Leave all lazy, expert, training and non-mirrored policies conservative.
+pub fn getEagerCudaMirrorWeightBytes(session: Session) ?usize {
+    if (comptime !build_options.enable_cuda) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .cuda or self.arch_config != .gpt) return null;
+    const cfg = self.arch_config.gpt;
+    if (cfg.family != .gemma or !cfg.usesGemma4Channels() or cfg.usesMoe() or cfg.gemma4_mtp_assistant) return null;
+    const compute = &self.backend_data.cuda.compute;
+    if (compute.capability_profile != .gemma4 or compute.lazy_host_store != null or
+        compute.a4b_inference != null or compute.resident_training_cache or compute.stats.bf16_mirror_weight_count == 0) return null;
+    return compute.stats.resident_weight_bytes;
+}
+
+pub fn retainedCudaMirrorWeightBytes(construction_bytes: usize, weight_bytes: usize) !usize {
+    return cuda_load_plan.retainedEagerMirrorBytes(construction_bytes, weight_bytes);
+}
+
 pub const CudaAllocationStats = struct {
     limit: usize,
     live: usize,
@@ -9483,6 +9503,23 @@ pub fn getComputeBackendWithBudget(
     try bindCudaVideoAdmission(session, &cb);
     try cb.beginRequest();
     return cb;
+}
+
+/// Qualified cooperative CUDA generation calls this under its model mutex.
+/// The returned handle keeps the run budget in request-owned metadata and
+/// rebinds it at step boundaries instead of borrowing it for the whole run.
+pub fn getCoordinatedCudaComputeBackend(session: Session, budget: *runtime.tier.memory.RunBudget) !ops.ComputeBackend {
+    if (comptime build_options.enable_cuda) {
+        if (session.vtable != &arch_vtable) return error.NotArchSession;
+        const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+        if (self.backend_type != .cuda) return error.CudaNotEnabled;
+        var cb = self.backend_data.cuda.compute.computeBackendWithStepRunBudget(budget);
+        cb.bindExecutionBudget();
+        errdefer cb.clearExecutionBudget();
+        try bindCudaVideoAdmission(session, &cb);
+        try cb.beginRequest();
+        return cb;
+    } else return error.CudaNotEnabled;
 }
 
 pub fn getGenericEncoderArchConfig(session: Session) !GenericEncoderArchConfig {

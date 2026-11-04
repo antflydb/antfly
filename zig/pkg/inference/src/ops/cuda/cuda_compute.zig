@@ -5673,6 +5673,18 @@ pub const CudaCompute = struct {
         return .{ .ptr = self, .vtable = &scoped_run_budget_vtable };
     }
 
+    /// The caller owns the model mutex for setup and every compute/cleanup
+    /// step. Unlike a whole-request scoped handle, deinit does not mutate the
+    /// shared binding while a different request may be executing.
+    pub fn computeBackendWithStepRunBudget(self: *CudaCompute, budget: *run_memory.RunBudget) ops.ComputeBackend {
+        return .{ .ptr = self, .vtable = &vtable, .execution_budget = budget, .execution_budget_bind = &bindStepRunBudget };
+    }
+
+    fn bindStepRunBudget(raw: *anyopaque, budget: ?*run_memory.RunBudget) void {
+        const self: *CudaCompute = @ptrCast(@alignCast(raw));
+        self.configureRunBudget(budget);
+    }
+
     pub fn deviceMemoryInfo(self: *CudaCompute) !context_mod.DeviceMemoryInfo {
         return self.ctx.memoryInfo();
     }
@@ -30727,6 +30739,29 @@ const scoped_run_budget_vtable = blk: {
     copied.deinitBackend = &deinitBackendClearRunBudget;
     break :blk copied;
 };
+
+test "generation cooperative CUDA handles bind budgets per step and retire without clearing a peer" {
+    var compute: CudaCompute = undefined;
+    compute.owned_by_backend = false;
+    compute.run_budget = null;
+    compute.lazy_device_budget_bytes = 0;
+    var first = run_memory.RunBudget.init(.{ .backend_limit_bytes = 1000 });
+    var second = run_memory.RunBudget.init(.{ .backend_limit_bytes = 2000 });
+    var a = compute.computeBackendWithStepRunBudget(&first);
+    var b = compute.computeBackendWithStepRunBudget(&second);
+    try std.testing.expect(compute.run_budget == null);
+    a.bindExecutionBudget();
+    try std.testing.expect(compute.run_budget == &first);
+    try std.testing.expectEqual(@as(usize, 1000), compute.lazy_device_budget_bytes);
+    a.clearExecutionBudget();
+    b.bindExecutionBudget();
+    a.deinit();
+    try std.testing.expect(compute.run_budget == &second);
+    try std.testing.expectEqual(@as(usize, 2000), compute.lazy_device_budget_bytes);
+    b.clearExecutionBudget();
+    b.deinit();
+    try std.testing.expect(compute.run_budget == null);
+}
 
 test "cuda compute vtable is type checked" {
     const backend_kind_fn: *const fn (*anyopaque) ops.BackendKind = &backendKind;

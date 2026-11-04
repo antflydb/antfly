@@ -1688,6 +1688,19 @@ pub const ComputeBackend = struct {
     /// `forwardWithControl` entry point.
     execution_control: ?InferenceExecutionControl = null,
     embedding_stage: ?*const EmbeddingStageControl = null,
+    /// Cooperative GPU handles bind their request budget only while owning
+    /// the model step mutex. The shared compute never retains an idle peer's
+    /// pointer, and retiring one handle cannot unbind another active peer.
+    execution_budget: ?*runtime.tier.memory.RunBudget = null,
+    execution_budget_bind: ?*const fn (*anyopaque, ?*runtime.tier.memory.RunBudget) void = null,
+
+    pub fn bindExecutionBudget(self: *const ComputeBackend) void {
+        if (self.execution_budget_bind) |bind| bind(self.ptr, self.execution_budget);
+    }
+
+    pub fn clearExecutionBudget(self: *const ComputeBackend) void {
+        if (self.execution_budget_bind) |bind| bind(self.ptr, null);
+    }
 
     pub fn checkExecutionControl(self: *const ComputeBackend) !void {
         if (self.execution_control) |control| try control.check();

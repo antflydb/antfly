@@ -1381,6 +1381,23 @@ pub const GenerationBatchingConfig = struct {
         return !graph_mode and !speculation_requested and !has_multimodal_input;
     }
 
+    pub fn cooperativeGemma4(
+        self: @This(),
+        backend: runtime.kv.pool.BackendKind,
+        cfg: gpt_model_mod.Config,
+        graph: bool,
+        draft: bool,
+        cache: bool,
+        media: bool,
+    ) bool {
+        if (backend != .cuda or cache or !self.enabledForRequest(.cuda, graph, draft, media)) return false;
+        // Step-scoped backend state is qualified independently from graph,
+        // prefix-cache, speculative and projector ownership.
+        return cfg.family == .gemma and cfg.usesGemma4Channels() and !cfg.usesMoe() and
+            !cfg.gemma4_mtp_assistant and cfg.hidden_size == 2560 and cfg.num_attention_heads == 8 and
+            cfg.effectiveKVHeads() == 2 and cfg.headDim() == 256 and cfg.global_head_dim == 512;
+    }
+
     pub fn schedulerPolicy(self: @This()) runtime.scheduler.native_generate.Policy {
         const validated_max_items: usize = 2;
         return .{
@@ -1441,6 +1458,28 @@ fn logAdmittedPrefillChunkPlan(plan: runtime.scheduler.native_generate.PrefillCh
             @tagName(tail.weight_route_hint),
         },
     );
+}
+
+/// A whole-request model gate serializes execution even when several callers
+/// already hold scheduler leases. Those queued callers must not shrink the
+/// immutable plan of the next gate owner. Isolated pipelines still share
+/// execution and retain the scheduler's fairness ceiling. Memory admission
+/// below this selection may reduce either ceiling before the plan is sealed.
+fn generationPrefillAdmissionCeiling(
+    prompt_tokens: usize,
+    requested_chunk_rows: usize,
+    idle_chunk_ceiling: usize,
+    scheduler_chunk_rows: ?usize,
+    isolated_generation: bool,
+) usize {
+    const execution_ceiling = if (isolated_generation)
+        scheduler_chunk_rows orelse idle_chunk_ceiling
+    else
+        idle_chunk_ceiling;
+    return @min(prompt_tokens, if (requested_chunk_rows > 0)
+        @min(requested_chunk_rows, execution_ceiling)
+    else
+        execution_ceiling);
 }
 
 fn promptCacheEligibleForNativeRequest(
@@ -6055,6 +6094,15 @@ pub const Node = struct {
             .pjrt, .wasm => return error.UnsupportedGeneratorProvider,
         };
         const kv_dtype = preflight.kvDType(gpt_config, backend_kind);
+        var direct_slot_control = execution_control;
+        if (direct_slot_control.io == null) direct_slot_control.io = io;
+        const direct_generation_slot = try model.generation_admission.acquire(
+            direct_slot_control,
+            backend_kind != .native,
+            self.config.max_concurrent_requests,
+            @min(@max(self.config.max_concurrent_requests, 1), 64),
+        );
+        defer direct_generation_slot.release();
         const prompt_cache_requested = prompt_cache_key != null and
             self.config.prompt_cache.enabled and
             promptCacheBackendEligible(self.config.prompt_cache.mode, backend_kind);
@@ -13095,6 +13143,24 @@ pub const Node = struct {
         return coordinator.acquire(admission);
     }
 
+    fn acquireCooperativeGenerateLease(
+        self: *const Node,
+        coordinator: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
+        admission: runtime.scheduler.native_generate.Admission,
+    ) !runtime.scheduler.native_generate.Lease {
+        var policy = self.config.generation_batching.schedulerPolicy();
+        policy.allow_mixed_sequence_lengths = true;
+        policy.short_context_burst = 8;
+        policy.max_step_prefill_items = 1;
+        policy.decode_coalesce_rows = policy.max_step_items;
+        policy.decode_coalesce_ready_only = true;
+        policy.decode_coalesce_after_turn = true;
+        policy.event_waits = true;
+        policy.contention_wait_us = 100;
+        coordinator.setPolicy(policy);
+        return coordinator.acquire(admission);
+    }
+
     /// Rendered prompt and tokenization retained from an admission estimate so
     /// the generation pipeline can skip re-rendering and re-encoding. Owns its
     /// memory; must stay alive until generation for the request completes.
@@ -14989,6 +15055,7 @@ pub const Node = struct {
     }
 
     fn generateContentScoped(self: *Node, ctx: *httpx.Context, completion: *?DeferredGenerationCompletion, native_transfer: ?*NativeCheckpointTransfer) !httpx.Response {
+        const generation_request_started_ns = platform.time.monotonicNs();
         const admission_started: ?i96 = if (serverGenerateTimingEnabled()) std.Io.Clock.awake.now(ctx.io).nanoseconds else null;
         defer if (admission_started) |started| {
             std.debug.print("native_request_timing_ms: scope_total={d}\n", .{@divTrunc(std.Io.Clock.awake.now(ctx.io).nanoseconds - started, std.time.ns_per_ms)});
@@ -15816,18 +15883,43 @@ pub const Node = struct {
             gpt_config,
             self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
         );
+        const cooperative_cuda = native_transfer == null and !selected_kv and self.config.generation_batching.cooperativeGemma4(
+            backend_kind,
+            gpt_config,
+            backend_selection.graph_mode_requested or graphModeEnabled() or effective_compiled_partition_backend != null,
+            effective_draft_model_name != null or auto_draft_sibling != null or config.speculation_requested,
+            config.prompt_cache_enabled,
+            generateMessagesHaveMedia(effective_messages),
+        );
+        const native_isolated = native_transfer == null and canIsolateGeneration(backend_kind, effective_compiled_partition_backend != null, effective_draft_model_name != null or auto_draft_sibling != null, config.prompt_cache_enabled, want_stream);
+        // Queued callers own neither scheduler work nor device KV/scratch.
+        // Exclusive requests fence the shared backend's cache/graph lifetime.
+        const generation_slot = model.generation_admission.acquire(
+            execution_control,
+            !cooperative_cuda and !native_isolated,
+            if (cooperative_cuda) 2 else self.config.max_concurrent_requests,
+            @min(@max(self.config.max_concurrent_requests, 1), 64),
+        ) catch |err| {
+            if (err == error.GenerationQueueFull) return modelResourceBusyResponse(ctx);
+            return inferenceFailureResponse(ctx, err);
+        };
+        defer generation_slot.release();
         var native_generate_lease: ?runtime.scheduler.native_generate.Lease = null;
         defer if (native_generate_lease) |lease| {
             if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
         };
         if (model.native_generate_coordinator) |coordinator| {
-            native_generate_lease = self.acquireNativeGenerateLease(coordinator, .{
+            const admission: runtime.scheduler.native_generate.Admission = .{
                 .requested_units = reserved_units,
                 .prompt_bytes = prompt_bytes,
                 .prompt_tokens = prompt_tokens,
                 .prefill_chunk_limit = if (config.prefill_chunk_size == 0) idle_prefill_ceiling else 0,
                 .max_tokens = configured_max_tokens,
-            }) catch |err| blk: {
+            };
+            native_generate_lease = (if (cooperative_cuda)
+                self.acquireCooperativeGenerateLease(coordinator, admission)
+            else
+                self.acquireNativeGenerateLease(coordinator, admission)) catch |err| blk: {
                 // A discovered drafter is an optimization: give back its extra
                 // admission and retry single-model before surfacing capacity
                 // errors the client's own request never earned.
@@ -16139,20 +16231,17 @@ pub const Node = struct {
             };
             budget_component_count = 2;
         }
-        const scheduler_prefill_ceiling = if (native_generate_lease) |lease|
-            lease.prefill_chunk_size
-        else
-            @min(
-                prompt_tokens,
-                if (config.prefill_chunk_size == 0)
-                    idle_prefill_ceiling
-                else
-                    self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
-            );
-        var admission_prefill_ceiling = if (config.prefill_chunk_size > 0)
-            @min(config.prefill_chunk_size, scheduler_prefill_ceiling)
-        else
-            scheduler_prefill_ceiling;
+        const isolated_generation = cooperative_cuda or (native_transfer == null and canIsolateGeneration(backend_kind, effective_compiled_partition_backend != null, draft_model_for_generation != null, config.prompt_cache_enabled, want_stream));
+        var admission_prefill_ceiling = generationPrefillAdmissionCeiling(
+            prompt_tokens,
+            config.prefill_chunk_size,
+            if (config.prefill_chunk_size == 0)
+                idle_prefill_ceiling
+            else
+                self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
+            if (native_generate_lease) |lease| lease.prefill_chunk_size else null,
+            isolated_generation and !cooperative_cuda,
+        );
         if (selected_kv) admission_prefill_ceiling = @min(admission_prefill_ceiling, runtime.kv.selection.defaults.prefill_chunk_rows);
         const speculative_budget_bonus: usize = if (draft_model_for_generation != null and
             config.speculation_policy != .off and
@@ -16171,7 +16260,6 @@ pub const Node = struct {
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
         };
         config.prefill_chunk_size = prefill_admission.max_chunk_rows;
-        const isolated_generation = native_transfer == null and canIsolateGeneration(backend_kind, effective_compiled_partition_backend != null, draft_model_for_generation != null, config.prompt_cache_enabled, want_stream);
         // Whole-request native owners cannot hold the model gate while waiting
         // for a turn belonging to an isolated peer that needs that same gate.
         if ((backend_kind == .native or native_transfer != null) and !isolated_generation) {
@@ -16369,7 +16457,11 @@ pub const Node = struct {
             else if (first_locked_model == model) draft_model else model
         else
             null;
-        if (!isolated_generation) {
+        var cooperative_setup_slot: ?execution_control_mod.ExecutionLane.Lease = null;
+        defer if (cooperative_setup_slot) |slot| slot.release();
+        if (cooperative_cuda) cooperative_setup_slot = model.native_generation_step_lane.acquireWithPriority(execution_control, true) catch |err|
+            return inferenceFailureResponse(ctx, err);
+        if (!isolated_generation or cooperative_cuda) {
             execution_control.lock(first_locked_model.nativeGenerationMutex()) catch |err|
                 return inferenceFailureResponse(ctx, err);
             if (second_locked_model) |second| execution_control.lock(second.nativeGenerationMutex()) catch |err| {
@@ -16377,7 +16469,7 @@ pub const Node = struct {
                 return inferenceFailureResponse(ctx, err);
             };
         }
-        var owns_generation_lock = !isolated_generation;
+        var owns_generation_lock = !isolated_generation or cooperative_cuda;
         defer if (owns_generation_lock) {
             if (second_locked_model) |second| second.unlockNativeGeneration();
             first_locked_model.unlockNativeGeneration();
@@ -16399,14 +16491,20 @@ pub const Node = struct {
         var draft_kv_manager: ?runtime.kv.manager.KvManager = null;
         defer if (draft_kv_manager) |*manager| manager.deinit();
 
-        var cb = session_factory.getComputeBackendWithBudget(model.session, execution_allocator, &run_budget) catch |err| {
+        var cb = (if (cooperative_cuda)
+            session_factory.getCoordinatedCudaComputeBackend(model.session, &run_budget)
+        else
+            session_factory.getComputeBackendWithBudget(model.session, execution_allocator, &run_budget)) catch |err| {
             if (err == error.MemoryBudgetExceeded) {
                 return generationMemoryBudgetResponse(ctx, model.session, &run_budget);
             }
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         };
         var cb_live = true;
-        defer if (cb_live) cb.deinit();
+        defer if (cb_live) {
+            if (cooperative_cuda and owns_generation_lock) cb.clearExecutionBudget();
+            cb.deinit();
+        };
         // Native checkpoint preparation runs direct prefill before its first
         // response write. Bind the request-local wrapper so weight acquisition
         // can observe a disconnected caller between decoder operations, rather
@@ -16481,7 +16579,16 @@ pub const Node = struct {
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) })
         else
             null;
-        defer if (kv_storage) |*storage| storage.deinit();
+        defer if (kv_storage) |*storage| {
+            const lock_cleanup = cooperative_cuda and !owns_generation_lock;
+            const cleanup_slot = if (lock_cleanup) model.native_generation_step_lane.acquireForCleanup(ctx.io, true) else null;
+            defer if (cleanup_slot) |slot| slot.release();
+            if (lock_cleanup) platform.sync.lockYielding(model.nativeGenerationMutex());
+            defer if (lock_cleanup) model.unlockNativeGeneration();
+            if (lock_cleanup) cb.bindExecutionBudget();
+            defer if (lock_cleanup) cb.clearExecutionBudget();
+            storage.deinit();
+        };
         if (kv_storage) |*storage| {
             cb.provisionKvDeviceWriteHook(storage) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
@@ -16493,7 +16600,16 @@ pub const Node = struct {
             decode_state.kv_storage = storage;
         }
         var decode_state_live = true;
-        defer if (decode_state_live) decode_state.deinit();
+        defer if (decode_state_live) {
+            const lock_cleanup = cooperative_cuda and !owns_generation_lock;
+            const cleanup_slot = if (lock_cleanup) model.native_generation_step_lane.acquireForCleanup(ctx.io, true) else null;
+            defer if (cleanup_slot) |slot| slot.release();
+            if (lock_cleanup) platform.sync.lockYielding(model.nativeGenerationMutex());
+            defer if (lock_cleanup) model.unlockNativeGeneration();
+            if (lock_cleanup) cb.bindExecutionBudget();
+            defer if (lock_cleanup) cb.clearExecutionBudget();
+            decode_state.deinit();
+        };
 
         var draft_decode_state: ?generation.NativeDecodeState = null;
         defer if (draft_decode_state) |*state| state.deinit();
@@ -16585,6 +16701,10 @@ pub const Node = struct {
             .scheduler = if (use_scheduler) model.native_generate_coordinator else null,
             .scheduler_lease = if (use_scheduler) if (native_generate_lease) |*lease| lease else null else null,
             .execution_lock = if (isolated_generation) model.nativeGenerationMutex() else null,
+            .generation_admission = &model.generation_admission,
+            .request_started_ns = generation_request_started_ns,
+            .execution_gate = if (cooperative_cuda) &model.native_generation_step_lane else null,
+            .execution_contention_wait_ns = if (cooperative_cuda) 100 * std.time.ns_per_us else 0,
             .draft_cb = if (draft_cb) |cb_value| cb_value else null,
             .draft_gpt_config = draft_gpt_config,
             .draft_decode_state = if (draft_decode_state) |*state| state else null,
@@ -16620,6 +16740,14 @@ pub const Node = struct {
                 "direct-eager");
         }
 
+        if (cooperative_cuda) {
+            cb.clearExecutionBudget();
+            first_locked_model.unlockNativeGeneration();
+            owns_generation_lock = false;
+            cooperative_setup_slot.?.release();
+            cooperative_setup_slot = null;
+        }
+
         if (want_stream) {
             return self.streamGenerate(
                 ctx,
@@ -16645,6 +16773,7 @@ pub const Node = struct {
             return generationErrorResponse(ctx, err);
         };
         defer result.deinit();
+        if (result.text.len > 0) model.generation_admission.noteFirstContent(generation_request_started_ns);
         if (native_transfer) |transfer| if (transfer.prepare) |prepare| {
             // The result owns only host arrays. Retire request GPU storage and
             // release the model gate before any network export can block.
@@ -18154,6 +18283,23 @@ pub const Node = struct {
                     BatchExecutionMode.shared_serial
                 else
                     batchExecutionMode(backend_kind);
+                const batch_generation_slot = model.generation_admission.acquire(
+                    httpInferenceExecutionControl(self, ctx),
+                    execution_mode != .isolated_parallel,
+                    self.config.max_concurrent_requests,
+                    @min(@max(self.config.max_concurrent_requests, 1), 64),
+                ) catch |err| {
+                    for (group_indices.items) |idx| {
+                        results[idx].@"error" = .{
+                            .code = if (err == error.GenerationQueueFull) "MODEL_RESOURCE_BUSY" else if (err == error.Timeout) "INFERENCE_TIMEOUT" else if (err == error.Cancelled or err == error.Canceled) "INFERENCE_CANCELLED" else "GENERATION_FAILED",
+                            .message = "generation execution slot unavailable",
+                            .retryable = err == error.GenerationQueueFull or err == error.Timeout,
+                        };
+                        pending[idx] = false;
+                    }
+                    continue;
+                };
+                defer batch_generation_slot.release();
                 const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
                     backend_kind,
                     gpt_config,
@@ -19279,8 +19425,17 @@ pub const Node = struct {
             parser: ?*tool_parser_mod.Parser,
             request_context: *const httpx.Context,
             defer_content: bool,
+            generation_admission: ?*runtime.scheduler.generation_admission.Lane = null,
+            request_started_ns: u64 = 0,
+            first_content_recorded: bool = false,
             write_error: ?anyerror = null,
             parser_failed: bool = false,
+
+            fn noteContent(stream: *@This()) void {
+                if (stream.first_content_recorded) return;
+                if (stream.generation_admission) |lane| lane.noteFirstContent(stream.request_started_ns);
+                stream.first_content_recorded = true;
+            }
 
             fn shouldContinue(raw_ctx: *anyopaque) bool {
                 const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
@@ -19306,6 +19461,7 @@ pub const Node = struct {
                             stream.write_error = err;
                             return false;
                         };
+                        stream.noteContent();
                     }
                     if (!parser.streamsIncrementalToolDeltas() and update.new_calls.len > 0) {
                         for (update.new_calls, 0..) |call, idx| {
@@ -19328,6 +19484,7 @@ pub const Node = struct {
                     stream.write_error = err;
                     return false;
                 };
+                if (token_text.len > 0) stream.noteContent();
                 return true;
             }
         };
@@ -19343,6 +19500,8 @@ pub const Node = struct {
             .parser = tool_parser,
             .request_context = ctx,
             .defer_content = shouldDeferStreamContentForReasoning(pipeline, config),
+            .generation_admission = if (comptime @hasField(@TypeOf(pipeline.*), "generation_admission")) pipeline.generation_admission else null,
+            .request_started_ns = if (comptime @hasField(@TypeOf(pipeline.*), "request_started_ns")) pipeline.request_started_ns else 0,
         };
 
         if (comptime @hasField(@TypeOf(pipeline.*), "continue_ctx") and
@@ -19467,6 +19626,7 @@ pub const Node = struct {
                 writer.close() catch {};
                 return ctx.response.build();
             };
+            if (result.text.len > 0) stream_ctx.noteContent();
         } else {
             if (result.reasoning_text) |reasoning| {
                 if (reasoning.len > 0) emitReasoningDelta(
@@ -25461,6 +25621,12 @@ pub const Node = struct {
         }
         try appendPromMetric(&writer.writer, "antfly_inference_admission_host_total_bytes", "gauge", "Live host bytes reserved by inference owners", admitted.hostTotalBytes());
         try appendPromMetric(&writer.writer, "antfly_inference_admission_backend_total_bytes", "gauge", "Live backend bytes reserved by inference owners", admitted.backendTotalBytes());
+        if (build_options.enable_cuda) {
+            const physical = @import("../ops/cuda/allocation_budget.zig").process_device_allocations.snapshot();
+            try appendPromMetric(&writer.writer, "antfly_inference_cuda_managed_live_bytes", "gauge", "Physical DeviceBuffer allocations across model contexts including cached scratch and KV; excludes vendor-private allocations", physical.live);
+            try appendPromMetric(&writer.writer, "antfly_inference_cuda_managed_peak_bytes", "gauge", "Worker lifetime peak physical DeviceBuffer allocation bytes", physical.peak);
+            try appendPromMetric(&writer.writer, "antfly_inference_cuda_managed_limit_bytes", "gauge", "Worker process physical DeviceBuffer allocation ceiling", physical.limit);
+        }
 
         // Scheduler metrics (computed on-the-fly from loaded models)
         {
@@ -25490,6 +25656,17 @@ pub const Node = struct {
             try appendPromptCacheMetrics(&writer.writer, self.model_manager.loaded);
         }
         try appendMetalExactJitMetrics(&writer.writer, aggregateMetalExactJitStats(loaded_snapshot.handles));
+        var generation_stats: runtime.scheduler.generation_admission.Stats = .{};
+        for (loaded_snapshot.handles) |handle| generation_stats.add(handle.get().generation_admission.snapshot());
+        try appendPromMetric(&writer.writer, "antfly_inference_generation_active_requests", "gauge", "Generation requests holding execution slots and memory admission", generation_stats.active);
+        try appendPromMetric(&writer.writer, "antfly_inference_generation_queued_requests", "gauge", "Generation requests waiting before KV and scratch admission", generation_stats.waiting);
+        try appendPromMetric(&writer.writer, "antfly_inference_generation_started_total", "counter", "Generation execution slots acquired", generation_stats.started);
+        try appendPromMetric(&writer.writer, "antfly_inference_generation_queue_rejected_total", "counter", "Requests rejected by the bounded generation queue", generation_stats.rejected);
+        try appendPromMetric(&writer.writer, "antfly_inference_generation_queue_cancelled_total", "counter", "Cancelled or expired generation waiters removed from the queue", generation_stats.cancelled);
+        try generation_stats.queue_wait.render(&writer.writer, "antfly_inference_generation_queue_wait_seconds", "Time waiting for a generation slot before device-memory admission");
+        try generation_stats.first_content.render(&writer.writer, "antfly_inference_generation_first_content_seconds", "Server-observed first public content availability including queue and prefill; excludes network transit");
+        try generation_stats.prefill.render(&writer.writer, "antfly_inference_generation_prefill_seconds", "Pipeline prefill elapsed time including cooperative scheduling waits");
+        try generation_stats.decode.render(&writer.writer, "antfly_inference_generation_decode_seconds", "Pipeline decode elapsed time including cooperative scheduling waits");
         const metal_telemetry = @import("../backends/metal_telemetry.zig");
         try metal_telemetry.render(&writer.writer, metal_telemetry.snapshot(build_options.enable_metal));
         try metal_telemetry.renderMemory(&writer.writer, metal_telemetry.memorySnapshot(build_options.enable_metal));
@@ -35481,6 +35658,28 @@ test "generation batching keeps the experimental CUDA envelope default-off" {
     );
 }
 
+test "generation cooperative CUDA eligibility fences shared backend state" {
+    var cfg: gpt_model_mod.Config = .{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+        .hidden_size = 2560,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+    };
+    const enabled = GenerationBatchingConfig{ .mode = .on };
+    try std.testing.expect(enabled.cooperativeGemma4(.cuda, cfg, false, false, false, false));
+    try std.testing.expect(!(GenerationBatchingConfig{}).cooperativeGemma4(.cuda, cfg, false, false, false, false));
+    try std.testing.expect(!enabled.cooperativeGemma4(.metal, cfg, false, false, false, false));
+    try std.testing.expect(!enabled.cooperativeGemma4(.cuda, cfg, true, false, false, false));
+    try std.testing.expect(!enabled.cooperativeGemma4(.cuda, cfg, false, true, false, false));
+    try std.testing.expect(!enabled.cooperativeGemma4(.cuda, cfg, false, false, true, false));
+    try std.testing.expect(!enabled.cooperativeGemma4(.cuda, cfg, false, false, false, true));
+    cfg.num_key_value_heads = 1;
+    try std.testing.expect(!enabled.cooperativeGemma4(.cuda, cfg, false, false, false, false));
+}
+
 test "native generation applies scheduler policy before the first lease" {
     var node = try Node.init(std.testing.allocator, .{
         .generation_batching = .{ .mode = .on, .max_step_items = 128 },
@@ -35498,6 +35697,59 @@ test "native generation applies scheduler policy before the first lease" {
 
     try std.testing.expectEqual(@as(usize, 3), leases[2].active_requests_snapshot);
     try std.testing.expectEqual(@as(usize, 1), coordinator.defaultStepBudget().max_items);
+}
+
+test "generation prefill planning excludes serialized waiters and preserves isolated fairness" {
+    var coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .max_idle_prefill_chunk_size = 512 });
+    const request: runtime.scheduler.native_generate.Admission = .{
+        .requested_units = 50,
+        .prompt_bytes = 120000,
+        .prompt_tokens = 31289,
+        .max_tokens = 128,
+    };
+    const first = try coordinator.acquire(request);
+    defer coordinator.release(first);
+    const second = try coordinator.acquire(request);
+    defer coordinator.release(second);
+    try std.testing.expectEqual(@as(usize, 32), second.prefill_chunk_size);
+
+    const serialized = Node.canIsolateGeneration(.cuda, false, false, false, false);
+    try std.testing.expect(!serialized);
+    const ceiling = generationPrefillAdmissionCeiling(31289, 0, 512, second.prefill_chunk_size, serialized);
+    try std.testing.expectEqual(@as(usize, 512), ceiling);
+    try std.testing.expectEqual(@as(usize, 128), generationPrefillAdmissionCeiling(31289, 128, 512, second.prefill_chunk_size, false));
+    try std.testing.expectEqual(@as(usize, 64), generationPrefillAdmissionCeiling(64, 0, 512, second.prefill_chunk_size, false));
+    try std.testing.expectEqual(@as(usize, 512), generationPrefillAdmissionCeiling(31289, 0, 512, null, false));
+    try std.testing.expectEqual(@as(usize, 32), generationPrefillAdmissionCeiling(31289, 0, 512, second.prefill_chunk_size, true));
+    try std.testing.expectEqual(@as(usize, 16), generationPrefillAdmissionCeiling(31289, 16, 512, second.prefill_chunk_size, true));
+
+    const cfg: gpt_model_mod.Config = .{
+        .family = .gemma,
+        .hidden_size = 2560,
+        .num_hidden_layers = 42,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .intermediate_size = 10240,
+        .vocab_size = 262144,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+        .ple_hidden_size = 256,
+        .position_encoding = .rope,
+    };
+    const smaller = try runtime.tier.memory.estimateGptGeneration(.cuda, .f16, cfg, 31289, 128, 256);
+    var budget = runtime.tier.memory.RunBudget.init(.{ .scratch_limit_bytes = smaller.scratch_bytes });
+    const bounded = try runtime.tier.memory.reserveGptGenerationPrefill(&budget, &.{.{
+        .backend = .cuda,
+        .kv_dtype = .f16,
+        .config = cfg,
+    }}, 31289, 128, ceiling);
+    try std.testing.expectEqual(@as(usize, 256), bounded.max_chunk_rows);
+    try std.testing.expectEqual(bounded.max_scratch_bytes, budget.scratchTotalBytes());
+    try std.testing.expect(bounded.max_scratch_bytes <= smaller.scratch_bytes);
 }
 
 test "generation batching treats every requested CUDA graph replay mode as serialized" {
@@ -41229,6 +41481,18 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
         .retryable = true,
     };
     return switch (err) {
+        error.Timeout => .{
+            .status = 504,
+            .code = "INFERENCE_TIMEOUT",
+            .message = "the inference deadline expired",
+            .retryable = true,
+        },
+        error.Canceled, error.Cancelled => .{
+            .status = 408,
+            .code = "INFERENCE_CANCELLED",
+            .message = "the inference request was cancelled",
+            .retryable = false,
+        },
         error.InvalidToolArguments => .{
             .status = 502,
             .code = "TOOL_ARGUMENTS_INVALID",
@@ -41290,6 +41554,19 @@ fn nativeCheckpointErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Resp
         error.NativeKvFrameBusy => modelResourceBusyResponse(ctx),
         else => inferenceFailureResponse(ctx, err),
     };
+}
+
+test "generation deadline errors retain canonical timeout and cancellation responses" {
+    const timeout = generationRequestFailure(error.Timeout).?;
+    try std.testing.expectEqual(@as(u16, 504), timeout.status);
+    try std.testing.expectEqualStrings("INFERENCE_TIMEOUT", timeout.code);
+    try std.testing.expect(timeout.retryable);
+    for ([_]anyerror{ error.Cancelled, error.Canceled }) |cause| {
+        const cancelled = generationRequestFailure(cause).?;
+        try std.testing.expectEqual(@as(u16, 408), cancelled.status);
+        try std.testing.expectEqualStrings("INFERENCE_CANCELLED", cancelled.code);
+        try std.testing.expect(!cancelled.retryable);
+    }
 }
 
 fn generationErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {

@@ -2687,6 +2687,8 @@ pub const LoadedModel = struct {
     shared_prefetch: ?*runtime.tier.shared.SharedPrefetchState = null,
     prompt_prefix_cache: runtime.kv.prompt_cache.PromptPrefixCache,
     native_generate_coordinator: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = null,
+    generation_admission: runtime.scheduler.generation_admission.Lane = .{},
+    native_generation_step_lane: execution_control_mod.ExecutionLane = .{},
     native_generation_graph_cache: graph_mod.cache.GraphCache,
     // ponytail: model-wide safety lock; replace with per-request backend state only when continuous batching is proven safe.
     native_generate_lock: std.atomic.Mutex = .unlocked,
@@ -10986,6 +10988,13 @@ fn loadSessionForPreferredBackends(
             defer loaded.deinit();
             if (control) |active| try active.check();
             if (manager.admission_enabled) {
+                if (session_factory.getEagerCudaMirrorWeightBytes(loaded.session)) |weight_bytes| {
+                    const construction_bytes = resident_amounts.backend_weight_bytes;
+                    resident_amounts.backend_weight_bytes = try session_factory.retainedCudaMirrorWeightBytes(construction_bytes, weight_bytes);
+                    std.log.info("cuda_eager_mirror_residency construction_bytes={d} measured_weight_bytes={d} retained_weight_bytes={d}", .{
+                        construction_bytes, weight_bytes, resident_amounts.backend_weight_bytes,
+                    });
+                }
                 if (serving_floor) |floor| session_factory.configureReservedGenerationWorkspace(
                     &loaded.session,
                     floor,

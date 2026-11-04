@@ -671,6 +671,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     if (max_work_units_override) |value| node_cfg.max_work_units = value;
     if (http_max_body_bytes_override) |value| node_cfg.http_max_body_bytes = value;
 
+    try inference.configureCudaProcessDeviceLimit(node_cfg.generation_budget_overrides.backend_limit_bytes);
     var node = try inference.server.Node.init(allocator, node_cfg);
     defer node.deinit();
     try node.attachIo(io);

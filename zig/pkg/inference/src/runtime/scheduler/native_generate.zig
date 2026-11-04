@@ -218,6 +218,9 @@ pub const Policy = struct {
     /// Backends opt in after heterogeneous position/KV batching passes their
     /// response-equivalence gate.
     allow_mixed_sequence_lengths: bool = false,
+    /// Prefer cheaper contexts for this many consecutive turns, then grant
+    /// the next round-robin owner. Zero preserves strict round robin.
+    short_context_burst: usize = 0,
     /// Optional rollout cap on the active request set. Above this count the
     /// coordinator preserves fairness but emits singleton forward steps.
     max_active_requests_for_batching: ?usize = null,
@@ -385,6 +388,8 @@ pub const NativeGenerateCoordinator = struct {
     in_turn_phase: ?Phase = null,
     last_prefill_granted: ?RequestId = null,
     last_decode_granted: ?RequestId = null,
+    prefill_priority_streak: usize = 0,
+    decode_priority_streak: usize = 0,
     consecutive_decode_turns: usize = 0,
     max_decode_streak_before_prefill: usize = 4,
     base_prefill_chunk_size: usize = 256,
@@ -1334,10 +1339,18 @@ pub const NativeGenerateCoordinator = struct {
         self.in_turn_phase = null;
         switch (phase) {
             .decode => {
+                self.decode_priority_streak = if (self.last_decode_granted == lease.request_id)
+                    self.decode_priority_streak +| 1
+                else
+                    1;
                 self.last_decode_granted = lease.request_id;
                 self.consecutive_decode_turns += 1;
             },
             .prefill => {
+                self.prefill_priority_streak = if (self.last_prefill_granted == lease.request_id)
+                    self.prefill_priority_streak +| 1
+                else
+                    1;
                 self.last_prefill_granted = lease.request_id;
                 self.consecutive_decode_turns = 0;
             },
@@ -1475,7 +1488,10 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     fn pickNextTurn(self: *const NativeGenerateCoordinator) ?RequestId {
-        const prefill_candidate = self.pickPendingPrefillRoundRobin(self.last_prefill_granted) orelse self.pickPhaseRoundRobin(.prefill, self.last_prefill_granted);
+        const prefill_candidate = if (self.policy.short_context_burst > 0)
+            self.pickShortContextPrefill()
+        else
+            self.pickPendingPrefillRoundRobin(self.last_prefill_granted) orelse self.pickPhaseRoundRobin(.prefill, self.last_prefill_granted);
         const decode_candidate = self.pickPendingDecodeRoundRobin(self.last_decode_granted);
 
         if (decode_candidate) |decode_id| {
@@ -1507,11 +1523,57 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     fn pickPendingDecodeRoundRobin(self: *const NativeGenerateCoordinator, last_granted: ?RequestId) ?RequestId {
-        return pickPendingRequestRoundRobin(self.pending_decode.items, last_granted);
+        var selected = pickPendingRequestRoundRobin(self.pending_decode.items, last_granted) orelse return null;
+        if (self.policy.short_context_burst == 0 or self.decode_priority_streak >= self.policy.short_context_burst) return selected;
+        var cheapest: usize = std.math.maxInt(usize);
+        // Start with the round-robin owner so equal-cost work stays fair.
+        for (self.pending_decode.items) |pending| if (pending.request_id == selected) {
+            cheapest = pending.total_sequence_len;
+            break;
+        };
+        for (self.pending_decode.items) |pending| if (pending.total_sequence_len < cheapest) {
+            selected = pending.request_id;
+            cheapest = pending.total_sequence_len;
+        };
+        return selected;
     }
 
     fn pickPendingPrefillRoundRobin(self: *const NativeGenerateCoordinator, last_granted: ?RequestId) ?RequestId {
-        return pickPendingRequestRoundRobin(self.pending_prefill.items, last_granted);
+        var selected = pickPendingRequestRoundRobin(self.pending_prefill.items, last_granted) orelse return null;
+        if (self.policy.short_context_burst == 0 or self.prefill_priority_streak >= self.policy.short_context_burst) return selected;
+        var cheapest = self.prefillContextCost(selected);
+        for (self.pending_prefill.items) |pending| {
+            const cost = self.prefillContextCost(pending.request_id);
+            if (cost < cheapest) {
+                selected = pending.request_id;
+                cheapest = cost;
+            }
+        }
+        return selected;
+    }
+
+    fn prefillContextCost(self: *const NativeGenerateCoordinator, id: RequestId) usize {
+        const entry = self.entries.items[self.indexOf(id) orelse return std.math.maxInt(usize)];
+        return if (entry.prompt_tokens > 0) entry.prompt_tokens else @max(entry.prompt_bytes / 4, 1);
+    }
+
+    fn pickShortContextPrefill(self: *const NativeGenerateCoordinator) ?RequestId {
+        // Final CUDA prefill/logit work owns a manual turn rather than a
+        // PendingPrefill. Compare all prefill owners, or continuously queued
+        // long chunks can starve a short request's final chunk. A completed
+        // owner will publish its next work/phase before another turn is needed.
+        var selected = self.pickPhaseRoundRobin(.prefill, self.last_prefill_granted) orelse return null;
+        if (self.prefill_priority_streak >= self.policy.short_context_burst) return selected;
+        var cheapest = self.prefillContextCost(selected);
+        for (self.entries.items) |entry| {
+            if (entry.phase != .prefill) continue;
+            const cost = self.prefillContextCost(entry.id);
+            if (cost < cheapest) {
+                selected = entry.id;
+                cheapest = cost;
+            }
+        }
+        return selected;
     }
 
     fn findPendingPrefill(self: *const NativeGenerateCoordinator, work_ptr: *anyopaque) ?usize {
@@ -3856,4 +3918,76 @@ test "LightOnOCR3 CUDA native generate coordinator turn coalescing reunites work
         coordinator.completeStep(&turn, step.items);
         try std.testing.expectEqual(@as(u64, 3), coordinator.stats.step_decode_items_total);
     }
+}
+
+test "short context priority bounds decode bursts and preserves disabled and equal-cost round robin" {
+    const Case = struct { burst: usize, long_tokens: usize, expected_short: []const bool };
+    for ([_]Case{
+        .{ .burst = 3, .long_tokens = 32000, .expected_short = &.{ true, true, true, false, true, true, true, false } },
+        .{ .burst = 0, .long_tokens = 32000, .expected_short = &.{ false, true, false, true } },
+        .{ .burst = 3, .long_tokens = 2000, .expected_short = &.{ false, true, false, true } },
+    }) |case| {
+        var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+        defer coordinator.deinit();
+        coordinator.policy.short_context_burst = case.burst;
+        var long = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = case.long_tokens * 4, .prompt_tokens = case.long_tokens, .max_tokens = 128 });
+        defer coordinator.release(long);
+        var short = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8000, .prompt_tokens = 2000, .max_tokens = 128 });
+        defer coordinator.release(short);
+        coordinator.beginDecode(&long, case.long_tokens);
+        coordinator.beginDecode(&short, 2000);
+        var long_work: u8 = 0;
+        var short_work: u8 = 0;
+        try coordinator.enqueueDecodeWork(long, &long_work, case.long_tokens + 1, case.long_tokens, 0, .{});
+        try coordinator.enqueueDecodeWork(short, &short_work, 2001, 2000, 0, .{});
+        for (case.expected_short) |choose_short| {
+            const owner = if (choose_short) &short else &long;
+            try std.testing.expectEqual(owner.request_id, coordinator.pickNextTurn().?);
+            try std.testing.expect(coordinator.tryAcquireTurn(owner, .decode));
+            coordinator.finishTurn(owner, .decode);
+        }
+    }
+}
+
+test "short context priority uses whole prompts and bounds equal-chunk prefill bursts" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.policy.short_context_burst = 3;
+    var long = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 128000, .prompt_tokens = 32000, .max_tokens = 128 });
+    defer coordinator.release(long);
+    var short = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8000, .prompt_tokens = 2000, .max_tokens = 128 });
+    defer coordinator.release(short);
+    coordinator.notePrefillProgress(&long, 0, 32000);
+    coordinator.notePrefillProgress(&short, 0, 2000);
+    var long_work: u8 = 0;
+    var short_work: u8 = 0;
+    try coordinator.enqueuePrefillWork(long, &long_work, 512, 512, 512, 0, .{});
+    try coordinator.enqueuePrefillWork(short, &short_work, 512, 512, 512, 0, .{});
+    for ([_]bool{ true, true, true, false, true, true, true, false }) |choose_short| {
+        const owner = if (choose_short) &short else &long;
+        try std.testing.expectEqual(owner.request_id, coordinator.pickNextTurn().?);
+        try std.testing.expect(coordinator.tryAcquireTurn(owner, .prefill));
+        coordinator.finishTurn(owner, .prefill);
+    }
+}
+
+test "short context priority admits a manual final prefill ahead of continuously queued long chunks" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.policy.short_context_burst = 3;
+    var long = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 128000, .prompt_tokens = 32000, .max_tokens = 128 });
+    defer coordinator.release(long);
+    var short = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 7644, .prompt_tokens = 1911, .max_tokens = 128 });
+    defer coordinator.release(short);
+    coordinator.notePrefillProgress(&long, 512, 32000);
+    coordinator.notePrefillProgress(&short, 1536, 1911);
+    var long_work: u8 = 0;
+    try coordinator.enqueuePrefillWork(long, &long_work, 1024, 512, 1024, 0, .{});
+    try std.testing.expectEqual(short.request_id, coordinator.pickNextTurn().?);
+    try std.testing.expect(coordinator.tryAcquireTurn(&short, .prefill));
+    coordinator.finishTurn(&short, .prefill);
+    coordinator.beginDecode(&short, 1911);
+    try std.testing.expectEqual(long.request_id, coordinator.pickNextTurn().?);
+    try std.testing.expect(coordinator.tryAcquireTurn(&long, .prefill));
+    coordinator.finishTurn(&long, .prefill);
 }

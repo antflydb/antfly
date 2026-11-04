@@ -4205,6 +4205,8 @@ pub const NativeGenerationPipeline = struct {
     /// Serializes the shared model backend for one claimed scheduler step.
     /// Request-local tokenization and sampling remain outside this lock.
     execution_lock: ?*std.atomic.Mutex = null,
+    generation_admission: ?*runtime.scheduler.generation_admission.Lane = null,
+    request_started_ns: u64 = 0,
     /// Optional FIFO/event admission for the same atomic backend mutex.
     execution_gate: ?*execution_control_mod.ExecutionLane = null,
     /// Optional bounded polling for a shared epoch gate; zero retains yielding.
@@ -4277,6 +4279,14 @@ pub const NativeGenerationPipeline = struct {
         const queued = if (gate) |lane| try lane.acquireWithPriority(control, waiters != null) else null;
         errdefer if (queued) |lease| lease.release();
         try control.lockWithPoll(mutex, self.execution_contention_wait_ns);
+        errdefer mutex.unlock();
+        if (self.execution_lock == mutex) {
+            self.cb.bindExecutionBudget();
+            errdefer self.cb.clearExecutionBudget();
+            // Captured-address and prepared-tail metadata belongs to the
+            // preceding owner, even though immutable weights are shared.
+            if (self.cb.execution_budget_bind != null) try self.cb.beginRequest();
+        }
     }
 
     fn lockExecutionForCleanup(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) void {
@@ -4293,9 +4303,11 @@ pub const NativeGenerationPipeline = struct {
         if (waiters != null) {
             (InferenceExecutionControl{}).lockWithPoll(mutex, if (self.execution_contention_wait_ns == 0) 100 * std.time.ns_per_us else self.execution_contention_wait_ns) catch unreachable;
         } else platform.sync.lockYielding(mutex);
+        if (self.execution_lock == mutex) self.cb.bindExecutionBudget();
     }
 
     fn unlockExecution(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) void {
+        if (self.execution_lock == mutex) self.cb.clearExecutionBudget();
         mutex.unlock();
         if (self.execution_lock == mutex) if (self.execution_gate) |lane| {
             (execution_control_mod.ExecutionLane.Lease{ .lane = lane }).release();
@@ -4438,7 +4450,7 @@ pub const NativeGenerationPipeline = struct {
         const logits = try self.allocator.dupe(f32, saved.logits);
         errdefer self.allocator.free(logits);
         if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-        defer if (self.execution_lock) |mutex| mutex.unlock();
+        defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
         const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
         const storage = destination.kv_storage orelse return error.UnsupportedAttentionMatchRoute;
         if (storage.sequences.items.len != 0 or storage.storage.config.store_cpu_bytes) return error.UnsupportedAttentionMatchRoute;
@@ -4477,7 +4489,7 @@ pub const NativeGenerationPipeline = struct {
         for (ids, tokens) |*id, token| id.* = std.math.cast(u32, token) orelse return error.InvalidCompactionProbe;
         var saved = blk: {
             if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-            defer if (self.execution_lock) |mutex| mutex.unlock();
+            defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
             if ((try cuda_compute.installedAttentionMatchActivity(compute, source_storage, source_sequence)) == null) return error.UnsupportedAttentionMatchRoute;
             break :blk try self.snapshotAttentionMatchState(ids, logits, source, identity, limits, 2 * 1024 * 1024 * 1024);
         };
@@ -4608,7 +4620,7 @@ pub const NativeGenerationPipeline = struct {
         if (comptime !build_options.enable_cuda) return error.UnsupportedCompactionQueryRoute;
         if (self.cb.kind() != .cuda or self.kv_dtype != .f16) return error.UnsupportedCompactionQueryDType;
         if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-        defer if (self.execution_lock) |mutex| mutex.unlock();
+        defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
         const checkpoint = runtime.kv.attention_match_checkpoint;
         const engine = runtime.kv.attention_match_engine;
         const storage = @import("../ops/cuda/attention_match_storage.zig");
@@ -4897,7 +4909,7 @@ pub const NativeGenerationPipeline = struct {
             const dtype = pipeline.kv_dtype orelse return error.UnsupportedCompactionQueryDType;
             if (pipeline.cb.kind() != .cuda or dtype != .f16) return error.UnsupportedCompactionQueryRoute;
             if (pipeline.execution_lock) |mutex| try pipeline.lockExecution(mutex);
-            defer if (pipeline.execution_lock) |mutex| mutex.unlock();
+            defer if (pipeline.execution_lock) |mutex| pipeline.unlockExecution(mutex);
             self.manager = runtime.kv.manager.KvManager.init(pipeline.allocator);
             errdefer self.deinit();
             const config = attentionMatchCheckpointPoolConfig(dtype, pipeline.gpt_config);
@@ -4927,7 +4939,7 @@ pub const NativeGenerationPipeline = struct {
                 donor_count += 1;
             }
             if (pipeline.execution_lock) |mutex| try pipeline.lockExecution(mutex);
-            defer if (pipeline.execution_lock) |mutex| mutex.unlock();
+            defer if (pipeline.execution_lock) |mutex| pipeline.unlockExecution(mutex);
             self.manager = runtime.kv.manager.KvManager.init(pipeline.allocator);
             errdefer self.deinit();
             var config = kvPoolConfig(.cuda, dtype, pipeline.gpt_config, false);
@@ -4970,7 +4982,7 @@ pub const NativeGenerationPipeline = struct {
     fn appendAttentionMatchProbeTokens(self: *NativeGenerationPipeline, state: *NativeDecodeState, tokens: []const i64) ![]f32 {
         if (tokens.len == 0) return error.InvalidCompactionProbe;
         if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-        defer if (self.execution_lock) |mutex| mutex.unlock();
+        defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
         var offset: usize = 0;
         while (offset + 1 < tokens.len) {
             try checkAttentionMatchQueryWork(self);
@@ -5247,7 +5259,7 @@ pub const NativeGenerationPipeline = struct {
         var collector = try queries.Collector.init(self.allocator, consumers[0..count], source_tokens.len, repeat_tokens.len, options.collection);
         errdefer collector.deinit();
         if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-        defer if (self.execution_lock) |mutex| mutex.unlock();
+        defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
         var manager = runtime.kv.manager.KvManager.init(self.allocator);
         defer manager.deinit();
         var pool_config = kvPoolConfig(.cuda, dtype, self.gpt_config, false);
@@ -7111,6 +7123,7 @@ pub const NativeGenerationPipeline = struct {
             timestampDurationMillis(started_at, text_decode_started_at),
             timestampDurationMillis(started_at, finished_generate_at),
         }) else null;
+        if (timing_ms) |timing| if (self.generation_admission) |lane| lane.notePipeline(timing.prefill, timing.decode);
         if (self.print_timing and timing_ms != null) {
             const timing = timing_ms.?;
             std.debug.print(
@@ -7485,6 +7498,8 @@ pub const NativeGenerationPipeline = struct {
             platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_RESERVE_PREFILL_KV", true))
         {
             if (cudaE4bPrefillKvCapacity(self.gpt_config, seq_len, config.max_tokens)) |capacity| {
+                if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+                defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
                 const limit = std.mem.alignForward(usize, seq_len + @as(usize, @intCast(config.max_tokens)), 16);
                 try decode_state.reserveFreshCudaKvCapacity(capacity, limit);
                 std.log.info("cuda_prefill_kv_reservation prompt_tokens={d} capacity_tokens={d}", .{ seq_len, capacity });
@@ -14417,12 +14432,10 @@ pub const NativeGenerationPipeline = struct {
         claimed: []const runtime.scheduler.native_generate.StepItem,
     ) void {
         if (self.execution_lock) |mutex| {
-            if (scheduler.usesStepEvents() or self.execution_gate != null) {
-                self.lockExecution(mutex) catch |err| {
-                    completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = err });
-                    return;
-                };
-            } else platform.sync.lockYielding(mutex);
+            self.lockExecution(mutex) catch |err| {
+                completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = err });
+                return;
+            };
         }
         defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
 
@@ -14744,6 +14757,13 @@ fn runStepLoop(
 
     while (!driver.isReady()) {
         if (events) scheduler.prepareWait(&waiter);
+        if (wait_error == null) {
+            if (@hasDecl(DriverChild, "checkControl")) {
+                driver.checkControl() catch |err| {
+                    wait_error = err;
+                };
+            }
+        }
         if (wait_error) |err| {
             // Cancellation cannot drop a stack-backed work pointer while a
             // peer may own it. Remove idle work immediately; otherwise wait
@@ -14756,9 +14776,18 @@ fn runStepLoop(
             continue;
         }
         if (dedicated) {
-            if (!driver.isReady()) waiter.event.wait(io) catch |err| {
-                wait_error = err;
-            };
+            if (!driver.isReady()) {
+                if (@hasDecl(DriverChild, "checkControl")) {
+                    // Application deadlines do not cancel the I/O event wait.
+                    // Poll them while preserving the claimed-work drain path.
+                    waiter.event.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch |err| switch (err) {
+                        error.Timeout => {},
+                        else => wait_error = err,
+                    };
+                } else waiter.event.wait(io) catch |err| {
+                    wait_error = err;
+                };
+            }
             continue;
         }
         if (@hasDecl(DriverChild, "preStep")) driver.preStep();
@@ -14794,6 +14823,10 @@ const DecodeStepDriver = struct {
     work: *NativeGenerationPipeline.PendingDecodeBatchWork,
     decode_state: *NativeDecodeState,
 
+    pub fn checkControl(self: *DecodeStepDriver) !void {
+        if (self.pipeline.execution_control) |control| try control.check();
+    }
+
     fn isReady(self: *const DecodeStepDriver) bool {
         return self.work.ready.load(.acquire);
     }
@@ -14822,6 +14855,10 @@ const PrefillStepDriver = struct {
     scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
     work: *NativeGenerationPipeline.PendingPrefillBatchWork,
     decode_state: *NativeDecodeState,
+
+    pub fn checkControl(self: *PrefillStepDriver) !void {
+        if (self.pipeline.execution_control) |control| try control.check();
+    }
 
     fn isReady(self: *const PrefillStepDriver) bool {
         return self.work.ready.load(.acquire);
@@ -16238,6 +16275,49 @@ test "runStepLoop drives stub driver to completion and reports per-iteration bud
     try std.testing.expectEqual(@as(usize, 1), driver.prestep_calls);
     try std.testing.expectEqual(@as(usize, 1), driver.budget_calls);
     try std.testing.expectEqual(@as(usize, 0), coordinator.pending_decode.items.len);
+}
+
+test "generation deadline cancels queued steps in inline and dedicated execution" {
+    const Coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator;
+    for ([_]bool{ false, true }) |dedicated| {
+        var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        var coordinator = Coordinator.init(std.testing.allocator);
+        defer coordinator.deinit();
+        var wake: std.Io.Event = .unset;
+        if (dedicated) coordinator.registerExecutor(&wake, io);
+        defer if (dedicated) coordinator.unregisterExecutor();
+        var lease = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 1 });
+        defer coordinator.release(lease);
+        coordinator.beginDecode(&lease, 4);
+        var work: u8 = 0;
+        try coordinator.enqueueDecodeWork(lease, &work, 5, 4, 0, .{});
+        const Driver = struct {
+            checks: usize = 0,
+            allowed_checks: usize,
+            pub fn checkControl(self: *@This()) !void {
+                self.checks += 1;
+                if (self.checks > self.allowed_checks) return error.Timeout;
+            }
+            fn isReady(_: *const @This()) bool {
+                return false;
+            }
+            fn stepBudget(_: *const @This()) runtime.scheduler.native_generate.StepBudget {
+                unreachable;
+            }
+            fn execute(_: *@This(), _: *Coordinator, _: *runtime.scheduler.native_generate.Lease, _: []const runtime.scheduler.native_generate.StepItem) void {
+                unreachable;
+            }
+        };
+        // Dedicated execution first waits for a peer that never claims work.
+        // Its timed event wait must wake and recheck the caller's deadline.
+        var driver: Driver = .{ .allowed_checks = if (dedicated) 1 else 0 };
+        try std.testing.expectError(error.Timeout, runStepLoop(std.testing.failing_allocator, &coordinator, &lease, &work, .decode, io, null, &driver));
+        try std.testing.expectEqual(@as(usize, 0), coordinator.pending_decode.items.len);
+        try std.testing.expect(coordinator.in_turn == null);
+        try std.testing.expect(coordinator.waiters == null);
+    }
 }
 
 test "runStepLoop cancellation removes idle stack work without executing it" {
@@ -20117,6 +20197,7 @@ test "LightOnOCR3 phase priority releases its waiter on cancellation and permits
     var waiters: std.atomic.Value(usize) = .init(0);
     var wake: std.Io.Event = .unset;
     var pipeline: NativeGenerationPipeline = undefined;
+    pipeline.cb = .{ .ptr = &mutex, .vtable = undefined }; // Lock-only fixture: no compute ops.
     pipeline.execution_lock = &mutex;
     pipeline.execution_gate = null;
     pipeline.execution_phase_wake = &wake;
@@ -20159,6 +20240,7 @@ test "LightOnOCR3 event execution gate removes cancelled waiters and drains clea
     var waiters: std.atomic.Value(usize) = .init(0);
     var cancel = Cancel{};
     var pipeline: NativeGenerationPipeline = undefined;
+    pipeline.cb = .{ .ptr = &mutex, .vtable = undefined }; // Lock-only fixture: no compute ops.
     pipeline.io = std.testing.io;
     pipeline.execution_lock = &mutex;
     pipeline.execution_gate = &gate;
@@ -20705,6 +20787,7 @@ test "LightOnOCR3 CUDA burst readback releases the execution lane and reacquires
         var mutex: std.atomic.Mutex = .unlocked;
         var gate: execution_control_mod.ExecutionLane = .{};
         var pipeline: NativeGenerationPipeline = undefined;
+        pipeline.cb = .{ .ptr = &mutex, .vtable = undefined }; // Lock-only fixture: no compute ops.
         pipeline.execution_lock = &mutex;
         pipeline.execution_gate = if (event_gate) &gate else null;
         pipeline.execution_phase_waiters = null;
@@ -20750,6 +20833,7 @@ test "LightOnOCR3 device vision cancellation retires independent page features o
         table.freeTensor = Probe.free;
         const cb = ops.ComputeBackend{ .ptr = &probe, .vtable = &table };
         var pipeline: NativeGenerationPipeline = undefined;
+        pipeline.cb = cb;
         pipeline.execution_lock = &mutex;
         pipeline.execution_gate = if (event_gate) &gate else null;
         pipeline.execution_phase_waiters = null;
