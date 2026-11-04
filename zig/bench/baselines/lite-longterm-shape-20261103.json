@@ -14,6 +14,18 @@
     {
       "component": "Resumable full-text replay",
       "implementation": "Durable index-generation/configuration/namespace-bound continuations split oversized journal records by primary document family. Row, delete, overwrite and asset effects remain together. Index durability precedes continuation publication. Scalar applied progress and completion seals advance only after the record completes. No-op scan progress is retained without certifying corpus completeness."
+    },
+    {
+      "component": "One bounded text projection",
+      "implementation": "Planning retains one source-byte-bounded window with ordinals, owned schema/analyzer dependencies and chunk-local field observations. Producer admission precedes segment allocation; preparation consumes the retained projection. Configuration changes replan only unpublished input. Projection memory is resource-accounted."
+    },
+    {
+      "component": "Detached source and immutable text runtime separation",
+      "implementation": "Eligible text-only runtimes retain immutable index inputs under inode/index/catalog/namespace witnesses, with a fresh primary epoch and reset replay/source/visibility observations each turn. Residency is bounded to root plus one namespace and ends when work settles. Other index/provider runtimes retain conservative reopen behavior. Named-table maintenance discovers and executes on the detached runtime instead of also opening a serving table."
+    },
+    {
+      "component": "Preparation feedback under contention",
+      "implementation": "Both replay controllers exclude measured admission/publication overhead when sizing preparation windows, while call deadlines and yield decisions continue to include that time."
     }
   ],
   "validation": [
@@ -85,13 +97,21 @@
       "failed": 0,
       "sources": 1059,
       "tool_tests_passed": 21
+    },
+    {
+      "suite": "Integrated model-free native C API contracts after cold-fixture corrections",
+      "source_commit": "805553f930662f1e7b7fa782f7c14225d5e804f3",
+      "passed": 102,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
     }
   ],
   "remaining": [
-    "Rebuild and rerun integrated C API/native contracts after cold-fixture corrections and cache-generation descriptor regression.",
+    "Build and validate retained projection, source-view rebinding, feedback accounting and generation descriptor regressions; integrate current main.",
     "Recheck SQL overlay operation counts with the current candidate only.",
     "Run the unchanged original importer locally for diagnosis, with correctly bound native snapshots or a fresh database; no baseline/reference reruns.",
-    "Measure remaining runtime-open and text-analysis costs before claiming E2E service capacity is fixed.",
+    "Measure candidate runtime-open/projection service counters and original-importer progress before claiming E2E service capacity is fixed.",
     "Candidate-only optimized final qualification on wolfspider, including importer contention and ten-minute active-write storage/visibility qualification.",
     "Applicable CI/model gates; full factory qualification remains with Beads."
   ],
@@ -99,6 +119,7 @@
     "This is an implementation checkpoint, not an E2E performance or merge-readiness claim.",
     "Replay family limits are scheduling bounds; one large family retains existing memory limits and a soft time bound.",
     "Legacy index configurations lacking a coverage generation retain whole-record replay.",
-    "No baseline/reference binary was rebuilt or rerun; wolfspider was not used for local development."
+    "No baseline/reference binary was rebuilt or rerun; wolfspider was not used for local development.",
+    "Retained source runtime reuse currently covers eligible text-only, nonrelational runtimes without provider/group or replacement state. Other runtimes still reopen conservatively; selecting named maintenance namespaces avoids duplicate serving opens for all native index kinds."
   ]
 }

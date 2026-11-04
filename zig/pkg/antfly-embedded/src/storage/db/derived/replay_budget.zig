@@ -88,7 +88,26 @@ pub const Controller = struct {
             self.lanes[lane] = .{ .records = @min(self.max_records, used.records * 2), .bytes = @min(self.max_bytes, used.bytes * 2) };
         }
     }
+
+    /// Admission and durable publication are fixed costs to amortize. They
+    /// still count toward the call's yield deadline, but shrinking preparation
+    /// windows because another writer held the gate amplifies contention.
+    pub fn observePreparation(self: *Controller, lane: usize, used: Budget, elapsed_ns: u64, publication_ns: u64, scanned: usize, failed: bool) void {
+        self.observe(lane, used, elapsed_ns -| publication_ns, scanned, failed);
+    }
 };
+
+test "replay budget excludes publication contention without hiding slow preparation or failure" {
+    var state: Controller = .{};
+    const initial = state.budget(0);
+    state.observePreparation(0, initial, 10 * std.time.ns_per_s, 10 * std.time.ns_per_s - 1, initial.records, false);
+    try std.testing.expectEqual(@as(usize, 128), state.budget(0).records);
+    const grown = state.budget(0);
+    state.observePreparation(0, grown, 10 * std.time.ns_per_s, 9 * std.time.ns_per_s, grown.records, false);
+    try std.testing.expectEqualDeep(initial, state.budget(0));
+    state.observePreparation(0, initial, 1, 2, 0, true);
+    try std.testing.expectEqual(@as(usize, 32), state.budget(0).records);
+}
 
 test "replay budget grows only on full cheap windows and shrinks expensive work" {
     var state: Controller = .{};

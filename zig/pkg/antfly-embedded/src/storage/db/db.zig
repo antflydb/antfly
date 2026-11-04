@@ -5006,6 +5006,39 @@ pub const DB = struct {
         try self.core.index_manager.refreshSourcePayloadGeneration();
     }
 
+    /// This cache contract is deliberately about immutable text inputs. Other
+    /// index/provider runtimes still reopen until they expose equivalent
+    /// source-view rebinding, rather than borrowing stale mutable caches.
+    pub fn canRefreshDetachedTextSource(self: *DB) bool {
+        const indexes = self.core.index_manager;
+        return !indexes.relational_base_rows and self.enrichment_runtime == null and
+            !indexes.hasGroupSources() and indexes.dense_indexes.items.len == 0 and
+            indexes.sparse_indexes.items.len == 0 and indexes.graph_indexes.items.len == 0 and
+            indexes.algebraic_indexes.items.len == 0 and self.shadow == null and
+            self.graph_replacement_manager == null and self.active_index_repairs.count() == 0 and
+            self.async_context.applied_sequence_coalescer.pending.count() == 0;
+    }
+
+    /// Caller drained all operations and checked inode, namespace, catalog and
+    /// immutable index identities before rebinding the native checkpoint. No
+    /// primary read epoch survives a turn. The index runtime stays at its stable
+    /// address, while its source observations are reconstructed from that cut.
+    pub fn refreshDetachedTextSource(self: *DB) !void {
+        if (!self.canRefreshDetachedTextSource()) return error.UnsupportedOperation;
+        try self.core.store.invalidateDetachedSourceObservations();
+        const range = try range_state_mod.loadRange(self.alloc, self.core.store);
+        defer range_state_mod.freeRange(self.alloc, range);
+        var shard = try shard_mod.ShardManager.init(self.alloc, self.core.store, range);
+        errdefer shard.deinit();
+        const summary = try doc_identity.visibilitySummaryFromStore(self.core.store);
+        self.core.shard_manager.deinit();
+        self.core.shard_manager.* = shard;
+        self.core.identity_visibility.clearLive();
+        self.core.identity_visibility.clearNonvisible();
+        self.core.identity_visibility.summary = summary;
+        self.local_source_completion_audit_pending = true;
+    }
+
     pub fn cancelVectorMigration(self: *DB, job_id: []const u8) !void {
         return self.cancelVectorMigrationImpl(job_id, null);
     }
@@ -32273,8 +32306,7 @@ pub const DB = struct {
                     // document preparation. Counting them shrinks contended
                     // producers to tiny windows and amplifies those costs.
                     const publication_ns = state.publication_overhead_ns.load(.monotonic) -| publication_before;
-                    const preparation_ns = (monotonicTimeNs() -| started) -| publication_ns;
-                    state.producer_replay_budget.observe(0, budget, preparation_ns, observed.discovered_document_groups, failed);
+                    state.producer_replay_budget.observePreparation(0, budget, monotonicTimeNs() -| started, publication_ns, observed.discovered_document_groups, failed);
                 }
                 observed = runtime.catchUpTurnWithLimits(sequence, options.cancellation, .{ .max_records = 4096, .max_document_groups = budget.records, .max_input_bytes = @intCast(budget.bytes) }) catch |err| blk: {
                     failed = true;
@@ -55905,9 +55937,10 @@ fn replayPendingDerivedBatches(
             self.core.store.runtime_store.capabilities().bounded_replay_admission and
             (self.core.index_manager.get(index_ref.name) orelse return error.IndexNotFound).coverage_generation != 0;
         const replay_started = monotonicTimeNs();
+        const publication_before = replay_state.publication_overhead_ns.load(.monotonic);
         var replay_completed = false;
         defer if (options.bounded_replay and !replay_completed)
-            replay_state.replay_budget.observe(replay_lane, adaptive_budget, monotonicTimeNs() - replay_started, 0, true);
+            replay_state.replay_budget.observePreparation(replay_lane, adaptive_budget, monotonicTimeNs() -| replay_started, replay_state.publication_overhead_ns.load(.monotonic) -| publication_before, 0, true);
         const stats = try derived_worker.catchUpIndexWithOptions(
             self.alloc,
             resources.replay_source,
@@ -55973,7 +56006,7 @@ fn replayPendingDerivedBatches(
             try self.core.saveAppliedSequence(index_ref.name, target_sequence);
         } else try abortReplayCapture(&replay_ctx, index_ref);
         if (options.bounded_replay)
-            replay_state.replay_budget.observe(replay_lane, adaptive_budget, monotonicTimeNs() - replay_started, @max(stats.scanned_entries, stats.collected_items), false);
+            replay_state.replay_budget.observePreparation(replay_lane, adaptive_budget, monotonicTimeNs() -| replay_started, replay_state.publication_overhead_ns.load(.monotonic) -| publication_before, @max(stats.scanned_entries, stats.collected_items), false);
         replay_completed = true;
     }
     if (options.truncate_replay) try truncateReplayJournalIfSafe(self);

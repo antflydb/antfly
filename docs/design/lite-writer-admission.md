@@ -147,6 +147,34 @@ uncertain publication still retries the identical control record once and then
 requires reopen. Sinks without phase information remain conservative; error
 names alone never certify that a publication did not occur.
 
+## Replay preparation and runtime ownership
+
+Text replay projects one source-byte-bounded window, including document
+ordinals, before producer admission. The plan owns schema-derived field names
+and analyzer pipelines; collected document bodies outlive the plan. Segment
+preparation consumes that projection without extracting the fields again.
+Observations are attributed to each admitted chunk, and index instance or
+projection revision changes discard only unpublished work. Projection residency
+is charged to the full-text build budget; neither a large journal record nor a
+producer-capacity wait creates an unbounded projection cache.
+
+Eligible text-only detached runtimes keep immutable index state across turns.
+Each turn independently acquires and releases its primary read epoch. Reuse
+requires the same inode, nonzero index identity, namespace bindings, recovered
+SQL decisions, and exact schema/index/provider configuration fingerprints.
+Before using the new primary cut, replay invalidates source certificates without
+reusing their generations, resets replay-head and retention observations, and
+reloads shard and identity visibility state. The cache retains at most root plus
+one named namespace and expires when source and artifact work settle. Other
+index/provider runtimes reopen until they define an equivalent rebinding
+contract. Selecting a named namespace uses the detached runtime directly,
+avoiding a duplicate serving-table open solely for maintenance discovery.
+
+Both producer and consumer controllers size preparation windows from elapsed
+time minus measured admission/publication overhead. That fixed cost still
+counts toward call deadlines and yield decisions. Contention therefore does
+not by itself shrink preparation windows and multiply admission and sync work.
+
 ## Qualification
 
 Component coverage includes the ordering model, slot reuse, bounded capacity,
@@ -160,8 +188,8 @@ allocator proof completion, local-lane timeouts, and suspended-call budgets.
 and posting-store publication/recovery contracts. Native adapter and queued-group
 regressions remain in `lite-native-test`.
 
-Final qualification uses the unchanged importer and its original timeout, matched
-optimized controls, contended writers with status/logical readers, acknowledged
+Final qualification uses the unchanged importer and its original timeout, cached
+optimized reference observations, contended writers with status/logical readers, acknowledged
 write and commit-outcome checks, equivalent index settling and byte accounting,
 active verified page reuse, and sustained throughput/storage tests. Cross-process
 ordering does not explain a single-process replay bottleneck; both dimensions

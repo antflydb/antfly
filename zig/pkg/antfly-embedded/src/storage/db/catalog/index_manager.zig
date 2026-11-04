@@ -745,10 +745,84 @@ pub const TextPublicationChunk = struct {
 pub const TextPublicationPlan = struct {
     alloc: Allocator,
     chunks: []TextPublicationChunk,
+    input_end: usize = 0,
+    mapper_projection: ?*OwnedTextMapperProjection = null,
 
     pub fn deinit(self: *TextPublicationPlan) void {
+        if (self.mapper_projection) |projection| projection.destroy();
         if (self.chunks.len > 0) self.alloc.free(self.chunks);
         self.* = undefined;
+    }
+};
+
+/// One source-byte-bounded projection window. Document bodies borrow the
+/// caller's collected batch; every schema/analyzer dependency is owned here.
+/// Keep this object stable: the arena's backing allocator borrows its budget.
+const OwnedTextMapperProjection = struct {
+    alloc: Allocator,
+    budget: ?resource_manager_mod.BudgetedAllocator,
+    arena: std.heap.ArenaAllocator,
+    revision: u64 = 0,
+    instance_id: u64 = 0,
+    input_end: usize = 0,
+    docs: []introducer_mod.TextDocument = &.{},
+    original_ends: []usize = &.{},
+    observed: []const mapper.ObservedFieldAnalyzer = &.{},
+    observed_ends: []usize = &.{},
+
+    fn create(a: Allocator, manager: ?*resource_manager_mod.ResourceManager) !*OwnedTextMapperProjection {
+        const self = try a.create(OwnedTextMapperProjection);
+        self.* = .{ .alloc = a, .budget = if (manager) |rm| resource_manager_mod.BudgetedAllocator.init(rm, .full_text_build_working_set, a, 1) else null, .arena = undefined };
+        self.arena = .init(if (self.budget) |*budget| budget.allocator() else a);
+        return self;
+    }
+
+    fn destroy(self: *OwnedTextMapperProjection) void {
+        const a = self.alloc;
+        self.arena.deinit();
+        if (self.budget) |*budget| budget.deinit();
+        a.destroy(self);
+    }
+
+    fn ownConfiguration(self: *OwnedTextMapperProjection) !void {
+        const a = self.arena.allocator();
+        var analyzers: std.AutoHashMapUnmanaged(usize, *const analysis_mod.Analyzer) = .empty;
+        for (self.docs) |*doc| {
+            const fields = try a.dupe(introducer_mod.TextField, doc.text_fields);
+            for (fields) |*field| {
+                field.field_name = try a.dupe(u8, field.field_name);
+                if (field.source_field) |source| field.source_field = try a.dupe(u8, source);
+                if (field.analyzer) |original| {
+                    const cached = try analyzers.getOrPut(a, @intFromPtr(original));
+                    if (!cached.found_existing) {
+                        const owned = try a.create(analysis_mod.Analyzer);
+                        owned.* = .{ .char_filters = try a.dupe(analysis_mod.CharFilter, original.char_filters), .tokenizer = original.tokenizer, .filters = try a.dupe(analysis_mod.TokenFilter, original.filters) };
+                        cached.value_ptr.* = owned;
+                    }
+                    field.analyzer = cached.value_ptr.*;
+                }
+            }
+            doc.text_fields = fields;
+            if (doc.typed_fields) |values| {
+                const owned = try a.dupe(introducer_mod.TypedFieldValue, values);
+                for (owned) |*value| value.field_name = try a.dupe(u8, value.field_name);
+                doc.typed_fields = owned;
+            }
+            const order = try a.dupe(introducer_mod.NamedSortValue, doc.index_sort_values);
+            for (order) |*value| value.field_name = try a.dupe(u8, value.field_name);
+            doc.index_sort_values = order;
+            inline for (.{ "infer_type_dynamic_paths", "unindexed_paths" }) |name| {
+                const paths = try a.dupe([]const u8, @field(doc, name));
+                for (paths) |*path| path.* = try a.dupe(u8, path.*);
+                @field(doc, name) = paths;
+            }
+        }
+        const observed = try a.dupe(mapper.ObservedFieldAnalyzer, self.observed);
+        for (observed) |*item| {
+            item.field_name = try a.dupe(u8, item.field_name);
+            item.analyzer_name = try a.dupe(u8, item.analyzer_name);
+        }
+        self.observed = observed;
     }
 };
 
@@ -20228,11 +20302,13 @@ pub const IndexManager = struct {
         return .{ .alloc = context.alloc, .chunks = try chunks.toOwnedSlice(context.alloc) };
     }
 
-    /// Plan publication from an already-parsed document boundary. Relational
-    /// callers supply MapperDoc.root, so both admission estimation and the
-    /// eventual apply avoid reparsing a materialized JSON document.
+    /// Project one bounded source window once. Planning retains its owned
+    /// projection through producer admission and segment construction. A caller
+    /// advances input_end before requesting the next window, bounding residency
+    /// independently of the size of a complete journal record.
     pub fn planTextMapperDocsPublication(
         self: *IndexManager,
+        store: *docstore_mod.DocStore,
         index_name: []const u8,
         context: *TextPublicationContext,
         docs: []const mapper.MapperDoc,
@@ -20244,104 +20320,124 @@ pub const IndexManager = struct {
         if (entry.instance_id != context.instance_id) return error.IndexNotFound;
         entry.lockAnalysisShared();
         defer entry.unlockAnalysisShared();
-        // Planning has not reserved capacity or prepared segments yet. Sample
-        // the current projection under the same analysis lease used to build
-        // the plan; a revision change is not an index replacement. Admission
-        // still revalidates this context before publishing prepared work.
         context.projection_revision = entry.projection_revision;
         context.chunk_backed = textEntryHasExplicitArtifactSources(entry);
 
-        var chunks = std.ArrayListUnmanaged(TextPublicationChunk).empty;
+        const projection = try OwnedTextMapperProjection.create(context.alloc, self.resource_manager);
+        errdefer projection.destroy();
+        projection.revision = entry.projection_revision;
+        projection.instance_id = entry.instance_id;
+        projection.input_end = if (docs.len == 0) 0 else splitMapperDocsEnd(docs, 0, textProjectionSourceBuildTargetBytes());
+        const a = projection.arena.allocator();
+        var filtered: std.ArrayListUnmanaged(mapper.MapperDoc) = .empty;
+        var original_ends: std.ArrayListUnmanaged(usize) = .empty;
+        for (docs[0..projection.input_end], 0..) |doc, i| {
+            if (!self.keyInRange(doc.key) or !try textIndexShouldConsumeDoc(self, entry, doc.key)) continue;
+            try filtered.append(a, doc);
+            try original_ends.append(a, i + 1);
+        }
+        const options = try self.textProjectionOptionsForSchema(a, entry.runtime_schema == null and !textIndexSelectsAnyField(entry));
+        const source = try mapper.buildTextProjectionSourceBatchWithOptions(a, filtered.items, options);
+        const with_ordinals = try self.textProjectionSourceDocsWithOrdinals(a, store, source.docs);
+        var observed: std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer) = .empty;
+        var projected_ends: std.ArrayListUnmanaged(usize) = .empty;
+        var builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(a, entry.text_analysis, entry.runtime_schema, &observed, entry.selected_field);
+        defer builder.deinit();
+        projection.observed_ends = try a.alloc(usize, projection.input_end + 1);
+        @memset(projection.observed_ends, 0);
+        for (with_ordinals, original_ends.items) |doc, original_end| {
+            const before = builder.text_docs.items.len;
+            try builder.appendSourceDocForIndex(doc, textIndexSelectedFieldForKey(entry, doc.key), entry.retainsEmptyPrimaryDocument(doc.key));
+            const appended = builder.text_docs.items.len - before;
+            if (appended > 1) return error.InvalidTextProjection;
+            if (appended == 1) try projected_ends.append(a, original_end);
+            projection.observed_ends[original_end] = observed.items.len;
+        }
+        for (projection.observed_ends[1..], 0..) |*end, i| end.* = @max(end.*, projection.observed_ends[i]);
+        projection.docs = try a.dupe(introducer_mod.TextDocument, builder.text_docs.items);
+        projection.original_ends = try projected_ends.toOwnedSlice(a);
+        projection.observed = observed.items;
+        try projection.ownConfiguration();
+
+        var chunks: std.ArrayListUnmanaged(TextPublicationChunk) = .empty;
         errdefer chunks.deinit(context.alloc);
-        if (docs.len == 0) {
-            try chunks.append(context.alloc, .{ .end = 0, .estimate = .{} });
-            return .{ .alloc = context.alloc, .chunks = try chunks.toOwnedSlice(context.alloc) };
-        }
-
-        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        var filtered = std.ArrayListUnmanaged(mapper.MapperDoc).empty;
-        defer filtered.deinit(arena);
-        var original_ends = std.ArrayListUnmanaged(usize).empty;
-        defer original_ends.deinit(arena);
-        for (docs, 0..) |doc, doc_idx| {
-            if (!self.keyInRange(doc.key)) continue;
-            if (!try textIndexShouldConsumeDoc(self, entry, doc.key)) continue;
-            try filtered.append(arena, doc);
-            try original_ends.append(arena, doc_idx + 1);
-        }
-        if (filtered.items.len == 0) {
-            try chunks.append(context.alloc, .{ .end = docs.len, .estimate = .{} });
-            return .{ .alloc = context.alloc, .chunks = try chunks.toOwnedSlice(context.alloc) };
-        }
-
-        const source_target_bytes = textProjectionSourceBuildTargetBytes();
-        const projection_options = try self.textProjectionOptionsForSchema(
-            arena,
-            entry.runtime_schema == null and !textIndexSelectsAnyField(entry),
-        );
-        var atomic_ranges = std.ArrayListUnmanaged(TextPublicationAtomicRange).empty;
-        defer atomic_ranges.deinit(arena);
-        var start: usize = 0;
-        while (start < filtered.items.len) {
-            const end = splitMapperDocsEnd(filtered.items, start, source_target_bytes);
-            var projection_arena_state = std.heap.ArenaAllocator.init(self.alloc);
-            defer projection_arena_state.deinit();
-            const projection_arena = projection_arena_state.allocator();
-            const source_batch = try mapper.buildTextProjectionSourceBatchWithOptions(
-                projection_arena,
-                filtered.items[start..end],
-                projection_options,
-            );
-            var projected_source_indices = std.ArrayListUnmanaged(usize).empty;
-            defer projected_source_indices.deinit(projection_arena);
-            const projection_batch = try buildTextProjectionBatchForEntry(
-                projection_arena,
-                entry,
-                source_batch.docs,
-                null,
-                &projected_source_indices,
-            );
-            if (projected_source_indices.items.len != projection_batch.docs.len)
-                return error.InvalidTextProjection;
-            var projected_original_ends = std.ArrayListUnmanaged(usize).empty;
-            defer projected_original_ends.deinit(projection_arena);
-            try projected_original_ends.ensureTotalCapacity(projection_arena, projection_batch.docs.len);
-            for (projected_source_indices.items) |source_idx| {
-                projected_original_ends.appendAssumeCapacity(original_ends.items[start + source_idx]);
+        if (projection.docs.len == 0) {
+            try chunks.append(context.alloc, .{ .end = projection.input_end, .estimate = .{} });
+        } else {
+            var ranges: std.ArrayListUnmanaged(TextPublicationAtomicRange) = .empty;
+            try appendProjectedTextPublicationAtomicRanges(projection.docs, projection.original_ends, projection.input_end, 0, projection.docs.len, try estimateProjectedTextPublication(a, projection.docs), reservation_limit, a, &ranges);
+            var current: TextPublicationEstimate = .{};
+            var current_end: usize = 0;
+            for (ranges.items) |range| {
+                if (current.segment_count > 0 and reservation_limit != std.math.maxInt(usize) and current.segment_count +| range.estimate.segment_count > reservation_limit) {
+                    try chunks.append(context.alloc, .{ .end = current_end, .estimate = current });
+                    current = .{};
+                }
+                current.segment_count +|= range.estimate.segment_count;
+                current.byte_count +|= range.estimate.byte_count;
+                current_end = range.end;
             }
-            try appendProjectedTextPublicationAtomicRanges(
-                projection_batch.docs,
-                projected_original_ends.items,
-                original_ends.items[end - 1],
-                0,
-                projection_batch.docs.len,
-                try estimateProjectedTextPublication(arena, projection_batch.docs),
-                reservation_limit,
-                arena,
-                &atomic_ranges,
-            );
-            start = end;
+            try chunks.append(context.alloc, .{ .end = projection.input_end, .estimate = current });
         }
+        return .{ .alloc = context.alloc, .chunks = try chunks.toOwnedSlice(context.alloc), .input_end = projection.input_end, .mapper_projection = projection };
+    }
 
-        var current = TextPublicationEstimate{};
-        var current_end: usize = 0;
-        for (atomic_ranges.items) |range| {
-            if (current.segment_count > 0 and reservation_limit != std.math.maxInt(usize) and
-                current.segment_count +| range.estimate.segment_count > reservation_limit)
-            {
-                try chunks.append(context.alloc, .{ .end = current_end, .estimate = current });
-                current = .{};
-            }
-            current.segment_count +|= range.estimate.segment_count;
-            current.byte_count +|= range.estimate.byte_count;
-            current_end = range.end;
+    /// Consume the already projected window after capacity admission. Never
+    /// inspect its schema-derived pointers until the captured context matches.
+    pub fn preparePlannedTextMapperPublication(
+        self: *IndexManager,
+        alloc: Allocator,
+        index_name: []const u8,
+        context: *TextPublicationContext,
+        plan: *const TextPublicationPlan,
+        start: usize,
+        end: usize,
+    ) !PreparedTextMapperPublication {
+        const projection = plan.mapper_projection orelse return error.InvalidTextProjection;
+        if (start > end or end > projection.input_end) return error.InvalidTextProjection;
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        if (entry.instance_id != projection.instance_id or entry.instance_id != context.instance_id) return error.IndexNotFound;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
+        if (entry.projection_revision != projection.revision or context.projection_revision != projection.revision) {
+            context.projection_revision = entry.projection_revision;
+            context.chunk_backed = textEntryHasExplicitArtifactSources(entry);
+            return error.TextProjectionChanged;
         }
-        std.debug.assert(current_end > 0);
-        try chunks.append(context.alloc, .{ .end = docs.len, .estimate = current });
-        return .{ .alloc = context.alloc, .chunks = try chunks.toOwnedSlice(context.alloc) };
+        var begin_doc: usize = 0;
+        while (begin_doc < projection.docs.len and projection.original_ends[begin_doc] <= start) begin_doc += 1;
+        var end_doc = begin_doc;
+        while (end_doc < projection.docs.len and projection.original_ends[end_doc] <= end) end_doc += 1;
+        const batch: mapper.TextProjectionBatch = .{
+            .docs = projection.docs[begin_doc..end_doc],
+            .observed_field_analyzers = projection.observed[projection.observed_ends[start]..projection.observed_ends[end]],
+        };
+        var observed: std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer) = .empty;
+        errdefer freeOwnedObservedFieldAnalyzers(alloc, &observed);
+        try appendOwnedObservedFieldAnalyzers(alloc, &observed, batch.observed_field_analyzers);
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        defer arena.deinit();
+        const index_sort = try textIndexSortFieldsForSegmentAlloc(arena.allocator(), if (entry.runtime_schema) |schema| schema.index_sort else &.{});
+        const segment_alloc = entry.persistent.alloc;
+        const built = try mapper.buildTextSegmentsFromProjectionBatch(segment_alloc, batch, entry.text_analysis, .{
+            .scratch_allocator = introducer_mod.textBuildScratchAllocator(),
+            .contribution_cache = self.analysisContributionCache(batch.docs),
+            .postings_run_io = if (textBuildSpoolDirectory(entry) != null) entry.io else null,
+            .postings_run_directory = textBuildSpoolDirectory(entry) orelse ".",
+            .target_segment_bytes = @max(@as(usize, 1), textSegmentBuildTargetBytes()),
+            .target_build_memory_bytes = @max(@as(usize, 1), textBuildMemoryTargetBytes()),
+            .doc_scratch_retained_bytes = textDocScratchRetainedBytes(),
+            .index_sort = index_sort,
+            .resource_manager = self.resource_manager,
+            .store_document_source = false,
+        });
+        defer segment_alloc.free(built);
+        errdefer for (built) |segment| segment_alloc.free(segment);
+        const segments = try alloc.dupe([]u8, built);
+        errdefer alloc.free(segments);
+        return .{ .alloc = alloc, .segment_alloc = segment_alloc, .segments = segments, .observed_field_analyzers = try observed.toOwnedSlice(alloc) };
     }
 
     /// Build immutable text segments while only read locks are held. This is
@@ -42084,6 +42180,56 @@ test "text query lease retains snapshot and analyzer across catalog removal" {
     try std.testing.expectEqual(@as(u32, 1), try lease.snapshot.termDocFreq(alloc, "body", "New York"));
 }
 
+test "text publication retains bounded mapper windows with custom analyzers and rejects replacement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var store = try docstore_mod.DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(a, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    const config: types.IndexConfig = .{ .name = "ft_v1", .kind = .full_text, .config_json = "{\"analysis_config\":{\"field_analyzers\":{\"body\":\"keyword\"}}}" };
+    try manager.addAllNoBackfill(&store, &.{config});
+    const previous_target = text_projection_source_build_target_bytes_cache.swap(2, .monotonic);
+    defer text_projection_source_build_target_bytes_cache.store(previous_target, .monotonic);
+    const docs = [_]mapper.MapperDoc{
+        .{ .key = "one", .value = "{\"body\":\"résumé 日本語\"}" },
+        .{ .key = "two", .value = "{\"body\":\"İstanbul\"}" },
+        .{ .key = "three", .value = "{\"body\":\"مرحبا بالعالم\"}" },
+    };
+    var context = try manager.acquireTextPublicationContext(a, config.name);
+    defer context.deinit();
+    var start: usize = 0;
+    while (start < docs.len) {
+        var plan = try manager.planTextMapperDocsPublication(&store, config.name, &context, docs[start..], 1);
+        defer plan.deinit();
+        try std.testing.expectEqual(@as(usize, 1), plan.input_end);
+        try std.testing.expectEqual(@as(usize, 1), plan.mapper_projection.?.docs.len);
+        var prepared = try manager.preparePlannedTextMapperPublication(a, config.name, &context, &plan, 0, plan.input_end);
+        defer prepared.deinit();
+        {
+            var guard = try manager.lockManagedIndexApply(.{ .name = config.name, .kind = .full_text });
+            defer guard.unlock();
+            try manager.applyPreparedTextMapperPublicationByNameWithOptions(&store, config.name, &.{}, &prepared, .{});
+        }
+        start += plan.input_end;
+    }
+    const snapshot = manager.textIndex(config.name).?.snapshot();
+    try std.testing.expectEqual(@as(u32, 3), snapshot.liveDocCount());
+    try std.testing.expectEqual(@as(u32, 1), try snapshot.termDocFreq(a, "body", "résumé 日本語"));
+    var stale = try manager.planTextMapperDocsPublication(&store, config.name, &context, &docs, 1);
+    defer stale.deinit();
+    const observed = [_]mapper.ObservedFieldAnalyzer{.{ .field_name = @constCast("new_field"), .analyzer_name = @constCast("whitespace") }};
+    try mergeObservedTextFieldAnalyzers(&manager, &store, manager.textIndexEntry(config.name).?, &observed);
+    try std.testing.expectError(error.TextProjectionChanged, manager.preparePlannedTextMapperPublication(a, config.name, &context, &stale, 0, stale.input_end));
+    try std.testing.expect(try manager.remove(&store, config.name));
+    try manager.addAllNoBackfill(&store, &.{config});
+    try std.testing.expectError(error.IndexNotFound, manager.preparePlannedTextMapperPublication(a, config.name, &context, &stale, 0, stale.input_end));
+}
+
 test "text publication planning rejects a same-name catalog replacement" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -42199,7 +42345,7 @@ test "text publication admission refreshes a projection revision change" {
         .value = writes[0].value,
         .root = parsed_doc.value,
     }};
-    var mapper_plan = try manager.planTextMapperDocsPublication(config.name, &stale_mapper_context, &mapper_docs, 1);
+    var mapper_plan = try manager.planTextMapperDocsPublication(&store, config.name, &stale_mapper_context, &mapper_docs, 1);
     defer mapper_plan.deinit();
     try std.testing.expectEqual(stale_context.projection_revision, stale_mapper_context.projection_revision);
     try std.testing.expectEqual(@as(u64, 1), mapper_plan.chunks[0].estimate.segment_count);
@@ -42209,7 +42355,7 @@ test "text publication admission refreshes a projection revision change" {
     const refresh = try manager.refreshTextPublicationContextAssumeCatalogLocked(config.name, &admission_context);
     manager.catalog_mutex.unlockShared();
     try std.testing.expectEqual(TextPublicationContextRefresh.projection_changed, refresh);
-    var prepared = try manager.prepareTextMapperDocsPublication(alloc, &store, config.name, &stale_mapper_context, &mapper_docs);
+    var prepared = try manager.preparePlannedTextMapperPublication(alloc, config.name, &stale_mapper_context, &mapper_plan, 0, mapper_plan.input_end);
     defer prepared.deinit();
     var guard = try manager.lockManagedIndexApply(.{ .name = config.name, .kind = .full_text });
     defer guard.unlock();

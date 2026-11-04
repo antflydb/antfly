@@ -3522,6 +3522,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 while (!applied_first_chunk or write_start < collected.docs.items.len) {
                     const plan_base = write_start;
                     var publication_plan = try ctx.index_manager.planTextMapperDocsPublication(
+                        ctx.store,
                         index_ref.name,
                         &publication_context,
                         collected.docs.items[plan_base..],
@@ -3533,7 +3534,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     var replan_suffix = false;
                     for (publication_plan.chunks) |planned| {
                         const write_end = plan_base + planned.end;
-                        const write_chunk = collected.docs.items[plan_base + relative_start .. write_end];
                         var applied_chunk = false;
                         var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
                         if (ctx.text_merge_runtime) |runtime| {
@@ -3551,12 +3551,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         // analysis lease inside preparation pins every borrowed config
                         // pointer for the duration of the build.
                         const prepare_start_ns = monotonicTimeNs();
-                        var prepared_publication = ctx.index_manager.prepareTextMapperDocsPublication(
+                        var prepared_publication = ctx.index_manager.preparePlannedTextMapperPublication(
                             ctx.alloc,
-                            ctx.store,
                             index_ref.name,
                             &publication_context,
-                            write_chunk,
+                            &publication_plan,
+                            relative_start,
+                            planned.end,
                         ) catch |err| switch (err) {
                             error.TextProjectionChanged => {
                                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_prepare_ns, prepare_start_ns);
@@ -3631,7 +3632,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
 
                     if (write_start == collected.docs.items.len) break;
-                    std.debug.assert(replan_suffix);
+                    std.debug.assert(replan_suffix or write_start == plan_base + publication_plan.input_end);
                 }
                 std.debug.assert(applied_first_chunk and write_start == collected.docs.items.len);
                 if (!ctx.projection_only) try clearPublishedAssetArtifactRepairIssuesContext(ctx, index_ref.name, batch.changed_artifact_keys, batch.sequence);

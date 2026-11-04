@@ -2563,6 +2563,26 @@ pub const DocStore = struct {
         self.observeCommittedReplaySequence(sequence);
     }
 
+    /// An exclusively owned detached replay runtime can retain immutable index
+    /// inputs while its native store adopts a fresh primary checkpoint. None of
+    /// these observations are authority at that new cut. Do not reset registry
+    /// identities: advancing them prevents old source tokens becoming valid.
+    pub fn invalidateDetachedSourceObservations(self: *DocStore) !void {
+        try self.ensurePortableImportOperational();
+        if (self.payload_recovery_required.load(.acquire) or
+            self.source_bulk_fences.load(.acquire) != 0 or
+            self.portable_import_reader_state.load(.acquire) != 0 or
+            self.deferred_replay_retirement != null) return error.FileBusy;
+        self.source_certificates.beginReplacement();
+        defer self.source_certificates.end();
+        self.replay_index_state.store(replay_index_unknown, .release);
+        self.next_replay_sequence_cached.store(0, .release);
+        self.committed_replay_next_cached.store(0, .release);
+        self.retained_effects_cache.store(0, .release);
+        _ = self.query_generation_revision.fetchAdd(1, .release);
+        _ = self.columnar_revision.fetchAdd(1, .release);
+    }
+
     pub fn lastReplaySequence(self: *DocStore, fallback_last: u64) u64 {
         const next = self.ensureCommittedReplayNextCached(fallback_last + 1);
         return if (next <= 1) 0 else next - 1;
