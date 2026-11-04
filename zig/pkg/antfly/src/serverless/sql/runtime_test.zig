@@ -1208,3 +1208,72 @@ test "distributed SQL bounded match trees preserve every join kind and partial a
 test "distributed SQL paged WAL bounds worker memory and preserves global changed-key suppression" {
     try hostedLakeSource(false, true, true);
 }
+
+test "distributed SQL recovery retires terminal hints and backs off idle sweeps" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    const service = fixture.service(a, memory.client(), "query-pod");
+    const store = service.state_store;
+    var client = memory.client();
+    const query: state.Query = .{ .id = @splat('a'), .expires_ms = 1000000 };
+    const key = try store.key(sa, query, null, 0);
+    try store.create(sa, key, query.id, query.expires_ms);
+    const marker = "tenant/sql-query-expiry/00000000000001000000/" ++ "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json";
+    var result = try client.putObject("queries", marker, "{}", .{});
+    result.deinit(a);
+    const claim = (try store.claim(sa, key, "owner", 60000)).?;
+    try store.terminate(sa, key, claim, .cancelled, "Cancelled");
+    var listed = try client.listObjects("queries", .{ .prefix = "tenant/sql-query-expiry/" });
+    defer listed.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), listed.entries.len);
+    // Recreate a legacy terminal marker; recovery must repair old leftovers.
+    var legacy = try client.putObject("queries", marker, "{}", .{});
+    legacy.deinit(a);
+    const DispatchNone = struct {
+        fn dispatch(_: *anyopaque, _: []const plan.Ticket, _: Context) !void {
+            return error.UnexpectedDispatch;
+        }
+    };
+    var driver: @import("driver.zig").Driver = .{ .service = service, .dispatcher = .{ .ptr = &fixture, .dispatch = DispatchNone.dispatch }, .principal_scopes = true };
+    defer driver.stop();
+    try std.testing.expectEqual(@as(usize, 0), try driver.tick());
+    const metrics = storage.operation_metrics;
+    const before = metrics.runtime.snapshot();
+    for (0..16) |_| try std.testing.expectEqual(@as(usize, 0), try driver.tick());
+    const after = metrics.runtime.snapshot();
+    try std.testing.expectEqual(before.calls[@backingInt(metrics.Operation.get)], after.calls[@backingInt(metrics.Operation.get)]);
+    try std.testing.expectEqual(@as(u32, 30000), driver.delay_ms);
+    try std.testing.expect(driver.sleepDelay() >= 30000 and driver.sleepDelay() < 33750);
+    // Foreign live leases require one record read, without plan I/O. Their
+    // owner can be replaced after the standard claim grace following a crash.
+    const column: plan.Column = .{ .name = "id", .type = .integer };
+    const left: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{column}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 2 };
+    var right = left;
+    right.table_id = 2;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    const spec = try plan.choose(left, right, service.tenant, 2000000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{}, fixture.now);
+    const foreign = try service.submit(spec);
+    const foreign_key = try store.key(sa, foreign, null, 0);
+    _ = (try store.claim(sa, foreign_key, "other-pod", 60000)).?;
+    const leased_before = metrics.runtime.snapshot();
+    try std.testing.expectEqual(@as(usize, 0), try driver.tick());
+    const leased_after = metrics.runtime.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), leased_after.calls[@backingInt(metrics.Operation.get)] - leased_before.calls[@backingInt(metrics.Operation.get)]);
+    fixture.now = 92001;
+    _ = try driver.tick(); // wrap the discovery cursor
+    _ = try driver.tick(); // reclaim the expired foreign owner
+    var recovered = (try store.load(sa, foreign_key)).?;
+    defer recovered.deinit(sa);
+    try std.testing.expectEqualStrings(service.owner, recovered.value.owner);
+    try std.testing.expectEqual(@as(u64, 2), recovered.value.epoch);
+    // Existing expiry GC still sees terminal state after hint retirement.
+    var expired = store;
+    expired.now_ms = query.expires_ms + 30001;
+    try std.testing.expectEqual(@as(usize, 1), try @import("collector.zig").collect(sa, expired, 64));
+}

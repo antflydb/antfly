@@ -23,6 +23,9 @@ pub const Driver = struct {
     dispatcher: runtime.Dispatcher,
     interval_ms: u32 = 100,
     principal_scopes: bool = false,
+    idle_delay_ms: u32 = 100,
+    delay_ms: u32 = 100,
+    sweep_work: bool = false,
     after: ?[]u8 = null,
     group: std.Io.Group = .init,
     started: bool = false,
@@ -49,8 +52,13 @@ pub const Driver = struct {
                 error.Canceled, error.Cancelled => return,
                 else => std.log.warn("distributed SQL recovery turn deferred: {s}", .{@errorName(err)}),
             };
-            std.Io.sleep(self.io.?, .fromMilliseconds(self.interval_ms), .awake) catch return;
+            std.Io.sleep(self.io.?, .fromMilliseconds(self.sleepDelay()), .awake) catch return;
         }
+    }
+    pub fn sleepDelay(self: *const Driver) u32 {
+        if (self.delay_ms <= self.interval_ms) return self.interval_ms;
+        // Boot-specific jitter prevents idle replicas from polling in lockstep.
+        return self.delay_ms + @as(u32, @intCast(std.hash.Wyhash.hash(0, self.service.owner) % @max(@as(u32, 1), self.delay_ms / 8)));
     }
     /// One bounded round-robin page. A long-lived query never monopolizes the
     /// head of the discovery index, and the cursor itself need not be durable.
@@ -82,7 +90,13 @@ pub const Driver = struct {
             records.context = service.context;
             var current = (try records.load(a, key)) orelse continue;
             defer current.deinit(a);
-            if (current.value.terminal()) continue;
+            if (current.value.terminal()) {
+                try client.deleteObject(self.service.state_store.bucket, entry.key, .{ .cancellation = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.contextCancellation(&service.context) });
+                continue;
+            }
+            // A live foreign owner drives its own fast loop. Its lease remains
+            // discoverable for takeover after failure, without reopening plans.
+            if (current.value.status == .running and !std.mem.eql(u8, current.value.owner, service.owner) and current.value.until_ms +| 30_000 >= service.clock.now()) continue;
             var scoped = service;
             if (self.principal_scopes) {
                 const plan_key = try std.fmt.allocPrint(a, "{s}/sql-execution-v2/{d:0>20}/{s}/plan.json", .{ service.state_store.prefix, query.expires_ms, query.id });
@@ -104,6 +118,13 @@ pub const Driver = struct {
         const next = if (listed.entries.len != 0) try self.service.a.dupe(u8, listed.entries[listed.entries.len - 1].key) else null;
         if (self.after) |value| self.service.a.free(value);
         self.after = next;
+        self.sweep_work = self.sweep_work or turns != 0;
+        self.delay_ms = self.interval_ms;
+        if (next == null) {
+            self.idle_delay_ms = if (self.sweep_work) self.interval_ms else @min(@as(u32, 30_000), @max(self.interval_ms, self.idle_delay_ms *| 2));
+            self.delay_ms = self.idle_delay_ms;
+            self.sweep_work = false;
+        }
         return turns;
     }
 };

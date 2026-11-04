@@ -112,7 +112,7 @@ export class SQLControl {
      if(record){
       if(record.size>1024*1024)throw Error('InvalidSqlExecutionState');
       const state=await record.json();
-      if(state.version===2&&digestText(state.plan)===match[2]&&state.expires_ms===expires_ms&&['succeeded','failed','cancelled'].includes(state.status))continue;
+      if(state.version===2&&digestText(state.plan)===match[2]&&state.expires_ms===expires_ms&&['succeeded','failed','cancelled'].includes(state.status)){await bucket.delete(object.key);continue;}
      }
      const raw=await bucket.get(`${base}/plan.json`);if(!raw)continue;
      if(raw.size>1024*1024)throw Error('InvalidSqlDistributedPlan');

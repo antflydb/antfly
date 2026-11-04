@@ -114,5 +114,7 @@ test('SQL discovery drains completed backlogs through durable alarms after evict
  // A failed listing retains a durable retry even with no cron invocation.
  const list=bucket.list.bind(bucket);bucket.list=async()=>{throw Error('transient list failure');};
  await assert.rejects(control().recover(),/transient list failure/);assert.ok(storage.alarm);
- bucket.list=list;now=storage.alarm;await control().alarm();assert.ok(await storage.get('cursor'));
+ bucket.list=list;now=storage.alarm;await control().alarm();assert.equal(await storage.get('cursor'),undefined);
+ assert.equal((await bucket.list({prefix:'state/sql-query-expiry/'})).objects.length,1);
+ assert.equal(kicks.length,2);
 });

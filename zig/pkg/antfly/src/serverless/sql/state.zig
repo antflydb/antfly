@@ -250,12 +250,23 @@ pub const Store = struct {
         }
         return error.PreconditionFailed;
     }
+    fn retireDiscovery(self: Store, a: A, path: []const u8, record: Record) void {
+        if (!std.mem.endsWith(u8, path, "/query.json")) return;
+        // The terminal CAS is durable authority. Expiry GC enumerates the
+        // actual state/exchange roots, so removing this hint cannot leak data.
+        const key_ = std.fmt.allocPrint(a, "{s}/sql-query-expiry/{d:0>20}/{s}.json", .{ self.prefix, record.expires_ms, record.plan }) catch return;
+        defer a.free(key_);
+        var client = self.client;
+        client.allocator = a;
+        client.deleteObject(self.bucket, key_, .{ .cancellation = catalog.types.contextCancellation(&self.context) }) catch {};
+    }
     pub fn complete(self: Store, a: A, path: []const u8, claim_: Claim, output: Output) !void {
         var old = (try self.load(a, path)) orelse return error.SqlExecutionNotFound;
         defer old.deinit(a);
         // Exact accepted retries survive an ACK loss, including after expiry.
         if (old.value.status == .succeeded) {
             if (old.value.epoch != claim_.epoch or !std.mem.eql(u8, old.value.owner, claim_.owner) or !std.meta.eql(old.value.output.?.hash, output.hash) or !std.mem.eql(u8, old.value.output.?.key, output.key) or old.value.output.?.bytes != output.bytes or old.value.output.?.rows != output.rows or old.value.output.?.partitions != output.partitions or old.value.output.?.index_bytes != output.index_bytes or !std.meta.eql(old.value.output.?.index_hash, output.index_hash) or !sameWitness(old.value.output.?.matches, output.matches)) return error.SqlExecutionFenced;
+            self.retireDiscovery(a, path, old.value);
             return;
         }
         if (old.value.expires_ms <= self.now_ms) return error.SqlQueryExpired;
@@ -269,6 +280,7 @@ pub const Store = struct {
             next.output = output;
         }
         try self.write(a, path, old, next);
+        self.retireDiscovery(a, path, next);
     }
     pub fn terminate(self: Store, a: A, path: []const u8, claim_: Claim, status: Status, failure: []const u8) !void {
         if ((status != .failed and status != .cancelled) or failure.len > 256) return error.InvalidSqlExecutionState;
@@ -278,6 +290,7 @@ pub const Store = struct {
         next.status = status;
         next.failure = failure;
         try self.write(a, path, old, next);
+        self.retireDiscovery(a, path, next);
     }
 };
 

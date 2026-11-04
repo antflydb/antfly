@@ -209,7 +209,9 @@ pub const Host = struct {
         if (cut.paged != null) owner.paged = try PagedReader.init(a, self.artifacts, self.store_identity, cut, delta, input, split, context);
         errdefer if (owner.paged) |*paged| paged.deinit();
         if (owner.paged) |paged| owner.recent_at = paged.begin;
-        const physical = try overlay.physicalRequest(scratch, scan, delta.*);
+        var initial_scan = scan;
+        if (cut.paged != null) initial_scan.fields = cut.pending.key_fields;
+        const physical = try overlay.physicalRequest(scratch, initial_scan, delta.*);
         const child = if (input.bucket_group) |group| blk: {
             const declared = input.bucket orelse return error.InvalidSqlDistributedPlan;
             if (declared.column >= input.columns.len) return error.InvalidSqlDistributedPlan;
@@ -220,8 +222,10 @@ pub const Host = struct {
         errdefer child.close(child.ptr);
         // Install a safe filter on the base and apply it again to post-overlay
         // rows. Changed-key suppression sees the entire cut on every split.
-        if (filter) |value| {
-            if (child.set_dynamic_filter) |install| _ = try install(child.ptr, value);
+        if (cut.paged == null) {
+            if (filter) |value| {
+                if (child.set_dynamic_filter) |install| _ = try install(child.ptr, value);
+            }
         }
         if (child.next_columns == null) return error.SqlDistributedJoinUnsupported;
         owner.cursor = child;
@@ -245,9 +249,8 @@ const Owner = struct {
     base_done: bool = false,
     recent_at: usize = 0,
     paged: ?PagedReader = null,
-    base_arena: ?std.heap.ArenaAllocator = null,
-    base_rows: []const []const Datum = &.{},
-    base_suppressed: []const bool = &.{},
+    cursor_closed: bool = false,
+    base_suppressed: []bool = &.{},
     base_at: usize = 0,
     base_prepared: bool = false,
     fn recentEnd(self: *const Owner) usize {
@@ -323,14 +326,13 @@ const Owner = struct {
         return null;
     }
     fn prepareBase(self: *Owner) !void {
-        self.base_arena = .init(self.a);
-        const owned = self.base_arena.?.allocator();
-        var rows: std.ArrayList([]const Datum) = .empty;
         var work = std.heap.ArenaAllocator.init(self.a);
         defer work.deinit();
         var lookups: std.ArrayList(PagedReader.Lookup) = .empty;
         var page_arena = std.heap.ArenaAllocator.init(self.a);
         defer page_arena.deinit();
+        // This cursor projects only stable keys. Do not fetch, coerce, or retain
+        // payloads until the accepted WAL has resolved visibility.
         while (!self.base_done) {
             try self.context.ensureActive();
             _ = page_arena.reset(.free_all);
@@ -343,18 +345,49 @@ const Owner = struct {
                 var key_row: std.json.Value = .{ .object = .empty };
                 for (self.cut.pending.key_fields) |key| try key_row.object.put(scratch, key, (try page.cell(scratch, index, (try self.table.column(key)).path)).value);
                 const key = lake.types.digestHex(try overlay.baseIdentity(scratch, self.cut.pending.key_fields, key_row, self.cut.kinds));
-                try lookups.append(work.allocator(), .{ .key = key, .row = rows.items.len });
-                const cells = try owned.alloc(Datum, self.input.columns.len);
-                for (self.input.columns, cells) |column, *cell| cell.* = try local.sql_operators.cloneDatum(owned, try page.typedCell(scratch, index, (try self.table.column(column.name)).path, column.element_type == .numeric));
-                try rows.append(owned, cells);
+                try lookups.append(work.allocator(), .{ .key = key, .row = lookups.items.len });
             }
         }
-        const suppressed = try owned.alloc(bool, rows.items.len);
-        @memset(suppressed, false);
-        try self.paged.?.suppressBatch(lookups.items, suppressed);
-        self.base_rows = rows.items;
-        self.base_suppressed = suppressed;
+        self.cursor.close(self.cursor.ptr);
+        self.cursor_closed = true;
+        self.base_suppressed = try self.a.alloc(bool, lookups.items.len);
+        @memset(self.base_suppressed, false);
+        try self.paged.?.suppressBatch(lookups.items, self.base_suppressed);
+        const all_suppressed = for (self.base_suppressed) |hidden| {
+            if (!hidden) break false;
+        } else true;
+        if (all_suppressed) {
+            self.a.free(self.base_suppressed);
+            self.base_suppressed = &.{};
+        } else {
+            var arena = std.heap.ArenaAllocator.init(self.a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const names = try scratch.alloc([]const u8, self.input.columns.len);
+            for (self.input.columns, names) |column, *name| name.* = column.name;
+            const scan = try overlay.physicalRequest(scratch, .{ .fields = names, .limit = 256 }, self.cut.*);
+            // Both passes use the same immutable, unfiltered split. A dynamic
+            // filter must not change ordinal alignment with the bitmap.
+            self.cursor = try local.sql_lake_cursor.openPinnedPartition(self.a, self.table, scan, Host.request(self.context), &self.source, self.split, self.input.splits);
+            self.cursor_closed = false;
+            self.base_done = false;
+        }
         self.base_prepared = true;
+    }
+    fn appendSelected(self: *Owner, a: A, rows: *std.ArrayList([]const Datum), cells: []const Datum) !void {
+        if (self.filter) |filter| {
+            var keys: [32]Datum = undefined;
+            for (filter.columns, 0..) |column, index| {
+                const ordinal = for (self.input.columns, 0..) |candidate, i| {
+                    if (std.mem.eql(u8, candidate.name, column.name)) break i;
+                } else return error.InvalidSqlDistributedPlan;
+                keys[index] = cells[ordinal];
+            }
+            if (!try filter.contains(keys[0..filter.columns.len])) return;
+        }
+        const values = try a.alloc(Datum, cells.len);
+        for (cells, values) |cell, *value| value.* = try local.sql_operators.cloneDatum(a, cell);
+        try rows.append(a, values);
     }
     fn nextPaged(self: *Owner, a: A, maximum: usize) !?[]const []const Datum {
         if (!self.base_prepared) try self.prepareBase();
@@ -365,47 +398,44 @@ const Owner = struct {
             try self.context.ensureActive();
             _ = scratch_arena.reset(.free_all);
             const scratch = scratch_arena.allocator();
-            const cells = if (self.base_at < self.base_rows.len) base: {
-                const index = self.base_at;
-                self.base_at += 1;
-                if (self.base_suppressed[index]) continue;
-                const values = try scratch.alloc(Datum, self.input.columns.len);
-                for (self.input.columns, self.base_rows[index], values) |column, raw, *value| value.* = try column.datum(scratch, raw);
-                break :base values;
-            } else recent: {
-                if (self.base_arena) |*arena| arena.deinit();
-                self.base_arena = null;
-                self.base_rows = &.{};
-                self.base_suppressed = &.{};
-                if (self.recent_at == self.recentEnd()) break;
-                const position = self.recent_at;
-                self.recent_at += 1;
-                const row = (try self.paged.?.recent(scratch, position)) orelse continue;
-                const values = try scratch.alloc(Datum, self.input.columns.len);
-                for (self.input.columns, values) |column, *cell| cell.* = try column.datum(scratch, try row.cell(column.name));
-                break :recent values;
-            };
-            if (self.filter) |filter| {
-                var keys: [32]Datum = undefined;
-                for (filter.columns, 0..) |column, index| {
-                    const ordinal = for (self.input.columns, 0..) |candidate, i| {
-                        if (std.mem.eql(u8, candidate.name, column.name)) break i;
-                    } else return error.InvalidSqlDistributedPlan;
-                    keys[index] = cells[ordinal];
+            if (!self.base_done) {
+                const page = try self.cursor.next_columns.?(self.cursor.ptr, scratch, @intCast(maximum - result.items.len));
+                try page.validate();
+                if (page.selection.len > maximum - result.items.len) return error.InvalidSqlBackendResponse;
+                self.base_done = page.after == null;
+                for (0..page.selection.len) |index| {
+                    if (self.base_at >= self.base_suppressed.len) return error.InvalidSqlBackendResponse;
+                    const hidden = self.base_suppressed[self.base_at];
+                    self.base_at += 1;
+                    if (hidden) continue;
+                    const cells = try scratch.alloc(Datum, self.input.columns.len);
+                    for (self.input.columns, cells) |column, *cell| cell.* = try column.datum(scratch, try page.typedCell(scratch, index, (try self.table.column(column.name)).path, column.element_type == .numeric));
+                    try self.appendSelected(a, &result, cells);
                 }
-                if (!try filter.contains(keys[0..filter.columns.len])) continue;
+                if (self.base_done) {
+                    if (self.base_at != self.base_suppressed.len) return error.InvalidSqlBackendResponse;
+                    self.a.free(self.base_suppressed);
+                    self.base_suppressed = &.{};
+                    self.cursor.close(self.cursor.ptr);
+                    self.cursor_closed = true;
+                }
+                continue;
             }
-            const values = try a.alloc(Datum, cells.len);
-            for (cells, values) |cell, *value| value.* = try local.sql_operators.cloneDatum(a, cell);
-            try result.append(a, values);
+            if (self.recent_at == self.recentEnd()) break;
+            const position = self.recent_at;
+            self.recent_at += 1;
+            const row = (try self.paged.?.recent(scratch, position)) orelse continue;
+            const values = try scratch.alloc(Datum, self.input.columns.len);
+            for (self.input.columns, values) |column, *cell| cell.* = try column.datum(scratch, try row.cell(column.name));
+            try self.appendSelected(a, &result, values);
         }
         return if (result.items.len == 0) null else result.items;
     }
     fn close(raw: *anyopaque) void {
         const self: *Owner = @ptrCast(@alignCast(raw));
-        if (self.base_arena) |*arena| arena.deinit();
+        self.a.free(self.base_suppressed);
         if (self.paged) |*paged| paged.deinit();
-        self.cursor.close(self.cursor.ptr);
+        if (!self.cursor_closed) self.cursor.close(self.cursor.ptr);
         self.source.deinit();
         self.arena.deinit();
         self.a.destroy(self);
@@ -573,6 +603,41 @@ test "distributed SQL clustered WAL keys read each exact page once" {
     try std.testing.expectEqual(@as(usize, 25), loaded.paged.?.keys.len);
     try std.testing.expect(gets <= loaded.paged.?.keys.len);
     for (suppressed, 0..) |value, index| try std.testing.expectEqual(index < 1500 or index == 1600, value);
+    // Hidden wide payloads must never be copied during key preparation.
+    const PageFixture = struct {
+        batch: local.sql_execution_batch.Batch,
+        selection: [128]usize,
+        calls: usize = 0,
+        fn columns(raw: *anyopaque, _: A, _: u32) !catalog.ColumnPage {
+            const fixture: *@This() = @ptrCast(@alignCast(raw));
+            fixture.calls += 1;
+            return .{ .native = .{ .values = &fixture.batch, .names = &.{ "id", "payload" } }, .selection = &fixture.selection };
+        }
+        fn next(_: *anyopaque, _: A, _: u32) !catalog.Page {
+            return error.UnexpectedRowPath;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    const payload = try sa.alloc(u8, 64 * 1024);
+    @memset(payload, 'x');
+    const base = try sa.alloc([]const Datum, 128);
+    for (base, 1..) |*row, id| row.* = try sa.dupe(Datum, &.{ Datum.json(.{ .integer = @intCast(id) }), Datum.json(.{ .string = payload }) });
+    var page_fixture: PageFixture = .{ .batch = .{ .rows = base }, .selection = undefined };
+    for (&page_fixture.selection, 0..) |*index, i| index.* = i;
+    var budget: local.sql_memory_budget = .{ .backing = a, .limit = 8 * 1024 * 1024 };
+    defer std.debug.assert(budget.live == 0);
+    var wide_input = input;
+    wide_input.columns = &.{ .{ .name = "id", .type = .integer }, .{ .name = "payload", .type = .string } };
+    var wide_table = table;
+    wide_table.columns = &.{ .{ .name = "id", .path = "id", .type = .integer }, .{ .name = "payload", .path = "payload", .type = .string } };
+    var owner: Owner = .{ .a = budget.allocator(), .arena = .init(budget.allocator()), .input = wide_input, .table = wide_table, .cut = &cut, .filter = null, .context = .{}, .cursor = .{ .ptr = &page_fixture, .next = PageFixture.next, .next_columns = PageFixture.columns, .close = PageFixture.close }, .paged = try PagedReader.init(budget.allocator(), &artifacts, identity_, loaded, &cut, input, 0, .{}) };
+    defer owner.arena.deinit();
+    defer owner.paged.?.deinit();
+    defer owner.a.free(owner.base_suppressed);
+    try owner.prepareBase();
+    try std.testing.expect(owner.base_done and owner.cursor_closed);
+    try std.testing.expectEqual(@as(usize, 0), owner.base_suppressed.len);
+    try std.testing.expectEqual(@as(usize, 1), page_fixture.calls);
     // Retained capabilities from older writers contain ASCII digest pages.
     var legacy = loaded;
     const legacy_pages = try sa.dupe(retained.KeyPage, loaded.paged.?.keys);

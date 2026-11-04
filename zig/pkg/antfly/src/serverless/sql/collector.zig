@@ -14,7 +14,7 @@
 // limitations under the License.
 
 //! Expiry-first enumeration and bounded, restartable task/query cleanup.
-//! The marker precedes plan creation and survives until the last state object.
+//! Active discovery hints precede plan creation; GC enumerates actual roots.
 const std = @import("std");
 const state = @import("state.zig");
 const A = std.mem.Allocator;

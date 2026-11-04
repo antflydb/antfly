@@ -44,7 +44,10 @@ workers validate the grant's scope, artifact-store identity, schema, table
 incarnation and expiry and reopen the captured snapshot and WAL suffix. They
 need source read access and snapshot-pin access, plus execution-store writes;
 they do not need table publication authority. Query pools run recovery and
-signed task/control RPCs. Maintenance pools collect expired execution records
+signed task/control RPCs. Terminal CAS operations retire discovery hints; expiry
+GC uses the actual state/exchange roots independently. Recovery skips live foreign
+leases, drains discovery pages promptly, and backs off empty sweeps to about
+30 seconds with boot-specific jitter. Active owners retain fast recovery. Maintenance pools collect expired execution records
 and exchange objects. API gateways never execute worker tasks.
 
 The companion Colony operator adds `AntflyCluster.spec.serverlessSQL` and
@@ -168,18 +171,21 @@ reserves compaction tasks together with join, proof and aggregate tasks.
 Distributed cuts larger than 64 KiB of WAL images retain those images in
 immutable pages, with a Bloom filter and sorted exact changed-key digest pages.
 Every worker suppresses changed base rows against that full index, while it
-reads only its disjoint contiguous interval of recent WAL images. Base split
-candidates are sorted by digest and checked against each relevant key page once. Candidate rows and the suppression bitmap share task memory;
-image pages are invocation-private. New writers use binary SHA-256 pages while
-readers also accept legacy ASCII pages; all child references bind the
-same table/store domain and expiry as the parent capability. Small cuts remain
-inline. Existing local cut readers can materialize paged capabilities normally.
+reads only its disjoint contiguous interval of recent WAL images. A key-only
+pass sorts candidate digests and checks each relevant key page once. Only keys
+and a suppression bitmap share task memory. A second pinned pass streams
+surviving payloads; fully suppressed splits skip that pass entirely. Both passes
+use unfiltered ordinals to keep the bitmap aligned. Image pages are invocation
+private. New writers use binary SHA-256 pages; readers also accept legacy ASCII
+pages. All child references bind the parent's table/store domain and expiry.
+Small cuts remain inline, and local cut readers can materialize paged cuts.
 
 Paged cuts include WAL bytes/rows in planning and advertise minimum parallelism
 that assigns at most 128 recent WAL images to each fragment. Committed base rows
 retain their normal scan and byte budgets, independently of the image limit.
 Workers enforce the image bound against the authenticated cut, rather than
 trusting estimated base row counts. Key-page reads are bounded by the exact
-index page count, rather than physical row order or cache misses. Object I/O budgets remain bounded.
-Bucket execution falls back to shuffle for these cuts. Pages target 32 KiB;
+index page count, rather than physical row order or cache misses. Object I/O
+budgets remain bounded.
+Bucket execution falls back to shuffle for these cuts. Image pages target 32 KiB;
 individual larger rows remain subject to the existing task/query budgets.

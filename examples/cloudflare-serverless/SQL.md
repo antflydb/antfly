@@ -144,10 +144,12 @@ original map tiles; ordinary reducers consume compacted roots. Resolved task
 and output reservations include these stages.
 
 Large retained WAL cuts use immutable image pages plus a Bloom filter and exact
-sorted key pages. Workers load only their assigned image interval. For each base split they
-sort candidate digests, stream each relevant exact-key page once, and retain a
-suppression bitmap in the task memory budget. Binary SHA-256 pages preserve
-exact membership while halving index transfer bytes. All base splits still suppress the complete changed-key set.
+sorted key pages. Workers load only their assigned image interval. Each base
+split first scans only keys, sort candidate digests, stream each relevant exact-key page once,
+and retain a suppression bitmap in the task memory budget. They then stream the
+visible payloads from the same pinned split; hidden payloads are never retained.
+Binary SHA-256 pages preserve exact membership while halving index transfer
+bytes. All base splits still suppress the complete changed-key set.
 The gateway includes WAL bytes and rows in its estimates and ensures each
 fragment owns at most 128 recent WAL images. Committed base scan sizing remains
 independent, avoiding tiny base fragments for a small paged WAL. Workers validate
