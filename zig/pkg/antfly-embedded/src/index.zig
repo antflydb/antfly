@@ -3147,7 +3147,7 @@ pub const IndexWriter = struct {
         global_field_lens: *std.StringHashMapUnmanaged(u64),
         reader: *const segment_mod.SegmentReader,
     ) !void {
-        for (reader.fields) |*fi| {
+        for (reader.fields, 0..) |*fi, ordinal| {
             if (std.mem.eql(u8, fi.name, segment_mod.doc_ordinals_field)) continue;
             for (fi.sections) |*si| {
                 if (si.section_type != .inverted_text) continue;
@@ -3155,7 +3155,7 @@ pub const IndexWriter = struct {
                     const offset: usize = @intCast(si.offset);
                     if (offset > reader.data.len or si.length > reader.data.len - offset) continue;
                 }
-                const inv = (try reader.invertedFieldStats(fi.name)) orelse continue;
+                const inv = reader.invertedFieldStatsAt(ordinal) orelse continue;
                 const gop = try global_field_lens.getOrPut(alloc, fi.name);
                 if (!gop.found_existing) gop.value_ptr.* = 0;
                 gop.value_ptr.* += inv.total_field_len;

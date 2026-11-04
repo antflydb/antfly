@@ -307,6 +307,17 @@ test "segment admission avoids per field reads while fencing replacement and pre
     std.debug.print("SEGMENT_ADMISSION fields=32 ordinary_reads={d} admitted_reads={d}\n", .{ ordinary_reads, admitted_reads });
     try std.testing.expect(admitted_reads < ordinary_reads);
     try std.testing.expectEqualDeep(try ordinary.invertedFieldStats("column31"), try admitted.invertedFieldStats("column31"));
+    var contiguous = try segment.SegmentReader.init(a, fixture.bytes);
+    defer contiguous.deinit();
+    const reads_before_stats = source.reads;
+    for (admitted.fields, 0..) |field, ordinal| {
+        const expected = try contiguous.invertedFieldStats(field.name);
+        try std.testing.expectEqualDeep(expected, contiguous.invertedFieldStatsAt(ordinal));
+        try std.testing.expectEqualDeep(expected, admitted.invertedFieldStatsAt(ordinal));
+    }
+    try std.testing.expectEqual(reads_before_stats, source.reads);
+    try std.testing.expect(contiguous.invertedFieldStatsAt(contiguous.fields.len) == null);
+    try std.testing.expect(admitted.invertedFieldStatsAt(std.math.maxInt(usize)) == null);
     var wrong_footer = owned.footer;
     wrong_footer[40] ^= 1;
     try std.testing.expectError(error.InvalidSegmentAdmission, segment.SegmentReader.initNativeCatalogAdmission(a, source.source(), owned.metadata, wrong_footer));

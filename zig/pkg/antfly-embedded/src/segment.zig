@@ -1491,17 +1491,22 @@ pub const SegmentReader = struct {
     /// Collection statistics preserve lazy payload checksum validation. Native
     /// admission reads only field descriptors, as the mapped path does.
     pub fn invertedFieldStats(self: *const SegmentReader, field: []const u8) !?InvertedFieldStats {
-        if (self.native != null or self.deferred != null) {
-            // Immutable admission metadata survives cache capability sealing.
-            for (self.fields) |info| if (std.mem.eql(u8, info.name, field)) return info.inverted_stats;
-            return null;
-        }
-        for (self.fields) |info| if (std.mem.eql(u8, info.name, field)) {
-            for (info.sections) |section| if (section.section_type == .inverted_text) {
-                if (section.offset > self.data.len or section.length > self.data.len - section.offset) return null;
-                const reader = inverted.InvertedIndexReader.init(self.alloc, self.data[@intCast(section.offset)..][0..@intCast(section.length)]) catch return null;
-                return .{ .doc_count = reader.doc_count, .total_field_len = reader.total_field_len };
-            };
+        for (self.fields, 0..) |info, ordinal| if (std.mem.eql(u8, info.name, field))
+            return self.invertedFieldStatsAt(ordinal);
+        return null;
+    }
+
+    /// A caller already walking the field directory must not search it again
+    /// by name for every field. Ordinals belong to this exact reader only.
+    pub fn invertedFieldStatsAt(self: *const SegmentReader, ordinal: usize) ?InvertedFieldStats {
+        if (ordinal >= self.fields.len) return null;
+        const info = &self.fields[ordinal];
+        // Immutable admission metadata survives cache capability sealing.
+        if (self.native != null or self.deferred != null) return info.inverted_stats;
+        for (info.sections) |section| if (section.section_type == .inverted_text) {
+            if (section.offset > self.data.len or section.length > self.data.len - section.offset) return null;
+            const reader = inverted.InvertedIndexReader.init(self.alloc, self.data[@intCast(section.offset)..][0..@intCast(section.length)]) catch return null;
+            return .{ .doc_count = reader.doc_count, .total_field_len = reader.total_field_len };
         };
         return null;
     }
