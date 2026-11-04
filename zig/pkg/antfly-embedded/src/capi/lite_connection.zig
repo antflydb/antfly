@@ -8983,17 +8983,20 @@ test "capi native cooperative replay separates raw text from generated artifact 
         try std.testing.expect(try db.core.indexRequiresEnrichmentReplay("generated"));
         var names: [32][32]u8 = undefined;
         var writes: [32]h.db_mod.types.BatchWrite = undefined;
-        for (&writes, 0..) |*write, i| write.* = .{
-            .key = try std.fmt.bufPrint(&names[i], "source-{d}", .{i}),
-            .value = "{\"text\":\"silver submarine\"}",
-        };
-        try db.batch(.{ .writes = &writes, .sync_level = .write });
+        for (&writes, 0..) |*write, i| {
+            write.* = .{
+                .key = try std.fmt.bufPrint(&names[i], "source-{d}", .{i}),
+                .value = "{\"text\":\"silver submarine\"}",
+            };
+            try db.batch(.{ .writes = writes[i .. i + 1], .sync_level = .write });
+        }
         const target = db.core.nextDerivedSequence();
         const generated_before = try db.core.loadAppliedSequence(a, "generated");
         _ = try db.runBackgroundTurnWithCancellation(.none, .replay);
         const produced = db.enrichment_runtime.?.stats().applied_sequence;
-        // The producer yields inside this one 32-document revision. Raw text
-        // is already visible, while its artifact-backed sibling cannot seal it.
+        // The producer yields after its eight-document prefix. Raw text is
+        // already visible beyond it, while its artifact-backed sibling cannot
+        // seal the remaining source revisions.
         try std.testing.expect(produced < target);
         try std.testing.expect(try db.core.loadAppliedSequence(a, "raw") >= target);
         try std.testing.expect(try db.core.loadAppliedSequence(a, "generated") <= @max(generated_before, produced));
