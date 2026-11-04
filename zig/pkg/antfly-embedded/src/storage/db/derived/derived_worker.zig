@@ -292,8 +292,9 @@ pub fn catchUpIndexFromMatchingCursor(
     var decode_scratch: change_journal_mod.BorrowedBinaryRecordScratch = .{};
     defer decode_scratch.deinit(scratch_alloc);
     const partial_enabled = options.max_items_per_window != 0 and options.save_partial_fn != null and index_ref.kind == .full_text;
-    // A saved resume point restricts the first window to that one record, so
-    // its items line up exactly with the offset.
+    // A saved resume point ends the first window at that record, so its items
+    // line up exactly with the offset. Records before it in the window have no
+    // work for this index: the call that saved it collected them ahead of it.
     var resume_cursor: ?PartialCursor = if (partial_enabled) if (options.load_partial_fn) |load| try load(options.partial_ctx.?, index_ref.name) else null else null;
     while (true) {
         // Oversized records may need more scratch once, but cannot establish
@@ -317,6 +318,7 @@ pub fn catchUpIndexFromMatchingCursor(
         builder.max_work_chunk_bytes = options.max_work_chunk_bytes;
         builder.dense_replay_working_set_factor = @max(@as(u64, 1), options.dense_replay_working_set_factor);
         builder.target_sequence = options.target_sequence;
+        if (resume_cursor) |cursor| builder.target_sequence = if (builder.target_sequence == 0) cursor.sequence else @min(builder.target_sequence, cursor.sequence);
         builder.decode_scratch = &decode_scratch;
         builder.scratch_alloc = scratch_alloc;
         builder.scratch_budget = if (scratch_budget) |*budget| budget else null;
@@ -325,7 +327,7 @@ pub fn catchUpIndexFromMatchingCursor(
         const collect_started_ns = monotonicTimeNs();
         const had_retained_scratch = decode_scratch.retainedCapacityBytes() != 0;
         var retried_fresh = false;
-        var collection_limit = if (resume_cursor != null) @as(usize, 1) else options.max_records_per_window;
+        var collection_limit = options.max_records_per_window;
         var retry_stats = replay_source_mod.MatchingRecordStats{};
         const chunk_stats = collect: while (true) {
             const collected = replay_cursor.forEachNext(collection_limit, &builder, replayChunkConsumeRecord) catch |err| {
@@ -354,6 +356,13 @@ pub fn catchUpIndexFromMatchingCursor(
         };
         stats.window_collect_ns += monotonicTimeNs() - collect_started_ns;
         if (chunk_stats.last_sequence == 0) {
+            // A resume point at or below the next record bounded this window
+            // to nothing; it is stale. The stopped record is still at the
+            // cursor: collect again without the bound.
+            if (resume_cursor != null) {
+                resume_cursor = null;
+                continue;
+            }
             break;
         }
         // Never begin a storage mutation after the caller's deadline. The
@@ -2001,6 +2010,8 @@ test "catchUpIndex yields inside an oversized full text record behind a no-op re
         .max_chunk_bytes = 512,
         // Already past: every call may apply at most one subchunk.
         .max_call_ns = 1,
+        // Background turns run one window each.
+        .max_windows_per_call = 1,
         .persist_ctx = &store,
         .persist_progress_fn = TestPartialStore.persist,
         .partial_ctx = &store,
@@ -2086,6 +2097,28 @@ test "catchUpIndex ignores a resume point for a record it did not collect" {
     });
     try std.testing.expectEqual(@as(usize, 3), capture.applied_documents);
     try std.testing.expectEqual(@as(?u64, 1), store.persisted);
+
+    // A point at or below the applied sequence is ignored too, rather than
+    // ending every window before the next record.
+    try appendChangeJournalRecord(&journal, alloc, .{
+        .sequence = 2,
+        .changed_doc_keys = &.{ "doc:d", "doc:e" },
+        .target_hints = &.{.full_text},
+    });
+    store.cursor = .{ .sequence = 1, .offset = 1 };
+    var next = TestApplyCapture{ .alloc = alloc };
+    defer next.deinit();
+    _ = try catchUpIndexWithOptions(alloc, replay_source_mod.Source.fromJournal(&journal), .{ .name = "text", .kind = .full_text }, 1, &next, testApplyCapture, .{
+        .max_items_per_window = 2,
+        .max_chunk_bytes = 512,
+        .persist_ctx = &store,
+        .persist_progress_fn = TestPartialStore.persist,
+        .partial_ctx = &store,
+        .load_partial_fn = TestPartialStore.load,
+        .save_partial_fn = TestPartialStore.save,
+    });
+    try std.testing.expectEqual(@as(usize, 2), next.applied_documents);
+    try std.testing.expectEqual(@as(?u64, 2), store.persisted);
 }
 
 test "catchUpIndex chunks dense replay by estimated vector byte budget" {
