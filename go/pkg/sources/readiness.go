@@ -28,7 +28,7 @@ import (
 // QueryDocumentFields covers the complete canonical metadata and the content
 // digest. Returning the original text again is unnecessary for readiness.
 func QueryDocumentFields() []string {
-	return []string{"grep.version", "grep.kind", "grep.media", "grep.uri", "grep.path", "grep.revision", "grep.indexed_at", "grep.permissions", "grep.metadata"}
+	return []string{"schema_version", "source", "content.mime_type", "content.resource", "permissions", "metadata"}
 }
 
 func projectionDigest(doc Document) ([32]byte, error) {
@@ -111,7 +111,7 @@ func waitForDocuments(ctx context.Context, query func(context.Context, string, [
 				return fmt.Errorf("unexpected canonical readiness identity")
 			}
 			returned[hit.ID] = true
-			got, err := projectionDigest(hit.Source.Grep)
+			got, err := projectionDigest(hit.Source.Document)
 			if err != nil {
 				return err
 			}

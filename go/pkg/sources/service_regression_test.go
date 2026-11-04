@@ -214,7 +214,7 @@ func TestCatalogAdvertisesMediaVersion(t *testing.T) {
 	for _, row := range backend.catalogRecords {
 		raw, err := json.Marshal(row)
 		require.NoError(t, err)
-		require.Contains(t, string(raw), `"document_version":2`)
+		require.Contains(t, string(raw), `"document_version":3`)
 		require.Contains(t, string(raw), `"publication":"media"`)
 	}
 }

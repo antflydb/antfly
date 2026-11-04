@@ -41,6 +41,7 @@ import (
 const corpusUnits = "document_units_v1"
 const corpusChunks = "document_chunks_v1"
 const corpusTextIndex = "document_text"
+const corpusUnitsIndex = "document_units_text"
 
 type corpusProgress struct {
 	Binding      string  `json:"binding,omitempty"`
@@ -343,7 +344,7 @@ func corpusPrepareCmd(args []string) error {
 			versionBytes, _ := json.Marshal(loc)
 			version := sha256.Sum256(versionBytes)
 			original := entry.Locator
-			doc := map[string]any{"title": path.Base(loc.Name), "filename": path.Base(loc.Name), "mime_type": entry.MIME, "version": hex.EncodeToString(version[:]), "url": sourceURL(cfg, loc), "original_url": sourceURL(cfg, original), "metadata": map[string]any{"dataset": entry.Dataset, "document_id": entry.ID, "source_locator": loc, "page_start": loc.First, "page_end": loc.Last, "original_pages": totalPages}}
+			doc := map[string]any{"title": path.Base(loc.Name), "filename": path.Base(loc.Name), "mime_type": entry.MIME, "version": hex.EncodeToString(version[:]), "indexed_at": time.Now().Unix(), "permissions": map[string]any{"public": false, "readers": []string{"user:self"}}, "url": sourceURL(cfg, loc), "original_url": sourceURL(cfg, original), "metadata": map[string]any{"dataset": entry.Dataset, "document_id": entry.ID, "source_locator": loc, "page_start": loc.First, "page_end": loc.Last, "original_pages": totalPages}}
 			source := cfg.Sources[loc.Source]
 			if receipt := archives[loc.Source]; receipt != nil {
 				doc["metadata"].(map[string]any)["archive_source"] = receipt
@@ -496,7 +497,7 @@ func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string
 	if err != nil {
 		return nil, err
 	}
-	indexes := map[string]any{corpusTextIndex: map[string]any{"type": "full_text", "field": "text", "artifact_name": corpusChunks, "enrichments": []any{
+	indexes := map[string]any{corpusUnitsIndex: map[string]any{"type": "full_text", "sources": []any{map[string]any{"artifact": corpusUnits, "field": "text"}}}, corpusTextIndex: map[string]any{"type": "full_text", "field": "text", "artifact_name": corpusChunks, "enrichments": []any{
 		map[string]any{"name": corpusUnits, "kind": "asset", "field": "url", "content_type": "application/json", "producer_json": string(producerJSON)},
 		map[string]any{"name": corpusChunks, "kind": "chunk", "field": "text", "source_artifact_name": corpusUnits, "chunk_size": 512, "chunk_overlap": 50},
 	}}}

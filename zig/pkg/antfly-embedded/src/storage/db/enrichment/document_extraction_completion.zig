@@ -27,13 +27,24 @@ pub fn inspect(alloc: std.mem.Allocator, manifest: []const u8) !Coverage {
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidDocumentExtractionManifest;
     var coverage: Coverage = .{};
+    if (parsed.value.object.get("unsupported_reason")) |reason| {
+        if (reason != .string and reason != .null) return error.InvalidDocumentExtractionManifest;
+        coverage.failed = reason == .string and reason.string.len > 0;
+    }
+    for ([_][]const u8{ "incomplete_unit_count", "retryable_incomplete_unit_count" }) |field| {
+        if (parsed.value.object.get(field)) |count| {
+            if (count != .integer or count.integer < 0) return error.InvalidDocumentExtractionManifest;
+            coverage.failed = coverage.failed or count.integer > 0;
+            if (std.mem.eql(u8, field, "retryable_incomplete_unit_count")) coverage.retryable = coverage.retryable or count.integer > 0;
+        }
+    }
     if (parsed.value.object.get("ocr_failed_count")) |count| {
         if (count != .integer or count.integer < 0) return error.InvalidDocumentExtractionManifest;
-        coverage.failed = count.integer > 0;
+        coverage.failed = coverage.failed or count.integer > 0;
     }
     if (parsed.value.object.get("ocr_retryable_failed_count")) |count| {
         if (count != .integer or count.integer < 0) return error.InvalidDocumentExtractionManifest;
-        coverage.retryable = count.integer > 0;
+        coverage.retryable = coverage.retryable or count.integer > 0;
         coverage.failed = coverage.failed or coverage.retryable;
     }
     if (parsed.value.object.get("ocr_failed_page_numbers")) |pages| {
@@ -81,4 +92,14 @@ test "aggregate OCR retry debt survives truncated terminal diagnostics" {
     );
     try std.testing.expect(terminal.failed and !terminal.retryable);
     try std.testing.expectError(error.InvalidDocumentExtractionManifest, inspect(a, "{\"ocr_retryable_failed_count\":-1}"));
+}
+
+test "missing modality producers and transcription failures remain incomplete" {
+    const a = std.testing.allocator;
+    const absent = try inspect(a, "{\"incomplete_unit_count\":1,\"retryable_incomplete_unit_count\":0}");
+    try std.testing.expect(absent.failed and !absent.retryable);
+    const transient = try inspect(a, "{\"incomplete_unit_count\":1,\"retryable_incomplete_unit_count\":1,\"ocr_failed_count\":0,\"ocr_retryable_failed_count\":0}");
+    try std.testing.expect(transient.failed and transient.retryable);
+    const unsupported = try inspect(a, "{\"unsupported_reason\":\"video route not configured\"}");
+    try std.testing.expect(unsupported.failed and !unsupported.retryable);
 }

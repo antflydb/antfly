@@ -5032,3 +5032,70 @@ CPU/latency gains vary by case, with increases retained in the report. These are
 warm synthetic whole-server comparisons against an older main revision on one
 shared host. They do not establish universal or zero-cost behavior. Document
 format and canonical ABI remain unchanged.
+
+## Native source and artifact streams
+
+New source runs use the neutral `source`/`content`/`permissions` v3 document
+contract, not a stored `grep.content` projection. Source catalogs advertise
+`fields` mappings and named `streams`; manual table configurations accept those
+same mappings for existing application tables. `document_field` remains an
+explicit adapter for older stored documents.
+
+```json
+{
+  "version": 1,
+  "endpoint": "http://127.0.0.1:8080/db/v1",
+  "principals": ["user:self"],
+  "tables": [{
+    "name": "recordings",
+    "fields": {"uri":"source.uri","path":"source.path","revision":"source.revision","indexed_at":"source.indexed_at","permissions":"permissions","metadata":"metadata"},
+    "streams": [
+      {"name":"transcript","artifact":"speech_units","index":"speech_text","field":"text","purpose":"transcription","default":true,"boundary":"unit","location_field":"provenance"},
+      {"name":"summary","artifact":"summary","index":"summary_text","field":"text","purpose":"summary","default":false,"generated":true,"boundary":"record"}
+    ]
+  }]
+}
+```
+
+```sh
+antfly-grep --table-config recordings.json 'Tuesday'
+antfly-grep --table-config recordings.json --artifact summary 'meeting'
+antfly-grep --table-config recordings.json --all-artifacts 'meeting'
+```
+
+`--artifact` is repeatable and accepts stream or artifact names. An unknown
+selection fails. `--all-artifacts` selects every configured stream and cannot be
+combined with `--artifact`. Default membership comes from the binding, so generated
+summaries and captions can remain opt-in. Generated streams are marked in display
+paths and JSON provenance. A match proves only that the returned artifact contains
+the text; a generated summary is not a verbatim original citation.
+
+Each returned native member is a regex boundary. `unit` means page, slide,
+transcript segment, or the native producer's declared unit; `record` means the
+whole returned artifact record. Neither joins across pagination or concatenates
+semantic chunks. Select nonoverlapping extraction units for default lexical
+search; explicitly selected semantic chunks may overlap. Match offsets address
+the returned artifact text, not original PDF/audio bytes. JSON provenance carries
+the parent document/source revision, artifact identity/key/revision, text field,
+boundary, producer purpose and available native locator data. Times and spatial
+coordinates retain the native producer's units/coordinate metadata; missing
+locators are not fabricated.
+
+Grep validates its ordinary native artifact-backed full-text index binding,
+then enumerates authorized source rows and seeks each selected producer through
+`hierarchy.children` member traversal. It applies path/type exclusions before
+fetching members and batches up to 100 authorized parents per traversal using
+`parent: {level: "source", ids: [...]}`. Parent and member pages share one retained
+snapshot; native prefix cursors bound page work without collecting or sorting
+the global artifact population. Original-content `candidate_index` trigrams
+never prune artifact text; their certificate does not cover derived content. The regex
+runs locally over the actual selected text. Native stream readiness and index
+incarnation and target/published data revisions are checked before and after the scan.
+Each member page also requires producer completion on the retained storage cut,
+so current readiness cannot certify an older incomplete snapshot. Scalar artifact
+values use the transient `{"$": value}` query projection; stored artifacts are unchanged. Pending/failed extraction,
+missing mappings, stale definitions, exhausted work/memory/request limits and
+expired snapshots produce incomplete/error status (exit 2), never a complete
+no-match (exit 1). Source publication alone does not establish extraction
+completeness. API credentials and current server authorization/RLS govern access;
+client principal/source filters only narrow the result set.

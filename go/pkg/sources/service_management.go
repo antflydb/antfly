@@ -44,13 +44,13 @@ func managementSource(source Source) management.Source {
 	_ = json.Unmarshal(source.Config, &cfg)
 	publication := source.Publication
 	if publication == "" {
-		publication = "text"
+		publication = "native"
 	}
 	var perms management.Permissions
 	if source.Permissions != nil {
 		perms = management.Permissions{Public: source.Permissions.Public, Readers: source.Permissions.Readers}
 	}
-	return management.Source{Id: source.ID, Name: source.Alias, Connection: source.Connection, Table: source.Table, Config: cfg, Permissions: perms, PermissionTtlSeconds: source.PermissionTTLSeconds, Publication: management.SourcePublication(publication), State: "configured"}
+	return management.Source{Streams: source.Streams, Id: source.ID, Name: source.Alias, Connection: source.Connection, Table: source.Table, Config: cfg, Permissions: perms, PermissionTtlSeconds: source.PermissionTTLSeconds, Publication: management.SourcePublication(publication), State: "configured"}
 }
 func (b localManagement) ListSources(ctx context.Context, limit int, cursor string) (management.SourcePage, error) {
 	b.s.mu.Lock()
@@ -111,7 +111,7 @@ func (b localManagement) PutSource(ctx context.Context, input management.Source)
 	if err != nil {
 		return management.Source{}, err
 	}
-	source := Source{ID: input.Id, Alias: input.Name, Connection: input.Connection, Table: input.Table, Config: cfg, Publication: string(input.Publication), Permissions: &Permissions{Public: input.Permissions.Public, Readers: input.Permissions.Readers}, PermissionTTLSeconds: input.PermissionTtlSeconds}
+	source := Source{Streams: input.Streams, ID: input.Id, Alias: input.Name, Connection: input.Connection, Table: input.Table, Config: cfg, Publication: string(input.Publication), Permissions: &Permissions{Public: input.Permissions.Public, Readers: input.Permissions.Readers}, PermissionTTLSeconds: input.PermissionTtlSeconds}
 	if _, err = b.legacy(ctx, "PUT", "/v1/sources/"+input.Id, source); err != nil {
 		return management.Source{}, err
 	}

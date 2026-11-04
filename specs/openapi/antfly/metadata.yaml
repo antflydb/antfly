@@ -9329,7 +9329,14 @@ components:
     HierarchyChildParent:
       type: object
       additionalProperties: false
-      required: [level, id]
+      required: [level]
+      not:
+        anyOf:
+          - required: [id, ids]
+          - not:
+              anyOf:
+                - required: [id]
+                - required: [ids]
       properties:
         level:
           type: string
@@ -9337,20 +9344,56 @@ components:
         id:
           type: string
           minLength: 1
+        ids:
+          type: array
+          minItems: 1
+          maxItems: 100
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+          description: Bounded source selection for member traversal; unit traversal requires id.
 
     HierarchyChildren:
       type: object
       additionalProperties: false
       required: [parent, level]
+      not:
+        anyOf:
+          - required: [artifact]
+            properties:
+              level:
+                enum: [unit]
+          - properties:
+              level:
+                enum: [unit]
+              parent:
+                not:
+                  required: [id]
+          - properties:
+              level:
+                enum: [member]
+            not:
+              required: [artifact]
       properties:
         parent:
           $ref: "#/components/schemas/HierarchyChildParent"
         level:
           type: string
-          enum: [unit]
+          enum: [unit, member]
           description: |
             Child level to enumerate. Unit traversal reads the versioned extraction
             hierarchy rather than a relevance index, so empty and failed units are included.
+            Member traversal requires artifact and seeks that producer's native storage
+            prefixes within the selected source or parent.ids batch (up to 100).
+            One global cursor orders the selected members; it includes generic assets and chunks.
+            Scalar member payloads are returned as {"$": value} in _source so
+            every query hit retains an object-shaped projection. Continuation
+            requires the remote_snapshot returned with the first page.
+        artifact:
+          type: string
+          minLength: 1
+          description: Producer name; required for member traversal and omitted for unit traversal.
 
     HierarchyChildrenOrderBy:
       type: array
@@ -9404,7 +9447,9 @@ components:
 
         `children` is a separate sequential-browsing operation. It enumerates every unit
         in the selected source revision, including units with no searchable chunk, and uses
-        the top-level `_sort`/`search_after` cursor contract.
+        the top-level `_sort`/`search_after` cursor contract. For member traversal,
+        `filter_query` applies to source parents before any artifact enumeration;
+        it never filters member payloads or changes the member pagination order.
 
         Ancestor and nested-match field projections are always explicit to keep response
         size predictable. The presence of this object selects the canonical contract:
@@ -9613,12 +9658,17 @@ components:
                     required: [group_by]
               - not:
                   required: [fields]
-          - description: Hierarchy child traversal requires an explicit top-level field projection.
+          - description: Unit child traversal requires an explicit top-level field projection.
             allOf:
               - required: [hierarchy]
                 properties:
                   hierarchy:
                     required: [children]
+                    properties:
+                      children:
+                        properties:
+                          level:
+                            enum: [unit]
               - not:
                   required: [fields]
           - description: Hierarchy child traversal requires its revision-bound ascending position order.
@@ -9672,7 +9722,18 @@ components:
                   - required: [order_by]
                   - required: [search_after]
                   - required: [search_before]
-          - description: Relevance, filtering, backward/offset pagination, and result transforms do not apply to sequential child traversal.
+          - description: Unit traversal has no public source-filter admission contract.
+            allOf:
+              - required: [filter_query, hierarchy]
+                properties:
+                  hierarchy:
+                    required: [children]
+                    properties:
+                      children:
+                        properties:
+                          level:
+                            enum: [unit]
+          - description: Relevance, backward/offset pagination, and result transforms do not apply to sequential child traversal.
             allOf:
               - required: [hierarchy]
                 properties:
@@ -9682,7 +9743,6 @@ components:
                   - required: [query]
                   - required: [full_text_search]
                   - required: [full_text_index]
-                  - required: [filter_query]
                   - required: [exclusion_query]
                   - required: [semantic_search]
                   - required: [embedding_template]
@@ -11038,6 +11098,12 @@ components:
           x-go-type-skip-optional-pointer: false
         unit_id:
           type: string
+        revision:
+          type: string
+          description: Opaque fingerprint of this member's native content and captured producer/input state; independent of hierarchy traversal cursors.
+        derivation_revision:
+          type: string
+          description: Opaque fingerprint of the captured producer/input state, when available. Changes to producer configuration or acquired input reopen this identity.
         source:
           $ref: "#/components/schemas/HierarchyArtifactSource"
 

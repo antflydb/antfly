@@ -20,10 +20,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -45,7 +48,7 @@ func TestSourceMediaArtifactIntegration(t *testing.T) {
 	runner.Profile.Endpoint = endpoint
 	runner.Profile.CatalogTable = table + "_catalog"
 	runner.Profile.Sources[0].Table = table
-	runner.Profile.Sources[0].Publication = "media"
+	runner.Profile.Sources[0].Publication = "native"
 	source := runner.Profile.Sources[0]
 	item := &fixture.inventory.Objects[0]
 	item.ID = strings.Replace(item.ID, "manual.txt", "manual.pdf", 1)
@@ -54,27 +57,38 @@ func TestSourceMediaArtifactIntegration(t *testing.T) {
 	fixture.data = map[string][]byte{item.ID: data}
 	item.Size = int64(len(data))
 	item.Metadata = map[string]any{"mime_type": "application/pdf"}
+	for i := 1; i < 3; i++ {
+		copy := *item
+		copy.ID = strings.Replace(item.ID, "manual.pdf", fmt.Sprintf("manual-%d.pdf", i), 1)
+		copy.Path, copy.Filename = fmt.Sprintf("manual-%d.pdf", i), fmt.Sprintf("manual-%d.pdf", i)
+		fixture.inventory.Objects = append(fixture.inventory.Objects, copy)
+		fixture.data[copy.ID] = data
+	}
 	origin := httptest.NewServer(http.NotFoundHandler())
 	defer origin.Close()
 	s, err := NewService(ServiceOptions{Profile: runner.Profile, StateDir: t.TempDir(), PublicURL: origin.URL, AdminToken: serviceTestToken, MediaKey: serviceTestKey, Factory: runner.Factory})
 	require.NoError(t, err)
 	defer s.Close()
 	origin.Config.Handler = s
-	publisher := &Publisher{Endpoint: endpoint}
+	publisher := &Publisher{Endpoint: endpoint, Client: &http.Client{Transport: smokeDiagnosticTransport{t}}}
 	asset := map[string]any{
-		"name": "document_units_v1", "kind": "asset", "template": "{{grep.media.uri}}", "content_type": "application/json",
+		"name": "document_units_v1", "kind": "asset", "template": "{{content.resource.uri}}", "content_type": "application/json",
 		"producer_json": `{"type":"document_extraction","config":{}}`,
 	}
 	chunks := map[string]any{"name": "document_chunks_v1", "kind": "chunk", "source_artifact_name": "document_units_v1", "field": "text", "chunk_size": 512, "chunk_overlap": 0}
 	_, err = publisher.call(t.Context(), "POST", tablePath(table), map[string]any{
 		"num_shards": 1,
-		"indexes": map[string]any{"source_chunks": map[string]any{
+		"indexes": map[string]any{"source_units": map[string]any{"type": "full_text", "sources": []any{map[string]any{"artifact": "document_units_v1", "field": "text"}}}, "source_chunks": map[string]any{
 			"type": "full_text", "field": "text", "artifact_name": "document_chunks_v1",
 			"enrichments": []any{asset, chunks},
 		}},
 	})
 	require.NoError(t, err)
 	defer func() {
+		if os.Getenv("ANTFLY_SOURCE_TEST_KEEP_TABLES") == "1" {
+			t.Logf("retained native smoke table=%s", table)
+			return
+		}
 		_, _ = publisher.call(context.Background(), "DELETE", tablePath(table), nil)
 		_, _ = publisher.call(context.Background(), "DELETE", tablePath(runner.Profile.CatalogTable), nil)
 	}()
@@ -89,6 +103,20 @@ func TestSourceMediaArtifactIntegration(t *testing.T) {
 		return job.State != "running"
 	}, 90*time.Second, 100*time.Millisecond)
 	require.Equal(t, "completed", job.State, job)
+	// A matching member from another source sorts before this source's rows.
+	// Source predicates must run before pagination, not after a one-hit page.
+	ref, err := s.pinMedia(t.Context(), source, Request{SourceNamespace: "job/" + source.ID, Config: source.Config, Mode: ImportModeSource}, fixture.inventory.Objects[0])
+	require.NoError(t, err)
+	otherID := "00000000-0000-4000-8000-000000000001"
+	otherItem := fixture.inventory.Objects[0]
+	otherItem.ID = strings.Replace(otherItem.ID, source.ID, otherID, 1)
+	other, err := NormalizeMedia(otherID, otherItem, ref, Permissions{Readers: []string{"user:self"}}, time.Now())
+	require.NoError(t, err)
+	otherKey, err := RecordKey(otherID, otherItem.ID)
+	require.NoError(t, err)
+	otherRow, err := SourceRow(otherKey, otherID, other)
+	require.NoError(t, err)
+	require.NoError(t, publisher.Batch(t.Context(), table, map[string]any{otherKey: otherRow}, nil))
 	key, err := RecordKey(source.ID, fixture.inventory.Objects[0].ID)
 	require.NoError(t, err)
 	path := tablePath(table) + "/documents/" + url.PathEscape(key) + "/artifacts/document_units_v1?detail=raw"
@@ -119,6 +147,47 @@ func TestSourceMediaArtifactIntegration(t *testing.T) {
 		}
 		return json.Unmarshal(raw, &result) == nil && len(result.Responses) > 0 && len(result.Responses[0].Hits.Hits) > 0
 	}, 60*time.Second, 250*time.Millisecond)
+	if binary := os.Getenv("ANTFLY_GREP_TEST_BINARY"); binary != "" {
+		require.Eventually(t, func() bool {
+			raw, err := publisher.call(t.Context(), "GET", tablePath(table)+"/indexes/source_units", nil)
+			if err != nil {
+				return false
+			}
+			var status struct {
+				Status struct{ Readiness struct{ Complete bool } }
+			}
+			return json.Unmarshal(raw, &status) == nil && status.Status.Readiness.Complete
+		}, 90*time.Second, 250*time.Millisecond)
+		config := map[string]any{"version": 1, "endpoint": endpoint, "page_size": 1, "principals": []string{"user:self"}, "tables": []any{map[string]any{
+			"name": "native-pdfs", "table": table, "fields": CanonicalDocumentFields(), "source_filter": json.RawMessage(SourceFilter(source.ID)),
+			"streams": []TextStream{{Name: "pages", Artifact: "document_units_v1", Index: "source_units", Field: "text", Purpose: "extraction", Default: true, Boundary: "unit", LocationField: "provenance"}},
+		}}}
+		file := filepath.Join(t.TempDir(), "grep.json")
+		require.NoError(t, writeJSON(file, config, 1<<20))
+		run := func(pattern string, args ...string) ([]byte, error) {
+			command := []string{"--table-config", file, "--json"}
+			command = append(command, args...)
+			command = append(command, pattern)
+			return exec.CommandContext(t.Context(), binary, command...).CombinedOutput()
+		}
+
+		output, err := run("retry")
+		require.NoError(t, err, string(output))
+		require.Equal(t, 3, bytes.Count(output, []byte(`"type":"match"`)), string(output))
+		require.Contains(t, string(output), `"artifact_key"`)
+		require.Contains(t, string(output), `"document_units_v1"`)
+		require.Contains(t, string(output), `"text_field":"text"`)
+		output, err = run("no-such-phrase")
+		var exit *exec.ExitError
+		require.ErrorAs(t, err, &exit, string(output))
+		require.Equal(t, 1, exit.ExitCode(), string(output))
+		output, err = run("retry", "--max-index-documents", "1")
+		require.ErrorAs(t, err, &exit, string(output))
+		require.Equal(t, 2, exit.ExitCode(), string(output))
+		output, err = run("retry", "--artifact", "not-configured")
+		require.ErrorAs(t, err, &exit, string(output))
+		require.Equal(t, 2, exit.ExitCode(), string(output))
+	}
 	require.NoError(t, publisher.Batch(t.Context(), table, map[string]any{"foreign": map[string]any{"title": "preserve"}}, nil))
 	suspended := source
 	suspended.ID = "22222222-2222-4222-8222-222222222222"
@@ -148,7 +217,7 @@ func TestSourceMediaArtifactIntegration(t *testing.T) {
 }
 
 func integrationPDF() []byte {
-	stream := "BT /F1 12 Tf 30 700 Td (retry budget) Tj ET"
+	stream := "BT /F1 12 Tf 30 700 Td (retry budget. Native acquisition preserves original bytes and source identity. The database extracts this complete text layer into a revision fenced native artifact. Search clients consume those artifacts without exporting or ingesting duplicate pages.) Tj ET"
 	objects := []string{
 		"<< /Type /Catalog /Pages 2 0 R >>",
 		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
@@ -170,4 +239,17 @@ func integrationPDF() []byte {
 	}
 	fmt.Fprintf(&out, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(offsets), xref)
 	return out.Bytes()
+}
+
+type smokeDiagnosticTransport struct{ t *testing.T }
+
+func (transport smokeDiagnosticTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := http.DefaultTransport.RoundTrip(request)
+	if err == nil && response.StatusCode >= 400 {
+		body, readErr := io.ReadAll(io.LimitReader(response.Body, 8<<20))
+		response.Body.Close()
+		response.Body = io.NopCloser(bytes.NewReader(body))
+		transport.t.Logf("native smoke API %s %s status=%d body=%s read_error=%v", request.Method, request.URL.Path, response.StatusCode, body, readErr)
+	}
+	return response, err
 }
