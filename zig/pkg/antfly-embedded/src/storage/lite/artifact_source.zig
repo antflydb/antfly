@@ -88,6 +88,80 @@ fn retainPooled(identity: ArtifactIdentity) ?*State {
     return state;
 }
 
+/// A file owner may retain immutable artifact Sources across runtime teardown.
+/// Entries hold neither a DB nor a primary snapshot. Exact pooled identities
+/// remain protected by their durable artifact leases for the retained lifetime.
+/// All methods are serialized by the file owner's admission gate.
+pub const WorkingSet = struct {
+    const max_entries = 128;
+    const max_bytes = 128 * 1024 * 1024;
+    const lifetime_ns = 5 * std.time.ns_per_s;
+    entries: [max_entries]?*State = @splat(null),
+    count: usize = 0,
+    inode: ?u64 = null,
+    bytes: u64 = 0,
+    range_bytes: u64 = 0,
+    expires_ns: u64 = 0,
+
+    pub fn clear(self: *WorkingSet) void {
+        // Release outside both pool and registry mutexes: final release may
+        // retire its marker and resource-accounting owner.
+        for (self.entries[0..self.count]) |entry| {
+            const state = entry.?;
+            State.releaseUse(state);
+            State.close(state);
+        }
+        self.* = .{};
+    }
+
+    pub fn observe(self: *WorkingSet, inode: u64, now_ns: u64) void {
+        if ((self.inode != null and self.inode.? != inode) or now_ns >= self.expires_ns)
+            self.clear();
+    }
+
+    pub fn capture(self: *WorkingSet, registry: *Registry, inode: u64, generation_bytes: u64, now_ns: u64) void {
+        self.observe(inode, now_ns);
+        if (self.count == max_entries) return;
+        // Source references are protected by the pool mutex. Registry owns
+        // list membership; each state's lifetime mutex protects active uses.
+        @import("antfly_platform").sync.lockYielding(&source_pool_mutex);
+        defer source_pool_mutex.unlock();
+        const io = registry.io();
+        registry.mutex.lockUncancelable(io);
+        defer registry.mutex.unlock(io);
+        var next = registry.first;
+        var visited: usize = 0;
+        while (next) |state| {
+            next = state.next;
+            visited += 1;
+            if (visited > max_entries or self.count == max_entries) break;
+            const identity = state.pool_identity orelse continue;
+            if (identity.inode != inode) continue;
+            var duplicate = false;
+            for (self.entries[0..self.count]) |entry| if (entry.? == state) {
+                duplicate = true;
+                break;
+            };
+            if (duplicate) continue;
+            @import("antfly_platform").sync.lockYielding(&state.lifetime_mutex);
+            defer state.lifetime_mutex.unlock();
+            if (state.marker == null or state.resources_closed.load(.monotonic)) continue;
+            const overhead = state.source().ranges.retention_overhead_bytes;
+            const charge = state.value.length +| overhead;
+            if (charge > max_bytes -| self.bytes or state.value.length > generation_bytes -| self.range_bytes) continue;
+            state.source_references += 1;
+            state.active_uses += 1;
+            self.entries[self.count] = state;
+            self.count += 1;
+            self.bytes += charge;
+            self.range_bytes += state.value.length;
+            self.inode = inode;
+            // Existing entries do not extend their deadline on every poll.
+            if (self.expires_ns == 0) self.expires_ns = now_ns +| lifetime_ns;
+        }
+    }
+};
+
 pub const Registry = struct {
     allocator: Allocator,
     io_impl: std.Io.Threaded,

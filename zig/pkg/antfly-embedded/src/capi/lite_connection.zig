@@ -1385,6 +1385,7 @@ pub const Owner = struct {
     maintenance_retained_logical: ?native.LogicalGenerations = null,
     text_source_runtime_cache: ?*TextSourceRuntimeCache = null,
     immutable_text_handoff: ?ImmutableTextHandoff = null,
+    immutable_sources: @import("../storage/lite/artifact_source.zig").WorkingSet = .{},
     maintenance_table_cursor: usize = 0,
     maintenance_round_pending: bool = false,
     maintenance_round_ttl_pending: bool = false,
@@ -1534,6 +1535,7 @@ pub const Owner = struct {
             defer probe.close();
             const file = &current.owned_lite_backend.?.native_docstore.?.file;
             const probe_inode = (try probe.file.stat(probe.runtime())).inode;
+            self.immutable_sources.observe(probe_inode, @import("antfly_platform").time.monotonicNs());
             // Establish the fenced tip before opening any new read pins.
             // Existing readers of an unknown peer publication remain poisoned.
             self.reader_coordinator.observeCurrent(probe_inode, probe.headerFingerprint());
@@ -2275,6 +2277,7 @@ pub const Owner = struct {
     /// File-wide uncertainty outlives a detached runtime. Preserve its fence
     /// on the serving wrapper before retiring cached immutable readers.
     fn preserveMaintenanceOutcomeFence(self: *Owner) void {
+        self.immutable_sources.clear();
         const current = self.current orelse return;
         const current_store = current.owned_lite_backend.?.native_docstore.?;
         for ([_]?*h.Handle{ self.maintenance_snapshot, if (self.pending_text_merge) |pending| pending.root else null }) |maybe_root| {
@@ -2348,7 +2351,15 @@ pub const Owner = struct {
         // allocation or resource refusal must not alter a committed outcome.
         self.clearImmutableTextHandoff();
         if (self.stopping.load(.acquire)) return;
-        if (self.current) |current| if (needsOutcomeReconciliation(current)) return;
+        if (self.current) |current| if (needsOutcomeReconciliation(current)) {
+            self.immutable_sources.clear();
+            return;
+        };
+        const store = root.owned_lite_backend.?.native_docstore.?;
+        if (store.artifact_registry) |registry| {
+            const inode = (store.file.file.stat(store.file.runtime()) catch return).inode;
+            self.immutable_sources.capture(registry, inode, store.file.activeCheckpoint().page_count *| store.file.header.page_size, @import("antfly_platform").time.monotonicNs());
+        }
         self.immutable_text_handoff = ImmutableTextHandoff.capture(root, database) catch null;
     }
 
@@ -2360,6 +2371,7 @@ pub const Owner = struct {
     }
 
     fn expireImmutableTextHandoff(self: *Owner, now_ns: u64) void {
+        if (now_ns >= self.immutable_sources.expires_ns) self.immutable_sources.clear();
         if (self.immutable_text_handoff) |handoff| if (now_ns >= handoff.expires_ns)
             self.clearImmutableTextHandoff();
     }
@@ -2442,6 +2454,7 @@ pub const Owner = struct {
         std.debug.assert(physical_tip == null or !need_database);
         std.debug.assert(name == null or need_database);
         const file = physical_tip orelse &foreground.owned_lite_backend.?.native_docstore.?.file;
+        self.immutable_sources.observe((try file.file.stat(file.runtime())).inode, @import("antfly_platform").time.monotonicNs());
         if (self.maintenance_snapshot) |snapshot| {
             const cached_store = snapshot.owned_lite_backend.?.native_docstore.?;
             const captured = &cached_store.file;
@@ -4020,6 +4033,7 @@ pub const Owner = struct {
 
     fn deinit(self: *Owner) void {
         if (self.worker) |worker| worker.join();
+        self.immutable_sources.clear();
         self.clearImmutableTextHandoff();
         self.clearTextSourceRuntimeCache();
         const uncertain_merge = if (self.pending_text_merge) |pending| needsOutcomeReconciliation(pending.root) else false;
@@ -9075,6 +9089,9 @@ test "capi native named runtime replacement hands off immutable artifact sources
     defer rejected.deinit();
     try std.testing.expect(!try rejected.append(selected.core.index_manager.text_indexes.items[0].persistent.acquireSnapshot(), 0, 0));
     owner.preserveImmutableTextHandoff(first, selected);
+    try std.testing.expect(owner.immutable_sources.count != 0);
+    try std.testing.expect(owner.immutable_sources.bytes <= 128 * 1024 * 1024);
+    try std.testing.expect(owner.immutable_sources.range_bytes <= first.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().page_count *| first.owned_lite_backend.?.native_docstore.?.file.header.page_size);
     try std.testing.expect(owner.immutable_text_handoff != null);
     try std.testing.expect(owner.immutable_text_handoff.?.pins.bytes <= ImmutableTextHandoff.max_bytes);
     try std.testing.expect(owner.immutable_text_handoff.?.pins.source_bytes <= owner.immutable_text_handoff.?.generation_bytes);
@@ -9099,6 +9116,8 @@ test "capi native named runtime replacement hands off immutable artifact sources
     // open fresh sources, and allocator-work counters move between wrappers.
     try std.testing.expectEqual(original_source.ranges.ptr, replacement_source.ranges.ptr);
     try std.testing.expect(owner.immutable_text_handoff == null);
+    // File-owned sources survive the single-namespace reader handoff.
+    try std.testing.expect(owner.immutable_sources.count != 0);
     {
         var row = (try (try tables.get(second, "active")).lookup(std.testing.allocator, "one", .{})) orelse return error.TestUnexpectedResult;
         defer row.deinit(std.testing.allocator);
@@ -9116,6 +9135,7 @@ test "capi native named runtime replacement hands off immutable artifact sources
     try std.testing.expect(owner.immutable_text_handoff.?.resource_owner.owned_resources != null);
     owner.expireImmutableTextHandoff(std.math.maxInt(u64));
     try std.testing.expect(owner.immutable_text_handoff == null);
+    try std.testing.expectEqual(@as(usize, 0), owner.immutable_sources.count);
 }
 
 test "capi native maintenance relational replay diagnoses bounded runtime reuse" {
