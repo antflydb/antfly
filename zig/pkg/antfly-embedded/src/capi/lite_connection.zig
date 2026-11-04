@@ -8676,18 +8676,18 @@ test "capi native foreground namespace refresh retains predecessor inputs only t
     var fixture = try AdmissionFollowupFixture.init("foreground-namespace-input-handoff", 5000, .batch);
     defer fixture.deinit();
     const owner = fixture.connection.owner;
-    const Probe = struct {
-        fn rewrite(f: *AdmissionFollowupFixture, path: []const u8, payload: []const u8) !void {
+    const Peer = struct {
+        fn advance(f: *AdmissionFollowupFixture) !void {
             var peer = try native.NativeFile.openWithIo(std.testing.allocator, h.handleLockIo(), f.path, .{ .externally_locked = true, .no_sync = true, .reader_coordinator = f.connection.owner.reader_coordinator });
             defer peer.close();
             try peer.inheritAllocatorVerification(&f.connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file);
-            try peer.putIndexCatalogRecord(path, payload);
+            var cut: [8]u8 = undefined;
+            std.mem.writeInt(u64, &cut, peer.activeCheckpoint().commit_sequence, .little);
+            // A real foreign metadata publication requires reconstruction, but
+            // leaves every named-table artifact's immutable value unchanged.
+            try peer.putCatalogRecord("test/foreground-admission-cut", &cut);
         }
     };
-    var key: []u8 = &.{};
-    defer a.free(key);
-    var bytes: []u8 = &.{};
-    defer a.free(bytes);
     var source_ptr: *anyopaque = undefined;
     var segment_id: u64 = undefined;
     var old_address: usize = undefined;
@@ -8701,26 +8701,20 @@ test "capi native foreground namespace refresh retains predecessor inputs only t
         const root = try owner.refresh();
         try tables.create(root, "active", "{}", false);
         const table = try tables.get(root, "active");
-        try table.createIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+        try table.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
         try table.batch(.{ .writes = &.{.{ .key = "one", .value = "{\"text\":\"first canary\"}" }}, .sync_level = .full_text });
         try table.batch(.{ .writes = &.{.{ .key = "two", .value = "{\"text\":\"second canary\"}" }}, .sync_level = .full_text });
-        const persistent = table.core.index_manager.textIndex("text").?;
         {
-            const snapshot = persistent.acquireSnapshot();
-            defer snapshot.release();
-            try std.testing.expectEqual(@as(usize, 2), snapshot.segments.len);
-            const source = snapshot.segments[0].reader.immutableSource();
-            try std.testing.expect(source == .ranges);
-            source_ptr = source.ranges.ptr;
-            segment_id = snapshot.segments[0].id;
-            key = try std.fmt.allocPrint(a, "{s}/{d}.seg", .{ persistent.segment_files.?.root_dir, snapshot.segments[1].id });
-            bytes = (try root.owned_lite_backend.?.native_docstore.?.file.getIndexCatalogRecordAlloc(a, key)) orelse return error.TestUnexpectedResult;
+            const inventory = table.core.index_manager.textIndex("text").?.acquireSnapshot();
+            defer inventory.release();
+            try std.testing.expectEqual(@as(usize, 2), inventory.segments.len);
         }
         old_address = @intFromPtr(root);
-        try Probe.rewrite(&fixture, key, bytes);
         const before_unbridged = root.owned_lite_backend.?.native_docstore.?.file.allocator_work.artifact_source_opens;
-        // A direct refresh has no admission bridge. Establish the negative
-        // control with the same native inputs, without a reference binary.
+        try Peer.advance(&fixture);
+        // No extra snapshot or read pin keeps the predecessor alive here.
+        // Establish the old lifecycle's negative control using this candidate,
+        // without building or running a performance-reference binary.
         const unbridged = try owner.refresh();
         try std.testing.expect(@intFromPtr(unbridged) != old_address);
         const cold_table = try tables.get(unbridged, "active");
@@ -8728,11 +8722,13 @@ test "capi native foreground namespace refresh retains predecessor inputs only t
         {
             const inventory = cold_table.core.index_manager.textIndex("text").?.acquireSnapshot();
             defer inventory.release();
-            source_ptr = inventory.segments[0].reader.immutableSource().ranges.ptr;
+            const source = inventory.segments[0].reader.immutableSource();
+            try std.testing.expect(source == .ranges and source.ranges.retention_artifact_only);
+            source_ptr = source.ranges.ptr;
             segment_id = inventory.segments[0].id;
         }
         old_address = @intFromPtr(unbridged);
-        try Probe.rewrite(&fixture, key, bytes);
+        try Peer.advance(&fixture);
         opens_before = unbridged.owned_lite_backend.?.native_docstore.?.file.allocator_work.artifact_source_opens;
     }
     var child: ?*anyopaque = null;
@@ -8748,17 +8744,15 @@ test "capi native foreground namespace refresh retains predecessor inputs only t
             fixture.connection.gate.mutex.unlock(io);
         }
         const table = try tables.get(owner.current.?, "active");
-        const snapshot = table.core.index_manager.textIndex("text").?.acquireSnapshot();
-        defer snapshot.release();
-        const unchanged = for (snapshot.segments) |*entry| {
+        const inventory = table.core.index_manager.textIndex("text").?.acquireSnapshot();
+        defer inventory.release();
+        const unchanged = for (inventory.segments) |*entry| {
             if (entry.id == segment_id) break entry.reader.immutableSource();
         } else return error.TestUnexpectedResult;
         try std.testing.expectEqual(source_ptr, unchanged.ranges.ptr);
-        // Only the rewritten artifact needs a new durable lease. Unchanged
-        // inputs must be borrowed while the predecessor still owns them.
-        try std.testing.expectEqual(opens_before + 1, owner.current.?.owned_lite_backend.?.native_docstore.?.file.allocator_work.artifact_source_opens);
+        try std.testing.expectEqual(opens_before, owner.current.?.owned_lite_backend.?.native_docstore.?.file.allocator_work.artifact_source_opens);
         try std.testing.expect((try owner.current.?.owned_lite_backend.?.native_docstore.?.file.check()).valid);
-        try Probe.rewrite(&fixture, key, bytes);
+        try Peer.advance(&fixture);
     }
     var missing: ?*anyopaque = null;
     try std.testing.expect(api.antfly_db_open_table(fixture.id, .fromSlice("missing"), &missing) != .ok);
