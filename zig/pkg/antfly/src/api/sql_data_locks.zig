@@ -80,6 +80,7 @@ pub fn submit(server: *Server, a: A, context: operation.RequestContext, table: [
     const group = input.admission.binding.namespace.group;
     const checked = try authorize(server, a, context, group, table, input);
     const request: local.storage_db_types.BatchRequest = .{ .sql_lock = checked, .sync_level = .write };
+
     if (server.cfg.routed_raft_batch_writer) |writer| {
         const forwarding = @import("internal_batch_forwarding.zig");
         // The data leader independently authorizes this strict private shape.
@@ -89,6 +90,25 @@ pub fn submit(server: *Server, a: A, context: operation.RequestContext, table: [
             .forwards_remaining = forwarding.max_forwards,
             .campaign_allowed = false,
         }, context)) orelse return error.GroupLeaderUnavailable;
+    } else if (server.cfg.deployment_mode != .standalone) {
+        // Metadata/compute ingress does not own a data Raft writer. Its
+        // group-local kernel cache is not authority to mutate a replica.
+        // Route the strict private control to the accepting data leader,
+        // exactly as observe routes its linearizable readback.
+        const routes = @import("table_router.zig");
+        var fallback = routes.CatalogBackedGroupRouter.init(server.catalogSource(), server.localSessionNodeId());
+        var route = (try routes.resolveGroupRoute(a, server.catalogSource(), server.cfg.session_router orelse fallback.router(), group, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
+        defer route.deinit(a);
+        if (route != .remote) return error.GroupLeaderUnavailable;
+        const encoded = try local.api_batch.encodeBatchRequest(a, request);
+        defer a.free(encoded);
+        var client = @import("http_client.zig").ApiHttpClient.init(a, server.cfg.session_executor orelse return error.UnsupportedOperation);
+        _ = client.withInternalServiceAuth(server.cfg.internal_service_secret, server.cfg.internal_service_issuer);
+        var cancellation = @import("../raft/transport/http_common.zig").RequestCancellation.fromToken(context.cancellation);
+        const forwarding = @import("internal_batch_forwarding.zig");
+        const remaining = @min((try context.remainingTimeoutMs()) orelse forwarding.max_remaining_ms, forwarding.max_remaining_ms);
+        var response = try client.fetchGroupBatchWithForwarding(route.remote.base_uri, group, table, encoded, remaining, .{ .remaining_ms = remaining, .forwards_remaining = forwarding.max_forwards, .campaign_allowed = false }, &cancellation, null);
+        defer response.deinit(a);
     } else {
         const writes = server.table_writes orelse return error.UnsupportedOperation;
         _ = (try writes.batchGroupLocal(a, group, table, request)) orelse return error.GroupLeaderUnavailable;

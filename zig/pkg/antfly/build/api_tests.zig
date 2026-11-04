@@ -2384,6 +2384,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL original temporal bins and transaction dates preserve typed writes and cold postimages",
             "mounted SQL original binary cursor preserves PostgreSQL scroll hold formats and cold owners",
             "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners",
+            "mounted SQL original server COPY",
             "SQL pgwire retained mutation preparation",
             "mounted SQL temporal originals and mutation assignments preserve diagnostics precise kinds and cold postimages",
             "mounted SQL temporal view domains survive nested replacement and cold owners",
@@ -2676,6 +2677,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const copy_input_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners", "SQL pgwire retained mutation preparation", "SQL schema cache COPY validator leases" });
     copy_input_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-copy-input-lifecycle-test", "Verify atomic COPY input through authenticated native transactions and cold owners").dependOn(&copy_input_run.step);
+    const server_copy_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original server COPY"});
+    server_copy_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-server-copy-test", "Qualify original server COPY file/program execution and native atomic completion").dependOn(&server_copy_run.step);
+    const copy_locking_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original server COPY", "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners", "SQL pgwire retained mutation preparation", "SQL schema cache COPY validator leases", "mounted SQL original advisory locks", "mounted SQL original table and row locks", "mounted SQL native sync controls", "mounted SQL original prepared transactions", "pgwire transaction preparation" });
+    copy_locking_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-copy-locking-test", "Verify COPY and locking regression cohorts with one native owner artifact").dependOn(&copy_locking_run.step);
+
     const cursor_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original binary cursor preserves PostgreSQL scroll hold formats and cold owners"});
     cursor_lifecycle_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-cursor-lifecycle-test", "Verify PostgreSQL cursor formats and lifetimes through authenticated cold native owners")

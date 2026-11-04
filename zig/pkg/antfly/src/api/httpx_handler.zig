@@ -6965,7 +6965,7 @@ pub const AntflyApiHandler = struct {
             const compiled = lease.compiled();
             // COPY owns a wire streaming contract. Neither JSON execution nor
             // JSON prepared resources may silently expose its SELECT body.
-            if (compiled.statement == .copy_to or compiled.statement == .copy_from) return error.UnsupportedSqlExecution;
+            if ((compiled.statement == .copy_to or compiled.statement == .copy_from) and @import("sql_copy_server.zig").target(compiled.statement) == null) return error.UnsupportedSqlExecution;
             if (self.prepared_mode == .prepare) {
                 if (self.statement.len > prepared.max_statement_bytes) return error.SqlProgramLimitExceeded;
                 switch (compiled.statement) {

@@ -416,6 +416,9 @@ pub const Adapter = struct {
     /// settings and snapshot scope as ordinary execution. Mutation and active
     /// transaction paths continue to own their acknowledgement result.
     read_delivery: ?struct {
+        /// Internal sinks may consume under the live transaction execution
+        /// lease. Public delivery keeps its existing post-stage contract.
+        in_transaction: bool = false,
         ptr: *anyopaque,
         deliver: *const fn (*anyopaque, std.mem.Allocator, *@import("antfly_local_sources").sql_read_stream.Stream) anyerror!@import("antfly_local_sources").sql_runtime.Result,
     } = null,
@@ -514,6 +517,8 @@ pub const Adapter = struct {
     }
 
     pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("antfly_local_sources").sql_compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits, guarded_backend: ?catalog.Backend) !@import("antfly_local_sources").sql_runtime.Result {
+        if (@import("sql_copy_server.zig").target(compiled.statement) != null)
+            return @import("sql_copy_server.zig").execute(self, alloc, compiled, parameters, limits, guarded_backend);
         defer self.releaseExecutionOwners();
         var result = self.executeInner(alloc, compiled, parameters, limits, guarded_backend) catch |err| {
             try @import("sql_sequence_execution.zig").flush(self);
@@ -642,7 +647,7 @@ pub const Adapter = struct {
             self.result_session_id = if (session.transaction_id) |id| std.fmt.bytesToHex(id, .lower) else null;
         }
         errdefer if (zig017_return_error) |err| if (err != error.SqlWriteCapacityUnavailable) session.statementFailed() catch {};
-        if ((compiled.statement == .select or compiled.statement == .explain) and self.read_requirements.visibility == .committed and inherited != null and inherited.?.metadata.accepted_lake_reads) return zig017_failure: {
+        if ((compiled.statement == .select or compiled.statement == .copy_to or compiled.statement == .explain) and self.read_requirements.visibility == .committed and inherited != null and inherited.?.metadata.accepted_lake_reads) return zig017_failure: {
             zig017_return_error = error.ReadSnapshotTooOld;
             break :zig017_failure error.ReadSnapshotTooOld;
         };
@@ -781,7 +786,7 @@ pub const Adapter = struct {
         };
         if (session.transaction_id != null) {
             const transaction = (session.statement(switch (compiled.statement) {
-                .select, .explain, .call, .notification => false,
+                .select, .copy_to, .explain, .call, .notification => false,
                 else => true,
             }) catch |zig017_err| {
                 zig017_return_error = zig017_err;
@@ -836,7 +841,7 @@ pub const Adapter = struct {
                     }
                 }
                 _ = (session.statement(switch (compiled.statement) {
-                    .select, .explain, .call, .notification => false,
+                    .select, .copy_to, .explain, .call, .notification => false,
                     else => true,
                 }) catch |zig017_err| {
                     zig017_return_error = zig017_err;
@@ -936,7 +941,15 @@ pub const Adapter = struct {
                     active_backend.coordinated_index_reads = self.dynamic_snapshot == null and self.pending_transaction_cut == null and self.range_reads != null and staged.tables.len == 0;
                     active_backend.dynamic_statement_read_set = self.dynamic_snapshot != null or self.pending_transaction_cut != null;
                 }
-                var output = (@import("antfly_local_sources").sql_runtime.executeOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), active_backend, compiled, parameters, limits) catch |zig017_err| {
+                var output = (delivered: {
+                    if (self.read_delivery) |delivery| if (delivery.in_transaction and (compiled.statement == .select or compiled.statement == .copy_to)) {
+                        if (try @import("antfly_local_sources").sql_read_stream.Stream.openOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), active_backend, compiled, parameters, limits)) |stream| {
+                            defer stream.close();
+                            break :delivered try delivery.deliver(delivery.ptr, alloc, stream);
+                        }
+                    };
+                    break :delivered @import("antfly_local_sources").sql_runtime.executeOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), active_backend, compiled, parameters, limits);
+                } catch |zig017_err| {
                     zig017_return_error = zig017_err;
                     return zig017_err;
                 });
@@ -1148,6 +1161,7 @@ pub const Adapter = struct {
         const bytes = try self.server.source.systemCatalog(alloc, context, .{ .setting_snapshot = scope });
         defer alloc.free(bytes);
         const snapshot = try std.json.parseFromSliceLeaky(setting_catalog.RawSnapshot, alloc, bytes, .{ .allocate = .alloc_always });
+        if (!snapshot.scope.matchesRequest(scope)) return error.InvalidSettingCatalogSnapshot;
         if (self.expected_setting_epoch) |epoch| if (snapshot.epoch != epoch) return error.SettingCatalogChanged;
         return http_server.authorizeSqlRoleDefaults(self.server, alloc, snapshot);
     }

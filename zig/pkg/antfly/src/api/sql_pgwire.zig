@@ -207,13 +207,11 @@ pub const Adapter = struct {
         var authenticated: ?http.AuthenticatedIdentity = try credential.identity(self.server.alloc);
         defer authenticated.?.deinit(self.server.alloc);
         var authority: Authority = .{ .credential = credential, .identity = &authenticated, .request = request };
-        var context = try authority.context();
-        context.setting_read_principal = credential.sessionPrincipal();
-        const scope: @import("antfly_local_sources").sql_setting_catalog.Scope = .{ .principal = credential.sessionPrincipal(), .database = request.database orelse "default" };
-        const bytes = try self.server.source.systemCatalog(alloc, context, .{ .setting_snapshot = scope });
-        defer alloc.free(bytes);
-        const snapshot = try std.json.parseFromSliceLeaky(@import("antfly_local_sources").sql_setting_catalog.RawSnapshot, alloc, bytes, .{ .allocate = .alloc_always });
-        return http.authorizeSqlRoleDefaults(self.server, alloc, snapshot);
+        const context = try authority.context();
+        var capture_adapter: execution.Adapter = .{ .server = self.server, .identity = &authenticated, .context = context, .database = request.database orelse "default", .namespace = request.namespace orelse "public" };
+        const capture = capture_adapter.settingCapture().?;
+        if (!std.mem.eql(u8, capture.scope.principal, credential.sessionPrincipal())) return error.Forbidden;
+        return capture.owner.load(capture.owner.ptr, alloc, capture.scope);
     }
 
     fn failTransaction(raw: *anyopaque, identity: wire.Identity, request: wire.Request) !void {
@@ -618,6 +616,7 @@ const OwnedRead = struct {
         var moved = false;
         defer if (!moved) plan.release(server.sqlPlanCacheIo());
         if (plan.compiled().statement != .select and plan.compiled().statement != .copy_to) return null;
+        if (@import("sql_copy_server.zig").target(plan.compiled().statement) != null) return null;
         var admission = try server.acquireSqlExecution(false);
         defer if (!moved) admission.release();
         const self = try alloc.create(OwnedRead);
@@ -1533,9 +1532,9 @@ const Job = struct {
             for (filter_descriptors, filter_types) |descriptor, *out| out.* = if (descriptor.kind) |kind| try wireType(kind) else .unknown;
             self.description = .{
                 .cursor_readable = compiled.statement == .select,
-                .copy_out = if (compiled.statement == .copy_to) try compiled.statement.copy_to.options.clone(self.alloc) else null,
-                .copy_in = if (copy_columns) |selected| .{ .source_statement = if (compiled.statement.copy_from.predicate != null) try self.alloc.dupe(u8, self.request.statement) else null, .table = try cloneName(self.alloc, compiled.statement.copy_from.table), .columns = selected, .options = try compiled.statement.copy_from.options.clone(self.alloc) } else null,
-                .columns = columns,
+                .copy_out = if (compiled.statement == .copy_to and compiled.statement.copy_to.target == null) try compiled.statement.copy_to.options.clone(self.alloc) else null,
+                .copy_in = if (copy_columns != null and compiled.statement.copy_from.target == null) .{ .source_statement = if (compiled.statement.copy_from.predicate != null) try self.alloc.dupe(u8, self.request.statement) else null, .table = try cloneName(self.alloc, compiled.statement.copy_from.table), .columns = copy_columns.?, .options = try compiled.statement.copy_from.options.clone(self.alloc) } else null,
+                .columns = if (@import("sql_copy_server.zig").target(compiled.statement) != null) &.{} else columns,
                 .parameter_types = if (copy_input != null) filter_types else parameter_types,
                 .parameter_descriptors = if (copy_input != null) filter_descriptors else owned_descriptors,
                 .binding_guard = if (hasViewBindings(captured_bindings.items)) try encodeViewBindings(self.alloc, captured_bindings.items) else try statementBindingGuard(self.alloc, native_adapter.revision, description.binding),
@@ -1576,7 +1575,7 @@ const Job = struct {
         const columns = try self.alloc.alloc(wire.Column, result.output.columns.len);
         for (columns, result.output.columns) |*out, column| out.* = .{ .name = column.name, .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(self.alloc, &enum_views, column.enum_view), .domain_view = try @import("antfly_local_sources").sql_scalar.ownDomainView(self.alloc, &domain_views, column.domain_view), .temporal_kind = column.temporal_kind };
         const native_owner = if (result.output.native_rows != null) try result.state.arena.allocator().create(NativeResultCells) else null;
-        if (native_owner) |owner| owner.* = .{ .result = result };
+        if (native_owner) |owner| owner.* = .{ .output = result.output };
         native_adapter.releaseExecutionOwners();
         command_scope.finish() catch return error.SqlMutationOutcomeUnknown;
         command_finished = true;
@@ -1709,6 +1708,7 @@ fn wireType(kind: ast.ColumnType) !wire.Type {
 fn commandTag(alloc: std.mem.Allocator, command: []const u8, rows: u64, affected: u64) ![]const u8 {
     if (std.mem.eql(u8, command, "DDL PENDING")) return alloc.dupe(u8, command);
     if (std.mem.eql(u8, command, "SELECT")) return std.fmt.allocPrint(alloc, "SELECT {d}", .{rows});
+    if (std.mem.eql(u8, command, "COPY")) return std.fmt.allocPrint(alloc, "COPY {d}", .{affected});
     if (std.mem.eql(u8, command, "INSERT")) return std.fmt.allocPrint(alloc, "INSERT 0 {d}", .{affected});
     if (std.mem.eql(u8, command, "UPDATE") or std.mem.eql(u8, command, "DELETE") or std.mem.eql(u8, command, "MERGE")) return std.fmt.allocPrint(alloc, "{s} {d}", .{ command, affected });
     if (std.mem.eql(u8, command, "REFRESH MATERIALIZED VIEW")) return alloc.dupe(u8, command);
@@ -1735,7 +1735,7 @@ test "SQL pgwire native materialized cells match public text and binary encoding
             defer result.deinit();
             var baseline = try native.execute(a, backend, &compiled, &.{}, .{});
             defer baseline.deinit();
-            var owner: NativeResultCells = .{ .result = result };
+            var owner: NativeResultCells = .{ .output = result.output };
             var columns: [4]wire.Column = undefined;
             for (&columns, result.output.columns) |*out, column| out.* = .{ .name = column.name, .type = try wireType(column.type), .element_type = column.element_type };
             const published: wire.Result = .{ .columns = &columns, .cells = .{ .context = &owner, .count = result.output.rowCount(), .width = columns.len, .read = NativeResultCells.read }, .command_tag = "SELECT 1" };
@@ -1759,37 +1759,7 @@ test "SQL pgwire native materialized cells match public text and binary encoding
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }
 
-const NativeResultCells = struct {
-    result: native.Result,
-    fn read(raw: *anyopaque, alloc: std.mem.Allocator, row: usize, column: usize) !wire.Cell {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        const rows = self.result.output.native_rows orelse return error.InvalidSqlBackendResponse;
-        if (row >= rows.len or column >= self.result.output.columns.len or rows[row].len != self.result.output.columns.len) return error.InvalidSqlBackendResponse;
-        const datum = rows[row][column];
-        if (datum.bytes()) |bytes| {
-            try datum.validateTemporal();
-            if (self.result.output.columns[column].type != .bytea) return error.InvalidSqlBackendResponse;
-            return .{ .bytea = bytes, .sql_null = false };
-        }
-        if (datum.enumeration()) |atom| {
-            try datum.validateTemporal();
-            return .{ .enumeration = atom, .sql_null = false };
-        }
-        if (datum.range()) |range| {
-            try datum.validateTemporal();
-            if (@import("antfly_local_sources").sql_range_value.kindFromType(self.result.output.columns[column].type) != range.kind) return error.InvalidSqlBackendResponse;
-            return .{ .range = range, .sql_null = false };
-        }
-        if (datum.temporal()) |value| {
-            try datum.validateTemporal();
-            const definition = self.result.output.columns[column];
-            if (definition.type != .datetime or (definition.temporal_kind orelse .timestamp_tz) != value.kind()) return error.InvalidSqlBackendResponse;
-            var text: [@import("antfly_local_sources").sql_temporal_text.output_capacity]u8 = undefined;
-            return .{ .value = .{ .string = try alloc.dupe(u8, try @import("antfly_local_sources").sql_temporal_text.format(value.*, &text)) }, .sql_null = false };
-        }
-        return .{ .value = if (!datum.sql_null and self.result.output.columns[column].type == .datetime and (self.result.output.columns[column].temporal_kind orelse .timestamp_tz) == .timestamp_tz) try datetimeResult(alloc, datum.value) else datum.value, .sql_null = datum.sql_null, .array = datum.array, .numeric = datum.numeric };
-    }
-};
+const NativeResultCells = @import("sql_wire_cells.zig").OutputCells;
 
 fn releaseResult(raw: *anyopaque) void {
     var result = native.Result{ .state = @ptrCast(@alignCast(raw)), .output = undefined };
@@ -3028,7 +2998,7 @@ test "SQL pgwire native void public results retain OID nullness and both wire fo
             defer result.deinit();
             var public = try native.execute(a, backend, &compiled, &.{}, .{});
             defer public.deinit();
-            var owner: NativeResultCells = .{ .result = result };
+            var owner: NativeResultCells = .{ .output = result.output };
             try std.testing.expectEqual(@as(usize, 1), result.output.rowCount());
             for (result.output.columns, 0..) |column, index| {
                 const kind = try wireType(column.type);

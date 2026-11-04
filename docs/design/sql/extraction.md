@@ -50,6 +50,45 @@ immutable bound relations, retained statement capture, owner-fenced commits and
 current catalog/constraint generations. No legacy adapter fallback may be
 introduced to claim parity.
 
+## Locking cohort closure
+
+All ten valid original locking cases execute through authenticated public SQL
+and native durable owners: table locks (`sql-0080`, `sql-0081`), advisory locks
+(`sql-0089`–`sql-0091`), and row locks (`sql-0173`, `sql-0433`–`sql-0436`).
+`sql-0437` names a relation outside the SELECT range table in `FOR UPDATE OF`;
+its explicit rejection is not positive locking implementation credit. No original
+locking case remains unresolved. The authoritative dispositions and exact test
+names remain in the parity ledger.
+
+The native integration gate covers contention, NOWAIT diagnostics, SKIP LOCKED
+refill, write ownership, savepoint release/rollback, failed-transaction cleanup,
+prepared lock custody after connection close, ordinary read barriers, and cold
+metadata/session/data recovery. Contract, authority and ledger gates additionally
+check all table/row conflict modes, key-preserving updates, grant reentrance,
+waiter fairness, hard/soft deadlocks, cancellation, exact replay receipts,
+bounded retirement and owner-incarnation isolation:
+
+```sh
+cd zig
+zig build antfly-api-sql-locking-test \
+  antfly-pessimistic-lock-contract-test \
+  antfly-pessimistic-lock-authority-test \
+  antfly-pessimistic-lock-ledger-test -Doptimize=Debug -j1
+```
+
+Independent PostgreSQL oracles qualify the conflict matrices and MVCC rules,
+advisory overloads/void values and lifetimes, and queued-wait/deadlock/cancellation
+semantics. Each script owns a disposable PostgreSQL server:
+
+```sh
+python3 scripts/check_sql_lock_postgres.py
+python3 scripts/check_sql_advisory_values_postgres.py
+python3 scripts/check_sql_advisory_wait_postgres.py
+```
+
+This closes the original locking cohort; it does not imply that every remaining
+SQL feature or every PostgreSQL lock-bearing query shape is implemented.
+
 ## Concurrent index DDL
 
 Nonunique `CREATE INDEX CONCURRENTLY` installs the ordinary live native index
@@ -77,7 +116,8 @@ this native concurrent-build contract.
 | --- | --- | --- |
 | Reads and operators | Joins, sets, CTEs, aggregates/windows, typed batch kernels, spill-backed blocking operators and pgwire continuation pages | Exact original-case adjudication; broader correlated/lateral shapes; remote workloads rather than only local kernel benchmarks |
 | Mutations | Native/document DML, joined UPDATE/DELETE, read-only CTE sources, MERGE, normalized RETURNING and guarded UNIQUE conflict ownership | Data-modifying CTE dataflow; broader demand-masked/correlated conflict subqueries and index membership proofs; MERGE partial/expression-key probe planning |
-| COPY input | [Transactional pgwire text, CSV and binary STDIN](copy-input.md), bounded decoding/batches, typed WHERE predicates/defaults, matching headers, native DEFAULT cells, soft conversion rejection and atomic rollback | COPY FREEZE, non-UTF8 and server-file/PROGRAM execution; active RLS uses INSERT |
+| Locking | Native table/row locks, NOWAIT/SKIP LOCKED and session/transaction advisory locks; savepoint ownership, prepared custody and cold recovery | Original locking cohort closed; PostgreSQL-compatible invalid target rejection remains explicit |
+| COPY | [Transactional text, CSV and binary COPY](copy-input.md), pgwire STDIN/STDOUT and globally authorized server files/PROGRAM; bounded decoding/batches, typed filters/defaults and native atomic completion | COPY FREEZE and non-UTF8; active RLS input uses INSERT |
 | Recursion | Bounded linear delta worklists, typed deduplication and captured physical sources | Mutual/nonlinear recursion, recursive aggregates/windows and nullable-side recursive self joins reject explicitly |
 | Sessions and protocols | READ COMMITTED sessions/savepoints, durable HTTP prepared/connection resources, pgwire scroll/hold cursors, typed settings and ordered multi-namespace lookup | Stronger-isolation provider activation/fault coverage, TTL visibility contract, guarded Lite sessions, restart/failover ownership and complete setting/policy parity; HTTP has no connection-owned cursor resource |
 | Catalog and retirement | Native schema/index/constraint, serial/identity defaults and owned-sequence DDL; hosted and native standalone external-FK/graph TRUNCATE with durable publication/recovery receipts | Sequence-aware initial FK creation and counter-aware table-archive imports, broader schema rewrite/restore and standby-promotion gates; pending receipts are not synchronous publication |
@@ -1235,8 +1275,9 @@ sources, option exclusion, conditional creation, TRUNCATE and retirement. A
 SELECT-granted role can copy a definition even when RLS hides every source row;
 the destination starts without the source's policies or RLS flags. These
 are supplemental evidence for the unchanged original, not additional inventory
-cases. TEMP/UNLOGGED publication and the remaining lock/trigger cohorts also remain
-open; this admission/authority work adds no implementation credit by itself.
+cases. TEMP/UNLOGGED publication and the trigger cohort remain open; the original
+locking cohort is now closed by the dedicated native and PostgreSQL gates above.
+This admission/authority work adds no implementation credit by itself.
 
 
 ### Identity defaults preserve SQL grant and policy authority

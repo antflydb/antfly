@@ -2038,7 +2038,7 @@ pub const Session = struct {
         const names = try a.alloc([]const u8, width);
         for (input.columns, names) |column, *name| name.* = column.name;
         try decoder.setColumns(names);
-        var batch: CopyBatch = .{ .session = self, .description = description, .arena = .init(self.alloc), .row_arena = .init(self.alloc), .max_rows = @min(@as(usize, 128), self.limits.parameters / width) };
+        var batch: CopyBatch = .{ .alloc = self.alloc, .driver = .{ .ptr = self, .check = CopyDriver.check, .execute = CopyDriver.execute, .notice = CopyDriver.notice, .diagnostic = CopyDriver.diagnostic, .sqlstate = sqlstate }, .description = description, .arena = .init(self.alloc), .row_arena = .init(self.alloc), .max_rows = @min(@as(usize, 128), self.limits.parameters / width) };
         defer batch.deinit();
         try batch.initColumns(a);
         var response: std.Io.Writer.Allocating = .init(self.alloc);
@@ -2137,179 +2137,28 @@ pub const Session = struct {
         rolled.deinit();
     }
 
-    const CopyBatch = struct {
-        session: *Session,
-        description: backend.Description,
-        arena: std.heap.ArenaAllocator,
-        row_arena: std.heap.ArenaAllocator,
-        row_cells: []@import("antfly_local_sources").sql_scalar.Datum = &.{},
-        modifiers: []?@import("antfly_local_sources").sql_scalar.Program = &.{},
-        defaults: std.ArrayList(bool) = .empty,
-        rejected: u64 = 0,
-        admission_started: bool = false,
-        received: u64 = 0,
-        max_rows: usize,
-        count: usize = 0,
-        total: u64 = 0,
-        bytes: usize = 0,
-        parameters: std.ArrayList(std.json.Value) = .empty,
-        cells: std.ArrayList(@import("antfly_local_sources").sql_scalar.Datum) = .empty,
-        types: std.ArrayList(backend.Type) = .empty,
-        descriptors: std.ArrayList(backend.Parameter) = .empty,
-        fn deinit(self: *CopyBatch) void {
-            for (self.modifiers) |*program| if (program.*) |*value| value.deinit();
-            self.arena.deinit();
-            self.row_arena.deinit();
-            self.defaults.deinit(self.session.alloc);
-            self.parameters.deinit(self.session.alloc);
-            self.cells.deinit(self.session.alloc);
-            self.types.deinit(self.session.alloc);
-            self.descriptors.deinit(self.session.alloc);
+    const CopyBatch = @import("../api/sql_copy_input_batch.zig").Batch;
+    const CopyDriver = struct {
+        fn check(ptr: *anyopaque) !void {
+            const session: *Session = @ptrCast(@alignCast(ptr));
+            try session.request("", &.{}, &.{}).check();
         }
-        fn initColumns(self: *CopyBatch, a: std.mem.Allocator) !void {
-            const scalar = @import("antfly_local_sources").sql_scalar;
-            const ast = @import("antfly_local_sources").sql_ast;
-            const columns = self.description.copy_in.?.columns;
-            self.row_cells = try a.alloc(scalar.Datum, columns.len);
-            self.modifiers = try a.alloc(?scalar.Program, columns.len);
-            @memset(self.modifiers, null);
-            for (columns, self.modifiers) |column, *program| if (column.numeric_modifier) |modifier| {
-                const descriptor = try values.parameterFromColumn(column);
-                const operand: ast.Scalar = .{ .column = "copy_value" };
-                const cast: ast.Scalar = .{ .cast = .{ .operand = &operand, .type = descriptor.kind.?, .element_type = descriptor.element_type, .numeric_modifier = modifier } };
-                program.* = try scalar.bindTyped(a, &cast, &.{.{ .name = "copy_value", .type = descriptor.kind.?, .element_type = descriptor.element_type }}, &.{}, .{});
-            };
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, sql: []const u8, parameters: []const std.json.Value, types: []const backend.Type, descriptors: []const backend.Parameter, cells: []const @import("antfly_local_sources").sql_scalar.Datum, guard: ?[]const u8, epoch: ?u64) !backend.Result {
+            const session: *Session = @ptrCast(@alignCast(ptr));
+            return session.executeCells(a, sql, parameters, types, descriptors, cells, null, guard, epoch);
         }
-        fn decodeRow(self: *CopyBatch, fields: []const @import("copy_in.zig").Field, defaults: []const bool) !void {
-            const input = self.description.copy_in.?;
-            const a = if (input.options.on_error == .ignore) self.row_arena.allocator() else self.arena.allocator();
-            for (fields, input.columns, self.row_cells, self.modifiers, 0..) |field, column, *datum, *program, i| {
-                if (defaults.len != 0 and defaults[i]) {
-                    if (!column.defaulted) return error.InvalidCopyData;
-                    datum.* = .{};
-                    continue;
-                }
-                if (column.type == .string) if (field) |bytes| {
-                    if (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null) return error.SqlInvalidTextEncoding;
-                };
-                datum.* = if (field) |bytes| try values.decodeColumnNative(a, column, if (input.options.format == .binary) 1 else 0, bytes) else .{};
-                if (program.*) |*value| datum.* = try value.evaluate(a, &.{datum.*}, &.{}, .{});
-            }
-        }
-        fn notice(self: *CopyBatch, message_text: []const u8) !void {
-            var bytes: std.Io.Writer.Allocating = .init(self.session.alloc);
+        fn notice(ptr: *anyopaque, text: []const u8) !void {
+            const session: *Session = @ptrCast(@alignCast(ptr));
+            var bytes: std.Io.Writer.Allocating = .init(session.alloc);
             defer bytes.deinit();
             try bytes.writer.writeAll("SNOTICE\x00C00000\x00M");
-            try bytes.writer.writeAll(message_text);
+            try bytes.writer.writeAll(text);
             try bytes.writer.writeAll("\x00\x00");
-            try self.session.message('N', bytes.written());
+            try session.message('N', bytes.written());
         }
-        fn report(self: *CopyBatch) !void {
-            if (self.rejected == 0 or self.description.copy_in.?.options.log_verbosity == .silent) return;
-            var buffer: [160]u8 = undefined;
-            try self.notice(try std.fmt.bufPrint(&buffer, "{d} rows were skipped due to data type incompatibility", .{self.rejected}));
-        }
-        fn row(self: *CopyBatch, fields: []const @import("copy_in.zig").Field, defaults: []const bool) !void {
-            const input = self.description.copy_in.?;
-            if (fields.len != input.columns.len or (defaults.len != 0 and defaults.len != fields.len)) return error.InvalidCopyData;
-            try self.session.request("", &.{}, &.{}).check();
-            self.received = std.math.add(u64, self.received, 1) catch return error.ProgramLimitExceeded;
-            var row_bytes: usize = 0;
-            for (fields) |field| if (field) |value| {
-                row_bytes +|= value.len;
-            };
-            if (self.count != 0 and self.bytes +| row_bytes > 256 * 1024) try self.flush();
-            _ = self.row_arena.reset(.retain_capacity);
-            self.decodeRow(fields, defaults) catch |err| {
-                const code = sqlstate(err);
-                // Only the typed input boundary supports soft rejection. Never
-                // catch framing, constraints, authority, commit or resource errors.
-                if (input.options.on_error != .ignore or !std.mem.startsWith(u8, code, "22") or err == error.InvalidCopyData or err == error.SqlInvalidTextEncoding) return err;
-                self.rejected = std.math.add(u64, self.rejected, 1) catch return error.ProgramLimitExceeded;
-                if (input.options.reject_limit) |limit| if (self.rejected > limit) {
-                    var buffer: [160]u8 = undefined;
-                    const message_text = try std.fmt.bufPrint(&buffer, "skipped more than REJECT_LIMIT ({d}) rows due to data type incompatibility", .{limit});
-                    self.session.diagnostic.set("22P02", message_text, null, false);
-                    return error.SqlInvalidTextRepresentation;
-                };
-                if (input.options.log_verbosity == .verbose) {
-                    var buffer: [160]u8 = undefined;
-                    try self.notice(try std.fmt.bufPrint(&buffer, "COPY input row {d} skipped due to data type incompatibility", .{self.received}));
-                }
-                return;
-            };
-            self.bytes +|= row_bytes;
-            const a = self.arena.allocator();
-            for (self.row_cells, input.columns, 0..) |value, column, i| {
-                const default = defaults.len != 0 and defaults[i];
-                try self.defaults.append(self.session.alloc, default);
-                if (default) continue;
-                const datum = if (input.options.on_error == .ignore) try @import("antfly_local_sources").sql_operators.cloneDatum(a, value) else value;
-                try self.cells.append(self.session.alloc, datum);
-                try self.parameters.append(self.session.alloc, datum.value);
-                try self.types.append(self.session.alloc, column.type);
-                try self.descriptors.append(self.session.alloc, try values.parameterFromColumn(column));
-            }
-            self.count += 1;
-            if (self.count == self.max_rows) try self.flush();
-        }
-        fn quote(writer: *std.Io.Writer, name: []const u8) !void {
-            try writer.writeByte('"');
-            for (name) |ch| {
-                try writer.writeByte(ch);
-                if (ch == '"') try writer.writeByte(ch);
-            }
-            try writer.writeByte('"');
-        }
-        fn flush(self: *CopyBatch) !void {
-            if (self.count == 0) return;
-            const input = self.description.copy_in.?;
-            const a = self.arena.allocator();
-            var sql: std.Io.Writer.Allocating = .init(a);
-            try sql.writer.writeAll("INSERT INTO ");
-            if (input.table.database) |database| {
-                try quote(&sql.writer, database);
-                try sql.writer.writeByte('.');
-            }
-            if (input.table.namespace) |namespace| {
-                try quote(&sql.writer, namespace);
-                try sql.writer.writeByte('.');
-            }
-            try quote(&sql.writer, input.table.table);
-            try sql.writer.writeByte('(');
-            for (input.columns, 0..) |column, i| {
-                if (i != 0) try sql.writer.writeByte(',');
-                try quote(&sql.writer, column.name);
-            }
-            try sql.writer.writeAll(") OVERRIDING SYSTEM VALUE VALUES ");
-            var parameter: usize = 0;
-            for (0..self.count) |row_index| {
-                if (row_index != 0) try sql.writer.writeByte(',');
-                try sql.writer.writeByte('(');
-                for (0..input.columns.len) |i| {
-                    if (i != 0) try sql.writer.writeByte(',');
-                    if (self.defaults.items[row_index * input.columns.len + i]) try sql.writer.writeAll("DEFAULT") else {
-                        parameter += 1;
-                        try sql.writer.print("${d}", .{parameter});
-                    }
-                }
-                try sql.writer.writeByte(')');
-            }
-            self.admission_started = true;
-            var result = try self.session.executeCells(a, sql.written(), self.parameters.items, self.types.items, self.descriptors.items, self.cells.items, null, self.description.binding_guard, self.description.setting_epoch);
-            defer result.deinit();
-            if (result.transaction_status != .in_transaction or result.rows_affected > self.count or (input.source_statement == null and result.rows_affected != self.count)) return error.InvalidResult;
-            self.total = std.math.add(u64, self.total, result.rows_affected) catch return error.ProgramLimitExceeded;
-            self.count = 0;
-            self.bytes = 0;
-            self.defaults.clearRetainingCapacity();
-            self.parameters.clearRetainingCapacity();
-            self.cells.clearRetainingCapacity();
-            self.types.clearRetainingCapacity();
-            self.descriptors.clearRetainingCapacity();
-            result.deinit();
-            _ = self.arena.reset(.retain_capacity);
-            self.admission_started = false;
+        fn diagnostic(ptr: *anyopaque, code: []const u8, text: []const u8) void {
+            const session: *Session = @ptrCast(@alignCast(ptr));
+            session.diagnostic.set(code, text, null, false);
         }
     };
 

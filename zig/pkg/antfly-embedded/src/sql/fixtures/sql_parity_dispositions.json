@@ -4786,6 +4786,43 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-qualified-server-copy-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-server-copy-test",
+        "-Dtest-filter=mounted SQL original server COPY",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-server-copy-io-debug": {
+      "command": [
+        "zig",
+        "build",
+        "pgwire-test",
+        "-Dtest-filter=SQL server COPY endpoints",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 180
+    },
+    "sql-qualified-server-copy-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/check_sql_server_copy_postgres.py"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -11905,18 +11942,69 @@
     },
     {
       "id": "sql-0375",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original executes through authenticated public SQL over native durable metadata/session/data owners. File input, simple-pgwire PROGRAM input, and HTTP/extended-pgwire PROGRAM output share the typed COPY decoder/batcher or spill-backed read stream. The native gate verifies exact output bytes, credential-cap intersection, SQL deadline cancellation of a blocked process group, multi-batch rollback after producer failure, constraints, savepoint recovery and complete cold restart. Distributed metadata ingress routes private lock controls to the data Raft leader; successful producer/consumer completion precedes transaction completion. PostgreSQL independently qualifies all three originals and their failure semantics. COPY FREEZE and non-UTF8 remain separate unsupported contracts.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_copy_server_integration_test.zig",
+          "test": "mounted SQL original server COPY completes files programs atomic batches credential caps and cold owners",
+          "gate": "sql-qualified-server-copy-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_copy_server_integration_test.zig",
+          "test": "mounted SQL original server COPY completes files programs atomic batches credential caps and cold owners",
+          "gate": "sql-qualified-server-copy-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_copy_io.zig",
+          "test": "SQL server COPY endpoints stream files and require producer and consumer completion",
+          "gate": "sql-qualified-server-copy-io-debug"
+        }
+      ]
     },
     {
       "id": "sql-0376",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original executes through authenticated public SQL over native durable metadata/session/data owners. File input, simple-pgwire PROGRAM input, and HTTP/extended-pgwire PROGRAM output share the typed COPY decoder/batcher or spill-backed read stream. The native gate verifies exact output bytes, credential-cap intersection, SQL deadline cancellation of a blocked process group, multi-batch rollback after producer failure, constraints, savepoint recovery and complete cold restart. Distributed metadata ingress routes private lock controls to the data Raft leader; successful producer/consumer completion precedes transaction completion. PostgreSQL independently qualifies all three originals and their failure semantics. COPY FREEZE and non-UTF8 remain separate unsupported contracts.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_copy_server_integration_test.zig",
+          "test": "mounted SQL original server COPY completes files programs atomic batches credential caps and cold owners",
+          "gate": "sql-qualified-server-copy-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_copy_server_integration_test.zig",
+          "test": "mounted SQL original server COPY completes files programs atomic batches credential caps and cold owners",
+          "gate": "sql-qualified-server-copy-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_copy_io.zig",
+          "test": "SQL server COPY endpoints stream files and require producer and consumer completion",
+          "gate": "sql-qualified-server-copy-io-debug"
+        }
+      ]
     },
     {
       "id": "sql-0377",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original executes through authenticated public SQL over native durable metadata/session/data owners. File input, simple-pgwire PROGRAM input, and HTTP/extended-pgwire PROGRAM output share the typed COPY decoder/batcher or spill-backed read stream. The native gate verifies exact output bytes, credential-cap intersection, SQL deadline cancellation of a blocked process group, multi-batch rollback after producer failure, constraints, savepoint recovery and complete cold restart. Distributed metadata ingress routes private lock controls to the data Raft leader; successful producer/consumer completion precedes transaction completion. PostgreSQL independently qualifies all three originals and their failure semantics. COPY FREEZE and non-UTF8 remain separate unsupported contracts.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_copy_server_integration_test.zig",
+          "test": "mounted SQL original server COPY completes files programs atomic batches credential caps and cold owners",
+          "gate": "sql-qualified-server-copy-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_copy_server_integration_test.zig",
+          "test": "mounted SQL original server COPY completes files programs atomic batches credential caps and cold owners",
+          "gate": "sql-qualified-server-copy-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_copy_io.zig",
+          "test": "SQL server COPY endpoints stream files and require producer and consumer completion",
+          "gate": "sql-qualified-server-copy-io-debug"
+        }
+      ]
     },
     {
       "id": "sql-0378",

@@ -3803,3 +3803,7 @@ test "pgwire producer capacity rejects execution before backend and preserves ro
     try std.testing.expect(!session.completion.unknown);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "54000") != null);
 }
+
+comptime {
+    _ = @import("../api/sql_copy_io.zig");
+}

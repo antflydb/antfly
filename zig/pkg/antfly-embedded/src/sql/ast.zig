@@ -764,14 +764,16 @@ pub const EffectBlock = struct {
 
 pub const notifications = @import("notification.zig");
 
+pub const CopyTarget = union(enum) { file: []const u8, program: []const u8 };
+
 pub const Statement = union(enum) {
     notification: notifications.Command,
     effect_block: EffectBlock,
     /// Read plan plus output contract. Ordinary execute must never silently
     /// expose this as SELECT; the COPY-capable stream owns protocol framing.
-    copy_to: struct { query: *const Select, options: CopyOptions, implicit_columns: bool = false },
+    copy_to: struct { query: *const Select, options: CopyOptions, implicit_columns: bool = false, target: ?CopyTarget = null },
     /// Input belongs to a transactional client stream, never ordinary execute.
-    copy_from: struct { table: Name, columns: []const []const u8, options: CopyOptions, predicate: ?*const Predicate = null },
+    copy_from: struct { table: Name, columns: []const []const u8, options: CopyOptions, predicate: ?*const Predicate = null, target: ?CopyTarget = null },
     explain: Explain,
     select: Select,
     lock_table: TableLock,

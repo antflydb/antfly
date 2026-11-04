@@ -63,6 +63,7 @@ test {
     _ = @import("api/sql_temporal_bin_integration_test.zig");
     _ = @import("api/sql_cursor_lifecycle_integration_test.zig");
     _ = @import("api/sql_copy_input_integration_test.zig");
+    _ = @import("api/sql_copy_server_integration_test.zig");
     _ = @import("api/sql_view_domain_integration_test.zig");
     _ = @import("api/sql_routine_lifecycle_integration_test.zig");
     _ = @import("api/sql_procedure_lifecycle_integration_test.zig");

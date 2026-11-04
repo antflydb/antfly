@@ -168,5 +168,41 @@ postimages after predicate/type/framing/constraint failures and cold replay.
 FREEZE remains unactivated, including the exact all-options original that
 requests it. It needs proof of creation/truncation in the current subtransaction
 and compatible snapshot ownership; it cannot be accepted as an unchecked
-transport option. Server-file/PROGRAM execution and non-UTF8 encodings are not
-provided. This work does not complete SQL parity.
+transport option. Non-UTF8 encodings remain unsupported. This work does not
+complete SQL parity.
+
+## Server files and programs
+
+Server COPY uses the same typed decoder, conversion/default programs and native
+transaction batches as pgwire input. Output uses the existing snapshot-pinned,
+spill-backed COPY read stream, including typed constant expressions. HTTP and
+pgwire execute server targets as ordinary commands; they never initiate a client
+COPY data exchange. Files refer to the executing coordinator's filesystem, and
+PROGRAM runs once on that coordinator through `/bin/sh -c`. COPY TO file requires
+an absolute path.
+
+Server file/PROGRAM execution requires a current global administrator grant,
+intersected with the credential's own caps. Table administration alone cannot
+authorize arbitrary server I/O. File operations use the native API filesystem
+executor; blocking I/O, deadlines and child waits use `std.Io`. Cancellation kills
+the owned process group and reports SQLSTATE `57014`. Program stderr is discarded
+rather than exposed through SQL or left in an undrained pipe.
+
+Both directions retain one native transaction through producer/consumer
+completion. Input producer failure rolls back every staged batch; an explicit
+transaction becomes failed and can recover through its normal savepoint controls.
+Output acquires read admission before opening the destination, retains its read
+locks until completion, and requires consumer success before committing. Native
+constraint, transaction-size, memory, scan and spill admission limits still apply;
+the decoder and row batches are bounded independently of the input stream.
+
+External program effects and partial output files cannot be rolled back. They
+are never replayed by SQL recovery, and failures after external I/O begins must
+not advertise automatic replay. Ambiguous native commit outcomes keep their
+existing reconciliation receipts. Distributed metadata/compute ingress forwards
+private lock mutations to the accepting data Raft leader; a local kernel cache
+cannot acknowledge a distributed lock write.
+
+The unchanged originals `sql-0375`–`sql-0377` are qualified by the native
+`antfly-api-sql-server-copy-test` Debug gate and the independent PostgreSQL oracle
+`scripts/check_sql_server_copy_postgres.py`. COPY FREEZE and non-UTF8 remain open.

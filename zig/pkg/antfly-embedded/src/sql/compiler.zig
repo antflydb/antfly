@@ -4177,7 +4177,13 @@ const Parser = struct {
         if (input and query_copy) return self.fail(error.InvalidSqlSyntax, "COPY FROM requires a table");
         // PostgreSQL's grammar accepts either stream spelling in either
         // direction; TO determines CopyOut even when the token says STDIN.
-        if (!self.ddlWord("STDOUT") and !self.ddlWord("STDIN")) return self.fail(error.UnsupportedSqlShape, "server files and PROGRAM are not COPY client streams");
+        const target: ?ast.CopyTarget = if (self.ddlWord("PROGRAM")) .{ .program = try self.copyString() } else if (self.peek(.string)) .{ .file = try self.copyString() } else if (self.ddlWord("STDOUT") or self.ddlWord("STDIN")) null else return self.fail(error.InvalidSqlSyntax, "COPY requires a stream, filename or PROGRAM");
+        if (target) |value_| {
+            const text = switch (value_) {
+                .file, .program => |bytes| bytes,
+            };
+            if (std.mem.indexOfScalar(u8, text, 0) != null) return self.fail(error.SqlInvalidParameterValue, "COPY target contains NUL");
+        }
         var options: ast.CopyOptions = .{};
         var on_error_seen = false;
         const with_options = self.keyword(.with);
@@ -4278,9 +4284,9 @@ const Parser = struct {
             if (options.force_quote_all or options.force_quote_columns.len != 0) return self.fail(error.UnsupportedSqlShape, "FORCE_QUOTE is only valid for COPY TO");
             const columns = try self.alloc.alloc([]const u8, query.columns.len);
             for (columns, query.columns) |*out, projection| out.* = projection.field;
-            return .{ .copy_from = .{ .table = query.table.?, .columns = columns, .options = options, .predicate = try self.where() } };
+            return .{ .copy_from = .{ .table = query.table.?, .columns = columns, .options = options, .predicate = try self.where(), .target = target } };
         }
-        return .{ .copy_to = .{ .query = query, .options = options, .implicit_columns = implicit_columns } };
+        return .{ .copy_to = .{ .query = query, .options = options, .implicit_columns = implicit_columns, .target = target } };
     }
 
     fn maintenance(self: *Parser, operation: @FieldType(ast.Maintenance, "operation")) Error!ast.CatalogDdl {
@@ -5937,9 +5943,6 @@ test "SQL COPY output retains format and read shape while guarding nonclient inp
         try std.testing.expect(compiled.statement == .copy_to);
     }
     for ([_][]const u8{
-        "COPY usage_records FROM PROGRAM 'cat'",
-        "COPY usage_records TO '/tmp/rows'",
-        "COPY usage_records TO PROGRAM 'cat'",
         "COPY (DELETE FROM usage_records RETURNING *) TO STDOUT",
     }) |sql| try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, sql, .{}));
     for ([_][]const u8{
@@ -6999,5 +7002,18 @@ test "compiler SQL database defaults preserve original scope and share bounded r
             unexpected.deinit();
             return error.ExpectedDatabaseDefaultSyntaxRejection;
         } else |_| {}
+    }
+}
+
+test "SQL COPY server targets retain owned producer identity and direction" {
+    for ([_][]const u8{ "COPY usage_records FROM PROGRAM 'cat'", "COPY usage_records TO '/tmp/rows'", "COPY usage_records TO PROGRAM 'cat'" }) |sql| {
+        var compiled = try compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        const target = switch (compiled.statement) {
+            .copy_to => |value_| value_.target,
+            .copy_from => |value_| value_.target,
+            else => null,
+        };
+        try std.testing.expect(target != null);
     }
 }
