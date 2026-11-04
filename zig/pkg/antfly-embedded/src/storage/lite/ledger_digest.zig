@@ -37,6 +37,27 @@ pub const Tree = struct {
         self.* = .{};
     }
 
+    /// Structural copy; the copy owns its nodes.
+    pub fn clone(self: *const Tree, allocator: Allocator) !Tree {
+        return .{
+            .root = if (self.root) |root| try cloneNode(allocator, root) else null,
+            .nodes = self.nodes,
+            .hashes = self.hashes,
+        };
+    }
+
+    fn cloneNode(allocator: Allocator, node: *const Node) !*Node {
+        const copy = try allocator.create(Node);
+        errdefer allocator.destroy(copy);
+        copy.* = .{ .key = node.key, .digest = node.digest };
+        if (node.branch) |branch| {
+            const left = try cloneNode(allocator, branch.children[0]);
+            errdefer destroy(allocator, left);
+            copy.branch = .{ .bit = branch.bit, .children = .{ left, try cloneNode(allocator, branch.children[1]) } };
+        }
+        return copy;
+    }
+
     fn destroy(allocator: Allocator, node: *Node) void {
         if (node.branch) |branch| for (branch.children) |child| destroy(allocator, child);
         allocator.destroy(node);

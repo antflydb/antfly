@@ -171,6 +171,11 @@ pub const ANTFLY_TXN_PENDING: antfly_txn_status = 0;
 pub const ANTFLY_TXN_COMMITTED: antfly_txn_status = 1;
 pub const ANTFLY_TXN_ABORTED: antfly_txn_status = 2;
 
+/// `antfly_db_outcome_receipt_status` result: the uncertain write applied.
+pub const ANTFLY_OUTCOME_RECEIPT_APPLIED: u8 = 1;
+/// `antfly_db_outcome_receipt_status` result: the uncertain write did not apply.
+pub const ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED: u8 = 2;
+
 // ---------------------------------------------------------------------
 // Open mode / profile / storage kind / flag constants
 // ---------------------------------------------------------------------
@@ -569,6 +574,38 @@ unsafe extern "C" {
         db: *mut antfly_db,
         request_json: antfly_slice,
         out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    /// Receipt of this thread's most recent `ANTFLY_OUTCOME_UNKNOWN` from an
+    /// autocommit SQL write or batch export; call on the same thread before
+    /// any other Antfly call. `ANTFLY_NOT_FOUND` when that call issued none.
+    pub fn antfly_last_error_outcome_receipt(out: *mut antfly_buffer) -> antfly_error_code;
+    /// `antfly_db_batch_json` that also returns the receipt in `receipt_out`
+    /// (only on `ANTFLY_OUTCOME_UNKNOWN`), for callers whose consecutive
+    /// native calls may run on different threads.
+    pub fn antfly_db_batch_with_receipt(
+        db: *mut antfly_db,
+        writes: *const antfly_write_intent,
+        write_count: usize,
+        predicates: *const antfly_version_predicate,
+        predicate_count: usize,
+        timestamp_ns: u64,
+        sync_level: u8,
+        receipt_out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_batch_json_with_receipt(
+        db: *mut antfly_db,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+        receipt_out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_outcome_receipt_status(
+        db: *mut antfly_db,
+        receipt: antfly_slice,
+        out_status: *mut u8,
+    ) -> antfly_error_code;
+    pub fn antfly_db_outcome_receipt_forget(
+        db: *mut antfly_db,
+        receipt: antfly_slice,
     ) -> antfly_error_code;
     pub fn antfly_db_begin_transaction_with_id(
         db: *mut antfly_db,
