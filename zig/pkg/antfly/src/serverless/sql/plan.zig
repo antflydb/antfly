@@ -18,9 +18,14 @@
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const A = std.mem.Allocator;
+const physical = @import("physical.zig");
 pub const Digest = @import("state.zig").Digest;
 pub const Column = local.sql_dynamic_filter.Column;
+pub const Bucket = struct { column: u16, count: u32 };
 pub const Input = struct {
+    bucket: ?Bucket = null,
+    /// Resolved only on a bucket task; source validates proof against the cut.
+    bucket_group: ?struct { index: u16, count: u16 } = null,
     table_id: u64,
     schema: Digest,
     snapshot: []const u8,
@@ -73,7 +78,7 @@ pub const Aggregation = struct {
     inputs: []const ?u16,
     specs: []const local.sql_operators.AggregateSpec,
 };
-pub const Strategy = enum { broadcast, shuffle };
+pub const Strategy = enum { broadcast, shuffle, bucket };
 pub const Plan = struct {
     version: u16 = 2,
     tenant: Digest,
@@ -87,6 +92,7 @@ pub const Plan = struct {
     aggregate: ?Aggregation = null,
     /// Coordinator-owned physical reducer boundaries; absent in submitted IR.
     reduce_boundaries: []const u16 = &.{},
+    skew: []const physical.Part = &.{},
     pub fn reduceCount(self: Plan) u32 {
         return if (self.reduce_boundaries.len == 0) self.partitions else @intCast(self.reduce_boundaries.len - 1);
     }
@@ -103,7 +109,7 @@ pub const Plan = struct {
         if (self.version != 2 or self.expires_ms <= now_ms) return error.SqlQueryExpired;
         const limits = self.limits;
         try limits.validate();
-        if (self.partitions == 0 or self.partitions > limits.max_partitions or !std.math.isPowerOfTwo(self.partitions)) return error.InvalidSqlDistributedPlan;
+        if (self.partitions == 0 or self.partitions > limits.max_partitions or (self.strategy != .bucket and !std.math.isPowerOfTwo(self.partitions))) return error.InvalidSqlDistributedPlan;
         if (self.left.columns.len == 0 or self.right.columns.len == 0 or self.left.columns.len + self.right.columns.len > 2048 or self.left.splits == 0 or self.right.splits == 0 or self.left.splits > 65536 or self.right.splits > 65536 or self.left.cut.len == 0 or self.right.cut.len == 0 or self.left.cut.len > 8192 or self.right.cut.len > 8192 or self.left.snapshot.len > 256 or self.right.snapshot.len > 256) return error.InvalidSqlDistributedPlan;
         if (self.join.left_keys.len == 0 or self.join.left_keys.len > 32 or self.join.left_keys.len != self.join.right_keys.len) return error.InvalidSqlDistributedPlan;
         for (self.join.left_keys, self.join.right_keys) |left, right| {
@@ -116,6 +122,18 @@ pub const Plan = struct {
         }
         for (self.join.projection) |index| if (index >= self.left.columns.len + (if (self.join.kind == .semi or self.join.kind == .anti) @as(usize, 0) else self.right.columns.len)) return error.InvalidSqlDistributedPlan;
         if (self.strategy == .broadcast and (self.partitions != 1 or self.join.preservesBuild())) return error.SqlDistributedJoinUnsupported;
+        if (self.left.bucket_group != null or self.right.bucket_group != null) return error.InvalidSqlDistributedPlan;
+        if (self.strategy == .bucket) {
+            const l = self.left.bucket orelse return error.InvalidSqlDistributedPlan;
+            const r = self.right.bucket orelse return error.InvalidSqlDistributedPlan;
+            if (l.column >= self.left.columns.len or r.column >= self.right.columns.len or l.count == 0 or r.count == 0 or l.count % self.partitions != 0 or r.count % self.partitions != 0) return error.InvalidSqlDistributedPlan;
+            const aligned = for (self.join.left_keys, self.join.right_keys) |left, right| {
+                if (left == l.column and right == r.column) break true;
+            } else false;
+            if (!aligned) return error.InvalidSqlDistributedPlan;
+            const kind = self.left.columns[l.column].type;
+            if (kind != .integer and kind != .string) return error.SqlDistributedJoinUnsupported;
+        }
         if (self.left.filter) |filter| {
             try filter.validate(self.left.columns.len);
             if (filter.output.kind != .boolean) return error.InvalidSqlDistributedPlan;
@@ -143,21 +161,59 @@ pub const Plan = struct {
         // Admission reserves every attempt and each task's maximum output.
         // Runtime counters still enforce per-task limits on actual input/output.
         if (@as(u64, tasks) *| limits.max_attempts *| limits.task_output_bytes > limits.query_exchange_bytes) return error.SqlJoinBudgetExceeded;
-        const requests = if (self.strategy == .broadcast) @as(u64, self.left.splits) *| 4 +| @as(u64, self.right.splits) *| 3 else (@as(u64, self.left.splits) +| self.right.splits) *| (@as(u64, self.partitions) *| 3 +| 4);
+        const requests = if (self.strategy == .bucket) @as(u64, self.partitions) *| 8 else if (self.strategy == .broadcast) @as(u64, self.left.splits) *| 4 +| @as(u64, self.right.splits) *| 3 else (@as(u64, self.left.splits) +| self.right.splits) *| (@as(u64, self.partitions) *| 3 +| 4);
         if (requests *| limits.max_attempts > limits.query_requests) return error.SqlJoinBudgetExceeded;
     }
+    pub fn outputStage(self: Plan) u32 {
+        return if (self.skew.len != 0) 2 else self.joinStage();
+    }
+    pub fn finalizerCount(self: Plan) !u32 {
+        var count = try physical.pairCount(self.skew, self.reduceCount());
+        for (self.skew) |part| {
+            if (self.join.preservesProbe() or self.join.kind == .semi) count = try std.math.add(u32, count, @intCast(part.left.len));
+            if (self.join.preservesBuild()) count = try std.math.add(u32, count, @intCast(part.right.len));
+        }
+        return count;
+    }
+    pub fn withPhysical(self: Plan, boundaries: []const u16, parts: []const physical.Part) !Plan {
+        var result = try self.withReducers(boundaries);
+        if (parts.len > self.partitions or (parts.len != 0 and (self.strategy != .shuffle or boundaries.len < 2))) return error.InvalidSqlExecutionState;
+        for (parts, 0..) |part, index| {
+            if (part.partition >= self.partitions or part.left.len == 0 or part.right.len == 0 or (index != 0 and parts[index - 1].partition >= part.partition)) return error.InvalidSqlExecutionState;
+            const isolated = for (boundaries[0 .. boundaries.len - 1], boundaries[1..]) |begin, end| {
+                if (begin == part.partition and end == begin + 1) break true;
+            } else false;
+            if (!isolated) return error.InvalidSqlExecutionState;
+            for (part.left) |tile| if (tile.map) |id| {
+                if (id < self.right.splits or id >= self.right.splits + self.left.splits or tile.rows == 0 or tile.rows > self.limits.task_scan_rows) return error.InvalidSqlExecutionState;
+            };
+            for (part.right) |tile| if (tile.map) |id| {
+                if (id >= self.right.splits or tile.rows == 0 or tile.rows > self.limits.task_scan_rows) return error.InvalidSqlExecutionState;
+            };
+        }
+        result.skew = parts;
+        const count = try result.taskCount();
+        if (parts.len != 0 and @as(u64, count) *| result.limits.max_attempts *| 16 > result.limits.query_requests) return error.SqlJoinBudgetExceeded;
+        if (count > result.limits.max_tasks or @as(u64, count) *| result.limits.max_attempts *| result.limits.task_output_bytes > result.limits.query_exchange_bytes) return error.SqlJoinBudgetExceeded;
+        return result;
+    }
+    pub fn joinStage(self: Plan) u32 {
+        return if (self.strategy == .bucket) 0 else 1;
+    }
     pub fn stageTasks(self: Plan, stage: u32) !u32 {
-        if (stage == 0) return if (self.strategy == .broadcast) self.right.splits else std.math.add(u32, self.left.splits, self.right.splits);
-        var count: u32 = if (self.strategy == .broadcast) self.left.splits else self.reduceCount();
-        if (stage == 1) return count;
+        const join_stage = self.joinStage();
+        if (stage < join_stage) return if (self.strategy == .broadcast) self.right.splits else std.math.add(u32, self.left.splits, self.right.splits);
+        var count: u32 = if (self.strategy == .broadcast) self.left.splits else if (self.skew.len != 0) try self.finalizerCount() else self.reduceCount();
+        if (self.skew.len != 0 and stage == 1) return physical.pairCount(self.skew, self.reduceCount());
+        if (stage == self.outputStage()) return count;
         if (self.aggregate == null or stage > 8) return error.InvalidSqlDistributedPlan;
-        for (2..stage + 1) |_| count = (count + 31) / 32;
+        for (self.outputStage() + 1..stage + 1) |_| count = (count + 31) / 32;
         return count;
     }
     pub fn finalStage(self: Plan) u32 {
-        if (self.aggregate == null) return 2;
-        var count: u32 = if (self.strategy == .broadcast) self.left.splits else self.reduceCount();
-        var stage: u32 = 2;
+        if (self.aggregate == null) return self.outputStage() + 1;
+        var count: u32 = if (self.strategy == .broadcast) self.left.splits else if (self.skew.len != 0) self.finalizerCount() catch return 9 else self.reduceCount();
+        var stage: u32 = self.outputStage() + 1;
         while (count > 32) {
             count = (count + 31) / 32;
             stage += 1;
@@ -181,19 +237,46 @@ pub const Plan = struct {
 pub const Task = struct {
     stage: u32,
     task: u32,
-    kind: enum { scan_build, broadcast_probe, map_left, map_right, reduce, aggregate, results },
+    kind: enum { tile_pair, finalize_probe, finalize_build, passthrough, bucket_join, scan_build, broadcast_probe, map_left, map_right, reduce, aggregate, results },
     split: u32 = 0,
     partition: u16 = 0,
     partition_end: u16 = 1,
+    physical_part: u16 = 0,
+    tile_left: u32 = 0,
+    tile_right: u32 = 0,
+    dependent: u32 = 0,
     finalize: bool = false,
 };
 /// No row payload travels through the dispatcher. The worker loads the durable
 /// plan and accepted dependency records using these deterministic identities.
 pub const Ticket = struct { tenant: Digest, query: @import("state.zig").Query, stage: u32, task: u32 };
+/// Parquet compression does not bound the resident typed rows or hash metadata.
+/// Include the fixed per-row representation before selecting a build strategy.
+pub fn estimatedRetained(input: Input) u64 {
+    const fixed = @sizeOf(local.sql_operators.Row) + input.columns.len * @sizeOf(local.sql_scalar.Datum);
+    return input.estimated_bytes +| input.estimated_rows *| fixed;
+}
 pub fn choose(left: Input, right: Input, tenant: Digest, expires_ms: u64, join: Join, limits: Limits, now_ms: u64) !Plan {
-    const broadcast = !join.preservesBuild() and right.estimated_bytes <= @min(64 * 1024 * 1024, limits.task_memory / 4);
+    if (left.bucket) |l| if (right.bucket) |r| {
+        const aligned = for (join.left_keys, join.right_keys) |lk, rk| {
+            if (lk == l.column and rk == r.column) break true;
+        } else false;
+        if (aligned and l.count > 0 and r.count > 0) {
+            const gcd = std.math.gcd(l.count, r.count);
+            var groups: u32 = @min(gcd, limits.max_partitions);
+            while (groups > 0) : (groups -= 1) {
+                if (gcd % groups != 0) continue;
+                if (estimatedRetained(right) / groups > limits.task_memory / 8 or (left.estimated_rows +| right.estimated_rows) / groups > limits.task_scan_rows / 2) break;
+                const result: Plan = .{ .tenant = tenant, .expires_ms = expires_ms, .left = left, .right = right, .join = join, .strategy = .bucket, .partitions = @intCast(groups), .limits = limits };
+                if (result.validate(now_ms)) |_| return result else |err| {
+                    if (err != error.SqlJoinBudgetExceeded) return err;
+                }
+            }
+        }
+    };
+    const broadcast = !join.preservesBuild() and estimatedRetained(right) <= @min(64 * 1024 * 1024, limits.task_memory / 8) and right.estimated_rows <= limits.task_scan_rows / 2;
     var partitions: u16 = 1;
-    if (!broadcast) while (@as(u64, partitions) *| (limits.task_memory / 2) < right.estimated_bytes and partitions < limits.max_partitions) {
+    if (!broadcast) while ((estimatedRetained(right) / partitions > limits.task_memory / 8 or (left.estimated_rows +| right.estimated_rows) / partitions > limits.task_scan_rows / 2) and partitions < limits.max_partitions) {
         if (partitions > limits.max_partitions / 2) break;
         partitions = std.math.mul(u16, partitions, 2) catch return error.SqlJoinBudgetExceeded;
     };
@@ -220,6 +303,12 @@ test "distributed SQL plan preserves join semantics and admits retry and exchang
     capped.max_partitions = 3;
     const bounded = try choose(input, larger, @splat('b'), 10000, selected.join, capped, 1);
     try std.testing.expectEqual(@as(u16, 2), bounded.partitions);
+    var compressed = input;
+    compressed.estimated_rows = 1_000_000;
+    const resident = try choose(input, compressed, @splat('b'), 10000, join, .{}, 1);
+    try std.testing.expectEqual(Strategy.shuffle, resident.strategy);
+    try std.testing.expect(estimatedRetained(compressed) / resident.partitions <= resident.limits.task_memory / 8);
+    try std.testing.expectError(error.InvalidSqlExecutionState, selected.withPhysical(&.{}, &.{.{ .partition = 0, .left = &.{.{}}, .right = &.{.{}} }}));
     selected.limits.query_exchange_bytes = 1;
     try std.testing.expectError(error.SqlJoinBudgetExceeded, selected.validate(1));
 }

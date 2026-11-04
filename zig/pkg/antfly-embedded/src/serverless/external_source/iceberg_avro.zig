@@ -994,24 +994,20 @@ fn readJsonAvroIntArrayAlloc(alloc: Allocator, reader: *Reader, schema: std.json
 }
 
 fn readJsonAvroPartitionStringAlloc(alloc: Allocator, reader: *Reader, schema: std.json.Value) !?[]u8 {
-    switch (schema) {
-        .array => |branches| {
-            const tag = try reader.readLong();
-            if (tag < 0) return error.InvalidIcebergDataManifest;
-            const tag_index = std.math.cast(usize, tag) orelse return error.InvalidIcebergDataManifest;
-            if (tag_index >= branches.items.len) return error.InvalidIcebergDataManifest;
-            const branch = branches.items[tag_index];
-            if (jsonTypeNameEql(branch, "null")) return null;
-            if (jsonTypeNameEql(branch, "string")) return try reader.readStringAlloc(alloc);
-            try skipJsonAvroValueAfterUnionTag(reader, branch);
-            return null;
-        },
-        else => {
-            if (jsonTypeNameEql(schema, "string")) return try reader.readStringAlloc(alloc);
-            try skipJsonAvroValue(reader, schema);
-            return null;
-        },
+    const value_schema = try readJsonUnionTagForValue(reader, schema) orelse return null;
+    if (jsonTypeNameEql(value_schema, "string")) return try reader.readStringAlloc(alloc);
+    if (jsonTypeNameEql(value_schema, "int") or jsonTypeNameEql(value_schema, "long")) {
+        const value = try reader.readLong();
+        if (jsonTypeNameEql(value_schema, "int") and std.math.cast(i32, value) == null) return error.InvalidIcebergDataManifest;
+        return try std.fmt.allocPrint(alloc, "{d}", .{value});
     }
+    if (jsonTypeNameEql(value_schema, "boolean")) {
+        const value = try reader.readByte();
+        if (value > 1) return error.InvalidIcebergDataManifest;
+        return try alloc.dupe(u8, if (value == 1) "true" else "false");
+    }
+    try skipJsonAvroValueAfterUnionTag(reader, value_schema);
+    return null;
 }
 
 fn readJsonAvroStringAlloc(alloc: Allocator, reader: *Reader, schema: std.json.Value) ![]u8 {

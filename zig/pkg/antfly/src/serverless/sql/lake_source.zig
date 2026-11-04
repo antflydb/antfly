@@ -146,7 +146,20 @@ pub const Host = struct {
             }
             break :blk serving.ServingSource.Estimates{ .bytes = bytes, .rows = rows };
         };
-        return .{ .table_id = table.id, .schema = try fingerprint(a, table), .snapshot = try a.dupe(u8, cut.snapshot_id), .wal_cut = pending.lsn, .cut = token, .columns = columns, .estimated_bytes = estimates.bytes, .estimated_rows = estimates.rows, .splits = splits };
+        return .{ .table_id = table.id, .schema = try fingerprint(a, table), .snapshot = try a.dupe(u8, cut.snapshot_id), .wal_cut = pending.lsn, .cut = token, .columns = columns, .estimated_bytes = estimates.bytes, .estimated_rows = estimates.rows, .splits = splits, .bucket = if (try bucketLayout(a, &pinned_source, context)) |layout| blk: {
+            for (columns, 0..) |column, index| if (std.mem.eql(u8, column.name, layout.column)) break :blk plan.Bucket{ .column = @intCast(index), .count = layout.count };
+            break :blk null;
+        } else null };
+    }
+    pub fn bucketLayout(a: A, pinned: *serving.ServingSource, context: Context) !?catalog.BucketLayout {
+        const metadata = pinned.catalog_metadata orelse return null;
+        const root = try lake.metadata.parse(a, metadata.metadata_json);
+        const schema = try lake.row_commit.schema(a, root);
+        // Unbucketed tables keep the lazy scan path without manifest discovery.
+        if (try lake.bucket.defaultSpec(root, schema) == null) return null;
+        try pinned.ensureInventory(context);
+        const spec = (try lake.bucket.prove(root, schema, pinned.inventory.files)) orelse return null;
+        return .{ .column = try a.dupe(u8, spec.source), .count = spec.count };
     }
     fn openNative(self: *Host, a: A, table: catalog.Table, cut: retained.Descriptor, context: Context) !serving.ServingSource {
         var options = self.options;
@@ -181,7 +194,13 @@ pub const Host = struct {
         const delta = try scratch.create(overlay.Cut);
         delta.* = try overlay.Cut.initForTable(scratch, cut.pending, table);
         const physical = try overlay.physicalRequest(scratch, scan, delta.*);
-        const child = try local.sql_lake_cursor.openPinnedPartition(a, table, physical, request(context), &owner.source, split, input.splits);
+        const child = if (input.bucket_group) |group| blk: {
+            const declared = input.bucket orelse return error.InvalidSqlDistributedPlan;
+            if (declared.column >= input.columns.len) return error.InvalidSqlDistributedPlan;
+            const layout = (try bucketLayout(scratch, &owner.source, context)) orelse return error.SqlExecutionUnauthorized;
+            if (layout.count != declared.count or !std.mem.eql(u8, layout.column, input.columns[declared.column].name)) return error.SqlExecutionUnauthorized;
+            break :blk try local.sql_lake_cursor.openPinnedBucket(a, table, physical, request(context), &owner.source, .{ .source = layout.column, .count = layout.count, .index = group.index, .groups = group.count });
+        } else try local.sql_lake_cursor.openPinnedPartition(a, table, physical, request(context), &owner.source, split, input.splits);
         errdefer child.close(child.ptr);
         // Install a safe filter on the base and apply it again to post-overlay
         // rows. Changed-key suppression sees the entire cut on every split.
@@ -244,9 +263,20 @@ const Owner = struct {
                     if (!self.base_done or self.recent_at == self.cut.pending.changes.len) break;
                     const position = self.recent_at;
                     self.recent_at += 1;
-                    if (position % self.input.splits != self.split) continue;
+                    if (self.input.bucket_group == null and position % self.input.splits != self.split) continue;
                     const row = (try overlay.recentRow(scratch, self.cut, position)) orelse continue;
                     for (self.input.columns, cells) |column, *cell| cell.* = try column.datum(scratch, try row.cell(column.name));
+                }
+                if (self.input.bucket_group) |group| {
+                    const layout = self.input.bucket.?;
+                    const cell = cells[layout.column];
+                    const hash: u32 = switch (cell.value) {
+                        .null => 0,
+                        .integer => |value| lake.bucket.hashInteger(value) & 0x7fffffff,
+                        .string => |value| lake.bucket.hashBytes(value) & 0x7fffffff,
+                        else => return error.InvalidSqlBackendResponse,
+                    };
+                    if (hash % group.count != group.index) continue;
                 }
                 if (self.filter) |filter| {
                     var keys: [32]Datum = undefined;

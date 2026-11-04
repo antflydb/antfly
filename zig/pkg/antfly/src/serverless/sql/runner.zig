@@ -39,25 +39,25 @@ pub const Source = struct {
     /// retain its base and copied WAL cut, and open exactly this immutable split.
     open: *const fn (*anyopaque, A, plan.Digest, plan.Input, u32, ?*const local.sql_dynamic_filter.Filter, Context) anyerror!Stream,
 };
-const OutputRows = struct {
+pub const OutputRows = struct {
     arena: std.heap.ArenaAllocator,
     partitions: []std.ArrayList(operators.Row),
     bytes: u64 = 0,
     limit: u64,
     aggregation: ?plan.Aggregation = null,
     grouped: ?*operators.Grouped = null,
-    fn init(a: A, count: usize, limit: u64) !OutputRows {
+    pub fn init(a: A, count: usize, limit: u64) !OutputRows {
         const partitions = try a.alloc(std.ArrayList(operators.Row), count);
         @memset(partitions, .empty);
         return .{ .arena = .init(a), .partitions = partitions, .limit = limit };
     }
-    fn deinit(self: *OutputRows, a: A) void {
+    pub fn deinit(self: *OutputRows, a: A) void {
         for (self.partitions) |*partition| partition.deinit(a);
         a.free(self.partitions);
         self.arena.deinit();
         if (self.grouped) |grouped| grouped.deinit();
     }
-    fn add(self: *OutputRows, a: A, partition: usize, cells: []const Datum) !void {
+    pub fn add(self: *OutputRows, a: A, partition: usize, cells: []const Datum) !void {
         if (self.aggregation) |aggregate| {
             var group_cells: [32]Datum = undefined;
             var inputs: [64]Datum = undefined;
@@ -74,7 +74,7 @@ const OutputRows = struct {
         try self.partitions[partition].append(a, .{ .values = owned, .keys = &.{}, .ordinal = self.partitions[partition].items.len });
         self.bytes += cost;
     }
-    fn publish(self: *OutputRows, a: A, store: exchange.Store, query: plan.Digest, expires: u64, limit: usize) !state.Output {
+    pub fn publish(self: *OutputRows, a: A, store: exchange.Store, query: plan.Digest, expires: u64, limit: usize) !state.Output {
         if (self.aggregation != null) {
             const previous = self.aggregation;
             self.aggregation = null;
@@ -119,8 +119,17 @@ pub const Runner = struct {
     pub fn run(self: Runner, query: plan.Digest, specification: plan.Plan, task: plan.Task, dependencies: []const state.Output) !state.Output {
         try self.context.ensureActive();
         return switch (task.kind) {
+            .tile_pair => @import("skew_runner.zig").pair(self, query, specification, task, dependencies),
+            .finalize_probe, .finalize_build => @import("skew_runner.zig").finalize(self, query, specification, task, dependencies),
+            .passthrough => blk: {
+                if (dependencies.len != 1) return error.InvalidSqlExecutionState;
+                var ref = dependencies[0];
+                ref.key = try self.a.dupe(u8, ref.key);
+                ref.matches = null;
+                break :blk ref;
+            },
             .scan_build, .map_left, .map_right => self.map(query, specification, task),
-            .broadcast_probe, .reduce => self.join(query, specification, task, dependencies),
+            .bucket_join, .broadcast_probe, .reduce => self.join(query, specification, task, dependencies),
             .aggregate => self.merge(query, specification, dependencies, task.finalize),
             .results => error.SqlDistributedJoinUnsupported,
         };
@@ -158,16 +167,17 @@ pub const Runner = struct {
     }
     fn join(self: Runner, query: plan.Digest, spec: plan.Plan, task: plan.Task, dependencies: []const state.Output) !state.Output {
         const broadcast = task.kind == .broadcast_probe;
+        const bucketed = task.kind == .bucket_join;
         if ((broadcast and spec.join.preservesBuild()) or task.partition >= spec.partitions) return error.SqlDistributedJoinUnsupported;
         const build_count = spec.right.splits;
-        if (!broadcast and self.spill != null and spec.join.kind != .semi and spec.join.kind != .anti) return self.grace(query, spec, task, dependencies);
-        if (dependencies.len != build_count + (if (broadcast) @as(usize, 0) else spec.left.splits)) return error.InvalidSqlDistributedPlan;
+        if (!broadcast and !bucketed and self.spill != null and spec.join.kind != .semi and spec.join.kind != .anti) return self.grace(query, spec, task, dependencies);
+        if (dependencies.len != (if (bucketed) @as(usize, 0) else build_count + (if (broadcast) @as(usize, 0) else spec.left.splits))) return error.InvalidSqlDistributedPlan;
         const hash = try operators.HashJoin.create(self.a, .{ .bytes = @intCast(spec.limits.task_memory / 2), .rows = @intCast(spec.limits.task_scan_rows), .spill = self.spill });
         defer hash.deinit();
         const columns = try self.a.alloc(local.sql_dynamic_filter.Column, spec.join.left_keys.len);
         defer self.a.free(columns);
         for (columns, spec.join.left_keys) |*column, ordinal| column.* = spec.left.columns[ordinal];
-        const filter = if (broadcast and spec.join.mayFilterProbe()) try local.sql_dynamic_filter.Filter.create(self.a, columns, 64 * 1024) else null;
+        const filter = if ((broadcast or bucketed) and spec.join.mayFilterProbe()) try local.sql_dynamic_filter.Filter.create(self.a, columns, 64 * 1024) else null;
         defer if (filter) |value| value.close();
         var decode = std.heap.ArenaAllocator.init(self.a);
         defer decode.deinit();
@@ -176,7 +186,29 @@ pub const Runner = struct {
         var row_arena = std.heap.ArenaAllocator.init(self.a);
         defer row_arena.deinit();
         var input_rows: u64 = 0;
-        for (dependencies[0..build_count]) |ref| {
+        if (bucketed) {
+            var input = spec.right;
+            input.bucket_group = .{ .index = task.partition, .count = spec.partitions };
+            const stream = try self.source.open(self.source.ptr, self.a, spec.tenant, input, task.partition, null, self.context);
+            defer stream.close();
+            while (true) {
+                try self.context.ensureActive();
+                _ = decode.reset(.free_all);
+                const rows = (try stream.next_fn(stream.ptr, decode.allocator(), 256)) orelse break;
+                if (rows.len == 0 or rows.len > 256) return error.InvalidSqlBackendResponse;
+                for (rows) |cells| {
+                    if (cells.len != spec.right.columns.len) return error.InvalidSqlBackendResponse;
+                    input_rows += 1;
+                    if (input_rows > spec.limits.task_scan_rows) return error.SqlJoinBudgetExceeded;
+                    if (spec.right.filter) |filter_| if (!try filter_.matches(self.a, cells)) continue;
+                    var key: [32]Datum = undefined;
+                    const values = try keys(cells, spec.join.right_keys, &key);
+                    if (!spec.join.preservesBuild() and try operators.HashJoin.keyHash(values) == null) continue;
+                    try hash.add(cells, values);
+                    if (filter) |value| try value.add(values);
+                }
+            }
+        } else for (dependencies[0..build_count]) |ref| {
             _ = decode.reset(.free_all);
             var data = try self.exchange_store.readRange(decode.allocator(), ref, if (broadcast) 0 else task.partition, if (broadcast) 1 else task.partition_end, @intCast(spec.limits.task_memory / 4));
             while (try data.nextBlock(&block_arena, @intCast(spec.limits.task_memory / 4))) |block| {
@@ -204,8 +236,10 @@ pub const Runner = struct {
             output.aggregation = aggregate;
             if (aggregate.groups.len == 0) try output.grouped.?.ensureGlobalGroup();
         }
-        if (broadcast) {
-            const stream = try self.source.open(self.source.ptr, self.a, spec.tenant, spec.left, task.split, filter, self.context);
+        if (broadcast or bucketed) {
+            var input = spec.left;
+            if (bucketed) input.bucket_group = .{ .index = task.partition, .count = spec.partitions };
+            const stream = try self.source.open(self.source.ptr, self.a, spec.tenant, input, if (bucketed) task.partition else task.split, filter, self.context);
             defer stream.close();
             while (true) {
                 try self.context.ensureActive();
@@ -368,7 +402,7 @@ pub const Runner = struct {
             try self.emit(spec, left, null, output, scratch.allocator());
         }
     }
-    fn emit(self: Runner, spec: plan.Plan, left: ?[]const Datum, right: ?[]const Datum, output: *OutputRows, a: A) !void {
+    pub fn emit(self: Runner, spec: plan.Plan, left: ?[]const Datum, right: ?[]const Datum, output: *OutputRows, a: A) !void {
         const width = spec.left.columns.len + (if (spec.join.kind == .semi or spec.join.kind == .anti) @as(usize, 0) else spec.right.columns.len);
         const cells = try a.alloc(Datum, width);
         @memset(cells, .{});

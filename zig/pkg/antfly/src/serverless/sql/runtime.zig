@@ -19,6 +19,7 @@ const std = @import("std");
 const storage = @import("objectstore");
 const local = @import("antfly_local_sources");
 const plan = @import("plan.zig");
+const physical = @import("physical.zig");
 const state = @import("state.zig");
 const exchange = @import("exchange.zig");
 const runner = @import("runner.zig");
@@ -97,7 +98,7 @@ pub const Service = struct {
     pub fn submit(self: Service, specification: plan.Plan) !state.Query {
         try self.requireQueryRole();
         try specification.validate(self.clock.now());
-        if (specification.reduce_boundaries.len != 0) return error.InvalidSqlDistributedPlan;
+        if (specification.reduce_boundaries.len != 0 or specification.skew.len != 0) return error.InvalidSqlDistributedPlan;
         if (specification.limits.task_memory > self.task_memory_ceiling) return error.SqlJoinBudgetExceeded;
         if (!std.mem.eql(u8, &self.tenant, &specification.tenant)) return error.SqlExecutionUnauthorized;
         try self.retention.ensure(self.retention.ptr, self.a, specification, self.context);
@@ -144,7 +145,30 @@ pub const Service = struct {
     }
     fn taskFor(spec: plan.Plan, stage: u32, task: u32) !plan.Task {
         if (task >= try tasks(spec, stage)) return error.InvalidSqlDistributedPlan;
-        if (stage >= 2) return .{ .stage = stage, .task = task, .kind = .aggregate, .finalize = stage + 1 == spec.finalStage() };
+        if (stage > spec.outputStage()) return .{ .stage = stage, .task = task, .kind = .aggregate, .finalize = stage + 1 == spec.finalStage() };
+        if (spec.skew.len != 0 and stage == 2) {
+            const pairs = try physical.pairCount(spec.skew, spec.reduceCount());
+            if (task < pairs) return .{ .stage = stage, .task = task, .kind = .passthrough, .dependent = task };
+            var next = task - pairs;
+            for (spec.skew, 0..) |part, index| {
+                if (spec.join.preservesProbe() or spec.join.kind == .semi) {
+                    if (next < part.left.len) return .{ .stage = stage, .task = task, .kind = .finalize_probe, .physical_part = @intCast(index), .tile_left = next };
+                    next -= @intCast(part.left.len);
+                }
+                if (spec.join.preservesBuild()) {
+                    if (next < part.right.len) return .{ .stage = stage, .task = task, .kind = .finalize_build, .physical_part = @intCast(index), .tile_right = next };
+                    next -= @intCast(part.right.len);
+                }
+            }
+            return error.InvalidSqlExecutionState;
+        }
+        if (spec.skew.len != 0 and stage == 1) {
+            switch (try physical.work(spec.skew, spec.reduce_boundaries, spec.reduceCount(), task)) {
+                .pair => |pair| return .{ .stage = stage, .task = task, .kind = .tile_pair, .physical_part = pair.part, .tile_left = pair.left, .tile_right = pair.right },
+                .reduce => |reducer| return .{ .stage = stage, .task = task, .kind = .reduce, .partition = spec.reduce_boundaries[reducer], .partition_end = spec.reduce_boundaries[reducer + 1] },
+            }
+        }
+        if (spec.strategy == .bucket) return .{ .stage = stage, .task = task, .kind = .bucket_join, .partition = @intCast(task), .partition_end = @intCast(task + 1) };
         if (stage == 0) return .{ .stage = stage, .task = task, .kind = if (spec.strategy == .broadcast) .scan_build else if (task < spec.right.splits) .map_right else .map_left, .split = if (task < spec.right.splits) task else task - spec.right.splits };
         return .{ .stage = stage, .task = task, .kind = if (spec.strategy == .broadcast) .broadcast_probe else .reduce, .split = task, .partition = if (spec.strategy == .shuffle) (if (spec.reduce_boundaries.len != 0) spec.reduce_boundaries[task] else @intCast(task)) else 0, .partition_end = if (spec.strategy == .shuffle) (if (spec.reduce_boundaries.len != 0) spec.reduce_boundaries[task + 1] else @intCast(task + 1)) else 1 };
     }
@@ -167,7 +191,7 @@ pub const Service = struct {
         // submit() retained both inputs through the immutable query expiry.
         // Workers revalidate their scanned capability on open. Reducer/control
         // turns consume accepted exchange, without reopening source catalogs.
-        spec = try spec.withReducers(current.value.reduce_boundaries);
+        spec = try spec.withPhysical(current.value.reduce_boundaries, current.value.skew);
         if (current.value.stage == spec.finalStage()) {
             const count = try tasks(spec, spec.finalStage() - 1);
             const pages = try a.alloc(state.Output, count);
@@ -231,20 +255,33 @@ pub const Service = struct {
         // loss replay only this bounded set, without relying on queue delivery.
         if (pending.items.len == 0 and cursor == count) {
             var boundaries: ?[]const u16 = null;
+            var skew: ?[]const physical.Part = null;
             if (current.value.stage == 0 and spec.strategy == .shuffle) {
                 // First persist the completed scan cursor, then checkpoint at
                 // most sixteen authenticated map directories per turn.
                 try self.store().checkpointTasks(a, query_key, claim, 0, cursor, &.{});
-                const resolution = try self.coalesce(a, spec, query, current.value.adaptive);
+                const resolution = self.coalesce(a, spec, query, current.value.adaptive) catch |err| {
+                    if (err != error.SqlJoinBudgetExceeded) return err;
+                    try self.store().terminate(a, query_key, claim, .failed, "SqlJoinBudgetExceeded");
+                    return true;
+                };
                 switch (resolution) {
                     .pending => |output| {
                         try self.store().saveAdaptive(a, query_key, claim, output);
                         return false;
                     },
-                    .done => |value| boundaries = value,
+                    .done => |value| {
+                        boundaries = value.boundaries;
+                        skew = value.skew;
+                        _ = spec.withPhysical(value.boundaries, value.skew) catch |err| {
+                            if (err != error.SqlJoinBudgetExceeded) return err;
+                            try self.store().terminate(a, query_key, claim, .failed, "SqlJoinBudgetExceeded");
+                            return true;
+                        };
+                    },
                 }
             }
-            try self.store().checkpointTasksAndReducers(a, query_key, claim, current.value.stage + 1, 0, &.{}, boundaries);
+            try self.store().checkpointPhysical(a, query_key, claim, current.value.stage + 1, 0, &.{}, boundaries, skew);
         } else try self.store().checkpointTasks(a, query_key, claim, current.value.stage, cursor, pending.items);
         if (tickets.items.len != 0) try dispatcher.dispatch(dispatcher.ptr, tickets.items, self.context);
         return false;
@@ -281,7 +318,7 @@ pub const Service = struct {
             }
             return err;
         };
-        spec = try spec.withReducers(query.value.reduce_boundaries);
+        spec = try spec.withPhysical(query.value.reduce_boundaries, query.value.skew);
         const task = try taskFor(spec, ticket.stage, ticket.task);
         if (task_memory.live > spec.limits.task_memory) {
             try self.store().terminate(self.a, key, claim, .failed, "SqlJoinBudgetExceeded");
@@ -326,6 +363,7 @@ pub const Service = struct {
             }
         };
         defer task_allocator.free(output.key);
+        defer if (output.matches) |witness| task_allocator.free(witness.key);
         try context.ensureActive();
         // Uses a fresh wall-clock reading, never the claim's stale timestamp.
         try scoped_service.store().complete(self.a, key, claim, output);
@@ -333,8 +371,8 @@ pub const Service = struct {
     /// Resolve adjacent partitions once from accepted map statistics. The
     /// boundary list is committed with the stage transition under the same CAS.
     /// Worker count and subsequent coordinator placement cannot change it.
-    const Adaptive = struct { cursor: u32 = 0, bytes: []u64, rows: []u64 };
-    const Resolution = union(enum) { pending: state.Output, done: []const u16 };
+    const Adaptive = struct { cursor: u32 = 0, bytes: []u64, rows: []u64, right_bytes: []u64, left_tiles: [][]const physical.Tile, right_tiles: [][]const physical.Tile };
+    const Resolution = union(enum) { pending: state.Output, done: struct { boundaries: []const u16, skew: []const physical.Part } };
     fn coalesce(self: Service, a: A, spec: plan.Plan, query: state.Query, previous: ?state.Output) !Resolution {
         var progress: Adaptive = if (previous) |output| blk: {
             var client = self.exchange_store.client;
@@ -348,7 +386,13 @@ pub const Service = struct {
             const rows = try a.alloc(u64, spec.partitions);
             @memset(bytes, 0);
             @memset(rows, 0);
-            break :blk .{ .bytes = bytes, .rows = rows };
+            const right_bytes = try a.alloc(u64, spec.partitions);
+            @memset(right_bytes, 0);
+            const left_tiles = try a.alloc([]const physical.Tile, spec.partitions);
+            @memset(left_tiles, &.{});
+            const right_tiles = try a.alloc([]const physical.Tile, spec.partitions);
+            @memset(right_tiles, &.{});
+            break :blk .{ .bytes = bytes, .rows = rows, .right_bytes = right_bytes, .left_tiles = left_tiles, .right_tiles = right_tiles };
         };
         const bytes = progress.bytes;
         const rows = progress.rows;
@@ -367,9 +411,17 @@ pub const Service = struct {
             objects.context = self.context;
             const directory = try objects.footer(sa, value.value.output.?);
             if (directory.partitions.len != spec.partitions) return error.InvalidSqlExchange;
-            for (directory.partitions, bytes, rows) |partition, *size, *row_count| {
+            for (directory.partitions, bytes, rows, 0..) |partition, *size, *row_count, index| {
                 size.* +|= partition.retained_bytes;
                 row_count.* +|= partition.rows;
+                if (id < spec.right.splits) progress.right_bytes[index] +|= partition.retained_bytes;
+                if (partition.rows != 0) {
+                    const tiles = if (id < spec.right.splits) &progress.right_tiles[index] else &progress.left_tiles[index];
+                    const appended = try a.alloc(physical.Tile, tiles.len + 1);
+                    @memcpy(appended[0..tiles.len], tiles.*);
+                    appended[tiles.len] = .{ .map = @intCast(id), .rows = partition.rows };
+                    tiles.* = appended;
+                }
             }
         }
         progress.cursor = end;
@@ -398,15 +450,58 @@ pub const Service = struct {
             total_rows +|= row_count;
         }
         try boundaries.append(a, spec.partitions);
-        return .{ .done = boundaries.items };
+        var skew: std.ArrayList(physical.Part) = .empty;
+        for (0..spec.partitions) |index| {
+            if (progress.right_bytes[index] <= spec.limits.task_memory / 8 and rows[index] <= spec.limits.task_scan_rows / 2) continue;
+            // Coalescing leaves an oversized partition isolated. Tile original
+            // accepted map partitions; no rehash can split one hot equal key.
+            const left = progress.left_tiles[index];
+            const right = progress.right_tiles[index];
+            try skew.append(a, .{ .partition = @intCast(index), .left = if (left.len == 0) &.{.{}} else left, .right = if (right.len == 0) &.{.{}} else right });
+        }
+        return .{ .done = .{ .boundaries = boundaries.items, .skew = skew.items } };
+    }
+    fn loadAccepted(self: Service, a: A, query: state.Query, stage: u32, id: u32) !state.Output {
+        const key = try self.store().key(a, query, stage, id);
+        var loaded = (try self.store().load(a, key)) orelse return error.InvalidSqlExecutionState;
+        defer loaded.deinit(a);
+        if (loaded.value.status != .succeeded) return error.InvalidSqlExecutionState;
+        var result = loaded.value.output.?;
+        result.key = try a.dupe(u8, result.key);
+        if (result.matches) |*witness| witness.key = try a.dupe(u8, witness.key);
+        return result;
     }
     fn loadDependencies(self: Service, a: A, spec: plan.Plan, query: state.Query, stage: u32, task: u32) ![]const state.Output {
+        const descriptor = try taskFor(spec, stage, task);
+        if (descriptor.kind == .passthrough) {
+            const refs = try a.alloc(state.Output, 1);
+            refs[0] = try self.loadAccepted(a, query, 1, descriptor.dependent);
+            return refs;
+        }
+        if (descriptor.kind == .tile_pair or descriptor.kind == .finalize_probe or descriptor.kind == .finalize_build) {
+            var refs: std.ArrayList(state.Output) = .empty;
+            const part = spec.skew[descriptor.physical_part];
+            if (descriptor.kind == .tile_pair) {
+                if (part.left[descriptor.tile_left].map) |id| try refs.append(a, try self.loadAccepted(a, query, 0, id));
+                if (part.right[descriptor.tile_right].map) |id| try refs.append(a, try self.loadAccepted(a, query, 0, id));
+            } else {
+                const build = descriptor.kind == .finalize_build;
+                const tile = if (build) part.right[descriptor.tile_right] else part.left[descriptor.tile_left];
+                if (tile.map) |id| try refs.append(a, try self.loadAccepted(a, query, 0, id));
+                const count = if (build) part.left.len else part.right.len;
+                for (0..count) |index| {
+                    const pair_id = try physical.pairId(spec.skew, spec.reduce_boundaries, spec.reduceCount(), .{ .part = descriptor.physical_part, .left = if (build) @intCast(index) else descriptor.tile_left, .right = if (build) descriptor.tile_right else @intCast(index) });
+                    try refs.append(a, try self.loadAccepted(a, query, 1, pair_id));
+                }
+            }
+            return refs.items;
+        }
         var dependencies: std.ArrayList(state.Output) = .empty;
         if (stage >= 1) {
             const previous = stage - 1;
             const count = try tasks(spec, previous);
-            const begin = if (stage >= 2) task * 32 else 0;
-            const end = if (stage >= 2) @min(count, begin + 32) else count;
+            const begin = if (stage > spec.outputStage()) task * 32 else 0;
+            const end = if (stage > spec.outputStage()) @min(count, begin + 32) else count;
             for (begin..end) |id| {
                 const dependency_key = try self.store().key(a, query, previous, @intCast(id));
                 var dependency = (try self.store().load(a, dependency_key)) orelse return error.InvalidSqlExecutionState;

@@ -109,6 +109,7 @@ pub const Stream = struct {
     borrowed_plan: bool = false,
     hydration_plan: ?@import("lake_decoded_cache.zig").Lease = null,
     planning_footer: ?@import("lake_decoded_cache.zig").Lease = null,
+    bucket_group: ?BucketGroup = null,
     partition_index: usize = 0,
     partition_count: usize = 1,
     discovered: ?parquet.DiscoveredObjectRangeRowGroupPlan = null,
@@ -460,8 +461,24 @@ pub const Stream = struct {
     fn groupPredicates(self: Stream) []const Predicate {
         return if (self.source.inventory.format == .iceberg) self.file_predicates else self.predicates;
     }
+    pub const BucketGroup = struct { source: []const u8, count: u32, index: u16, groups: u16 };
+    fn bucketMatches(self: Stream, file: external.FileEntry) bool {
+        const group = self.bucket_group orelse return true;
+        const rules = self.source.partition_rules orelse return true;
+        const spec = file.partition_spec_id orelse return true;
+        for (rules.items) |rule| {
+            if (rule.spec != spec or !std.mem.eql(u8, rule.source, group.source)) continue;
+            // The SQL source already authenticated the complete bucket proof.
+            for (file.partition_values) |value| if (std.mem.eql(u8, value.column_id, rule.partition)) {
+                const bucket = std.fmt.parseInt(u32, value.string_value, 10) catch return true;
+                return bucket % group.groups == group.index;
+            };
+            if (file.partition_field_count == 1 and file.partition_values.len == 0) return group.index == 0;
+        }
+        return true;
+    }
     fn fileMatches(self: Stream, file: external.FileEntry) bool {
-        return (if (self.source.inventory.format == .iceberg) icebergFileMayMatch(file, self.schema_contract, self.predicates) else fileMayMatch(file, self.predicates)) and
+        return self.bucketMatches(file) and (if (self.source.inventory.format == .iceberg) icebergFileMayMatch(file, self.schema_contract, self.predicates) else fileMayMatch(file, self.predicates)) and
             (if (self.source.partition_rules) |rules| @import("lake_partition_pruning.zig").mayMatch(rules.items, file, self.predicates) else true);
     }
 

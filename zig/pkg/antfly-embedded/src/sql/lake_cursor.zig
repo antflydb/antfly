@@ -146,6 +146,16 @@ pub fn openPinnedPartition(alloc: Allocator, table: catalog.Table, request: cata
     return cursor;
 }
 
+/// Bucket groups retain the complete file iterator; manifest partition pruning
+/// chooses files, independently of the number or order of physical files.
+pub fn openPinnedBucket(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *serving.ServingSource, group: @import("../serverless/query/lake_stream.zig").Stream.BucketGroup) !catalog.Cursor {
+    if (group.groups == 0 or group.index >= group.groups or group.count == 0 or group.count % group.groups != 0) return error.InvalidSqlBackendResponse;
+    const cursor = try openPinned(alloc, table, request, context, source);
+    const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+    owner.stream.bucket_group = group;
+    return cursor;
+}
+
 fn openPinnedMaterialized(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *serving.ServingSource) !catalog.Cursor {
     if (request.include_primary_digest or request.include_document or request.index_equality != null) return error.UnsupportedSqlExecution;
     try context.ensureActive();

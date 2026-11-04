@@ -33,7 +33,37 @@ pub const Query = struct {
         if (self.expires_ms == 0) return error.InvalidSqlExecutionState;
     }
 };
-pub const Output = struct { key: []const u8, hash: Digest, bytes: u64, rows: u64 = 0, partitions: u16 = 0, index_bytes: u32 = 0, index_hash: ?Digest = null };
+pub const Witness = struct {
+    key: []const u8,
+    hash: Digest,
+    bytes: u64,
+    rows: u64,
+    partitions: u16,
+    index_bytes: u32,
+    index_hash: ?Digest,
+    pub fn output(self: Witness) Output {
+        return .{ .key = self.key, .hash = self.hash, .bytes = self.bytes, .rows = self.rows, .partitions = self.partitions, .index_bytes = self.index_bytes, .index_hash = self.index_hash };
+    }
+};
+pub const Output = struct {
+    key: []const u8,
+    hash: Digest,
+    bytes: u64,
+    rows: u64 = 0,
+    partitions: u16 = 0,
+    index_bytes: u32 = 0,
+    index_hash: ?Digest = null,
+    matches: ?Witness = null,
+    pub fn witness(self: Output) Witness {
+        return .{ .key = self.key, .hash = self.hash, .bytes = self.bytes, .rows = self.rows, .partitions = self.partitions, .index_bytes = self.index_bytes, .index_hash = self.index_hash };
+    }
+};
+fn sameWitness(left: ?Witness, right: ?Witness) bool {
+    if (left == null or right == null) return left == null and right == null;
+    const l = left.?;
+    const r = right.?;
+    return std.mem.eql(u8, l.key, r.key) and std.meta.eql(l.hash, r.hash) and l.bytes == r.bytes and l.rows == r.rows and l.partitions == r.partitions and l.index_bytes == r.index_bytes and std.meta.eql(l.index_hash, r.index_hash);
+}
 pub const Status = enum { pending, running, succeeded, failed, cancelled };
 pub const Record = struct {
     version: u8 = 2,
@@ -47,6 +77,7 @@ pub const Record = struct {
     cursor: u32 = 0,
     pending: []const u32 = &.{},
     reduce_boundaries: []const u16 = &.{},
+    skew: []const @import("physical.zig").Part = &.{},
     adaptive: ?Output = null,
     cancel_requested: bool = false,
     output: ?Output = null,
@@ -155,6 +186,9 @@ pub const Store = struct {
         return self.checkpointTasksAndReducers(a, path, claim_, stage, cursor, pending, null);
     }
     pub fn checkpointTasksAndReducers(self: Store, a: A, path: []const u8, claim_: Claim, stage: u32, cursor: u32, pending: []const u32, boundaries: ?[]const u16) !void {
+        return self.checkpointPhysical(a, path, claim_, stage, cursor, pending, boundaries, null);
+    }
+    pub fn checkpointPhysical(self: Store, a: A, path: []const u8, claim_: Claim, stage: u32, cursor: u32, pending: []const u32, boundaries: ?[]const u16, skew: ?[]const @import("physical.zig").Part) !void {
         if (pending.len > 256) return error.InvalidSqlExecutionState;
         for (pending, 0..) |id, index| {
             if (id >= cursor or (index != 0 and id <= pending[index - 1])) return error.InvalidSqlExecutionState;
@@ -170,6 +204,7 @@ pub const Store = struct {
             if (old.value.stage != 0 or stage != 1 or old.value.reduce_boundaries.len != 0 or value.len < 2 or value.len > 1025) return error.InvalidSqlExecutionState;
             next.reduce_boundaries = value;
             next.adaptive = null;
+            if (skew) |parts| next.skew = parts;
         }
         try self.write(a, path, old, next);
     }
@@ -203,7 +238,7 @@ pub const Store = struct {
         defer old.deinit(a);
         // Exact accepted retries survive an ACK loss, including after expiry.
         if (old.value.status == .succeeded) {
-            if (old.value.epoch != claim_.epoch or !std.mem.eql(u8, old.value.owner, claim_.owner) or !std.meta.eql(old.value.output.?.hash, output.hash) or !std.mem.eql(u8, old.value.output.?.key, output.key) or old.value.output.?.bytes != output.bytes or old.value.output.?.rows != output.rows or old.value.output.?.partitions != output.partitions or old.value.output.?.index_bytes != output.index_bytes or !std.meta.eql(old.value.output.?.index_hash, output.index_hash)) return error.SqlExecutionFenced;
+            if (old.value.epoch != claim_.epoch or !std.mem.eql(u8, old.value.owner, claim_.owner) or !std.meta.eql(old.value.output.?.hash, output.hash) or !std.mem.eql(u8, old.value.output.?.key, output.key) or old.value.output.?.bytes != output.bytes or old.value.output.?.rows != output.rows or old.value.output.?.partitions != output.partitions or old.value.output.?.index_bytes != output.index_bytes or !std.meta.eql(old.value.output.?.index_hash, output.index_hash) or !sameWitness(old.value.output.?.matches, output.matches)) return error.SqlExecutionFenced;
             return;
         }
         if (old.value.expires_ms <= self.now_ms) return error.SqlQueryExpired;

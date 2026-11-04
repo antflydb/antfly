@@ -632,7 +632,9 @@ pub const StatisticsSketch = struct {
 };
 /// Durable, authorized external read identity exported from an already pinned
 /// statement cursor. It must never acquire a newer snapshot or WAL cut.
+pub const BucketLayout = struct { column: []const u8, count: u32 };
 pub const ReadCapability = struct {
+    bucket: ?BucketLayout = null,
     token: []const u8,
     schema: [64]u8,
     snapshot: []const u8,

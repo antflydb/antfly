@@ -66,7 +66,7 @@ shared 2 MiB ingress reservation and a concurrent request bound. The queue
 profile processes one task per delivery and permits configurable provider
 consumer concurrency.
 
-Typed Parquet scans, retained WAL overlays, scalar predicates, broadcast/shuffle
+Typed Parquet scans, retained WAL overlays, scalar predicates, broadcast/shuffle/bucket
 joins, accepted outputs and adaptive adjacent partition coalescing share the
 native implementation. Authenticated exchange block indices support bounded
 range reads. Small immutable byte caches are scoped to physical deployment
@@ -75,9 +75,29 @@ state remains invocation-private, and native disk caches are excluded from WASM.
 Input pins cover the admitted query expiry; coordinator turns do not repeatedly
 reopen source catalogs to renew them.
 
-Bucket-compatible execution/native bucketed writes and distributed recursive
-repartitioning/skew tiling are not implemented yet. Oversized hosted tasks fail
-their explicit budgets; this profile does not claim unbounded join support or a
+Managed native writes and compaction honor single-column Iceberg `bucket[N]`
+specs for `int`, `long` and `string`. Compatible joins use a common divisor of
+both bucket counts, prune files before opening Parquet and route copied WAL rows
+with the same Iceberg hash. Proof checks all active files against their retained
+specs; mixed or unsupported layouts use shuffle. Equality deletes remain global
+so updates can move bucket keys and partition specs can evolve safely. Bucket
+manifests merge independently by spec while retaining original file sequences.
+
+Oversized accepted shuffle partitions resolve to durable tile-pair tasks over
+bounded original map partitions. This also splits a single repeated hot key,
+which additional hash bits cannot separate. Pair tasks publish compact match
+bitmaps separately from result rows. Independent finalizers OR all accepted
+witnesses before emitting unmatched outer rows or semi/anti existence results;
+residual `ON` predicates contribute evidence only after they accept a pair.
+The query CAS commits this layout together with the stage transition. A new
+coordinator reconstructs the same tasks, and result pass-through references avoid
+copying joined rows into another exchange. Sparse partitions still use ordinary
+reducers and adjacent coalescing. Resolved tasks, retry/output reservations and
+request estimates are checked again before tile dispatch.
+
+Each tile remains subject to task memory, scan, output and runtime limits. Large
+Cartesian results and excessive tile grids fail explicit query budgets. This
+profile does not claim unbounded join support or a
 cloud throughput qualification.
 
 ## Verification
@@ -90,7 +110,10 @@ ANTFLY_ZIG=/path/to/pinned/zig npm run test:sql-workerd
 The runner exports a fresh native fixture containing real typed Parquet, a
 retained snapshot and accepted WAL delete/upsert images, then builds and
 instruments WASM. Tests execute that fixture in a fresh WASM instance, lose a
-completion response and verify accepted-output recovery. Control tests cover
+completion response and verify accepted-output recovery. A separate kernel stress
+fixture seeds 16,384 accepted build rows into a hot partition, then executes
+portable tile joins, compact match proofs and global NULL/unmatched finalization.
+Control tests cover
 service JWT validation, queue retries, alarm recovery, bounded discovery and
 cache scope. Workerd tests exercise actual R2, Queue and Durable Object bindings,
 progress without client turns, cancellation and result reuse after restart.

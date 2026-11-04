@@ -26,6 +26,7 @@ const Context = local.serverless_query_lake_read_context.Context;
 const Fixture = struct {
     now: u64 = 1000,
     opens: usize = 0,
+    custom_right: ?[]const []const Datum = null,
     retained: usize = 0,
     filters: usize = 0,
     left: [3][1]Datum = .{ .{Datum.json(.{ .integer = 1 })}, .{Datum.json(.{ .integer = 2 })}, .{.{}} },
@@ -46,21 +47,26 @@ const Fixture = struct {
         input: u64,
         split: u32,
         partitions: u32,
+        bucketed: bool = false,
         position: usize = 0,
         filter: ?*const local.sql_dynamic_filter.Filter,
         columns: []const plan.Column,
         fn next(raw: *anyopaque, a: A, maximum: usize) !?[]const []const Datum {
             const self: *InputStream = @ptrCast(@alignCast(raw));
             var rows: std.ArrayList([]const Datum) = .empty;
-            const count: usize = if (self.input == 1) self.fixture.left.len else self.fixture.right.len;
+            const count: usize = if (self.input == 1) self.fixture.left.len else (if (self.fixture.custom_right) |rows_| rows_.len else self.fixture.right.len);
             while (self.position < count and rows.items.len < maximum) {
                 const index = self.position;
                 self.position += 1;
-                if (index % self.partitions != self.split) continue;
-                const cells: []const Datum = if (self.input == 1) &self.fixture.left[index] else &self.fixture.right[index];
+                if (!self.bucketed and index % self.partitions != self.split) continue;
+                const cells: []const Datum = if (self.input == 1) &self.fixture.left[index] else if (self.fixture.custom_right) |rows_| rows_[index] else &self.fixture.right[index];
+                if (self.bucketed) {
+                    const hash = if (cells[0].sql_null) 0 else local.serverless_external_source_mod.lake_catalog.bucket.hashInteger(cells[0].value.integer) & 0x7fffffff;
+                    if (hash % self.partitions != self.split) continue;
+                }
                 const projected = try a.alloc(Datum, self.columns.len);
                 for (self.columns, projected) |column, *out| {
-                    out.* = if (std.mem.eql(u8, column.name, "id")) cells[0] else if (std.mem.eql(u8, column.name, "_id")) Datum.json(.{ .string = "row" }) else return error.InvalidSqlBackendResponse;
+                    out.* = if (std.mem.eql(u8, column.name, "id")) cells[0] else if (std.mem.eql(u8, column.name, "payload")) cells[1] else if (std.mem.eql(u8, column.name, "flag")) cells[2] else if (std.mem.eql(u8, column.name, "_id")) Datum.json(.{ .string = "row" }) else return error.InvalidSqlBackendResponse;
                 }
                 if (self.filter) |filter| {
                     var filter_keys: [32]Datum = undefined;
@@ -79,11 +85,11 @@ const Fixture = struct {
     fn open(raw: *anyopaque, a: A, _: state.Digest, input: plan.Input, split: u32, filter: ?*const local.sql_dynamic_filter.Filter, context: Context) !runner.Stream {
         const self: *Fixture = @ptrCast(@alignCast(raw));
         try context.ensureActive();
-        if (!std.mem.eql(u8, input.cut, "retained-accepted-cut") or split >= input.splits) return error.SqlExecutionUnauthorized;
+        if (!std.mem.eql(u8, input.cut, "retained-accepted-cut") or split >= (if (input.bucket_group) |g| g.count else input.splits)) return error.SqlExecutionUnauthorized;
         self.opens += 1;
         if (filter != null) self.filters += 1;
         const stream = try a.create(InputStream);
-        stream.* = .{ .a = a, .fixture = self, .input = input.table_id, .split = split, .partitions = input.splits, .filter = filter, .columns = input.columns };
+        stream.* = .{ .a = a, .fixture = self, .input = input.table_id, .split = split, .partitions = if (input.bucket_group) |g| g.count else input.splits, .bucketed = input.bucket_group != null, .filter = filter, .columns = input.columns };
         return .{ .ptr = stream, .next_fn = InputStream.next, .close_fn = InputStream.close };
     }
     fn service(self: *Fixture, a: A, client: storage.Client, owner: []const u8) runtime.Service {
@@ -125,7 +131,7 @@ test "distributed SQL runtime executes broadcast and shuffle SQL join semantics 
     const a = std.testing.allocator;
     const Case = struct { kind: @FieldType(plan.Join, "kind"), count: u64 };
     for ([_]Case{ .{ .kind = .inner, .count = 2 }, .{ .kind = .left, .count = 4 }, .{ .kind = .right, .count = 4 }, .{ .kind = .full, .count = 6 }, .{ .kind = .semi, .count = 1 }, .{ .kind = .anti, .count = 2 } }) |case| {
-        for ([_]plan.Strategy{ .broadcast, .shuffle }) |strategy| {
+        for ([_]plan.Strategy{ .broadcast, .shuffle, .bucket }) |strategy| {
             for ([_]bool{ false, true }) |aggregate| {
                 if (strategy == .broadcast and (case.kind == .right or case.kind == .full)) continue;
                 var arena = std.heap.ArenaAllocator.init(a);
@@ -156,9 +162,13 @@ test "distributed SQL runtime executes broadcast and shuffle SQL join semantics 
                     .right = .{ .table_id = 2, .schema = @splat('c'), .snapshot = "old-right", .wal_cut = 8, .cut = "retained-accepted-cut", .columns = &.{column}, .estimated_bytes = 100, .estimated_rows = 4, .splits = 2 },
                     .join = .{ .kind = case.kind, .left_keys = &.{0}, .right_keys = &.{0} },
                     .strategy = strategy,
-                    .partitions = if (strategy == .shuffle) 4 else 1,
+                    .partitions = if (strategy == .broadcast) 1 else 4,
                     .limits = .{},
                 };
+                if (strategy == .bucket) {
+                    spec.left.bucket = .{ .column = 0, .count = 12 };
+                    spec.right.bucket = .{ .column = 0, .count = 8 };
+                }
                 spec.limits.query_exchange_bytes = 16 * 1024 * 1024 * 1024;
                 if (aggregate) {
                     spec.left.splits = 33; // Exercise the bounded fan-in tree.
@@ -235,6 +245,10 @@ test "distributed SQL runtime executes broadcast and shuffle SQL join semantics 
 }
 
 test "distributed SQL native lake source retains accepted WAL cuts across ingestion and splits overlays exactly once" {
+    try nativeLakeSource(false);
+    try nativeLakeSource(true);
+}
+fn nativeLakeSource(bucketed: bool) !void {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -253,10 +267,10 @@ test "distributed SQL native lake source retains accepted WAL cuts across ingest
     defer opened.deinit();
     const lake = local.serverless_external_source_mod.lake_catalog;
     var managed: lake.managed.Managed = .{ .client = opened.client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = binding.binding.source_uri };
-    _ = try managed.create(sa, "create", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
-    _ = try ingestion.accept(sa, binding.binding, options, .{}, "{\"batch_id\":\"base\",\"source\":\"s\",\"epoch\":\"1\",\"checkpoint\":\"1\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"id\":1}},{\"op\":\"upsert\",\"row\":{\"id\":2}}]}");
+    _ = try managed.create(sa, "create", if (bucketed) "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true},{\"id\":2,\"name\":\"key\",\"type\":\"string\",\"required\":false}]},\"partition-spec\":{\"spec-id\":1,\"fields\":[{\"source-id\":2,\"field-id\":1000,\"name\":\"key_bucket\",\"transform\":\"bucket[4]\"}]}}" else "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+    _ = try ingestion.accept(sa, binding.binding, options, .{}, if (bucketed) "{\"batch_id\":\"base\",\"source\":\"s\",\"epoch\":\"1\",\"checkpoint\":\"1\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"id\":1,\"key\":\"old\"}},{\"op\":\"upsert\",\"row\":{\"id\":2,\"key\":\"deleted\"}}]}" else "{\"batch_id\":\"base\",\"source\":\"s\",\"epoch\":\"1\",\"checkpoint\":\"1\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"id\":1}},{\"op\":\"upsert\",\"row\":{\"id\":2}}]}");
     try std.testing.expect(try ingestion.drain(sa, binding.binding, options, .{}));
-    _ = try ingestion.accept(sa, binding.binding, options, .{}, "{\"batch_id\":\"overlay\",\"source\":\"s\",\"epoch\":\"1\",\"checkpoint\":\"2\",\"expected_checkpoint\":\"1\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"delete\",\"row\":{\"id\":2}},{\"op\":\"upsert\",\"row\":{\"id\":3}}]}");
+    _ = try ingestion.accept(sa, binding.binding, options, .{}, if (bucketed) "{\"batch_id\":\"overlay\",\"source\":\"s\",\"epoch\":\"1\",\"checkpoint\":\"2\",\"expected_checkpoint\":\"1\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"delete\",\"row\":{\"id\":2}},{\"op\":\"upsert\",\"row\":{\"id\":1,\"key\":\"moved\"}},{\"op\":\"upsert\",\"row\":{\"id\":3,\"key\":\"new\"}}]}" else "{\"batch_id\":\"overlay\",\"source\":\"s\",\"epoch\":\"1\",\"checkpoint\":\"2\",\"expected_checkpoint\":\"1\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"delete\",\"row\":{\"id\":2}},{\"op\":\"upsert\",\"row\":{\"id\":3}}]}");
     const Authorization = struct {
         table: local.sql_catalog.Table,
         fn resolve(raw: *anyopaque, _: A, tenant: state.Digest, id: u64, _: Context) !local.sql_catalog.Table {
@@ -265,7 +279,7 @@ test "distributed SQL native lake source retains accepted WAL cuts across ingest
             return self.table;
         }
     };
-    var auth: Authorization = .{ .table = .{ .id = 7, .physical_name = "events", .schema_version = 1, .external_base_source = binding, .columns = &.{.{ .name = "id", .path = "id", .type = .integer }} } };
+    var auth: Authorization = .{ .table = .{ .id = 7, .physical_name = "events", .schema_version = 1, .external_base_source = binding, .columns = if (bucketed) &.{ .{ .name = "id", .path = "id", .type = .integer }, .{ .name = "key", .path = "key", .type = .string } } else &.{.{ .name = "id", .path = "id", .type = .integer }} } };
     const current_table = try managed.load(sa);
     const detected = try local.serverless_query_lake_schema.icebergSchema(sa, current_table.metadata_json, null);
     auth.table.external_base_source.?.binding.schema_fingerprint = detected.fingerprint;
@@ -274,7 +288,7 @@ test "distributed SQL native lake source retains accepted WAL cuts across ingest
     var artifacts = objects.artifactStore();
     var host: @import("lake_source.zig").Host = .{ .artifacts = &artifacts, .store_identity = try @import("../../api/native_retained_cut.zig").storeIdentity(sa, objects.locator), .options = options, .io = std.testing.io, .authorization = .{ .ptr = &auth, .resolve = Authorization.resolve } };
     const now: u64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
-    const input = try host.capture(sa, @splat('a'), 7, &.{.{ .name = "id", .type = .integer }}, 2, now + 600000, .{ .io = std.testing.io });
+    const input = try host.capture(sa, @splat('a'), 7, if (bucketed) &.{ .{ .name = "id", .type = .integer }, .{ .name = "key", .type = .string } } else &.{.{ .name = "id", .type = .integer }}, 2, now + 600000, .{ .io = std.testing.io });
     // An independently opened worker needs no in-process catalog resolver.
     // Its only authority is the immutable scope-bound admitted read grant.
     var portable_host = host;
@@ -296,7 +310,8 @@ test "distributed SQL native lake source retains accepted WAL cuts across ingest
     try std.testing.expect(try ingestion.drain(sa, binding.binding, options, .{}));
     var service = deployed.service;
     service.tenant = @splat('a');
-    const specification = try plan.choose(input, input, @splat('a'), now + 600000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{}, now);
+    const specification = try plan.choose(input, input, @splat('a'), now + 600000, .{ .left_keys = if (bucketed) &.{1} else &.{0}, .right_keys = if (bucketed) &.{1} else &.{0} }, .{}, now);
+    try std.testing.expectEqual(if (bucketed) plan.Strategy.bucket else plan.Strategy.broadcast, specification.strategy);
     const query = try service.submit(specification);
     const claim = (try service.acquire(query)).?;
     const Direct = struct {
@@ -665,6 +680,10 @@ test "distributed SQL task budget failure is terminal and reported to the query"
 }
 
 test "distributed SQL hosted bound-client execution reopens native cuts and typed Parquet" {
+    try hostedLakeSource(false);
+    try hostedLakeSource(true);
+}
+fn hostedLakeSource(bucketed: bool) !void {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -674,7 +693,7 @@ test "distributed SQL hosted bound-client execution reopens native cuts and type
     var memory = storage.MemoryClient.init(a);
     defer memory.deinit();
     var managed: lake.managed.Managed = .{ .client = memory.client(), .bucket = "source", .prefix = "table", .source_uri = "s3://source/table" };
-    const initial = try managed.create(sa, "create", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+    const initial = try managed.create(sa, "create", if (bucketed) "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]},\"partition-spec\":{\"spec-id\":1,\"fields\":[{\"source-id\":1,\"field-id\":1000,\"name\":\"id_bucket\",\"transform\":\"bucket[4]\"}]}}" else "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
     const images = try std.json.parseFromSliceLeaky(std.json.Value, sa, "[{\"id\":1},{\"id\":2}]", .{});
     const batch: lake.row_commit.Batch = .{ .batch_id = "base", .source = "s", .epoch = "1", .checkpoint = "1", .key_fields = &.{"id"}, .changes = &.{ .{ .op = .upsert, .row = images.array.items[0] }, .{ .op = .upsert, .row = images.array.items[1] } } };
     const prepared = try lake.row_commit.prepare(sa, initial, .{ .client = memory.client(), .bucket = "source", .prefix = "table", .uri = "s3://source/table" }, batch, 1, 2);
@@ -695,10 +714,10 @@ test "distributed SQL hosted bound-client execution reopens native cuts and type
     const descriptor: @import("../../api/lake_sql_retained_cut.zig").Descriptor = .{ .table_id = 7, .schema_version = 1, .object_generation = 0, .expires_ms = expires, .metadata_location = committed.metadata_location, .metadata_json = committed.metadata_json, .table_uuid = try lake.metadata.str(try lake.metadata.get(root, "table-uuid")), .snapshot_id = snapshot, .pending = .{ .lsn = 2, .key_fields = &.{"id"}, .changes = &.{ .{ .op = .delete, .row = recent.array.items[0] }, .{ .op = .upsert, .row = recent.array.items[1] } } }, .authorization = .{ .scope = @splat('a'), .table = @import("../../api/lake_sql_retained_cut.zig").ReadTable.from(table) } };
     const identity = try @import("../../api/native_retained_cut.zig").storeIdentity(sa, config.artifacts);
     const cut = try @import("../../api/lake_sql_retained_cut.zig").save(sa, &artifacts, identity, std.testing.io, descriptor, .none);
-    const input: plan.Input = .{ .table_id = 7, .schema = try @import("lake_source.zig").Host.fingerprint(sa, table), .snapshot = snapshot, .wal_cut = 2, .cut = cut, .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 100, .estimated_rows = 2, .splits = 2 };
-    const spec: plan.Plan = .{ .tenant = @splat('a'), .expires_ms = expires, .left = input, .right = input, .join = .{ .left_keys = &.{0}, .right_keys = &.{0} }, .strategy = .shuffle, .partitions = 4, .limits = .{ .task_memory = config.task_memory } };
+    const input: plan.Input = .{ .table_id = 7, .schema = try @import("lake_source.zig").Host.fingerprint(sa, table), .snapshot = snapshot, .wal_cut = 2, .cut = cut, .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 100, .estimated_rows = 2, .splits = 2, .bucket = if (bucketed) .{ .column = 0, .count = 4 } else null };
+    const spec: plan.Plan = .{ .tenant = @splat('a'), .expires_ms = expires, .left = input, .right = input, .join = .{ .left_keys = &.{0}, .right_keys = &.{0} }, .strategy = if (bucketed) .bucket else .shuffle, .partitions = 4, .limits = .{ .task_memory = config.task_memory } };
     const raw_plan = try spec.encode(sa);
-    if (std.testing.environ.getPosix("ANTFLY_SQL_HOSTED_FIXTURE")) |path| {
+    if (std.testing.environ.getPosix(if (bucketed) "ANTFLY_SQL_HOSTED_BUCKET_FIXTURE" else "ANTFLY_SQL_HOSTED_FIXTURE")) |path| {
         const Item = struct { bucket: []const u8, key: []const u8, body_base64: []const u8 };
         var items: std.ArrayList(Item) = .empty;
         var buckets = memory.buckets.iterator();
@@ -740,7 +759,8 @@ test "distributed SQL hosted bound-client execution reopens native cuts and type
     const result = try hosted.execute(sa, memory.client(), std.testing.io, .{ .io = std.testing.io }, try std.json.Stringify.valueAlloc(sa, request, .{}));
     const value = try std.json.parseFromSliceLeaky(runtime.Result, sa, result, .{});
     try std.testing.expectEqual(@as(u64, 2), value.rows);
-    try std.testing.expectEqual(@as(usize, 1), value.pages.len);
+    try std.testing.expectEqual(if (bucketed) @as(usize, 4) else 1, value.pages.len);
+    if (!bucketed) if (std.testing.environ.getPosix("ANTFLY_SQL_HOSTED_SKEW_FIXTURE")) |path| try exportSkewFixture(sa, &memory, config, input, expires - 1, path);
 }
 
 test "distributed SQL cancellation is durable before dispatch and scope checked" {
@@ -786,4 +806,116 @@ test "distributed SQL maintenance deployment opens without source table credenti
     try std.testing.expect(owned.artifacts == null);
     try std.testing.expect(owned.host == null);
     try std.testing.expectError(error.SqlQueryRoleRequired, owned.service.acquire(.{ .id = @splat('a'), .expires_ms = 1000000 }));
+}
+
+test "distributed SQL skew tiles merge match evidence across pods for every join kind" {
+    const Case = struct { kind: @FieldType(plan.Join, "kind"), rows: u64 };
+    for ([_]Case{ .{ .kind = .inner, .rows = 4 }, .{ .kind = .left, .rows = 6 }, .{ .kind = .right, .rows = 8 }, .{ .kind = .full, .rows = 10 }, .{ .kind = .semi, .rows = 1 }, .{ .kind = .anti, .rows = 2 } }) |case| {
+        for ([_]bool{ false, true }) |aggregate| {
+            const a = std.testing.allocator;
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const sa = arena.allocator();
+            var memory = storage.MemoryClient.init(a);
+            defer memory.deinit();
+            const payload = try sa.alloc(u8, 160 * 1024);
+            @memset(payload, 'x');
+            var wide: [8][3]Datum = undefined;
+            var rows_: [8][]const Datum = undefined;
+            for (&wide, &rows_, 0..) |*row, *reference, index| {
+                row.* = .{ Datum.json(.{ .integer = 2 }), Datum.json(.{ .string = payload }), Datum.json(.{ .bool = index % 2 == 0 }) };
+                reference.* = row;
+            }
+            var fixture: Fixture = .{ .custom_right = &rows_ };
+            var service = fixture.service(a, memory.client(), "coordinator-a");
+            var dispatch: Dispatch = .{ .workers = .{ fixture.service(a, memory.client(), "worker-a"), fixture.service(a, memory.client(), "worker-b") }, .drop_once = false };
+            const column: plan.Column = .{ .name = "id", .type = .integer };
+            const left: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{column}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 2 };
+            var right = left;
+            right.table_id = 2;
+            right.snapshot = "old-right";
+            right.wal_cut = 8;
+            right.columns = &.{ column, .{ .name = "payload", .type = .string }, .{ .name = "flag", .type = .boolean } };
+            right.splits = 4;
+            right.estimated_bytes = 8 * 160 * 1024;
+            right.estimated_rows = 8;
+            var spec: plan.Plan = .{ .tenant = @splat('a'), .expires_ms = 1000000, .left = left, .right = right, .join = .{ .kind = case.kind, .left_keys = &.{0}, .right_keys = &.{0}, .projection = &.{0}, .condition = .{ .instructions = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .column = 3 } }}, .root = 0, .output = .{ .kind = .boolean } } }, .strategy = .shuffle, .partitions = 1, .limits = .{ .task_memory = 8 * 1024 * 1024, .task_output_bytes = 2 * 1024 * 1024, .query_exchange_bytes = 2 * 1024 * 1024 * 1024 } };
+            if (aggregate) spec.aggregate = .{ .inputs = &.{null}, .specs = &.{.{ .kind = .count }} };
+            const query = try service.submit(spec);
+            var claim = (try service.acquire(query)).?;
+            var complete = false;
+            var moved = false;
+            for (0..128) |_| {
+                complete = try service.tick(query, claim, .{ .ptr = &dispatch, .dispatch = Dispatch.run });
+                if (complete) break;
+                const key = try service.state_store.key(sa, query, null, 0);
+                var record = (try service.state_store.load(sa, key)).?;
+                defer record.deinit(sa);
+                if (record.value.stage == 2 and !moved) {
+                    try std.testing.expectEqual(@as(usize, 1), record.value.skew.len);
+                    fixture.now += 92001;
+                    service = fixture.service(a, memory.client(), "coordinator-b");
+                    claim = (try service.acquire(query)).?;
+                    moved = true;
+                }
+            }
+            try std.testing.expect(complete);
+            try std.testing.expect(moved);
+            const result = (try service.pollResult(sa, query)).?;
+            try std.testing.expectEqual(if (aggregate) @as(u64, 1) else case.rows, result.rows);
+            if (aggregate) for (result.pages) |page| {
+                var data = try service.exchange_store.read(sa, page, 0, 2 * 1024 * 1024);
+                while (try data.next(sa, 2 * 1024 * 1024)) |block| {
+                    defer block.deinit();
+                    try std.testing.expectEqual(@as(i64, @intCast(case.rows)), (try block.cell(0, 0)).value.integer);
+                }
+            };
+        }
+    }
+}
+
+/// Seed accepted map outputs to stress the portable distributed join kernel.
+/// Parquet/capability execution is covered by the independent source fixtures.
+fn exportSkewFixture(a: A, memory: *storage.MemoryClient, config: @import("hosted.zig").Config, original: plan.Input, expires: u64, path: []const u8) !void {
+    const hosted = @import("hosted.zig");
+    var left = original;
+    left.splits = 2;
+    var right = original;
+    right.splits = 32;
+    right.estimated_rows = 16384;
+    right.estimated_bytes = 2 * 1024 * 1024;
+    const spec: plan.Plan = .{ .tenant = @splat('a'), .expires_ms = expires, .left = left, .right = right, .join = .{ .kind = .full, .left_keys = &.{0}, .right_keys = &.{0}, .projection = &.{0} }, .strategy = .shuffle, .partitions = 1, .limits = .{ .task_memory = config.task_memory, .task_output_bytes = 2 * 1024 * 1024, .query_exchange_bytes = 8 * 1024 * 1024 * 1024 } };
+    const raw = try spec.encode(a);
+    const submitted = try hosted.execute(a, memory.client(), std.testing.io, .{ .io = std.testing.io }, try std.json.Stringify.valueAlloc(a, hosted.Request{ .op = .sql_submit, .config = config, .tenant = spec.tenant, .owner = "seed", .raw_plan = raw }, .{}));
+    const query = (try std.json.parseFromSliceLeaky(struct { query: state.Query }, a, submitted, .{})).query;
+    const now: u64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+    const store: state.Store = .{ .client = memory.client(), .bucket = config.state.bucket, .prefix = config.state.prefix, .now_ms = now };
+    const objects: @import("exchange.zig").Store = .{ .client = memory.client(), .bucket = config.exchange.bucket, .prefix = config.exchange.prefix };
+    for (0..34) |id| {
+        var cells: [512][1]Datum = undefined;
+        var rows_: [512]local.sql_operators.Row = undefined;
+        const count: usize = if (id < 32) 512 else if (id == 32) 2 else 1;
+        for (cells[0..count], rows_[0..count], 0..) |*row, *out, index| {
+            row.* = .{if (id < 32) (if (index == 511) Datum{} else Datum.json(.{ .integer = 2 })) else if (id == 32) (if (index == 0) Datum.json(.{ .integer = 1 }) else Datum{}) else Datum.json(.{ .integer = 2 })};
+            out.* = .{ .values = row, .keys = &.{}, .ordinal = index };
+        }
+        const key = try store.key(a, query, 0, @intCast(id));
+        _ = try store.ensure(a, key, query.id, expires);
+        const claim = (try store.claim(a, key, "seed-map", 60000)).?;
+        const ref = try objects.put(a, query.id, expires, &.{rows_[0..count]}, 2 * 1024 * 1024);
+        try store.complete(a, key, claim, ref);
+    }
+    const Item = struct { bucket: []const u8, key: []const u8, body_base64: []const u8 };
+    var items: std.ArrayList(Item) = .empty;
+    var buckets = memory.buckets.iterator();
+    while (buckets.next()) |bucket| {
+        var entries = bucket.value_ptr.iterator();
+        while (entries.next()) |entry| {
+            const bytes = entry.value_ptr.body;
+            const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+            _ = std.base64.standard.Encoder.encode(encoded, bytes);
+            try items.append(a, .{ .bucket = bucket.key_ptr.*, .key = entry.key_ptr.*, .body_base64 = encoded });
+        }
+    }
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = try std.json.Stringify.valueAlloc(a, .{ .config = config, .raw_plan = raw, .tenant = spec.tenant, .query = query, .expected_rows = 16386, .expected_pages = 98, .objects = items.items }, .{}) });
 }
