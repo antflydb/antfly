@@ -8,6 +8,10 @@
     "url": "git+https://github.com/antflydb/antfly.git",
     "directory": "ts/packages/cli-linux-arm64"
   },
+  "homepage": "https://github.com/antflydb/antfly/tree/main/ts/packages/cli-linux-arm64#readme",
+  "bugs": {
+    "url": "https://github.com/antflydb/antfly/issues"
+  },
   "files": [
     "bin",
     "include",
