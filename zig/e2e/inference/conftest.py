@@ -905,9 +905,26 @@ def api(base_url):
             _check(r)
             return r.json()
 
-        def transcribe(self, audio: str, model: str, **kwargs):
-            body = {"model": model, "audio": audio, **kwargs}
-            r = self.post("/transcribe", json=body)
+        def read_audio(
+            self,
+            audio: str,
+            model: str,
+            *,
+            language=None,
+            timestamps=None,
+            diarization=None,
+            **kwargs,
+        ):
+            options = dict(kwargs.pop("audio_options", {}))
+            for key, value in {
+                "language": language,
+                "timestamps": timestamps,
+                "diarization": diarization,
+            }.items():
+                if value is not None:
+                    options[key] = value
+            body = {"model": model, "audio": audio, "audio_options": options, **kwargs}
+            r = self.post("/read", json=body)
             _check(r)
             return r.json()
 

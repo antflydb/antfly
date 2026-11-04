@@ -45,8 +45,10 @@ pub enum Error {
     /// The requested resource is temporarily busy or changed during
     /// streaming; stabilize it and retry.
     Busy,
-    /// The operation was published, but crash durability could not be
-    /// confirmed. Inspect the destination; do not retry automatically.
+    /// The operation may have taken effect: it was published but crash
+    /// durability could not be confirmed, or a failure left it unknown
+    /// whether it applied. Inspect the affected data; do not retry
+    /// automatically.
     OutcomeUnknown,
     /// The operation requires a capability that is not supported by this
     /// platform or filesystem. Retrying unchanged will not succeed.
@@ -177,8 +179,8 @@ impl Error {
                  stabilize it and retry"
             }
             Error::OutcomeUnknown => {
-                "the operation was published, but crash durability could not be confirmed; \
-                 inspect the destination and do not retry automatically"
+                "the operation may have taken effect, but whether it applied or became durable \
+                 could not be confirmed; inspect the affected data and do not retry automatically"
             }
             Error::Unsupported => {
                 "the operation requires a capability that is not supported by this platform \
