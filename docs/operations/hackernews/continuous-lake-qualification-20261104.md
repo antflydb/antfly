@@ -435,10 +435,49 @@ failed with `LakeOverlayCoverageUnavailable` before the change and passes after
 it; the existing admission/backpressure controls also pass. A cached replay
 test verifies normalization of the longer committed suffix to its final row
 image. Fresh optimized qualification of these subsequent fixes remains required.
-The shared SQL scheduling tests, all 59 object-WAL owner tests and the broader
-697-test Debug lake corpus (one skipped) passed without leaks. The SQL test
+The shared SQL scheduling tests, all 59 object-WAL owner tests and 697 Debug
+lake tests (one additional test skipped) passed without leaks. The SQL test
 owner also needed its missing native runtime ABI import for shared memory
 admission's named callbacks.
+
+The production Debug engine at `de3921a563` built and passed its local HTTP
+smoke with zero query failures. Its SHA-256 is
+`3f39f3389fa197cfdf3666c7bd9083eaad9e180c646aea39f7ceda2065944567`.
+A continuation of the retained GCS history operation completed after 53 further
+turns, at 474.47 seconds; validation and shutdown took 543.50 seconds overall.
+It reported 29 additional deletions and preserved all 102 expected accepted and
+published row images. Independent checks read 98 current manifests and all 296
+referenced Parquet files; two expired indexed-table manifest lists returned 404.
+This proves recovery from that saved cursor, not a controlled speedup or a pass
+of the earlier 300-second qualification allowance.
+
+A Debug sample of that continuation found remote trie reads while testing
+already-completed manifests during reachability marking. Read-only checkpoint
+inspection found a 113,222-byte hint with 140 nodes but 65 missing nodes reachable
+from the completed-manifest root. A cold control with 384 long manifest URIs and
+a larger object-membership tree required 110 additional canonical GETs after
+loading the previous hint.
+
+The next change compresses hint JSON and prioritizes the first supplied root,
+the completed-manifest tree. The stored object remains bounded at 128 KiB and
+256 nodes; decoded JSON has a separate 1 MiB bound. All restored nodes retain
+their canonical SHA-256 checks and are not treated as durable uploads. Legacy
+plain JSON remains readable; older readers decline compressed optional hints
+and use canonical reads. The cache key, canonical trie/checkpoint formats and
+deletion authority are unchanged. Required reads remain the fallback for absent,
+partial, stale, malformed or oversized hints. The control now needs zero extra
+canonical GETs for the repeated manifest cohort. This is a native operation-count
+result, not a measured GCS speedup.
+
+Another cold control exposed 114 unnecessary provider operations when a hinted
+root received a duplicate bulk insertion. Bulk insertion now returns unchanged
+input roots without rewriting them, matching single-insert idempotence. That
+control now needs zero provider operations. Newly introduced nodes still require
+durable upload and lost-response verification. Tests retain the unpersisted-node
+guard and cover legacy JSON, truncated compression, excessive decoded size,
+excessive node count and bounded partial-cache fallback. All six hint tests and
+700 Debug lake tests passed, with one additional skip and no leaks. Fresh
+provider and optimized workload qualification of these changes remains required.
 
 Next work should:
 

@@ -26,6 +26,30 @@ const Hint = struct { hash: Digest, node: Node };
 const Hints = struct { version: u8 = 1, nodes: []const Hint };
 const Cached = struct { node: Node, durable: bool };
 pub const hint_bytes = 128 * 1024;
+const decoded_hint_bytes = 1024 * 1024;
+fn decodeHint(a: A, bytes: []const u8) ![]const u8 {
+    // Legacy plain JSON remains readable. Older readers safely decline a
+    // compressed optional hint and fall back to canonical hash-checked nodes.
+    if (!std.mem.startsWith(u8, bytes, &.{ 0x1f, 0x8b })) return bytes;
+    var input: std.Io.Reader = .fixed(bytes);
+    var history: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompress: std.compress.flate.Decompress = .init(&input, .gzip, &history);
+    const decoded = decompress.reader.allocRemaining(a, .limited(decoded_hint_bytes + 1)) catch |err| switch (err) {
+        error.StreamTooLong => return error.LakeRetirementIndexBudgetExceeded,
+        else => return err,
+    };
+    if (decoded.len > decoded_hint_bytes) return error.LakeRetirementIndexBudgetExceeded;
+    return decoded;
+}
+fn encodeHint(a: A, bytes: []const u8) ![]const u8 {
+    const buffer = try a.alloc(u8, hint_bytes);
+    var output: std.Io.Writer = .fixed(buffer);
+    var history: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(&output, &history, .gzip, .default);
+    compressor.writer.writeAll(bytes) catch return error.LakeRetirementIndexBudgetExceeded;
+    compressor.finish() catch return error.LakeRetirementIndexBudgetExceeded;
+    return output.buffered();
+}
 pub const Index = struct {
     arena: std.heap.ArenaAllocator,
     client: storage.Client,
@@ -79,7 +103,7 @@ pub const Index = struct {
         var context = self.hintContext();
         var object = try self.client.getObject(self.bucket, path, .{ .skip_metadata_probe = true, .max_response_bytes = hint_bytes, .cancellation = types.contextCancellation(&context) });
         defer object.deinit(self.client.allocator);
-        const hints = try std.json.parseFromSliceLeaky(Hints, a, object.body, .{ .allocate = .alloc_always });
+        const hints = try std.json.parseFromSliceLeaky(Hints, a, try decodeHint(a, object.body), .{ .allocate = .alloc_always });
         if (hints.version != 1 or hints.nodes.len > 256) return error.InvalidLakeRetirementIndex;
         // Validate the entire hint before making any of it available.
         for (hints.nodes) |hint| {
@@ -103,29 +127,31 @@ pub const Index = struct {
         try self.context.ensureActive();
         const a = self.arena.allocator();
         var queue: std.ArrayList(Digest) = .empty;
-        for (roots) |root| if (root) |hash| try queue.append(a, hash);
+        for (0..roots.len) |i| if (roots[roots.len - 1 - i]) |hash| try queue.append(a, hash);
         var seen: std.AutoHashMapUnmanaged(Digest, void) = .empty;
         var hints: std.ArrayList(Hint) = .empty;
         var bytes_used: usize = 256;
-        var position: usize = 0;
-        // Breadth-first selection keeps the shared upper levels hot. Export
-        // cached nodes only; warming never fetches more source objects.
-        while (position < queue.items.len and hints.items.len < 256) : (position += 1) {
+        // Roots are prioritized, so repeated completed-manifest lookups do not
+        // lose their leaves to a larger object-membership tree. Export cached
+        // nodes only; warming never fetches additional source objects.
+        while (queue.items.len != 0 and hints.items.len < 256) {
             try self.context.ensureActive();
-            const hash = queue.items[position];
+            const hash = queue.pop().?;
             if ((try seen.getOrPut(a, hash)).found_existing) continue;
             const node = (self.cache.get(hash) orelse continue).node;
             const bytes = try std.json.Stringify.valueAlloc(a, node, .{});
             defer a.free(bytes);
             // Digest-array framing is bounded by 256 bytes per entry.
-            if (bytes.len + 256 > hint_bytes - bytes_used) continue;
+            if (bytes.len + 256 > decoded_hint_bytes - bytes_used) continue;
             bytes_used += bytes.len + 256;
             try hints.append(a, .{ .hash = hash, .node = node });
-            if (node.children) |children| for (children) |child| if (child) |next| try queue.append(a, next);
+            if (node.children) |children| for (0..children.len) |i| if (children[children.len - 1 - i]) |next| try queue.append(a, next);
         }
         if (hints.items.len == 0) return;
-        const bytes = try std.json.Stringify.valueAlloc(a, Hints{ .nodes = hints.items }, .{});
-        if (bytes.len > hint_bytes) return error.LakeRetirementIndexBudgetExceeded;
+        const plain = try std.json.Stringify.valueAlloc(a, Hints{ .nodes = hints.items }, .{});
+        if (plain.len > decoded_hint_bytes) return error.LakeRetirementIndexBudgetExceeded;
+        try self.context.ensureActive();
+        const bytes = try encodeHint(a, plain);
         const hash = digest(bytes);
         if (self.hint_digest) |previous| if (std.mem.eql(u8, &hash, &previous)) return;
         var context = self.hintContext();
@@ -227,6 +253,9 @@ pub const Index = struct {
             for (uris) |uri| try groups[nibble(uri, depth)].append(a, uri);
             var children = existing;
             for (&children, groups) |*child, group| child.* = try self.insertManyAt(child.*, group.items, depth + 1);
+            // Returning an unchanged input root introduces no new durability
+            // claim. A hint alone must still never acknowledge a new node.
+            if (std.meta.eql(children, existing)) return root;
             return try self.write(.{ .children = children });
         }
         var items: std.ArrayList([]const u8) = .empty;
@@ -243,6 +272,7 @@ pub const Index = struct {
             items.items[count] = uri;
             count += 1;
         }
+        if (root != null and count == node.items.len) return root;
         if (count <= 8) return try self.write(.{ .items = items.items[0..count] });
         if (depth == 64) return error.LakeRetirementHashCollision;
         var groups: [16]std.ArrayList([]const u8) = @splat(.empty);
@@ -407,6 +437,34 @@ test "external lake retirement hints survive cold turns without becoming authori
     try std.testing.expectEqual(@as(u64, 0), memory.operationCount());
 }
 
+test "external lake retirement hints prioritize a repeated manifest cohort within stored bounds" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var index = Index.init(a, memory.client(), "archive", "reachable", .{});
+    defer index.deinit();
+    var uris: [384][]const u8 = undefined;
+    const prefix: [192]u8 = @splat('x');
+    for (&uris, 0..) |*uri, i| uri.* = try std.fmt.allocPrint(ca, "gs://archive/{s}/manifest-{d}.avro", .{ prefix, i });
+    const manifests = try index.insertMany(null, &uris);
+    var members: ?Digest = null;
+    for (0..4) |batch| {
+        var files: [256][]const u8 = undefined;
+        for (&files, 0..) |*file, i| file.* = try std.fmt.allocPrint(ca, "gs://archive/{s}/data-{d}.parquet", .{ prefix, batch * files.len + i });
+        members = try index.insertMany(members, &files);
+    }
+    try index.saveHints(&.{ manifests, members });
+    var cold = Index.init(a, memory.client(), "archive", "reachable", .{});
+    defer cold.deinit();
+    try cold.loadHints();
+    memory.resetOperationCount();
+    for (uris) |uri| try std.testing.expect(try cold.contains(manifests, uri));
+    try std.testing.expectEqual(@as(u64, 0), memory.operationCount());
+}
+
 test "external lake retirement hints stay bounded and fall back for uncached nodes" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -416,7 +474,7 @@ test "external lake retirement hints stay bounded and fall back for uncached nod
     defer memory.deinit();
     var index = Index.init(a, memory.client(), "archive", "reachable", .{});
     defer index.deinit();
-    var uris: [512][]const u8 = undefined;
+    var uris: [2048][]const u8 = undefined;
     const padding: [512]u8 = @splat('x');
     for (&uris, 0..) |*uri, i| uri.* = try std.fmt.allocPrint(ca, "s3://archive/{s}/{d}.parquet", .{ padding, i });
     const root = try index.insertMany(null, &uris);
@@ -433,6 +491,79 @@ test "external lake retirement hints stay bounded and fall back for uncached nod
     for (uris) |uri| try std.testing.expect(try cold.contains(root, uri));
     try std.testing.expect(memory.operationCount() > 0);
     try std.testing.expect(!try cold.contains(root, "s3://archive/missing.parquet"));
+}
+
+test "external lake retirement hints bound decoding and retain legacy fallback" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    var index = Index.init(a, client, "archive", "reachable", .{});
+    defer index.deinit();
+    const uri = "gs://archive/live.parquet";
+    const root = (try index.insertMany(null, &.{uri})).?;
+    const legacy = try std.json.Stringify.valueAlloc(ca, Hints{ .nodes = &.{.{ .hash = root, .node = index.cache.get(root).?.node }} }, .{});
+    var stored = try client.putObject("archive", "reachable/warm-v1.json", legacy, .{});
+    stored.deinit(a);
+    var old = Index.init(a, client, "archive", "reachable", .{});
+    defer old.deinit();
+    try old.loadHints();
+    memory.resetOperationCount();
+    try std.testing.expect(try old.contains(root, uri));
+    try std.testing.expectEqual(@as(u64, 0), memory.operationCount());
+
+    const compressed = try encodeHint(ca, legacy);
+    stored = try client.putObject("archive", "reachable/warm-v1.json", compressed[0 .. compressed.len / 2], .{});
+    stored.deinit(a);
+    var truncated = Index.init(a, client, "archive", "reachable", .{});
+    defer truncated.deinit();
+    const rejected = if (truncated.loadHints()) |_| false else |_| true;
+    try std.testing.expect(rejected);
+    try std.testing.expectEqual(@as(usize, 0), truncated.cache.count());
+    try std.testing.expect(try truncated.contains(root, uri));
+
+    const bomb = try ca.alloc(u8, decoded_hint_bytes + 32);
+    @memset(bomb, 'x');
+    stored = try client.putObject("archive", "reachable/warm-v1.json", try encodeHint(ca, bomb), .{});
+    stored.deinit(a);
+    var oversized = Index.init(a, client, "archive", "reachable", .{});
+    defer oversized.deinit();
+    try std.testing.expectError(error.LakeRetirementIndexBudgetExceeded, oversized.loadHints());
+    try std.testing.expectEqual(@as(usize, 0), oversized.cache.count());
+
+    const nodes = try ca.alloc(Hint, 257);
+    @memset(nodes, .{ .hash = root, .node = index.cache.get(root).?.node });
+    const excessive = try std.json.Stringify.valueAlloc(ca, Hints{ .nodes = nodes }, .{});
+    stored = try client.putObject("archive", "reachable/warm-v1.json", try encodeHint(ca, excessive), .{});
+    stored.deinit(a);
+    var excessive_nodes = Index.init(a, client, "archive", "reachable", .{});
+    defer excessive_nodes.deinit();
+    try std.testing.expectError(error.InvalidLakeRetirementIndex, excessive_nodes.loadHints());
+    try std.testing.expectEqual(@as(usize, 0), excessive_nodes.cache.count());
+}
+
+test "external lake retirement hints make repeated bulk updates read only" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var index = Index.init(a, memory.client(), "archive", "reachable", .{});
+    defer index.deinit();
+    var uris: [128][]const u8 = undefined;
+    for (&uris, 0..) |*uri, i| uri.* = try std.fmt.allocPrint(ca, "gs://archive/{d}.parquet", .{i});
+    const root = try index.insertMany(null, &uris);
+    try index.saveHints(&.{root});
+    var cold = Index.init(a, memory.client(), "archive", "reachable", .{});
+    defer cold.deinit();
+    try cold.loadHints();
+    memory.resetOperationCount();
+    try std.testing.expectEqual(root, try cold.insertMany(root, &uris));
+    try std.testing.expectEqual(@as(u64, 0), memory.operationCount());
 }
 
 test "external lake retirement hints cannot acknowledge an unpersisted node" {
