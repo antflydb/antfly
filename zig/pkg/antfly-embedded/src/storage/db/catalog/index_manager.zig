@@ -42243,19 +42243,20 @@ test "text publication retains bounded mapper windows with custom analyzers and 
     const snapshot = manager.textIndex(config.name).?.snapshot();
     try std.testing.expectEqual(@as(u32, 3), snapshot.liveDocCount());
     try std.testing.expectEqual(@as(u32, 1), try snapshot.termDocFreq(a, "body", "résumé 日本語"));
-    try std.testing.expect(try manager.remove(&store, config.name));
-    try manager.addAllNoBackfill(&store, &.{config});
-    context = try manager.acquireTextPublicationContext(a, config.name);
-    var stale = try manager.planTextMapperDocsPublication(&store, config.name, &context, &docs, 1);
+    const empty_config: types.IndexConfig = .{ .name = "ft_empty", .kind = .full_text, .config_json = "{}" };
+    try manager.addAllNoBackfill(&store, &.{empty_config});
+    var empty_context = try manager.acquireTextPublicationContext(a, empty_config.name);
+    defer empty_context.deinit();
+    var stale = try manager.planTextMapperDocsPublication(&store, empty_config.name, &empty_context, &docs, 1);
     defer stale.deinit();
     const fields = [_]schema_mod.FullTextField{.{ .path = "body", .emitted_name = "body", .analyzer = "keyword" }};
     const documents = [_]schema_mod.FullTextDocument{.{ .name = "message", .fields = &fields }};
     try std.testing.expect(try schema_mod.saveSchema(&store, a, .{ .version = 0, .default_type = "message", .full_text_documents = &documents }));
     try manager.refreshEmptyTextIndexSchemas(&store);
-    try std.testing.expectError(error.TextProjectionChanged, manager.preparePlannedTextMapperPublication(a, config.name, &context, &stale, 0, stale.input_end));
-    try std.testing.expect(try manager.remove(&store, config.name));
-    try manager.addAllNoBackfill(&store, &.{config});
-    try std.testing.expectError(error.IndexNotFound, manager.preparePlannedTextMapperPublication(a, config.name, &context, &stale, 0, stale.input_end));
+    try std.testing.expectError(error.TextProjectionChanged, manager.preparePlannedTextMapperPublication(a, empty_config.name, &empty_context, &stale, 0, stale.input_end));
+    try std.testing.expect(try manager.remove(&store, empty_config.name));
+    try manager.addAllNoBackfill(&store, &.{empty_config});
+    try std.testing.expectError(error.IndexNotFound, manager.preparePlannedTextMapperPublication(a, empty_config.name, &empty_context, &stale, 0, stale.input_end));
 }
 
 test "text publication planning rejects a same-name catalog replacement" {
