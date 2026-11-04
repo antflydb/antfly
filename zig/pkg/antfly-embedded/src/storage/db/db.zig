@@ -7578,6 +7578,10 @@ pub const DB = struct {
     /// `batchTracked` that also commits an outcome-receipt marker atomically
     /// with the primary write (see `apply_receipts.OutcomeMarker`).
     pub fn batchTrackedWithMarker(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker: ?apply_receipts.OutcomeMarker) anyerror!void {
+        return self.batchTrackedWithPreparedDocuments(req, primary_committed, marker, null);
+    }
+
+    pub fn batchTrackedWithPreparedDocuments(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker: ?apply_receipts.OutcomeMarker, prepared: ?*@import("prepared_document_batch.zig").Plan) anyerror!void {
         primary_committed.* = false;
         var marker_key: [apply_receipts.outcome_marker_key_len]u8 = undefined;
         var marker_value: [apply_receipts.outcome_marker_value_len]u8 = undefined;
@@ -7590,7 +7594,7 @@ pub const DB = struct {
         const previous = backend_types.commit_progress;
         backend_types.commit_progress = &progress;
         defer backend_types.commit_progress = previous;
-        self.batchTrackedProfiled(req, primary_committed, marker_write) catch |err| {
+        self.batchTrackedProfiled(req, primary_committed, marker_write, prepared) catch |err| {
             if (progress.maybe_applied and !primary_committed.* and !isOutcomeUnknownError(err)) {
                 std.log.warn("batch failed after its write may have applied: {s}", .{@errorName(err)});
                 return error.OutcomeUnknown;
@@ -7606,8 +7610,8 @@ pub const DB = struct {
         };
     }
 
-    fn batchTrackedProfiled(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker_write: ?docstore_mod.KVPair) anyerror!void {
-        const opts: BatchExecutionOptions = .{ .primary_committed = primary_committed, .outcome_marker_write = marker_write };
+    fn batchTrackedProfiled(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker_write: ?docstore_mod.KVPair, prepared: ?*@import("prepared_document_batch.zig").Plan) anyerror!void {
+        const opts: BatchExecutionOptions = .{ .primary_committed = primary_committed, .outcome_marker_write = marker_write, .prepared_documents = prepared };
         if (benchMetricsEnabled()) {
             var profile = BatchProfile{};
             try self.batchInternal(req, &profile, opts);
@@ -76864,6 +76868,37 @@ test "db algebraic bulk ingest survives reopen with durable lsm primary backend"
         defer alloc.free(bob_group);
         try std.testing.expectEqual(@as(f64, 7), (try entry.index.numericValue(reopened.core.store, "sum_by_customer", bob_group)).?);
     }
+}
+
+test "db owned document preparation transfers effects and rejects changed identities" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("owned-document-preparation");
+    defer directory.cleanup();
+    var database = try DB.open(a, std.mem.span(directory.path().ptr), .{ .start_index_workers = false });
+    defer database.close();
+    const request: types.BatchRequest = .{ .writes = &.{
+        .{ .key = "discarded", .value = "invalid json discarded by delete" },
+        .{ .key = "你好", .value = "invalid json overwritten below" },
+        .{ .key = "你好", .value = "{\"message\":\"κόσμος\"}" },
+    }, .deletes = &.{"discarded"}, .sync_level = .write };
+    const Prepared = @import("prepared_document_batch.zig").Plan;
+    var prepared = (try Prepared.capture(a, &database)).?;
+    defer prepared.deinit();
+    try prepared.prepare(request);
+    try std.testing.expect(try prepared.matches(&database));
+    // A refreshed runtime can have a different local plan counter with the
+    // same durable catalogs. Exact contents still authorize pure mapping.
+    database.core.index_manager.invalidateWritePlanSnapshot();
+    try std.testing.expect(try prepared.matches(&database));
+    var committed = false;
+    try database.batchTrackedWithPreparedDocuments(request, &committed, null, &prepared);
+    try std.testing.expect(committed);
+    try std.testing.expect(prepared.rows.get("你好").?.extracted == null);
+    const value = (try database.get(a, "你好")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("{\"message\":\"κόσμος\"}", value);
+    prepared.incarnation ^= 1;
+    try std.testing.expect(!try prepared.matches(&database));
 }
 
 test "db detached replay leaves optional maintenance to its retained continuation" {

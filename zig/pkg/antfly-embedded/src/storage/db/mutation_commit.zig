@@ -1514,6 +1514,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 effective_req.merge_artifacts = filtered_cleanup_replay_writes.?;
             }
 
+            const prepared_documents_current = if (opts.prepared_documents) |plan| try plan.matches(struct { core: @TypeOf(S.ownerField(self, "core").*), root_incarnation: u128 }{ .core = S.ownerField(self, "core").*, .root_incarnation = S.ownerField(self, "root_incarnation").* }) else false;
             const group_plan: ?*const group_mutations.Plan = if (preparation.write_plan) |pinned|
                 if (pinned.plan().group_sources) |*plan| if (plan.entries.len > 0) plan else null else null
             else
@@ -1576,8 +1577,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
                 const mapper_extract_start_ns = monotonicTimeNs();
                 const semantic_hash = if (prepared_relational) |*prepared| prepared.semantic_hash else null;
+                const prepared_document = if (prepared_relational == null and prepared_documents_current)
+                    opts.prepared_documents.?.take(S.ownerField(self, "alloc").*, write.key, write.value)
+                else
+                    null;
                 extracted[i] = if (prepared_relational) |*prepared|
                     prepared.takeExtracted()
+                else if (prepared_document) |prepared|
+                    prepared
                 else
                     try mapper.extractWrite(S.ownerField(self, "alloc").*, write.key, write.value);
                 // Ownership has transferred even if a later graph/vector consumer
@@ -1585,7 +1592,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 extracted_initialized += 1;
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_mapper_ns, mapper_extract_start_ns);
                 const graph_field_extract_start_ns = monotonicTimeNs();
-                if (!use_preprepared_rows) {
+                if (!use_preprepared_rows and prepared_document == null) {
                     if (prepared_relational) |*prepared|
                         try augmentExtractedWriteWithGraphFieldEdgesParsed(self, S.ownerField(self, "alloc").*, write.key, prepared.parsedValue(), &extracted[i])
                     else
@@ -1593,7 +1600,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_graph_fields_ns, graph_field_extract_start_ns);
                 const index_field_embeddings_start_ns = monotonicTimeNs();
-                if (!use_preprepared_rows) {
+                if (!use_preprepared_rows and prepared_document == null) {
                     if (prepared_relational) |*prepared|
                         try S.ownerField(self, "core").*.index_manager.appendIndexFieldEmbeddingsFromPreparedToExtractedWrite(S.ownerField(self, "alloc").*, write.key, prepared.parsedValue(), try prepared.typedView(apply_schema_view.?.tableSchema().*, apply_schema_view.?.physicalLayout()), &extracted[i])
                     else

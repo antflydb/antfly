@@ -1319,11 +1319,15 @@ pub fn batchInternal(
 /// `table_name` names the SQL table whose database `database` is (null for
 /// the handle's root database), so its receipt finds the marker.
 pub fn trackedBatch(database: *db_mod.DB, req: db_mod.types.BatchRequest, primary_committed: *bool, table_name: ?[]const u8) anyerror!void {
+    return trackedBatchWithPreparedDocuments(database, req, primary_committed, table_name, null);
+}
+
+fn trackedBatchWithPreparedDocuments(database: *db_mod.DB, req: db_mod.types.BatchRequest, primary_committed: *bool, table_name: ?[]const u8, prepared: ?*@import("../storage/db/prepared_document_batch.zig").Plan) anyerror!void {
     const receipts = @import("outcome_receipts.zig");
-    const writer = receipts.activeWriter() orelse return database.batchTracked(req, primary_committed);
+    const writer = receipts.activeWriter() orelse return database.batchTrackedWithPreparedDocuments(req, primary_committed, null, prepared);
     const named = if (table_name) |name| (if (std.mem.eql(u8, name, "default")) null else name) else null;
     const marker = writer.next(named);
-    database.batchTrackedWithMarker(req, primary_committed, marker) catch |err| {
+    database.batchTrackedWithPreparedDocuments(req, primary_committed, marker, prepared) catch |err| {
         if (!primary_committed.* and antfly.capi_dependencies.sql_errors.isUnknownOutcome(err))
             writer.retire(marker, if (named) |name| .{ .name = name, .id = database.core.identity_namespace.table_id } else null);
         return err;
@@ -5089,13 +5093,29 @@ pub fn antfly_db_batch_json(
     var response: ?[]u8 = batch_api.encodeBatchResponse(response_allocator, owned.result()) catch |err|
         return capi.mapErrorContext(err, "batch response allocation failed before mutation; no write applied");
     defer if (response) |buffer| response_allocator.free(buffer);
+    const Prepared = @import("../storage/db/prepared_document_batch.zig").Plan;
+    var prepared: ?Prepared = null;
+    defer if (prepared) |*plan| plan.deinit();
+    if (owned.req.writes.len != 0) {
+        // Capture only immutable catalog inputs under ordinary handle lifetime
+        // admission. Parsing/mapping and graph-field extraction then proceed
+        // without either process gate or native writer lease.
+        const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
+        defer guard.leave();
+        if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
+        prepared = Prepared.capture(a, guard.handle.database()) catch |err| return capi.mapError(err);
+    }
+    if (prepared) |*plan| plan.prepare(owned.req) catch |err| return capi.mapError(err);
     const Request = struct {
+        owned: *@TypeOf(owned),
+        prepared: ?*Prepared,
         fn apply(raw: *anyopaque, handle: *Handle, primary_committed: *bool) !void {
-            const request: *@TypeOf(owned) = @ptrCast(@alignCast(raw));
-            try trackedBatch(handle.database(), request.req, primary_committed, handle.selected_table_name);
+            const request: *@This() = @ptrCast(@alignCast(raw));
+            try trackedBatchWithPreparedDocuments(handle.database(), request.owned.req, primary_committed, handle.selected_table_name, request.prepared);
         }
     };
-    const code = executeBatchWithReplayAdmissionRetry(handle_ptr, &owned, Request.apply);
+    var request: Request = .{ .owned = &owned, .prepared = if (prepared) |*plan| plan else null };
+    const code = executeBatchWithReplayAdmissionRetry(handle_ptr, &request, Request.apply);
     if (code != .ok) return code;
     out_buf.* = .{ .ptr = response.?.ptr, .len = response.?.len };
     response = null;

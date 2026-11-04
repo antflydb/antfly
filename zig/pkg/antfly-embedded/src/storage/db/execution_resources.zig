@@ -1034,6 +1034,7 @@ pub const BatchVisibilityCompletion = struct {
 };
 
 pub const BatchExecutionOptions = struct {
+    prepared_documents: ?*@import("prepared_document_batch.zig").Plan = null,
     resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
     group_source_command: ?*const @import("group_source_contract.zig").Command = null,
     /// Native-only completion observation; never encoded in a replicated command.
