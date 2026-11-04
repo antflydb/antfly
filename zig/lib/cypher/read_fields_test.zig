@@ -649,3 +649,61 @@ test "read demand native authorized projection retains key shapes and value over
     hooks.allow = false;
     try std.testing.expect(try adapter.node(a, "docs", "d1", "{\"body\":true}") == null);
 }
+
+test "read demand propagates projections comprehensions slices and path components" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "MATCH(d:D) WITH coalesce(d,null) AS x RETURN x{.score}",
+        "MATCH(d:D) WITH d,coalesce(d,null) AS x WITH d{x} AS m RETURN m.x.score",
+        "MATCH(d:D) WITH d,coalesce(d,null) AS x WITH d{x:x} AS m RETURN m.x.score",
+        "MATCH(d:D) WITH [x IN [d] | x] AS xs RETURN head(xs){.score}",
+        "MATCH(d:D) WITH [d] AS xs RETURN [x IN xs | x{.score}]",
+        "MATCH(d:D) WITH [d] AS xs WITH xs[0..] AS ys RETURN head(ys).score",
+        "MATCH(d:D) WITH [d] AS xs RETURN any(d IN xs WHERE d.score=7)",
+        "MATCH p=(a:D)-[r:R]->(b:D) RETURN [x IN nodes(p) | x.score]",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand;
+        try expectNames(&.{"score"}, demand.table("docs").?.nodes.fields.?);
+        try expectNames(&.{}, demand.relationships.fields.?);
+    }
+    for ([_][]const u8{
+        "MATCH(d:D) WITH [i IN [1] | d] AS xs RETURN antfly.documentKey(head(xs))",
+        "MATCH(d:D) WITH [d] AS xs RETURN [x IN xs | antfly.documentKey(x)]",
+        "MATCH(d:D) WITH [d] AS xs WITH xs[0..] AS ys RETURN antfly.documentKey(head(ys))",
+        "MATCH p=(a:D)-[r:R]->(b:D) RETURN [x IN nodes(p) | antfly.documentKey(x)]",
+        "MATCH p=(a:D)-[r:R]->(b:D) RETURN [x IN relationships(p) | type(x)]",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand;
+        try expectNames(&.{}, demand.table("docs").?.nodes.fields.?);
+        try expectNames(&.{}, demand.relationships.fields.?);
+    }
+    for ([_][]const u8{
+        "MATCH(d:D) WITH d,coalesce(d,null) AS x RETURN size(keys(d{x}.x))",
+        "MATCH(d:D) WITH d,coalesce(d,null) AS x RETURN size(keys(d{x:x}.x))",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand;
+        try std.testing.expect(demand.table("docs").?.nodes.projection[0].root);
+    }
+    for ([_][]const u8{
+        "MATCH p=(a:D)-[r:R]->(b:D) RETURN nodes(p)",
+        "MATCH p=(a:D)-[r:R]->(b:D) RETURN [x IN nodes(p) | x]",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand;
+        try std.testing.expect(demand.table("docs").?.nodes.fields == null);
+        try expectNames(&.{}, demand.relationships.fields.?);
+    }
+}

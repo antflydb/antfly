@@ -1045,29 +1045,6 @@ fn metadataRestoreLeadershipIsCurrent(ptr: *anyopaque, leadership_term: u64) boo
     return svc.localMetadataLeadershipTerm() == leadership_term;
 }
 
-fn metadataSessionRouterLocalNodeId(ptr: *anyopaque) u64 {
-    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    return svc.raft.host.http_host.host.cfg.local_node_id;
-}
-fn metadataSessionRouterNodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
-    if (try metadataStoreRouterNodeBaseUri(ptr, alloc, node_id)) |uri| return uri;
-    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    for (svc.reallocation_protocol_peers) |peer| if (peer.node_id == node_id) {
-        if (peer.orchestration_url) |uri| if (uri.len != 0) return try alloc.dupe(u8, uri);
-    };
-    return null;
-}
-fn metadataSessionRouter(svc: *service.MetadataHttpService) api_table_router.HostedGroupRouter {
-    return .{ .ptr = svc, .vtable = &.{
-        .local_node_id = metadataSessionRouterLocalNodeId,
-        .local_status = metadataStoreRouterLocalStatus,
-        .group_node_ids = metadataDataBearingStoreRouterGroupNodeIds,
-        .node_status = metadataDataBearingStoreRouterNodeStatus,
-        .node_base_uri = metadataSessionRouterNodeBaseUri,
-        .node_base_uri_for_group = metadataStoreRouterNodeBaseUriForGroup,
-    } };
-}
-
 fn metadataStoreGroupRouter(svc: *service.MetadataHttpService) api_table_router.HostedGroupRouter {
     return .{
         .ptr = svc,
@@ -1860,12 +1837,6 @@ test "metadata server can expose admin listener endpoints" {
     try std.testing.expect(public_cfg.session_store_path == null);
     try std.testing.expect(public_cfg.session_maintenance_local_only);
     try std.testing.expect(public_cfg.session_store_scope == .cluster_shared);
-    const api = server.owned_public_http_server.?;
-    const durable_session = try api.txn_sessions.begin(std.heap.page_allocator, .{}, public_cfg.session_router.?.localNodeId());
-    var persisted = (try api.txn_sessions.durable.?.load(durable_session.txn_id)).?;
-    persisted.deinit(std.heap.page_allocator);
-    // Retire the fixture record after proving the default store is durable.
-    try std.testing.expect(api.txn_sessions.removeBeforeExecution(std.heap.page_allocator, durable_session.txn_id));
     try std.testing.expect(public_cfg.session_executor != null);
     try std.testing.expect(public_cfg.session_executor.?.ptr == server.svc.raft.host.http_host.request_executor.ptr);
     try std.testing.expect(public_cfg.session_router != null);
@@ -1880,6 +1851,13 @@ test "metadata server can expose admin listener endpoints" {
     });
     try server.svc.campaignMetadataGroup();
     try server.runRound();
+    const api = server.owned_public_http_server.?;
+    const durable_session = try api.txn_sessions.begin(std.heap.page_allocator, .{}, public_cfg.session_router.?.localNodeId());
+    var persisted = (try api.txn_sessions.durable.?.load(durable_session.txn_id)).?;
+    persisted.deinit(std.heap.page_allocator);
+    // Retire the fixture record after proving the default store is durable.
+    try std.testing.expect(api.txn_sessions.removeBeforeExecution(std.heap.page_allocator, durable_session.txn_id));
+
     try server.svc.upsertTable(.{ .table_id = 77, .name = "docs" });
 
     var rounds: usize = 0;

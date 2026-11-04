@@ -365,6 +365,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         test_mod.*.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     }
     const media_status_step = b.step("antfly-media-status-test", "Verify output counters and rolling runtime status profiles");
+    const cypher_metadata_frames = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{"metadata durable job state and transaction sessions retain distinct command frames"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-metadata-frame-test", "Verify graph session and SQL completion command compatibility")
+        .dependOn(&addFilteredTestRunArtifact(b, cypher_metadata_frames).step);
     const metadata_sql_sessions = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[4],
         .filters = &.{ "metadata server can expose admin listener endpoints", "metadata SQL session routing" },

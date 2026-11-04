@@ -50,7 +50,7 @@ pub const Coordinator = struct {
         return recoverLocked(self.handle);
     }
     pub fn commit(self: Coordinator, requests: []const contract.TableCommitRequest, out_id: *?h.db_mod.types.TxnId) !catalog.MutationOutcome {
-        return commitLocked(self.handle, requests, &.{}, null, out_id);
+        return commitLocked(self.handle, requests, &.{}, null, out_id, .sql);
     }
 };
 const TestHook = struct { ptr: *anyopaque, run: *const fn (*anyopaque) anyerror!void };
@@ -158,7 +158,7 @@ pub const GraphGuard = struct {
 pub fn commitWithGraphGuards(handle: *h.Handle, requests: []const contract.TableCommitRequest, guards: []const GraphGuard, requested_id: ?h.db_mod.types.TxnId, out_id: *?h.db_mod.types.TxnId) !catalog.MutationOutcome {
     const coordinator = acquire(handle);
     defer coordinator.release();
-    return commitLocked(handle, requests, guards, requested_id, out_id);
+    return commitLocked(handle, requests, guards, requested_id, out_id, .graph);
 }
 
 /// Whether the native checkpoint publication is in its uncertain window, so a
@@ -181,7 +181,7 @@ fn publicationUncertain(handle: *h.Handle) bool {
 ///    receipt id left in `out_id`.
 /// 3. After a committed decision, failing to resolve participants is
 ///    committed-pending; recovery finishes it.
-fn commitLocked(handle: *h.Handle, requests: []const contract.TableCommitRequest, guards: []const GraphGuard, requested_id: ?h.db_mod.types.TxnId, out_id: *?h.db_mod.types.TxnId) !catalog.MutationOutcome {
+fn commitLocked(handle: *h.Handle, requests: []const contract.TableCommitRequest, guards: []const GraphGuard, requested_id: ?h.db_mod.types.TxnId, out_id: *?h.db_mod.types.TxnId, language: enum { sql, graph }) !catalog.MutationOutcome {
     // Participants were admitted before preparing this decision. Replaying or
     // publishing it must not recursively start a namespace's DDL coordinator.
     const was_recovering = handle.sql_ddl_recovering;
@@ -190,7 +190,13 @@ fn commitLocked(handle: *h.Handle, requests: []const contract.TableCommitRequest
     if (requests.len == 0) return .committed;
     out_id.* = null;
     const outcomes = dependencies.sql_errors;
-    const id = prepareDecision(handle, requests, guards, requested_id) catch |err| return outcomes.notApplied(err);
+    const id = prepareDecision(handle, requests, guards, requested_id) catch |err| {
+        // Graph diagnostics carry domain identities (including a consumed
+        // request ID). Preserve them at the proven pre-decision boundary;
+        // SQL maps unclassified storage failures into its SQLSTATE contract.
+        if (language == .graph and !outcomes.isUnknownOutcome(err)) return err;
+        return outcomes.notApplied(err);
+    };
     out_id.* = id.id;
     handle.db.commitTransaction(id.id, id.now +| 1) catch |commit_err| {
         const status = handle.db.getTransactionStatus(id.id) catch {

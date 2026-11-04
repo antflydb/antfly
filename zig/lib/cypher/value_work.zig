@@ -429,6 +429,12 @@ pub const Work = struct {
     }
     pub fn compare(self: *Work, a: v.Value, b: v.Value) !?std.math.Order {
         try self.charge(self.ptr, 1);
+        if (a == .null or b == .null) return null;
+        if (a == .string and b == .string) {
+            // Shared immutable spans prove their common prefix without a scan.
+            if (a.string.ptr == b.string.ptr) return std.math.order(a.string.len, b.string.len);
+            return try self.orderText(a.string, b.string);
+        }
         const left = try self.info(a);
         if (identical(a, b)) return if (left.unknown) null else .eq;
         try self.charge(self.ptr, left.comparison_work);
@@ -654,4 +660,31 @@ test "metered scalar equality only reads equal-length string prefixes" {
     counter.left = 100000;
     try std.testing.expectEqual(@as(?bool, true), try work.equal(.{ .string = left }, .{ .string = right }));
     try std.testing.expectEqual(@as(usize, 0), work.cache.count());
+}
+
+test "nullable string comparison meters decisive prefixes and equal tails" {
+    const Counter = struct {
+        left: usize,
+        fn charge(ptr: *anyopaque, amount: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (amount > self.left) return error.CypherStateBudgetExceeded;
+            self.left -= amount;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = try a.alloc(u8, 2 << 20);
+    @memset(text, 'x');
+    var counter: Counter = .{ .left = 256 };
+    var work: Work = .{ .a = a, .ptr = &counter, .charge = Counter.charge };
+    for (0..32) |_| try std.testing.expectEqual(std.math.Order.gt, (try work.compare(.{ .string = text }, .{ .string = "7" })).?);
+    counter.left = 2;
+    try std.testing.expectEqual(std.math.Order.eq, (try work.compare(.{ .string = text }, .{ .string = text })).?);
+    try std.testing.expectEqual(std.math.Order.gt, (try work.compare(.{ .string = text }, .{ .string = text[0..1] })).?);
+    counter.left = 256;
+    const copy = try a.dupe(u8, text);
+    try std.testing.expectError(error.CypherStateBudgetExceeded, work.compare(.{ .string = text }, .{ .string = copy }));
+    counter.left = 256;
+    try std.testing.expectEqual(@as(?std.math.Order, null), try work.compare(.null, .{ .string = text }));
 }

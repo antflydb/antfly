@@ -84,7 +84,7 @@ const NodePlan = struct {
 };
 const RelationshipPlan = struct { table: []const u8, index: []const u8, stored_type: []const u8, plan: NodePlan = .{} };
 const Need = enum { value, identity, nullness, labels, keys, evaluate };
-const Selector = union(enum) { field: []const u8, item: i64, element };
+const Selector = union(enum) { field: []const u8, item: i64, element, path_nodes, path_relationships };
 const Entities = std.StringHashMapUnmanaged(Binding);
 const Derived = struct {
     expression: *const ast.Expr,
@@ -348,11 +348,18 @@ const Plan = struct {
             .map => |entries| for (entries) |entry| {
                 if (self.forwards(entry.value.*)) break true;
             } else false,
-            .map_projection => |projection| self.forwards(projection.base.*),
+            .map_projection => |projection| self.forwards(projection.base.*) or for (projection.items) |item| {
+                switch (item) {
+                    .entry => |entry| if (self.forwards(entry.value.*)) break true,
+                    .variable => |name| if (self.entities.contains(name) or self.derived.contains(name)) break true,
+                    else => {},
+                }
+            } else false,
+            .comprehension => |local| self.forwards(local.input.*) or (if (local.projection) |projection| self.forwards(projection.*) else false),
             .case_when => |case| for (case.branches) |branch| {
                 if (self.forwards(branch.value.*)) break true;
             } else if (case.otherwise) |other| self.forwards(other.*) else false,
-            .call => |call| if (std.ascii.eqlIgnoreCase(call.name, "coalesce") or std.ascii.eqlIgnoreCase(call.name, "head") or std.ascii.eqlIgnoreCase(call.name, "last") or std.ascii.eqlIgnoreCase(call.name, "properties")) for (call.args) |arg| {
+            .call => |call| if (std.ascii.eqlIgnoreCase(call.name, "coalesce") or std.ascii.eqlIgnoreCase(call.name, "head") or std.ascii.eqlIgnoreCase(call.name, "last") or std.ascii.eqlIgnoreCase(call.name, "properties") or std.ascii.eqlIgnoreCase(call.name, "nodes") or std.ascii.eqlIgnoreCase(call.name, "relationships")) for (call.args) |arg| {
                 if (self.forwards(arg.*)) break true;
             } else false else false,
             else => false,
@@ -398,6 +405,16 @@ const Plan = struct {
         return result;
     }
     fn bindingNeed(self: *Plan, binding: Binding, need: Need, selectors: []const Selector) !void {
+        if (binding.kind == .path and selectors.len != 0 and (selectors[0] == .path_nodes or selectors[0] == .path_relationships)) {
+            var component = binding;
+            component.kind = if (selectors[0] == .path_nodes) .node else .relationship;
+            const rest = selectors[1..];
+            // Component producers return lists. A selected position may refer
+            // to any endpoint/domain in a variable path, but never the other
+            // component kind.
+            const selected = if (rest.len != 0 and (rest[0] == .item or rest[0] == .element)) rest[1..] else rest;
+            return self.bindingNeed(component, need, selected);
+        }
         var parts: std.ArrayList([]const u8) = .empty;
         try parts.appendSlice(self.a, binding.prefix);
         for (selectors) |selector| {
@@ -464,13 +481,51 @@ const Plan = struct {
                 try self.consume(index.base.*, need, try self.prepend(selector, selectors));
                 return true;
             },
+            .slice => |slice| {
+                try self.walk(slice.start);
+                try self.walk(slice.end);
+                // Slice bounds change positions, not the element domain.
+                const rest = if (selectors.len != 0 and (selectors[0] == .item or selectors[0] == .element)) selectors[1..] else selectors;
+                try self.consume(slice.base.*, need, try self.prepend(.element, rest));
+                return true;
+            },
+            .comprehension => |local| {
+                try self.localList(local.alias, local.input, local.predicate, local.projection, need, selectors);
+                return true;
+            },
+            .list_predicate => |local| {
+                try self.localList(local.alias, local.input, local.predicate, null, .identity, &.{});
+                return true;
+            },
+            .map_projection => |projection| {
+                // A projection must still evaluate/validate its base, even if
+                // only the output key shape or an explicit entry is observed.
+                try self.consume(projection.base.*, .evaluate, &.{});
+                for (projection.items) |item| {
+                    const name: ?[]const u8 = switch (item) {
+                        .property, .variable => |name| name,
+                        .entry => |entry| entry.name,
+                        .all => null,
+                    };
+                    const selected = selectors.len == 0 or selectors[0] == .element or (selectors[0] == .field and (name == null or std.mem.eql(u8, selectors[0].field, name.?)));
+                    const observation: Need = if (!selected or (selectors.len == 0 and (need == .keys or need == .nullness))) .identity else need;
+                    const rest = if (selected and selectors.len != 0) selectors[1..] else &.{};
+                    switch (item) {
+                        .property => |key| try self.consume(projection.base.*, observation, try self.prepend(.{ .field = key }, rest)),
+                        .entry => |entry| try self.consume(entry.value.*, observation, rest),
+                        .variable => |key| try self.consume(.{ .span = expression.span, .value = .{ .variable = key } }, observation, rest),
+                        .all => try self.consume(projection.base.*, if (selectors.len == 0) need else observation, if (selected) selectors else &.{}),
+                    }
+                }
+                return true;
+            },
             .list => |items| {
                 for (items, 0..) |item, i| {
                     var selected = selectors.len == 0;
                     if (selectors.len != 0) selected = switch (selectors[0]) {
                         .element => true,
                         .item => |index| @as(i128, if (index < 0) @as(i128, items.len) + index else index) == i,
-                        .field => false,
+                        else => false,
                     };
                     try self.consume(item.*, if (selected) (if (selectors.len == 0 and (need == .nullness or need == .keys)) .identity else need) else .identity, if (selected and selectors.len != 0) selectors[1..] else &.{});
                 }
@@ -517,6 +572,11 @@ const Plan = struct {
                     try self.consume(call.args[0].*, need, try self.prepend(.{ .item = if (std.ascii.eqlIgnoreCase(call.name, "head")) 0 else -1 }, selectors));
                     return true;
                 }
+                if ((std.ascii.eqlIgnoreCase(call.name, "nodes") or std.ascii.eqlIgnoreCase(call.name, "relationships")) and call.args.len == 1) {
+                    const component: Selector = if (std.ascii.eqlIgnoreCase(call.name, "nodes")) .path_nodes else .path_relationships;
+                    try self.consume(call.args[0].*, need, try self.prepend(component, selectors));
+                    return true;
+                }
                 if (std.ascii.eqlIgnoreCase(call.name, "properties") and call.args.len == 1) {
                     try self.consume(call.args[0].*, if (need == .keys) .keys else .value, selectors);
                     return true;
@@ -536,6 +596,24 @@ const Plan = struct {
             return true;
         }
         return false;
+    }
+    fn localList(self: *Plan, alias: []const u8, input: *const ast.Expr, predicate: ?*const ast.Expr, projection: ?*const ast.Expr, need: Need, selectors: []const Selector) !void {
+        const element = try self.capture(input, &.{.element});
+        try self.consume(input.*, .identity, &.{});
+        const outer = self.entities;
+        const outer_derived = self.derived;
+        self.entities = try outer.clone(self.a);
+        self.derived = try outer_derived.clone(self.a);
+        defer {
+            self.entities = outer;
+            self.derived = outer_derived;
+        }
+        _ = self.entities.remove(alias);
+        try self.derived.put(self.a, alias, element);
+        try self.walk(predicate);
+        const rest = if (selectors.len != 0 and (selectors[0] == .item or selectors[0] == .element)) selectors[1..] else selectors;
+        const observation: Need = if (selectors.len == 0 and (need == .nullness or need == .keys)) .identity else need;
+        if (projection) |expr| try self.consume(expr.*, observation, rest) else try self.consumeDerived(element, observation, rest);
     }
     fn clauses(self: *Plan, items: []const ast.Clause, internal_return: bool) anyerror!void {
         for (items) |clause| switch (clause.operation) {
@@ -720,29 +798,6 @@ const Plan = struct {
         if (T == ast.Expr) {
             if (try self.observe(value, .value, &.{})) return;
             switch (value.value) {
-                .comprehension => |local| {
-                    try self.walk(local.input.*);
-                    const outer = try self.entities.clone(self.a);
-                    const outer_derived = try self.derived.clone(self.a);
-                    _ = self.entities.remove(local.alias);
-                    _ = self.derived.remove(local.alias);
-                    try self.walk(local.predicate);
-                    try self.walk(local.projection);
-                    self.entities = outer;
-                    self.derived = outer_derived;
-                    return;
-                },
-                .list_predicate => |local| {
-                    try self.walk(local.input.*);
-                    const outer = try self.entities.clone(self.a);
-                    const outer_derived = try self.derived.clone(self.a);
-                    _ = self.entities.remove(local.alias);
-                    _ = self.derived.remove(local.alias);
-                    try self.walk(local.predicate.*);
-                    self.entities = outer;
-                    self.derived = outer_derived;
-                    return;
-                },
                 .reduce => |local| {
                     try self.walk(local.initial.*);
                     try self.walk(local.input.*);
@@ -778,23 +833,6 @@ const Plan = struct {
                     self.entities = outer;
                     self.derived = outer_derived;
                     return;
-                },
-                .map_projection => |projection| {
-                    if (try self.lineage(projection.base.*)) |binding| {
-                        if (binding.prefix.len != 0) try self.recordPath(binding, binding.prefix, false, true);
-                        for (projection.items) |item| switch (item) {
-                            .property => |name| {
-                                const parts = try self.a.alloc([]const u8, binding.prefix.len + 1);
-                                @memcpy(parts[0..binding.prefix.len], binding.prefix);
-                                parts[parts.len - 1] = name;
-                                try self.propertyPath(binding, parts, false);
-                            },
-                            .entry => |entry| try self.walk(entry.value.*),
-                            .variable => |name| if (self.entities.get(name)) |other| try self.whole(other),
-                            .all => try self.whole(binding),
-                        };
-                        return;
-                    }
                 },
                 else => {},
             }

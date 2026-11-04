@@ -5636,3 +5636,68 @@ owned/borrowed count projection, bounded adjacency and callback ABI checks pass.
 Zig/Python formatting, Python lint and whitespace checks pass. `origin/main` at
 `eb185ad90c` was already merged and remains an ancestor; repository cache cleanup
 completed while preserving active builds and recent output.
+
+### Projection and collection observation closure
+
+Map projections now resolve shorthand variables and explicit entries through the
+same captured lexical environment. A computed alias in `d{x}` carries the same
+property, key, label and complete-value requirements as `d{x:x}`. Evaluating a
+projection base retains its validation requirements without making its unrelated
+properties observable.
+
+Comprehensions and list predicates bind their local variable to the captured
+input element. Nested scopes preserve shadowing, and downstream observations
+cross intermediate list aliases and slices. Slice positions conservatively
+retain the element domain; scalar bounds and predicates still execute normally.
+Path component selectors separate `nodes(p)` from `relationships(p)`, so a node
+observer never forces relationship metadata, and a relationship observer never
+forces node properties. Returning full components retains their complete public
+values. Unknown producers retain the existing conservative behavior.
+
+Nullable string ordering uses the same prefix-metered comparator as ordering
+operators. It checks only the decisive prefix for ordinary mismatches; long
+common prefixes still consume work and cancellation checks. NULL and container
+comparisons retain their Cypher semantics.
+
+The main merge also preserves the newer SQL decision-boundary classification,
+issuer-scoped completion outboxes and metadata routing. Embedded graph writes
+retain graph-specific pre-decision diagnostics. SQL completion commands keep
+wire tag 81; graph transaction sessions use tag 82, gated by topology version 79.
+Generated SDK specifications and workbench assets are rebuilt from the merged
+sources rather than selecting one branch's generated bundle.
+
+The authenticated regression uses two documents with 2 MiB root/nested strings
+and wide relationship metadata. Its narrow cases keep a 1 MiB memory ceiling;
+the full-value controls explicitly allow larger results. Reported query memory:
+
+| Shape | Review document / relational | Implemented document / relational |
+| --- | ---: | ---: |
+| Computed alias map projection | 63,654,354 / 87,567,426 B | 95,450 / 95,450 B |
+| Identity comprehension | 63,654,654 / 87,567,726 B | 94,816 / 94,816 B |
+| Sliced list followed by identity | 63,657,014 / 87,570,086 B | 136,842 / 125,340 B |
+| Path node identities | 63,656,794 / 87,569,866 B | 137,094 / 125,592 B |
+
+The final node/list checks include deterministic ordering. Relationship type
+comprehensions use 137,074 / 125,572 B and do not retain node properties or edge
+payloads. Shorthand and explicit map entries return identical key counts (4 and
+3); full shorthand entity returns preserve the wide body and labels. Selected
+node scores and relationship ranks remain correct through path comprehensions.
+
+Changing-operand string ordering now completes all 32 comparisons in 542 / 572
+work units. The review used 262,250 / 262,252 units for only four comparisons and
+failed 32 comparisons at the one-million-work ceiling. Full strings remain
+available when actually returned, and long equal prefixes remain budgeted.
+
+Shared immutable string spans prove their common prefix in constant work,
+including a shorter view starting at the same address. Separate equal strings
+still require bounded traversal; the unit regression distinguishes these cases
+with strict work ceilings.
+
+Qualification after merging `origin/main` at `2c0905501d`: all 567 core tests,
+all ten authenticated performance campaigns, and final document/relational
+controls against the shared-span build pass. Native C API, projection, adjacency,
+callback ABI, metadata session routing, graph transaction and command-frame
+checks pass. All Go SDK packages, 14 schema/generator contract tests, and the
+SDK/workbench build pass. Formatting, lint and whitespace checks pass. Repository
+cache cleanup was run; completed worktree object output was reclaimed after
+builds, preserving the tested binary and required disk admission headroom.

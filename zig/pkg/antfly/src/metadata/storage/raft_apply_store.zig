@@ -43595,7 +43595,13 @@ test "metadata durable job state and transaction sessions retain distinct comman
     // Preserve main's durable job tag and give the graph branch's transaction
     // journal its own frame, admitted only by the merged protocol floor.
     try std.testing.expectEqual(@as(u8, 79), job[transition_magic.len]);
-    try std.testing.expectEqual(@as(u8, 81), transaction[transition_magic.len]);
+    try std.testing.expectEqual(@as(u8, 82), transaction[transition_magic.len]);
+    const completion = try encodeTransitionCommand(a, .{ .apply_sql_completion_reference = "completion" });
+    defer a.free(completion);
+    try std.testing.expectEqual(@as(u8, 81), completion[transition_magic.len]);
+    var decoded_completion = (try decodeTransitionCommand(a, completion)).?;
+    defer decoded_completion.deinit(a);
+    try std.testing.expectEqualStrings("completion", decoded_completion.apply_sql_completion_reference);
     var decoded_transaction = (try decodeTransitionCommand(a, transaction)).?;
     defer decoded_transaction.deinit(a);
     try std.testing.expectEqualStrings(record, decoded_transaction.apply_transaction_sessions);

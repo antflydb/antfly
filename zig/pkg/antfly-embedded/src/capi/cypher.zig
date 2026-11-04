@@ -613,6 +613,7 @@ test "capi embedded graph catalog and query retain table identities across reope
         try std.testing.expect(std.mem.indexOf(u8, output.ptr.?[0..output.len], "\"status\":\"committed\"") != null);
         api.antfly_buffer_free(&output);
         try std.testing.expectEqual(h.capi.ErrorCode.version_conflict, antfly_db_cypher_json(handle, .fromSlice("knowledge"), .fromSlice(write), &output));
+        try std.testing.expect(std.mem.indexOf(u8, output.ptr.?[0..output.len], "CypherWriteRequestAlreadyUsed") != null);
         api.antfly_buffer_free(&output);
         const rollback = "{\"query\":\"CREATE (n:Document {id:'aborted'}) RETURN 1/0\"}";
         try std.testing.expectEqual(h.capi.ErrorCode.invalid_argument, antfly_db_cypher_json(handle, .fromSlice("knowledge"), .fromSlice(rollback), &output));

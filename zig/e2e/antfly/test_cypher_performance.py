@@ -2827,8 +2827,11 @@ def test_authenticated_cypher_identity_membership_and_edge_domains(
     def call(path, body=None, method="POST"):
         try:
             response = session.request(method, base + path, json=body, timeout=45)
-        except requests.RequestException:
-            raise AssertionError(server.log_path.read_text()[-20000:]) from None
+        except requests.RequestException as exc:
+            raise AssertionError(
+                f"{exc!r}; process={server.proc.poll()}\n"
+                + server.log_path.read_text()[-20000:]
+            ) from None
         assert response.status_code in (200, 201, 202), (
             response.status_code,
             response.text,
@@ -2963,6 +2966,62 @@ def test_authenticated_cypher_identity_membership_and_edge_domains(
         def string(value):
             return {"type": "string", "value": value}
 
+        # Every producer must forward the actual downstream observation.
+        for projection in ("d{x}.x", "d{x:x}.x"):
+            assert query(
+                f"MATCH(d:D) WITH d,coalesce(d,null) AS x RETURN size(keys({projection})) ORDER BY antfly.documentKey(d)"
+            )["rows"] == [[integer(4)], [integer(3)]]
+        for projection_base in ("d", "coalesce(d,null)"):
+            projected = query(
+                f"MATCH(d:D) WITH {projection_base} AS x RETURN x{{.score}} AS projected ORDER BY antfly.documentKey(x)"
+            )["rows"]
+            assert [row[0]["value"]["score"] for row in projected] == [
+                integer(7),
+                integer(0),
+            ]
+
+        def list_value(values):
+            return {"type": "list", "value": values}
+
+        assert query(
+            "MATCH(d:D) WITH [d] AS xs RETURN [x IN xs | antfly.documentKey(x)] ORDER BY antfly.documentKey(head(xs))"
+        )["rows"] == [[list_value([string("d1")])], [list_value([string("d2")])]]
+        assert query(
+            "MATCH(d:D) WITH [d] AS xs WITH xs[0..] AS ys RETURN antfly.documentKey(head(ys)) ORDER BY antfly.documentKey(head(ys))"
+        )["rows"] == [[string("d1")], [string("d2")]]
+        assert query(
+            "MATCH p=(a:D)-[r:R]->(b:D) RETURN [x IN nodes(p) | antfly.documentKey(x)]"
+        )["rows"] == [[list_value([string("d1"), string("d2")])]]
+        assert query(
+            "MATCH p=(a:D)-[r:R]->(b:D) RETURN [x IN relationships(p) | type(x)]"
+        )["rows"] == [[list_value([string("R")])]]
+        assert query("MATCH p=(a:D)-[r:R]->(b:D) RETURN [x IN nodes(p) | x{.score}]")[
+            "rows"
+        ] == [
+            [
+                list_value(
+                    [
+                        {"type": "map", "value": {"score": integer(7)}},
+                        {"type": "map", "value": {"score": integer(0)}},
+                    ]
+                )
+            ]
+        ]
+        assert query(
+            "MATCH p=(a:D)-[r:R]->(b:D) RETURN [x IN relationships(p) | x.rank]"
+        )["rows"] == [[list_value([integer(7)])]]
+        compared = query(
+            "MATCH(d:D) WHERE d.id='d1' UNWIND range(1,32) AS i RETURN d.body<toString(i)",
+            memory=128 << 20,
+        )
+        assert compared["rows"] == [[{"type": "boolean", "value": False}]] * 32
+        assert compared["stats"]["intermediate_states"] < 10000, compared["stats"]
+        shared = query(
+            "MATCH(d:D) WHERE d.id='d1' UNWIND range(1,32) AS i RETURN d.body<d.body",
+            memory=128 << 20,
+        )
+        assert shared["rows"] == [[{"type": "boolean", "value": False}]] * 32
+        assert shared["stats"]["intermediate_states"] < 10000, shared["stats"]
         for statement in (
             "MATCH(d:D) RETURN d=d",
             "MATCH(d:D) RETURN d IS NOT NULL",
@@ -3078,6 +3137,15 @@ def test_authenticated_cypher_identity_membership_and_edge_domains(
             result["rows"][0][0]["value"]["properties"]["value"]["body"]["value"]
             == wide
         ), result
+        result = query(
+            "MATCH(d:D) WHERE d.id='d1' WITH d,coalesce(d,null) AS x RETURN d{x}.x",
+            128 << 20,
+        )
+        assert (
+            result["rows"][0][0]["value"]["properties"]["value"]["body"]["value"]
+            == wide
+        )
+        assert result["rows"][0][0]["value"]["labels"] == ["D"]
         result = query(
             "MATCH(d:D) WHERE d.id='d1' UNWIND range(1,32) AS i RETURN d.body=toString(i)",
             64 << 20,
