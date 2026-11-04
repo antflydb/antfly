@@ -139,3 +139,18 @@ The final CPU admission suite passed 81 tests with 17 accelerator-dependent
 skips. Shared inference/provider contracts (including twelve dense/sparse HTTP
 error combinations), strict focused API contracts, generated registry/catalog
 checks, and the regenerated Go SDK tests also passed.
+
+The final Metal-enabled admission suite passed 97 tests with 17 skips. The
+rebuilt Metal server also passed all ten mixed-model smoke requests under the
+24 GiB process envelope and 7,372 MiB backend cap described above: flat/grouped
+text, image embeddings, Whisper-small, and three concurrent image/ASR pairs.
+Both model load selections were Metal; no model reload was observed between
+pairs. These remain admission and output-shape smoke checks, not new quality or
+throughput qualification.
+
+The complete CPU production database build passed for source commit
+`5e8ecab4ad` on the initial main merge (`95592ec39a`), using
+`zig build antfly admission-routing-test -j2 -Dmetal=false -Dcuda=false
+-Doptimize=ReleaseFast`. Both real HTTP regressions passed with no leaks and
+also exited zero with strict unexpected-error-log enforcement. The installed
+executable returned its version successfully.
