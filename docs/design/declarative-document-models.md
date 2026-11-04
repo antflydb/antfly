@@ -126,8 +126,14 @@ runs fail with a revision mismatch instead of mixing execution policies.
 
 Local audio reads decode the source once. The generation pipeline borrows the
 admitted PCM through projector preprocessing; it retains source bytes for media
-identity and transport accounting. Hosted calls poll the complete request
-cancellation checkpoint throughout provider I/O.
+identity and transport accounting. Decode allocations obey the available work
+budget; small recordings do not require a fixed 512 MiB allowance. Generator
+audio reads clamp an omitted output-token default to the effective executor
+ceiling, while explicit values above that ceiling remain errors. Hosted audio
+leaves borrow the same run-owned HTTP pool as routing, extraction and verification,
+including across sources and nested readers. Pool state outlives page scratch
+arenas and is released after all workers finish. Cancellation and deadlines remain
+per-call and poll the complete request checkpoint throughout provider I/O.
 
 
 For conditional refinement, add another `operation: "read", input: "audio"`
