@@ -1215,6 +1215,7 @@ pub const MaintenanceHoldSites = struct {
     pub const Site = struct { count: u64 = 0, ns: u64 = 0, max_ns: u64 = 0 };
     writer_primary: Site = .{},
     writer_index: Site = .{},
+    writer_index_read: Site = .{},
     writer_reclamation: Site = .{},
     writer_artifact_lease: Site = .{},
     writer_allocator_service: Site = .{},
@@ -1240,6 +1241,7 @@ pub const MaintenanceHoldSites = struct {
         return switch (scope) {
             .primary => &self.writer_primary,
             .index => &self.writer_index,
+            .index_read => &self.writer_index_read,
             .reclamation => &self.writer_reclamation,
             .artifact_lease => &self.writer_artifact_lease,
             .allocator_service => &self.writer_allocator_service,
@@ -3977,13 +3979,21 @@ pub const Owner = struct {
         // Numeric/enum diagnostics only: no path, SQL, model or document data.
         // Preparation overlaps actor service; durations are not additive.
         std.log.info("antfly_bench_native_owner source_turns={d} capture_ns={d} replay_ns={d} artifacts_ns={d} storage_ns={d} runtime_refreshes={d} maintenance_errors={d} maintenance_timeouts={d} merge_started={d} merge_applied={d} merge_discarded={d} merge_prepare_ns={d} merge_staging_ns={d} merge_staged_bytes={d} merge_publication_ns={d} sql_overlay_hits={d} sql_overlay_scope_extensions={d} sql_overlay_rebuilds={d} sql_overlay_rebuild_entries={d} sql_overlay_evictions={d} sql_staged_statements={d} replay_waits={d} replay_refused_prepare_ns={d} last_failure={s}", .{ p.maintenance_source_turns, p.maintenance_capture_ns, p.maintenance_replay_ns, p.maintenance_artifacts_ns, p.maintenance_storage_ns, p.serving_runtime_refreshes, p.maintenance_errors, p.maintenance_queue_timeouts, p.text_merge_jobs_started, p.text_merge_jobs_applied, p.text_merge_jobs_discarded, p.text_merge_prepare_ns, p.text_merge_staging_ns, p.text_merge_staged_bytes, p.text_merge_publication_ns, p.sql_constraint_overlay_hits, p.sql_constraint_overlay_scope_extensions, p.sql_constraint_overlay_rebuilds, p.sql_constraint_overlay_rebuild_entries, p.sql_constraint_overlay_evictions, p.sql_constraint_staged_statements, p.replay_backpressure_waits, p.replay_refused_preparation_ns, p.last_maintenance_failure orelse "none" });
+        inline for (@typeInfo(MaintenanceHoldSites).@"struct".field_names) |field_name| {
+            if (comptime !std.mem.eql(u8, field_name, "capture_steps")) {
+                const site = @field(p.maintenance_hold_sites, field_name);
+                std.log.info("antfly_bench_native_hold_" ++ field_name ++ " count={d} ns={d} max_ns={d}", .{ site.count, site.ns, site.max_ns });
+            }
+        }
+        const steps = p.maintenance_hold_sites.capture_steps;
+        std.log.info("antfly_bench_native_capture_steps refresh_ns={d} marker_sweep_ns={d} recover_ns={d} catalog_ns={d} debt_checks_ns={d} schedule_ns={d} snapshot_ns={d} publication_catalog_ns={d}", .{ steps.refresh_ns, steps.marker_sweep_ns, steps.recover_ns, steps.catalog_ns, steps.debt_checks_ns, steps.schedule_ns, steps.snapshot_ns, steps.publication_catalog_ns });
         inline for (@typeInfo(TextRuntimeCacheDiagnostics).@"struct".field_names) |field_name| {
             const count = @field(p.text_runtime_cache, field_name);
             if (count != 0) std.log.info("antfly_bench_native_runtime_cache_{s} count={d}", .{ field_name, count });
         }
         if (self.current) |current| {
             const work = current.owned_lite_backend.?.native_docstore.?.file.allocatorWorkSnapshot();
-            std.log.info("antfly_bench_native_allocator full_loads={d} full_load_ns={d} digest_rebuilds={d} digest_rebuild_ns={d} journal_rebases={d} journal_rebase_ns={d} cache_transfers={d}", .{ work.full_loads, work.full_load_ns, work.digest_rebuilds, work.digest_rebuild_ns, work.journal_rebases, work.journal_rebase_ns, work.cache_transfers });
+            std.log.info("antfly_bench_native_allocator full_loads={d} full_load_ns={d} digest_rebuilds={d} digest_rebuild_ns={d} journal_rebases={d} journal_rebase_ns={d} cache_transfers={d} cache_copies={d}", .{ work.full_loads, work.full_load_ns, work.digest_rebuilds, work.digest_rebuild_ns, work.journal_rebases, work.journal_rebase_ns, work.cache_transfers, work.cache_copies });
             std.log.info("antfly_bench_native_artifact_sources opens={d} reuses={d}", .{ work.artifact_source_opens, work.artifact_source_reuses });
         }
         const f = p.maintenance_failures;
