@@ -7486,7 +7486,16 @@ pub const DB = struct {
     /// applied unless the error is an unknown outcome. Keeps `batch`'s
     /// ANTFLY_BENCH_METRICS phase profile.
     pub fn batchTracked(self: *DB, req: types.BatchRequest, primary_committed: *bool) anyerror!void {
+        return self.batchTrackedWithMarker(req, primary_committed, null);
+    }
+
+    /// `batchTracked` that also commits an outcome-receipt marker atomically
+    /// with the primary write (see `apply_receipts.OutcomeMarker`).
+    pub fn batchTrackedWithMarker(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker: ?apply_receipts.OutcomeMarker) anyerror!void {
         primary_committed.* = false;
+        var marker_key: [apply_receipts.outcome_marker_key_len]u8 = undefined;
+        var marker_value: [apply_receipts.outcome_marker_value_len]u8 = undefined;
+        const marker_write: ?docstore_mod.KVPair = if (marker) |m| apply_receipts.outcomeMarkerWrite(m, &marker_key, &marker_value) else null;
         // Storage commits keep their original error; this records whether a
         // failed commit may still have applied (for example, LSM WAL appended
         // and then a sync or flush failed). For an exported call that is an
@@ -7495,7 +7504,7 @@ pub const DB = struct {
         const previous = backend_types.commit_progress;
         backend_types.commit_progress = &progress;
         defer backend_types.commit_progress = previous;
-        self.batchTrackedProfiled(req, primary_committed) catch |err| {
+        self.batchTrackedProfiled(req, primary_committed, marker_write) catch |err| {
             if (progress.maybe_applied and !primary_committed.* and !isOutcomeUnknownError(err)) {
                 std.log.warn("batch failed after its write may have applied: {s}", .{@errorName(err)});
                 return error.OutcomeUnknown;
@@ -7511,14 +7520,26 @@ pub const DB = struct {
         };
     }
 
-    fn batchTrackedProfiled(self: *DB, req: types.BatchRequest, primary_committed: *bool) anyerror!void {
+    fn batchTrackedProfiled(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker_write: ?docstore_mod.KVPair) anyerror!void {
+        const opts: BatchExecutionOptions = .{ .primary_committed = primary_committed, .outcome_marker_write = marker_write };
         if (benchMetricsEnabled()) {
             var profile = BatchProfile{};
-            try self.batchInternal(req, &profile, .{ .primary_committed = primary_committed });
+            try self.batchInternal(req, &profile, opts);
             logBatchProfile(req, profile);
         } else {
-            try self.batchInternal(req, null, .{ .primary_committed = primary_committed });
+            try self.batchInternal(req, null, opts);
         }
+    }
+
+    /// The last applied sequence recorded for an outcome-receipt writer.
+    pub fn readOutcomeMarker(self: *DB, writer: [apply_receipts.outcome_writer_len]u8) !?u64 {
+        return apply_receipts.readOutcomeMarker(self.alloc, self.core.store, writer);
+    }
+
+    /// Removes a writer's marker once its receipt is no longer needed.
+    pub fn deleteOutcomeMarker(self: *DB, writer: [apply_receipts.outcome_writer_len]u8) !void {
+        const key = apply_receipts.outcomeMarkerKey(writer);
+        try self.batchInternal(.{}, null, .{ .extra_store_deletes = &.{&key} });
     }
 
     pub fn batchWithVisibilityCancellation(self: *DB, req: types.BatchRequest, cancellation: types.CancellationToken) anyerror!void {
@@ -26359,6 +26380,7 @@ pub const DB = struct {
             if (!opts.bypass_replication_write_gate and self.local_execution.replication_async_batch_mirror != null)
                 payload = if (req.artifact_catalog != null) try replication_effects_mod.encodeArtifactCatalogMutationRequestAlloc(self.alloc, req, opts.ordered_apply_receipt orelse return error.InvalidArtifactCatalogCommand) else try replication_effects_mod.encodeOnlineSourceMutationRequestAlloc(self.alloc, req, applied_index);
             for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
+            if (opts.outcome_marker_write) |write| try txn.put(write.key, write.value);
             if (opts.ordered_apply_receipt) |entry| {
                 var bytes: [ordered_apply_receipt_value_len]u8 = undefined;
                 const marker = orderedApplyReceiptWrite(entry, &bytes);
@@ -26640,7 +26662,7 @@ pub const DB = struct {
         const command = req.leann_record orelse return error.InvalidBatchRequest;
         const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
         if (entry.term == 0 or entry.index == 0 or opts.artifact_upload_finalize != null or
-            opts.extra_store_writes.len != 0 or opts.extra_store_deletes.len != 0) return error.InvalidBatchRequest;
+            opts.extra_store_writes.len != 0 or opts.extra_store_deletes.len != 0 or opts.outcome_marker_write != null) return error.InvalidBatchRequest;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         // Hot-standby mirrors run standalone, where LEANN stays replica-local.
         if (self.local_execution.replication_async_batch_mirror != null) return error.UnsupportedLeannReplication;
@@ -26716,7 +26738,7 @@ pub const DB = struct {
         const command = req.merge_proof_adoption orelse return error.InvalidBatchRequest;
         const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
         if (entry.term == 0 or entry.index == 0 or opts.artifact_upload_finalize != null or
-            opts.extra_store_writes.len != 0 or opts.extra_store_deletes.len != 0) return error.InvalidBatchRequest;
+            opts.extra_store_writes.len != 0 or opts.extra_store_deletes.len != 0 or opts.outcome_marker_write != null) return error.InvalidBatchRequest;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
 
         var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
@@ -26925,6 +26947,7 @@ pub const DB = struct {
             try txn.put(standby.key, standby.value);
         }
         for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
+        if (opts.outcome_marker_write) |write| try txn.put(write.key, write.value);
         for (opts.extra_store_deletes) |key| try txn.delete(key);
         try self.stageRestoreStagingReplicationOutbox(&txn, replication_payload);
         try txn.commit();
@@ -26956,6 +26979,7 @@ pub const DB = struct {
             try txn.put(standby.key, standby.value);
         }
         for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
+        if (opts.outcome_marker_write) |write| try txn.put(write.key, write.value);
         for (opts.extra_store_deletes) |key| try txn.delete(key);
         try self.stageRestoreStagingReplicationOutbox(&txn, replication_payload);
         try txn.commit();
@@ -27311,6 +27335,7 @@ pub const DB = struct {
                 try txn.put(standby.key, standby.value);
             }
             for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
+            if (opts.outcome_marker_write) |write| try txn.put(write.key, write.value);
             for (opts.extra_store_deletes) |key| try txn.delete(key);
             try self.stageRestoreStagingReplicationOutbox(&txn, replication_payload);
             try txn.commit();
@@ -27365,6 +27390,7 @@ pub const DB = struct {
                     try txn.put(standby.key, standby.value);
                 }
                 for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
+                if (opts.outcome_marker_write) |write| try txn.put(write.key, write.value);
                 for (opts.extra_store_deletes) |key| try txn.delete(key);
                 try self.stageRestoreStagingReplicationOutbox(&txn, replication_payload);
                 try txn.commit();
@@ -27506,6 +27532,7 @@ pub const DB = struct {
             try @import("relational_integrity_topology.zig").requireUnfenced(&txn);
             try inventory.stageOrdered(self.alloc, &txn, command, entry.index);
             for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
+            if (opts.outcome_marker_write) |write| try txn.put(write.key, write.value);
             var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
             const marker = orderedApplyReceiptWrite(entry, &marker_bytes);
             try txn.put(marker.key, marker.value);
@@ -56195,6 +56222,35 @@ fn replayPendingDerivedBatches(
         }
     };
 
+    // Resume points inside an oversized full-text record (bounded replay).
+    const PartialReplayProgress = struct {
+        fn configHash(db: anytype, index_name: []const u8) u64 {
+            return if (db.core.index_manager.get(index_name)) |cfg| types.indexConfigHash(cfg.*) else 0;
+        }
+
+        fn load(ctx: *anyopaque, index_name: []const u8) !?derived_worker.PartialCursor {
+            const progress: *PersistReplayProgressContext = @ptrCast(@alignCast(ctx));
+            const db = progress.db;
+            const cursor = (try apply_state.loadPartialReplayCursor(db.alloc, db.core.store, index_name)) orelse return null;
+            // Written under another index configuration: start the record over.
+            if (cursor.config_hash != configHash(db, index_name)) return null;
+            return .{ .sequence = cursor.sequence, .offset = cursor.offset };
+        }
+
+        fn save(ctx: *anyopaque, index_name: []const u8, cursor: derived_worker.PartialCursor) !void {
+            const progress: *PersistReplayProgressContext = @ptrCast(@alignCast(ctx));
+            const db = progress.db;
+            if (cursor.offset == 0) return apply_state.clearPartialReplayCursor(db.alloc, db.core.store, index_name);
+            // As for applied progress: the index output is durable first.
+            try db.core.index_manager.checkpointLsmWalForManagedIndex(.{ .name = index_name, .kind = .full_text });
+            try apply_state.savePartialReplayCursor(db.alloc, db.core.store, index_name, .{
+                .sequence = cursor.sequence,
+                .offset = cursor.offset,
+                .config_hash = configHash(db, index_name),
+            });
+        }
+    };
+
     const DenseReplayProgressContext = struct {
         db: *DB,
         persist: *PersistReplayProgressContext,
@@ -56373,6 +56429,7 @@ fn replayPendingDerivedBatches(
             .algebraic => 4,
         };
         const adaptive_budget = replay_state.replay_budget.budget(replay_lane);
+        const bounded_full_text = options.bounded_replay and index_ref.kind == .full_text;
         const replay_started = monotonicTimeNs();
         var replay_completed = false;
         defer if (options.bounded_replay and !replay_completed)
@@ -56403,6 +56460,14 @@ fn replayPendingDerivedBatches(
                 ),
                 .max_windows_per_call = options.max_windows_per_index,
                 .deadline_ns = options.deadline_ns,
+                // Bounded full-text replay splits a large record into small
+                // subchunks and may stop between them, resuming next turn, so
+                // one record cannot hold the writer for its whole apply.
+                .max_items_per_window = if (bounded_full_text) @import("derived/catch_up_policy.zig").boundedFullTextReplayMaxItems() else 0,
+                .max_call_ns = if (bounded_full_text) @import("derived/catch_up_policy.zig").boundedFullTextReplayQuantumNs() else 0,
+                .partial_ctx = if (bounded_full_text) &persist_progress_ctx else null,
+                .load_partial_fn = if (bounded_full_text) PartialReplayProgress.load else null,
+                .save_partial_fn = if (bounded_full_text) PartialReplayProgress.save else null,
             },
         );
         if (openProfileEnabled()) logReplayCatchUpProfile(index_ref, applied, stats);

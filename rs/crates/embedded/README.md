@@ -125,6 +125,18 @@ survives subsequent calls. `Error` is `Clone` rather than `Copy`; use
 `error.kind()` when matching stable variants and `error.detail()` for the
 message. Equality and hashing compare the stable code, independent of detail.
 
+When `batch`, `batch_json`, or an autocommit `sql_json` write fails with
+`OutcomeUnknown`, the error may carry an outcome receipt
+(`Error::OutcomeUnknownWithReceipt`, which compares equal to
+`Error::OutcomeUnknown`; read it with `error.outcome_receipt()` or
+`SqlError::outcome_receipt()`). Resolve it on any handle for the same
+database with `db.outcome_receipt_status(receipt)`, which returns
+`OutcomeReceiptStatus::Applied` or `NotApplied`, or `Error::Stalled` while
+the uncertain commit is not reconciled yet (Lite: retry; directory database:
+close the issuing handle and reopen first). Call
+`db.forget_outcome_receipt(receipt)` once resolved; afterwards the receipt can
+no longer be resolved.
+
 [`Inference`] opens the same embedded inference runtime on its own, with no
 database -- `Inference::open`/`open_default` (options: [`InferenceOptions`],
 covering models directory, resource budgets, and a per-call timeout) and
