@@ -47,6 +47,9 @@ const Fault = struct {
     pub fn get(self: *Fault, key: []const u8) ![]const u8 {
         return self.txn.get(key);
     }
+    pub fn openCursor(self: *Fault) !docstore.DocStore.Txn.CursorAdapter {
+        return self.txn.openCursor();
+    }
     pub fn put(self: *Fault, key: []const u8, value: []const u8) !void {
         if (self.remaining == 0) return error.InjectedFailure;
         self.remaining -= 1;
@@ -204,6 +207,8 @@ test "SQL scope retirement journal rejects cross group replay and inconsistent q
 }
 
 const wire = @import("scope_retirement_wire.zig");
+const lifecycle = @import("table_lifecycle_lock.zig");
+const dependencies = @import("schema_validation_dependencies.zig");
 const AdmissionHarness = struct {
     fn request(store: *native.RaftApplyStore, a: std.mem.Allocator, nonce: u8) !wire.Request {
         const bytes = try store.prepareScopeRetirementManifestJsonWithContext(a, group, .{ .kind = .database, .name = "tenant_ops", .creator = .bootstrap }, .{});
@@ -335,7 +340,12 @@ test "SQL scope retirement native admission fences capability stale cuts nonce s
     // Disjoint namespaces in another database remain writable.
     const outside: native.SystemCatalogCommand = .{ .expected_revision = meta.revision, .mutation = .{ .action = .create, .kind = .namespace, .name = "outside_scope" } };
     try store.applyStandaloneCommand(group, .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(scratch, outside, .{}) });
-    const rejected = (try AdmissionHarness.apply(&store, scratch, try AdmissionHarness.request(&store, scratch, 82), 3, false)).outcome.?;
+    try std.testing.expectError(error.TableTransitionActive, AdmissionHarness.request(&store, scratch, 82));
+    var contender = request;
+    contender.admission.nonce = @splat(82);
+    contender.admission.head = (try store.systemCatalogMeta(scratch, group)).revision;
+    contender.operation.reserve.catalog_revision = contender.admission.head;
+    const rejected = (try AdmissionHarness.apply(&store, scratch, contender, 3, false)).outcome.?;
     try std.testing.expectEqual(wire.Rejection.TableTransitionActive, rejected.result.rejected);
     _ = try AdmissionHarness.apply(&store, scratch, AdmissionHarness.cancel(original.query.lookup, 83), 4, false);
     // A new attempt based on the old cut is durably rejected. Replaying the
@@ -382,6 +392,30 @@ test "SQL scope retirement admission and outcome writes abort as one native tran
         const observed = try std.json.parseFromSliceLeaky(wire.Observation, scratch, try store.scopeRetirementObservationJson(scratch, group, input.query), .{});
         try std.testing.expect(observed.outcome == null and observed.current == null);
     }
+    const admitted = (try AdmissionHarness.apply(&store, scratch, request, 1, false)).outcome.?.result.accepted;
+    const cancel = AdmissionHarness.cancel(admitted.lookup, 92);
+    var cancellation = try wire.Input.parse(a, group, try cancel.encodeAlloc(scratch));
+    defer cancellation.deinit();
+    // Cancellation releases all active custody and retains both the exact
+    // result and its per-job receipt link in one abortable native transaction.
+    for (0..6 + prepared.manifest.resources.len) |fail_at| {
+        var txn = try store.store.beginWriteTxn();
+        var open = true;
+        defer if (open) txn.abort();
+        var fault: Fault = .{ .txn = &txn, .remaining = fail_at };
+        if (ledger.stageAdvance(&fault, &prepared, admitted, try admitted.progress.cancelBeforeEffects())) |after| {
+            try std.testing.expectError(error.InjectedFailure, wire.stageOutcome(&fault, .{ .query = cancellation.query, .result = .{ .accepted = after } }));
+        } else |err| try std.testing.expectEqual(error.InjectedFailure, err);
+        txn.abort();
+        open = false;
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqualDeep(admitted, (try ledger.existing(&read, &prepared)).?);
+        const observed = try wire.observation(&read, cancellation.query);
+        try std.testing.expect(observed.outcome == null);
+        try std.testing.expectEqualDeep(admitted, observed.current.?);
+        try std.testing.expectError(error.NotFound, wire.terminalQuery(&read, admitted.lookup));
+    }
 }
 
 test "SQL scope retirement native admission rejects changed physical cuts without relying on logical catalog revision" {
@@ -408,5 +442,183 @@ test "SQL scope retirement native admission rejects changed physical cuts withou
         try std.testing.expectEqual(if (change == .incarnation) wire.Rejection.MetadataIncarnationMismatch else wire.Rejection.CatalogGenerationChanged, result.result.rejected);
         try std.testing.expectEqualStrings("null", try store.scopeRetirementWorkJson(scratch, group, 0));
         try absent(&store, result.query.lookup);
+    }
+}
+
+fn replaceRow(store: *native.RaftApplyStore, key: []const u8, value: ?[]const u8) !void {
+    var txn = try store.store.beginWriteTxn();
+    var committed = false;
+    defer if (!committed) txn.abort();
+    if (value) |bytes| try txn.put(key, bytes) else try txn.delete(key);
+    try txn.commit();
+    committed = true;
+}
+
+fn rejectDamagedCustody(store: *native.RaftApplyStore, a: std.mem.Allocator, checkpoint: []const u8, key: []const u8, value: ?[]const u8) !void {
+    const before: ?[]u8 = before: {
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        const bytes = read.get(key) catch |err| switch (err) {
+            error.NotFound => break :before null,
+            else => return err,
+        };
+        break :before try a.dupe(u8, bytes);
+    };
+    defer if (before) |bytes| a.free(bytes);
+    try replaceRow(store, key, value);
+    defer replaceRow(store, key, before) catch @panic("cannot restore damaged test row");
+    // Both paths use the same streamed custody rules. Snapshot refusal must
+    // occur before encoding/publishing a replacement image; checkpoint refusal
+    // must occur before creating a portable native artifact.
+    try std.testing.expectError(error.InvalidMetadataSnapshot, store.snapshotBuilder().buildSnapshot(a, group));
+    try std.testing.expectError(error.InvalidMetadataHACheckpoint, store.exportHotStandbyCheckpoint(store.io_impl.io(), checkpoint));
+}
+
+test "SQL scope retirement recovery rejects every orphan missing owner overlap and fabricated progress through snapshots and native checkpoints" {
+    const a = std.testing.allocator;
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/scope-checkpoint", .{tmp.sub_path});
+    const checkpoint = try std.fmt.allocPrint(scratch, "{s}/damaged.bin", .{path});
+    var store = try native.RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    try seed(&store, scratch);
+    const request = try AdmissionHarness.request(&store, scratch, 81);
+    const accepted = (try AdmissionHarness.apply(&store, scratch, request, 1, false)).outcome.?;
+    const head = accepted.result.accepted;
+    var prepared = try ledger.prepare(a, group, head.lookup.reference.id, try std.json.Stringify.valueAlloc(scratch, request.operation.reserve, .{}));
+    defer prepared.deinit();
+    var buffer: [320]u8 = undefined;
+    // Required forward images, work and immutable admission cannot disappear.
+    try rejectDamagedCustody(&store, a, checkpoint, try ledger.key(&buffer, head.lookup, .head), null);
+    try rejectDamagedCustody(&store, a, checkpoint, try ledger.key(&buffer, head.lookup, .manifest), null);
+    try rejectDamagedCustody(&store, a, checkpoint, try ledger.queueKey(&buffer, group, head.sequence), null);
+    try rejectDamagedCustody(&store, a, checkpoint, try ledger.memberKey(&buffer, group, .database, head.lookup.reference.root), null);
+    try rejectDamagedCustody(&store, a, checkpoint, try wire.outcomeKey(&buffer, accepted.query), null);
+    try rejectDamagedCustody(&store, a, checkpoint, try ledger.counterKey(&buffer, group), null);
+    var count: [8]u8 = undefined;
+    std.mem.writeInt(u64, &count, head.sequence + 1, .little);
+    try rejectDamagedCustody(&store, a, checkpoint, try ledger.counterKey(&buffer, group), &count);
+    const lease = try ledger.LeaseRecord.init(.{ .lookup = head.lookup, .metadata_incarnation = head.metadata_incarnation });
+    try rejectDamagedCustody(&store, a, checkpoint, try ledger.memberKey(&buffer, group, .table, 999), lease.slice());
+    const queue = try ledger.QueueRecord.init(head.lookup);
+    try rejectDamagedCustody(&store, a, checkpoint, try ledger.queueKey(&buffer, group, head.sequence + 1), queue.slice());
+    var duplicate = accepted;
+    duplicate.query.nonce = @splat(84);
+    var extra_receipt = try wire.OutcomeRecord.init(duplicate);
+    try rejectDamagedCustody(&store, a, checkpoint, try wire.outcomeKey(&buffer, duplicate.query), extra_receipt.slice());
+    const extra_link = try wire.QueryRecord.init(duplicate.query);
+    try rejectDamagedCustody(&store, a, checkpoint, try ledger.key(&buffer, head.lookup, .terminal_outcome), extra_link.slice());
+    var orphan = head.lookup;
+    orphan.reference.id = @splat(82);
+    try rejectDamagedCustody(&store, a, checkpoint, try ledger.key(&buffer, orphan, .manifest), prepared.encoded);
+    try rejectDamagedCustody(&store, a, checkpoint, try std.fmt.bufPrint(&buffer, "\x00\x00__metadata__:system_catalog:{d}:scope-retirement-unknown", .{group}), "unknown");
+    var altered = head;
+    altered.metadata_incarnation[0] ^= 1;
+    var record = try ledger.HeadRecord.init(altered);
+    try rejectDamagedCustody(&store, a, checkpoint, try ledger.key(&buffer, head.lookup, .head), record.slice());
+    altered = head;
+    altered.progress = try head.progress.drained();
+    record = try ledger.HeadRecord.init(altered);
+    try rejectDamagedCustody(&store, a, checkpoint, try ledger.key(&buffer, head.lookup, .head), record.slice());
+    // A durable lifecycle key or a new FK parent lease cannot coexist with
+    // reserved table custody, even if an unchecked writer copied one in.
+    const lock = lifecycle.value(.index_build, @splat(9));
+    try rejectDamagedCustody(&store, a, checkpoint, try lifecycle.key(&buffer, group, 101), &lock);
+    const parent: dependencies.Key = .{ .group = group, .parent = 101, .child = 909, .id = @splat(9), .ordinal = 0 };
+    try rejectDamagedCustody(&store, a, checkpoint, try parent.encode(&buffer), "unbacked lease");
+    // Terminal ownership needs the exact cancellation receipt, not merely a
+    // terminal-looking head. No terminal body, member or queue may survive.
+    const terminal = (try AdmissionHarness.apply(&store, scratch, AdmissionHarness.cancel(head.lookup, 83), 2, false)).outcome.?;
+    try rejectDamagedCustody(&store, a, checkpoint, try wire.outcomeKey(&buffer, terminal.query), null);
+    try rejectDamagedCustody(&store, a, checkpoint, try ledger.key(&buffer, head.lookup, .terminal_outcome), null);
+    var wrong_query = terminal.query;
+    wrong_query.digest[0] ^= 1;
+    const wrong_link = try wire.QueryRecord.init(wrong_query);
+    try rejectDamagedCustody(&store, a, checkpoint, try ledger.key(&buffer, head.lookup, .terminal_outcome), wrong_link.slice());
+    duplicate = terminal;
+    duplicate.query.nonce = @splat(84);
+    extra_receipt = try wire.OutcomeRecord.init(duplicate);
+    try rejectDamagedCustody(&store, a, checkpoint, try wire.outcomeKey(&buffer, duplicate.query), extra_receipt.slice());
+    try rejectDamagedCustody(&store, a, checkpoint, try ledger.key(&buffer, head.lookup, .manifest), prepared.encoded);
+    try rejectDamagedCustody(&store, a, checkpoint, try ledger.memberKey(&buffer, group, .database, head.lookup.reference.root), lease.slice());
+    try rejectDamagedCustody(&store, a, checkpoint, try ledger.queueKey(&buffer, group, head.sequence), queue.slice());
+    const snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
+    defer a.free(snapshot);
+    const artifact = try store.exportHotStandbyCheckpoint(store.io_impl.io(), checkpoint);
+    try std.testing.expect(artifact.size_bytes > 0);
+}
+
+test "SQL scope retirement admission excludes every lifecycle kind and FK parent leases bidirectionally without blocking disjoint tables" {
+    const a = std.testing.allocator;
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/scope-exclusion", .{tmp.sub_path});
+    var store = try native.RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    try seed(&store, scratch);
+    const request = try AdmissionHarness.request(&store, scratch, 91);
+    var prepared = try ledger.prepare(a, group, @splat(91), try std.json.Stringify.valueAlloc(scratch, request.operation.reserve, .{}));
+    defer prepared.deinit();
+    inline for (comptime std.meta.tags(lifecycle.Kind).*) |kind| {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try lifecycle.acquire(&txn, group, 101, .{ .kind = kind, .id = @splat(9) });
+        try std.testing.expectError(error.TableTransitionActive, ledger.stageBegin(&txn, &prepared));
+    }
+    const source: local.storage_db_relational_schema_owner_contract.ForeignKeySource = .{ .table_name = "borrower", .parents = &.{.{ .constraint_name = "fk", .declared_parent = "table:101", .parent_table = "table:101", .parent_table_id = 101, .parent_schema_version = 1, .parent_schema = @splat(1), .parent_public = @splat(2), .parent_catalog = @splat(3), .parent_unique = "pk", .parent_generation = @splat(4), .parent_definition = @splat(5) }} };
+    const child = .{ .metadata_group_id = group, .metadata_incarnation = @as([32]u8, @splat('1')), .table_id = @as(u64, 909), .id = @as([16]u8, @splat(9)), .plan_digest = @as([32]u8, @splat(10)) };
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try dependencies.acquire(scratch, &txn, child, source);
+        try std.testing.expectError(error.TableTransitionActive, ledger.stageBegin(&txn, &prepared));
+    }
+    const admitted = (try AdmissionHarness.apply(&store, scratch, request, 1, false)).outcome.?;
+    inline for (comptime std.meta.tags(lifecycle.Kind).*) |kind| {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.GenerationPublicationChanged, lifecycle.acquire(&txn, group, 101, .{ .kind = kind, .id = @splat(9) }));
+        try std.testing.expect(try lifecycle.read(&txn, group, 101) == null);
+        try lifecycle.acquire(&txn, group, 999, .{ .kind = kind, .id = @splat(9) });
+        try lifecycle.release(&txn, group, 999, .{ .kind = kind, .id = @splat(9) });
+    }
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.GenerationPublicationChanged, dependencies.acquire(scratch, &txn, child, source));
+        try dependencies.requireUnleased(&txn, group, 101);
+        var parents = [_]local.storage_db_relational_schema_owner_contract.ForeignKeyParent{ source.parents[0], source.parents[0] };
+        parents[0].constraint_name = "external_first";
+        parents[0].parent_table_id = 999;
+        parents[0].declared_parent = "table:999";
+        parents[0].parent_table = "table:999";
+        const combined: local.storage_db_relational_schema_owner_contract.ForeignKeySource = .{ .table_name = source.table_name, .parents = &parents };
+        try std.testing.expectError(error.GenerationPublicationChanged, dependencies.acquire(scratch, &txn, child, combined));
+        try dependencies.requireUnleased(&txn, group, 999);
+        try dependencies.requireUnleased(&txn, group, 101);
+        const uses = @import("../system_catalog/sequence_default_dependencies.zig");
+        var buffer: [320]u8 = undefined;
+        const lease = try ledger.LeaseRecord.init(.{ .lookup = admitted.query.lookup, .metadata_incarnation = admitted.result.accepted.metadata_incarnation });
+        try txn.put(try ledger.memberKey(&buffer, group, .sequence, 909), lease.slice());
+        var references = [_]uses.Reference{.{ .column_id = 1, .sequence_id = 909, .namespace_id = 2, .incarnation = @splat(1), .generation = .serial }};
+        try std.testing.expectError(error.CatalogPublicationProofPending, uses.prepare(a, &txn, group, 999, &references));
+        references[0].sequence_id = 998;
+        var allowed = (try uses.prepare(a, &txn, group, 999, &references)).?;
+        defer allowed.deinit();
+    }
+    _ = try AdmissionHarness.apply(&store, scratch, AdmissionHarness.cancel(admitted.query.lookup, 92), 2, false);
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try lifecycle.acquire(&txn, group, 101, .{ .kind = .index_build, .id = @splat(9) });
+        try lifecycle.release(&txn, group, 101, .{ .kind = .index_build, .id = @splat(9) });
+        try dependencies.acquire(scratch, &txn, child, source);
     }
 }

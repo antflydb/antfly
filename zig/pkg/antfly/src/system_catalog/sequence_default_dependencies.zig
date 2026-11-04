@@ -324,6 +324,9 @@ pub fn prepare(a: A, txn: anytype, group: u64, table: u64, references: []const R
         a.free(before);
         return null;
     }
+    for (references) |reference| {
+        if (try @import("../metadata/scope_retirement_fence.zig").occupied(txn, group, "sequence", reference.sequence_id)) return error.CatalogPublicationProofPending;
+    }
     const after = try a.dupe(Reference, references);
     errdefer a.free(after);
     const bytes = if (after.len != 0) try encode(a, after) else null;

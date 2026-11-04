@@ -90,6 +90,7 @@ pub fn read(txn: anytype, group_id: u64, table_id: u64) !?Lock {
 /// revision, never by guessing that an equal lock means begin was completed.
 pub fn acquire(txn: anytype, group_id: u64, table_id: u64, lock: Lock) !void {
     const bytes = try lock.encode();
+    try @import("scope_retirement_fence.zig").requireTableWritable(txn, group_id, table_id);
     if (lock.kind == .generation or lock.kind == .sql_drop or lock.kind == .table_retirement) try @import("schema_validation_dependencies.zig").requireUnleased(txn, group_id, table_id);
     if (try read(txn, group_id, table_id) != null) return error.GenerationPublicationChanged;
     var buf: [160]u8 = undefined;
@@ -143,9 +144,10 @@ test "table lifecycle lock point CAS rejects cross kind release and preserves st
             if (self.failed) return error.StorageFailure;
             return .{};
         }
-        fn get(self: *@This(), _: []const u8) ![]const u8 {
+        pub fn get(self: *@This(), name: []const u8) ![]const u8 {
             self.reads += 1;
             if (self.failed) return error.StorageFailure;
+            if (!std.mem.startsWith(u8, name, all_prefix)) return error.NotFound;
             return if (self.bytes) |*bytes| bytes else error.NotFound;
         }
         fn put(self: *@This(), _: []const u8, bytes: []const u8) !void {
@@ -160,7 +162,7 @@ test "table lifecycle lock point CAS rejects cross kind release and preserves st
     var txn: Txn = .{};
     const lock: Lock = .{ .kind = .index_build, .id = @splat(9) };
     try acquire(&txn, 1, 2, lock);
-    try std.testing.expectEqual(@as(usize, 1), txn.reads);
+    try std.testing.expectEqual(@as(usize, 2), txn.reads);
     try std.testing.expectEqual(@as(usize, 1), txn.writes);
     try std.testing.expectError(error.GenerationPublicationChanged, acquire(&txn, 1, 2, lock));
     try std.testing.expectError(error.GenerationPublicationChanged, release(&txn, 1, 2, .{ .kind = .generation, .id = lock.id }));

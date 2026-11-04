@@ -79,7 +79,7 @@ pub fn prepare(backing: A, group: u64, id: contract.Id, bytes: []const u8) !Prep
     const encoded = try std.json.Stringify.valueAlloc(a, manifest, .{});
     return .{ .arena = arena, .manifest = manifest, .lookup = lookup, .encoded = encoded };
 }
-const Kind = enum { head, manifest };
+const Kind = enum { head, manifest, terminal_outcome };
 pub fn prefix(buffer: []u8, group: u64) ![]const u8 {
     if (group == 0) return error.InvalidScopeRetirement;
     return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:system_catalog:{d}:scope-retirement:", .{group});
@@ -90,8 +90,7 @@ pub fn key(buffer: []u8, lookup: Lookup, kind: Kind) ![]const u8 {
     return std.fmt.bufPrint(buffer, "{s}{s}:{x:0>16}:{s}:{s}", .{ try prefix(&base, lookup.group), @tagName(lookup.reference.kind), lookup.reference.root, std.fmt.bytesToHex(lookup.reference.id, .lower), @tagName(kind) });
 }
 pub fn memberKey(buffer: []u8, group: u64, kind: local.system_catalog_domain.Kind, id: u64) ![]const u8 {
-    if (group == 0 or id == 0) return error.InvalidScopeRetirement;
-    return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:system_catalog:{d}:scope-retirement-member:{s}:{x:0>16}", .{ group, @tagName(kind), id });
+    return @import("scope_retirement_fence.zig").memberKey(buffer, group, @tagName(kind), id);
 }
 pub fn queuePrefix(buffer: []u8, group: u64) ![]const u8 {
     if (group == 0) return error.InvalidScopeRetirement;
@@ -160,6 +159,16 @@ pub fn requireVacant(reader: anytype, prepared: *const Prepared) !void {
     if (try member(reader, group, .database, prepared.manifest.scope.database.id) != null) return error.TableTransitionActive;
     if (try member(reader, group, rootKind(prepared.manifest), prepared.manifest.scope.root().id) != null) return error.TableTransitionActive;
     for (prepared.manifest.resources) |resource| if (try member(reader, group, resource.kind, resource.id) != null) return error.TableTransitionActive;
+    // Admission and competing lifecycle jobs use the same native transaction.
+    // Check both directions: a scope cannot capture an existing job or a parent
+    // leased by FK validation, and later jobs cannot pass a scope's member key.
+    for (prepared.manifest.tables) |table| {
+        if (try @import("table_lifecycle_lock.zig").read(reader, group, table.id) != null) return error.TableTransitionActive;
+        @import("schema_validation_dependencies.zig").requireUnleased(reader, group, table.id) catch |err| switch (err) {
+            error.GenerationPublicationChanged => return error.TableTransitionActive,
+            else => return err,
+        };
+    }
 }
 /// Exact replay is observed before checking current vacancy. A completed or
 /// canceled operation cannot reacquire reservations or replace its manifest.
@@ -180,7 +189,8 @@ pub fn stageBegin(txn: anytype, prepared: *const Prepared) !Head {
     if (try existing(txn, prepared)) |previous| return previous;
     try requireVacant(txn, prepared);
     var buffer: [256]u8 = undefined;
-    if (try optional(txn, try key(&buffer, prepared.lookup, .manifest)) != null) return error.InvalidScopeRetirement;
+    if (try optional(txn, try key(&buffer, prepared.lookup, .manifest)) != null or
+        try optional(txn, try key(&buffer, prepared.lookup, .terminal_outcome)) != null) return error.InvalidScopeRetirement;
     const previous = if (try optional(txn, try counterKey(&buffer, prepared.lookup.group))) |bytes| blk: {
         if (bytes.len != 8) return error.InvalidScopeRetirement;
         break :blk std.mem.readInt(u64, bytes[0..8], .little);

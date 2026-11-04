@@ -21287,7 +21287,8 @@ pub const RaftApplyStore = struct {
     }
 
     fn fkGenerationTableLockedTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !bool {
-        return (try self.fkTableLockKindTxn(txn, group_id, table_id)) != null;
+        return (try self.fkTableLockKindTxn(txn, group_id, table_id)) != null or
+            try @import("../scope_retirement_fence.zig").occupied(txn, group_id, "table", table_id);
     }
 
     /// Recheck the reconciler's durable schema-progress predicate at apply
@@ -21367,6 +21368,7 @@ pub const RaftApplyStore = struct {
     }
 
     fn validateFkGenerationTableTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, expected: metadata.TableRecord, ranges: []const metadata.RangeRecord) !void {
+        try @import("../scope_retirement_fence.zig").requireTableWritable(txn, group_id, expected.table_id);
         if (try backupCohortLocksTableTxn(txn, group_id, expected.table_id) or
             try restoreStagingLocksTableTxn(txn, group_id, expected.table_id)) return error.GenerationPublicationChanged;
         var table_key_buf: [160]u8 = undefined;
@@ -37942,28 +37944,17 @@ pub const RaftApplyStore = struct {
                     if (!try self.relationalTargetValid(schema, table.name, table.schema_json)) return false;
                     continue;
                 }
-                var prefix_buf: [128]u8 = undefined;
-                const prefix = try tablePrefixForGroup(&prefix_buf, group_id);
-                var cursor = try txn.openCursor();
-                defer cursor.close();
-                var entry = try cursor.seekAtOrAfter(prefix);
-                var found = false;
-                while (entry) |row| : (entry = try cursor.next()) {
-                    if (!std.mem.startsWith(u8, row.key, prefix)) break;
-                    const candidate = try decodeTableRecord(self.alloc, row.value);
-                    defer metadata_table_manager.freeTable(self.alloc, candidate);
-                    if (std.mem.eql(u8, fk.parent_table, candidate.name)) {
-                        if (try self.fkTableLockKindTxn(txn, group_id, candidate.table_id)) |held| if (held == .sql_drop or held == .table_retirement) return false;
-                        if (try backupCohortLocksTableTxn(txn, group_id, candidate.table_id)) return false;
-                        if (try restoreStagingLocksTableTxn(txn, group_id, candidate.table_id)) return false;
-                        if (try stagingGet(txn, try restore_staging.nameKey(&staging_buf, group_id, candidate.name)) != null) return false;
-                        if (candidate.relational_retirement_json.len != 0) return false;
-                        if (!try self.relationalTargetValid(schema, candidate.name, candidate.schema_json)) return false;
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) return false;
+                // Resolve the referenced parent through the native name index.
+                // Admission must not decode every unrelated table for each FK.
+                const candidate = (try self.foreignKeyParentTxn(txn, group_id, fk.parent_table)) orelse return false;
+                defer metadata_table_manager.freeTable(self.alloc, candidate);
+                if (try @import("../scope_retirement_fence.zig").occupied(txn, group_id, "table", candidate.table_id)) return false;
+                if (try self.fkTableLockKindTxn(txn, group_id, candidate.table_id)) |held| if (held == .sql_drop or held == .table_retirement) return false;
+                if (try backupCohortLocksTableTxn(txn, group_id, candidate.table_id)) return false;
+                if (try restoreStagingLocksTableTxn(txn, group_id, candidate.table_id)) return false;
+                if (try stagingGet(txn, try restore_staging.nameKey(&staging_buf, group_id, candidate.name)) != null) return false;
+                if (candidate.relational_retirement_json.len != 0) return false;
+                if (!try self.relationalTargetValid(schema, candidate.name, candidate.schema_json)) return false;
             }
         }
         // Changing a parent column's type must not publish an incompatible
@@ -38009,6 +38000,26 @@ pub const RaftApplyStore = struct {
             }
         }
         return true;
+    }
+
+    fn foreignKeyParentTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, name: []const u8) !?metadata.TableRecord {
+        var buffer: [160]u8 = undefined;
+        if (try stagingGet(txn, try derivedCatalogIndexVersionKey(&buffer, group)) != null)
+            return self.getTableByNameTxn(self.alloc, txn, group, name);
+        // Raw bootstrap/restore writers may precede index initialization. An
+        // adopted catalog must never hide a missing index behind a table scan.
+        if (try relationWriterEnabledTxn(txn, group)) return error.InvalidDerivedCatalogIndex;
+        const prefix = try tablePrefixForGroup(&buffer, group);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var row = try cursor.seekAtOrAfter(prefix);
+        while (row) |entry| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const identity = try decodeTableIdentity(self.alloc, entry.value);
+            defer identity.deinit(self.alloc);
+            if (std.mem.eql(u8, identity.name, name)) return try decodeTableRecord(self.alloc, entry.value);
+        }
+        return null;
     }
 
     fn relationalTargetValid(self: *RaftApplyStore, child: []const u8, parent_name: []const u8, parent: []const u8) !bool {
@@ -40182,6 +40193,7 @@ pub const RaftApplyStore = struct {
         if (requirement.semantic_version < 39 or requirement.encoding_version < 39) return error.InvalidSchemaUpdateRequest;
         _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_type_version);
         for (guards) |guard| {
+            if (try @import("../scope_retirement_fence.zig").occupied(txn, group, "named_type", guard.id)) return error.CatalogPublicationProofPending;
             if (try sql_type_uses.retirementLock(txn, group, guard.id) != null) return error.CatalogPublicationProofPending;
             if (try schema_validation.activeType(txn, group, guard.id)) |job| {
                 const lock = (try @import("../table_lifecycle_lock.zig").read(txn, group, record.table_id)) orelse return error.CatalogPublicationProofPending;
@@ -42787,6 +42799,7 @@ pub const RaftApplyStore = struct {
                 var table_buf: [160]u8 = undefined;
                 const raw_table = try txn.get(try tableKeyForGroup(&table_buf, group, source.table_id));
                 const table = try decodeTableRecord(a, raw_table);
+                if (try @import("../scope_retirement_fence.zig").occupied(txn, group, "table", source.table_id)) return error.TableTransitionActive;
                 if (try self.fkTableLockKindTxn(txn, group, table.table_id)) |kind| if (kind == .sql_drop or kind == .table_retirement) return error.TableTransitionActive;
                 if (table.table_id != source.table_id or !std.mem.eql(u8, table.name, source.physical_name)) return error.CatalogGenerationChanged;
                 if (try restoreStagingLocksTableTxn(txn, group, table.table_id)) return error.CatalogGenerationChanged;
@@ -42810,6 +42823,7 @@ pub const RaftApplyStore = struct {
                 if (prior == null) try bootstrap.append(a, .{ .key = try a.dupe(u8, &key), .value = bytes });
             },
             .view => {
+                if (try @import("../scope_retirement_fence.zig").occupied(txn, group, "view", source.table_id)) return error.TableTransitionActive;
                 try view_leases.requireUnleased(txn, group, source.table_id);
                 var resource = (try system_catalog_storage.getById(a, txn, group, .view, source.table_id)) orelse return error.CatalogGenerationChanged;
                 defer resource.deinit();
@@ -50977,8 +50991,44 @@ fn verifyInitialCounterLeaseCut(backing: std.mem.Allocator, group: u64, reader: 
 /// Same closure rules for Raft images and native checkpoints. The latter
 /// streams only this group's two sequence/catalog namespaces, retaining no
 /// copies of unrelated table schemas, topology or primary data.
+const ScopeRetirementCheckpoint = struct {
+    alloc: std.mem.Allocator,
+    group: u64,
+    pub fn verifyHead(self: @This(), reader: anytype, head: scope_retirement.Head) !void {
+        if (!std.mem.eql(u8, &head.metadata_incarnation, &try RaftApplyStore.catalogIncarnationTxn(reader, self.group))) return error.InvalidScopeRetirement;
+        var buffer: [256]u8 = undefined;
+        var activation = try std.json.parseFromSlice(topology_protocol.Activation, self.alloc, try reader.get(try RaftApplyStore.topologyActivationKeyForGroup(&buffer, self.group)), .{});
+        defer activation.deinit();
+        if (activation.value.version < topology_protocol.sql_scope_retirement_version or activation.value.version > topology_protocol.current_version or
+            activation.value.member_count == 0 or std.mem.allEqual(u8, &activation.value.membership_fingerprint, 0)) return error.InvalidScopeRetirement;
+        const incarnation = try decodeMetadataIncarnationRecord(try reader.get(try metadataIncarnationKeyForGroup(&buffer, self.group)));
+        if (!std.meta.eql(activation.value.incarnation, incarnation.incarnation)) return error.InvalidScopeRetirement;
+    }
+    fn requireResource(self: @This(), reader: anytype, resource: system_catalog.Resource) !void {
+        var region: std.heap.ArenaAllocator = .init(self.alloc);
+        defer region.deinit();
+        const a = region.allocator();
+        var actual = (try system_catalog_storage.getById(a, reader, self.group, resource.kind, resource.id)) orelse return error.InvalidScopeRetirement;
+        defer actual.deinit();
+        const before = try std.json.Stringify.valueAlloc(a, resource, .{});
+        const current = try std.json.Stringify.valueAlloc(a, actual.value, .{});
+        if (!std.mem.eql(u8, before, current)) return error.InvalidScopeRetirement;
+    }
+    pub fn verifyManifest(self: @This(), reader: anytype, head: scope_retirement.Head, manifest: system_catalog.scope_retirement.Manifest) !void {
+        _ = head;
+        const meta = try system_catalog_storage.readMeta(self.alloc, reader, self.group);
+        if (meta.revision < manifest.catalog_revision) return error.InvalidScopeRetirement;
+        try self.requireResource(reader, manifest.scope.root());
+        for (manifest.resources) |resource| try self.requireResource(reader, resource);
+        for (manifest.tables) |table| {
+            if (try @import("../table_lifecycle_lock.zig").read(reader, self.group, table.id) != null) return error.InvalidScopeRetirement;
+        }
+    }
+};
+
 fn verifySqlSequenceCut(backing: std.mem.Allocator, group: u64, reader: anytype, rows: anytype, cancelled: ?*const std.atomic.Value(bool)) !void {
     const Reader = @TypeOf(reader.*);
+    try @import("../scope_retirement_checkpoint.zig").verifyDirectory(backing, reader, group, rows, ScopeRetirementCheckpoint{ .alloc = backing, .group = group }, cancelled);
     try table_retirement.verifyDirectory(backing, reader, group, rows, TableRetirementCheckpoint{ .alloc = backing, .group = group }, cancelled);
     try verifyInitialCounterLeaseCut(backing, group, reader, rows, cancelled);
     try verifySequenceDefaultDirectory(backing, group, reader, rows, cancelled);
@@ -67262,6 +67312,46 @@ test "relational index publication native owner binding snapshot uses its format
         const checkpoint = try reopened.snapshotBuilder().buildSnapshot(a, group);
         a.free(checkpoint);
     }
+}
+
+test "SQL scope retirement FK admission resolves only indexed parents and honors source fences" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/indexed-fk-admission", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    const group = 21;
+    try store.ensureDerivedCatalogIndexes(group);
+    var txn = try store.store.beginWriteTxn();
+    defer txn.abort();
+    const parent: metadata.TableRecord = .{ .table_id = 7, .name = "parents", .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    };
+    const child: metadata.TableRecord = .{ .table_id = 8, .name = "children", .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"parents","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    };
+    const bytes = try encodeTableRecord(a, parent);
+    defer a.free(bytes);
+    var buffer: [256]u8 = undefined;
+    try txn.put(try tableKeyForGroup(&buffer, group, parent.table_id), bytes);
+    try store.putTableNameIndexTxn(&txn, group, parent.name, parent.table_id);
+    const progress = try (sql_fk_uses.Progress{ .revision = 1, .complete = true }).encode();
+    try txn.put(try sql_fk_uses.progressKey(&buffer, group), &progress);
+    // This row sorts before the parent. Decoding it would fail: admission must
+    // use the name directory and the complete incoming-edge directory instead
+    // of touching unrelated table definitions. No corrupt fixture is committed.
+    try txn.put(try tableKeyForGroup(&buffer, group, 1), "unrelated undecodable definition");
+    try std.testing.expect(try store.relationalParentsExistTxn(&txn, group, child));
+    const fence = try @import("../scope_retirement_fence.zig").memberKey(&buffer, group, "table", parent.table_id);
+    try txn.put(fence, "reserved");
+    try std.testing.expect(!try store.relationalParentsExistTxn(&txn, group, child));
+    try txn.delete(fence);
+    try std.testing.expect(try store.relationalParentsExistTxn(&txn, group, child));
+    const lock = @import("../table_lifecycle_lock.zig").value(.table_retirement, @splat(9));
+    try txn.put(try @import("../table_lifecycle_lock.zig").key(&buffer, group, parent.table_id), &lock);
+    try std.testing.expect(!try store.relationalParentsExistTxn(&txn, group, child));
 }
 
 test "incoming FK directory native writes cold recovery retained layouts and atomic subtraction" {

@@ -124,25 +124,37 @@ fn optional(txn: anytype, key: []const u8) !?[]const u8 {
 
 pub fn acquire(a: A, txn: anytype, head: anytype, source: contract.ForeignKeySource) !void {
     try source.validate();
+    var encoded: [256]?[]u8 = @splat(null);
+    defer for (encoded[0..source.parents.len]) |bytes| if (bytes) |value| a.free(value);
+    // Admit the complete parent footprint before staging any edge. A later
+    // parent conflict cannot leave earlier parent/source pairs in a transaction
+    // whose caller records a definite semantic refusal.
     for (source.parents, 0..) |parent, ordinal| {
+        try @import("scope_retirement_fence.zig").requireTableWritable(txn, head.metadata_group_id, parent.parent_table_id);
         if (try @import("table_lifecycle_lock.zig").read(txn, head.metadata_group_id, parent.parent_table_id)) |lock| {
             if (lock.kind == .generation) return error.GenerationPublicationChanged;
         }
         const record = try Record.fromSource(head, source, ordinal);
-        const bytes = try record.encode(a);
-        defer a.free(bytes);
+        encoded[ordinal] = try record.encode(a);
         var key_buf: [256]u8 = undefined;
         const parent_key = try record.key.encode(&key_buf);
         if (try optional(txn, parent_key) != null) return error.GenerationPublicationChanged;
-        try txn.put(parent_key, bytes);
         var source_key = record.key;
         source_key.parent = null;
         const index_key = try source_key.encode(&key_buf);
         if (try optional(txn, index_key) != null) return error.GenerationPublicationChanged;
+    }
+    for (source.parents, 0..) |_, ordinal| {
+        const record = try Record.fromSource(head, source, ordinal);
+        const bytes = encoded[ordinal].?;
+        var key_buf: [256]u8 = undefined;
+        try txn.put(try record.key.encode(&key_buf), bytes);
+        var source_key = record.key;
+        source_key.parent = null;
         var index: [40]u8 = undefined;
         std.mem.writeInt(u64, index[0..8], record.key.parent.?, .little);
         @memcpy(index[8..40], &contract.hash(bytes));
-        try txn.put(index_key, &index);
+        try txn.put(try source_key.encode(&key_buf), &index);
     }
 }
 

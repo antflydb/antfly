@@ -57,6 +57,7 @@ pub const Query = struct {
         if (std.mem.allEqual(u8, &self.nonce, 0) or std.mem.allEqual(u8, &self.digest, 0)) return error.InvalidScopeRetirement;
     }
 };
+pub const QueryRecord = records.Record(Query, "SRTL", 2048);
 pub const Input = struct {
     arena: std.heap.ArenaAllocator,
     request: Request,
@@ -148,8 +149,12 @@ pub const Observation = struct {
 };
 pub fn outcomeKey(buffer: []u8, query: Query) ![]const u8 {
     try query.validate();
+    return outcomeNonceKey(buffer, query.lookup.group, query.nonce);
+}
+pub fn outcomeNonceKey(buffer: []u8, group: u64, nonce: [16]u8) ![]const u8 {
+    if (std.mem.allEqual(u8, &nonce, 0)) return error.InvalidScopeRetirement;
     var prefix: [128]u8 = undefined;
-    return std.fmt.bufPrint(buffer, "{s}outcome:{s}", .{ try ledger.prefix(&prefix, query.lookup.group), std.fmt.bytesToHex(query.nonce, .lower) });
+    return std.fmt.bufPrint(buffer, "{s}outcome:{s}", .{ try ledger.prefix(&prefix, group), std.fmt.bytesToHex(nonce, .lower) });
 }
 pub fn observation(reader: anytype, query: Query) !Observation {
     var buffer: [320]u8 = undefined;
@@ -170,7 +175,22 @@ pub fn stageOutcome(txn: anytype, value: Outcome) !void {
     try value.validate();
     const encoded = try OutcomeRecord.init(value);
     var buffer: [320]u8 = undefined;
+    if (value.result == .accepted and value.result.accepted.progress.phase == .canceled) {
+        if (std.mem.eql(u8, &value.query.nonce, &value.query.lookup.reference.id)) return error.InvalidScopeRetirement;
+        const link = try QueryRecord.init(value.query);
+        try txn.put(try ledger.key(&buffer, value.query.lookup, .terminal_outcome), link.slice());
+    }
     try txn.put(try outcomeKey(&buffer, value.query), encoded.slice());
+}
+
+/// A terminal head names exactly one retained command, independent of how many
+/// other canceled jobs exist. Counts alone cannot prove per-job receipt custody.
+pub fn terminalQuery(reader: anytype, lookup: ledger.Lookup) !Query {
+    var buffer: [320]u8 = undefined;
+    const result = try QueryRecord.decode(try reader.get(try ledger.key(&buffer, lookup, .terminal_outcome)));
+    try result.validate();
+    if (!std.meta.eql(result.lookup, lookup) or std.mem.eql(u8, &result.nonce, &lookup.reference.id)) return error.InvalidScopeRetirement;
+    return result;
 }
 
 /// Only after transport has proved that no proposal occurred. Matching an

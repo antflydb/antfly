@@ -53,7 +53,10 @@ const Campaign = struct {
         const call: @import("../system_catalog/server_call.zig").Call = .{ .scope_retirement_prepare = .{ .kind = .namespace, .name = "tenant_ops", .creator = .bootstrap, .cascade = true } };
         try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, call));
         const context: local.api_operation.RequestContext = .{ .setting_admin = true, .schema_validation_authority = true, .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 10 * std.time.ns_per_s };
-        const bytes = try source.systemCatalog(a, context, call);
+        const bytes = if (self.admitted) |admitted| stored: {
+            try std.testing.expectError(error.TableTransitionActive, source.systemCatalog(a, context, call));
+            break :stored try source.systemCatalog(a, context, .{ .scope_retirement_manifest = admitted.query.lookup });
+        } else try source.systemCatalog(a, context, call);
         const manifest = try std.json.parseFromSliceLeaky(contract.Manifest, a, bytes, .{});
         try manifest.validate(a);
         try std.testing.expectEqualStrings("tenant_ops", manifest.scope.root().name);
@@ -101,6 +104,10 @@ const Campaign = struct {
             const result = try std.json.parseFromSliceLeaky(wire.Observation, a, response, .{});
             self.admitted = result.outcome.?;
             try std.testing.expectEqual(contract.Phase.draining_connections, self.admitted.?.result.accepted.progress.phase);
+            var dependent = try client.execute(ctx, "CREATE VIEW scope_new_dependent AS SELECT id FROM tenant_ops.events", .never);
+            defer dependent.deinit(ctx.alloc);
+            errdefer std.debug.print("reserved scope dependent status={d} body={s}\n", .{ dependent.status, dependent.body });
+            try std.testing.expect(dependent.status >= 400);
         } else {
             const original = self.admitted.?;
             const prior = try std.json.parseFromSliceLeaky(wire.Observation, a, try http.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc).systemCatalog(a, context, .{ .scope_retirement_observation = original.query }), .{});
@@ -116,6 +123,9 @@ const Campaign = struct {
             const observed = try std.json.parseFromSliceLeaky(wire.Observation, a, retried_bytes, .{});
             try std.testing.expectEqualDeep(original, observed.outcome.?);
             try std.testing.expectEqual(contract.Phase.canceled, observed.current.?.progress.phase);
+            // Identical dependency admission succeeds after native cancellation;
+            // a parser/permission failure cannot satisfy the reservation test.
+            try execute(ctx, "CREATE VIEW scope_new_dependent AS SELECT id FROM tenant_ops.events");
             try execute(ctx, "CREATE TABLE tenant_ops.resumed(id bigint PRIMARY KEY)");
         }
     }

@@ -77,11 +77,34 @@ images do not pin all prior parsing scratch. Stale catalog cuts fail before the
 scope is walked again. Idle recovery reads one compact cyclic queue item; only
 an explicit manifest read loads the immutable membership body.
 
+Lifecycle acquisition and scope reservation check each other's durable table
+keys in the same native transaction. Existing FK-validation parent leases also
+exclude scope admission, and new parent leases check the scope fence. Validation
+admits and encodes its complete parent footprint before staging any edge, so a
+conflict on a later parent cannot strand an earlier pair. New table/view definitions check selected table, view, sequence and named-type
+source leases during semantic preparation. After native index initialization,
+FK parent lookup uses the existing name index, rather than decoding unrelated
+table definitions for every declaration. Raw bootstrap/restore writers retain
+bounded discovery until initialization; an adopted catalog refuses a missing
+index instead of silently scanning.
+
 Private HTTP submission shares the one-attempt lifecycle delivery machinery.
 Forwarding headers and socket timeouts use the same bounded budget accepted by
 the receiver. A definite pre-proposal error remains distinct from unknown
 submission. Native snapshots retain active work, manifests and exact outcomes;
 a definition-only portable export rejects active scope custody.
+
+Snapshot and native hot-standby checkpoint validation share a streamed scope
+verifier. It checks each head's original admission, incarnation, decoder floor,
+canonical manifest, selected catalog identities, exact members and queue. A
+reverse pass rejects orphan or additional bodies, leases, work and accepted
+receipts. Cancellation retains an exact per-job command link in the same native
+transaction as its outcome and custody release. Each canceled head must resolve
+its own exact receipt; aggregate counts cannot substitute for this proof.
+Allocation high-water cannot survive a missing retained head. Only one bounded
+manifest is decoded at a time; member rows do not repeatedly decode that body.
+Since native physical progress commands are not admitted yet, recovery rejects
+fabricated drained/published progress rather than treating it as an owner ACK.
 
 Reservation does not verify connection drainage, physical child ACKs or final
 catalog withdrawal. Its progress state cannot stand for those proofs. Native
