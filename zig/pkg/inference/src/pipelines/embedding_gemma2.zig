@@ -5045,7 +5045,9 @@ test "embeddinggemma2 CUDA one second WAV stays within production scratch admiss
     const session = Session{ .ptr = &dummy, .vtable = &PhaseTestSession.vtable, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = limits, .static_workspace_bytes = 512 * 1024 * 1024, .model_profile = .{ .hidden_size = 512, .embedding_gemma2_cuda = true }, .check_live_memory = false } };
     var permit = try session.admit(request);
     defer permit.deinit();
-    try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admit(.{ .batch = 1, .sequence = 8192, .workspace_bytes = 1536 * 1024 * 1024 }));
+    // The request alone exceeds the scratch ceiling; releasing the active
+    // WAV permit cannot make it feasible. Preserve the permanent identity.
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admit(.{ .batch = 1, .sequence = 8192, .workspace_bytes = 1536 * 1024 * 1024 }));
 }
 
 test "embeddinggemma2 CUDA audio admission preserves decode hint precedence" {
