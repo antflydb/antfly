@@ -112,6 +112,39 @@ pub const Cache = struct {
         defer if (owned) self.leave(file);
     }
 
+    pub const Replacement = struct {
+        cache: *Cache,
+
+        /// The new inode is already published. Drop the old descriptor now;
+        /// retaining an idle allocator cache must not retain a compacted file's
+        /// physical storage until the next mutation or connection close.
+        pub fn committed(self: *Replacement) void {
+            if (self.cache.holder) |holder| {
+                self.cache.work.absorb(&holder.allocator_work);
+                const a = holder.allocator;
+                holder.close();
+                a.destroy(holder);
+                self.cache.holder = null;
+            }
+        }
+
+        pub fn release(self: *Replacement) void {
+            self.cache.mutex.unlock();
+            self.* = undefined;
+        }
+    };
+
+    /// Hold the cache boundary across generation publication, so an optional
+    /// cache inspection cannot start a loan between the idle check and rename.
+    pub fn beginReplacement(self: *Cache) !Replacement {
+        sync.lockYielding(&self.mutex);
+        if (self.borrower != null) {
+            self.mutex.unlock();
+            return error.FileBusy;
+        }
+        return .{ .cache = self };
+    }
+
     /// Totals stay with the path instead of moving between runtime wrappers.
     /// The caller protects its local counters with its Store mutex. Work in
     /// another in-flight operation appears when that operation releases its

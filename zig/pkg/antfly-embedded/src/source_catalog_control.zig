@@ -863,3 +863,8 @@ pub const storage_db_enrichment_media_output_counts = @import("storage/db/enrich
 
 pub const storage_db_field_projection_source = @import("storage/db/field_projection_source.zig");
 pub const storage_source_value_identity = @import("storage/source_value_identity.zig");
+pub const storage_db_enrichment_document_extraction_completion = @import("storage/db/enrichment/document_extraction_completion.zig");
+pub const storage_lite_path_admission = @import("storage/lite/path_admission.zig");
+pub const storage_lite_replay_admission = @import("storage/lite/replay_admission.zig");
+pub const storage_lite_writer_queue = @import("storage/lite/writer_queue.zig");
+pub const storage_segment_admission = @import("storage/segment_admission.zig");

@@ -705,6 +705,39 @@ test "lite path allocator cache alternates wrappers without full reloads or dige
     try std.testing.expect((try cache.holder.?.check()).valid);
 }
 
+test "lite path allocator cache drops retired descriptors at generation publication" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "path-allocator-cache-replacement.aflite");
+    defer a.free(path);
+    var cache: WriterAllocatorCache = .{};
+    defer cache.deinit();
+    var writer = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    writer.writer_allocator_cache = &cache;
+    writer.allocator_certificate_on_commit = true;
+    try writer.putDocument("document", "original");
+    try std.testing.expect(cache.holder != null);
+    try writer.beginTransaction();
+    try std.testing.expectError(error.FileBusy, cache.beginReplacement());
+    writer.abortTransaction();
+    try writer.putDocument("document", "before replacement");
+    const before = writer.allocatorWorkSnapshot();
+    const old_inode = (try writer.file.stat(std.testing.io)).inode;
+    _ = try writer.vacuum();
+    try std.testing.expect(cache.holder == null);
+    try std.testing.expect(cache.borrower == null);
+    try std.testing.expect((try writer.file.stat(std.testing.io)).inode != old_inode);
+    const after = writer.allocatorWorkSnapshot();
+    try std.testing.expect(after.full_loads >= before.full_loads);
+    try std.testing.expect(after.cache_transfers >= before.cache_transfers);
+    try writer.putDocument("document", "after replacement");
+    try std.testing.expect(cache.holder != null);
+    try std.testing.expectEqual((try writer.file.stat(std.testing.io)).inode, (try cache.holder.?.file.stat(std.testing.io)).inode);
+    try std.testing.expect((try writer.check()).valid);
+}
+
 test "lite path allocator cache abort and uncertain close release exclusive loans" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -12292,6 +12325,8 @@ pub const NativeFile = struct {
         if (self.read_only or prepared.read_only) return error.ReadOnly;
         if (std.mem.eql(u8, self.path, prepared.path)) return error.InvalidNativeSnapshotPath;
 
+        var replacement = if (self.writer_allocator_cache) |cache| try cache.beginReplacement() else null;
+        defer if (replacement) |*guard| guard.release();
         const io = self.runtimeIo();
         try prepared.preparePrivatePublication(self.path);
         try renameFilePath(io, prepared.path, self.path);
@@ -12301,6 +12336,7 @@ pub const NativeFile = struct {
         self.invalidateIndexPathRevisions();
         self.header = prepared.header;
         prepared.header = retired_header;
+        if (replacement) |*guard| guard.committed();
         self.invalidateLedger();
         prepared.invalidateLedger();
         self.durable_header = null;

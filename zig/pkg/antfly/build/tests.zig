@@ -7375,6 +7375,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.portable_wal.",
             "storage.posting_segment_store.",
             "storage.resource_manager.",
+            "storage.segment_admission.",
             "storage.retained_effects.",
             "storage.rewrite_program_cache.",
             "storage.rewrite_tail_spool.",

@@ -9,7 +9,7 @@
     },
     {
       "component": "Writer allocator ownership",
-      "implementation": "A path-owned cache exclusively loans checked ledger/digest state to native transactions, page allocation and admitted inspection. Clean state returns after publication; dirty or uncertain state never becomes authority. Existing inode/header/certificate/rebase checks remain. Detached proof capture and publication serialize mutable wrapper bookkeeping under the Store mutex."
+      "implementation": "A path-owned cache exclusively loans checked ledger/digest state to native transactions, page allocation and admitted inspection. Clean state returns after publication; dirty or uncertain state never becomes authority. Existing inode/header/certificate/rebase checks remain. Detached proof capture and publication serialize mutable wrapper bookkeeping under the Store mutex. Generation publication rejects active loans and immediately closes any cached retired descriptor, preserving cumulative work counters."
     },
     {
       "component": "Resumable full-text replay",
@@ -59,10 +59,36 @@
       "skipped": 0,
       "failed": 0,
       "leaked": 0
+    },
+    {
+      "suite": "Integrated C API native contracts before cold-fixture corrections",
+      "passed": 94,
+      "skipped": 1,
+      "failed": 6,
+      "leaked": 0,
+      "failure": "Six proof fixtures invalidated only a wrapper hint while leaving valid path authority. Updated fixtures invalidate all quiescent donors and a new regression explicitly checks warm authority reuse. Rerun pending. The model-dependent semantic-quality case skipped."
+    },
+    {
+      "suite": "Embedded Python SQL/concurrency/catalog/outcome contracts",
+      "passed": 209,
+      "failed": 0,
+      "note": "208 passed under sandbox; the HTTP embedder mock test passed with local-listener permission. Library source c827787e7fca9331f1a5c921683713023a6c8d31."
+    },
+    {
+      "suite": "C API ABI, linkage, smoke",
+      "public_exports": 134,
+      "failed": 0,
+      "source_commit": "c827787e7fca9331f1a5c921683713023a6c8d31"
+    },
+    {
+      "suite": "Storage test ownership and embedded source boundary audit",
+      "failed": 0,
+      "sources": 1059,
+      "tool_tests_passed": 21
     }
   ],
   "remaining": [
-    "Build integrated C API library and owner tests; run ABI/linkage and affected SDK contracts.",
+    "Rebuild and rerun integrated C API/native contracts after cold-fixture corrections and cache-generation descriptor regression.",
     "Recheck SQL overlay operation counts with the current candidate only.",
     "Run the unchanged original importer locally for diagnosis, with correctly bound native snapshots or a fresh database; no baseline/reference reruns.",
     "Measure remaining runtime-open and text-analysis costs before claiming E2E service capacity is fixed.",

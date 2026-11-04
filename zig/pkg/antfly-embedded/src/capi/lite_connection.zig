@@ -3773,7 +3773,7 @@ test "capi native unbounded writer admits reusable pool before a large request" 
                 connection.gate.mutex.unlock(io);
             }
             const store = owner.current.?.owned_lite_backend.?.native_docstore.?;
-            store.file.free_pages_verified = false;
+            forgetAllocatorAuthorityForTest(owner);
             store.file.max_file_bytes = null;
             store.maintenance_policy.options.max_storage_bytes = 0;
             store.maintenance_policy.options.capacity_probe = null;
@@ -3977,7 +3977,7 @@ test "capi SQL native read intent avoids allocator proofs with exclusive locking
     api.antfly_buffer_free(&output);
     owner.allocator_verification_started = false;
     const store = owner.current.?.owned_lite_backend.?.native_docstore.?;
-    store.file.free_pages_verified = false;
+    forgetAllocatorAuthorityForTest(owner);
     store.file.max_file_bytes = null;
     store.maintenance_policy.options.max_storage_bytes = 0;
     store.maintenance_policy.options.capacity_probe = null;
@@ -4066,7 +4066,7 @@ test "capi native allocator proof reacquisition honors per-connection busy admis
         // Options belong to a connection, not to the shared storage owner.
         // The background case must remain nonblocking even with this budget.
         connection.options.busy_timeout_ms = if (scenario == .immediate) 0 else 5000;
-        owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+        forgetAllocatorAuthorityForTest(owner);
         const Probe = struct {
             path: []const u8,
             held: ?native.PathWriterLock = null,
@@ -4185,8 +4185,11 @@ test "capi native allocator proof survives close and foreground runtime replacem
             // Bootstrap may now publish a live certificate. Keep this fixture
             // explicitly unsealed so replacement/cancellation still exercises
             // the original pending-proof lineage, including legacy writers.
+            const certify_on_commit = store.file.allocator_certificate_on_commit;
+            store.file.allocator_certificate_on_commit = false;
+            defer store.file.allocator_certificate_on_commit = certify_on_commit;
             try store.file.putCatalogRecord("uncertified-proof-fixture", "primitive publication without a seal");
-            store.file.free_pages_verified = false;
+            forgetAllocatorAuthorityForTest(owner);
             store.file.defer_allocator_verification = true;
             store.file.max_file_bytes = null;
             store.maintenance_policy.options.max_storage_bytes = 0;
@@ -4377,7 +4380,7 @@ test "capi native close bounds proof work and skips legacy files" {
             const file = &owner.current.?.owned_lite_backend.?.native_docstore.?.file;
             try std.testing.expectEqual(indexed, file.header.indexed_reclamation);
             if (reason == .large) try std.testing.expect(file.activeCheckpoint().page_count *| file.header.page_size > Owner.close_allocator_proof_max_bytes);
-            file.free_pages_verified = false;
+            forgetAllocatorAuthorityForTest(owner);
             file.defer_allocator_verification = true;
             file.max_file_bytes = null;
             try file.putCatalogRecord("changed", "one small publication");
@@ -4625,7 +4628,7 @@ test "capi native allocator proof refuses admission on a moving tip" {
         if (lease) |*held| held.close();
         connection.gate.mutex.unlock(io);
     }
-    owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+    forgetAllocatorAuthorityForTest(owner);
     const proof_walks_before = owner.publication_stats.allocator_proof_walks;
     const proof_failures_before = owner.publication_stats.allocator_proof_failures;
     const result = connection.refresh(&lease, .mutation);
@@ -4804,7 +4807,7 @@ test "capi native allocator proof mutation preflight honors busy timeout before 
             var probe: Probe = .{ .owner = owner };
             owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
             defer owner.test_after_allocator_capture = null;
-            owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+            forgetAllocatorAuthorityForTest(owner);
             const key = "accepted";
             const value = "{\"text\":\"one accepted batch\"}";
             const writes = [_]h.capi.WriteIntent{.{ .key = .{ .ptr = key.ptr, .len = key.len }, .value = .{ .ptr = value.ptr, .len = value.len }, .is_delete = false }};
@@ -4863,7 +4866,7 @@ test "capi native allocator proof peer close certificate survives runtime refres
             if (lease) |*held| held.close();
             connection.gate.mutex.unlock(io);
         }
-        owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+        forgetAllocatorAuthorityForTest(owner);
         try owner.verifyAllocatorAssumeLocked(&lease, connection);
         try std.testing.expect(owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
     }
@@ -4962,7 +4965,7 @@ test "capi native allocator proof admission shares deadline with lease reacquisi
         owner.test_after_allocator_capture = null;
         connection.test_path_lease_busy = null;
     }
-    owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+    forgetAllocatorAuthorityForTest(owner);
     const writes = [_]h.capi.WriteIntent{.{ .key = .fromSlice("rejected"), .value = .fromSlice("{}"), .is_delete = false }};
     const result = api.antfly_db_batch(id, &writes, writes.len, null, 0, 0, 0);
     if (probe.failure) |err| return err;
@@ -4978,6 +4981,21 @@ test "capi native allocator proof admission shares deadline with lease reacquisi
 }
 
 const AdmissionFollowupOperation = enum { batch, sql, read };
+
+// Model a cold process, rather than clearing one stale wrapper hint while
+// another quiescent runtime or the path cache still owns checked authority.
+fn forgetAllocatorAuthorityForTest(owner: *Owner) void {
+    std.debug.assert(h.builtin.is_test and !owner.allocator_verification_active);
+    owner.gate.writer_allocator_cache.deinit();
+    const roots = [_]?*h.Handle{ owner.current, owner.maintenance_snapshot, if (owner.pending_text_merge) |pending| pending.root else null };
+    for (roots) |maybe_root| if (maybe_root) |root| {
+        const file = &root.owned_lite_backend.?.native_docstore.?.file;
+        file.free_pages_verified = false;
+        file.allocator_rebase_header = null;
+        file.allocator_ledger_rebased = false;
+        file.allocator_verification_base = null;
+    };
+}
 
 const AdmissionFollowupFixture = struct {
     tmp: api.TestDirectory,
@@ -5025,9 +5043,7 @@ const AdmissionFollowupFixture = struct {
             try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_sql_json(id, .fromSlice("{\"statement\":\"CREATE TABLE numbers (n BIGINT)\"}"), &out));
         }
         if (operation == .read) try boundCapacity(owner.current.?);
-        owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
-        // Model a genuinely cold owner, including its path-owned cache.
-        owner.gate.writer_allocator_cache.deinit();
+        forgetAllocatorAuthorityForTest(owner);
         return .{ .tmp = tmp, .path = path, .id = id, .connection = connection };
     }
 
@@ -5100,6 +5116,29 @@ const ConstraintOverlayProbe = struct {
         return null;
     }
 };
+
+test "capi native allocator proof uses checked path authority despite stale wrapper hints" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("warm-path-allocator-authority", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    const owner = fixture.connection.owner;
+    const walks = owner.publication_stats.allocator_proof_walks;
+    {
+        var lease = try fixture.connection.acquire();
+        defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        defer lease.close();
+        const file = &owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+        try std.testing.expect(owner.gate.writer_allocator_cache.holder.?.free_pages_verified);
+        try std.testing.expect(owner.gate.writer_allocator_cache.holder.?.ledger != null);
+        // This deliberately leaves the exact path-owned proof intact.
+        file.free_pages_verified = false;
+    }
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    try std.testing.expectEqual(walks, owner.publication_stats.allocator_proof_walks);
+    try std.testing.expect(owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+    try fixture.expectWritten(.batch, true);
+}
 
 test "capi native SQL constraint overlay fences dependencies while ignoring unrelated primary writes" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
