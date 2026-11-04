@@ -119,6 +119,7 @@ pub const Runner = struct {
     pub fn run(self: Runner, query: plan.Digest, specification: plan.Plan, task: plan.Task, dependencies: []const state.Output) !state.Output {
         try self.context.ensureActive();
         return switch (task.kind) {
+            .merge_probe_matches, .merge_build_matches => @import("skew_runner.zig").merge(self, query, specification, task, dependencies),
             .tile_pair => @import("skew_runner.zig").pair(self, query, specification, task, dependencies),
             .finalize_probe, .finalize_build => @import("skew_runner.zig").finalize(self, query, specification, task, dependencies),
             .passthrough => blk: {

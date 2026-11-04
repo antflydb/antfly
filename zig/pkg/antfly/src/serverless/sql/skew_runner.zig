@@ -142,25 +142,29 @@ pub fn pair(self: anytype, query: plan.Digest, spec: plan.Plan, task: plan.Task,
     accepted.matches = witness.witness();
     return accepted;
 }
-/// One map tile owns its unmatched/existence results. OR all accepted pair
-/// witnesses before emitting; a delayed/retried pair cannot duplicate output.
-pub fn finalize(self: anytype, query: plan.Digest, spec: plan.Plan, task: plan.Task, dependencies: []const state.Output) !state.Output {
-    const part = spec.skew[task.physical_part];
-    const build = task.kind == .finalize_build;
+pub fn merge(self: anytype, query: plan.Digest, spec: plan.Plan, task: plan.Task, dependencies: []const state.Output) !state.Output {
+    if (dependencies.len == 0 or dependencies.len > 32) return error.InvalidSqlExecutionState;
+    const build = task.kind == .merge_build_matches;
     const tile = if (build) task.right_tile else task.left_tile;
-    const count = if (build) part.leftCount() else part.rightCount();
-    if (dependencies.len != count + @intFromBool(tile.map != null)) return error.InvalidSqlExecutionState;
     const bits = try self.a.alloc(u8, @intCast((tile.rows + 7) / 8));
     defer self.a.free(bits);
     @memset(bits, 0);
+    try mergeBits(self, spec, dependencies, bits, task.stage == 2, build);
+    var result = try runner.OutputRows.init(self.a, 1, spec.limits.task_memory / 8);
+    defer result.deinit(self.a);
+    try result.add(self.a, 0, &.{Datum.json(.{ .string = bits })});
+    return result.publish(self.a, self.exchange_store, query, spec.expires_ms, @intCast(spec.limits.task_output_bytes));
+}
+fn mergeBits(self: anytype, spec: plan.Plan, dependencies: []const state.Output, bits: []u8, pairs: bool, build: bool) !void {
     var decode = std.heap.ArenaAllocator.init(self.a);
     defer decode.deinit();
     var blocks = std.heap.ArenaAllocator.init(self.a);
     defer blocks.deinit();
-    for (dependencies[@intFromBool(tile.map != null)..]) |dependency| {
+    for (dependencies) |dependency| {
+        try self.context.ensureActive();
         _ = decode.reset(.free_all);
-        const witness = (dependency.matches orelse return error.InvalidSqlExchange).output();
-        var data = try self.exchange_store.read(decode.allocator(), witness, if (build) 1 else 0, @intCast(spec.limits.task_memory / 4));
+        const witness = if (pairs) (dependency.matches orelse return error.InvalidSqlExchange).output() else dependency;
+        var data = try self.exchange_store.read(decode.allocator(), witness, if (pairs and build) 1 else 0, @intCast(spec.limits.task_memory / 4));
         var witnesses: usize = 0;
         while (try data.nextBlock(&blocks, @intCast(spec.limits.task_memory / 4))) |block| {
             defer block.deinit();
@@ -172,6 +176,25 @@ pub fn finalize(self: anytype, query: plan.Digest, spec: plan.Plan, task: plan.T
         }
         if (witnesses != 1) return error.InvalidSqlExchange;
     }
+}
+/// One map tile owns its unmatched/existence results. OR all accepted pair
+/// witnesses before emitting; a delayed/retried pair cannot duplicate output.
+pub fn finalize(self: anytype, query: plan.Digest, spec: plan.Plan, task: plan.Task, dependencies: []const state.Output) !state.Output {
+    const part = spec.skew[task.physical_part];
+    const build = task.kind == .finalize_build;
+    const tile = if (build) task.right_tile else task.left_tile;
+    const opposite = if (build) part.leftCount() else part.rightCount();
+    const levels = plan.Plan.witnessLevels(opposite);
+    const count = if (levels == 0) opposite else 1;
+    if (dependencies.len != count + @intFromBool(tile.map != null)) return error.InvalidSqlExecutionState;
+    const bits = try self.a.alloc(u8, @intCast((tile.rows + 7) / 8));
+    defer self.a.free(bits);
+    @memset(bits, 0);
+    var decode = std.heap.ArenaAllocator.init(self.a);
+    defer decode.deinit();
+    var blocks = std.heap.ArenaAllocator.init(self.a);
+    defer blocks.deinit();
+    try mergeBits(self, spec, dependencies[@intFromBool(tile.map != null)..], bits, levels == 0, build);
     var result = try output(self, spec);
     defer result.deinit(self.a);
     if (tile.map != null) {

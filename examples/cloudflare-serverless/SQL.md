@@ -86,8 +86,9 @@ manifests merge independently by spec while retaining original file sequences.
 Oversized accepted shuffle partitions resolve to durable tile-pair tasks over
 bounded original map partitions. This also splits a single repeated hot key,
 which additional hash bits cannot separate. Pair tasks publish compact match
-bitmaps separately from result rows. Independent finalizers OR all accepted
-witnesses before emitting unmatched outer rows or semi/anti existence results;
+bitmaps separately from result rows. Deterministic reduction trees OR accepted match witnesses with fan-in at most
+32. Finalizers consume a merged root (or at most 32 direct proofs for small
+fan-ins) before emitting unmatched outer rows or semi/anti existence results;
 residual `ON` predicates contribute evidence only after they accept a pair.
 Authenticated immutable pages hold tile descriptors; the query CAS commits only
 a bounded layout reference together with the stage transition. A new
@@ -99,6 +100,12 @@ request estimates are checked again before tile dispatch.
 Source task splitting uses canonical row ranges within Parquet row groups and
 estimates retained column values instead of compressed bytes alone. A large
 single row group can therefore execute across multiple bounded tasks.
+
+Completion scans at most 64 accepted task records per turn and checkpoints a
+constant-size reference to immutable linked result pages. Large result handles
+contain a `manifests` head instead of expanding every output into `pages`.
+Gateways stream the authenticated page chain without buffering the whole result
+manifest; `ORDER BY` remains in the normal SQL engine.
 
 Each tile remains subject to task memory, scan, output and runtime limits. Large
 Cartesian results and excessive tile grids fail explicit query budgets. This
@@ -117,9 +124,11 @@ retained snapshot and accepted WAL delete/upsert images, then builds and
 instruments WASM. Tests execute that fixture in a fresh WASM instance, lose a
 completion response and verify accepted-output recovery. The row-range fixture
 executes a 16,384-row single-group source with narrow per-task output budgets. A separate kernel stress
-fixture seeds 16,384 accepted build rows into a hot partition, then executes
+fixture seeds 153,600 accepted build rows across 300 hot build tiles, then executes
 portable tile joins, compact match proofs and global NULL/unmatched finalization.
-Control tests cover
+A 1,000-page completion regression checks lost checkpoint acknowledgements and
+coordinator takeover. Hosted execution tests enforce the production 900-operation
+cap throughout. Control tests cover
 service JWT validation, queue retries, alarm recovery, bounded discovery and
 cache scope. Workerd tests exercise actual R2, Queue and Durable Object bindings,
 progress without client turns, cancellation and result reuse after restart.

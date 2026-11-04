@@ -165,7 +165,39 @@ pub const Plan = struct {
         if (requests *| limits.max_attempts > limits.query_requests) return error.SqlJoinBudgetExceeded;
     }
     pub fn outputStage(self: Plan) u32 {
-        return if (self.skew.len != 0) 2 else self.joinStage();
+        return if (self.skew.len != 0) 2 + self.matchLevels() else self.joinStage();
+    }
+    pub fn witnessLevels(count_: u32) u32 {
+        if (count_ <= 32) return 0;
+        var count = count_;
+        var levels: u32 = 0;
+        while (count > 1) : (levels += 1) count = (count + 31) / 32;
+        return levels;
+    }
+    pub fn witnessGroups(count_: u32, level: u32) u32 {
+        if (level == 0) return count_;
+        if (level > witnessLevels(count_)) return 0;
+        var count = count_;
+        for (0..level) |_| count = (count + 31) / 32;
+        return count;
+    }
+    pub fn matchLevels(self: Plan) u32 {
+        var levels: u32 = 0;
+        for (self.skew) |part| {
+            if (self.join.preservesProbe() or self.join.kind == .semi) levels = @max(levels, witnessLevels(part.rightCount()));
+            if (self.join.preservesBuild()) levels = @max(levels, witnessLevels(part.leftCount()));
+        }
+        return levels;
+    }
+    pub fn witnessOffset(self: Plan, target: usize, build: bool, level: u32) !u32 {
+        var offset: u32 = 0;
+        for (self.skew, 0..) |part, index| {
+            if (index == target and !build) return offset;
+            if (self.join.preservesProbe() or self.join.kind == .semi) offset = try std.math.add(u32, offset, try std.math.mul(u32, part.leftCount(), witnessGroups(part.rightCount(), level)));
+            if (index == target) return offset;
+            if (self.join.preservesBuild()) offset = try std.math.add(u32, offset, try std.math.mul(u32, part.rightCount(), witnessGroups(part.leftCount(), level)));
+        }
+        return offset;
     }
     pub fn finalizerCount(self: Plan) !u32 {
         var count = try physical.pairCount(self.skew, self.reduceCount());
@@ -205,8 +237,9 @@ pub const Plan = struct {
         if (stage < join_stage) return if (self.strategy == .broadcast) self.right.splits else std.math.add(u32, self.left.splits, self.right.splits);
         var count: u32 = if (self.strategy == .broadcast) self.left.splits else if (self.skew.len != 0) try self.finalizerCount() else self.reduceCount();
         if (self.skew.len != 0 and stage == 1) return physical.pairCount(self.skew, self.reduceCount());
+        if (self.skew.len != 0 and stage > 1 and stage < self.outputStage()) return self.witnessOffset(self.skew.len, false, stage - 1);
         if (stage == self.outputStage()) return count;
-        if (self.aggregate == null or stage > 8) return error.InvalidSqlDistributedPlan;
+        if (self.aggregate == null or stage > 16) return error.InvalidSqlDistributedPlan;
         for (self.outputStage() + 1..stage + 1) |_| count = (count + 31) / 32;
         return count;
     }
@@ -237,7 +270,7 @@ pub const Plan = struct {
 pub const Task = struct {
     stage: u32,
     task: u32,
-    kind: enum { tile_pair, finalize_probe, finalize_build, passthrough, bucket_join, scan_build, broadcast_probe, map_left, map_right, reduce, aggregate, results },
+    kind: enum { tile_pair, merge_probe_matches, merge_build_matches, finalize_probe, finalize_build, passthrough, bucket_join, scan_build, broadcast_probe, map_left, map_right, reduce, aggregate, results },
     split: u32 = 0,
     partition: u16 = 0,
     partition_end: u16 = 1,
@@ -247,6 +280,7 @@ pub const Task = struct {
     tile_left: u32 = 0,
     tile_right: u32 = 0,
     dependent: u32 = 0,
+    witness_group: u32 = 0,
     finalize: bool = false,
 };
 /// No row payload travels through the dispatcher. The worker loads the durable

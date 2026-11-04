@@ -36,7 +36,7 @@ test(mode==='skew'?'WASM skew kernel finalizes accepted native map tiles with gl
   request.query = submitted.query;
   assert.equal(await host.request({...request,op:'sql_result'}),null);
   let complete=false,accepted=false,lost=false;
-  for (let turn=0;turn<64;turn++) {
+  for (let turn=0;turn<512;turn++) {
     const result = await host.request({...request,op:'sql_turn'});
     if (result.complete) { complete=true;break; }
     for (const ticket of result.tickets) {
@@ -51,11 +51,11 @@ test(mode==='skew'?'WASM skew kernel finalizes accepted native map tiles with gl
         return result;
       };
       let outcome;
-      try { outcome=await host.request(task,{transport:fault}); }
+      try { outcome=await host.request(task,{transport:fault,maxOperations:900}); }
       catch(error) {
         if (!lost) throw error;
         const replacement=await instantiateHost(module,transport);
-        outcome=await replacement.request(task);
+        outcome=await replacement.request(task,{maxOperations:900});
       }
       assert.equal(outcome.status,'succeeded');
       accepted=true;
@@ -63,8 +63,19 @@ test(mode==='skew'?'WASM skew kernel finalizes accepted native map tiles with gl
   }
   assert.ok(complete);assert.ok(accepted);assert.ok(lost);
   const result=await host.request({...request,op:'sql_result'});
-  assert.equal(result.rows,fixture.expected_rows??2);if(mode!=='range') assert.equal(result.pages.length,fixture.expected_pages??(bucketed?4:1));
-  assert.ok(result.pages[0].index_bytes>0);
+  assert.equal(result.rows,fixture.expected_rows??2);
+  const pages=[...result.pages];
+  const manifests=[...(result.manifests??[])];
+  while(manifests.length){
+    const ref=manifests.pop();
+    const bytes=buckets.execution.objects.get(ref.key).body;
+    const digest=Buffer.from(await crypto.subtle.digest('SHA-256',bytes)).toString('hex');
+    assert.equal(digest,typeof ref.hash==='string'?ref.hash:String.fromCharCode(...ref.hash));
+    const chunk=JSON.parse(new TextDecoder().decode(bytes));assert.ok(chunk.pages.length<=64);pages.push(...chunk.pages);if(chunk.previous)manifests.push(chunk.previous);
+  }
+  if(mode!=='range') assert.equal(pages.length,fixture.expected_pages??(bucketed?4:1));
+  assert.equal(pages.reduce((n,p)=>n+p.rows,0),result.rows);
+  assert.ok(pages[0].index_bytes>0);
   const other=await instantiateHost(module,transport);
   assert.deepEqual(await other.request({...request,op:'sql_result'}),result);
   await assert.rejects(other.request({...request,op:'sql_submit',tenant:Array(64).fill(98),raw_plan:fixture.raw_plan}),/SqlExecutionUnauthorized/);
@@ -72,7 +83,7 @@ test(mode==='skew'?'WASM skew kernel finalizes accepted native map tiles with gl
   const expiry=JSON.parse(fixture.raw_plan).expires_ms;
   const collector=await instantiateHost(module,transport,{clock:()=>expiry+31000});
   let deleted=0;
-  for(let turn=0;turn<16&&buckets.execution.objects.size;turn++){
+  for(let turn=0;turn<64&&buckets.execution.objects.size;turn++){
     const collected=await collector.request({...request,op:'sql_collect'});
     deleted+=collected.deleted;
   }
@@ -82,3 +93,44 @@ test(mode==='skew'?'WASM skew kernel finalizes accepted native map tiles with gl
 });
 
 }
+
+
+test('WASM result assembly stays bounded through 1000 pages, lost checkpoint ACK and coordinator takeover', async()=>{
+  const fixture=JSON.parse(await readFile(new URL('../dist/sql-skew-fixture.json',import.meta.url)));
+  const plan=JSON.parse(fixture.raw_plan);
+  plan.strategy='broadcast';plan.join.kind='inner';plan.left.splits=1000;plan.right.splits=1;plan.limits.task_output_bytes=4096;
+  const raw=JSON.stringify(plan),id=Buffer.from(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(raw))).toString('hex');
+  const query={id,expires_ms:plan.expires_ms},root=`state/sql-execution-v2/${String(query.expires_ms).padStart(20,'0')}/${id}`;
+  const buckets={source:new Bucket(),execution:new Bucket()};
+  const seed=fixture.objects.find(o=>o.key.includes('/stage/0/task/21.json')&&o.key.includes(typeof fixture.query.id==='string'?fixture.query.id:String.fromCharCode(...fixture.query.id)));
+  const accepted=JSON.parse(Buffer.from(seed.body_base64,'base64'));accepted.plan=id;
+  const record={...accepted,status:'pending',owner:'',epoch:0,until_ms:0,stage:2,cursor:0,pending:[],reduce_boundaries:[],skew:[],physical:null,adaptive:null,result_progress:null,output:null};
+  await buckets.execution.put(root+'/plan.json',raw);await buckets.execution.put(root+'/query.json',JSON.stringify(record));
+  for(let i=0;i<1000;i++)await buckets.execution.put(root+`/stage/1/task/${i}.json`,JSON.stringify(accepted));
+  const transport=createR2Transport(buckets);
+  let now=query.expires_ms-1000000,lost=false,maximum=0,complete=false;
+  let host=await instantiateHost(module,transport,{clock:()=>now});
+  const request={op:'sql_turn',config:fixture.config,tenant:plan.tenant,query,owner:'first'};
+  for(let turn=0;turn<20;turn++){
+    const fault=async(call,body)=>{
+      const result=await transport(call,body);
+      if(!lost&&call.op==='put'&&call.key===root+'/query.json'&&JSON.parse(new TextDecoder().decode(body)).result_progress){lost=true;throw Error('lost result checkpoint ACK');}
+      return result;
+    };
+    try{complete=(await host.request(request,{transport:fault,maxOperations:900,onMetrics:m=>{maximum=Math.max(maximum,m.operations);}})).complete;}
+    catch(error){assert.ok(lost,String(error));}
+    if(complete)break;
+    if(turn===3){now+=92001;request.owner='replacement';host=await instantiateHost(module,transport,{clock:()=>now});}
+  }
+  assert.ok(complete);assert.ok(lost);assert.ok(maximum<100,`unbounded completion turn: ${maximum}`);
+  const result=await host.request({...request,op:'sql_result'},{maxOperations:900});
+  assert.equal(result.rows,1000*accepted.output.rows);assert.equal(result.pages.length,0);assert.equal(result.manifests.length,1);
+  let next=result.manifests[0],pages=0,rows=0;
+  while(next){
+    const bytes=buckets.execution.objects.get(next.key).body;
+    assert.equal(Buffer.from(await crypto.subtle.digest('SHA-256',bytes)).toString('hex'),typeof next.hash==='string'?next.hash:String.fromCharCode(...next.hash));
+    const chunk=JSON.parse(new TextDecoder().decode(bytes));assert.ok(chunk.pages.length<=64);
+    pages+=chunk.pages.length;rows+=chunk.rows;next=chunk.previous;
+  }
+  assert.equal(pages,1000);assert.equal(rows,result.rows);
+});

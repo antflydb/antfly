@@ -49,7 +49,7 @@ pub const Dispatcher = struct {
     /// deterministic tickets recovers dispatch without an external queue.
     dispatch: *const fn (*anyopaque, []const plan.Ticket, Context) anyerror!void,
 };
-pub const Result = struct { version: u16 = 2, query: state.Query, pages: []const state.Output, rows: u64 };
+pub const Result = struct { version: u16 = 2, query: state.Query, pages: []const state.Output = &.{}, manifests: []const state.Output = &.{}, rows: u64 };
 pub const Factory = struct {
     ptr: *anyopaque,
     /// Returns a borrowed process-owned service for this authenticated scope.
@@ -147,7 +147,7 @@ pub const Service = struct {
     fn taskFor(spec: plan.Plan, stage: u32, task: u32) !plan.Task {
         if (task >= try tasks(spec, stage)) return error.InvalidSqlDistributedPlan;
         if (stage > spec.outputStage()) return .{ .stage = stage, .task = task, .kind = .aggregate, .finalize = stage + 1 == spec.finalStage() };
-        if (spec.skew.len != 0 and stage == 2) {
+        if (spec.skew.len != 0 and stage == spec.outputStage()) {
             const pairs = try physical.pairCount(spec.skew, spec.reduceCount());
             if (task < pairs) return .{ .stage = stage, .task = task, .kind = .passthrough, .dependent = task };
             var next = task - pairs;
@@ -159,6 +159,21 @@ pub const Service = struct {
                 if (spec.join.preservesBuild()) {
                     if (next < part.rightCount()) return .{ .stage = stage, .task = task, .kind = .finalize_build, .physical_part = @intCast(index), .tile_right = next };
                     next -= @intCast(part.rightCount());
+                }
+            }
+            return error.InvalidSqlExecutionState;
+        }
+        if (spec.skew.len != 0 and stage > 1 and stage < spec.outputStage()) {
+            var next = task;
+            for (spec.skew, 0..) |part, index| {
+                inline for (.{ false, true }) |build| {
+                    if (if (build) spec.join.preservesBuild() else (spec.join.preservesProbe() or spec.join.kind == .semi)) {
+                        const groups = plan.Plan.witnessGroups(if (build) part.leftCount() else part.rightCount(), stage - 1);
+                        const tiles = if (build) part.rightCount() else part.leftCount();
+                        const count = try std.math.mul(u32, groups, tiles);
+                        if (next < count) return .{ .stage = stage, .task = task, .kind = if (build) .merge_build_matches else .merge_probe_matches, .physical_part = @intCast(index), .tile_left = if (build) 0 else next / groups, .tile_right = if (build) next / groups else 0, .witness_group = next % groups };
+                        next -= count;
+                    }
                 }
             }
             return error.InvalidSqlExecutionState;
@@ -198,30 +213,7 @@ pub const Service = struct {
             return true;
         };
         if (current.value.stage == spec.finalStage()) {
-            const count = try tasks(spec, spec.finalStage() - 1);
-            const pages = try a.alloc(state.Output, count);
-            var rows: u64 = 0;
-            for (pages, 0..) |*page, task| {
-                const key = try self.store().key(a, query, spec.finalStage() - 1, @intCast(task));
-                var result = (try self.store().load(a, key)) orelse return error.InvalidSqlExecutionState;
-                defer result.deinit(a);
-                if (result.value.status != .succeeded) return error.InvalidSqlExecutionState;
-                page.* = result.value.output.?;
-                page.key = try a.dupe(u8, page.key);
-                rows = try std.math.add(u64, rows, page.rows);
-            }
-            const bytes = try std.json.Stringify.valueAlloc(a, Result{ .query = query, .pages = pages, .rows = rows }, .{});
-            if (bytes.len > 4 * 1024 * 1024) {
-                try self.store().terminate(a, query_key, claim, .failed, "SqlJoinBudgetExceeded");
-                return true;
-            }
-            const key = try std.fmt.allocPrint(a, "{s}/sql-exchange/{d:0>20}/{s}/{s}.result.json", .{ self.exchange_store.prefix, spec.expires_ms, query.id, digest(bytes) });
-            var result_service = self;
-            result_service.state_store.client = self.exchange_store.client;
-            result_service.state_store.bucket = self.exchange_store.bucket;
-            try result_service.immutable(a, key, bytes, 4 * 1024 * 1024);
-            try self.store().complete(a, query_key, claim, .{ .key = key, .hash = digest(bytes), .bytes = bytes.len, .rows = rows });
-            return true;
+            return self.assembleResult(a, spec, query, query_key, claim, current.value.result_progress);
         }
         const count = try tasks(spec, current.value.stage);
         var cursor = current.value.cursor;
@@ -440,8 +432,8 @@ pub const Service = struct {
     }
     fn hydrateTask(self: Service, a: A, spec: plan.Plan, original: plan.Task) !plan.Task {
         var task = original;
-        if (task.kind == .tile_pair or task.kind == .finalize_probe) task.left_tile = try self.loadTile(a, spec.skew[task.physical_part], false, task.tile_left);
-        if (task.kind == .tile_pair or task.kind == .finalize_build) task.right_tile = try self.loadTile(a, spec.skew[task.physical_part], true, task.tile_right);
+        if (task.kind == .tile_pair or task.kind == .finalize_probe or task.kind == .merge_probe_matches) task.left_tile = try self.loadTile(a, spec.skew[task.physical_part], false, task.tile_left);
+        if (task.kind == .tile_pair or task.kind == .finalize_build or task.kind == .merge_build_matches) task.right_tile = try self.loadTile(a, spec.skew[task.physical_part], true, task.tile_right);
         return task;
     }
     fn flushTiles(self: Service, a: A, query: state.Query, part: *physical.Part, build: bool, buffer: *[]const physical.Tile) !void {
@@ -551,6 +543,41 @@ pub const Service = struct {
         }
         return .{ .pending = try self.putMetadata(a, query, "adaptive", try std.json.Stringify.valueAlloc(a, progress, .{}), physical.max_index_bytes) };
     }
+    pub const ResultPage = struct { pages: []const state.Output, rows: u64, previous: ?state.Output = null };
+    const ResultProgress = struct { cursor: u32 = 0, rows: u64 = 0, head: ?state.Output = null };
+    pub fn readResultPage(self: Service, a: A, ref: state.Output) !ResultPage {
+        return std.json.parseFromSliceLeaky(ResultPage, a, try self.getMetadata(a, ref, 128 * 1024), .{ .allocate = .alloc_always });
+    }
+    fn assembleResult(self: Service, a: A, spec: plan.Plan, query: state.Query, query_key: []const u8, claim: state.Claim, previous: ?state.Output) !bool {
+        var progress: ResultProgress = if (previous) |ref| try std.json.parseFromSliceLeaky(ResultProgress, a, try self.getMetadata(a, ref, physical.max_index_bytes), .{ .allocate = .alloc_always }) else .{};
+        const count = try tasks(spec, spec.finalStage() - 1);
+        if (progress.cursor > count) return error.InvalidSqlExecutionState;
+        const end = @min(count, progress.cursor + 64);
+        const pages = try a.alloc(state.Output, end - progress.cursor);
+        var rows: u64 = 0;
+        for (pages, progress.cursor..) |*page, task| {
+            page.* = try self.loadAccepted(a, query, spec.finalStage() - 1, @intCast(task));
+            page.matches = null;
+            rows = try std.math.add(u64, rows, page.rows);
+        }
+        progress.rows = try std.math.add(u64, progress.rows, rows);
+        if (count <= 64) return self.completeResult(a, query, query_key, claim, .{ .query = query, .pages = pages, .rows = progress.rows });
+        const page_ref = try self.putMetadata(a, query, "result-page", try std.json.Stringify.valueAlloc(a, ResultPage{ .pages = pages, .rows = rows, .previous = progress.head }, .{}), 128 * 1024);
+        progress.head = page_ref;
+        progress.cursor = end;
+        if (end == count) return self.completeResult(a, query, query_key, claim, .{ .query = query, .manifests = &.{page_ref}, .rows = progress.rows });
+        const checkpoint = try self.putMetadata(a, query, "result-progress", try std.json.Stringify.valueAlloc(a, progress, .{}), physical.max_index_bytes);
+        try self.store().saveResultProgress(a, query_key, claim, checkpoint);
+        return false;
+    }
+    fn completeResult(self: Service, a: A, query: state.Query, query_key: []const u8, claim: state.Claim, result: Result) !bool {
+        const bytes = try std.json.Stringify.valueAlloc(a, result, .{});
+        const ref = try self.putMetadata(a, query, "result", bytes, physical.max_index_bytes);
+        var output = ref;
+        output.rows = result.rows;
+        try self.store().complete(a, query_key, claim, output);
+        return true;
+    }
     fn loadAccepted(self: Service, a: A, query: state.Query, stage: u32, id: u32) !state.Output {
         const key = try self.store().key(a, query, stage, id);
         var loaded = (try self.store().load(a, key)) orelse return error.InvalidSqlExecutionState;
@@ -569,20 +596,31 @@ pub const Service = struct {
             refs[0] = try self.loadAccepted(a, query, 1, descriptor.dependent);
             return refs;
         }
-        if (descriptor.kind == .tile_pair or descriptor.kind == .finalize_probe or descriptor.kind == .finalize_build) {
+        if (descriptor.kind == .tile_pair or descriptor.kind == .finalize_probe or descriptor.kind == .finalize_build or descriptor.kind == .merge_probe_matches or descriptor.kind == .merge_build_matches) {
             var refs: std.ArrayList(state.Output) = .empty;
             const part = spec.skew[descriptor.physical_part];
             if (descriptor.kind == .tile_pair) {
                 if (descriptor.left_tile.map) |id| try refs.append(a, try self.loadAccepted(a, query, 0, id));
                 if (descriptor.right_tile.map) |id| try refs.append(a, try self.loadAccepted(a, query, 0, id));
             } else {
-                const build = descriptor.kind == .finalize_build;
+                const build = descriptor.kind == .finalize_build or descriptor.kind == .merge_build_matches;
+                const merging = descriptor.kind == .merge_probe_matches or descriptor.kind == .merge_build_matches;
                 const tile = if (build) descriptor.right_tile else descriptor.left_tile;
-                if (tile.map) |id| try refs.append(a, try self.loadAccepted(a, query, 0, id));
-                const count = if (build) part.leftCount() else part.rightCount();
-                for (0..count) |index| {
-                    const pair_id = try physical.pairId(spec.skew, spec.reduce_boundaries, spec.reduceCount(), .{ .part = descriptor.physical_part, .left = if (build) @intCast(index) else descriptor.tile_left, .right = if (build) descriptor.tile_right else @intCast(index) });
-                    try refs.append(a, try self.loadAccepted(a, query, 1, pair_id));
+                if (!merging) if (tile.map) |id| try refs.append(a, try self.loadAccepted(a, query, 0, id));
+                const opposite = if (build) part.leftCount() else part.rightCount();
+                const level = if (merging) descriptor.stage - 2 else plan.Plan.witnessLevels(opposite);
+                const groups = plan.Plan.witnessGroups(opposite, level);
+                const begin = if (merging) descriptor.witness_group * 32 else 0;
+                const end = if (merging) @min(groups, begin + 32) else groups;
+                const ordinal = if (build) descriptor.tile_right else descriptor.tile_left;
+                for (begin..end) |index| {
+                    if (level == 0) {
+                        const pair_id = try physical.pairId(spec.skew, spec.reduce_boundaries, spec.reduceCount(), .{ .part = descriptor.physical_part, .left = if (build) @intCast(index) else ordinal, .right = if (build) ordinal else @intCast(index) });
+                        try refs.append(a, try self.loadAccepted(a, query, 1, pair_id));
+                    } else {
+                        const id = try spec.witnessOffset(descriptor.physical_part, build, level) + ordinal * groups + @as(u32, @intCast(index));
+                        try refs.append(a, try self.loadAccepted(a, query, 1 + level, id));
+                    }
                 }
             }
             return refs.items;

@@ -138,3 +138,20 @@ Query control requests select a stable worker by query identity, with bounded
 failover. Statement deadlines and cancellation cover result exchange reads.
 Both SQL roles expose capability readiness at `/readyz/sql` on the health
 listener (port 4200 by default); maintenance does not need a query listener.
+
+
+Result assembly checkpoints at most 64 accepted outputs per coordinator turn.
+Immutable result pages link to the preceding page, keeping checkpoint and final
+root size constant while writing each descriptor once. Results with at most
+64 outputs retain the inline `pages` representation. Larger internal result
+handles expose a single `manifests` head; follow each authenticated result
+page's `previous` reference to stream its `pages`. Physical output order is
+unspecified; the ordinary SQL engine still owns `ORDER BY`. The native gateway
+keeps only one manifest page and one exchange decode block resident.
+
+For outer/semi/anti skew joins, fan-ins above 32 use deterministic distributed
+bitmap reduction trees. Each merge task consumes at most 32 accepted proofs;
+a finalizer consumes the merged root. Small fan-ins read pair proofs directly.
+The resolved plan reserves every tree task and output before dispatch. Tree
+identities, accepted outputs and result checkpoints survive at-least-once
+messages, lost acknowledgements and coordinator replacement.

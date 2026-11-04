@@ -80,6 +80,7 @@ pub const Record = struct {
     skew: []const @import("physical.zig").Part = &.{},
     physical: ?Output = null,
     adaptive: ?Output = null,
+    result_progress: ?Output = null,
     cancel_requested: bool = false,
     output: ?Output = null,
     failure: ?[]const u8 = null,
@@ -215,6 +216,13 @@ pub const Store = struct {
             next.adaptive = null;
             if (skew) |parts| next.skew = parts;
         }
+        try self.write(a, path, old, next);
+    }
+    pub fn saveResultProgress(self: Store, a: A, path: []const u8, claim_: Claim, output: Output) !void {
+        var old = try self.owned(a, path, claim_);
+        defer old.deinit(a);
+        var next = old.value;
+        next.result_progress = output;
         try self.write(a, path, old, next);
     }
     pub fn saveAdaptive(self: Store, a: A, path: []const u8, claim_: Claim, output: Output) !void {

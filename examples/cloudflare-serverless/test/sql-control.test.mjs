@@ -82,6 +82,10 @@ test('SQL byte caching is opt-in, physical-binding scoped and excludes mutable q
  const {createImmutableReadCache,isImmutableObjectKey}=await import('../../../zig/lib/objectstore/wasm/cache.mjs');
  const key='state/sql-execution-v2/00000000000001000000/'+'a'.repeat(64)+'/plan.json';
  assert.equal(isImmutableObjectKey(key),false);assert.equal(isImmutableObjectKey(key,{includeSQL:true}),true);
+ for(const suffix of ['result-page','result-progress','physical','tiles']){
+  const metadata='exchange/sql-exchange/00000000000001000000/'+'a'.repeat(64)+'/'+'b'.repeat(64)+'.'+suffix+'.json';
+  assert.equal(isImmutableObjectKey(metadata),false);assert.equal(isImmutableObjectKey(metadata,{includeSQL:true}),true);
+ }
  const cache=createImmutableReadCache({includeSQL:true});let reads=0;
  const transport=async request=>{reads++;return{json:{content_length:2,etag:'immutable'},body:new Uint8Array([1,2])};};
  const first=cache.wrap(transport,'physical-a'),other=cache.wrap(transport,'physical-b');

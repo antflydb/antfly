@@ -522,7 +522,7 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
             fn capability(raw: *anyopaque, _: A) !?local.sql_catalog.ReadCapability {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 self.backend.captures += 1;
-                return .{ .token = "retained-accepted-cut", .schema = @splat('b'), .snapshot = if (self.table == 1) "old-left" else "old-right", .wal_cut = if (self.table == 1) 7 else 8, .expires_ms = 1000000, .estimated_bytes = 100, .estimated_rows = if (self.table == 1) 3 else 4 };
+                return .{ .token = "retained-accepted-cut", .schema = @splat('b'), .snapshot = if (self.table == 1) "old-left" else "old-right", .wal_cut = if (self.table == 1) 7 else 8, .expires_ms = 1000000, .estimated_bytes = if (self.table == 1) 400000 else 100, .estimated_rows = if (self.table == 1) 3 else 4 };
             }
             fn close(_: *anyopaque) void {}
             fn next(raw: *anyopaque, a_: A, maximum: u32) !local.sql_catalog.Page {
@@ -584,7 +584,7 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
         var fixture: Fixture = .{};
         var backend: Backend = .{ .fixture = &fixture };
         var dispatch: Dispatch = .{ .workers = .{ fixture.service(a, memory.client(), "worker-a"), fixture.service(a, memory.client(), "worker-b") }, .drop_once = false };
-        var bridge: @import("bridge.zig").Bridge = .{ .service = fixture.service(a, memory.client(), "coordinator"), .dispatcher = .{ .ptr = &dispatch, .dispatch = Dispatch.run }, .local_bytes = 0 };
+        var bridge: @import("bridge.zig").Bridge = .{ .service = fixture.service(a, memory.client(), "coordinator"), .dispatcher = .{ .ptr = &dispatch, .dispatch = Dispatch.run }, .local_bytes = 0, .limits = .{ .task_output_bytes = 16384 } };
         var compiled = try local.sql_compiler.compile(a, sql, .{});
         defer compiled.deinit();
         var ordinary = try local.sql_runtime.execute(a, backend.backend(), &compiled, &.{}, .{});
@@ -913,22 +913,22 @@ fn exportSkewFixture(a: A, memory: *storage.MemoryClient, config: @import("hoste
     var left = original;
     left.splits = 2;
     var right = original;
-    right.splits = 32;
-    right.estimated_rows = 16384;
+    right.splits = 300;
+    right.estimated_rows = 153600;
     right.estimated_bytes = 2 * 1024 * 1024;
-    const spec: plan.Plan = .{ .tenant = @splat('a'), .expires_ms = expires, .left = left, .right = right, .join = .{ .kind = .full, .left_keys = &.{0}, .right_keys = &.{0}, .projection = &.{0} }, .strategy = .shuffle, .partitions = 1, .limits = .{ .task_memory = config.task_memory, .task_output_bytes = 2 * 1024 * 1024, .query_exchange_bytes = 8 * 1024 * 1024 * 1024 } };
+    const spec: plan.Plan = .{ .tenant = @splat('a'), .expires_ms = expires, .left = left, .right = right, .join = .{ .kind = .full, .left_keys = &.{0}, .right_keys = &.{0}, .projection = &.{0} }, .strategy = .shuffle, .partitions = 1, .limits = .{ .task_memory = config.task_memory, .task_output_bytes = 2 * 1024 * 1024, .query_exchange_bytes = 16 * 1024 * 1024 * 1024 } };
     const raw = try spec.encode(a);
     const submitted = try hosted.execute(a, memory.client(), std.testing.io, .{ .io = std.testing.io }, try std.json.Stringify.valueAlloc(a, hosted.Request{ .op = .sql_submit, .config = config, .tenant = spec.tenant, .owner = "seed", .raw_plan = raw }, .{}));
     const query = (try std.json.parseFromSliceLeaky(struct { query: state.Query }, a, submitted, .{})).query;
     const now: u64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
     const store: state.Store = .{ .client = memory.client(), .bucket = config.state.bucket, .prefix = config.state.prefix, .now_ms = now };
     const objects: @import("exchange.zig").Store = .{ .client = memory.client(), .bucket = config.exchange.bucket, .prefix = config.exchange.prefix };
-    for (0..34) |id| {
+    for (0..302) |id| {
         var cells: [512][1]Datum = undefined;
         var rows_: [512]local.sql_operators.Row = undefined;
-        const count: usize = if (id < 32) 512 else if (id == 32) 2 else 1;
+        const count: usize = if (id < 300) 512 else if (id == 300) 2 else 1;
         for (cells[0..count], rows_[0..count], 0..) |*row, *out, index| {
-            row.* = .{if (id < 32) (if (index == 511) Datum{} else Datum.json(.{ .integer = 2 })) else if (id == 32) (if (index == 0) Datum.json(.{ .integer = 1 }) else Datum{}) else Datum.json(.{ .integer = 2 })};
+            row.* = .{if (id < 300) (if (index == 511) Datum{} else Datum.json(.{ .integer = 2 })) else if (id == 300) (if (index == 0) Datum.json(.{ .integer = 1 }) else Datum{}) else Datum.json(.{ .integer = 2 })};
             out.* = .{ .values = row, .keys = &.{}, .ordinal = index };
         }
         const key = try store.key(a, query, 0, @intCast(id));
@@ -949,7 +949,7 @@ fn exportSkewFixture(a: A, memory: *storage.MemoryClient, config: @import("hoste
             try items.append(a, .{ .bucket = bucket.key_ptr.*, .key = entry.key_ptr.*, .body_base64 = encoded });
         }
     }
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = try std.json.Stringify.valueAlloc(a, .{ .config = config, .raw_plan = raw, .tenant = spec.tenant, .query = query, .expected_rows = 16386, .expected_pages = 98, .objects = items.items }, .{}) });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = try std.json.Stringify.valueAlloc(a, .{ .config = config, .raw_plan = raw, .tenant = spec.tenant, .query = query, .expected_rows = 153602, .expected_pages = 902, .objects = items.items }, .{}) });
 }
 
 test "distributed SQL row ranges bound a large single Parquet row group" {
@@ -1046,4 +1046,123 @@ fn pagedLayout(maps: u32, partitions: u16, hot: bool, max_tasks: u32, budget_fai
     var task = (try records.load(sa, task_key)).?;
     defer task.deinit(sa);
     try std.testing.expectEqual(state.Status.succeeded, task.value.status);
+}
+
+test "distributed SQL result manifests checkpoint bounded pages across coordinator takeover" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    var service = fixture.service(a, memory.client(), "result-a");
+    const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 100, .estimated_rows = 1000, .splits = 1000 };
+    var right = input;
+    right.splits = 1;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    const spec: plan.Plan = .{ .tenant = service.tenant, .expires_ms = 1000000, .left = input, .right = right, .join = .{ .left_keys = &.{0}, .right_keys = &.{0} }, .strategy = .broadcast, .partitions = 1, .limits = .{ .task_output_bytes = 4096 } };
+    const query = try service.submit(spec);
+    var claim = (try service.acquire(query)).?;
+    const key = try service.state_store.key(sa, query, null, 0);
+    var records = service.state_store;
+    records.now_ms = fixture.now;
+    const row = [_]local.sql_operators.Row{.{ .values = &.{Datum.json(.{ .integer = 42 })}, .keys = &.{}, .ordinal = 0 }};
+    const output = try service.exchange_store.put(sa, query.id, query.expires_ms, &.{&row}, 4096);
+    for (0..1000) |id| {
+        const task_key = try records.key(sa, query, 1, @intCast(id));
+        try records.create(sa, task_key, query.id, query.expires_ms);
+        const owner = (try records.claim(sa, task_key, "seed", 60000)).?;
+        try records.complete(sa, task_key, owner, output);
+    }
+    try records.checkpointTasks(sa, key, claim, 2, 0, &.{});
+    const Ignore = struct {
+        fn run(_: *anyopaque, _: []const plan.Ticket, _: Context) !void {}
+    };
+    for (0..16) |turn| {
+        try std.testing.expectEqual(turn == 15, try service.tick(query, claim, .{ .ptr = &fixture, .dispatch = Ignore.run }));
+        if (turn == 3) {
+            fixture.now += 92001;
+            service = fixture.service(a, memory.client(), "result-b");
+            claim = (try service.acquire(query)).?;
+        }
+    }
+    const result = (try service.pollResult(sa, query)).?;
+    try std.testing.expectEqual(@as(u64, 1000), result.rows);
+    try std.testing.expectEqual(@as(usize, 0), result.pages.len);
+    try std.testing.expectEqual(@as(usize, 1), result.manifests.len);
+    var rows: u64 = 0;
+    var next: ?state.Output = result.manifests[0];
+    var chunks: usize = 0;
+    while (next) |ref| {
+        const page = try service.readResultPage(sa, ref);
+        try std.testing.expect(page.pages.len <= 64);
+        for (page.pages) |child| rows += child.rows;
+        next = page.previous;
+        chunks += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 16), chunks);
+    try std.testing.expectEqual(result.rows, rows);
+}
+
+test "distributed SQL bounded match trees preserve every join kind and partial aggregates" {
+    const Case = struct { kind: @FieldType(plan.Join, "kind"), rows: u64 };
+    for ([_]Case{ .{ .kind = .inner, .rows = 39 }, .{ .kind = .left, .rows = 41 }, .{ .kind = .right, .rows = 40 }, .{ .kind = .full, .rows = 42 }, .{ .kind = .semi, .rows = 1 }, .{ .kind = .anti, .rows = 2 } }) |case| {
+        for ([_]bool{ false, true }) |aggregate| {
+            const a = std.testing.allocator;
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const sa = arena.allocator();
+            var memory = storage.MemoryClient.init(a);
+            defer memory.deinit();
+            var rows: [40][1]Datum = undefined;
+            const values = try sa.alloc([]const Datum, rows.len);
+            for (&rows, values, 0..) |*row, *value, id| {
+                row.* = .{if (id == 39) Datum{} else Datum.json(.{ .integer = 2 })};
+                value.* = row;
+            }
+            var fixture: Fixture = .{ .custom_right = values };
+            var service = fixture.service(a, memory.client(), "tree-a");
+            var dispatch: Dispatch = .{ .workers = .{ fixture.service(a, memory.client(), "worker-a"), fixture.service(a, memory.client(), "worker-b") } };
+            const left: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 1 };
+            var right = left;
+            right.table_id = 2;
+            right.snapshot = "old-right";
+            right.wal_cut = 8;
+            right.splits = 40;
+            right.estimated_rows = 40;
+            var spec: plan.Plan = .{ .tenant = service.tenant, .expires_ms = 1000000, .left = left, .right = right, .join = .{ .kind = case.kind, .left_keys = &.{0}, .right_keys = &.{0} }, .strategy = .shuffle, .partitions = 1, .limits = .{ .task_scan_rows = 32, .task_output_bytes = 4096 } };
+            if (aggregate) spec.aggregate = .{ .inputs = &.{null}, .specs = &.{.{ .kind = .count }} };
+            const query = try service.submit(spec);
+            var claim = (try service.acquire(query)).?;
+            var moved = false;
+            var complete = false;
+            for (0..256) |_| {
+                complete = try service.tick(query, claim, .{ .ptr = &dispatch, .dispatch = Dispatch.run });
+                if (complete) break;
+                var record = (try service.state_store.load(sa, try service.state_store.key(sa, query, null, 0))).?;
+                defer record.deinit(sa);
+                const resolved = try service.resolvePhysical(sa, spec, record.value);
+                if (!moved and record.value.stage == 2 and resolved.matchLevels() != 0) {
+                    fixture.now += 92001;
+                    service = fixture.service(a, memory.client(), "tree-b");
+                    claim = (try service.acquire(query)).?;
+                    moved = true;
+                }
+            }
+            try std.testing.expect(complete);
+            // Inner joins need no match-evidence tree.
+            if (case.kind != .inner and case.kind != .right) try std.testing.expect(moved);
+            const result = (try service.pollResult(sa, query)).?;
+            try std.testing.expectEqual(if (aggregate) @as(u64, 1) else case.rows, result.rows);
+            if (aggregate) for (result.pages) |page| {
+                var data = try service.exchange_store.read(sa, page, 0, 4096);
+                while (try data.next(sa, 4096)) |block| {
+                    defer block.deinit();
+                    try std.testing.expectEqual(@as(i64, @intCast(case.rows)), (try block.cell(0, 0)).value.integer);
+                }
+            };
+        }
+    }
 }

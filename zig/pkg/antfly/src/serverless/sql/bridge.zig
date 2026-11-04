@@ -111,6 +111,9 @@ pub const Bridge = struct {
                 const pages = try scratch.dupe(state.Output, result.pages);
                 for (pages) |*page| page.key = try scratch.dupe(u8, page.key);
                 owner.pages = pages;
+                const manifests = try scratch.dupe(state.Output, result.manifests);
+                for (manifests) |*manifest| manifest.key = try scratch.dupe(u8, manifest.key);
+                owner.manifests = manifests;
                 transferred = true;
                 return .{ .ptr = owner, .next = Owner.next, .close = Owner.close };
             }
@@ -184,6 +187,10 @@ const Owner = struct {
     parent_context: local.serverless_query_lake_read_context.Context,
     pages: []const state.Output = &.{},
     page: usize = 0,
+    manifests: []const state.Output = &.{},
+    manifest: usize = 0,
+    previous_manifest: ?state.Output = null,
+    manifest_arena: ?std.heap.ArenaAllocator = null,
     data: ?@import("exchange.zig").Data = null,
     block: ?local.sql_spill.ColumnarBlock = null,
     row: usize = 0,
@@ -215,7 +222,23 @@ const Owner = struct {
                 }
                 self.data = null;
             }
-            if (self.page == self.pages.len) break;
+            if (self.page == self.pages.len) {
+                if (self.previous_manifest == null and self.manifest == self.manifests.len) break;
+                // Copy the borrowed link before resetting the previous page arena.
+                const link = self.previous_manifest orelse self.manifests[self.manifest];
+                const next_key = try self.a.dupe(u8, link.key);
+                defer self.a.free(next_key);
+                var owned = link;
+                owned.key = next_key;
+                if (self.previous_manifest == null) self.manifest += 1;
+                if (self.manifest_arena == null) self.manifest_arena = .init(self.a);
+                _ = self.manifest_arena.?.reset(.free_all);
+                const page = try self.service.readResultPage(self.manifest_arena.?.allocator(), owned);
+                self.pages = page.pages;
+                self.previous_manifest = page.previous;
+                self.page = 0;
+                continue;
+            }
             _ = self.decode.reset(.free_all);
             self.data = try self.service.exchange_store.read(self.decode.allocator(), self.pages[self.page], 0, @import("exchange.zig").max_object_bytes);
             self.page += 1;
@@ -225,6 +248,7 @@ const Owner = struct {
     fn close(raw: *anyopaque) void {
         const self: *Owner = @ptrCast(@alignCast(raw));
         if (self.block) |block| block.deinit();
+        if (self.manifest_arena) |*arena| arena.deinit();
         self.block_arena.deinit();
         self.decode.deinit();
         self.arena.deinit();
