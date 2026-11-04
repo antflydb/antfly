@@ -146507,3 +146507,110 @@ test "db transient remote source failures resume after restart without repair" {
         try std.testing.expectEqual(@as(usize, 1), probe.embed_calls);
     }
 }
+
+test "db minimum chunk content retires stale vectors and skips embedding page scraps" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var counting = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{ .owner_id = "worker-a", .dense_embedder = counting.interface() },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"generator":{"kind":"dense_embedding","source_field":"body","chunk_name":"body_chunks_v1","embedding_name":"chunk_dense_v1","chunker":{"provider":"antfly","store_chunks":true,"text":{"target_tokens":128,"overlap_tokens":0,"min_chars":16}}}}
+        ,
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"replace all six gyroscopes\"}" }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(@as(u64, 1), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+    const before = counting.calls;
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"C-8\\n)\\n\"}" }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(before, counting.calls);
+    try std.testing.expectEqual(@as(u64, 0), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+    try std.testing.expectEqual(@as(usize, 0), try testChunkArtifactCount(alloc, &db, "doc:a", "body_chunks_v1"));
+    // The same empty replacement must work in background replay, too.
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"searchable guidance sensor evidence\"}" }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(u64, 1), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+    const replay_before = counting.calls;
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"C-9\"}" }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(replay_before, counting.calls);
+    try std.testing.expectEqual(@as(u64, 0), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+}
+
+test "db document quality policy reprocess retires text and vectors across reopen" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("db");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var counting = CountingDenseEmbedder{};
+    const chunks = types.EnrichmentConfig{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .full_text_index = true,
+        .chunker_json = "{\"provider\":\"antfly\",\"store_chunks\":true,\"text\":{\"target_tokens\":128,\"overlap_tokens\":0}}",
+    };
+    var filtered = chunks;
+    filtered.chunker_json = "{\"provider\":\"antfly\",\"store_chunks\":true,\"text\":{\"target_tokens\":128,\"overlap_tokens\":0,\"min_chars\":16}}";
+    {
+        var db = try DB.open(a, std.mem.span(path), .{ .enrichment = .{ .owner_id = "quality", .dense_embedder = counting.interface() } });
+        defer db.close();
+        try db.addEnrichment(.{ .name = "document_units_v1", .kind = .asset, .field = "url", .content_type = "application/json", .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}" });
+        try db.addEnrichment(chunks);
+        try db.addEnrichment(.{ .name = "document_chunk_dense_v1", .kind = .embedding, .field = "text", .source_artifact_name = "document_chunks_v1", .expected_dims = 3 });
+        try db.addIndex(.{ .name = "dv_v1", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}" });
+        try db.addIndex(.{ .name = "ft_default", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"document_chunks_v1\"}]}" });
+        try db.batch(.{ .writes = &.{
+            .{ .key = "scrap", .value = "{\"url\":\"data:text/plain,scrap\"}" },
+            .{ .key = "real", .value = "{\"url\":\"data:text/plain,searchable%20guidance%20sensor%20evidence\"}" },
+        }, .sync_level = .full_index });
+        try db.runUntilIdle();
+        try std.testing.expectEqual(@as(u64, 2), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+        try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(a, &db, "scrap"));
+        _ = try db.upsertEnrichment(filtered);
+        // Reprocess the same source bytes: a policy change alone must retire
+        // both full-text rows and vectors, including after reopening the DB.
+        for ([_][]const u8{ "scrap", "real" }) |key| try std.testing.expect(try db.reprocessDocumentArtifact(a, key, "document_units_v1"));
+        try db.runUntilIdle();
+        try std.testing.expectEqual(@as(u64, 1), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+        try std.testing.expectEqual(@as(u32, 0), try testDefaultTextHitCount(a, &db, "scrap"));
+        try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(a, &db, "guidance"));
+        try std.testing.expectEqual(@as(usize, 0), try testChunkArtifactCount(a, &db, "scrap", "document_chunks_v1"));
+    }
+    {
+        var db = try DB.open(a, std.mem.span(path), .{ .enrichment = .{ .owner_id = "quality", .dense_embedder = counting.interface() } });
+        defer db.close();
+        try db.runUntilIdle();
+        try std.testing.expectEqual(@as(u64, 1), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+        try std.testing.expectEqual(@as(u32, 0), try testDefaultTextHitCount(a, &db, "scrap"));
+        _ = try db.upsertEnrichment(chunks);
+        try std.testing.expect(try db.reprocessDocumentArtifact(a, "scrap", "document_units_v1"));
+        try db.runUntilIdle();
+        try std.testing.expectEqual(@as(u64, 2), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+        try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(a, &db, "scrap"));
+        const original = (try db.get(a, "scrap")).?;
+        defer a.free(original);
+        try std.testing.expectEqualStrings("{\"url\":\"data:text/plain,scrap\"}", original);
+    }
+}

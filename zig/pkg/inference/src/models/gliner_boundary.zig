@@ -30,8 +30,8 @@ pub const model_type = "gliner2.5";
 /// family-wide coarse checks (ModelManifest.mayLoadQualifiedGlinerBoundaryRuntime,
 /// gliner_boundary_qualification.hasPublishedProfiles) return true once at
 /// least one production row exists. The exact weight/sidecar identity,
-/// backend, feature set, and geometry are still independently enforced by
-/// gliner_boundary_qualification.require() against the live session before
+/// backend and feature set are enforced against the live session; actual
+/// geometry is admitted by processor/encoder/device plans before
 /// any request executes. See gliner_boundary_qualification.zig's production
 /// table and zig/pkg/inference/models/gliner2/GLINER25.md for the reviewed
 /// artifacts this currently covers.

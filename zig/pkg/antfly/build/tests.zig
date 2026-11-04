@@ -2271,7 +2271,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-artifact-http-test", "Run artifact maintenance request and authorization contracts").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, artifact_http_tests, artifact_http_filters).step);
-    const native_query_repository_filters = &.{ "external lake native", "external lake invalid native" };
+    const native_query_repository_filters = &.{ "external lake native", "external lake invalid native", "objectstore-backed configured adapters", "external lake single request", "external lake bounded WAL retained cuts", "external lake retained cursor cohorts" };
     const native_query_repository_tests = b.addTest(.{
         .name = "native-query-repository-tests",
         .root_module = api_http_runtime_test_mod,
@@ -5465,6 +5465,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "local generate message conversion preserves tool history and admission",
             "inference worker",
             "standalone inference host placement",
+            "standalone chunk minimum content",
             "native call policy is scoped",
             "memory admission diagnostics retain",
             "session manager load clones preserve",
@@ -6041,6 +6042,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     index_manager_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
 
     const db_test_mod = makeLmdbModule(b, "pkg/antfly/src/db_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    const document_quality_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "db minimum chunk content", "db document quality policy", "enrichment chunker omits short text" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const quality_step = b.step("antfly-document-quality-test", "Verify extraction filtering, provider parity and stale text/vector retirement");
+    quality_step.dependOn(&addFilteredTestRunArtifact(b, document_quality_tests).step);
+    const quality_host_tests = b.addTest(.{
+        .root_module = test_imports.runtime.inference_host,
+        .filters = &.{"standalone chunk minimum content"},
+    });
+    quality_step.dependOn(&b.addRunArtifact(quality_host_tests).step);
     const graph_admission_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = selectTestFilters(b, &.{
