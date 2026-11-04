@@ -62,7 +62,9 @@ pub const Index = struct {
         const a = self.arena.allocator();
         const path = try self.key(a, hash);
         var client = self.client;
-        var object = try client.getObject(self.bucket, path, .{ .max_response_bytes = 64 * 1024, .cancellation = types.contextCancellation(&self.context) });
+        // The content-addressed name and checked body hash are the authority;
+        // a separate mutable-metadata probe adds no protection to this read.
+        var object = try client.getObject(self.bucket, path, .{ .skip_metadata_probe = true, .max_response_bytes = 64 * 1024, .cancellation = types.contextCancellation(&self.context) });
         defer object.deinit(client.allocator);
         if (!std.mem.eql(u8, &digest(object.body), &hash)) return error.InvalidLakeRetirementIndex;
         if (self.cached_bytes + object.body.len > 32 * 1024 * 1024) return error.LakeRetirementIndexBudgetExceeded;
@@ -257,4 +259,12 @@ test "external lake retirement batch preserves canonical roots with bounded obje
     defer canceled.deinit();
     try std.testing.expectError(error.DeadlineExceeded, canceled.insertMany(root, &.{"s3://archive/canceled.parquet"}));
     try std.testing.expect(!try reopened.contains(root, "s3://archive/canceled.parquet"));
+    // Unpinned immutable reads still reject a replaced object's body, even
+    // when its replacement is a syntactically valid empty node.
+    const root_key = try batch.key(ca, root.?);
+    var forged = try client.putObject("archive", root_key, "{}", .{});
+    forged.deinit(a);
+    var cold = Index.init(a, memory.client(), "archive", "batch", .{});
+    defer cold.deinit();
+    try std.testing.expectError(error.InvalidLakeRetirementIndex, cold.contains(root, uris[0]));
 }

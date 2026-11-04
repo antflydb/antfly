@@ -20,8 +20,9 @@ Debug executable SHA-256:
 
 Later main at `2c0905501d` includes #1479 (`270057158c`), changing Lite/LSM
 writer admission and commit outcomes, and #1386's inference work. Neither was in
-the frozen engine baseline. Their effects on these observations have not been
-measured; retest that newer revision before attributing the stalls to current main.
+the frozen engine baseline. The Debug follow-up below does not clear the original
+ReleaseFast failures; fresh optimized qualification is required before attributing
+those stalls to current main.
 
 The input was an existing 10,000-row HN Parquet export, SHA-256
 `e23a8fe4215d3a8c66cd79b98314225211c8396cb5ff827365835bf6bce4947a`.
@@ -156,7 +157,7 @@ These observations alone do not establish the cause of the original timeouts.
 
 ## Engine corrections under validation
 
-The follow-up merges main's #1479 writer-admission changes and addresses three
+The follow-up merges main's #1479 writer-admission changes and addresses four
 independently established implementation problems:
 
 - Standalone metadata callbacks checked cancellation before an unbounded mutex
@@ -179,6 +180,10 @@ independently established implementation problems:
   a different metadata document, the worker checks that its selected table is
   still current. This prevents a stale table read from rebasing newer work
   backwards; the checkpoint CAS also protects a competing worker's later save.
+- Content-addressed trie reads issued a separate GCS metadata request before
+  fetching the body. They now use the existing direct-read option, keeping the
+  response-size limit and SHA-256 body check. A cold-reader regression rejects
+  an object replaced with a syntactically valid empty node.
 
 Request-local slow-query profiles now expose reader admission and native
 catalog/WAL-cut preparation separately. Inline publications with no dense/sparse
@@ -194,8 +199,19 @@ Focused validation passes: 45 Python tests, 65 shared runtime contract tests,
 the standalone admission and public catalog cancellation tests, and 694 lake
 tests (one additional test skipped), with no native test leaks. The checkpoint
 interleaving regression failed with a missing checkpoint before the guard change
-and passed afterward. API checks and fresh Debug/ReleaseFast qualification remain
-in progress.
+and passed afterward. The two focused lake API checks also passed.
+
+At `b68a495444`, a fresh Debug engine build and eight-row functional smoke passed
+through changes, highlighted search, exact rows and restart, with zero query
+failures. That short run does not qualify retention or archive performance.
+An additional Debug continuation of the retained GCS job remained incomplete
+after 19 acknowledged turns and 540.47 seconds. It reported zero deletions; its
+reachability checkpoint ended at snapshot cursor 73 of 104. The accepted row image
+was checked before maintenance; post-maintenance row/deletion checks were not
+reached. A Debug stack sample and object counters identified substantial remote
+reachability/inventory work. The immutable-read probe removal is under separate
+Debug validation; it was not present in that continuation. ReleaseFast
+requalification remains outstanding.
 
 Next work should:
 
@@ -217,7 +233,7 @@ stop watchdog. Raw reports, logs, credentials and local investigation text files
 are not repository artifacts. See the [runbook](../../../examples/hackernews/CONTINUOUS_LAKE.md)
 for bounds and interpretation.
 
-Validation: both native engine builds succeeded; 44 relevant Python tests, Ruff
+Baseline validation: both native engine builds succeeded; 44 relevant Python tests, Ruff
 and documentation-link checks passed. Final ReleaseFast smoke tests passed
 through changes, published/accepted search, row checks and restart. Raw full-run
 failures remain qualification failures despite those successful checks.
