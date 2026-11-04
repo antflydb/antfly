@@ -28,6 +28,54 @@ const platform_time = @import("antfly_platform").time;
 
 const metadata_prefix = "\x00\x00__metadata__:derived_apply:";
 const projection_metadata_prefix = "\x00\x00__metadata__:derived_projection:";
+const partial_cursor_prefix = "\x00\x00__metadata__:derived_partial:";
+
+/// Resume point inside one oversized replay record: the items of `sequence`
+/// before `offset` are already applied and durable in the index. Valid only
+/// for the index configuration it was written under, and only while
+/// `sequence` is the next record to apply; once that sequence completes, the
+/// ordinary applied sequence passes it and the cursor is ignored.
+pub const PartialReplayCursor = struct {
+    sequence: u64,
+    offset: u64,
+    config_hash: u64,
+};
+
+const partial_cursor_value_len = 3 * @sizeOf(u64);
+
+pub fn savePartialReplayCursor(alloc: Allocator, store: anytype, index_name: []const u8, cursor: PartialReplayCursor) !void {
+    var key_buf: [256]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "{s}{s}", .{ partial_cursor_prefix, index_name });
+    var value: [partial_cursor_value_len]u8 = undefined;
+    std.mem.writeInt(u64, value[0..8], cursor.sequence, .little);
+    std.mem.writeInt(u64, value[8..16], cursor.offset, .little);
+    std.mem.writeInt(u64, value[16..24], cursor.config_hash, .little);
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    try txn.put(key, &value);
+    try txn.commit();
+}
+
+pub fn loadPartialReplayCursor(alloc: Allocator, store: anytype, index_name: []const u8) !?PartialReplayCursor {
+    var key_buf: [256]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "{s}{s}", .{ partial_cursor_prefix, index_name });
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginProbe();
+    defer txn.abort();
+    const raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (raw.len != partial_cursor_value_len) return error.InvalidDerivedApplyState;
+    return .{
+        .sequence = std.mem.readInt(u64, raw[0..8], .little),
+        .offset = std.mem.readInt(u64, raw[8..16], .little),
+        .config_hash = std.mem.readInt(u64, raw[16..24], .little),
+    };
+}
 const projection_metadata_magic = "AFPRJMD1";
 const projection_metadata_len = 46;
 const checkpoint_file_name = "derived_apply.checkpoint";
@@ -1476,6 +1524,24 @@ test "derived apply state works with lsm backend store" {
     try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequence(std.testing.allocator, runtime, "idx"));
     try saveAppliedSequence(runtime, "idx", 31);
     try std.testing.expectEqual(@as(u64, 31), try loadAppliedSequence(std.testing.allocator, runtime, "idx"));
+}
+
+test "partial replay cursor round-trips per index and is independent of applied progress" {
+    var backend = lsm_backend.Backend.init(std.testing.allocator, .{ .flush_threshold = 2 });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    try std.testing.expectEqual(@as(?PartialReplayCursor, null), try loadPartialReplayCursor(std.testing.allocator, runtime, "text"));
+    try savePartialReplayCursor(std.testing.allocator, runtime, "text", .{ .sequence = 9, .offset = 128, .config_hash = 77 });
+    try savePartialReplayCursor(std.testing.allocator, runtime, "other", .{ .sequence = 3, .offset = 1, .config_hash = 5 });
+    try std.testing.expectEqual(PartialReplayCursor{ .sequence = 9, .offset = 128, .config_hash = 77 }, (try loadPartialReplayCursor(std.testing.allocator, runtime, "text")).?);
+    // Overwritten in place as the record advances.
+    try savePartialReplayCursor(std.testing.allocator, runtime, "text", .{ .sequence = 9, .offset = 256, .config_hash = 77 });
+    try std.testing.expectEqual(@as(u64, 256), (try loadPartialReplayCursor(std.testing.allocator, runtime, "text")).?.offset);
+    // Applied progress is a separate record.
+    try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequence(std.testing.allocator, runtime, "text"));
+    try std.testing.expectEqual(@as(u64, 3), (try loadPartialReplayCursor(std.testing.allocator, runtime, "other")).?.sequence);
 }
 
 test "derived apply state lsm point load does not clone mutable snapshot" {

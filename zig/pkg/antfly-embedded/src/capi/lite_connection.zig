@@ -1458,7 +1458,7 @@ pub const Owner = struct {
         h.closeHandle(root);
     }
 
-    fn needsOutcomeReconciliation(root: *h.Handle) bool {
+    pub fn needsOutcomeReconciliation(root: *h.Handle) bool {
         const store = root.owned_lite_backend.?.native_docstore.?;
         return root.sql_decision_uncertain or store.file.checkpoint_publication_uncertain or store.secret_store_uncertain;
     }

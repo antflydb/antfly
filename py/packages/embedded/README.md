@@ -310,6 +310,16 @@ inventory; retry until it is `true` or your own deadline expires.
   `OutcomeUnknownError`, `UnsupportedError`, `StalledError`,
   `CancelledError`, `InternalError`. Unrecognized codes raise `AntflyError`
   directly.
+- **Outcome receipts**: when `batch()`, `batch_json()`, or an autocommit
+  `sql()` write fails with ANTFLY_OUTCOME_UNKNOWN, the `OutcomeUnknownError`
+  (or `SQLStateError`, and the DB-API error mapped from either) carries
+  `.outcome_receipt` (`None` when the call issued none). Resolve it on any
+  handle for the same database with `db.outcome_receipt_status(receipt)`,
+  which returns `OutcomeReceiptStatus.APPLIED` or `.NOT_APPLIED`, or raises
+  `StalledError` while the uncertain commit is not reconciled yet (Lite:
+  retry; directory database: close the issuing handle and reopen first).
+  Call `db.forget_outcome_receipt(receipt)` once resolved; afterwards it can
+  no longer be resolved.
 
 `create()` provisions the default `full_text_index_v0` full-text index,
 matching the server's table-create behavior, so `add_index()` is only

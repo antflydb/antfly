@@ -653,6 +653,163 @@ test "capi SQL outcome batch on a directory handle is unknown once the LSM write
     }
 }
 
+test {
+    _ = @import("outcome_receipts.zig");
+}
+
+fn lastReceiptAlloc() ![]u8 {
+    const api = @import("db.zig");
+    var buf: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&buf);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_last_error_outcome_receipt(&buf));
+    return std.testing.allocator.dupe(u8, buf.ptr.?[0..buf.len]);
+}
+
+fn receiptStatus(id: ?*anyopaque, receipt: []const u8) !struct { code: h.capi.ErrorCode, status: u8 } {
+    var status: u8 = 0;
+    const code = @import("db.zig").antfly_db_outcome_receipt_status(id, .fromSlice(receipt), &status);
+    return .{ .code = code, .status = status };
+}
+
+test "capi SQL outcome receipt resolves a Lite autocommit write of unknown outcome" {
+    const api = @import("db.zig");
+    var f = try OutcomeFixture.init("receipt-autocommit");
+    defer f.deinit();
+    const receipt = blk: {
+        var fault: PrimaryFault = .{ .fixture = &f, .err = error.InputOutput, .publication = true };
+        fault.arm();
+        defer PrimaryFault.disarm();
+        var reply = try f.sql(insert_one);
+        defer reply.deinit();
+        try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, reply.code);
+        const receipt = try lastReceiptAlloc();
+        // The SQL error body carries the same receipt.
+        try std.testing.expectEqualStrings(receipt, reply.parsed.?.value.object.get("outcome_receipt").?.string);
+        break :blk receipt;
+    };
+    defer std.testing.allocator.free(receipt);
+    // Querying enters (and so reconciles) the connection, then answers exactly.
+    const first = try receiptStatus(f.id, receipt);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, first.code);
+    const expected: u8 = if (try f.rows() == 1) @import("db.zig").ANTFLY_OUTCOME_RECEIPT_APPLIED else @import("db.zig").ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED;
+    try std.testing.expectEqual(expected, first.status);
+    // Later writes use a fresh writer and never move the receipt's marker.
+    try f.expectOk("{\"statement\":\"INSERT INTO t (_id,n) VALUES ('later',2)\"}");
+    try std.testing.expectEqual(expected, (try receiptStatus(f.id, receipt)).status);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_outcome_receipt_forget(f.id, .fromSlice(receipt)));
+    try std.testing.expectEqual(h.capi.ErrorCode.invalid_argument, (try receiptStatus(f.id, "or1:not-a-receipt")).code);
+}
+
+test "capi SQL outcome receipt for a Lite batch export of unknown outcome" {
+    const api = @import("db.zig");
+    var f = try OutcomeFixture.init("receipt-batch");
+    defer f.deinit();
+    var fault: PrimaryFault = .{ .fixture = &f, .err = error.InputOutput, .publication = true };
+    fault.arm();
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out);
+    const code = api.antfly_db_batch_json(f.id, .fromSlice("{\"inserts\":{\"receipt-key\":{\"v\":1}}}"), &out);
+    PrimaryFault.disarm();
+    try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, code);
+    const receipt = try lastReceiptAlloc();
+    defer std.testing.allocator.free(receipt);
+    const resolved = try receiptStatus(f.id, receipt);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, resolved.code);
+    var lookup: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&lookup);
+    const found = api.antfly_db_lookup_json(f.id, .fromSlice("receipt-key"), &lookup) == .ok;
+    // The same-call variant returns a receipt in its output parameter.
+    var again: PrimaryFault = .{ .fixture = &f, .err = error.InputOutput, .publication = true };
+    again.arm();
+    var out2: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out2);
+    var receipt_out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&receipt_out);
+    try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, api.antfly_db_batch_json_with_receipt(f.id, .fromSlice("{\"inserts\":{\"receipt-key-2\":{\"v\":1}}}"), &out2, &receipt_out));
+    PrimaryFault.disarm();
+    const second = receipt_out.ptr.?[0..receipt_out.len];
+    try std.testing.expect(std.mem.startsWith(u8, second, "or1:"));
+    try std.testing.expect(!std.mem.eql(u8, second, receipt));
+    try std.testing.expectEqual(if (found) api.ANTFLY_OUTCOME_RECEIPT_APPLIED else api.ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED, resolved.status);
+}
+
+test "capi SQL outcome receipt on a directory handle stays pending until reopen, then resolves" {
+    const api = @import("db.zig");
+    const Backend = @import("../storage/lsm_backend.zig").Backend;
+    for ([_]struct { at: @FieldType(Backend.TestCommitFault, "at"), receipt: bool }{
+        .{ .at = .before_wal_append, .receipt = false },
+        .{ .at = .after_wal_append, .receipt = true },
+        .{ .at = .after_publish, .receipt = true },
+    }) |case| {
+        var directory = try api.TestDirectory.init("receipt-lsm");
+        defer directory.cleanup();
+        try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+        const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}", .{directory.path()}, 0);
+        defer std.testing.allocator.free(path);
+        var id: ?*anyopaque = null;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open(path, &id));
+        var open = true;
+        defer if (open) api.antfly_db_close(id);
+
+        Backend.test_commit_fault = .{ .at = case.at, .err = error.InputOutput };
+        var out: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free(&out);
+        _ = api.antfly_db_batch_json(id, .fromSlice("{\"inserts\":{\"receipt-key\":{\"v\":1}}}"), &out);
+        Backend.test_commit_fault = null;
+        if (!case.receipt) {
+            var none: h.capi.Buffer = .{};
+            try std.testing.expectEqual(h.capi.ErrorCode.not_found, api.antfly_last_error_outcome_receipt(&none));
+            continue;
+        }
+        const receipt = try lastReceiptAlloc();
+        defer std.testing.allocator.free(receipt);
+        // The WAL record may be durable but unpublished: not settled yet.
+        try std.testing.expectEqual(h.capi.ErrorCode.stalled, (try receiptStatus(id, receipt)).code);
+        api.antfly_db_close(id);
+        open = false;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open(path, &id));
+        open = true;
+        const resolved = try receiptStatus(id, receipt);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, resolved.code);
+        var lookup: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free(&lookup);
+        const found = api.antfly_db_lookup_json(id, .fromSlice("receipt-key"), &lookup) == .ok;
+        // Whichever way it settled (a clean close checkpoints and resets the
+        // WAL, dropping an unpublished record; a crash would replay it), the
+        // receipt reports what is actually stored.
+        try std.testing.expectEqual(if (found) api.ANTFLY_OUTCOME_RECEIPT_APPLIED else api.ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED, resolved.status);
+        // A write that was published before its flush failed stays applied.
+        if (case.at == .after_publish) try std.testing.expect(found);
+    }
+}
+
+test "capi SQL outcome receipt marker of a cleanly closed handle is removed" {
+    const api = @import("db.zig");
+    var directory = try api.TestDirectory.init("receipt-close");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}", .{directory.path()}, 0);
+    defer std.testing.allocator.free(path);
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open(path, &id));
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(id, .fromSlice("{\"inserts\":{\"k\":{\"v\":1}}}"), &out));
+    const writer = blk: {
+        const guard = api.enterHandle(id, .read).?;
+        defer guard.leave();
+        const writer = guard.lock_handle.outcome_writer.id.?;
+        try std.testing.expectEqual(@as(?u64, 1), try guard.handle.database().readOutcomeMarker(writer));
+        break :blk writer;
+    };
+    api.antfly_db_close(id);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open(path, &id));
+    defer api.antfly_db_close(id);
+    const guard = api.enterHandle(id, .read).?;
+    defer guard.leave();
+    try std.testing.expectEqual(@as(?u64, null), try guard.handle.database().readOutcomeMarker(writer));
+}
+
 test "capi SQL outcome refusals after an unresolved decision are not unknown" {
     const errors = dependencies.sql_errors;
     for ([_]anyerror{ error.SqlReconciliationRequired, error.OutcomeReconciliationRequired }) |err| {

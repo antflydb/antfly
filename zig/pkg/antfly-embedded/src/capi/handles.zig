@@ -59,6 +59,8 @@ pub const Handle = struct {
     parent_handle: ?*Handle = null,
     table_handles: std.ArrayList(*anyopaque) = .empty,
     sql_decision_uncertain: bool = false,
+    /// Outcome-receipt writer for exported writes on this database handle.
+    outcome_writer: @import("outcome_receipts.zig").Writer = .{},
     // New generations inspect durable recovery once. Every job producer dirties
     // these flags before admission, including uncertain publication outcomes.
     sql_commit_recovery_needed: bool = true,
@@ -264,6 +266,8 @@ pub fn closeHandle(handle: *Handle) void {
         }
     }
     invalidateQueryProducer(handle);
+    // Uncertain directory-handle commits settle on the next open.
+    handle.outcome_writer.deinit();
     if (handle.lite_connection) |connection| {
         connection.close();
         handle.alloc.destroy(handle);

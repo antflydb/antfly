@@ -99,6 +99,7 @@ export type {
   InferenceStatus,
   MemoryAdmissionStats,
   OpenOptions,
+  OutcomeReceiptStatus,
   PendingWorkStatus,
   PullProgress,
   ReplayGeneratedEnrichmentsResult,

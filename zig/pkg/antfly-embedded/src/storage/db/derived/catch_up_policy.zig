@@ -312,6 +312,18 @@ fn replayMaxItemsPerWindow() usize {
     return envUsize("ANTFLY_DERIVED_REPLAY_MAX_ITEMS_PER_WINDOW", replay_default_max_items_per_window);
 }
 
+/// Bounded (background) full-text replay: subchunk size inside one record.
+/// Small enough that a 1024-key journal record can be split.
+pub fn boundedFullTextReplayMaxItems() usize {
+    return @max(1, envUsize("ANTFLY_LITE_FULL_TEXT_REPLAY_SUBCHUNK_ITEMS", 128));
+}
+
+/// Bounded full-text replay: time after which a turn stops between subchunks
+/// and resumes the record on the next turn.
+pub fn boundedFullTextReplayQuantumNs() u64 {
+    return @max(1, envU64("ANTFLY_LITE_FULL_TEXT_REPLAY_QUANTUM_MS", 100)) * std.time.ns_per_ms;
+}
+
 fn environmentValue(name: [:0]const u8) ?[]const u8 {
     return if (getenv(name)) |raw| std.mem.span(raw) else null;
 }

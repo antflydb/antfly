@@ -312,6 +312,7 @@ pub fn clearLastError() void {
     if (comptime storage_engine.enabled) return antfly_storage_error_clear_v1();
     last_error_code = .ok;
     last_error_detail = "";
+    @import("outcome_receipts.zig").clearLast();
 }
 
 pub fn lastErrorDetail() [*:0]const u8 {

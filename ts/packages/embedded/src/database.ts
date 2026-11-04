@@ -16,7 +16,13 @@
 import * as fsp from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { validateAbi } from "./abi.js";
-import { checkCode, InvalidArgumentError } from "./errors.js";
+import {
+  checkCode,
+  ErrorCode,
+  InternalError,
+  InvalidArgumentError,
+  OutcomeUnknownError,
+} from "./errors.js";
 import {
   callAsync,
   type DecodedBuffer,
@@ -42,6 +48,7 @@ import {
   type CompactReport,
   OpenMode,
   type OpenOptions,
+  type OutcomeReceiptStatus,
   type PendingWorkStatus,
   Profile,
   type ReplayGeneratedEnrichmentsResult,
@@ -51,6 +58,10 @@ import {
   type VacuumReport,
   type WriteIntent,
 } from "./types.js";
+
+// antfly.h ANTFLY_OUTCOME_RECEIPT_APPLIED / ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED.
+const OUTCOME_RECEIPT_APPLIED = 1;
+const OUTCOME_RECEIPT_NOT_APPLIED = 2;
 
 const OPEN_FLAG_NO_SYNC = 1 << 0;
 const OPEN_FLAG_TTL_CLEANUP = 1 << 1;
@@ -196,7 +207,12 @@ export class Database implements AsyncDisposable {
       const code = await callAsync(fn, handle, ...args, out);
       const body = takeBuffer(this.#native, out);
       const value = body.length ? JSON.parse(body.toString("utf8")) : undefined;
-      if (code && value?.error) throw new SqlError(value.error, value.transaction_id);
+      if (code && value?.error) {
+        throw new SqlError(value.error, value.transaction_id, value.outcome_receipt);
+      }
+      if (code === ErrorCode.OutcomeUnknown && typeof value?.outcome_receipt === "string") {
+        throw new OutcomeUnknownError(undefined, value.outcome_receipt);
+      }
       checkCode(code);
       return value;
     });
@@ -382,7 +398,26 @@ export class Database implements AsyncDisposable {
   }
 
   batchJsonRaw(request: JsonInput): Promise<Buffer> {
-    return this.#invokeBuffer(this.#native.dbBatchJson, jsonSlice(request));
+    return this.#run(async (handle) => {
+      // The same-call variant: the receipt cannot follow an async call to
+      // another worker thread through the thread-local accessor.
+      const out: DecodedBuffer = newBufferOut();
+      const receiptOut: DecodedBuffer = newBufferOut();
+      const code = await callAsync(
+        this.#native.dbBatchJsonWithReceipt,
+        handle,
+        jsonSlice(request),
+        out,
+        receiptOut
+      );
+      const receipt = takeBuffer(this.#native, receiptOut);
+      if (code === ErrorCode.OutcomeUnknown && receipt.length) {
+        takeBuffer(this.#native, out);
+        throw new OutcomeUnknownError(undefined, receipt.toString("utf8"));
+      }
+      checkCode(code);
+      return takeBuffer(this.#native, out);
+    });
   }
   async batchJson(request: JsonInput): Promise<unknown> {
     return parseJson(await this.batchJsonRaw(request));
@@ -759,6 +794,34 @@ export class Database implements AsyncDisposable {
       checkCode(code);
       return out[0] as TxnStatus;
     });
+  }
+
+  /**
+   * Resolves an outcome receipt (`SqlError.outcomeReceipt` or
+   * `OutcomeUnknownError.outcomeReceipt`) on any handle for the same
+   * database. Rejects with `StalledError` while the uncertain commit is not
+   * reconciled yet: retry on a Lite database; for a directory database,
+   * close the issuing handle and reopen first.
+   */
+  outcomeReceiptStatus(receipt: string): Promise<OutcomeReceiptStatus> {
+    return this.#run(async (handle) => {
+      const out = [0];
+      const code = await callAsync(
+        this.#native.dbOutcomeReceiptStatus,
+        handle,
+        stringSlice(receipt),
+        out
+      );
+      checkCode(code);
+      if (out[0] === OUTCOME_RECEIPT_APPLIED) return "applied";
+      if (out[0] === OUTCOME_RECEIPT_NOT_APPLIED) return "not_applied";
+      throw new InternalError(`unexpected outcome receipt status ${out[0]}`);
+    });
+  }
+
+  /** Removes a resolved receipt's durable marker; afterwards it cannot be resolved. */
+  forgetOutcomeReceipt(receipt: string): Promise<void> {
+    return this.#invokeCode(this.#native.dbOutcomeReceiptForget, stringSlice(receipt));
   }
 
   commitVersion(txnId: Uint8Array | string): Promise<bigint> {
