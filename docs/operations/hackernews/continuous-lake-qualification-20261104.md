@@ -1,7 +1,7 @@
 # Continuous writable-lake qualification — 2026-11-04 UTC
 
-**At `79bba11f0b`, two fresh full optimized filesystem runs passed; GCS had no
-query failures but still failed bounded vacuum recovery.** Both the baseline and
+**Through `8bdf82339e`, three fresh full optimized filesystem runs passed; GCS had
+no query failures in the latest runs but still failed bounded vacuum recovery.** Both the baseline and
 first follow-up optimized runs failed qualification on each provider. The catalog-history
 changes in #1480 work in this workload, and indexed acknowledged rows survived
 searchable publication and restart. GCS maintenance completion remains a
@@ -573,6 +573,48 @@ The full Debug lake suite passed 703 tests, with one additional skip and no leak
 The object-store unit suite passed 210 tests with two live-provider tests skipped;
 its local mock GCS HTTP test required loopback permission. The final focused
 retirement controls also passed after exercising both concurrency opt-in gates.
+
+At `8bdf82339e`, the Debug engine built in 568.26 seconds and passed its HTTP
+smoke. Its SHA-256 is
+`a9f8844b4d551cb53832e4eb06cf34b7a79e2ed5fe41d9d5ad29e96a0e42f34b`.
+The stripped ReleaseFast engine built in 2,858.52 seconds and passed its smoke;
+its SHA-256 is
+`b88b56003bfe02322e701ff48d30dce35b0a6a1a076d72ca3fb8306c9f3863c1`.
+The full filesystem run passed every check in 940.72 seconds with 738
+continuous-phase queries and zero failures, 102 verified final row images, one
+reported deletion during writes and 73 overall. Accepted median/p95/maximum were
+47.74/85.63/1,438.12 ms; published values were 25.59/66.26/3,795.53 ms. Publication
+catch-up took 8.37 seconds. These are updating-fixture observations, not a matched
+attribution of the earlier static-archive outlier.
+
+The fresh optimized GCS run at that revision remained unqualified after 2,210.17
+seconds: all 284 continuous-phase queries succeeded and all 103 expected accepted
+SQL/published row images survived restart, but the 31-snapshot history operation
+exceeded 300 seconds of restart recovery. Published median/p95/maximum were
+1,337.26/1,842.58/3,794.01 ms, and accepted values were
+1,929.59/2,709.93/5,996.05 ms. Publication catch-up took 213.06 seconds; sampled
+publication lag was median 212.06 seconds and p95 378.42 seconds. The driver
+reported two deletions during writes and 26 overall, without reaching its final
+post-vacuum oracle. No timeout, retention, work bound or oracle was relaxed.
+
+A separate full Debug mixed workload at the same revision had zero query
+failures but also exceeded restart recovery, for 37 expired snapshots. Its saved
+operation subsequently completed in an additional bounded continuation;
+validation and shutdown took 340.06 seconds. Independent checks preserved 102 row
+images and verified 92 current manifests and 290 Parquet files. The separate,
+larger 109-snapshot diagnostic still required multiple continuations and remained
+pending; a validation-only attempt independently preserved all 103 row images
+and read all 94 current manifests and 292 Parquet files. That validation is not
+completion of the pending job. Real GCS stack samples confirmed the new parallel
+upload path, but none of these controls clears the failed fresh optimized bound.
+
+Further inspection found an unused metadata preflight in the body-only reader
+for catalog-selected immutable Iceberg files. A provider-level control reproduced
+two GCS requests per read; the reader now uses one bounded body GET. Mutable heads
+retain revision-bearing catalog operations. Table scope and response-size bounds
+remain enforced, and context checks preserve deadline expiry before and during
+I/O. All 704 Debug lake tests passed, with one additional skip and no leaks.
+Fresh engine/provider qualification of this subsequent change remains required.
 
 Next work should:
 
