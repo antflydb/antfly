@@ -179,7 +179,7 @@ pub const Builder = struct {
         // Read-only shared-manifest edges do not consume the mutation budget,
         // but still have their own bound and deadline checks.
         var edges: usize = 4096;
-        var sources: usize = 4;
+        var sources: inventory.BootstrapBudget = .{};
         while (work != 0 and try self.canWork() and progress.statistic < progress.roots.statistics.len) {
             try members.append(a, progress.roots.statistics[progress.statistic]);
             progress.statistic += 1;
@@ -223,9 +223,9 @@ pub const Builder = struct {
                     progress.file += 1;
                     work -= 1;
                 }
-                if (sources == 0 or edges == 0 or !try self.canWork()) break;
+                if (sources.exhausted() or edges == 0 or !try self.canWork()) break;
             }
-            if (sources == 0 or edges == 0 or !try self.canWork()) break;
+            if (sources.exhausted() or edges == 0 or !try self.canWork()) break;
         }
         // Publish all children before either the proof or mutable checkpoint
         // can expose these roots. Cancellation leaves only unreachable nodes.

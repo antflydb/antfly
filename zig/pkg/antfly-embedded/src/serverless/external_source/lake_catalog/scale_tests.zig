@@ -617,3 +617,28 @@ test "lake catalog reachability catches up under continuous appends across manif
     try std.testing.expect(proof.ready);
     try std.testing.expectEqual(@as(usize, 0), proof.steps);
 }
+
+test "lake catalog reachability uses its byte budget for a small immutable cohort" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory = storage.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var table = try Table.init(alloc, memory.client(), "archive", "events", "gs://archive/events", "gs://archive/events");
+    defer table.deinit(alloc);
+    for (0..8) |i| try table.commitRow(alloc, @intCast(i + 2));
+    const current = try metadata.parse(a, table.current.metadata_json);
+    const snapshots = (try metadata.get(current, "snapshots")).array.items;
+    var objects: std.ArrayList([]const u8) = .empty;
+    for (snapshots) |snapshot| try objects.append(a, try metadata.str(try metadata.get(snapshot, "manifest-list")));
+    try objects.append(a, "gs://archive/events/data/never-written.parquet");
+    var proof = try table.catalog.referencesBounded(alloc, .{ .objects = objects.items, .max_steps = 64 });
+    defer proof.deinit(alloc);
+    try std.testing.expect(proof.steps <= 64);
+    // All source files are tiny, uncompressed native Avro. The encoded-byte
+    // and mutation budgets have room for this entire cold cohort in one turn.
+    try std.testing.expect(proof.ready);
+    for (proof.referenced[0..snapshots.len]) |referenced| try std.testing.expect(referenced);
+    try std.testing.expect(!proof.referenced[snapshots.len]);
+}

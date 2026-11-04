@@ -616,9 +616,27 @@ remain enforced, and context checks preserve deadline expiry before and during
 I/O. All 704 Debug lake tests passed, with one additional skip and no leaks.
 Fresh engine/provider qualification of this subsequent change remains required.
 
+
+Cold reachability bootstrap also spent its entire source allowance after four
+small native Avro files. A regression with eight single-row snapshots failed to
+finish despite spare mutation and byte budgets. Bootstrap now accounts for the
+encoded bytes of uncompressed containers, with a 1 MiB minimum charge per file
+and at most 64 files per turn. The total credit remains 64 MiB, each object stays
+bounded to 16 MiB, and compressed containers retain the previous four-object
+allowance because their encoded size does not bound decoded work. A source that
+cannot fit the remainder yields without publishing an inventory or advancing its
+cursor, then resumes with fresh credit. Mutation, edge, deadline and decoded-block
+limits remain unchanged.
+
+All 709 Debug lake tests passed, with one additional skip and no leaks. Controls
+cover the formerly failing cold cohort, all four supported Avro codecs, truncated
+and malformed headers, yielding and resuming without partial receipts, and
+rejecting expanded budgets before I/O. This is a bounded-work regression fix;
+fresh production-engine/provider qualification remains required.
+
 Next work should:
 
-1. Attribute the remaining accepted-search failures with live public stages,
+1. Monitor accepted searches with live public stages,
    request-scoped catalog/lease/WAL timings and unavailable-cause counters.
    Repeat the optimized workload under recorded host conditions before changing
    behavior based on an unproven cause.
