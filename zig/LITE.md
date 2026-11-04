@@ -1285,6 +1285,21 @@ before releasing the predecessor. Unchanged immutable artifact ranges transfer
 through the inode/root-fenced source pool, so fresh mutable replay actors do not
 require fresh durable leases for every unchanged segment. Failed construction
 leaves the predecessor owned; an active merge keeps its independent reference.
+
+Text upserts and deletions seek immutable external-ID routing instead of
+scanning all retained stored identities for every replay fragment. Segment
+version 6 persists a sorted table of 64-bit Wyhash IDs (seed zero) and local
+document numbers. Native readers authenticate only the pages they touch and
+compare each candidate's exact stored ID, so collisions cannot tombstone a
+different document. Every live duplicate remains eligible for deletion, and
+bitmap persistence retains its atomic rollback contract. Both append and
+sorted merges rebuild routing in output coordinates; native merges spill-sort
+within their existing scratch budget. Version-4/5 inputs remain readable and
+build compatibility routing once per immutable physical reader, charged to
+that reader's allocator and freed with it. Compaction replaces those inputs
+with persisted routing. A process or reader reconstruction can rebuild this
+compatibility routing; this fallback is not a persistent migration cache.
+
 When providers require ending the old runtime before replacement, a separate
 handoff pins individual immutable text readers, with one file-wide limit of
 256 MiB and 1,024 segment visits. Oversized ranges are skipped, so a large

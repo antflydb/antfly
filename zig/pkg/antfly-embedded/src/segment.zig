@@ -26,15 +26,16 @@
 //! File layout (footer at end, read backwards):
 //!   [stored fields data]
 //!   [field sections...]
-//!   [v5 page checksums: one BE CRC32 per 64 KiB of preceding data]
+//!   [v5/v6 page checksums: one BE CRC32 per 64 KiB of preceding data]
 //!   [v5 directory descriptor, then section index]
 //!   [footer]
 //!
 //! The 20-byte directory descriptor stores offset (u64 BE), length (u64 BE),
 //! and CRC32 (u32 BE). The footer metadata checksum authenticates it along
 //! with the section index. Native v5 readers verify touched immutable pages;
-//! v4 readers retain whole-region checksums. Contiguous readers accept both.
-//! New artifacts require a v5-capable reader; compaction rewrites old artifacts.
+//! v4 readers retain whole-region checksums. Version 6 adds a paged external-ID
+//! lookup for bounded update/delete routing; readers still accept v4/v5.
+//! New artifacts require a v6-capable reader; compaction rewrites old artifacts.
 //!
 //! The section-based layout was originally inspired by Bleve's zapx.
 
@@ -47,13 +48,14 @@ const inverted = @import("section/inverted.zig");
 const typed_dv = @import("section/typed_doc_values.zig");
 const snappy = @import("encoding/snappy.zig");
 const roaring = @import("encoding/roaring.zig");
+const identity_lookup = @import("document_identity_lookup.zig");
 
 // ============================================================================
 // Constants
 // ============================================================================
 
 const magic: [4]u8 = "AFSM".*; // AntFly SegMent
-const segment_version: u32 = 5; // v5: authenticated page directory; v4 remains readable.
+const segment_version: u32 = 6; // v6: indexed external IDs; v4/v5 remain readable.
 const integrity = @import("segment_integrity.zig");
 /// Recipe-fenced lake source bodies live in independently compressed columns.
 /// This non-JSON marker cannot be mistaken for a legacy source document.
@@ -92,11 +94,13 @@ pub const SectionType = enum(u16) {
     index_sort = 6,
     index_sort_bounds = 7,
     doc_key_range = 8,
+    doc_id_lookup = 9,
 };
 
 pub const doc_ordinals_field = "\x00__antfly_doc_ordinals";
 pub const index_sort_field = "\x00__antfly_index_sort";
 pub const doc_key_range_field = "\x00__antfly_doc_key_range";
+pub const doc_id_lookup_field = "\x00__antfly_doc_id_lookup";
 
 pub const SegmentIndexSortField = struct {
     /// Full producer traversal proves absent typed values are semantic nulls.
@@ -401,6 +405,29 @@ pub const SegmentWriter = struct {
         try self.writeToSinkTracked(&sink);
     }
     fn writeToSinkTracked(self: *SegmentWriter, sink: *SegmentSink) !void {
+        // Construct identity routing with the immutable output, before writer
+        // admission. Native readers seek authenticated pages without retaining
+        // the whole lookup. Omitted stored identities retain the legacy path.
+        const identities: []identity_lookup.Entry = if (self.doc_count > 0 and self.stored_fields.items.len == self.doc_count)
+            try self.alloc.alloc(identity_lookup.Entry, self.doc_count)
+        else
+            &.{};
+        defer if (identities.len != 0) self.alloc.free(identities);
+        if (identities.len != 0) {
+            for (self.fields.items) |field| if (std.mem.eql(u8, field.name, doc_id_lookup_field)) return error.InvalidSegment;
+            for (self.stored_fields.items, identities, 0..) |doc, *entry, i| entry.* = .{ .hash = identity_lookup.hash(doc.id), .doc = @intCast(i) };
+            identity_lookup.sort(identities);
+            const Builder = struct {
+                fn write(_: Allocator, context: *anyopaque, output: *SegmentSink) !void {
+                    const rows: *[]identity_lookup.Entry = @ptrCast(@alignCast(context));
+                    try identity_lookup.writeHeader(output, @intCast(rows.len));
+                    for (rows.*) |entry| try identity_lookup.writeEntry(output, entry);
+                }
+            };
+            const field = try self.addField(doc_id_lookup_field);
+            // The descriptor is consumed synchronously within this call.
+            try self.addSectionBuilder(field, .doc_id_lookup, .{ .context = @ptrCast(@constCast(&identities)), .write = Builder.write });
+        }
         const stored_offset: u64 = @intCast(sink.len());
         const stored_metadata_length = try self.writeStoredFieldsToSink(sink);
         const stored_length: u64 = @intCast(sink.len() - @as(usize, @intCast(stored_offset)));
@@ -919,7 +946,7 @@ pub const SegmentReader = struct {
         try input_source.readInto(input_source.len() - footer_size, &footer);
         if (!std.mem.eql(u8, footer[52..], &magic)) return error.InvalidMagic;
         const version = std.mem.readInt(u32, footer[44..48], .big);
-        if (version != 4 and version != segment_version) return error.UnsupportedVersion;
+        if (version != 4 and version != 5 and version != segment_version) return error.UnsupportedVersion;
         return footer;
     }
 
@@ -942,7 +969,7 @@ pub const SegmentReader = struct {
         const version = std.mem.readInt(u32, footer[44..48], .big);
         var paged: ?*integrity.PagedSource = null;
         errdefer if (paged) |owner| owner.deinit();
-        if (version == segment_version) {
+        if (version >= 5) {
             const directory = try integrity.Directory.read(input_source, metadata.index_offset);
             if (directory.offset < metadata.stored_offset + metadata.stored_length or metadata.index_offset + integrity.descriptor_size > input_source.len() - footer_size) return error.InvalidSegment;
             paged = try integrity.PagedSource.init(alloc, input_source, directory);
@@ -1006,7 +1033,7 @@ pub const SegmentReader = struct {
                     section.typed_navigation = navigation;
                 }
                 switch (section.section_type) {
-                    .inverted_text, .typed_doc_values, .doc_ordinals, .vector, .columnar_stored => continue,
+                    .inverted_text, .typed_doc_values, .doc_ordinals, .vector, .columnar_stored, .doc_id_lookup => continue,
                     else => {},
                 }
                 const bytes = try alloc.alloc(u8, @intCast(section.length));
@@ -1143,7 +1170,7 @@ pub const SegmentReader = struct {
 
         const metadata_crc = std.mem.readInt(u32, data[end - 8 ..][0..4], .big);
         const ver = std.mem.readInt(u32, data[end - 12 ..][0..4], .big);
-        if (ver != 4 and ver != segment_version) return error.UnsupportedVersion;
+        if (ver != 4 and ver != 5 and ver != segment_version) return error.UnsupportedVersion;
         const stored_metadata_crc = std.mem.readInt(u32, data[end - 16 ..][0..4], .big);
         const sections_index_offset = std.mem.readInt(u64, data[end - 24 ..][0..8], .big);
         const stored_metadata_length = std.mem.readInt(u64, data[end - 32 ..][0..8], .big);
@@ -1209,7 +1236,7 @@ pub const SegmentReader = struct {
         // Parse sections index (big-endian)
         var pos = index_offset;
         var payload_end = index_offset;
-        if (ver == segment_version) {
+        if (ver >= 5) {
             const directory = try integrity.Directory.read(.{ .contiguous = data }, index_offset);
             payload_end = @intCast(directory.offset);
             if (payload_end < stored_start + stored_len) return error.InvalidSegment;
@@ -1338,7 +1365,7 @@ pub const SegmentReader = struct {
             if (entry.length == 0) return null;
             if (entry.cached_navigation) |bytes| return bytes;
             switch (section_type) {
-                .inverted_text, .typed_doc_values, .doc_ordinals, .vector, .columnar_stored => return error.NativeSectionRequiresScope,
+                .inverted_text, .typed_doc_values, .doc_ordinals, .vector, .columnar_stored, .doc_id_lookup => return error.NativeSectionRequiresScope,
                 else => {},
             }
             @import("antfly_platform").sync.lockYielding(&native.identity_mutex);
@@ -1509,6 +1536,10 @@ pub const SegmentReader = struct {
             return .{ .doc_count = reader.doc_count, .total_field_len = reader.total_field_len };
         };
         return null;
+    }
+
+    pub fn documentIdentityLookup(self: *const SegmentReader) !?@import("segment_source.zig").View {
+        return self.sectionView(doc_id_lookup_field, .doc_id_lookup);
     }
 
     pub fn sectionView(self: *const SegmentReader, field: []const u8, kind: SectionType) !?@import("segment_source.zig").View {
@@ -3847,7 +3878,7 @@ pub fn writeMergedSegmentToSinkWithOptions(alloc: Allocator, output: *SegmentSin
             plan.statistics = prepared.statistics;
             plan.spans = prepared.spans;
         }
-        try writeSortedMergedSegmentToSink(alloc, sink, inputs, options.index_sort, &plan);
+        try writeSortedMergedSegmentToSink(alloc, sink, inputs, options.index_sort, &plan, options.scratch);
         // Typed merges already emitted coalesced provenance during preparation.
         // Source-only merges retain their allocation-free traversal.
         if (plan.statistics == null) if (options.provenance) |observer| {
@@ -3873,7 +3904,7 @@ pub fn writeMergedSegmentToSinkWithOptions(alloc: Allocator, output: *SegmentSin
         }
         return;
     }
-    try writeAppendMergedSegmentToSink(alloc, sink, inputs, doc_counts, rank_maps);
+    try writeAppendMergedSegmentToSink(alloc, sink, inputs, doc_counts, rank_maps, options.scratch);
     if (options.source_map != null or options.provenance != null) {
         var output_doc: u32 = 0;
         for (inputs, 0..) |input, input_idx| {
@@ -3991,7 +4022,79 @@ fn appendSortProofAlloc(a: Allocator, inputs: []const MergeInput) !?AppendSortPr
     return if (first != null) .{ .fields = fields, .bounds = .{ .first = first.?.first, .last = previous.?.last } } else null;
 }
 
-fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: []const MergeInput, doc_counts: []const u32, rank_maps: []const inverted.RankDocMap) !void {
+// Merge identity routing in output coordinates. Native merges use the same
+// bounded spill-sort capability as their document-order plan; no corpus-sized
+// hash map or output buffer is retained under publication admission.
+fn appendMergedIdentityLookup(a: Allocator, sink: *SegmentSink, inputs: []const MergeInput, order: ?SortedRecords, count: u32, scratch: ?MergeScratchOptions, fields: *std.ArrayListUnmanaged(BuiltField)) !void {
+    if (count == 0) return;
+    const spill = @import("spill_sort.zig");
+    var sorter: ?spill.Sorter = if (scratch) |options|
+        if (@as(u64, count) * @sizeOf(identity_lookup.Entry) > options.in_memory_plan_bytes)
+            try spill.Sorter.init(a, .{ .io = options.io, .directory = options.directory, .resource_manager = options.resource_manager, .chunk_bytes = options.external_sort_chunk_bytes, .chunk_records = options.external_sort_chunk_documents, .fan_in = options.external_sort_fan_in, .tie_break_prefix_bytes = 4 })
+        else
+            null
+    else
+        null;
+    defer if (sorter) |*value| value.deinit();
+    const entries: []identity_lookup.Entry = if (sorter == null) try a.alloc(identity_lookup.Entry, count) else &.{};
+    defer if (entries.len != 0) a.free(entries);
+    var ids = @import("segment_source.zig").Scratch.init(a, 64 * 1024);
+    defer ids.deinit();
+    const Collect = struct {
+        fn add(memory: []identity_lookup.Entry, sorted: ?*spill.Sorter, doc: u32, id: []const u8) !void {
+            const hash = identity_lookup.hash(id);
+            if (sorted) |value| {
+                var payload: [4]u8 = undefined;
+                std.mem.writeInt(u32, &payload, doc, .big);
+                try value.add(hash, &payload);
+            } else memory[doc] = .{ .hash = hash, .doc = doc };
+        }
+    };
+    const sorted: ?*spill.Sorter = if (sorter) |*value| value else null;
+    var output: u32 = 0;
+    if (order) |records| {
+        var it = records.iterator();
+        while (try it.next()) |record| {
+            ids.reset();
+            const id = (try inputs[record.ref.input_idx].reader.storedIdAlloc(ids.allocator(), record.ref.doc_id)) orelse return;
+            try Collect.add(entries, sorted, output, id);
+            output += 1;
+        }
+    } else {
+        for (inputs) |input| {
+            var live = LiveDocs.init(&input, 0, input.reader.doc_count);
+            while (live.next()) |doc| {
+                ids.reset();
+                const id = (try input.reader.storedIdAlloc(ids.allocator(), doc)) orelse return;
+                try Collect.add(entries, sorted, output, id);
+                output += 1;
+            }
+        }
+    }
+    if (output != count) return error.InvalidSegment;
+    const start = sink.len();
+    sink.beginSection();
+    try identity_lookup.writeHeader(sink, count);
+    if (sorter) |*value| {
+        const range = (try value.finish()) orelse return error.InvalidSegment;
+        if (range.count != count) return error.InvalidSegment;
+        var cursor = spill.Cursor.init(a, value.run, range);
+        defer cursor.deinit();
+        while (try cursor.next()) |record| {
+            if (record.payload.len != 4) return error.InvalidSegment;
+            try identity_lookup.writeEntry(sink, .{ .hash = record.key, .doc = std.mem.readInt(u32, record.payload[0..4], .big) });
+        }
+    } else {
+        identity_lookup.sort(entries);
+        for (entries) |entry| try identity_lookup.writeEntry(sink, entry);
+    }
+    var field: BuiltField = .{ .name = doc_id_lookup_field };
+    errdefer field.deinit(a);
+    try field.sections.append(a, .{ .section_type = .doc_id_lookup, .offset = start, .length = sink.len() - start, .checksum = try sink.crc32Range(start, sink.len() - start) });
+    try fields.append(a, field);
+}
+
+fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: []const MergeInput, doc_counts: []const u32, rank_maps: []const inverted.RankDocMap, merge_scratch: ?MergeScratchOptions) !void {
     if (inputs.len == 0) return error.NoSegments;
 
     const stored_offset: u64 = @intCast(sink.len());
@@ -4009,6 +4112,7 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
             if (std.mem.eql(u8, f.name, doc_ordinals_field)) continue;
             if (std.mem.eql(u8, f.name, index_sort_field)) continue;
             if (std.mem.eql(u8, f.name, doc_key_range_field)) continue;
+            if (std.mem.eql(u8, f.name, doc_id_lookup_field)) continue;
             try field_set.put(alloc, f.name, {});
         }
     }
@@ -4105,6 +4209,8 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
         try built_fields.append(alloc, built_field);
     }
 
+    try appendMergedIdentityLookup(alloc, sink, inputs, null, doc_count, merge_scratch, &built_fields);
+
     const ordinal_start = sink.len();
     sink.beginSection();
     if (try writeMergedDocOrdinals(alloc, sink, inputs, null, doc_count)) {
@@ -4155,6 +4261,7 @@ fn writeSortedMergedSegmentToSink(
     inputs: []const MergeInput,
     index_sort: []const SegmentIndexSortField,
     plan: *const SortedMergePlan,
+    scratch: ?MergeScratchOptions,
 ) !void {
     if (inputs.len == 0) return error.NoSegments;
 
@@ -4172,6 +4279,7 @@ fn writeSortedMergedSegmentToSink(
             if (std.mem.eql(u8, f.name, doc_ordinals_field)) continue;
             if (std.mem.eql(u8, f.name, index_sort_field)) continue;
             if (std.mem.eql(u8, f.name, doc_key_range_field)) continue;
+            if (std.mem.eql(u8, f.name, doc_id_lookup_field)) continue;
             try field_set.put(alloc, f.name, {});
         }
     }
@@ -4232,6 +4340,8 @@ fn writeSortedMergedSegmentToSink(
         }
         try built_fields.append(alloc, built_field);
     }
+
+    try appendMergedIdentityLookup(alloc, sink, inputs, plan.ordered(), doc_count, scratch, &built_fields);
 
     const ordinal_start = sink.len();
     sink.beginSection();
@@ -6765,7 +6875,7 @@ test "segment roundtrip" {
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(u32, 2), reader.doc_count);
-    try std.testing.expectEqual(@as(u16, 1), reader.num_fields);
+    try std.testing.expectEqual(@as(u16, 2), reader.num_fields);
     try std.testing.expectEqualStrings("content", reader.fields[0].name);
 
     // Read inverted index
@@ -7678,7 +7788,7 @@ test "multi-field segment" {
     var reader = try SegmentReader.init(alloc, seg);
     defer reader.deinit();
 
-    try std.testing.expectEqual(@as(u16, 2), reader.num_fields);
+    try std.testing.expectEqual(@as(u16, 3), reader.num_fields);
 
     // "zig" in title field
     var title_reader = (try reader.invertedIndex("title")) orelse return error.TestExpectedEqual;
@@ -7805,7 +7915,7 @@ pub const RangeSegmentReader = struct {
         var version: [4]u8 = undefined;
         try source.readInto(source.len() - 12, &version);
         const ver = std.mem.readInt(u32, &version, .big);
-        return ver == 4 or ver == segment_version;
+        return ver == 4 or ver == 5 or ver == segment_version;
     }
 
     pub fn init(alloc: Allocator, input_source: SegmentSource, options: Options) !RangeSegmentReader {
@@ -7816,7 +7926,7 @@ pub const RangeSegmentReader = struct {
         try source.readInto(footer_start, &footer);
         if (!std.mem.eql(u8, footer[52..], &magic)) return error.InvalidMagic;
         const version = std.mem.readInt(u32, footer[44..48], .big);
-        if (version != 4 and version != segment_version) return error.UnsupportedVersion;
+        if (version != 4 and version != 5 and version != segment_version) return error.UnsupportedVersion;
         const count = std.math.cast(u32, std.mem.readInt(u64, footer[0..8], .big)) orelse return error.InvalidSegment;
         const stored = std.mem.readInt(u64, footer[8..16], .big);
         const stored_len = std.mem.readInt(u64, footer[16..24], .big);
@@ -7829,7 +7939,7 @@ pub const RangeSegmentReader = struct {
         if (try source.checksum(index, source.len() - 8 - index, &checksum_scratch) != std.mem.readInt(u32, footer[48..52], .big)) return error.CrcMismatch;
         var paged_source: ?*integrity.PagedSource = null;
         errdefer if (paged_source) |paged| paged.deinit();
-        if (version == segment_version) {
+        if (version >= 5) {
             const directory = try integrity.Directory.read(source, index);
             if (directory.offset < stored + stored_len or index + integrity.descriptor_size > footer_start) return error.InvalidSegment;
             paged_source = try integrity.PagedSource.init(alloc, source, directory);
@@ -9076,6 +9186,64 @@ test "segment native stored decoder streams compressed input and discards oversi
     const small = (try cursor.get(&reader, 1)).?;
     try std.testing.expectEqualStrings("small body", small.data);
     try std.testing.expect(budget.live < 1024 * 1024);
+}
+
+test "identity lookup merge preserves duplicate IDs deletion remapping and bounded spill output" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(directory);
+    var first = SegmentWriter.init(a);
+    defer first.deinit();
+    for ([_][]const u8{ "m", "a", "a", "z" }) |id| try first.addStoredDoc(id, "{}");
+    const left_bytes = try first.build();
+    defer a.free(left_bytes);
+    var second = SegmentWriter.init(a);
+    defer second.deinit();
+    for ([_][]const u8{ "c", "m" }) |id| try second.addStoredDoc(id, "{}");
+    const right_bytes = try second.build();
+    defer a.free(right_bytes);
+    var left = try SegmentReader.init(a, left_bytes);
+    defer left.deinit();
+    var right = try SegmentReader.init(a, right_bytes);
+    defer right.deinit();
+    var deleted = roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    try deleted.add(3);
+    const inputs = [_]MergeInput{ .{ .reader = &left, .deleted = deleted }, .{ .reader = &right } };
+    const sort = [_]SegmentIndexSortField{.{ .field = "_id", .desc = false }};
+    for ([_]bool{ false, true }) |sorted| {
+        const memory = try mergeSegmentInputsWithOptions(a, &inputs, .{ .input_order = .arbitrary, .index_sort = if (sorted) &sort else &.{} });
+        defer a.free(memory);
+        const spilled = try mergeSegmentInputsWithOptions(a, &inputs, .{
+            .input_order = .arbitrary,
+            .index_sort = if (sorted) &sort else &.{},
+            .scratch = .{ .io = std.testing.io, .directory = directory, .in_memory_plan_bytes = 0, .external_sort_chunk_documents = 2 },
+        });
+        defer a.free(spilled);
+        try std.testing.expectEqualSlices(u8, memory, spilled);
+        for ([_]bool{ false, true }) |native| {
+            var reader = if (native) try SegmentReader.initSource(a, .{ .contiguous = spilled }) else try SegmentReader.init(a, spilled);
+            defer reader.deinit();
+            const lookup = (try reader.documentIdentityLookup()).?;
+            try std.testing.expectEqual(@as(u32, 5), reader.doc_count);
+            for ([_][]const u8{ "a", "m", "c", "z" }, [_]u32{ 2, 2, 1, 0 }) |id, expected| {
+                const hash = identity_lookup.hash(id);
+                var cursor = try identity_lookup.seek(lookup, reader.doc_count, hash);
+                var found: u32 = 0;
+                while (cursor < reader.doc_count) : (cursor += 1) {
+                    const candidate = try identity_lookup.readEntry(lookup, cursor, reader.doc_count);
+                    if (candidate.hash != hash) break;
+                    const actual = (try reader.storedIdAlloc(a, candidate.doc)).?;
+                    defer a.free(actual);
+                    try std.testing.expectEqualStrings(id, actual);
+                    found += 1;
+                }
+                try std.testing.expectEqual(expected, found);
+            }
+        }
+    }
 }
 
 fn legacyV4Fixture(allocator: Allocator, bytes: []const u8) ![]u8 {
@@ -12835,6 +13003,7 @@ test "external lake lazy routing binds physical field order by identity" {
     const bytes = try writer.build();
     defer a.free(bytes);
     const route = [_]SegmentReader.RoutingField{
+        .{ .name = doc_id_lookup_field, .stats = null, .section_mask = @as(u16, 1) << @backingInt(SectionType.doc_id_lookup) },
         .{ .name = "a_key", .stats = null },
         .{ .name = "z_body", .stats = .{ .doc_count = 1, .total_field_len = 1 }, .section_mask = @as(u16, 1) << @backingInt(SectionType.inverted_text) },
     };
@@ -12846,12 +13015,12 @@ test "external lake lazy routing binds physical field order by identity" {
     try std.testing.expect(bound.hasSection("z_body", .inverted_text));
     // Order tolerance must not weaken the advertised stats/name contract.
     var wrong_stats = route;
-    wrong_stats[1].stats.?.total_field_len = 2;
+    wrong_stats[2].stats.?.total_field_len = 2;
     var corrupt = try SegmentReader.initRouting(a, 1, &wrong_stats, SegmentReader.initSource);
     defer corrupt.deinit();
     try std.testing.expectError(error.InvalidSegment, corrupt.bindSource(a, .{ .contiguous = bytes }));
     var wrong_name = route;
-    wrong_name[0].name = "absent";
+    wrong_name[1].name = "absent";
     var missing = try SegmentReader.initRouting(a, 1, &wrong_name, SegmentReader.initSource);
     defer missing.deinit();
     try std.testing.expectError(error.InvalidSegment, missing.bindSource(a, .{ .contiguous = bytes }));
