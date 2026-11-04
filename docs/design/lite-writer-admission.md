@@ -98,6 +98,9 @@ Existing uncertain handles remain fenced even at an unchanged checkpoint. A
 fresh writable open skips cached owners with uncertain serving or detached publication state
 and reconstructs the durable decision from disk. Old query/runtime references
 retain their original ownership until close.
+Refusing a new operation on that fenced handle requires reconciliation; it does
+not assign a second unknown outcome to a mutation that never started. The
+original publication still preserves its unknown disposition and receipt.
 
 Decode the hexadecimal token into its 16-byte transaction ID and use
 `antfly_db_get_transaction_status`, or Python's

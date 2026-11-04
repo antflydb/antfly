@@ -490,6 +490,23 @@ const OutcomeFixture = struct {
         self.directory.cleanup();
     }
 
+    fn reopen(self: *OutcomeFixture) !void {
+        const wrapper = try api.openLiteHandleAlloc(self.path, .{ .no_sync = true, .profile = .hosted, .busy_timeout_ms = 5000 }, false);
+        const id = api.publishHandle(wrapper) catch |err| {
+            h.closeHandle(wrapper);
+            return err;
+        };
+        api.antfly_db_close(self.id);
+        self.id = id;
+        self.wrapper = wrapper;
+        const owner = wrapper.lite_connection.?.owner;
+        owner.stopping.store(true, .release);
+        owner.wake.set(h.handleLockIo());
+        if (owner.worker) |worker| worker.join();
+        owner.worker = null;
+        owner.stopping.store(false, .release);
+    }
+
     /// The current storage root. Arm faults immediately before a call.
     fn file(self: *OutcomeFixture) *@import("../storage/lite/native.zig").NativeFile {
         const root = self.wrapper.lite_connection.?.current.?;
@@ -594,8 +611,12 @@ test "capi SQL outcome autocommit failure inside checkpoint publication is unkno
         // Never "cancelled" or a retryable code: the commit may be durable.
         try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, reply.code);
         try std.testing.expectEqualStrings("40003", reply.state().?);
-        // The connection reconciles on its next call: the injected failure
-        // came before the slot write, so the row is durably absent.
+        // The uncertain owner stays fenced. Reopen reconstructs durable
+        // truth: this injected failure preceded the checkpoint slot write.
+        var refused = try f.sql(insert_one);
+        defer refused.deinit();
+        try std.testing.expectEqual(h.capi.ErrorCode.stalled, refused.code);
+        try f.reopen();
         try std.testing.expectEqual(@as(usize, 0), try f.rows());
         try f.expectOk(insert_one);
     }

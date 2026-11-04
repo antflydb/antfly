@@ -5012,22 +5012,44 @@ pub const DB = struct {
     /// This cache contract is deliberately about immutable text inputs. Other
     /// index/provider runtimes still reopen until they expose equivalent
     /// source-view rebinding, rather than borrowing stale mutable caches.
-    pub fn canRefreshDetachedTextSource(self: *DB) bool {
+    pub const DetachedTextSourceBlock = enum {
+        manual,
+        enrichment,
+        queries,
+        policy,
+        transition,
+        index_loads,
+        admission,
+        resolver,
+        split,
+        groups,
+        nontext_indexes,
+        replacement,
+        repairs,
+        coalescer,
+    };
+
+    pub fn detachedTextSourceBlock(self: *DB) ?DetachedTextSourceBlock {
         const indexes = self.core.index_manager;
-        return self.executor.isManual() and self.enrichment_runtime == null and
-            self.retained_value_scope == null and self.retained_query_lease == null and self.retained_remote_query_lease == null and
-            self.local_execution.native_query_reuse == null and self.local_execution.row_policy_bundle == null and
-            self.core.table_catalog.row_policy_phase == .disabled and
-            !self.local_execution.initial_child_hidden.load(.acquire) and self.local_execution.initial_child_bootstrap == null and
-            !self.local_execution.restore_staging_required.load(.acquire) and !self.local_execution.vector_migration_active.load(.acquire) and
-            indexes.failed_index_loads.count() == 0 and indexes.managed_admission_indexes.count() == 0 and
-            !self.hasConfiguredResolvers() and !self.core.hasGeneratedEnrichmentTargets() and
-            self.core.shard_manager.getSplitState() == null and
-            !indexes.hasGroupSources() and indexes.dense_indexes.items.len == 0 and
-            indexes.sparse_indexes.items.len == 0 and indexes.graph_indexes.items.len == 0 and
-            indexes.algebraic_indexes.items.len == 0 and self.shadow == null and
-            self.graph_replacement_manager == null and self.active_index_repairs.count() == 0 and
-            self.async_context.applied_sequence_coalescer.pending.count() == 0;
+        if (!self.executor.isManual()) return .manual;
+        if (self.enrichment_runtime != null) return .enrichment;
+        if (self.retained_value_scope != null or self.retained_query_lease != null or self.retained_remote_query_lease != null or self.local_execution.native_query_reuse != null) return .queries;
+        if (self.local_execution.row_policy_bundle != null or self.core.table_catalog.row_policy_phase != .disabled) return .policy;
+        if (self.local_execution.initial_child_hidden.load(.acquire) or self.local_execution.initial_child_bootstrap != null or self.local_execution.restore_staging_required.load(.acquire) or self.local_execution.vector_migration_active.load(.acquire)) return .transition;
+        if (indexes.failed_index_loads.count() != 0) return .index_loads;
+        if (indexes.managed_admission_indexes.count() != 0) return .admission;
+        if (self.hasConfiguredResolvers() or self.core.hasGeneratedEnrichmentTargets()) return .resolver;
+        if (self.core.shard_manager.getSplitState() != null) return .split;
+        if (indexes.hasGroupSources()) return .groups;
+        if (indexes.dense_indexes.items.len != 0 or indexes.sparse_indexes.items.len != 0 or indexes.graph_indexes.items.len != 0 or indexes.algebraic_indexes.items.len != 0) return .nontext_indexes;
+        if (self.shadow != null or self.graph_replacement_manager != null) return .replacement;
+        if (self.active_index_repairs.count() != 0) return .repairs;
+        if (self.async_context.applied_sequence_coalescer.pending.count() != 0) return .coalescer;
+        return null;
+    }
+
+    pub fn canRefreshDetachedTextSource(self: *DB) bool {
+        return self.detachedTextSourceBlock() == null;
     }
 
     /// Caller drained all operations and checked inode, namespace, catalog and
