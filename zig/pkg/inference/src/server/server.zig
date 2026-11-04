@@ -9735,7 +9735,7 @@ pub const Node = struct {
         const broker_deadline = try directExecutorDeadline(io, deadline_ns);
         var read_control = BorrowedReadControl{ .deadline_ns = deadline_ns, .cancellation = cancellation };
         const execution_control = self.bindExecutionControl(io, .{ .ptr = &read_control, .check_fn = BorrowedReadControl.check });
-        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "readers");
+        const model_path = try self.resolveReadModelPath(io, if (model_name.len > 0) model_name else null);
         defer self.allocator.free(model_path);
         try execution_control.check();
 
@@ -10048,7 +10048,7 @@ pub const Node = struct {
         const broker_deadline = try directExecutorDeadline(io, deadline_ns);
         var read_control = BorrowedReadControl{ .deadline_ns = deadline_ns, .cancellation = cancellation };
         const execution_control = self.bindExecutionControl(io, .{ .ptr = &read_control, .check_fn = BorrowedReadControl.check });
-        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "readers");
+        const model_path = try self.resolveReadModelPath(io, if (model_name.len > 0) model_name else null);
         defer self.allocator.free(model_path);
         try execution_control.check();
 
@@ -26687,15 +26687,15 @@ test "gliner boundary v2 direct cancellation and HTTP capacity use existing admi
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 503), response.status.code);
     try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
-    // Cancellation at the direct entrypoint intentionally precedes route
-    // selection and extraction observation; only the HTTP capacity attempt is
-    // admitted to the endpoint metrics below.
-    try std.testing.expectEqual(@as(u64, 0), node.metrics.extraction_v2.requests.get(.direct));
+    // The two observed direct cancellations remain counted. The HTTP capacity
+    // failure adds one request and one admission error, without another direct
+    // request or cancellation outcome.
+    try std.testing.expectEqual(@as(u64, 2), node.metrics.extraction_v2.requests.get(.direct));
     try std.testing.expectEqual(@as(u64, 1), node.metrics.extraction_v2.requests.get(.http));
-    try std.testing.expectEqual(@as(u64, 0), node.metrics.extraction_v2.outcomes.get(.cancelled));
+    try std.testing.expectEqual(@as(u64, 2), node.metrics.extraction_v2.outcomes.get(.cancelled));
     try std.testing.expectEqual(@as(u64, 1), node.metrics.extraction_v2.outcomes.get(.admission));
-    try std.testing.expectEqual(@as(u64, 1), node.metrics.extract_requests.impl.count);
-    try std.testing.expectEqual(@as(u64, 1), node.metrics.errors_total.impl.count);
+    try std.testing.expectEqual(@as(u64, 3), node.metrics.extract_requests.impl.count);
+    try std.testing.expectEqual(@as(u64, 3), node.metrics.errors_total.impl.count);
     try std.testing.expectEqual(@as(i64, 0), node.metrics.requests_active.impl.value);
     try std.testing.expectEqual(@as(i64, 0), node.metrics.extraction_v2.active.impl.value);
 }
@@ -34623,7 +34623,8 @@ test "valid direct entity failures release admission and partial model state" {
         defer response.deinit();
         return error.TestUnexpectedResult;
     }
-    try std.testing.expectEqual(@as(usize, 64), request_work_test_counters.model_resolution_attempts);
+    // Each invocation probes its document definition, then resolves the leaf.
+    try std.testing.expectEqual(@as(usize, 2 * 64), request_work_test_counters.model_resolution_attempts);
 }
 
 test "direct entity extraction response populates requested canonical fields" {
@@ -34862,7 +34863,8 @@ test "REBEL rejects unsupported typed schemas before model loading" {
             .schema_json = "{\"entities\":[\"person\"]}",
         }),
     );
-    try std.testing.expectEqual(@as(usize, 1), request_work_test_counters.model_resolution_attempts);
+    // Typed dispatch checks for a document definition before the leaf gate.
+    try std.testing.expectEqual(@as(usize, 2), request_work_test_counters.model_resolution_attempts);
     try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());

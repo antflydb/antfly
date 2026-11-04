@@ -107,7 +107,10 @@ A recording is one bounded source unit with `kind: "audio"` and
 The planner preserves source identity, model revisions, completion status,
 measured usage, events, and the same deadline/call/token/output limits as
 image and document reads. Audio/video sources reject page selection and slide
-options. Each source must match its reader's declared input modality. Audio MIME
+options. Each source must match its reader's declared input modality. Transport
+schemes match case-insensitively while signed URL paths and query strings remain
+unchanged. HTTP, encoded-image and raster entry points share scoped model
+resolution and reject ambiguous bare names. Audio MIME
 type/subtype matching is case-insensitive, including generic octet-stream inline
 input; accepted sources still publish the detected canonical media type. Ogg
 container declarations also accept Opus; codec-specific declarations are not

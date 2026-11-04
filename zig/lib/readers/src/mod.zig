@@ -87,7 +87,10 @@ pub fn mediaTypeEssence(value: []const u8) ![]const u8 {
 /// a bare base64 recording is wrapped using the caller's invocation arena.
 pub fn audioSourceUrl(a: Allocator, value: []const u8) ![]const u8 {
     if (value.len == 0) return error.InvalidDocumentSource;
-    const url = if (data_uri.hasScheme(value) or std.mem.startsWith(u8, value, "https://") or std.mem.startsWith(u8, value, "http://") or std.mem.startsWith(u8, value, "s3://")) value else try std.fmt.allocPrint(a, "data:application/octet-stream;base64,{s}", .{value});
+    const remote = std.ascii.startsWithIgnoreCase(value, "https://") or
+        std.ascii.startsWithIgnoreCase(value, "http://") or
+        std.ascii.startsWithIgnoreCase(value, "s3://");
+    const url = if (data_uri.hasScheme(value) or remote) value else try std.fmt.allocPrint(a, "data:application/octet-stream;base64,{s}", .{value});
     if (try data_uri.parse(url)) |parsed| _ = try parsed.decodedSize();
     return url;
 }
@@ -1970,4 +1973,24 @@ test "antfly audio reader preserves truncated completion and measured usage" {
     try std.testing.expectEqual(Completion.length, result.?.items[0].completion);
     try std.testing.expectEqual(@as(i64, 15), result.?.usage.?.total_tokens);
     try std.testing.expectError(error.ReadOutputTruncated, requireComplete(result.?.items));
+}
+
+test "audio source URL schemes ignore case while signed paths and queries stay borrowed" {
+    var scratch: [256]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&scratch);
+    for ([_][]const u8{
+        "https://example.com/Clip.WAV?token=AbCd", "HTTPS://example.com/Clip.WAV?token=AbCd",
+        "http://example.com/Clip.WAV",             "Http://example.com/Clip.WAV",
+        "s3://bucket/Clip.WAV?versionId=AbCd",     "S3://bucket/Clip.WAV?versionId=AbCd",
+        "DATA:Audio/Wav;base64,AA==",
+    }) |url| {
+        const normalized = try audioSourceUrl(bounded.allocator(), url);
+        try std.testing.expectEqualStrings(url, normalized);
+        try std.testing.expect(normalized.ptr == url.ptr);
+    }
+    try std.testing.expectEqual(@as(usize, 0), bounded.end_index);
+    const wrapped = try audioSourceUrl(bounded.allocator(), "AA==");
+    try std.testing.expectEqualStrings("data:application/octet-stream;base64,AA==", wrapped);
+    try std.testing.expectError(error.InvalidDocumentSource, audioSourceUrl(bounded.allocator(), ""));
+    try std.testing.expectError(error.InvalidBase64, audioSourceUrl(bounded.allocator(), "not audio"));
 }
