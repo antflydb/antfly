@@ -27,6 +27,12 @@ pub const ModelSource = union(enum) {
     media: struct { mime_type: []const u8, data: []const u8 },
 };
 
+/// Model-aware source fields may contain plain media locators. Keep this
+/// recognition shared with offline backup inspection; parsing never fetches.
+pub fn isRemoteModelLocator(value: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(value, "https://") or std.ascii.startsWithIgnoreCase(value, "http://") or std.ascii.startsWithIgnoreCase(value, "s3://") or std.ascii.startsWithIgnoreCase(value, "gs://");
+}
+
 pub fn modelSourceFromValue(field: std.json.Value) !ModelSource {
     if (field == .null) return .none;
     if (field == .string) return .{ .text = field.string };

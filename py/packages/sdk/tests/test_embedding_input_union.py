@@ -56,3 +56,16 @@ def test_embedding_input_union_transport_and_round_trip(input_value, wire_value,
 def test_embedding_input_union_rejects_ambiguous_lists(invalid) -> None:
     with pytest.raises(TypeError):
         InferenceEmbedRequest.from_dict({"model": "embeddinggemma-2", "input": invalid})
+
+
+def test_embedding_input_union_preserves_revision_and_identity_pins() -> None:
+    request = InferenceEmbedRequest(
+        model="embeddinggemma-2",
+        input_=InferenceEmbeddingContentInput(content=[TEXT, AUDIO]),
+        model_revision="11" * 32,
+        model_identity="22" * 32,
+    )
+    wire = request.to_dict()
+    assert wire["model_revision"] == "11" * 32
+    assert wire["model_identity"] == "22" * 32
+    assert InferenceEmbedRequest.from_dict(wire).to_dict() == wire

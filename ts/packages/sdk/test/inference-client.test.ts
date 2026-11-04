@@ -1560,8 +1560,8 @@ describe("InferenceClient with mock fetch", () => {
       const mockResponse = {
         model: "openai/whisper-tiny",
         object: "list",
-        data: [{object: "read", index: 0, text: "Hello, how are you today?"}],
-        usage: {prompt_tokens: 0, completion_tokens: 0, total_tokens: 0},
+        data: [{ object: "read", index: 0, text: "Hello, how are you today?" }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
       };
 
       vi.mocked(fetch).mockResolvedValueOnce({

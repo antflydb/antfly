@@ -59,6 +59,7 @@ fn hashBytes(hash: *std.crypto.hash.Blake3, value: []const u8) void {
 
 pub const Proof = struct {
     version: u8 = 3,
+    execution_identity: ?publication.Digest = null,
     namespace: publication.Namespace,
     authority_epoch: u64,
     catalog_digest: publication.Digest,
@@ -123,20 +124,23 @@ pub const Proof = struct {
     }
 
     pub fn inputCommand(self: Proof) publication.Command {
-        return .{ .namespace = self.namespace, .authority_epoch = self.authority_epoch, .catalog_digest = self.catalog_digest, .producer_kind = self.producer_kind, .producer_name = self.producer_name, .producer_generation = self.producer_generation, .producer_artifact_name = self.producer_artifact_name, .producer_scope_key = self.producer_scope_key, .sources = self.sources, .artifact_sources = self.artifact_sources, .mutation_preconditions = self.mutation_preconditions, .mutations = &.{}, .publication_digest = self.publication_digest };
+        return .{ .namespace = self.namespace, .authority_epoch = self.authority_epoch, .catalog_digest = self.catalog_digest, .producer_kind = self.producer_kind, .producer_name = self.producer_name, .producer_generation = self.producer_generation, .producer_artifact_name = self.producer_artifact_name, .producer_scope_key = self.producer_scope_key, .execution_identity = self.execution_identity, .sources = self.sources, .artifact_sources = self.artifact_sources, .mutation_preconditions = self.mutation_preconditions, .mutations = &.{}, .publication_digest = self.publication_digest };
     }
 
     pub fn validate(self: Proof) !void {
-        if (self.version != 3 or self.authority_epoch == 0 or (self.producer_generation == 0 and self.producer_kind != .resolver) or
+        if ((self.version != 3 and self.version != 4) or (self.version == 4) != (self.execution_identity != null) or self.authority_epoch == 0 or (self.producer_generation == 0 and self.producer_kind != .resolver) or
             self.producer_name.len == 0 or self.producer_artifact_name.len == 0 or
             self.sources.len == 0 or self.sources.len > publication.max_source_documents or
             self.artifact_sources.len > publication.max_source_documents or
             self.mutation_preconditions.len > publication.max_source_documents - self.artifact_sources.len or self.effects.len == 0 or
             self.effects.len > publication.max_mutations or !std.mem.eql(u8, &self.input_digest, &self.inputCommand().inputDigest())) return error.ArtifactCatalogCorrupt;
+        if (self.execution_identity != null and (self.producer_kind != .index or self.producer_scope_key.len != 0 or
+            self.sources.len != 1 or self.effects.len != 1 or self.effects[0].family != .base_vector)) return error.ArtifactCatalogCorrupt;
         for (self.effects) |effect| if (effect.source_index >= self.sources.len or
             (effect.value_digest == null and effect.value_bytes != 0)) return error.ArtifactCatalogCorrupt;
         if (self.origin) |origin| {
             if (!origin.binding.valid() or origin.binding.effect_protocol < 15 or
+                (self.execution_identity != null and origin.binding.effect_protocol < 17) or
                 std.mem.allEqual(u8, &origin.source_pin, 0) or std.mem.allEqual(u8, &origin.binding.digest, 0) or
                 std.mem.allEqual(u8, &origin.proof_checksum, 0) or self.mutation_preconditions.len != 0 or
                 origin.selected_bitmap.len != (self.sources.len + 7) / 8) return error.ArtifactCatalogCorrupt;
@@ -304,6 +308,7 @@ fn proofPositionSize(size: *usize, value: ?publication.Position) !void {
 
 fn proofEncodedLength(proof: Proof) !usize {
     var size: usize = 4 + 1 + 1 + 24 + 8 + 32 + 8 + 32 + 32 + 4 * 4 + 1 + 32;
+    if (proof.execution_identity != null) try proofAdd(&size, 32);
     try proofBlobSize(&size, proof.producer_name);
     try proofBlobSize(&size, proof.producer_artifact_name);
     try proofBlobSize(&size, proof.producer_scope_key);
@@ -371,6 +376,7 @@ pub fn encodeAlloc(alloc: std.mem.Allocator, proof: Proof) ![]u8 {
     writer.writeU64(proof.producer_generation);
     writer.write(&proof.publication_digest);
     writer.write(&proof.input_digest);
+    if (proof.execution_identity) |value| writer.write(&value);
     writer.blob(proof.producer_name);
     writer.blob(proof.producer_artifact_name);
     writer.blob(proof.producer_scope_key);
@@ -475,6 +481,7 @@ fn decode(alloc: std.mem.Allocator, raw: []const u8, copy_bytes: bool) !Owned {
     var cursor: ProofCursor = .{ .bytes = owned_raw[0 .. owned_raw.len - 32] };
     if (!std.mem.eql(u8, try cursor.take(4), proof_magic)) return error.ArtifactCatalogCorrupt;
     const version = try cursor.byte();
+    if (version != 3 and version != 4) return error.ArtifactCatalogCorrupt;
     const producer_kind = std.enums.fromInt(@FieldType(publication.Command, "producer_kind"), try cursor.byte()) orelse return error.ArtifactCatalogCorrupt;
     const namespace: publication.Namespace = (try cursor.take(24))[0..24].*;
     const epoch = try cursor.readU64();
@@ -482,6 +489,7 @@ fn decode(alloc: std.mem.Allocator, raw: []const u8, copy_bytes: bool) !Owned {
     const generation = try cursor.readU64();
     const publication_digest: publication.Digest = (try cursor.take(32))[0..32].*;
     const input_digest: publication.Digest = (try cursor.take(32))[0..32].*;
+    const execution_identity: ?publication.Digest = if (version == 4) (try cursor.take(32))[0..32].* else null;
     const producer_name = try cursor.blob();
     const producer_artifact_name = try cursor.blob();
     const producer_scope_key = try cursor.blob();
@@ -533,7 +541,7 @@ fn decode(alloc: std.mem.Allocator, raw: []const u8, copy_bytes: bool) !Owned {
         effect.* = .{ .family = family, .key = key_bytes, .source_index = source_index, .value_digest = value_digest, .value_bytes = try cursor.readU64() };
     }
     if (cursor.pos != cursor.bytes.len) return error.ArtifactCatalogCorrupt;
-    const proof: Proof = .{ .version = version, .namespace = namespace, .authority_epoch = epoch, .catalog_digest = catalog_digest, .producer_kind = producer_kind, .producer_name = producer_name, .producer_generation = generation, .producer_artifact_name = producer_artifact_name, .producer_scope_key = producer_scope_key, .publication_digest = publication_digest, .input_digest = input_digest, .sources = sources, .artifact_sources = artifact_sources, .mutation_preconditions = mutation_preconditions, .effects = effects, .origin = origin };
+    const proof: Proof = .{ .version = version, .execution_identity = execution_identity, .namespace = namespace, .authority_epoch = epoch, .catalog_digest = catalog_digest, .producer_kind = producer_kind, .producer_name = producer_name, .producer_generation = generation, .producer_artifact_name = producer_artifact_name, .producer_scope_key = producer_scope_key, .publication_digest = publication_digest, .input_digest = input_digest, .sources = sources, .artifact_sources = artifact_sources, .mutation_preconditions = mutation_preconditions, .effects = effects, .origin = origin };
     try proof.validate();
     return .{ .arena = arena, .proof = proof };
 }
@@ -560,6 +568,8 @@ pub fn fromCommand(alloc: std.mem.Allocator, command: publication.Command) !Owne
         effect.* = .{ .family = mutation.family, .key = try owned.dupe(u8, mutation.key), .source_index = mutation.source_index, .value_digest = digest, .value_bytes = if (mutation.value) |value| value.len else 0 };
     }
     const proof: Proof = .{
+        .version = if (command.execution_identity != null) 4 else 3,
+        .execution_identity = command.execution_identity,
         .namespace = command.namespace,
         .authority_epoch = command.authority_epoch,
         .catalog_digest = command.catalog_digest,
@@ -1865,6 +1875,31 @@ test "ordered artifact inventory compact proof preserves output CAS history" {
     try std.testing.expectEqualDeep(before, recovered.proof.mutation_preconditions[0]);
     try recovered.proof.validatePortableShape(alloc);
     try std.testing.expectEqualDeep(command.inputDigest(), recovered.proof.inputCommand().inputDigest());
+    const old_input = command.inputDigest();
+    command.execution_identity = @splat(7);
+    command.publication_digest = command.digest();
+    var revised = try fromCommand(alloc, command);
+    defer revised.deinit();
+    const revised_raw = try encodeAlloc(alloc, revised.proof);
+    defer alloc.free(revised_raw);
+    var revised_decoded = try decodeAlloc(alloc, revised_raw);
+    defer revised_decoded.deinit();
+    try std.testing.expectEqual(@as(u8, 4), revised_decoded.proof.version);
+    try std.testing.expectEqualDeep(command.execution_identity, revised_decoded.proof.execution_identity);
+    try std.testing.expect(!std.mem.eql(u8, &old_input, &revised_decoded.proof.input_digest));
+    try revised_decoded.proof.validatePortableShape(alloc);
+    const transport = @import("artifact_publication_transport_codec.zig");
+    const wire = try transport.encodeAlloc(alloc, command);
+    defer alloc.free(wire);
+    try std.testing.expectEqualStrings("APB2", wire[0..4]);
+    var decoded_wire = try transport.decodeBorrowed(alloc, wire);
+    defer decoded_wire.deinit();
+    try std.testing.expectEqualDeep(command, decoded_wire.command);
+    const json = try std.json.Stringify.valueAlloc(alloc, command, .{});
+    defer alloc.free(json);
+    var parsed = try std.json.parseFromSlice(publication.Command, alloc, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualDeep(command, parsed.value);
 }
 
 test "ordered artifact inventory portable scoped proof requires its causal unit guard" {

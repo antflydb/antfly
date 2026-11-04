@@ -87,11 +87,12 @@ function sampleRequest(
 ): string {
   // Streaming requires affirmative gateway support; unknown includes manually
   // entered IDs and catalog entries without capability metadata.
-  const sample = operation === "read" && (model?.task === "transcribe" || model?.id.startsWith("transcribers/"))
-    ? { audio: "<base64 audio>", audio_options: {} }
-    : operation === "chat/completions"
-      ? { ...samples[operation], stream: model?.gateway_capabilities?.streaming === "supported" }
-      : samples[operation];
+  const sample =
+    operation === "read" && (model?.task === "transcribe" || model?.id.startsWith("transcribers/"))
+      ? { audio: "<base64 audio>", audio_options: {} }
+      : operation === "chat/completions"
+        ? { ...samples[operation], stream: model?.gateway_capabilities?.streaming === "supported" }
+        : samples[operation];
   return JSON.stringify(sample, null, 2);
 }
 

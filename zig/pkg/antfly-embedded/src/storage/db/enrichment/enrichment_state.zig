@@ -778,3 +778,120 @@ test "admission wait budget survives disk close and WAL replay" {
         try saveRuntimeStatus(store, "admission-test", status);
     }
 }
+
+pub const scoped_retries = @import("scoped_retries.zig");
+const scoped_retry_key = "\x00\x00__metadata__:enrichment_scoped_retries:v1";
+
+pub fn loadScopedRetries(alloc: Allocator, store: anytype) !scoped_retries.State {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginProbe();
+    defer txn.abort();
+    const raw = txn.get(scoped_retry_key) catch |err| if (err == error.NotFound) return .{} else return err;
+    if (!scoped_retries.State.isHeader(raw)) return scoped_retries.State.decode(alloc, raw);
+    var header = try scoped_retries.State.decodeHeader(alloc, raw);
+    errdefer header.state.deinit(alloc);
+    for (header.slots[0..header.count]) |slot| {
+        const bytes = try txn.get(&scopedRetryTicketKey(slot));
+        var ticket = try scoped_retries.State.decodeTicket(alloc, bytes, slot);
+        errdefer ticket.deinit(alloc);
+        try header.state.tickets.append(alloc, ticket);
+    }
+    header.state.markPersisted();
+    return header.state;
+}
+
+fn saveScopedRetries(store: anytype, raw: []const u8) !void {
+    var runtime = try initRuntimeStore(std.heap.page_allocator, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    try txn.put(scoped_retry_key, raw);
+    try txn.commit();
+}
+
+const scoped_retry_ticket_prefix = "\x00\x00__metadata__:enrichment_scoped_retry_ticket:v2:";
+fn scopedRetryTicketKey(slot: u8) [scoped_retry_ticket_prefix.len + 1]u8 {
+    var key: [scoped_retry_ticket_prefix.len + 1]u8 = undefined;
+    @memcpy(key[0..scoped_retry_ticket_prefix.len], scoped_retry_ticket_prefix);
+    key[scoped_retry_ticket_prefix.len] = slot;
+    return key;
+}
+
+/// One ownership-fenced transaction publishes the manifest, changed rows and
+/// retirements. A failed transaction leaves every dirty bit/old slot intact.
+pub fn saveScopedRetryState(a: Allocator, store: anytype, state: *scoped_retries.State, guard: anytype) !void {
+    const prepared = try state.preparePersistence(a, false);
+    defer prepared.deinit(a);
+    var runtime = try initRuntimeStore(a, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    try guard.validate(&txn);
+    for (prepared.rows) |row| try txn.put(&scopedRetryTicketKey(row.slot), row.bytes);
+    for (prepared.removed[0..prepared.removed_len]) |slot| txn.delete(&scopedRetryTicketKey(slot)) catch |err| if (err != error.NotFound) {
+        return err;
+    };
+    try txn.put(scoped_retry_key, prepared.header);
+    try txn.commit();
+    state.markPersisted();
+}
+
+test "durable enrichment scoped retry persists incremental records and migrates legacy clocks" {
+    const a = std.testing.allocator;
+    const backend_mod = @import("../../mem_backend.zig");
+    var backend = backend_mod.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "retry-migration" });
+    defer store.deinit();
+    const Guard = struct {
+        pub fn validate(_: @This(), _: anytype) !void {}
+    };
+    const old =
+        \\{"version":1,"scanned_sequence":100,"tickets":[{"document":"ZG9j","sequence":2,"source_digest":null,"deadline_ms":3601000,"revision":1,"budgets":[{"fingerprint":17,"logical_fingerprint":7,"failures":2,"waits":3,"deadline_ms":3601000,"revision":1}]}]}
+    ;
+    try saveScopedRetries(store, old);
+    var migrated = try loadScopedRetries(a, store);
+    defer migrated.deinit(a);
+    try saveScopedRetryState(a, store, &migrated, Guard{});
+    var restored = try loadScopedRetries(a, store);
+    defer restored.deinit(a);
+    try std.testing.expectEqual(@as(u64, 3_601_000), restored.deadline());
+    try std.testing.expectEqual(@as(u32, 2), restored.prior(17).failures);
+    try std.testing.expectEqual(@as(u32, 3), restored.prior(17).waits);
+    try std.testing.expectEqual(@as(u64, 1), restored.appliedThrough(100));
+    const unchanged = try restored.preparePersistence(a, false);
+    defer unchanged.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), unchanged.rows.len);
+    const due = try restored.due(a, 3_601_000);
+    defer due.deinit(a);
+    const old_slot = restored.tickets.items[0].slot;
+    restored.retire(a, due.tokens);
+    try saveScopedRetryState(a, store, &restored, Guard{});
+    var handle = try initRuntimeStore(a, store);
+    defer handle.deinit();
+    {
+        var read = try handle.store.beginProbe();
+        defer read.abort();
+        try std.testing.expectError(error.NotFound, read.get(&scopedRetryTicketKey(old_slot)));
+    }
+    // Reuse a retired slot. A rejected transaction cannot clear dirty state
+    // or expose a manifest that references an unwritten ticket.
+    try restored.park(a, .{ .doc_key = "replacement", .sequence = 101 }, 9_000_000, .{ .fingerprint = 19, .failures = 1 }, null);
+    try std.testing.expectEqual(old_slot, restored.tickets.items[0].slot);
+    const Reject = struct {
+        pub fn validate(_: @This(), _: anytype) !void {
+            return error.FenceLost;
+        }
+    };
+    try std.testing.expectError(error.FenceLost, saveScopedRetryState(a, store, &restored, Reject{}));
+    try std.testing.expect(restored.tickets.items[0].dirty);
+    var still_empty = try loadScopedRetries(a, store);
+    defer still_empty.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), still_empty.tickets.items.len);
+    try saveScopedRetryState(a, store, &restored, Guard{});
+    var reused = try loadScopedRetries(a, store);
+    defer reused.deinit(a);
+    try std.testing.expectEqual(@as(u64, 9_000_000), reused.deadline());
+    try std.testing.expectEqual(@as(u32, 1), reused.prior(19).failures);
+}
