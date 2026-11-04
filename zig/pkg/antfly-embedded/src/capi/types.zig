@@ -291,7 +291,7 @@ pub fn errorCodeDescription(code: c_int) [*:0]const u8 {
         @backingInt(ErrorCode.intent_conflict) => "a transaction intent conflicts with the requested operation",
         @backingInt(ErrorCode.txn_not_found) => "the requested transaction was not found",
         @backingInt(ErrorCode.busy) => "the requested resource is temporarily busy or changed during streaming; stabilize it and retry",
-        @backingInt(ErrorCode.outcome_unknown) => "the operation was published, but crash durability could not be confirmed; inspect the destination and do not retry automatically",
+        @backingInt(ErrorCode.outcome_unknown) => "the operation may have taken effect, but whether it applied or became durable could not be confirmed; inspect the affected data and do not retry automatically",
         @backingInt(ErrorCode.unsupported) => "the operation requires a capability that is not supported by this platform or filesystem",
         @backingInt(ErrorCode.stalled) => "derived work stalled or failed; inspect pending-work diagnostics and repair or reopen the database",
         @backingInt(ErrorCode.cancelled) => "the caller cancelled the operation",
