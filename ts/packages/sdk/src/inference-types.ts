@@ -72,7 +72,6 @@ export type RewriteResponse = components["schemas"]["InferenceRewriteResponse"];
 
 export type ModelsResponse = components["schemas"]["InferenceModelsResponse"];
 
-
 export type InferenceChatMessage = components["schemas"]["InferenceChatMessage"];
 export type GenerateRequest = components["schemas"]["InferenceGenerateRequest"];
 export type GenerateResponse = components["schemas"]["InferenceGenerateResponse"];

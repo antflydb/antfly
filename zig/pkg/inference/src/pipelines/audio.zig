@@ -28,6 +28,7 @@ pub const PcmAudio = generic.PcmAudio;
 pub const PcmAudioInterleaved = generic.PcmAudioInterleaved;
 pub const EncodedFormat = generic.EncodedFormat;
 pub const DecodeOptions = generic.DecodeOptions;
+pub const EncodedClip = generic.EncodedClip;
 pub const decodeWav = generic.decodeWav;
 pub const detectFormat = generic.detectFormat;
 pub const detectFormatFromMime = generic.detectFormatFromMime;

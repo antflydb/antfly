@@ -76,7 +76,7 @@ pub fn reconcileDbIndexesWithOptions(
     try collectDesiredEnrichmentsFromJson(alloc, indexes_json, options.embedding_options, &desired_enrichments);
     try indexes_api.validateArtifactEnrichmentConfigs(alloc, desired_enrichments.items);
     dedupeDesiredEnrichments(alloc, &desired_enrichments);
-    indexes_api.sortArtifactEnrichmentsByDependency(desired_enrichments.items);
+    try indexes_api.sortArtifactEnrichmentsByDependency(alloc, desired_enrichments.items);
 
     // Read/query opens attach to already-persisted index state only. Metadata-driven
     // materialization is owned by writable provisioners so stale readers never
@@ -146,7 +146,7 @@ pub fn reconcileDbIndexTargetWithOptions(
     try collectDesiredEnrichmentsFromJson(alloc, indexes_json, options.embedding_options, &desired_enrichments);
     try indexes_api.validateArtifactEnrichmentConfigs(alloc, desired_enrichments.items);
     dedupeDesiredEnrichments(alloc, &desired_enrichments);
-    indexes_api.sortArtifactEnrichmentsByDependency(desired_enrichments.items);
+    try indexes_api.sortArtifactEnrichmentsByDependency(alloc, desired_enrichments.items);
 
     var target_enrichments = std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig).empty;
     defer {
@@ -181,7 +181,7 @@ pub fn reconcileDbIndexTargetWithOptions(
     if (target_value) |value| {
         try indexes_api.collectArtifactEnrichmentsFromValueWithOptions(alloc, value, options.embedding_options, &target_enrichments);
         dedupeDesiredEnrichments(alloc, &target_enrichments);
-        indexes_api.sortArtifactEnrichmentsByDependency(target_enrichments.items);
+        try indexes_api.sortArtifactEnrichmentsByDependency(alloc, target_enrichments.items);
     }
     const enrichment_summary = try ensureEnrichments(db, target_enrichments.items);
 

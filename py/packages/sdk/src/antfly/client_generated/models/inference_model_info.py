@@ -38,6 +38,9 @@ class InferenceModelInfo:
         dense_output (InferenceModelInfoDenseOutput | Unset): Proven native dense output width and inclusive supported
             truncation range, read from resolved metadata without loading weights. Omitted when unknown or for non-embedding
             tasks.
+        model_revision_pinning (bool | Unset): The embedding endpoint enforces model_revision and acknowledges
+            successful execution in X-Antfly-Model-Revision for both JSON and numeric responses. An observed model_revision
+            alone does not establish this support. Default: False.
         model_revision (str | Unset): Immutable resolved embedding or generator generation, returned for scoped
             model/task discovery without loading weights.
         qualified_limits (InferenceModelInfoQualifiedLimits | Unset): Pull-time qualified request profiles for this
@@ -63,6 +66,7 @@ class InferenceModelInfo:
     chunking_limits: InferenceModelInfoChunkingLimits | Unset = UNSET
     inference_capabilities: InferenceModelInfoInferenceCapabilities | Unset = UNSET
     dense_output: InferenceModelInfoDenseOutput | Unset = UNSET
+    model_revision_pinning: bool | Unset = False
     model_revision: str | Unset = UNSET
     qualified_limits: InferenceModelInfoQualifiedLimits | Unset = UNSET
     compatibility: InferenceModelInfoCompatibility | Unset = UNSET
@@ -88,6 +92,8 @@ class InferenceModelInfo:
         dense_output: dict[str, Any] | Unset = UNSET
         if not isinstance(self.dense_output, Unset):
             dense_output = self.dense_output.to_dict()
+
+        model_revision_pinning = self.model_revision_pinning
 
         model_revision = self.model_revision
 
@@ -124,6 +130,8 @@ class InferenceModelInfo:
             field_dict["inference_capabilities"] = inference_capabilities
         if dense_output is not UNSET:
             field_dict["dense_output"] = dense_output
+        if model_revision_pinning is not UNSET:
+            field_dict["model_revision_pinning"] = model_revision_pinning
         if model_revision is not UNSET:
             field_dict["model_revision"] = model_revision
         if qualified_limits is not UNSET:
@@ -179,6 +187,8 @@ class InferenceModelInfo:
         else:
             dense_output = InferenceModelInfoDenseOutput.from_dict(_dense_output)
 
+        model_revision_pinning = d.pop("model_revision_pinning", UNSET)
+
         model_revision = d.pop("model_revision", UNSET)
 
         _qualified_limits = d.pop("qualified_limits", UNSET)
@@ -213,6 +223,7 @@ class InferenceModelInfo:
             chunking_limits=chunking_limits,
             inference_capabilities=inference_capabilities,
             dense_output=dense_output,
+            model_revision_pinning=model_revision_pinning,
             model_revision=model_revision,
             qualified_limits=qualified_limits,
             compatibility=compatibility,

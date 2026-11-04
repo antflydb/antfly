@@ -345,6 +345,15 @@ pub fn collectObsoleteEpochPage(alloc: std.mem.Allocator, store_handle: anytype,
 /// it on every cleanup page. Registries without local identity keep all current
 /// epoch rows, preserving the ordinary obligation-GC contract.
 pub fn collectObsoleteEpochPageForIdentity(alloc: std.mem.Allocator, store_handle: anytype, comptime registry_prefix: []const u8, comptime min_identity_bytes: usize, comptime max_identity_bytes: usize, active_identity: ?[]const u8) !bool {
+    return collectObsoleteEpochPageForIdentityWithRetention(alloc, store_handle, registry_prefix, min_identity_bytes, max_identity_bytes, active_identity, struct {
+        pub fn epoch(_: anytype, authority: publication.Authority) !u64 {
+            return authority.epoch;
+        }
+    });
+}
+
+pub fn collectObsoleteEpochPageForIdentityWithRetention(alloc: std.mem.Allocator, store_handle: anytype, comptime registry_prefix: []const u8, comptime min_identity_bytes: usize, comptime max_identity_bytes: usize, active_identity: ?[]const u8, comptime Retention: type) !bool {
+    var retained_epoch: u64 = 0;
     comptime std.debug.assert(std.mem.startsWith(u8, registry_prefix, "\x00\x00__artifact_publication__:"));
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -355,6 +364,7 @@ pub fn collectObsoleteEpochPageForIdentity(alloc: std.mem.Allocator, store_handl
         var read = try store_handle.beginReadTxnWithBlockCacheAdmission(.transient);
         defer read.abort();
         const authority = (try publication.authority(&read)) orelse return true;
+        retained_epoch = try Retention.epoch(&read, authority);
         const prefix = try std.mem.concat(scratch, u8, &.{ registry_prefix, &authority.namespace });
         var cursor = try read.openPhysicalCursorAdapter();
         defer cursor.close();
@@ -369,11 +379,11 @@ pub fn collectObsoleteEpochPageForIdentity(alloc: std.mem.Allocator, store_handl
             if (item.key.len < prefix.len + 8 + min_identity_bytes or item.key.len > prefix.len + 8 + max_identity_bytes) return error.ArtifactCatalogCorrupt;
             const epoch = std.mem.readInt(u64, item.key[prefix.len..][0..8], .big);
             if (epoch == 0) return error.ArtifactCatalogCorrupt;
-            if (epoch > authority.epoch or (epoch == authority.epoch and active_identity == null)) {
+            if (epoch > authority.epoch or (epoch == retained_epoch and active_identity == null)) {
                 entry = null;
                 break;
             }
-            if (epoch == authority.epoch) if (active_identity) |identity| {
+            if (epoch == retained_epoch) if (active_identity) |identity| {
                 if (identity.len == 0 or identity.len > min_identity_bytes) return error.InvalidArgument;
                 if (std.mem.startsWith(u8, item.key[prefix.len + 8 ..], identity)) {
                     const upper = try @import("../internal_keys.zig").nextPrefixAlloc(scratch, item.key[0 .. prefix.len + 8 + identity.len]);
@@ -393,7 +403,7 @@ pub fn collectObsoleteEpochPageForIdentity(alloc: std.mem.Allocator, store_handl
     var write = try store_handle.beginWriteTxn();
     errdefer write.abort();
     const current = (try publication.authority(&write)) orelse return error.ArtifactCatalogDrift;
-    if (!std.meta.eql(current, authority)) return error.ArtifactCatalogDrift;
+    if (!std.meta.eql(current, authority) or try Retention.epoch(&write, current) != retained_epoch) return error.ArtifactCatalogDrift;
     for (retired.items) |retired_key| write.delete(retired_key) catch |err| switch (err) {
         error.NotFound => {},
         else => return err,
