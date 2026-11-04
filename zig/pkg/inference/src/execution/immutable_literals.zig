@@ -70,8 +70,7 @@ pub const SharedLiteralStore = struct {
             const backend = eligible(graph, plan, backends, @intCast(node_id)) orelse continue;
             const attrs = node.op.constant;
             const bytes = try std.math.mul(usize, attrs.data_len, @sizeOf(f32));
-            const functions = backends[backend].vtable.kernels.?;
-            const bound = if (functions.physicalStorageReservationBytes) |query| try query(backends[backend].ptr, bytes) else bytes;
+            const bound = try ops.physical_storage.reservationBytes(backends[backend], .{ .byte_size = bytes });
             if (bound < bytes) return error.InvalidPhysicalStorageReservation;
             literals[index] = .{ .node = @intCast(node_id), .shape = node.output_shape, .data = graph.constantData(attrs.data_offset, attrs.data_len), .allocation = try plan.addConstantBinding(backends[backend].kind(), bytes), .backend_index = backend, .cold_bound = bound };
             indices[node_id] = @intCast(index);
@@ -467,20 +466,21 @@ const LiteralCallbackProbe = struct {
         try native.vtable_impl.kernels.?.writePhysicalFloat32.?(raw, value, input);
         if (self.fail_upload) return error.InjectedLiteralUploadFailure;
     }
-    fn allocate(raw: *anyopaque, bytes: usize) !?CT {
+    fn allocate(raw: *anyopaque, request: ops.physical_storage.Request) !?CT {
         try fromCompute(raw).outsideMutex();
-        return native.vtable_impl.kernels.?.allocatePhysicalStorage.?(raw, bytes);
+        return native.vtable_impl.kernels.?.physical_storage_policy.?.allocate(raw, request);
     }
     fn view(raw: *anyopaque, request: ops.physical_storage.View) !?CT {
         try fromCompute(raw).outsideMutex();
         return native.vtable_impl.kernels.?.physicalTensorView.?(raw, request);
     }
+    const physical_policy: ops.physical_storage.Policy = .{ .allocate = allocate };
     const kernels: ops.KernelBackend = blk: {
         var result = native.vtable_impl.kernels.?.*;
         result.implementation_table = null;
         result.acceptsImplementation = null;
         result.createPhysicalCompletion = completion;
-        result.allocatePhysicalStorage = allocate;
+        result.physical_storage_policy = &physical_policy;
         result.physicalTensorView = view;
         result.writePhysicalFloat32 = write;
         break :blk result;

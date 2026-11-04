@@ -28,6 +28,8 @@ pub const SegmentAttentionGemm = struct {
     pub const key_block = 512;
     pub const sgemmTransBSync = @import("native.zig").sgemmTransBSync;
     pub const sgemmSync = @import("native.zig").sgemmSync;
+    pub const sgemmSyncValue = @import("native.zig").sgemmSyncValue;
+    pub const sgemmTransBSyncValue = @import("native.zig").sgemmTransBSyncValue;
 };
 
 /// A 512-query BLAS tile amortizes dispatch for wide heads and short segments.
@@ -38,6 +40,8 @@ pub fn WideSegmentAttentionGemm(comptime key_tile: usize) type {
         pub const key_block = key_tile;
         pub const sgemmTransBSync = @import("native.zig").sgemmTransBSync;
         pub const sgemmSync = @import("native.zig").sgemmSync;
+        pub const sgemmSyncValue = @import("native.zig").sgemmSyncValue;
+        pub const sgemmTransBSyncValue = @import("native.zig").sgemmTransBSyncValue;
     };
 }
 
@@ -142,6 +146,31 @@ const c = struct {
 pub const Io = std.Io;
 pub const Cancelable = std.Io.Cancelable;
 
+const ObservedGemm = enum { normal, transposed, transposed_f16 };
+fn observedGemm(comptime family: ObservedGemm, io: ?Io, m: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: anytype, beta: f32, c_out: []f32) Cancelable!void {
+    const observed = @import("../execution/runtime_observation.zig");
+    if (!observed.kernelEnabled()) {
+        switch (family) {
+            .normal => if (io) |active| try linalg.sgemm(active, m, n, k, alpha, a, b, beta, c_out) else linalg.sgemmSync(m, n, k, alpha, a, b, beta, c_out),
+            .transposed => if (io) |active| try linalg.sgemmTransB(active, m, n, k, alpha, a, b, beta, c_out) else linalg.sgemmTransBSync(m, n, k, alpha, a, b, beta, c_out),
+            .transposed_f16 => if (io) |active| try linalg.sgemmTransBF16Weights(active, m, n, k, alpha, a, b, beta, c_out) else linalg.sgemmTransBF16WeightsSync(m, n, k, alpha, a, b, beta, c_out),
+        }
+        return;
+    }
+    return observedGemmEnabled(family, io, m, n, k, alpha, a, b, beta, c_out);
+}
+noinline fn observedGemmEnabled(comptime family: ObservedGemm, io: ?Io, m: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: anytype, beta: f32, c_out: []f32) Cancelable!void {
+    const observed = @import("../execution/runtime_observation.zig");
+    var value: linalg.GemmObservation = .{};
+    defer observed.nativeDenseWorkers(value);
+    const evidence: ?*linalg.GemmObservation = &value;
+    switch (family) {
+        .normal => if (io) |active| try linalg.sgemmObserved(active, m, n, k, alpha, a, b, beta, c_out, evidence) else linalg.sgemmSyncObserved(m, n, k, alpha, a, b, beta, c_out, evidence),
+        .transposed => if (io) |active| try linalg.sgemmTransBObserved(active, m, n, k, alpha, a, b, beta, c_out, evidence) else linalg.sgemmTransBSyncObserved(m, n, k, alpha, a, b, beta, c_out, evidence),
+        .transposed_f16 => if (io) |active| try linalg.sgemmTransBF16WeightsObserved(active, m, n, k, alpha, a, b, beta, c_out, evidence) else linalg.sgemmTransBF16WeightsSyncObserved(m, n, k, alpha, a, b, beta, c_out, evidence),
+    }
+}
+
 // --- Canonical Io-aware API ---
 //
 // These take an `io: std.Io` and dispatch via `linalg.sgemm*`, which uses
@@ -162,7 +191,7 @@ pub fn sgemm(
     c_out: []f32,
 ) Cancelable!void {
     if (!useBlas()) {
-        return linalg.sgemm(io, m, n, k, alpha, a, b, beta, c_out);
+        return observedGemm(.normal, io, m, n, k, alpha, a, b, beta, c_out);
     }
     sgemmSync(m, n, k, alpha, a, b, beta, c_out);
 }
@@ -181,7 +210,7 @@ pub fn sgemmTransB(
     c_out: []f32,
 ) Cancelable!void {
     if (!useBlas()) {
-        return linalg.sgemmTransB(io, m, n, k, alpha, a, b, beta, c_out);
+        return observedGemm(.transposed, io, m, n, k, alpha, a, b, beta, c_out);
     }
     sgemmTransBSync(m, n, k, alpha, a, b, beta, c_out);
 }
@@ -235,8 +264,8 @@ pub fn sgemmTransBStrided(
         return;
     }
     if (output_stride == n) {
-        if (io) |runtime_io| return linalg.sgemmTransB(runtime_io, m, n, k, alpha, a, b, beta, c_out);
-        linalg.sgemmTransBSync(m, n, k, alpha, a, b, beta, c_out);
+        if (io) |runtime_io| return observedGemm(.transposed, runtime_io, m, n, k, alpha, a, b, beta, c_out);
+        observedGemm(.transposed, null, m, n, k, alpha, a, b, beta, c_out) catch unreachable;
         return;
     }
     // The portable API has no output leading dimension. Callers processing
@@ -245,9 +274,9 @@ pub fn sgemmTransBStrided(
         const output_row = c_out[row * output_stride ..][0..n];
         const input_row = a[row * k ..][0..k];
         if (io) |runtime_io| {
-            try linalg.sgemmTransB(runtime_io, 1, n, k, alpha, input_row, b, beta, output_row);
+            try observedGemm(.transposed, runtime_io, 1, n, k, alpha, input_row, b, beta, output_row);
         } else {
-            linalg.sgemmTransBSync(1, n, k, alpha, input_row, b, beta, output_row);
+            observedGemm(.transposed, null, 1, n, k, alpha, input_row, b, beta, output_row) catch unreachable;
         }
     }
 }
@@ -286,7 +315,7 @@ pub fn sgemmTransBF16Weights(
     beta: f32,
     c_out: []f32,
 ) Cancelable!void {
-    return linalg.sgemmTransBF16Weights(io, m, n, k, alpha, a, b, beta, c_out);
+    return observedGemm(.transposed_f16, io, m, n, k, alpha, a, b, beta, c_out);
 }
 
 // --- Sync escape hatches ---
@@ -308,7 +337,7 @@ pub fn sgemmSync(
     c_out: []f32,
 ) void {
     if (!useBlas()) {
-        linalg.sgemmSync(m, n, k, alpha, a, b, beta, c_out);
+        observedGemm(.normal, null, m, n, k, alpha, a, b, beta, c_out) catch unreachable;
         return;
     }
     c.sgemm(
@@ -340,7 +369,7 @@ pub fn sgemmTransBSync(
     c_out: []f32,
 ) void {
     if (!useBlas()) {
-        linalg.sgemmTransBSync(m, n, k, alpha, a, b, beta, c_out);
+        observedGemm(.transposed, null, m, n, k, alpha, a, b, beta, c_out) catch unreachable;
         return;
     }
     c.sgemm(
@@ -371,7 +400,7 @@ pub fn sgemmTransBF16WeightsSync(
     beta: f32,
     c_out: []f32,
 ) void {
-    linalg.sgemmTransBF16WeightsSync(m, n, k, alpha, a, b, beta, c_out);
+    observedGemm(.transposed_f16, null, m, n, k, alpha, a, b, beta, c_out) catch unreachable;
 }
 
 /// SGEMM with A transposed: C = alpha * A^T @ B + beta * C
@@ -388,7 +417,7 @@ pub fn sgemmTransA(
     c_out: []f32,
 ) void {
     if (!useBlas()) {
-        linalg.sgemmTransA(m, n, k, alpha, a, b, beta, c_out);
+        sgemmTransAAuthored(m, n, k, alpha, a, b, beta, c_out);
         return;
     }
     c.sgemm(
@@ -407,7 +436,105 @@ pub fn sgemmTransA(
         c_out.ptr,
         @intCast(n),
     );
+    @import("../execution/runtime_observation.zig").nativeTransposedA(0, true);
 }
 
 pub const l2Normalize = linalg.l2Normalize;
 pub const meanPool = linalg.meanPool;
+
+test "Native actual dense worker dispatch values publish authored leaf identity while public BLAS stays opaque" {
+    const observation = @import("../execution/runtime_observation.zig");
+    const a = std.testing.allocator;
+    const input = try a.alloc(f32, 64 * 513);
+    defer a.free(input);
+    @memset(input, 1);
+    const weights = try a.alloc(f32, 131 * 513);
+    defer a.free(weights);
+    @memset(weights, 2);
+    const output = try a.alloc(f32, 64 * 131);
+    defer a.free(output);
+    var parent: observation.KernelScope = .{};
+    parent.begin();
+    var parent_live = true;
+    defer if (parent_live) {
+        _ = parent.finish();
+    };
+    var child: observation.KernelScope = .{};
+    child.begin();
+    var child_live = true;
+    defer if (child_live) {
+        _ = child.finish();
+    };
+    try observedGemm(.normal, null, 64, 131, 513, 1, input, weights, 0, output);
+    _ = child.finish();
+    child_live = false;
+    try std.testing.expect(child.native_workers.dense_dispatched_workers > 0);
+    try std.testing.expectEqual(child.native_workers.dense_entered_workers, child.native_workers.dense_returned_workers);
+    var returns: u64 = 0;
+    for (child.native_workers.dense_successful_leaf_returns) |count| returns += count;
+    try std.testing.expectEqual(child.native_workers.dense_returned_workers, returns);
+    try std.testing.expectEqual(@as(u64, 0), child.native_workers.dense_successful_leaf_returns[2] + child.native_workers.dense_successful_leaf_returns[3]);
+    const before_public = parent.native_workers.dense_returned_workers;
+    sgemmSync(64, 131, 513, 1, input, weights, 0, output);
+    if (useBlas()) try std.testing.expectEqual(before_public, parent.native_workers.dense_returned_workers) else try std.testing.expect(parent.native_workers.dense_returned_workers > before_public);
+    _ = parent.finish();
+    parent_live = false;
+    for (output) |value| try std.testing.expectEqual(@as(f32, 1026), value);
+}
+
+/// Explicit worker-local values. These functions never look up an observing
+/// scope or publish from a worker. Vendor calls preserve their existing entry
+/// and expose only the actual synchronous API return, never internal kernels.
+pub fn sgemmSyncValue(m: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f32, beta: f32, c_out: []f32, result: *linalg.GemmObservation) void {
+    if (useBlas()) {
+        sgemmSync(m, n, k, alpha, a, b, beta, c_out);
+        result.opaque_vendor_returns +|= 1;
+    } else linalg.sgemmSyncObserved(m, n, k, alpha, a, b, beta, c_out, result);
+}
+pub fn sgemmTransBSyncValue(m: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f32, beta: f32, c_out: []f32, result: *linalg.GemmObservation) void {
+    if (useBlas()) {
+        sgemmTransBSync(m, n, k, alpha, a, b, beta, c_out);
+        result.opaque_vendor_returns +|= 1;
+    } else linalg.sgemmTransBSyncObserved(m, n, k, alpha, a, b, beta, c_out, result);
+}
+
+// This is the actual portable branch used by the public adapter. The arithmetic
+// remains in linalg; the post-return note has only the existing TLS-null check.
+fn sgemmTransAAuthored(m: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f32, beta: f32, c_out: []f32) void {
+    linalg.sgemmTransA(m, n, k, alpha, a, b, beta, c_out);
+    @import("../execution/runtime_observation.zig").nativeTransposedA(@intFromPtr(&linalg.sgemmTransA), false);
+}
+test "Native actual transposed A branch preserves beta tails and separates vendor API returns" {
+    const observation = @import("../execution/runtime_observation.zig");
+    const a = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const b = [_]f32{ 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+    var authored: [6]f32 = @splat(2);
+    var public: [6]f32 = @splat(2);
+    var outer: observation.KernelScope = .{};
+    outer.begin();
+    defer if (outer.attached) {
+        _ = outer.finish();
+    };
+    var inner: observation.KernelScope = .{};
+    inner.begin();
+    defer if (inner.attached) {
+        _ = inner.finish();
+    };
+    sgemmTransAAuthored(2, 3, 3, 0.5, &a, &b, 0.25, &authored);
+    _ = inner.finish();
+    try std.testing.expectEqual(@as(u64, 1), inner.native_workers.transposed_a_successful_body_returns);
+    try std.testing.expectEqual(@intFromPtr(&linalg.sgemmTransA), inner.native_workers.transposed_a_body_identity);
+    sgemmTransA(2, 3, 3, 0.5, &a, &b, 0.25, &public);
+    _ = outer.finish();
+    for (0..2) |row| for (0..3) |col| {
+        var expected: f32 = 0.5;
+        for (0..3) |k| expected += 0.5 * a[k * 2 + row] * b[k * 3 + col];
+        try std.testing.expectEqual(expected, authored[row * 3 + col]);
+        try std.testing.expectApproxEqAbs(expected, public[row * 3 + col], 1e-5);
+    };
+    try std.testing.expectEqual(@as(u64, if (useBlas()) 1 else 2), outer.native_workers.transposed_a_successful_body_returns);
+    try std.testing.expectEqual(@as(u64, if (useBlas()) 1 else 0), outer.native_workers.transposed_a_vendor_api_returns);
+    const held = outer.native_workers;
+    outer.native_workers = .{};
+    try std.testing.expectEqual(@as(u64, 1), held.transposed_a_successful_body_returns - @intFromBool(!useBlas()));
+}

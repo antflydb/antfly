@@ -531,7 +531,10 @@ pub const Model = struct {
 
         // Is it an initializer (weight)?
         if (self.initializer_map.get(name)) |init_idx| {
-            const tensor = self.initializerAt(init_idx) catch return error.NodeNotFound;
+            const tensor = self.initializerAt(init_idx) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.NodeNotFound,
+            };
             const shape = try tensor_mod.tensorShape(tensor);
             const count = tensor_mod.numElements(tensor.dims);
 

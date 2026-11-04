@@ -59,6 +59,9 @@ pub const ProjectedImages = struct {
 
 /// Owned projected rows in input order. The creating backend must outlive this value.
 pub const ResidentProjectedImages = struct {
+    /// Semantic producer attestation only. Physical provenance and lifetime
+    /// still require the actual backend/runtime owner checks at handoff.
+    pub const OutputOwnership = enum { unknown, completed_fresh_destination };
     allocator: std.mem.Allocator,
     backend: *const ComputeBackend,
     embeddings: CT,
@@ -66,6 +69,7 @@ pub const ResidentProjectedImages = struct {
     hidden_size: usize,
     batches_executed: usize,
     max_batch_executed: usize,
+    output_ownership: OutputOwnership = .unknown,
 
     pub fn deinit(self: *ResidentProjectedImages) void {
         self.backend.free(self.embeddings);
@@ -2766,7 +2770,7 @@ fn encodePreparedImagesResidentWithWeights(cb: *const ComputeBackend, a: std.mem
         batches += 1;
         maximum = @max(maximum, count);
     }
-    return .{ .allocator = a, .backend = cb, .embeddings = tensor, .tokens_per_image = lengths, .hidden_size = cfg.text_hidden, .batches_executed = batches, .max_batch_executed = maximum };
+    return .{ .allocator = a, .backend = cb, .embeddings = tensor, .tokens_per_image = lengths, .hidden_size = cfg.text_hidden, .batches_executed = batches, .max_batch_executed = maximum, .output_ownership = .completed_fresh_destination };
 }
 
 pub fn encodePreparedEmbeddingGemma2ImagesResident(cb: *const ComputeBackend, a: std.mem.Allocator, prepared: []const PreparedImage, options: ImageBatchOptions) !ResidentProjectedImages {

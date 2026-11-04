@@ -74,6 +74,7 @@ pub const HostBuffer = struct {
 };
 
 pub const DeviceBuffer = struct {
+    pub const Purpose = @import("allocation_budget.zig").OwnedPurpose;
     /// CUDA cuMemAlloc base guarantee, also used by canonical cuBLASLt profiles.
     /// Borrowed private KV slots preserve this base selection contract.
     pub const allocation_alignment: usize = 256;
@@ -82,11 +83,17 @@ pub const DeviceBuffer = struct {
     /// Original allocation size, independent of a logical view's length.
     /// Non-owning descriptors constructed from pointers have no charge.
     allocation_bytes: usize = 0,
+    /// Immutable birth purpose travels with the movable ownership descriptor.
+    /// Borrowed views never allocate/free; no post-publication re-tagging.
+    allocation_purpose: @import("allocation_budget.zig").OwnedPurpose = .unclassified,
     /// Suballocations of a graph arena cannot be freed through an op's direct
     /// error cleanup. The arena owner alone releases their physical storage.
     borrowed: bool = false,
 
     pub fn alloc(ctx: *context_mod.CudaContext, len: usize) driver_mod.Error!DeviceBuffer {
+        return allocWithPurpose(ctx, len, .unclassified);
+    }
+    pub fn allocWithPurpose(ctx: *context_mod.CudaContext, len: usize, purpose: @import("allocation_budget.zig").OwnedPurpose) driver_mod.Error!DeviceBuffer {
         if (len == 0) return .{};
         try ctx.makeCurrent();
         try ctx.device_allocations.reserve(len);
@@ -105,8 +112,8 @@ pub const DeviceBuffer = struct {
             std.log.err("CUDA cuMemAlloc failed: bytes={d} error={s} ({s})", .{ len, ctx.driver.errorName(result), ctx.driver.errorString(result) });
             return error.CudaDriverError;
         }
-        ctx.device_allocations.allocated(len);
-        return .{ .ptr = ptr, .len = len, .allocation_bytes = len };
+        ctx.device_allocations.allocatedWithPurpose(len, purpose);
+        return .{ .ptr = ptr, .len = len, .allocation_bytes = len, .allocation_purpose = purpose };
     }
 
     /// Retained owners must preserve both the address and its physical charge
@@ -121,7 +128,7 @@ pub const DeviceBuffer = struct {
         const bytes = self.allocation_bytes;
         const result = ctx.driver.fns.cuMemFree(self.ptr);
         if (result != driver_mod.CUDA_SUCCESS) return error.CudaDriverError;
-        ctx.device_allocations.freed(bytes);
+        ctx.device_allocations.freedWithPurpose(bytes, self.allocation_purpose);
         self.* = .{};
         return bytes;
     }
@@ -135,7 +142,7 @@ pub const DeviceBuffer = struct {
             ctx.makeCurrent() catch {};
             const result = ctx.driver.fns.cuMemFree(self.ptr);
             if (result == driver_mod.CUDA_SUCCESS) {
-                ctx.device_allocations.freed(self.allocation_bytes);
+                ctx.device_allocations.freedWithPurpose(self.allocation_bytes, self.allocation_purpose);
             } else {
                 // Keep the failed free charged; it cannot authorize a later
                 // allocation. Context teardown remains the final cleanup.
@@ -281,4 +288,47 @@ test "CUDA strict transfer audit rejects downloads before any driver access" {
     try std.testing.expectError(error.DeviceReadbackForbidden, storage.copyToHost(undefined, &bytes));
     try std.testing.expectEqual(@as(u64, 0), scope.download_calls);
     try std.testing.expectError(error.InvalidCudaState, (DeviceBuffer{ .ptr = 4096, .len = 2 }).copyToHost(undefined, &bytes));
+}
+
+test "CUDA immutable allocation purpose fits original descriptor and survives checked free failure" {
+    const Original = struct { ptr: driver_mod.CUdeviceptr = 0, len: usize = 0, allocation_bytes: usize = 0, borrowed: bool = false };
+    try std.testing.expectEqual(@sizeOf(Original), @sizeOf(DeviceBuffer));
+    try std.testing.expectEqual(@alignOf(Original), @alignOf(DeviceBuffer));
+    const Mock = struct {
+        var fail_free: bool = true;
+        var fail_alloc: bool = true;
+        fn setCurrent(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn alloc(ptr: *driver_mod.CUdeviceptr, _: usize) callconv(.c) driver_mod.CUresult {
+            if (fail_alloc) return driver_mod.CUDA_ERROR_OUT_OF_MEMORY;
+            ptr.* = 16;
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn free(_: driver_mod.CUdeviceptr) callconv(.c) driver_mod.CUresult {
+            return if (fail_free) driver_mod.CUDA_ERROR_OUT_OF_MEMORY else driver_mod.CUDA_SUCCESS;
+        }
+    };
+    var ctx: context_mod.CudaContext = undefined;
+    ctx.observation = .init(null);
+    ctx.observation_enable_failed = .init(false);
+    ctx.ctx = @ptrFromInt(1);
+    ctx.device_allocations = .{ .limit = 32 };
+    ctx.driver.fns.cuCtxSetCurrent = Mock.setCurrent;
+    ctx.driver.fns.cuMemAlloc = Mock.alloc;
+    ctx.driver.fns.cuMemFree = Mock.free;
+    Mock.fail_alloc = true;
+    Mock.fail_free = true;
+    try std.testing.expectError(error.CudaMemoryLimitExceeded, DeviceBuffer.allocWithPurpose(&ctx, 16, .kv_state));
+    try std.testing.expectEqual(@as(u64, 0), ctx.device_allocations.snapshot().purpose_peak[@backingInt(DeviceBuffer.Purpose.kv_state)]);
+    try std.testing.expectEqual(@as(u64, 0), ctx.device_allocations.snapshot().allocations);
+    Mock.fail_alloc = false;
+    var buffer = try DeviceBuffer.allocWithPurpose(&ctx, 16, .kv_state);
+    const before = ctx.device_allocations.snapshot();
+    try std.testing.expectError(error.CudaDriverError, buffer.freeChecked(&ctx));
+    try std.testing.expectEqualDeep(before, ctx.device_allocations.snapshot());
+    try std.testing.expectEqual(DeviceBuffer.Purpose.kv_state, buffer.allocation_purpose);
+    Mock.fail_free = false;
+    try std.testing.expectEqual(@as(usize, 16), try buffer.freeChecked(&ctx));
+    try std.testing.expectEqual(@as(u64, 0), ctx.device_allocations.snapshot().purpose_live[@backingInt(DeviceBuffer.Purpose.kv_state)]);
 }

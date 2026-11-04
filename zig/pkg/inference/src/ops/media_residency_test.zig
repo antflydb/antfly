@@ -44,10 +44,13 @@ pub fn onNative(comptime populate: anytype, comptime check: anytype) !void {
 }
 
 pub fn onMetal(comptime populate: anytype, comptime check: anytype) !void {
+    return onMetalWithAllocator(std.testing.allocator, populate, check);
+}
+
+pub fn onMetalWithAllocator(allocator: std.mem.Allocator, comptime populate: anytype, comptime check: anytype) !void {
     if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
     const metal = @import("metal_compute.zig");
-    const allocator = std.testing.allocator;
     var weights = native.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer weights.deinitOwned();
     try populate(&weights);

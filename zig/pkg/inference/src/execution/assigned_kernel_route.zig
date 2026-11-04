@@ -210,3 +210,11 @@ pub fn belongsTo(selected: *const route.Owned, backend: ops.ComputeBackend) bool
     const owner: *const Direct = @ptrCast(@alignCast(selected.context));
     return owner.backend.ptr == backend.ptr and owner.backend.vtable == backend.vtable;
 }
+
+/// A provider may attest only its exact private Direct implementation. This
+/// does not change invocation validation or certify a model Tensor's layout.
+pub fn belongsToProgram(selected: *const route.Owned, backend: ops.ComputeBackend, support: Support) bool {
+    if (!belongsTo(selected, backend)) return false;
+    const owner: *const Direct = @ptrCast(@alignCast(selected.context));
+    return owner.support == support;
+}

@@ -32,20 +32,18 @@ pub fn textEncoderForward(
     batch: usize,
     seq_len: usize,
 ) ![]f32 {
-    const bert_cfg = cfg.text_config;
-    const H = bert_cfg.hidden_size;
-    const total = batch * seq_len;
-
-    var hidden = try embeddings(cb, allocator, input_ids, token_type_ids, total, seq_len, H, cfg.text_pad_token_id);
-    for (0..bert_cfg.num_hidden_layers) |layer| {
-        const new_hidden = try encoderLayer(cb, hidden, attention_mask, batch, seq_len, layer, bert_cfg);
-        cb.free(hidden);
-        hidden = new_hidden;
+    if (cb.vtable.takeRows != null) {
+        const output = try textEncoderForwardTensor(cb, allocator, cfg, input_ids, attention_mask, token_type_ids, batch, seq_len);
+        defer cb.free(output);
+        return cb.toFloat32(output, allocator);
     }
-
-    const hidden_data = try cb.toFloat32(hidden, allocator);
+    const H = cfg.text_config.hidden_size;
+    const hidden_data = exported: {
+        const hidden = try textEncoderHiddenTensor(cb, allocator, cfg, input_ids, attention_mask, token_type_ids, batch, seq_len);
+        defer cb.free(hidden);
+        break :exported try cb.toFloat32(hidden, allocator);
+    };
     defer allocator.free(hidden_data);
-    cb.free(hidden);
 
     const pooled = try allocator.alloc(f32, batch * H);
     defer allocator.free(pooled);
@@ -54,6 +52,55 @@ pub fn textEncoderForward(
     }
 
     return projectText(cb, allocator, cfg, pooled, batch);
+}
+
+pub fn textEncoderForwardTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: clap_mod.Config, input_ids: []const i64, attention_mask: []const i64, token_type_ids: ?[]const i64, batch: usize, seq_len: usize) !CT {
+    const tokens = std.math.mul(usize, batch, seq_len) catch return error.InvalidInputShape;
+    if (batch == 0 or seq_len == 0 or input_ids.len != tokens or attention_mask.len != tokens or (token_type_ids != null and token_type_ids.?.len != tokens)) return error.InvalidInputShape;
+    if (cb.vtable.takeRows == null) return error.UnsupportedResidentClapText;
+    const H: usize = cfg.text_config.hidden_size;
+    const pooled = selected: {
+        const hidden = try textEncoderHiddenTensor(cb, allocator, cfg, input_ids, attention_mask, token_type_ids, batch, seq_len);
+        defer cb.free(hidden);
+        const rows = try allocator.alloc(u32, batch);
+        defer allocator.free(rows);
+        for (rows, 0..) |*row, b| row.* = std.math.cast(u32, b * seq_len) orelse return error.InvalidInputShape;
+        break :selected (try cb.takeRows(hidden, rows, batch, H)) orelse return error.UnsupportedResidentClapText;
+    };
+    defer cb.free(pooled);
+    if (try cb.tensorDType(pooled) != .f32) return error.UnsupportedResidentPrecisionBoundary;
+    const projected = try clapLinearTensor(cb, pooled, batch, H, H, "text_model.pooler.dense.weight", "text_model.pooler.dense.bias");
+    defer cb.free(projected);
+    const activated_pool = try cb.tanh_act(projected);
+    defer cb.free(activated_pool);
+    const activated = activation: {
+        const first = try clapLinearTensor(cb, activated_pool, batch, H, cfg.projection_dim, "text_projection.linear1.weight", "text_projection.linear1.bias");
+        defer cb.free(first);
+        if (try cb.tensorDType(first) != .f32) return error.UnsupportedResidentPrecisionBoundary;
+        break :activation switch (cfg.projection_hidden_act) {
+            .relu => try cb.relu(first),
+            .gelu => try cb.gelu(first),
+        };
+    };
+    defer cb.free(activated);
+    if (try cb.tensorDType(activated) != .f32) return error.UnsupportedResidentPrecisionBoundary;
+    return clapLinearTensor(cb, activated, batch, cfg.projection_dim, cfg.projection_dim, "text_projection.linear2.weight", "text_projection.linear2.bias");
+}
+
+fn textEncoderHiddenTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: clap_mod.Config, input_ids: []const i64, attention_mask: []const i64, token_type_ids: ?[]const i64, batch: usize, seq_len: usize) !CT {
+    const bert_cfg = cfg.text_config;
+    const H = bert_cfg.hidden_size;
+    const total = batch * seq_len;
+
+    var hidden = try embeddings(cb, allocator, input_ids, token_type_ids, total, seq_len, H, cfg.text_pad_token_id);
+    errdefer cb.free(hidden);
+    for (0..bert_cfg.num_hidden_layers) |layer| {
+        const new_hidden = try encoderLayer(cb, hidden, attention_mask, batch, seq_len, layer, bert_cfg);
+        cb.free(hidden);
+        hidden = new_hidden;
+    }
+
+    return hidden;
 }
 
 pub fn audioEncoderForward(
@@ -67,7 +114,7 @@ pub fn audioEncoderForward(
     mel_bins: usize,
     is_longer: []const u8,
 ) ![]f32 {
-    return audioEncoderForwardWithGraphTail(cb, allocator, cfg, input_features, batch, channels, time_frames, mel_bins, is_longer, null);
+    return (try audioEncoderForwardWithGraphTail(cb, allocator, cfg, input_features, batch, channels, time_frames, mel_bins, is_longer, null, .host)).?.host;
 }
 
 pub fn audioEncoderForwardGraphTail(
@@ -82,7 +129,14 @@ pub fn audioEncoderForwardGraphTail(
     is_longer: []const u8,
     strategy: graph_runtime.Strategy,
 ) ![]f32 {
-    return audioEncoderForwardWithGraphTail(cb, allocator, cfg, input_features, batch, channels, time_frames, mel_bins, is_longer, strategy);
+    return (try audioEncoderForwardWithGraphTail(cb, allocator, cfg, input_features, batch, channels, time_frames, mel_bins, is_longer, strategy, .host)).?.host;
+}
+
+const AudioOutput = union(enum) { host: []f32, resident: CT };
+
+pub fn audioEncoderForwardResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: clap_mod.Config, features: []const f32, batch: usize, channels: usize, frames: usize, mels: usize, longer: []const u8) !?CT {
+    const result = (try audioEncoderForwardWithGraphTail(cb, allocator, cfg, features, batch, channels, frames, mels, longer, null, .resident)) orelse return null;
+    return result.resident;
 }
 
 fn audioEncoderForwardWithGraphTail(
@@ -96,7 +150,9 @@ fn audioEncoderForwardWithGraphTail(
     mel_bins: usize,
     is_longer: []const u8,
     graph_tail_strategy: ?graph_runtime.Strategy,
-) ![]f32 {
+    placement: enum { host, resident },
+) !?AudioOutput {
+    if (placement == .resident and (graph_tail_strategy != null or !supportsResidentClapAudio(cb))) return null;
     const ac = cfg.audio_config;
     if (mel_bins != ac.num_mel_bins) return error.InvalidInputShape;
     if (channels == 0) return error.InvalidInputShape;
@@ -134,8 +190,9 @@ fn audioEncoderForwardWithGraphTail(
         };
         defer cb.free(input);
         const result = try audioEncoderFromPatchTokensTensor(cb, allocator, cfg, input, batch, out_height, out_width);
+        if (placement == .resident) return .{ .resident = result };
         defer cb.free(result);
-        return cb.toFloat32(result, allocator);
+        return .{ .host = try cb.toFloat32(result, allocator) };
     }
     var hidden = try patchEmbed(cb, allocator, image, batch, channels, height, width, ac, is_longer, graph_tail_strategy);
     height = out_height;
@@ -159,7 +216,7 @@ fn audioEncoderForwardWithGraphTail(
     const hidden_dim: usize = ac.hidden_size;
     if (graph_tail_strategy) |strategy| {
         defer allocator.free(hidden);
-        return clap_graph.runAudioTailGraph(cb, allocator, cfg, hidden, batch, height * width, hidden_dim, strategy);
+        return .{ .host = try clap_graph.runAudioTailGraph(cb, allocator, cfg, hidden, batch, height * width, hidden_dim, strategy) };
     }
 
     const hidden_normed = try layerNormData(
@@ -176,7 +233,7 @@ fn audioEncoderForwardWithGraphTail(
 
     const pooled = try avgPoolTokens(allocator, hidden_normed, batch, height * width, hidden_dim);
     allocator.free(hidden_normed);
-    return projectAudio(cb, allocator, cfg, pooled, batch);
+    return .{ .host = try projectAudio(cb, allocator, cfg, pooled, batch) };
 }
 
 fn projectText(
@@ -934,6 +991,7 @@ fn embeddings(
     const word_emb = try cb.getWeight("text_model.embeddings.word_embeddings.weight");
     defer cb.free(word_emb);
     var result = try cb.embeddingLookup(word_emb, input_ids, total, H);
+    errdefer cb.free(result);
 
     const pos_emb = try cb.getWeight("text_model.embeddings.position_embeddings.weight");
     defer cb.free(pos_emb);
@@ -961,7 +1019,10 @@ fn embeddings(
         const with_tt = try cb.add(result, tt_lookup);
         cb.free(result);
         result = with_tt;
-    } else |_| {}
+    } else |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => {},
+        else => return err,
+    }
 
     const ln_w = try cb.getWeight("text_model.embeddings.LayerNorm.weight");
     defer cb.free(ln_w);
@@ -1066,6 +1127,8 @@ fn encoderLayer(
     const attn_ln_b = try getLayerWeight(cb, layer, "attention.output.LayerNorm.bias", &attn_ln_b_buf);
     defer cb.free(attn_ln_b);
     const attn_normed = try cb.layerNorm(attn_res, attn_ln_w, attn_ln_b, H, 1e-12);
+    var attn_normed_live = true;
+    defer if (attn_normed_live) cb.free(attn_normed);
 
     var ffn_i_w_buf: [256]u8 = undefined;
     var ffn_i_b_buf: [256]u8 = undefined;
@@ -1090,6 +1153,7 @@ fn encoderLayer(
 
     const ffn_res = try cb.add(ffn_out, attn_normed);
     cb.free(attn_normed);
+    attn_normed_live = false;
     defer cb.free(ffn_res);
 
     var ffn_ln_w_buf: [256]u8 = undefined;
@@ -2076,4 +2140,410 @@ test "media residency CLAP audio Metal parity" {
 
 test "media residency CLAP audio CUDA parity" {
     try @import("../ops/media_residency_test.zig").onCuda(populateResidentClapWeights, checkClapAudioResidency);
+}
+
+const clap_text_resident_test_config = clap_mod.Config{ .text_config = .{ .model_type = .roberta, .hidden_size = 64, .num_hidden_layers = 1, .num_attention_heads = 2, .intermediate_size = 128, .max_position_embeddings = 8, .type_vocab_size = 2 }, .projection_dim = 16 };
+fn populateClapTextResidentWeights(store: *@import("../ops/native_compute.zig").WeightStore) !void {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.putWeight(store, "text_model.embeddings.word_embeddings.weight", &.{ 8, 64 }, null);
+    try fixture.putWeight(store, "text_model.embeddings.position_embeddings.weight", &.{ 8, 64 }, null);
+    try fixture.putWeight(store, "text_model.embeddings.token_type_embeddings.weight", &.{ 2, 64 }, null);
+    for ([_][]const u8{ "embeddings.LayerNorm", "encoder.layer.0.attention.output.LayerNorm", "encoder.layer.0.output.LayerNorm" }) |prefix| {
+        var key: [192]u8 = undefined;
+        try fixture.putWeight(store, try std.fmt.bufPrint(&key, "text_model.{s}.weight", .{prefix}), &.{64}, 1);
+        try fixture.putWeight(store, try std.fmt.bufPrint(&key, "text_model.{s}.bias", .{prefix}), &.{64}, 0);
+    }
+    for ([_][]const u8{ "attention.self.query", "attention.self.key", "attention.self.value", "attention.output.dense" }) |projection| {
+        var key: [192]u8 = undefined;
+        try fixture.putWeight(store, try std.fmt.bufPrint(&key, "text_model.encoder.layer.0.{s}.weight", .{projection}), &.{ 64, 64 }, null);
+        try fixture.putWeight(store, try std.fmt.bufPrint(&key, "text_model.encoder.layer.0.{s}.bias", .{projection}), &.{64}, null);
+    }
+    try fixture.putWeight(store, "text_model.encoder.layer.0.intermediate.dense.weight", &.{ 128, 64 }, null);
+    try fixture.putWeight(store, "text_model.encoder.layer.0.intermediate.dense.bias", &.{128}, null);
+    try fixture.putWeight(store, "text_model.encoder.layer.0.output.dense.weight", &.{ 64, 128 }, null);
+    try fixture.putWeight(store, "text_model.encoder.layer.0.output.dense.bias", &.{64}, null);
+    try fixture.putWeight(store, "text_model.pooler.dense.weight", &.{ 64, 64 }, null);
+    try fixture.putWeight(store, "text_model.pooler.dense.bias", &.{64}, null);
+    try fixture.putWeight(store, "text_projection.linear1.weight", &.{ 16, 64 }, null);
+    try fixture.putWeight(store, "text_projection.linear1.bias", &.{16}, null);
+    try fixture.putWeight(store, "text_projection.linear2.weight", &.{ 16, 16 }, null);
+    try fixture.putWeight(store, "text_projection.linear2.bias", &.{16}, null);
+}
+fn checkClapTextResident(cb: ComputeBackend, reference: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const ids = [_]i64{ 0, 3, 4, 1, 0, 2, 1, 1 };
+    const mask = [_]i64{ 1, 1, 1, 0, 1, 1, 0, 0 };
+    var legacy_table = reference.vtable.*;
+    legacy_table.takeRows = null;
+    const legacy = ComputeBackend{ .ptr = reference.ptr, .vtable = &legacy_table };
+    if (cb.kind() == .metal) try checkClapTextStages(cb, reference, &ids, &mask);
+    for ([_]clap_mod.ProjectionActivation{ .relu, .gelu }) |activation| {
+        var cfg = clap_text_resident_test_config;
+        cfg.projection_hidden_act = activation;
+        const expected = try textEncoderForward(&legacy, a, cfg, &ids, &mask, null, 2, 4);
+        defer a.free(expected);
+        const before = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+        var resident_table = cb.vtable.*;
+        resident_table.toFloat32 = rejectClapTextReadback;
+        const resident = ComputeBackend{ .ptr = cb.ptr, .vtable = &resident_table };
+        const output = try textEncoderForwardTensor(&resident, a, cfg, &ids, &mask, null, 2, 4);
+        defer cb.free(output);
+        try before.expectUnchanged(cb);
+        const actual = try cb.toFloat32(output, a);
+        defer a.free(actual);
+        try std.testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0002);
+        const host = try textEncoderForward(&cb, a, cfg, &ids, &mask, null, 2, 4);
+        defer a.free(host);
+        for (actual, host) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00001);
+    }
+    var unsupported = cb.vtable.*;
+    unsupported.takeRows = null;
+    const decline = ComputeBackend{ .ptr = cb.ptr, .vtable = &unsupported };
+    try std.testing.expectError(error.UnsupportedResidentClapText, textEncoderForwardTensor(&decline, a, clap_text_resident_test_config, &ids, &mask, null, 2, 4));
+}
+test "CLAP text two-stage resident head actual Native preserves F32 boundaries" {
+    try @import("../ops/media_residency_test.zig").onNative(populateClapTextResidentWeights, checkClapTextResident);
+}
+test "CLAP text two-stage resident head actual Metal avoids intermediate downloads" {
+    try @import("../ops/media_residency_test.zig").onMetal(populateClapTextResidentWeights, checkClapTextResident);
+}
+test "CLAP text two-stage resident head actual CUDA avoids intermediate downloads" {
+    try @import("../ops/media_residency_test.zig").onCuda(populateClapTextResidentWeights, checkClapTextResident);
+}
+
+fn rejectClapTextReadback(_: *anyopaque, _: CT, _: std.mem.Allocator) anyerror![]f32 {
+    return error.UnexpectedClapTextReadback;
+}
+fn populateClapFullResidentWeights(store: *@import("../ops/native_compute.zig").WeightStore) !void {
+    try populateResidentClapWeights(store);
+    const fixture = @import("../ops/media_residency_test.zig");
+    for ([_][]const u8{ "weight", "bias", "running_mean", "running_var" }) |suffix| {
+        var name: [128]u8 = undefined;
+        try fixture.putWeight(store, try std.fmt.bufPrint(&name, "audio_model.audio_encoder.batch_norm.{s}", .{suffix}), &.{64}, if (std.mem.eql(u8, suffix, "weight") or std.mem.eql(u8, suffix, "running_var")) 1 else 0);
+    }
+}
+fn checkClapFullResident(cb: ComputeBackend, reference: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    var cfg = resident_clap_test_config;
+    cfg.audio_config.spec_size = 64;
+    const values = try a.alloc(f32, 64 * 64);
+    defer a.free(values);
+    for (values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 31)) * 0.02;
+    if (cb.kind() == .native) {
+        try std.testing.expect((try audioEncoderForwardResident(&cb, a, cfg, values, 1, 1, 64, 64, &.{})) == null);
+        return;
+    }
+    const before = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+    const output = (try audioEncoderForwardResident(&cb, a, cfg, values, 1, 1, 64, 64, &.{})) orelse return error.MissingResidentClapAudio;
+    defer cb.free(output);
+    // The legacy frontend reads four small immutable batch-norm vectors.
+    // These are weight reads, not hidden activation exports. The existing
+    // from-patch-token fixture independently asserts zero tail downloads.
+    if (cb.kind() == .cuda) try std.testing.expectEqual(before.cuda_bytes + 4 * 64 * @sizeOf(f32), cb.trainingRuntimeStats().d2h_bytes);
+    const actual = try cb.toFloat32(output, a);
+    defer a.free(actual);
+    const expected = try audioEncoderForward(&reference, a, cfg, values, 1, 1, 64, 64, &.{});
+    defer a.free(expected);
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0002);
+}
+test "CLAP full audio resident seam Native honest decline" {
+    try @import("../ops/media_residency_test.zig").onNative(populateClapFullResidentWeights, checkClapFullResident);
+}
+test "CLAP full audio resident seam Metal matches independent full host frontend and head" {
+    try @import("../ops/media_residency_test.zig").onMetal(populateClapFullResidentWeights, checkClapFullResident);
+}
+test "CLAP full audio resident seam CUDA matches independent full host frontend and head" {
+    try @import("../ops/media_residency_test.zig").onCuda(populateClapFullResidentWeights, checkClapFullResident);
+}
+
+test "CLAP text resident entry allocation faults retire partial actual Native outputs" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const native = @import("../ops/native_compute.zig");
+            var weights = native.WeightStore{ .allocator = std.testing.allocator, .resident_weights = .{}, .lazy_weights = .{} };
+            defer weights.deinitOwned();
+            try populateClapTextResidentWeights(&weights);
+            var compute = native.NativeCompute.init(a, &weights, null);
+            defer compute.deinit();
+            const cb = compute.computeBackend();
+            const output = try textEncoderForwardTensor(&cb, a, clap_text_resident_test_config, &.{ 0, 3, 1, 1 }, &.{ 1, 1, 0, 0 }, null, 1, 4);
+            defer cb.free(output);
+        }
+    };
+    try Case.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "CLAP text resident cancellation checkpoints preserve actual Native recovery" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer weights.deinitOwned();
+    try populateClapTextResidentWeights(&weights);
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const Cancel = struct {
+        calls: usize = 0,
+        stop: usize,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls >= self.stop) return error.Cancelled;
+        }
+    };
+    for ([_]usize{ 1, 3, 8, 16 }) |stop| {
+        var cancel = Cancel{ .stop = stop };
+        var cb = compute.computeBackend();
+        cb.execution_control = .{ .ptr = &cancel, .check_fn = Cancel.check };
+        try std.testing.expectError(error.Cancelled, textEncoderForwardTensor(&cb, a, clap_text_resident_test_config, &.{ 0, 3, 1, 1 }, &.{ 1, 1, 0, 0 }, null, 1, 4));
+        cb.execution_control = null;
+        const recovered = try textEncoderForwardTensor(&cb, a, clap_text_resident_test_config, &.{ 0, 3, 1, 1 }, &.{ 1, 1, 0, 0 }, null, 1, 4);
+        defer cb.free(recovered);
+        try std.testing.expectEqual(@import("../backends/tensor.zig").DType.f32, try cb.tensorDType(recovered));
+    }
+}
+
+test "CLAP text post-producer row refusal propagates without replay or host fallback" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer weights.deinitOwned();
+    try populateClapTextResidentWeights(&weights);
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const Probe = struct {
+        var embedding_calls: usize = 0;
+        fn embed(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize) !CT {
+            embedding_calls += 1;
+            return native.vtable_impl.embeddingLookup(ctx, weight, ids, total, dim);
+        }
+        fn decline(_: *anyopaque, _: *const ops.TakeRowsRequest) !?CT {
+            return null;
+        }
+    };
+    var table = native.vtable_impl;
+    table.embeddingLookup = Probe.embed;
+    table.takeRows = Probe.decline;
+    const cb = ComputeBackend{ .ptr = &compute, .vtable = &table };
+    Probe.embedding_calls = 0;
+    try std.testing.expectError(error.UnsupportedResidentClapText, textEncoderForward(&cb, a, clap_text_resident_test_config, &.{ 0, 3, 1, 1 }, &.{ 1, 1, 0, 0 }, null, 1, 4));
+    try std.testing.expectEqual(@as(usize, 3), Probe.embedding_calls);
+    Probe.embedding_calls = 0;
+    table.takeRows = null;
+    try std.testing.expectError(error.UnsupportedResidentClapText, textEncoderForwardTensor(&cb, a, clap_text_resident_test_config, &.{ 0, 3, 1, 1 }, &.{ 1, 1, 0, 0 }, null, 1, 4));
+    try std.testing.expectEqual(@as(usize, 0), Probe.embedding_calls);
+}
+
+// Test-only localization: diagnostic exports finish before the strict measured
+// resident call below. Each value is compared against the original Native op.
+fn checkClapTextStages(cb: ComputeBackend, reference: ComputeBackend, ids: []const i64, mask: []const i64) !void {
+    const a = std.testing.allocator;
+    const cfg = clap_text_resident_test_config;
+    const Pair = struct {
+        fn check(label: []const u8, device: ComputeBackend, native: ComputeBackend, x: CT, y: CT) !void {
+            const dx = try device.toFloat32(x, std.testing.allocator);
+            defer std.testing.allocator.free(dx);
+            const dy = try native.toFloat32(y, std.testing.allocator);
+            defer std.testing.allocator.free(dy);
+            try std.testing.expectEqual(dy.len, dx.len);
+            var maximum: f32 = 0;
+            for (dx, dy) |v, w| maximum = @max(maximum, @abs(v - w));
+            std.debug.print("clap_text_checkpoint stage={s} max_abs={d}\n", .{ label, maximum });
+            for (dx, dy) |v, w| try std.testing.expectApproxEqAbs(w, v, 0.0002);
+        }
+    };
+    try checkClapEncoderStages(Pair, cb, reference, ids, mask);
+    const x = try textEncoderHiddenTensor(&cb, a, cfg, ids, mask, null, 2, 4);
+    defer cb.free(x);
+    const y = try textEncoderHiddenTensor(&reference, a, cfg, ids, mask, null, 2, 4);
+    defer reference.free(y);
+    try Pair.check("encoder_hidden", cb, reference, x, y);
+    const xp = (try cb.takeRows(x, &.{ 0, 4 }, 2, 64)).?;
+    defer cb.free(xp);
+    const yp = (try reference.takeRows(y, &.{ 0, 4 }, 2, 64)).?;
+    defer reference.free(yp);
+    try Pair.check("cls_rows", cb, reference, xp, yp);
+    const xl = try clapLinearTensor(&cb, xp, 2, 64, 64, "text_model.pooler.dense.weight", "text_model.pooler.dense.bias");
+    defer cb.free(xl);
+    const yl = try clapLinearTensor(&reference, yp, 2, 64, 64, "text_model.pooler.dense.weight", "text_model.pooler.dense.bias");
+    defer reference.free(yl);
+    try Pair.check("pooler_linear", cb, reference, xl, yl);
+    const xt = try cb.tanh_act(xl);
+    defer cb.free(xt);
+    const yt = try reference.tanh_act(yl);
+    defer reference.free(yt);
+    try Pair.check("pooler_tanh", cb, reference, xt, yt);
+    const x1 = try clapLinearTensor(&cb, xt, 2, 64, 16, "text_projection.linear1.weight", "text_projection.linear1.bias");
+    defer cb.free(x1);
+    const y1 = try clapLinearTensor(&reference, yt, 2, 64, 16, "text_projection.linear1.weight", "text_projection.linear1.bias");
+    defer reference.free(y1);
+    try Pair.check("projection1", cb, reference, x1, y1);
+}
+
+// Diagnostic composition only; every numerical step calls the unchanged real
+// backend operation. This runs before the original strict residency interval.
+fn checkClapEncoderStages(comptime Pair: type, cb: ComputeBackend, native: ComputeBackend, ids: []const i64, mask: []const i64) !void {
+    const a = std.testing.allocator;
+    const Step = struct {
+        fn lookup(backend: ComputeBackend, name: []const u8, tokens: []const i64) !CT {
+            const weight = try backend.getWeight(name);
+            defer backend.free(weight);
+            return backend.embeddingLookup(weight, tokens, 8, 64);
+        }
+        fn linear(comptime name: []const u8, backend: ComputeBackend, input: CT, in_dim: usize, out_dim: usize) !CT {
+            return clapLinearTensor(&backend, input, 8, in_dim, out_dim, "text_model.encoder.layer.0." ++ name ++ ".weight", "text_model.encoder.layer.0." ++ name ++ ".bias");
+        }
+        fn norm(comptime name: []const u8, backend: ComputeBackend, input: CT) !CT {
+            return clapNormTensor(&backend, input, 64, "text_model." ++ name ++ ".weight", "text_model." ++ name ++ ".bias", 1e-12);
+        }
+        fn triple(backend: ComputeBackend, input: CT) !ops.LinearTripleResult {
+            const qw = try backend.getWeight("text_model.encoder.layer.0.attention.self.query.weight");
+            defer backend.free(qw);
+            const qb = try backend.getWeight("text_model.encoder.layer.0.attention.self.query.bias");
+            defer backend.free(qb);
+            const kw = try backend.getWeight("text_model.encoder.layer.0.attention.self.key.weight");
+            defer backend.free(kw);
+            const kb = try backend.getWeight("text_model.encoder.layer.0.attention.self.key.bias");
+            defer backend.free(kb);
+            const vw = try backend.getWeight("text_model.encoder.layer.0.attention.self.value.weight");
+            defer backend.free(vw);
+            const vb = try backend.getWeight("text_model.encoder.layer.0.attention.self.value.bias");
+            defer backend.free(vb);
+            return backend.linearTriple(input, qw, qb, kw, kb, vw, vb, 8, 64, 64);
+        }
+    };
+    const x_word = try Step.lookup(cb, "text_model.embeddings.word_embeddings.weight", ids);
+    defer cb.free(x_word);
+    const y_word = try Step.lookup(native, "text_model.embeddings.word_embeddings.weight", ids);
+    defer native.free(y_word);
+    try Pair.check("word", cb, native, x_word, y_word);
+    var position_ids: [8]i64 = undefined;
+    buildRobertaPositionIds(&position_ids, ids, 4, clap_text_resident_test_config.text_pad_token_id);
+    const x_position = try Step.lookup(cb, "text_model.embeddings.position_embeddings.weight", &position_ids);
+    defer cb.free(x_position);
+    const y_position = try Step.lookup(native, "text_model.embeddings.position_embeddings.weight", &position_ids);
+    defer native.free(y_position);
+    try Pair.check("position", cb, native, x_position, y_position);
+    const x_word_position = try cb.add(x_word, x_position);
+    defer cb.free(x_word_position);
+    const y_word_position = try native.add(y_word, y_position);
+    defer native.free(y_word_position);
+    try Pair.check("word_position", cb, native, x_word_position, y_word_position);
+    const x_token_type = try Step.lookup(cb, "text_model.embeddings.token_type_embeddings.weight", &.{ 0, 0, 0, 0, 0, 0, 0, 0 });
+    defer cb.free(x_token_type);
+    const y_token_type = try Step.lookup(native, "text_model.embeddings.token_type_embeddings.weight", &.{ 0, 0, 0, 0, 0, 0, 0, 0 });
+    defer native.free(y_token_type);
+    try Pair.check("token_type", cb, native, x_token_type, y_token_type);
+    const x_embedding_sum = try cb.add(x_word_position, x_token_type);
+    defer cb.free(x_embedding_sum);
+    const y_embedding_sum = try native.add(y_word_position, y_token_type);
+    defer native.free(y_embedding_sum);
+    try Pair.check("embedding_sum", cb, native, x_embedding_sum, y_embedding_sum);
+    const x_embedding_norm = try Step.norm("embeddings.LayerNorm", cb, x_embedding_sum);
+    defer cb.free(x_embedding_norm);
+    const y_embedding_norm = try Step.norm("embeddings.LayerNorm", native, y_embedding_sum);
+    defer native.free(y_embedding_norm);
+    try Pair.check("embedding_norm", cb, native, x_embedding_norm, y_embedding_norm);
+    const xq = try Step.triple(cb, x_embedding_norm);
+    defer {
+        cb.free(xq.first);
+        cb.free(xq.second);
+        cb.free(xq.third);
+    }
+    const yq = try Step.triple(native, y_embedding_norm);
+    defer {
+        native.free(yq.first);
+        native.free(yq.second);
+        native.free(yq.third);
+    }
+    try Pair.check("query", cb, native, xq.first, yq.first);
+    try Pair.check("key", cb, native, xq.second, yq.second);
+    try Pair.check("value", cb, native, xq.third, yq.third);
+    const x_sdpa = try cb.scaledDotProductAttention(xq.first, xq.second, xq.third, mask, null, 2, 4, 2, 32);
+    defer cb.free(x_sdpa);
+    const y_sdpa = try native.scaledDotProductAttention(yq.first, yq.second, yq.third, mask, null, 2, 4, 2, 32);
+    defer native.free(y_sdpa);
+    try Pair.check("sdpa", cb, native, x_sdpa, y_sdpa);
+    const x_attention_projection = try Step.linear("attention.output.dense", cb, x_sdpa, 64, 64);
+    defer cb.free(x_attention_projection);
+    const y_attention_projection = try Step.linear("attention.output.dense", native, y_sdpa, 64, 64);
+    defer native.free(y_attention_projection);
+    try Pair.check("attention_projection", cb, native, x_attention_projection, y_attention_projection);
+    const x_attention_residual = try cb.add(x_attention_projection, x_embedding_norm);
+    defer cb.free(x_attention_residual);
+    const y_attention_residual = try native.add(y_attention_projection, y_embedding_norm);
+    defer native.free(y_attention_residual);
+    try Pair.check("attention_residual", cb, native, x_attention_residual, y_attention_residual);
+    const x_attention_norm = try Step.norm("encoder.layer.0.attention.output.LayerNorm", cb, x_attention_residual);
+    defer cb.free(x_attention_norm);
+    const y_attention_norm = try Step.norm("encoder.layer.0.attention.output.LayerNorm", native, y_attention_residual);
+    defer native.free(y_attention_norm);
+    try Pair.check("attention_norm", cb, native, x_attention_norm, y_attention_norm);
+    const x_ffn_linear1 = try Step.linear("intermediate.dense", cb, x_attention_norm, 64, 128);
+    defer cb.free(x_ffn_linear1);
+    const y_ffn_linear1 = try Step.linear("intermediate.dense", native, y_attention_norm, 64, 128);
+    defer native.free(y_ffn_linear1);
+    try Pair.check("ffn_linear1", cb, native, x_ffn_linear1, y_ffn_linear1);
+    const x_ffn_gelu = try cb.gelu(x_ffn_linear1);
+    defer cb.free(x_ffn_gelu);
+    const y_ffn_gelu = try native.gelu(y_ffn_linear1);
+    defer native.free(y_ffn_gelu);
+    try Pair.check("ffn_gelu", cb, native, x_ffn_gelu, y_ffn_gelu);
+    const x_ffn_linear2 = try Step.linear("output.dense", cb, x_ffn_gelu, 128, 64);
+    defer cb.free(x_ffn_linear2);
+    const y_ffn_linear2 = try Step.linear("output.dense", native, y_ffn_gelu, 128, 64);
+    defer native.free(y_ffn_linear2);
+    try Pair.check("ffn_linear2", cb, native, x_ffn_linear2, y_ffn_linear2);
+    const x_ffn_residual = try cb.add(x_ffn_linear2, x_attention_norm);
+    defer cb.free(x_ffn_residual);
+    const y_ffn_residual = try native.add(y_ffn_linear2, y_attention_norm);
+    defer native.free(y_ffn_residual);
+    try Pair.check("ffn_residual", cb, native, x_ffn_residual, y_ffn_residual);
+    const x_ffn_norm = try Step.norm("encoder.layer.0.output.LayerNorm", cb, x_ffn_residual);
+    defer cb.free(x_ffn_norm);
+    const y_ffn_norm = try Step.norm("encoder.layer.0.output.LayerNorm", native, y_ffn_residual);
+    defer native.free(y_ffn_norm);
+    try Pair.check("ffn_norm", cb, native, x_ffn_norm, y_ffn_norm);
+    // Compare original producers to the independent composition on each
+    // backend separately. Cross-backend stage agreement alone cannot decide
+    // whether the original Native producer has the same semantics/lifetime.
+    const native_produced = try textEncoderHiddenTensor(&native, a, clap_text_resident_test_config, ids, mask, null, 2, 4);
+    defer native.free(native_produced);
+    try Pair.check("original_native_vs_stages", native, native, native_produced, y_ffn_norm);
+    const metal_produced = try textEncoderHiddenTensor(&cb, a, clap_text_resident_test_config, ids, mask, null, 2, 4);
+    defer cb.free(metal_produced);
+    try Pair.check("original_metal_vs_stages", cb, cb, metal_produced, x_ffn_norm);
+}
+
+test "CLAP original Metal hidden producer arena metadata discriminator without intermediate exports" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const Check = struct {
+        fn run(cb: ComputeBackend, reference: ComputeBackend) !void {
+            const a = std.testing.allocator;
+            const ids = [_]i64{ 0, 3, 4, 1, 0, 2, 1, 1 };
+            const mask = [_]i64{ 1, 1, 1, 0, 1, 1, 0, 0 };
+            const expected = try textEncoderHiddenTensor(&reference, a, clap_text_resident_test_config, &ids, &mask, null, 2, 4);
+            defer reference.free(expected);
+            const before = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+            const actual = try textEncoderHiddenTensor(&cb, a, clap_text_resident_test_config, &ids, &mask, null, 2, 4);
+            defer cb.free(actual);
+            try before.expectUnchanged(cb);
+            const x = try cb.toFloat32(actual, a);
+            defer a.free(x);
+            const y = try reference.toFloat32(expected, a);
+            defer a.free(y);
+            try std.testing.expectEqual(y.len, x.len);
+            var maximum: f32 = 0;
+            for (x, y) |v, w| maximum = @max(maximum, @abs(v - w));
+            std.debug.print("clap_text_metadata_discriminator allocator=arena max_abs={d}\n", .{maximum});
+            for (x, y) |v, w| try std.testing.expectApproxEqAbs(w, v, 0.0002);
+        }
+    };
+    try @import("../ops/media_residency_test.zig").onMetalWithAllocator(arena.allocator(), populateClapTextResidentWeights, Check.run);
 }

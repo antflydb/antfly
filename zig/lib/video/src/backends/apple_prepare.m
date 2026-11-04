@@ -18,6 +18,7 @@
 #import <Metal/Metal.h>
 #include <string.h>
 #include <math.h>
+#include "apple_resource_observation.h"
 // Embedded by the Zig build as a generated header, never loaded from cwd.
 #include "video_prepare_shader.h"
 // Model-owned, bounded immutable storage. Preparers/commands retain borrowed
@@ -216,7 +217,7 @@ int32_t av_preparer_output_slab(void *handle, size_t bytes) {
     @autoreleasepool {
         AVPreparer *p = (__bridge AVPreparer *)handle;
         if (!bytes || bytes % sizeof(float) || p.outputCapacity) return -1;
-        p.outputSlab = [p.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        p.outputSlab = av_observe_owned_buffer([p.device newBufferWithLength:bytes options:MTLResourceStorageModeShared]);
         if (!p.outputSlab) return -1;
         p.outputCapacity = bytes;
         return 0;
@@ -236,7 +237,7 @@ int32_t av_preparation_cache_get(void *handle, uint32_t kind, const uint32_t *ke
     }
 }
 static id<MTLBuffer> upload(id<MTLDevice> device, const void *bytes, size_t length) {
-    return [device newBufferWithBytes:bytes length:length options:MTLResourceStorageModeShared];
+    return av_observe_owned_buffer([device newBufferWithBytes:bytes length:length options:MTLResourceStorageModeShared]);
 }
 @interface AVCoefficients : NSObject
 @property(nonatomic, strong) id<MTLBuffer> xb;
@@ -330,7 +331,7 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
                 // shader branch never reads it or invents a chroma plane.
                 MTLTextureDescriptor *dummy = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:uvf width:1 height:1 mipmapped:NO];
                 dummy.storageMode = MTLStorageModePrivate; dummy.usage = MTLTextureUsageShaderRead;
-                nativeUV = [p.device newTextureWithDescriptor:dummy];
+                nativeUV = av_observe_owned_texture([p.device newTextureWithDescriptor:dummy]);
                 if (!nativeUV) return -1;
             }
             result.nativeY = y = nativeY; result.nativeUV = uv = nativeUV;
@@ -350,7 +351,7 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
             uv = (__bridge id<MTLTexture>)av_metal_plane_texture(imported, 1);
         }
         size_t height = (params[4] & 1) ? params[0] - params[13] - params[15] : params[1] - params[14] - params[16];
-        id<MTLBuffer> temp = [p.device newBufferWithLength:(size_t)params[2] * height * 3 options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> temp = av_observe_owned_buffer([p.device newBufferWithLength:(size_t)params[2] * height * 3 options:MTLResourceStorageModePrivate]);
         size_t outputBytes = (size_t)params[2] * params[3] * 3 * sizeof(float);
         BOOL slab = !destination && p.outputCapacity;
         if (slab) {
@@ -359,7 +360,7 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
             destinationOffset = p.outputUsed;
         }
         if (destination && (destination.device != p.device || destinationOffset % sizeof(float) || destinationOffset > destination.length || outputBytes > destination.length-destinationOffset)) return -1;
-        result.output = destination ?: [p.device newBufferWithLength:outputBytes options:MTLResourceStorageModeShared];
+        result.output = destination ?: av_observe_owned_buffer([p.device newBufferWithLength:outputBytes options:MTLResourceStorageModeShared]);
         result.outputOffset = destination ? destinationOffset : 0;
         result.outputBytes = outputBytes;
         result.command = [p.queue commandBuffer];
@@ -371,7 +372,7 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
             if (!chroma.x || !chroma.y) return -1;
             size_t columns = ((params[0] & 1) || params[9] == 3) ? params[0] : (params[0] + 1) / 2;
             size_t rows = params[9] == 1 ? (params[1] + 1) / 2 : params[1];
-            chromaHorizontal = [p.device newBufferWithLength:columns * rows * 4 options:MTLResourceStorageModePrivate];
+            chromaHorizontal = av_observe_owned_buffer([p.device newBufferWithLength:columns * rows * 4 options:MTLResourceStorageModePrivate]);
             if (!chromaHorizontal) return -1;
             id<MTLComputeCommandEncoder> filter = [result.command computeCommandEncoder];
             if (!filter) return -1;
@@ -458,11 +459,14 @@ void *av_prepared_buffer(void *p) { return (__bridge void *)((__bridge AVPrepare
 int32_t av_prepared_copy(void *p, float *out, size_t count) {
     AVPrepared *result = (__bridge AVPrepared *)p;
     if (av_prepared_poll(p) != 1 || count > result.outputBytes / sizeof(float)) return -1;
-    id<MTLBuffer> readable = result.output;
+    // The prepared handle pins output; a strong precise local also pins any
+    // private readback staging through memcpy without an implicit inner-pointer
+    // autorelease extending backing lifetime beyond this synchronous copy.
+    __attribute__((objc_precise_lifetime)) id<MTLBuffer> readable = result.output;
     size_t offset = result.outputOffset, bytes = count * sizeof(float);
     if (readable.storageMode == MTLStorageModePrivate) {
         id<MTLCommandQueue> queue = [readable.device newCommandQueue];
-        id<MTLBuffer> staging = [readable.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> staging = av_observe_owned_buffer([readable.device newBufferWithLength:bytes options:MTLResourceStorageModeShared]);
         id<MTLCommandBuffer> command = [queue commandBuffer];
         id<MTLBlitCommandEncoder> encoder = [command blitCommandEncoder];
         if (!staging || !command || !encoder) return -1;
@@ -504,7 +508,7 @@ int32_t av_prepare_host_submit(void *handle, const uint8_t *yb, size_t ys, const
         MTLTextureDescriptor *yd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:params[8] == 8 ? MTLPixelFormatR8Uint : MTLPixelFormatR16Uint width:params[0] height:params[1] mipmapped:NO];
         MTLTextureDescriptor *uvd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:params[8] == 8 ? MTLPixelFormatRG8Uint : MTLPixelFormatRG16Uint width:cw height:ch mipmapped:NO];
         yd.storageMode = uvd.storageMode = MTLStorageModeShared; yd.usage = uvd.usage = MTLTextureUsageShaderRead;
-        id<MTLTexture> y = [p.device newTextureWithDescriptor:yd], uv = params[9] == 0 ? nil : [p.device newTextureWithDescriptor:uvd];
+        id<MTLTexture> y = av_observe_owned_texture([p.device newTextureWithDescriptor:yd]), uv = params[9] == 0 ? nil : av_observe_owned_texture([p.device newTextureWithDescriptor:uvd]);
         if (!y || (params[9] != 0 && !uv)) return -1;
         [y replaceRegion:MTLRegionMake2D(0, 0, params[0], params[1]) mipmapLevel:0 withBytes:yb bytesPerRow:ys];
         if (params[9] != 0) [uv replaceRegion:MTLRegionMake2D(0, 0, cw, ch) mipmapLevel:0 withBytes:uvb bytesPerRow:uvs];

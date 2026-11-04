@@ -37,6 +37,8 @@ pub const sgemm_tile = gemm.sgemm_tile;
 pub const sgemmTransA = gemm.sgemmTransA;
 pub const sgemmSequential = gemm.sgemmSequential;
 pub const sgemmTransBSequential = gemm.sgemmTransBSequential;
+pub const sgemmSequentialValue = gemm.sgemmSequentialValue;
+pub const sgemmTransBSequentialValue = gemm.sgemmTransBSequentialValue;
 
 const applyBeta = gemm.applyBeta;
 const sgemmAddSlice = gemm.sgemmAddSlice;
@@ -135,6 +137,9 @@ fn dispatchRows(
         var ctx = template;
         ctx.m_start = 0;
         ctx.m_end = m;
+        defer if (comptime @hasDecl(CtxT, "observe_workers")) {
+            if (comptime CtxT.observe_workers) CtxT.collect(&.{ctx});
+        };
         CtxT.run(@ptrCast(&ctx));
         return;
     }
@@ -151,12 +156,19 @@ fn dispatchRows(
         jobs[num_jobs] = .{ .fn_ptr = CtxT.run, .ctx = @ptrCast(&contexts[num_jobs]) };
         num_jobs += 1;
     }
+    // dispatchJobsIo drains canceled jobs before returning. Collect private
+    // worker values only after that drain, including partial canceled work.
+    defer if (comptime @hasDecl(CtxT, "observe_workers")) {
+        if (comptime CtxT.observe_workers) CtxT.collect(contexts[0..num_jobs]);
+    };
     if (io) |io_runtime| {
         try pool.dispatchJobsIo(io_runtime, jobs[0..num_jobs]);
     } else {
         dispatchJobs(jobs[0..num_jobs]);
     }
 }
+
+pub const GemmObservation = gemm.GemmObservation;
 
 /// Generic dispatch context for SGEMM entry points.  Each shape
 /// instantiates this with its B-element type (f32 or f16) and the AddSlice
@@ -167,7 +179,7 @@ fn dispatchRows(
 /// The `add_slice` parameter is comptime, so each `dispatchRows` call
 /// dispatches through the AddSlice it was instantiated with -- no runtime
 /// indirection and no risk of mixing shapes.
-fn SgemmDispatchCtx(comptime BT: type, comptime add_slice: anytype) type {
+fn SgemmDispatchCtx(comptime observing: bool, comptime BT: type, comptime add_slice: anytype, comptime selected_slice: anytype) type {
     return struct {
         m_start: usize,
         m_end: usize,
@@ -177,12 +189,32 @@ fn SgemmDispatchCtx(comptime BT: type, comptime add_slice: anytype) type {
         a: []const f32,
         b: []const BT,
         c_out: []f32,
+        measurement: if (observing) struct { out: *GemmObservation, evidence: GemmObservation = .{} } else void = if (observing) undefined else {},
+        pub const observe_workers = observing;
+        fn collect(contexts: []const @This()) void {
+            if (comptime !observing) return;
+            if (contexts.len == 0) return;
+            const out = contexts[0].measurement.out;
+            out.dispatched_workers += contexts.len;
+            for (contexts) |ctx| {
+                out.entered_workers += ctx.measurement.evidence.entered_workers;
+                out.returned_workers += ctx.measurement.evidence.returned_workers;
+                for (&out.successful_leaf_returns, ctx.measurement.evidence.successful_leaf_returns) |*count, value| count.* += value;
+            }
+        }
 
         const Self = @This();
 
         fn run(raw: *anyopaque) void {
-            const ctx: *const Self = @ptrCast(@alignCast(raw));
-            add_slice(ctx.m_start, ctx.m_end, ctx.n, ctx.k, ctx.alpha, ctx.a, ctx.b, ctx.c_out);
+            const ctx: *Self = @ptrCast(@alignCast(raw));
+            if (comptime observing) ctx.measurement.evidence.entered_workers = 1;
+            defer if (comptime observing) {
+                ctx.measurement.evidence.returned_workers = 1;
+            };
+            if (comptime observing) {
+                const body = selected_slice(ctx.m_start, ctx.m_end, ctx.n, ctx.k, ctx.alpha, ctx.a, ctx.b, ctx.c_out);
+                ctx.measurement.evidence.successful_leaf_returns[@backingInt(body)] += 1;
+            } else add_slice(ctx.m_start, ctx.m_end, ctx.n, ctx.k, ctx.alpha, ctx.a, ctx.b, ctx.c_out);
         }
     };
 }
@@ -192,7 +224,7 @@ fn SgemmDispatchCtx(comptime BT: type, comptime add_slice: anytype) type {
 /// range of output columns, i.e. a contiguous panel of B rows, and runs the
 /// same AddSlice kernel on every row of A. Results are bit-identical to the
 /// row-dispatched path: each output element is one kernel dot product.
-fn TransBColsCtx(comptime BT: type, comptime add_slice: anytype) type {
+fn TransBColsCtx(comptime observing: bool, comptime BT: type, comptime add_slice: anytype, comptime selected_slice: anytype) type {
     return struct {
         n_start: usize,
         n_end: usize,
@@ -203,15 +235,35 @@ fn TransBColsCtx(comptime BT: type, comptime add_slice: anytype) type {
         a: []const f32,
         b: []const BT,
         c_out: []f32,
+        measurement: if (observing) struct { out: *GemmObservation, evidence: GemmObservation = .{} } else void = if (observing) undefined else {},
+        pub const observe_workers = observing;
+        fn collect(contexts: []const @This()) void {
+            if (comptime !observing) return;
+            if (contexts.len == 0) return;
+            const out = contexts[0].measurement.out;
+            out.dispatched_workers += contexts.len;
+            for (contexts) |ctx| {
+                out.entered_workers += ctx.measurement.evidence.entered_workers;
+                out.returned_workers += ctx.measurement.evidence.returned_workers;
+                for (&out.successful_leaf_returns, ctx.measurement.evidence.successful_leaf_returns) |*count, value| count.* += value;
+            }
+        }
 
         const Self = @This();
 
         fn run(raw: *anyopaque) void {
-            const ctx: *const Self = @ptrCast(@alignCast(raw));
+            const ctx: *Self = @ptrCast(@alignCast(raw));
+            if (comptime observing) ctx.measurement.evidence.entered_workers = 1;
+            defer if (comptime observing) {
+                ctx.measurement.evidence.returned_workers = 1;
+            };
             const cols = ctx.n_end - ctx.n_start;
             const b_panel = ctx.b[ctx.n_start * ctx.k ..][0 .. cols * ctx.k];
             for (0..ctx.m) |row| {
-                add_slice(0, 1, cols, ctx.k, ctx.alpha, ctx.a[row * ctx.k ..][0..ctx.k], b_panel, ctx.c_out[row * ctx.n + ctx.n_start ..][0..cols]);
+                if (comptime observing) {
+                    const body = selected_slice(0, 1, cols, ctx.k, ctx.alpha, ctx.a[row * ctx.k ..][0..ctx.k], b_panel, ctx.c_out[row * ctx.n + ctx.n_start ..][0..cols]);
+                    ctx.measurement.evidence.successful_leaf_returns[@backingInt(body)] += 1;
+                } else add_slice(0, 1, cols, ctx.k, ctx.alpha, ctx.a[row * ctx.k ..][0..ctx.k], b_panel, ctx.c_out[row * ctx.n + ctx.n_start ..][0..cols]);
             }
         }
     };
@@ -247,6 +299,7 @@ fn dispatchColsTransB(
         jobs[num_jobs] = .{ .fn_ptr = CtxT.run, .ctx = @ptrCast(&contexts[num_jobs]) };
         num_jobs += 1;
     }
+    defer if (comptime CtxT.observe_workers) CtxT.collect(contexts[0..num_jobs]);
     if (io) |io_runtime| {
         try pool.dispatchJobsIo(io_runtime, jobs[0..num_jobs]);
     } else {
@@ -255,11 +308,18 @@ fn dispatchColsTransB(
     return true;
 }
 
-const SgemmTransBF16ColsCtx = TransBColsCtx(f16, sgemmTransBF16AddSlice);
-
-const SgemmCtx = SgemmDispatchCtx(f32, sgemmAddSlice);
-const SgemmTransBCtx = SgemmDispatchCtx(f32, sgemmTransBAddSlice);
-const SgemmTransBF16Ctx = SgemmDispatchCtx(f16, sgemmTransBF16AddSlice);
+fn SgemmTransBF16ColsCtx(comptime observing: bool) type {
+    return TransBColsCtx(observing, f16, sgemmTransBF16AddSlice, gemm.sgemmTransBF16AddSliceSelected);
+}
+fn SgemmCtx(comptime observing: bool) type {
+    return SgemmDispatchCtx(observing, f32, sgemmAddSlice, gemm.sgemmAddSliceSelected);
+}
+fn SgemmTransBCtx(comptime observing: bool) type {
+    return SgemmDispatchCtx(observing, f32, sgemmTransBAddSlice, gemm.sgemmTransBAddSliceSelected);
+}
+fn SgemmTransBF16Ctx(comptime observing: bool) type {
+    return SgemmDispatchCtx(observing, f16, sgemmTransBF16AddSlice, gemm.sgemmTransBF16AddSliceSelected);
+}
 
 // --- sgemm: C = alpha * A @ B + beta * C ---
 
@@ -274,11 +334,39 @@ pub fn sgemmSync(
     beta: f32,
     c_out: []f32,
 ) void {
+    return sgemmSyncPolicy(false, m, n, k, alpha, a, b, beta, c_out, {});
+}
+pub fn sgemmSyncObserved(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: []const f32,
+    b: []const f32,
+    beta: f32,
+    c_out: []f32,
+    out: ?*GemmObservation,
+) void {
+    if (out) |value| return sgemmSyncPolicy(true, m, n, k, alpha, a, b, beta, c_out, value);
+    return sgemmSyncPolicy(false, m, n, k, alpha, a, b, beta, c_out, {});
+}
+fn sgemmSyncPolicy(
+    comptime observing: bool,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: []const f32,
+    b: []const f32,
+    beta: f32,
+    c_out: []f32,
+    out: if (observing) *GemmObservation else void,
+) void {
     if (m == 0 or n == 0) return;
     applyBeta(c_out[0 .. m * n], beta);
     if (k == 0) return;
     const work = @as(u64, m) * @as(u64, n) * @as(u64, k);
-    dispatchRows(null, SgemmCtx, .{
+    dispatchRows(null, SgemmCtx(observing), .{
         .m_start = 0,
         .m_end = 0,
         .n = n,
@@ -287,6 +375,7 @@ pub fn sgemmSync(
         .a = a,
         .b = b,
         .c_out = c_out,
+        .measurement = if (observing) .{ .out = out } else {},
     }, m, work) catch unreachable;
 }
 
@@ -311,11 +400,39 @@ pub fn sgemmTransBF16WeightsSync(
     beta: f32,
     c_out: []f32,
 ) void {
+    return sgemmTransBF16WeightsSyncPolicy(false, m, n, k, alpha, a, b, beta, c_out, {});
+}
+pub fn sgemmTransBF16WeightsSyncObserved(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: []const f32,
+    b: []const f16,
+    beta: f32,
+    c_out: []f32,
+    out: ?*GemmObservation,
+) void {
+    if (out) |value| return sgemmTransBF16WeightsSyncPolicy(true, m, n, k, alpha, a, b, beta, c_out, value);
+    return sgemmTransBF16WeightsSyncPolicy(false, m, n, k, alpha, a, b, beta, c_out, {});
+}
+fn sgemmTransBF16WeightsSyncPolicy(
+    comptime observing: bool,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: []const f32,
+    b: []const f16,
+    beta: f32,
+    c_out: []f32,
+    out: if (observing) *GemmObservation else void,
+) void {
     if (m == 0 or n == 0) return;
     applyBeta(c_out[0 .. m * n], beta);
     if (k == 0) return;
     const work = @as(u64, m) * @as(u64, n) * @as(u64, k);
-    if (dispatchColsTransB(null, SgemmTransBF16ColsCtx, .{
+    if (dispatchColsTransB(null, SgemmTransBF16ColsCtx(observing), .{
         .n_start = 0,
         .n_end = 0,
         .m = m,
@@ -325,8 +442,9 @@ pub fn sgemmTransBF16WeightsSync(
         .a = a,
         .b = b,
         .c_out = c_out,
+        .measurement = if (observing) .{ .out = out } else {},
     }, m, n, work) catch unreachable) return;
-    dispatchRows(null, SgemmTransBF16Ctx, .{
+    dispatchRows(null, SgemmTransBF16Ctx(observing), .{
         .m_start = 0,
         .m_end = 0,
         .n = n,
@@ -335,6 +453,7 @@ pub fn sgemmTransBF16WeightsSync(
         .a = a,
         .b = b,
         .c_out = c_out,
+        .measurement = if (observing) .{ .out = out } else {},
     }, m, work) catch unreachable;
 }
 
@@ -351,11 +470,39 @@ pub fn sgemmTransBSync(
     beta: f32,
     c_out: []f32,
 ) void {
+    return sgemmTransBSyncPolicy(false, m, n, k, alpha, a, b, beta, c_out, {});
+}
+pub fn sgemmTransBSyncObserved(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: []const f32,
+    b: []const f32,
+    beta: f32,
+    c_out: []f32,
+    out: ?*GemmObservation,
+) void {
+    if (out) |value| return sgemmTransBSyncPolicy(true, m, n, k, alpha, a, b, beta, c_out, value);
+    return sgemmTransBSyncPolicy(false, m, n, k, alpha, a, b, beta, c_out, {});
+}
+fn sgemmTransBSyncPolicy(
+    comptime observing: bool,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: []const f32,
+    b: []const f32,
+    beta: f32,
+    c_out: []f32,
+    out: if (observing) *GemmObservation else void,
+) void {
     if (m == 0 or n == 0) return;
     applyBeta(c_out[0 .. m * n], beta);
     if (k == 0) return;
     const work = @as(u64, m) * @as(u64, n) * @as(u64, k);
-    dispatchRows(null, SgemmTransBCtx, .{
+    dispatchRows(null, SgemmTransBCtx(observing), .{
         .m_start = 0,
         .m_end = 0,
         .n = n,
@@ -364,6 +511,7 @@ pub fn sgemmTransBSync(
         .a = a,
         .b = b,
         .c_out = c_out,
+        .measurement = if (observing) .{ .out = out } else {},
     }, m, work) catch unreachable;
 }
 
@@ -459,11 +607,41 @@ pub fn sgemm(
     beta: f32,
     c_out: []f32,
 ) Cancelable!void {
+    return sgemmPolicy(false, io, m, n, k, alpha, a, b, beta, c_out, {});
+}
+pub fn sgemmObserved(
+    io: Io,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: []const f32,
+    b: []const f32,
+    beta: f32,
+    c_out: []f32,
+    out: ?*GemmObservation,
+) Cancelable!void {
+    if (out) |value| return sgemmPolicy(true, io, m, n, k, alpha, a, b, beta, c_out, value);
+    return sgemmPolicy(false, io, m, n, k, alpha, a, b, beta, c_out, {});
+}
+fn sgemmPolicy(
+    comptime observing: bool,
+    io: Io,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: []const f32,
+    b: []const f32,
+    beta: f32,
+    c_out: []f32,
+    out: if (observing) *GemmObservation else void,
+) Cancelable!void {
     if (m == 0 or n == 0) return;
     applyBeta(c_out[0 .. m * n], beta);
     if (k == 0) return;
     const work = @as(u64, m) * @as(u64, n) * @as(u64, k);
-    return dispatchRows(io, SgemmCtx, .{
+    return dispatchRows(io, SgemmCtx(observing), .{
         .m_start = 0,
         .m_end = 0,
         .n = n,
@@ -472,6 +650,7 @@ pub fn sgemm(
         .a = a,
         .b = b,
         .c_out = c_out,
+        .measurement = if (observing) .{ .out = out } else {},
     }, m, work);
 }
 
@@ -488,11 +667,41 @@ pub fn sgemmTransB(
     beta: f32,
     c_out: []f32,
 ) Cancelable!void {
+    return sgemmTransBPolicy(false, io, m, n, k, alpha, a, b, beta, c_out, {});
+}
+pub fn sgemmTransBObserved(
+    io: Io,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: []const f32,
+    b: []const f32,
+    beta: f32,
+    c_out: []f32,
+    out: ?*GemmObservation,
+) Cancelable!void {
+    if (out) |value| return sgemmTransBPolicy(true, io, m, n, k, alpha, a, b, beta, c_out, value);
+    return sgemmTransBPolicy(false, io, m, n, k, alpha, a, b, beta, c_out, {});
+}
+fn sgemmTransBPolicy(
+    comptime observing: bool,
+    io: Io,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: []const f32,
+    b: []const f32,
+    beta: f32,
+    c_out: []f32,
+    out: if (observing) *GemmObservation else void,
+) Cancelable!void {
     if (m == 0 or n == 0) return;
     applyBeta(c_out[0 .. m * n], beta);
     if (k == 0) return;
     const work = @as(u64, m) * @as(u64, n) * @as(u64, k);
-    return dispatchRows(io, SgemmTransBCtx, .{
+    return dispatchRows(io, SgemmTransBCtx(observing), .{
         .m_start = 0,
         .m_end = 0,
         .n = n,
@@ -501,6 +710,7 @@ pub fn sgemmTransB(
         .a = a,
         .b = b,
         .c_out = c_out,
+        .measurement = if (observing) .{ .out = out } else {},
     }, m, work);
 }
 
@@ -518,11 +728,41 @@ pub fn sgemmTransBF16Weights(
     beta: f32,
     c_out: []f32,
 ) Cancelable!void {
+    return sgemmTransBF16WeightsPolicy(false, io, m, n, k, alpha, a, b, beta, c_out, {});
+}
+pub fn sgemmTransBF16WeightsObserved(
+    io: Io,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: []const f32,
+    b: []const f16,
+    beta: f32,
+    c_out: []f32,
+    out: ?*GemmObservation,
+) Cancelable!void {
+    if (out) |value| return sgemmTransBF16WeightsPolicy(true, io, m, n, k, alpha, a, b, beta, c_out, value);
+    return sgemmTransBF16WeightsPolicy(false, io, m, n, k, alpha, a, b, beta, c_out, {});
+}
+fn sgemmTransBF16WeightsPolicy(
+    comptime observing: bool,
+    io: Io,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: []const f32,
+    b: []const f16,
+    beta: f32,
+    c_out: []f32,
+    out: if (observing) *GemmObservation else void,
+) Cancelable!void {
     if (m == 0 or n == 0) return;
     applyBeta(c_out[0 .. m * n], beta);
     if (k == 0) return;
     const work = @as(u64, m) * @as(u64, n) * @as(u64, k);
-    if (try dispatchColsTransB(io, SgemmTransBF16ColsCtx, .{
+    if (try dispatchColsTransB(io, SgemmTransBF16ColsCtx(observing), .{
         .n_start = 0,
         .n_end = 0,
         .m = m,
@@ -532,8 +772,9 @@ pub fn sgemmTransBF16Weights(
         .a = a,
         .b = b,
         .c_out = c_out,
+        .measurement = if (observing) .{ .out = out } else {},
     }, m, n, work)) return;
-    return dispatchRows(io, SgemmTransBF16Ctx, .{
+    return dispatchRows(io, SgemmTransBF16Ctx(observing), .{
         .m_start = 0,
         .m_end = 0,
         .n = n,
@@ -542,6 +783,7 @@ pub fn sgemmTransBF16Weights(
         .a = a,
         .b = b,
         .c_out = c_out,
+        .measurement = if (observing) .{ .out = out } else {},
     }, m, work);
 }
 
@@ -1027,26 +1269,66 @@ pub const denseAttentionPortableHostWithIo = attention.denseAttentionPortableHos
 pub const segmentAttentionGroupedHostWithGemmParallelIo = attention.segmentAttentionGroupedHostWithGemmParallelIo;
 
 extern fn antfly_x86_sgemm_prepared(start: usize, end: usize, n: usize, k: usize, panel_count: usize, data: [*]f32, a: [*]const f32, c: [*]f32) callconv(.c) void;
-const PreparedCtx = struct {
-    m_start: usize = 0,
-    m_end: usize = 0,
-    panels: prepared_gemm.Panels,
-    a: []const f32,
-    c: []f32,
-    pub fn run(raw: *anyopaque) void {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        if (comptime x86.enabled) {
-            if (x86.selected() == .avx2) {
-                antfly_x86_sgemm_prepared(self.m_start, self.m_end, self.panels.n, self.panels.k, self.panels.data.len, self.panels.data.ptr, self.a.ptr, self.c.ptr);
-                return;
+/// Actual authored leaf entries and successful returns, collected after join.
+/// Workers write only their private dispatch context; no callback or TLS hook
+/// runs in a numerical loop. Vendor BLAS and other schedules are not covered.
+pub const PreparedObservation = struct {
+    pub const Body = enum { portable_packed_rows, x86_avx2_prepared };
+    entries: [2]u64 = @splat(0),
+    successful_returns: [2]u64 = @splat(0),
+    dispatched_workers: u64 = 0,
+    not_entered_workers: u64 = 0,
+};
+fn PreparedCtx(comptime observing: bool) type {
+    return struct {
+        m_start: usize = 0,
+        m_end: usize = 0,
+        panels: prepared_gemm.Panels,
+        a: []const f32,
+        c: []f32,
+        measurement: if (observing) struct { out: *PreparedObservation, selected: ?PreparedObservation.Body = null, returned: bool = false } else void = if (observing) undefined else {},
+        pub const observe_workers = observing;
+        fn collect(contexts: []const @This()) void {
+            if (comptime !observing) return;
+            if (contexts.len == 0) return;
+            const out = contexts[0].measurement.out;
+            out.dispatched_workers += contexts.len;
+            for (contexts) |ctx| {
+                if (ctx.measurement.selected) |body| {
+                    out.entries[@backingInt(body)] += 1;
+                    if (ctx.measurement.returned) out.successful_returns[@backingInt(body)] += 1;
+                } else out.not_entered_workers += 1;
             }
         }
-        prepared_gemm.rows(self.panels, self.m_start, self.m_end, self.a, self.c);
-    }
-};
+        pub fn run(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            defer if (comptime observing) {
+                self.measurement.returned = true;
+            };
+            if (comptime x86.enabled) {
+                if (x86.selected() == .avx2) {
+                    if (comptime observing) self.measurement.selected = .x86_avx2_prepared;
+                    antfly_x86_sgemm_prepared(self.m_start, self.m_end, self.panels.n, self.panels.k, self.panels.data.len, self.panels.data.ptr, self.a.ptr, self.c.ptr);
+                    return;
+                }
+            }
+            if (comptime observing) self.measurement.selected = .portable_packed_rows;
+            prepared_gemm.rows(self.panels, self.m_start, self.m_end, self.a, self.c);
+        }
+    };
+}
 pub fn sgemmPrepared(io: ?Io, m: usize, panels: prepared_gemm.Panels, a: []const f32, c: []f32) Cancelable!void {
+    return sgemmPreparedPolicy(false, io, m, panels, a, c, {});
+}
+/// Optional value-only evidence. The caller owns out through synchronous join;
+/// on cancellation it contains only jobs actually entered before the drain.
+pub fn sgemmPreparedObserved(io: ?Io, m: usize, panels: prepared_gemm.Panels, a: []const f32, c: []f32, out: ?*PreparedObservation) Cancelable!void {
+    if (out) |value| return sgemmPreparedPolicy(true, io, m, panels, a, c, value);
+    return sgemmPreparedPolicy(false, io, m, panels, a, c, {});
+}
+fn sgemmPreparedPolicy(comptime observing: bool, io: ?Io, m: usize, panels: prepared_gemm.Panels, a: []const f32, c: []f32, out: if (observing) *PreparedObservation else void) Cancelable!void {
     if (m == 0) return;
-    return dispatchRows(io, PreparedCtx, .{ .panels = panels, .a = a, .c = c }, m, @as(u64, m) * panels.n * panels.k);
+    return dispatchRows(io, PreparedCtx(observing), .{ .panels = panels, .a = a, .c = c, .measurement = if (observing) .{ .out = out } else {} }, m, @as(u64, m) * panels.n * panels.k);
 }
 
 test "prepared GEMM threaded sync and Io dispatch preserve independent columns" {
@@ -1070,7 +1352,89 @@ test "prepared GEMM threaded sync and Io dispatch preserve independent columns" 
     const io = std.Io.Threaded.global_single_threaded.io();
     for ([_]?Io{ null, io }) |runtime| {
         @memset(actual, std.math.nan(f32));
-        try sgemmPrepared(runtime, m, panels, x, actual);
+        var evidence: PreparedObservation = .{};
+        try sgemmPreparedObserved(runtime, m, panels, x, actual, &evidence);
+        try std.testing.expect(evidence.dispatched_workers > 0);
+        try std.testing.expectEqual(evidence.dispatched_workers, evidence.entries[0] + evidence.entries[1]);
+        try std.testing.expectEqual(evidence.entries, evidence.successful_returns);
+        try std.testing.expectEqual(@as(u64, 0), evidence.not_entered_workers);
         for (expected, actual) |e, v| try std.testing.expectApproxEqAbs(e, v, 2e-5);
     }
 }
+
+test "dense GEMM value observations retain row and column schedules and exact F32 F16 tails" {
+    const allocator = std.testing.allocator;
+    const m = 64;
+    const n = 131;
+    const k = 513;
+    const a = try allocator.alloc(f32, m * k);
+    defer allocator.free(a);
+    @memset(a, 1);
+    const b = try allocator.alloc(f32, n * k);
+    defer allocator.free(b);
+    @memset(b, 2);
+    const half = try allocator.alloc(f16, n * k);
+    defer allocator.free(half);
+    @memset(half, 2);
+    const c = try allocator.alloc(f32, m * n);
+    defer allocator.free(c);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    inline for (.{ 0, 1, 2 }) |family| {
+        for ([_]?Io{ null, io }) |runtime| {
+            @memset(c, 8);
+            var evidence: GemmObservation = .{};
+            switch (family) {
+                0 => if (runtime) |active| try sgemmObserved(active, m, n, k, 1, a, b, 0.25, c, &evidence) else sgemmSyncObserved(m, n, k, 1, a, b, 0.25, c, &evidence),
+                1 => if (runtime) |active| try sgemmTransBObserved(active, m, n, k, 1, a, b, 0.25, c, &evidence) else sgemmTransBSyncObserved(m, n, k, 1, a, b, 0.25, c, &evidence),
+                2 => if (runtime) |active| try sgemmTransBF16WeightsObserved(active, m, n, k, 1, a, half, 0.25, c, &evidence) else sgemmTransBF16WeightsSyncObserved(m, n, k, 1, a, half, 0.25, c, &evidence),
+                else => unreachable,
+            }
+            try std.testing.expect(evidence.dispatched_workers > 0);
+            try std.testing.expectEqual(evidence.dispatched_workers, evidence.returned_workers);
+            try std.testing.expectEqual(evidence.entered_workers, evidence.returned_workers);
+            try std.testing.expectEqual(evidence.returned_workers, evidence.successful_leaf_returns[family * 2] + evidence.successful_leaf_returns[family * 2 + 1]);
+            for (c) |value| try std.testing.expectEqual(@as(f32, 1028), value);
+        }
+    }
+    // Actual tiny-row F16 column partition route (when the host can dispatch
+    // multiple workers), including a tail column and multiple leaves per job.
+    const col_k = 10923;
+    const col_n = 129;
+    const col_m = 3;
+    const x = try allocator.alloc(f32, col_m * col_k);
+    defer allocator.free(x);
+    @memset(x, 1);
+    const w = try allocator.alloc(f16, col_n * col_k);
+    defer allocator.free(w);
+    @memset(w, 2);
+    const y = try allocator.alloc(f32, col_m * col_n);
+    defer allocator.free(y);
+    var columns: GemmObservation = .{};
+    try sgemmTransBF16WeightsObserved(io, col_m, col_n, col_k, 1, x, w, 0, y, &columns);
+    const leaf_returns = columns.successful_leaf_returns[4] + columns.successful_leaf_returns[5];
+    try std.testing.expectEqual(columns.returned_workers, columns.dispatched_workers);
+    try std.testing.expectEqual(if (columns.dispatched_workers > 1) col_m * columns.dispatched_workers else 1, leaf_returns);
+    for (y) |value| try std.testing.expectEqual(@as(f32, 21846), value);
+}
+
+test "unobserved dense and prepared worker contexts preserve original numerical argument layout" {
+    const Dense = struct { m_start: usize, m_end: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f32, c_out: []f32 };
+    const HalfDense = struct { m_start: usize, m_end: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f16, c_out: []f32 };
+    const Columns = struct { n_start: usize, n_end: usize, m: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f16, c_out: []f32 };
+    const Prepared = struct { m_start: usize = 0, m_end: usize = 0, panels: prepared_gemm.Panels, a: []const f32, c: []f32 };
+    inline for (.{ .{ Dense, SgemmCtx(false) }, .{ Dense, SgemmTransBCtx(false) }, .{ HalfDense, SgemmTransBF16Ctx(false) }, .{ Columns, SgemmTransBF16ColsCtx(false) }, .{ Prepared, PreparedCtx(false) } }) |pair| {
+        try std.testing.expectEqual(@sizeOf(pair[0]), @sizeOf(pair[1]));
+        try std.testing.expectEqual(@alignOf(pair[0]), @alignOf(pair[1]));
+        try std.testing.expect(@FieldType(pair[1], "measurement") == void);
+    }
+}
+
+pub const AttentionObservation = attention.AttentionObservation;
+pub const flashAttentionHostWithIoObserved = attention.flashAttentionHostWithIoObserved;
+pub const segmentAttentionHostWithGemmParallelIoObserved = attention.segmentAttentionHostWithGemmParallelIoObserved;
+pub const segmentAttentionHostWithGemmSerialIoObserved = attention.segmentAttentionHostWithGemmSerialIoObserved;
+pub const segmentAttentionGroupedHostWithGemmIoObserved = attention.segmentAttentionGroupedHostWithGemmIoObserved;
+pub const segmentAttentionGroupedHostWithGemmParallelIoObserved = attention.segmentAttentionGroupedHostWithGemmParallelIoObserved;
+pub const relativeAttentionHostObserved = attention.relativeAttentionHostObserved;
+pub const denseAttentionHostWithGemmIoObserved = attention.denseAttentionHostWithGemmIoObserved;
+pub const denseAttentionPortableHostWithIoObserved = attention.denseAttentionPortableHostWithIoObserved;

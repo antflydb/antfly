@@ -727,7 +727,7 @@ pub const EmbeddingPipeline = struct {
         var permit = try self.session.admitInputs(&.{ ids, mask, values }, allocator, self.execution_control);
         defer permit.deinitWithCleanup(.{ .boundary = cleanup_owner.epoch() });
         if (cleanup_owner.epoch()) |epoch| try permit.bindCurrentCleanupEpoch(epoch);
-        const embeddings = try self.embedPreparedTextInputs(&.{ ids, mask, values }, mask_i32, prepared.input_ids, 1, prepared.sequence, &permit, null, .{ .boundary = cleanup_owner.epoch() }, &projection_execution);
+        const embeddings = try self.embedPreparedTextInputs(&.{ ids, mask, values }, mask_i32, prepared.input_ids, 1, prepared.sequence, &permit, null, .{ .boundary = cleanup_owner.epoch() }, &projection_execution, null);
         defer allocator.free(embeddings);
         if (embeddings.len != 1) {
             for (embeddings) |embedding| allocator.free(embedding);
@@ -1137,6 +1137,7 @@ pub const EmbeddingPipeline = struct {
             &projection_shell,
             .{ .boundary = cleanup_owner.epoch() },
             &projection_execution,
+            if (owns_gate) &admission_waiter else null,
         );
         for (all_mask[0 .. texts.len * effective_len]) |valid| if (valid != 0) {
             self.last_input_tokens +|= 1;
@@ -1247,7 +1248,7 @@ pub const EmbeddingPipeline = struct {
             self.execution_gate_held = false;
             self.session.releaseSelectedCohortGate(&admission_waiter);
         };
-        return self.embedPreparedTextInputs(input_set.slice(), mask_i32, input_ids, batch, seq_len, active_permit, &projection_shell, .{ .boundary = cleanup_owner.epoch() }, &projection_execution);
+        return self.embedPreparedTextInputs(input_set.slice(), mask_i32, input_ids, batch, seq_len, active_permit, &projection_shell, .{ .boundary = cleanup_owner.epoch() }, &projection_execution, if (owns_gate) &admission_waiter else null);
     }
 
     /// Returns backend telemetry for the most recent successful resident
@@ -1267,6 +1268,7 @@ pub const EmbeddingPipeline = struct {
         supplied_projection_shell: ?*?@import("../execution/resource_retirement.zig").PreparedCharge,
         cleanup: CleanupContext,
         projection_execution: *?session_mod.RunPermit,
+        source_cohort: ?*@import("../runtime/embedding_scheduler.zig").Scheduler.Waiter,
     ) ![][]f32 {
         if (self.usesResidentTextOutputs() and cleanup.boundary == null) return error.MissingCurrentCleanupEpoch;
         const alloc = self.allocator;
@@ -1280,8 +1282,9 @@ pub const EmbeddingPipeline = struct {
         const lock_started = if (self.trace != null) embedding_trace.now() else 0;
         if (self.execution_control) |control| try control.update(.executing, 0, 0);
         var cohort_waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter{};
-        if (!self.execution_gate_held) try self.session.enterExecutionCohort(self.execution_lock, self.execution_control orelse .{}, &cohort_waiter);
-        defer if (!self.execution_gate_held) self.session.leaveExecutionCohort(self.execution_lock, &cohort_waiter);
+        const own_cohort = !self.execution_gate_held;
+        if (own_cohort) try self.session.enterExecutionCohort(self.execution_lock, self.execution_control orelse .{}, &cohort_waiter);
+        defer if (own_cohort) self.session.leaveExecutionCohort(self.execution_lock, &cohort_waiter);
         const execute_started = if (self.trace != null) embedding_trace.now() else 0;
         if (self.trace) |trace| trace.execution_lock_ns += execute_started -| lock_started;
         defer if (self.trace) |trace| {
@@ -1331,6 +1334,7 @@ pub const EmbeddingPipeline = struct {
                 projection_shell,
                 cleanup,
                 projection_execution,
+                source_cohort,
             )) |resident_embeddings| {
                 return resident_embeddings;
             }
@@ -1351,6 +1355,19 @@ pub const EmbeddingPipeline = struct {
             alloc.free(outputs);
         }
 
+        // Host execution has also completed: source prepared state and its
+        // actual lane end before any downstream supplier/admission callback.
+        if (self.text_projection != null) {
+            run_permit.retireExecutionWithCleanup(cleanup);
+            try self.releaseTextSourceCohort(source_cohort);
+            outputs = try run_permit.attachHostOutputs(outputs, alloc);
+            run_permit.deinitWithCleanup(cleanup);
+        }
+        return self.finishTextHostOutputs(outputs, all_mask, batch, effective_len);
+    }
+
+    fn finishTextHostOutputs(self: *EmbeddingPipeline, outputs: []Tensor, all_mask: []const i32, batch: usize, effective_len: usize) ![][]f32 {
+        const alloc = self.allocator;
         if (outputs.len == 0) return error.NoOutputTensors;
 
         if (self.text_projection) |proj| {
@@ -1805,48 +1822,34 @@ pub const EmbeddingPipeline = struct {
         // bytes and reserves the remaining host/backend peak.
         try preprocess_permit.retainHostBytes(retained_host_bytes);
 
-        // Serialize only access to resident backend/session state. Transition
-        // from the retained host lease to a composed run lease while owning
-        // this mutex, so queued preprocessors cannot reserve GPU capacity and
-        // there is no unadmitted release/reacquire interval.
-        var encoder_shell = if (self.visual_projection != null) try vs.prepareResidentRetirement() else null;
-        defer if (encoder_shell) |*shell| shell.destroyUnused();
-        var projection_shell = if (self.visual_projection) |projection| try projection.prepareResidentRetirement() else null;
-        defer if (projection_shell) |*shell| shell.destroyUnused();
-        try self.lockExecution();
-        defer self.unlockExecution();
-        var run_permit = try vs.admit(.{
+        if (self.execution_gate_held) return error.PreparedAdmissionRequiresReadyTurn;
+        var source_stage: session_mod.PreparedSource = .{};
+        defer source_stage.deinit();
+        try source_stage.initBeforeExecutionInto(vs, self.session, self.execution_lock, .{ .host = &.{input_tensor} }, .{
             .batch = valid_count,
             .sequence = 1,
             .input_bytes = pixel_bytes,
             .host_preprocess_bytes = encoded_bytes,
             .pre_admitted_host_bytes = retained_host_bytes,
-        });
-        defer run_permit.deinit();
-        if (self.visual_projection != null) try run_permit.adoptResidentOutputRetirement(&encoder_shell);
+        }, null, if (self.visual_projection != null) .resident_consumer else .host, alloc, self.execution_control);
+        try source_stage.enter();
 
         if (self.visual_projection) |proj| {
-            const resident = self.tryEmbedResidentProjection(
+            const resident = try self.tryEmbedResidentProjection(
                 &.{input_tensor},
                 proj,
                 .image,
                 valid_count,
                 "image.encoder.resident",
                 "image.projection.resident",
-                &run_permit,
-                &projection_shell,
-            ) catch |err| {
-                if (self.residentProjectionRequired()) return err;
-                return err;
-            };
+                &source_stage,
+            );
             if (resident) |embeddings| return self.expandIndexedImageVectors(embeddings, item_errors);
         }
 
         // Run vision encoder
         const encoder_start = embedTimingStart(self.print_timing);
-        const outputs = run_permit.runWithControl(&.{input_tensor}, alloc, self.execution_control) catch |err| {
-            return err;
-        };
+        const outputs = try source_stage.runHost(&.{input_tensor});
         logEmbedTiming("image.encoder", batch, encoder_start);
         defer {
             for (outputs) |*o| o.deinit();
@@ -1993,20 +1996,17 @@ pub const EmbeddingPipeline = struct {
             return error.ResourceLimitExceeded;
         try preprocess_permit.retainHostBytes(retained_host_bytes);
 
-        var encoder_shell = if (self.visual_projection != null) try vs.prepareResidentRetirement() else null;
-        defer if (encoder_shell) |*shell| shell.destroyUnused();
-        var projection_shell = if (self.visual_projection) |projection| try projection.prepareResidentRetirement() else null;
-        defer if (projection_shell) |*shell| shell.destroyUnused();
-        try self.lockExecution();
-        defer self.unlockExecution();
-        var run_permit = try vs.admit(.{
+        if (self.execution_gate_held) return error.PreparedAdmissionRequiresReadyTurn;
+        var source_stage: session_mod.PreparedSource = .{};
+        defer source_stage.deinit();
+        try source_stage.initBeforeExecutionInto(vs, self.session, self.execution_lock, .{ .host = &.{pv_tensor} }, .{
             .batch = batch,
             .sequence = 1,
             .input_bytes = pixel_bytes,
             .host_preprocess_bytes = raster_bytes,
             .pre_admitted_host_bytes = retained_host_bytes,
-        });
-        defer run_permit.deinit();
+        }, null, if (self.visual_projection != null) .resident_consumer else .host, alloc, self.execution_control);
+        try source_stage.enter();
 
         if (self.visual_projection) |proj| {
             const resident = try self.tryEmbedResidentProjection(
@@ -2016,14 +2016,13 @@ pub const EmbeddingPipeline = struct {
                 batch,
                 "image.encoder.resident",
                 "image.projection.resident",
-                &run_permit,
-                &projection_shell,
+                &source_stage,
             );
             if (resident) |embeddings| return embeddings;
         }
 
         const encoder_start = embedTimingStart(self.print_timing);
-        const outputs = try run_permit.runWithControl(&.{pv_tensor}, alloc, self.execution_control);
+        const outputs = try source_stage.runHost(&.{pv_tensor});
         logEmbedTiming("image.encoder", batch, encoder_start);
         defer {
             for (outputs) |*output| output.deinit();
@@ -2700,11 +2699,6 @@ pub const EmbeddingPipeline = struct {
 
     fn embedClapPreparedFeatures(self: *EmbeddingPipeline, as: backends.Session, feature_plan: ClapBatchPlan, batch: usize, all_mels: []const f32, is_longer: []const u8, permit: *@import("../backends/session.zig").RunPermit) ![][]f32 {
         const alloc = self.allocator;
-        if (self.audio_projection != null) try permit.prepareResidentOutputRetirement();
-        var projection_shell = if (self.audio_projection) |projection| try projection.prepareResidentRetirement() else null;
-        defer if (projection_shell) |*shell| shell.destroyUnused();
-        try self.lockExecution();
-        defer self.unlockExecution();
         // Build input tensor: [batch, channels, n_frames, n_mels]
         const mel_shape = [_]i64{ @intCast(batch), @intCast(feature_plan.channels), @intCast(feature_plan.frames), @intCast(feature_plan.mels) };
         var mel_tensor = try Tensor.initFloat32(alloc, "input_features", &mel_shape, all_mels);
@@ -2719,6 +2713,12 @@ pub const EmbeddingPipeline = struct {
         else
             &[_]Tensor{mel_tensor};
 
+        if (self.execution_gate_held) return error.PreparedAdmissionRequiresReadyTurn;
+        var source_stage: session_mod.PreparedSource = .{};
+        defer source_stage.deinit();
+        try source_stage.initBeforeExecutionInto(as, self.session, self.execution_lock, .{ .host = run_inputs }, .{}, permit, if (self.audio_projection != null) .resident_consumer else .host, alloc, self.execution_control);
+        try source_stage.enter();
+
         if (self.audio_projection) |proj| {
             if (try self.tryEmbedResidentProjection(
                 run_inputs,
@@ -2727,13 +2727,12 @@ pub const EmbeddingPipeline = struct {
                 batch,
                 "audio.encoder.resident",
                 "audio.projection.resident",
-                permit,
-                &projection_shell,
+                &source_stage,
             )) |embeddings| return embeddings;
         }
 
         const encoder_start = embedTimingStart(self.print_timing);
-        var outputs = try permit.runWithControl(run_inputs, alloc, self.execution_control);
+        const outputs = try source_stage.runHost(run_inputs);
         logEmbedTiming("audio.encoder", batch, encoder_start);
         logEmbedTensorShapes(self.print_timing, "audio.outputs", outputs);
         defer {
@@ -2741,6 +2740,11 @@ pub const EmbeddingPipeline = struct {
             alloc.free(outputs);
         }
 
+        return self.audioEmbeddingsFromOutputs(outputs, batch);
+    }
+
+    fn audioEmbeddingsFromOutputs(self: *EmbeddingPipeline, outputs: []Tensor, batch: usize) ![][]f32 {
+        const alloc = self.allocator;
         if (outputs.len == 0) return error.NoOutputTensors;
 
         if (self.audio_projection) |proj| {
@@ -2821,14 +2825,10 @@ pub const EmbeddingPipeline = struct {
             return error.ResourceLimitExceeded;
         const input_bytes = std.math.mul(usize, input_elements, @sizeOf(f32)) catch
             return error.ResourceLimitExceeded;
-        var run_permit = try proj.admit(.{
-            .batch = batch,
-            .sequence = 1,
-            .input_bytes = input_bytes,
-            .host_preprocess_bytes = input_bytes,
-        });
-        defer run_permit.deinit();
-
+        if (self.execution_gate_held) return error.ProjectionAdmissionRequiresStageBoundary;
+        if (self.execution_control) |control| try control.check();
+        var packed_permit = try proj.admitHostPreprocess(try std.math.mul(usize, input_bytes, 2));
+        defer packed_permit.deinit();
         const packed_embeddings = try alloc.alloc(f32, input_elements);
         defer alloc.free(packed_embeddings);
         for (embeddings, 0..) |embedding, b| {
@@ -2839,8 +2839,18 @@ pub const EmbeddingPipeline = struct {
         var proj_input = try Tensor.initFloat32(alloc, "input", &proj_shape, packed_embeddings);
         defer proj_input.deinit();
 
+        var destination: session_mod.PreparedSource = .{};
+        defer destination.deinit();
+        try destination.initBeforeExecutionInto(proj, proj, self.execution_lock, .{ .host = &.{proj_input} }, .{
+            .batch = batch,
+            .sequence = 1,
+            .input_bytes = input_bytes,
+            .host_preprocess_bytes = input_bytes,
+            .pre_admitted_host_bytes = try std.math.mul(usize, input_bytes, 2),
+        }, null, .host, alloc, self.execution_control);
+        try destination.enter();
         const projection_start = embedTimingStart(self.print_timing);
-        var proj_outputs = try run_permit.runWithControl(&.{proj_input}, alloc, self.execution_control);
+        var proj_outputs = try destination.runHost(&.{proj_input});
         logEmbedTiming("projection", batch, projection_start);
         defer {
             for (proj_outputs) |*o| o.deinit();
@@ -2974,26 +2984,17 @@ pub const EmbeddingPipeline = struct {
         );
         logEmbedTiming("text.encoder.qwen3.resident", batch, encoder_start);
 
-        // encoder_outputs.deinit() owns and frees output_storage; a defer
-        // free here would double-free the slice (heap corruption).
-        const output_storage = try self.allocator.alloc(ops_mod.CT, 1);
-        output_storage[0] = hidden;
+        // A borrowed stack vector needs no fallible metadata allocation after
+        // the actual producer. The original backend owns the one hidden CT.
+        defer cb.free(hidden);
+        var output_storage = [_]ops_mod.CT{hidden};
         var encoder_outputs = session_mod.ResidentOutputs{
-            .outputs = output_storage,
+            .outputs = &output_storage,
             .backend = cb,
             .allocator = self.allocator,
         };
-        defer encoder_outputs.deinit();
 
-        const embeddings = self.finishResidentTextRows(&encoder_outputs, mask, batch, seq_len, self.config.normalize) catch |err| switch (err) {
-            error.UnsupportedResidentTextPooling,
-            error.UnsupportedPrimitiveOp,
-            error.UnsupportedOperation,
-            error.UnsupportedShape,
-            => return self.residentProjectionFallback(.text, "text.pool.qwen3.resident", batch, @errorName(err)),
-            else => return err,
-        };
-        self.recordResidentProjection(.text, .success, "text.encoder.qwen3.resident", batch, null);
+        const embeddings = try self.finishProducedTextRows(&encoder_outputs, mask, batch, seq_len, self.config.normalize, "text.pool.qwen3.resident", "text.encoder.qwen3.resident");
         return embeddings;
     }
 
@@ -3038,16 +3039,64 @@ pub const EmbeddingPipeline = struct {
             .allocator = self.allocator,
         };
 
-        const embeddings = self.finishResidentTextRows(&encoder_outputs, mask, batch, seq_len, self.config.normalize and !normalize_in_frame) catch |err| switch (err) {
+        const embeddings = try self.finishProducedTextRows(&encoder_outputs, mask, batch, seq_len, self.config.normalize and !normalize_in_frame, "text.pool.qwen3.graph", "text.encoder.qwen3.graph");
+        return embeddings;
+    }
+
+    /// Null is reserved for pre-producer eligibility. A completed hidden CT
+    /// survives pooling refusal and is consumed exactly once by the host path.
+    fn finishProducedTextRows(self: *EmbeddingPipeline, outputs: *session_mod.ResidentOutputs, mask: []const i32, batch: usize, sequence: usize, normalize: bool, phase: []const u8, success_phase: []const u8) ![][]f32 {
+        const rows = self.finishResidentTextRows(outputs, mask, batch, sequence, normalize) catch |err| switch (err) {
             error.UnsupportedResidentTextPooling,
             error.UnsupportedPrimitiveOp,
             error.UnsupportedOperation,
             error.UnsupportedShape,
-            => return null,
+            => return self.finishProducedTextHost(outputs, mask, batch, sequence, normalize, phase, @errorName(err)),
             else => return err,
         };
-        self.recordResidentProjection(.text, .success, "text.encoder.qwen3.graph", batch, null);
-        return embeddings;
+        self.recordResidentProjection(.text, .success, success_phase, batch, null);
+        return rows;
+    }
+    fn finishProducedTextHost(self: *EmbeddingPipeline, outputs: *session_mod.ResidentOutputs, mask: []const i32, batch: usize, sequence: usize, normalize: bool, phase: []const u8, reason: []const u8) ![][]f32 {
+        self.recordResidentProjection(.text, .fallback, phase, batch, reason);
+        if (self.residentProjectionRequired()) return error.ResidentEmbeddingFallback;
+        const host = try outputs.materializeFloat32(self.allocator, &.{}, outputs.backend.operationToken());
+        defer {
+            for (host) |*value| value.deinit();
+            self.allocator.free(host);
+        }
+        // Selected graph rows may already be normalized in the actual frame.
+        // This borrowed task policy changes no ownership and is never deinited.
+        var remaining = self.*;
+        remaining.config.normalize = normalize;
+        return remaining.finishTextHostOutputs(host, mask, batch, sequence);
+    }
+
+    fn releaseTextSourceCohort(self: *EmbeddingPipeline, source: ?*@import("../runtime/embedding_scheduler.zig").Scheduler.Waiter) !void {
+        const waiter = source orelse return error.ProjectionAdmissionRequiresStageBoundary;
+        // A missing/acquired-false waiter is not authority over an ambient gate.
+        if (waiter.gate == null and waiter.owner == null and self.execution_lock == null) {
+            self.execution_gate_held = false;
+            return;
+        }
+        if (!waiter.acquired or waiter.gate != self.execution_lock) return error.UnselectedExecutionCohort;
+        self.session.leaveSelectedCohort(waiter);
+        self.execution_gate_held = false;
+    }
+
+    fn finishPooledTextProjection(self: *EmbeddingPipeline, pooled: *const ResidentPooled, mask: []const i32, batch: usize, seq_len: usize, reason: []const u8) ![][]f32 {
+        self.recordResidentProjection(.text, .fallback, "text.projection.resident", batch, reason);
+        if (self.residentProjectionRequired()) return error.ResidentEmbeddingFallback;
+        // Borrow only the pooled value. Its original physical owner stays live
+        // across this checked host export and the downstream task-owned head.
+        var values = [_]ops_mod.CT{pooled.value};
+        var borrowed = session_mod.ResidentOutputs{ .outputs = &values, .backend = pooled.backend, .allocator = self.allocator };
+        const host = try borrowed.materializeFloat32(self.allocator, &.{}, pooled.backend.operationToken());
+        defer {
+            for (host) |*value| value.deinit();
+            self.allocator.free(host);
+        }
+        return self.finishTextHostOutputs(host, mask, batch, seq_len);
     }
 
     fn tryEmbedTextResidentProjection(
@@ -3061,6 +3110,7 @@ pub const EmbeddingPipeline = struct {
         projection_shell: *?@import("../execution/resource_retirement.zig").PreparedCharge,
         cleanup: CleanupContext,
         projection_execution: *?session_mod.RunPermit,
+        source_cohort: ?*@import("../runtime/embedding_scheduler.zig").Scheduler.Waiter,
     ) !?[][]f32 {
         const expected_dim = projectionInputDim(proj) orelse
             return self.residentProjectionFallback(
@@ -3075,15 +3125,48 @@ pub const EmbeddingPipeline = struct {
         var encoder_outputs = (try permit.runResidentWithControl(inputs, self.allocator, self.execution_control)) orelse
             return self.residentProjectionFallback(.text, "text.encoder.resident", batch, "unsupported");
         logEmbedTiming("text.encoder.resident", batch, encoder_start);
-        defer encoder_outputs.deinitWithBoundary(cleanup.boundary);
+        var encoder_live = true;
+        defer if (encoder_live) encoder_outputs.deinitWithBoundary(cleanup.boundary);
         if (encoder_outputs.outputs.len == 0) return error.NoOutputTensors;
 
+        try permit.attachResidentOutputs(&encoder_outputs);
+
+        // Promotion validates the COMPLETE original output set, exact model,
+        // concrete backend/table, live operation and current B before a derived
+        // pooled CT/backend can escape. Decline retains the original source.
+        const source_ready = try encoder_outputs.prepareResidentConsumer(.{ .boundary = cleanup.boundary, .operation = encoder_outputs.backend.operationToken() });
+        if (!source_ready) {
+            self.recordResidentProjection(.text, .fallback, "text.encoder.resident", batch, "source_not_detachable");
+            if (self.residentProjectionRequired()) return error.ResidentEmbeddingFallback;
+            const host = try encoder_outputs.materializeFloat32(self.allocator, &.{}, encoder_outputs.backend.operationToken());
+            defer {
+                for (host) |*value| value.deinit();
+                self.allocator.free(host);
+            }
+            encoder_outputs.deinitWithBoundary(cleanup.boundary);
+            encoder_live = false;
+            permit.retireExecutionWithCleanup(cleanup);
+            try self.releaseTextSourceCohort(source_cohort);
+            permit.deinitWithCleanup(cleanup);
+            return try self.finishTextHostOutputs(host, mask, batch, seq_len);
+        }
+        // The original Engine/provider has retired; the payload/model/quota
+        // moved intact. Keep B alive through the destination, release only the
+        // caller's exact selected model cohort, and never replay the encoder.
+        permit.retireExecutionWithCleanup(cleanup);
+        try self.releaseTextSourceCohort(source_cohort);
+        permit.deinitWithCleanup(cleanup);
         var pooled = self.residentPoolTextOutput(&encoder_outputs, mask, batch, seq_len) catch |err| switch (err) {
-            error.UnsupportedResidentTextPooling,
-            error.UnsupportedPrimitiveOp,
-            error.UnsupportedOperation,
-            error.UnsupportedShape,
-            => return self.residentProjectionFallback(.text, "text.pool.resident", batch, @errorName(err)),
+            error.UnsupportedResidentTextPooling, error.UnsupportedPrimitiveOp, error.UnsupportedOperation, error.UnsupportedShape => {
+                self.recordResidentProjection(.text, .fallback, "text.pool.resident", batch, @errorName(err));
+                if (self.residentProjectionRequired()) return error.ResidentEmbeddingFallback;
+                const host = try encoder_outputs.materializeFloat32(self.allocator, &.{}, encoder_outputs.backend.operationToken());
+                defer {
+                    for (host) |*value| value.deinit();
+                    self.allocator.free(host);
+                }
+                return try self.finishTextHostOutputs(host, mask, batch, seq_len);
+            },
             else => return err,
         };
         defer pooled.deinit();
@@ -3102,13 +3185,24 @@ pub const EmbeddingPipeline = struct {
         }};
         const projection_start = embedTimingStart(self.print_timing);
         std.debug.assert(projection_execution.* == null);
-        projection_execution.* = try proj.admitResidentInputsWithRetirement(&resident_input, projection_shell);
+        projection_execution.* = try proj.admitResidentInputsBeforeExecutionWithRetirement(&resident_input, projection_shell, self.allocator, self.execution_control);
         const projection_permit = &projection_execution.*.?;
-        try projection_permit.bindCurrentCleanupEpoch(cleanup.boundary orelse return error.MissingCurrentCleanupEpoch);
+        // Cold physical bank funding must precede the destination's actual
+        // provider operation; execution may only adopt already-funded storage.
+        try projection_permit.preparePhysicalStorage(self.allocator);
+        try projection_permit.bindPhysicalCleanupEpoch(cleanup.boundary orelse return error.MissingCurrentCleanupEpoch);
         var proj_outputs = (projection_permit.runResidentInputsWithControl(&resident_input, self.allocator, self.execution_control) catch |err| switch (err) {
-            error.UnsupportedResidentInputBackend => return self.residentProjectionFallback(.text, "text.projection.resident", batch, @errorName(err)),
+            error.UnsupportedResidentInputBackend => {
+                projection_permit.deinitWithCleanup(cleanup);
+                projection_execution.* = null;
+                return try self.finishPooledTextProjection(&pooled, mask, batch, seq_len, @errorName(err));
+            },
             else => return err,
-        }) orelse return self.residentProjectionFallback(.text, "text.projection.resident", batch, "unsupported");
+        }) orelse {
+            projection_permit.deinitWithCleanup(cleanup);
+            projection_execution.* = null;
+            return try self.finishPooledTextProjection(&pooled, mask, batch, seq_len, "unsupported");
+        };
         logEmbedTiming("text.projection.resident", batch, projection_start);
         defer proj_outputs.deinitWithBoundary(cleanup.boundary);
 
@@ -3155,12 +3249,44 @@ pub const EmbeddingPipeline = struct {
             error.UnsupportedPrimitiveOp,
             error.UnsupportedOperation,
             error.UnsupportedShape,
-            => return self.residentProjectionFallback(.text, "text.pool.resident", batch, @errorName(err)),
+            => {
+                // The encoder has committed. A pooling capability decline
+                // consumes this same hidden result; null is only pre-producer.
+                self.recordResidentProjection(.text, .fallback, "text.pool.resident", batch, @errorName(err));
+                if (self.residentProjectionRequired()) return error.ResidentEmbeddingFallback;
+                const host = try encoder_outputs.materializeFloat32(self.allocator, &.{}, encoder_outputs.backend.operationToken());
+                defer {
+                    for (host) |*tensor| tensor.deinit();
+                    self.allocator.free(host);
+                }
+                return try self.finishTextHostOutputs(host, mask, batch, seq_len);
+            },
             else => return err,
         };
         self.last_resident_backend_timing = @import("../execution/metadata_sample.zig").snapshot(encoder_outputs.backend);
         self.recordResidentProjection(.text, .success, "text.encoder.resident", batch, null);
         return embeddings;
+    }
+
+    fn finishMediaHostOutputs(self: *EmbeddingPipeline, outputs: []Tensor, batch: usize, modality: ResidentProjectionModality) ![][]f32 {
+        return switch (modality) {
+            .image => self.imageEmbeddingsFromOutputs(outputs, batch),
+            .audio => self.audioEmbeddingsFromOutputs(outputs, batch),
+            .text => error.InvalidMediaProjection,
+        };
+    }
+
+    fn finishMediaSelectedHost(self: *EmbeddingPipeline, selected: *const ResidentPooled, batch: usize, modality: ResidentProjectionModality, projection_phase: []const u8, reason: []const u8) ![][]f32 {
+        self.recordResidentProjection(modality, .fallback, projection_phase, batch, reason);
+        if (self.residentProjectionRequired()) return error.ResidentEmbeddingFallback;
+        var values = [_]ops_mod.CT{selected.value};
+        var borrowed = session_mod.ResidentOutputs{ .outputs = &values, .backend = selected.backend, .allocator = self.allocator };
+        const host = try borrowed.materializeFloat32(self.allocator, &.{}, selected.backend.operationToken());
+        defer {
+            for (host) |*tensor| tensor.deinit();
+            self.allocator.free(host);
+        }
+        return self.finishMediaHostOutputs(host, batch, modality);
     }
 
     fn tryEmbedResidentProjection(
@@ -3171,53 +3297,65 @@ pub const EmbeddingPipeline = struct {
         batch: usize,
         encoder_phase: []const u8,
         projection_phase: []const u8,
-        permit: *session_mod.RunPermit,
-        projection_shell: *?@import("../execution/resource_retirement.zig").PreparedCharge,
+        source: *session_mod.PreparedSource,
     ) !?[][]f32 {
         const expected_dim = projectionInputDim(proj) orelse
             return self.residentProjectionFallback(modality, projection_phase, batch, "unknown_projection_input_dim");
-
-        try permit.validateResidentOutputRetirement();
-        if (proj.run_admission != null and projection_shell.* == null) return error.UnpreparedOutputRetirement;
         const encoder_start = embedTimingStart(self.print_timing);
-        var encoder_outputs = (try permit.runResidentWithControl(inputs, self.allocator, self.execution_control)) orelse
-            return self.residentProjectionFallback(modality, encoder_phase, batch, "unsupported");
+        var encoder_outputs = try source.runResident(.{ .host = inputs });
+        if (encoder_outputs == null) return self.residentProjectionFallback(modality, encoder_phase, batch, "unsupported");
         logEmbedTiming(encoder_phase, batch, encoder_start);
-        defer encoder_outputs.deinit();
-        if (encoder_outputs.outputs.len == 0) return error.NoOutputTensors;
-
-        var selected = self.selectResidentProjectedInput(&encoder_outputs, expected_dim, batch) catch |err| switch (err) {
-            error.UnsupportedResidentProjectionInput,
-            error.UnsupportedPrimitiveOp,
-            error.UnsupportedOperation,
-            error.UnsupportedShape,
-            => return self.residentProjectionFallback(modality, encoder_phase, batch, @errorName(err)),
+        defer if (encoder_outputs) |*outputs| outputs.deinitWithBoundary(source.epoch());
+        if (encoder_outputs.?.outputs.len == 0) return error.NoOutputTensors;
+        // Complete source ownership is resolved before selecting a derived CT.
+        if (!try source.handoffResident(&encoder_outputs.?)) {
+            self.recordResidentProjection(modality, .fallback, encoder_phase, batch, "source_not_detachable");
+            if (self.residentProjectionRequired()) return error.ResidentEmbeddingFallback;
+            const host = try source.materializeResident(&encoder_outputs);
+            defer {
+                for (host) |*tensor| tensor.deinit();
+                self.allocator.free(host);
+            }
+            return try self.finishMediaHostOutputs(host, batch, modality);
+        }
+        var selected = self.selectResidentProjectedInput(&encoder_outputs.?, expected_dim, batch) catch |err| switch (err) {
+            error.UnsupportedResidentProjectionInput, error.UnsupportedPrimitiveOp, error.UnsupportedOperation, error.UnsupportedShape => {
+                self.recordResidentProjection(modality, .fallback, encoder_phase, batch, @errorName(err));
+                if (self.residentProjectionRequired()) return error.ResidentEmbeddingFallback;
+                const host = try source.materializeResident(&encoder_outputs);
+                defer {
+                    for (host) |*tensor| tensor.deinit();
+                    self.allocator.free(host);
+                }
+                return try self.finishMediaHostOutputs(host, batch, modality);
+            },
             else => return err,
         };
         defer selected.deinit();
-
         const resident_shape = [_]i64{ @intCast(batch), @intCast(expected_dim) };
         const resident_input = [_]session_mod.ResidentInput{.{
             .value = selected.value,
             .backend = selected.backend,
-            .estimated_bytes = std.math.mul(
-                usize,
-                std.math.mul(usize, batch, expected_dim) catch
-                    return error.ResourceLimitExceeded,
-                @sizeOf(f32),
-            ) catch return error.ResourceLimitExceeded,
+            .estimated_bytes = try std.math.mul(usize, try std.math.mul(usize, batch, expected_dim), @sizeOf(f32)),
             .shape = &resident_shape,
         }};
+        var destination: session_mod.PreparedSource = .{};
+        defer destination.deinit();
+        try destination.initBeforeExecutionInto(proj, proj, self.execution_lock, .{ .resident = &resident_input }, .{ .batch = batch, .sequence = 1, .input_bytes = resident_input[0].estimated_bytes }, null, .resident_consumer, self.allocator, self.execution_control);
+        try destination.enter();
         const projection_start = embedTimingStart(self.print_timing);
-        var projection_permit = try proj.admitResidentInputsWithRetirement(&resident_input, projection_shell);
-        defer projection_permit.deinit();
-        var proj_outputs = (projection_permit.runResidentInputsWithControl(&resident_input, self.allocator, self.execution_control) catch |err| switch (err) {
-            error.UnsupportedResidentInputBackend => return self.residentProjectionFallback(modality, projection_phase, batch, @errorName(err)),
+        var proj_outputs = (destination.runResident(.{ .resident = &resident_input }) catch |err| switch (err) {
+            error.UnsupportedResidentInputBackend => {
+                destination.deinit();
+                return try self.finishMediaSelectedHost(&selected, batch, modality, projection_phase, @errorName(err));
+            },
             else => return err,
-        }) orelse return self.residentProjectionFallback(modality, projection_phase, batch, "unsupported");
+        }) orelse {
+            destination.deinit();
+            return try self.finishMediaSelectedHost(&selected, batch, modality, projection_phase, "unsupported");
+        };
+        defer proj_outputs.deinitWithBoundary(destination.epoch());
         logEmbedTiming(projection_phase, batch, projection_start);
-        defer proj_outputs.deinit();
-
         const embeddings = try self.resident2DToEmbeddings(&proj_outputs, batch);
         self.recordResidentProjection(modality, .success, projection_phase, batch, null);
         return embeddings;
@@ -5500,6 +5638,8 @@ test "raw text projection refusal preserves current B and retires quota after ac
         bounded_source_closes: usize = 0,
         raw_source_closes: usize = 0,
         callbacks: usize = 0,
+        source_calls: usize = 0,
+        projection_calls: usize = 0,
         failure: ?anyerror = null,
         fn run(_: *anyopaque, _: []const Tensor, _: std.mem.Allocator) ![]Tensor {
             return error.UnexpectedHostForward;
@@ -5536,6 +5676,8 @@ test "raw text projection refusal preserves current B and retires quota after ac
                 self.gate.unlock();
                 return error.TextForwardMissingActualGate;
             }
+            self.source_calls += 1;
+            if (self.source_calls != 1) return error.ConsumedSourceReplayed;
             const backend = &self.backends[0];
             var scope = try operation.enter(backend.*, null, null, .managed);
             defer scope.deinitChecked() catch @panic("raw text source operation cleanup failed");
@@ -5549,13 +5691,20 @@ test "raw text projection refusal preserves current B and retires quota after ac
         fn residentControlled(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, _: InferenceExecutionControl) !?session_mod.ResidentOutputs {
             return resident(raw, inputs, allocator);
         }
-        fn project(_: *anyopaque, _: []const session_mod.ResidentInput, _: std.mem.Allocator) !?session_mod.ResidentOutputs {
+        fn project(raw: *anyopaque, _: []const session_mod.ResidentInput, _: std.mem.Allocator) !?session_mod.ResidentOutputs {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.projection_calls += 1;
+            try self.reenter();
             return error.ProjectionRefused;
         }
         fn projectControlled(raw: *anyopaque, inputs: []const session_mod.ResidentInput, allocator: std.mem.Allocator, _: InferenceExecutionControl) !?session_mod.ResidentOutputs {
             return project(raw, inputs, allocator);
         }
-        fn reserve(_: *anyopaque, _: memory_admission.AdmissionAmounts) memory_admission.AdmissionResourceError!usize {
+        fn reserve(raw: *anyopaque, _: memory_admission.AdmissionAmounts) memory_admission.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reenter() catch |err| {
+                self.failure = err;
+            };
             return 1;
         }
         fn retain(_: *anyopaque, _: usize, _: memory_admission.AdmissionAmounts) memory_admission.AdmissionResourceError!void {}
@@ -5594,9 +5743,546 @@ test "raw text projection refusal preserves current B and retires quota after ac
     const projection = backends.Session{ .ptr = &probe, .vtable = &Probe.projection_table, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false } };
     var pipeline = EmbeddingPipeline{ .allocator = a, .session = source, .text_projection = projection, .tok = undefined, .execution_lock = &gate, .config = .{ .normalize = false, .max_length = 2, .pooling = .mean } };
     try std.testing.expectError(error.ProjectionRefused, pipeline.embedTokenized(&.{ 1, 2 }, &.{ 1, 1 }, 1, 2));
+    try std.testing.expectEqual(@as(usize, 1), probe.source_calls);
+    try std.testing.expectEqual(@as(usize, 1), probe.projection_calls);
     try std.testing.expectEqual(@as(usize, 1), probe.bounded_source_closes);
     try std.testing.expectEqual(@as(usize, 0), probe.raw_source_closes);
     try std.testing.expect(probe.callbacks > 0);
     if (probe.failure) |err| return err;
     try std.testing.expectEqualDeep(memory_admission.AdmissionAmounts{}, controller.snapshot());
+}
+
+fn checkPreparedTextProjectionBoundary(backend_kind: backends.BackendType) !void {
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const imported = @import("../backends/imported_onnx_session.zig");
+    const Probe = struct {
+        source_counter: ?*std.atomic.Value(u64),
+        retired_source_executions: u64 = 0,
+        gate: *std.atomic.Mutex,
+        providers: []const *std.atomic.Mutex,
+        source_backend: ops_mod.ComputeBackend,
+        cancel_on_destination: bool,
+        cancelled: bool = false,
+        live: usize = 0,
+        tokens: [128]memory_admission.AdmissionAmounts = @splat(.{}),
+        next_token: usize = 1,
+        source_token: usize = 0,
+        source_host_bytes: usize = 0,
+        source_funded_at_destination: bool = false,
+        callbacks: usize = 0,
+        callback_phase: enum { reserve, retain, release } = .reserve,
+        failure: ?anyerror = null,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancelled) return error.Cancelled;
+        }
+        fn sourceExecutions(self: *const @This()) u64 {
+            return if (self.source_counter) |counter| counter.load(.acquire) else self.retired_source_executions;
+        }
+        fn retireWrapperMetadata(self: *@This()) void {
+            self.retired_source_executions = self.sourceExecutions();
+            self.source_counter = null;
+        }
+        fn observe(self: *@This()) void {
+            self.callbacks += 1;
+            if (!self.gate.tryLock()) self.failure = error.SourceModelGateDuringSupplier else self.gate.unlock();
+            for (self.providers, 0..) |gate, provider_index| {
+                if (!gate.tryLock()) {
+                    if (self.failure == null) {
+                        std.debug.print("TEXT_STAGE_SUPPLIER_PROVIDER_HELD phase={s} provider={d} source_executions={d} callbacks={d}\n", .{ @tagName(self.callback_phase), provider_index, self.sourceExecutions(), self.callbacks });
+                        std.debug.dumpCurrentStackTrace(.{ .first_address = @returnAddress(), .allow_unsafe_unwind = false });
+                    }
+                    self.failure = error.SourceOrDestinationProviderDuringSupplier;
+                } else gate.unlock();
+            }
+            if (self.source_backend.operationToken() != null) {
+                self.failure = error.SourceOperationDuringSupplier;
+            }
+        }
+        fn reserve(raw: *anyopaque, amounts: memory_admission.AdmissionAmounts) memory_admission.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.callback_phase = .reserve;
+            self.observe();
+            if (self.next_token == self.tokens.len) return error.ResourceLimitExceeded;
+            const token = self.next_token;
+            self.next_token += 1;
+            if (self.sourceExecutions() != 0) {
+                if (self.source_token == 0 or self.tokens[self.source_token].host_scratch_bytes < self.source_host_bytes or self.source_host_bytes < 2 * @sizeOf(f32) or self.tokens[self.source_token].hostTotalBytes() + self.tokens[self.source_token].backendTotalBytes() == 0) self.failure = error.SourceHostQuotaLostBeforeDestination;
+                self.source_funded_at_destination = true;
+                if (self.cancel_on_destination) self.cancelled = true;
+            }
+            self.tokens[token] = amounts;
+            self.live += 1;
+            return token;
+        }
+        fn retain(raw: *anyopaque, token: usize, amounts: memory_admission.AdmissionAmounts) memory_admission.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.callback_phase = .retain;
+            self.observe();
+            self.tokens[token] = amounts;
+        }
+        fn release(raw: *anyopaque, token: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.callback_phase = .release;
+            self.observe();
+            self.tokens[token] = .{};
+            self.live -= 1;
+        }
+        fn close(session: backends.Session) void {
+            const Sink = @import("../execution/retirement_sink.zig");
+            var sink = Sink.Ref.create() catch @panic("test cleanup sink");
+            defer sink.release();
+            var guard = sink.enter() catch @panic("test cleanup guard");
+            defer guard.finish();
+            var epoch = guard.retainEpoch() catch @panic("test cleanup epoch");
+            defer epoch.release();
+            session.closeWithBoundary(&epoch);
+        }
+    };
+    // 0: actual resident success; 1: unsupported rank after actual prepared
+    // execution; 2: cancellation first observed at destination admission.
+    for (0..3) |mode| {
+        // Pin the actual provider owners independently of Imported wrappers.
+        // These defers run AFTER both session-close defers, including errors.
+        const Shared = @import("../backends/compute_context.zig").SharedBackendContext;
+        var source_provider: ?*Shared = null;
+        defer if (source_provider) |owner| owner.release();
+        var projection_provider: ?*Shared = null;
+        defer if (projection_provider) |owner| owner.release();
+        var source_graph = ml.graph.Graph.init(a);
+        defer source_graph.deinit();
+        var source_builder = ml.graph.Builder.init(&source_graph);
+        const ids = try source_builder.parameter("input_ids", ml.graph.Shape.init(.i64, &.{ 1, 2 }));
+        const negative = try source_builder.neg(try source_builder.convertDtype(ids, .f32));
+        try source_graph.markOutput(if (mode == 1) try source_builder.reshape(negative, ml.graph.Shape.init(.f32, &.{ 1, 1, 1, 2 })) else negative);
+        const source_bytes = try @import("onnx_graph").exportGraph(a, &source_graph, .{});
+        defer a.free(source_bytes);
+        var projection_graph = ml.graph.Graph.init(a);
+        defer projection_graph.deinit();
+        var projection_builder = ml.graph.Builder.init(&projection_graph);
+        const value = try projection_builder.parameter("input", ml.graph.Shape.init(.f32, &.{ 1, 2 }));
+        try projection_graph.markOutput(try projection_builder.add(value, value));
+        const projection_bytes = try @import("onnx_graph").exportGraph(a, &projection_graph, .{});
+        defer a.free(projection_bytes);
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        try directory.dir.writeFile(std.testing.io, .{ .sub_path = "source.onnx", .data = source_bytes });
+        try directory.dir.writeFile(std.testing.io, .{ .sub_path = "projection.onnx", .data = projection_bytes });
+        const source_path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..], "source.onnx" });
+        defer a.free(source_path);
+        const projection_path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..], "projection.onnx" });
+        defer a.free(projection_path);
+        var source = try imported.createSessionWithOptions(a, source_path, backend_kind, .{ .graph_runtime_strategy = .partitioned });
+        var source_open = true;
+        defer if (source_open) Probe.close(source);
+        var projection = try imported.createSessionWithOptions(a, projection_path, backend_kind, .{ .graph_runtime_strategy = .partitioned });
+        var projection_open = true;
+        defer if (projection_open) Probe.close(projection);
+        const source_impl: *imported.ImportedOnnxSession = @ptrCast(@alignCast(source.ptr));
+        const projection_impl: *imported.ImportedOnnxSession = @ptrCast(@alignCast(projection.ptr));
+        source_provider = source_impl.shared_backend_ctx.retain();
+        projection_provider = projection_impl.shared_backend_ctx.retain();
+        var gate: std.atomic.Mutex = .unlocked;
+        var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+        source.execution_gate = &gate;
+        source.cohort_scheduler = &scheduler;
+        var probe = Probe{ .source_counter = &source_impl.execution_count, .gate = &gate, .providers = &.{ &source_impl.shared_backend_ctx.operations.gate.mutex, &projection_impl.shared_backend_ctx.operations.gate.mutex }, .source_backend = source_impl.cb, .cancel_on_destination = mode == 2 };
+        // Imported execution-count storage belongs to the wrapper; backend
+        // header is copied by value and its exact context is independently pinned.
+        defer probe.retireWrapperMetadata();
+        const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+        defer domain.release();
+        const controller = &domain.controller;
+        try std.testing.expect(source.model_lifetime.?.admission_domain == null and projection.model_lifetime.?.admission_domain == null);
+        source.model_lifetime.?.admission_domain = domain.pin();
+        projection.model_lifetime.?.admission_domain = domain.pin();
+        try controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+        const admission = session_mod.RunAdmission{ .controller = controller, .backend_class = if (backend_kind == .native) .cpu else .gpu, .limits = .{ .host_limit_bytes = 8 * 1024 * 1024, .backend_limit_bytes = 8 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false };
+        source.run_admission = admission;
+        projection.run_admission = admission;
+        var pipeline = EmbeddingPipeline{ .allocator = a, .session = source, .text_projection = projection, .execution_lock = &gate, .tok = undefined, .execution_control = .{ .ptr = &probe, .check_fn = Probe.check, .native_call_policy = .in_process }, .config = .{ .normalize = false, .max_length = 2, .pooling = .mean, .resident_projection_required = mode == 0 and backend_kind == .native } };
+        {
+            var cleanup = try @import("../execution/cleanup_owner.zig").Owner.beginResident(source);
+            defer cleanup.finishAfterUnlock();
+            var projection_execution: ?session_mod.RunPermit = null;
+            defer if (projection_execution) |*owned| owned.deinitWithCleanup(.{ .boundary = cleanup.epoch() });
+            var ids_tensor = try Tensor.initInt64(a, "input_ids", &.{ 1, 2 }, &.{ 1, 2 });
+            defer ids_tensor.deinit();
+            var waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter{};
+            try source.selectReadyCohort(&gate, pipeline.execution_control.?, &waiter);
+            defer source.leaveSelectedCohort(&waiter);
+            var permit = try source.admitInputs(&.{ids_tensor}, a, pipeline.execution_control);
+            defer permit.deinitWithCleanup(.{ .boundary = cleanup.epoch() });
+            try permit.prepareResidentOutputRetirement();
+            try permit.preparePhysicalStorage(a);
+            try permit.bindPhysicalCleanupEpoch(cleanup.epoch().?);
+            // Capture the ACTUAL source permit token, not a heuristic largest
+            // reservation or unrelated preprocessing/cached bank charge.
+            probe.source_token = permit.lease.?.external_lease orelse if (permit.lease.?.shared_external) |shared| shared.token else return error.MissingSourceExternalQuotaToken;
+            probe.source_host_bytes = permit.lease.?.amounts.host_scratch_bytes;
+            var projection_shell = try projection.prepareResidentRetirement();
+            defer if (projection_shell) |*shell| shell.destroyUnused();
+            try source.acquireSelectedCohort(pipeline.execution_control.?, &waiter);
+            pipeline.execution_gate_held = true;
+            defer {
+                source.releaseSelectedCohortGate(&waiter);
+                pipeline.execution_gate_held = false;
+            }
+            const result = pipeline.tryEmbedTextResidentProjection(&.{ids_tensor}, &.{ 1, 1 }, 1, 2, projection, &permit, &projection_shell, .{ .boundary = cleanup.epoch() }, &projection_execution, &waiter);
+            if (mode == 0) {
+                const outputs = (try result) orelse return error.SourceNotAttempted;
+                defer freeEmbeddingSlices(a, outputs);
+                try std.testing.expectEqual(@as(usize, 1), outputs.len);
+                try std.testing.expectEqualSlices(f32, &.{ -2, -4 }, outputs[0]);
+            } else try std.testing.expectError(if (mode == 1) error.UnexpectedOutputShape else error.Cancelled, result);
+        }
+        try std.testing.expectEqual(@as(u64, 1), imported.executionStats(source).?.executions);
+        try std.testing.expectEqual(@as(u64, if (mode == 0) 1 else 0), imported.executionStats(projection).?.executions);
+        try std.testing.expect(!pipeline.execution_gate_held and scheduler.head == null);
+        // Stop reading wrapper-owned counter metadata before actual retirement;
+        // copied backend and provider gates remain live and checked through B.
+        probe.retireWrapperMetadata();
+        Probe.close(source);
+        source_open = false;
+        Probe.close(projection);
+        projection_open = false;
+        try std.testing.expectEqualDeep(memory_admission.AdmissionAmounts{}, probe.tokens[probe.source_token]);
+        try std.testing.expect(probe.callbacks > 0);
+        if (mode != 1) try std.testing.expect(probe.source_funded_at_destination);
+        if (probe.failure) |err| return err;
+        try std.testing.expectEqual(@as(usize, 0), probe.live);
+        try std.testing.expectEqualDeep(memory_admission.AdmissionAmounts{}, controller.snapshot());
+    }
+}
+
+test "actual prepared Native text projection releases source lanes preserves output and never replays consumed source" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    try checkPreparedTextProjectionBoundary(.native);
+}
+
+test "actual prepared Metal nonpromotable text source retains exact host quota through destination admission and cancellation" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    try checkPreparedTextProjectionBoundary(.metal);
+}
+
+fn checkPreparedMediaSourceBoundary(backend_kind: backends.BackendType, modality: ResidentProjectionModality) !void {
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const imported = @import("../backends/imported_onnx_session.zig");
+    const Probe = struct {
+        source_counter: ?*std.atomic.Value(u64),
+        retired_source_executions: u64 = 0,
+        gate: *std.atomic.Mutex,
+        providers: []const *std.atomic.Mutex,
+        source_backend: ops_mod.ComputeBackend,
+        cancel_on_destination: bool,
+        cancelled: bool = false,
+        live: usize = 0,
+        tokens: [128]memory_admission.AdmissionAmounts = @splat(.{}),
+        next_token: usize = 1,
+        source_token: usize = 0,
+        source_host_bytes: usize = 0,
+        source_funded_at_destination: bool = false,
+        callbacks: usize = 0,
+        callback_phase: enum { reserve, retain, release } = .reserve,
+        failure: ?anyerror = null,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancelled) return error.Cancelled;
+        }
+        fn sourceExecutions(self: *const @This()) u64 {
+            return if (self.source_counter) |counter| counter.load(.acquire) else self.retired_source_executions;
+        }
+        fn retireWrapperMetadata(self: *@This()) void {
+            self.retired_source_executions = self.sourceExecutions();
+            self.source_counter = null;
+        }
+        fn observe(self: *@This()) void {
+            self.callbacks += 1;
+            if (!self.gate.tryLock()) self.failure = error.SourceModelGateDuringSupplier else self.gate.unlock();
+            for (self.providers, 0..) |gate, provider_index| {
+                if (!gate.tryLock()) {
+                    if (self.failure == null) {
+                        std.debug.print("TEXT_STAGE_SUPPLIER_PROVIDER_HELD phase={s} provider={d} source_executions={d} callbacks={d}\n", .{ @tagName(self.callback_phase), provider_index, self.sourceExecutions(), self.callbacks });
+                        std.debug.dumpCurrentStackTrace(.{ .first_address = @returnAddress(), .allow_unsafe_unwind = false });
+                    }
+                    self.failure = error.SourceOrDestinationProviderDuringSupplier;
+                } else gate.unlock();
+            }
+            if (self.source_backend.operationToken() != null) {
+                self.failure = error.SourceOperationDuringSupplier;
+            }
+        }
+        fn reserve(raw: *anyopaque, amounts: memory_admission.AdmissionAmounts) memory_admission.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.callback_phase = .reserve;
+            self.observe();
+            if (self.next_token == self.tokens.len) return error.ResourceLimitExceeded;
+            const token = self.next_token;
+            self.next_token += 1;
+            if (self.sourceExecutions() != 0) {
+                if (self.source_token == 0 or self.tokens[self.source_token].host_scratch_bytes < self.source_host_bytes or self.source_host_bytes < 2 * @sizeOf(f32) or self.tokens[self.source_token].hostTotalBytes() + self.tokens[self.source_token].backendTotalBytes() == 0) self.failure = error.SourceHostQuotaLostBeforeDestination;
+                self.source_funded_at_destination = true;
+                if (self.cancel_on_destination) self.cancelled = true;
+            }
+            self.tokens[token] = amounts;
+            self.live += 1;
+            return token;
+        }
+        fn retain(raw: *anyopaque, token: usize, amounts: memory_admission.AdmissionAmounts) memory_admission.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.callback_phase = .retain;
+            self.observe();
+            self.tokens[token] = amounts;
+        }
+        fn release(raw: *anyopaque, token: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.callback_phase = .release;
+            self.observe();
+            self.tokens[token] = .{};
+            self.live -= 1;
+        }
+        fn close(session: backends.Session) void {
+            const Sink = @import("../execution/retirement_sink.zig");
+            var sink = Sink.Ref.create() catch @panic("test cleanup sink");
+            defer sink.release();
+            var guard = sink.enter() catch @panic("test cleanup guard");
+            defer guard.finish();
+            var epoch = guard.retainEpoch() catch @panic("test cleanup epoch");
+            defer epoch.release();
+            session.closeWithBoundary(&epoch);
+        }
+    };
+    // 0: actual resident success; 1: unsupported rank after actual prepared
+    // execution; 2: cancellation first observed at destination admission.
+    for (0..3) |mode| {
+        // Pin the actual provider owners independently of Imported wrappers.
+        // These defers run AFTER both session-close defers, including errors.
+        const Shared = @import("../backends/compute_context.zig").SharedBackendContext;
+        var source_provider: ?*Shared = null;
+        defer if (source_provider) |owner| owner.release();
+        var projection_provider: ?*Shared = null;
+        defer if (projection_provider) |owner| owner.release();
+        var source_graph = ml.graph.Graph.init(a);
+        defer source_graph.deinit();
+        var source_builder = ml.graph.Builder.init(&source_graph);
+        const ids = try source_builder.parameter("input_ids", ml.graph.Shape.init(.i64, &.{ 1, 2 }));
+        const negative = try source_builder.neg(try source_builder.convertDtype(ids, .f32));
+        try source_graph.markOutput(if (mode == 1) try source_builder.reshape(negative, ml.graph.Shape.init(.f32, &.{ 1, 1, 1, 2 })) else negative);
+        const source_bytes = try @import("onnx_graph").exportGraph(a, &source_graph, .{});
+        defer a.free(source_bytes);
+        var projection_graph = ml.graph.Graph.init(a);
+        defer projection_graph.deinit();
+        var projection_builder = ml.graph.Builder.init(&projection_graph);
+        const value = try projection_builder.parameter("input", ml.graph.Shape.init(.f32, &.{ 1, 2 }));
+        try projection_graph.markOutput(try projection_builder.add(value, value));
+        const projection_bytes = try @import("onnx_graph").exportGraph(a, &projection_graph, .{});
+        defer a.free(projection_bytes);
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        try directory.dir.writeFile(std.testing.io, .{ .sub_path = "source.onnx", .data = source_bytes });
+        try directory.dir.writeFile(std.testing.io, .{ .sub_path = "projection.onnx", .data = projection_bytes });
+        const source_path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..], "source.onnx" });
+        defer a.free(source_path);
+        const projection_path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..], "projection.onnx" });
+        defer a.free(projection_path);
+        var source = try imported.createSessionWithOptions(a, source_path, backend_kind, .{ .graph_runtime_strategy = .partitioned });
+        var source_open = true;
+        defer if (source_open) Probe.close(source);
+        var projection = try imported.createSessionWithOptions(a, projection_path, backend_kind, .{ .graph_runtime_strategy = .partitioned });
+        var projection_open = true;
+        defer if (projection_open) Probe.close(projection);
+        const source_impl: *imported.ImportedOnnxSession = @ptrCast(@alignCast(source.ptr));
+        const projection_impl: *imported.ImportedOnnxSession = @ptrCast(@alignCast(projection.ptr));
+        source_provider = source_impl.shared_backend_ctx.retain();
+        projection_provider = projection_impl.shared_backend_ctx.retain();
+        var gate: std.atomic.Mutex = .unlocked;
+        var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+        source.execution_gate = &gate;
+        source.cohort_scheduler = &scheduler;
+        var probe = Probe{ .source_counter = &source_impl.execution_count, .gate = &gate, .providers = &.{ &source_impl.shared_backend_ctx.operations.gate.mutex, &projection_impl.shared_backend_ctx.operations.gate.mutex }, .source_backend = source_impl.cb, .cancel_on_destination = mode == 2 };
+        defer probe.retireWrapperMetadata();
+        const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+        defer domain.release();
+        const controller = &domain.controller;
+        try std.testing.expect(source.model_lifetime.?.admission_domain == null and projection.model_lifetime.?.admission_domain == null);
+        source.model_lifetime.?.admission_domain = domain.pin();
+        projection.model_lifetime.?.admission_domain = domain.pin();
+        try controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+        const admission = session_mod.RunAdmission{ .controller = controller, .backend_class = if (backend_kind == .native) .cpu else .gpu, .limits = .{ .host_limit_bytes = 8 * 1024 * 1024, .backend_limit_bytes = 8 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false };
+        source.run_admission = admission;
+        projection.run_admission = admission;
+        var pipeline = EmbeddingPipeline{ .allocator = a, .session = source, .visual_projection = if (modality == .image) projection else null, .audio_projection = if (modality == .audio) projection else null, .execution_lock = &gate, .tok = undefined, .execution_control = .{ .ptr = &probe, .check_fn = Probe.check, .native_call_policy = .in_process }, .config = .{ .normalize = false, .max_length = 2, .pooling = .mean, .resident_projection_required = mode == 0 and backend_kind == .native } };
+        {
+            var ids_tensor = try Tensor.initInt64(a, "input_ids", &.{ 1, 2 }, &.{ 1, 2 });
+            defer ids_tensor.deinit();
+            var source_stage: session_mod.PreparedSource = .{};
+            defer source_stage.deinit();
+            try source_stage.initBeforeExecutionInto(pipeline.session, pipeline.session, &gate, .{ .host = &.{ids_tensor} }, .{ .batch = 1, .sequence = 2, .input_bytes = 16 }, null, .resident_consumer, a, pipeline.execution_control);
+            try std.testing.expect(scheduler.head == &source_stage.waiter);
+            probe.source_token = source_stage.permit.?.lease.?.external_lease orelse if (source_stage.permit.?.lease.?.shared_external) |shared| shared.token else return error.MissingSourceExternalQuotaToken;
+            probe.source_host_bytes = source_stage.permit.?.lease.?.amounts.host_scratch_bytes;
+            try source_stage.enter();
+            const result = pipeline.tryEmbedResidentProjection(&.{ids_tensor}, projection, modality, 1, "media.encoder.resident", "media.projection.resident", &source_stage);
+            if (mode == 0) {
+                const outputs = (try result) orelse return error.SourceNotAttempted;
+                defer freeEmbeddingSlices(a, outputs);
+                try std.testing.expectEqual(@as(usize, 1), outputs.len);
+                try std.testing.expectEqualSlices(f32, &.{ -2, -4 }, outputs[0]);
+            } else try std.testing.expectError(if (mode == 1) error.UnexpectedOutputShape else error.Cancelled, result);
+            // Both committed success and post-producer refusal consume the
+            // one actual source; retrying it cannot replay numerical work.
+            try std.testing.expectError(error.SourceInvocationAlreadyExecuted, source_stage.runHost(&.{ids_tensor}));
+        }
+        try std.testing.expectEqual(@as(u64, 1), imported.executionStats(source).?.executions);
+        try std.testing.expectEqual(@as(u64, if (mode == 0) 1 else 0), imported.executionStats(projection).?.executions);
+        try std.testing.expect(!pipeline.execution_gate_held and scheduler.head == null);
+        probe.retireWrapperMetadata();
+        Probe.close(source);
+        source_open = false;
+        Probe.close(projection);
+        projection_open = false;
+        try std.testing.expectEqualDeep(memory_admission.AdmissionAmounts{}, probe.tokens[probe.source_token]);
+        try std.testing.expect(probe.callbacks > 0);
+        if (mode != 1) try std.testing.expect(probe.source_funded_at_destination);
+        if (probe.failure) |err| return err;
+        try std.testing.expectEqual(@as(usize, 0), probe.live);
+        try std.testing.expectEqualDeep(memory_admission.AdmissionAmounts{}, controller.snapshot());
+    }
+}
+
+test "actual Native media source owner image and audio handoff keep quota lanes and exactly once producer" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    for ([_]ResidentProjectionModality{ .image, .audio }) |modality| try checkPreparedMediaSourceBoundary(.native, modality);
+}
+test "actual Metal media source owner image and audio nonpromotable fallback keep host quota and cancellation" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    for ([_]ResidentProjectionModality{ .image, .audio }) |modality| try checkPreparedMediaSourceBoundary(.metal, modality);
+}
+
+test "nonprojection text pooling capability decline consumes actual Native hidden once and strict mode never replays" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Shared = @import("../backends/compute_context.zig").SharedBackendContext;
+    const shared = try Shared.init(a, .native, null);
+    defer shared.release();
+    const Producer = struct {
+        backend: ops_mod.ComputeBackend,
+        calls: usize = 0,
+        fn host(_: *anyopaque, _: []const Tensor, _: std.mem.Allocator) ![]Tensor {
+            return error.ConsumedEncoderReplayed;
+        }
+        fn resident(raw: *anyopaque, _: []const Tensor, allocator: std.mem.Allocator) !?session_mod.ResidentOutputs {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls != 1) return error.ConsumedEncoderReplayed;
+            const outputs = try allocator.alloc(ops_mod.CT, 1);
+            errdefer allocator.free(outputs);
+            outputs[0] = try self.backend.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 2, 2 });
+            return .{ .outputs = outputs, .backend = &self.backend, .allocator = allocator };
+        }
+        fn info(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn kind(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        const table = backends.Session.VTable{ .run = host, .runResident = resident, .inputInfo = info, .outputInfo = info, .backend = kind, .close = close };
+    };
+    for ([_]bool{ false, true }) |decline| {
+        for ([_]bool{ false, true }) |strict| {
+            var partial = shared.stableBackend().vtable.*;
+            // Deliberately untrusted partial provider: this test grants NO
+            // physical-owner/promotion authority to the copied table. It only
+            // exercises unsupported pooling after real Native CT production.
+            partial.whereSelect = null;
+            partial.operation_services = null;
+            var producer = Producer{ .backend = shared.computeBackend() };
+            if (decline) producer.backend.vtable = &partial;
+            const session = backends.Session{ .ptr = &producer, .vtable = &Producer.table };
+            var pipeline = EmbeddingPipeline{ .allocator = a, .session = session, .tok = undefined, .config = .{ .pooling = .max, .normalize = false, .resident_projection_required = strict } };
+            var cleanup = try @import("../execution/cleanup_owner.zig").Owner.beginResident(session);
+            defer cleanup.finishAfterUnlock();
+            var permit = try session.admit(.{});
+            defer permit.deinitWithCleanup(.{ .boundary = cleanup.epoch() });
+            const result = pipeline.tryEmbedTextResidentEncoder(&.{}, &.{ 1, 1 }, 1, 2, &permit, .{ .boundary = cleanup.epoch() });
+            if (strict and decline) {
+                try std.testing.expectError(error.ResidentEmbeddingFallback, result);
+            } else {
+                const rows = (try result) orelse return error.CommittedEncoderReturnedNotAttempted;
+                defer freeEmbeddingSlices(a, rows);
+                try std.testing.expectEqual(@as(usize, 1), rows.len);
+                try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, rows[0]);
+            }
+            try std.testing.expectEqual(@as(usize, 1), producer.calls);
+        }
+    }
+}
+
+fn qwenSameResultAllocationCase(a: std.mem.Allocator, strict: bool) !void {
+    const Native = @import("../ops/native_compute.zig");
+    var weights = Native.WeightStore{ .allocator = std.testing.allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer weights.deinitOwned();
+    var compute = Native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    var table = Native.vtable_impl;
+    table.whereSelect = null;
+    table.operation_services = null;
+    const cb = ops_mod.ComputeBackend{ .ptr = &compute, .vtable = &table };
+    const Producer = struct {
+        calls: usize = 0,
+        fn run(self: *@This(), backend: *const ops_mod.ComputeBackend) !ops_mod.CT {
+            self.calls += 1;
+            if (self.calls != 1) return error.ConsumedEncoderReplayed;
+            return backend.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 2, 2 });
+        }
+    };
+    var producer = Producer{};
+    const hidden = try producer.run(&cb);
+    defer cb.free(hidden);
+    var storage = [_]ops_mod.CT{hidden};
+    var output = session_mod.ResidentOutputs{ .outputs = &storage, .backend = &cb, .allocator = a };
+    var pipeline = EmbeddingPipeline{ .allocator = a, .session = undefined, .tok = undefined, .config = .{ .pooling = .max, .normalize = true, .resident_projection_required = strict } };
+    if (strict) {
+        try std.testing.expectError(error.ResidentEmbeddingFallback, pipeline.finishProducedTextRows(&output, &.{ 1, 1 }, 1, 2, true, "text.pool.qwen3.resident", "text.encoder.qwen3.resident"));
+    } else {
+        const rows = try pipeline.finishProducedTextRows(&output, &.{ 1, 1 }, 1, 2, true, "text.pool.qwen3.resident", "text.encoder.qwen3.resident");
+        defer freeEmbeddingSlices(a, rows);
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        for ([_]f32{ 0.6, 0.8 }, rows[0]) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-6);
+    }
+    try std.testing.expectEqual(@as(usize, 1), producer.calls);
+}
+
+test "Qwen committed hidden pooling refusal consumes actual Native output once and survives all allocation failures" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    try qwenSameResultAllocationCase(std.testing.allocator, false);
+    try qwenSameResultAllocationCase(std.testing.allocator, true);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, qwenSameResultAllocationCase, .{false});
+}
+
+test "Qwen selected graph row host fallback preserves completed normalization boundary" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Native = @import("../ops/native_compute.zig");
+    var weights = Native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer weights.deinitOwned();
+    var compute = Native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var normalized = [_]f32{ 17, 23, 31 };
+    linalg.l2Normalize(&normalized, normalized.len);
+    const hidden = try cb.fromFloat32Shape(&normalized, &.{ 1, 3 });
+    defer cb.free(hidden);
+    var storage = [_]ops_mod.CT{hidden};
+    var output = session_mod.ResidentOutputs{ .outputs = &storage, .backend = &cb, .allocator = a };
+    var pipeline = EmbeddingPipeline{ .allocator = a, .session = undefined, .tok = undefined, .config = .{ .pooling = .last, .normalize = true } };
+    const rows = try pipeline.finishProducedTextHost(&output, &.{ 1, 1, 0, 0 }, 1, 4, false, "text.pool.qwen3.graph", "unsupported_pooling");
+    defer freeEmbeddingSlices(a, rows);
+    try std.testing.expectEqualSlices(f32, &normalized, rows[0]);
+    try std.testing.expect(pipeline.config.normalize);
 }

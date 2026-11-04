@@ -4169,8 +4169,9 @@ pub const ComputeBackend = struct {
         const output = stable_storage: {
             // Stable target storage bypasses temporary arena slots. The owned
             // reshape retains the flat allocation through the published value.
-            if (self.vtable.kernels) |functions| if (functions.allocatePhysicalStorage) |allocate| {
-                const storage = (try allocate(self.ptr, try std.math.mul(usize, count, @sizeOf(f32)))) orelse return error.UnsupportedBackendOp;
+            if (self.vtable.kernels) |functions| if (functions.physical_storage_policy) |policy| {
+                if (!functions.accepts(self.vtable)) return error.UnsupportedPhysicalStoragePolicy;
+                const storage = (try policy.allocate(self.ptr, .{ .byte_size = try std.math.mul(usize, count, @sizeOf(f32)) })) orelse return error.UnsupportedBackendOp;
                 defer self.free(storage);
                 const dimensions = [_]i64{ @intCast(rows), @intCast(cols) };
                 break :stable_storage try self.primReshape(storage, &dimensions);

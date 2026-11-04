@@ -200,12 +200,13 @@ pub const Runtime = struct {
         options: *const interpreter.ExecuteOptions,
         output: *Result,
     ) !void {
+        if (options.prepared_routes) |routes| try routes.pool.validateExecutionPolicy();
         const profile_owned = if (options.region_execution_profile) |profile| try profile.ensureScope(.{ .operation = .graph_execution, .implementation = .{ .context = self.default_backend.ptr, .table = self.default_backend.vtable }, .program = graph }) else false;
         errdefer if (profile_owned) options.region_execution_profile.?.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         const operation = @import("../execution/backend_operation.zig");
         const borrowed_operation = options.backend_operation orelse self.default_backend.operationToken() orelse if (options.region_execution_profile) |profile| profile.operation_lease else null;
         var operation_scope: operation.Scope = undefined;
-        try operation.enterInto(self.default_backend, graph, borrowed_operation, if (options.region_execution_profile != null) .managed else .legacy_unknown_frame, &operation_scope);
+        try operation.enterInto(self.default_backend, graph, borrowed_operation, if (options.region_execution_profile != null or (if (options.prepared_routes) |routes| routes.pool.requiresManagedExecution() else false)) .managed else .legacy_unknown_frame, &operation_scope);
         errdefer operation_scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         const transfer_audit = @import("../execution/transfer_audit.zig");
         var audit = transfer_audit.Audit{ .forbid_activation_readbacks = options.activation_readbacks == .forbidden };
@@ -362,7 +363,8 @@ pub const Runtime = struct {
                 };
                 if (options.host_inputs) |inputs| {
                     const active = frame orelse return error.PreparedHostIngressUnavailable;
-                    const uploaded = try active.bindHostInputsWithControl(inputs, options.execution_control);
+                    const ingress_operation = backend_operation;
+                    const uploaded = try active.bindHostInputsWithOperation(inputs, options.execution_control, if (ingress_operation) |*token| token else null);
                     const existing = options.runtime_inputs orelse &.{};
                     const count = try std.math.add(usize, existing.len, uploaded.len);
                     const merged = if (count <= input_storage.len) input_storage[0..count] else blk: {
@@ -1324,11 +1326,11 @@ test "graph runtime producer outputs retain fallback ownership and repeated bind
     defer graph.deinit();
     var b = Builder.init(&graph);
     const x = try b.parameter("x", Shape.init(.f32, &.{ 2, 3 }));
-    const indices = try b.parameter("indices", Shape.init(.i32, &.{2}));
-    // LayerNorm now has a qualified general CUDA route. Use an unsupported
-    // non-row gather to force the ownership boundary this regression needs.
-    const out = try b.gather(x, indices, Shape.init(.f32, &.{ 2, 2 }));
-    graph.nodeMut(out).op.gather.axis = 1;
+    const indices = try b.parameter("indices", Shape.init(.i32, &.{ 2, 1 }));
+    // GatherND retains the Native fallback this ownership regression needs.
+    // Ordinary axis gathers have qualified general CUDA routes.
+    const out = try b.gather(x, indices, Shape.init(.f32, &.{ 2, 3 }));
+    graph.nodeMut(out).op.gather.nd = true;
     try graph.markOutput(out);
     try graph.markOutput(out);
     var weights = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
@@ -1350,7 +1352,7 @@ test "graph runtime producer outputs retain fallback ownership and repeated bind
     defer if (runtime_live) runtime.deinit();
     const value = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 3 });
     defer cb.free(value);
-    const index_values = (try cb.fromInt32Shape(&.{ 1, 0 }, &.{2})).?;
+    const index_values = (try cb.fromInt32Shape(&.{ 1, 0 }, &.{ 2, 1 })).?;
     defer cb.free(index_values);
     const inputs = [_]interpreter.RuntimeInput{ .{ .node_id = x, .value = value }, .{ .node_id = indices, .value = index_values } };
     var resident = try runtime.execute(a, &graph, .{ .runtime_inputs = &inputs, .output_placement = .producer });
@@ -1358,6 +1360,7 @@ test "graph runtime producer outputs retain fallback ownership and repeated bind
     try std.testing.expectEqual(BackendKind.native, resident.backendFor(&runtime, 0).kind());
     const expected = try resident.backendFor(&runtime, 0).toFloat32(resident.outputs[0], a);
     defer a.free(expected);
+    try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6, 1, 2, 3 }, expected);
     var normalized = try runtime.execute(a, &graph, .{ .runtime_inputs = &inputs });
     defer normalized.deinit(&runtime);
     try std.testing.expectEqual(BackendKind.cuda, normalized.backendFor(&runtime, 0).kind());

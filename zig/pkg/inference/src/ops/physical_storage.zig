@@ -20,6 +20,30 @@ const ops = @import("ops.zig");
 const admission = @import("../execution/storage_admission.zig");
 const accounting = @import("../execution/storage_accounting.zig");
 
+/// The usage describes initialization, not an accounting class or permission
+/// to weaken backend storage policy. Unsupported requests fail before SDK work.
+pub const Usage = enum { ordinary, host_input };
+pub const Request = struct {
+    byte_size: usize,
+    usage: Usage = .ordinary,
+    admitted: bool = false,
+};
+/// One canonical allocation policy. KernelBackend.accepts must be checked
+/// before invoking any callback, including metadata-only reservation queries.
+pub const Policy = struct {
+    allocate: *const fn (*anyopaque, Request) anyerror!?ops.CT,
+    reservation_bytes: ?*const fn (*anyopaque, Request) anyerror!usize = null,
+    mark_admitted: ?*const fn (*anyopaque, ops.CT) anyerror!void = null,
+};
+pub fn reservationBytes(backend: ops.ComputeBackend, request: Request) !usize {
+    const functions = backend.vtable.kernels orelse return if (request.usage == .ordinary) request.byte_size else error.UnsupportedPhysicalStorageUsage;
+    if (!functions.accepts(backend.vtable)) return error.UnsupportedPhysicalStoragePolicy;
+    const policy = functions.physical_storage_policy orelse return if (request.usage == .ordinary) request.byte_size else error.UnsupportedPhysicalStorageUsage;
+    const bound = if (policy.reservation_bytes) |query| try query(backend.ptr, request) else request.byte_size;
+    if (bound < request.byte_size) return error.InvalidPhysicalStorageReservation;
+    return bound;
+}
+
 pub const Lease = struct {
     allocator: std.mem.Allocator,
     backend: ops.ComputeBackend,
@@ -92,15 +116,20 @@ pub const Lease = struct {
         return createAdmitted(allocator, backend, byte_size, ledger, class, null);
     }
     pub fn createAdmitted(allocator: std.mem.Allocator, backend: ops.ComputeBackend, byte_size: usize, ledger: ?*accounting.Ledger, class: accounting.Class, capability: ?admission.Capability) !?*Lease {
+        return createAdmittedWithUsage(allocator, backend, byte_size, ledger, class, capability, .ordinary);
+    }
+    pub fn createAdmittedWithUsage(allocator: std.mem.Allocator, backend: ops.ComputeBackend, byte_size: usize, ledger: ?*accounting.Ledger, class: accounting.Class, capability: ?admission.Capability, usage: Usage) !?*Lease {
         if (byte_size == 0 or byte_size % @sizeOf(f32) != 0 or byte_size / @sizeOf(f32) > std.math.maxInt(i32)) return null;
         const self = try allocator.create(Lease);
         errdefer allocator.destroy(self);
-        const reserved = if (capability) |cap| try reserveBinding(allocator, backend, byte_size, class, cap) else AdmissionBinding{};
+        const reserved = if (capability) |cap| try reserveBinding(allocator, backend, .{ .byte_size = byte_size, .usage = usage }, class, cap) else AdmissionBinding{};
         errdefer reserved.rollback(allocator);
         const owned = reserved.backing;
         const functions = backend.vtable.kernels;
-        const allocate_storage = if (functions) |f| if (owned != null and backend.kind() == .metal) f.allocateAdmittedPhysicalStorage else f.allocatePhysicalStorage else null;
-        const tensor = (if (allocate_storage) |allocate| try allocate(backend.ptr, byte_size) else try backend.allocUninitF32Shape(&.{@intCast(byte_size / @sizeOf(f32))})) orelse {
+        if (functions) |f| if (!f.accepts(backend.vtable)) return error.UnsupportedPhysicalStoragePolicy;
+        const policy = if (functions) |f| f.physical_storage_policy else null;
+        if (policy == null and usage != .ordinary) return error.UnsupportedPhysicalStorageUsage;
+        const tensor = (if (policy) |p| try p.allocate(backend.ptr, .{ .byte_size = byte_size, .usage = usage, .admitted = owned != null }) else try backend.allocUninitF32Shape(&.{@intCast(byte_size / @sizeOf(f32))})) orelse {
             if (capability != null) return error.PhysicalStorageAllocationDeclined;
             allocator.destroy(self);
             return null;
@@ -122,21 +151,21 @@ pub const Lease = struct {
     const AdmissionBinding = admission.Binding;
     fn validatePreparedBackingSupport(backend: ops.ComputeBackend) !void {
         const functions = backend.vtable.kernels orelse return error.UnsupportedPhysicalStorageRetirement;
-        if (!functions.accepts(backend.vtable) or functions.allocatePhysicalStorage == null) return error.UnsupportedPhysicalStorageRetirement;
+        if (!functions.accepts(backend.vtable) or functions.physical_storage_policy == null) return error.UnsupportedPhysicalStorageRetirement;
         switch (backend.kind()) {
             .native, .cuda => {},
             .metal => {
                 const services = backend.vtable.resource_retirement_services orelse return error.UnsupportedPhysicalStorageRetirement;
-                if (functions.allocateAdmittedPhysicalStorage == null or functions.markPhysicalStorageAdmitted == null or !services.accepts(backend.vtable)) return error.UnsupportedPhysicalStorageRetirement;
+                if (functions.physical_storage_policy.?.mark_admitted == null or !services.accepts(backend.vtable)) return error.UnsupportedPhysicalStorageRetirement;
             },
             else => return error.UnsupportedPhysicalStorageRetirement,
         }
     }
-    fn reserveBinding(allocator: std.mem.Allocator, backend: ops.ComputeBackend, bytes: usize, class: accounting.Class, capability: admission.Capability) !AdmissionBinding {
-        const functions = backend.vtable.kernels;
+    fn reserveBinding(allocator: std.mem.Allocator, backend: ops.ComputeBackend, request: Request, class: accounting.Class, capability: admission.Capability) !AdmissionBinding {
         if (capability.services.takeBacking != null) try validatePreparedBackingSupport(backend);
-        const bound = if (functions) |f| (if (f.physicalStorageReservationBytes) |query| try query(backend.ptr, bytes) else bytes) else bytes;
-        if (bound < bytes) return error.InvalidPhysicalStorageReservation;
+        var allocation_request = request;
+        allocation_request.admitted = capability.services.takeBacking != null;
+        const bound = try reservationBytes(backend, allocation_request);
         return capability.reserveOwned(allocator, backend.kind(), class, bound);
     }
     fn attachPhysicalCharge(backend: ops.ComputeBackend, tensor: ops.CT, binding: admission.BackingReservation) !void {
@@ -159,7 +188,7 @@ pub const Lease = struct {
         if (capability.services.takeBacking != null) {
             try validatePreparedBackingSupport(self.backend);
             if (self.backend.kind() == .metal) {
-                const mark = self.backend.vtable.kernels.?.markPhysicalStorageAdmitted.?;
+                const mark = self.backend.vtable.kernels.?.physical_storage_policy.?.mark_admitted.?;
                 try mark(self.backend.ptr, self.tensor);
             }
         }
@@ -676,9 +705,9 @@ test "physical Metal allocation admission bound covers SDK span without audio bu
     const cb = context.computeBackend();
     const functions = cb.vtable.kernels.?;
     for ([_]usize{ 4, 8, 12, 16, 252, 256, 260, 4092, 4096, 4100, 16384 }) |bytes| {
-        const upper = try functions.physicalStorageReservationBytes.?(cb.ptr, bytes);
+        const upper = try functions.physical_storage_policy.?.reservation_bytes.?(cb.ptr, .{ .byte_size = bytes });
         try std.testing.expect(upper >= bytes);
-        const tensor = (try functions.allocatePhysicalStorage.?(cb.ptr, bytes)).?;
+        const tensor = (try functions.physical_storage_policy.?.allocate(cb.ptr, .{ .byte_size = bytes })).?;
         defer cb.free(tensor);
         const actual = (try backingBytes(cb, tensor)) orelse return error.MissingPhysicalBackingMeasurement;
         try std.testing.expect(actual <= upper);
@@ -847,8 +876,8 @@ test "Metal standalone physical reservation covers model scale allocation extent
     var exceeded: usize = 0;
     // Includes standalone page boundaries and MiniLM positional/word tables.
     for ([_]usize{ 16, 4100, 16380, 16384, 16388, 24576, 32764, 32768, 32772, 98304, 512 * 384 * 4, 30522 * 384 * 4 }) |bytes| {
-        const upper = try functions.physicalStorageReservationBytes.?(cb.ptr, bytes);
-        const tensor = (try functions.allocatePhysicalStorage.?(cb.ptr, bytes)).?;
+        const upper = try functions.physical_storage_policy.?.reservation_bytes.?(cb.ptr, .{ .byte_size = bytes });
+        const tensor = (try functions.physical_storage_policy.?.allocate(cb.ptr, .{ .byte_size = bytes })).?;
         defer cb.free(tensor);
         const actual = (try backingBytes(cb, tensor)) orelse return error.MissingPhysicalBackingMeasurement;
         if (upper < bytes or actual > upper) {
@@ -857,7 +886,7 @@ test "Metal standalone physical reservation covers model scale allocation extent
         }
     }
     if (exceeded != 0) return error.MetalPhysicalAllocationBoundViolated;
-    try std.testing.expectError(error.InvalidPhysicalStorageReservation, functions.physicalStorageReservationBytes.?(cb.ptr, std.math.maxInt(usize)));
+    try std.testing.expectError(error.InvalidPhysicalStorageReservation, functions.physical_storage_policy.?.reservation_bytes.?(cb.ptr, .{ .byte_size = std.math.maxInt(usize) }));
 }
 
 test "Metal standalone planned banks admit their exact bound and reject one byte less" {
@@ -878,7 +907,7 @@ test "Metal standalone planned banks admit their exact bound and reject one byte
         }
     };
     for ([_]usize{ 16, 16388, 24576, 32764, 32772, 30522 * 384 * 4 }) |bytes| {
-        const upper = try cb.vtable.kernels.?.physicalStorageReservationBytes.?(cb.ptr, bytes);
+        const upper = try cb.vtable.kernels.?.physical_storage_policy.?.reservation_bytes.?(cb.ptr, .{ .byte_size = bytes });
         var owner = Owner{ .run = undefined, .limit = upper - 1 };
         defer owner.controller.deinit();
         owner.run = try owner.controller.tryAcquire(.gpu, .{}, .{}, false);
@@ -1066,4 +1095,60 @@ test "actual Native bank survives route eviction held view and exact final clean
 }
 test "actual Native bank route cleanup evictions unwind every allocation failure" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, preparedBankCacheLifetimeCase, .{});
+}
+
+test "typed physical policy validates full table before reservation and allocation callbacks" {
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const canonical = context.computeBackend();
+    const Reject = struct {
+        fn accepts(_: *const anyopaque) bool {
+            return false;
+        }
+        fn allocate(_: *anyopaque, _: Request) !?ops.CT {
+            return error.UnsafePolicyCallback;
+        }
+        fn bound(_: *anyopaque, _: Request) !usize {
+            return error.UnsafePolicyCallback;
+        }
+        const policy = Policy{ .allocate = allocate, .reservation_bytes = bound };
+    };
+    var kernels = canonical.vtable.kernels.?.*;
+    kernels.implementation_table = null;
+    kernels.acceptsImplementation = Reject.accepts;
+    kernels.physical_storage_policy = &Reject.policy;
+    var table = canonical.vtable.*;
+    table.kernels = &kernels;
+    // Deliberately invalid context proves neither callback can be entered.
+    const copied = ops.ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &table };
+    try std.testing.expectError(error.UnsupportedPhysicalStoragePolicy, reservationBytes(copied, .{ .byte_size = 16, .usage = .host_input }));
+    try std.testing.expectError(error.UnsupportedPhysicalStoragePolicy, Lease.create(a, copied, 16));
+}
+
+test "typed physical policy carries initialization and admitted mode through one reservation contract" {
+    const Probe = struct {
+        seen: bool = false,
+        fn allocate(_: *anyopaque, _: Request) !?ops.CT {
+            return error.UnexpectedAllocation;
+        }
+        fn bound(raw: *anyopaque, request: Request) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (request.usage != .host_input or !request.admitted) return error.IncorrectPhysicalStorageRequest;
+            self.seen = true;
+            return std.math.add(usize, request.byte_size, 64);
+        }
+        const policy = Policy{ .allocate = allocate, .reservation_bytes = bound };
+    };
+    const native = @import("native_compute.zig");
+    var state = Probe{};
+    var kernels = native.vtable_impl.kernels.?.*;
+    var table = native.vtable_impl;
+    kernels.implementation_table = &table;
+    kernels.acceptsImplementation = null;
+    kernels.physical_storage_policy = &Probe.policy;
+    table.kernels = &kernels;
+    const cb = ops.ComputeBackend{ .ptr = &state, .vtable = &table };
+    try std.testing.expectEqual(@as(usize, 80), try reservationBytes(cb, .{ .byte_size = 16, .usage = .host_input, .admitted = true }));
+    try std.testing.expect(state.seen);
 }

@@ -21,9 +21,12 @@ pub const Requirements = struct {
     host_backing_bytes: ?usize = null,
     alignment: u32 = @alignOf(f32),
     profile: u32,
+    /// Direct CPU writes to a unified device bank require the actual managed
+    /// provider scope, whose prior command buffers are terminal on entry.
+    requires_managed_operation: bool = false,
 
     pub fn eql(self: Requirements, other: Requirements) bool {
-        return self.validation_scope == other.validation_scope and self.bytes == other.bytes and self.host_bytes == other.host_bytes and self.host_backing_bytes == other.host_backing_bytes and self.alignment == other.alignment and self.profile == other.profile;
+        return self.validation_scope == other.validation_scope and self.bytes == other.bytes and self.host_bytes == other.host_bytes and self.host_backing_bytes == other.host_backing_bytes and self.alignment == other.alignment and self.profile == other.profile and self.requires_managed_operation == other.requires_managed_operation;
     }
 };
 pub const Upload = struct {
@@ -40,7 +43,16 @@ pub const Upload = struct {
         write: *const fn (*anyopaque, CT, route.AssignedOutput, []const u8) anyerror!void,
         deinit: *const fn (*anyopaque) void,
     };
+    pub fn validateOperation(self: Upload, operation: ?*const @import("backend_operation.zig").Borrowed) !void {
+        if (!self.requirements.requires_managed_operation) return;
+        const token = operation orelse return error.HostIngressRequiresManagedOperation;
+        try token.validate(.{ .implementation = self.implementation, .program = null, .mode = .managed });
+    }
     pub fn write(self: Upload, output: CT, assigned: route.AssignedOutput, values: []const u8) !void {
+        return self.writeWithOperation(output, assigned, values, null);
+    }
+    pub fn writeWithOperation(self: Upload, output: CT, assigned: route.AssignedOutput, values: []const u8, operation: ?*const @import("backend_operation.zig").Borrowed) !void {
+        try self.validateOperation(operation);
         if (values.len != self.requirements.bytes or !self.matchesSlot(assigned.slot)) return error.InvalidHostIngressAuthority;
         if (self.index_bounds) |bounds| try bounds.validate(self.slot.logical.dtype, values);
         try self.vtable.write(self.context, output, assigned, values);

@@ -12,6 +12,7 @@ const gpt_arch = @import("../architectures/gpt.zig");
 const graph_mod = @import("../graph/root.zig");
 const decoder_forward = @import("decoder_forward.zig");
 const decoder_routes = @import("decoder_routes.zig");
+const decoder_storage = @import("decoder_storage.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
 const decoder_tail_runtime = @import("../backends/decoder_tail_runtime.zig");
 const control = @import("../execution_control.zig");
@@ -214,6 +215,54 @@ fn classifyChunkOutcome(result: ChunkOutcome) @import("invocation_observation.zi
     };
 }
 
+/// Semantic output needs and scheduler fairness are borrowed request facts.
+/// The physical decoder owns route, chunk/window and representation choices.
+/// No tokenizer/task object, callback or numerical token is retained here.
+pub const PromptRequest = struct {
+    route: decoder_routes.Request,
+    prompt_tokens: usize,
+    query_tokens: usize,
+    prefilled_tokens: usize,
+    allow_resident_greedy: bool,
+    capture_hidden: bool,
+    selected_kv: bool,
+    checkpoint: bool,
+    has_draft: bool,
+    has_prompt_cache: bool,
+    scheduler_peers: bool,
+    execution_serialized: bool,
+    configured_chunk_rows: usize,
+    scheduler_chunk_rows: usize,
+    speculative_k: u32,
+    sampled_ring_qualified: bool,
+};
+
+pub const PromptPlan = struct {
+    exact_repeat_probe: bool,
+    cuda_greedy: bool,
+    metal_greedy: bool,
+    metal_last_logits: bool,
+    typed_outputs: bool,
+    shared_kv: bool,
+    cuda_last_logits: bool,
+    compiled_whole_model: bool,
+    pub fn greedy(self: PromptPlan) bool {
+        return self.cuda_greedy or self.metal_greedy;
+    }
+};
+
+pub const CompiledPromptPlan = struct { chunk_rows: usize, bounded_swa: bool };
+
+pub fn firstTokenEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN", true);
+}
+pub fn greedyTokenEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PREFILL_GREEDY_TOKEN", true);
+}
+pub fn firstTokenCoalesceLimit() usize {
+    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS") orelse 2048;
+}
+
 pub const Runtime = struct {
     inline fn acquireForObservation(self: *Runtime) !void {
         self.execution.acquire() catch |err| {
@@ -226,6 +275,58 @@ pub const Runtime = struct {
     state: *graph_mod.decode_state_runtime.NativeDecodeState,
     execution: control.ExecutionAccess = .{},
     work_control: runtime.kv.attention_match.Control = .{},
+
+    /// Resolve from the actual loaded backend/model/cache, not task-selected
+    /// backend labels. The request retains only semantic and scheduling facts.
+    pub fn planPrompt(self: *const Runtime, request: PromptRequest) !PromptPlan {
+        const context = self.forward.context;
+        const backend = context.cb.kind();
+        const model = context.gpt_config;
+        const typed = self.forward.graph_cache == null and context.compiled_partition_backend == null;
+        const fit_probe = platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_PROBE");
+        const exact = platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_EXACT_PREFILL_PROBE");
+        if (exact and (!build_options.enable_cuda or backend != .cuda or context.kv_dtype != .f16 or
+            model.family != .gemma or !model.usesGemma4Channels() or !fit_probe or !typed or
+            request.has_draft or request.has_prompt_cache or request.capture_hidden or request.prefilled_tokens != 0 or
+            request.prompt_tokens > 32768 or !self.state.isPaged() or request.selected_kv or decoder_forward.cudaReplayLastLogitsEnabled()))
+            return error.UnsupportedCompactionQueryRoute;
+        const cuda_greedy = !request.checkpoint and !fit_probe and
+            (!request.execution_serialized or !request.scheduler_peers) and
+            decoder_routes.shouldUseCudaPrefillGreedyToken(backend, request.route, request.allow_resident_greedy, model.suppressTokenIds().len > 0, greedyTokenEnabled());
+        const metal_greedy = backend == .metal and decoder_routes.metalPreparedPrefillHiddenCaptureEnabled() and
+            request.capture_hidden and request.allow_resident_greedy and request.route.storage.pure_greedy and !request.route.storage.grammar;
+        return .{
+            .exact_repeat_probe = exact,
+            .cuda_greedy = cuda_greedy,
+            .metal_greedy = metal_greedy,
+            .metal_last_logits = decoder_routes.shouldUseMetalGemmaTargetLastLogits(backend, model, request.capture_hidden),
+            .typed_outputs = typed,
+            .shared_kv = typed and !request.checkpoint and !request.capture_hidden and request.route.exact_hybrid,
+            .cuda_last_logits = typed and backend == .cuda,
+            .compiled_whole_model = !request.selected_kv and context.compiled_partition_backend != null and
+                context.compiled_attachment_target == .whole_model and self.forward.graph_cache != null,
+        };
+    }
+
+    /// Own the complete whole-model physical window before its first chunk.
+    /// Scheduler turn/progress publication remains in the caller.
+    pub fn prepareCompiledPrompt(self: *Runtime, request: PromptRequest) !CompiledPromptPlan {
+        if (request.prefilled_tokens != 0) return error.UnsupportedShape;
+        const context = self.forward.context;
+        const route: decoder_storage.Route = if (context.compiled_partition_backend == .metal and context.cb.kind() == .metal and self.state.isPaged() and context.kv_dtype != null) .metal_whole_model else .standard;
+        const policy = decoder_storage.routeCapacityPolicy(route, context.gpt_config.*, request.route.storage, context.kv_dtype orelse .f16, request.sampled_ring_qualified);
+        const bounded = policy == .split_swa_ring;
+        const rows = decoder_routes.wholeModelExecutionPrefillChunkSize(context.compiled_partition_backend, request.configured_chunk_rows, request.scheduler_chunk_rows, request.query_tokens, bounded);
+        const speculative = @min(@as(usize, @intCast(request.speculative_k)), @as(usize, runtime.tier.memory.generation_max_speculative_k)) + 1;
+        self.state.configureKvMaxInflightTokens(@max(rows, speculative), bounded);
+        return .{ .chunk_rows = rows, .bounded_swa = bounded };
+    }
+
+    pub fn prepareChunkWindow(self: *Runtime, request: PromptRequest, chunk_rows: usize) void {
+        const speculative = @min(@as(usize, @intCast(request.speculative_k)), 16) + 1;
+        self.state.configureKvMaxInflightTokens(@max(chunk_rows, speculative), self.forward.context.cb.kind() == .metal and
+            request.prefilled_tokens == 0 and decoder_storage.ringRequestEligible(request.route.storage, request.sampled_ring_qualified));
+    }
 
     fn checkWork(raw: ?*anyopaque) !void {
         const self: *Runtime = @ptrCast(@alignCast(raw.?));
@@ -1345,4 +1446,114 @@ test "prefill selection preserves measured CUDA coalescing eligibility and sched
     policy.coalesce_token_limit = 99;
     cursor = try ChunkCursor.select(request, policy);
     try std.testing.expectEqual(@as(usize, 32), cursor.current_chunk_size);
+}
+
+fn promptOwnerTestRequest(rows: usize) PromptRequest {
+    return .{
+        .route = .{ .storage = .{ .pure_greedy = true, .grammar = false, .prompt_cache = false, .compaction = false, .speculation = false, .draft = false }, .has_token_observer = false, .exact_hybrid = false },
+        .prompt_tokens = rows,
+        .query_tokens = rows,
+        .prefilled_tokens = 0,
+        .allow_resident_greedy = false,
+        .capture_hidden = false,
+        .selected_kv = false,
+        .checkpoint = false,
+        .has_draft = false,
+        .has_prompt_cache = false,
+        .scheduler_peers = false,
+        .execution_serialized = false,
+        .configured_chunk_rows = 2,
+        .scheduler_chunk_rows = 0,
+        .speculative_k = 4,
+        .sampled_ring_qualified = false,
+    };
+}
+
+fn checkPromptOwner(cb: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const cfg = CompiledPrefillFixture.config();
+    const ids = [_]i64{ 0, 1, 0, 1, 0 };
+    const expected = try CompiledPrefillFixture.eager(cb, cfg, &ids);
+    defer a.free(expected);
+    // The same request facts pass through the physical owner with every
+    // numerical chunk executing against real one-layer attention/MLP weights.
+    for ([_]usize{ 1, 2, ids.len }) |chunk_rows| {
+        const kv_config = runtime.kv.pool.KvPoolConfig{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_layers_packed = @intCast(cfg.num_hidden_layers), .num_kv_heads = cfg.effectiveKVHeads(), .head_dim = cfg.headDim(), .store_cpu_bytes = true };
+        var manager = runtime.kv.manager.KvManager.init(a);
+        defer manager.deinit();
+        const pool = try manager.addPool(kv_config);
+        var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, kv_config);
+        defer storage.deinit();
+        var state = graph_mod.decode_state_runtime.NativeDecodeState.initPaged(a, &manager, pool, null);
+        state.kv_storage = &storage;
+        defer state.deinit();
+        var physical = Runtime{ .forward = .{ .context = .{ .allocator = a, .cb = &cb, .gpt_config = &cfg } }, .state = &state };
+        const request = promptOwnerTestRequest(ids.len);
+        const plan = try physical.planPrompt(request);
+        try std.testing.expect(!plan.greedy() and !plan.compiled_whole_model and plan.typed_outputs);
+        physical.prepareChunkWindow(request, chunk_rows);
+        var cursor = try ChunkCursor.init(.{ .query_tokens = ids.len, .prefilled_tokens = 0, .prompt_tokens = ids.len, .initial_chunk_rows = chunk_rows });
+        while (try cursor.next(chunk_rows)) |attempt| {
+            defer cursor.cancel(attempt) catch {};
+            const outcome = try physical.runChunk(.{
+                .token_ids = ids[attempt.start..attempt.end],
+                .total_chunk_end = attempt.total_end,
+                .prompt_tokens = ids.len,
+                .already_prefilled = 0,
+                .processed_rows = attempt.start,
+                .output_intent = attempt.output_intent,
+                .capture_hidden = false,
+                .shared_kv_pruning = plan.shared_kv,
+                .prepared_metal_whole_prompt = false,
+                .metal_target_last_logits = plan.metal_last_logits,
+                .cuda_direct_last_logits = plan.cuda_last_logits,
+                .typed_outputs = plan.typed_outputs,
+                .attempted_chunk_size = attempt.chunk.rows,
+                .allow_resize = false,
+            });
+            switch (outcome) {
+                .retry_chunk_size => return error.UnexpectedPromptOwnerRetry,
+                .complete => |output| {
+                    defer if (output.last_logits) |values| a.free(values);
+                    defer if (output.last_hidden) |hidden| cb.free(hidden);
+                    if (attempt.end == ids.len) {
+                        const actual = output.last_logits orelse return error.MissingPromptOwnerLogits;
+                        try std.testing.expectEqual(expected.len, actual.len);
+                        for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0001);
+                    } else try std.testing.expect(output.last_logits == null and output.greedy_token == null and output.last_hidden == null);
+                },
+            }
+            const view = state.kvView() orelse return error.MissingActualPromptKvView;
+            const blocks = view.logical_blocks orelse return error.MissingActualPromptKvBlocks;
+            try std.testing.expect(view.kv_storage == &storage and blocks.len > 0);
+            try std.testing.expectEqual(attempt.total_end, view.token_count);
+            try std.testing.expectEqual(attempt.total_end, state.total_tokens);
+            try std.testing.expectEqual(attempt.total_end, manager.tokenCount(state.sequence_id.?).?);
+            try std.testing.expectEqual(attempt.total_end, storage.tokenCount(state.sequence_id.?).?);
+            var physical_state = BorrowedDecodeStateRuntime.init(&state);
+            const decode = physical_state.makeDecodeContext(attempt.total_end, attempt.chunk.rows);
+            try std.testing.expect(decode.kv_cache != null and decode.kv_cache.?.kv_storage == &storage);
+            try cursor.commit(attempt);
+        }
+        try cursor.finish();
+        try std.testing.expectEqual(ids.len, state.total_tokens);
+        // Physical planning borrows the backend and state, retaining neither
+        // request memory nor a second state/lease; it allocates nothing.
+        var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        physical.forward.context.allocator = fail.allocator();
+        _ = try physical.planPrompt(request);
+        physical.prepareChunkWindow(request, chunk_rows);
+        try std.testing.expectEqual(@as(usize, 0), fail.alloc_index);
+        try std.testing.expectEqual(ids.len, state.total_tokens);
+        try std.testing.expectEqual(@as(usize, 0), state.kv_max_inflight_tokens);
+        var hit = request;
+        hit.prefilled_tokens = 1;
+        try std.testing.expectError(error.UnsupportedShape, physical.prepareCompiledPrompt(hit));
+        try std.testing.expectEqual(ids.len, state.total_tokens);
+    }
+}
+
+test "physical prompt owner preserves real Native eager chunk numerics and allocation-free planning" {
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onNative(CompiledPrefillFixture.populate, checkPromptOwner);
 }

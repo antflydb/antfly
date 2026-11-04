@@ -58,7 +58,9 @@ const VectorMath = struct {
 /// Scheduling and transcendental approximations stay native-owned; the scalar
 /// expression is shared with generated GPU kernels. Preserve the existing
 /// cube-first SIMD GELU and left-associated scalar tail independently.
-fn applyActivation(comptime kind: kernel_math.Activation, data: []f32) void {
+// One arithmetic source; compiler instantiations retain the original default
+// inline body and a separate enabled terminal entry with truthful identity.
+inline fn activationArithmetic(comptime kind: kernel_math.Activation, data: []f32) void {
     const vector_recipe = comptime kernel_math.activation(kind, .cube_first);
     const scalar_recipe = comptime kernel_math.activation(kind, .left_associated);
     var i: usize = 0;
@@ -67,14 +69,39 @@ fn applyActivation(comptime kind: kernel_math.Activation, data: []f32) void {
         data[i..][0..VEC_LEN].* = kernel_math.evaluate(vector_recipe, VectorMath, v);
     }
     while (i < data.len) : (i += 1) data[i] = kernel_math.evaluate(scalar_recipe, kernel_math.ScalarMath, data[i]);
-    // Observe only after this actual terminal body completed. Independent
-    // worker threads stay outside the submitting-thread observation scope.
+}
+fn applyActivation(comptime kind: kernel_math.Activation, data: []f32) void {
+    activationArithmetic(kind, data);
     @import("../execution/runtime_observation.zig").nativeActivationBody(@tagName(kind), VEC_LEN, data.len / VEC_LEN, data.len % VEC_LEN);
+}
+noinline fn geluValue(data: []f32, values: *ActivationValues) void {
+    activationArithmetic(.gelu, data);
+    values.terminal_body_identity = @intFromPtr(&geluValue);
+    values.terminal_calls +|= 1;
+    values.vector_iterations +|= data.len / VEC_LEN;
+    values.scalar_elements +|= data.len % VEC_LEN;
 }
 
 /// GELU and gate multiplication stream through cache-sized tiles. Workers
 /// own disjoint output ranges and retain the exact existing SIMD arithmetic.
+/// Internal nested callers already selected their outer diagnostics mode.
+/// Preserve the old ordinary numerical body without another per-row TLS check.
+pub fn geluMultiplyIoUnobserved(io: ?std.Io, gate: []const f32, up: []const f32, out: []f32) !void {
+    return geluMultiplyBody(false, io, gate, up, out, {});
+}
 pub fn geluMultiplyIo(io: ?std.Io, gate: []const f32, up: []const f32, out: []f32) !void {
+    if (!@import("../execution/runtime_observation.zig").kernelEnabled()) return geluMultiplyBody(false, io, gate, up, out, {});
+    return geluMultiplyObserved(io, gate, up, out);
+}
+noinline fn geluMultiplyObserved(io: ?std.Io, gate: []const f32, up: []const f32, out: []f32) !void {
+    var values: ActivationValues = .{};
+    defer @import("../execution/runtime_observation.zig").nativeActivationPrograms(values);
+    try geluMultiplyBody(true, io, gate, up, out, &values);
+}
+pub fn geluMultiplyIoValue(io: ?std.Io, gate: []const f32, up: []const f32, out: []f32, values: *ActivationValues) !void {
+    try geluMultiplyBody(true, io, gate, up, out, values);
+}
+inline fn geluMultiplyBody(comptime observing: bool, io: ?std.Io, gate: []const f32, up: []const f32, out: []f32, values: if (observing) *ActivationValues else void) !void {
     if (gate.len != up.len or gate.len != out.len) return error.InvalidTensorShape;
     const Job = struct {
         io: ?std.Io,
@@ -87,14 +114,25 @@ pub fn geluMultiplyIo(io: ?std.Io, gate: []const f32, up: []const f32, out: []f3
                 self.failure = err;
             };
         }
+        fn runValue(self: *@This(), result: *ActivationValues) void {
+            self.executeValue(result) catch |err| {
+                self.failure = err;
+            };
+        }
         fn execute(self: *@This()) !void {
+            return executeBody(false, self, {});
+        }
+        noinline fn executeValue(self: *@This(), result: *ActivationValues) !void {
+            return executeBody(true, self, result);
+        }
+        inline fn executeBody(comptime measured: bool, self: *@This(), result: if (measured) *ActivationValues else void) !void {
             var offset: usize = 0;
             while (offset < self.out.len) {
                 if (self.io) |runtime| try runtime.checkCancel();
                 const stop = @min(self.out.len, offset + 4096);
                 const tile = self.out[offset..stop];
                 @memcpy(tile, self.gate[offset..stop]);
-                gelu(tile);
+                if (comptime measured) geluValue(tile, result) else gelu(tile);
                 var lane: usize = 0;
                 while (lane + VEC_LEN <= tile.len) : (lane += VEC_LEN) tile[lane..][0..VEC_LEN].* = @as(F32xN, tile[lane..][0..VEC_LEN].*) * @as(F32xN, self.up[offset + lane ..][0..VEC_LEN].*);
                 while (lane < tile.len) : (lane += 1) tile[lane] *= self.up[offset + lane];
@@ -102,6 +140,20 @@ pub fn geluMultiplyIo(io: ?std.Io, gate: []const f32, up: []const f32, out: []f3
             }
         }
     };
+    if (comptime @import("builtin").is_test) {
+        const OriginalJob = struct {
+            io: ?std.Io,
+            gate: []const f32,
+            up: []const f32,
+            out: []f32,
+            failure: ?anyerror = null,
+        };
+        if (@sizeOf(Job) != @sizeOf(OriginalJob) or @alignOf(Job) != @alignOf(OriginalJob)) @compileError("ordinary GELU multiply Job gained metadata");
+        const legacy_run: *const fn (*Job) void = Job.run;
+        const legacy_execute: *const fn (*Job) anyerror!void = Job.execute;
+        _ = legacy_run;
+        _ = legacy_execute;
+    }
     const workers: usize = if (io != null and gate.len >= 262144) 4 else 1;
     var jobs: [4]Job = undefined;
     for (jobs[0..workers], 0..) |*job, index| {
@@ -109,7 +161,7 @@ pub fn geluMultiplyIo(io: ?std.Io, gate: []const f32, up: []const f32, out: []f3
         const last = if (index + 1 == workers) gate.len else (gate.len / VEC_LEN * (index + 1) / workers) * VEC_LEN;
         job.* = .{ .io = io, .gate = gate[first..last], .up = up[first..last], .out = out[first..last] };
     }
-    if (workers == 1) jobs[0].run() else {
+    if (comptime observing) try collectGroupValues(Job, io, jobs[0..workers], .gelu_multiply_chunk, @intFromPtr(&Job.executeValue), values) else if (workers == 1) jobs[0].run() else {
         var group: std.Io.Group = .init;
         defer group.cancel(io.?);
         for (jobs[0..workers]) |*job| group.async(io.?, Job.run, .{job});
@@ -120,32 +172,51 @@ pub fn geluMultiplyIo(io: ?std.Io, gate: []const f32, up: []const f32, out: []f3
 
 /// Split independent GELU lanes without changing SIMD groups or the scalar
 /// tail. Jobs borrow disjoint slices; every job is drained before return.
+const ActivationValueKernel = *const fn ([]f32, *ActivationValues) void;
+const GeluParallelKernel = struct {
+    fn apply(data: []f32) void {
+        gelu(data);
+    }
+};
 pub fn geluParallelIo(io: std.Io, data: []f32) std.Io.Cancelable!void {
-    const Kernel = struct {
-        fn apply(values: []f32) void {
-            gelu(values);
-        }
-    };
-    return geluParallelWithKernel(Kernel, io, data);
+    if (!@import("../execution/runtime_observation.zig").kernelEnabled()) return geluParallelWithKernel(GeluParallelKernel, io, data);
+    return geluParallelObserved(io, data);
+}
+noinline fn geluParallelObserved(io: std.Io, data: []f32) std.Io.Cancelable!void {
+    var values: ActivationValues = .{};
+    defer @import("../execution/runtime_observation.zig").nativeActivationPrograms(values);
+    try geluParallelBody(true, GeluParallelKernel, geluValue, io, data, &values);
 }
 
 fn geluParallelWithKernel(comptime Kernel: type, io: std.Io, data: []f32) std.Io.Cancelable!void {
+    return geluParallelBody(false, Kernel, null, io, data, {});
+}
+inline fn geluParallelBody(comptime observing: bool, comptime Kernel: type, comptime value_kernel: ?ActivationValueKernel, io: std.Io, data: []f32, values: if (observing) *ActivationValues else void) std.Io.Cancelable!void {
     try io.checkCancel();
     const vectors = data.len / VEC_LEN;
     const lanes = @min(vectors, 4);
     if (lanes < 2) {
-        Kernel.apply(data);
+        if (comptime observing) directKernelValue(Kernel, value_kernel, data, values) else Kernel.apply(data);
         try io.checkCancel();
         return;
     }
     const Chunk = struct {
         values: []f32,
+        fn runValue(self: *@This(), result: *ActivationValues) void {
+            kernelValue(Kernel, value_kernel, self.values, result);
+        }
         fn run(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             Kernel.apply(self.values);
         }
     };
     const pool = @import("inference_linalg").pool;
+    if (comptime @import("builtin").is_test) {
+        const OriginalChunk = struct { values: []f32 };
+        if (@sizeOf(Chunk) != @sizeOf(OriginalChunk) or @alignOf(Chunk) != @alignOf(OriginalChunk)) @compileError("ordinary GELU parallel Chunk gained metadata");
+        const legacy_run: *const fn (*anyopaque) void = Chunk.run;
+        _ = legacy_run;
+    }
     var chunks: [4]Chunk = undefined;
     var jobs: [4]pool.Job = undefined;
     for (0..lanes) |lane| {
@@ -154,7 +225,7 @@ fn geluParallelWithKernel(comptime Kernel: type, io: std.Io, data: []f32) std.Io
         chunks[lane] = .{ .values = data[begin..end] };
         jobs[lane] = .{ .fn_ptr = Chunk.run, .ctx = &chunks[lane] };
     }
-    try pool.dispatchJobsIo(io, jobs[0..lanes]);
+    if (comptime observing) try collectPoolValues(Chunk, io, chunks[0..lanes], .gelu_parallel_chunk, kernelProgramIdentity(Kernel, value_kernel), values) else try pool.dispatchJobsIo(io, jobs[0..lanes]);
     try io.checkCancel();
 }
 
@@ -1304,4 +1375,332 @@ test "embeddinggemma2 fused GELU product preserves SIMD tails and parallel parti
             try std.testing.expectEqualSlices(f32, expected, actual);
         }
     }
+}
+
+pub const ActivationFamily = enum { gelu_multiply_chunk, gelu_parallel_chunk, packed_gelu_rows };
+pub const ActivationProgramValue = struct {
+    family: ActivationFamily = .gelu_multiply_chunk,
+    program_identity: usize = 0,
+    entries: u64 = 0,
+    returns: u64 = 0,
+    error_returns: u64 = 0,
+    not_entered: u64 = 0,
+    last_error: ?anyerror = null,
+};
+pub const ActivationValues = struct {
+    records: [4]ActivationProgramValue = @splat(.{}),
+    count: u8 = 0,
+    unrecorded_events: u64 = 0,
+    terminal_body_identity: usize = 0,
+    terminal_calls: u64 = 0,
+    vector_width: usize = VEC_LEN,
+    vector_iterations: u64 = 0,
+    scalar_elements: u64 = 0,
+    unobserved_custom_callbacks: u64 = 0,
+    pub fn merge(self: *ActivationValues, inner: ActivationValues) void {
+        if (inner.terminal_body_identity != 0) self.terminal_body_identity = inner.terminal_body_identity;
+        self.terminal_calls +|= inner.terminal_calls;
+        self.vector_iterations +|= inner.vector_iterations;
+        self.scalar_elements +|= inner.scalar_elements;
+        self.unobserved_custom_callbacks +|= inner.unobserved_custom_callbacks;
+        self.unrecorded_events +|= inner.unrecorded_events;
+        for (inner.records[0..inner.count]) |item| self.add(item);
+    }
+    pub fn add(self: *ActivationValues, value: ActivationProgramValue) void {
+        var found: ?*ActivationProgramValue = null;
+        for (self.records[0..self.count]) |*item| if (item.family == value.family and item.program_identity == value.program_identity) {
+            found = item;
+            break;
+        };
+        if (found == null) {
+            if (self.count == self.records.len) {
+                self.unrecorded_events +|= value.entries +| value.not_entered;
+                return;
+            }
+            found = &self.records[self.count];
+            self.count += 1;
+            found.?.* = .{ .family = value.family, .program_identity = value.program_identity };
+        }
+        found.?.entries +|= value.entries;
+        found.?.returns +|= value.returns;
+        found.?.error_returns +|= value.error_returns;
+        found.?.not_entered +|= value.not_entered;
+        if (value.last_error) |err| found.?.last_error = err;
+    }
+};
+fn ActivationSlot(comptime Context: type) type {
+    return struct {
+        job: *Context,
+        inner: ActivationValues = .{},
+        entered: bool = false,
+        returned: bool = false,
+        fn run(self: *@This()) void {
+            self.entered = true;
+            defer self.returned = true;
+            Context.runValue(self.job, &self.inner);
+        }
+        fn runRaw(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.run();
+        }
+        fn finish(self: *@This(), family: ActivationFamily, body: usize, values: *ActivationValues) void {
+            const failure = if (comptime @hasField(Context, "failure")) self.job.failure else @as(?anyerror, null);
+            values.merge(self.inner);
+            values.add(.{ .family = family, .program_identity = body, .entries = @intFromBool(self.entered), .returns = @intFromBool(self.returned), .not_entered = @intFromBool(!self.entered), .error_returns = @intFromBool(self.returned and failure != null), .last_error = failure });
+        }
+    };
+}
+// This exact Group policy is also used by packed GELU rows. All async jobs
+// retain their original disjoint contexts; cancel/drain precedes value reads.
+pub noinline fn collectGroupValues(comptime Context: type, io: ?std.Io, jobs: []Context, family: ActivationFamily, body: usize, values: *ActivationValues) std.Io.Cancelable!void {
+    std.debug.assert(jobs.len <= 4);
+    var slots: [4]ActivationSlot(Context) = undefined;
+    for (jobs, 0..) |*job, i| slots[i] = .{ .job = job };
+    defer for (slots[0..jobs.len]) |*slot| slot.finish(family, body, values);
+    if (jobs.len == 1) slots[0].run() else {
+        var group: std.Io.Group = .init;
+        defer group.cancel(io.?);
+        for (slots[0..jobs.len]) |*slot| group.async(io.?, ActivationSlot(Context).run, .{slot});
+        try group.await(io.?);
+    }
+}
+noinline fn collectPoolValues(comptime Context: type, io: std.Io, contexts: []Context, family: ActivationFamily, body: usize, values: *ActivationValues) std.Io.Cancelable!void {
+    const pool = @import("inference_linalg").pool;
+    std.debug.assert(contexts.len <= 4);
+    var slots: [4]ActivationSlot(Context) = undefined;
+    var jobs: [4]pool.Job = undefined;
+    for (contexts, 0..) |*ctx, i| {
+        slots[i] = .{ .job = ctx };
+        jobs[i] = .{ .fn_ptr = ActivationSlot(Context).runRaw, .ctx = &slots[i] };
+    }
+    defer for (slots[0..contexts.len]) |*slot| slot.finish(family, body, values);
+    try pool.dispatchJobsIo(io, jobs[0..contexts.len]);
+}
+// Static binding belongs to the authored entry. No worker reflection/TLS or
+// optional runtime dispatch can silently reclassify this known terminal body
+// as an unknown custom callback. Custom test kernels pass null explicitly.
+fn kernelProgramIdentity(comptime Kernel: type, comptime value_kernel: ?ActivationValueKernel) usize {
+    if (comptime value_kernel != null) return @intFromPtr(value_kernel.?);
+    return @intFromPtr(&Kernel.apply);
+}
+fn kernelValue(comptime Kernel: type, comptime value_kernel: ?ActivationValueKernel, data: []f32, values: *ActivationValues) void {
+    if (comptime value_kernel != null) value_kernel.?(data, values) else {
+        Kernel.apply(data);
+        values.unobserved_custom_callbacks +|= 1;
+    }
+}
+noinline fn directKernelValue(comptime Kernel: type, comptime value_kernel: ?ActivationValueKernel, data: []f32, values: *ActivationValues) void {
+    kernelValue(Kernel, value_kernel, data, values);
+    values.add(.{ .family = .gelu_parallel_chunk, .program_identity = kernelProgramIdentity(Kernel, value_kernel), .entries = 1, .returns = 1 });
+}
+
+test "Native activation values retain actual parallel GELU terminal returns and multiply bits" {
+    const a = std.testing.allocator;
+    const n = 262149;
+    const gate = try a.alloc(f32, n);
+    defer a.free(gate);
+    const up = try a.alloc(f32, n);
+    defer a.free(up);
+    const expected = try a.alloc(f32, n);
+    defer a.free(expected);
+    const actual = try a.alloc(f32, n);
+    defer a.free(actual);
+    for (gate, up, 0..) |*x, *y, i| {
+        x.* = @sin(@as(f32, @floatFromInt(i % 61))) * 3;
+        y.* = @cos(@as(f32, @floatFromInt(i % 37)));
+    }
+    @memcpy(expected, gate);
+    gelu(expected);
+    for (expected, up) |*x, y| x.* *= y;
+    const observation = @import("../execution/runtime_observation.zig");
+    var outer: observation.KernelScope = .{};
+    outer.begin();
+    defer if (outer.attached) {
+        _ = outer.finish();
+    };
+    var inner: observation.KernelScope = .{};
+    inner.begin();
+    defer if (inner.attached) {
+        _ = inner.finish();
+    };
+    try geluMultiplyIo(std.testing.io, gate, up, actual);
+    _ = inner.finish();
+    try std.testing.expectEqualSlices(f32, expected, actual);
+    const value = inner.activation_programs;
+    try std.testing.expectEqual(@as(u8, 1), value.count);
+    try std.testing.expectEqual(@as(u64, 4), value.records[0].entries);
+    try std.testing.expectEqual(value.records[0].entries, value.records[0].returns);
+    try std.testing.expect(value.terminal_gelu_calls > 4);
+    try std.testing.expectEqual(@intFromPtr(&geluValue), value.terminal_body_identity);
+    try std.testing.expectEqual(@as(u64, n / VEC_LEN), value.vector_iterations);
+    try std.testing.expectEqual(@as(u64, n % VEC_LEN), value.scalar_elements);
+    try std.testing.expectEqual(@as(u64, 0), inner.native_bodies.total_calls); // no double publication from worker TLS
+    @memcpy(actual, gate);
+    try std.testing.expect(observation.kernelEnabled());
+    try geluParallelIo(std.testing.io, actual);
+    try std.testing.expect(observation.kernelEnabled());
+    try std.testing.expectEqual(@as(u64, 0), outer.activation_programs.unobserved_custom_callbacks);
+    var parallel_entries: u64 = 0;
+    var parallel_returns: u64 = 0;
+    for (outer.activation_programs.records[0..outer.activation_programs.count]) |record| {
+        if (std.mem.eql(u8, record.family, "gelu_parallel_chunk")) {
+            try std.testing.expectEqual(@intFromPtr(&geluValue), record.program_identity);
+            parallel_entries += record.entries;
+            parallel_returns += record.returns;
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 4), parallel_entries);
+    try std.testing.expectEqual(@as(u64, 4), parallel_returns);
+    _ = outer.finish();
+    @memcpy(expected, gate);
+    gelu(expected);
+    try std.testing.expectEqualSlices(f32, expected, actual);
+    try std.testing.expectEqual(value.terminal_gelu_calls + 4, outer.activation_programs.terminal_gelu_calls);
+    try std.testing.expectEqual(@as(u8, 2), outer.activation_programs.count);
+    const snapshot = @import("../execution/diagnostics.zig").Snapshot{ .runtime = .{ .native_activation_programs = outer.activation_programs } };
+    const report = @import("../execution/invocation_report.zig").Report.init(snapshot);
+    outer.activation_programs = .{};
+    try std.testing.expectEqual(value.terminal_gelu_calls + 4, report.native_activation_programs.?.terminal_gelu_calls);
+}
+test "Native activation values report actual canceled multiply bodies without completed terminal calls" {
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) std.Io.Cancelable!void {
+            return error.Canceled;
+        }
+    };
+    var table = std.testing.io.vtable.*;
+    table.checkCancel = Cancel.check;
+    var io = std.testing.io;
+    io.vtable = &table;
+    const input: [17]f32 = @splat(0.25);
+    var output: [17]f32 = @splat(-7);
+    var values: ActivationValues = .{};
+    try std.testing.expectError(error.Canceled, geluMultiplyIoValue(io, &input, &input, &output, &values));
+    try std.testing.expectEqual(@as(u64, 0), values.terminal_calls);
+    try std.testing.expectEqual(@as(u64, 1), values.records[0].entries);
+    try std.testing.expectEqual(@as(u64, 1), values.records[0].returns);
+    try std.testing.expectEqual(@as(u64, 1), values.records[0].error_returns);
+    try std.testing.expectEqual(error.Canceled, values.records[0].last_error.?);
+    for (output) |x| try std.testing.expectEqual(@as(f32, -7), x);
+}
+
+test "Native activation values wait for actual canceled custom GELU chunks and preserve unknown scope" {
+    const Lifecycle = struct {
+        io: std.Io,
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        started: std.atomic.Value(usize) = .init(0),
+        finished: std.atomic.Value(usize) = .init(0),
+    };
+    const BlockingKernel = struct {
+        var lifecycle: *Lifecycle = undefined;
+        fn apply(values: []f32) void {
+            if (lifecycle.started.fetchAdd(1, .acq_rel) + 1 == 4) lifecycle.entered.set(lifecycle.io);
+            lifecycle.release.waitUncancelable(lifecycle.io);
+            gelu(values);
+            _ = lifecycle.finished.fetchAdd(1, .acq_rel);
+        }
+    };
+    const Case = struct {
+        fn run(io: std.Io, values: []f32, observation: *ActivationValues) std.Io.Cancelable!void {
+            return geluParallelBody(true, BlockingKernel, null, io, values, observation);
+        }
+        fn release(lifecycle: *Lifecycle) void {
+            std.Io.sleep(lifecycle.io, .fromMilliseconds(20), .awake) catch unreachable;
+            lifecycle.release.set(lifecycle.io);
+        }
+    };
+    var runtime = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(4), .concurrent_limit = .limited(8) });
+    defer runtime.deinit();
+    const io = runtime.io();
+    var lifecycle = Lifecycle{ .io = io };
+    BlockingKernel.lifecycle = &lifecycle;
+    var values: [67]f32 = @splat(0.75);
+    var expected = values;
+    gelu(&expected);
+    var observed: ActivationValues = .{};
+    var request = try io.concurrent(Case.run, .{ io, &values, &observed });
+    var pending = true;
+    defer if (pending) {
+        lifecycle.release.set(io);
+        _ = request.cancel(io) catch {};
+    };
+    lifecycle.entered.waitUncancelable(io);
+    var releaser = try io.concurrent(Case.release, .{&lifecycle});
+    defer releaser.await(io);
+    const result = request.cancel(io);
+    pending = false;
+    try std.testing.expectError(error.Canceled, result);
+    try std.testing.expectEqual(@as(usize, 4), lifecycle.finished.load(.acquire));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&expected), std.mem.sliceAsBytes(&values));
+    @memset(&values, 0.75);
+    try std.testing.expectEqual(@as(u64, 4), observed.records[0].entries);
+    try std.testing.expectEqual(@as(u64, 4), observed.records[0].returns);
+    try std.testing.expectEqual(@as(u64, 0), observed.terminal_calls);
+    try std.testing.expectEqual(@as(u64, 4), observed.unobserved_custom_callbacks);
+    try Case.run(io, &values, &observed);
+    try std.testing.expectEqual(@as(u64, 8), observed.records[0].returns);
+    try std.testing.expectEqual(@as(usize, 8), lifecycle.finished.load(.acquire));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&expected), std.mem.sliceAsBytes(&values));
+}
+
+test "Native activation value capacity is explicit and error values own no borrowed text" {
+    var values: ActivationValues = .{};
+    for (0..6) |i| values.add(.{ .family = .gelu_multiply_chunk, .program_identity = i + 1, .entries = 1, .returns = 1, .error_returns = 1, .last_error = error.ActualGeluBodyCanceled });
+    try std.testing.expectEqual(@as(u8, 4), values.count);
+    try std.testing.expectEqual(@as(u64, 2), values.unrecorded_events);
+    const observation = @import("../execution/runtime_observation.zig");
+    var parent: observation.KernelScope = .{};
+    parent.begin();
+    defer if (parent.attached) {
+        _ = parent.finish();
+    };
+    var child: observation.KernelScope = .{};
+    child.begin();
+    defer if (child.attached) {
+        _ = child.finish();
+    };
+    observation.nativeActivationPrograms(values);
+    _ = child.finish();
+    _ = parent.finish();
+    const held = child.activation_programs;
+    values = .{};
+    child.activation_programs = .{};
+    try std.testing.expectEqual(@as(u64, 2), held.unrecorded_events);
+    try std.testing.expectEqual(@as(u64, 1), held.records[0].error_returns);
+    try std.testing.expectEqualStrings("ActualGeluBodyCanceled", held.records[0].last_error.bytes[0..held.records[0].last_error.len]);
+    try std.testing.expectEqual(parent.activation_programs.records[0].returns, held.records[0].returns);
+}
+
+test "Native disabled activation jobs keep original layout and erased numerical call ABI" {
+    const input = [_]f32{ -0.5, 0.25, 1.0, 0.75, 0.0, -1.0, 2.0, 0.5, 1.5 };
+    var expected = input;
+    gelu(&expected);
+    var ordinary: [input.len]f32 = undefined;
+    const up: [input.len]f32 = @splat(1);
+    try geluMultiplyIoUnobserved(null, &input, &up, &ordinary);
+    try std.testing.expectEqualSlices(f32, &expected, &ordinary);
+    var parallel = input;
+    try geluParallelWithKernel(GeluParallelKernel, std.testing.io, &parallel);
+    try std.testing.expectEqualSlices(f32, &expected, &parallel);
+}
+
+test "Native authored GELU parallel binding returns exact joined terminals independently of TLS publication" {
+    const n = 129;
+    var values: [n]f32 = undefined;
+    for (&values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i % 29)));
+    var expected = values;
+    gelu(&expected);
+    var evidence: ActivationValues = .{};
+    try geluParallelBody(true, GeluParallelKernel, geluValue, std.testing.io, &values, &evidence);
+    try std.testing.expectEqualSlices(f32, &expected, &values);
+    const lanes = @min(n / VEC_LEN, 4);
+    try std.testing.expectEqual(@as(u64, lanes), evidence.terminal_calls);
+    try std.testing.expectEqual(@as(u64, n / VEC_LEN), evidence.vector_iterations);
+    try std.testing.expectEqual(@as(u64, n % VEC_LEN), evidence.scalar_elements);
+    try std.testing.expectEqual(@as(u64, 0), evidence.unobserved_custom_callbacks);
+    try std.testing.expectEqual(@intFromPtr(&geluValue), evidence.terminal_body_identity);
+    try std.testing.expectEqual(@intFromPtr(&geluValue), evidence.records[0].program_identity);
+    try std.testing.expectEqual(@as(u64, lanes), evidence.records[0].entries);
+    try std.testing.expectEqual(@as(u64, lanes), evidence.records[0].returns);
 }

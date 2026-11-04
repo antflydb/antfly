@@ -38,6 +38,77 @@ pub fn textEncoderForward(
     batch: usize,
     seq_len: usize,
 ) ![]f32 {
+    if (cb.vtable.takeRows != null) {
+        const output = try textEncoderForwardTensor(cb, allocator, cfg, input_ids, batch, seq_len);
+        defer cb.free(output);
+        return cb.toFloat32(output, allocator);
+    }
+    const H: usize = cfg.text_hidden_size;
+    const hidden_data = exported: {
+        const hidden = try textEncoderHiddenTensor(cb, allocator, cfg, input_ids, batch, seq_len);
+        defer cb.free(hidden);
+        break :exported try cb.toFloat32(hidden, allocator);
+    };
+    defer allocator.free(hidden_data);
+
+    const eos_embeddings = try allocator.alloc(f32, batch * H);
+    var owns_eos = true;
+    defer if (owns_eos) allocator.free(eos_embeddings);
+    for (0..batch) |b| {
+        const eos_pos = clipEotPosition(input_ids, b, seq_len);
+        @memcpy(eos_embeddings[b * H ..][0..H], hidden_data[(b * seq_len + eos_pos) * H ..][0..H]);
+    }
+
+    // Text projection (linear, no bias)
+    const proj_w = cb.getWeight("text_projection.weight") catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => {
+            owns_eos = false;
+            return eos_embeddings;
+        },
+        else => return err,
+    };
+    defer cb.free(proj_w);
+    const eos_shape = [_]i32{ @intCast(batch), @intCast(H) };
+    const eos_ct = try cb.fromFloat32Shape(eos_embeddings, &eos_shape);
+    defer cb.free(eos_ct);
+    allocator.free(eos_embeddings);
+    owns_eos = false;
+
+    const projected = try cb.linearNoBias(eos_ct, proj_w, batch, H, cfg.projection_dim);
+    defer cb.free(projected);
+    return try cb.toFloat32(projected, allocator);
+}
+
+/// Return an owned projected text tensor. EOS metadata remains in the CLIP
+/// adapter; actual row selection and both projections use existing programs.
+pub fn textEncoderForwardTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: clip_mod.Config, input_ids: []const i64, batch: usize, seq_len: usize) !CT {
+    const tokens = std.math.mul(usize, batch, seq_len) catch return error.InvalidInputShape;
+    if (batch == 0 or seq_len == 0 or input_ids.len != tokens) return error.InvalidInputShape;
+    if (cb.vtable.takeRows == null) return error.UnsupportedResidentClipText;
+    const H: usize = cfg.text_hidden_size;
+    const pooled = selected: {
+        const hidden = try textEncoderHiddenTensor(cb, allocator, cfg, input_ids, batch, seq_len);
+        defer cb.free(hidden);
+        const rows = try allocator.alloc(u32, batch);
+        defer allocator.free(rows);
+        for (rows, 0..) |*row, b| row.* = std.math.cast(u32, b * seq_len + clipEotPosition(input_ids, b, seq_len)) orelse return error.InvalidInputShape;
+        break :selected (try cb.takeRows(hidden, rows, batch, H)) orelse return error.UnsupportedResidentClipText;
+    };
+    var pooled_live = true;
+    defer if (pooled_live) cb.free(pooled);
+    if (try cb.tensorDType(pooled) != .f32) return error.UnsupportedResidentPrecisionBoundary;
+    const weight = cb.getWeight("text_projection.weight") catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => {
+            pooled_live = false;
+            return pooled;
+        },
+        else => return err,
+    };
+    defer cb.free(weight);
+    return cb.linearNoBias(pooled, weight, batch, H, cfg.projection_dim);
+}
+
+fn textEncoderHiddenTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: clip_mod.Config, input_ids: []const i64, batch: usize, seq_len: usize) !CT {
     const H: usize = cfg.text_hidden_size;
     const total = batch * seq_len;
 
@@ -45,6 +116,7 @@ pub fn textEncoderForward(
     const tok_w = try cb.getWeight("text_model.embeddings.token_embedding.weight");
     defer cb.free(tok_w);
     var hidden = try cb.embeddingLookup(tok_w, input_ids, total, H);
+    errdefer cb.free(hidden);
 
     // Position embeddings (learned, repeated across batch)
     {
@@ -81,30 +153,7 @@ pub fn textEncoderForward(
         hidden = normed;
     }
 
-    // EOS token pooling: CLIP tokenizers use the highest token id as EOT.
-    const hidden_data = try cb.toFloat32(hidden, allocator);
-    defer allocator.free(hidden_data);
-    cb.free(hidden);
-
-    const eos_embeddings = try allocator.alloc(f32, batch * H);
-    for (0..batch) |b| {
-        const eos_pos = clipEotPosition(input_ids, b, seq_len);
-        @memcpy(eos_embeddings[b * H ..][0..H], hidden_data[(b * seq_len + eos_pos) * H ..][0..H]);
-    }
-
-    // Text projection (linear, no bias)
-    const proj_w = cb.getWeight("text_projection.weight") catch {
-        return eos_embeddings;
-    };
-    defer cb.free(proj_w);
-    const eos_shape = [_]i32{ @intCast(batch), @intCast(H) };
-    const eos_ct = try cb.fromFloat32Shape(eos_embeddings, &eos_shape);
-    defer cb.free(eos_ct);
-    allocator.free(eos_embeddings);
-
-    const projected = try cb.linearNoBias(eos_ct, proj_w, batch, H, cfg.projection_dim);
-    defer cb.free(projected);
-    return try cb.toFloat32(projected, allocator);
+    return hidden;
 }
 
 fn clipEotPosition(input_ids: []const i64, batch_index: usize, seq_len: usize) usize {
@@ -209,6 +258,18 @@ fn uploadVisionPixels(cb: *const ComputeBackend, allocator: std.mem.Allocator, d
     if (!try cb.copyRows2D(allocator, device, 0, input, 0, batch * 3 * image_size, image_size))
         return error.UnsupportedResidentClipVision;
     return device;
+}
+
+/// Host input boundary for the existing resident vision program. No model
+/// activation is materialized between patch packing and the projected tensor.
+pub fn visionEncoderForwardResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: clip_mod.Config, pixels: []const f32, batch: usize) !?CT {
+    if (!(cb.kind() == .cuda or cb.kind() == .metal) or !supportsResidentVision(cb)) return null;
+    try validateVisionInput(cfg, batch);
+    const expected = try std.math.mul(usize, batch, try std.math.mul(usize, 3, try std.math.mul(usize, cfg.image_size, cfg.image_size)));
+    if (pixels.len != expected) return error.UnexpectedOutputShape;
+    const input = try uploadVisionPixels(cb, allocator, pixels, batch, cfg.image_size);
+    defer cb.free(input);
+    return try visionEncoderForwardTensor(cb, allocator, cfg, input, batch);
 }
 
 /// Borrow normalized F32 NCHW pixels on the compute backend and return an owned
@@ -835,4 +896,144 @@ test "clip resident vision propagates execution failures and frees intermediates
     // The input is borrowed and still reusable after both errors.
     const recovered = try visionEncoderForwardTensor(&cb, allocator, clip_test_config, input, 1);
     defer cb.free(recovered);
+}
+
+const clip_text_resident_test_config = clip_mod.Config{ .text_hidden_size = 64, .text_num_layers = 1, .text_num_heads = 2, .text_intermediate_size = 128, .text_max_position_embeddings = 8, .projection_dim = 16 };
+fn populateClipTextResidentWeights(store: *native_compute.WeightStore) !void {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.putWeight(store, "text_model.embeddings.token_embedding.weight", &.{ 8, 64 }, null);
+    try fixture.putWeight(store, "text_model.embeddings.position_embedding.weight", &.{ 8, 64 }, null);
+    for ([_][]const u8{ "final_layer_norm", "encoder.layers.0.layer_norm1", "encoder.layers.0.layer_norm2" }) |prefix| {
+        var key: [192]u8 = undefined;
+        try fixture.putWeight(store, try std.fmt.bufPrint(&key, "text_model.{s}.weight", .{prefix}), &.{64}, 1);
+        try fixture.putWeight(store, try std.fmt.bufPrint(&key, "text_model.{s}.bias", .{prefix}), &.{64}, 0);
+    }
+    for ([_][]const u8{ "q_proj", "k_proj", "v_proj", "out_proj" }) |projection| {
+        var key: [192]u8 = undefined;
+        try fixture.putWeight(store, try std.fmt.bufPrint(&key, "text_model.encoder.layers.0.self_attn.{s}.weight", .{projection}), &.{ 64, 64 }, null);
+        try fixture.putWeight(store, try std.fmt.bufPrint(&key, "text_model.encoder.layers.0.self_attn.{s}.bias", .{projection}), &.{64}, null);
+    }
+    try fixture.putWeight(store, "text_model.encoder.layers.0.mlp.fc1.weight", &.{ 128, 64 }, null);
+    try fixture.putWeight(store, "text_model.encoder.layers.0.mlp.fc1.bias", &.{128}, null);
+    try fixture.putWeight(store, "text_model.encoder.layers.0.mlp.fc2.weight", &.{ 64, 128 }, null);
+    try fixture.putWeight(store, "text_model.encoder.layers.0.mlp.fc2.bias", &.{64}, null);
+    try fixture.putWeight(store, "text_projection.weight", &.{ 16, 64 }, null);
+}
+fn checkClipTextResident(cb: ComputeBackend, reference: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const cfg = clip_text_resident_test_config;
+    const ids = [_]i64{ 0, 7, 7, 1, 7, 2, 3, 0 };
+    var legacy_table = reference.vtable.*;
+    legacy_table.takeRows = null;
+    const legacy = ComputeBackend{ .ptr = reference.ptr, .vtable = &legacy_table };
+    const expected = try textEncoderForward(&legacy, a, cfg, &ids, 2, 4);
+    defer a.free(expected);
+    var no_readback_table = cb.vtable.*;
+    no_readback_table.toFloat32 = rejectClipReadback;
+    const resident = ComputeBackend{ .ptr = cb.ptr, .vtable = &no_readback_table };
+    const before = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+    const output = try textEncoderForwardTensor(&resident, a, cfg, &ids, 2, 4);
+    defer cb.free(output);
+    try before.expectUnchanged(cb);
+    const actual = try cb.toFloat32(output, a);
+    defer a.free(actual);
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0002);
+    // The legacy host API now has exactly its one final output download.
+    const before_host = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+    const host = try textEncoderForward(&cb, a, cfg, &ids, 2, 4);
+    defer a.free(host);
+    for (actual, host) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00001);
+    if (cb.kind() == .cuda) try std.testing.expectEqual(before_host.cuda_bytes + host.len * @sizeOf(f32), cb.trainingRuntimeStats().d2h_bytes);
+    var unsupported = cb.vtable.*;
+    unsupported.takeRows = null;
+    const decline = ComputeBackend{ .ptr = cb.ptr, .vtable = &unsupported };
+    try std.testing.expectError(error.UnsupportedResidentClipText, textEncoderForwardTensor(&decline, a, cfg, &ids, 2, 4));
+}
+test "CLIP text resident head actual Native matches frozen host pooling and projection" {
+    try @import("../ops/media_residency_test.zig").onNative(populateClipTextResidentWeights, checkClipTextResident);
+}
+test "CLIP text resident head actual Metal matches frozen host pooling without intermediate downloads" {
+    try @import("../ops/media_residency_test.zig").onMetal(populateClipTextResidentWeights, checkClipTextResident);
+}
+test "CLIP text resident head actual CUDA matches frozen host pooling without intermediate downloads" {
+    try @import("../ops/media_residency_test.zig").onCuda(populateClipTextResidentWeights, checkClipTextResident);
+}
+
+test "CLIP text resident entry allocation faults retire partial actual Native outputs" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var weights = native_compute.WeightStore{ .allocator = std.testing.allocator, .resident_weights = .{}, .lazy_weights = .{} };
+            defer weights.deinitOwned();
+            try populateClipTextResidentWeights(&weights);
+            var compute = native_compute.NativeCompute.init(a, &weights, null);
+            defer compute.deinit();
+            const cb = compute.computeBackend();
+            const output = try textEncoderForwardTensor(&cb, a, clip_text_resident_test_config, &.{ 0, 7, 7, 1 }, 1, 4);
+            defer cb.free(output);
+        }
+    };
+    try Case.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "CLIP text resident cancellation checkpoints preserve actual Native recovery" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var weights = native_compute.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer weights.deinitOwned();
+    try populateClipTextResidentWeights(&weights);
+    var compute = native_compute.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const Cancel = struct {
+        calls: usize = 0,
+        stop: usize,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls >= self.stop) return error.Cancelled;
+        }
+    };
+    for ([_]usize{ 1, 3, 8, 16 }) |stop| {
+        var cancel = Cancel{ .stop = stop };
+        var cb = compute.computeBackend();
+        cb.execution_control = .{ .ptr = &cancel, .check_fn = Cancel.check };
+        try std.testing.expectError(error.Cancelled, textEncoderForwardTensor(&cb, a, clip_text_resident_test_config, &.{ 0, 7, 7, 1 }, 1, 4));
+        cb.execution_control = null;
+        const recovered = try textEncoderForwardTensor(&cb, a, clip_text_resident_test_config, &.{ 0, 7, 7, 1 }, 1, 4);
+        defer cb.free(recovered);
+        try std.testing.expectEqual(@import("../backends/tensor.zig").DType.f32, try cb.tensorDType(recovered));
+    }
+}
+
+test "CLIP text post-producer row refusal propagates without replay or host fallback" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var weights = native_compute.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer weights.deinitOwned();
+    try populateClipTextResidentWeights(&weights);
+    var compute = native_compute.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const Probe = struct {
+        var embedding_calls: usize = 0;
+        fn embed(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize) !CT {
+            embedding_calls += 1;
+            return native_compute.vtable_impl.embeddingLookup(ctx, weight, ids, total, dim);
+        }
+        fn decline(_: *anyopaque, _: *const ops.TakeRowsRequest) !?CT {
+            return null;
+        }
+    };
+    var table = native_compute.vtable_impl;
+    table.embeddingLookup = Probe.embed;
+    table.takeRows = Probe.decline;
+    const cb = ComputeBackend{ .ptr = &compute, .vtable = &table };
+    Probe.embedding_calls = 0;
+    try std.testing.expectError(error.UnsupportedResidentClipText, textEncoderForward(&cb, a, clip_text_resident_test_config, &.{ 0, 7, 7, 1 }, 1, 4));
+    try std.testing.expectEqual(@as(usize, 2), Probe.embedding_calls);
+    Probe.embedding_calls = 0;
+    table.takeRows = null;
+    try std.testing.expectError(error.UnsupportedResidentClipText, textEncoderForwardTensor(&cb, a, clip_text_resident_test_config, &.{ 0, 7, 7, 1 }, 1, 4));
+    try std.testing.expectEqual(@as(usize, 0), Probe.embedding_calls);
 }

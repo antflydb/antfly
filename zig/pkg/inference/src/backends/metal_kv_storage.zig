@@ -1962,6 +1962,10 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
             .head_dim = head_dim,
         }, &decoded_keys, &decoded_values);
         var gpu_scores: [rows]f32 = undefined;
+        const score_memory_0 = @import("metal_telemetry.zig").memorySnapshot(true);
+        var score_interval_0: @import("metal_telemetry.zig").BufferInterval = .{};
+        score_interval_0.begin(true);
+        defer _ = score_interval_0.finish(true);
         try MetalKvStorage.scoreSelectedAttention(@ptrCast(owned), .{
             .sequence_id = 91,
             .layer_index = 0,
@@ -1976,6 +1980,12 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
             .check_ctx = null,
             .check_fn = selectionTestNotCancelled,
         });
+        const score_owned_0 = score_interval_0.finish(true).?;
+        try std.testing.expectEqual(@as(u64, 5), score_owned_0.owned_allocations);
+        try std.testing.expectEqual(@as(u64, 5), score_owned_0.owned_frees);
+        try std.testing.expectEqual(score_memory_0[0], score_owned_0.live_bytes[0]);
+        try std.testing.expect(score_owned_0.interval_peak_bytes[0] > score_owned_0.live_bytes[0]);
+
         const oracle = try selection.scoreConsumerNormalizedAttention(allocator, .{
             .queries = &queries,
             .query_positions = &.{ 2, 3 },
@@ -2003,6 +2013,10 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
         });
         try std.testing.expectEqual(@as(usize, 3), compact.token_count);
         var compact_scores: [3]f32 = undefined;
+        const score_memory_1 = @import("metal_telemetry.zig").memorySnapshot(true);
+        var score_interval_1: @import("metal_telemetry.zig").BufferInterval = .{};
+        score_interval_1.begin(true);
+        defer _ = score_interval_1.finish(true);
         try MetalKvStorage.scoreSelectedAttention(@ptrCast(owned), .{
             .sequence_id = 91,
             .layer_index = 0,
@@ -2017,6 +2031,12 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
             .check_ctx = null,
             .check_fn = selectionTestNotCancelled,
         });
+        const score_owned_1 = score_interval_1.finish(true).?;
+        try std.testing.expectEqual(@as(u64, 5), score_owned_1.owned_allocations);
+        try std.testing.expectEqual(@as(u64, 5), score_owned_1.owned_frees);
+        try std.testing.expectEqual(score_memory_1[0], score_owned_1.live_bytes[0]);
+        try std.testing.expect(score_owned_1.interval_peak_bytes[0] > score_owned_1.live_bytes[0]);
+
         var compact_keys: [3 * width]f32 = undefined;
         try MetalKvStorage.gatherLayerKeys(@ptrCast(owned), .{
             .sequence_id = 91,
@@ -2059,6 +2079,9 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
             output_bytes,
         ));
         const compact_blocks = [_]u32{0};
+        var positions_interval: @import("metal_telemetry.zig").BufferInterval = .{};
+        positions_interval.begin(true);
+        defer _ = positions_interval.finish(true);
         try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_attention_paged_slot_device_selected(
             metal,
             compact.slot,
@@ -2085,6 +2108,12 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
             out_device,
             0,
         ));
+        const positions_owned = positions_interval.finish(true).?;
+        // Small table/sinks use setBytes; this existing selected-position
+        // route owns exactly one copied key-position MTLBuffer.
+        try std.testing.expectEqual(@as(u64, 1), positions_owned.owned_allocations);
+        try std.testing.expectEqual(@as(u64, 1), positions_owned.owned_frees);
+
         var gpu_attention: [output_values]f32 = undefined;
         try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(metal, out_device, 0, &gpu_attention, output_bytes));
         var cpu_attention: [output_values]f32 = @splat(0);

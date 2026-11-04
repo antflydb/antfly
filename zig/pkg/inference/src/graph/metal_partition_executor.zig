@@ -1587,6 +1587,44 @@ pub const MetalPartitionExecutor = struct {
         return &self.pe;
     }
 
+    /// Cold canonical-executor proof. The caller owns the actual provider's
+    /// metadata operation before touching the cached region plan. This reuses
+    /// the plan and reachability authority already used by real execution.
+    pub fn attestOwnedFrameDispatch(actual: *const PartitionExecutor, graph: *const Graph, backend: *const ComputeBackend, nodes: []const NodeId, reachable: []const bool, last_use: []const u32) !bool {
+        if (actual.vtable != &vtable or backend.kind() != .metal or !ownedFramePolicyAvailable()) return false;
+        const self: *MetalPartitionExecutor = @ptrCast(@alignCast(actual.ptr));
+        if (!self.owned or self.graph != graph or self.backend.ptr != backend.ptr or self.backend.vtable != backend.vtable or reachable.len != graph.nodeCount() or last_use.len != graph.nodeCount()) return false;
+        for (nodes) |id| {
+            if (id >= reachable.len) return false;
+            if (!reachable[id]) continue;
+            const node = graph.node(id);
+            if (node.output_shape.dtype != .f32) return false;
+            if (node.op == .parameter) continue;
+            // The existing fused families all require a linear, dot or norm.
+            // Keep those families on their tuned owner path until its complete
+            // ingress/output/scratch contract is declared; never disable them.
+            // Regular RoPE descriptors derive positions in the shared kernel;
+            // the route separately verifies its exact specialized pipeline.
+            const descriptor = ops_mod.kernel_descriptor.lower(graph, id);
+            if (descriptor) |value| switch (value.operation) {
+                .linear, .dot, .norm, .gather => return false,
+                else => {},
+            } else if (@import("../execution/metadata_alias.zig").Plan.lower(graph, id, .metal) == null) return false;
+            // These exact heuristics run ahead of the physical branch. Even
+            // a supported descriptor cannot claim a producer they defer.
+            if (shouldDeferScaleMulForAdd(graph, id, reachable, last_use, null) or shouldDeferElementwiseMulForAdd(graph, id, reachable, last_use, null) or shouldDeferTransposeForLinearDot(graph, id, reachable, last_use)) return false;
+        }
+        var transient: ?RuntimeRegionPlan = null;
+        defer if (transient) |*plan| plan.deinit(self.allocator);
+        const plan = try self.runtimeRegionPlan(self.allocator, graph, nodes, graph.nodeCount(), reachable, last_use, null, &transient);
+        if (!plan.matches(nodes, graph.nodeCount()) or plan.region_count != 0 or plan.covered_node_count != 0 or plan.elided_node_count != 0 or plan.pre_skipped_node_count != 0) return false;
+        for (nodes, 0..) |id, position| {
+            if (!reachable[id] or graph.node(id).op == .parameter) continue;
+            if (plan.descriptorAt(position) == null and @import("../execution/metadata_alias.zig").Plan.lower(graph, id, .metal) == null) return false;
+        }
+        return true;
+    }
+
     fn executeFn(
         ctx: *anyopaque,
         values: []?CT,
@@ -1784,9 +1822,11 @@ pub const MetalPartitionExecutor = struct {
 
         const chunk_ops = frameChunkOpsForExecution(exec_ctx.options);
         const planned_primitives = if (exec_ctx.options) |opts| opts.planned_device_execution else false;
+        const owned_frame = if (exec_ctx.options) |options| if (options.physical_frame) |frame| frame.pool.completeOwnedPayload() != null and frame.pool.metal_frame_dispatch else false else false;
+        if (owned_frame and !ownedFramePolicyAvailable()) return error.PreparedMetalFramePolicyChanged;
         const graph_plan_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-        if (reservePartitionGraphPlanForExecution(chunk_ops) or
-            (planned_primitives and !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_PARTITION_GRAPH_PLAN", false)))
+        if (!owned_frame and (reservePartitionGraphPlanForExecution(chunk_ops) or
+            (planned_primitives and !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_PARTITION_GRAPH_PLAN", false))))
         {
             var metal_graph_plan = try buildMetalGraphPlan(allocator, buffer_plan, partition_view);
             defer metal_graph_plan.deinit(allocator);
@@ -1935,6 +1975,7 @@ pub const MetalPartitionExecutor = struct {
         const begin_frame_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
         var frame_active = if (metalPartitionFrameDisabled() or (!planned_primitives and runtime_region_plan.region_count == 0)) false else try cb.decoderRuntimeBeginFrame();
         errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+        if (owned_frame and !frame_active) return error.PreparedMetalFrameDispatchChanged;
         if (collect_loop_profile) loop_profile.begin_frame_ns += metalPartitionElapsedNs(begin_frame_start_ns, metalPartitionNowNs());
         if (trace_progress) std.debug.print("metal_partition_progress: phase=begin_frame_end partition={d} active={}\n", .{ partition_index, frame_active });
         if (trace_nodes) std.debug.print("graph_executor_node_trace: begin_frame_end partition={d} active={}\n", .{ partition_index, frame_active });
@@ -2301,8 +2342,8 @@ pub const MetalPartitionExecutor = struct {
                         // that lifetime; keep its existing allocation path.
                         if (!frame_active) break :physical null;
                         if (metalPartitionRuntimeCommandsDisabled()) break :physical null;
-                        if (runtime_region_plan.descriptorAt(node_pos) == null) break :physical null;
                         const frame = options.physical_frame orelse break :physical null;
+                        if (runtime_region_plan.descriptorAt(node_pos) == null and !frame.hasPreparedMetadataAlias(node_id)) break :physical null;
                         // Metal may intentionally leave a producer absent so
                         // the command path below can fold it into its consumer
                         // (broadcasts, scales and transposes, for example).
@@ -2313,6 +2354,7 @@ pub const MetalPartitionExecutor = struct {
                         }
                         break :physical try frame.execute(cb, values, node_id, try interpreter.ropePositionOverride(exec_state.options.attention));
                     };
+                    if (owned_frame and physical_output == null) return error.PreparedMetalFrameDispatchChanged;
                     var output_hint_source: ?OutputHintSource = null;
                     const output_hint: ?CT = if (physical_output != null) null else blk: {
                         if (chunk_local_outputs) {
@@ -22781,4 +22823,11 @@ test "Metal public cached graph runtime refreshes same-shaped weight bindings an
 
 test "Metal public cached graph runtime rejects rebound same-shaped prepared slots" {
     try expectCachedPreparedParameters(true);
+}
+
+/// The proof preserves current command/encoder policy. Turning a required
+/// facility off invalidates eligibility rather than silently choosing an
+/// allocating compatibility path after an exact admission has been granted.
+pub fn ownedFramePolicyAvailable() bool {
+    return !metalPartitionFrameDisabled() and !metalPartitionRuntimeCommandsDisabled() and !runtimeRegionPlanDisabled();
 }

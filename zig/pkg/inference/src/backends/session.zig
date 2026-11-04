@@ -229,6 +229,58 @@ pub const ResidentOutputs = struct {
         return detach(self, current);
     }
 
+    /// End the source's numerical dependence before an immediate resident
+    /// consumer is admitted. Native callbacks synchronously join their workers;
+    /// an exact canonical Native backend with no held operation can retain its
+    /// existing owner. Eligible Metal outputs instead move their complete dense
+    /// payload before any pooled/sliced tensor or backend pointer is selected.
+    /// False leaves the source owning the same already-executed result; callers
+    /// may materialize that result, but must never replay its invocation.
+    pub fn prepareResidentConsumer(self: *ResidentOutputs, current: @import("../execution/cleanup_context.zig").Context) !bool {
+        if (comptime @import("build_options").enable_native) if (self.backend.vtable == &@import("../ops/native_compute.zig").vtable_impl and self.backend.operationToken() == null) {
+            if (current.operation != null) return false;
+            return true;
+        };
+        const services = self.backend_owner_cleanup_services orelse return false;
+        if (services.detach_dense_f32 == null or !services.accepts(self)) return false;
+        const operation = current.operation orelse return false;
+        if (operation.mode == .metadata) return error.BackendCleanupNumericalAuthorityRequired;
+        try operation.validate(.{ .implementation = .{ .context = self.backend.ptr, .table = self.backend.vtable }, .program = null, .mode = .legacy_unknown_frame });
+        const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+        // Bind only the explicit pre-source epoch to this actual operation.
+        // An existing, different bound epoch is rejected by operationFor below.
+        var bound = try operation.retainCleanupEpoch();
+        defer if (bound) |*held| held.release();
+        if (bound == null and !try self.backend.bindCleanupEpoch(epoch)) return false;
+        return self.detachDenseF32PhysicalPayload(current);
+    }
+
+    /// Materialize this already-executed tensor set without replaying its
+    /// invocation. The caller retains its admitted output/IO envelope until
+    /// these independent host tensors and the source owner are retired.
+    pub fn materializeFloat32(self: *ResidentOutputs, allocator: std.mem.Allocator, info: []const TensorInfo, borrowed: ?@import("../execution/backend_operation.zig").Borrowed) ![]Tensor {
+        return @import("../execution/backend_operation.zig").callOpaque(self.backend.*, borrowed orelse self.backend.operationToken(), @This().materializeFloat32WithinOperation, .{ self, allocator, info });
+    }
+
+    fn materializeFloat32WithinOperation(self: *ResidentOutputs, allocator: std.mem.Allocator, info: []const TensorInfo) ![]Tensor {
+        const result = try allocator.alloc(Tensor, self.outputs.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |*value| value.deinit();
+            allocator.free(result);
+        }
+        for (self.outputs, 0..) |output, index| {
+            const shape = try self.backend.tensorShape(output, allocator);
+            defer allocator.free(shape);
+            const values = try self.backend.toFloat32(output, allocator);
+            errdefer allocator.free(values);
+            const name = if (index < info.len) info[index].name else "";
+            result[index] = try Tensor.initFloat32Owned(allocator, name, shape, values);
+            initialized += 1;
+        }
+        return result;
+    }
+
     pub fn deinit(self: *ResidentOutputs) void {
         self.deinitWithCleanup(.{ .outside_execution = true });
     }
@@ -1834,10 +1886,11 @@ pub const Session = struct {
 
     /// Supplemental admission reports the same denial constraint as initial
     /// admission, while preserving credit from independently owned live leases.
-    pub fn admitSupplementPairWithPressure(self: Session, base: *const RunPermit, other: ?*const RunPermit, target: memory.AdmissionAmounts, pressure: *?memory.AdmissionPressure) !RunPermit {
-        pressure.* = null;
+    /// Pure component-wise deficit. Zero requires no supplier/provider handoff;
+    /// the exact same identity/class/independent-credit checks govern admission.
+    pub fn supplementPairDeficit(self: *const Session, base: *const RunPermit, other: ?*const RunPermit, target: memory.AdmissionAmounts) !memory.AdmissionAmounts {
         if (base.session.ptr != self.ptr or base.session.vtable != self.vtable or base.execution_yielded) return error.InvalidAdmissionLeaseReduction;
-        const admission = self.run_admission orelse return self.retainPermit(.{ .session = self, .lease = null });
+        const admission = self.run_admission orelse return .{};
         const lease = base.lease orelse return error.InvalidAdmissionLeaseReduction;
         if (lease.controller != admission.controller or lease.retain_backend_class != admission.backend_class) return error.InvalidAdmissionLeaseReduction;
         var owned = lease.amounts;
@@ -1850,6 +1903,13 @@ pub const Session = struct {
         }
         var extra = memory.AdmissionAmounts{};
         inline for (@typeInfo(memory.AdmissionAmounts).@"struct".field_names) |name| @field(extra, name) = @field(target, name) -| @field(owned, name);
+        return extra;
+    }
+
+    pub fn admitSupplementPairWithPressure(self: Session, base: *const RunPermit, other: ?*const RunPermit, target: memory.AdmissionAmounts, pressure: *?memory.AdmissionPressure) !RunPermit {
+        pressure.* = null;
+        const extra = try self.supplementPairDeficit(base, other, target);
+        const admission = self.run_admission orelse return self.retainPermit(.{ .session = self, .lease = null });
         if (std.meta.eql(extra, memory.AdmissionAmounts{})) return self.retainPermit(.{ .session = self, .lease = null });
         if (admission.controller.consumeForcedRunDenialForTesting()) return error.ResourceTemporarilyUnavailable;
         return self.retainPermit(.{ .session = self, .lease = try admission.controller.tryAcquireWithPressure(admission.backend_class, admission.limits, extra, admission.check_live_memory, pressure) });
@@ -2043,6 +2103,22 @@ pub const Session = struct {
     pub fn admitResidentInputsWithRetirement(self: Session, inputs: []const ResidentInput, prepared: *?@import("../execution/resource_retirement.zig").PreparedCharge) !RunPermit {
         if (self.run_admission != null and prepared.* == null) return error.UnpreparedOutputRetirement;
         var permit = self.retainPermit(.{ .session = self, .lease = if (self.run_admission) |admission| try admission.acquireResidentInputs(inputs, self.outputInfo()) else null });
+        errdefer permit.deinit();
+        try permit.adoptResidentOutputRetirement(prepared);
+        return permit;
+    }
+
+    /// Actual cold resident selection. The caller owns an outside-lanes ready
+    /// turn; shape metadata, selected program and quota precede destination entry.
+    /// The preallocated retirement shell transfers only after selection succeeds.
+    pub fn admitResidentInputsBeforeExecutionWithRetirement(self: Session, inputs: []const ResidentInput, prepared: *?@import("../execution/resource_retirement.zig").PreparedCharge, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !RunPermit {
+        if (self.run_admission != null and prepared.* == null) return error.UnpreparedOutputRetirement;
+        if (control) |active| try active.check();
+        var metadata = std.heap.ArenaAllocator.init(allocator);
+        defer metadata.deinit();
+        const info = try residentShapeInfo(self, inputs, metadata.allocator());
+        const batch = if (info.len > 0) positiveDimension(info[0].shape, 0) else 1;
+        var permit = try self.admitShapeRequestBeforeExecution(.{ .resident_inputs = .{ .info = info, .values = inputs } }, try self.planShapes(info, batch), allocator, control);
         errdefer permit.deinit();
         try permit.adoptResidentOutputRetirement(prepared);
         return permit;
@@ -2430,6 +2506,179 @@ pub const Session = struct {
     }
 };
 
+/// A prepared source invocation at its final address. This owner holds the
+/// actual FIFO turn, source execution/admission and whole-consumer cleanup B.
+/// Inputs and task output policy remain borrowed synchronous caller facts.
+/// initBeforeExecutionInto must run outside enclosing model/provider lanes;
+/// after initialization this value MUST NOT MOVE until deinit returns.
+pub const PreparedSource = struct {
+    const Owner = @import("../execution/cleanup_owner.zig").Owner;
+    const Waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter;
+    pub const Placement = enum { host, resident_consumer };
+    const Phase = enum { empty, preparing, ready, executing, released, closed };
+
+    allocator: std.mem.Allocator = undefined,
+    control: ?InferenceExecutionControl = null,
+    scheduling_session: ?Session = null,
+    permit: ?RunPermit = null,
+    cleanup: Owner = .{},
+    waiter: Waiter = .{},
+    source_model: ?*Session.ModelLifetime = null,
+    scheduling_model: ?*Session.ModelLifetime = null,
+    phase: Phase = .empty,
+    executed: bool = false,
+
+    pub fn initBeforeExecutionInto(self: *PreparedSource, source: Session, fallback_scheduling: Session, fallback_gate: ?*std.atomic.Mutex, inputs: invocation.Inputs, declared: RunRequest, supplied_preprocess: ?*RunPermit, placement: Placement, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !void {
+        if (self.phase != .empty) return error.SourceInvocationAlreadyInitialized;
+        self.allocator = allocator;
+        self.control = control;
+        const scheduling = if (source.execution_gate != null) source else fallback_scheduling;
+        const gate = source.execution_gate orelse fallback_gate;
+        self.scheduling_session = scheduling;
+        self.phase = .preparing;
+        self.source_model = if (source.model_lifetime) |model| model.retain() else null;
+        if (scheduling.model_lifetime) |model| if (model != self.source_model) {
+            self.scheduling_model = model.retain();
+        };
+        errdefer self.deinit();
+        self.cleanup = if (placement == .resident_consumer or source.preparesInvocation()) try Owner.beginResident(source) else try Owner.beginAdmitted(source);
+        try scheduling.selectReadyCohort(gate, control orelse .{}, &self.waiter);
+        const envelope = if (supplied_preprocess) |supplied| original: {
+            if (supplied.session.ptr != source.ptr or supplied.session.vtable != source.vtable or supplied.dispatch_cleanup_epoch != null or supplied.invocation_started or supplied.prepared != null or supplied.physical_storage != null) return error.InvalidSourcePreprocessingPermit;
+            break :original supplied.request orelse return error.MissingRunRequest;
+        } else declared;
+        var request = envelope;
+        var shape_arena = std.heap.ArenaAllocator.init(allocator);
+        defer shape_arena.deinit();
+        const needs_shapes = source.run_admission != null or source.preparesInvocation() or source.vtable.runGeometry != null or source.output_geometry != null or source.cached_decoder_geometry != null;
+        const shapes: ShapeInputs = switch (inputs) {
+            .host => |host| .{ .tensors = host },
+            .resident => |resident| if (needs_shapes)
+                .{ .resident_inputs = .{ .info = try residentShapeInfo(source, resident, shape_arena.allocator()), .values = resident } }
+            else
+                .{ .shapes = &.{} },
+        };
+        if (needs_shapes) try source.resolveRunGeometry(shapes, &request);
+        // Shape-derived geometry cannot discard explicit caller envelopes.
+        request.workspace_bytes = @max(request.workspace_bytes, envelope.workspace_bytes);
+        request.sequence = @max(request.sequence, envelope.sequence);
+        if (envelope.output_bytes) |bytes| request.output_bytes = @max(request.output_bytes orelse 0, bytes);
+        request.output_kv_bytes = @max(request.output_kv_bytes, envelope.output_kv_bytes);
+        if (supplied_preprocess) |supplied| {
+            // The task retains its actual PCM/feature preparation lease. Only
+            // the execution remainder moves into this runtime owner. Preserve
+            // both explicit outer producer credit and retained local IO bytes.
+            supplied.request = request;
+            _ = try supplied.yieldExecution();
+            const local_host = if (supplied.lease) |lease| lease.amounts.host_scratch_bytes else 0;
+            request.pre_admitted_host_bytes = @min(try addBytes(request.input_bytes, request.host_preprocess_bytes), try addBytes(envelope.pre_admitted_host_bytes, local_host));
+        }
+        self.permit = if (source.run_admission == null and !source.preparesInvocation())
+            try source.admit(request)
+        else
+            try source.admitShapeRequestBeforeExecution(shapes, request, allocator, control);
+        if (placement == .resident_consumer) {
+            if (supplied_preprocess) |supplied| {
+                if (supplied.output_retirement_shell != null) try self.permit.?.adoptResidentOutputRetirement(&supplied.output_retirement_shell);
+            }
+            try self.permit.?.prepareResidentOutputRetirement();
+        }
+        try self.permit.?.preparePhysicalStorage(allocator);
+        if (self.epoch()) |b| try self.permit.?.bindPhysicalCleanupEpoch(b);
+        self.phase = .ready;
+    }
+
+    pub fn epoch(self: *const PreparedSource) ?*const @import("../execution/retirement_sink.zig").Epoch {
+        return self.cleanup.epoch();
+    }
+
+    pub fn enter(self: *PreparedSource) !void {
+        if (self.phase != .ready) return error.SourceInvocationNotReady;
+        try self.scheduling_session.?.acquireSelectedCohort(self.control orelse .{}, &self.waiter);
+        self.phase = .executing;
+    }
+
+    pub fn runResident(self: *PreparedSource, inputs: invocation.Inputs) !?ResidentOutputs {
+        if (self.phase != .executing or self.executed) return error.SourceInvocationAlreadyExecuted;
+        // An error may follow committed numerical work. Only an explicit
+        // pre-numerical null permits the same source's host dispatch.
+        self.executed = true;
+        var outputs = (try switch (inputs) {
+            .host => |host| self.permit.?.runResidentWithControl(host, self.allocator, self.control),
+            .resident => |resident| self.permit.?.runResidentInputsWithControl(resident, self.allocator, self.control),
+        }) orelse {
+            self.executed = false;
+            return null;
+        };
+        errdefer outputs.deinitWithBoundary(self.epoch());
+        try self.permit.?.attachResidentOutputs(&outputs);
+        return outputs;
+    }
+
+    pub fn handoffResident(self: *PreparedSource, outputs: *ResidentOutputs) !bool {
+        if (self.phase != .executing or !self.executed) return error.SourceInvocationNotExecuted;
+        if (!try outputs.prepareResidentConsumer(.{ .boundary = self.epoch(), .operation = outputs.backend.operationToken() })) return false;
+        self.finishSourceNumerical();
+        return true;
+    }
+
+    /// Consume the SAME already-executed result only after host export succeeds.
+    /// The exact source lease retires under B and stays charged through this
+    /// owner's consumer lifetime. No copied/second lease holder is created.
+    pub fn materializeResident(self: *PreparedSource, source: *?ResidentOutputs) ![]Tensor {
+        if ((self.phase != .executing and self.phase != .released) or !self.executed or source.* == null) return error.SourceInvocationNotExecuted;
+        const outputs = &source.*.?;
+        const host = try outputs.materializeFloat32(self.allocator, &.{}, outputs.backend.operationToken());
+        outputs.deinitWithBoundary(self.epoch());
+        source.* = null;
+        if (self.phase == .executing) self.finishSourceNumerical();
+        return host;
+    }
+
+    pub fn runHost(self: *PreparedSource, inputs: []const Tensor) ![]Tensor {
+        if (self.phase != .executing or self.executed) return error.SourceInvocationAlreadyExecuted;
+        self.executed = true;
+        var outputs = try self.permit.?.runWithControl(inputs, self.allocator, self.control);
+        errdefer deinitTensorSlice(outputs, self.allocator);
+        self.finishSourceNumerical();
+        outputs = try self.permit.?.attachHostOutputs(outputs, self.allocator);
+        self.permit.?.deinitWithCleanup(.{ .boundary = self.epoch() });
+        return outputs;
+    }
+
+    fn finishSourceNumerical(self: *PreparedSource) void {
+        const current = @import("../execution/cleanup_context.zig").Context{ .boundary = self.epoch() };
+        if (self.permit) |*permit| permit.retireExecutionWithCleanup(current);
+        const scheduling = self.scheduling_session orelse return;
+        scheduling.releaseSelectedCohortGate(&self.waiter);
+        scheduling.leaveSelectedCohort(&self.waiter);
+        self.phase = .released;
+    }
+
+    pub fn deinit(self: *PreparedSource) void {
+        if (self.phase == .empty or self.phase == .closed) return;
+        const b = self.epoch();
+        if (self.permit) |*permit| permit.retireExecutionWithCleanup(.{ .boundary = b });
+        if (self.scheduling_session) |scheduling| {
+            scheduling.releaseSelectedCohortGate(&self.waiter);
+            scheduling.leaveSelectedCohort(&self.waiter);
+        }
+        // All numerical/provider ownership has ended before external callbacks.
+        if (self.permit) |*permit| permit.deinitWithCleanup(.{ .boundary = b });
+        self.permit = null;
+        if (self.scheduling_model) |model| {
+            if (b != null) model.releaseWithBoundary(b) else model.release();
+        }
+        self.scheduling_model = null;
+        if (self.source_model) |model| {
+            if (b != null) model.releaseWithBoundary(b) else model.release();
+        }
+        self.source_model = null;
+        self.phase = .closed;
+        self.cleanup.finishAfterUnlock();
+    }
+};
+
 pub const RunPermit = struct {
     session: Session,
     resource_pin: ?Session.ModelLifetime.ResourcePin = null,
@@ -2740,6 +2989,18 @@ pub const RunPermit = struct {
     /// Drop transient forward scratch once only materialized outputs remain.
     pub fn retainOutputs(self: *RunPermit, outputs: []const Tensor) !void {
         if (self.lease) |*lease| try lease.retain(try retainedOutputAmounts(outputs, lease.amounts.host_kv_bytes > 0));
+    }
+
+    /// Transfer an already-executed resident result's exact reservation before
+    /// the source permit is retired at an owning stage boundary. No supplier,
+    /// metadata allocation or second lease holder is introduced by this move.
+    pub fn attachResidentOutputs(self: *RunPermit, outputs: *ResidentOutputs) !void {
+        if (self.lease == null) return;
+        if (outputs.resource_lease != null) return error.ResidentOutputsAlreadyAdmitted;
+        if (self.session.model_lifetime) |model| if (outputs.model_retention != model) return error.ResidentOutputsOwnerChanged;
+        if (self.lease != null and outputs.retirement_shell == null) return error.UnpreparedOutputRetirement;
+        outputs.resource_lease = self.lease;
+        self.lease = null;
     }
 
     /// Move the exact host-output reservation after provider/model unlock.
@@ -5655,4 +5916,232 @@ test "bound raw resident cancellation after actual Native forward keeps quota un
     try std.testing.expectEqual(@as(usize, 1), probe.callbacks);
     if (probe.failure) |err| return err;
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+}
+
+test "resident host materialization preserves actual Native outputs across all allocation failures without invocation replay" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const a = std.testing.allocator;
+            const Shared = @import("compute_context.zig").SharedBackendContext;
+            const shared = try Shared.init(a, .native, null);
+            defer shared.release();
+            const backend = shared.stableBackend();
+            const first = try backend.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+            defer backend.free(first);
+            const second = try backend.fromFloat32Shape(&.{ 5, 6 }, &.{2});
+            defer backend.free(second);
+            var tensors = [_]ops.CT{ first, second };
+            var outputs = ResidentOutputs{ .outputs = &tensors, .backend = backend, .allocator = a };
+            const info = [_]TensorInfo{ .{ .name = "first", .dtype = .f32, .shape = &.{ 2, 2 } }, .{ .name = "second", .dtype = .f32, .shape = &.{2} } };
+            // Regardless of failure position, this exact source remains usable.
+            defer {
+                const original = backend.toFloat32(first, a) catch @panic("source invalid after materialization");
+                defer a.free(original);
+                std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, original) catch @panic("source changed by materialization");
+            }
+            const host = try outputs.materializeFloat32(allocator, &info, null);
+            defer {
+                for (host) |*value| value.deinit();
+                allocator.free(host);
+            }
+            try std.testing.expectEqualStrings("first", host[0].name);
+            try std.testing.expectEqualStrings("second", host[1].name);
+            try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, host[0].shape);
+            try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, host[0].asFloat32());
+            try std.testing.expectEqualSlices(f32, &.{ 5, 6 }, host[1].asFloat32());
+            try std.testing.expectEqual(@as(usize, 2), outputs.outputs.len);
+        }
+    };
+    try Case.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "resident consumer boundary accepts canonical idle Native only and refuses held copied or custom backend tables without mutation" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const shared = try @import("compute_context.zig").SharedBackendContext.init(a, .native, null);
+    defer shared.release();
+    const backend = shared.stableBackend();
+    const value = try backend.fromFloat32Shape(&.{ 1, 2 }, &.{ 1, 2 });
+    defer backend.free(value);
+    var values = [_]ops.CT{value};
+    var outputs = ResidentOutputs{ .outputs = &values, .backend = backend, .allocator = a };
+    try std.testing.expect(try outputs.prepareResidentConsumer(.{}));
+    var scope: @import("../execution/backend_operation.zig").Scope = undefined;
+    try @import("../execution/backend_operation.zig").enterInto(backend, null, null, .managed, &scope);
+    var scope_live = true;
+    defer if (scope_live) scope.deinitChecked() catch @panic("Native source test scope");
+    try std.testing.expect(!try outputs.prepareResidentConsumer(.{ .operation = scope.token() }));
+    try scope.finish();
+    scope_live = false;
+    var copied_table = backend.vtable.*;
+    var copied_backend = backend.*;
+    copied_backend.vtable = &copied_table;
+    outputs.backend = &copied_backend;
+    try std.testing.expect(!try outputs.prepareResidentConsumer(.{}));
+    copied_table.operation_services = null;
+    try std.testing.expect(!try outputs.prepareResidentConsumer(.{}));
+    try std.testing.expect(outputs.backend == &copied_backend);
+    try std.testing.expectEqual(value, outputs.outputs[0]);
+    try std.testing.expect(outputs.resource_lease == null and outputs.model_retention == null and outputs.backend_owner == null);
+    outputs.backend = backend;
+    try std.testing.expect(try outputs.prepareResidentConsumer(.{}));
+}
+
+test "resident materialization borrows exact explicit Native scope and rejects foreign scope before allocator or provider reentry" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const operation = @import("../execution/backend_operation.zig");
+    const Shared = @import("compute_context.zig").SharedBackendContext;
+    const first = try Shared.init(a, .native, null);
+    defer first.release();
+    const second = try Shared.init(a, .native, null);
+    defer second.release();
+    const backend = first.stableBackend();
+    const value = try backend.fromFloat32Shape(&.{ 1, 2 }, &.{ 1, 2 });
+    defer backend.free(value);
+    var values = [_]ops.CT{value};
+    var outputs = ResidentOutputs{ .outputs = &values, .backend = backend, .allocator = a };
+    var first_scope: operation.Scope = undefined;
+    try operation.enterInto(backend, null, null, .managed, &first_scope);
+    defer first_scope.deinitChecked() catch @panic("first materialization test scope");
+    var second_scope: operation.Scope = undefined;
+    try operation.enterInto(second.stableBackend(), null, null, .managed, &second_scope);
+    defer second_scope.deinitChecked() catch @panic("second materialization test scope");
+    var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.BackendOperationChanged, outputs.materializeFloat32(fail.allocator(), &.{}, second_scope.token()));
+    try std.testing.expectEqual(@as(usize, 0), fail.alloc_index);
+    const host = try outputs.materializeFloat32(a, &.{}, first_scope.token());
+    defer {
+        for (host) |*tensor| tensor.deinit();
+        a.free(host);
+    }
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, host[0].asFloat32());
+    try first_scope.finish();
+    try second_scope.finish();
+}
+
+test "prepared source final address owns actual FIFO and raw host preparation allocates no metadata" {
+    // This is a scheduling/disabled-allocation fixture, not numerical backend proof.
+    var raw: u8 = 0;
+    var gate: std.atomic.Mutex = .unlocked;
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    const source = Session{ .ptr = &raw, .vtable = &DeadlineProbeSession.vtable, .execution_gate = &gate, .cohort_scheduler = &scheduler };
+    var fail = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var prepared: PreparedSource = .{};
+    defer prepared.deinit();
+    try prepared.initBeforeExecutionInto(source, source, &gate, .{ .host = &.{} }, .{}, null, .host, fail.allocator(), null);
+    try std.testing.expect(scheduler.head == &prepared.waiter);
+    try std.testing.expectEqual(@as(usize, 0), fail.alloc_index);
+    try std.testing.expect(prepared.epoch() == null);
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    try prepared.enter();
+    try std.testing.expect(!gate.tryLock());
+    try std.testing.expectError(error.SourceInvocationAlreadyInitialized, prepared.initBeforeExecutionInto(source, source, &gate, .{ .host = &.{} }, .{}, null, .host, fail.allocator(), null));
+    prepared.deinit();
+    try std.testing.expect(scheduler.head == null);
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 0), fail.alloc_index);
+}
+
+test "prepared source cancellation before producer releases exact selected FIFO without executing callback" {
+    const Cancellation = struct {
+        cancelled: bool = false,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancelled) return error.Cancelled;
+        }
+    };
+    var cancellation = Cancellation{};
+    var raw: u8 = 0;
+    var gate: std.atomic.Mutex = .unlocked;
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    const source = Session{ .ptr = &raw, .vtable = &DeadlineProbeSession.vtable, .execution_gate = &gate, .cohort_scheduler = &scheduler };
+    var prepared: PreparedSource = .{};
+    defer prepared.deinit();
+    try prepared.initBeforeExecutionInto(source, source, &gate, .{ .host = &.{} }, .{}, null, .host, std.testing.allocator, .{ .ptr = &cancellation, .check_fn = Cancellation.check });
+    cancellation.cancelled = true;
+    try std.testing.expectError(error.Cancelled, prepared.enter());
+    try std.testing.expect(!prepared.executed);
+    prepared.deinit();
+    try std.testing.expect(scheduler.head == null);
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+}
+
+fn preparedNativeSourceAllocationCase(injected: std.mem.Allocator, supplied: bool) !void {
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const imported = @import("imported_onnx_session.zig");
+    const Close = struct {
+        fn run(source: Session) void {
+            const Sink = @import("../execution/retirement_sink.zig");
+            var sink = Sink.Ref.create() catch @panic("source fixture close sink");
+            defer sink.release();
+            var guard = sink.enter() catch @panic("source fixture close guard");
+            defer guard.finish();
+            var epoch = guard.retainEpoch() catch @panic("source fixture close epoch");
+            defer epoch.release();
+            source.closeWithBoundary(&epoch);
+        }
+    };
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input_node = try builder.parameter("value", ml.graph.Shape.init(.f32, &.{ 1, 2 }));
+    try graph.markOutput(try builder.absOp(input_node));
+    const bytes = try @import("onnx_graph").exportGraph(a, &graph, .{});
+    defer a.free(bytes);
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "source.onnx", .data = bytes });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..], "source.onnx" });
+    defer a.free(path);
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    defer std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot()) catch @panic("prepared source quota leak");
+    var source = try imported.createSessionWithOptions(a, path, .native, .{ .graph_runtime_strategy = .partitioned });
+    defer Close.run(source);
+    source.model_lifetime.?.admission_domain = domain.pin();
+    source.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 8 * 1024 * 1024, .backend_limit_bytes = 8 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false };
+    var gate: std.atomic.Mutex = .unlocked;
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    source.execution_gate = &gate;
+    source.cohort_scheduler = &scheduler;
+    var input = try Tensor.initFloat32(a, "value", &.{ 1, 2 }, &.{ -2, 3 });
+    defer input.deinit();
+    var preprocessing = if (supplied) try source.admit(.{ .batch = 1, .sequence = 2, .input_bytes = 8, .host_preprocess_bytes = 16, .output_bytes = 8 }) else null;
+    defer if (preprocessing) |*permit| permit.deinit();
+    var prepared: PreparedSource = .{};
+    defer {
+        prepared.deinit();
+        std.testing.expect(scheduler.head == null) catch @panic("prepared source FIFO leak");
+        std.testing.expect(gate.tryLock()) catch @panic("prepared source gate leak");
+        gate.unlock();
+    }
+    try prepared.initBeforeExecutionInto(source, source, &gate, .{ .host = &.{input} }, .{ .batch = 1, .sequence = 2, .input_bytes = 8 }, if (preprocessing) |*permit| permit else null, .host, injected, null);
+    if (preprocessing) |permit| {
+        try std.testing.expect(permit.execution_yielded);
+        try std.testing.expectEqual(@as(usize, 24), permit.lease.?.amounts.host_scratch_bytes);
+        try std.testing.expectEqual(@as(usize, 24), prepared.permit.?.request.?.pre_admitted_host_bytes);
+    }
+    try std.testing.expect(scheduler.head == &prepared.waiter);
+    try prepared.enter();
+    const outputs = try prepared.runHost(&.{input});
+    defer deinitTensorSlice(outputs, injected);
+    try std.testing.expectEqual(@as(usize, 1), outputs.len);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 3 }, outputs[0].asFloat32());
+    try std.testing.expectEqual(@as(u64, 1), imported.executionStats(source).?.executions);
+    try std.testing.expect(scheduler.head == null);
+    try std.testing.expectError(error.SourceInvocationAlreadyExecuted, prepared.runHost(&.{input}));
+}
+
+test "actual Native prepared source host output lifecycle survives all owner allocation failures" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, preparedNativeSourceAllocationCase, .{false});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, preparedNativeSourceAllocationCase, .{true});
 }

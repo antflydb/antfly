@@ -104,6 +104,7 @@ pub const backend_operation = @import("backend_operation.zig");
 test {
     _ = @import("allocation_observer.zig");
     _ = @import("allocation_registry.zig");
+    _ = @import("device_allocation_registry.zig");
     _ = @import("invocation_report.zig");
 }
 

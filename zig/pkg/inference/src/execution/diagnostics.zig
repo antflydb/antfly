@@ -22,7 +22,15 @@ const ops = @import("../ops/ops.zig");
 pub const ExecutionStats = @import("stats.zig").ExecutionStats;
 pub const Specializations = @import("specialization_cache.zig").Stats;
 const observation = @import("runtime_observation.zig");
-pub const Start = struct { runtime: ops.RuntimeTelemetry, scope: observation.Scope, device_owners: ?*const @import("device_owner_registry.zig").Registry = null };
+pub const Start = struct {
+    runtime: ops.RuntimeTelemetry,
+    scope: observation.Scope,
+    device_owners: ?*const @import("device_owner_registry.zig").Registry = null,
+    device_roots: ?*const @import("device_allocation_registry.zig").Registry = null,
+    kernels: ?*const observation.KernelScope = null,
+    metal_buffers: ?*@import("../backends/metal_telemetry.zig").BufferInterval = null,
+    video_resources: ?*@import("antfly_video").preparation.OwnedResourceInterval = null,
+};
 pub const Text = struct {
     bytes: [128]u8 = @splat(0),
     len: u8 = 0,
@@ -178,6 +186,22 @@ fn observedRuntime(after: ops.RuntimeTelemetry, before: ?Start) ops.RuntimeTelem
     if (before) |start| {
         runtime.submission = start.scope.snapshot();
         if (start.device_owners) |owners| runtime.device_owners = owners.snapshot();
+        if (start.device_roots) |roots| runtime.device_allocator_roots = roots.snapshot();
+        if (start.kernels) |kernels| {
+            runtime.resolved_project_cuda_launches = kernels.values;
+            runtime.resolved_project_metal_dispatches = if (comptime @import("build_options").enable_metal) kernels.metal else null;
+            runtime.terminal_native_bodies = kernels.native_bodies;
+            runtime.selected_native_dispatches = kernels.native_dispatches;
+            runtime.joined_native_workers = kernels.native_workers;
+            runtime.native_quant_worker_callbacks = kernels.quant_worker_callbacks;
+            runtime.native_attention_programs = kernels.attention_programs;
+            runtime.native_activation_programs = kernels.activation_programs;
+            runtime.owned_native_fallbacks = kernels.native_fallbacks;
+        }
+        if (start.metal_buffers) |buffers| runtime.metal_buffer_interval = buffers.snapshot(@import("build_options").enable_metal);
+        if (start.video_resources) |resources| if (resources.snapshot(@import("build_options").enable_metal)) |value| {
+            runtime.video_owned_resources = @import("runtime_telemetry.zig").VideoOwnedResources.from(value);
+        };
     }
     return runtime;
 }

@@ -556,5 +556,25 @@ pub fn nativeMetalRotary(comptime name: []const u8, comptime planes: []const Rot
         "    if (!termite_rope_pair_indices(d, p.head_dim, p.rope_dim, p.consecutive_pairs, idx0, idx1, j)) { " ++ copies ++ "return; }\n" ++
         "    float pos = float(positions[chunk]); float freq = 1.0f / pow(p.theta, float(2u * j) / float(p.rope_dim)); float angle = pos * p.freq_scale * freq; float cos_val = cos(angle); float sin_val = sin(angle);\n" ++ loads ++
         "    if (d == idx0) { " ++ lower ++ "} else if (d == idx1) { " ++ upper ++ "} else { " ++ copies ++ "}\n";
+    // A single optional policy specializes regular integer indexing. The
+    // explicit-vector export retains its original undefined-constant default;
+    // all frequency/trigonometric/arithmetic statements stay shared verbatim.
+    if (planes.len == 1) {
+        const policies = "constant ushort antfly_rope_position_policy [[function_constant(0)]];\n" ++
+            "constant ushort antfly_rope_effective_position_policy = is_function_constant_defined(antfly_rope_position_policy) ? antfly_rope_position_policy : 0;\n" ++
+            // Exact regular-position division. Power-of-two geometry uses a
+            // host-snapshotted shift, while other divisors need one mulhi and
+            // at most one quotient correction. No per-element GPU division.
+            "inline uint antfly_rope_divide_u32(uint x, uint divisor, uint reciprocal, uint shift) { if (shift < 32u) return x >> shift; uint q = mulhi(x, reciprocal); return q + uint(x - q * divisor >= divisor); }\n";
+        const old_position = "float pos = float(positions[chunk]);";
+        const new_position = "uint position; if (antfly_rope_effective_position_policy == 2) { position = positions[2]; } else if (antfly_rope_effective_position_policy == 1) { uint token = antfly_rope_divide_u32(chunk, positions[1], positions[3], positions[5]); uint batch = antfly_rope_divide_u32(token, positions[0], positions[4], positions[6]); position = positions[2] + (token - batch * positions[0]); } else { position = positions[chunk]; } float pos = float(position);";
+        const index = std.mem.indexOf(u8, body, old_position).?;
+        const positioned_body = body[0..index] ++ new_position ++ body[index + old_position.len ..];
+        const old_chunk = "uint chunk = gid / p.head_dim;";
+        const new_chunk = "uint chunk = antfly_rope_effective_position_policy == 0 ? gid / p.head_dim : antfly_rope_divide_u32(gid, p.head_dim, positions[7], positions[8]);";
+        const chunk_index = std.mem.indexOf(u8, positioned_body, old_chunk).?;
+        const specialized_body = positioned_body[0..chunk_index] ++ new_chunk ++ positioned_body[chunk_index + old_chunk.len ..];
+        return policies ++ nativeMetalExport(name, buffers, "termite_metal_rope_params", &.{"uint gid [[thread_position_in_grid]]"}, specialized_body);
+    }
     return nativeMetalExport(name, buffers, "termite_metal_rope_params", &.{"uint gid [[thread_position_in_grid]]"}, body);
 }

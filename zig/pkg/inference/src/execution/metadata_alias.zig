@@ -36,7 +36,7 @@ pub const Plan = struct {
                 if (attrs.runtime_shape or !attrs.new_shape.eq(output) or input.numElements() != output.numElements()) return null;
             },
             .slice => |attrs| {
-                if (backend != .native or attrs.runtime_starts or attrs.runtime_limits or attrs.num_axes != input.rank() or !input.eq(output)) return null;
+                if ((backend != .native and backend != .metal) or attrs.runtime_starts or attrs.runtime_limits or attrs.num_axes != input.rank() or !input.eq(output)) return null;
                 const slice = @import("../ops/slice_plan.zig").Plan.init(input.dims[0..input.rank()], attrs.starts[0..attrs.num_axes], attrs.limits[0..attrs.num_axes], attrs.strides[0..attrs.num_axes], input.dims[0..input.rank()]) catch return null;
                 if (slice.base != 0 or slice.count != slice.input_count or !slice.contiguous()) return null;
                 result.kind = .full_slice;
@@ -74,7 +74,13 @@ pub const Plan = struct {
 
     pub fn apply(self: Plan, source: ownership.Plane) ?ownership.Plane {
         const desc = source.descriptor;
-        if (source.role != .primary or !desc.shape.eq(self.input) or desc.current_backend != .native or (desc.storage != .host_f32 and desc.storage != .metadata_view) or desc.quant_format != null or desc.attention_storage != null or desc.attention_kv_format != null) return null;
+        if (source.role != .primary or !desc.shape.eq(self.input) or desc.quant_format != null or desc.attention_storage != null or desc.attention_kv_format != null) return null;
+        switch (desc.current_backend orelse return null) {
+            .native => if (desc.storage != .host_f32 and desc.storage != .metadata_view) return null,
+            .cuda => if (desc.storage != .cuda_buffer or self.kind != .reshape) return null,
+            .metal => if (desc.storage != .metal_buffer or (self.kind != .reshape and self.kind != .full_slice)) return null,
+            else => return null,
+        }
         const input_bytes = logicalBytes(self.input) orelse return null;
         if (source.logical_bytes != input_bytes) return null;
         const read = readableBytes(self.input, desc.strides) orelse return null;
@@ -101,7 +107,7 @@ pub const Plan = struct {
         var result = source;
         result.descriptor.shape = self.output;
         result.descriptor.strides = strides;
-        result.descriptor.storage = .metadata_view;
+        if (desc.current_backend == .native) result.descriptor.storage = .metadata_view;
         result.descriptor.view_source = self.source;
         result.logical_bytes = logicalBytes(self.output) orelse return null;
         result.readable_bytes = output_read;
@@ -166,7 +172,7 @@ test "affine reshape declines strided input and malformed layouts" {
     const plan = Plan{ .node = 4, .source = 3, .input = shape, .output = Shape.init(.f32, &.{6}), .kind = .reshape };
     try std.testing.expect(plan.apply(source) == null);
     try std.testing.expect(readableBytes(shape, Strides.init(&.{ -1, 1 })) == null);
-    try std.testing.expect(readableBytes(shape, Strides.init(&.{std.math.maxInt(i64), std.math.maxInt(i64)})) == null);
+    try std.testing.expect(readableBytes(shape, Strides.init(&.{ std.math.maxInt(i64), std.math.maxInt(i64) })) == null);
     try std.testing.expect(readableBytes(Shape.init(.i64, &.{3}), Strides.init(&.{1})) == null);
 }
 
@@ -181,9 +187,57 @@ test "affine lowering declines inconsistent static target attributes" {
     try std.testing.expect(Plan.lower(&graph, reshaped, .native) == null);
     const output = Shape.init(.f32, &.{ 2, 2, 3 });
     var axes: [8]u8 = @splat(0);
-    axes[0] = 1; axes[1] = 2;
+    axes[0] = 1;
+    axes[1] = 2;
     const expanded = try graph.addNode(.{ .op = .{ .broadcast_in_dim = .{ .target_shape = output, .broadcast_axes = axes, .num_axes = 2 } }, .output_shape = output, .inputs = .{ input, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node }, .num_inputs = 1 });
     try std.testing.expect(Plan.lower(&graph, expanded, .native) != null);
     graph.nodes.items[expanded].op.broadcast_in_dim.target_shape = Shape.init(.f32, &.{12});
     try std.testing.expect(Plan.lower(&graph, expanded, .native) == null);
+}
+
+/// Only the complete dense logical view is retained; extra SDK/bank capacity
+/// never becomes initialized data or a writable alias capability.
+pub fn fullSpanRequest(value: *const Request, actual_shape: []const i64, available_bytes: usize) bool {
+    const bytes = logicalBytes(value.input.shape) orelse return false;
+    return value.input.shape.rank() == actual_shape.len and std.mem.eql(i64, value.input.shape.dims[0..value.input.shape.rank()], actual_shape) and logicalBytes(value.output.shape) == bytes and value.input.readable_bytes == bytes and value.output.readable_bytes == bytes and bytes <= available_bytes and dense(value.input.shape, value.input.strides) and dense(value.output.shape, value.output.strides);
+}
+/// Follow the existing planner's alias/root lifetime, never inventing a new
+/// root or recoloring a live source. External inputs/constants remain opaque.
+pub fn activationRoot(plan: *const @import("../graph/buffer_plan.zig").BufferPlan, node: ml.graph.NodeId, backend: contracts.BackendKind) ?@import("../graph/buffer_plan.zig").LogicalSlot {
+    var current = (plan.slotForNode(node) orelse return null).*;
+    var depth: usize = 0;
+    while (current.kind == .view) : (depth += 1) {
+        if (current.backend != backend or depth >= plan.slots.len) return null;
+        const parent = current.source_slot orelse return null;
+        if (parent >= plan.slots.len) return null;
+        current = plan.slots[parent];
+    }
+    return if (current.backend == backend and current.kind == .allocation) current else null;
+}
+
+test "GPU full span alias metadata preserves source offsets and rejects padded or strided claims" {
+    inline for (.{ contracts.BackendKind.cuda, contracts.BackendKind.metal }) |backend| {
+        const input = Shape.init(.f32, &.{ 2, 3 });
+        const output = Shape.init(.f32, &.{6});
+        var descriptor = contracts.TensorDesc.init(input, if (backend == .cuda) .cuda_buffer else .metal_buffer);
+        descriptor.current_backend = backend;
+        const source = ownership.Plane{ .descriptor = descriptor, .role = .primary, .storage_epoch = 7, .backing = .{ .kind = if (backend == .cuda) .cuda else .metal, .base = 4096 }, .byte_offset = 16, .logical_bytes = 24, .readable_bytes = 24 };
+        const plan = Plan{ .node = 3, .source = 2, .input = input, .output = output, .kind = .reshape };
+        const alias = plan.apply(source) orelse return error.MissingFullSpanAlias;
+        try std.testing.expectEqual(@as(usize, 16), alias.byte_offset);
+        try std.testing.expectEqual(@as(usize, 24), alias.readable_bytes);
+        try std.testing.expect(alias.writable == null and alias.layout_key == null);
+        var exact = request(source, alias);
+        try std.testing.expect(fullSpanRequest(&exact, &.{ 2, 3 }, 512));
+        exact.output.readable_bytes = 28;
+        try std.testing.expect(!fullSpanRequest(&exact, &.{ 2, 3 }, 512));
+        exact = request(source, alias);
+        exact.output.strides = Strides.init(&.{2});
+        try std.testing.expect(!fullSpanRequest(&exact, &.{ 2, 3 }, 512));
+        exact = request(source, alias);
+        try std.testing.expect(!fullSpanRequest(&exact, &.{ 2, 3 }, 20));
+        var affine = plan;
+        affine.kind = .transpose;
+        try std.testing.expect(affine.apply(source) == null);
+    }
 }

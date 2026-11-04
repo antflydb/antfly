@@ -181,6 +181,14 @@ pub const Snapshot = struct {
     resolved_project_metal_dispatches: ?@import("runtime_observation.zig").MetalDispatches = null,
     terminal_native_bodies: ?@import("runtime_observation.zig").NativeBodies = null,
     selected_native_dispatches: ?@import("runtime_observation.zig").NativeDispatches = null,
+    joined_native_workers: ?@import("runtime_observation.zig").NativeWorkers = null,
+    native_quant_worker_callbacks: ?@import("runtime_observation.zig").NativeQuantWorkerCallbacks = null,
+    native_attention_programs: ?@import("runtime_observation.zig").NativeAttentionPrograms = null,
+    native_activation_programs: ?@import("runtime_observation.zig").NativeActivationPrograms = null,
+    owned_native_fallbacks: ?@import("runtime_observation.zig").NativeFallbacks = null,
+    device_allocator_roots: ?@import("device_allocation_registry.zig").Summary = null,
+    metal_buffer_interval: ?@import("../backends/metal_telemetry.zig").BufferIntervalReport = null,
+    video_owned_resources: ?VideoOwnedResources = null,
     resolved_project_cuda_launches: ?@import("runtime_observation.zig").Kernels = null,
     transfers: ?@import("transfer_audit.zig").Measurements = null,
     counters: Counters = .{},
@@ -199,6 +207,14 @@ pub const Snapshot = struct {
             .resolved_project_metal_dispatches = self.resolved_project_metal_dispatches,
             .terminal_native_bodies = self.terminal_native_bodies,
             .selected_native_dispatches = self.selected_native_dispatches,
+            .joined_native_workers = self.joined_native_workers,
+            .native_quant_worker_callbacks = self.native_quant_worker_callbacks,
+            .native_attention_programs = self.native_attention_programs,
+            .native_activation_programs = self.native_activation_programs,
+            .owned_native_fallbacks = self.owned_native_fallbacks,
+            .device_allocator_roots = self.device_allocator_roots,
+            .metal_buffer_interval = self.metal_buffer_interval,
+            .video_owned_resources = self.video_owned_resources,
             .resolved_project_cuda_launches = self.resolved_project_cuda_launches,
             .transfers = self.transfers,
             .counters = self.counters.since(before.counters),
@@ -221,3 +237,25 @@ test "runtime telemetry distinguishes unavailable reset and measured zero counte
     try std.testing.expectEqual(@as(?u64, 64), delta.memory.live_bytes);
     try std.testing.expectEqual(@as(?u64, 1024), delta.memory.lifetime_peak_bytes);
 }
+
+/// Copied lower-video typed root observation. Kept separate from inference's
+/// buffer/CUDA roots: independent root peaks are never summed.
+pub const VideoOwnedResources = struct {
+    root_identity: usize,
+    coverage: enum { tracked_authored_resources, partial_metadata_failure },
+    scope: enum { process_authored_video_resources_including_concurrent_users } = .process_authored_video_resources_including_concurrent_users,
+    backing: enum { owned_MTLBuffer_and_MTLTexture_allocatedSize_not_residency } = .owned_MTLBuffer_and_MTLTexture_allocatedSize_not_residency,
+    semantic_lifetime_classes: enum { mixed_owned_lifetimes_not_inferred_from_storageMode } = .mixed_owned_lifetimes_not_inferred_from_storageMode,
+    live_bytes: [3]u64,
+    interval_peak_bytes: [3]u64,
+    lifetime_peak_bytes: [3]u64,
+    buffer_allocations: u64,
+    buffer_frees: u64,
+    texture_allocations: u64,
+    texture_frees: u64,
+    lifetime_metadata_failures: u64,
+    interval_metadata_failures: u64,
+    pub fn from(value: anytype) VideoOwnedResources {
+        return .{ .root_identity = value.root_identity, .coverage = if (value.lifetime_metadata_failures == 0) .tracked_authored_resources else .partial_metadata_failure, .live_bytes = value.live_bytes, .interval_peak_bytes = value.interval_peak_bytes, .lifetime_peak_bytes = value.lifetime_peak_bytes, .buffer_allocations = value.buffer_allocations, .buffer_frees = value.buffer_frees, .texture_allocations = value.texture_allocations, .texture_frees = value.texture_frees, .lifetime_metadata_failures = value.lifetime_metadata_failures, .interval_metadata_failures = value.interval_metadata_failures };
+    }
+};

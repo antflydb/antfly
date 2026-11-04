@@ -4770,6 +4770,83 @@ pub const CudaCompute = struct {
         // Live detached borrowers keep their bytes/leases until release.
     }
 
+    /// Exact model-owned CUDA stages borrow the stable compute, not a copied
+    /// endpoint or request budget. The caller owns its actual model cohort and
+    /// ManagedComputeBackend protection until all stream work is quiescent.
+    pub fn acceptsEmbeddingStage(cb: *const ops.ComputeBackend, expected: *const CudaCompute) bool {
+        return cb.vtable == &vtable and @as(*const anyopaque, @ptrCast(cb.ptr)) == @as(*const anyopaque, @ptrCast(expected));
+    }
+    pub fn validateEmbeddingStage(cb: *const ops.ComputeBackend, expected: *const CudaCompute) !void {
+        if (!acceptsEmbeddingStage(cb, expected)) return error.UnsupportedEmbeddingStage;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.shared_operation_owner != null or self.run_budget != null) return error.UnsupportedEmbeddingStage;
+        if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or self.execution_scope != null or self.audio_execution_active or self.lighton_burst_readback.busy) return error.EmbeddingStageBusy;
+        // A raw SDK capture need not have passed our debug-flag publisher.
+        // Unknown query support cannot certify an idle stream for allocation,
+        // event operations or synchronization at this ownership handoff.
+        if (self.ctx.driver.fns.cuStreamIsCapturing == null) return error.UnsupportedCudaStageCaptureQuery;
+        if (try self.ctx.streamCaptureActive()) return error.EmbeddingStageBusy;
+    }
+    pub fn quiesceEmbeddingStage(cb: *const ops.ComputeBackend, expected: *const CudaCompute) !void {
+        try validateEmbeddingStage(cb, expected);
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        // No global cache eviction, planner reset, borrowed epoch or numerical
+        // token is synthesized. A peer may reuse caches only after this fence.
+        try self.ctx.synchronize();
+    }
+    pub const StageCopyStats = struct { bytes: usize = 0, nanos: u64 = 0 };
+    /// A snapshot crossing a shared-compute phase owns ordinary allocations.
+    /// Copy storage planes byte-for-byte: BF16 boundaries and existing mirror
+    /// selection remain unchanged. Sparse/indexed/quantized codecs must supply
+    /// their own complete descriptor; they are never silently widened to F32.
+    pub fn escapeEmbeddingStage(cb: *const ops.ComputeBackend, value: CT, stats: ?*StageCopyStats) !CT {
+        if (cb.vtable != &vtable) return error.UnsupportedEmbeddingStage;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        try validateEmbeddingStage(cb, self);
+        const source = tensorFromCt(value);
+        if (source.dtype != .f32 and source.dtype != .bf16) return error.UnsupportedCudaStageTensor;
+        if (source.quant_type != null or source.tc_quant != null or source.resident_indices != null or source.training_upload_host.ptr != null or source.training_upload_generation != null) return error.UnsupportedCudaStageTensor;
+        const bytes = try source.dtype.byteCount(source.elem_count);
+        if (bytes == 0 or source.buffer.ptr == 0 or source.buffer.len < bytes) return error.InvalidShape;
+        const mirror_bytes = if (source.bf16_mirror.ptr != 0) try std.math.mul(usize, source.elem_count, @sizeOf(u16)) else 0;
+        if (source.bf16_mirror.len < mirror_bytes) return error.InvalidShape;
+        // All fallible header metadata precedes the first numerical copy.
+        const shape = try self.allocator.dupe(i64, source.shape);
+        errdefer self.allocator.free(shape);
+        const result = try self.allocator.create(CudaTensor);
+        errdefer self.allocator.destroy(result);
+        const hook = cb.embedding_stage;
+        const observe = stats != null or (if (hook) |active| active.copy_fn != null else false);
+        const clock = if (observe) platform.time.monotonicNs() else 0;
+        var device = try allocStageSnapshotBuffer(self, bytes);
+        errdefer releaseDeviceBuffer(self, &device);
+        var mirror: buffer_mod.DeviceBuffer = .{};
+        errdefer releaseDeviceBuffer(self, &mirror);
+        if (mirror_bytes != 0) mirror = try allocStageSnapshotBuffer(self, mirror_bytes);
+        // An error after an enqueue must establish completion before releasing
+        // either independently allocated destination. No source replay follows.
+        errdefer self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+        try copyFromDeviceTracked(self, device, source.buffer, bytes);
+        if (mirror_bytes != 0) try copyFromDeviceTracked(self, mirror, source.bf16_mirror, mirror_bytes);
+        result.* = .{ .buffer = device, .bf16_mirror = mirror, .dtype = source.dtype, .shape = shape, .elem_count = source.elem_count, .resident_owner = self };
+        const elapsed = if (observe) platform.time.monotonicNs() - clock else 0;
+        if (stats) |out| out.* = .{ .bytes = bytes + mirror_bytes, .nanos = elapsed } else if (hook) |active| if (active.copy_fn) |record| record(active.ptr, bytes + mirror_bytes, elapsed);
+        return @ptrCast(result);
+    }
+    fn allocStageSnapshotBuffer(self: *CudaCompute, bytes: usize) !buffer_mod.DeviceBuffer {
+        // Skip execution arenas and learned/pinned ordinals. The returned
+        // ordinary allocation leaves the idle cache until its final CT closes.
+        while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.temp_buffer_mutex.unlock();
+        const sequence = self.temp_trace_seq;
+        self.temp_trace_seq +%= 1;
+        const buffer = try allocUnpinnedDeviceBufferUnlocked(self, bytes, sequence, true);
+        // The ordinary cache cannot contain arena/pinned aliases. Fail closed
+        // on a corrupted provenance contract, rather than publishing one.
+        if (buffer.borrowed or buffer.allocation_bytes < bytes) platform.inference_process_supervisor.restartWorker();
+        return buffer;
+    }
+
     pub fn evictEmbeddingGemma2Caches(self: *CudaCompute) !void {
         if (self.audio_execution_active) return error.ResourceTemporarilyUnavailable;
         self.audio_plans.clear();
@@ -7570,7 +7647,7 @@ const CudaKvDeviceStorage = struct {
             if (layer.capacity_owners[2] != null) return error.DeviceKvCapacityAdmissionRequired;
             self.capacity_epoch = try std.math.add(u64, self.capacity_epoch, 1);
             try preparePersistentCudaBufferReallocation(self.compute);
-            var new_table = try buffer_mod.DeviceBuffer.alloc(&self.compute.ctx, block_table_bytes);
+            var new_table = try buffer_mod.DeviceBuffer.allocWithPurpose(&self.compute.ctx, block_table_bytes, .kv_state);
             errdefer new_table.free(&self.compute.ctx);
             self.compute.noteDeviceBytes(block_table_bytes);
             layer.block_table.free(&self.compute.ctx);
@@ -7663,9 +7740,9 @@ const CudaKvDeviceStorage = struct {
             const new_capacity = if (capacity_limit) |limit| @min(growth_capacity, limit) else growth_capacity;
             const k_bytes = try checkedMul(new_capacity, key_row_bytes);
             const v_bytes = try checkedMul(new_capacity, value_row_bytes);
-            var new_k = try buffer_mod.DeviceBuffer.alloc(&self.compute.ctx, k_bytes);
+            var new_k = try buffer_mod.DeviceBuffer.allocWithPurpose(&self.compute.ctx, k_bytes, .kv_state);
             errdefer new_k.free(&self.compute.ctx);
-            var new_v = try buffer_mod.DeviceBuffer.alloc(&self.compute.ctx, v_bytes);
+            var new_v = try buffer_mod.DeviceBuffer.allocWithPurpose(&self.compute.ctx, v_bytes, .kv_state);
             errdefer new_v.free(&self.compute.ctx);
             self.compute.noteDeviceBytes(try checkedAdd(k_bytes, v_bytes));
             if (layer.capacity_tokens != 0) {
@@ -7978,10 +8055,10 @@ const CudaKvDeviceStorage = struct {
                 if (item.prefix_tokens == 0) continue;
                 const key_range = try request.byteRange(item, layer.key_row_bytes);
                 const value_range = try request.byteRange(item, layer.value_row_bytes);
-                const key_source = buffer_mod.DeviceBuffer{ .ptr = @intCast(try checkedAdd(@intCast(layer.k.ptr), key_range.source)), .len = key_range.bytes, .borrowed = true };
-                const key_target = buffer_mod.DeviceBuffer{ .ptr = @intCast(try checkedAdd(@intCast(layer.k.ptr), key_range.destination)), .len = key_range.bytes, .borrowed = true };
-                const value_source = buffer_mod.DeviceBuffer{ .ptr = @intCast(try checkedAdd(@intCast(layer.v.ptr), value_range.source)), .len = value_range.bytes, .borrowed = true };
-                const value_target = buffer_mod.DeviceBuffer{ .ptr = @intCast(try checkedAdd(@intCast(layer.v.ptr), value_range.destination)), .len = value_range.bytes, .borrowed = true };
+                const key_source = buffer_mod.DeviceBuffer{ .ptr = @intCast(try checkedAdd(@intCast(layer.k.ptr), key_range.source)), .len = key_range.bytes, .allocation_purpose = layer.k.allocation_purpose, .borrowed = true };
+                const key_target = buffer_mod.DeviceBuffer{ .ptr = @intCast(try checkedAdd(@intCast(layer.k.ptr), key_range.destination)), .len = key_range.bytes, .allocation_purpose = layer.k.allocation_purpose, .borrowed = true };
+                const value_source = buffer_mod.DeviceBuffer{ .ptr = @intCast(try checkedAdd(@intCast(layer.v.ptr), value_range.source)), .len = value_range.bytes, .allocation_purpose = layer.v.allocation_purpose, .borrowed = true };
+                const value_target = buffer_mod.DeviceBuffer{ .ptr = @intCast(try checkedAdd(@intCast(layer.v.ptr), value_range.destination)), .len = value_range.bytes, .allocation_purpose = layer.v.allocation_purpose, .borrowed = true };
                 attempted = true; // SDK failure may still leave work queued.
                 try Copy.copy(self.compute, key_target, key_source, key_range.bytes);
                 try Copy.copy(self.compute, value_target, value_source, value_range.bytes);
@@ -8031,7 +8108,7 @@ const CudaKvDeviceStorage = struct {
     fn growCapacity(ctx: *anyopaque, implementation: *const anyopaque, plan: *const kv_storage_runtime.device_capacity.Plan, claim: *kv_storage_runtime.device_capacity.Claim, cleanup: *const @import("../../execution/retirement_sink.zig").Epoch) !void {
         const Allocation = struct {
             fn alloc(context: *context_mod.CudaContext, bytes: usize) !buffer_mod.DeviceBuffer {
-                return buffer_mod.DeviceBuffer.alloc(context, bytes);
+                return buffer_mod.DeviceBuffer.allocWithPurpose(context, bytes, .kv_state);
             }
         };
         return growCapacityUsing(ctx, implementation, plan, claim, cleanup, Allocation);
@@ -8175,8 +8252,8 @@ const CudaKvDeviceStorage = struct {
             };
             const k_bytes = try checkedMul(request.capacity, layer.key_row_bytes);
             const v_bytes = try checkedMul(request.capacity, layer.value_row_bytes);
-            layer.k = try buffer_mod.DeviceBuffer.alloc(&staged.compute.ctx, k_bytes);
-            layer.v = try buffer_mod.DeviceBuffer.alloc(&staged.compute.ctx, v_bytes);
+            layer.k = try buffer_mod.DeviceBuffer.allocWithPurpose(&staged.compute.ctx, k_bytes, .kv_state);
+            layer.v = try buffer_mod.DeviceBuffer.allocWithPurpose(&staged.compute.ctx, v_bytes, .kv_state);
             staged.compute.noteDeviceBytes(try checkedAdd(k_bytes, v_bytes));
             const copy_k = try checkedMul(request.tokens, layer.key_row_bytes);
             const copy_v = try checkedMul(request.tokens, layer.value_row_bytes);
@@ -8189,7 +8266,7 @@ const CudaKvDeviceStorage = struct {
                 // would exceed the single-table admission bound transiently.
                 const table_capacity = request.capacity / request.page_size;
                 const table_bytes = try checkedMul(table_capacity, @sizeOf(kv_block_mod.KvBlockId));
-                layer.block_table = try buffer_mod.DeviceBuffer.alloc(&staged.compute.ctx, table_bytes);
+                layer.block_table = try buffer_mod.DeviceBuffer.allocWithPurpose(&staged.compute.ctx, table_bytes, .kv_state);
                 layer.block_table_capacity = table_capacity;
                 staged.compute.noteDeviceBytes(table_bytes);
                 try staged.ensureLayerBlockTable(layer, request.destination_blocks, request.tokens, request.page_size);
@@ -9017,6 +9094,7 @@ fn unsupportedCt() anyerror!CT {
 
 fn registerRuntimeObservationOp(ctx: *anyopaque) void {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    self.ctx.device_allocations.registerObservation();
     if (self.storage_retirement) |owner| owner.registerObservation();
 }
 fn registerTensorOwnershipObservationOp(_: *anyopaque, value: CT) void {
@@ -17523,6 +17601,21 @@ fn uploadOwnedHost(self: *CudaCompute, data: []f32, shape_src: []const i64) !CT 
     noteTopTransferSize(&self.stats.upload_top_sizes, &self.stats.upload_top_counts, byte_len);
     self.allocator.free(data);
     return createTensor(self, device, shape, elem_count);
+}
+
+fn createMetadataAliasOp(ctx: *anyopaque, input: CT, request: *const @import("../../execution/metadata_alias.zig").Request) anyerror!?CT {
+    const source = tensorFromCt(input);
+    const lease = source.physical_lease orelse return null;
+    if (lease.backend.ptr != ctx or !acceptsPhysicalImplementation(lease.backend.vtable) or source.dtype != .f32 or source.quant_type != null or source.bf16_mirror.ptr != 0) return null;
+    const base = tensorFromCt(lease.tensor).buffer;
+    if (source.buffer.ptr < base.ptr) return null;
+    const offset = source.buffer.ptr - base.ptr;
+    if (offset > lease.byte_size or source.buffer.len > lease.byte_size - offset) return null;
+    for (source.auxiliary_leases) |extra| if (extra != null) return null;
+    if (!@import("../../execution/metadata_alias.zig").fullSpanRequest(request, source.shape, source.buffer.len)) return null;
+    // The existing retained reshape body owns its shape header and pins this
+    // exact physical Lease. It submits no work or independent buffer copy.
+    return try reshapeOp(ctx, input, request.output.shape.dims[0..request.output.shape.rank()]);
 }
 
 fn reshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT {
@@ -30143,7 +30236,7 @@ const kernel_backend_impl: ops.KernelBackend = .{
     .ownedPayloadServices = &owned_payload_services,
     .physicalReplayReshapeViews = true,
     .physicalExecutionScope = &physicalExecutionScopeOp,
-    .allocatePhysicalStorage = &allocatePhysicalStorageOp,
+    .physical_storage_policy = &physical_storage_policy,
     .implementation_table = &vtable,
     .acceptsImplementation = &acceptsPhysicalImplementation,
     .storageOwnership = &storageOwnershipOp,
@@ -30156,6 +30249,7 @@ const kernel_backend_impl: ops.KernelBackend = .{
     .physicalReplayTensorSupported = &physicalReplayTensorSupportedOp,
     .physicalReplayKernelSupported = &physicalReplayKernelSupportedOp,
     .materializesOutput = &materializesOutputOp,
+    .createMetadataAlias = &createMetadataAliasOp,
     .assignedKernelAuxiliaries = &assignedKernelAuxiliariesOp,
     .assignedKernelWorkspace = &assignedKernelWorkspaceOp,
     .runAssignedKernel = &runAssignedKernelOp,
@@ -33187,6 +33281,12 @@ fn cudaTensorReadOnly(tensor: *const CudaTensor) bool {
         if (owner.physical_lease) |lease| if (lease.isReadOnly()) return true;
         owner = owner.resident_parent orelse return false;
     }
+}
+
+const physical_storage_policy: ops.physical_storage.Policy = .{ .allocate = allocatePhysicalRequest };
+fn allocatePhysicalRequest(ctx: *anyopaque, request: ops.physical_storage.Request) anyerror!?CT {
+    // Existing Native/CUDA input banks have the same storage representation.
+    return allocatePhysicalStorageOp(ctx, request.byte_size);
 }
 
 fn allocatePhysicalStorageOp(ctx: *anyopaque, byte_size: usize) anyerror!?CT {
@@ -38911,12 +39011,13 @@ const PreparedCudaProjection = struct {
     const Dense = cublaslt_mod.CublasLt;
     const Family = enum { vendor_f32, vendor_f16, vendor_bf16, f32, f32_tiled, f32_bias, f32_bias_tiled, f16_scalar, bf16_scalar, quantized };
     const Packed = struct {
-        const Kind = enum { q4_0_hmma_bf16, q4_0_hmma_f16, q4_0_q8_tile8, q4_0_q8_tile4, q4_0_q8_w8, q8_hmma, q8_variant, q8_base, q8_tile4, q4k_hmma, q4k_variant, q4k_tile4, q4k_tile8, q4k_bias4, q4k_bias4r2, q6k_q8, q6k_tile4 };
+        const Kind = enum { q4_0_hmma_bf16, q4_0_hmma_f16, q4_0_q8_tile8, q4_0_q8_tile4, q4_0_q8_w8, q8_hmma, q8_variant, q8_base, q8_tile4, q4k_hmma, q4k_variant, q4k_tile4, q4k_tile8, q4k_bias4, q4k_bias4r2, q4k_span, q6k_q8, q6k_tile4 };
         kind: Kind,
         function: driver_mod.CUfunction,
         variant: kernels_mod.QMatmulVariant = .legacy,
         append_bias: bool = false,
         row_variant: kernels_mod.Q4_0Q8_1PrefillRowsVariant = .none,
+        activation_recipe: ?kernels_mod.KernelModule.Q4_0Q8_1Recipe = null,
         fn q8Function(self: *const CudaCompute, variant: kernels_mod.QMatmulVariant, bias: bool) driver_mod.CUfunction {
             return switch (variant) {
                 .fast_r2c4 => if (bias) self.kernels.linear_q8_0_bias_f32_tile4_r2 else self.kernels.linear_q8_0_f32_tile4_r2,
@@ -38953,10 +39054,13 @@ const PreparedCudaProjection = struct {
             switch (format) {
                 .Q4_0 => {
                     if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill, g.rows, false)) {
-                        // This earlier branch can dequantize an entire weight
-                        // through cuBLAS. It needs its own declared quantized-to-
-                        // reduced resource and must not be silently bypassed.
-                        if (self.tuned_route_gates.q4_0_cublas_prefill and g.rows >= 128 and !self.kernels.attention_match_repeat and self.cublaslt != null and self.kernels.dequant_q4_0_bf16 != null and weight.elem_count <= 128 * 1024 * 1024 / 2) return null;
+                        if (self.tuned_route_gates.q4_0_cublas_prefill and g.rows >= 128 and !self.kernels.attention_match_repeat and self.cublaslt != null and self.kernels.dequant_q4_0_bf16 != null and weight.elem_count <= 128 * 1024 * 1024 / 2) {
+                            if (!cudaCublasLtEnabled() or self.ctx.info.compute_major < 8) return null;
+                            p.family = .vendor_bf16;
+                            p.dequant_weight_bytes = try checkedMul(try checkedMul(g.width, g.columns), 2);
+                            p.dequant_function = self.kernels.dequant_q4_0_bf16;
+                            return p;
+                        }
                         if (tcQuantBuffer(weight, .q4_0_hmma)) |quantized| {
                             if (self.kernels.linear_q4_0_f32_tc_hmma_bf16) |function| {
                                 selected = .{ .kind = .q4_0_hmma_bf16, .function = function, .append_bias = g.bias };
@@ -38974,15 +39078,13 @@ const PreparedCudaProjection = struct {
                         }
                     }
                     if (!cudaQ4_0LinearQ8_1Dp4aEnabled(self) or !cudaQ4_0Q8_1RowsEligible(self, g.rows) or g.width % 32 != 0 or self.kernels.quantize_f32_q8_1_rows == null) return null;
-                    if (cudaQ4_0LinearQ8_1Tile8Enabled() and self.kernels.linear_q4_0_q8_1_f32_tile8 != null) selected = .{ .kind = .q4_0_q8_tile8, .function = self.kernels.linear_q4_0_q8_1_f32_tile8, .append_bias = g.bias } else if (cudaQ4_0LinearQ8_1Tile4W8Enabled(self, g.width)) {
-                        const variant = self.kernels.q4_0Q8_1Tile4W8PrefillRowsVariant(g.rows, g.width, g.columns);
-                        // Specialized row schedules choose private leaf ABIs.
-                        // Keep them on their existing route until that exact
-                        // immutable recipe is exported by the kernel module.
-                        if (variant != .single and variant != .generic_rows) return null;
-                        if (g.width == 10240 and g.columns == 2560) return null;
-                        selected = .{ .kind = .q4_0_q8_w8, .function = self.kernels.linear_q4_0_q8_1_f32_tile4_w8 orelse return null, .row_variant = variant, .append_bias = g.bias };
-                    } else selected = .{ .kind = .q4_0_q8_tile4, .function = self.kernels.linear_q4_0_q8_1_f32_tile4 orelse return null, .append_bias = g.bias };
+                    const family: kernels_mod.KernelModule.Q4_0Q8_1Recipe.Family = if (cudaQ4_0LinearQ8_1Tile8Enabled() and self.kernels.linear_q4_0_q8_1_f32_tile8 != null) .tile8 else if (cudaQ4_0LinearQ8_1Tile4W8Enabled(self, g.width)) .tile4_w8 else .tile4;
+                    const recipe = self.kernels.q4_0Q8_1Recipe(family, g.rows, g.width, g.columns) orelse return null;
+                    selected = .{ .kind = switch (family) {
+                        .tile8 => .q4_0_q8_tile8,
+                        .tile4_w8 => .q4_0_q8_w8,
+                        .tile4 => .q4_0_q8_tile4,
+                    }, .function = recipe.function, .activation_recipe = recipe, .row_variant = recipe.variant, .append_bias = g.bias };
                     p.workspace_bytes = try checkedMul(try checkedMul(g.rows, g.width / 32), 36);
                 },
                 .Q8_0 => {
@@ -39018,8 +39120,9 @@ const PreparedCudaProjection = struct {
                             selected = .{ .kind = .q4k_variant, .function = q4Function(self, fallback) orelse return null, .variant = fallback };
                         } else selected = .{ .kind = .q4k_tile4, .function = self.kernels.linear_q4_k_f32_tile4 orelse return null };
                     } else if (g.bias) {
-                        if (useGlinerSpanQ4Kernel(self, g.rows, g.width, g.columns)) return null;
-                        selected = if (g.rows >= 2) .{ .kind = .q4k_bias4r2, .function = self.kernels.linear_q4_k_bias_f32_tile4_r2 orelse return null } else .{ .kind = .q4k_bias4, .function = self.kernels.linear_q4_k_bias_f32_tile4 orelse return null };
+                        if (useGlinerSpanQ4Kernel(self, g.rows, g.width, g.columns)) {
+                            selected = .{ .kind = .q4k_span, .function = self.kernels.linear_q4_k_span_bias_f32_tile4_r8 orelse return null };
+                        } else selected = if (g.rows >= 2) .{ .kind = .q4k_bias4r2, .function = self.kernels.linear_q4_k_bias_f32_tile4_r2 orelse return null } else .{ .kind = .q4k_bias4, .function = self.kernels.linear_q4_k_bias_f32_tile4 orelse return null };
                     } else if (g.rows == 1 and cudaEnableQ4KDecodeFast() and cudaEnableQ4KDecodeTile8() and self.kernels.linear_q4_k_f32_tile8 != null) selected = .{ .kind = .q4k_tile8, .function = self.kernels.linear_q4_k_f32_tile8 } else selected = .{ .kind = .q4k_tile4, .function = self.kernels.linear_q4_k_f32_tile4 orelse return null };
                 },
                 .Q6_K => {
@@ -39054,9 +39157,7 @@ const PreparedCudaProjection = struct {
             switch (self.kind) {
                 .q4_0_hmma_bf16 => try compute.kernels.launchLinearQ4_0TcHmmaBf16F32(&compute.ctx, output, input, p.weight, g.rows, g.width, g.columns),
                 .q4_0_hmma_f16 => try compute.kernels.launchLinearQ4_0TcHmmaF32(&compute.ctx, output, input, p.weight, g.rows, g.width, g.columns),
-                .q4_0_q8_tile8 => try compute.kernels.launchLinearQ4_0Q8_1Tile8F32(&compute.ctx, output, input, p.weight, g.rows, g.width, g.columns),
-                .q4_0_q8_tile4 => try compute.kernels.launchLinearQ4_0Q8_1Tile4F32(&compute.ctx, output, input, p.weight, g.rows, g.width, g.columns),
-                .q4_0_q8_w8 => try compute.kernels.launchLinearQ4_0Q8_1Tile4W8F32(&compute.ctx, output, input, p.weight, g.rows, g.width, g.columns),
+                .q4_0_q8_tile8, .q4_0_q8_tile4, .q4_0_q8_w8 => try kernels_mod.KernelModule.launchQ4_0Q8_1Recipe(self.activation_recipe orelse return error.PreparedKernelBindingChanged, &compute.ctx, output, input, p.weight, g.rows, g.width, g.columns),
                 .q8_hmma => if (g.bias) try compute.kernels.launchLinearQ8_0BiasTcHmmaF32(&compute.ctx, output, input, p.weight, bias, g.rows, g.width, g.columns) else try compute.kernels.launchLinearQ8_0TcHmmaF32(&compute.ctx, output, input, p.weight, g.rows, g.width, g.columns),
                 .q8_variant => if (g.bias) try compute.kernels.launchLinearQ8_0BiasVariantF32(self.variant, &compute.ctx, output, input, p.weight, bias, g.rows, g.width, g.columns) else try compute.kernels.launchLinearQ8_0VariantF32(self.variant, &compute.ctx, output, input, p.weight, g.rows, g.width, g.columns),
                 .q8_base => try compute.kernels.launchLinearQ8_0F32(&compute.ctx, output, input, p.weight, g.rows, g.width, g.columns),
@@ -39066,6 +39167,7 @@ const PreparedCudaProjection = struct {
                 .q4k_tile4 => try compute.kernels.launchLinearQ4KTile4F32(&compute.ctx, output, input, p.weight, g.rows, g.width, g.columns),
                 .q4k_tile8 => try compute.kernels.launchLinearQ4KTile8F32(&compute.ctx, output, input, p.weight, g.rows, g.width, g.columns),
                 .q4k_bias4 => try compute.kernels.launchLinearQ4KBiasTile4F32(&compute.ctx, output, input, p.weight, bias, g.rows, g.width, g.columns),
+                .q4k_span => try compute.kernels.launchPreparedLinearQ4KSpanBiasF32(self.function, &compute.ctx, output, input, p.weight, bias, g.rows, g.width, g.columns),
                 .q4k_bias4r2 => try compute.kernels.launchLinearQ4KBiasTile4Rows2F32(&compute.ctx, output, input, p.weight, bias, g.rows, g.width, g.columns),
                 .q6k_q8 => try compute.kernels.launchLinearQ6KQ8_1F32Tile8E4B(&compute.ctx, output, input, p.weight, g.width, g.columns),
                 .q6k_tile4 => try compute.kernels.launchLinearQ6KTile4F32(&compute.ctx, output, input, p.weight, g.rows, g.width, g.columns),
@@ -39083,6 +39185,9 @@ const PreparedCudaProjection = struct {
         activation_mirror: bool = false,
         fused_bias: bool = false,
         tuning: cublaslt_mod.MatmulTuning = .{},
+        dequant_weight_bytes: usize = 0,
+        dequant_function: driver_mod.CUfunction = null,
+        activation_offset: usize = 0,
         conversion_bytes: usize = 0,
         vendor_offset: usize = 0,
         vendor_bytes: usize = 0,
@@ -39095,6 +39200,9 @@ const PreparedCudaProjection = struct {
     descriptor: ops.kernel_descriptor.Descriptor,
     slot: route.OutputSlot,
     profile: Profile,
+    // Pure algorithm recipe, no SDK descriptors or caller token retained.
+    // Actual per-frame descriptors are bound only after storage admission.
+    cold_dense_recipe: ?Dense.DenseRecipe = null,
 
     fn shapeEqual(a: Shape, b: Shape) bool {
         return a.dtype == b.dtype and a.rank() == b.rank() and std.mem.eql(i64, a.dims[0..a.rank()], b.dims[0..b.rank()]);
@@ -39173,12 +39281,22 @@ const PreparedCudaProjection = struct {
         } else if (g.rows == 1 and weight.quant_type == null and weight.dtype == .f32 and weight.bf16_mirror.ptr != 0 and weight.bf16_mirror.len >= try checkedMul(weight.elem_count, 2)) {
             p.family = .bf16_scalar;
             p.weight = weight.bf16_mirror;
-        } else if (weight.quant_type != null) return try Packed.select(self, p, weight) else if (weight.dtype != .f32) return null;
+        } else if (weight.quant_type != null) {
+            return finishProfile(self, descriptor, bindings, weight, (try Packed.select(self, p, weight)) orelse return null);
+        } else if (weight.dtype != .f32) return null;
+        return finishProfile(self, descriptor, bindings, weight, p);
+    }
+    fn finishProfile(self: *CudaCompute, descriptor: *const ops.kernel_descriptor.Descriptor, bindings: []const route.Binding, weight: *const CudaTensor, initial: Profile) !?Profile {
+        var p = initial;
+        const g = p.geometry;
         if (p.family == .vendor_bf16) {
             // This existing policy rounds the GEMM result itself to BF16. A
             // F32-out vendor plan must not silently change that arithmetic.
             if ((self.lighton_bf16_decode_outputs or self.lighton_bf16_projection_outputs) and self.capability_profile == .lightonocr3) return null;
-            if (!cudaCublasLtEnabled() or self.ctx.info.compute_major < 8 or self.cublaslt == null) p.family = .bf16_scalar;
+            if (!cudaCublasLtEnabled() or self.ctx.info.compute_major < 8 or self.cublaslt == null) {
+                if (p.dequant_weight_bytes != 0) return null;
+                p.family = .bf16_scalar;
+            }
         }
         if (p.family == .vendor_f16 and !canUseF16TensorCoreWeights(self)) p.family = .f16_scalar;
         if (p.family == .f32) {
@@ -39205,6 +39323,7 @@ const PreparedCudaProjection = struct {
                 }
             } else p.fused_bias = g.bias and self.capability_profile == .florence2 and self.florence_fused_bias_enabled and self.florence_f16_weights_enabled and g.rows >= 2;
             if (p.family == .vendor_bf16 and !p.activation_mirror and self.kernels.f32_to_bf16 == null) {
+                if (p.dequant_weight_bytes != 0) return null;
                 p.family = .bf16_scalar;
                 p.physical_rows = g.rows;
                 p.fused_bias = false;
@@ -39212,7 +39331,8 @@ const PreparedCudaProjection = struct {
                 return if (self.kernels.linear_bf16_weight_f32_tiled != null) p else null;
             }
             p.conversion_bytes = if (p.activation_mirror) 0 else try checkedMul(try checkedMul(p.physical_rows, g.width), 2);
-            p.vendor_offset = (try std.math.add(usize, p.conversion_bytes, 255)) & ~@as(usize, 255);
+            p.activation_offset = (try std.math.add(usize, p.dequant_weight_bytes, 255)) & ~@as(usize, 255);
+            p.vendor_offset = (try std.math.add(usize, try std.math.add(usize, p.activation_offset, p.conversion_bytes), 255)) & ~@as(usize, 255);
             p.vendor_bytes = self.runtime_policy.workspace_bytes;
             p.workspace_bytes = try std.math.add(usize, p.vendor_offset, p.vendor_bytes);
             // Physical leases are F32-granular; padding is uninitialized and is
@@ -39232,13 +39352,19 @@ const PreparedCudaProjection = struct {
         return if (available) p else null;
     }
     fn equivalent(a: Profile, b: Profile) bool {
-        return a.family == b.family and std.meta.eql(a.geometry, b.geometry) and a.physical_rows == b.physical_rows and a.weight.ptr == b.weight.ptr and a.weight.len == b.weight.len and a.activation_mirror == b.activation_mirror and a.fused_bias == b.fused_bias and std.meta.eql(a.tuning, b.tuning) and a.conversion_bytes == b.conversion_bytes and a.vendor_offset == b.vendor_offset and a.vendor_bytes == b.vendor_bytes and a.workspace_bytes == b.workspace_bytes and a.primary_bytes == b.primary_bytes and std.meta.eql(a.quantized, b.quantized);
+        return a.family == b.family and std.meta.eql(a.geometry, b.geometry) and a.physical_rows == b.physical_rows and a.weight.ptr == b.weight.ptr and a.weight.len == b.weight.len and a.activation_mirror == b.activation_mirror and a.fused_bias == b.fused_bias and std.meta.eql(a.tuning, b.tuning) and a.dequant_weight_bytes == b.dequant_weight_bytes and a.dequant_function == b.dequant_function and a.activation_offset == b.activation_offset and a.conversion_bytes == b.conversion_bytes and a.vendor_offset == b.vendor_offset and a.vendor_bytes == b.vendor_bytes and a.workspace_bytes == b.workspace_bytes and a.primary_bytes == b.primary_bytes and std.meta.eql(a.quantized, b.quantized);
     }
     fn matches(raw: *anyopaque, request: route.Validate) bool {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (request.output.node != self.slot.node or request.output.allocation != self.slot.allocation or !shapeEqual(request.output.logical, self.descriptor.output_shape)) return false;
         const current = (select(self.compute, &self.descriptor, request.inputs) catch return false) orelse return false;
-        return equivalent(self.profile, current);
+        if (!equivalent(self.profile, current)) return false;
+        if (self.cold_dense_recipe) |*recipe| {
+            const blas = if (self.compute.cublaslt) |*value| value else return false;
+            const layout = coldProjectionLayout(self.compute, request.inputs, current) orelse return false;
+            if (recipe.owner != blas or !recipe.matchesLayout(layout)) return false;
+        }
+        return true;
     }
     fn validate(raw: *anyopaque, request: route.Validate) !void {
         if (!matches(raw, request)) return error.PreparedKernelBindingChanged;
@@ -39264,7 +39390,12 @@ const PreparedCudaProjection = struct {
     fn scratch(self: *const @This(), invocation: ops.kernel_descriptor.Invocation) !buffer_mod.DeviceBuffer {
         if (self.profile.workspace_bytes == 0) return .{};
         const value = tensorFromCt(invocation.workspace orelse return error.MissingAssignedWorkspace);
-        if (value.physical_lease == null or value.buffer.len < self.profile.workspace_bytes or cudaTensorReadOnly(value)) return error.InvalidAssignedWorkspace;
+        const lease = value.physical_lease orelse return error.InvalidAssignedWorkspace;
+        if (lease.backend.ptr != @as(*anyopaque, @ptrCast(self.compute)) or !acceptsPhysicalImplementation(lease.backend.vtable) or value.buffer.len < self.profile.workspace_bytes or cudaTensorReadOnly(value)) return error.InvalidAssignedWorkspace;
+        const base = tensorFromCt(lease.tensor).buffer;
+        if (value.buffer.ptr < base.ptr) return error.InvalidAssignedWorkspace;
+        const offset = value.buffer.ptr - base.ptr;
+        if (offset > lease.byte_size or self.profile.workspace_bytes > lease.byte_size - offset) return error.InvalidAssignedWorkspace;
         return value.buffer;
     }
     fn buffers(self: *const @This(), invocation: ops.kernel_descriptor.Invocation) !cublaslt_mod.TensorCoreInvocation {
@@ -39273,7 +39404,7 @@ const PreparedCudaProjection = struct {
         if (input.dtype != .f32 or input.quant_type != null or input.elem_count != self.profile.geometry.rows * self.profile.geometry.width) return error.PreparedKernelBindingChanged;
         const workspace = try self.scratch(invocation);
         const p = self.profile;
-        const activation: buffer_mod.DeviceBuffer = if (p.family == .vendor_f32) input.buffer else if (p.activation_mirror) input.bf16_mirror else .{ .ptr = workspace.ptr, .len = p.conversion_bytes };
+        const activation: buffer_mod.DeviceBuffer = if (p.family == .vendor_f32) input.buffer else if (p.activation_mirror) input.bf16_mirror else .{ .ptr = workspace.ptr + p.activation_offset, .len = p.conversion_bytes };
         if (p.activation_mirror and (activation.ptr == 0 or activation.len < self.profile.geometry.rows * self.profile.geometry.width * 2)) return error.PreparedKernelBindingChanged;
         const output = try self.outputBuffer(invocation);
         if (kernel_geometry.byteRangesOverlap(output.ptr, output.len, input.buffer.ptr, input.buffer.len) or kernel_geometry.byteRangesOverlap(output.ptr, output.len, p.weight.ptr, p.weight.len)) return error.InvalidAssignedAlias;
@@ -39281,13 +39412,21 @@ const PreparedCudaProjection = struct {
             const bias = tensorFromCt(invocation.inputs[2]).buffer;
             if (kernel_geometry.byteRangesOverlap(output.ptr, output.len, bias.ptr, bias.len)) return error.InvalidAssignedAlias;
         }
+        if (workspace.len != 0) for (invocation.inputs) |value| {
+            const source = tensorFromCt(value).buffer;
+            if (kernel_geometry.byteRangesOverlap(workspace.ptr, p.workspace_bytes, source.ptr, source.len)) return error.InvalidAssignedAlias;
+        };
         if (workspace.len != 0 and (kernel_geometry.byteRangesOverlap(workspace.ptr, p.workspace_bytes, output.ptr, output.len) or kernel_geometry.byteRangesOverlap(workspace.ptr, p.workspace_bytes, input.buffer.ptr, input.buffer.len) or kernel_geometry.byteRangesOverlap(workspace.ptr, p.workspace_bytes, p.weight.ptr, p.weight.len))) return error.InvalidAssignedAlias;
-        return .{ .dst = output, .input = activation, .weight = p.weight, .workspace = if (p.vendor_bytes == 0) .{} else .{ .ptr = workspace.ptr + p.vendor_offset, .len = p.vendor_bytes }, .bias = if (p.fused_bias) tensorFromCt(invocation.inputs[2]).buffer else null };
+        return .{ .dst = output, .input = activation, .weight = if (p.dequant_weight_bytes == 0) p.weight else .{ .ptr = workspace.ptr, .len = p.dequant_weight_bytes }, .workspace = if (p.vendor_bytes == 0) .{} else .{ .ptr = workspace.ptr + p.vendor_offset, .len = p.vendor_bytes }, .bias = if (p.fused_bias) tensorFromCt(invocation.inputs[2]).buffer else null };
     }
     fn stage(self: *const @This(), invocation: ops.kernel_descriptor.Invocation) !void {
         const p = self.profile;
-        if (!isVendor(p) or p.family == .vendor_f32 or p.activation_mirror) return;
+        if (!isVendor(p)) return;
         const buffers_ = try self.buffers(invocation);
+        if (p.dequant_weight_bytes != 0) {
+            try kernels_mod.KernelModule.launchPreparedDequantQ4_0Bf16(p.dequant_function, &self.compute.ctx, buffers_.weight, p.weight, p.geometry.width * p.geometry.columns / 32);
+        }
+        if (p.family == .vendor_f32 or p.activation_mirror) return;
         const input = tensorFromCt(invocation.inputs[0]);
         const count = p.geometry.rows * p.geometry.width;
         if (p.family == .vendor_f16) try self.compute.kernels.launchF32ToF16(&self.compute.ctx, buffers_.input, input.buffer, count) else try self.compute.kernels.launchF32ToBf16(&self.compute.ctx, buffers_.input, input.buffer, count);
@@ -39316,6 +39455,12 @@ const PreparedCudaProjection = struct {
         if (!isVendor(self.profile)) return null;
         const resources = try request.allocator.create(Resources);
         errdefer request.allocator.destroy(resources);
+        if (self.cold_dense_recipe) |*recipe| {
+            const blas = if (self.compute.cublaslt) |*value| value else return error.PreparedKernelBindingChanged;
+            const vendor = try blas.bindDenseRecipe(&self.compute.ctx, recipe, try self.buffers(request.invocation.*));
+            resources.* = .{ .allocator = request.allocator, .program = self, .vendor = vendor };
+            return .{ .context = resources, .key = @intFromPtr(resources), .validate = Resources.validate, .deinit = Resources.deinit };
+        }
         // Any numerical tuning probe sees initialized assigned activation and
         // unpublished output. It cannot allocate a hidden conversion buffer.
         try self.stage(request.invocation.*);
@@ -39406,11 +39551,47 @@ const PreparedCudaProjection = struct {
         }
         if (p.family == .bf16_scalar) self.compute.stats.bf16_scalar_linear_calls += 1;
         if (p.family == .f16_scalar) self.compute.stats.f16_scalar_linear_calls += 1;
-        if (p.quantized == null) self.compute.dispatch_stats.note(self.compute.allocator, if (g.bias) .linear else .linear_no_bias, if (p.family == .vendor_f16 or p.family == .f16_scalar) .f16 else if (p.family == .vendor_bf16 or p.family == .bf16_scalar) .bf16 else .f32, if (isVendor(p)) .dense_lt else if (p.family == .f16_scalar or p.family == .bf16_scalar) .dense_cuda else .f32_cuda, if (g.bias) .bias else .none, .none, g.rows, g.width, g.columns, 0);
+        if (p.dequant_weight_bytes != 0) {
+            // Preserve the original Q4 no-bias + optional standalone-bias
+            // dispatch observations while moving only its resource ownership.
+            self.compute.dispatch_stats.note(self.compute.allocator, .linear_no_bias, .q4_0, .dense_lt, .none, .none, g.rows, g.width, g.columns, p.dequant_weight_bytes);
+            if (g.bias) self.compute.dispatch_stats.note(self.compute.allocator, .linear, .q4_0, .q4_simt, .bias, .none, g.rows, g.width, g.columns, 0);
+        } else if (p.quantized == null) self.compute.dispatch_stats.note(self.compute.allocator, if (g.bias) .linear else .linear_no_bias, if (p.family == .vendor_f16 or p.family == .f16_scalar) .f16 else if (p.family == .vendor_bf16 or p.family == .bf16_scalar) .bf16 else .f32, if (isVendor(p)) .dense_lt else if (p.family == .f16_scalar or p.family == .bf16_scalar) .dense_cuda else .f32_cuda, if (g.bias) .bias else .none, .none, g.rows, g.width, g.columns, 0);
         self.compute.stats.launch_linear += 1;
         return true;
     }
 };
+
+fn coldProjectionLayout(self: *CudaCompute, inputs: []const @import("../../execution/kernel_route.zig").Binding, profile: PreparedCudaProjection.Profile) ?cublaslt_mod.CublasLt.DenseLayout {
+    var input_alignment: u32 = buffer_mod.DeviceBuffer.allocation_alignment;
+    if (profile.activation_mirror) {
+        // Only actual stable tensor-plane addresses can supply a mirror's
+        // exact alignment here. Unqualified planned/foreign mirrors retain
+        // their compatibility path; never force conversion to earn credit.
+        const input = PreparedCudaProjection.tensorFact(self, inputs[0]) orelse return null;
+        var root = input;
+        while (root.resident_parent) |parent| root = parent;
+        if (!root.owns_bf16_mirror or root.bf16_mirror.borrowed or root.bf16_mirror.ptr != input.bf16_mirror.ptr or root.bf16_mirror.allocation_bytes < input.bf16_mirror.len) return null;
+        const pointer = input.bf16_mirror.ptr;
+        if (pointer == 0) return null;
+        input_alignment = @intCast(@as(u64, 1) << @min(@as(u6, 8), @as(u6, @intCast(@ctz(pointer)))));
+    }
+    return .{ .request = .{ .precision = .bf16, .rows = profile.physical_rows, .in_dim = profile.geometry.width, .out_dim = profile.geometry.columns, .tuning = profile.tuning }, .workspace_bytes = profile.vendor_bytes, .alignments = .{ buffer_mod.DeviceBuffer.allocation_alignment, input_alignment, buffer_mod.DeviceBuffer.allocation_alignment, buffer_mod.DeviceBuffer.allocation_alignment } };
+}
+
+fn qualifyColdProjection(self: *CudaCompute, request: @import("../../execution/kernel_route.zig").Prepare, profile: PreparedCudaProjection.Profile) !?cublaslt_mod.CublasLt.DenseRecipe {
+    const authority = request.metadata_authority orelse return null;
+    const implementation = request.implementation orelse return null;
+    // Exact live nonce/table/provider authority, not an ambient SDK context.
+    try authority.validate(.{ .implementation = .{ .context = implementation.context, .table = implementation.table }, .program = null, .mode = .metadata });
+    if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return null;
+    const layout = coldProjectionLayout(self, request.inputs, profile) orelse return null;
+    const blas = if (self.cublaslt) |*value| value else return null;
+    return blas.prepareDenseLayout(&self.ctx, layout) catch |err| switch (err) {
+        error.CublasLtUnsupported => null,
+        else => return err,
+    };
+}
 
 fn prepareKernelRouteOp(ctx: *anyopaque, request: @import("../../execution/kernel_route.zig").Prepare) anyerror!?@import("../../execution/kernel_route.zig").Owned {
     if (request.descriptor.output_shape.dtype != .f32) return null;
@@ -39427,16 +39608,20 @@ fn prepareKernelRouteOp(ctx: *anyopaque, request: @import("../../execution/kerne
         return @import("../../execution/assigned_kernel_route.zig").prepareImmutable(.{ .ptr = self, .vtable = table }, request, directCudaRouteSupported);
     }
     const profile = (try PreparedCudaProjection.select(self, request.descriptor, request.inputs)) orelse return null;
+    const cold_recipe: ?cublaslt_mod.CublasLt.DenseRecipe = if (profile.dequant_weight_bytes != 0)
+        (try qualifyColdProjection(self, request, profile)) orelse return null
+    else
+        null;
     const owner = try request.allocator.create(PreparedCudaProjection);
-    owner.* = .{ .allocator = request.allocator, .compute = self, .descriptor = request.descriptor.*, .slot = request.output, .profile = profile };
-    const key_fields = [8]u64{ @intCast(profile.geometry.rows), @intCast(profile.geometry.width), @intCast(profile.geometry.columns), @intCast(profile.weight.ptr), @backingInt(profile.family), @intCast(profile.primary_bytes), @intCast(profile.workspace_bytes), @intFromBool(profile.fused_bias) | (@as(u64, @intFromBool(profile.activation_mirror)) << 1) | (if (profile.quantized) |quantized| @as(u64, @backingInt(quantized.kind)) << 8 else @as(u64, 0)) };
+    owner.* = .{ .allocator = request.allocator, .compute = self, .descriptor = request.descriptor.*, .slot = request.output, .profile = profile, .cold_dense_recipe = cold_recipe };
+    const key_fields = [8]u64{ @intCast(profile.geometry.rows), @intCast(profile.geometry.width), @intCast(profile.geometry.columns), @intCast(profile.weight.ptr), @backingInt(profile.family), @intCast(profile.primary_bytes), @intCast(profile.workspace_bytes), @intFromBool(profile.fused_bias) | (@as(u64, @intFromBool(profile.activation_mirror)) << 1) | (@as(u64, @intFromBool(profile.dequant_weight_bytes != 0)) << 2) | (if (profile.quantized) |quantized| @as(u64, @backingInt(quantized.kind)) << 8 else @as(u64, 0)) };
     const key = std.hash.Wyhash.hash(0, std.mem.asBytes(&key_fields));
     // Every selected Projection writes F32 into the explicitly assigned dense
     // primary span; outputBuffer verifies dtype/geometry/authority/disjointness,
     // and all auxiliary output planes are empty. Padded physical rows remain
     // in the declared primary span. The source/profile is still invocation-
     // validated by matches/run; no model Tensor plane inherits this authority.
-    return route.Owned{ .context = owner, .output_plane_metadata = .assigned_dense, .implementation = .{ .context = implementation.context, .table = implementation.table, .policy_epoch = key }, .key = key, .requirements = .{ .primary_bytes = profile.primary_bytes, .profile = @backingInt(profile.family), .workspace = .{ .byte_size = profile.workspace_bytes, .alignment = 256 }, .probe_output = if (PreparedCudaProjection.isVendor(profile)) .assigned_unpublished else .none, .capture = .supported }, .vtable = &PreparedCudaProjection.vtable };
+    return route.Owned{ .context = owner, .output_plane_metadata = .assigned_dense, .implementation = .{ .context = implementation.context, .table = implementation.table, .policy_epoch = key }, .key = key, .requirements = .{ .primary_bytes = profile.primary_bytes, .primary_alignment = if (cold_recipe != null) @as(u32, @intCast(buffer_mod.DeviceBuffer.allocation_alignment)) else 1, .profile = @backingInt(profile.family), .workspace = .{ .byte_size = profile.workspace_bytes, .alignment = 256 }, .probe_output = if (cold_recipe == null and PreparedCudaProjection.isVendor(profile)) .assigned_unpublished else .none, .capture = .supported }, .vtable = &PreparedCudaProjection.vtable };
 }
 fn directCudaRouteSupported(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
     // Index metadata gathering and non-projection dots retain their existing
@@ -39456,6 +39641,7 @@ fn initPreparedCudaMetadataFixture(self: *CudaCompute) void {
     self.training_blas = null;
     self.resident_training_cache = false;
     self.tuned_route_gates = .{};
+    self.kernels = .{};
     self.kernels.attention_match_repeat = false;
     self.kernels.dequant_q4_0_bf16 = null;
     self.kernels.quantize_f32_q8_1_rows = @ptrFromInt(16);
@@ -39611,6 +39797,11 @@ test "CUDA selected projection routes preserve legacy outputs through eviction a
     };
     defer compute.deinit();
     if (compute.cublaslt == null or compute.ctx.info.compute_major < 8 or !cudaCublasLtEnabled()) return error.SkipZigTest;
+    // Match the canonical SharedBackendContext provider protocol at a stable
+    // final address; cold metadata never borrows ambient numerical authority.
+    var metadata_owner = @import("../../execution/operation_owner.zig").Owner{};
+    compute.shared_operation_owner = &metadata_owner;
+    defer compute.shared_operation_owner = null;
     const cb = compute.computeBackend();
     compute.strict_f32_weights = true;
     compute.runtime_policy.workspace_bytes = 1024 * 1024;
@@ -39622,14 +39813,14 @@ test "CUDA selected projection routes preserve legacy outputs through eviction a
     compute.tuned_route_gates.linear_q8_1_dp4a = true;
     compute.tuned_route_gates.q8_1_prefill_rows = true;
     compute.tuned_route_gates.q4_0_tc_hmma_prefill = false;
-    const Format = enum { f32, f16, bf16, q4_0, q8_0, q4_k, q6_k };
+    const Format = enum { f32, f16, bf16, q4_0, q4_0_rows, q4_0_vendor, q8_0, q4_k, q4_k_span, q6_k };
     const route = @import("../../execution/kernel_route.zig");
     const Shape = @import("ml").graph.Shape;
     inline for (comptime std.meta.tags(Format)) |format| {
         const quantized: ?gguf_tensor_types.KnownTensorType = switch (format) {
-            .q4_0 => .Q4_0,
+            .q4_0, .q4_0_rows, .q4_0_vendor => .Q4_0,
             .q8_0 => .Q8_0,
-            .q4_k => .Q4_K,
+            .q4_k, .q4_k_span => .Q4_K,
             .q6_k => .Q6_K,
             else => null,
         };
@@ -39639,15 +39830,38 @@ test "CUDA selected projection routes preserve legacy outputs through eviction a
             .bf16 => .bf16,
             else => .u8,
         };
+        compute.tuned_route_gates.q4_0_tc_hmma_prefill = format == .q4_0_vendor;
+        compute.tuned_route_gates.q4_0_cublas_prefill = format == .q4_0_vendor;
+        compute.tuned_route_gates.linear_q8_1_tile4_w8 = format == .q4_0_rows;
+        compute.tuned_route_gates.linear_q8_1_tile4_w8_min_in_dim = 0;
         inline for (.{ false, true }) |with_bias| {
             if (comptime format == .q6_k and with_bias) continue;
             inline for (.{ 3, 128 }) |rows| {
-                const width = if (quantized != null) 256 else 64;
+                if (comptime format == .q4_k_span and rows == 128) continue;
+                if (comptime format == .q4_0_vendor and rows < 128) continue;
+                if (format == .q4_0_vendor and (compute.kernels.dequant_q4_0_bf16 == null or compute.kernels.f32_to_bf16 == null)) return error.SkipZigTest;
+                const width = if (format == .q4_k_span) 768 else if (quantized != null) 256 else 64;
+                const columns = if (format == .q4_k_span) 3072 else width;
+                const Env = struct {
+                    extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+                    extern "c" fn unsetenv([*:0]const u8) c_int;
+                };
+                const variant_name = "ANTFLY_CUDA_QMATMUL_VARIANT";
+                const old_variant = if (format == .q4_k_span) if (platform.env.getenv(variant_name)) |value| try a.dupeSentinel(u8, value, 0) else null else null;
+                defer if (old_variant) |value| a.free(value);
+                defer if (format == .q4_k_span) {
+                    if (old_variant) |value| {
+                        _ = Env.setenv(variant_name, value.ptr, 1);
+                    } else {
+                        _ = Env.unsetenv(variant_name);
+                    }
+                };
+                if (format == .q4_k_span) try std.testing.expectEqual(@as(c_int, 0), Env.setenv(variant_name, "legacy", 1));
                 const input_values = try a.alloc(f32, rows * width);
                 defer a.free(input_values);
-                const weight_values = try a.alloc(f32, width * width);
+                const weight_values = try a.alloc(f32, width * columns);
                 defer a.free(weight_values);
-                const bias_values = try a.alloc(f32, width);
+                const bias_values = try a.alloc(f32, columns);
                 defer a.free(bias_values);
                 for (input_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 11)) - 5)) / 16;
                 for (weight_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 7)) - 3)) / 16;
@@ -39658,9 +39872,9 @@ test "CUDA selected projection routes preserve legacy outputs through eviction a
                     bits.* = if (dtype == .f16) @bitCast(@as(f16, @floatCast(value))) else @truncate(@as(u32, @bitCast(value)) >> 16);
                 };
                 const encoded: ?[]u8 = switch (format) {
-                    .q4_0 => try quant_codec.quantizeQ4_0FromF32(a, weight_values),
+                    .q4_0, .q4_0_rows, .q4_0_vendor => try quant_codec.quantizeQ4_0FromF32(a, weight_values),
                     .q8_0 => try quant_codec.quantizeQ8_0FromF32(a, weight_values),
-                    .q4_k => try quant_codec.quantizeQ4_KFromF32(a, weight_values),
+                    .q4_k, .q4_k_span => try quant_codec.quantizeQ4_KFromF32(a, weight_values),
                     .q6_k => try quant_codec.quantizeQ6_KFromF32(a, weight_values),
                     else => null,
                 };
@@ -39670,8 +39884,8 @@ test "CUDA selected projection routes preserve legacy outputs through eviction a
                 var weight_buffer_owned = true;
                 defer if (weight_buffer_owned) weight_buffer.free(&compute.ctx);
                 try weight_buffer.copyFromHost(&compute.ctx, host_weight);
-                const weight_shape = try a.dupe(i64, &.{ width, width });
-                const weight_ct = createTensorWithDType(&compute, weight_buffer, weight_shape, width * width, dtype) catch |err| {
+                const weight_shape = try a.dupe(i64, &.{ columns, width });
+                const weight_ct = createTensorWithDType(&compute, weight_buffer, weight_shape, width * columns, dtype) catch |err| {
                     a.free(weight_shape);
                     return err;
                 };
@@ -39680,24 +39894,74 @@ test "CUDA selected projection routes preserve legacy outputs through eviction a
                 if (quantized) |kind| tensorFromCt(weight_ct).quant_type = .{ .known = kind };
                 const input = try cb.fromFloat32Shape(input_values, &.{ rows, width });
                 defer cb.free(input);
-                const bias = try cb.fromFloat32Shape(bias_values, &.{width});
+                const bias = try cb.fromFloat32Shape(bias_values, &.{columns});
                 defer cb.free(bias);
-                const legacy = if (with_bias) try linear(&compute, input, weight_ct, bias, rows, width, width) else try linearNoBias(&compute, input, weight_ct, rows, width, width);
+                const legacy = if (with_bias) try linear(&compute, input, weight_ct, bias, rows, width, columns) else try linearNoBias(&compute, input, weight_ct, rows, width, columns);
                 defer cb.free(legacy);
                 const expected = try cb.toFloat32(legacy, a);
                 defer a.free(expected);
                 const input_shape = Shape.init(.f32, &.{ rows, width });
-                const weight_logical = Shape.init(.f32, &.{ width, width });
-                const descriptor = ops.kernel_descriptor.Descriptor{ .operation = .{ .linear = .{ .rows = rows, .in_dim = width, .out_dim = width, .bias = with_bias } }, .input_count = if (with_bias) 3 else 2, .input_shapes = .{ input_shape, weight_logical, Shape.init(.f32, &.{width}) }, .output_shape = input_shape };
+                const weight_logical = Shape.init(.f32, &.{ columns, width });
+                const descriptor = ops.kernel_descriptor.Descriptor{ .operation = .{ .linear = .{ .rows = rows, .in_dim = width, .out_dim = columns, .bias = with_bias } }, .input_count = if (with_bias) 3 else 2, .input_shapes = .{ input_shape, weight_logical, Shape.init(.f32, &.{columns}) }, .output_shape = Shape.init(.f32, &.{ rows, columns }) };
                 const implementation = route.Implementation{ .context = &compute, .table = cb.vtable };
                 const facts = [_]route.Binding{ .{ .tensor = .{ .value = input, .implementation = implementation } }, .{ .tensor = .{ .value = weight_ct, .implementation = implementation } }, .{ .tensor = .{ .value = bias, .implementation = implementation } } };
-                const slot = route.OutputSlot{ .allocation = 0, .node = 2, .epoch = 1, .logical = input_shape, .writable_bytes = 0 };
-                var selected = (try prepareKernelRouteOp(&compute, .{ .allocator = a, .implementation = implementation, .descriptor = &descriptor, .inputs = facts[0..descriptor.input_count], .output = slot })) orelse return error.MissingSelectedProjection;
+                const slot = route.OutputSlot{ .allocation = 0, .node = 2, .epoch = 1, .logical = descriptor.output_shape, .writable_bytes = 0 };
+                var metadata = try @import("../../execution/backend_operation.zig").enter(cb, null, null, .metadata);
+                defer metadata.deinitChecked() catch @panic("cold projection metadata cleanup");
+                var request = route.Prepare{ .allocator = a, .implementation = implementation, .descriptor = &descriptor, .inputs = facts[0..descriptor.input_count], .output = slot, .metadata_authority = metadata.token() };
+                if (format == .q4_0_vendor) {
+                    var no_allocation = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                    var veto = request;
+                    veto.allocator = no_allocation.allocator();
+                    const copied_table = cb.vtable.*;
+                    veto.implementation.?.table = &copied_table;
+                    try std.testing.expect((try prepareKernelRouteOp(&compute, veto)) == null);
+                    try std.testing.expect(!no_allocation.has_induced_failure);
+                    // A REAL SDK capture is active, not only a boolean latch.
+                    // This recipe must decline before metadata descriptors,
+                    // route owner publication or any attempted numerics.
+                    const captured = (try createPhysicalReplayOp(&compute)).?;
+                    defer captured.deinit();
+                    try std.testing.expect(try captured.begin(&.{}));
+                    var capturing = true;
+                    errdefer if (capturing) captured.abort();
+                    veto = request;
+                    veto.allocator = no_allocation.allocator();
+                    const physical_before = compute.ctx.device_allocations.snapshot();
+                    try std.testing.expect((try prepareKernelRouteOp(&compute, veto)) == null);
+                    try std.testing.expect(!no_allocation.has_induced_failure);
+                    try std.testing.expectEqualDeep(physical_before, compute.ctx.device_allocations.snapshot());
+                    captured.abort();
+                    capturing = false;
+                    // SDK layout qualification succeeds before route-header
+                    // publication, and the sole header allocation still unwinds.
+                    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                    request.allocator = failing.allocator();
+                    try std.testing.expectError(error.OutOfMemory, prepareKernelRouteOp(&compute, request));
+                    try std.testing.expect(failing.has_induced_failure);
+                    request.allocator = a;
+                }
+                var selected = (try prepareKernelRouteOp(&compute, request)) orelse return error.MissingSelectedProjection;
                 defer selected.deinit();
+                if (format == .q4_0_vendor) {
+                    const program: *PreparedCudaProjection = @ptrCast(@alignCast(selected.context));
+                    try std.testing.expect(program.cold_dense_recipe != null and program.profile.dequant_weight_bytes == width * columns * 2);
+                    try std.testing.expect(selected.requirements.probe_output == .none);
+                }
+                try metadata.finish();
+                if (format == .q4_0_vendor) {
+                    // The same record stays pinned here but has relinquished
+                    // its actual provider gate: a former token is no authority.
+                    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                    var stale = request;
+                    stale.allocator = failing.allocator();
+                    try std.testing.expectError(error.BackendOperationInactive, prepareKernelRouteOp(&compute, stale));
+                    try std.testing.expect(!failing.has_induced_failure);
+                }
                 const output_lease = (try ops.physical_storage.Lease.create(a, cb, selected.requirements.primary_bytes)).?;
                 defer output_lease.release();
                 try output_lease.bindAllocationSlot(0, 1, selected.requirements.primary_bytes);
-                const output = (try physicalTensorViewOp(&compute, .{ .storage = output_lease, .shape = &.{ rows, width } })).?;
+                const output = (try physicalTensorViewOp(&compute, .{ .storage = output_lease, .shape = &.{ rows, columns } })).?;
                 defer cb.free(output);
                 const workspace_lease = if (selected.requirements.workspace.byte_size != 0) (try ops.physical_storage.Lease.create(a, cb, selected.requirements.workspace.byte_size)).? else null;
                 defer if (workspace_lease) |value| value.release();
@@ -39707,6 +39971,11 @@ test "CUDA selected projection routes preserve legacy outputs through eviction a
                 assignment.slot.writable_bytes = selected.requirements.primary_bytes;
                 const inputs = [_]CT{ input, weight_ct, bias };
                 var invocation = ops.kernel_descriptor.Invocation{ .descriptor = &descriptor, .inputs = inputs[0..descriptor.input_count], .output = output, .workspace = workspace, .prepared_route = &selected, .assigned_output = &assignment };
+                if (format == .q4_0_vendor) {
+                    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                    try std.testing.expectError(error.OutOfMemory, selected.prepareAssigned(.{ .allocator = failing.allocator(), .invocation = &invocation, .output = assignment.slot }));
+                    try std.testing.expect(failing.has_induced_failure);
+                }
                 var resources = try selected.prepareAssigned(.{ .allocator = a, .invocation = &invocation, .output = assignment.slot });
                 defer if (resources) |value| value.deinit(value.context);
                 invocation.prepared_resources = if (resources) |*value| value else null;
@@ -39715,9 +39984,9 @@ test "CUDA selected projection routes preserve legacy outputs through eviction a
                 // Direct packed routes do not populate the vendor cache.
                 // Seed a real independent vendor plan before testing eviction,
                 // so every format exercises actual cache retirement.
-                const eviction_seed = try cb.fromFloat32Shape(weight_values, &.{ width, width });
+                const eviction_seed = try cb.fromFloat32Shape(weight_values, &.{ columns, width });
                 defer cb.free(eviction_seed);
-                try vendor.matmulF32WeightF32Out(&compute.ctx, tensorFromCt(output).buffer, tensorFromCt(input).buffer, tensorFromCt(eviction_seed).buffer, rows, width, width);
+                try vendor.matmulF32WeightF32Out(&compute.ctx, tensorFromCt(output).buffer, tensorFromCt(input).buffer, tensorFromCt(eviction_seed).buffer, rows, width, columns);
                 try std.testing.expect(vendor.tensor_core_plans.count() > 0);
                 try std.testing.expect(try vendor.reserveTensorCorePlanSlots(&compute.ctx, vendor.plan_cache_capacity));
                 try std.testing.expectEqual(@as(usize, 0), vendor.tensor_core_plans.count());
@@ -39734,7 +40003,18 @@ test "CUDA selected projection routes preserve legacy outputs through eviction a
                 const actual = try cb.toFloat32(output, a);
                 defer a.free(actual);
                 try std.testing.expectEqualSlices(f32, expected, actual);
-                try std.testing.expectEqual(@as(usize, rows * width * 4), tensorFromCt(output).buffer.len);
+                if (comptime format == .q4_k_span) {
+                    const decoded = try a.alloc(f32, width * columns);
+                    defer a.free(decoded);
+                    try quant_codec.dequantizeToFloat32(.{ .known = .Q4_K }, encoded.?, decoded);
+                    for (actual, 0..) |value, index| {
+                        var sum: f32 = 0;
+                        for (0..width) |k| sum += input_values[(index / columns) * width + k] * decoded[(index % columns) * width + k];
+                        if (with_bias) sum += bias_values[index % columns];
+                        try std.testing.expectApproxEqAbs(sum, value, 0.002);
+                    }
+                }
+                try std.testing.expectEqual(@as(usize, rows * columns * 4), tensorFromCt(output).buffer.len);
                 try std.testing.expectEqual(@as(usize, 0), vendor.tensor_core_plans.count());
             }
         }
@@ -39987,6 +40267,11 @@ test "CUDA retained cache owner survives producer compute and request budget des
     var source = try tensor_mod.Tensor.initFloat32(a, "foreign-held", &.{ 2, 2 }, &.{ 1, 2, 3, 4 });
     defer source.deinit();
     try origin.insertWeightFromTensor(try a.dupe(u8, "foreign-held"), &source);
+    const root_registry = @import("../../execution/device_allocation_registry.zig");
+    var root_observation: root_registry.Registry = undefined;
+    root_observation.begin(a);
+    defer _ = root_observation.end();
+    origin.ctx.device_allocations.registerObservation();
     const device_registry = @import("../../execution/device_owner_registry.zig");
     var observation: device_registry.Registry = undefined;
     observation.begin(a);
@@ -40038,6 +40323,15 @@ test "CUDA retained cache owner survives producer compute and request budget des
     try std.testing.expectEqual(@as(usize, 0), cleaned.physical_live_bytes);
     try std.testing.expect(cleaned.cleanup_physical_frees.? > 0);
     try std.testing.expectEqual(expected_bytes, cleaned.handed_off_bytes);
+    const roots_after = root_observation.snapshot();
+    try std.testing.expectEqual(@as(usize, 2), roots_after.roots);
+    // The original context has been freed. Both independent metadata roots
+    // remain safe to snapshot; source transfer is not a fake physical free.
+    try std.testing.expectEqual(@as(u64, 0), roots_after.reports[0].live_bytes);
+    try std.testing.expectEqual(@as(u64, 1), roots_after.reports[0].handoffs_out);
+    try std.testing.expectEqual(@as(u64, expected_bytes), roots_after.reports[1].interval_peak_bytes);
+    try std.testing.expectEqual(@as(u64, 0), roots_after.reports[1].live_bytes);
+    try std.testing.expect(roots_after.reports[1].frees > 0);
 }
 
 test "CUDA detached owner checked cleanup preserves failed SDK address and quota" {
@@ -40103,7 +40397,49 @@ const CudaStorageRetirement = struct {
         return .{ .identity = @intFromPtr(self), .phase = if (self.source_context != null) .attached_subset else .detached_cleanup, .source_ledger_identity = if (self.source_context) |source| @intFromPtr(&source.device_allocations) else null, .physical_live_bytes = self.physical_bytes, .handed_off_bytes = self.handed_off_bytes, .cleanup_physical_frees = if (self.source_context == null and self.provider != null) self.provider.?.device_allocations.snapshot().frees else null };
     }
     const observation_vtable = Observation.Owner.VTable{ .retain = observeRetain, .release = observeRelease, .snapshot = observeSnapshot };
+    // Never borrow the embedded source Budget beyond the owner mutex. On a
+    // cold miss allocate independent metadata outside BOTH owner/Budget locks,
+    // then reselect the live source/provider before install-winner publication.
+    fn rootObservationPin(self: *CudaStorageRetirement, provider_only: bool, candidate: ?*@import("../../execution/allocation_observer.zig").State) ?@import("allocation_budget.zig").Budget.ObservationPin {
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const budget: ?*@import("allocation_budget.zig").Budget = if (provider_only)
+            (if (self.provider) |*provider| &provider.device_allocations else null)
+        else if (self.source_context) |source| &source.device_allocations else if (self.provider) |*provider| &provider.device_allocations else null;
+        const current = budget orelse return null;
+        if (candidate) |value| return current.installObservation(value);
+        return if (current.retainObservation()) |state| .{ .state = state, .installed = false } else null;
+    }
+    fn registerRootObservation(self: *CudaStorageRetirement, provider_only: bool) void {
+        const roots = @import("../../execution/device_allocation_registry.zig");
+        if (!roots.enabled()) return;
+        platform.sync.lockYielding(&self.mutex);
+        const has_budget = if (provider_only) self.provider != null else self.source_context != null or self.provider != null;
+        self.mutex.unlock();
+        // A zero-payload inert retirement shell has no SDK allocation root.
+        // Its absence is not optional-metadata OOM or incomplete registration.
+        if (!has_budget) return;
+        if (self.rootObservationPin(provider_only, null)) |pin| {
+            defer pin.state.release();
+            roots.bind(.{ .state = pin.state, .backing = .cuda_successful_cuMemAlloc_owned_spans });
+            return;
+        }
+        const State = @import("../../execution/allocation_observer.zig").State;
+        const candidate = State.createExternal(@import("../../execution/allocation_registry.zig").metadataAllocator(), .{}) catch {
+            roots.missing();
+            return;
+        };
+        const pin = self.rootObservationPin(provider_only, candidate) orelse {
+            candidate.release();
+            roots.missing();
+            return;
+        };
+        if (!pin.installed) candidate.release();
+        defer pin.state.release();
+        roots.bind(.{ .state = pin.state, .backing = .cuda_successful_cuMemAlloc_owned_spans });
+    }
     fn registerObservation(self: *CudaStorageRetirement) void {
+        self.registerRootObservation(false);
         if (Observation.enabled()) Observation.bind(.{ .context = self, .vtable = &observation_vtable });
     }
     fn create(allocator: std.mem.Allocator) !*CudaStorageRetirement {
@@ -40154,6 +40490,9 @@ const CudaStorageRetirement = struct {
         self.physical_bytes = std.math.add(usize, self.physical_bytes, bytes) catch unreachable;
     }
     fn detachSource(self: *CudaStorageRetirement) void {
+        // Independent cleanup root is registered before custody moves, while
+        // optional allocation and registry metadata stay outside the owner gate.
+        self.registerRootObservation(true);
         platform.sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         if (self.source_context) |source| {
@@ -41028,8 +41367,8 @@ test "CUDA zero-growth encoded KV COW validates capacity capture and all planes 
             defer a.free(key_result);
             const value_result = try a.alloc(u8, layer.value_row_bytes);
             defer a.free(value_result);
-            const key_view = buffer_mod.DeviceBuffer{ .ptr = layer.k.ptr + target * 2 * layer.key_row_bytes, .len = key_result.len, .borrowed = true };
-            const value_view = buffer_mod.DeviceBuffer{ .ptr = layer.v.ptr + target * 2 * layer.value_row_bytes, .len = value_result.len, .borrowed = true };
+            const key_view = buffer_mod.DeviceBuffer{ .ptr = layer.k.ptr + target * 2 * layer.key_row_bytes, .len = key_result.len, .allocation_purpose = layer.k.allocation_purpose, .borrowed = true };
+            const value_view = buffer_mod.DeviceBuffer{ .ptr = layer.v.ptr + target * 2 * layer.value_row_bytes, .len = value_result.len, .allocation_purpose = layer.v.allocation_purpose, .borrowed = true };
             try key_view.copyToHost(&compute.ctx, key_result);
             try value_view.copyToHost(&compute.ctx, value_result);
             try compute.ctx.synchronize();
@@ -41196,7 +41535,7 @@ test "CUDA admitted KV growth preserves every encoded plane on partial OOM and c
             fn alloc(ctx: *context_mod.CudaContext, bytes: usize) !buffer_mod.DeviceBuffer {
                 calls += 1;
                 if (calls == fail_at) return error.OutOfMemory;
-                return buffer_mod.DeviceBuffer.alloc(ctx, bytes);
+                return buffer_mod.DeviceBuffer.allocWithPurpose(ctx, bytes, .kv_state);
             }
             fn grow(raw: *anyopaque, implementation: *const anyopaque, prepared: *const capacity.Plan, claim: *capacity.Claim, epoch: *const sink_mod.Epoch) !void {
                 if (implementation != @as(*const anyopaque, @ptrCast(&hook))) return error.WrongKvFaultProvider;
@@ -42608,7 +42947,7 @@ pub const ColdKvBank = struct {
     }
     const Physical = struct {
         fn alloc(ctx: *context_mod.CudaContext, bytes: usize) !buffer_mod.DeviceBuffer {
-            return buffer_mod.DeviceBuffer.alloc(ctx, bytes);
+            return buffer_mod.DeviceBuffer.allocWithPurpose(ctx, bytes, .kv_state);
         }
     };
     /// Pure pre-join description. Caller pins the published target through this
@@ -42735,7 +43074,7 @@ pub const ColdKvBank = struct {
         bank.* = .{ .allocator = allocator, .target = target.*, .window = window, .geometry = canonical, .dtype = dtype, .mode = mode, .parents = parents, .private_tokens = if (mode == .sequence_private) per_sequence_tokens else 0, .rows = rows, .storage = storage, .bytes = plan.new_bytes };
         // The actual retained model now proves the primary-context lifetime.
         // The temporary endpoint has NO SDK work left and closes before lanes.
-        endpoint.device_allocations.handoffTo(&bank.budget, bank.bytes) catch platform.inference_process_supervisor.restartWorker();
+        endpoint.device_allocations.handoffToWithPurpose(&bank.budget, bank.bytes, .kv_state) catch platform.inference_process_supervisor.restartWorker();
         target.model = null;
         return bank;
     }
@@ -42747,7 +43086,7 @@ pub const ColdKvBank = struct {
     fn slicePlane(parent: buffer_mod.DeviceBuffer, slot: usize, stride: usize, length: usize) !buffer_mod.DeviceBuffer {
         const offset = try checkedMul(slot, stride);
         if (offset > parent.len or length > parent.len - offset or stride < length or stride % buffer_mod.DeviceBuffer.allocation_alignment != 0 or parent.ptr % buffer_mod.DeviceBuffer.allocation_alignment != 0) return error.InvalidDeviceCapacityLayout;
-        return .{ .ptr = try std.math.add(driver_mod.CUdeviceptr, parent.ptr, @intCast(offset)), .len = length, .borrowed = true };
+        return .{ .ptr = try std.math.add(driver_mod.CUdeviceptr, parent.ptr, @intCast(offset)), .len = length, .allocation_purpose = parent.allocation_purpose, .borrowed = true };
     }
     fn freeLayer(layer: *CudaKvLayer, endpoint: *context_mod.CudaContext, cleanup: *const Epoch) void {
         const planes = [_]*buffer_mod.DeviceBuffer{ &layer.k, &layer.v, &layer.block_table };
@@ -42797,7 +43136,7 @@ pub const ColdKvBank = struct {
             const layer = storage.layers.getPtr(try CudaKvDeviceStorage.key(if (self.mode == .shared_physical_pages) 0 else 1, layout.index)).?;
             if (current.row_width != layer.row_width or current.key_row_bytes != layer.key_row_bytes or current.base_key_row_bytes != layer.base_key_row_bytes or current.value_row_bytes != layer.value_row_bytes or current.compressed_format != layer.compressed_format or current.value_format != layer.value_format) return error.ColdKvStorageChanged;
         }
-        try self.budget.handoffTo(&compute.ctx.device_allocations, self.bytes);
+        try self.budget.handoffToWithPurpose(&compute.ctx.device_allocations, self.bytes, .kv_state);
         storage.compute = compute;
         self.phase = .adopted;
         runtime.setDeviceWriteHook(storage.hook());
@@ -42823,7 +43162,7 @@ pub const ColdKvBank = struct {
         var protection = model.beginClose();
         defer protection.deinit();
         var endpoint = openEndpoint(self.target.target.cuda) catch platform.inference_process_supervisor.restartWorker();
-        self.budget.handoffTo(&endpoint.device_allocations, self.bytes) catch platform.inference_process_supervisor.restartWorker();
+        self.budget.handoffToWithPurpose(&endpoint.device_allocations, self.bytes, .kv_state) catch platform.inference_process_supervisor.restartWorker();
         freePlanes(self.storage.?, self.parents, &endpoint, cleanup);
         if (self.parents.len != 0) self.allocator.free(self.parents);
         self.parents = &.{};
@@ -43011,6 +43350,9 @@ test "CUDA cold KV bank adopts into a different allocator and reuses sparse glob
     try std.testing.expectEqual(before.allocations, after.allocations);
     try std.testing.expectEqual(before.frees, after.frees);
     try std.testing.expectEqual(before.physical_live + (try F.bytes()), after.physical_live);
+    const kv_index = @backingInt(buffer_mod.DeviceBuffer.Purpose.kv_state);
+    try std.testing.expectEqual(before.purpose_live[kv_index] + (try F.bytes()), after.purpose_live[kv_index]);
+    try std.testing.expectEqual(@as(u64, 0), bank.budget.snapshot().purpose_live[kv_index]);
     try std.testing.expect(proof.covers(bank.snapshotCoverage()));
     // The bank's real strong model pin now owns its primary-context lifetime.
     owner.model.release();
@@ -43027,6 +43369,9 @@ test "CUDA cold KV bank adopts into a different allocator and reuses sparse glob
     for (F.geometry, 0..) |layout, index| {
         const layer = device.layers.get(layout.index).?;
         addresses[index] = .{ layer.k.ptr, layer.v.ptr, layer.block_table.ptr };
+        try std.testing.expectEqual(buffer_mod.DeviceBuffer.Purpose.kv_state, layer.k.allocation_purpose);
+        try std.testing.expectEqual(buffer_mod.DeviceBuffer.Purpose.kv_state, layer.v.allocation_purpose);
+        try std.testing.expectEqual(buffer_mod.DeviceBuffer.Purpose.kv_state, layer.block_table.allocation_purpose);
     }
     const allocations = owner.compute.ctx.device_allocations.snapshot().allocations;
     for (0..64) |turn| {
@@ -43053,6 +43398,7 @@ test "CUDA cold KV bank adopts into a different allocator and reuses sparse glob
     runtime.deinitWithBoundary(&epoch);
     runtime_live = false;
     admission.provider_gate.unlock();
+    try std.testing.expectEqual(before.purpose_live[kv_index], owner.compute.ctx.device_allocations.snapshot().purpose_live[kv_index]);
     arena.deinit();
     arena_live = false;
     backend.deinit();
@@ -43077,7 +43423,7 @@ test "CUDA cold KV preparation failure cleans each physical prefix without consu
             // A deterministic pre-call failure, with real successful CUDA
             // allocations before it. No expected SDK error logging is hidden.
             if (index == fail_at) return error.OutOfMemory;
-            return buffer_mod.DeviceBuffer.alloc(ctx, requested);
+            return buffer_mod.DeviceBuffer.allocWithPurpose(ctx, requested, .kv_state);
         }
     };
     const a = std.testing.allocator;
@@ -43298,7 +43644,7 @@ test "CUDA private coalesced cold KV allocation failures retire only complete pa
             const index = calls;
             calls += 1;
             if (index == fail_at) return error.OutOfMemory;
-            return buffer_mod.DeviceBuffer.alloc(ctx, requested);
+            return buffer_mod.DeviceBuffer.allocWithPurpose(ctx, requested, .kv_state);
         }
     };
     const a = std.testing.allocator;
@@ -44107,6 +44453,9 @@ const CompleteCudaProgramBudget = struct {
     open: bool = true,
 
     fn init(pool: *@import("../../execution/physical_buffers.zig").Pool, payload: usize, compute: *CudaCompute) !@This() {
+        return initForIO(pool, payload, payload, compute);
+    }
+    fn initForIO(pool: *@import("../../execution/physical_buffers.zig").Pool, input_bytes: usize, output_bytes: usize, compute: *CudaCompute) !@This() {
         const domain = try Domain.create();
         errdefer domain.release();
         var retirement = try sink.Ref.create();
@@ -44146,10 +44495,10 @@ const CompleteCudaProgramBudget = struct {
         // Exercise the public class-specific formula for EACH actual reduced/
         // packed physical plan, rather than repeating its arithmetic in a test.
         const session = @import("../../backends/session.zig");
-        const request = session.RunRequest{ .input_bytes = payload, .backend_input_bytes = payload, .output_bytes = payload };
+        const request = session.RunRequest{ .input_bytes = input_bytes, .backend_input_bytes = input_bytes, .output_bytes = output_bytes };
         var policy = session.RunAdmission{ .controller = &domain.controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 1024 * 1024 * 1024, .static_workspace_kind = .estimate, .opaque_workspace_bytes = 257, .check_live_memory = false };
         const plan = try policy.planRequest(request, &.{});
-        try std.testing.expectEqual(payload * 3, plan.protected.host_scratch_bytes);
+        try std.testing.expectEqual(input_bytes * 2 + output_bytes, plan.protected.host_scratch_bytes);
         try std.testing.expectEqual(@as(usize, 257), plan.opaque_compatibility.backend_scratch_bytes);
         policy.static_workspace_kind = .mandatory;
         const mandatory = try policy.planRequest(request, &.{});
@@ -44259,7 +44608,12 @@ fn qualifyCudaDirectModelTensorTaint(allocator: std.mem.Allocator, backend: *con
     try std.testing.expectEqualSlices(f32, expected, values);
 }
 
-fn qualifyCompleteCudaProgram(comptime format: enum { f32, f16, bf16, q4_0 }, comptime qualified_f32: bool) !void {
+const CompleteCudaProgramFormat = enum { f32, f16, bf16, q4_0 };
+fn qualifyCompleteCudaProgram(comptime format: CompleteCudaProgramFormat, comptime qualified_f32: bool, comptime activation_aliases: bool) !void {
+    return qualifyCompleteCudaProgramRecipe(format, qualified_f32, activation_aliases, .ordinary);
+}
+
+fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, comptime qualified_f32: bool, comptime activation_aliases: bool, comptime recipe: enum { ordinary, rows_w8, dequant_vendor }) !void {
     if (comptime !cuda_enabled) return error.SkipZigTest;
     const a = std.testing.allocator;
     const shared = @import("../../backends/compute_context.zig").SharedBackendContext.init(a, .cuda, null) catch |err| switch (err) {
@@ -44273,15 +44627,20 @@ fn qualifyCompleteCudaProgram(comptime format: enum { f32, f16, bf16, q4_0 }, co
     defer if (budget) |*value| value.deinit();
     const compute = shared.ctx.cuda;
     if (compute.ctx.info.compute_major < 8 or compute.cublaslt == null) return error.SkipZigTest;
+    if (recipe == .dequant_vendor and !cudaCublasLtEnabled()) return error.SkipZigTest;
     compute.strict_f32_weights = true;
     compute.qualified_span_fp32 = qualified_f32;
     compute.runtime_policy.workspace_bytes = if (qualified_f32) 32 * 1024 * 1024 else 8192;
     compute.tuned_route_gates.linear_q8_1_dp4a = true;
     compute.tuned_route_gates.q8_1_prefill_rows = true;
-    compute.tuned_route_gates.q4_0_tc_hmma_prefill = false;
+    compute.tuned_route_gates.q4_0_tc_hmma_prefill = recipe == .dequant_vendor;
+    compute.tuned_route_gates.q4_0_cublas_prefill = recipe == .dequant_vendor;
+    if (recipe == .dequant_vendor and (compute.kernels.dequant_q4_0_bf16 == null or compute.kernels.f32_to_bf16 == null)) return error.SkipZigTest;
+    compute.tuned_route_gates.linear_q8_1_tile4_w8 = recipe == .rows_w8;
+    compute.tuned_route_gates.linear_q8_1_tile4_w8_min_in_dim = 0;
     const cb = shared.computeBackend();
     const width = if (format == .q4_0) 256 else 64;
-    const rows = 128;
+    const rows = if (recipe == .rows_w8) 3 else 128;
     const ml = @import("ml");
     const Shape = ml.graph.Shape;
     const executable_mod = @import("../../execution/executable.zig");
@@ -44293,8 +44652,12 @@ fn qualifyCompleteCudaProgram(comptime format: enum { f32, f16, bf16, q4_0 }, co
     const x = try builder.parameter("x", Shape.init(.f32, &.{ rows, width }));
     const w = try builder.parameter("w", Shape.init(.f32, &.{ width, width }));
     const first = try builder.linearNoBias(x, w, rows, width, width);
-    var out = try builder.linearNoBias(try builder.absOp(first), w, rows, width, width);
+    const activation_input = if (activation_aliases) try builder.reshape(first, Shape.init(.f32, &.{rows * width})) else first;
+    const activated = try builder.absOp(activation_input);
+    const projection_input = if (activation_aliases) try builder.reshape(activated, Shape.init(.f32, &.{ rows, width })) else activated;
+    var out = try builder.linearNoBias(projection_input, w, rows, width, width);
     for (0..8) |_| out = try builder.add(out, x);
+    if (activation_aliases) out = try builder.reshape(out, Shape.init(.f32, &.{rows * width}));
     try graph.markOutput(out);
     var program = try Program.init(a, &graph, &.{ .{ .name = "x", .node_id = x, .kind = .input }, .{ .name = "w", .node_id = w, .kind = .weight }, .{ .name = "out", .node_id = out, .kind = .output } });
     defer program.deinit();
@@ -44351,10 +44714,24 @@ fn qualifyCompleteCudaProgram(comptime format: enum { f32, f16, bf16, q4_0 }, co
     };
     try std.testing.expectEqual(.device, witness.accounting_class);
     try std.testing.expect(witness.operations >= 3);
+    if (activation_aliases) try std.testing.expect(witness.aliases >= 1);
     const plane_selection = &routes.pool.selection.?;
     try std.testing.expect(!plane_selection.planes_witnessed[program.id_map[w]]);
     const first_projection = plane_selection.routes[program.id_map[first]] orelse return error.MissingProjectionRoute;
     try std.testing.expectEqual(@import("../../execution/kernel_route.zig").ValidationScope.invocation, first_projection.validation_scope);
+    const selected_program: *const PreparedCudaProjection = @ptrCast(@alignCast(first_projection.context));
+    if (recipe == .dequant_vendor) {
+        try std.testing.expectEqual(PreparedCudaProjection.Family.vendor_bf16, selected_program.profile.family);
+        try std.testing.expect(selected_program.profile.quantized == null and selected_program.cold_dense_recipe != null);
+        try std.testing.expectEqual(width * width * 2, selected_program.profile.dequant_weight_bytes);
+        try std.testing.expectEqual(rows * width * 2, selected_program.profile.conversion_bytes);
+        try std.testing.expectEqual(compute.runtime_policy.workspace_bytes, selected_program.profile.vendor_bytes);
+        try std.testing.expect(first_projection.requirements.probe_output == .none);
+    }
+    if (recipe == .rows_w8) {
+        try std.testing.expect(selected_program.profile.quantized != null);
+        try std.testing.expectEqual(kernels_mod.KernelModule.Q4_0Q8_1Recipe.Family.tile4_w8, selected_program.profile.quantized.?.activation_recipe.?.family);
+    }
     try std.testing.expectEqual(@import("../../execution/kernel_route.zig").OutputPlaneMetadata.assigned_dense, first_projection.output_plane_metadata);
     try std.testing.expect(plane_selection.planes_witnessed[program.id_map[first]]);
     var source_checked = false;
@@ -44421,7 +44798,7 @@ fn qualifyCompleteCudaProgram(comptime format: enum { f32, f16, bf16, q4_0 }, co
         // The original Q4 route quantizes activations to Q8_1 twice. With
         // unit-range samples, their combined rounding bound is 1/127;
         // ordinary/reduced identity kernels retain the tighter tolerance.
-        const tolerance: f32 = if (format == .q4_0) 1.0 / 127.0 + 0.002 else 0.002;
+        const tolerance: f32 = if (format == .q4_0 and recipe != .dequant_vendor) 1.0 / 127.0 + 0.002 else 0.002;
         for (actual, input.asFloat32()) |value, original| try std.testing.expectApproxEqAbs(projection_sign * @abs(original) + 8 * original, value, tolerance);
         if (iteration == 4) {
             held = result;
@@ -44452,7 +44829,7 @@ fn qualifyCompleteCudaProgram(comptime format: enum { f32, f16, bf16, q4_0 }, co
     {
         const recovery_values = try cb.toFloat32(recovery.outputs[0], a);
         defer a.free(recovery_values);
-        const recovery_tolerance: f32 = if (format == .q4_0) 1.0 / 127.0 + 0.002 else 0.002;
+        const recovery_tolerance: f32 = if (format == .q4_0 and recipe != .dequant_vendor) 1.0 / 127.0 + 0.002 else 0.002;
         for (recovery_values, input.asFloat32()) |value, original| try std.testing.expectApproxEqAbs(projection_sign * @abs(original) + 8 * original, value, recovery_tolerance);
         // One exact CUDA device is already proved by the witness. Keep its actual
         // process-owned backend value for output cleanup after Runtime teardown.
@@ -44484,6 +44861,18 @@ fn qualifyCompleteCudaProgram(comptime format: enum { f32, f16, bf16, q4_0 }, co
         try std.testing.expectEqual(before, compute.ctx.device_allocations.snapshot().allocations);
         try std.testing.expectEqual(@as(usize, 0), ReplayProbe.calls.load(.acquire));
         compute.resident_training_cache = false;
+        if (recipe == .dequant_vendor) {
+            compute.tuned_route_gates.q4_0_cublas_prefill = false;
+            defer compute.tuned_route_gates.q4_0_cublas_prefill = true;
+            if (executable.run(a, .{ .runtime_inputs = &weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() })) |unexpected| {
+                var cleanup = unexpected;
+                cleanup.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
+                return error.ExpectedDequantVendorPolicyRefusal;
+            } else |err| try std.testing.expectEqual(error.PreparedKernelBindingChanged, err);
+            try std.testing.expectEqual(before, compute.ctx.device_allocations.snapshot().allocations);
+            try std.testing.expectEqual(@as(usize, 0), ReplayProbe.calls.load(.acquire));
+            compute.tuned_route_gates.q4_0_cublas_prefill = true;
+        }
         routes.releaseWithCleanup(budget.?.cleanup());
         routes_live = false;
         executable.deinitWithCleanup(budget.?.cleanup());
@@ -44499,7 +44888,7 @@ fn qualifyCompleteCudaProgram(comptime format: enum { f32, f16, bf16, q4_0 }, co
     input.deinit();
     input_live = false;
     try budget.?.finishChecked();
-    if (format == .f32) try qualifyCudaDirectModelTensorTaint(a, &cb, weight, width, &identity);
+    if (format == .f32 and !activation_aliases) try qualifyCudaDirectModelTensorTaint(a, &cb, weight, width, &identity);
     {
         var alias_graph = ml.graph.Graph.init(a);
         defer alias_graph.deinit();
@@ -44515,8 +44904,8 @@ fn qualifyCompleteCudaProgram(comptime format: enum { f32, f16, bf16, q4_0 }, co
         const alias_pool = alias_executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
         const alias_routes = (try alias_pool.prepareRoutes(&.{.{ .node_id = alias_node, .value = .{ .imported_host = .{ .logical = alias_program.graph.node(alias_node).output_shape, .target = .cuda, .owned_ingress = true } } }})) orelse return error.MissingPreparedKernelRoute;
         defer alias_routes.release();
-        try std.testing.expect(alias_routes.pool.completeOwnedPayload() == null);
-        try std.testing.expectEqual(@import("../../execution/owned_coverage.zig").Reason.alias, alias_routes.pool.payload_coverage.compatibility);
+        const alias_witness = alias_routes.pool.completeOwnedPayload() orelse return error.MissingActivationAliasCoverage;
+        try std.testing.expectEqual(@as(usize, 1), alias_witness.aliases);
         var alias_host = try Tensor.initFloat32(a, "alias_input", &.{4}, &.{ -1, 2, -3, 4 });
         defer alias_host.deinit();
         const alias_ingress = [_]@import("../../execution/host_ingress.zig").Input{.{ .node_id = alias_node, .value = &alias_host }};
@@ -44531,10 +44920,10 @@ fn qualifyCompleteCudaProgram(comptime format: enum { f32, f16, bf16, q4_0 }, co
     }
 }
 test "complete CUDA ModelProgram assigned routes capture F32 reduced and packed input-aware storage with an independent oracle" {
-    inline for (.{ .f32, .f16, .bf16, .q4_0 }) |format| try qualifyCompleteCudaProgram(format, false);
+    inline for (.{ .f32, .f16, .bf16, .q4_0 }) |format| try qualifyCompleteCudaProgram(format, false, false);
     // Also exercise the qualified legacy F32 workspace allowance through
     // real assigned storage, exact admission boundaries and graph capture.
-    try qualifyCompleteCudaProgram(.f32, true);
+    try qualifyCompleteCudaProgram(.f32, true, false);
 }
 
 test "complete CUDA payload service vetoes copied custom tables before any context or tensor cast" {
@@ -44611,4 +45000,366 @@ test "CUDA prepared F32 vendor metadata preserves qualified workspace policy and
             try generic.validate(.{ .inputs = inputs, .output = slot });
         }
     };
+}
+
+test "complete CUDA activation aliases retain full spans under exact caps held output and capture" {
+    try qualifyCompleteCudaProgram(.f32, false, true);
+}
+
+test "CUDA private KV borrowed plane preserves purpose without duplicate ownership" {
+    const parent = buffer_mod.DeviceBuffer{ .ptr = 4096, .len = 1024, .allocation_bytes = 1024, .allocation_purpose = .kv_state };
+    var view = try ColdKvBank.slicePlane(parent, 1, 256, 128);
+    try std.testing.expectEqual(buffer_mod.DeviceBuffer.Purpose.kv_state, view.allocation_purpose);
+    try std.testing.expect(view.borrowed);
+    try std.testing.expectEqual(@as(usize, 0), view.allocation_bytes);
+    try std.testing.expectEqual(@as(usize, 0), try view.freeChecked(undefined));
+    try std.testing.expectEqual(@as(usize, 1024), parent.allocation_bytes);
+}
+
+test "CUDA prepared packed row leaf identity rejects symbol and live policy changes before dispatch" {
+    const a = std.testing.allocator;
+    const route = @import("../../execution/kernel_route.zig");
+    const Shape = @import("ml").graph.Shape;
+    var compute: CudaCompute = undefined;
+    initPreparedCudaMetadataFixture(&compute);
+    compute.tuned_route_gates.linear_q8_1_dp4a = true;
+    compute.tuned_route_gates.q8_1_prefill_rows = true;
+    compute.tuned_route_gates.linear_q8_1_tile4_w8 = true;
+    compute.tuned_route_gates.linear_q8_1_tile4_w8_min_in_dim = 0;
+    compute.kernels.linear_q4_0_q8_1_f32_tile4_w8_rows4 = @ptrFromInt(32);
+    compute.kernels.linear_q4_0_q8_1_f32_tile4_w8_rows2 = @ptrFromInt(48);
+    const Env = struct {
+        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+        extern "c" fn unsetenv([*:0]const u8) c_int;
+    };
+    const flag = "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE8";
+    const old = if (platform.env.getenv(flag)) |value| try a.dupeSentinel(u8, value, 0) else null;
+    defer if (old) |value| a.free(value);
+    defer if (old) |value| {
+        _ = Env.setenv(flag, value.ptr, 1);
+    } else {
+        _ = Env.unsetenv(flag);
+    };
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(flag, "0", 1));
+    var shape = [_]i64{ 256, 256 };
+    const bytes = 256 * 256 / 32 * 18;
+    var weight = CudaTensor{ .buffer = .{ .ptr = 4096, .len = bytes, .allocation_bytes = bytes }, .dtype = .u8, .shape = &shape, .elem_count = 256 * 256, .quant_type = .{ .known = .Q4_0 } };
+    const input_shape = Shape.init(.f32, &.{ 3, 256 });
+    const descriptor = ops.kernel_descriptor.Descriptor{ .operation = .{ .linear = .{ .rows = 3, .in_dim = 256, .out_dim = 256, .bias = false } }, .input_count = 2, .input_shapes = .{ input_shape, Shape.init(.f32, &shape), undefined }, .output_shape = input_shape };
+    const implementation = route.Implementation{ .context = &compute, .table = &vtable };
+    const facts = [_]route.Binding{ .{ .imported_host = .{ .logical = input_shape, .target = .cuda } }, .{ .tensor = .{ .value = @ptrCast(&weight), .implementation = implementation } } };
+    const slot = route.OutputSlot{ .allocation = 0, .node = 2, .epoch = 0, .logical = input_shape, .writable_bytes = 0 };
+    var selected = (try prepareKernelRouteOp(&compute, .{ .allocator = a, .implementation = implementation, .descriptor = &descriptor, .inputs = &facts, .output = slot })) orelse return error.MissingPackedRowRecipe;
+    defer selected.deinit();
+    const program: *const PreparedCudaProjection = @ptrCast(@alignCast(selected.context));
+    try std.testing.expectEqual(kernels_mod.Q4_0Q8_1PrefillRowsVariant.rows4, program.profile.quantized.?.row_variant);
+    try std.testing.expectEqual(@as(usize, 3 * (256 / 32) * 36), selected.requirements.workspace.byte_size);
+    compute.kernels.linear_q4_0_q8_1_f32_tile4_w8_rows4 = @ptrFromInt(64);
+    try std.testing.expectError(error.PreparedKernelBindingChanged, selected.validate(.{ .inputs = &facts, .output = slot }));
+    compute.kernels.linear_q4_0_q8_1_f32_tile4_w8_rows4 = null;
+    try std.testing.expectError(error.PreparedKernelBindingChanged, selected.validate(.{ .inputs = &facts, .output = slot }));
+    compute.kernels.linear_q4_0_q8_1_f32_tile4_w8_rows4 = @ptrFromInt(32);
+    try selected.validate(.{ .inputs = &facts, .output = slot });
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(flag, "1", 1));
+    try std.testing.expectError(error.PreparedKernelBindingChanged, selected.validate(.{ .inputs = &facts, .output = slot }));
+}
+
+test "complete CUDA ModelProgram span packed bias owns exact output banks through capture caps policy changes and held close" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const shared = @import("../../backends/compute_context.zig").SharedBackendContext.init(a, .cuda, null) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer shared.release();
+    var budget: ?CompleteCudaProgramBudget = null;
+    defer if (budget) |*value| value.deinit();
+    const compute = shared.ctx.cuda;
+    const cb = shared.computeBackend();
+    const Env = struct {
+        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+        extern "c" fn unsetenv([*:0]const u8) c_int;
+    };
+    const variant_flag = "ANTFLY_CUDA_QMATMUL_VARIANT";
+    const disabled_flag = "TERMITE_CUDA_DISABLE_GLINER_SPAN_Q4_KERNELS";
+    const old_variant = if (platform.env.getenv(variant_flag)) |value| try a.dupeSentinel(u8, value, 0) else null;
+    defer if (old_variant) |value| a.free(value);
+    const old_disabled = if (platform.env.getenv(disabled_flag)) |value| try a.dupeSentinel(u8, value, 0) else null;
+    defer if (old_disabled) |value| a.free(value);
+    defer if (old_variant) |value| {
+        _ = Env.setenv(variant_flag, value.ptr, 1);
+    } else {
+        _ = Env.unsetenv(variant_flag);
+    };
+    defer if (old_disabled) |value| {
+        _ = Env.setenv(disabled_flag, value.ptr, 1);
+    } else {
+        _ = Env.unsetenv(disabled_flag);
+    };
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(variant_flag, "legacy", 1));
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(disabled_flag, "0", 1));
+    if (!cudaGlinerSpanQ4KernelsEnabled() or !compute.kernels.hasGlinerSpanQ4KPrimitives()) return error.SkipZigTest;
+    const rows = 3;
+    const width = 768;
+    const columns = 3072;
+    const ml = @import("ml");
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const x = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{ rows, width }));
+    const w = try builder.parameter("w", ml.graph.Shape.init(.f32, &.{ columns, width }));
+    const b = try builder.parameter("b", ml.graph.Shape.init(.f32, &.{columns}));
+    const projected = try builder.linear(x, w, b, rows, width, columns);
+    const activated = try builder.absOp(projected);
+    const output = try builder.reshape(try builder.neg(activated), ml.graph.Shape.init(.f32, &.{rows * columns}));
+    try graph.markOutput(output);
+    var program = try @import("../../execution/program.zig").ModelProgram.init(a, &graph, &.{ .{ .name = "x", .node_id = x, .kind = .input }, .{ .name = "w", .node_id = w, .kind = .weight }, .{ .name = "b", .node_id = b, .kind = .weight } });
+    defer program.deinit();
+    const weight_values = try a.alloc(f32, width * columns);
+    defer a.free(weight_values);
+    for (weight_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 7)) - 3)) / 16;
+    const encoded = try quant_codec.quantizeQ4_KFromF32(a, weight_values);
+    defer a.free(encoded);
+    const decoded = try a.alloc(f32, width * columns);
+    defer a.free(decoded);
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q4_K }, encoded, decoded);
+    var device_weight = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, encoded.len);
+    var device_live = true;
+    defer if (device_live) device_weight.free(&compute.ctx);
+    try device_weight.copyFromHost(&compute.ctx, encoded);
+    const shape = try a.dupe(i64, &.{ columns, width });
+    const weight = createTensorWithDType(compute, device_weight, shape, width * columns, .u8) catch |err| {
+        a.free(shape);
+        return err;
+    };
+    device_live = false;
+    defer cb.free(weight);
+    tensorFromCt(weight).quant_type = .{ .known = .Q4_K };
+    var bias_values: [columns]f32 = undefined;
+    for (&bias_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 5)) / 32;
+    const bias = try cb.fromFloat32Shape(&bias_values, &.{columns});
+    defer cb.free(bias);
+    const route = @import("../../execution/kernel_route.zig");
+    const implementation = route.Implementation{ .context = compute, .table = cb.vtable };
+    const facts = [_]route.InputBinding{ .{ .node_id = program.id_map[w], .value = .{ .tensor = .{ .value = weight, .implementation = implementation } } }, .{ .node_id = program.id_map[b], .value = .{ .tensor = .{ .value = bias, .implementation = implementation } } } };
+    var executable = try @import("../../execution/executable.zig").prepareWithOptions(a, &program, &cb, .partitioned, .{ .immutable_input_bindings = &facts });
+    var executable_live = true;
+    defer if (executable_live) executable.deinitWithCleanup(if (budget) |*value| value.cleanup() else .{});
+    const input_node = program.id_map[x];
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const routes = (try pool.prepareRoutes(&.{.{ .node_id = input_node, .value = .{ .imported_host = .{ .logical = program.graph.node(input_node).output_shape, .target = .cuda, .owned_ingress = true } } }})) orelse return error.MissingPreparedKernelRoute;
+    var routes_live = true;
+    defer if (routes_live) routes.releaseWithCleanup(if (budget) |*value| value.cleanup() else .{});
+    const witness = routes.pool.completeOwnedPayload() orelse return error.MissingCompleteCudaPayload;
+    try std.testing.expectEqual(.device, witness.accounting_class);
+    try std.testing.expect(witness.operations >= 3 and witness.aliases >= 1);
+    const selected = routes.pool.preparedKernelRoute(program.id_map[projected]).?;
+    const owner: *const PreparedCudaProjection = @ptrCast(@alignCast(selected.context));
+    try std.testing.expectEqual(PreparedCudaProjection.Packed.Kind.q4k_span, owner.profile.quantized.?.kind);
+    try std.testing.expectEqual(@as(usize, 0), selected.requirements.workspace.byte_size);
+    budget = try CompleteCudaProgramBudget.initForIO(routes.pool, rows * width * 4, rows * columns * 4, compute);
+    const Tensor = @import("../../backends/tensor.zig").Tensor;
+    var input_values: [rows * width]f32 = undefined;
+    @memset(&input_values, 0);
+    var input = try Tensor.initFloat32(a, "x", &.{ rows, width }, &input_values);
+    defer input.deinit();
+    const host = [_]@import("../../execution/host_ingress.zig").Input{.{ .node_id = input_node, .value = &input }};
+    const weights = [_]@import("../../graph/interpreter.zig").RuntimeInput{ .{ .node_id = program.id_map[w], .value = weight, .source_backend = &cb }, .{ .node_id = program.id_map[b], .value = bias, .source_backend = &cb } };
+    var held: ?@import("../../graph/runtime.zig").Result = null;
+    defer if (held) |*value| value.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
+    var captures: u64 = 0;
+    var replays: u64 = 0;
+    var warm: ?@TypeOf(compute.ctx.device_allocations.snapshot()) = null;
+    for (0..5) |iteration| {
+        for (input.asFloat32Mut(), 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 11)) - 5 + @as(i32, @intCast(iteration)))) / 16;
+        var result = try executable.run(a, .{ .runtime_inputs = &weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability(), .collect_partition_stats = true, .activation_readbacks = .forbidden });
+        var result_live = true;
+        defer if (result_live) result.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
+        captures += result.stats.physical_graph_captures;
+        replays += result.stats.physical_graph_replays;
+        const actual = try cb.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        for (actual, 0..) |value, index| {
+            const row = index / columns;
+            const column = index % columns;
+            var sum: f32 = 0;
+            for (0..width) |k| sum += input.asFloat32()[row * width + k] * decoded[column * width + k];
+            const expected = -@abs(sum + bias_values[column]);
+            try std.testing.expectApproxEqAbs(expected, value, 0.002);
+        }
+        if (warm) |expected| try std.testing.expectEqualDeep(expected, compute.ctx.device_allocations.snapshot()) else warm = compute.ctx.device_allocations.snapshot();
+        if (iteration == 4) {
+            result.owner_backend = cb;
+            held = result;
+            result_live = false;
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 1), captures);
+    try std.testing.expect(replays >= 2);
+    const before = compute.ctx.device_allocations.snapshot();
+    if (executable.run(a, .{ .runtime_inputs = &weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() })) |unexpected| {
+        var result = unexpected;
+        result.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
+        return error.ExpectedHeldSpanBankRefusal;
+    } else |err| try std.testing.expect(err == error.UnpreparedPhysicalStorageReservation or err == error.PhysicalFrameUnavailable or err == error.QueueFull);
+    try std.testing.expectEqualDeep(before, compute.ctx.device_allocations.snapshot());
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(disabled_flag, "1", 1));
+    {
+        var metadata = try @import("../../execution/backend_operation.zig").enter(cb, &program.graph, null, .metadata);
+        defer metadata.deinitChecked() catch unreachable;
+        try std.testing.expectError(error.PreparedKernelBindingChanged, selected.validate(.{ .inputs = &.{ .{ .imported_host = .{ .logical = program.graph.node(input_node).output_shape, .target = .cuda, .owned_ingress = true } }, facts[0].value, facts[1].value }, .output = owner.slot }));
+    }
+    try std.testing.expectEqualDeep(before, compute.ctx.device_allocations.snapshot());
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(disabled_flag, "0", 1));
+    routes.releaseWithCleanup(budget.?.cleanup());
+    routes_live = false;
+    executable.deinitWithCleanup(budget.?.cleanup());
+    executable_live = false;
+    try std.testing.expect(budget.?.domain.controller.snapshot().backend_scratch_bytes >= budget.?.physical.backend_scratch_bytes);
+    const after_close = try cb.toFloat32(held.?.outputs[0], a);
+    defer a.free(after_close);
+    try std.testing.expectEqual(@as(usize, rows * columns), after_close.len);
+    held.?.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
+    held = null;
+    try budget.?.finishChecked();
+}
+
+test "complete CUDA ModelProgram packed row recipe retains exact caps held outputs and immutable capture after vendor eviction" {
+    try qualifyCompleteCudaProgramRecipe(.q4_0, false, true, .rows_w8);
+}
+
+test "CUDA prepared packed recipes retain compatibility for unqualified dequant vendor acceptance before allocation" {
+    const a = std.testing.allocator;
+    const route = @import("../../execution/kernel_route.zig");
+    const Shape = @import("ml").graph.Shape;
+    var compute: CudaCompute = undefined;
+    initPreparedCudaMetadataFixture(&compute);
+    compute.tuned_route_gates.q4_0_tc_hmma_prefill = true;
+    compute.tuned_route_gates.q4_0_cublas_prefill = true;
+    compute.kernels.dequant_q4_0_bf16 = @ptrFromInt(32);
+    compute.kernels.linear_q4_0_f32_tc_hmma_bf16 = @ptrFromInt(48);
+    const bytes = 256 * 256 / 32 * 18;
+    var weight_shape = [_]i64{ 256, 256 };
+    var weight = CudaTensor{ .buffer = .{ .ptr = 4096, .len = bytes, .allocation_bytes = bytes }, .dtype = .u8, .shape = &weight_shape, .elem_count = 256 * 256, .quant_type = .{ .known = .Q4_0 }, .tc_quant = .{ .layout = .q4_0_hmma, .buffer = .{ .ptr = 8192, .len = bytes, .allocation_bytes = bytes }, .row_blocks = 8, .bytes = bytes } };
+    for ([_]usize{ 127, 128, 129 }) |rows| {
+        const input_shape = Shape.init(.f32, &.{ @intCast(rows), 256 });
+        const descriptor = ops.kernel_descriptor.Descriptor{ .operation = .{ .linear = .{ .rows = rows, .in_dim = 256, .out_dim = 256, .bias = false } }, .input_count = 2, .input_shapes = .{ input_shape, Shape.init(.f32, &weight_shape), undefined }, .output_shape = input_shape };
+        const implementation = route.Implementation{ .context = &compute, .table = &vtable };
+        const facts = [_]route.Binding{ .{ .imported_host = .{ .logical = input_shape, .target = .cuda } }, .{ .tensor = .{ .value = @ptrCast(&weight), .implementation = implementation } } };
+        const slot = route.OutputSlot{ .allocation = 0, .node = 2, .epoch = 0, .logical = input_shape, .writable_bytes = 0 };
+        if (rows < 128) {
+            var selected = (try prepareKernelRouteOp(&compute, .{ .allocator = a, .implementation = implementation, .descriptor = &descriptor, .inputs = &facts, .output = slot })) orelse return error.MissingTensorCorePackedRoute;
+            defer selected.deinit();
+            try std.testing.expectEqual(@as(usize, 0), selected.requirements.workspace.byte_size);
+        } else {
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+            if (try prepareKernelRouteOp(&compute, .{ .allocator = failing.allocator(), .implementation = implementation, .descriptor = &descriptor, .inputs = &facts, .output = slot })) |unexpected| {
+                var selected = unexpected;
+                selected.deinit();
+                return error.ExpectedUnqualifiedVendorDecline;
+            }
+            try std.testing.expect(!failing.has_induced_failure);
+        }
+    }
+}
+
+test "CUDA stage snapshots preserve actual F32 BF16 planes and reject copied tables before context" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = CudaCompute.init(a) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var copied = cb.vtable.*;
+    const forged = ops.ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &copied };
+    try std.testing.expectError(error.UnsupportedEmbeddingStage, CudaCompute.quiesceEmbeddingStage(&forged, &compute));
+    try std.testing.expectError(error.UnsupportedEmbeddingStage, CudaCompute.escapeEmbeddingStage(&forged, @ptrFromInt(32), null));
+    const raw = [_]u16{ 0x3f80, 0x4000, 0x4040, 0x4080 };
+    for ([_]tensor_mod.DType{ .f32, .bf16 }) |dtype| {
+        const source = try compute.createEmbeddingGemma2Tensor(&.{ 2, 2 }, dtype);
+        defer cb.free(source);
+        const original = tensorFromCt(source);
+        if (dtype == .f32) {
+            try copyFromHostTracked(&compute, original.buffer, std.mem.sliceAsBytes(&[_]f32{ 1, 2, 3, 4 }));
+            original.bf16_mirror = try allocStageMirrorForTest(&compute, std.mem.sliceAsBytes(&raw));
+        } else try copyFromHostTracked(&compute, original.buffer, std.mem.sliceAsBytes(&raw));
+        // An actual non-owning arena-style dense descriptor is snapshotted
+        // through the same raw plane copy; its real allocation remains owned
+        // by source until after checked completion.
+        var view = original.*;
+        view.buffer.borrowed = true;
+        view.owns_buffer = false;
+        view.owned_by_tensor = false;
+        var stats = CudaCompute.StageCopyStats{};
+        const result = try CudaCompute.escapeEmbeddingStage(&cb, @ptrCast(&view), &stats);
+        defer cb.free(result);
+        const output = tensorFromCt(result);
+        try std.testing.expectEqual(dtype, output.dtype);
+        try std.testing.expect(!output.buffer.borrowed and output.buffer.allocation_bytes >= try dtype.byteCount(4));
+        try std.testing.expect(output.buffer.ptr != original.buffer.ptr);
+        try std.testing.expectEqual(@as(usize, if (dtype == .f32) 24 else 8), stats.bytes);
+        try CudaCompute.quiesceEmbeddingStage(&cb, &compute);
+        try cb.beginRequest(); // Actual shared-compute peer boundary.
+        const actual = try cb.toFloat32(result, a);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, actual);
+        if (dtype == .f32) {
+            try std.testing.expect(output.bf16_mirror.ptr != original.bf16_mirror.ptr);
+            var values: [4]u16 = undefined;
+            try output.bf16_mirror.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&values));
+            try std.testing.expectEqualSlices(u16, &raw, &values);
+        }
+        compute.debug_cuda_graph_capture_active = true;
+        try std.testing.expectError(error.EmbeddingStageBusy, CudaCompute.escapeEmbeddingStage(&cb, source, null));
+        compute.debug_cuda_graph_capture_active = false;
+        original.quant_type = .{ .known = .Q8_0 };
+        try std.testing.expectError(error.UnsupportedCudaStageTensor, CudaCompute.escapeEmbeddingStage(&cb, source, null));
+        original.quant_type = null;
+    }
+}
+fn allocStageMirrorForTest(compute: *CudaCompute, bytes: []const u8) !buffer_mod.DeviceBuffer {
+    var mirror = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, bytes.len);
+    errdefer mirror.free(&compute.ctx);
+    try copyFromHostTracked(compute, mirror, bytes);
+    return mirror;
+}
+
+test "CUDA stage refuses actual unflagged stream capture before allocation or synchronization" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    var compute = CudaCompute.init(std.testing.allocator) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer compute.deinit();
+    if (compute.ctx.driver.fns.cuStreamIsCapturing == null) return error.SkipZigTest;
+    const cb = compute.computeBackend();
+    try compute.ctx.synchronize();
+    const syncs = compute.ctx.stats.stream_syncs;
+    const allocation_before = compute.ctx.device_allocations.snapshot();
+    try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
+    var capturing = true;
+    defer if (capturing) {
+        compute.ctx.debug_graph_capture_active = true;
+        const graph = compute.ctx.endStreamCapture() catch platform.inference_process_supervisor.restartWorker();
+        compute.ctx.destroyGraph(graph);
+    };
+    compute.ctx.debug_graph_capture_active = false;
+    compute.debug_cuda_graph_capture_active = false;
+    try std.testing.expectError(error.EmbeddingStageBusy, CudaCompute.quiesceEmbeddingStage(&cb, &compute));
+    // The invalid payload address cannot be inspected on a capture decline.
+    try std.testing.expectError(error.EmbeddingStageBusy, CudaCompute.escapeEmbeddingStage(&cb, @ptrFromInt(32), null));
+    try std.testing.expectEqual(syncs, compute.ctx.stats.stream_syncs);
+    try std.testing.expectEqualDeep(allocation_before, compute.ctx.device_allocations.snapshot());
+    try std.testing.expect(try compute.ctx.streamCaptureActive());
+    compute.ctx.debug_graph_capture_active = true;
+    const graph = try compute.ctx.endStreamCapture();
+    capturing = false;
+    defer compute.ctx.destroyGraph(graph);
+    try CudaCompute.quiesceEmbeddingStage(&cb, &compute);
+}
+
+test "CUDA cold dequant vendor recipe preserves public exact caps independent oracle held output and capture" {
+    try qualifyCompleteCudaProgramRecipe(.q4_0, false, true, .dequant_vendor);
 }

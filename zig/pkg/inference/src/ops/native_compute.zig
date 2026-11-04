@@ -22,6 +22,26 @@ const platform = @import("antfly_platform");
 const ops = @import("ops.zig");
 const kernel_geometry = @import("kernel_geometry.zig");
 const linalg = @import("inference_linalg");
+// Values cross the joined worker boundary; observation never enters a worker's
+// TLS or numerical loop. Defers retain partial evidence on cancellation.
+fn observedPreparedGemm(io: ?std.Io, m: usize, panels: linalg.prepared_gemm.Panels, input: []const f32, output: []f32) std.Io.Cancelable!void {
+    const observation = @import("../execution/runtime_observation.zig");
+    if (!observation.kernelEnabled()) return linalg.sgemmPrepared(io, m, panels, input, output);
+    var evidence: linalg.PreparedObservation = .{};
+    defer observation.nativePreparedWorkers(evidence);
+    try linalg.sgemmPreparedObserved(io, m, panels, input, output, &evidence);
+}
+// The submitting thread publishes only values returned by the existing joined
+// attention program. This branch owns no observation storage when disabled.
+inline fn observedAttention(comptime plain: anytype, comptime measured: anytype, args: anytype) @TypeOf(@call(.auto, plain, args)) {
+    if (!@import("../execution/runtime_observation.zig").kernelEnabled()) return @call(.auto, plain, args);
+    return observedAttentionValues(measured, args);
+}
+noinline fn observedAttentionValues(comptime measured: anytype, args: anytype) @TypeOf(@call(.auto, measured, args ++ .{@as(?*linalg.AttentionObservation, null)})) {
+    var evidence: linalg.AttentionObservation = .{};
+    defer @import("../execution/runtime_observation.zig").nativeAttentionPrograms(evidence);
+    return @call(.auto, measured, args ++ .{@as(?*linalg.AttentionObservation, &evidence)});
+}
 const backend_contracts = @import("../graph/backend_contracts.zig");
 const quant_matmul = @import("../graph/quant_matmul.zig");
 const AttentionContext = ops.AttentionContext;
@@ -4813,7 +4833,7 @@ const kernel_backend_impl: ops.KernelBackend = .{
     .storageOwnership = &storageOwnershipOp,
     .registerTensorOwnershipObservation = &registerTensorOwnershipObservationOp,
     .physicalTensorView = &physicalTensorViewOp,
-    .allocatePhysicalStorage = &allocateNativePhysicalStorageOp,
+    .physical_storage_policy = &physical_storage_policy,
     .runAssignedKernel = &runAssignedKernelOp,
     .writePhysicalFloat32 = &writePhysicalFloat32Op,
     .copyPhysicalInput = &copyPhysicalInputOp,
@@ -7428,17 +7448,44 @@ fn packedGeluMultiplyOp(ctx: *anyopaque, input: CT, rows: usize, width: usize) a
                 job.failure = err;
             };
         }
+        pub fn runValue(job: *@This(), values: *activations_mod.ActivationValues) void {
+            job.executeValue(values) catch |err| {
+                job.failure = err;
+            };
+        }
         fn execute(job: *@This()) !void {
+            return executeBody(false, job, {});
+        }
+        noinline fn executeValue(job: *@This(), values: *activations_mod.ActivationValues) !void {
+            return executeBody(true, job, values);
+        }
+        inline fn executeBody(comptime observing: bool, job: *@This(), values: if (observing) *activations_mod.ActivationValues else void) !void {
             for (job.first..job.last) |row| {
                 if (job.io) |io| try io.checkCancel();
-                try activations_mod.geluMultiplyIo(null, job.source[row * job.width * 2 ..][0..job.width], job.source[row * job.width * 2 + job.width ..][0..job.width], job.output[row * job.width ..][0..job.width]);
+                if (comptime observing) try activations_mod.geluMultiplyIoValue(null, job.source[row * job.width * 2 ..][0..job.width], job.source[row * job.width * 2 + job.width ..][0..job.width], job.output[row * job.width ..][0..job.width], values) else try activations_mod.geluMultiplyIoUnobserved(null, job.source[row * job.width * 2 ..][0..job.width], job.source[row * job.width * 2 + job.width ..][0..job.width], job.output[row * job.width ..][0..job.width]);
             }
         }
     };
+    if (comptime builtin.is_test) {
+        const OriginalWork = struct {
+            io: ?std.Io,
+            source: []const f32,
+            output: []f32,
+            width: usize,
+            first: usize,
+            last: usize,
+            failure: ?anyerror = null,
+        };
+        if (@sizeOf(Work) != @sizeOf(OriginalWork) or @alignOf(Work) != @alignOf(OriginalWork)) @compileError("ordinary packed GELU Work gained metadata");
+        const legacy_run: *const fn (*Work) void = Work.run;
+        const legacy_execute: *const fn (*Work) anyerror!void = Work.execute;
+        _ = legacy_run;
+        _ = legacy_execute;
+    }
     const workers: usize = if (self.io != null and data.len >= 262144) 4 else 1;
     var jobs: [4]Work = undefined;
     for (jobs[0..workers], 0..) |*job, index| job.* = .{ .io = self.io, .source = source, .output = data, .width = width, .first = rows * index / workers, .last = rows * (index + 1) / workers };
-    if (workers == 1) jobs[0].run() else {
+    if (@import("../execution/runtime_observation.zig").kernelEnabled()) try observedPackedActivation(Work, self.io, jobs[0..workers]) else if (workers == 1) jobs[0].run() else {
         var group: std.Io.Group = .init;
         defer group.cancel(self.io.?);
         for (jobs[0..workers]) |*job| group.async(self.io.?, Work.run, .{job});
@@ -8001,6 +8048,8 @@ fn embeddingGemma2VisionAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, batch:
         pub const dense_key_block = 2048;
         pub const sgemmTransBSync = native.sgemmTransBSync;
         pub const sgemmSync = native.sgemmSync;
+        pub const sgemmSyncValue = native.sgemmSyncValue;
+        pub const sgemmTransBSyncValue = native.sgemmTransBSyncValue;
     };
     const calibrate = native.useBlas() and sequence >= 256 and heads == 12 and dim == 64 and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_ATTENTION_CALIBRATION");
     const ticket = if (calibrate) dense_vision_tiles.begin(.{ .batch = batch, .sequence = sequence, .heads = heads, .dim = dim }) else DenseVisionTiles.Ticket{};
@@ -8008,11 +8057,11 @@ fn embeddingGemma2VisionAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, batch:
     var completed = false;
     defer if (ticket.slot != null) dense_vision_tiles.finish(ticket, if (completed) platform.time.monotonicNs() - started else null);
     const output = if (native.useBlas() and ticket.policy == 1)
-        try linalg.denseAttentionHostWithGemmIo(WideKeys, self.allocator, self.io, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), batch, sequence, heads, dim)
+        try observedAttention(linalg.denseAttentionHostWithGemmIo, linalg.denseAttentionHostWithGemmIoObserved, .{ WideKeys, self.allocator, self.io, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), batch, sequence, heads, dim })
     else if (native.useBlas())
-        try linalg.denseAttentionHostWithGemmIo(native.SegmentAttentionGemm, self.allocator, self.io, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), batch, sequence, heads, dim)
+        try observedAttention(linalg.denseAttentionHostWithGemmIo, linalg.denseAttentionHostWithGemmIoObserved, .{ native.SegmentAttentionGemm, self.allocator, self.io, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), batch, sequence, heads, dim })
     else
-        try linalg.denseAttentionPortableHostWithIo(self.allocator, self.io, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), batch, sequence, heads, dim);
+        try observedAttention(linalg.denseAttentionPortableHostWithIo, linalg.denseAttentionPortableHostWithIoObserved, .{ self.allocator, self.io, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), batch, sequence, heads, dim });
     const tensor = try self.makeOwnedBuf(output);
     errdefer freeTensor(self, tensor);
     const result = try self.withLogicalShape(tensor, &shape);
@@ -8114,19 +8163,7 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
         (mask.len == 0 or mask.len >= effective_batch * effective_seq_len) and
         (bias == null or bias.?.len == bias_seq_len or bias.?.len == bias_shared_len or bias.?.len == bias_batched_len);
     if (flash_eligible) {
-        const flash_output = try linalg.flashAttentionHostWithIo(
-            self.allocator,
-            self.io,
-            q_data,
-            k_data,
-            v_data,
-            bias,
-            mask,
-            effective_batch,
-            effective_seq_len,
-            num_heads,
-            head_dim,
-        );
+        const flash_output = try observedAttention(linalg.flashAttentionHostWithIo, linalg.flashAttentionHostWithIoObserved, .{ self.allocator, self.io, q_data, k_data, v_data, bias, mask, effective_batch, effective_seq_len, num_heads, head_dim });
         var raw_flash_output: ?[]f32 = flash_output;
         errdefer if (raw_flash_output) |raw| self.allocator.free(raw);
         if (token_major) {
@@ -8365,10 +8402,20 @@ fn canonicalCpuPanels(self: *NativeCompute, names: []const []const u8, k: usize)
 }
 
 fn canonicalPanelLinear(self: *NativeCompute, input: CT, weight: CT, output: []f32, rows: usize, k: usize, n: usize) !bool {
-    if (native.useBlas() or !self.cache_embeddinggemma2_bf16_weights or k < 64 or n < 64) return false;
+    const observed = @import("../execution/runtime_observation.zig");
+    if (native.useBlas() or !self.cache_embeddinggemma2_bf16_weights or k < 64 or n < 64) {
+        observed.nativeFallback(.canonical_panel_projection, .projection_eligibility_policy_or_shape);
+        return false;
+    }
     const buf = toBuf(weight);
-    if (weightOrigin(buf) == null or weightData(self, buf) != self.data) return false;
-    if (buf.name.len == 0 or buf.view_strides != null) return false;
+    if (weightOrigin(buf) == null or weightData(self, buf) != self.data) {
+        observed.nativeFallback(.canonical_panel_projection, .incompatible_weight_owner_or_layout);
+        return false;
+    }
+    if (buf.name.len == 0 or buf.view_strides != null) {
+        observed.nativeFallback(.canonical_panel_projection, .incompatible_weight_owner_or_layout);
+        return false;
+    }
     var storage: [3][256]u8 = undefined;
     var names_buf: [3][]const u8 = undefined;
     var start = buf.source_row;
@@ -8384,12 +8431,25 @@ fn canonicalPanelLinear(self: *NativeCompute, input: CT, weight: CT, output: []f
         break :blk siblings;
     } else &.{buf.name};
     const panels = (canonicalCpuPanels(self, names, k) catch |err| switch (err) {
-        error.OutOfMemory, error.MemoryBudgetExceeded => return false,
+        error.OutOfMemory => {
+            observed.nativeFallback(.canonical_panel_projection, .panel_preparation_out_of_memory);
+            return false;
+        },
+        error.MemoryBudgetExceeded => {
+            observed.nativeFallback(.canonical_panel_projection, .panel_memory_budget_exceeded);
+            return false;
+        },
         else => return err,
-    }) orelse return false;
-    if (start % 64 != 0 or start > panels.n or n > panels.n - start) return false;
+    }) orelse {
+        observed.nativeFallback(.canonical_panel_projection, .required_cached_panels_unavailable);
+        return false;
+    };
+    if (start % 64 != 0 or start > panels.n or n > panels.n - start) {
+        observed.nativeFallback(.canonical_panel_projection, .panel_slice_alignment_or_extent);
+        return false;
+    }
     const view = linalg.prepared_gemm.Panels{ .data = panels.data[start / 64 * k * 64 ..][0 .. (try linalg.prepared_gemm.Panels.bytes(n, k)) / 4], .n = n, .k = k };
-    try linalg.sgemmPrepared(self.io, rows, view, getData(input), output);
+    try observedPreparedGemm(self.io, rows, view, getData(input), output);
     return true;
 }
 
@@ -8471,13 +8531,23 @@ fn cachedImmutableDensePanels(self: *NativeCompute, source: []const f32, n: usiz
     return panels;
 }
 fn preparedDenseLinear(self: *NativeCompute, input: []const f32, source: []const f32, output: []f32, m: usize, n: usize, k: usize) !bool {
+    const observed = @import("../execution/runtime_observation.zig");
     // Direct dot products remain preferable for tiny row counts.
-    if (!dense_projection_policy.preparedRows(m, k, n, native.useBlas())) return false;
+    if (!dense_projection_policy.preparedRows(m, k, n, native.useBlas())) {
+        observed.nativeFallback(.prepared_dense_projection, .projection_eligibility_policy_or_shape);
+        return false;
+    }
     const panels = (cachedImmutableDensePanels(self, source, n, k) catch |err| switch (err) {
-        error.OutOfMemory => return false,
+        error.OutOfMemory => {
+            observed.nativeFallback(.prepared_dense_projection, .panel_preparation_out_of_memory);
+            return false;
+        },
         else => return err,
-    }) orelse return false;
-    try linalg.sgemmPrepared(self.io, m, panels, input, output);
+    }) orelse {
+        observed.nativeFallback(.prepared_dense_projection, .required_cached_panels_unavailable);
+        return false;
+    };
+    try observedPreparedGemm(self.io, m, panels, input, output);
     return true;
 }
 
@@ -9004,7 +9074,7 @@ fn linearPackedNamedOp(ctx: *anyopaque, input: CT, names: []const []const u8, wi
         if (panels.n != total) return error.InvalidTensorShape;
         const output = try self.allocator.alloc(f32, rows * total);
         errdefer self.allocator.free(output);
-        try linalg.sgemmPrepared(self.io, rows, panels, getData(input), output);
+        try observedPreparedGemm(self.io, rows, panels, getData(input), output);
         return makeLinearNoBiasResult(self, output, rows, total);
     }
     const joined = try std.mem.join(self.allocator, "|", names);
@@ -12219,6 +12289,13 @@ fn dispatchAndCheckQuantWorkers(
     jobs: []const linalg.pool.Job,
     contexts: anytype,
 ) !void {
+    if (!@import("../execution/runtime_observation.zig").kernelEnabled()) return dispatchAndCheckQuantWorkersBody(io, jobs, contexts);
+    return observeQuantWorkerBatch(io, jobs, contexts);
+}
+
+// No proxy/context/record storage on the disabled path. The original pool and
+// context-error tail remain shared, preserving cancellation/error precedence.
+fn dispatchAndCheckQuantWorkersBody(io: ?std.Io, jobs: []const linalg.pool.Job, contexts: anytype) !void {
     if (io) |runtime_io| {
         try linalg.pool.dispatchJobsIo(runtime_io, jobs);
     } else {
@@ -12227,6 +12304,44 @@ fn dispatchAndCheckQuantWorkers(
     for (contexts) |ctx| {
         if (ctx.err) |err| return err;
     }
+}
+
+const QuantWorkerObservationSlot = struct {
+    original: linalg.pool.Job,
+    entered: bool = false,
+    returned: bool = false,
+    fn run(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.entered = true;
+        defer self.returned = true;
+        self.original.fn_ptr(self.original.ctx);
+    }
+};
+noinline fn observeQuantWorkerBatch(io: ?std.Io, jobs: []const linalg.pool.Job, contexts: anytype) !void {
+    const observed = @import("../execution/runtime_observation.zig");
+    if (jobs.len > max_q4_k_parallel_workers or jobs.len != contexts.len) {
+        observed.nativeQuantWorkerBatchOmitted(jobs.len);
+        return dispatchAndCheckQuantWorkersBody(io, jobs, contexts);
+    }
+    var slots: [max_q4_k_parallel_workers]QuantWorkerObservationSlot = undefined;
+    var forwarded: [max_q4_k_parallel_workers]linalg.pool.Job = undefined;
+    for (jobs, 0..) |job, index| {
+        slots[index] = .{ .original = job };
+        forwarded[index] = .{ .fn_ptr = QuantWorkerObservationSlot.run, .ctx = @ptrCast(&slots[index]) };
+    }
+    // Body returns only after dispatchJobsIo's existing cancellation drain.
+    // Read private worker/context values then publish on the submitting thread;
+    // no observer TLS/callback/clock/allocator runs in the original workers.
+    defer for (slots[0..jobs.len], contexts) |slot, ctx| {
+        var dots: [2]usize = @splat(0);
+        const Context = @TypeOf(ctx);
+        if (comptime @hasField(Context, "dot_fn")) dots[0] = @intFromPtr(ctx.dot_fn);
+        if (comptime @hasField(Context, "dot_fn_a")) dots[0] = @intFromPtr(ctx.dot_fn_a);
+        if (comptime @hasField(Context, "dot_fn_b")) dots[1] = @intFromPtr(ctx.dot_fn_b);
+        const vectorized: ?bool = if (comptime @hasField(Context, "vectorized")) ctx.vectorized else null;
+        observed.nativeQuantWorkerReturn(@intFromPtr(slot.original.fn_ptr), dots, vectorized, slot.entered, slot.returned, if (ctx.err) |err| @errorName(err) else null);
+    };
+    try dispatchAndCheckQuantWorkersBody(io, forwarded[0..jobs.len], contexts);
 }
 
 const KPreparedWorkerCtx = struct {
@@ -31468,6 +31583,7 @@ fn causalSelfAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bia
     const bias: ?[]f32 = if (attn_bias_ct) |b| getData(b) else null;
 
     const output = try flashCausalAttentionHost(self.allocator, Q, K, V, bias, null, 0, batch, seq_len, seq_len, 0, 0, num_heads, num_heads, head_dim);
+    errdefer self.allocator.free(output);
     return self.makeBuf(output, true);
 }
 
@@ -31681,7 +31797,7 @@ fn disentangledRelativeAttentionWithControlOp(ctx: *anyopaque, q_ct: CT, k_ct: C
         const output = try debertaDisentangledAttentionBlasMaterialized(self.allocator, Q, K, V, Q_r, K_r, mask, batch, seq_len, num_heads, head_dim);
         return self.makeOwnedBuf(output);
     }
-    const output = try linalg.debertaDisentangledAttentionHost(self.allocator, Q, K, V, Q_r, K_r, mask, batch, seq_len, num_heads, head_dim);
+    const output = try observedAttention(linalg.debertaDisentangledAttentionHost, linalg.relativeAttentionHostObserved, .{ self.allocator, Q, K, V, Q_r, K_r, mask, batch, seq_len, num_heads, head_dim });
     return self.makeOwnedBuf(output);
 }
 
@@ -36724,10 +36840,12 @@ fn groupedAttentionForSession(comptime Gemm: type, self: *NativeCompute, q: CT, 
             pub const key_block = 512;
             pub const sgemmSync = linalg.sgemmSequential;
             pub const sgemmTransBSync = linalg.sgemmTransBSequential;
+            pub const sgemmSyncValue = linalg.sgemmSequentialValue;
+            pub const sgemmTransBSyncValue = linalg.sgemmTransBSequentialValue;
         };
-        return linalg.segmentAttentionGroupedHostWithGemmParallelIo(Portable, self.allocator, self.io.?, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), r.ranges, r.query_positions, r.key_positions, r.window, r.queries, r.keys, r.num_heads, request.num_kv_heads, r.head_dim, request.score_scale);
+        return observedAttention(linalg.segmentAttentionGroupedHostWithGemmParallelIo, linalg.segmentAttentionGroupedHostWithGemmParallelIoObserved, .{ Portable, self.allocator, self.io.?, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), r.ranges, r.query_positions, r.key_positions, r.window, r.queries, r.keys, r.num_heads, request.num_kv_heads, r.head_dim, request.score_scale });
     }
-    return linalg.segmentAttentionGroupedHostWithGemmIo(Gemm, self.allocator, self.io, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), r.ranges, r.query_positions, r.key_positions, r.window, r.queries, r.keys, r.num_heads, request.num_kv_heads, r.head_dim, request.score_scale);
+    return observedAttention(linalg.segmentAttentionGroupedHostWithGemmIo, linalg.segmentAttentionGroupedHostWithGemmIoObserved, .{ Gemm, self.allocator, self.io, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), r.ranges, r.query_positions, r.key_positions, r.window, r.queries, r.keys, r.num_heads, request.num_kv_heads, r.head_dim, request.score_scale });
 }
 
 fn segmentAttentionForSession(comptime Gemm: type, self: *NativeCompute, q: []const f32, k: []const f32, v: []const f32, request: *const ops.SegmentAttention) ![]f32 {
@@ -36738,9 +36856,9 @@ fn segmentAttentionForSession(comptime Gemm: type, self: *NativeCompute, q: []co
         request.queries >= 128 and request.queries <= 512 and request.keys <= 512 and
         request.num_heads >= 2 and request.num_heads <= 4)
     {
-        return linalg.segmentAttentionHostWithGemmParallelIo(Gemm, self.allocator, self.io.?, q, k, v, request.ranges, request.query_positions, request.key_positions, request.window, request.queries, request.keys, request.num_heads, request.head_dim);
+        return observedAttention(linalg.segmentAttentionHostWithGemmParallelIo, linalg.segmentAttentionHostWithGemmParallelIoObserved, .{ Gemm, self.allocator, self.io.?, q, k, v, request.ranges, request.query_positions, request.key_positions, request.window, request.queries, request.keys, request.num_heads, request.head_dim });
     }
-    return linalg.segmentAttentionHostWithGemmSerialIo(Gemm, self.allocator, self.io, q, k, v, request.ranges, request.query_positions, request.key_positions, request.window, request.queries, request.keys, request.num_heads, request.head_dim);
+    return observedAttention(linalg.segmentAttentionHostWithGemmSerialIo, linalg.segmentAttentionHostWithGemmSerialIoObserved, .{ Gemm, self.allocator, self.io, q, k, v, request.ranges, request.query_positions, request.key_positions, request.window, request.queries, request.keys, request.num_heads, request.head_dim });
 }
 
 test "embeddinggemma2 CPU adaptive segment tiles preserve generic masks empty rows and independent attention" {
@@ -48617,12 +48735,16 @@ test "embeddinggemma2 dense vision tile benchmark" {
         pub const dense_key_block = 1024;
         pub const sgemmTransBSync = native.sgemmTransBSync;
         pub const sgemmSync = native.sgemmSync;
+        pub const sgemmSyncValue = native.sgemmSyncValue;
+        pub const sgemmTransBSyncValue = native.sgemmTransBSyncValue;
     };
     const New = struct {
         pub const dense_query_block = 128;
         pub const dense_key_block = 2048;
         pub const sgemmTransBSync = native.sgemmTransBSync;
         pub const sgemmSync = native.sgemmSync;
+        pub const sgemmSyncValue = native.sgemmSyncValue;
+        pub const sgemmTransBSyncValue = native.sgemmTransBSyncValue;
     };
     for ([_]usize{ 576, 1089, 2025 }) |sequence| {
         const data = try a.alloc(f32, sequence * 12 * 64);
@@ -48832,6 +48954,8 @@ test "embeddinggemma2 grouped portable shared KV scheduling benchmark" {
         pub const key_block = 512;
         pub const sgemmSync = linalg.sgemmSequential;
         pub const sgemmTransBSync = linalg.sgemmTransBSequential;
+        pub const sgemmSyncValue = linalg.sgemmSequentialValue;
+        pub const sgemmTransBSyncValue = linalg.sgemmTransBSequentialValue;
     };
     for ([_][3]usize{ .{ 128, 256, 2 }, .{ 512, 256, 2 }, .{ 2048, 512, 1 } }) |shape| {
         const rows = shape[0];
@@ -53629,6 +53753,12 @@ test "Native transpose broadcast and full slice retain lazy alias schedules" {
 /// Physical banks guarantee the alignment of every qualified logical view.
 /// DenseStorage records the original allocation contract for its final free;
 /// ordinary/adopted F32 buffers continue to use their original alignment.
+const physical_storage_policy: ops.physical_storage.Policy = .{ .allocate = allocatePhysicalRequest };
+fn allocatePhysicalRequest(ctx: *anyopaque, request: ops.physical_storage.Request) anyerror!?CT {
+    // Existing Native/CUDA input banks have the same storage representation.
+    return allocateNativePhysicalStorageOp(ctx, request.byte_size);
+}
+
 fn allocateNativePhysicalStorageOp(ctx: *anyopaque, bytes: usize) !?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     if (bytes % 4 != 0) return error.InvalidPhysicalStorageSize;
@@ -54372,4 +54502,310 @@ test "Native quantized outer dispatch families publish actual Q8 output with nes
     try std.testing.expectEqual(@as(u64, 3), parent.total_events);
     try std.testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
     try std.testing.expect(!failing.has_induced_failure);
+}
+
+const NativePreparedWorkerFixture = struct {
+    fn run(panels: linalg.prepared_gemm.Panels, input: []const f32, output: []f32) !void {
+        try observedPreparedGemm(null, 64, panels, input, output);
+    }
+    fn nested(binding: @import("../execution/invocation_observation.zig").Binding, panels: linalg.prepared_gemm.Panels, input: []const f32, output: []f32) !void {
+        try run(panels, input, output);
+        try @import("../execution/invocation_observation.zig").call(binding, run, .{ panels, input, output });
+    }
+};
+test "Native actual prepared worker bodies publish nested uniform reports with unchanged numerical output" {
+    const a = std.testing.allocator;
+    const invocation = @import("../execution/invocation_observation.zig");
+    const diagnostics = @import("../execution/diagnostics.zig");
+    const input = try a.alloc(f32, 64 * 129);
+    defer a.free(input);
+    @memset(input, 1);
+    const weights = try a.alloc(f32, 67 * 129);
+    defer a.free(weights);
+    @memset(weights, 2);
+    const output = try a.alloc(f32, 64 * 67);
+    defer a.free(output);
+    const panels = try linalg.prepared_gemm.Panels.init(a, weights, 67, 129);
+    defer panels.deinit(a);
+    var parent = diagnostics.Diagnostics{};
+    parent.configure(true);
+    var child = diagnostics.Diagnostics{};
+    child.configure(true);
+    try invocation.call(invocation.Binding{ .diagnostics = &parent }, NativePreparedWorkerFixture.nested, .{ invocation.Binding{ .diagnostics = &child }, panels, @as([]const f32, input), output });
+    for (output) |value| try std.testing.expectEqual(@as(f32, 258), value);
+    const outer = parent.snapshot().?.report.?.joined_native_workers.?;
+    const inner = child.snapshot().?.report.?.joined_native_workers.?;
+    try std.testing.expect(inner.dispatched_workers > 0);
+    try std.testing.expectEqual(inner.dispatched_workers * 2, outer.dispatched_workers);
+    try std.testing.expectEqual(outer.dispatched_workers, outer.portable_packed_rows_entries + outer.x86_avx2_prepared_entries);
+    try std.testing.expectEqual(outer.portable_packed_rows_entries, outer.portable_packed_rows_returns);
+    try std.testing.expectEqual(outer.x86_avx2_prepared_entries, outer.x86_avx2_prepared_returns);
+    parent.configure(false);
+    try invocation.call(invocation.Binding{ .diagnostics = &parent }, NativePreparedWorkerFixture.run, .{ panels, @as([]const f32, input), output });
+    try std.testing.expect(parent.snapshot() == null);
+    for (output) |value| try std.testing.expectEqual(@as(f32, 258), value);
+}
+
+test "Native optional prepared route records actual policy refusal without numerical invocation failure" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    var scope: @import("../execution/runtime_observation.zig").KernelScope = .{};
+    scope.begin();
+    var output: [1]f32 = .{17};
+    try std.testing.expect(!try preparedDenseLinear(&compute, &.{2}, &.{3}, &output, 1, 1, 1));
+    _ = scope.finish();
+    try std.testing.expectEqual(@as(f32, 17), output[0]);
+    try std.testing.expectEqual(@as(u64, 1), scope.native_fallbacks.total_attempts);
+    try std.testing.expectEqual(.projection_eligibility_policy_or_shape, scope.native_fallbacks.records[0].reason);
+}
+
+const ActualQuantWorkerObservationFixture = struct {
+    fn run(io: ?std.Io, malformed_second: bool, output: []f32) !void {
+        var raw: [68]u8 = @splat(0);
+        std.mem.writeInt(u16, raw[0..2], @bitCast(@as(f16, 1)), .little);
+        std.mem.writeInt(u16, raw[34..36], @bitCast(@as(f16, 1)), .little);
+        @memset(raw[2..34], 1);
+        @memset(raw[36..68], 2);
+        const input: [32]f32 = @splat(1);
+        @memset(output, -7);
+        var contexts: [2]QuantizedLinearWorkerCtx = undefined;
+        var jobs: [2]linalg.pool.Job = undefined;
+        for (&contexts, &jobs, 0..) |*ctx, *job, index| {
+            ctx.* = .{ .input = &input, .weight_raw = &raw, .output = output, .rows = 1, .in_dim = 32, .out_dim = 2, .out_start = index, .out_end = if (malformed_second and index == 1) 3 else index + 1, .block_size = 34, .values_per_block = 32, .row_stride = 34, .dot_fn = &dotQ8_0Block };
+            job.* = .{ .fn_ptr = quantizedLinearWorkerJob, .ctx = @ptrCast(ctx) };
+        }
+        try dispatchAndCheckQuantWorkers(io, &jobs, &contexts);
+    }
+    fn nested(inner: @import("../execution/invocation_observation.zig").Binding, output: []f32) !void {
+        try run(null, false, output);
+        try @import("../execution/invocation_observation.zig").call(inner, run, .{ @as(?std.Io, std.testing.io), false, output });
+    }
+};
+test "Native authored quant workers publish actual Q8 identities outputs nested reports errors and disabled path" {
+    const invocation = @import("../execution/invocation_observation.zig");
+    const diagnostics = @import("../execution/diagnostics.zig");
+    var parent = diagnostics.Diagnostics{};
+    parent.configure(true);
+    var child = diagnostics.Diagnostics{};
+    child.configure(true);
+    var output: [2]f32 = undefined;
+    try invocation.call(invocation.Binding{ .diagnostics = &parent }, ActualQuantWorkerObservationFixture.nested, .{ invocation.Binding{ .diagnostics = &child }, @as([]f32, &output) });
+    try std.testing.expectEqualSlices(f32, &.{ 32, 64 }, &output);
+    const combined = parent.snapshot().?.report.?.native_quant_worker_callbacks.?;
+    const nested = child.snapshot().?.report.?.native_quant_worker_callbacks.?;
+    try std.testing.expectEqual(@as(u64, 4), combined.entered_workers);
+    try std.testing.expectEqual(@as(u64, 4), combined.returned_workers);
+    try std.testing.expectEqual(@as(u64, 2), nested.entered_workers);
+    try std.testing.expectEqual(@intFromPtr(&quantizedLinearWorkerJob), combined.records[0].function_identity);
+    try std.testing.expectEqual(@intFromPtr(&dotQ8_0Block), combined.records[0].configured_dot_function_identities[0]);
+    try std.testing.expectEqual(@as(u64, 0), combined.context_error_returns);
+    try std.testing.expectError(error.InvalidQuantizedLinearShape, invocation.call(invocation.Binding{ .diagnostics = &child }, ActualQuantWorkerObservationFixture.run, .{ @as(?std.Io, null), true, @as([]f32, &output) }));
+    try std.testing.expectEqualSlices(f32, &.{ 32, -7 }, &output);
+    const failed = child.snapshot().?.report.?.native_quant_worker_callbacks.?;
+    try std.testing.expectEqual(@as(u64, 2), failed.returned_workers);
+    try std.testing.expectEqual(@as(u64, 1), failed.context_error_returns);
+    const text = failed.records[0].last_context_error;
+    try std.testing.expectEqualStrings("InvalidQuantizedLinearShape", text.bytes[0..text.len]);
+    child.configure(false);
+    try invocation.call(invocation.Binding{ .diagnostics = &child }, ActualQuantWorkerObservationFixture.run, .{ @as(?std.Io, null), false, @as([]f32, &output) });
+    try std.testing.expect(child.snapshot() == null);
+    try std.testing.expectEqualSlices(f32, &.{ 32, 64 }, &output);
+}
+
+test "Native quant worker cancellation drains original callbacks before metadata publication" {
+    const observation = @import("../execution/runtime_observation.zig");
+    const Lifecycle = struct {
+        io: std.Io,
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        started: std.atomic.Value(usize) = .init(0),
+        finished: std.atomic.Value(usize) = .init(0),
+        measured: observation.NativeQuantWorkerCallbacks = .{},
+    };
+    const Work = struct {
+        lifecycle: *Lifecycle,
+        err: ?anyerror = null,
+        fn run(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.lifecycle.started.fetchAdd(1, .acq_rel);
+            self.lifecycle.entered.set(self.lifecycle.io);
+            self.lifecycle.release.waitUncancelable(self.lifecycle.io);
+            _ = self.lifecycle.finished.fetchAdd(1, .acq_rel);
+        }
+    };
+    const Request = struct {
+        fn run(lifecycle: *Lifecycle) !void {
+            var scope: observation.KernelScope = .{};
+            scope.begin();
+            defer {
+                _ = scope.finish();
+                lifecycle.measured = scope.quant_worker_callbacks;
+            }
+            var contexts: [2]Work = .{ .{ .lifecycle = lifecycle }, .{ .lifecycle = lifecycle } };
+            const jobs = [_]linalg.pool.Job{ .{ .fn_ptr = Work.run, .ctx = &contexts[0] }, .{ .fn_ptr = Work.run, .ctx = &contexts[1] } };
+            try dispatchAndCheckQuantWorkers(lifecycle.io, &jobs, &contexts);
+            // Preserve a pending request cancellation even if the group had
+            // already completed before its await checked cancellation.
+            try lifecycle.io.checkCancel();
+        }
+        fn release(lifecycle: *Lifecycle) void {
+            std.Io.sleep(lifecycle.io, .fromMilliseconds(20), .awake) catch unreachable;
+            lifecycle.release.set(lifecycle.io);
+        }
+    };
+    var worker_runtime = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(4), .concurrent_limit = .limited(8) });
+    defer worker_runtime.deinit();
+    const io = worker_runtime.io();
+    var lifecycle = Lifecycle{ .io = io };
+    var request = try io.concurrent(Request.run, .{&lifecycle});
+    var pending = true;
+    defer if (pending) {
+        lifecycle.release.set(io);
+        _ = request.cancel(io) catch {};
+    };
+    lifecycle.entered.waitUncancelable(io);
+    var releaser = try io.concurrent(Request.release, .{&lifecycle});
+    defer releaser.await(io);
+    const result = request.cancel(io);
+    pending = false;
+    try std.testing.expectError(error.Canceled, result);
+    const started = lifecycle.started.load(.acquire);
+    try std.testing.expect(started > 0 and started <= 2);
+    try std.testing.expectEqual(started, lifecycle.finished.load(.acquire));
+    try std.testing.expectEqual(@as(u64, started), lifecycle.measured.entered_workers);
+    try std.testing.expectEqual(@as(u64, started), lifecycle.measured.returned_workers);
+    try std.testing.expectEqual(@as(u64, 2), lifecycle.measured.submitted_workers);
+}
+
+test "Native quant metadata capacity refusal preserves original oversized job execution" {
+    const observation = @import("../execution/runtime_observation.zig");
+    const Work = struct {
+        calls: usize = 0,
+        err: ?anyerror = null,
+        fn run(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+    var contexts: [max_q4_k_parallel_workers + 1]Work = @splat(.{});
+    var jobs: [max_q4_k_parallel_workers + 1]linalg.pool.Job = undefined;
+    for (&jobs, &contexts) |*job, *ctx| job.* = .{ .fn_ptr = Work.run, .ctx = ctx };
+    var scope: observation.KernelScope = .{};
+    scope.begin();
+    defer _ = scope.finish();
+    try dispatchAndCheckQuantWorkers(null, &jobs, &contexts);
+    for (contexts) |ctx| try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+    try std.testing.expectEqual(@as(u64, jobs.len), scope.quant_worker_callbacks.unobserved_capacity_workers);
+    try std.testing.expectEqual(@as(u64, jobs.len), scope.quant_worker_callbacks.submitted_workers);
+    try std.testing.expectEqual(@as(u64, 0), scope.quant_worker_callbacks.entered_workers);
+}
+
+test "Native attention producer publishes joined program and inner leaf values to nested owned reports" {
+    const observation = @import("../execution/runtime_observation.zig");
+    const input = [_]f32{ 1, 0, 0, 1 };
+    var outer: observation.KernelScope = .{};
+    outer.begin();
+    defer if (outer.attached) {
+        _ = outer.finish();
+    };
+    var inner: observation.KernelScope = .{};
+    inner.begin();
+    defer if (inner.attached) {
+        _ = inner.finish();
+    };
+    const result = try observedAttention(linalg.flashAttentionHostWithIo, linalg.flashAttentionHostWithIoObserved, .{ std.testing.allocator, @as(?std.Io, null), @as([]const f32, &input), @as([]const f32, &input), @as([]const f32, &input), @as(?[]const f32, null), @as([]const i64, &.{}), @as(usize, 1), @as(usize, 2), @as(usize, 1), @as(usize, 2) });
+    defer std.testing.allocator.free(result);
+    _ = inner.finish();
+    _ = outer.finish();
+    try std.testing.expectEqual(@as(u64, 1), inner.attention_programs.entries);
+    try std.testing.expectEqual(inner.attention_programs.entries, outer.attention_programs.entries);
+    try std.testing.expectEqual(inner.attention_programs.returns, outer.attention_programs.returns);
+    try std.testing.expect(inner.attention_programs.records[0].program_identity != 0);
+    try std.testing.expect(inner.attention_programs.records[0].original_callback_identity != 0);
+    var leaves: u64 = 0;
+    for (inner.native_workers.dense_successful_leaf_returns) |count| leaves += count;
+    try std.testing.expectEqual(@as(u64, 2), leaves);
+    const snapshot = @import("../execution/diagnostics.zig").Snapshot{ .runtime = .{ .native_attention_programs = inner.attention_programs, .joined_native_workers = inner.native_workers } };
+    const report = @import("../execution/invocation_report.zig").Report.init(snapshot);
+    const saved = report.native_attention_programs.?;
+    inner.attention_programs = .{};
+    try std.testing.expectEqual(@as(u64, 1), saved.returns);
+    try std.testing.expectEqualStrings("flash_head_lane", saved.records[0].family);
+}
+
+noinline fn observedPackedActivation(comptime Work: type, io: ?std.Io, jobs: []Work) std.Io.Cancelable!void {
+    var values: activations_mod.ActivationValues = .{};
+    defer @import("../execution/runtime_observation.zig").nativeActivationPrograms(values);
+    try activations_mod.collectGroupValues(Work, io, jobs, .packed_gelu_rows, @intFromPtr(&Work.executeValue), &values);
+}
+
+test "Native packed GELU values join outer rows and inner terminals without duplicate observations" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    compute.io = std.testing.io;
+    const rows = 128;
+    const width = 2048;
+    const seed = try a.alloc(f32, 2 * rows * width);
+    defer a.free(seed);
+    for (seed, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i % 73))) * 2;
+    const cb = compute.computeBackend();
+    const input = try cb.fromFloat32Shape(seed, &.{ rows, 2 * width });
+    defer cb.free(input);
+    const plain = (try packedGeluMultiplyOp(&compute, input, rows, width)).?;
+    defer cb.free(plain);
+    const observation = @import("../execution/runtime_observation.zig");
+    var scope: observation.KernelScope = .{};
+    scope.begin();
+    defer if (scope.attached) {
+        _ = scope.finish();
+    };
+    const measured = (try packedGeluMultiplyOp(&compute, input, rows, width)).?;
+    defer cb.free(measured);
+    _ = scope.finish();
+    try std.testing.expectEqualSlices(f32, getData(plain), getData(measured));
+    try std.testing.expectEqual(@as(u64, rows), scope.activation_programs.terminal_gelu_calls);
+    try std.testing.expectEqual(@as(u64, 0), scope.native_bodies.total_calls);
+    var outer_returns: u64 = 0;
+    var inner_returns: u64 = 0;
+    for (scope.activation_programs.records[0..scope.activation_programs.count]) |record| {
+        try std.testing.expectEqual(record.entries, record.returns);
+        if (std.mem.eql(u8, record.family, "packed_gelu_rows")) outer_returns += record.returns;
+        if (std.mem.eql(u8, record.family, "gelu_multiply_chunk")) inner_returns += record.returns;
+    }
+    try std.testing.expectEqual(@as(u64, 4), outer_returns);
+    try std.testing.expectEqual(@as(u64, rows), inner_returns);
+}
+
+test "Native packed GELU observed all-fault unwind preserves original output ownership" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+            var compute = NativeCompute.init(a, &store, null);
+            defer compute.deinit();
+            const cb = compute.computeBackend();
+            const input = try cb.fromFloat32Shape(&.{ -2, 1, 3, 4, 0.5, -0.25, 2, 3 }, &.{ 2, 4 });
+            defer cb.free(input);
+            const observation = @import("../execution/runtime_observation.zig");
+            var scope: observation.KernelScope = .{};
+            scope.begin();
+            defer if (scope.attached) {
+                _ = scope.finish();
+            };
+            const output = (try packedGeluMultiplyOp(&compute, input, 2, 2)).?;
+            defer cb.free(output);
+            const gate = try cb.fromFloat32Shape(&.{ -2, 1, 0.5, -0.25 }, &.{ 2, 2 });
+            defer cb.free(gate);
+            const up = try cb.fromFloat32Shape(&.{ 3, 4, 2, 3 }, &.{ 2, 2 });
+            defer cb.free(up);
+            const expected = (try cb.activationMultiply(gate, up, .gelu)).?;
+            defer cb.free(expected);
+            for (getData(expected), getData(output)) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-6);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

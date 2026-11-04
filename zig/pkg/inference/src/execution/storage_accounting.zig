@@ -19,6 +19,13 @@
 //! separate scope; these measurements cover this prepared program's leases.
 const std = @import("std");
 
+/// Exact authored owning lifetime at allocation birth. This is independent of
+/// storageMode and program planned Class. Unknown producers stay unclassified;
+/// KV state stays charged through hook/cache/command and cleanup custody until
+/// the actual successful physical free. It is not a duration/RSS estimate.
+pub const OwnedPurpose = enum { unclassified, kv_state, model_cache, command_workspace };
+pub const owned_purpose_count = @typeInfo(OwnedPurpose).@"enum".field_names.len;
+
 pub const Class = enum { constant, activation, workspace, host_workspace };
 pub const Usage = struct {
     requested_live_bytes: u64 = 0,

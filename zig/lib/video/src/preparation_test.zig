@@ -547,3 +547,93 @@ test "video GBR scalar SIMD Metal preparation matches independent RGB raster thr
     };
     try std.testing.expectEqual(oracle.len, offset);
 }
+
+extern fn av_owned_resource_observation_check(*anyopaque) i32;
+test "video owned resource root covers actual nested concurrent retained buffers textures and metadata refusal" {
+    if (comptime @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const device = av_test_device_create() orelse return error.MetalPreparationUnavailable;
+    defer av_test_device_destroy(device);
+    try std.testing.expectEqual(@as(i32, 0), av_owned_resource_observation_check(device));
+}
+
+test "video owned resource intervals retain real host preparation backing beyond producer and source close" {
+    if (comptime @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const device = av_test_device_create() orelse return error.MetalPreparationUnavailable;
+    defer av_test_device_destroy(device);
+    var root: prep.OwnedResourceInterval = .{};
+    root.begin(true);
+    defer _ = root.finish(true);
+    const baseline = root.snapshot(true).?;
+    var pool = media.admission.Pool{ .limits = .{ .device_bytes = 2 * 1024 * 1024, .commands = 2 } };
+    const options = prep.Options{ .width = 48, .height = 48, .matrix = .bt601, .admission_pool = &pool };
+    const host = hostFixture();
+    const expected = try prep.referenceHost(a, host, options, .{});
+    defer a.free(expected);
+    var owner = try prep.Metal.init(device);
+    var owner_live = true;
+    defer if (owner_live) owner.deinit();
+    try owner.admit(&pool, 64 * 1024);
+    var result = try owner.submitHost(a, host, options, .{});
+    var result_live = true;
+    defer if (result_live) result.deinit();
+    owner.deinit();
+    owner_live = false;
+    try result.wait(std.testing.io, .{});
+    const held = root.snapshot(true).?;
+    try std.testing.expect(held.texture_allocations >= 2);
+    try std.testing.expect(held.live_bytes[2] > baseline.live_bytes[2]);
+    try std.testing.expect(held.live_bytes[1] > baseline.live_bytes[1]);
+    try std.testing.expect(pool.snapshot().device_bytes > 0);
+    const actual = try result.readback(a);
+    defer a.free(actual);
+    for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1.0 / 255.0 + 1e-6);
+    try result.releaseSource();
+    const output_only = root.snapshot(true).?;
+    try std.testing.expectEqual(baseline.live_bytes[2], output_only.live_bytes[2]);
+    try std.testing.expect(output_only.live_bytes[1] > baseline.live_bytes[1]);
+    _ = try result.buffer();
+    result.deinit();
+    result_live = false;
+    const final = root.finish(true).?;
+    try std.testing.expectEqual(baseline.live_bytes, final.live_bytes);
+    try std.testing.expectEqual(@as(u64, 0), pool.snapshot().device_bytes);
+    try std.testing.expect(final.interval_peak_bytes[0] >= held.live_bytes[0]);
+    try std.testing.expect(final.buffer_allocations > 0 and final.buffer_frees > 0);
+    try std.testing.expectEqual(final.texture_allocations, final.texture_frees);
+}
+
+test "video borrowed CoreVideo plane wrappers retain external surfaces without inventing owned backing" {
+    if (comptime @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const device = av_test_device_create() orelse return error.MetalPreparationUnavailable;
+    defer av_test_device_destroy(device);
+    var root: prep.OwnedResourceInterval = .{};
+    root.begin(true);
+    defer _ = root.finish(true);
+    const baseline = root.snapshot(true).?;
+    const bytes = [_]u8{ 0, 30, 70, 100, 140, 170, 210, 255, 60, 200, 190, 80 };
+    const pixel = av_test_surface_create(&bytes, 4, 2, 1) orelse return error.SurfaceMappingFailed;
+    var surface = apple.Surface.fromBorrowed(pixel) catch |err| {
+        av_test_surface_destroy(pixel);
+        return err;
+    };
+    av_test_surface_destroy(pixel);
+    var surface_live = true;
+    defer if (surface_live) surface.deinit();
+    var cache = try apple.MetalCache.init(device);
+    var cache_live = true;
+    defer if (cache_live) cache.deinit();
+    var imported = try cache.import(&surface);
+    defer imported.deinit();
+    cache.deinit();
+    cache_live = false;
+    surface.deinit();
+    surface_live = false;
+    _ = try imported.texture(0);
+    _ = try imported.texture(1);
+    const held = root.finish(true).?;
+    try std.testing.expectEqual(baseline.live_bytes, held.live_bytes);
+    try std.testing.expectEqual(@as(u64, 0), held.buffer_allocations);
+    try std.testing.expectEqual(@as(u64, 0), held.texture_allocations);
+    // These assertions describe only the authored root. CoreVideo cache/view
+    // internals and externally produced pixel backing are explicitly excluded.
+}

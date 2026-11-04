@@ -111,6 +111,25 @@ pub fn metalDirectTailEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_DIRECT_GREEDY", metalDirectTailDefault());
 }
 
+/// Task semantics that affect physical device-token placement. The runtime
+/// inspects its actual backend/cache/state; no grammar or sampler is retained.
+pub const DeviceRouteRequest = struct {
+    mode: enum { scalar, tensor, seed },
+    generated_tokens: usize,
+    pure_greedy: bool,
+    grammar_active: bool,
+};
+pub const DeviceRoute = enum {
+    eligible,
+    backend_not_device,
+    graph_blocked,
+    first_token_blocked,
+    kv_missing,
+    non_greedy,
+    grammar_blocked,
+    handoff_disabled,
+};
+
 pub const Runtime = struct {
     fn classifyDeviceStep(result: DeviceStepResult) @import("invocation_observation.zig").ResultClassification {
         return .{ .unsupported = result == .declined };
@@ -130,6 +149,37 @@ pub const Runtime = struct {
         activation: []f32,
         next_target_choice: ?u32 = null,
     };
+
+    pub fn deviceRoute(self: *const Runtime, state: *NativeDecodeState, request: DeviceRouteRequest) DeviceRoute {
+        const kind = self.context.cb.kind();
+        // Preserve the seed route's existing opt-out-before-probe behavior.
+        if (request.mode == .seed and !deviceTokenHandoffEnabled()) return .handoff_disabled;
+        if (if (request.mode == .scalar) kind != .cuda and kind != .metal else kind != .cuda) return .backend_not_device;
+        if (self.graph_cache != null or self.context.compiled_partition_backend != null) return .graph_blocked;
+        var decode = BorrowedDecodeStateRuntime.init(state);
+        if (request.mode != .seed and request.generated_tokens == 0 and decode.kvView() == null) return .first_token_blocked;
+        if (decode.kvView() == null) return .kv_missing;
+        if (request.mode != .scalar and !request.pure_greedy) return .non_greedy;
+        if (request.grammar_active) return .grammar_blocked;
+        if (request.mode == .tensor and !deviceTokenHandoffEnabled()) return .handoff_disabled;
+        return .eligible;
+    }
+
+    /// Integer input placement and cleanup belong to the physical decoder.
+    /// A supplied access is the caller's exact model-lane capability. Cleanup
+    /// uses its noncancellable path even when the request was cancelled.
+    pub fn createDeviceToken(self: *Runtime, token: usize, access: ?@import("../execution_control.zig").ExecutionAccess) !?ops.CT {
+        if (access) |lane| try lane.acquire();
+        defer if (access) |lane| lane.release();
+        const data = [_]i32{@intCast(token)};
+        return self.context.cb.fromInt32Shape(&data, &.{1});
+    }
+
+    pub fn destroyDeviceToken(self: *Runtime, tensor: ops.CT, access: ?@import("../execution_control.zig").ExecutionAccess) void {
+        if (access) |lane| lane.acquireForCleanup();
+        defer if (access) |lane| lane.release();
+        self.context.cb.free(tensor);
+    }
 
     pub fn forwardDeviceStep(self: *Runtime, state: *NativeDecodeState, request: DeviceStepRequest, events: *DeviceStepEvents) !DeviceStepResult {
         return @import("invocation_observation.zig").callContextOperationClassified(&self.context, .decode_step, classifyDeviceStep, @This().forwardDeviceStepUnobserved, .{ self, state, request, events });
@@ -1772,4 +1822,79 @@ test "physical decoder publishes actual Native prefill decode failures and disab
 
 test "physical decoder publishes actual Metal prefill decode and explicit submission scopes" {
     try DecoderObservationFixture.helper.onMetal(DecoderObservationFixture.weights.populate, DecoderObservationFixture.check);
+}
+
+fn checkDevicePlacementOwner(cb: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const cfg = @import("testing/decoder.zig").config();
+    var state = NativeDecodeState.initContiguous(a);
+    defer state.deinit();
+    var physical = Runtime{ .context = .{ .allocator = a, .cb = &cb, .gpt_config = &cfg } };
+    const route = physical.deviceRoute(&state, .{ .mode = .scalar, .generated_tokens = 0, .pure_greedy = true, .grammar_active = false });
+    try std.testing.expectEqual(if (cb.kind() == .native) DeviceRoute.backend_not_device else DeviceRoute.first_token_blocked, route);
+    try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
+    // The same real backend and lane are used for placement and cancellation.
+    // No copied callback table is accepted as evidence of a device route.
+    const ctl = @import("../execution_control.zig");
+    var mutex: std.atomic.Mutex = .unlocked;
+    var lane: ctl.ExecutionLane = .{};
+    const Cancel = struct {
+        cancelled: bool = false,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancelled) return error.Cancelled;
+        }
+    };
+    var cancel = Cancel{};
+    const access = ctl.ExecutionAccess{ .mutex = &mutex, .gate = &lane, .control = .{ .ptr = &cancel, .check_fn = Cancel.check } };
+    cancel.cancelled = true;
+    try std.testing.expectError(error.Cancelled, physical.createDeviceToken(1, access));
+    try @import("testing/decoder.zig").checkUnlocked(&mutex, &lane);
+    cancel.cancelled = false;
+    const token = (try physical.createDeviceToken(1, access)) orelse return error.MissingDeviceTokenPlacement;
+    var live = true;
+    defer if (live) physical.destroyDeviceToken(token, access);
+    try @import("testing/decoder.zig").checkUnlocked(&mutex, &lane);
+    try std.testing.expectEqual(@import("../backends/tensor.zig").DType.i32, try cb.tensorDType(token));
+    const shape = try cb.tensorShape(token, a);
+    defer a.free(shape);
+    try std.testing.expectEqualSlices(i64, &.{1}, shape);
+    cancel.cancelled = true;
+    physical.destroyDeviceToken(token, access);
+    live = false;
+    try @import("testing/decoder.zig").checkUnlocked(&mutex, &lane);
+    try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
+}
+
+test "physical token placement actual Native cancellation and cleanup keep lane and decode state valid" {
+    try @import("../ops/media_residency_test.zig").onNative(@import("../ops/media_residency_test.zig").noWeights, checkDevicePlacementOwner);
+}
+
+test "physical token placement actual Metal cancellation and cleanup keep lane and decode state valid" {
+    try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, checkDevicePlacementOwner);
+}
+
+test "physical token placement actual Native allocation faults leave no physical token or lane" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const native = @import("../ops/native_compute.zig");
+            var weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+            defer weights.deinitOwned();
+            var compute = native.NativeCompute.init(a, &weights, null);
+            defer compute.deinit();
+            const cb = compute.computeBackend();
+            const cfg = @import("testing/decoder.zig").config();
+            var physical = Runtime{ .context = .{ .allocator = a, .cb = &cb, .gpt_config = &cfg } };
+            const ctl = @import("../execution_control.zig");
+            var mutex: std.atomic.Mutex = .unlocked;
+            var lane: ctl.ExecutionLane = .{};
+            const access = ctl.ExecutionAccess{ .mutex = &mutex, .gate = &lane };
+            defer @import("testing/decoder.zig").checkUnlocked(&mutex, &lane) catch @panic("leaked physical token lane");
+            const token = (try physical.createDeviceToken(1, access)) orelse return error.MissingDeviceTokenPlacement;
+            defer physical.destroyDeviceToken(token, access);
+        }
+    };
+    try Case.run(std.testing.allocator);
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

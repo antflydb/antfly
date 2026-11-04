@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Optional measurements on the submitting thread. Nested observations include
-//! work in child scopes. They exclude independent worker threads and never
+//! work in child scopes. Joined worker values are explicit; unreported workers
+//! remain excluded. These observations never
 //! pretend that an opaque vendor encode reveals its internal kernel launches.
 const build_options = @import("build_options");
 
@@ -237,6 +238,11 @@ pub const KernelScope = struct {
     metal: MetalDispatches = .{},
     native_bodies: NativeBodies = .{},
     native_dispatches: NativeDispatches = .{},
+    native_workers: NativeWorkers = .{},
+    quant_worker_callbacks: NativeQuantWorkerCallbacks = .{},
+    attention_programs: NativeAttentionPrograms = .{},
+    activation_programs: NativeActivationPrograms = .{},
+    native_fallbacks: NativeFallbacks = .{},
     attached: bool = false,
     /// Must be called only after the owner reaches final address-stable storage.
     pub fn begin(self: *KernelScope) void {
@@ -478,4 +484,366 @@ test "Native outer dispatch note scopes preserve phases nesting truncation and d
     nativeDispatchFamily(Family.same_family, .successful_return);
     try std.testing.expect(active_kernels == null);
     try std.testing.expectEqual(@as(u64, 9), outer.native_dispatches.total_events);
+}
+
+/// Returned values from actual joined project-owned prepared/dense GEMM workers.
+/// Each worker entry is a leaf invocation, not an MR tile or CPU instruction.
+pub const NativeWorkers = struct {
+    scope: enum { authored_dense_gemm_body_returns_and_joined_worker_values } = .authored_dense_gemm_body_returns_and_joined_worker_values,
+    unit: enum { authored_body_entries_and_successful_returns } = .authored_body_entries_and_successful_returns,
+    coverage: enum { prepared_and_dense_gemm_other_schedules_unobserved_vendor_opaque } = .prepared_and_dense_gemm_other_schedules_unobserved_vendor_opaque,
+    portable_packed_rows_entries: u64 = 0,
+    portable_packed_rows_returns: u64 = 0,
+    x86_avx2_prepared_entries: u64 = 0,
+    x86_avx2_prepared_returns: u64 = 0,
+    dispatched_workers: u64 = 0,
+    not_entered_workers: u64 = 0,
+    /// Order is lower-library SelectedBody: portable normal, AVX2 normal,
+    /// portable transposed F32, AVX2 transposed F32, portable transposed F16,
+    /// AVX2 transposed F16. These are actual successful leaf returns, separate
+    /// from worker counts (a column worker can invoke several row leaves).
+    dense_successful_leaf_returns: [6]u64 = @splat(0),
+    dense_dispatched_workers: u64 = 0,
+    dense_entered_workers: u64 = 0,
+    dense_returned_workers: u64 = 0,
+    dense_opaque_vendor_returns: u64 = 0,
+    dense_unobserved_callback_returns: u64 = 0,
+    /// Actual direct authored compatibility body, separate from dense worker
+    /// units and BLAS API returns. This does not enumerate vendor internals.
+    transposed_a_body_identity: usize = 0,
+    transposed_a_successful_body_returns: u64 = 0,
+    transposed_a_vendor_api_returns: u64 = 0,
+};
+pub inline fn kernelEnabled() bool {
+    return active_kernels != null;
+}
+pub fn nativePreparedWorkers(value: anytype) void {
+    var cursor = active_kernels;
+    while (cursor) |scope| : (cursor = scope.previous) {
+        const result = &scope.native_workers;
+        result.portable_packed_rows_entries +|= value.entries[0];
+        result.portable_packed_rows_returns +|= value.successful_returns[0];
+        result.x86_avx2_prepared_entries +|= value.entries[1];
+        result.x86_avx2_prepared_returns +|= value.successful_returns[1];
+        result.dispatched_workers +|= value.dispatched_workers;
+        result.not_entered_workers +|= value.not_entered_workers;
+    }
+}
+
+test "Native joined worker observations preserve nested partial entry and return units" {
+    const std = @import("std");
+    const Value = struct { entries: [2]u64, successful_returns: [2]u64, dispatched_workers: u64, not_entered_workers: u64 };
+    var outer: KernelScope = .{};
+    outer.begin();
+    var inner: KernelScope = .{};
+    inner.begin();
+    nativePreparedWorkers(Value{ .entries = .{ 2, 1 }, .successful_returns = .{ 2, 0 }, .dispatched_workers = 4, .not_entered_workers = 1 });
+    _ = inner.finish();
+    nativePreparedWorkers(Value{ .entries = .{ 1, 0 }, .successful_returns = .{ 1, 0 }, .dispatched_workers = 1, .not_entered_workers = 0 });
+    _ = outer.finish();
+    try std.testing.expectEqual(@as(u64, 3), outer.native_workers.portable_packed_rows_entries);
+    try std.testing.expectEqual(@as(u64, 2), inner.native_workers.portable_packed_rows_returns);
+    try std.testing.expectEqual(@as(u64, 0), outer.native_workers.x86_avx2_prepared_returns);
+    try std.testing.expectEqual(@as(u64, 1), outer.native_workers.not_entered_workers);
+}
+
+/// Actual declined optional authored-route attempts, not invocation failures.
+pub const NativeFallbackFamily = enum { prepared_dense_projection, canonical_panel_projection };
+pub const NativeFallbackReason = enum { projection_eligibility_policy_or_shape, incompatible_weight_owner_or_layout, required_cached_panels_unavailable, panel_preparation_out_of_memory, panel_memory_budget_exceeded, panel_slice_alignment_or_extent };
+pub const NativeFallback = struct { family: NativeFallbackFamily = .prepared_dense_projection, reason: NativeFallbackReason = .projection_eligibility_policy_or_shape, attempts: u64 = 0 };
+pub const NativeFallbacks = struct {
+    scope: enum { instrumented_optional_projection_attempts_on_submitting_thread } = .instrumented_optional_projection_attempts_on_submitting_thread,
+    records: [8]NativeFallback = @splat(.{}),
+    count: u8 = 0,
+    total_attempts: u64 = 0,
+    truncated_attempts: u64 = 0,
+};
+pub inline fn nativeFallback(family: NativeFallbackFamily, reason: NativeFallbackReason) void {
+    if (active_kernels == null) return;
+    nativeFallbackEnabled(family, reason);
+}
+noinline fn nativeFallbackEnabled(family: NativeFallbackFamily, reason: NativeFallbackReason) void {
+    var cursor = active_kernels;
+    while (cursor) |scope| : (cursor = scope.previous) {
+        const result = &scope.native_fallbacks;
+        result.total_attempts +|= 1;
+        var found: ?*NativeFallback = null;
+        for (result.records[0..result.count]) |*item| if (item.family == family and item.reason == reason) {
+            found = item;
+            break;
+        };
+        if (found == null) {
+            if (result.count == result.records.len) {
+                result.truncated_attempts +|= 1;
+                continue;
+            }
+            found = &result.records[result.count];
+            result.count += 1;
+            found.?.* = .{ .family = family, .reason = reason };
+        }
+        found.?.attempts +|= 1;
+    }
+}
+
+pub fn nativeDenseWorkers(value: anytype) void {
+    var cursor = active_kernels;
+    while (cursor) |scope| : (cursor = scope.previous) {
+        const result = &scope.native_workers;
+        for (&result.dense_successful_leaf_returns, value.successful_leaf_returns) |*count, observed| count.* +|= observed;
+        result.dense_dispatched_workers +|= value.dispatched_workers;
+        result.dense_entered_workers +|= value.entered_workers;
+        result.dense_returned_workers +|= value.returned_workers;
+        if (comptime @hasField(@TypeOf(value), "opaque_vendor_returns")) result.dense_opaque_vendor_returns +|= value.opaque_vendor_returns;
+        if (comptime @hasField(@TypeOf(value), "unobserved_callback_returns")) result.dense_unobserved_callback_returns +|= value.unobserved_callback_returns;
+    }
+}
+
+/// Actual original worker callback identities invoked by the authored quantized
+/// scheduler, including activation preparation. These are not inferred terminal
+/// dot/MR kernel counts, vendor kernels or generic observation-proxy identities.
+pub const NativeQuantWorkerCallback = struct {
+    function_identity: usize = 0,
+    configured_dot_function_identities: [2]usize = @splat(0),
+    configured_vectorized: ?bool = null,
+    entered_workers: u64 = 0,
+    returned_workers: u64 = 0,
+    context_error_returns: u64 = 0,
+    not_entered_workers: u64 = 0,
+    last_context_error: FailureText = .{},
+};
+pub const NativeQuantWorkerCallbacks = struct {
+    scope: enum { joined_authored_quant_scheduler_original_worker_callbacks } = .joined_authored_quant_scheduler_original_worker_callbacks,
+    unit: enum { worker_callback_entries_returns_and_recorded_context_errors } = .worker_callback_entries_returns_and_recorded_context_errors,
+    configured_dot_scope: enum { immutable_context_bindings_not_dot_invocation_counts } = .immutable_context_bindings_not_dot_invocation_counts,
+    inner_MR_and_vendor_terminal_coverage: enum { unavailable } = .unavailable,
+    records: [8]NativeQuantWorkerCallback = @splat(.{}),
+    count: u8 = 0,
+    submitted_workers: u64 = 0,
+    entered_workers: u64 = 0,
+    returned_workers: u64 = 0,
+    context_error_returns: u64 = 0,
+    not_entered_workers: u64 = 0,
+    unrepresented_worker_records: u64 = 0,
+    unobserved_capacity_workers: u64 = 0,
+};
+pub fn nativeQuantWorkerBatchOmitted(workers: usize) void {
+    var cursor = active_kernels;
+    while (cursor) |scope| : (cursor = scope.previous) {
+        scope.quant_worker_callbacks.submitted_workers +|= workers;
+        scope.quant_worker_callbacks.unobserved_capacity_workers +|= workers;
+    }
+}
+pub fn nativeQuantWorkerReturn(identity: usize, dots: [2]usize, vectorized: ?bool, entered: bool, returned: bool, failure: ?[]const u8) void {
+    const std = @import("std");
+    var cursor = active_kernels;
+    while (cursor) |scope| : (cursor = scope.previous) {
+        const result = &scope.quant_worker_callbacks;
+        result.submitted_workers +|= 1;
+        result.entered_workers +|= @intFromBool(entered);
+        result.returned_workers +|= @intFromBool(returned);
+        result.context_error_returns +|= @intFromBool(returned and failure != null);
+        result.not_entered_workers +|= @intFromBool(!entered);
+        var found: ?*NativeQuantWorkerCallback = null;
+        for (result.records[0..result.count]) |*item| if (item.function_identity == identity and std.meta.eql(item.configured_dot_function_identities, dots) and item.configured_vectorized == vectorized) {
+            found = item;
+            break;
+        };
+        if (found == null) {
+            if (result.count == result.records.len) {
+                result.unrepresented_worker_records +|= 1;
+                continue;
+            }
+            found = &result.records[result.count];
+            result.count += 1;
+            found.?.* = .{ .function_identity = identity, .configured_dot_function_identities = dots, .configured_vectorized = vectorized };
+        }
+        found.?.entered_workers +|= @intFromBool(entered);
+        found.?.returned_workers +|= @intFromBool(returned);
+        found.?.not_entered_workers +|= @intFromBool(!entered);
+        if (returned) if (failure) |message| {
+            found.?.context_error_returns +|= 1;
+            found.?.last_context_error = FailureText.init(message);
+        };
+    }
+}
+
+test "Native quant worker value records preserve nested partial error ownership and bounded identities" {
+    const std = @import("std");
+    var outer: KernelScope = .{};
+    outer.begin();
+    var inner: KernelScope = .{};
+    inner.begin();
+    var failure: [80]u8 = @splat('x');
+    nativeQuantWorkerReturn(1, .{ 11, 0 }, false, true, true, &failure);
+    @memset(&failure, 'z');
+    nativeQuantWorkerReturn(2, .{ 0, 0 }, null, false, false, null);
+    _ = inner.finish();
+    for (3..10) |identity| nativeQuantWorkerReturn(identity, .{ 0, 0 }, null, true, true, null);
+    _ = outer.finish();
+    const retained = outer.quant_worker_callbacks;
+    try std.testing.expectEqual(@as(u64, 9), retained.submitted_workers);
+    try std.testing.expectEqual(@as(u64, 8), retained.entered_workers);
+    try std.testing.expectEqual(@as(u64, 1), retained.context_error_returns);
+    try std.testing.expectEqual(@as(u64, 1), retained.not_entered_workers);
+    try std.testing.expectEqual(@as(u8, 8), retained.count);
+    try std.testing.expectEqual(@as(u64, 1), retained.unrepresented_worker_records);
+    try std.testing.expect(retained.records[0].last_context_error.truncated);
+    for (retained.records[0].last_context_error.bytes) |byte| try std.testing.expectEqual(@as(u8, 'x'), byte);
+    try std.testing.expectEqual(@as(u64, 2), inner.quant_worker_callbacks.submitted_workers);
+}
+
+/// Actual authored attention program callbacks/direct heads, returned after the
+/// original scheduler drains. Inner GEMM leaf returns use NativeWorkers units;
+/// these records never claim MR/dot counts, vendor internals or other families.
+pub const NativeAttentionProgram = struct {
+    family: []const u8 = "",
+    program_identity: usize = 0,
+    original_callback_identity: usize = 0,
+    entries: u64 = 0,
+    returns: u64 = 0,
+    error_returns: u64 = 0,
+    not_entered: u64 = 0,
+    last_error: FailureText = .{},
+};
+pub const NativeAttentionPrograms = struct {
+    scope: enum { authored_attention_program_values_after_join_or_direct_return } = .authored_attention_program_values_after_join_or_direct_return,
+    coverage: enum { flash_segment_relative_dense_rows_other_families_unobserved } = .flash_segment_relative_dense_rows_other_families_unobserved,
+    records: [8]NativeAttentionProgram = @splat(.{}),
+    count: u8 = 0,
+    submitted: u64 = 0,
+    entries: u64 = 0,
+    returns: u64 = 0,
+    error_returns: u64 = 0,
+    not_entered: u64 = 0,
+    unrecorded_events: u64 = 0,
+    unobserved_capacity_jobs: u64 = 0,
+};
+pub fn nativeAttentionPrograms(value: anytype) void {
+    nativeDenseWorkers(value.gemm_values);
+    var cursor = active_kernels;
+    while (cursor) |scope| : (cursor = scope.previous) {
+        const out = &scope.attention_programs;
+        out.submitted +|= value.submitted;
+        out.entries +|= value.entries;
+        out.returns +|= value.returns;
+        out.error_returns +|= value.error_returns;
+        out.not_entered +|= value.not_entered;
+        out.unrecorded_events +|= value.unrecorded_events;
+        out.unobserved_capacity_jobs +|= value.unobserved_capacity_jobs;
+        for (value.records[0..value.count]) |item| {
+            const family = @tagName(item.family); // enum tag storage has static lifetime
+            var found: ?*NativeAttentionProgram = null;
+            for (out.records[0..out.count]) |*record| if (@import("std").mem.eql(u8, record.family, family) and record.program_identity == item.program_identity and record.original_callback_identity == item.original_callback_identity) {
+                found = record;
+                break;
+            };
+            if (found == null) {
+                if (out.count == out.records.len) {
+                    out.unrecorded_events +|= item.entries +| item.not_entered;
+                    continue;
+                }
+                found = &out.records[out.count];
+                out.count += 1;
+                found.?.* = .{ .family = family, .program_identity = item.program_identity, .original_callback_identity = item.original_callback_identity };
+            }
+            found.?.entries +|= item.entries;
+            found.?.returns +|= item.returns;
+            found.?.error_returns +|= item.error_returns;
+            found.?.not_entered +|= item.not_entered;
+            if (item.last_error) |err| found.?.last_error = FailureText.init(@errorName(err));
+        }
+    }
+}
+
+test "Native attention returned error values survive nested observation and bounded projection" {
+    const Family = enum { authored_test };
+    const Record = struct { family: Family = .authored_test, program_identity: usize = 1, original_callback_identity: usize = 2, entries: u64 = 1, returns: u64 = 1, error_returns: u64 = 1, not_entered: u64 = 0, last_error: ?anyerror = error.ActualAttentionBodyCanceled };
+    const Value = struct { records: [1]Record = .{.{}}, count: u8 = 1, submitted: u64 = 1, entries: u64 = 1, returns: u64 = 1, error_returns: u64 = 1, not_entered: u64 = 0, unrecorded_events: u64 = 0, unobserved_capacity_jobs: u64 = 0, gemm_values: struct { successful_leaf_returns: [6]u64 = @splat(0), dispatched_workers: u64 = 0, entered_workers: u64 = 0, returned_workers: u64 = 0 } = .{} };
+    var parent: KernelScope = .{};
+    parent.begin();
+    var child: KernelScope = .{};
+    child.begin();
+    nativeAttentionPrograms(Value{});
+    _ = child.finish();
+    _ = parent.finish();
+    const copy = child.attention_programs;
+    child.attention_programs = .{};
+    try @import("std").testing.expectEqual(@as(u64, 1), parent.attention_programs.error_returns);
+    try @import("std").testing.expectEqualStrings("ActualAttentionBodyCanceled", copy.records[0].last_error.bytes[0..copy.records[0].last_error.len]);
+}
+
+pub inline fn nativeTransposedA(body_identity: usize, vendor_api: bool) void {
+    if (active_kernels == null) return;
+    nativeTransposedAEnabled(body_identity, vendor_api);
+}
+noinline fn nativeTransposedAEnabled(body_identity: usize, vendor_api: bool) void {
+    var cursor = active_kernels;
+    while (cursor) |scope| : (cursor = scope.previous) {
+        const out = &scope.native_workers;
+        if (vendor_api) out.transposed_a_vendor_api_returns +|= 1 else {
+            out.transposed_a_body_identity = body_identity;
+            out.transposed_a_successful_body_returns +|= 1;
+        }
+    }
+}
+
+pub const NativeActivationProgram = struct {
+    family: []const u8 = "",
+    /// Actual selected whole-program callable; terminal math is the separate
+    /// terminal_body_identity field, never inferred from a generic wrapper.
+    program_identity: usize = 0,
+    entries: u64 = 0,
+    returns: u64 = 0,
+    error_returns: u64 = 0,
+    not_entered: u64 = 0,
+    last_error: FailureText = .{},
+};
+pub const NativeActivationPrograms = struct {
+    scope: enum { joined_or_direct_authored_gelu_program_values } = .joined_or_direct_authored_gelu_program_values,
+    /// Program values count callbacks/chunks. Terminal GELU fields measure the
+    /// shared actual completed body only, including independent workers.
+    records: [4]NativeActivationProgram = @splat(.{}),
+    count: u8 = 0,
+    unrecorded_events: u64 = 0,
+    terminal_body_identity: usize = 0,
+    terminal_gelu_calls: u64 = 0,
+    vector_width: usize = 0,
+    vector_iterations: u64 = 0,
+    scalar_elements: u64 = 0,
+    unobserved_custom_callbacks: u64 = 0,
+};
+pub fn nativeActivationPrograms(value: anytype) void {
+    var cursor = active_kernels;
+    while (cursor) |scope| : (cursor = scope.previous) {
+        const out = &scope.activation_programs;
+        if (value.terminal_body_identity != 0) out.terminal_body_identity = value.terminal_body_identity;
+        out.terminal_gelu_calls +|= value.terminal_calls;
+        out.vector_width = value.vector_width;
+        out.vector_iterations +|= value.vector_iterations;
+        out.scalar_elements +|= value.scalar_elements;
+        out.unobserved_custom_callbacks +|= value.unobserved_custom_callbacks;
+        out.unrecorded_events +|= value.unrecorded_events;
+        for (value.records[0..value.count]) |item| {
+            const family = @tagName(item.family);
+            var found: ?*NativeActivationProgram = null;
+            for (out.records[0..out.count]) |*record| if (@import("std").mem.eql(u8, record.family, family) and record.program_identity == item.program_identity) {
+                found = record;
+                break;
+            };
+            if (found == null) {
+                if (out.count == out.records.len) {
+                    out.unrecorded_events +|= item.entries +| item.not_entered;
+                    continue;
+                }
+                found = &out.records[out.count];
+                out.count += 1;
+                found.?.* = .{ .family = family, .program_identity = item.program_identity };
+            }
+            found.?.entries +|= item.entries;
+            found.?.returns +|= item.returns;
+            found.?.error_returns +|= item.error_returns;
+            found.?.not_entered +|= item.not_entered;
+            if (item.last_error) |err| found.?.last_error = FailureText.init(@errorName(err));
+        }
+    }
 }

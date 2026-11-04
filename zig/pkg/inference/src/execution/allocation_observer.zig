@@ -9,22 +9,28 @@
 const std = @import("std");
 const platform = @import("antfly_platform");
 
+const purpose_count = @import("storage_accounting.zig").owned_purpose_count;
+
 pub const Coverage = enum { since_enable, from_owner_creation };
 
 pub const Snapshot = struct {
+    purpose_live_bytes: [purpose_count]u64 = @splat(0),
+    purpose_lifetime_peak_bytes: [purpose_count]u64 = @splat(0),
     requested_live_bytes: u64 = 0,
     requested_lifetime_peak_bytes: u64 = 0,
     allocations: u64 = 0,
     frees: u64 = 0,
     resizes: u64 = 0,
     remaps: u64 = 0,
+    custody_transfers_in: u64 = 0,
+    custody_transfers_out: u64 = 0,
     unobserved_frees: u64 = 0,
     unobserved_resizes: u64 = 0,
     unobserved_remaps: u64 = 0,
     pub fn since(self: Snapshot, before: Snapshot) Snapshot {
         var result = self;
         inline for (@typeInfo(Snapshot).@"struct".field_names) |field| {
-            if (comptime !std.mem.eql(u8, field, "requested_live_bytes") and !std.mem.eql(u8, field, "requested_lifetime_peak_bytes"))
+            if (comptime !std.mem.eql(u8, field, "requested_live_bytes") and !std.mem.eql(u8, field, "requested_lifetime_peak_bytes") and !std.mem.eql(u8, field, "purpose_live_bytes") and !std.mem.eql(u8, field, "purpose_lifetime_peak_bytes"))
                 @field(result, field) = @field(self, field) -| @field(before, field);
         }
         return result;
@@ -41,6 +47,7 @@ pub const State = struct {
     records: std.AutoHashMapUnmanaged(usize, usize) = .empty,
     usage: Snapshot = .{},
     intervals: ?*Interval = null,
+    external_ledger: bool = false,
 
     /// Stable metadata: independently allocated, or borrowed at its final
     /// address until finish. Includes all activity on this owner, including
@@ -51,9 +58,17 @@ pub const State = struct {
         next: ?*Interval,
         before: Snapshot,
         peak: u64,
+        purpose_peak: [purpose_count]u64,
         heap_owned: bool,
 
-        pub const Result = struct { usage: Snapshot, peak: u64 };
+        pub const Result = struct { usage: Snapshot, peak: u64, purpose_peak: [purpose_count]u64 };
+
+        pub fn snapshot(self: *const Interval) Result {
+            const owner = self.owner;
+            platform.sync.lockYielding(&owner.mutex);
+            defer owner.mutex.unlock();
+            return .{ .usage = owner.usage.since(self.before), .peak = self.peak, .purpose_peak = self.purpose_peak };
+        }
 
         pub fn finish(self: *Interval) Result {
             const owner = self.owner;
@@ -61,17 +76,29 @@ pub const State = struct {
             var link = &owner.intervals;
             while (link.* != self) link = &link.*.?.next;
             link.* = self.next;
-            const result = Result{ .usage = owner.usage.since(self.before), .peak = self.peak };
+            const result = Result{ .usage = owner.usage.since(self.before), .peak = self.peak, .purpose_peak = self.purpose_peak };
             // Metadata may be a non-thread-safe independent allocator. Use
             // the same lock as record bookkeeping for allocation and release.
-            if (self.heap_owned) owner.metadata.destroy(self);
+            const external_heap = self.heap_owned and owner.external_ledger;
+            if (self.heap_owned and !external_heap) owner.metadata.destroy(self);
             owner.mutex.unlock();
+            // External ledger metadata is independently thread-safe. Keep its
+            // allocator callbacks outside the ledger lock, unlike legacy host
+            // observer bookkeeping whose explicit allocator may not be safe.
+            if (external_heap) owner.metadata.destroy(self);
             owner.release();
             return result;
         }
     };
 
     pub fn beginInterval(self: *State) !*Interval {
+        if (self.external_ledger) {
+            const interval = try self.metadata.create(Interval);
+            platform.sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            self.beginIntervalLocked(interval, true);
+            return interval;
+        }
         platform.sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         const interval = try self.metadata.create(Interval);
@@ -89,7 +116,7 @@ pub const State = struct {
 
     fn beginIntervalLocked(self: *State, interval: *Interval, heap_owned: bool) void {
         _ = self.retain();
-        interval.* = .{ .owner = self, .next = self.intervals, .before = self.usage, .peak = self.usage.requested_live_bytes, .heap_owned = heap_owned };
+        interval.* = .{ .owner = self, .next = self.intervals, .before = self.usage, .peak = self.usage.requested_live_bytes, .purpose_peak = self.usage.purpose_live_bytes, .heap_owned = heap_owned };
         self.intervals = interval;
     }
 
@@ -104,6 +131,28 @@ pub const State = struct {
         const self = try metadata.create(State);
         self.* = .{ .backing = backing, .metadata = metadata, .coverage = coverage, .parent_owner = if (forAllocator(backing)) |owner| owner.retain() else null };
         return self;
+    }
+
+    /// Reuses interval/refcount machinery for an existing authored ledger.
+    /// No wrapped allocator or payload map is exposed for this state. Updates
+    /// arrive only after the caller commits its real alloc/free/custody event.
+    /// metadata must be independently thread-safe and outlive every retained
+    /// state/subscription. Production uses the concurrent process allocator.
+    pub fn createExternal(metadata: std.mem.Allocator, initial: Snapshot) !*State {
+        const self = try metadata.create(State);
+        self.* = .{ .backing = metadata, .metadata = metadata, .coverage = .from_owner_creation, .external_ledger = true, .usage = initial };
+        return self;
+    }
+    pub fn commitExternal(self: *State, current: Snapshot) void {
+        std.debug.assert(self.external_ledger);
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        self.usage = current;
+        var cursor = self.intervals;
+        while (cursor) |interval| : (cursor = interval.next) {
+            interval.peak = @max(interval.peak, current.requested_live_bytes);
+            for (&interval.purpose_peak, current.purpose_live_bytes) |*peak, live| peak.* = @max(peak.*, live);
+        }
     }
 
     pub fn forAllocator(value: std.mem.Allocator) ?*State {
@@ -135,6 +184,7 @@ pub const State = struct {
     }
 
     pub fn allocator(self: *State) std.mem.Allocator {
+        std.debug.assert(!self.external_ledger);
         return .{ .ptr = self, .vtable = &vtable };
     }
 

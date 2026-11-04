@@ -748,6 +748,10 @@ pub const CublasLt = struct {
     }
 
     fn createTensorCoreDescriptors(self: *CublasLt, key: TensorCorePlanKey, invocation: TensorCoreInvocation) Error!TensorCorePlan {
+        return self.createTensorCoreDescriptorsFacts(key, invocation.bias, false);
+    }
+
+    fn createTensorCoreDescriptorsFacts(self: *CublasLt, key: TensorCorePlanKey, bias: ?buffer_mod.DeviceBuffer, comptime cold: bool) Error!TensorCorePlan {
         var plan = TensorCorePlan{
             .algo = undefined,
             .workspace_size = 0,
@@ -760,15 +764,15 @@ pub const CublasLt = struct {
         };
         errdefer self.destroyTensorCorePlan(plan);
 
-        try self.check(self.fns.cublasLtMatmulDescCreate(&plan.op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+        try self.checkDiscovery(self.fns.cublasLtMatmulDescCreate(&plan.op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F), cold);
         var transa: c_int = undefined;
         var transb: c_int = undefined;
         switch (key.kind) {
             .dense, .dense_bias => {
                 transa = CUBLAS_OP_T;
                 transb = CUBLAS_OP_N;
-                try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.a_desc, key.input_type, key.in_dim, key.out_dim, key.in_dim));
-                try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.b_desc, key.input_type, key.in_dim, key.rows, key.in_dim));
+                try self.checkDiscovery(self.fns.cublasLtMatrixLayoutCreate(&plan.a_desc, key.input_type, key.in_dim, key.out_dim, key.in_dim), cold);
+                try self.checkDiscovery(self.fns.cublasLtMatrixLayoutCreate(&plan.b_desc, key.input_type, key.in_dim, key.rows, key.in_dim), cold);
             },
             .dense_input_gradient => {
                 // Row-major W[out, in] is column-major [in, out] in-place;
@@ -776,28 +780,28 @@ pub const CublasLt = struct {
                 // ordinary column-major product is the row-major dX result.
                 transa = CUBLAS_OP_N;
                 transb = CUBLAS_OP_N;
-                try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.a_desc, key.input_type, key.in_dim, key.out_dim, key.in_dim));
-                try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.b_desc, key.input_type, key.out_dim, key.rows, key.out_dim));
+                try self.checkDiscovery(self.fns.cublasLtMatrixLayoutCreate(&plan.a_desc, key.input_type, key.in_dim, key.out_dim, key.in_dim), cold);
+                try self.checkDiscovery(self.fns.cublasLtMatrixLayoutCreate(&plan.b_desc, key.input_type, key.out_dim, key.rows, key.out_dim), cold);
             },
             .strided_batched => {
                 if (key.batch_count > std.math.maxInt(i32)) return error.CublasLtUnsupported;
                 transa = CUBLAS_OP_N;
                 transb = CUBLAS_OP_T;
-                try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.a_desc, key.input_type, key.out_dim, key.in_dim, key.in_dim));
-                try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.b_desc, key.input_type, key.rows, key.in_dim, key.in_dim));
+                try self.checkDiscovery(self.fns.cublasLtMatrixLayoutCreate(&plan.a_desc, key.input_type, key.out_dim, key.in_dim, key.in_dim), cold);
+                try self.checkDiscovery(self.fns.cublasLtMatrixLayoutCreate(&plan.b_desc, key.input_type, key.rows, key.in_dim, key.in_dim), cold);
             },
         }
-        try self.check(self.fns.cublasLtMatmulDescSetAttribute(plan.op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, @sizeOf(c_int)));
-        try self.check(self.fns.cublasLtMatmulDescSetAttribute(plan.op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, @sizeOf(c_int)));
+        try self.checkDiscovery(self.fns.cublasLtMatmulDescSetAttribute(plan.op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, @sizeOf(c_int)), cold);
+        try self.checkDiscovery(self.fns.cublasLtMatmulDescSetAttribute(plan.op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, @sizeOf(c_int)), cold);
         const output_dim = if (key.kind == .dense_input_gradient) key.in_dim else key.out_dim;
-        try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.c_desc, key.output_type, output_dim, key.rows, output_dim));
-        try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.d_desc, key.output_type, output_dim, key.rows, output_dim));
-        if (key.kind == .dense_bias) try self.setBias(plan.op_desc, invocation.bias orelse return error.CublasLtUnsupported, key.output_type);
+        try self.checkDiscovery(self.fns.cublasLtMatrixLayoutCreate(&plan.c_desc, key.output_type, output_dim, key.rows, output_dim), cold);
+        try self.checkDiscovery(self.fns.cublasLtMatrixLayoutCreate(&plan.d_desc, key.output_type, output_dim, key.rows, output_dim), cold);
+        if (key.kind == .dense_bias) try self.setBias(plan.op_desc, bias orelse return error.CublasLtUnsupported, key.output_type);
 
         if (key.kind == .strided_batched) {
             var row_order = CUBLASLT_ORDER_ROW;
-            try self.check(self.fns.cublasLtMatrixLayoutSetAttribute(plan.a_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, @sizeOf(c_int)));
-            try self.check(self.fns.cublasLtMatrixLayoutSetAttribute(plan.b_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, @sizeOf(c_int)));
+            try self.checkDiscovery(self.fns.cublasLtMatrixLayoutSetAttribute(plan.a_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, @sizeOf(c_int)), cold);
+            try self.checkDiscovery(self.fns.cublasLtMatrixLayoutSetAttribute(plan.b_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, @sizeOf(c_int)), cold);
             const batch_i32: i32 = @intCast(key.batch_count);
             const weight_stride = try checkedI64Product(key.out_dim, key.in_dim);
             const input_stride = try checkedI64Product(key.rows, key.in_dim);
@@ -881,6 +885,76 @@ pub const CublasLt = struct {
         with_bias: bool = false,
         tuning: MatmulTuning = .{},
     };
+
+    /// Exact immutable layout/alignment facts for cold SDK metadata discovery.
+    /// No pointer, allocation, staging, numerical probe or stream submission is
+    /// permitted here. Fused pointer-bearing epilogues remain bound-only.
+    pub const DenseLayout = struct {
+        request: DenseRequest,
+        workspace_bytes: usize,
+        alignments: [4]u32 = @splat(256), // A(weight), B(input), C/D(output)
+        fn key(self: DenseLayout, owner: *const CublasLt) Error!TensorCorePlanKey {
+            const r = self.request;
+            if (r.with_bias or r.rows == 0 or r.in_dim == 0 or r.out_dim == 0 or r.rows > std.math.maxInt(u32) or r.in_dim > std.math.maxInt(u32) or r.out_dim > std.math.maxInt(u32)) return error.CublasLtUnsupported;
+            const element_bytes: usize = if (r.precision == .f32) 4 else 2;
+            _ = try checkedMatrixBytes(r.rows, r.in_dim, element_bytes);
+            _ = try checkedMatrixBytes(r.out_dim, r.in_dim, element_bytes);
+            _ = try checkedMatrixBytes(r.rows, r.out_dim, 4);
+            for (self.alignments) |alignment| if (alignment == 0 or alignment > 256 or !std.math.isPowerOfTwo(alignment)) return error.CublasLtUnsupported;
+            const tuning = r.tuning.normalized();
+            return .{ .kind = .dense, .input_type = r.precision.native(), .output_type = CUDA_R_32F, .batch_count = 1, .rows = @intCast(r.rows), .in_dim = @intCast(r.in_dim), .out_dim = @intCast(r.out_dim), .workspace_bytes = self.workspace_bytes, .alignment_a_bytes = self.alignments[0], .alignment_b_bytes = self.alignments[1], .alignment_c_bytes = self.alignments[2], .alignment_d_bytes = self.alignments[3], .tuning_fingerprint = tuning.fingerprint(), .canonical_rows = owner.canonicalDecodeRows(.dense, r.precision.native(), CUDA_R_32F, 1, r.rows, r.in_dim, r.out_dim, tuning) };
+        }
+    };
+    /// Algorithms are copied by value in the existing cache/clone protocol.
+    /// This recipe owns no SDK object/buffer/model/Io/allocator. Only a later
+    /// bound PreparedDense owns descriptors through its actual frame/capture.
+    pub const DenseRecipe = struct {
+        // Borrowed identity only; the containing route/program retains its
+        // actual compute/library lifetime, as for PreparedDense today.
+        owner: *CublasLt,
+        key: TensorCorePlanKey,
+        algo: MatmulAlgo,
+        workspace_size: usize,
+        selection: MatmulSelection,
+        precision: DensePrecision,
+        tuning: MatmulTuning,
+        pub fn matchesLayout(self: *const DenseRecipe, layout: DenseLayout) bool {
+            const current = layout.key(self.owner) catch return false;
+            return self.precision == layout.request.precision and std.meta.eql(current, self.key);
+        }
+        pub fn validate(self: *const DenseRecipe, invocation: TensorCoreInvocation) Error!void {
+            const prepared = PreparedDense{ .owner = self.owner, .plan = undefined, .key = self.key, .tuning = self.tuning, .precision = self.precision, .with_bias = false };
+            try prepared.validate(invocation);
+            try checkRawBytes(invocation.workspace, self.workspace_size);
+        }
+    };
+    pub fn prepareDenseLayout(self: *CublasLt, ctx: *context_mod.CudaContext, layout: DenseLayout) Error!DenseRecipe {
+        const key = try layout.key(self); // Refuse malformed declarations before SDK.
+        try self.validateContext(ctx);
+        if (ctx.streamCaptureActive() catch return error.CublasLtError) return error.CublasLtUnsupported;
+        spinLock(&self.tensor_core_plans_mutex);
+        const cached = self.tensor_core_plans.get(key);
+        self.tensor_core_plans_mutex.unlock();
+        const tuning = layout.request.tuning.normalized();
+        if (cached) |plan| return .{ .owner = self, .key = key, .algo = plan.algo, .workspace_size = plan.workspace_size, .selection = plan.selection, .precision = layout.request.precision, .tuning = tuning };
+        // A cold tuned miss needs real admitted probe buffers. Preserve its
+        // ordinary compatibility path rather than downgrade or invent data.
+        if (tuning.enabled) return error.CublasLtUnsupported;
+        const plan = try self.createTensorCorePlanFacts(key, tuning, ctx, null, true);
+        defer self.destroyTensorCorePlan(plan);
+        return .{ .owner = self, .key = key, .algo = plan.algo, .workspace_size = plan.workspace_size, .selection = plan.selection, .precision = layout.request.precision, .tuning = tuning };
+    }
+    pub fn bindDenseRecipe(self: *CublasLt, ctx: *context_mod.CudaContext, recipe: *const DenseRecipe, invocation: TensorCoreInvocation) Error!PreparedDense {
+        if (recipe.owner != self) return error.CublasLtUnsupported;
+        try recipe.validate(invocation); // Exact binding before any SDK mutation.
+        try self.validateContext(ctx);
+        if (ctx.streamCaptureActive() catch return error.CublasLtError) return error.CublasLtUnsupported;
+        var plan = try self.createTensorCoreDescriptors(recipe.key, invocation);
+        plan.algo = recipe.algo;
+        plan.workspace_size = recipe.workspace_size;
+        plan.selection = recipe.selection;
+        return .{ .owner = self, .key = recipe.key, .plan = plan, .tuning = recipe.tuning, .precision = recipe.precision, .with_bias = false };
+    }
 
     /// Prepare after assigned storage exists and before recording a graph.
     /// Algorithm probes use only the caller's declared unpublished output
@@ -991,22 +1065,27 @@ pub const CublasLt = struct {
         ctx: *context_mod.CudaContext,
         invocation: TensorCoreInvocation,
     ) Error!TensorCorePlan {
-        var plan = try self.createTensorCoreDescriptors(key, invocation);
+        return self.createTensorCorePlanFacts(key, tuning, ctx, invocation, false);
+    }
+
+    fn createTensorCorePlanFacts(self: *CublasLt, key: TensorCorePlanKey, tuning: MatmulTuning, ctx: *context_mod.CudaContext, binding: ?TensorCoreInvocation, comptime cold: bool) Error!TensorCorePlan {
+        if (cold and tuning.enabled) return error.CublasLtUnsupported;
+        var plan = try self.createTensorCoreDescriptorsFacts(key, if (binding) |value| value.bias else null, cold);
         errdefer self.destroyTensorCorePlan(plan);
 
         var pref: MatmulPreference = null;
-        try self.check(self.fns.cublasLtMatmulPreferenceCreate(&pref));
+        try self.checkDiscovery(self.fns.cublasLtMatmulPreferenceCreate(&pref), cold);
         defer _ = self.fns.cublasLtMatmulPreferenceDestroy(pref);
         var max_workspace = key.workspace_bytes;
-        try self.check(self.fns.cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_workspace, @sizeOf(usize)));
+        try self.checkDiscovery(self.fns.cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_workspace, @sizeOf(usize)), cold);
         var alignment_a = key.alignment_a_bytes;
         var alignment_b = key.alignment_b_bytes;
         var alignment_c = key.alignment_c_bytes;
         var alignment_d = key.alignment_d_bytes;
-        try self.check(self.fns.cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, &alignment_a, @sizeOf(u32)));
-        try self.check(self.fns.cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, &alignment_b, @sizeOf(u32)));
-        try self.check(self.fns.cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, &alignment_c, @sizeOf(u32)));
-        try self.check(self.fns.cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, &alignment_d, @sizeOf(u32)));
+        try self.checkDiscovery(self.fns.cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, &alignment_a, @sizeOf(u32)), cold);
+        try self.checkDiscovery(self.fns.cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, &alignment_b, @sizeOf(u32)), cold);
+        try self.checkDiscovery(self.fns.cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, &alignment_c, @sizeOf(u32)), cold);
+        try self.checkDiscovery(self.fns.cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, &alignment_d, @sizeOf(u32)), cold);
 
         var heuristics: [maximum_matmul_heuristics]MatmulHeuristicResult = undefined;
         var returned: c_int = 0;
@@ -1021,13 +1100,13 @@ pub const CublasLt = struct {
             var probe_key = key;
             probe_key.rows = key.canonical_rows;
             probe_key.canonical_rows = 0;
-            const probe = self.createTensorCorePlan(probe_key, .{}, ctx, invocation) catch |err| {
+            const probe = self.createTensorCorePlanFacts(probe_key, .{}, ctx, binding, cold) catch |err| {
                 if (!lighton_probe or err != error.CublasLtUnsupported) return err;
                 // A library may decline the descriptor probe while supporting
                 // the real shape. Preserve its ordinary cuBLAS route.
                 var ordinary_key = key;
                 ordinary_key.canonical_rows = 0;
-                const ordinary = try self.createTensorCorePlan(ordinary_key, tuning, ctx, invocation);
+                const ordinary = try self.createTensorCorePlanFacts(ordinary_key, tuning, ctx, binding, cold);
                 self.destroyTensorCorePlan(plan);
                 return ordinary;
             };
@@ -1038,18 +1117,19 @@ pub const CublasLt = struct {
                 // Keep the ordinary exact-shape heuristic as a fallback when
                 // the preferred tile cannot execute these actual buffers.
                 var ordinary_count: c_int = 0;
-                try self.check(self.fns.cublasLtMatmulAlgoGetHeuristic(self.handle, plan.op_desc, plan.a_desc, plan.b_desc, plan.c_desc, plan.d_desc, pref, 1, heuristics[1..].ptr, &ordinary_count));
+                try self.checkDiscovery(self.fns.cublasLtMatmulAlgoGetHeuristic(self.handle, plan.op_desc, plan.a_desc, plan.b_desc, plan.c_desc, plan.d_desc, pref, 1, heuristics[1..].ptr, &ordinary_count), cold);
                 if (ordinary_count == 1) returned = 2;
             }
         } else {
-            try self.check(self.fns.cublasLtMatmulAlgoGetHeuristic(self.handle, plan.op_desc, plan.a_desc, plan.b_desc, plan.c_desc, plan.d_desc, pref, requested, &heuristics, &returned));
+            try self.checkDiscovery(self.fns.cublasLtMatmulAlgoGetHeuristic(self.handle, plan.op_desc, plan.a_desc, plan.b_desc, plan.c_desc, plan.d_desc, pref, requested, &heuristics, &returned), cold);
         }
         const result_count = try checkedHeuristicResultCount(returned, requested, heuristics.len);
         var checked_heuristics: [maximum_matmul_heuristics]MatmulHeuristicResult = undefined;
         var checked_count: usize = 0;
         for (heuristics[0..result_count]) |heuristic| {
+            if (cold and heuristic.state != CUBLAS_STATUS_SUCCESS and heuristic.state != CUBLAS_STATUS_NOT_SUPPORTED) try self.checkDiscovery(heuristic.state, cold);
             if (heuristic.state != CUBLAS_STATUS_SUCCESS or
-                heuristic.workspace_size > invocation.workspace.len)
+                heuristic.workspace_size > key.workspace_bytes)
             {
                 continue;
             }
@@ -1058,7 +1138,7 @@ pub const CublasLt = struct {
             // exact operation/layout descriptors and current device before it
             // can become either the fallback or a timed candidate.
             var checked = heuristic;
-            if (self.fns.cublasLtMatmulAlgoCheck(
+            const check_status = self.fns.cublasLtMatmulAlgoCheck(
                 self.handle,
                 plan.op_desc,
                 plan.a_desc,
@@ -1067,9 +1147,14 @@ pub const CublasLt = struct {
                 plan.d_desc,
                 &heuristic.algo,
                 &checked,
-            ) != CUBLAS_STATUS_SUCCESS) continue;
+            );
+            if (check_status != CUBLAS_STATUS_SUCCESS) {
+                if (cold and check_status != CUBLAS_STATUS_NOT_SUPPORTED) try self.checkDiscovery(check_status, cold);
+                continue;
+            }
+            if (cold and checked.state != CUBLAS_STATUS_SUCCESS and checked.state != CUBLAS_STATUS_NOT_SUPPORTED) try self.checkDiscovery(checked.state, cold);
             if (checked.state != CUBLAS_STATUS_SUCCESS or
-                checked.workspace_size > invocation.workspace.len)
+                checked.workspace_size > key.workspace_bytes)
             {
                 continue;
             }
@@ -1079,7 +1164,7 @@ pub const CublasLt = struct {
             checked_count += 1;
         }
         const candidates = checked_heuristics[0..checked_count];
-        const fallback = firstUsableHeuristicIndex(candidates, invocation.workspace.len) orelse {
+        const fallback = firstUsableHeuristicIndex(candidates, key.workspace_bytes) orelse {
             return error.CublasLtUnsupported;
         };
         if (key.canonical_rows != 0) {
@@ -1097,7 +1182,7 @@ pub const CublasLt = struct {
                 ctx,
                 plan,
                 candidates,
-                invocation,
+                binding orelse return error.CublasLtUnsupported,
                 tuning,
             );
             selected = fastest.index;
@@ -1572,6 +1657,13 @@ pub const CublasLt = struct {
         try self.check(self.fns.cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, @ptrCast(&pointer), @sizeOf(@TypeOf(pointer))));
     }
 
+    fn checkDiscovery(self: *const CublasLt, status: Status, comptime cold: bool) Error!void {
+        if (cold and status == CUBLAS_STATUS_NOT_SUPPORTED) return error.CublasLtUnsupported;
+        // Allocation/driver/policy failures must never masquerade as a harmless
+        // unsupported-algorithm decline. The legacy error adapter is unchanged.
+        return self.check(status);
+    }
+
     fn check(self: *const CublasLt, status: Status) Error!void {
         _ = self;
         if (status != CUBLAS_STATUS_SUCCESS) return error.CublasLtError;
@@ -1943,11 +2035,12 @@ test "prepared vendor descriptor ownership survives source retirement and every 
     const Fake = struct {
         var calls: usize = 0;
         var fail_at: usize = 0;
+        var failure_status: Status = CUBLAS_STATUS_NOT_SUPPORTED;
         var next_id: usize = 1;
         var live: [64]bool = @splat(false);
         fn status() Status {
             calls += 1;
-            return if (calls == fail_at) CUBLAS_STATUS_NOT_SUPPORTED else CUBLAS_STATUS_SUCCESS;
+            return if (calls == fail_at) failure_status else CUBLAS_STATUS_SUCCESS;
         }
         fn create(target: *?*anyopaque) Status {
             const result = status();
@@ -1973,6 +2066,23 @@ test "prepared vendor descriptor ownership survives source retirement and every 
         fn attribute(_: ?*anyopaque, _: c_int, _: ?*const anyopaque, _: usize) callconv(.c) Status {
             return status();
         }
+        fn preferenceCreate(target: *MatmulPreference) callconv(.c) Status {
+            return create(target);
+        }
+        fn heuristic(_: Handle, _: MatmulDesc, _: MatrixLayout, _: MatrixLayout, _: MatrixLayout, _: MatrixLayout, _: MatmulPreference, requested: c_int, results: [*]MatmulHeuristicResult, returned: *c_int) callconv(.c) Status {
+            const result = status();
+            if (result != CUBLAS_STATUS_SUCCESS) return result;
+            std.debug.assert(requested > 0);
+            results[0] = .{ .algo = .{ .data = @splat(17) }, .workspace_size = 256, .state = CUBLAS_STATUS_SUCCESS, .waves_count = 0, .reserved = @splat(0) };
+            returned.* = 1;
+            return result;
+        }
+        fn algoCheck(_: Handle, _: MatmulDesc, _: MatrixLayout, _: MatrixLayout, _: MatrixLayout, _: MatrixLayout, algo: *const MatmulAlgo, checked: *MatmulHeuristicResult) callconv(.c) Status {
+            const result = status();
+            if (result != CUBLAS_STATUS_SUCCESS) return result;
+            checked.* = .{ .algo = algo.*, .workspace_size = 256, .state = CUBLAS_STATUS_SUCCESS, .waves_count = 0, .reserved = @splat(0) };
+            return result;
+        }
         fn count() usize {
             var result: usize = 0;
             for (live) |value| result += @intFromBool(value);
@@ -1981,6 +2091,7 @@ test "prepared vendor descriptor ownership survives source retirement and every 
         fn reset(failure: usize) void {
             calls = 0;
             fail_at = failure;
+            failure_status = CUBLAS_STATUS_NOT_SUPPORTED;
             next_id = 1;
             live = @splat(false);
         }
@@ -1993,6 +2104,12 @@ test "prepared vendor descriptor ownership survives source retirement and every 
     blas.fns.cublasLtMatrixLayoutDestroy = &Fake.destroy;
     blas.fns.cublasLtMatmulDescSetAttribute = &Fake.attribute;
     blas.fns.cublasLtMatrixLayoutSetAttribute = &Fake.attribute;
+    blas.fns.cublasLtMatmulPreferenceCreate = &Fake.preferenceCreate;
+    blas.fns.cublasLtMatmulPreferenceDestroy = &Fake.destroy;
+    blas.fns.cublasLtMatmulPreferenceSetAttribute = &Fake.attribute;
+    blas.fns.cublasLtMatmulAlgoGetHeuristic = &Fake.heuristic;
+    blas.fns.cublasLtMatmulAlgoCheck = &Fake.algoCheck;
+    blas.handle = null;
     blas.florence_canonical_f16_decode = false;
     blas.lighton_projection_profile = .off;
     const invocation = TensorCoreInvocation{
@@ -2035,4 +2152,73 @@ test "prepared vendor descriptor ownership survives source retirement and every 
         blas.destroyTensorCorePlan(owned);
         try std.testing.expectEqual(@as(usize, 0), Fake.count());
     }
+    // Exercise the SAME cold descriptor/heuristic/AlgoCheck implementation.
+    // No driver table, stream, buffers or numerical function is initialized:
+    // any accidental probe/submission would access undefined state.
+    const layout = CublasLt.DenseLayout{ .request = .{ .precision = .bf16, .rows = 3, .in_dim = 32, .out_dim = 16 }, .workspace_bytes = 4096 };
+    const cold_key = try layout.key(&blas);
+    var no_driver: context_mod.CudaContext = undefined;
+    for ([_]Status{ CUBLAS_STATUS_NOT_SUPPORTED, 3 }) |failure_status| {
+        var failure: usize = 1;
+        while (true) : (failure += 1) {
+            Fake.reset(failure);
+            Fake.failure_status = failure_status;
+            if (blas.createTensorCorePlanFacts(cold_key, .{}, &no_driver, null, true)) |plan| {
+                try std.testing.expect(failure > Fake.calls);
+                try std.testing.expectEqual(@as(usize, 5), Fake.count());
+                const recipe = CublasLt.DenseRecipe{ .owner = &blas, .key = cold_key, .algo = plan.algo, .workspace_size = plan.workspace_size, .selection = plan.selection, .precision = .bf16, .tuning = .{} };
+                blas.destroyTensorCorePlan(plan);
+                try std.testing.expectEqual(@as(usize, 0), Fake.count());
+                var exact = invocation;
+                exact.bias = null;
+                try recipe.validate(exact);
+                try std.testing.expect(recipe.matchesLayout(layout));
+                var changed = layout;
+                changed.workspace_bytes += 256;
+                try std.testing.expect(!recipe.matchesLayout(changed));
+                try std.testing.expectEqual(@as([8]u64, @splat(17)), recipe.algo.data);
+                break;
+            } else |err| {
+                try std.testing.expectEqual(if (failure_status == CUBLAS_STATUS_NOT_SUPPORTED) error.CublasLtUnsupported else error.CublasLtError, err);
+                try std.testing.expectEqual(@as(usize, 0), Fake.count());
+            }
+        }
+    }
+    Fake.reset(0);
+    try std.testing.expectError(error.CublasLtUnsupported, blas.createTensorCorePlanFacts(cold_key, .{ .enabled = true }, &no_driver, null, true));
+    try std.testing.expectEqual(@as(usize, 0), Fake.calls);
+    // Only SDK NOT_SUPPORTED is a compatibility decline; real SDK allocation
+    // and execution failures keep the existing public error classification.
+    try std.testing.expectError(error.CublasLtUnsupported, blas.checkDiscovery(CUBLAS_STATUS_NOT_SUPPORTED, true));
+    try std.testing.expectError(error.CublasLtError, blas.checkDiscovery(3, true));
+}
+
+test "cold vendor layout and recipe reject malformed metadata before any CUDA or SDK access" {
+    var blas: CublasLt = undefined;
+    blas.florence_canonical_f16_decode = false;
+    blas.lighton_projection_profile = .off;
+    var no_driver: context_mod.CudaContext = undefined;
+    const layout = CublasLt.DenseLayout{ .request = .{ .precision = .bf16, .rows = 3, .in_dim = 32, .out_dim = 16 }, .workspace_bytes = 4096 };
+    var changed = layout;
+    changed.request.rows = 0;
+    try std.testing.expectError(error.CublasLtUnsupported, blas.prepareDenseLayout(&no_driver, changed));
+    changed = layout;
+    changed.request.with_bias = true;
+    try std.testing.expectError(error.CublasLtUnsupported, blas.prepareDenseLayout(&no_driver, changed));
+    changed = layout;
+    changed.alignments[1] = 192;
+    try std.testing.expectError(error.CublasLtUnsupported, blas.prepareDenseLayout(&no_driver, changed));
+    changed = layout;
+    changed.alignments[3] = 512;
+    try std.testing.expectError(error.CublasLtUnsupported, blas.prepareDenseLayout(&no_driver, changed));
+    const recipe = CublasLt.DenseRecipe{ .owner = &blas, .key = try layout.key(&blas), .algo = undefined, .workspace_size = 256, .selection = .heuristic, .precision = .bf16, .tuning = .{} };
+    var invocation = TensorCoreInvocation{ .input = .{ .ptr = 0x10000, .len = 3 * 32 * 2 }, .weight = .{ .ptr = 0x20000, .len = 16 * 32 * 2 }, .dst = .{ .ptr = 0x30000, .len = 3 * 16 * 4 }, .workspace = .{ .ptr = 0x40000, .len = 4096 } };
+    try recipe.validate(invocation);
+    invocation.weight.ptr += 2;
+    try std.testing.expectError(error.CublasLtUnsupported, blas.bindDenseRecipe(&no_driver, &recipe, invocation));
+    invocation.weight.ptr -= 2;
+    invocation.workspace.len -= 1;
+    try std.testing.expectError(error.CublasLtUnsupported, blas.bindDenseRecipe(&no_driver, &recipe, invocation));
+    var foreign: CublasLt = undefined;
+    try std.testing.expectError(error.CublasLtUnsupported, foreign.bindDenseRecipe(&no_driver, &recipe, invocation));
 }

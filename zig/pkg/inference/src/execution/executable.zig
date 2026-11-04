@@ -40,18 +40,52 @@ pub const Executable = struct {
     /// Borrow invocation options synchronously and write a fresh caller-owned
     /// result directly. The value API remains available to existing callers.
     pub fn runInto(self: *Executable, allocator: std.mem.Allocator, options: *const interpreter.ExecuteOptions, result: *runtime_module.Result) !void {
+        if (!self.diagnostics.isEnabled()) return self.runBodyInto(false, allocator, options, result, {});
+        return self.runObservedInto(allocator, options, result);
+    }
+    // Rich scope arrays live only on the enabled stack. Both paths share the
+    // actual option preparation, execution and error/publication behavior.
+    noinline fn runObservedInto(self: *Executable, allocator: std.mem.Allocator, options: *const interpreter.ExecuteOptions, result: *runtime_module.Result) !void {
         var device_owners: @import("device_owner_registry.zig").Registry = undefined;
-        const observing = self.diagnostics.isEnabled();
+        const observing = true;
         if (observing) device_owners.begin(@import("allocation_registry.zig").metadataAllocator());
         defer if (observing) {
             _ = device_owners.end();
         };
         var before: ?@import("diagnostics.zig").Start = if (observing) self.diagnostics.beginEnabled(self.runtime.default_backend) else null;
-        if (before) |*start| start.device_owners = &device_owners;
+        var device_roots: @import("device_allocation_registry.zig").Registry = undefined;
+        var kernels: @import("runtime_observation.zig").KernelScope = .{};
+        var metal_buffers: @import("../backends/metal_telemetry.zig").BufferInterval = .{};
+        var video_resources: @import("antfly_video").preparation.OwnedResourceInterval = .{};
+        if (observing) {
+            device_roots.begin(@import("allocation_registry.zig").metadataAllocator());
+            kernels.begin();
+            metal_buffers.begin(@import("build_options").enable_metal);
+            video_resources.begin(@import("build_options").enable_metal);
+            // beginEnabled registered the retained owner census before the
+            // roots attached. Bind the actual context root at this boundary.
+            self.runtime.default_backend.registerRuntimeObservation();
+        }
+        defer if (observing) {
+            _ = video_resources.finish(@import("build_options").enable_metal);
+            _ = metal_buffers.finish(@import("build_options").enable_metal);
+            _ = kernels.finish();
+            _ = device_roots.end();
+        };
+        if (before) |*start| {
+            start.device_owners = &device_owners;
+            start.device_roots = &device_roots;
+            start.kernels = &kernels;
+            start.metal_buffers = &metal_buffers;
+            start.video_resources = &video_resources;
+        }
         if (observing) if (options.runtime_inputs) |inputs| for (inputs) |input| {
             (input.source_backend orelse self.runtime.default_backend).registerTensorOwnershipObservation(input.value);
         };
         defer if (observing) @import("diagnostics.zig").Diagnostics.end(before);
+        return self.runBodyInto(true, allocator, options, result, before);
+    }
+    fn runBodyInto(self: *Executable, comptime observing: bool, allocator: std.mem.Allocator, options: *const interpreter.ExecuteOptions, result: *runtime_module.Result, before: if (observing) ?@import("diagnostics.zig").Start else void) !void {
         var prepared_options = options.*;
         prepared_options.cached_analysis = self.analysis;
         prepared_options.mutable_parameters = self.mutable_parameters;
@@ -103,7 +137,10 @@ pub fn prepareWithOptions(allocator: std.mem.Allocator, program: *const ModelPro
     prepared.mutable_parameters = program.mutable_parameters;
     if (comptime !@import("build_options").enable_wasm) {
         if (prepared.runtime.physical_pool) |pool| for (program.bindings) |binding| {
-            if (binding.kind == .state_input or binding.kind == .state_output) pool.cuda_frame_dispatch = false;
+            if (binding.kind == .state_input or binding.kind == .state_output) {
+                pool.cuda_frame_dispatch = false;
+                pool.metal_frame_dispatch = false;
+            }
         };
     }
     return prepared;
@@ -141,7 +178,7 @@ pub fn prepareAnalyzedGraph(allocator: std.mem.Allocator, graph: *const @import(
     else
         try runtime_module.Runtime.initWithOptions(allocator, graph, backend, strategy, .{ .tensor_descs = tensor_descs, .analysis = analysis, .region_costs = options.region_costs }) };
     errdefer result.deinit();
-    configureOwnedCoverage(&result, graph, analysis);
+    try configureOwnedCoverage(&result, graph, analysis);
     if (comptime !@import("build_options").enable_wasm) if (result.runtime.physical_pool) |pool| try pool.configureRoutes(options.immutable_input_bindings orelse &.{});
     return result;
 }
@@ -1914,12 +1951,14 @@ test "prepared physical warm capacity excludes measured allocator padding" {
     defer context.deinit(a);
     const original_backend = context.computeBackend();
     const Padded = struct {
-        fn bound(_: *anyopaque, bytes: usize) !usize {
-            return std.math.add(usize, bytes, 128);
+        fn bound(_: *anyopaque, request: ops.physical_storage.Request) !usize {
+            return std.math.add(usize, request.byte_size, 128);
         }
     };
     var kernels = original_backend.vtable.kernels.?.*;
-    kernels.physicalStorageReservationBytes = Padded.bound;
+    var physical_policy = kernels.physical_storage_policy.?.*;
+    physical_policy.reservation_bytes = Padded.bound;
+    kernels.physical_storage_policy = &physical_policy;
     var table = original_backend.vtable.*;
     kernels.implementation_table = &table; // Explicit fixture physical-program opt-in.
     table.kernels = &kernels;
@@ -2569,7 +2608,11 @@ test "direct executable diagnostics replace success with actual failed invocatio
     var bound = [_]interpreter.RuntimeInput{.{ .node_id = x, .value = input }};
     var result = try executable.run(a, .{ .runtime_inputs = try program.remapInputs(&bound) });
     result.deinit(&executable.runtime);
-    try std.testing.expectEqual(.success, executable.diagnostics.snapshot().?.outcome);
+    const successful = executable.diagnostics.snapshot().?;
+    try std.testing.expectEqual(.success, successful.outcome);
+    try std.testing.expect(successful.report.?.joined_native_workers != null);
+    try std.testing.expect(successful.report.?.device_allocator_roots != null);
+    try std.testing.expect(successful.report.?.owned_program_fallbacks != null);
     const invalid = [_]interpreter.RuntimeInput{.{ .node_id = std.math.maxInt(ml.graph.NodeId), .value = input }};
     if (executable.run(a, .{ .runtime_inputs = &invalid })) |unexpected| {
         var owned = unexpected;
@@ -2583,16 +2626,75 @@ test "direct executable diagnostics replace success with actual failed invocatio
         try std.testing.expect(measured.runtime.device_owners != null);
     }
     try std.testing.expect(!@import("device_owner_registry.zig").enabled());
+    try std.testing.expect(!@import("device_allocation_registry.zig").enabled());
+    try std.testing.expect(!@import("runtime_observation.zig").kernelEnabled());
 }
 
-fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").graph.Graph, analysis: interpreter.CachedAnalysis) void {
+fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").graph.Graph, analysis: interpreter.CachedAnalysis) !void {
     if (comptime @import("build_options").enable_wasm) return;
     const pool = executable.runtime.physical_pool orelse return;
     pool.coverage_graph = graph;
     pool.coverage_reachable = analysis.reachable;
     pool.native_frame_dispatch = false;
     pool.cuda_frame_dispatch = false;
+    pool.metal_frame_dispatch = false;
     pool.coverage_backend = .{ .ptr = executable.runtime.default_backend.ptr, .vtable = executable.runtime.default_backend.vtable };
+    if (comptime @import("build_options").enable_metal) {
+        if (executable.runtime.default_backend.kind() == .metal and @import("device_owned_coverage.zig").services(executable.runtime.default_backend.*) != null) {
+            const plan = executable.runtime.plan orelse return;
+            const mesh = executable.runtime.mesh orelse return;
+            const entry = executable.runtime.runtime_cache_entry orelse return;
+            const compiled = entry.compiled_partitions orelse return;
+            if (plan.device_assignment.len != plan.base.partitions.len or plan.base.node_assignment.len != graph.nodeCount() or analysis.reachable.len != graph.nodeCount() or pool.plan.transfers.len != 0) return;
+            var targets: usize = 0;
+            for (mesh.devices, 0..) |device, index| {
+                for (mesh.devices[0..index]) |previous| if (previous.id == device.id) return;
+                if (device.backend.ptr == executable.runtime.default_backend.ptr and device.backend.vtable == executable.runtime.default_backend.vtable) {
+                    if (device.id != 0 or device.kind != .metal) return;
+                    targets += 1;
+                }
+            }
+            if (targets != 1) return;
+            // Nonblocking compatibility decline if this cold executable was built
+            // beneath an external owner. Never wait while an unknown outer lane is
+            // held, and never reinterpret its legacy scope as managed authority.
+            var metadata = @import("backend_operation.zig").enter(executable.runtime.default_backend.*, graph, null, .metadata) catch |err| switch (err) {
+                error.QueueFull => return,
+                else => return err,
+            };
+            defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            if (metadata.token() == null) return;
+            for (plan.base.partitions, 0..) |part, index| {
+                var active = false;
+                for (part.node_ids) |id| {
+                    if (id >= analysis.reachable.len) return;
+                    if (!analysis.reachable[id]) continue;
+                    if (plan.base.node_assignment[id] != index or graph.node(id).op == .fused_from_float32) return;
+                    active = true;
+                }
+                if (!active) continue;
+                if (part.backend != .metal or plan.device_assignment[index] != 0) return;
+                const actual = part.executor orelse return;
+                var owned = false;
+                for (compiled) |cached| if (cached.partition_idx == index and actual.ptr == cached.executor.ptr and actual.vtable == cached.executor.vtable) {
+                    owned = true;
+                };
+                if (!owned or !try @import("../graph/metal_partition_executor.zig").MetalPartitionExecutor.attestOwnedFrameDispatch(actual, graph, executable.runtime.default_backend, part.node_ids, analysis.reachable, analysis.last_use)) return;
+            }
+            for (analysis.reachable, 0..) |active, id| {
+                if (!active) continue;
+                const assigned = plan.base.node_assignment[id];
+                if (assigned >= plan.base.partitions.len) return;
+                var count: usize = 0;
+                for (plan.base.partitions[assigned].node_ids) |node| if (node == id) {
+                    count += 1;
+                };
+                if (count != 1) return;
+            }
+            pool.metal_frame_dispatch = true;
+            return;
+        }
+    }
     // CUDA's ordinary per-node branch calls interpreter.executeNode and its
     // Frame first. No compiled executor/fusion may bypass the selected route.
     if (@import("cuda_owned_coverage.zig").services(executable.runtime.default_backend.*) != null) {
@@ -3568,10 +3670,10 @@ test "CUDA owned dispatch permits unused Native catalog and declines active fall
         // concrete execution plan: it must never inherit CUDA physical credit.
         device_plan.base.partitions[active_part].backend = .native;
         mutable_assignments[active_part] = 1;
-        configureOwnedCoverage(&executable, executable.graph, executable.analysis);
+        try configureOwnedCoverage(&executable, executable.graph, executable.analysis);
         try std.testing.expect(!pool.cuda_frame_dispatch);
     }
-    configureOwnedCoverage(&executable, executable.graph, executable.analysis);
+    try configureOwnedCoverage(&executable, executable.graph, executable.analysis);
     try std.testing.expect(pool.cuda_frame_dispatch);
     {
         const mesh_mod = @import("../graph/device_mesh.zig");
@@ -3579,7 +3681,7 @@ test "CUDA owned dispatch permits unused Native catalog and declines active fall
         defer aliased.deinit();
         executable.runtime.mesh = aliased;
         defer executable.runtime.mesh = original_mesh;
-        configureOwnedCoverage(&executable, executable.graph, executable.analysis);
+        try configureOwnedCoverage(&executable, executable.graph, executable.analysis);
         try std.testing.expect(!pool.cuda_frame_dispatch);
     }
     {
@@ -3593,14 +3695,93 @@ test "CUDA owned dispatch permits unused Native catalog and declines active fall
         mutable_assignments[active_part] = 77;
         // Null source_backend runtime inputs resolve to DeviceId0 in the real
         // executor; a lone target at77 cannot prove absence of transfers.
-        configureOwnedCoverage(&executable, executable.graph, executable.analysis);
+        try configureOwnedCoverage(&executable, executable.graph, executable.analysis);
         try std.testing.expect(!pool.cuda_frame_dispatch);
     }
-    configureOwnedCoverage(&executable, executable.graph, executable.analysis);
+    try configureOwnedCoverage(&executable, executable.graph, executable.analysis);
     try std.testing.expect(pool.cuda_frame_dispatch);
     var state_program = try ModelProgram.init(a, &graph, &.{ .{ .name = "x", .node_id = input, .kind = .state_input }, .{ .name = "out", .node_id = output, .kind = .output } });
     defer state_program.deinit();
     var state_executable = try prepare(a, &state_program, &backend, .partitioned);
     defer state_executable.deinit();
     try std.testing.expect(!state_executable.runtime.physical_pool.?.cuda_frame_dispatch);
+}
+
+test "Metal Frame coverage refuses input rooted aliases and keeps tuned linear executor ownership" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const x = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{ 128, 64 }));
+    const alias = try builder.reshape(x, ml.graph.Shape.init(.f32, &.{8192}));
+    try graph.markOutput(try builder.absOp(alias));
+    var program = try ModelProgram.init(a, &graph, &.{.{ .name = "x", .node_id = x, .kind = .input }});
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .partitioned);
+    defer executable.deinit();
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const before = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
+    const bindings = [_]@import("kernel_route.zig").InputBinding{.{ .node_id = program.id_map[x], .value = .{ .imported_host = .{ .target = .metal, .logical = ml.graph.Shape.init(.f32, &.{ 128, 64 }), .owned_ingress = true } } }};
+    if (@import("../backends/metal_runtime.zig").antfly_metal_host_input_shared_supported(context.metal_hosted.compute.provider_impl.raw_decode_runtime)) {
+        const selected = (try pool.prepareRoutes(&bindings)) orelse return error.MissingPreparedRoute;
+        defer selected.release();
+        try std.testing.expect(selected.pool.completeOwnedPayload() == null);
+        try std.testing.expectEqual(.alias, selected.pool.payload_coverage.compatibility);
+        try std.testing.expectEqual(before.device_owned_buffers_created, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
+    }
+    var projection_graph = ml.graph.Graph.init(a);
+    defer projection_graph.deinit();
+    var projection = ml.graph.Builder.init(&projection_graph);
+    const px = try projection.parameter("x", ml.graph.Shape.init(.f32, &.{ 128, 64 }));
+    const pw = try projection.parameter("w", ml.graph.Shape.init(.f32, &.{ 64, 64 }));
+    try projection_graph.markOutput(try projection.linearNoBias(px, pw, 128, 64, 64));
+    var projection_program = try ModelProgram.init(a, &projection_graph, &.{ .{ .name = "x", .node_id = px, .kind = .input }, .{ .name = "w", .node_id = pw, .kind = .input } });
+    defer projection_program.deinit();
+    var tuned = try prepare(a, &projection_program, &cb, .partitioned);
+    defer tuned.deinit();
+    try std.testing.expect(!tuned.runtime.physical_pool.?.metal_frame_dispatch);
+    // Compilation keeps the actual canonical Metal owner attached. Coverage
+    // refusal cannot switch the partition to a per-node/interpreter schedule.
+    const plan = tuned.runtime.plan orelse return error.MissingGraphRuntimePlan;
+    var owned: usize = 0;
+    for (plan.base.partitions) |part| if (part.backend == .metal and part.node_ids.len != 0) {
+        try std.testing.expect(part.executor != null);
+        owned += 1;
+    };
+    try std.testing.expect(owned != 0);
+}
+
+test "Metal Frame cold metadata publication unwinds every allocation failure without SDK payload" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const x = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{ 128, 64 }));
+    const root = try builder.neg(x);
+    const alias = try builder.reshape(root, ml.graph.Shape.init(.f32, &.{8192}));
+    try graph.markOutput(try builder.absOp(alias));
+    var analysis = try interpreter.CachedAnalysis.compute(a, &graph);
+    defer analysis.deinit(a);
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator, ir: *const ml.graph.Graph, cached: interpreter.CachedAnalysis, cb: *const ops.ComputeBackend) !void {
+            var executable = try prepareAnalyzedGraph(allocator, ir, cached, cb, .partitioned, .{});
+            defer executable.deinit();
+            try std.testing.expect(executable.runtime.physical_pool.?.metal_frame_dispatch);
+        }
+    };
+    const before = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Case.run, .{ &graph, analysis, &backend });
+    try std.testing.expectEqual(before.device_owned_buffers_created, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
 }

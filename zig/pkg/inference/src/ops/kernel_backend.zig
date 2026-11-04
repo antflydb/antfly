@@ -58,16 +58,9 @@ pub const VTable = struct {
     /// Borrow the current frame's stable storage table. Entries may be filled
     /// during warmup; capture retains their leases before recording addresses.
     physicalExecutionScope: ?*const fn (ctx: *anyopaque, storages: ?[]const ?*physical_storage.Lease) anyerror!void = null,
-    allocatePhysicalStorage: ?*const fn (ctx: *anyopaque, byte_size: usize) anyerror!?CT = null,
-    /// Canonical admitted bank allocation: ownership metadata and conditional
-    /// nonrecycling authority exist before any SDK buffer escapes.
-    allocateAdmittedPhysicalStorage: ?*const fn (ctx: *anyopaque, byte_size: usize) anyerror!?CT = null,
-    /// Metadata-only canonical-bank adoption. Conditional nonrecycling must be
-    /// established before a token moves or any fallible SDK witness install.
-    markPhysicalStorageAdmitted: ?*const fn (*anyopaque, CT) anyerror!void = null,
-    /// Backing buffer span, including allocator reuse/rounding. Null is unknown.
-    /// Metadata-only preflight upper bound for the owned SDK allocation span.
-    physicalStorageReservationBytes: ?*const fn (ctx: *anyopaque, byte_size: usize) anyerror!usize = null,
+    /// Canonical typed physical allocation policy, accepted as part of this
+    /// complete backend table before any context callback is invoked.
+    physical_storage_policy: ?*const physical_storage.Policy = null,
     /// Authoritative cold backing/plane ownership. Visitors allocate nothing
     /// in the provider; aliases resolve full canonical owners and exact quota.
     storageOwnership: ?*const fn (ctx: *anyopaque, tensor: CT, visitor: @import("../execution/storage_ownership.zig").Visitor) anyerror!@import("../execution/storage_ownership.zig").Coverage = null,

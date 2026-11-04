@@ -524,9 +524,10 @@ pub fn createSessionWithOptions(
     var construction_operation: @import("../execution/backend_operation.zig").Scope = undefined;
     try @import("../execution/backend_operation.zig").enterInto(&self.cb, &self.program.graph, null, .managed, &construction_operation);
     var construction_succeeded = false;
-    defer {
+    var construction_active = true;
+    defer if (construction_active) {
         if (construction_succeeded) construction_operation.finish() catch @import("antfly_platform").inference_process_supervisor.restartWorker() else construction_operation.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-    }
+    };
     self.io = options.io;
     self.requested_strategy = options.graph_runtime_strategy orelse graph_runtime_mod.strategyFromEnv();
     if ((requested_backend == .native or requested_backend == .metal or requested_backend == .cuda) and options.graph_runtime_strategy == null and
@@ -598,6 +599,27 @@ pub fn createSessionWithOptions(
 
     const immutable_facts = try immutableRouteBindings(allocator, self.static_runtime_inputs, self.input_node_ids, &self.cb);
     defer allocator.free(immutable_facts);
+    // Literal eligibility currently reads the real runtime frame state. Keep
+    // such compatibility constructors under their original operation too;
+    // reuse cached reachability, never infer absence from parameter count.
+    var context_sensitive_literals = false;
+    if (self.cb.kind() == .metal and self.static_runtime_inputs.len == 0) {
+        for (self.program.graph.nodes.items, 0..) |node, id| {
+            if (self.program.analysis.reachable[id] and node.op == .constant) {
+                context_sensitive_literals = true;
+                break;
+            }
+        }
+    }
+    // Empty-input, literal-free construction has no numerical/backend-owned values left to
+    // unwind. End its last numerical operation before cold executable metadata
+    // obtains the independent provider/index snapshot gate. A managed scope is
+    // never reinterpreted as metadata authority. Constructors with static SDK
+    // values keep the original scope through their fallible ownership transfer.
+    if (self.cb.kind() == .metal and self.static_runtime_inputs.len == 0 and !context_sensitive_literals and self.source_path == null and self.requested_strategy != .interpreter) {
+        try construction_operation.finish();
+        construction_active = false;
+    }
     self.executable = try executable_mod.prepareWithOptions(
         allocator,
         &self.program,
@@ -683,8 +705,8 @@ fn prepareInvocationIntoWithCleanup(session: *const Session, shapes: session_mod
     prepared.backend_cookie = events;
     if (comptime !build_options.enable_wasm) {
         if (target.executable.runtime.physical_pool) |root_pool| {
-            if (!InvocationInputFacts.needsResidentStorage(shapes) and @import("../execution/cuda_owned_coverage.zig").services(target.cb) != null)
-                try prepareCudaPhysicalInvocation(prepared, session, target, root_pool, shapes, allocator, cleanup, if (control) |*value| value else null)
+            if (!InvocationInputFacts.needsResidentStorage(shapes) and (@import("../execution/cuda_owned_coverage.zig").services(target.cb) != null or root_pool.metal_frame_dispatch))
+                try prepareDevicePhysicalInvocation(prepared, session, target, root_pool, shapes, allocator, cleanup, if (control) |*value| value else null)
             else
                 try preparePhysicalInvocationWithCleanup(prepared, session, target, root_pool, shapes, allocator, cleanup);
         }
@@ -1171,6 +1193,7 @@ fn runConcreteWithOutputs(
     region_claims: ?*@import("../execution/region_claims.zig").Set,
     region_execution_profile: ?*@import("../execution/region_execution_profile.zig").Claim,
 ) !if (resident) ResidentOutputs else []Tensor {
+    if (prepared_routes) |routes| try routes.pool.validateExecutionPolicy();
     const profile_owned = if (region_execution_profile) |profile| try profile.ensureScope(.{ .operation = .graph_execution, .implementation = .{ .context = self.cb.ptr, .table = self.cb.vtable }, .program = self.executable.graph }) else false;
     var profile_succeeded = false;
     defer if (profile_owned) {
@@ -1178,7 +1201,7 @@ fn runConcreteWithOutputs(
         if (profile_succeeded) profile.finishSubmission() catch @import("antfly_platform").inference_process_supervisor.restartWorker() else profile.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
     };
     var operation_scope: @import("../execution/backend_operation.zig").Scope = undefined;
-    try @import("../execution/backend_operation.zig").enterInto(&self.cb, self.executable.graph, if (region_execution_profile) |profile| profile.operation_lease else self.cb.operationToken(), if (region_execution_profile != null) .managed else .legacy_unknown_frame, &operation_scope);
+    try @import("../execution/backend_operation.zig").enterInto(&self.cb, self.executable.graph, if (region_execution_profile) |profile| profile.operation_lease else self.cb.operationToken(), if (region_execution_profile != null or (if (prepared_routes) |routes| routes.pool.requiresManagedExecution() else false)) .managed else .legacy_unknown_frame, &operation_scope);
     var operation_succeeded = false;
     defer {
         if (operation_succeeded) operation_scope.finish() catch @import("antfly_platform").inference_process_supervisor.restartWorker() else operation_scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
@@ -3350,6 +3373,8 @@ test "ONNX host outputs export directly from a final CPU fallback" {
     native_vtable.relu = &Probe.nativeRelu;
     var functions = native_vtable.kernels.?.*;
     functions.runAssignedKernel = &Probe.nativeAssigned;
+    functions.implementation_table = &native_vtable;
+    functions.acceptsImplementation = null;
     native_vtable.kernels = &functions;
     fallback.backend.vtable = &native_vtable;
     // The instrumentation preserves the implementation, so bind its vtable
@@ -4038,6 +4063,10 @@ const InvocationInputFacts = struct {
     /// Eligibility is a whole-entry metadata proof. Stage controls already
     /// enter through resident dispatch, so they retain their existing contract.
     fn supportsOwnedHostIngress(target: *const ImportedOnnxSession, shapes: session_mod.ShapeInputs) !bool {
+        if (target.cb.kind() == .metal) {
+            const pool = target.executable.runtime.physical_pool orelse return false;
+            if (!pool.metal_frame_dispatch or !@import("../graph/metal_partition_executor.zig").ownedFramePolicyAvailable()) return false;
+        }
         switch (shapes) {
             .tensors, .host_shapes => {},
             else => return false,
@@ -4984,7 +5013,7 @@ fn selectPhysicalInvocationControlled(prepared: *prepared_mod.PreparedInvocation
 // Generic preparation can run lazily while an outer caller owns a model lane.
 // It must never wait for another provider owner. Only Session's explicit
 // BeforeExecution admission contract may retry the failure-atomic preparation.
-noinline fn prepareCudaPhysicalInvocation(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, shapes: session_mod.ShapeInputs, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context, control: ?*const InferenceExecutionControl) !void {
+noinline fn prepareDevicePhysicalInvocation(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, shapes: session_mod.ShapeInputs, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context, control: ?*const InferenceExecutionControl) !void {
     var facts: InvocationInputFacts = undefined;
     {
         if (control) |active| try active.check();
@@ -5809,4 +5838,238 @@ test "complete Imported CUDA assigned chain preserves host IO opaque floors exac
     try std.testing.expect(replays >= 2);
     _ = @import("../execution/resource_retirement.zig").poll();
     try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "complete Imported Metal Frame encoder owns shared ingress aliases outputs and exact device caps" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const memory = @import("../runtime/tier/memory.zig");
+    const rows = 128;
+    const width = 64;
+    const payload = rows * width * @sizeOf(f32);
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    const controller = &domain.controller;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ rows, width }));
+    const negative = try builder.neg(x);
+    const flat = try builder.reshape(negative, Shape.init(.f32, &.{rows * width}));
+    const absolute = try builder.absOp(flat);
+    const restored = try builder.reshape(absolute, Shape.init(.f32, &.{ rows, width }));
+    var out = try builder.add(restored, x);
+    for (0..4) |_| out = try builder.add(out, x);
+    try graph.markOutput(try builder.reshape(out, Shape.init(.f32, &.{rows * width})));
+    const encoded = try onnx_graph.exportGraph(a, &graph, .{});
+    defer a.free(encoded);
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "complete-metal-frame.onnx", .data = encoded });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..], "complete-metal-frame.onnx" });
+    defer a.free(path);
+    var session = try createSessionWithOptions(a, path, .metal, .{ .graph_runtime_strategy = .partitioned });
+    var session_open = true;
+    defer if (session_open) session.close();
+    session.model_lifetime.?.admission_domain = domain.pin();
+    const impl: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+    if (!@import("../backends/metal_runtime.zig").antfly_metal_host_input_shared_supported(impl.shared_backend_ctx.ctx.metal_hosted.compute.provider_impl.raw_decode_runtime)) return error.SkipZigTest;
+    try std.testing.expect(session.configureExecutionDiagnostics(true));
+    var values: [rows * width]f32 = undefined;
+    for (&values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 11)) - 5)) / 8;
+    var input = try Tensor.initFloat32(a, "x", &.{ rows, width }, &values);
+    defer input.deinit();
+    session.run_admission = .{ .controller = controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 1024 * 1024 * 1024, .static_workspace_kind = .estimate, .check_live_memory = false };
+    var proof = (try prepared_mod.prepare(session, .{ .tensors = &.{input} }, a, null)).?;
+    var proof_open = true;
+    defer if (proof_open) proof.deinit();
+    if (!proof.hasCompleteOwnedPayload()) {
+        std.debug.print("METAL_FRAME_WITNESS_DECLINE root={} child={} reason={s}\n", .{ impl.executable.runtime.physical_pool.?.metal_frame_dispatch, proof.routes.?.pool.metal_frame_dispatch, if (proof.routes.?.pool.payload_coverage == .compatibility) @tagName(proof.routes.?.pool.payload_coverage.compatibility) else "complete" });
+        const dispatch = impl.executable.runtime.plan orelse return error.MissingGraphRuntimePlan;
+        std.debug.print("METAL_ATTEST_DIAG policy={} services={} nodes={d} transfers={d} compiled={}\n", .{ @import("../graph/metal_partition_executor.zig").ownedFramePolicyAvailable(), @import("../execution/device_owned_coverage.zig").services(impl.cb) != null, impl.executable.graph.nodeCount(), impl.executable.runtime.physical_pool.?.plan.transfers.len, impl.executable.runtime.runtime_cache_entry != null });
+        for (impl.executable.runtime.mesh.?.devices) |device| std.debug.print("METAL_ATTEST_DEVICE id={d} kind={s} target={} table={}\n", .{ device.id, @tagName(device.kind), device.backend.ptr == impl.cb.ptr, device.backend.vtable == impl.cb.vtable });
+        var diagnosis_metadata = @import("../execution/backend_operation.zig").enter(impl.cb, impl.executable.graph, null, .metadata) catch |err| {
+            std.debug.print("METAL_ATTEST_POST_CONSTRUCTION_METADATA error={s}\n", .{@errorName(err)});
+            return error.MissingCompleteMetalFramePayload;
+        };
+        defer diagnosis_metadata.deinitChecked() catch unreachable;
+        for (dispatch.base.partitions, 0..) |part, part_index| {
+            std.debug.print("METAL_ATTEST_PART index={d} backend={s} executor={} device={d} nodes={any}\n", .{ part_index, @tagName(part.backend), part.executor != null, dispatch.device_assignment[part_index], part.node_ids });
+            if (part.backend == .metal) if (part.executor) |actual| {
+                const result = try @import("../graph/metal_partition_executor.zig").MetalPartitionExecutor.attestOwnedFrameDispatch(actual, impl.executable.graph, &impl.cb, part.node_ids, impl.executable.analysis.reachable, impl.executable.analysis.last_use);
+                std.debug.print("METAL_ATTEST_POST_CONSTRUCTION part={d} result={}\n", .{ part_index, result });
+            };
+            for (part.node_ids) |id| {
+                const node = impl.executable.graph.node(id);
+                const descriptor = @import("../ops/kernel_descriptor.zig").lower(impl.executable.graph, id);
+                const alias = @import("../execution/metadata_alias.zig").Plan.lower(impl.executable.graph, id, .metal);
+                const slot = impl.executable.runtime.physical_pool.?.plan.slotForNode(id);
+                std.debug.print("METAL_ATTEST_NODE id={d} op={s} dtype={s} dims={any} inputs={any} reachable={} assigned={d} descriptor={s} alias={s} slot={s}\n", .{ id, @tagName(node.op), @tagName(node.output_shape.dtype), node.output_shape.dims[0..node.output_shape.rank()], node.getInputs(), impl.executable.analysis.reachable[id], dispatch.base.node_assignment[id], if (descriptor) |value| @tagName(value.operation) else "none", if (alias) |value| @tagName(value.kind) else "none", if (slot) |value| @tagName(value.kind) else "none" });
+            }
+        }
+        return error.MissingCompleteMetalFramePayload;
+    }
+    const owned = proof.requirement.owned_payload.?;
+    try std.testing.expectEqual(.device, owned.accounting_class);
+    try std.testing.expect(owned.aliases >= 1);
+    const physical = proof.requirement.physical;
+    try std.testing.expectEqual(@as(usize, 0), physical.host_scratch_bytes);
+    try std.testing.expect(physical.backend_scratch_bytes >= 2 * payload);
+    try std.testing.expect(proof.routes.?.pool.hostIngressBackingKnown());
+    const request = try session.planRun(&.{input}, null);
+    const admission_plan = try session.run_admission.?.planRequest(request, session.outputInfo());
+    try std.testing.expectEqual(@as(usize, 3 * payload), admission_plan.protected.host_scratch_bytes);
+    const cap = try admission_plan.protected.merge(physical);
+    proof.deinit();
+    proof_open = false;
+    {
+        const Worker = struct {
+            session: Session,
+            input: *const Tensor,
+            allocator: std.mem.Allocator,
+            checks: std.atomic.Value(usize) = .init(0),
+            done: std.atomic.Value(bool) = .init(false),
+            failure: ?anyerror = null,
+            fn check(raw: ?*anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                _ = self.checks.fetchAdd(1, .acq_rel);
+            }
+            fn run(self: *@This()) void {
+                self.prepare() catch |err| {
+                    self.failure = err;
+                };
+                self.done.store(true, .release);
+            }
+            fn prepare(self: *@This()) !void {
+                const control = InferenceExecutionControl{ .ptr = self, .check_fn = check, .native_call_policy = .in_process, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s };
+                var permit = try self.session.admitInputsBeforeExecution(&.{self.input.*}, self.allocator, control);
+                defer permit.deinit();
+                if (!permit.prepared.?.hasCompleteOwnedPayload()) return error.MissingWarmMetalWitness;
+            }
+        };
+        var numerical = try @import("../execution/backend_operation.zig").enter(impl.cb, impl.executable.graph, null, .managed);
+        defer numerical.deinitChecked() catch unreachable;
+        const cache = impl.executable.runtime.physical_pool.?.variant_cache.?;
+        const builds = cache.stats.builds;
+        const misses = cache.stats.misses;
+        const count = impl.execution_count.load(.acquire);
+        const sdk = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
+        // Generic admission may already own an unknown external lane: it is
+        // nonblocking and cannot allocate/build another semantic variant.
+        if (session.admitInputs(&.{input}, a, null)) |unexpected| {
+            var permit = unexpected;
+            permit.deinit();
+            return error.ExpectedBusyMetalMetadata;
+        } else |err| try std.testing.expectEqual(error.QueueFull, err);
+        try std.testing.expectEqual(builds, cache.stats.builds);
+        try std.testing.expectEqual(misses, cache.stats.misses);
+        var worker = Worker{ .session = session, .input = &input, .allocator = a };
+        const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+        var joined = false;
+        defer if (!joined) thread.join();
+        const deadline = @import("antfly_platform").time.monotonicNs() + 4 * std.time.ns_per_s;
+        while (worker.checks.load(.acquire) < 2 and !worker.done.load(.acquire)) {
+            if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
+            std.Thread.yield() catch {};
+        }
+        try numerical.finish();
+        thread.join();
+        joined = true;
+        if (worker.failure) |err| return err;
+        try std.testing.expectEqual(builds, cache.stats.builds);
+        try std.testing.expectEqual(misses, cache.stats.misses);
+        try std.testing.expectEqual(count, impl.execution_count.load(.acquire));
+        try std.testing.expectEqual(sdk.device_owned_buffers_created, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
+    }
+    session.run_admission.?.limits = .{ .host_limit_bytes = cap.hostTotalBytes(), .backend_limit_bytes = cap.backendTotalBytes(), .combined_limit_bytes = try std.math.add(usize, cap.hostTotalBytes(), cap.backendTotalBytes()) };
+    const tensors = @import("../backends/metal_tensor.zig");
+    const before = tensors.memoryStatsSnapshot();
+    var below = session;
+    below.run_admission.?.limits.backend_limit_bytes -= 1;
+    if (below.admitInputs(&.{input}, a, null)) |unexpected| {
+        var permit = unexpected;
+        permit.deinit();
+        return error.ExpectedOneByteBelowMetalFrameDenial;
+    } else |err| try std.testing.expectEqual(error.ResourceLimitExceeded, err);
+    try std.testing.expectEqual(before.device_owned_buffers_created, tensors.memoryStatsSnapshot().device_owned_buffers_created);
+    var mandatory = session;
+    mandatory.run_admission.?.static_workspace_kind = .mandatory;
+    try std.testing.expectError(error.ResourceLimitExceeded, mandatory.admitInputs(&.{input}, a, null));
+    var private_policy = session;
+    private_policy.run_admission.?.opaque_workspace_bytes = 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, private_policy.admitInputs(&.{input}, a, null));
+    var warm_creations: ?u64 = null;
+    for (0..4) |iteration| {
+        for (input.asFloat32Mut(), 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 11)) - 5 + @as(i32, @intCast(iteration)))) / 8;
+        var result = (try session.runResident(&.{input}, a)) orelse return error.MissingResidentResult;
+        var result_open = true;
+        defer if (result_open) result.deinit();
+        const stats = session.executionDiagnostics().?.execution.?;
+        try std.testing.expect(stats.assigned_kernel_dispatches >= 3);
+        try std.testing.expectEqual(@as(u64, 0), stats.graph_plan_slots_reserved);
+        try std.testing.expectEqual(@as(u64, 0), stats.graph_output_owned_copies);
+        try std.testing.expectEqual(@as(u64, 0), stats.physical_graph_captures);
+        const creations = tensors.memoryStatsSnapshot().device_owned_buffers_created;
+        if (warm_creations) |expected| try std.testing.expectEqual(expected, creations) else warm_creations = creations;
+        const actual = try result.backend.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        for (actual, input.asFloat32()) |value, original| try std.testing.expectApproxEqAbs(@abs(original) + 5 * original, value, 0.00001);
+        if (iteration == 3) {
+            if (session.admitInputs(&.{input}, a, null)) |unexpected| {
+                var permit = unexpected;
+                permit.deinit();
+                return error.ExpectedHeldMetalFramePressure;
+            } else |err| try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, err);
+            session.close();
+            session_open = false;
+            try std.testing.expect(controller.snapshot().backend_scratch_bytes > 0);
+            const retained = try result.backend.toFloat32(result.outputs[0], a);
+            defer a.free(retained);
+            try std.testing.expectEqualSlices(f32, actual, retained);
+        }
+        result.deinit();
+        result_open = false;
+    }
+    _ = @import("../execution/resource_retirement.zig").poll();
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "empty Metal Imported construction ends numerical phase before owned Frame metadata and unwinds every OOM" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ 128, 64 }));
+    const negative = try builder.neg(x);
+    const flat = try builder.reshape(negative, Shape.init(.f32, &.{8192}));
+    try graph.markOutput(try builder.absOp(flat));
+    const encoded = try onnx_graph.exportGraph(a, &graph, .{});
+    defer a.free(encoded);
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "empty-metal-construction.onnx", .data = encoded });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..], "empty-metal-construction.onnx" });
+    defer a.free(path);
+    const shared = try SharedBackendContext.init(a, .metal, std.testing.io);
+    defer shared.release();
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator, model_path: []const u8, shared_owner: *SharedBackendContext) !void {
+            const session = try createSessionWithOptions(allocator, model_path, .metal, .{ .shared_backend_ctx = shared_owner, .graph_runtime_strategy = .partitioned });
+            defer session.close();
+            const impl: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+            try std.testing.expectEqual(@as(usize, 0), impl.static_runtime_inputs.len);
+            try std.testing.expect(impl.executable.runtime.physical_pool.?.metal_frame_dispatch);
+            // Actual provider metadata admission proves the numerical ticket is
+            // gone on return; this is not a synthetic lock/flag assertion.
+            var metadata = try @import("../execution/backend_operation.zig").enter(impl.cb, impl.executable.graph, null, .metadata);
+            defer metadata.deinitChecked() catch unreachable;
+            try std.testing.expect(metadata.token() != null);
+        }
+    };
+    const before = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Case.run, .{ path, shared });
+    try std.testing.expectEqual(before.device_owned_buffers_created, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
 }

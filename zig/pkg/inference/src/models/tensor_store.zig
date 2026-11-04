@@ -124,6 +124,24 @@ pub const TensorStore = struct {
         deinit: *const fn (*anyopaque) void,
     };
 
+    /// Exact canonical model mapping, owned until this store closes. Callers
+    /// synchronize lazy shard publication; copied/custom tables grant no pin.
+    pub fn ownsMappedStorageSpan(self: TensorStore, mapped: []const u8) bool {
+        if (self.vtable != &SafetensorsStore.vtable and self.vtable != &ShardedSafetensorsStore.vtable and
+            self.vtable != &GgufStore.vtable and self.vtable != &CompositeGlinerStore.vtable and
+            self.vtable != &CompositeProjectorStore.vtable) return false;
+        const Match = struct {
+            target: []const u8,
+            found: bool = false,
+            fn visit(ctx: *anyopaque, bytes: []const u8, class: @import("../execution/storage_inventory.zig").Class) !void {
+                const state: *@This() = @ptrCast(@alignCast(ctx));
+                if (class == .mapped_file and bytes.ptr == state.target.ptr and bytes.len == state.target.len) state.found = true;
+            }
+        };
+        var match = Match{ .target = mapped };
+        _ = self.visitStorageSpans(.{ .ptr = &match, .visit_fn = Match.visit }) catch return false;
+        return match.found;
+    }
     /// Caller synchronizes with lazy shard opening. Custom stores report
     /// unsupported rather than exposing a logical-size estimate as ownership.
     pub fn visitStorageSpans(self: TensorStore, visitor: StorageVisitor) !bool {
@@ -1858,6 +1876,17 @@ fn expectMappedStorageInventory(store: TensorStore, allocator: std.mem.Allocator
     const result = try collector.finish(true);
     try std.testing.expectEqual(@as(u64, expected), result.mapped_file_extent_bytes);
     try std.testing.expectEqual(@as(u64, 0), result.owned_heap_payload_bytes);
+    for (collector.ranges.items) |span| {
+        if (span.class != .mapped_file) continue;
+        const pointer: [*]const u8 = @ptrFromInt(span.start);
+        const mapped = pointer[0 .. span.end - span.start];
+        try std.testing.expect(store.ownsMappedStorageSpan(mapped));
+        if (mapped.len > 1) try std.testing.expect(!store.ownsMappedStorageSpan(mapped[1..]));
+        var copied = store;
+        var copied_table = store.vtable.*;
+        copied.vtable = &copied_table;
+        try std.testing.expect(!copied.ownsMappedStorageSpan(mapped));
+    }
     // Even a familiar kind cannot authorize a downcast for an opaque source.
     var custom = store;
     var table = store.vtable.*;

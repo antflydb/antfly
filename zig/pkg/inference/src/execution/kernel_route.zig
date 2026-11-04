@@ -89,6 +89,10 @@ pub const Requirements = struct {
 };
 
 pub const Prepare = struct {
+    /// Synchronous cold authority for optional SDK descriptor/algorithm
+    /// qualification. Never retained in a route/profile/frame or inferred
+    /// from an ambient operation; unknown/raw callers remain conservative.
+    metadata_authority: ?@import("backend_operation.zig").Borrowed = null,
     host_readonly_inputs: [3]bool = @splat(false),
     allocator: std.mem.Allocator,
     /// Exact target callback-table identity; a generic caller cannot substitute

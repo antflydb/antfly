@@ -1442,15 +1442,9 @@ fn enableGenerationStageDebug() bool {
 // Promoted default: the CUDA prefill-first-token path is default-on. The
 // route is still guarded by shouldUsePrefillFirstTokenPath (CUDA backend,
 // pure-greedy, non-speculative); explicit env values override both ways.
-fn enableCudaPrefillFirstToken() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN", true);
-}
+const enableCudaPrefillFirstToken = decoder_prefill.firstTokenEnabled;
 
-fn enableCudaPrefillGreedyToken() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PREFILL_GREEDY_TOKEN", true);
-}
-
-const enableCudaGreedyDeviceTokenHandoff = decoder_forward.deviceTokenHandoffEnabled;
+const enableCudaPrefillGreedyToken = decoder_prefill.greedyTokenEnabled;
 
 const metalFinalHiddenFrameOwnsResidentPrefix = decoder_forward.metalFinalHiddenFrameOwnsResidentPrefix;
 
@@ -1479,9 +1473,7 @@ fn pendingTokenReadbackStreamingArgsValid(
 // Promoted default: coalesce the whole prompt into the first-token prefill
 // chunk for prompts up to 2048 tokens (tuned profile value; previously 8).
 // Explicit env values override both ways; 0 disables coalescing.
-fn cudaPrefillFirstTokenCoalesceTokenLimit() usize {
-    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS") orelse 2048;
-}
+const cudaPrefillFirstTokenCoalesceTokenLimit = decoder_prefill.firstTokenCoalesceLimit;
 
 fn enableFirstTokenTrace() bool {
     return getenvBool("ANTFLY_INFERENCE_GENERATE_FIRST_TOKEN_TRACE");
@@ -4470,15 +4462,27 @@ pub const NativeGenerationPipeline = struct {
         allow_resident_greedy_token: bool,
         capture_last_hidden: bool,
     ) !PrefillOutput {
-        // Private opt-in qualification only. Preserve admitted chunk shapes,
-        // scheduler turns and the original final-logit projection.
-        const exact_prefill_probe = platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_EXACT_PREFILL_PROBE");
-        if (exact_prefill_probe and (!build_options.enable_cuda or self.cb.kind() != .cuda or self.kv_dtype != .f16 or
-            self.gpt_config.family != .gemma or !self.gpt_config.usesGemma4Channels() or
-            !platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_PROBE") or
-            self.graph_cache != null or self.compiled_partition_backend != null or self.draft_cb != null or self.prompt_cache != null or
-            capture_last_hidden or prefilled_tokens != 0 or seq_len > 32768 or !decode_state.isPaged() or
-            config.kv_cache_mode == .select_v1 or cudaReplayLastLogitsEnabled())) return error.UnsupportedCompactionQueryRoute;
+        var prompt_runtime = self.prefillRuntime(decode_state, null);
+        const request = decoder_prefill.PromptRequest{
+            .route = decoderRouteRequest(config),
+            .prompt_tokens = seq_len,
+            .query_tokens = prompt_ids.len,
+            .prefilled_tokens = prefilled_tokens,
+            .allow_resident_greedy = allow_resident_greedy_token,
+            .capture_hidden = capture_last_hidden,
+            .selected_kv = config.kv_cache_mode == .select_v1,
+            .checkpoint = self.checkpoint_prepare != null or self.checkpoint_resume != null,
+            .has_draft = self.draft_cb != null,
+            .has_prompt_cache = self.prompt_cache != null,
+            .scheduler_peers = if (self.scheduler) |scheduler| scheduler.shouldCoordinateCurrentRequests() else false,
+            .execution_serialized = self.execution_lock != null,
+            .configured_chunk_rows = config.prefill_chunk_size,
+            .scheduler_chunk_rows = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
+            .speculative_k = config.speculative_k,
+            .sampled_ring_qualified = exact_hybrid_sampled_ring_qualification_override,
+        };
+        const prompt_plan = try prompt_runtime.planPrompt(request);
+        const exact_prefill_probe = prompt_plan.exact_repeat_probe;
         var exact_prefill_calls: usize = 0;
         defer if (exact_prefill_probe) {
             std.log.info("attention_match_exact_prefill source_tokens={d} split_launches={d} diagnostic_only=1", .{ seq_len, exact_prefill_calls });
@@ -4489,40 +4493,13 @@ pub const NativeGenerationPipeline = struct {
         var prefill_last_hidden: ?ops.CT = null;
         var prefill_last_hidden_rows: usize = 0;
         errdefer if (prefill_last_hidden) |hidden| self.cb.free(hidden);
-        const has_scheduler_peers = if (self.scheduler) |scheduler| scheduler.shouldCoordinateCurrentRequests() else false;
-        // A sole CUDA request keeps the device-greedy fast path. If a peer
-        // arrives after this check, execution_lock still serializes the
-        // direct forward against scheduler-driven work.
-        const use_cuda_prefill_greedy_token = self.checkpoint_prepare == null and self.checkpoint_resume == null and
-            !platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_PROBE") and
-            (self.execution_lock == null or !has_scheduler_peers) and
-            shouldUseCudaPrefillGreedyToken(
-                self.cb.kind(),
-                config,
-                allow_resident_greedy_token,
-                self.gpt_config.suppressTokenIds().len > 0,
-                enableCudaPrefillGreedyToken(),
-            );
-        // Keep the prepared greedy route MTP-only. Target-only Metal takes the
-        // final-row logits path below without touching prepared-tail state.
-        const use_metal_prefill_greedy_token = self.cb.kind() == .metal and
-            gemma4MtpMetalPrefillHiddenCaptureEnabled() and
-            capture_last_hidden and
-            allow_resident_greedy_token and
-            isPureGreedyConfig(config) and
-            config.grammar == null;
-        const use_prefill_greedy_token = use_cuda_prefill_greedy_token or use_metal_prefill_greedy_token;
-        const use_metal_target_last_logits = shouldUseMetalGemmaTargetLastLogits(
-            self.cb.kind(),
-            &self.gpt_config,
-            capture_last_hidden,
-        );
-        const can_use_typed_prefill_outputs = self.graph_cache == null and self.compiled_partition_backend == null;
-        const allow_shared_kv_prefill = can_use_typed_prefill_outputs and
-            self.checkpoint_prepare == null and self.checkpoint_resume == null and
-            !capture_last_hidden and config.kv_cache_mode == .exact_hybrid;
-        var prompt_state = self.prefillRuntime(decode_state, null);
-        try prompt_state.preparePromptState(.{
+        const use_cuda_prefill_greedy_token = prompt_plan.cuda_greedy;
+        const use_metal_prefill_greedy_token = prompt_plan.metal_greedy;
+        const use_prefill_greedy_token = prompt_plan.greedy();
+        const use_metal_target_last_logits = prompt_plan.metal_last_logits;
+        const can_use_typed_prefill_outputs = prompt_plan.typed_outputs;
+        const allow_shared_kv_prefill = prompt_plan.shared_kv;
+        try prompt_runtime.preparePromptState(.{
             .prompt_tokens = seq_len,
             .generated_tokens = config.max_tokens,
             .fresh_cuda_capacity = allow_shared_kv_prefill,
@@ -4532,7 +4509,7 @@ pub const NativeGenerationPipeline = struct {
             .has_draft = self.draft_cb != null,
             .speculation_requested = config.speculation_requested,
         });
-        const prefer_cuda_direct_last_logits = can_use_typed_prefill_outputs and self.cb.kind() == .cuda;
+        const prefer_cuda_direct_last_logits = prompt_plan.cuda_last_logits;
         debugGenerationStage(
             "executePrefill enter seq_len={d} prefilled={d} query_len={d} paged={} scheduler={} compiled_whole_model={} prefill_greedy={}",
             .{
@@ -4552,35 +4529,9 @@ pub const NativeGenerationPipeline = struct {
             }
         }
 
-        if (config.kv_cache_mode != .select_v1 and self.compiled_partition_backend != null and self.compiled_attachment_target == .whole_model and self.graph_cache != null) {
-            if (prefilled_tokens != 0) return error.UnsupportedShape;
-            const whole_model_kv_policy = generationKvCapacityPolicyForRoute(
-                if (self.compiled_partition_backend == .metal and
-                    self.cb.kind() == .metal and decode_state.isPaged() and
-                    self.kv_dtype != null)
-                    .metal_whole_model
-                else
-                    .standard,
-                self.gpt_config,
-                config,
-                self.kv_dtype orelse .f16,
-            );
-            const bounded_swa_prefill = whole_model_kv_policy == .split_swa_ring;
-            const prefill_chunk_size = wholeModelExecutionPrefillChunkSize(
-                self.compiled_partition_backend,
-                config.prefill_chunk_size,
-                if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
-                prompt_ids.len,
-                bounded_swa_prefill,
-            );
-            const max_speculative_rows = @min(
-                @as(usize, @intCast(config.speculative_k)),
-                @as(usize, runtime.tier.memory.generation_max_speculative_k),
-            ) + 1;
-            decode_state.configureKvMaxInflightTokens(
-                @max(prefill_chunk_size, max_speculative_rows),
-                bounded_swa_prefill,
-            );
+        if (prompt_plan.compiled_whole_model) {
+            const compiled = try prompt_runtime.prepareCompiledPrompt(request);
+            const prefill_chunk_size = compiled.chunk_rows;
             debugGenerationStage(
                 "executePrefill whole-model fast path seq_len={d} chunk_size={d} ring={}",
                 .{ seq_len, prefill_chunk_size, decode_state.allow_swa_ring },
@@ -4663,13 +4614,7 @@ pub const NativeGenerationPipeline = struct {
                 "prefill_first_token legacy_coalesced_prefill_chunk_size from={d} to={d} seq_len={d}",
                 .{ cursor.uncoalesced_chunk_size, cursor.current_chunk_size, query_len },
             );
-            const max_speculative_rows = @min(@as(usize, @intCast(config.speculative_k)), 16) + 1;
-            decode_state.configureKvMaxInflightTokens(
-                @max(cursor.current_chunk_size, max_speculative_rows),
-                self.cb.kind() == .metal and
-                    prefilled_tokens == 0 and
-                    metalRingDecodeRequestEligible(config),
-            );
+            prompt_runtime.prepareChunkWindow(request, cursor.current_chunk_size);
             while (try cursor.next(if (self.scheduler_lease) |lease| lease.prefill_chunk_size else cursor.current_chunk_size)) |attempt| {
                 defer cursor.cancel(attempt) catch {};
                 const processed = attempt.start;
@@ -5980,33 +5925,17 @@ pub const NativeGenerationPipeline = struct {
         gbnf_grammar: ?*const grammar_mod.GbnfGrammar,
         input_token_tensor: ?ops.CT,
     ) !?DeviceDecodeOutcome {
-        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         decoder_runtime_debug_stats.forward_attempts += 1;
-        const backend_kind = self.cb.kind();
-        if (backend_kind != .cuda and backend_kind != .metal) {
-            decoder_runtime_debug_stats.backend_not_device_decode += 1;
-            return null;
-        }
-        if (self.graph_cache != null or self.compiled_partition_backend != null) {
-            decoder_runtime_debug_stats.graph_blocked += 1;
-            return null;
-        }
-        if (tokens_generated == 0 and decode_runtime.kvView() == null) {
-            decoder_runtime_debug_stats.first_token_blocked += 1;
-            return null;
-        }
-        if (decode_runtime.kvView() == null) {
-            decoder_runtime_debug_stats.kv_missing += 1;
-            return null;
-        }
-        if (token_table != null or json_grammar.* != null or gbnf_grammar != null) {
-            decoder_runtime_debug_stats.grammar_blocked += 1;
-            return null;
-        }
+        var numerical = self.physicalDecoder();
+        if (!noteDeviceRoute(numerical.deviceRoute(decode_state, .{
+            .mode = .scalar,
+            .generated_tokens = tokens_generated,
+            .pure_greedy = isPureGreedyConfig(config),
+            .grammar_active = token_table != null or json_grammar.* != null or gbnf_grammar != null,
+        }))) return null;
         const sampled = !isPureGreedyConfig(config);
         var events = decoder_forward.DeviceStepEvents{};
         defer noteDeviceStepEvents(events);
-        var numerical = self.physicalDecoder();
         const outcome = try numerical.forwardDeviceStep(decode_state, .{
             .token_ids = token_ids,
             .sequence_length = seq_len,
@@ -6050,38 +5979,17 @@ pub const NativeGenerationPipeline = struct {
         gbnf_grammar: ?*const grammar_mod.GbnfGrammar,
         input_token_tensor: ops.CT,
     ) !?ops.CT {
-        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         decoder_runtime_debug_stats.forward_attempts += 1;
-        const backend_kind = self.cb.kind();
-        if (backend_kind != .cuda) {
-            decoder_runtime_debug_stats.backend_not_device_decode += 1;
-            return null;
-        }
-        if (self.graph_cache != null or self.compiled_partition_backend != null) {
-            decoder_runtime_debug_stats.graph_blocked += 1;
-            return null;
-        }
-        if (tokens_generated == 0 and decode_runtime.kvView() == null) {
-            decoder_runtime_debug_stats.first_token_blocked += 1;
-            return null;
-        }
-        if (decode_runtime.kvView() == null) {
-            decoder_runtime_debug_stats.kv_missing += 1;
-            return null;
-        }
-        if (!isPureGreedyConfig(config)) {
-            decoder_runtime_debug_stats.non_greedy += 1;
-            return null;
-        }
-        if (token_table != null or json_grammar.* != null or gbnf_grammar != null) {
-            decoder_runtime_debug_stats.grammar_blocked += 1;
-            return null;
-        }
-        if (!enableCudaGreedyDeviceTokenHandoff()) return null;
+        var numerical = self.physicalDecoder();
+        if (!noteDeviceRoute(numerical.deviceRoute(decode_state, .{
+            .mode = .tensor,
+            .generated_tokens = tokens_generated,
+            .pure_greedy = isPureGreedyConfig(config),
+            .grammar_active = token_table != null or json_grammar.* != null or gbnf_grammar != null,
+        }))) return null;
 
         var events = decoder_forward.DeviceStepEvents{};
         defer noteDeviceStepEvents(events);
-        var numerical = self.physicalDecoder();
         return numerical.forwardDeviceTokenTensor(decode_state, seq_len, input_token_tensor, prefetch_drain_budget_per_step, &events);
     }
 
@@ -6100,30 +6008,37 @@ pub const NativeGenerationPipeline = struct {
         json_grammar: *const ?grammar_mod.JsonGrammar,
         gbnf_grammar: ?*const grammar_mod.GbnfGrammar,
     ) bool {
-        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
-        _ = tokens_generated;
-        const backend_kind = self.cb.kind();
-        if (!enableCudaGreedyDeviceTokenHandoff()) return false;
-        if (backend_kind != .cuda) return false;
-        if (self.graph_cache != null or self.compiled_partition_backend != null) return false;
-        if (decode_runtime.kvView() == null) return false;
-        if (!isPureGreedyConfig(config)) return false;
-        if (token_table != null or json_grammar.* != null or gbnf_grammar != null) return false;
-        return true;
+        const numerical = self.physicalDecoder();
+        return numerical.deviceRoute(decode_state, .{
+            .mode = .seed,
+            .generated_tokens = tokens_generated,
+            .pure_greedy = isPureGreedyConfig(config),
+            .grammar_active = token_table != null or json_grammar.* != null or gbnf_grammar != null,
+        }) == .eligible;
+    }
+
+    fn noteDeviceRoute(route: decoder_forward.DeviceRoute) bool {
+        switch (route) {
+            .eligible => return true,
+            .backend_not_device => decoder_runtime_debug_stats.backend_not_device_decode += 1,
+            .graph_blocked => decoder_runtime_debug_stats.graph_blocked += 1,
+            .first_token_blocked => decoder_runtime_debug_stats.first_token_blocked += 1,
+            .kv_missing => decoder_runtime_debug_stats.kv_missing += 1,
+            .non_greedy => decoder_runtime_debug_stats.non_greedy += 1,
+            .grammar_blocked => decoder_runtime_debug_stats.grammar_blocked += 1,
+            .handoff_disabled => {},
+        }
+        return false;
     }
 
     fn makeDeviceTokenTensor(self: *NativeGenerationPipeline, token_id: usize) !?ops.CT {
-        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-        defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
-        const data = [_]i32{@intCast(token_id)};
-        const shape = [_]i32{1};
-        return try self.cb.fromInt32Shape(&data, &shape);
+        var numerical = self.physicalDecoder();
+        return numerical.createDeviceToken(token_id, if (self.execution_lock) |mutex| self.executionAccess(mutex) else null);
     }
 
     fn freeDeviceTokenTensor(self: *NativeGenerationPipeline, tensor: ops.CT) void {
-        if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex);
-        defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
-        self.cb.free(tensor);
+        var numerical = self.physicalDecoder();
+        numerical.destroyDeviceToken(tensor, if (self.execution_lock) |mutex| self.executionAccess(mutex) else null);
     }
 
     fn forwardLastLogits(

@@ -11,7 +11,7 @@ const registry_mod = @import("allocation_registry.zig");
 const observer = @import("allocation_observer.zig");
 const observation = @import("runtime_observation.zig");
 const build_options = @import("build_options");
-const metal = if (build_options.enable_metal) @import("../backends/metal_telemetry.zig") else struct {};
+const metal = @import("../backends/metal_telemetry.zig");
 
 /// Borrowed model-owned capabilities, valid until the retaining Session closes.
 /// A stable backend must outlive every synchronous invocation. Temporary native
@@ -219,19 +219,25 @@ const Invocation = struct {
     capture: diagnostics_mod.Capture,
     owners: registry_mod.Registry,
     device_owners: @import("device_owner_registry.zig").Registry,
+    device_roots: @import("device_allocation_registry.zig").Registry,
     scope: observation.Scope,
     transfers: @import("transfer_audit.zig").Audit = .{},
     kernels: observation.KernelScope = .{},
+    metal_buffers: metal.BufferInterval = .{},
+    video_resources: @import("antfly_video").preparation.OwnedResourceInterval = .{},
     before: ?ops.RuntimeTelemetry = null,
     process_before: ?@import("runtime_telemetry.zig").Process = null,
     error_name: ?[]const u8 = null,
     unsupported: bool = false,
 
     fn begin(self: *Invocation, binding: Binding) void {
-        self.* = .{ .binding = binding, .capture = undefined, .owners = undefined, .device_owners = undefined, .scope = observation.Scope.init() };
+        self.* = .{ .binding = binding, .capture = undefined, .owners = undefined, .device_owners = undefined, .device_roots = undefined, .scope = observation.Scope.init() };
+        self.metal_buffers.begin(build_options.enable_metal);
+        self.video_resources.begin(build_options.enable_metal);
         self.capture.beginPrograms(binding.diagnostics, binding.capture_programs);
         self.owners.begin(registry_mod.metadataAllocator());
         self.device_owners.begin(registry_mod.metadataAllocator());
+        self.device_roots.begin(registry_mod.metadataAllocator());
         if (binding.model_allocator) |allocator| {
             if (observer.State.forAllocator(allocator)) |owner| registry_mod.bind(.model, owner) else registry_mod.missing(.model);
         }
@@ -261,10 +267,18 @@ const Invocation = struct {
         snapshot.runtime.resolved_project_metal_dispatches = if (comptime build_options.enable_metal) self.kernels.metal else null;
         snapshot.runtime.terminal_native_bodies = self.kernels.native_bodies;
         snapshot.runtime.selected_native_dispatches = self.kernels.native_dispatches;
+        snapshot.runtime.joined_native_workers = self.kernels.native_workers;
+        snapshot.runtime.native_quant_worker_callbacks = self.kernels.quant_worker_callbacks;
+        snapshot.runtime.native_attention_programs = self.kernels.attention_programs;
+        snapshot.runtime.native_activation_programs = self.kernels.activation_programs;
+        snapshot.runtime.owned_native_fallbacks = self.kernels.native_fallbacks;
         snapshot.runtime.resolved_project_cuda_launches = self.kernels.finish();
         snapshot.runtime.submission = self.scope.snapshot();
         snapshot.runtime.allocation_owners = self.owners.finish();
         snapshot.runtime.device_owners = self.device_owners.end();
+        snapshot.runtime.device_allocator_roots = self.device_roots.end();
+        snapshot.runtime.metal_buffer_interval = self.metal_buffers.finish(build_options.enable_metal);
+        if (self.video_resources.finish(build_options.enable_metal)) |value| snapshot.runtime.video_owned_resources = @import("runtime_telemetry.zig").VideoOwnedResources.from(value);
         if (comptime build_options.enable_metal) {
             if (self.process_before) |before| snapshot.runtime.process = metal.runtimeProcessSnapshot().since(before);
         }

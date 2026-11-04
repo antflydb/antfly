@@ -155,6 +155,7 @@ pub const Pool = struct {
     coverage_reachable: ?[]const bool = null,
     native_frame_dispatch: bool = false,
     cuda_frame_dispatch: bool = false,
+    metal_frame_dispatch: bool = false,
     coverage_backend: ?ops.ComputeBackend = null,
     payload_coverage: @import("owned_coverage.zig").Coverage = .{ .compatibility = .no_selected_routes },
     route_owner: ?*prepared_routes.PreparedRoutes = null,
@@ -314,12 +315,12 @@ pub const Pool = struct {
         defer metadata_aliases.deinit();
         for (graph.nodes.items, 0..) |_, node_id| {
             const slot = plan.slotForNode(@intCast(node_id)) orelse continue;
-            if (slot.kind != .view or slot.backend != .native or slot.desc.quant_format != null) continue;
-            const alias = @import("metadata_alias.zig").Plan.lower(graph, @intCast(node_id), .native) orelse continue;
+            if (slot.kind != .view or slot.desc.quant_format != null) continue;
+            const alias = @import("metadata_alias.zig").Plan.lower(graph, @intCast(node_id), slot.backend) orelse continue;
             const source = plan.slotForNode(alias.source) orelse continue;
-            if (slot.source_slot != source.id or source.backend != .native) continue;
+            if (slot.source_slot != source.id or source.backend != slot.backend) continue;
             for (owned_backends) |backend| {
-                if (backend.kind() != .native) continue;
+                if (backend.kind() != slot.backend) continue;
                 const functions = backend.vtable.kernels orelse continue;
                 if (!functions.accepts(backend.vtable) or functions.createMetadataAlias == null) continue;
                 try metadata_aliases.append(alias);
@@ -658,7 +659,8 @@ pub const Pool = struct {
         const backend = self.backends[index];
         const bytes: usize = @intCast(allocation.byte_size);
         const functions = backend.vtable.kernels orelse return error.InvalidPhysicalAllocation;
-        const bound = if (functions.physicalStorageReservationBytes) |query| try query(backend.ptr, bytes) else bytes;
+        _ = functions;
+        const bound = try ops.physical_storage.reservationBytes(backend, .{ .byte_size = bytes, .usage = if (allocation.kind == .input_binding) .host_input else .ordinary, .admitted = true });
         if (bound < bytes) return error.InvalidPhysicalStorageReservation;
         seen[id] = bound;
         switch (backend.kind()) {
@@ -703,21 +705,31 @@ pub const Pool = struct {
         return cache.prepareFilteredWithCleanup(RegionPrepareContext{ .root = self, .policy = policy, .profile = profile }, inputs, prepareRegionVariant, RegionFilter{ .policy = policy, .profile = profile }, cleanup);
     }
 
+    pub fn validateExecutionPolicy(self: *const Pool) !void {
+        if (self.requiresManagedExecution() and !@import("../graph/metal_partition_executor.zig").ownedFramePolicyAvailable()) return error.PreparedMetalFramePolicyChanged;
+    }
+    pub fn requiresManagedExecution(self: *const Pool) bool {
+        if (!self.metal_frame_dispatch) return false;
+        for (self.host_input_plans) |plan| if (plan.requirements.requires_managed_operation) return true;
+        return false;
+    }
+
     pub fn matchesRoutes(self: *const Pool, inputs: []const route.InputBinding) bool {
         return self.matchesRoutesChecked(inputs) catch false;
     }
     pub inline fn matchesRoutesChecked(self: *const Pool, inputs: []const route.InputBinding) anyerror!bool {
-        if (self.cuda_frame_dispatch) return self.matchesCudaRoutes(inputs);
+        if (self.cuda_frame_dispatch or self.metal_frame_dispatch) return self.matchesDeviceRoutes(inputs);
         const selected = if (self.selection) |*value| value else return false;
         return selected.matches(self, inputs) and self.matchesRegions(inputs);
     }
-    noinline fn matchesCudaRoutes(self: *const Pool, inputs: []const route.InputBinding) anyerror!bool {
+    noinline fn matchesDeviceRoutes(self: *const Pool, inputs: []const route.InputBinding) anyerror!bool {
         const selected = if (self.selection) |*value| value else return false;
         const backend = self.coverage_backend orelse return false;
         var metadata: @import("backend_operation.zig").Scope = .{};
         try @import("backend_operation.zig").enterInto(&backend, self.coverage_graph, null, .metadata, &metadata);
         defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         if (metadata.token() == null) return error.PreparedMetadataAuthorityUnavailable;
+        if (self.metal_frame_dispatch and !@import("../graph/metal_partition_executor.zig").ownedFramePolicyAvailable()) return false;
         return selected.matches(self, inputs) and self.matchesRegions(inputs);
     }
     pub fn validateRoutes(self: *const Pool, inputs: []const route.InputBinding) !void {
@@ -747,7 +759,11 @@ pub const Pool = struct {
         if (coverage.epoch != selected.epoch) return null;
         switch (coverage.accounting_class) {
             .host => if (!self.native_frame_dispatch) return null,
-            .device => if (!self.cuda_frame_dispatch) return null,
+            .device => switch ((self.coverage_backend orelse return null).kind()) {
+                .cuda => if (!self.cuda_frame_dispatch) return null,
+                .metal => if (!self.metal_frame_dispatch) return null,
+                else => return null,
+            },
         }
         return coverage;
     }
@@ -851,6 +867,7 @@ pub const Pool = struct {
     }
 
     pub fn supportsHostInputs(self: *const Pool, inputs: []const host_ingress.Input) bool {
+        if (self.coverage_backend) |target| if (target.kind() == .metal and !self.metal_frame_dispatch) return false;
         if (inputs.len == 0 or inputs.len != self.host_input_plans.len) return false;
         for (inputs, 0..) |input, i| {
             const index = self.hostInputIndex(input.node_id) orelse return false;
@@ -932,7 +949,7 @@ pub const Pool = struct {
         const ledger = try accounting.Ledger.create(self.allocator);
         errdefer ledger.release();
         const child = try self.allocator.create(Pool);
-        child.* = .{ .metadata_aliases = metadata_aliases, .replay_config = self.replay_config, .coverage_graph = self.coverage_graph, .coverage_reachable = self.coverage_reachable, .native_frame_dispatch = self.native_frame_dispatch, .cuda_frame_dispatch = self.cuda_frame_dispatch, .coverage_backend = self.coverage_backend, .reshape_sources = reshapes, .allocator = self.allocator, .accounting = ledger, .plan = plan, .owns_plan = true, .kernels = selected, .transfers = transfers, .backends = backends, .workspace_allocations = workspaces, .host_workspace_allocation = self.host_workspace_allocation, .max_frames = self.max_frames, .replay_inputs = replay_inputs, .replay_input_indices = replay_indices, .replay_outputs = replay_outputs, .replay_kernel_count = self.replay_kernel_count, .replay_backend = self.replay_backend, .replay_decision = self.replay_decision, .host_alignment = self.host_alignment, .root_pool = self };
+        child.* = .{ .metadata_aliases = metadata_aliases, .replay_config = self.replay_config, .coverage_graph = self.coverage_graph, .coverage_reachable = self.coverage_reachable, .native_frame_dispatch = self.native_frame_dispatch, .cuda_frame_dispatch = self.cuda_frame_dispatch, .metal_frame_dispatch = self.metal_frame_dispatch, .coverage_backend = self.coverage_backend, .reshape_sources = reshapes, .allocator = self.allocator, .accounting = ledger, .plan = plan, .owns_plan = true, .kernels = selected, .transfers = transfers, .backends = backends, .workspace_allocations = workspaces, .host_workspace_allocation = self.host_workspace_allocation, .max_frames = self.max_frames, .replay_inputs = replay_inputs, .replay_input_indices = replay_indices, .replay_outputs = replay_outputs, .replay_kernel_count = self.replay_kernel_count, .replay_backend = self.replay_backend, .replay_decision = self.replay_decision, .host_alignment = self.host_alignment, .root_pool = self };
         if (self.literal_store) |store| {
             store.retain();
             child.literal_store = store;
@@ -943,7 +960,7 @@ pub const Pool = struct {
 
     fn prepareVariant(root: *Pool, inputs: []const route.InputBinding, policy: @import("region_route.zig").SelectionPolicy, profile: @import("region_route.zig").ExecutionProfile) !?*prepared_routes.PreparedRoutes {
         var metadata: @import("backend_operation.zig").Scope = .{};
-        if (root.cuda_frame_dispatch) {
+        if (root.cuda_frame_dispatch or root.metal_frame_dispatch) {
             const backend = root.coverage_backend orelse return error.MissingPreparedKernelRoute;
             try @import("backend_operation.zig").enterInto(&backend, root.coverage_graph, null, .metadata, &metadata);
         }
@@ -956,8 +973,8 @@ pub const Pool = struct {
         child.region_policy = policy;
         child.region_execution_profile = profile;
         try @import("reachable_projection.zig").deactivate(child);
-        child.selection = try RouteSelection.create(child, inputs);
-        if (policy == .select_regions) try child.prepareRegions();
+        child.selection = try RouteSelection.createWithAuthority(child, inputs, metadata.token());
+        if (policy == .select_regions) try child.prepareRegionsWithAuthority(metadata.token());
         try child.applyRouteRequirements();
         try child.recomputeHostWorkspace();
         try child.prepareHostIngress();
@@ -973,8 +990,8 @@ pub const Pool = struct {
             }
         };
         try @import("reachable_projection.zig").refine(child);
-        child.payload_coverage = if (child.cuda_frame_dispatch)
-            @import("cuda_owned_coverage.zig").assess(child, child.coverage_backend.?, metadata.token())
+        child.payload_coverage = if (child.cuda_frame_dispatch or child.metal_frame_dispatch)
+            @import("device_owned_coverage.zig").assess(child, child.coverage_backend.?, metadata.token())
         else
             @import("owned_coverage.zig").assess(child);
         const immutable = child.immutable_bindings orelse return error.MissingImmutableKernelBindings;
@@ -1087,6 +1104,9 @@ pub const Pool = struct {
     }
 
     fn prepareRegions(self: *Pool) !void {
+        return self.prepareRegionsWithAuthority(null);
+    }
+    fn prepareRegionsWithAuthority(self: *Pool, authority: ?@import("backend_operation.zig").Borrowed) !void {
         if (self.region_execution_profile == .unknown) return;
         const region_binding = @import("region_binding.zig");
         const preparation = @import("region_preparation.zig");
@@ -1118,7 +1138,7 @@ pub const Pool = struct {
         try self.rebindRegionKernelSlots();
         // Per-node owners capture allocation IDs. Rebuild them against the
         // final coloring; input representations/profile policies remain exact.
-        try selected.refresh(self);
+        try selected.refreshWithAuthority(self, authority);
         const installed = try self.allocator.alloc(region_binding.Installed, owned.owners.len);
         errdefer self.allocator.free(installed);
         var initialized: usize = 0;
@@ -1733,8 +1753,8 @@ pub const Frame = struct {
             }
         };
     }
-    fn allocateStorage(self: *Frame, cb: ops.ComputeBackend, bytes: usize, class: accounting.Class) !?*storage.Lease {
-        return storage.Lease.createAdmitted(self.pool.allocator, cb, bytes, self.pool.accounting, class, self.storage_admission) catch |err| {
+    fn allocateStorage(self: *Frame, cb: ops.ComputeBackend, bytes: usize, class: accounting.Class, usage: storage.Usage) !?*storage.Lease {
+        return storage.Lease.createAdmittedWithUsage(self.pool.allocator, cb, bytes, self.pool.accounting, class, self.storage_admission, usage) catch |err| {
             if (self.storage_admission != null) self.storage_admission_failed = true;
             return err;
         };
@@ -1829,6 +1849,7 @@ pub const Frame = struct {
         self.pool.allocator.destroy(self);
     }
     pub fn begin(self: *Frame) !void {
+        if (self.pool.requiresManagedExecution() and !@import("../graph/metal_partition_executor.zig").ownedFramePolicyAvailable()) return error.PreparedMetalFramePolicyChanged;
         for (self.pool.regions, self.region_claims) |installed, maybe| if (installed.owner.requirements.payload_claim_required and maybe == null) return error.PreparedRegionClaimRequired;
         std.debug.assert(self.scope_backends == 0);
         // Replays skip runAssignedKernel: validate mutable code policy at the
@@ -1939,6 +1960,9 @@ pub const Frame = struct {
         return self.bindHostInputsWithControl(inputs, null);
     }
     pub fn bindHostInputsWithControl(self: *Frame, inputs: []const host_ingress.Input, control: ?@import("../execution_control.zig").InferenceExecutionControl) ![]const interpreter.RuntimeInput {
+        return self.bindHostInputsWithOperation(inputs, control, null);
+    }
+    pub fn bindHostInputsWithOperation(self: *Frame, inputs: []const host_ingress.Input, control: ?@import("../execution_control.zig").InferenceExecutionControl, operation: ?*const @import("backend_operation.zig").Borrowed) ![]const interpreter.RuntimeInput {
         if (self.retired or self.bound_host_input_count != 0) return error.InvalidHostIngressBinding;
         try self.pool.validateHostInputs(inputs);
         errdefer self.releaseHostInputs();
@@ -1948,6 +1972,9 @@ pub const Frame = struct {
             const plan = self.pool.host_input_plans[index];
             const cb = &self.pool.backends[plan.backend_index];
             const resource = try self.hostInputResource(index);
+            // Refuse before bank allocation or the first CPU write. Metadata
+            // ownership and a cleanup Epoch do not grant numerical authority.
+            try resource.resource.validateOperation(operation);
             if (plan.borrowed) {
                 const value = try resource.resource.vtable.bind_borrowed.?(resource.resource.context, input.value.data);
                 self.host_bound_inputs[self.bound_host_input_count] = .{ .node_id = input.node_id, .value = value, .source_backend = cb };
@@ -1968,7 +1995,7 @@ pub const Frame = struct {
                 break :create view;
             };
             errdefer if (!cache_view) cb.free(value);
-            resource.resource.write(value, assigned, input.value.data) catch |err| {
+            resource.resource.writeWithOperation(value, assigned, input.value.data, operation) catch |err| {
                 self.retired = true;
                 return err;
             };
@@ -2245,7 +2272,7 @@ pub const Frame = struct {
                 if (cb.vtable.kernels.?.createPhysicalCompletion) |make_completion| self.completions[backend_index] = try make_completion(cb.ptr);
             }
             const bytes: usize = @intCast(self.pool.plan.allocations[allocation_id].byte_size);
-            self.storages[allocation_id] = (try self.allocateStorage(cb.*, bytes, if (self.pool.plan.allocations[allocation_id].kind == .workspace) .workspace else .activation)) orelse return null;
+            self.storages[allocation_id] = (try self.allocateStorage(cb.*, bytes, if (self.pool.plan.allocations[allocation_id].kind == .workspace) .workspace else .activation, if (self.pool.plan.allocations[allocation_id].kind == .input_binding) .host_input else .ordinary)) orelse return null;
             self.stats.allocations += 1;
             self.stats.allocated_bytes += bytes;
         } else self.stats.reused_allocations += 1;
@@ -2401,13 +2428,20 @@ pub const Frame = struct {
         return result;
     }
 
+    pub fn hasPreparedMetadataAlias(self: *const Frame, id: NodeId) bool {
+        const selected = if (self.pool.selection) |*value| value else return false;
+        if (id >= selected.plane_counts.len or selected.plane_counts[id] != 1) return false;
+        for (self.pool.metadata_aliases, 0..) |alias, index| if (index < selected.alias_enabled.len and alias.node == id and selected.alias_enabled[index]) return true;
+        return false;
+    }
+
     fn executeMetadataAlias(self: *Frame, cb: *const ops.ComputeBackend, values: []const ?CT, id: NodeId) !?CT {
         const selection = if (self.pool.selection) |*value| value else return null;
         for (self.pool.metadata_aliases, 0..) |alias, alias_index| {
             if (alias.node != id or !selection.alias_enabled[alias_index]) continue;
             if (id >= selection.plane_counts.len or selection.plane_counts[id] != 1) return null;
             const functions = cb.vtable.kernels orelse return error.PreparedMetadataAliasChanged;
-            if (cb.kind() != .native or !functions.accepts(cb.vtable)) return error.PreparedMetadataAliasChanged;
+            if (!functions.accepts(cb.vtable)) return error.PreparedMetadataAliasChanged;
             var registered = false;
             for (self.pool.backends) |backend| if (backend.ptr == cb.ptr and backend.vtable == cb.vtable) {
                 registered = true;
@@ -2419,7 +2453,12 @@ pub const Frame = struct {
             const incoming = selection.binding(self.pool, alias.source, selection.inputs.entries);
             const primary = (try @import("dense_alias.zig").primary(incoming, cb.*, alias.input)) orelse return error.PreparedMetadataAliasChanged;
             const request = @import("metadata_alias.zig").request(primary, selection.planes[id][0]);
-            return (try make_alias(cb.ptr, source, &request)) orelse error.PreparedMetadataAliasChanged;
+            const result = try make_alias(cb.ptr, source, &request);
+            // A faster Metal region/fusion may legitimately own the source
+            // outside this Frame. Without exact program credit, preserve its
+            // original retained primitive path rather than forcing a bank.
+            if (result == null and cb.kind() == .metal and self.pool.payload_coverage != .complete) return null;
+            return result orelse error.PreparedMetadataAliasChanged;
         }
         return null;
     }
@@ -3169,3 +3208,6 @@ test "physical frame cold and warm admission callbacks run unlocked with exclusi
     try frameAdmissionCallbackCase(std.testing.allocator, true);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, frameAdmissionCallbackOomCase, .{});
 }
+
+// Managed numerical exclusion is required for direct Shared host writes. No
+// cleanup Epoch or metadata scope can upgrade a foreign legacy frame to this.

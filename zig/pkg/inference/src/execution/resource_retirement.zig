@@ -1136,7 +1136,7 @@ test "Metal physical KV reservation follows real buffer aliases until SDK backin
     var request = try domain.controller.tryAcquire(.gpu, .{}, .{}, false);
     defer request.release();
     const bytes: usize = 24576;
-    const upper = try cb.vtable.kernels.?.physicalStorageReservationBytes.?(cb.ptr, bytes);
+    const upper = try cb.vtable.kernels.?.physical_storage_policy.?.reservation_bytes.?(cb.ptr, .{ .byte_size = bytes });
     var reservation: ?@import("storage_admission.zig").Reservation = try @import("storage_admission.zig").fromRunKvLease(a, &request, .{ .controller = &domain.controller, .backend_class = .gpu, .limits = .{ .backend_limit_bytes = upper }, .check_live_memory = false }, upper);
     defer if (reservation) |*value| value.release();
     var pin: ?admission.Pin = domain.pin();
@@ -1145,7 +1145,7 @@ test "Metal physical KV reservation follows real buffer aliases until SDK backin
     var charge_live = true;
     defer if (charge_live) charge.release();
     defer _ = poll();
-    const tensor = (try cb.vtable.kernels.?.allocatePhysicalStorage.?(cb.ptr, bytes)).?;
+    const tensor = (try cb.vtable.kernels.?.physical_storage_policy.?.allocate(cb.ptr, .{ .byte_size = bytes })).?;
     var tensor_live = true;
     defer if (tensor_live) cb.free(tensor);
     const alias = (try cb.cloneTensorShape(tensor, &.{@intCast(bytes / 4)})).?;

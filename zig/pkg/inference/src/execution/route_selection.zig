@@ -37,6 +37,9 @@ pub const Selection = struct {
     literal_claim_selection: ?*physical.SharedLiteralStore.LiteralSelection = null,
 
     pub fn create(pool: *physical.Pool, runtime: []const route.InputBinding) !Selection {
+        return createWithAuthority(pool, runtime, null);
+    }
+    pub fn createWithAuthority(pool: *physical.Pool, runtime: []const route.InputBinding, authority: ?@import("backend_operation.zig").Borrowed) !Selection {
         const allocator = pool.allocator;
         for (runtime) |input| {
             const slot = pool.plan.slotForNode(input.node_id) orelse return error.InvalidKernelInputBinding;
@@ -76,7 +79,7 @@ pub const Selection = struct {
         var self = Selection{ .allocator = allocator, .epoch = epoch, .inputs = inputs, .routes = selected, .planes = planes, .plane_counts = counts, .literal_enabled = enabled, .alias_enabled = aliases, .planes_witnessed = witnessed };
         errdefer self.clearRoutes();
         errdefer allocator.free(self.invocation_nodes);
-        try self.refresh(pool);
+        try self.refreshWithAuthority(pool, authority);
         return self;
     }
 
@@ -101,11 +104,14 @@ pub const Selection = struct {
     /// Cold only, before a Frame/admission claim exists. Region recoloring can
     /// change output allocation IDs without changing semantic input layouts.
     pub fn refresh(self: *Selection, pool: *physical.Pool) !void {
+        return self.refreshWithAuthority(pool, null);
+    }
+    pub fn refreshWithAuthority(self: *Selection, pool: *physical.Pool, authority: ?@import("backend_operation.zig").Borrowed) !void {
         self.clearRoutes();
         if (self.literal_claim_selection) |claim| claim.release();
         self.literal_claim_selection = null;
         while (true) {
-            try self.select(pool);
+            try self.select(pool, authority);
             var changed = false;
             if (pool.literal_store) |store| for (store.literals, 0..) |literal, index| {
                 if (!self.literal_enabled[index] or store.backends[literal.backend_index].kind() == .native) continue;
@@ -236,7 +242,7 @@ pub const Selection = struct {
         return .{ .descriptor = descriptor, .role = role, .storage_epoch = epoch, .byte_offset = 0, .logical_bytes = bytes, .readable_bytes = bytes };
     }
 
-    fn select(self: *Selection, pool: *physical.Pool) !void {
+    fn select(self: *Selection, pool: *physical.Pool, authority: ?@import("backend_operation.zig").Borrowed) !void {
         if (pool.literal_store) |store| for (store.literals, 0..) |literal, index| {
             if (!self.literal_enabled[index]) continue;
             self.planes[literal.node][0] = try densePlane(literal.shape, store.backends[literal.backend_index].kind(), .primary, self.epoch);
@@ -268,7 +274,7 @@ pub const Selection = struct {
                 witnesses[index] = self.bindingWitnessed(pool, input, self.inputs.entries);
                 output_witnessed = output_witnessed and witnesses[index];
             }
-            const owned = (try prepare(backend.ptr, .{ .allocator = self.allocator, .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .descriptor = &kernel.descriptor, .host_readonly_inputs = readOnlyHostInputs(pool, kernel.*), .inputs = incoming[0..kernel.descriptor.input_count], .inputs_witnessed = witnesses, .output = self.output(pool, node, 0) })) orelse continue;
+            const owned = (try prepare(backend.ptr, .{ .metadata_authority = authority, .allocator = self.allocator, .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .descriptor = &kernel.descriptor, .host_readonly_inputs = readOnlyHostInputs(pool, kernel.*), .inputs = incoming[0..kernel.descriptor.input_count], .inputs_witnessed = witnesses, .output = self.output(pool, node, 0) })) orelse continue;
             self.routes[node] = owned;
             const required = owned.requirements;
             if (required.auxiliaries.count > ops.kernel_descriptor.max_auxiliaries) return error.InvalidPreparedKernelRequirements;
@@ -301,9 +307,16 @@ pub const Selection = struct {
         if (pool.plan.slotForNode(node) == null) return false;
         for (pool.metadata_aliases, 0..) |alias, alias_index| {
             if (alias.node != node or !self.alias_enabled[alias_index]) continue;
+            const slot = pool.plan.slotForNode(node).?;
             const incoming = self.binding(pool, alias.source, self.inputs.entries);
+            if (slot.backend != .native and (incoming != .planned or incoming.planned.planes.len != 1 or @import("metadata_alias.zig").activationRoot(&pool.plan, alias.source, slot.backend) == null)) {
+                // Preserve the existing ordinary GPU reshape facts/dispatch.
+                // No exact retained Frame hook is claimed for external inputs.
+                self.alias_enabled[alias_index] = false;
+                break;
+            }
             for (pool.backends) |backend| {
-                if (backend.kind() != .native) continue;
+                if (backend.kind() != slot.backend) continue;
                 const functions = backend.vtable.kernels orelse continue;
                 if (!functions.accepts(backend.vtable) or functions.createMetadataAlias == null) continue;
                 // Public host facts describe import semantics, not a retained
@@ -315,8 +328,11 @@ pub const Selection = struct {
                 self.planes_witnessed[node] = self.bindingWitnessed(pool, alias.source, self.inputs.entries);
                 return true;
             }
-            // A declined Native alias must not regain stale dense reshape facts.
-            return false;
+            // A declined Native affine alias must not regain stale facts.
+            // Ordinary GPU input/legacy reshape behavior remains unchanged.
+            if (slot.backend == .native) return false;
+            self.alias_enabled[alias_index] = false;
+            break;
         }
         if (pool.plan.slotForNode(node)) |slot| if (slot.backend == .native) return false;
         if (node >= pool.reshape_sources.len) return false;

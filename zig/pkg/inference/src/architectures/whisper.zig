@@ -806,8 +806,8 @@ pub const CacheGeometry = struct {
     pub fn cacheAmounts(self: CacheGeometry, cb: *const ComputeBackend) !@import("../runtime/tier/memory.zig").AdmissionAmounts {
         if (self.layers == 0) return .{ .host_scratch_bytes = self.known_metadata_bytes };
         const functions = cb.vtable.kernels;
-        const cross = if (functions) |table| if (table.physicalStorageReservationBytes) |bound| try bound(cb.ptr, self.cross_tensor_bytes) else self.cross_tensor_bytes else self.cross_tensor_bytes;
-        const slab = if (functions) |table| if (table.physicalStorageReservationBytes) |bound| try bound(cb.ptr, self.self_tensor_bytes) else self.self_tensor_bytes else self.self_tensor_bytes;
+        const cross = if (functions) |table| if (table.physical_storage_policy) |_| try ops.physical_storage.reservationBytes(cb.*, .{ .byte_size = self.cross_tensor_bytes }) else self.cross_tensor_bytes else self.cross_tensor_bytes;
+        const slab = if (functions) |table| if (table.physical_storage_policy) |_| try ops.physical_storage.reservationBytes(cb.*, .{ .byte_size = self.self_tensor_bytes }) else self.self_tensor_bytes else self.self_tensor_bytes;
         if (cross < self.cross_tensor_bytes or slab < self.self_tensor_bytes) return error.InvalidPhysicalStorageReservation;
         const bytes = try cacheMul(usize, try cacheMul(usize, self.layers, 2), try cacheAdd(usize, cross, slab));
         var result = @import("../runtime/tier/memory.zig").AdmissionAmounts{ .host_scratch_bytes = self.known_metadata_bytes };
@@ -1569,8 +1569,8 @@ fn checkIncrementalResidentEncoder(cb: ComputeBackend, reference: ComputeBackend
     } else {
         try std.testing.expectEqual(@as(usize, 0), amounts.host_kv_bytes);
         try std.testing.expect(amounts.backend_kv_bytes >= logical);
-        if (cb.vtable.kernels) |table| if (table.physicalStorageReservationBytes) |bound| {
-            const actual_bound = 2 * config.decoder_layers * (try bound(cb.ptr, geometry.cross_tensor_bytes) + try bound(cb.ptr, geometry.self_tensor_bytes));
+        if (cb.vtable.kernels) |table| if (table.physical_storage_policy) |_| {
+            const actual_bound = 2 * config.decoder_layers * (try ops.physical_storage.reservationBytes(cb, .{ .byte_size = geometry.cross_tensor_bytes }) + try ops.physical_storage.reservationBytes(cb, .{ .byte_size = geometry.self_tensor_bytes }));
             try std.testing.expectEqual(actual_bound, amounts.backend_kv_bytes);
         };
     }

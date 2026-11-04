@@ -19,7 +19,7 @@
 // retains shared and non-format-specific operations. Required slots ignore it.
 #pragma once
 
-#define ANTFLY_METAL_PIPELINE_COUNT 458u
+#define ANTFLY_METAL_PIPELINE_COUNT 460u
 
 #define ANTFLY_METAL_PIPELINE_GROUP_0(X) \
     X(video_position_pipeline, @"antfly_video_position", precise_library, 55, 64, ALWAYS) \
@@ -535,7 +535,9 @@
     X(turbo3_attention_span_pipeline, @"termite_turbo3_attention_span", library, 457, 448, ALWAYS)
 
 #define ANTFLY_METAL_PIPELINE_GROUP_28(X) \
-    X(audio_pad_pipeline, @"antfly_audio_pad", precise_library, 290, 457, ALWAYS)
+    X(audio_pad_pipeline, @"antfly_audio_pad", precise_library, 290, 457, ALWAYS) \
+    X(rope_regular_pipeline, @"termite_apply_rope", precise_library, 458, 458, ALWAYS) \
+    X(rope_broadcast_pipeline, @"termite_apply_rope", precise_library, 459, 459, ALWAYS)
 
 #define ANTFLY_METAL_PIPELINES(X) \
     ANTFLY_METAL_PIPELINE_GROUP_0(X) \

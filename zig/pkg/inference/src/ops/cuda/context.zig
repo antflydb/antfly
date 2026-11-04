@@ -104,6 +104,7 @@ pub const CudaContext = struct {
     debug_graph_capture_tensor_trace_count: usize = 0,
 
     pub fn enableRuntimeObservation(self: *CudaContext) void {
+        _ = self.device_allocations.enableObservation(@import("../../execution/allocation_registry.zig").metadataAllocator());
         self.enableRuntimeObservationWithAllocator(std.heap.page_allocator);
     }
     fn enableRuntimeObservationWithAllocator(self: *CudaContext, allocator: std.mem.Allocator) void {
@@ -212,6 +213,7 @@ pub const CudaContext = struct {
     /// Leave driver entry points loaded for host-only cleanup after a lost
     /// context has relinquished all in-flight device references.
     pub fn releaseResources(self: *CudaContext) void {
+        defer self.device_allocations.releaseObservation();
         if (self.observation.swap(null, .acq_rel)) |state| state.deinit();
         if (self.ctx != null) {
             _ = self.driver.fns.cuCtxSetCurrent(self.ctx);
@@ -576,6 +578,8 @@ test "CUDA observation cold installation publishes one complete state and retire
     };
     var allocator = BarrierAllocator{};
     var context: CudaContext = undefined;
+    context.device_allocations = .{};
+    defer context.device_allocations.releaseObservation();
     context.observation = .init(null);
     context.observation_enable_failed = .init(false);
     defer if (context.observation.swap(null, .acq_rel)) |state| state.deinit();
