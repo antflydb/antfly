@@ -1485,6 +1485,46 @@ pub fn acknowledgeRelationalIndexOwner(svc: anytype, alloc: std.mem.Allocator, c
 
 /// Submit once, observe exactly, never turn a lost wait/read into nonadmission.
 /// Callers retain the immutable command/receipt identity for status recovery.
+pub fn submitScopeRetirement(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/scope_retirement_wire.zig").Request) ![]u8 {
+    const wire = @import("../metadata/scope_retirement_wire.zig");
+    if (!context.schema_validation_authority or !context.setting_admin) return error.Forbidden;
+    try context.ensureActive();
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_scope_retirement_version);
+    const command = try request.encodeAlloc(alloc);
+    defer alloc.free(command);
+    try svc.ensureLinearizableReadWithContext(context);
+    svc.lockCatalogMutation();
+    var locked = true;
+    defer if (locked) svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const checked = try store.scopeRetirementPreflightJson(alloc, svc.metadata_group_id, command);
+    defer alloc.free(checked);
+    var query = try std.json.parseFromSlice(wire.Query, alloc, checked, .{});
+    defer query.deinit();
+    const prior = try store.scopeRetirementObservationJson(alloc, svc.metadata_group_id, query.value);
+    var owned = true;
+    defer if (owned) alloc.free(prior);
+    var previous = try std.json.parseFromSlice(wire.Observation, alloc, prior, .{});
+    defer previous.deinit();
+    if (previous.value.outcome != null) {
+        owned = false;
+        return prior;
+    }
+    try context.ensureActive();
+    const receipt = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, .{ .apply_scope_retirement = command });
+    svc.unlockCatalogMutation();
+    locked = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const bytes = store.scopeRetirementObservationJson(alloc, svc.metadata_group_id, query.value) catch return error.MetadataMutationOutcomeUnknown;
+    errdefer alloc.free(bytes);
+    var observed = std.json.parseFromSlice(wire.Observation, alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+    defer observed.deinit();
+    observed.value.requireFor(query.value) catch return error.MetadataMutationOutcomeUnknown;
+    if (observed.value.outcome == null) return error.MetadataMutationOutcomeUnknown;
+    return bytes;
+}
+
 pub fn submitTableRetirement(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: []const u8) ![]u8 {
     if (!context.schema_validation_authority or !context.setting_admin) return error.Forbidden;
     try context.ensureActive();
@@ -2568,6 +2608,19 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .policy_publication_mutate => |command| mutatePolicyPublication(svc, alloc, context, command),
         .table_retirement_submit => |command| submitTableRetirement(svc, alloc, context, command),
         .table_retirement_receipt, .table_retirement_queue, .table_retirement_effects, .table_retirement_owner_work => readTableRetirement(svc, alloc, context, input),
+        .scope_retirement_work, .scope_retirement_manifest => blk: {
+            if (!context.setting_admin or !context.schema_validation_authority) return error.Forbidden;
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk if (input == .scope_retirement_work) store.scopeRetirementWorkJson(alloc, svc.metadata_group_id, input.scope_retirement_work) else store.scopeRetirementManifestJson(alloc, svc.metadata_group_id, input.scope_retirement_manifest);
+        },
+        .scope_retirement_submit => |request| submitScopeRetirement(svc, alloc, context, request),
+        .scope_retirement_observation => |query| blk: {
+            if (!context.setting_admin or !context.schema_validation_authority) return error.Forbidden;
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.scopeRetirementObservationJson(alloc, svc.metadata_group_id, query);
+        },
         .scope_retirement_prepare => |request| blk: {
             if (!context.setting_admin) return error.Forbidden;
             _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.foreign_key_directory_version);

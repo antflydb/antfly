@@ -2966,6 +2966,16 @@ const LocalStandaloneMetadata = struct {
         }
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
+        if (call == .scope_retirement_work or call == .scope_retirement_manifest) {
+            if (!context.setting_admin or !context.schema_validation_authority) return error.Forbidden;
+            const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+            return if (call == .scope_retirement_work) store.scopeRetirementWorkJson(alloc, group_ids.main_metadata_group_id, call.scope_retirement_work) else store.scopeRetirementManifestJson(alloc, group_ids.main_metadata_group_id, call.scope_retirement_manifest);
+        }
+        if (call == .scope_retirement_observation) {
+            if (!context.setting_admin or !context.schema_validation_authority) return error.Forbidden;
+            const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+            return store.scopeRetirementObservationJson(alloc, group_ids.main_metadata_group_id, call.scope_retirement_observation);
+        }
         if (call == .scope_retirement_prepare) {
             if (!context.setting_admin) return error.Forbidden;
             const store = self.lifecycle_store orelse return error.UnsupportedOperation;
@@ -3006,7 +3016,7 @@ const LocalStandaloneMetadata = struct {
         }
         const shared_catalog_mutation = call == .resolver_authority_mutate or call == .sql_view_mutate or call == .sql_sequence_mutate or call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
             call == .policy_publication_begin or call == .policy_publication_mutate or
-            call == .sql_completion_reference_mutate or call == .schema_validation_submit or call == .table_retirement_submit or call == .fk_initial_create_begin or call == .fk_initial_create_mutate or call == .relational_index_owner_ack or call == .relational_index_publish_decide or call == .relational_index_cancel or call == .store_root_enroll;
+            call == .sql_completion_reference_mutate or call == .schema_validation_submit or call == .table_retirement_submit or call == .scope_retirement_submit or call == .fk_initial_create_begin or call == .fk_initial_create_mutate or call == .relational_index_owner_ack or call == .relational_index_publish_decide or call == .relational_index_cancel or call == .store_root_enroll;
         if (shared_catalog_mutation) if (self.hot_standby_catalog_server) |server| {
             try server.hot_standby_public_gate_state.checkWrite(server.hot_standby_public_gate_state.currentGeneration());
         };
@@ -3030,7 +3040,7 @@ const LocalStandaloneMetadata = struct {
             return std.json.Stringify.valueAlloc(alloc, capture.value, .{});
         }
         switch (call) {
-            .scope_retirement_prepare, .table_retirement_prepare => unreachable,
+            .scope_retirement_work, .scope_retirement_manifest, .scope_retirement_observation, .scope_retirement_prepare, .table_retirement_prepare => unreachable,
             .sql_snapshot_cohort => |request| {
                 const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
                 return store.sqlSnapshotCohort(alloc, group_ids.main_metadata_group_id, request.database);
@@ -3098,6 +3108,39 @@ const LocalStandaloneMetadata = struct {
                 var observed = try self.readTableRetirementReceipt(alloc, request);
                 defer observed.deinit();
                 return std.json.Stringify.valueAlloc(alloc, observed.value, .{});
+            },
+            .scope_retirement_submit => |request| {
+                const wire = @import("../metadata/scope_retirement_wire.zig");
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                const command = try request.encodeAlloc(alloc);
+                defer alloc.free(command);
+                const checked = try store.scopeRetirementPreflightJson(alloc, group_ids.main_metadata_group_id, command);
+                defer alloc.free(checked);
+                var query = try std.json.parseFromSlice(wire.Query, alloc, checked, .{});
+                defer query.deinit();
+                const prior = try store.scopeRetirementObservationJson(alloc, group_ids.main_metadata_group_id, query.value);
+                var owned = true;
+                defer if (owned) alloc.free(prior);
+                var previous = try std.json.parseFromSlice(wire.Observation, alloc, prior, .{});
+                defer previous.deinit();
+                if (previous.value.outcome != null) {
+                    owned = false;
+                    return prior;
+                }
+                try context.ensureActive();
+                store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_scope_retirement = command }) catch return error.MetadataMutationOutcomeUnknown;
+                const bytes = store.scopeRetirementObservationJson(alloc, group_ids.main_metadata_group_id, query.value) catch return error.MetadataMutationOutcomeUnknown;
+                errdefer alloc.free(bytes);
+                var observed = std.json.parseFromSlice(wire.Observation, alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+                defer observed.deinit();
+                observed.value.requireFor(query.value) catch return error.MetadataMutationOutcomeUnknown;
+                if (observed.value.outcome == null) return error.MetadataMutationOutcomeUnknown;
+                const revision = store.standaloneRevision() catch return error.MetadataMutationOutcomeUnknown;
+                if (self.durable_revision != 0 and self.durable_revision != std.math.maxInt(u64) and revision == self.durable_revision + 1) {
+                    self.epoch = revision;
+                    self.durable_revision = revision;
+                } else self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                return bytes;
             },
             .table_retirement_submit => |command| {
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
@@ -3668,6 +3711,43 @@ const LocalStandaloneMetadata = struct {
                         command.change = .{ .drop = records.items[prior_index].identity };
                         _ = records.orderedRemove(prior_index);
                     },
+                    .database_default => |change| {
+                        try change.validate();
+                        if (self.settingDatabaseId(change.database) == null) return error.DatabaseNotFound;
+                        if (change.all) {
+                            var needed = false;
+                            for (records.items) |*record| {
+                                var retained_defaults: std.ArrayList(settings.DatabaseDefault) = .empty;
+                                for (record.database_defaults) |entry| {
+                                    if (std.mem.eql(u8, entry.database, change.database)) {
+                                        if (record.policy_sensitive) return error.SettingWriteForbidden;
+                                        needed = true;
+                                    } else try retained_defaults.append(a, entry);
+                                }
+                                record.database_defaults = retained_defaults.items;
+                            }
+                            if (!needed) return std.json.Stringify.valueAlloc(alloc, system_catalog.Meta{ .revision = state.revision, .next_id = state.next_id }, .{});
+                            command.change = .{ .reset_database_defaults = change.database };
+                        } else {
+                            const index: ?usize = for (records.items, 0..) |record, at| {
+                                if (std.ascii.eqlIgnoreCase(record.name, change.name)) break at;
+                            } else null;
+                            const prior = if (index) |at| records.items[at] else blk: {
+                                const native_default = settings.builtinInput(change.name) orelse return error.UnknownSetting;
+                                if (change.value == null) return std.json.Stringify.valueAlloc(alloc, system_catalog.Meta{ .revision = state.revision, .next_id = state.next_id }, .{});
+                                break :blk native_default.record(.{ .id = state.next_id, .generation = 1 });
+                            };
+                            const defaults = try change.applyAlloc(a, prior);
+                            const input: settings.Input = .{ .name = prior.name, .kind = prior.kind, .policy_sensitive = prior.policy_sensitive, .session_writable = prior.session_writable, .default = prior.default, .database_defaults = defaults, .role_defaults = prior.role_defaults };
+                            if (input.matches(prior)) return std.json.Stringify.valueAlloc(alloc, system_catalog.Meta{ .revision = state.revision, .next_id = state.next_id }, .{});
+                            const next = input.record(prior.identity);
+                            try next.validate();
+                            if (index) |at| records.items[at] = next else try records.append(a, next);
+                            command.change = .{ .put = next };
+                        }
+                        command.database_defaults_only = true;
+                        command.command_fence = change.command_fence;
+                    },
                     .role_default => |change| {
                         try change.validate();
                         var bound_change = change;
@@ -3691,6 +3771,7 @@ const LocalStandaloneMetadata = struct {
                         if (index) |i| records.items[i] = next else try records.append(a, next);
                         command.change = .{ .put = next };
                         command.role_defaults_only = true;
+                        command.command_fence = change.command_fence;
                     },
                 }
                 const encoded = try std.json.Stringify.valueAlloc(a, command, .{});
@@ -19266,6 +19347,62 @@ test "system catalog prepared ordinary DDL submits exact native outcomes through
             const annotated = (try metadata.lifecycle_store.?.getTable(scratch, group_ids.main_metadata_group_id, prepared_relation.mutation.table_id)).?;
             try std.testing.expectEqualStrings("retained standalone annotation", annotated.description);
             try std.testing.expectEqualDeep(before, try metadata.lifecycle_store.?.systemCatalogMeta(scratch, group_ids.main_metadata_group_id));
+        }
+    }
+}
+
+test "SQL scope retirement standalone reservation and recovery use the native owner without shadow progress" {
+    if (comptime control_only_storage_sources) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/scope-standalone.json", .{tmp.sub_path});
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer backend.deinit();
+    const wire = @import("../metadata/scope_retirement_wire.zig");
+    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .setting_admin = true, .schema_validation_authority = true };
+    var request: wire.Request = undefined;
+    var accepted: wire.Outcome = undefined;
+    for (0..2) |pass| {
+        var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+        defer metadata.deinit();
+        const source = metadata.statusSource();
+        if (pass == 0) {
+            _ = try source.systemCatalog(scratch, context, .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "tenant_ops" } } });
+            const bytes = try source.systemCatalog(scratch, context, .{ .scope_retirement_prepare = .{ .kind = .database, .name = "tenant_ops", .creator = .bootstrap } });
+            const manifest = try std.json.parseFromSliceLeaky(system_catalog.scope_retirement.Manifest, scratch, bytes, .{});
+            const protocol = @import("../metadata/topology_protocol.zig");
+            const activation: protocol.Activation = .{ .version = protocol.current_version, .incarnation = std.fmt.bytesToHex(manifest.metadata_incarnation, .lower), .member_count = 1, .membership_fingerprint = @splat(7) };
+            try metadata.lifecycle_store.?.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(scratch, activation, .{}) });
+            _ = try source.systemCatalog(scratch, context, .{ .setting_mutate = .{ .put = .{ .name = "app.scope_default", .kind = .string, .default = .{ .string = "base" } } } });
+            _ = try source.systemCatalog(scratch, context, .{ .setting_mutate = .{ .database_default = .{ .name = "app.scope_default", .database = "tenant_ops", .value = .{ .string = "durable" } } } });
+            const refreshed = try std.json.parseFromSliceLeaky(system_catalog.scope_retirement.Manifest, scratch, try source.systemCatalog(scratch, context, .{ .scope_retirement_prepare = .{ .kind = .database, .name = "tenant_ops", .creator = .bootstrap } }), .{});
+            request = .{ .admission = .{ .nonce = @splat(77), .head = refreshed.catalog_revision }, .operation = .{ .reserve = refreshed } };
+            const result = try std.json.parseFromSliceLeaky(wire.Observation, scratch, try source.systemCatalog(scratch, context, .{ .scope_retirement_submit = request }), .{});
+            accepted = result.outcome.?;
+            try std.testing.expectEqual(system_catalog.scope_retirement.Phase.draining_connections, result.current.?.progress.phase);
+        } else {
+            const settings = @import("antfly_local_sources").system_catalog_settings;
+            const snapshot = try std.json.parseFromSliceLeaky(settings.Snapshot, scratch, try source.systemCatalog(scratch, context, .{ .setting_snapshot = .{ .principal = "alice", .database = "tenant_ops" } }), .{});
+            const configured = for (snapshot.definitions) |definition| {
+                if (std.mem.eql(u8, definition.name, "app.scope_default")) break definition;
+            } else return error.MissingSetting;
+            try std.testing.expectEqualStrings("durable", configured.database_default.?.string);
+            const result = try std.json.parseFromSliceLeaky(wire.Observation, scratch, try source.systemCatalog(scratch, context, .{ .scope_retirement_submit = request }), .{});
+            try std.testing.expectEqualDeep(accepted, result.outcome.?);
+            const cancel: wire.Request = .{ .admission = .{ .nonce = @splat(78), .head = 0 }, .operation = .{ .cancel = .{ .lookup = accepted.query.lookup, .expected_revision = 1 } } };
+            _ = try source.systemCatalog(scratch, context, .{ .scope_retirement_submit = cancel });
+            const retry = try std.json.parseFromSliceLeaky(wire.Observation, scratch, try source.systemCatalog(scratch, context, .{ .scope_retirement_submit = request }), .{});
+            try std.testing.expectEqualDeep(accepted, retry.outcome.?);
+            try std.testing.expectEqual(system_catalog.scope_retirement.Phase.canceled, retry.current.?.progress.phase);
+            try std.testing.expectEqualStrings("null", try source.systemCatalog(scratch, context, .{ .scope_retirement_work = 0 }));
+            _ = try source.systemCatalog(scratch, context, .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .namespace, .database = "tenant_ops", .name = "resumed" } } });
+            _ = try source.systemCatalog(scratch, context, .{ .setting_mutate = .{ .database_default = .{ .name = "", .all = true, .database = "tenant_ops", .value = null } } });
+            const reset = try std.json.parseFromSliceLeaky(settings.Snapshot, scratch, try source.systemCatalog(scratch, context, .{ .setting_snapshot = .{ .principal = "alice", .database = "tenant_ops" } }), .{});
+            for (reset.definitions) |definition| if (std.mem.eql(u8, definition.name, "app.scope_default")) try std.testing.expect(definition.database_default == null);
         }
     }
 }

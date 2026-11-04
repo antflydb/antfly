@@ -1062,6 +1062,25 @@ pub const RaftApplyStore = struct {
     pub fn tableRetirementWorkJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, lookup: @import("../metadata/table_retirement_ledger.zig").Lookup) ![]u8 {
         return self.rawCatalogProjection(a, group, .{ .table_retirement_work = lookup }, 32768);
     }
+    pub fn scopeRetirementWorkJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, after: u64) ![]u8 {
+        return self.rawCatalogProjection(a, group, .{ .scope_retirement_work = after }, 8192);
+    }
+    pub fn scopeRetirementManifestJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, lookup: @import("../metadata/scope_retirement_ledger.zig").Lookup) ![]u8 {
+        try lookup.validate();
+        return self.rawCatalogProjection(a, group, .{ .scope_retirement_manifest = lookup }, @import("antfly_local_sources").system_catalog_domain.scope_retirement.max_manifest_bytes);
+    }
+    pub fn scopeRetirementPreflightJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, bytes: []const u8) ![]u8 {
+        return self.rawCatalogProjection(a, group, .{ .scope_retirement_preflight = bytes }, 8192);
+    }
+    pub fn scopeRetirementObservationJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, query: @import("../metadata/scope_retirement_wire.zig").Query) ![]u8 {
+        try query.validate();
+        const bytes = try self.rawCatalogProjection(a, group, .{ .scope_retirement_observation = query }, 16384);
+        errdefer a.free(bytes);
+        var parsed = try std.json.parseFromSlice(@import("../metadata/scope_retirement_wire.zig").Observation, a, bytes, .{});
+        defer parsed.deinit();
+        try parsed.value.requireFor(query);
+        return bytes;
+    }
     pub fn prepareScopeRetirementManifestJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("antfly_local_sources").system_catalog_domain.scope_retirement.Prepare, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         try request.validate();
         const normalized = try context.platformDeadline();

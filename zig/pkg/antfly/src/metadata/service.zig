@@ -3733,6 +3733,7 @@ fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.Transitio
 }
 
 fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    if (command == .apply_scope_retirement) return metadata_topology_protocol.sql_scope_retirement_version;
     const notifications = switch (command) {
         .apply_sql_lock_scope, .apply_sql_prepared_transaction => |bytes| @import("schema_reader_wire.zig").requiresSqlNotifications(bytes),
         else => false,
@@ -3742,7 +3743,7 @@ fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCom
     // This native home participant has a newer decoder than command fences.
     if (command == .apply_sql_prepared_transaction) return metadata_topology_protocol.sql_prepared_lock_handoff_version;
     const command_fence = switch (command) {
-        .apply_system_catalog, .apply_sql_sequence_counter, .apply_sql_prepared_transaction, .apply_sql_lock_scope, .apply_sql_settings, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_schema_validation, .apply_table_retirement => |bytes| @import("schema_reader_wire.zig").requiresSqlCommandFence(bytes),
+        .apply_system_catalog, .apply_sql_sequence_counter, .apply_sql_prepared_transaction, .apply_sql_lock_scope, .apply_sql_settings, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_schema_validation, .apply_table_retirement, .apply_scope_retirement => |bytes| @import("schema_reader_wire.zig").requiresSqlCommandFence(bytes),
         else => false,
     };
     if (command_fence) return metadata_topology_protocol.sql_command_fence_version;

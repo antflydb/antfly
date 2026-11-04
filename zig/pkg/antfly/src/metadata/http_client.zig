@@ -1243,7 +1243,8 @@ pub const MetadataHttpClient = struct {
         if (input == .schema_validation_prepare) try input.schema_validation_prepare.validate();
         if (input == .schema_validation_status) try input.schema_validation_status.validate();
         if (input == .schema_validation_receipt_read) try input.schema_validation_receipt_read.validate();
-        if (remaining_ms == 0) return error.Timeout;
+        const budget_ms = @min(remaining_ms, raft_mutation_forwarding.max_remaining_ms);
+        if (budget_ms == 0) return error.Timeout;
         if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
         defer self.alloc.free(body);
@@ -1258,15 +1259,20 @@ pub const MetadataHttpClient = struct {
         const grant = if (input.requiresAdministrativeGrant() or input.requiresSettingAuthorityReadGrant()) try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, if (input.requiresAdministrativeGrant()) .admin else .read, body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) else null;
         defer if (grant) |value| self.alloc.free(value);
         const headers = [_]http_common.RequestHeader{
-            .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{remaining_ms}) },
+            .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{budget_ms}) },
             .{ .name = routes.Routes.raft_mutation_forwards_remaining_header, .value = "0" },
             .{ .name = routes.Routes.raft_mutation_campaign_allowed_header, .value = "false" },
             .{ .name = authority.header_name, .value = grant orelse "" },
         };
-        var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation, .max_response_bytes = catalogResponseLimit(input) }, self.internal_service);
+        var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, budget_ms), .cancellation = cancellation, .max_response_bytes = catalogResponseLimit(input) }, self.internal_service);
         defer response.deinit(self.alloc);
         if (input.isSchemaValidationCall()) {
-            if (response.status != 200) return @import("schema_validation_read.zig").ownerReadHttpFailure(response.status, response.body) orelse error.RemoteUnavailable;
+            if (response.status != 200) {
+                if (input == .scope_retirement_prepare or input == .scope_retirement_work or input == .scope_retirement_manifest or input == .scope_retirement_observation) {
+                    if (@import("scope_retirement_wire.zig").definiteHttpFailure(response.status, response.body)) |err| return err;
+                }
+                return @import("schema_validation_read.zig").ownerReadHttpFailure(response.status, response.body) orelse error.RemoteUnavailable;
+            }
             const media = responseHeader(response, "content-type") orelse return error.InvalidGenerationPublication;
             const token = std.mem.trim(u8, media[0 .. std.mem.indexOfScalar(u8, media, ';') orelse media.len], " \t");
             if (!std.ascii.eqlIgnoreCase(token, input.responseContentType())) return error.InvalidGenerationPublication;
@@ -1481,6 +1487,8 @@ pub const MetadataHttpClient = struct {
     }
 
     fn executeLifecycleSubmission(self: *MetadataHttpClient, base_uri: []const u8, path: []const u8, command: []const u8, grant: []const u8, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation, delivery: *http_common.RequestDeliveryTracker, max_response_bytes: usize, submitted: ?*bool) ![]u8 {
+        const budget_ms = @min(remaining_ms, raft_mutation_forwarding.max_remaining_ms);
+        if (budget_ms == 0) return error.Timeout;
         var possible_submission = false;
         defer if (possible_submission) if (submitted) |observed| {
             observed.* = true;
@@ -1490,7 +1498,7 @@ pub const MetadataHttpClient = struct {
         defer self.alloc.free(uri);
         var remaining_buf: [10]u8 = undefined;
         const headers = [_]http_common.RequestHeader{
-            .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{remaining_ms}) },
+            .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{budget_ms}) },
             .{ .name = routes.Routes.raft_mutation_forwards_remaining_header, .value = "0" },
             .{ .name = routes.Routes.raft_mutation_campaign_allowed_header, .value = "false" },
             .{ .name = authority.header_name, .value = grant },
@@ -1503,7 +1511,7 @@ pub const MetadataHttpClient = struct {
             .headers = &headers,
             .body = command,
             .content_type = "application/octet-stream",
-            .timeout_ms = @min(default_request_timeout_ms, remaining_ms),
+            .timeout_ms = @min(default_request_timeout_ms, budget_ms),
             .delivery_tracker = delivery,
             .cancellation = cancellation,
             .max_response_bytes = max_response_bytes,
@@ -1522,6 +1530,9 @@ pub const MetadataHttpClient = struct {
         };
         if (std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed)) {
             possible_submission = false;
+            if (std.mem.eql(u8, path, routes.Routes.internal_scope_retirement)) {
+                if (@import("scope_retirement_wire.zig").definiteHttpFailure(response.status, response.body)) |err| return err;
+            }
             if (@import("schema_validation_read.zig").ownerReadHttpFailure(response.status, response.body)) |err| return err;
             return error.MetadataMutationOutcomeUnknown;
         }
@@ -1530,6 +1541,32 @@ pub const MetadataHttpClient = struct {
         if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, std.mem.sliceTo(content_type, ';'), " \t"), "application/json")) return error.MetadataMutationOutcomeUnknown;
         if (response.body.len == 0 or response.body.len > max_response_bytes) return error.MetadataMutationOutcomeUnknown;
         return self.alloc.dupe(u8, response.body) catch return error.MetadataMutationOutcomeUnknown;
+    }
+
+    fn submitScopeRetirementWithControl(self: *MetadataHttpClient, base_uri: []const u8, request: @import("scope_retirement_wire.zig").Request, remaining_ms: u32, setting_admin: bool, control: CatalogControl) ![]u8 {
+        const wire = @import("scope_retirement_wire.zig");
+        if (!setting_admin) return error.Forbidden;
+        if (remaining_ms == 0) return error.Timeout;
+        if (control.cancellation) |value| if (value.isCancelled()) return error.Cancelled;
+        const command = try request.encodeAlloc(self.alloc);
+        defer self.alloc.free(command);
+        const group = switch (request.operation) {
+            .reserve => |manifest| manifest.metadata_group_id,
+            .cancel => |cancel| cancel.lookup.group,
+        };
+        var input = try wire.Input.parse(self.alloc, group, command);
+        defer input.deinit();
+        const authority = @import("../system_catalog/setting_authority.zig");
+        const grant = try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, .admin, command, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+        defer self.alloc.free(grant);
+        var delivery: http_common.RequestDeliveryTracker = .{};
+        const bytes = try self.executeLifecycleSubmission(base_uri, routes.Routes.internal_scope_retirement, command, grant, remaining_ms, control.cancellation, &delivery, 16384, control.submitted);
+        errdefer self.alloc.free(bytes);
+        var observed = std.json.parseFromSlice(wire.Observation, self.alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+        defer observed.deinit();
+        observed.value.requireFor(input.query) catch return error.MetadataMutationOutcomeUnknown;
+        if (observed.value.outcome == null) return error.MetadataMutationOutcomeUnknown;
+        return bytes;
     }
 
     pub fn submitTableRetirementControlled(self: *MetadataHttpClient, base_uri: []const u8, command: []const u8, remaining_ms: u32, setting_admin: bool, cancellation: ?*const http_common.RequestCancellation) ![]u8 {
@@ -1573,6 +1610,7 @@ pub const MetadataHttpClient = struct {
         const cancellation = control.cancellation;
         if (input == .schema_validation_submit) return self.submitSchemaValidationWithControl(base_uri, input.schema_validation_submit, forwarding.remaining_ms, setting_admin, control);
         if (input == .table_retirement_submit) return self.submitTableRetirementWithControl(base_uri, input.table_retirement_submit, forwarding.remaining_ms, setting_admin, control);
+        if (input == .scope_retirement_submit) return self.submitScopeRetirementWithControl(base_uri, input.scope_retirement_submit, forwarding.remaining_ms, setting_admin, control);
         if (input.isSchemaValidationCall()) return (try self.readSystemCatalog(base_uri, input, forwarding.remaining_ms, cancellation)).body;
         if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         var possible_submission = false;
@@ -5473,6 +5511,9 @@ fn catalogResponseLimit(input: @import("../system_catalog/server_call.zig").Call
         .schema_validation_discover => 1024,
         .schema_validation_work => @import("schema_validation_work.zig").max_wire_bytes,
         .schema_validation_prepare => @import("schema_validation_admission.zig").max_wire_bytes,
+        .scope_retirement_work => 8192,
+        .scope_retirement_prepare, .scope_retirement_manifest => @import("antfly_local_sources").system_catalog_domain.scope_retirement.max_manifest_bytes,
+        .scope_retirement_observation => 16384,
         .table_retirement_prepare, .table_retirement_effects => @import("table_retirement_manifest.zig").max_bytes,
         .sql_sequence_snapshot => |request| if (request.prepare_retirement) @import("../system_catalog/sequence_catalog.zig").Snapshot.max_retirement_bytes else null,
         .schema_validation_status => @import("schema_validation_admission.zig").Status.max_wire_bytes,
@@ -6077,4 +6118,47 @@ test "SQL command fence catalog preparation preserves definite naming diagnostic
     executor.body = "undefinedcolumn";
     try std.testing.expectError(error.InvalidCatalogName, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
     try std.testing.expectEqual(@as(usize, 10), executor.calls);
+}
+
+test "SQL scope retirement HTTP submission preserves definite conflicts and never replays unknown delivery" {
+    const a = std.testing.allocator;
+    const Executor = struct {
+        calls: usize = 0,
+        outcome: []const u8 = routes.Routes.raft_mutation_outcome_not_proposed,
+        response_status: u16 = 409,
+        response_body: []const u8 = "ScopeRetirementChanged",
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, routes.Routes.internal_scope_retirement));
+            try std.testing.expectEqualStrings("application/octet-stream", request.content_type orelse "");
+            try std.testing.expectEqualStrings("5000", request.header(routes.Routes.raft_mutation_remaining_ms_header).?);
+            try std.testing.expectEqual(@as(?u32, 5000), request.timeout_ms);
+            const body = try alloc.dupe(u8, self.response_body);
+            errdefer alloc.free(body);
+            const headers = try alloc.alloc(http_common.Header, 1);
+            errdefer alloc.free(headers);
+            const name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header);
+            errdefer alloc.free(name);
+            headers[0] = .{ .name = name, .value = try alloc.dupe(u8, self.outcome) };
+            return .{ .status = self.response_status, .body = body, .headers = headers };
+        }
+    };
+    var executor: Executor = .{};
+    var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    var delivery: http_common.RequestDeliveryTracker = .{};
+    inline for (.{ error.ScopeRetirementChanged, error.InvalidScopeRetirement, error.CatalogGenerationChanged, error.TableTransitionActive, error.SequenceAdmissionConflict }) |err| {
+        executor.response_status = system_catalog.httpStatus(err);
+        executor.response_body = @errorName(err);
+        executor.outcome = routes.Routes.raft_mutation_outcome_not_proposed;
+        const before = executor.calls;
+        try std.testing.expectError(err, client.executeLifecycleSubmission("http://metadata.invalid", routes.Routes.internal_scope_retirement, "scope-command", "grant", 20000, null, &delivery, 16384, null));
+        try std.testing.expectEqual(before + 1, executor.calls);
+        inline for (.{ routes.Routes.raft_mutation_outcome_unknown, routes.Routes.raft_mutation_outcome_committed }) |outcome| {
+            executor.outcome = outcome;
+            const previous = executor.calls;
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.executeLifecycleSubmission("http://metadata.invalid", routes.Routes.internal_scope_retirement, "scope-command", "grant", 20000, null, &delivery, 16384, null));
+            try std.testing.expectEqual(previous + 1, executor.calls);
+        }
+    }
 }

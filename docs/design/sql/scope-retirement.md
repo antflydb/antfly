@@ -56,10 +56,36 @@ Terminal progress releases leases, body and work rows atomically while keeping
 the compact outcome. Native tests abort every staged admission and terminal
 write and reopen the store between progress steps.
 
-The reservation primitive does not itself admit a Raft operation or verify an
-owner ACK. Its caller must independently verify the catalog/preimage cut,
-connection drainage and physical outcomes in the same native writer. Its state
-machine cannot be treated as those proofs.
+The private reservation command now crosses the ordinary metadata ingress,
+coordinated decoder floor, opaque storage-owner ABI and Raft apply transaction.
+Reservation binds its entire body to one metadata-group nonce. The accepting
+writer rechecks the immutable catalog and physical-definition/range cut, command
+ownership and scope vacancy. Accepted outcomes and expected CAS/conflict
+rejections are retained atomically with their effects. Exact observation precedes
+current source and command-liveness checks; cancellation cannot make a lost
+reservation reply acquire the scope again. Unknown submission outcomes remain
+unknown until their immutable query is observed.
+
+Ordinary catalog writes check selected identities and their database/namespace
+ancestors with constant-depth point reads. Moving an object checks both parents;
+a batch checks its whole footprint before any resource effect. Table-definition
+replacement and removal also respect captured table leases. These are metadata
+admission fences, not yet a complete query, connection or physical-owner fence.
+Disjoint scopes remain writable without a global query lock. Temporary table
+and range decoding uses a separate scratch arena per table, so retained manifest
+images do not pin all prior parsing scratch. Stale catalog cuts fail before the
+scope is walked again. Idle recovery reads one compact cyclic queue item; only
+an explicit manifest read loads the immutable membership body.
+
+Private HTTP submission shares the one-attempt lifecycle delivery machinery.
+Forwarding headers and socket timeouts use the same bounded budget accepted by
+the receiver. A definite pre-proposal error remains distinct from unknown
+submission. Native snapshots retain active work, manifests and exact outcomes;
+a definition-only portable export rejects active scope custody.
+
+Reservation does not verify connection drainage, physical child ACKs or final
+catalog withdrawal. Its progress state cannot stand for those proofs. Native
+workers and final publication must verify each independently before advancing.
 
 ## Remaining activation
 
@@ -68,10 +94,12 @@ machine cannot be treated as those proofs.
    Bind root and affected-survivor fences to immutable identities. Block new
    connection/object admission and incompatible table publications without a
    global query lock.
-2. Admit the scope operation through Raft and standby decoder capabilities with
-   the original SQL command fence, retained exact outcomes and a bounded work
-   feed. Register each deterministic child before its proposal so lost replies
-   recover the admitted child rather than allocating another operation.
+2. Register each deterministic child before its proposal so lost replies
+   recover the admitted child rather than allocating another operation. A
+   constant-size cyclic native work feed and verified immutable manifest read
+   already cross the storage-owner and private metadata boundaries. Reservation
+   and cancellation retain exact outcomes under the decoder capability and
+   optional originating SQL command fence; that does not authorize child work.
 3. Drive existing native retirement workers under that root custody. Validate
    the predicted subtract-only schema evolution between children; a reusable
    display name cannot replace a captured member. Physical and catalog changes
@@ -91,6 +119,7 @@ machine cannot be treated as those proofs.
 cd zig
 zig build sql-test -Dtest-filter='SQL scope retirement' -Doptimize=Debug -j1
 zig build antfly-metadata-scope-retirement-test -Doptimize=Debug -j1
+zig build antfly-standalone-scope-retirement-test -Doptimize=Debug -j1
 zig build antfly-api-sql-scope-retirement-test \
   -Dtest-filter='mounted SQL scope retirement capture' -Doptimize=Debug -j1
 ```

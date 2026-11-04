@@ -28,6 +28,9 @@ const Campaign = struct {
     credentials: client.ApiKeyHeaders = .{},
     identity: ?contract.Digest = null,
     table_id: u64 = 0,
+    retained_alloc: std.mem.Allocator,
+    reservation: ?[]u8 = null,
+    admitted: ?@import("../metadata/scope_retirement_wire.zig").Outcome = null,
     pub fn configureAuth(manager: *@import("../usermgr/mod.zig").UserManager) !void {
         const users = @import("../usermgr/mod.zig");
         inline for (.{ users.ResourceType.database, users.ResourceType.namespace }) |kind| {
@@ -70,6 +73,52 @@ const Campaign = struct {
             self.table_id = manifest.tables[0].id;
         }
     }
+    fn admission(self: *@This(), ctx: *fixture.Context, cancel: bool) !void {
+        const wire = @import("../metadata/scope_retirement_wire.zig");
+        const Transport = struct {
+            inner: @import("../raft/transport/http_common.zig").RequestExecutor,
+            fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../raft/transport/http_common.zig").HttpRequest) !@import("../raft/transport/http_common.zig").HttpResponse {
+                const self_transport: *@This() = @ptrCast(@alignCast(ptr));
+                const response = try self_transport.inner.execute(alloc, request);
+                if (response.status >= 400) std.debug.print("scope admission HTTP status={d} body={s}\n", .{ response.status, response.body[0..@min(response.body.len, 256)] });
+                return response;
+            }
+        };
+        var transport: Transport = .{ .inner = ctx.transport };
+        var remote = ctx.catalogClient();
+        remote.executor = .{ .ptr = &transport, .vtable = &.{ .execute = Transport.execute } };
+        var region: std.heap.ArenaAllocator = .init(ctx.alloc);
+        defer region.deinit();
+        const a = region.allocator();
+        const context: local.api_operation.RequestContext = .{ .setting_admin = true, .schema_validation_authority = true, .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 20 * std.time.ns_per_s };
+        if (!cancel) {
+            const bytes = try http.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc).systemCatalog(a, context, .{ .scope_retirement_prepare = .{ .kind = .namespace, .name = "tenant_ops", .creator = .bootstrap, .cascade = true } });
+            const manifest = try std.json.parseFromSliceLeaky(contract.Manifest, a, bytes, .{});
+            const request: wire.Request = .{ .admission = .{ .nonce = @splat(71), .head = manifest.catalog_revision }, .operation = .{ .reserve = manifest } };
+            self.reservation = try request.encodeAlloc(self.retained_alloc);
+            const response = try remote.forwardSystemCatalog(ctx.metadata_uri, .{ .scope_retirement_submit = request }, .{ .remaining_ms = 20000, .forwards_remaining = 0, .campaign_allowed = false }, true);
+            defer ctx.alloc.free(response);
+            const result = try std.json.parseFromSliceLeaky(wire.Observation, a, response, .{});
+            self.admitted = result.outcome.?;
+            try std.testing.expectEqual(contract.Phase.draining_connections, self.admitted.?.result.accepted.progress.phase);
+        } else {
+            const original = self.admitted.?;
+            const prior = try std.json.parseFromSliceLeaky(wire.Observation, a, try http.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc).systemCatalog(a, context, .{ .scope_retirement_observation = original.query }), .{});
+            try std.testing.expectEqualDeep(original, prior.outcome.?);
+            const request: wire.Request = .{ .admission = .{ .nonce = @splat(72), .head = 0 }, .operation = .{ .cancel = .{ .lookup = original.query.lookup, .expected_revision = 1 } } };
+            const canceled_bytes = try remote.forwardSystemCatalog(ctx.metadata_uri, .{ .scope_retirement_submit = request }, .{ .remaining_ms = 20000, .forwards_remaining = 0, .campaign_allowed = false }, true);
+            defer ctx.alloc.free(canceled_bytes);
+            const canceled = try std.json.parseFromSliceLeaky(wire.Observation, a, canceled_bytes, .{});
+            try std.testing.expectEqual(contract.Phase.canceled, canceled.current.?.progress.phase);
+            const retry = try std.json.parseFromSliceLeaky(wire.Request, a, self.reservation.?, .{});
+            const retried_bytes = try remote.forwardSystemCatalog(ctx.metadata_uri, .{ .scope_retirement_submit = retry }, .{ .remaining_ms = 20000, .forwards_remaining = 0, .campaign_allowed = false }, true);
+            defer ctx.alloc.free(retried_bytes);
+            const observed = try std.json.parseFromSliceLeaky(wire.Observation, a, retried_bytes, .{});
+            try std.testing.expectEqualDeep(original, observed.outcome.?);
+            try std.testing.expectEqual(contract.Phase.canceled, observed.current.?.progress.phase);
+            try execute(ctx, "CREATE TABLE tenant_ops.resumed(id bigint PRIMARY KEY)");
+        }
+    }
     fn rows(ctx: *fixture.Context) !void {
         var response = try client.execute(ctx, "SELECT id,payload FROM tenant_ops.events ORDER BY id", .read);
         defer response.deinit(ctx.alloc);
@@ -98,16 +147,20 @@ const Campaign = struct {
         try execute(ctx, "CREATE FUNCTION tenant_ops.audit(bigint) RETURNS bigint LANGUAGE SQL AS 'SELECT $1'");
         try self.observe(ctx);
         try rows(ctx);
+        try self.admission(ctx, false);
     }
     pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
         try self.credentials.activateWithCatalog(ctx, true);
         ctx.headers = ctx.admin_headers;
         try self.observe(ctx);
         try rows(ctx);
+        try self.admission(ctx, true);
     }
 };
 
 test "mounted SQL scope retirement capture crosses native storage owners and cold catalog cuts" {
     // Preparation alone earns no positive credit for sql-0105/0108/0109.
-    try fixture.runWithState(Campaign, .{});
+    var retained: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer retained.deinit();
+    try fixture.runWithState(Campaign, .{ .retained_alloc = retained.allocator() });
 }

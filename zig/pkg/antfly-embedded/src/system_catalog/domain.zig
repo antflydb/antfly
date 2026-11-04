@@ -1674,13 +1674,13 @@ pub const TableStatusTarget = union(enum) {
 
 pub fn httpStatus(err: anyerror) u16 {
     return switch (err) {
-        error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists => 409,
+        error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ScopeRetirementChanged, error.SequenceAdmissionConflict => 409,
         error.CatalogGenerationExhausted, error.ProgramLimitExceeded, error.UndefinedColumn, error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.SqlViewCycle, error.SqlProgramLimitExceeded => 400,
         error.SqlDependentObjectsExist => 409,
         error.ForeignKeyValidationRequired, error.ConstraintRetirementRequired, error.TableTransitionActive, error.ForeignKeyReferenced => 409,
         error.CatalogOccupancyNotReady => 503,
         error.MetadataReplicationPending => 503,
-        error.InvalidSchemaValidationJob, error.InvalidSchemaOwnerControl => 400,
+        error.InvalidSchemaValidationJob, error.InvalidSchemaOwnerControl, error.InvalidScopeRetirement => 400,
         error.SchemaValidationJobChanged, error.SchemaValidationPublicationRequired, error.SchemaValidationJobRequired, error.SchemaValidationRuntimeRecoveryRequired, error.SchemaValidationNotReady, error.SchemaValidationCanceled, error.SchemaValidationCancellationRequired => 409,
         error.SqlIndexNotFound, error.SqlConstraintNotFound, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.TableNotFound => 404,
         error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.GenerationPublicationChanged, error.GenerationPublicationNotFound, error.ForeignKeyGenerationPublicationRequired, error.RowPolicyCatalogChanged, error.RowPolicyInstallationPending, error.RowPolicyReadersActive, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.TableAlreadyExists => 409,

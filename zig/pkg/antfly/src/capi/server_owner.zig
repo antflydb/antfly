@@ -2422,6 +2422,22 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.tableRetirementWorkJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionBytes(alloc, out_json, value);
                 },
+                .scope_retirement_work => |input| {
+                    const value = handle.store.scopeRetirementWorkJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionBytes(alloc, out_json, value);
+                },
+                .scope_retirement_manifest => |input| {
+                    const value = handle.store.scopeRetirementManifestJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionBytes(alloc, out_json, value);
+                },
+                .scope_retirement_preflight => |input| {
+                    const value = handle.store.scopeRetirementPreflightJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionBytes(alloc, out_json, value);
+                },
+                .scope_retirement_observation => |input| {
+                    const value = handle.store.scopeRetirementObservationJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionBytes(alloc, out_json, value);
+                },
                 .scope_retirement_prepare => |input| {
                     const value = handle.store.prepareScopeRetirementManifestJsonWithContext(a, group_id, input.request, .{ .deadline_ns = input.deadline_ns }) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionBytes(alloc, out_json, value);

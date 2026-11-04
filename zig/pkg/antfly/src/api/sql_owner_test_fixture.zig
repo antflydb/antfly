@@ -29,6 +29,10 @@ const test_helpers = @import("../public_test_helpers.zig");
 const usermgr = @import("../usermgr/mod.zig");
 const casbin = @import("antfly_casbin");
 
+const internal_secret = "pk-rewrite-e2e-internal-service-secret-v1";
+const trusted_secret = "pk-rewrite-e2e-trusted-principal-secret-v1";
+const issuer = "pk-rewrite-e2e";
+
 /// The fixture is the cluster administrator for this disposable deployment.
 /// Registration only advertises a key; it must not silently approve a root.
 /// Use the real signed enrollment and Raft apply path before campaigns need it.
@@ -242,6 +246,15 @@ pub const Context = struct {
     base: []const u8,
     progress: [4]*raft.ManagedProgressDriver,
 
+    /// Authenticated private transport for mounted owner campaigns. These
+    /// credentials belong only to this disposable fixture deployment.
+    pub fn catalogClient(self: *const Context) @import("../metadata/http_client.zig").MetadataHttpClient {
+        var value = @import("../metadata/http_client.zig").MetadataHttpClient.init(self.alloc, self.transport);
+        _ = value.withInternalServiceAuth(internal_secret, issuer);
+        _ = value.withSettingAuthority(trusted_secret, issuer);
+        return value;
+    }
+
     pub fn checkDrivers(self: *const Context) !void {
         // A slow durable round is a readiness observation, not a failed owner.
         // Let the same owner finish within each request's bounded deadline;
@@ -321,9 +334,6 @@ pub fn run(comptime Campaign: type) !void {
 pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
     const alloc = std.testing.allocator;
     const process_alloc = platform.allocator.processAllocator(alloc);
-    const internal_secret = "pk-rewrite-e2e-internal-service-secret-v1";
-    const trusted_secret = "pk-rewrite-e2e-trusted-principal-secret-v1";
-    const issuer = "pk-rewrite-e2e";
     const rewrite_username = "pk-rewriter";
     const rewrite_password = "pk-rewrite-durable-password";
     var auth_store = usermgr.MemoryStore.init(alloc);

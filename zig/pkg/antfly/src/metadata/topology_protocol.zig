@@ -168,7 +168,9 @@ const std = @import("std");
 // unreleased SQL profile reserves floors above 78; historical notes above
 // describe its development sequence before this rebasing. Published transition
 // tag 81 remains SQL completion references; private SQL tags begin at 82.
-pub const current_version: u16 = 163;
+pub const current_version: u16 = 164;
+/// Immutable ancestor reservation custody and body-bound native outcomes.
+pub const sql_scope_retirement_version: u16 = 164;
 /// Database defaults and managed-role snapshots preserve credential policy,
 /// existing login baselines and definition identities.
 pub const sql_database_defaults_version: u16 = 163;

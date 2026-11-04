@@ -1295,9 +1295,35 @@ fn removeResourceRow(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, grou
     };
 }
 
+/// Constant-depth checks through the same immutable parent policy used by
+/// admission and capture. No global catalog scan or query mutex is involved.
+pub fn requireScopeResourceWritable(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, resource: domain.Resource, meta: Meta) !void {
+    _ = meta;
+    return requireScopeResourceWritableWithParents(alloc, txn, group, resource, &.{});
+}
+fn requireScopeResourceWritableWithParents(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, resource: domain.Resource, planned: []const domain.Resource) !void {
+    const retirement = @import("../metadata/scope_retirement_ledger.zig");
+    if (try retirement.member(txn, group, resource.kind, resource.id) != null) return error.TableTransitionActive;
+    switch (domain.parentScope(resource.kind)) {
+        .global => {},
+        .database => if (try retirement.member(txn, group, .database, resource.parent_id) != null) return error.TableTransitionActive,
+        .namespace => {
+            if (try retirement.member(txn, group, .namespace, resource.parent_id) != null) return error.TableTransitionActive;
+            var stored = try getById(alloc, txn, group, .namespace, resource.parent_id);
+            defer if (stored) |*value| value.deinit();
+            const parent = if (stored) |value| value.value else (domain.State{}).byId(.namespace, resource.parent_id) orelse blk: {
+                for (planned) |value| if (value.kind == .namespace and value.id == resource.parent_id) break :blk value;
+                return error.InvalidCatalogRecord;
+            };
+            if (try retirement.member(txn, group, .database, parent.parent_id) != null) return error.TableTransitionActive;
+        },
+    }
+}
+
 /// Existing identities need three writes, independent of child/settings count.
 /// The authority replans this delta inside the serialized catalog transaction.
 pub fn applyPresentationRecord(alloc: std.mem.Allocator, txn: anytype, group_id: u64, resource: domain.Resource, previous: Meta, command_hash: [32]u8) !void {
+    try requireScopeResourceWritable(alloc, txn, group_id, resource, previous);
     const record_key = try recordKeyAlloc(alloc, group_id, resource.kind, resource.id);
     defer alloc.free(record_key);
     const bytes = try std.json.Stringify.valueAlloc(alloc, resource, .{});
@@ -1321,6 +1347,17 @@ fn writeMeta(alloc: std.mem.Allocator, txn: anytype, group_id: u64, previous: Me
 }
 
 pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, delta: domain.Delta, previous: Meta, command_hash: [32]u8) !void {
+    // Validate the complete footprint, including old parents of a move, before
+    // any settings, ownership, topology or catalog effect can be committed.
+    for (delta.removes) |resource| try requireScopeResourceWritableWithParents(alloc, txn, group_id, resource, delta.upserts);
+    for (delta.upserts) |resource| {
+        try requireScopeResourceWritableWithParents(alloc, txn, group_id, resource, delta.upserts);
+        if (try getById(alloc, txn, group_id, resource.kind, resource.id)) |value| {
+            var prior = value;
+            defer prior.deinit();
+            if (prior.value.parent_id != resource.parent_id) try requireScopeResourceWritableWithParents(alloc, txn, group_id, prior.value, delta.upserts);
+        }
+    }
     if (delta.presentation_only and (delta.upserts.len != 1 or delta.removes.len != 0 or delta.next_id != previous.next_id or
         (delta.upserts[0].kind != .database and delta.upserts[0].kind != .namespace and delta.upserts[0].kind != .named_type))) return error.InvalidCatalogMutation;
     if (delta.presentation_only and previous.revision != 0) {

@@ -2080,6 +2080,7 @@ pub const MetadataHttpServer = struct {
         try server.post("/internal/v1/system-catalog", httpx.Handler.bind(self, metadataSystemCatalog));
         try server.post(routes.Routes.internal_schema_validation, httpx.Handler.bind(self, metadataSchemaValidation));
         try server.postWithBodyLimit(routes.Routes.internal_table_retirement, @import("table_retirement_ledger.zig").max_command_bytes, httpx.Handler.bind(self, metadataTableRetirement));
+        try server.postWithBodyLimit(routes.Routes.internal_scope_retirement, @import("scope_retirement_wire.zig").max_command_bytes, httpx.Handler.bind(self, metadataScopeRetirement));
         try server.post(routes.Routes.internal_catalog_publication_check, httpx.Handler.bind(self, metadataCatalogPublicationCheck));
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
         try server.post(routes.Routes.internal_catalog_group_retirement_check, httpx.Handler.bind(self, metadataCatalogGroupRetirementCheck));
@@ -2158,18 +2159,29 @@ pub const MetadataHttpServer = struct {
         return self.metadataSystemCatalogImpl(ctx, .retirement);
     }
 
-    fn metadataSystemCatalogImpl(self: *MetadataHttpServer, ctx: *httpx.Context, transport: enum { json, schema, retirement }) !httpx.Response {
+    fn metadataScopeRetirement(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        return self.metadataSystemCatalogImpl(ctx, .scope);
+    }
+
+    fn metadataSystemCatalogImpl(self: *MetadataHttpServer, ctx: *httpx.Context, transport: enum { json, schema, retirement, scope }) !httpx.Response {
+        const raw_scope = transport == .scope;
         const raw_schema = transport == .schema;
         const raw_retirement = transport == .retirement;
         try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_proposed);
         const body = (try ctx.body()) orelse return ctx.status(400).text("missing body");
         const Call = @import("../system_catalog/server_call.zig").Call;
         const ledger = @import("schema_validation_ledger.zig");
-        const maximum: usize = if (raw_retirement) @import("table_retirement_ledger.zig").max_command_bytes else if (raw_schema) (if (ledger.requiresAdmissionAuthority(body)) ledger.max_command_bytes else ledger.max_control_command_bytes) else system_catalog.max_command_bytes;
+        const maximum: usize = if (raw_scope) @import("scope_retirement_wire.zig").max_command_bytes else if (raw_retirement) @import("table_retirement_ledger.zig").max_command_bytes else if (raw_schema) (if (ledger.requiresAdmissionAuthority(body)) ledger.max_command_bytes else ledger.max_control_command_bytes) else system_catalog.max_command_bytes;
         if (body.len > maximum) return ctx.status(413).text("catalog request too large");
         var parsed: ?std.json.Parsed(Call) = null;
         defer if (parsed) |*value| value.deinit();
-        const input: Call = if (raw_retirement) blk: {
+        var scope: ?std.json.Parsed(@import("scope_retirement_wire.zig").Request) = null;
+        defer if (scope) |*value| value.deinit();
+        const input: Call = if (raw_scope) blk: {
+            if (!std.mem.eql(u8, ctx.header("content-type") orelse "", "application/octet-stream")) return ctx.status(415).text("lifecycle submission requires raw transport");
+            scope = std.json.parseFromSlice(@import("scope_retirement_wire.zig").Request, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid scope retirement");
+            break :blk .{ .scope_retirement_submit = scope.?.value };
+        } else if (raw_retirement) blk: {
             if (!std.mem.eql(u8, ctx.header("content-type") orelse "", "application/octet-stream")) return ctx.status(415).text("lifecycle submission requires raw transport");
             break :blk .{ .table_retirement_submit = body };
         } else if (raw_schema) blk: {
@@ -2178,7 +2190,7 @@ pub const MetadataHttpServer = struct {
             break :blk .{ .schema_validation_submit = body };
         } else blk: {
             parsed = std.json.parseFromSlice(Call, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid catalog request");
-            if (parsed.?.value == .schema_validation_submit or parsed.?.value == .table_retirement_submit)
+            if (parsed.?.value == .schema_validation_submit or parsed.?.value == .table_retirement_submit or parsed.?.value == .scope_retirement_submit)
                 return ctx.status(415).text("schema validation requires binary transport");
             break :blk parsed.?.value;
         };

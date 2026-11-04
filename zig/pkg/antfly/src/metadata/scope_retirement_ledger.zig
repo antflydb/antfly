@@ -128,10 +128,32 @@ pub fn member(reader: anytype, group: u64, kind: local.system_catalog_domain.Kin
     if (lease.lookup.group != group) return error.InvalidScopeRetirement;
     return lease;
 }
+/// One compact cyclic queue item. Queue membership and head progress share
+/// the same native transaction; corrupt or orphaned work is never skipped.
+pub fn nextWork(reader: anytype, group: u64, after: u64) !?Head {
+    var prefix_buffer: [256]u8 = undefined;
+    const base = try queuePrefix(&prefix_buffer, group);
+    var seek_buffer: [256]u8 = undefined;
+    const seek = if (after == std.math.maxInt(u64)) base else try queueKey(&seek_buffer, group, after + 1);
+    var cursor = try reader.openCursor();
+    defer cursor.close();
+    var row = try cursor.seekAtOrAfter(seek);
+    if (row == null or !std.mem.startsWith(u8, row.?.key, base)) row = try cursor.seekAtOrAfter(base);
+    const entry = row orelse return null;
+    if (!std.mem.startsWith(u8, entry.key, base)) return null;
+    if (entry.key.len != base.len + 16) return error.InvalidScopeRetirement;
+    const sequence = std.fmt.parseInt(u64, entry.key[base.len..], 16) catch return error.InvalidScopeRetirement;
+    const lookup = try QueueRecord.decode(entry.value);
+    if (lookup.group != group) return error.InvalidScopeRetirement;
+    const value = (try head(reader, lookup)) orelse return error.InvalidScopeRetirement;
+    if (!value.active() or value.sequence != sequence) return error.InvalidScopeRetirement;
+    return value;
+}
+
 fn rootKind(value: contract.Manifest) local.system_catalog_domain.Kind {
     return if (value.scope.kind == .database) .database else .namespace;
 }
-fn requireVacant(reader: anytype, prepared: *const Prepared) !void {
+pub fn requireVacant(reader: anytype, prepared: *const Prepared) !void {
     const group = prepared.lookup.group;
     // Distinct namespaces can retire concurrently. A database retirement
     // intersects every namespace reservation, and blocks new namespace jobs.

@@ -5946,6 +5946,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_catalog_command_step.dependOn(&prepared_catalog_standalone_run.step);
     sql_catalog_command_step.dependOn(sql_command_fence_step);
     ordinary_catalog_step.dependOn(sql_catalog_command_step);
+    const standalone_scope_tests = b.addTest(.{
+        .root_module = system_catalog_standalone_test_mod,
+        .filters = &.{ "SQL scope retirement standalone", "system catalog standalone setting publication" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const standalone_scope_run = addFilteredTestRunArtifact(b, standalone_scope_tests);
+    standalone_scope_run.addArg("--require-no-skips");
+    b.step("antfly-standalone-scope-retirement-test", "Verify native scope reservation and catalog settings through standalone cold owners").dependOn(&standalone_scope_run.step);
     const system_catalog_standalone_step = b.step("antfly-system-catalog-standalone-test", "Run standalone catalog checkpoint and rollback tests");
     system_catalog_standalone_step.dependOn(&b.addRunArtifact(system_catalog_standalone_tests).step);
     // Same physical source module and linked provider as the broad catalog
