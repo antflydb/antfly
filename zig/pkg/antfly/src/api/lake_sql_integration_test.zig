@@ -257,9 +257,6 @@ fn acceptedTransactionFixture(isolation: @import("antfly_local_sources").sql_ses
     defer first.deinit();
     try std.testing.expectEqualStrings("1", first.output.rows[0][0].string);
     if (isolation == .serializable) try adapter.validateAcceptedSerializable(a, transaction.txn_id);
-    var next = try lake_api.execute(a, &server, "events", 7, null, .{}, .{ .action = .changes, .body = "{\"batch_id\":\"second\",\"source\":\"test\",\"epoch\":\"1\",\"checkpoint\":\"2\",\"expected_checkpoint\":\"1\",\"key_fields\":[\"amount\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"amount\":2}}]}" });
-    defer next.deinit(a);
-    if (isolation == .serializable) try std.testing.expectError(error.SqlWriteConflict, adapter.validateAcceptedSerializable(a, transaction.txn_id));
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, source.table[0].schema_json)).?;
     defer binding.deinit(a);
     // Use the production reconciliation path with local artifact fallback,
@@ -274,6 +271,12 @@ fn acceptedTransactionFixture(isolation: @import("antfly_local_sources").sql_ses
     var published = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(a, binding.binding, .{ .node_config = &config, .catalog_table_id = 7 }, .{}, .load);
     defer published.deinit(a);
     try std.testing.expectEqual(@as(u64, 1), try @import("../serverless/lake_ingestion.zig").coverage(a, published.table));
+    // Accept the second transaction only after publication. A drain pass
+    // group-commits every pending transaction, so accepting it earlier would
+    // publish both; this fixture needs the catalog one transaction behind.
+    var next = try lake_api.execute(a, &server, "events", 7, null, .{}, .{ .action = .changes, .body = "{\"batch_id\":\"second\",\"source\":\"test\",\"epoch\":\"1\",\"checkpoint\":\"2\",\"expected_checkpoint\":\"1\",\"key_fields\":[\"amount\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"amount\":2}}]}" });
+    defer next.deinit(a);
+    if (isolation == .serializable) try std.testing.expectError(error.SqlWriteConflict, adapter.validateAcceptedSerializable(a, transaction.txn_id));
     // New request and recompiled/prepared statement reuse the durable cut.
     // The current catalog now contains both rows, unlike the initial empty
     // snapshot plus the single copied WAL image held by this transaction.
