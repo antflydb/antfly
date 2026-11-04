@@ -587,6 +587,9 @@ test "ordered artifact inventory document stream closure requires current output
                 const MetadataAndPrimary = struct {
                     txn: *@TypeOf(read),
                     output: []const u8,
+                    pub fn openPhysicalCursorAdapter(self: *@This()) @TypeOf(self.txn.openPhysicalCursorAdapter()) {
+                        return self.txn.openPhysicalCursorAdapter();
+                    }
                     pub fn get(self: *@This(), selected: []const u8) ![]const u8 {
                         // Provenance/revision witnesses replace vector-body
                         // reads during preparation, not only final commit.
@@ -666,7 +669,9 @@ test "ordered artifact inventory document stream closure requires current output
                 const primary = if (dense) try keys.relationalRowKeyAlloc(arena.allocator(), "doc") else try keys.documentKeyAlloc(arena.allocator(), "doc");
                 var token = (try input.capture(alloc, &read, db.root_incarnation, request, plan, primary, try read.get(primary), null)).?;
                 defer token.deinit();
-                try std.testing.expectError(error.EnrichmentSourceChanged, token.accepted(&read));
+                // The input is still current: replaced output is a cache
+                // miss that schedules fresh work, while the old closure fails.
+                try std.testing.expect(!try token.accepted(&read));
                 try std.testing.expectError(error.EnrichmentSourceChanged, previous.?.requireCurrent(&read, db.root_incarnation));
                 try std.testing.expectError(error.EnrichmentSourceChanged, prepareDocumentClosure(alloc, &read, db.root_incarnation, request, plan));
                 var refs: @import("artifact_producer_dispatch.zig").Buffer = undefined;

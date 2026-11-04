@@ -1307,7 +1307,11 @@ def test_preview_identifier_and_streaming_sample_budgets(stateful_api):
     table = "privacy_preview_budget_" + uuid4().hex[:8]
     stateful_api.create_table(table)
     key = "x" * (9 * 1024 * 1024)
-    stateful_api.batch_write(table, inserts={key: {"ordinal": 1}})
+    # Finish initial publication before testing sample admission. In Raft,
+    # catch-up for this large identifier can otherwise occupy the read fence.
+    stateful_api.batch_write(
+        table, inserts={key: {"ordinal": 1}}, sync_level="full_index"
+    )
     policy = {
         "mode": "monitor",
         "fields": ["body"],
@@ -1319,7 +1323,11 @@ def test_preview_identifier_and_streaming_sample_budgets(stateful_api):
             json={"policy": policy, "sample": sample},
             timeout=120,
         )
-        assert response.status_code == 422, response.text[:500]
+        assert response.status_code == 422, (
+            "explicit" if "keys" in sample else "automatic",
+            response.text[:500],
+            stateful_api.debug_logs()[-12000:],
+        )
         assert response.json()["code"] == "privacy_sample_too_large"
     stateful_api.batch_write(
         table, deletes=[key], inserts={"small": {"ordinal": 1}, "tail": {"ordinal": 2}}

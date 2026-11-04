@@ -1635,6 +1635,9 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
             reader: @TypeOf(&reopened),
             primary: []const u8,
             row: []const u8,
+            pub fn openPhysicalCursorAdapter(self: *@This()) @TypeOf(self.reader.openPhysicalCursorAdapter()) {
+                return self.reader.openPhysicalCursorAdapter();
+            }
             pub fn get(self: *@This(), selected: []const u8) ![]const u8 {
                 if (std.mem.eql(u8, selected, self.primary) or std.mem.eql(u8, selected, self.row)) return error.UnexpectedPrimaryBodyRead;
                 return self.reader.get(selected);
