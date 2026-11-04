@@ -178,6 +178,34 @@ pub const Tokenizer = struct {
         return self.vtable.decode(self.ptr, allocator, ids);
     }
 
+    /// Decode a finished text result, omitting incomplete or invalid UTF-8
+    /// sequences. Byte-level tokens can end midway through a character when
+    /// generation hits a limit. Streaming callers must keep using decode or
+    /// tokenPiece so that bytes spanning successive tokens are preserved.
+    /// Valid output needs no allocation beyond the decoder's owned buffer.
+    pub fn decodeText(self: Tokenizer, allocator: std.mem.Allocator, ids: []const i32) ![]u8 {
+        const bytes = try self.decode(allocator, ids);
+        errdefer allocator.free(bytes);
+        if (std.unicode.utf8ValidateSlice(bytes)) return bytes;
+
+        var read: usize = 0;
+        var written: usize = 0;
+        while (read < bytes.len) {
+            const len = std.unicode.utf8ByteSequenceLength(bytes[read]) catch {
+                read += 1;
+                continue;
+            };
+            if (len <= bytes.len - read and std.unicode.utf8ValidateSlice(bytes[read..][0..len])) {
+                std.mem.copyForwards(u8, bytes[written..][0..len], bytes[read..][0..len]);
+                written += len;
+                read += len;
+            } else {
+                read += 1;
+            }
+        }
+        return try allocator.realloc(bytes, written);
+    }
+
     pub fn decodeToken(self: Tokenizer, allocator: std.mem.Allocator, id: i32, at_start: bool) ![]u8 {
         if (self.vtable.decodeToken) |decode_token| return decode_token(self.ptr, allocator, id, at_start);
         return self.decode(allocator, &.{id});

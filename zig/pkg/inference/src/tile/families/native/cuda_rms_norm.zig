@@ -21,12 +21,12 @@ fn rms(comptime e: norm.RmsExport) []const u8 {
     return norm.cudaRms(e, "termite_rms_norm_impl") ++ "\n";
 }
 pub const source_0 = program.join(&.{
-    rms(.{ .name = "termite_rms_norm_f32", .params_macro = "ANTFLY_CUDA_RMS_NORM_PARAMS" }),
+    rms(.{ .name = "termite_rms_norm_f32", .params_macro = "ANTFLY_CUDA_RMS_NORM_PARAMS", .register_row = .{ .width = 2560 } }),
     rms(.{ .name = "termite_rms_norm_f32_bf16", .params_macro = "ANTFLY_CUDA_RMS_NORM_F32_BF16_PARAMS", .bf16 = true }),
-    rms(.{ .name = "termite_rms_norm_add_f32", .params_macro = "ANTFLY_CUDA_RMS_NORM_ADD_PARAMS", .residual = true }),
+    rms(.{ .name = "termite_rms_norm_add_f32", .params_macro = "ANTFLY_CUDA_RMS_NORM_ADD_PARAMS", .residual = true, .register_row = .{ .width = 2560 } }),
     rms(.{ .name = "termite_rms_norm_add_f32_bf16", .params_macro = "ANTFLY_CUDA_RMS_NORM_ADD_F32_BF16_PARAMS", .residual = true, .bf16 = true }),
     rms(.{ .name = "termite_rms_norm_add_mul_scalar_f32", .params_macro = "ANTFLY_CUDA_RMS_NORM_ADD_MUL_SCALAR_PARAMS", .residual = true, .scale = .before_residual }),
-    rms(.{ .name = "termite_rms_norm_add_output_scale_f32", .params_macro = "ANTFLY_CUDA_RMS_NORM_ADD_MUL_SCALAR_PARAMS", .residual = true, .scale = .output }),
+    rms(.{ .name = "termite_rms_norm_add_output_scale_f32", .params_macro = "ANTFLY_CUDA_RMS_NORM_ADD_MUL_SCALAR_PARAMS", .residual = true, .scale = .output, .register_row = .{ .width = 2560 } }),
     rms(.{ .name = "termite_rms_norm_bare_f32", .params_macro = "ANTFLY_CUDA_RMS_NORM_BARE_PARAMS", .weighted = false }),
 });
 

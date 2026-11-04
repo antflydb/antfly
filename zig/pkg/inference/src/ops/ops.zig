@@ -198,6 +198,18 @@ pub const RmsNormTripleResult = struct {
 /// Exact NCHW transposed-convolution request. Weights use the ONNX layout
 /// [in_channels, out_channels / groups, kernel...]. Only the first
 /// `num_spatial` entries of each spatial array are used.
+/// Metadata for optional device unfold. A provider advertising this contract
+/// must decide capability before the caller commits the unfold or dense body.
+pub const Conv1dUnfoldRequest = struct {
+    batch: usize,
+    channels: usize,
+    time: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+    time_major: bool,
+};
+
 pub const ConvTransposeRequest = struct {
     input: CT,
     weight: CT,
@@ -2313,6 +2325,11 @@ pub const ComputeBackend = struct {
     };
 
     pub const SequenceProjectionRegion = struct {
+        /// Null hook retains legacy unfold policy. A present false decision
+        /// declines before dense-slot preparation or any numerical submission.
+        unfold1dReady: ?*const fn (ctx: *anyopaque, request: *const Conv1dUnfoldRequest) anyerror!bool = null,
+        /// Immutable backend-preferred cross-attention cache; null preserves input precision.
+        prepareCrossKv: ?*const fn (ctx: *anyopaque, k: CT, v: CT) anyerror!?LinearNoBiasPairResult = null,
         /// GLiNER-specific word embedding aggregation:
         /// takes the first encoder hidden row by a host words_mask into
         /// [batch * num_words, hidden_size].
@@ -4411,6 +4428,13 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    /// Null retains a legacy provider's composition policy. Present false
+    /// declines before dense-slot preparation or input materialization.
+    pub fn conv1dIm2colAvailability(self: *const ComputeBackend, request: *const Conv1dUnfoldRequest) !?bool {
+        if (self.vtable.regions.sequence_projection.unfold1dReady) |query| return try query(self.ptr, request);
+        return null;
+    }
+
     /// Unfold a conv1d input into `[batch * out_time, in_channels * kernel]`
     /// rows so the convolution runs as a dense linear over the backend's
     /// matmul path. `time_major` reads `[batch * time, channels]` input
@@ -4461,6 +4485,16 @@ pub const ComputeBackend = struct {
         if (self.vtable.packedQkvRope) |f| return f(self.ptr, input, positions, hidden, head_dim, theta);
         return null;
     }
+
+    /// Return new immutable, backend-preferred cross-attention caches.
+    /// Inputs remain owned by the caller; null retains their current format.
+    pub fn prepareCrossAttentionKv(self: *const ComputeBackend, k: CT, v: CT) !?LinearNoBiasPairResult {
+        if (self.vtable.regions.sequence_projection.prepareCrossKv) |f| return f(self.ptr, k, v);
+        return null;
+    }
+
+    /// Compatibility name for the original model adapter. New callers use the operation API.
+    pub const whisperPrepareCrossKv = prepareCrossAttentionKv;
 
     /// Encode Whisper's constrained argmax and log-sum-exp statistics over a
     /// `[1, vocab]` device logits row. The values are read back with

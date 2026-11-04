@@ -25,3 +25,23 @@ pub const source_0 =
     \\}
     \\
 ;
+
+/// The existing shared row-statistics body retains its 256-lane moments
+/// tree; this export changes only the residual load and two-output epilogue.
+pub const source_1 =
+    \\extern "C" __global__ void termite_add_layer_norm_sum_f32(
+    \\    float* dst, float* sum_out, const float* a, const float* b,
+    \\    const float* gamma, const float* beta, unsigned rows, unsigned dim, float eps) {
+    \\    const unsigned row = blockIdx.x;
+    \\    if (row >= rows) return;
+    \\    const unsigned base = row * dim;
+    \\    __shared__ float sums[256], sumsq[256];
+    \\    antfly_row_layer_norm(dim, eps, sums, sumsq,
+    \\        [&](unsigned i) { return a[base + i] + b[base + i]; },
+    \\        [&](unsigned i, float x, float mean, float inv) {
+    \\            sum_out[base + i] = x;
+    \\            dst[base + i] = (x - mean) * inv * gamma[i] + beta[i];
+    \\        });
+    \\}
+    \\
+;

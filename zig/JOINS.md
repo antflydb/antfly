@@ -166,7 +166,8 @@ The key is to avoid forcing all joins through the heavy path.
 
 - `foreign_sources` still need broader parity work
 - serverless still has only local join execution; it does not have distributed
-  shuffle execution or a durable join-job lifecycle
+  shuffle execution or a durable join-job lifecycle (proposal:
+  [serverless multi-node SQL joins](../docs/design/serverless-distributed-joins.md))
 - no shared cluster-wide persisted result store exists for shuffle jobs
 - incomplete-job recovery across arbitrary API-server loss is still limited to
   finalizer-local durable state plus metadata-backed lease ownership and

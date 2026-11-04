@@ -17,7 +17,7 @@ const program = @import("../../native_program.zig");
 const tile = @import("antfly_tile");
 const f = tile.fexpr;
 const expr = tile.native_math.cudaExpression;
-pub const source_0 = program.render(
+pub const source_0 = tile.native_normalization.cudaRegisterRms(.{ .width = 2560 }) ++ program.render(
     \\template<bool Weighted, bool Residual, bool Bf16, int ScaleStage>
     \\__device__ __forceinline__ void termite_rms_norm_impl(
     \\    float* dst, unsigned short* dst_bf16, const float* input,

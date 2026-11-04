@@ -1572,7 +1572,7 @@ pub const Index = struct {
                 for (list.items) |nb| try wr.writeInt(u32, nb, .little);
             }
         }
-        const crc = std.hash.Crc32.hash(w.written());
+        const crc = @import("antfly_hash").Crc32.hash(w.written());
         try wr.writeInt(u32, crc, .little);
         return w.toOwnedSlice();
     }
@@ -1581,7 +1581,7 @@ pub const Index = struct {
         if (bytes.len < magic.len + 4) return error.InvalidFormat;
         const body = bytes[0 .. bytes.len - 4];
         const stored_crc = std.mem.readInt(u32, bytes[bytes.len - 4 ..][0..4], .little);
-        if (std.hash.Crc32.hash(body) != stored_crc) return error.InvalidFormat;
+        if (@import("antfly_hash").Crc32.hash(body) != stored_crc) return error.InvalidFormat;
 
         var r: std.Io.Reader = .fixed(body);
         const head = r.take(magic.len) catch return error.InvalidFormat;

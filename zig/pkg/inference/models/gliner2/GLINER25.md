@@ -80,7 +80,7 @@ ZIG_GLOBAL_CACHE_DIR="$PWD/../.zig-cache/global" zig build inference-test \
   '-Dtest-filter=extractors.gliner_boundary_long_executor.test.' \
   '-Dtest-filter=gliner boundary pipeline Python parity pinned base' \
   '-Dtest-filter=qualified limits JSON' \
-  '-Dtest-filter=boundary full context learned' \
+  '-Dtest-filter=boundary full context learned Metal' \
   '-Dtest-filter=GLiNER bounded window composition'
 ```
 
@@ -185,6 +185,78 @@ states isolate head execution from the encoder. All 16 optional-head combination
 and pinned base all-task pipeline parity passed. The no-model-read regression
 also proves that impossible head caps fail before encoder dispatch. GPU execution
 and throughput were not remeasured for this native admission change.
+
+### Complete native pipeline and HTTP qualification
+
+Real-weight native Debug execution now covers the encoder, shared head and
+decoder together at 4096 body words (4105 prompt tokens), at four full-word
+windows (16440 logical prompt tokens), and at 16381 of 16384 encoded tokens in
+one window. All six selected checks passed without skips, including projection
+parity, allocation-failure cleanup and pinned all-task parity. The three learned
+cases share the serving path's unchanged 512 MiB live-heap bound; their measured
+peaks were 186167928, 384021726 and 517336416 bytes respectively.
+
+The encoded-token HTTP check initially exposed a real native heap refusal.
+Native DeBERTa now projects unique relative-position buckets for long inputs,
+expands their results into the existing attention layout, and releases content
+and relative projections after synchronous attention. Attention output is freed
+after its output projection, before the FFN. This removes overlapping phase
+lifetimes without increasing the request heap or the model/work limits. Device
+backends retain their command-frame lifetimes.
+
+With the pinned base model installed, select the word/window checks separately
+from the more expensive encoded-token boundary:
+
+```sh
+ANTFLY_GLINER25_BASE_MODEL_DIR=/path/to/gliner2.5-base-v1 \
+VECLIB_MAXIMUM_THREADS=2 \
+ZIG_GLOBAL_CACHE_DIR="$PWD/../.zig-cache/global" zig build inference-test \
+  -Doptimize=debug -j1 --cache-dir ../.zig-cache \
+  '-Dtest-filter=boundary full context learned native base word capacity' \
+  '-Dtest-filter=boundary full context learned native grouped words'
+```
+
+The explicit `scripts/gliner25/qualify_context_http.py` command checks encoded
+capacity through an already-running loopback HTTP service. It measures dense
+and filler word token costs using small requests, fills exactly 16384 tokens, and
+requires a single window, exact reported token usage and valid source spans.
+It does not measure long-context extraction accuracy:
+
+```sh
+python3 pkg/inference/scripts/gliner25/qualify_context_http.py \
+  --endpoint http://127.0.0.1:18776/ai/v1/extract --output context-report.json
+```
+
+`benchmark_linux_cpu_http.py --concurrency 4` adds synchronized client bursts to
+the paired warm HTTP comparison. Burst timing starts when all clients are ready
+and ends at the last response body. Every client captures its body and timestamp
+before any response parsing or oracle comparison begins; all checks finish
+before the next arm starts. Reports retain individual client latencies, burst
+throughput, paired confidence intervals and per-round host load. Every response
+is checked against the pinned oracle, and binaries/model files are hashed before
+and after measurement. The four-client profile provisions the same 4 GiB
+aggregate scratch allowance on both services (`--scratch-budget-mb 4096`); the
+initial baseline trial exhausted its default 1 GiB allowance. Per-request model,
+head and work limits remain unchanged.
+
+The [2026-11-03 local qualification receipt](../../../../bench/baselines/gliner-native-http-20261103/summary.json)
+records the fixed native service accepting exactly 16384 prompt tokens in one
+window with the unchanged 512 MiB request heap. Performance qualification remains
+partial. Some paired confidence intervals do not establish the declared 5%
+median-cost bound, and one short-request phase showed a large slowdown that was
+not consistently reproduced. Changing host/runtime state remains an unresolved
+confounder. These shared-host measurements do not establish production tail
+latency or long-context extraction accuracy, and aggregate CI remains outstanding.
+The earlier concurrent timings are preserved as superseded evidence because
+validation could delay other clients' timestamps. The full-word four-client run
+failed after seven complete pairs with live-host-memory admission refusal.
+The corrected harness completed 100 pairs each for four-client short and
+reference-window requests. Their candidate/baseline median ratios were 0.9867
+(95% interval 0.9580–0.9958) and 1.0050 (0.9814–1.0264), meeting the declared
+1.05 upper-bound criterion. The same campaign then failed during composed
+windows after 53 complete pairs: live-host admission refused a fourth 512 MiB
+reservation. The server/model artifacts and cases were verified unchanged after
+failure. Composed-window and full-word concurrency qualification remain open.
 
 ## Current status
 

@@ -112,6 +112,7 @@ const LinkedResourceBudgetContext = struct {
 };
 
 const InferenceRuntimeConfig = struct {
+    audio_readers: []const @import("antfly_transcribing").NamedConfig = &.{},
     embedded_enabled: bool = true,
     /// Environment forwarded only when a server host launches its worker.
     worker_environment: []const worker_runtime.EnvironmentEntry = &.{},
@@ -831,6 +832,7 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
     errdefer if (owned_ml_dir) |path| alloc.free(path);
 
     var node_config = inference.server.NodeConfig{
+        .audio_readers = runtime_config.value.audio_readers,
         .models_dir = context.models_dir.slice() orelse owned_models_dir.?,
         .ml_dir = context.ml_dir.slice() orelse owned_ml_dir.?,
         .generation_budget_overrides = .{
@@ -1642,6 +1644,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                     .text = .{
                         .target_tokens = cfg.defaultedTargetTokens(),
                         .overlap_tokens = cfg.defaultedOverlapTokens(),
+                        .min_chars = cfg.text.min_chars,
                         .separator = cfg.defaultedSeparator(),
                     },
                     .audio = .{
@@ -2019,7 +2022,7 @@ test "document execution manifests retain raw duplex body mode" {
 }
 
 test "route templates match registered path-parameter patterns" {
-    try std.testing.expect(routeTemplateMatches("/transcribe", "/transcribe"));
+    try std.testing.expect(routeTemplateMatches("/read", "/read"));
     try std.testing.expect(routeTemplateMatches("/transcription/sessions/{session_id}/audio", "/transcription/sessions/:session_id/audio"));
     try std.testing.expect(!routeTemplateMatches("/transcription/sessions/{session_id}", "/transcription/sessions/:other"));
     try std.testing.expect(!routeTemplateMatches("/transcription/sessions/{session_id}", "/transcription/sessions"));
@@ -3042,7 +3045,7 @@ fn localModelCapabilitiesInScope(
         .rewrite => "rewriters",
         .transcribe => "transcribers",
     };
-    const model_path = try node.resolveModelPath(io, if (model.len > 0) model else null, scope);
+    const model_path = if (task == .read and scope_override == null) try node.resolveReadModelPath(io, if (model.len > 0) model else null) else try node.resolveModelPath(io, if (model.len > 0) model else null, scope);
     defer node.allocator.free(model_path);
     var manifest = try inference.models.manifest.loadFromDir(node.allocator, model_path);
     defer manifest.deinit();
@@ -3057,7 +3060,10 @@ fn localModelCapabilitiesInScope(
     // Older manifests may omit explicit inputs. Use resolved architecture
     // metadata, never the user-provided model name, for compatibility.
     if (@as(u8, @bitCast(modalities)) == 0) switch (task) {
-        .read => modalities.image = true,
+        .read => {
+            modalities.image = manifest.model_type != .transcriber;
+            modalities.audio = manifest.model_type == .transcriber or (manifest.audio_model_path != null or manifest.audio_projection_path != null);
+        },
         .generate => {
             modalities.text = true;
             modalities.image = manifest.gguf_projector_path != null;
@@ -3886,5 +3892,113 @@ test "native checkpoint route manifest preserves binary upload and export stream
         const resume_request = routeMetadata(.post, prefix ++ "/generate/context/resume");
         try std.testing.expectEqual(http_abi.RequestBodyMode.buffered, resume_request.request_body);
         try std.testing.expect(resume_request.streaming_response);
+    }
+}
+
+test "standalone chunk minimum content survives the real provider ABI" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    const io = std.testing.io;
+    var out: ?*anyopaque = null;
+    const handle = try linkedInferenceCreate(&.{
+        .abi_version = inference_bridge.abi_version,
+        .data_dir_ptr = path.ptr,
+        .data_dir_len = path.len,
+        .models_dir = .init(path),
+        .ml_dir = .init(path),
+        .host_limit_bytes = 0,
+        .backend_limit_bytes = 0,
+        .combined_limit_bytes = 0,
+        .kv_limit_bytes = 0,
+        .scratch_limit_bytes = 0,
+        .process_memory_limit_bytes = 0,
+        .preload_ptr = null,
+        .preload_len = 0,
+        .keep_alive = .{},
+        .max_loaded_models = 0,
+        .has_max_loaded_models = 0,
+        .content_security_json = .{},
+        .s3_credentials_json = .{},
+        .runtime_config_json = .init("{}"),
+        .executor = .init(&io),
+        .out_handle = &out,
+    });
+    defer linkedInferenceDestroy(handle);
+    const cases = [_]struct { text: []const u8, minimum: u32, count: usize }{
+        .{ .text = "C-8", .minimum = 16, .count = 0 },
+        .{ .text = "replace all six gyroscopes", .minimum = 16, .count = 1 },
+        .{ .text = "C-8", .minimum = 0, .count = 1 },
+    };
+    for (cases) |case| {
+        const request = try std.json.Stringify.valueAlloc(a, ChunkInputRequest{
+            .model = "fixed",
+            .input = .{ .text = case.text },
+            .config = .{ .provider = .antfly, .text = .{ .target_tokens = 128, .min_chars = case.minimum } },
+        }, .{});
+        defer a.free(request);
+        var response: ?*anyopaque = null;
+        var json: inference_bridge.String = undefined;
+        try linkedInferenceInvokeProvider(&.{
+            .abi_version = inference_bridge.abi_version,
+            .handle = handle,
+            .operation = @backingInt(inference_bridge.ProviderOperation.chunk_input),
+            .request_json = .init(request),
+            .deadline_ns = 0,
+            .has_deadline = 0,
+            .out_response_handle = &response,
+            .out_response_json = &json,
+        });
+        defer linkedInferenceDestroyProviderResponse(response.?);
+        var chunks = try std.json.parseFromSlice([]inference_chunker.Chunk, a, json.slice(), .{});
+        defer chunks.deinit();
+        try std.testing.expectEqual(case.count, chunks.value.len);
+        if (case.count != 0) try std.testing.expectEqualStrings(case.text, chunks.value[0].text.?);
+
+        const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+        const direct = try state.node.chunkInputDirect(a, "fixed", .{ .text = case.text }, .{
+            .text = .{ .target_tokens = 128, .min_chars = case.minimum },
+        });
+        defer inference_chunker.types.freeChunks(a, direct);
+        try std.testing.expectEqual(chunks.value.len, direct.len);
+
+        const http_body = try std.json.Stringify.valueAlloc(a, .{
+            .input = case.text,
+            .config = .{ .text = .{ .target_tokens = 128, .min_chars = case.minimum } },
+        }, .{});
+        defer a.free(http_body);
+        var http_request = try httpx.Request.init(a, .POST, "/ai/v1/chunk");
+        defer http_request.deinit();
+        http_request.body = http_body;
+        var ctx = httpx.Context.init(a, io, &http_request);
+        defer ctx.deinit();
+        // Warm requests must not allocate another owner-held vocabulary,
+        // including when the minimum rule rejects the whole source.
+        var no_cache_allocations = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        const owner_allocator = state.node.allocator;
+        if (state.node.fixed_chunk_runtime.tokenizer != null) state.node.allocator = no_cache_allocations.allocator();
+        defer state.node.allocator = owner_allocator;
+        var http_response = try state.node.chunkText(&ctx);
+        defer http_response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), http_response.status.code);
+        var http_chunks = try std.json.parseFromSlice(std.json.Value, a, http_response.body.?, .{});
+        defer http_chunks.deinit();
+        try std.testing.expectEqual(@as(usize, 0), no_cache_allocations.allocated_bytes);
+        const usage = http_chunks.value.object.get("usage").?.object;
+        try std.testing.expectEqual(@as(i64, @intCast(try inference_chunker.fixed_text.countTextTokens(a, case.text))), usage.get("prompt_tokens").?.integer);
+        const data = http_chunks.value.object.get("data").?.array.items;
+        try std.testing.expectEqual(chunks.value.len, data.len);
+        for (chunks.value, direct, data) |abi_chunk, direct_chunk, http_chunk| {
+            try std.testing.expectEqualStrings(abi_chunk.text.?, direct_chunk.text.?);
+            try std.testing.expectEqualStrings(abi_chunk.text.?, http_chunk.object.get("text").?.string);
+            try std.testing.expectEqual(abi_chunk.id, direct_chunk.id);
+            try std.testing.expectEqual(abi_chunk.start_char, direct_chunk.start_char);
+            try std.testing.expectEqual(abi_chunk.end_char, direct_chunk.end_char);
+            try std.testing.expectEqual(@as(i64, abi_chunk.id), http_chunk.object.get("id").?.integer);
+            try std.testing.expectEqual(@as(i64, @intCast(abi_chunk.start_char.?)), http_chunk.object.get("start_char").?.integer);
+            try std.testing.expectEqual(@as(i64, @intCast(abi_chunk.end_char.?)), http_chunk.object.get("end_char").?.integer);
+        }
     }
 }

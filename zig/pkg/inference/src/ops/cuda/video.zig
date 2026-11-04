@@ -29,6 +29,9 @@ const Callback = *const fn (*anyopaque, u64, u32, u32, u32, i64, u32, u32) callc
 extern fn antfly_nvdec_open(*?*anyopaque, ?*anyopaque, *anyopaque, Callback) c_int;
 extern fn antfly_nvdec_packet(*anyopaque, ?[*]const u8, u32, i64, c_int) c_int;
 extern fn antfly_nvdec_close(*anyopaque) void;
+extern fn antfly_nvdec_close_checked(*anyopaque) c_int;
+extern fn antfly_nvdec_retirement_ready(*anyopaque, *anyopaque, *const fn (*anyopaque) callconv(.c) void) c_int;
+extern fn antfly_nvdec_detach_budget(*anyopaque, *anyopaque, *const fn (*anyopaque) callconv(.c) void, *anyopaque, *const fn (*anyopaque) callconv(.c) void) c_int;
 extern fn antfly_nvdec_begin(*anyopaque, ?*anyopaque, *anyopaque, Callback, u32, u32, c_int, c_int, c_int) c_int;
 extern fn antfly_nvdec_finish(*anyopaque) void;
 
@@ -50,6 +53,47 @@ fn releaseDecoder(raw: *anyopaque) callconv(.c) void {
     const ctx: *context.CudaContext = @ptrCast(@alignCast(raw));
     ctx.video_cache_budget.release();
 }
+
+/// A final-address carrier owns the OLD decoder budget independently of the
+/// context's newly published decoder. Its lease is parked before destruction;
+/// this C callback therefore returns only the physical opaque-envelope ledger.
+pub const DetachedDecoder = struct {
+    handle: ?*anyopaque = null,
+    budget: @import("video_cache_budget.zig").CacheBudget = .{},
+    fn released(raw: *anyopaque) callconv(.c) void {
+        const self: *DetachedDecoder = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.budget.lease == null);
+        self.budget.release();
+    }
+    pub fn ready(ctx: *context.CudaContext) !void {
+        const decoder = ctx.video_decoder_cache orelse {
+            if (ctx.video_cache_budget.bytes != 0 or ctx.video_cache_budget.lease != null or ctx.video_cache_budget.physical != null) return error.InvalidCacheRetirementState;
+            return;
+        };
+        if (ctx.video_decoder_release != antfly_nvdec_close) return error.UnsupportedCachedVideoDecoder;
+        if (antfly_nvdec_retirement_ready(decoder, ctx, releaseDecoder) == 0) return error.EmbeddingStageBusy;
+    }
+    pub fn detach(self: *DetachedDecoder, ctx: *context.CudaContext) !void {
+        std.debug.assert(self.handle == null and self.budget.bytes == 0);
+        try ready(ctx);
+        const decoder = ctx.video_decoder_cache orelse return;
+        if (antfly_nvdec_detach_budget(decoder, ctx, releaseDecoder, self, released) == 0) return error.CacheRetirementChanged;
+        self.handle = decoder;
+        self.budget = ctx.video_cache_budget;
+        const admission = ctx.video_cache_budget.admission;
+        ctx.video_decoder_cache = null;
+        ctx.video_decoder_release = null;
+        ctx.video_cache_budget = .{ .admission = admission };
+    }
+    pub fn clearRetired(self: *DetachedDecoder, ctx: *context.CudaContext) !void {
+        const decoder = self.handle orelse return;
+        std.debug.assert(self.budget.lease == null);
+        try ctx.makeCurrent();
+        if (antfly_nvdec_close_checked(decoder) != 0) return error.VideoDecoderRetirementFailed;
+        self.handle = null;
+        std.debug.assert(self.budget.bytes == 0);
+    }
+};
 
 pub const max_frames = 60;
 pub const max_duration_us = 60_000_000;
@@ -1127,4 +1171,95 @@ test "embeddinggemma2 video staging fences coalesce repeats and drain consumer e
     try std.testing.expectEqual(@as(usize, 1), consumer.ready);
     try std.testing.expectEqual(@as(usize, 1), Mock.synchronizations);
     try std.testing.expectEqual(error.Cancelled, state.failure.?);
+}
+
+test "CUDA detached NVDEC retirement frees old surfaces and quota without touching the actual replacement decoder budget" {
+    if (comptime !build_options.enable_cuda or builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Domain = @import("../../runtime/tier/admission_domain.zig").Domain;
+    const Quotas = @import("cache_retirement.zig").PreparedQuotas;
+    const old_domain = try Domain.create();
+    defer old_domain.release();
+    const next_domain = try Domain.create();
+    defer next_domain.release();
+    const old_pin = old_domain.pin();
+    defer old_pin.release();
+    var compute = try cuda.CudaCompute.testing.init(a);
+    defer compute.deinit();
+    const Probe = struct {
+        calls: usize = 0,
+        gate: *@import("../../backends/session.zig").Session.ModelLifetime,
+        blocked: bool = false,
+        fn reserve(_: *anyopaque, _: @import("../../runtime/tier/memory.zig").AdmissionAmounts) @import("../../runtime/tier/memory.zig").AdmissionResourceError!usize {
+            return 1;
+        }
+        fn retain(_: *anyopaque, _: usize, _: @import("../../runtime/tier/memory.zig").AdmissionAmounts) @import("../../runtime/tier/memory.zig").AdmissionResourceError!void {}
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (!self.gate.execution_gate.tryLock()) self.blocked = true else self.gate.execution_gate.unlock();
+        }
+    };
+    var model: @import("../../backends/session.zig").Session.ModelLifetime = .{};
+    var probe = Probe{ .gate = &model };
+    try old_domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    compute.ctx.video_cache_budget.admission = .{ .controller = &old_domain.controller, .limits = .{ .backend_limit_bytes = 256 * 1024 * 1024 }, .check_live_memory = false };
+    const Consume = struct {
+        count: usize = 0,
+        fn check(_: *anyopaque) !void {}
+        fn frame(raw: *anyopaque, _: Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+        }
+    };
+    var consumer = Consume{};
+    const bytes = @embedFile("../../testdata/video/codecs/h264.mp4");
+    _ = try decodeMp4Sampled(a, &compute.ctx, bytes, .{ .context = &consumer, .consume = Consume.frame, .check = Consume.check }, .embedding_gemma2);
+    try std.testing.expect(consumer.count != 0);
+    const old_bytes = compute.ctx.video_cache_budget.bytes;
+    const old_handle = compute.ctx.video_decoder_cache.?;
+    try std.testing.expect(old_bytes != 0);
+    const quotas = try Quotas.prepare(1, &old_pin); // before actual owner gate
+    var retired: DetachedDecoder = .{}; // final address through synchronous SDK close
+    var quota_owner = true;
+    defer if (quota_owner) {
+        if (quotas.issued == 0) quotas.destroyUnused() else {
+            retired.clearRetired(&compute.ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            quotas.completeSdkRetirementOutside();
+            quotas.release();
+        }
+    };
+    var gate_held = false;
+    defer if (gate_held) model.execution_gate.unlock();
+    try std.testing.expect(model.execution_gate.tryLock());
+    gate_held = true;
+    try compute.ctx.synchronize();
+    try retired.detach(&compute.ctx);
+    @import("cache_retirement.zig").parkLease(quotas, &retired.budget.lease);
+    model.execution_gate.unlock();
+    gate_held = false;
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    try std.testing.expectEqual(old_bytes, old_domain.controller.snapshot().backend_scratch_bytes);
+    // The original callback now names retired, never ctx's next generation.
+    compute.ctx.video_cache_budget.admission = .{ .controller = &next_domain.controller, .limits = .{ .backend_limit_bytes = 256 * 1024 * 1024 }, .check_live_memory = false };
+    consumer.count = 0;
+    _ = try decodeMp4Sampled(a, &compute.ctx, bytes, .{ .context = &consumer, .consume = Consume.frame, .check = Consume.check }, .embedding_gemma2);
+    try std.testing.expect(consumer.count != 0 and compute.ctx.video_decoder_cache.? != old_handle);
+    const replacement = compute.ctx.video_decoder_cache;
+    const next_bytes = compute.ctx.video_cache_budget.bytes;
+    try std.testing.expect(next_bytes != 0);
+    try retired.clearRetired(&compute.ctx);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls); // quota still held by prepared roots
+    try std.testing.expectEqual(replacement, compute.ctx.video_decoder_cache);
+    try std.testing.expectEqual(next_bytes, compute.ctx.video_cache_budget.bytes);
+    try std.testing.expectEqual(next_bytes, next_domain.controller.snapshot().backend_scratch_bytes);
+    quotas.completeSdkRetirementOutside();
+    quotas.release();
+    quota_owner = false;
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(!probe.blocked);
+    try std.testing.expectEqual(@as(usize, 0), old_domain.controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(next_bytes, next_domain.controller.snapshot().backend_scratch_bytes);
+    _ = try compute.ctx.evictVideoDecoder();
+    try std.testing.expectEqual(@as(usize, 0), next_domain.controller.snapshot().backend_scratch_bytes);
 }

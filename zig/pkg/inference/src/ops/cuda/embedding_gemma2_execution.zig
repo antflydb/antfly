@@ -20,6 +20,7 @@ const Context = @import("context.zig").CudaContext;
 const Buffer = @import("buffer.zig").DeviceBuffer;
 const driver = @import("driver.zig");
 const memory = @import("../../runtime/tier/memory.zig");
+const prepared = @import("prepared_cache.zig");
 pub const packed_limit = 512 * 1024 * 1024;
 pub const arena_limit = 128 * 1024 * 1024;
 pub const graph_rows_limit = 4096;
@@ -50,6 +51,9 @@ pub const Arena = struct {
     completion: driver.CUevent = null,
     pending: bool = false,
     fence_valid: bool = false,
+    pub fn hasBacking(self: *const Arena) bool {
+        return self.bytes() != 0 or self.graph != null or self.completion != null or self.timing != null or self.lease != null;
+    }
     pub fn noteUse(self: *Arena, ctx: *Context) void {
         self.pending = true;
         self.fence_valid = false;
@@ -65,7 +69,7 @@ pub const Arena = struct {
         } else try ctx.synchronize();
         self.pending = false;
     }
-    fn bytes(self: *const Arena) usize {
+    pub fn bytes(self: *const Arena) usize {
         var total: usize = 0;
         for (self.buffers) |b| total += b.len;
         return total;
@@ -117,14 +121,45 @@ pub const Cache = struct {
     clock: u64 = 0,
     next_arena: usize = 0,
 
+    pub fn retirementLeaseCount(self: *const Cache, controller: *?*memory.AdmissionController) !usize {
+        const quotas = @import("cache_retirement.zig");
+        var count: usize = 0;
+        for (self.arenas) |arena_value| count += try quotas.scanLease(arena_value.lease, controller);
+        var iterator = self.weights.iterator();
+        while (iterator.next()) |entry| count += try quotas.scanLease(entry.value_ptr.lease, controller);
+        return count;
+    }
+    pub fn parkRetirementLeases(self: *Cache, quotas: *@import("cache_retirement.zig").PreparedQuotas) void {
+        for (&self.arenas) |*entry| @import("cache_retirement.zig").parkLease(quotas, &entry.lease);
+        var iterator = self.weights.iterator();
+        while (iterator.next()) |entry| @import("cache_retirement.zig").parkLease(quotas, &entry.value_ptr.lease);
+    }
     pub fn clear(self: *Cache, allocator: std.mem.Allocator, ctx: *Context) !void {
         if (self.weights.capacity() == 0 and self.next_arena == 0) return;
         try ctx.synchronize();
-        for (&self.arenas) |*entry| entry.deinit(ctx);
+        try self.clearRetired(allocator, ctx);
+    }
+    /// Fenced detach cleanup. Failure preserves the remaining SDK handles and
+    /// all old quota. No second wait or hidden replacement storage is created.
+    pub fn clearRetired(self: *Cache, allocator: std.mem.Allocator, ctx: *Context) !void {
+        for (&self.arenas) |*entry| {
+            if (entry.timing) |*pair| {
+                try ctx.destroyEventChecked(&pair.start);
+                try ctx.destroyEventChecked(&pair.end);
+                entry.timing = null;
+            }
+            try ctx.destroyEventChecked(&entry.completion);
+            try ctx.destroyGraphExecChecked(&entry.graph);
+            for (&entry.buffers) |*buffer| _ = try buffer.freeChecked(ctx);
+            if (entry.lease) |*lease| lease.release();
+            entry.* = .{};
+        }
         var iterator = self.weights.iterator();
+        while (iterator.next()) |entry| _ = try entry.value_ptr.buffer.freeChecked(ctx);
+        // Host key/table destructors follow every fallible SDK release, so
+        // retry after a partial driver failure cannot observe freed map keys.
+        iterator = self.weights.iterator();
         while (iterator.next()) |entry| {
-            var buffer = entry.value_ptr.buffer;
-            buffer.free(ctx);
             if (entry.value_ptr.lease) |*lease| lease.release();
             allocator.free(entry.key_ptr.*);
         }
@@ -148,6 +183,18 @@ pub const Cache = struct {
 
     pub fn discardPacked(self: *Cache, allocator: std.mem.Allocator, ctx: *Context, key: []const u8) !void {
         try ctx.synchronize();
+        if (ctx.prepared_cache_funding) |funding| {
+            const value = self.weights.getPtr(key) orelse return;
+            const bytes = value.buffer.len;
+            const request = try prepared.Request.packedSpan(key, bytes);
+            _ = try value.buffer.freeChecked(ctx); // Failure preserves cache/key/quota ownership.
+            var removed = self.weights.fetchRemove(key).?;
+            self.packed_bytes -= bytes;
+            self.weight_generation +%= 1;
+            funding.rollbackPublished(request, &removed.value.lease);
+            allocator.free(removed.key);
+            return;
+        }
         if (self.weights.fetchRemove(key)) |entry| {
             var value = entry.value;
             self.packed_bytes -= value.buffer.len;
@@ -165,16 +212,22 @@ pub const Cache = struct {
     /// None is a policy/admission decline before any work has been queued.
     pub fn allocatePacked(self: *Cache, allocator: std.mem.Allocator, ctx: *Context, key: []const u8, bytes: usize) !?Buffer {
         if (bytes == 0 or bytes > packed_limit - self.packed_bytes) return null;
-        var lease = acquire(ctx, bytes) catch return null;
-        errdefer if (lease) |*active| active.release();
+        var lease = if (ctx.prepared_cache_funding != null) funded: {
+            const request = prepared.Request.packedSpan(key, bytes) catch return null;
+            break :funded prepared.acquire(ctx, request, .{ .backend_scratch_bytes = bytes }) catch return null;
+        } else prepared.acquireRaw(ctx, .{ .backend_scratch_bytes = bytes }) catch return null;
+        errdefer lease.releaseAfterSdkDeath();
         var buffer = Buffer.alloc(ctx, bytes) catch {
-            if (lease) |*active| active.release();
+            lease.releaseAfterSdkDeath();
             return null;
         };
-        errdefer buffer.free(ctx);
+        errdefer if (lease.funded()) {
+            _ = buffer.freeChecked(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        } else buffer.free(ctx);
         const name = try allocator.dupe(u8, key);
         errdefer allocator.free(name);
-        try self.weights.put(allocator, name, .{ .buffer = buffer, .lease = lease });
+        try self.weights.put(allocator, name, .{ .buffer = buffer, .lease = lease.value });
+        _ = lease.publish();
         self.packed_bytes += bytes;
         self.weight_generation +%= 1;
         return buffer;
@@ -193,74 +246,92 @@ pub const Cache = struct {
     pub fn audioArena(self: *Cache, ctx: *Context, key: u64, bytes: usize) !?*Arena {
         return self.arenaFor(ctx, .audio, 1, 1, 0, @intCast(key), 0, .{ bytes, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
     }
-    fn victim(self: *Cache) *Arena {
-        for (&self.arenas) |*slot| if (slot.bytes() == 0) return slot;
-        return self.oldestOccupied(null).?;
-    }
-    fn oldestOccupied(self: *Cache, exclude: ?*Arena) ?*Arena {
-        var best: ?*Arena = null;
-        for (&self.arenas) |*slot| {
-            if (slot == exclude or slot.bytes() == 0) continue;
-            if (best == null or slot.last_used < best.?.last_used) best = slot;
+    pub const ArenaSelection = struct { index: usize, hit: bool, victims: u8, bytes: usize };
+    pub fn selectArena(self: *const Cache, request: prepared.Arena) !?ArenaSelection {
+        if (request.batch == 0 or request.batch > (if (request.kind == .encoder) @as(usize, 4) else 8) or request.sequence == 0 or request.sequence > 8192 or request.batch > graph_rows_limit / request.sequence) return null;
+        for (self.arenas, 0..) |entry, index| if (@backingInt(entry.kind) == @backingInt(request.kind) and entry.grid_x == request.grid_x and entry.grid_y == request.grid_y and entry.sequence == request.sequence and entry.batch == request.batch and entry.mask_kind == request.mask_kind) {
+            for (entry.buffers, request.sizes) |buffer, size| if (buffer.len != size) return error.InvalidCudaState;
+            return .{ .index = index, .hit = true, .victims = 0, .bytes = entry.bytes() };
+        };
+        var bytes: usize = 0;
+        for (request.sizes) |size| bytes = try std.math.add(usize, bytes, size);
+        if (bytes > arena_limit) return null;
+        var selected: ?usize = null;
+        for (self.arenas, 0..) |entry, index| {
+            if (entry.bytes() == 0) {
+                selected = index;
+                break;
+            }
+            if (selected == null or entry.last_used < self.arenas[selected.?].last_used) selected = index;
         }
-        return best;
+        const index = selected.?;
+        const entry = &self.arenas[index];
+        const clock = self.clock +| 1;
+        if (entry.bytes() != 0 and entry.uses >= 2 and clock -| entry.last_used < 4) return null;
+        var retained: usize = 0;
+        for (self.arenas) |value| retained = try std.math.add(usize, retained, value.bytes());
+        var victims: u8 = if (entry.hasBacking()) @as(u8, 1) << @intCast(index) else 0;
+        while (retained - entry.bytes() + bytes > 4 * arena_limit) {
+            var victim: ?usize = null;
+            for (self.arenas, 0..) |value, candidate| {
+                if (candidate == index or value.bytes() == 0 or victims & (@as(u8, 1) << @intCast(candidate)) != 0) continue;
+                if (victim == null or value.last_used < self.arenas[victim.?].last_used) victim = candidate;
+            }
+            const candidate = victim orelse return null;
+            const value = &self.arenas[candidate];
+            if (value.uses >= 2 and clock -| value.last_used < 4) return null;
+            retained -= value.bytes();
+            victims |= @as(u8, 1) << @intCast(candidate);
+        }
+        return .{ .index = index, .hit = false, .victims = victims, .bytes = bytes };
     }
-
     fn arenaFor(self: *Cache, ctx: *Context, kind: @FieldType(Arena, "kind"), batch: usize, sequence: usize, mask_kind: u8, grid_x: usize, grid_y: usize, sizes: [11]usize) !?*Arena {
+        const request: prepared.Arena = .{ .kind = @fromBackingInt(@intCast(@backingInt(kind))), .batch = batch, .sequence = sequence, .mask_kind = mask_kind, .grid_x = grid_x, .grid_y = grid_y, .sizes = sizes };
         if (batch == 0 or batch > (if (kind == .encoder) @as(usize, 4) else 8) or sequence == 0 or sequence > 8192 or batch > graph_rows_limit / sequence) return null;
+        const preview = self.selectArena(request) catch |err| {
+            self.clock +|= 1;
+            return err;
+        };
         self.clock +|= 1;
-        for (&self.arenas) |*entry| if (entry.kind == kind and entry.grid_x == grid_x and entry.grid_y == grid_y and entry.sequence == sequence and entry.batch == batch and entry.mask_kind == mask_kind) {
-            for (entry.buffers, sizes) |buffer, size| if (buffer.len != size) return error.InvalidCudaState;
+        const selected = preview orelse return null;
+        if (!selected.hit and selected.victims != 0 and ctx.prepared_cache_funding != null) return null;
+        const entry = &self.arenas[selected.index];
+        if (selected.hit) {
             entry.last_used = self.clock;
             entry.uses +|= 1;
             return entry;
-        };
-        var bytes: usize = 0;
-        for (sizes) |size| bytes = try std.math.add(usize, bytes, size);
-        if (bytes > arena_limit) return null;
-        // Empty descriptors require no barrier. Retention is byte bounded,
-        // not just descriptor bounded; protect hot stages from one-off shapes.
-        const entry = self.victim();
-        if (entry.bytes() != 0 and entry.uses >= 2 and self.clock -| entry.last_used < 4) return null;
-        var retained: usize = 0;
-        for (&self.arenas) |*slot| retained += slot.bytes();
-        while (retained - entry.bytes() + bytes > 4 * arena_limit) {
-            const victim_slot = self.oldestOccupied(entry) orelse break;
-            if (victim_slot.uses >= 2 and self.clock -| victim_slot.last_used < 4) return null;
-            const released = victim_slot.bytes();
-            try victim_slot.drain(ctx);
-            victim_slot.deinit(ctx);
-            retained -= released;
         }
-        // If the budget cannot retain this candidate without displacing a
-        // protected hot shape, eager execution keeps the warmed cache intact.
-        if (retained - entry.bytes() + bytes > 4 * arena_limit) return null;
-        try entry.drain(ctx);
-        entry.deinit(ctx);
-        var lease = acquire(ctx, bytes) catch return null;
-        errdefer if (lease) |*active| active.release();
+        for (&self.arenas, 0..) |*value, index| if (selected.victims & (@as(u8, 1) << @intCast(index)) != 0) {
+            try value.drain(ctx);
+            value.deinit(ctx); // Explicit raw path only; bound path proved empty.
+        };
+        var lease = prepared.acquire(ctx, .{ .arena = request }, .{ .backend_scratch_bytes = selected.bytes }) catch return null;
+        errdefer lease.releaseAfterSdkDeath();
         var candidate = Arena{ .kind = kind, .grid_x = grid_x, .grid_y = grid_y, .sequence = sequence, .batch = batch, .mask_kind = mask_kind };
-        errdefer for (&candidate.buffers) |*buffer| buffer.free(ctx);
+        errdefer for (&candidate.buffers) |*buffer| {
+            if (lease.funded()) {
+                _ = buffer.freeChecked(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            } else buffer.free(ctx);
+        };
         for (&candidate.buffers, sizes) |*buffer, size| {
             buffer.* = Buffer.alloc(ctx, size) catch {
-                for (&candidate.buffers) |*allocated| allocated.free(ctx);
-                if (lease) |*active| active.release();
+                for (&candidate.buffers) |*allocated| {
+                    if (lease.funded()) {
+                        _ = allocated.freeChecked(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+                    } else allocated.free(ctx);
+                }
+                lease.releaseAfterSdkDeath();
                 return null;
             };
         }
         candidate.last_used = self.clock;
         candidate.uses = 1;
-        candidate.lease = lease;
+        candidate.lease = lease.publish();
         entry.* = candidate;
         self.next_arena += 1;
         return entry;
     }
 };
-fn acquire(ctx: *Context, bytes: usize) !?memory.AdmissionLease {
-    const admission = ctx.video_cache_budget.admission orelse return null;
-    return try admission.controller.tryAcquire(.gpu, admission.limits, .{ .backend_scratch_bytes = bytes }, admission.check_live_memory);
-}
-
 test "embeddinggemma2 execution cache bounds cohort graph buckets and packed retention" {
     try std.testing.expectEqual(@as(usize, 8), @as(Cache, .{}).arenas.len);
     try std.testing.expect(arena_limit * 4 + packed_limit <= 1024 * 1024 * 1024);
@@ -296,6 +367,7 @@ test "embeddinggemma2 execution cache retains shared admission and releases grap
     Mock.graphs = 0;
     var controller = memory.AdmissionController{};
     var ctx: Context = undefined;
+    ctx.prepared_cache_funding = null;
     ctx.observation.store(null, .release);
     ctx.observation_enable_failed.store(false, .release);
     ctx.ctx = @ptrFromInt(1);
@@ -432,6 +504,7 @@ test "embeddinggemma2 graph retention keeps mixed stages and fences only replace
     Mock.barriers = 0;
     Mock.waits = 0;
     var ctx: Context = undefined;
+    ctx.prepared_cache_funding = null;
     ctx.observation.store(null, .release);
     ctx.observation_enable_failed.store(false, .release);
     ctx.ctx = @ptrFromInt(1);

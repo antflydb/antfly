@@ -46,10 +46,12 @@ pub fn create(ctx: Context) Suite {
     // 28 GiB covers that measurement with at least 10% headroom. Other CUDA
     // hosts retain 24 GiB; Metal retains its measured 20 GiB reservation.
     // These bounds schedule compiler memory, not model/runtime admission.
+    // Incoming native aarch64 Linux document orchestration peaked at14.26 GB;
+    // retain its16 GiB reservation alongside the larger measured GPU bounds.
     const cuda_arm_linux = ctx.backend.enable_cuda and b.graph.host.result.os.tag == .linux and
         b.graph.host.result.cpu.arch == .aarch64;
     const tests = b.addTest(.{
-        .max_rss = if (native_cpu_macos) @as(usize, if (ctx.optimize == .debug) 12_672 else 12_032) * 1024 * 1024 else @as(usize, if (cuda_arm_linux) 28 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 20 else 9) * 1024 * 1024 * 1024,
+        .max_rss = if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and ctx.target.result.os.tag == .linux and ctx.target.result.cpu.arch == .aarch64 and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt) 16 * 1024 * 1024 * 1024 else if (native_cpu_macos) @as(usize, if (ctx.optimize == .debug) 12_672 else 12_032) * 1024 * 1024 else @as(usize, if (cuda_arm_linux) 28 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 20 else 9) * 1024 * 1024 * 1024,
 
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),

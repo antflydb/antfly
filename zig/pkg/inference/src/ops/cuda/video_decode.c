@@ -161,13 +161,42 @@ static int display(void *opaque, CUVIDPARSERDISPINFO *picture) {
     if (ok < 0 || unmapped) { d->failed = 4; return 0; }
     return 1;
 }
-void antfly_nvdec_close(Decoder *d) {
-    if (!d) return;
-    if (d->parser) d->destroy_parser(d->parser);
-    if (d->decoder) d->destroy_decoder(d->decoder);
-    release_budget(d);
-    if (d->library) dlclose(d->library);
+static int close_decoder(Decoder *d, int checked) {
+    if (!d) return 0;
+    if (d->parser) {
+        CUresult status = d->destroy_parser(d->parser);
+        if (checked && status != CUDA_SUCCESS) return 3;
+        d->parser = NULL;
+    }
+    if (d->decoder) {
+        CUresult status = d->destroy_decoder(d->decoder);
+        if (checked && status != CUDA_SUCCESS) return 3;
+        d->decoder = NULL;
+    }
+    if (d->library) {
+        int status = dlclose(d->library);
+        if (checked && status != 0) return 3;
+        d->library = NULL;
+    }
+    release_budget(d); // strict retirement follows actual surface/SDK death
     free(d);
+    return 0;
+}
+void antfly_nvdec_close(Decoder *d) { (void)close_decoder(d, 0); }
+int antfly_nvdec_close_checked(Decoder *d) { return close_decoder(d, 1); }
+// Exact idle decoder budget ownership, not a pointer into the context's next
+// decoder generation. No SDK operation, allocation or supplier callback here.
+int antfly_nvdec_retirement_ready(Decoder *d, void *expected_user, release_decoder expected_release) {
+    return d && !d->parser && !d->user && !d->frame &&
+        d->budget_user == expected_user && d->release_budget == expected_release;
+}
+int antfly_nvdec_detach_budget(Decoder *d, void *expected_user, release_decoder expected_release,
+                             void *new_user, release_decoder new_release) {
+    if (!antfly_nvdec_retirement_ready(d, expected_user, expected_release)) return 0;
+    d->budget_user = new_user;
+    d->reserve_budget = NULL; // retired decoder can only be destroyed
+    d->release_budget = new_release;
+    return 1;
 }
 int antfly_nvdec_open(Decoder **out, void *stream, void *user, frame_callback callback) {
     Decoder *d = calloc(1, sizeof(*d));
@@ -203,7 +232,13 @@ int antfly_nvdec_begin(Decoder *d, void *stream, void *user, frame_callback call
     return d->create_parser(&d->parser, &p) ? 3 : 0;
 }
 void antfly_nvdec_finish(Decoder *d) {
-    if (d->parser) d->destroy_parser(d->parser);
+    // Preserve a failed SDK handle for checked retirement. Losing it here
+    // would falsely certify an idle decoder while its parser is still live.
+    if (d->parser && d->destroy_parser(d->parser) != CUDA_SUCCESS) {
+        d->failed = 3;
+        d->user = NULL; d->frame = NULL;
+        return;
+    }
     d->parser = NULL; d->user = NULL; d->frame = NULL;
 }
 

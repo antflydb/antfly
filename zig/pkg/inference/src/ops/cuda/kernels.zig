@@ -410,8 +410,9 @@ fn generatedGqaScorePreworkTiled64Eligible(
     compute_major: i32,
     compute_minor: i32,
 ) bool {
-    if (!@import("../../graph/quant_kernel_catalog.zig").portableCudaDeviceSupported(compute_major, compute_minor) or
-        request.num_heads != 8 or request.num_kv_heads != 1 or
+    const portable_e2b = @import("../../graph/quant_kernel_catalog.zig").portableCudaDeviceSupported(compute_major, compute_minor) and request.num_kv_heads == 1;
+    const gb10_e4b = compute_major == 12 and compute_minor == 1 and request.num_kv_heads == 2;
+    if ((!portable_e2b and !gb10_e4b) or request.num_heads != 8 or
         request.format != 2 or request.value_format != 2)
     {
         return false;
@@ -1461,8 +1462,14 @@ const GqaFlashPrefillRequest = struct {
     total_sequence_len: usize,
 };
 
+fn gqaFlashPrefillTargetSupported(major: i32, minor: i32, kv_heads: usize) bool {
+    // E4B's page-16 F16 kernel is also qualified on GB10. The automatic
+    // selector still excludes E4B, so this requires an explicit Flash profile.
+    return (major == 8 and minor == 9) or (major == 12 and minor == 1 and kv_heads == 2);
+}
+
 fn gqaFlashPrefillEligibility(request: GqaFlashPrefillRequest) GqaFlashPrefillEligibility {
-    if (request.compute_major != 8 or request.compute_minor != 9) {
+    if (!gqaFlashPrefillTargetSupported(request.compute_major, request.compute_minor, request.base.num_kv_heads)) {
         return .compute_capability_ineligible;
     }
     const kv_heads: usize = if (request.base.num_kv_heads == 2) 2 else 1;
@@ -2313,6 +2320,39 @@ pub fn attentionMatchSplitScratchBytes(queries: usize) !usize {
     return bytes;
 }
 
+fn rmsQ8RangesOverlap(a: buffer_mod.DeviceBuffer, b: buffer_mod.DeviceBuffer) bool {
+    if (a.ptr == 0 or b.ptr == 0 or a.len == 0 or b.len == 0) return false;
+    return a.ptr < b.ptr +| b.len and b.ptr < a.ptr +| a.len;
+}
+
+test "CUDA RMS Q8 tiled launch rejects overlapping outputs before GPU work" {
+    var module = KernelModule{ .rms_q8_1_2560 = @ptrFromInt(1) };
+    var context: context_mod.CudaContext = undefined;
+    const input = buffer_mod.DeviceBuffer{ .ptr = 0x10000, .len = 2560 * @sizeOf(f32) };
+    const weight = buffer_mod.DeviceBuffer{ .ptr = 0x30000, .len = 2560 * @sizeOf(f32) };
+    const q8 = buffer_mod.DeviceBuffer{ .ptr = 0x50000, .len = 80 * 36 };
+    try std.testing.expectError(error.InvalidCudaState, module.launchRmsQ8Mirror2560(&context, .norm, .{ .ptr = input.ptr + 4, .len = input.len }, q8, input, weight, .{}, .{}, 1e-6));
+    try std.testing.expectError(error.InvalidCudaState, module.launchRmsQ8Mirror2560(&context, .norm, .{ .ptr = 0x70000, .len = input.len }, .{ .ptr = q8.ptr, .len = 1 }, input, weight, .{}, .{}, 1e-6));
+}
+
+test "CUDA E4B prefetch keeps A100 on generic kernels and requires GB10 opt in" {
+    var module = KernelModule{
+        .e4b_head_prefetch_l2 = @ptrFromInt(1),
+        .e4b_pair_prefetch_l2 = @ptrFromInt(2),
+        .e4b_down_prefetch_l2 = @ptrFromInt(3),
+    };
+    const routes = [_]KernelModule.E4bPrefetchRoute{ .head, .pair, .down };
+    for (routes, 0..) |route, index| {
+        // Even an inherited GB10 flag cannot select its kernels on SM80.
+        try std.testing.expect(module.e4bPrefetchFunctionForDevice(true, 8, 0, route) == null);
+        try std.testing.expect(module.e4bPrefetchFunctionForDevice(true, 12, 0, route) == null);
+        try std.testing.expect(module.e4bPrefetchFunctionForDevice(false, 12, 1, route) == null);
+        try std.testing.expectEqual(@as(driver_mod.CUfunction, @ptrFromInt(index + 1)), module.e4bPrefetchFunctionForDevice(true, 12, 1, route));
+    }
+    var missing = KernelModule{};
+    try std.testing.expect(missing.e4bPrefetchFunctionForDevice(true, 12, 1, .head) == null);
+}
+
 pub const KernelModule = struct {
     module: driver_mod.CUmodule = null,
     runtime_jit_modules: [quant_kernel_compiler.first_generated_artifacts.len]driver_mod.CUmodule =
@@ -2340,6 +2380,10 @@ pub const KernelModule = struct {
     linear_f32_tiled: driver_mod.CUfunction = null,
     linear_bf16_weight_f32_tiled: driver_mod.CUfunction = null,
     linear_f16_weight_f32_tiled: driver_mod.CUfunction = null,
+    linear_f16_rowpair_f32: driver_mod.CUfunction = null,
+    linear_f16_rowpair_gelu_f32: driver_mod.CUfunction = null,
+    linear_f16_rowpair_qkv_f32: driver_mod.CUfunction = null,
+    add_bias_gelu_rows_f32: driver_mod.CUfunction = null,
     argmax_last_row_f32: driver_mod.CUfunction = null,
     argmax_rows_f32: driver_mod.CUfunction = null,
     argmax_rows_suppress_f32: driver_mod.CUfunction = null,
@@ -2382,6 +2426,14 @@ pub const KernelModule = struct {
     linear_pair_bias_f32_tile4_r2: driver_mod.CUfunction = null,
     linear_triple_bias_f32_tile4_r2: driver_mod.CUfunction = null,
     rms_norm_f32: driver_mod.CUfunction = null,
+    e4b_head_prefetch_l2: driver_mod.CUfunction = null,
+    e4b_pair_prefetch_l2: driver_mod.CUfunction = null,
+    e4b_down_prefetch_l2: driver_mod.CUfunction = null,
+    e4b_prefetch_reported: [3]bool = @splat(false),
+    e4b_prefetch_missing_reported: [3]bool = @splat(false),
+    rms_q8_1_2560: driver_mod.CUfunction = null,
+    rms_add_q8_1_2560: driver_mod.CUfunction = null,
+    rms_add_scale_q8_1_2560: driver_mod.CUfunction = null,
     rms_norm_f32_bf16: driver_mod.CUfunction = null,
     rms_norm_add_f32_bf16: driver_mod.CUfunction = null,
     rms_norm_add_f32: driver_mod.CUfunction = null,
@@ -2392,6 +2444,7 @@ pub const KernelModule = struct {
     gemma4_a4b_parallel_ffn_post_residual_f32: driver_mod.CUfunction = null,
     layer_norm_f32: driver_mod.CUfunction = null,
     add_layer_norm_f32: driver_mod.CUfunction = null,
+    add_layer_norm_sum_f32: driver_mod.CUfunction = null,
     elementwise_f32: driver_mod.CUfunction = null,
     elementwise_broadcast_f32: driver_mod.CUfunction = null,
     primitive_where_f32: driver_mod.CUfunction = null,
@@ -2417,6 +2470,10 @@ pub const KernelModule = struct {
     gliner_gru_combine_f32: driver_mod.CUfunction = null,
     concat_lastdim_f32: driver_mod.CUfunction = null,
     conv2d_f32: driver_mod.CUfunction = null,
+    im2col_nct_k3_s1_p1_f32: driver_mod.CUfunction = null,
+    im2col_ntc_k3_s1_p1_f32: driver_mod.CUfunction = null,
+    im2col_nct_k3_s2_p1_f32: driver_mod.CUfunction = null,
+    im2col_ntc_k3_s2_p1_f32: driver_mod.CUfunction = null,
     attention_f32: driver_mod.CUfunction = null,
     attention_f32_block: driver_mod.CUfunction = null,
     laya_action_features_f32: driver_mod.CUfunction = null,
@@ -2446,6 +2503,9 @@ pub const KernelModule = struct {
     attention_f32_bert_prefill_s256_hd64_q16: driver_mod.CUfunction = null,
     attention_f32_bert_prefill_s256_hd64_mma: driver_mod.CUfunction = null,
     cross_attention_f32: driver_mod.CUfunction = null,
+    cross_split_hd64_f32: driver_mod.CUfunction = null,
+    cross_split_hd64_f16: driver_mod.CUfunction = null,
+    cross_split_hd64_merge_f32: driver_mod.CUfunction = null,
     cross_attention_q1_f32: driver_mod.CUfunction = null,
     token_to_nchw_f32: driver_mod.CUfunction = null,
     nchw_to_token_f32: driver_mod.CUfunction = null,
@@ -2750,6 +2810,12 @@ pub const KernelModule = struct {
     // Typed fields are the symbol registry. Only native-name exceptions and
     // requiredness need metadata; loading and clearing consume the same fields.
     fn bundledSymbol(comptime field: []const u8) ?[:0]const u8 {
+        if (std.mem.eql(u8, field, "e4b_head_prefetch_l2")) return "antfly_gemma4_e4b_head_prefetch_l2";
+        if (std.mem.eql(u8, field, "e4b_pair_prefetch_l2")) return "antfly_gemma4_e4b_pair_prefetch_l2";
+        if (std.mem.eql(u8, field, "e4b_down_prefetch_l2")) return "antfly_gemma4_e4b_down_prefetch_l2";
+        if (std.mem.eql(u8, field, "rms_q8_1_2560")) return "antfly_rms_q8_1_2560_tile256";
+        if (std.mem.eql(u8, field, "rms_add_q8_1_2560")) return "antfly_rms_add_q8_1_2560_tile256";
+        if (std.mem.eql(u8, field, "rms_add_scale_q8_1_2560")) return "antfly_rms_add_scale_q8_1_2560_tile256";
         if (std.mem.eql(u8, field, "gqa_repeat_hd256")) return "antfly_gqa_repeat_prefill_exact_hd256_f32";
         if (std.mem.eql(u8, field, "gqa_repeat_hd512")) return "antfly_gqa_repeat_prefill_exact_hd512_f32";
         if (std.mem.eql(u8, field, "gqa_repeat_split_scores")) return "antfly_gqa_repeat_split_scores_f32";
@@ -2895,6 +2961,7 @@ pub const KernelModule = struct {
     }
 
     fn bundledFunctionEnabled(comptime field: []const u8, major: i32, minor: i32) bool {
+        if (comptime std.mem.eql(u8, field, "e4b_down_prefetch_l2")) return major == 12 and minor == 1;
         if (comptime std.mem.eql(u8, field, "linear_q4_0_f32_tc_hmma_bf16")) return bundledQ4_0TcHmmaBf16Supported(major, minor);
         if (comptime std.mem.eql(u8, field, "linear_q4_0_bf16_staged")) return major == 8 and minor == 9 and bundledQ4_0TcHmmaBf16Supported(major, minor);
         if (comptime std.mem.eql(u8, field, "gqa_attention_prefill_flash_sm89_e4b_hd256_f32") or std.mem.eql(u8, field, "gqa_attention_prefill_flash_sm89_e4b_hd512_f32")) return !cuda_artifact.uses_jit;
@@ -4210,6 +4277,9 @@ pub const KernelModule = struct {
                 }
                 if (in_dim == 10240 and out_dim == 2560) {
                     if (rows == 1 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN", false)) {
+                        if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_DOWN_PREFETCH_L2", false)) {
+                            if (self.e4b_down_prefetch_l2) |function| return .{ .family = family, .leaf = .down_w10, .function = function, .variant = variant };
+                        }
                         if (self.linear_q4_0_q8_1_f32_tile4_w10_e4b_down) |function| return .{ .family = family, .leaf = .down_w10, .function = function, .variant = variant };
                     }
                     if (rows > 1) {
@@ -4651,6 +4721,86 @@ pub const KernelModule = struct {
         var arguments: launch_abi.ArgumentsFor("LINEAR_BF16_WEIGHT_F32_TILED") = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
         var params = launch_abi.fieldsFor("LINEAR_BF16_WEIGHT_F32_TILED", &arguments);
         try launchBlocks(function, ctx, out_count, f32_tiled_threads, &params);
+    }
+
+    pub const F16RowPairEpilogue = enum { identity, gelu };
+
+    fn validateF16RowPair(dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, bias: buffer_mod.DeviceBuffer, inputs: usize, outputs: usize) driver_mod.Error!void {
+        if (inputs == 0 or outputs == 0 or inputs > std.math.maxInt(i32) or outputs > std.math.maxInt(i32)) return error.InvalidCudaState;
+        const matrix_bytes = try checkedTensorElements(try checkedTensorElements(inputs, outputs), 2);
+        const input_bytes = try checkedTensorElements(inputs, 4);
+        const output_bytes = try checkedTensorElements(outputs, 4);
+        try checkRawBytes(dst, output_bytes);
+        try checkRawBytes(input, input_bytes);
+        try checkRawBytes(weight, matrix_bytes);
+        if (dst.ptr == 0 or input.ptr == 0 or weight.ptr == 0 or dst.ptr % 4 != 0 or input.ptr % 4 != 0 or weight.ptr % (if (inputs % 2 == 0) @as(usize, 4) else 2) != 0) return error.InvalidCudaState;
+        if (bias.ptr != 0) {
+            try checkRawBytes(bias, output_bytes);
+            if (bias.ptr % 4 != 0) return error.InvalidCudaState;
+        }
+        const output = buffer_mod.DeviceBuffer{ .ptr = dst.ptr, .len = output_bytes };
+        for ([_]buffer_mod.DeviceBuffer{ .{ .ptr = input.ptr, .len = input_bytes }, .{ .ptr = weight.ptr, .len = matrix_bytes }, .{ .ptr = bias.ptr, .len = if (bias.ptr != 0) output_bytes else 0 } }) |source| if (rmsQ8RangesOverlap(output, source)) return error.InvalidCudaState;
+    }
+
+    pub fn launchLinearF16RowPair(self: *KernelModule, ctx: *context_mod.CudaContext, epilogue: F16RowPairEpilogue, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, bias: buffer_mod.DeviceBuffer, inputs: usize, outputs: usize) driver_mod.Error!void {
+        const function = switch (epilogue) {
+            .identity => self.linear_f16_rowpair_f32,
+            .gelu => self.linear_f16_rowpair_gelu_f32,
+        };
+        if (function == null) return error.CudaKernelUnavailable;
+        try validateF16RowPair(dst, input, weight, bias, inputs, outputs);
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight.ptr;
+        var bias_ptr = bias.ptr;
+        var inputs_u32 = try toU32(inputs);
+        var outputs_u32 = try toU32(outputs);
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &bias_ptr, &inputs_u32, &outputs_u32 });
+        try launchBlocks(function, ctx, (outputs + 7) / 8, 128, &params);
+    }
+
+    pub fn launchLinearF16RowPairQkv(self: *KernelModule, ctx: *context_mod.CudaContext, destinations: [3]buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weights: [3]buffer_mod.DeviceBuffer, biases: [3]buffer_mod.DeviceBuffer, inputs: usize, q_outputs: usize, kv_outputs: usize) driver_mod.Error!void {
+        if (self.linear_f16_rowpair_qkv_f32 == null) return error.CudaKernelUnavailable;
+        const outputs = [_]usize{ q_outputs, kv_outputs, kv_outputs };
+        for (0..3) |i| try validateF16RowPair(destinations[i], input, weights[i], biases[i], inputs, outputs[i]);
+        for (0..3) |i| {
+            const destination = buffer_mod.DeviceBuffer{ .ptr = destinations[i].ptr, .len = outputs[i] * 4 };
+            for (0..3) |j| {
+                if (j != i and rmsQ8RangesOverlap(destination, .{ .ptr = destinations[j].ptr, .len = outputs[j] * 4 })) return error.InvalidCudaState;
+                if (rmsQ8RangesOverlap(destination, .{ .ptr = weights[j].ptr, .len = try checkedTensorElements(try checkedTensorElements(inputs, outputs[j]), 2) }) or rmsQ8RangesOverlap(destination, .{ .ptr = biases[j].ptr, .len = if (biases[j].ptr != 0) outputs[j] * 4 else 0 })) return error.InvalidCudaState;
+            }
+        }
+        var q = destinations[0].ptr;
+        var k = destinations[1].ptr;
+        var v = destinations[2].ptr;
+        var source = input.ptr;
+        var qw = weights[0].ptr;
+        var kw = weights[1].ptr;
+        var vw = weights[2].ptr;
+        var qb = biases[0].ptr;
+        var kb = biases[1].ptr;
+        var vb = biases[2].ptr;
+        var ni = try toU32(inputs);
+        var nq = try toU32(q_outputs);
+        var nkv = try toU32(kv_outputs);
+        var params = launch_abi.addresses(.{ &q, &k, &v, &source, &qw, &kw, &vw, &qb, &kb, &vb, &ni, &nq, &nkv });
+        try launch2d(self.linear_f16_rowpair_qkv_f32, ctx, (@max(q_outputs, kv_outputs) + 7) / 8, 3, 128, &params);
+    }
+
+    pub fn launchAddBiasGeluRowsF32(self: *KernelModule, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, bias: buffer_mod.DeviceBuffer, rows: usize, outputs: usize) driver_mod.Error!void {
+        if (self.add_bias_gelu_rows_f32 == null) return error.CudaKernelUnavailable;
+        if (rows == 0 or outputs == 0) return error.InvalidCudaState;
+        const count = try checkedTensorElements(rows, outputs);
+        if (count > std.math.maxInt(i32)) return error.InvalidCudaState;
+        try checkBytes(dst, count);
+        try checkBytes(bias, outputs);
+        if (dst.ptr == 0 or bias.ptr == 0 or dst.ptr % 4 != 0 or bias.ptr % 4 != 0 or rmsQ8RangesOverlap(dst, bias)) return error.InvalidCudaState;
+        var destination = dst.ptr;
+        var offset = bias.ptr;
+        var r = try toU32(rows);
+        var c = try toU32(outputs);
+        var params = launch_abi.addresses(.{ &destination, &offset, &r, &c });
+        try launch1d(self.add_bias_gelu_rows_f32, ctx, count, &params);
     }
 
     pub fn launchLinearF16WeightF32Tiled(
@@ -5261,12 +5411,6 @@ pub const KernelModule = struct {
         const use_e4b_stage1 =
             !use_a4b_stage1 and rows == 1 and in_dim == 2560 and out_dim == 262144 and suppress_count == 0 and
             self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b != null;
-        const stage1 = if (use_a4b_stage1)
-            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b orelse return error.CudaKernelUnavailable
-        else if (use_e4b_stage1)
-            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b orelse return error.CudaKernelUnavailable
-        else
-            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8 orelse return error.CudaKernelUnavailable;
         const reduce = self.argmax_reduce_rows_pairs_f32_w16 orelse (self.argmax_reduce_rows_pairs_f32 orelse return error.CudaKernelUnavailable);
         if (rows == 0 or in_dim == 0 or out_dim == 0 or in_dim % q6_k_values_per_block != 0) return error.InvalidCudaState;
         const row_blocks = in_dim / q6_k_values_per_block;
@@ -5280,10 +5424,19 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q6_k_block_bytes));
         try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
 
+        const prefetch = if (use_e4b_stage1) self.e4bPrefetchFunction(ctx, .head) else null;
+        const stage1 = if (prefetch) |function| function else if (use_a4b_stage1)
+            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b orelse return error.CudaKernelUnavailable
+        else if (use_e4b_stage1)
+            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b orelse return error.CudaKernelUnavailable
+        else
+            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8 orelse return error.CudaKernelUnavailable;
+
         var arguments = try quantArgmaxArguments(true, partial_values, partial_indices, input_q8_1, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
         var stage1_params = launch_abi.fieldsFor("Q8_QUANT_ARGMAX", &arguments);
         const stage1_threads: usize = if (use_a4b_stage1) 192 else if (use_e4b_stage1) 160 else q6KQ8_1Tile8Stage1Threads(row_blocks);
         try launchBlocks(stage1, ctx, partial_count, stage1_threads, &stage1_params);
+        if (prefetch != null) self.noteE4bPrefetchLaunch(.head);
 
         var dst_ptr = dst.ptr;
         var col_tiles_u32 = try toU32(col_tiles);
@@ -5856,6 +6009,112 @@ pub const KernelModule = struct {
         try launchF32RowTiles(function, ctx, rows, in_dim, out_dim, &rows_u32, &bindings, &params);
     }
 
+    const E4bPrefetchRoute = enum { head, pair, down };
+
+    fn e4bPrefetchFunction(self: *KernelModule, ctx: *const context_mod.CudaContext, route: E4bPrefetchRoute) driver_mod.CUfunction {
+        const enabled = platform.env.getenvBoolDefault(switch (route) {
+            .head => "ANTFLY_INFERENCE_CUDA_E4B_HEAD_PREFETCH_L2",
+            .pair => "ANTFLY_INFERENCE_CUDA_E4B_PAIR_PREFETCH_L2",
+            .down => "ANTFLY_INFERENCE_CUDA_E4B_DOWN_PREFETCH_L2",
+        }, false);
+        return self.e4bPrefetchFunctionForDevice(enabled, ctx.info.compute_major, ctx.info.compute_minor, route);
+    }
+
+    fn e4bPrefetchFunctionForDevice(self: *KernelModule, enabled: bool, compute_major: i32, compute_minor: i32, route: E4bPrefetchRoute) driver_mod.CUfunction {
+        if (!enabled) return null;
+        const index = @backingInt(route);
+        const device_supported = compute_major == 12 and compute_minor == 1;
+        const function = if (device_supported) switch (route) {
+            .head => self.e4b_head_prefetch_l2,
+            .pair => self.e4b_pair_prefetch_l2,
+            .down => self.e4b_down_prefetch_l2,
+        } else null;
+        if (function == null) {
+            if (!self.e4b_prefetch_missing_reported[index]) {
+                self.e4b_prefetch_missing_reported[index] = true;
+                std.log.warn("cuda_e4b_prefetch: route={s} requested=1 active=0 reason={s}", .{
+                    @tagName(route), if (device_supported) @as([]const u8, "kernel_unavailable") else "unsupported_device",
+                });
+            }
+            return null;
+        }
+        return function;
+    }
+
+    fn noteE4bPrefetchLaunch(self: *KernelModule, route: E4bPrefetchRoute) void {
+        const index = @backingInt(route);
+        if (!self.e4b_prefetch_reported[index]) {
+            self.e4b_prefetch_reported[index] = true;
+            const symbol = switch (route) {
+                .head => "antfly_gemma4_e4b_head_prefetch_l2",
+                .pair => "antfly_gemma4_e4b_pair_prefetch_l2",
+                .down => "antfly_gemma4_e4b_down_prefetch_l2",
+            };
+            std.log.info("cuda_e4b_prefetch: route={s} requested=1 active=1 cache=L2 next_column=1 arithmetic=unchanged kernel={s}", .{ @tagName(route), symbol });
+        }
+    }
+
+    pub const RmsQ8Operation = enum { norm, add, add_scale };
+
+    pub fn hasRmsQ8Mirror2560(self: *const KernelModule, operation: RmsQ8Operation) bool {
+        return switch (operation) {
+            .norm => self.rms_q8_1_2560 != null,
+            .add => self.rms_add_q8_1_2560 != null,
+            .add_scale => self.rms_add_scale_q8_1_2560 != null,
+        };
+    }
+
+    /// Qualified exact single-row E4B shape. The tiled reduction reads the
+    /// whole row in every CTA; all outputs must therefore be disjoint inputs.
+    pub fn launchRmsQ8Mirror2560(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        operation: RmsQ8Operation,
+        dst: buffer_mod.DeviceBuffer,
+        q8: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        residual: buffer_mod.DeviceBuffer,
+        scalar: buffer_mod.DeviceBuffer,
+        eps: f32,
+    ) driver_mod.Error!void {
+        const function = switch (operation) {
+            .norm => self.rms_q8_1_2560,
+            .add => self.rms_add_q8_1_2560,
+            .add_scale => self.rms_add_scale_q8_1_2560,
+        } orelse return error.CudaKernelUnavailable;
+        try checkBytes(dst, 2560);
+        try checkBytes(input, 2560);
+        try checkBytes(weight, 2560);
+        if (q8.ptr == 0 or q8.len < 80 * 36) return error.InvalidCudaState;
+        if (operation != .norm) try checkBytes(residual, 2560);
+        if (operation == .add_scale) try checkBytes(scalar, 1);
+        const output_range = buffer_mod.DeviceBuffer{ .ptr = dst.ptr, .len = 2560 * @sizeOf(f32) };
+        const q8_range = buffer_mod.DeviceBuffer{ .ptr = q8.ptr, .len = 80 * 36 };
+        if (rmsQ8RangesOverlap(output_range, q8_range)) return error.InvalidCudaState;
+        for ([_]buffer_mod.DeviceBuffer{
+            input,                                     weight,
+            if (operation != .norm) residual else .{}, if (operation == .add_scale) scalar else .{},
+        }) |source| {
+            if (rmsQ8RangesOverlap(output_range, source) or rmsQ8RangesOverlap(q8_range, source)) return error.InvalidCudaState;
+        }
+        var dst_ptr = dst.ptr;
+        var q8_ptr = q8.ptr;
+        var mirror_ptr: driver_mod.CUdeviceptr = 0;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight.ptr;
+        var residual_ptr = residual.ptr;
+        var scalar_ptr = scalar.ptr;
+        var rows_u32: u32 = 1;
+        var eps_value = eps;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),    @ptrCast(&q8_ptr),     @ptrCast(&mirror_ptr),
+            @ptrCast(&input_ptr),  @ptrCast(&weight_ptr), @ptrCast(&residual_ptr),
+            @ptrCast(&scalar_ptr), @ptrCast(&rows_u32),   @ptrCast(&eps_value),
+        };
+        try launchBlocks(function, ctx, 10, 256, &params);
+    }
+
     pub fn launchRmsNormF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -6234,6 +6493,40 @@ pub const KernelModule = struct {
         var arguments = try normArguments("LAYER_NORM", .{ .dst = dst.ptr, .input = input.ptr, .gamma = gamma.ptr, .beta = beta.ptr }, rows, dim, eps);
         var params = launch_abi.fieldsFor("LAYER_NORM", &arguments);
         try launchBlocks(self.layer_norm_f32, ctx, rows, f32_tiled_threads, &params);
+    }
+
+    pub fn launchAddLayerNormSumF32(self: *KernelModule, ctx: *context_mod.CudaContext, normed: buffer_mod.DeviceBuffer, sum: buffer_mod.DeviceBuffer, a: buffer_mod.DeviceBuffer, b: buffer_mod.DeviceBuffer, gamma: buffer_mod.DeviceBuffer, beta: buffer_mod.DeviceBuffer, rows: usize, dim: usize, eps: f32) driver_mod.Error!void {
+        if (self.add_layer_norm_sum_f32 == null) return error.CudaKernelUnavailable;
+        if (rows == 0 or dim == 0 or !std.math.isFinite(eps) or eps < 0) return error.InvalidCudaState;
+        const count = try checkedTensorElements(rows, dim);
+        if (count > std.math.maxInt(i32)) return error.InvalidCudaState;
+        const bytes = try checkedTensorElements(count, 4);
+        const weight_bytes = try checkedTensorElements(dim, 4);
+        for ([_]buffer_mod.DeviceBuffer{ normed, sum, a, b }) |span| {
+            try checkRawBytes(span, bytes);
+            if (span.ptr == 0 or span.ptr % 4 != 0) return error.InvalidCudaState;
+        }
+        for ([_]buffer_mod.DeviceBuffer{ gamma, beta }) |span| {
+            try checkRawBytes(span, weight_bytes);
+            if (span.ptr == 0 or span.ptr % 4 != 0) return error.InvalidCudaState;
+        }
+        const output = buffer_mod.DeviceBuffer{ .ptr = normed.ptr, .len = bytes };
+        const residual = buffer_mod.DeviceBuffer{ .ptr = sum.ptr, .len = bytes };
+        if (rmsQ8RangesOverlap(output, residual)) return error.InvalidCudaState;
+        for ([_]buffer_mod.DeviceBuffer{ .{ .ptr = a.ptr, .len = bytes }, .{ .ptr = b.ptr, .len = bytes }, .{ .ptr = gamma.ptr, .len = weight_bytes }, .{ .ptr = beta.ptr, .len = weight_bytes } }) |source| {
+            if (rmsQ8RangesOverlap(output, source) or rmsQ8RangesOverlap(residual, source)) return error.InvalidCudaState;
+        }
+        var out = normed.ptr;
+        var saved = sum.ptr;
+        var first = a.ptr;
+        var second = b.ptr;
+        var scale = gamma.ptr;
+        var offset = beta.ptr;
+        var r = try toU32(rows);
+        var d = try toU32(dim);
+        var epsilon = eps;
+        var params = launch_abi.addresses(.{ &out, &saved, &first, &second, &scale, &offset, &r, &d, &epsilon });
+        try launchBlocks(self.add_layer_norm_sum_f32, ctx, rows, 256, &params);
     }
 
     pub fn launchAddLayerNormF32(
@@ -6985,6 +7278,56 @@ pub const KernelModule = struct {
         try launch1d(self.concat_lastdim_f32, ctx, count, &params);
     }
 
+    pub const Im2colParams = extern struct { channels: u32, t_in: u32, t_out: u32 };
+    comptime {
+        if (@sizeOf(Im2colParams) != 12 or @alignOf(Im2colParams) != 4 or @offsetOf(Im2colParams, "t_in") != 4 or @offsetOf(Im2colParams, "t_out") != 8)
+            @compileError("Tile im2col by-value native parameter ABI mismatch");
+    }
+    pub const Im2colPlan = struct { batch: usize, output_time: usize, input_batch_bytes: usize, output_batch_bytes: usize, output_batch_elements: usize, output_elements: usize };
+    pub fn planIm2col(batch: usize, channels: usize, time: usize, kernel: usize, stride: usize, padding: usize) driver_mod.Error!Im2colPlan {
+        if (batch == 0 or channels == 0 or time == 0 or kernel != 3 or (stride != 1 and stride != 2) or padding != 1) return error.InvalidCudaState;
+        const padded = std.math.add(usize, time, 2) catch return error.InvalidCudaState;
+        if (padded > std.math.maxInt(i32) or padded < kernel) return error.InvalidCudaState;
+        const output_time = (padded - kernel) / stride + 1;
+        const input_count = try checkedTensorElements(channels, time);
+        const output_count = try checkedTensorElements(try checkedTensorElements(output_time, channels), kernel);
+        if (input_count > std.math.maxInt(i32) or output_count > std.math.maxInt(i32)) return error.InvalidCudaState;
+        _ = try toU32(batch);
+        const total = try checkedTensorElements(batch, output_count);
+        if (total > std.math.maxInt(i32)) return error.InvalidCudaState;
+        return .{ .batch = batch, .output_time = output_time, .input_batch_bytes = try checkedTensorElements(input_count, 4), .output_batch_bytes = try checkedTensorElements(output_count, 4), .output_batch_elements = output_count, .output_elements = total };
+    }
+    pub fn im2colFunction(self: *const KernelModule, kernel: usize, stride: usize, padding: usize, time_major: bool) driver_mod.CUfunction {
+        if (kernel != 3 or padding != 1) return null;
+        return switch (stride) {
+            1 => if (time_major) self.im2col_ntc_k3_s1_p1_f32 else self.im2col_nct_k3_s1_p1_f32,
+            2 => if (time_major) self.im2col_ntc_k3_s2_p1_f32 else self.im2col_nct_k3_s2_p1_f32,
+            else => null,
+        };
+    }
+    pub fn launchConv1dIm2col(self: *KernelModule, ctx: *context_mod.CudaContext, output: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, batch: usize, channels: usize, time: usize, kernel: usize, stride: usize, padding: usize, time_major: bool) driver_mod.Error!void {
+        const function = self.im2colFunction(kernel, stride, padding, time_major) orelse return error.CudaKernelUnavailable;
+        const plan = try planIm2col(batch, channels, time, kernel, stride, padding);
+        const input_bytes = try checkedTensorElements(batch, plan.input_batch_bytes);
+        const output_bytes = try checkedTensorElements(batch, plan.output_batch_bytes);
+        try checkRawBytes(input, input_bytes);
+        try checkRawBytes(output, output_bytes);
+        if (input.ptr == 0 or output.ptr == 0 or input.ptr % 4 != 0 or output.ptr % 4 != 0) return error.InvalidCudaState;
+        _ = std.math.add(driver_mod.CUdeviceptr, input.ptr, input_bytes) catch return error.InvalidCudaState;
+        _ = std.math.add(driver_mod.CUdeviceptr, output.ptr, output_bytes) catch return error.InvalidCudaState;
+        if (rmsQ8RangesOverlap(.{ .ptr = input.ptr, .len = input_bytes }, .{ .ptr = output.ptr, .len = output_bytes })) return error.InvalidCudaState;
+        var source = input.ptr;
+        var destination = output.ptr;
+        var parameters = Im2colParams{ .channels = try toU32(channels), .t_in = try toU32(time), .t_out = try toU32(plan.output_time) };
+        var arguments = launch_abi.addresses(.{ &source, &destination, &parameters });
+        // Whole-batch bounds and both pointer end points precede first submit.
+        for (0..batch) |index| {
+            source = input.ptr + index * plan.input_batch_bytes;
+            destination = output.ptr + index * plan.output_batch_bytes;
+            try launch1d(function, ctx, plan.output_batch_elements, &arguments);
+        }
+    }
+
     pub fn launchConv2dF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -7322,6 +7665,79 @@ pub const KernelModule = struct {
         } else {
             try launch1d(self.attention_f32, ctx, count, &params);
         }
+    }
+
+    /// Static BSHD, head64, keytile128 split-KV schedule. Scratch holds
+    /// [maximum, denominator, 64 numerators] per row/head/key tile.
+    pub fn crossSplitHd64WorkspaceElements(batch: usize, queries: usize, keys: usize, heads: usize) driver_mod.Error!usize {
+        if (batch == 0 or queries == 0 or keys == 0 or heads == 0) return error.InvalidCudaState;
+        const rows = try checkedTensorElements(try checkedTensorElements(batch, queries), heads);
+        if (rows > std.math.maxInt(i32)) return error.InvalidCudaState;
+        _ = try toU32(queries);
+        _ = try toU32(keys);
+        _ = try toU32(heads);
+        const splits = (keys - 1) / 128 + 1;
+        // CUDA grid.y is bounded independently from the x/u32 ABI.
+        if (splits > 65535) return error.InvalidCudaState;
+        return checkedTensorElements(try checkedTensorElements(rows, splits), 66);
+    }
+
+    pub fn launchCrossSplitHd64(self: *KernelModule, ctx: *context_mod.CudaContext, dtype: TensorDType, dst: buffer_mod.DeviceBuffer, q: buffer_mod.DeviceBuffer, k: buffer_mod.DeviceBuffer, v: buffer_mod.DeviceBuffer, mask: buffer_mod.DeviceBuffer, partial: buffer_mod.DeviceBuffer, batch: usize, queries: usize, keys: usize, heads: usize) driver_mod.Error!void {
+        const width: usize = switch (dtype) {
+            .f32 => 4,
+            .f16 => 2,
+            else => return error.InvalidCudaState,
+        };
+        const function = switch (dtype) {
+            .f32 => self.cross_split_hd64_f32,
+            .f16 => self.cross_split_hd64_f16,
+            else => unreachable,
+        };
+        if (function == null or self.cross_split_hd64_merge_f32 == null) return error.CudaKernelUnavailable;
+        const partial_count = try crossSplitHd64WorkspaceElements(batch, queries, keys, heads);
+        const rows = try checkedTensorElements(try checkedTensorElements(batch, queries), heads);
+        const q_count = try checkedTensorElements(rows, 64);
+        const kv_count = try checkedTensorElements(try checkedTensorElements(try checkedTensorElements(batch, keys), heads), 64);
+        const q_bytes = try checkedTensorElements(q_count, 4);
+        const kv_bytes = try checkedTensorElements(kv_count, width);
+        const partial_bytes = try checkedTensorElements(partial_count, 4);
+        try checkRawBytes(dst, q_bytes);
+        try checkRawBytes(q, q_bytes);
+        try checkRawBytes(k, kv_bytes);
+        try checkRawBytes(v, kv_bytes);
+        try checkRawBytes(partial, partial_bytes);
+        if (q.ptr == 0 or k.ptr == 0 or v.ptr == 0 or dst.ptr == 0 or partial.ptr == 0 or
+            q.ptr % 4 != 0 or dst.ptr % 4 != 0 or partial.ptr % 4 != 0 or k.ptr % width != 0 or v.ptr % width != 0)
+            return error.InvalidCudaState;
+        const output_range = buffer_mod.DeviceBuffer{ .ptr = dst.ptr, .len = q_bytes };
+        const partial_range = buffer_mod.DeviceBuffer{ .ptr = partial.ptr, .len = partial_bytes };
+        if (rmsQ8RangesOverlap(output_range, partial_range)) return error.InvalidCudaState;
+        const mask_bytes = if (mask.ptr != 0) try checkedTensorElements(try checkedTensorElements(batch, keys), 8) else 0;
+        if (mask.ptr != 0) {
+            try checkRawBytes(mask, mask_bytes);
+            if (mask.ptr % 8 != 0) return error.InvalidCudaState;
+        }
+        for ([_]buffer_mod.DeviceBuffer{
+            .{ .ptr = q.ptr, .len = q_bytes },  .{ .ptr = k.ptr, .len = kv_bytes },
+            .{ .ptr = v.ptr, .len = kv_bytes }, .{ .ptr = mask.ptr, .len = mask_bytes },
+        }) |source| {
+            if (rmsQ8RangesOverlap(output_range, source) or rmsQ8RangesOverlap(partial_range, source)) return error.InvalidCudaState;
+        }
+        var partial_ptr = partial.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var mask_ptr = mask.ptr;
+        var queries_u32 = try toU32(queries);
+        var keys_u32 = try toU32(keys);
+        var heads_u32 = try toU32(heads);
+        var splits_u32 = try toU32((keys - 1) / 128 + 1);
+        var partial_params = launch_abi.addresses(.{ &partial_ptr, &q_ptr, &k_ptr, &v_ptr, &mask_ptr, &queries_u32, &keys_u32, &heads_u32, &splits_u32 });
+        var dst_ptr = dst.ptr;
+        var merge_params = launch_abi.addresses(.{ &dst_ptr, &partial_ptr, &splits_u32 });
+        // Every host check and both argument tables precede the first submit.
+        try launch2d(function, ctx, rows, splits_u32, 128, &partial_params);
+        try launchBlocks(self.cross_split_hd64_merge_f32, ctx, rows, 64, &merge_params);
     }
 
     pub fn launchCrossAttentionF32(
@@ -12707,9 +13123,12 @@ pub const KernelModule = struct {
                     return;
                 }
             }
-            if (self.linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn) |function| {
+            const prefetch = self.e4bPrefetchFunction(ctx, .pair);
+            const selected = if (prefetch != null) prefetch else self.linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn;
+            if (selected) |function| {
                 var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_gate_ptr, &weight_up_ptr, &activation_u32 });
                 try launchBlocks(function, ctx, out_dim / q4_0_col_tile, q4_0_tiled_threads, &params);
+                if (prefetch != null) self.noteE4bPrefetchLaunch(.pair);
                 return;
             }
         }
@@ -16286,6 +16705,7 @@ pub fn smokeDenseF32(allocator: std.mem.Allocator) !void {
 
     try smokeLinearF32(allocator, &ctx, &module);
     try smokeRmsNormF32(allocator, &ctx, &module);
+    try smokeRmsNormE4BShape(allocator, &ctx, &module);
     try smokeRmsNormBareF32(allocator, &ctx, &module);
     try smokeElementwiseF32(allocator, &ctx, &module);
     try smokeLayerNormF32(allocator, &ctx, &module);
@@ -17689,6 +18109,69 @@ fn smokeRmsNormF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, 
     try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
     try expectApproxSlice(out, &expected, 0.003);
+}
+
+// Cover the E4B register-retained fast path, including multiple rows and
+// output aliasing. The oracle accumulates in f64 independently of the GPU tree.
+fn smokeRmsNormE4BShape(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const dim = 2560;
+    const rows = 3;
+    const count = rows * dim;
+    const eps: f32 = 1e-5;
+    const x = try allocator.alloc(f32, count);
+    defer allocator.free(x);
+    const w = try allocator.alloc(f32, dim);
+    defer allocator.free(w);
+    const r = try allocator.alloc(f32, count);
+    defer allocator.free(r);
+    const expected = try allocator.alloc(f32, count);
+    defer allocator.free(expected);
+    const actual = try allocator.alloc(f32, count);
+    defer allocator.free(actual);
+    for (x, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 211)) - 105)) / 31.0;
+    for (w, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 37)) - 18)) / 13.0;
+    for (r, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 53)) - 26)) / 17.0;
+    var input = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer input.free(ctx);
+    var weight = try buffer_mod.DeviceBuffer.alloc(ctx, dim * @sizeOf(f32));
+    defer weight.free(ctx);
+    var residual = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer residual.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer output.free(ctx);
+    var scalar = try buffer_mod.DeviceBuffer.alloc(ctx, @sizeOf(f32));
+    defer scalar.free(ctx);
+    const scale = [_]f32{-0.375};
+    try weight.copyFromHost(ctx, std.mem.sliceAsBytes(w));
+    try residual.copyFromHost(ctx, std.mem.sliceAsBytes(r));
+    try scalar.copyFromHost(ctx, std.mem.sliceAsBytes(&scale));
+    for (0..3) |op| {
+        for (0..rows) |row| {
+            var sum: f64 = 0;
+            for (x[row * dim ..][0..dim]) |value| sum += @as(f64, value) * value;
+            const inv = 1.0 / @sqrt(sum / dim + eps);
+            for (0..dim) |col| {
+                const i = row * dim + col;
+                var value = @as(f64, x[i]) * inv * w[col];
+                if (op != 0) value += r[i];
+                if (op == 2) value *= scale[0];
+                expected[i] = @floatCast(value);
+            }
+        }
+        for ([_]bool{ false, true }) |in_place| {
+            try input.copyFromHost(ctx, std.mem.sliceAsBytes(x));
+            const dst = if (in_place) input else output;
+            switch (op) {
+                0 => try module.launchRmsNormF32(ctx, dst, input, weight, rows, dim, eps),
+                1 => try module.launchRmsNormAddF32(ctx, dst, input, weight, residual, rows, dim, eps),
+                2 => try module.launchRmsNormAddOutputScaleF32(ctx, dst, input, weight, residual, scalar, rows, dim, eps),
+                else => unreachable,
+            }
+            try dst.copyToHost(ctx, std.mem.sliceAsBytes(actual));
+            try ctx.synchronize();
+            try expectApproxSlice(actual, expected, 5e-6);
+        }
+    }
 }
 
 fn smokeRmsNormBareF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
@@ -20220,6 +20703,49 @@ test "generated CUDA score prework tiled64 consumer is typed and fail closed" {
     try std.testing.expectEqual(@as(u16, 4096), global.score_capacity);
 }
 
+test "generated CUDA tiled64 GB10 E4B opt-in preserves topology format and paging bounds" {
+    var request = GeneratedGqaScorePreworkRequest{
+        .batch = 1,
+        .q_seq_len = 1,
+        .kv_seq_len = 256,
+        .num_heads = 8,
+        .num_kv_heads = 2,
+        .head_dim = 256,
+        .sliding_window = 512,
+        .mask_len = 0,
+        .bias_mode = 0,
+        .key_row_bytes = 1024,
+        .base_key_row_bytes = 1024,
+        .value_row_bytes = 1024,
+        .block_count = 16,
+        .page_size_tokens = 16,
+        .format = 2,
+        .value_format = 2,
+        .physical_token_capacity = 256,
+    };
+    const selected = generatedGqaScorePreworkSelectionWithConsumerFor(request, .explicit, .required_tiled64, 12, 1) orelse return error.MissingScorePreworkSelection;
+    try std.testing.expectEqual(GeneratedGqaScorePreworkConsumer.tiled64, selected.consumer);
+    try std.testing.expect(selected.tiled64_required);
+    // The eligibility extension does not promote automatic score prework.
+    try std.testing.expect(generatedGqaScorePreworkSelectionWithConsumerFor(request, .automatic, .serial, 12, 1) == null);
+    for ([_][2]i32{ .{ 12, 0 }, .{ 8, 0 }, .{ 8, 9 } }) |cc| {
+        const other = generatedGqaScorePreworkSelectionWithConsumerFor(request, .explicit, .tiled64, cc[0], cc[1]) orelse return error.MissingScorePreworkSelection;
+        try std.testing.expectEqual(GeneratedGqaScorePreworkConsumer.serial, other.consumer);
+    }
+    request.block_count = 15;
+    try std.testing.expectEqual(std.meta.Tag(GeneratedGqaScorePreworkDecision).required_tiled64_rejected, std.meta.activeTag(generatedGqaScorePreworkDecisionFor(request, .explicit, .required_tiled64, 12, 1)));
+    request.block_count = 16;
+    request.head_dim = 512;
+    request.sliding_window = 0;
+    request.key_row_bytes = 2048;
+    request.base_key_row_bytes = 2048;
+    request.value_row_bytes = 2048;
+    const global = generatedGqaScorePreworkSelectionWithConsumerFor(request, .explicit, .required_tiled64, 12, 1) orelse return error.MissingScorePreworkSelection;
+    try std.testing.expectEqual(GeneratedGqaScorePreworkConsumer.tiled64, global.consumer);
+    request.value_format = 0;
+    try std.testing.expectEqual(std.meta.Tag(GeneratedGqaScorePreworkDecision).required_tiled64_rejected, std.meta.activeTag(generatedGqaScorePreworkDecisionFor(request, .explicit, .required_tiled64, 12, 1)));
+}
+
 test "generated CUDA score prework consumer telemetry is bounded by event consumer and head dim" {
     var word = std.atomic.Value(u64).init(0);
     try std.testing.expect(claimGeneratedGqaScorePreworkConsumerLog(&word, .active, .tiled64, 256));
@@ -21811,6 +22337,12 @@ test "E4B Flash selector checks two-head strides and long-context bounds" {
         .base = .{ .batch = 1, .q_seq_len = 2048, .kv_seq_len = 32768, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .mask_len = 0, .bias_mode = 0, .key_row_bytes = 2048, .base_key_row_bytes = 2048, .value_row_bytes = 2048, .block_count = 2048, .page_size_tokens = 16, .format = 2, .value_format = 2, .physical_token_capacity = 32768, .block_table_present = true, .decode_scalars_present = false },
     };
     try std.testing.expect(gqaFlashPrefillEligibility(request) == .eligible);
+    request.compute_major = 12;
+    request.compute_minor = 1;
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .eligible);
+    request.compute_minor = 0;
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .compute_capability_ineligible);
+    request.compute_minor = 1;
     // The old one-KV-head exact/warp entry points must still reject E4B.
     try std.testing.expect(gqaF16PrefillEligibility(request.base) == .shape_ineligible);
     request.base.value_row_bytes = 1024;
@@ -21828,6 +22360,16 @@ test "E4B Flash selector checks two-head strides and long-context bounds" {
     request.query_position_offset = 24575;
     request.base.q_seq_len = 8193;
     try std.testing.expect(gqaFlashPrefillEligibility(request) == .query_length_policy_ineligible);
+}
+
+test "E4B Flash prefill target gate keeps GB10 qualification narrow" {
+    try std.testing.expect(gqaFlashPrefillTargetSupported(8, 9, 1));
+    try std.testing.expect(gqaFlashPrefillTargetSupported(8, 9, 2));
+    try std.testing.expect(gqaFlashPrefillTargetSupported(12, 1, 2));
+    try std.testing.expect(!gqaFlashPrefillTargetSupported(12, 1, 1));
+    try std.testing.expect(!gqaFlashPrefillTargetSupported(12, 0, 2));
+    try std.testing.expect(!gqaFlashPrefillTargetSupported(8, 0, 2));
+    try std.testing.expect(!gqaFlashPrefillTargetSupported(9, 0, 2));
 }
 
 test "E4B Flash warp decode selection preserves compressed and E2B routes" {
@@ -22195,4 +22737,71 @@ test "CUDA immutable packed special leaves preserve integer oracle bounds and ca
             try std.testing.expectEqualDeep(before, ctx.device_allocations.snapshot());
         }
     }
+}
+
+test "CUDA split cross validates complete static plan and output ranges before SDK borrowing" {
+    try std.testing.expectEqual(@as(usize, 2 * 3 * 2 * 2 * 66), try KernelModule.crossSplitHd64WorkspaceElements(2, 3, 129, 2));
+    try std.testing.expectEqual(@as(usize, 66), try KernelModule.crossSplitHd64WorkspaceElements(1, 1, 128, 1));
+    try std.testing.expectError(error.InvalidCudaState, KernelModule.crossSplitHd64WorkspaceElements(1, 0, 1, 1));
+    try std.testing.expectError(error.InvalidCudaState, KernelModule.crossSplitHd64WorkspaceElements(std.math.maxInt(usize), 2, 1, 1));
+    try std.testing.expectError(error.InvalidCudaState, KernelModule.crossSplitHd64WorkspaceElements(1, 1, 65535 * 128 + 1, 1));
+    var module = KernelModule{ .cross_split_hd64_f16 = @ptrFromInt(8), .cross_split_hd64_merge_f32 = @ptrFromInt(16) };
+    var ctx: context_mod.CudaContext = undefined;
+    const out = buffer_mod.DeviceBuffer{ .ptr = 0x10000, .len = 256 };
+    const q = buffer_mod.DeviceBuffer{ .ptr = 0x20000, .len = 256 };
+    const k = buffer_mod.DeviceBuffer{ .ptr = 0x30000, .len = 128 };
+    const v = buffer_mod.DeviceBuffer{ .ptr = 0x40000, .len = 128 };
+    const scratch = buffer_mod.DeviceBuffer{ .ptr = 0x50000, .len = 264 };
+    try std.testing.expectError(error.InvalidCudaState, module.launchCrossSplitHd64(&ctx, .bf16, out, q, k, v, .{}, scratch, 1, 1, 1, 1));
+    try std.testing.expectError(error.InvalidCudaState, module.launchCrossSplitHd64(&ctx, .f16, out, q, .{ .ptr = k.ptr, .len = 127 }, v, .{}, scratch, 1, 1, 1, 1));
+    try std.testing.expectError(error.InvalidCudaState, module.launchCrossSplitHd64(&ctx, .f16, out, q, k, v, .{}, .{ .ptr = out.ptr, .len = 264 }, 1, 1, 1, 1));
+    try std.testing.expectError(error.InvalidCudaState, module.launchCrossSplitHd64(&ctx, .f16, out, q, k, v, .{}, .{ .ptr = scratch.ptr, .len = 263 }, 1, 1, 1, 1));
+    try std.testing.expectError(error.InvalidCudaState, module.launchCrossSplitHd64(&ctx, .f16, out, q, k, v, .{ .ptr = 3, .len = 8 }, scratch, 1, 1, 1, 1));
+}
+
+test "CUDA F16 rowpair validates vector alignment ranges and supplied QKV overlap before SDK borrowing" {
+    var module = KernelModule{ .linear_f16_rowpair_f32 = @ptrFromInt(8), .linear_f16_rowpair_gelu_f32 = @ptrFromInt(16), .linear_f16_rowpair_qkv_f32 = @ptrFromInt(24), .add_bias_gelu_rows_f32 = @ptrFromInt(32) };
+    var ctx: context_mod.CudaContext = undefined;
+    const out = buffer_mod.DeviceBuffer{ .ptr = 0x10000, .len = 9 * 4 };
+    const source = buffer_mod.DeviceBuffer{ .ptr = 0x20000, .len = 8 * 4 };
+    const weight = buffer_mod.DeviceBuffer{ .ptr = 0x30000, .len = 9 * 8 * 2 };
+    try std.testing.expectError(error.InvalidCudaState, module.launchLinearF16RowPair(&ctx, .identity, out, source, weight, .{}, 0, 9));
+    try std.testing.expectError(error.InvalidCudaState, module.launchLinearF16RowPair(&ctx, .identity, out, source, .{ .ptr = weight.ptr + 2, .len = weight.len }, .{}, 8, 9));
+    try std.testing.expectError(error.InvalidCudaState, module.launchLinearF16RowPair(&ctx, .gelu, out, source, .{ .ptr = weight.ptr, .len = weight.len - 1 }, .{}, 8, 9));
+    try std.testing.expectError(error.InvalidCudaState, module.launchLinearF16RowPair(&ctx, .identity, .{ .ptr = source.ptr, .len = out.len }, source, weight, .{}, 8, 9));
+    try std.testing.expectError(error.InvalidCudaState, module.launchLinearF16RowPairQkv(&ctx, .{ out, out, out }, source, .{ weight, weight, weight }, .{ .{}, .{}, .{} }, 8, 9, 9));
+    try std.testing.expectError(error.InvalidCudaState, module.launchAddBiasGeluRowsF32(&ctx, out, out, 1, 9));
+}
+
+test "CUDA residual norm two-output alias and invalid metadata refuse before SDK borrowing" {
+    var module = KernelModule{ .add_layer_norm_sum_f32 = @ptrFromInt(8) };
+    var ctx: context_mod.CudaContext = undefined;
+    const output = buffer_mod.DeviceBuffer{ .ptr = 0x10000, .len = 256 };
+    const sum = buffer_mod.DeviceBuffer{ .ptr = 0x20000, .len = 256 };
+    const first = buffer_mod.DeviceBuffer{ .ptr = 0x30000, .len = 256 };
+    const second = buffer_mod.DeviceBuffer{ .ptr = 0x40000, .len = 256 };
+    const gamma = buffer_mod.DeviceBuffer{ .ptr = 0x50000, .len = 256 };
+    const beta = buffer_mod.DeviceBuffer{ .ptr = 0x60000, .len = 256 };
+    try std.testing.expectError(error.InvalidCudaState, module.launchAddLayerNormSumF32(&ctx, output, output, first, second, gamma, beta, 1, 64, 1e-5));
+    try std.testing.expectError(error.InvalidCudaState, module.launchAddLayerNormSumF32(&ctx, first, sum, first, second, gamma, beta, 1, 64, 1e-5));
+    try std.testing.expectError(error.InvalidCudaState, module.launchAddLayerNormSumF32(&ctx, output, sum, first, second, gamma, beta, 0, 64, 1e-5));
+    try std.testing.expectError(error.InvalidCudaState, module.launchAddLayerNormSumF32(&ctx, output, sum, first, second, gamma, beta, 1, 64, std.math.nan(f32)));
+    try std.testing.expectError(error.InvalidCudaState, module.launchAddLayerNormSumF32(&ctx, output, sum, first, second, .{ .ptr = gamma.ptr, .len = 255 }, beta, 1, 64, 1e-5));
+}
+
+test "CUDA Tile im2col extern ABI plan and whole batch ranges validate before SDK borrowing" {
+    const plan = try KernelModule.planIm2col(2, 2, 4, 3, 2, 1);
+    try std.testing.expectEqual(@as(usize, 2), plan.output_time);
+    try std.testing.expectEqual(@as(usize, 24), plan.output_elements);
+    try std.testing.expectEqual(@as(usize, 12), @sizeOf(KernelModule.Im2colParams));
+    try std.testing.expectError(error.InvalidCudaState, KernelModule.planIm2col(std.math.maxInt(usize), 2, 4, 3, 2, 1));
+    try std.testing.expectError(error.InvalidCudaState, KernelModule.planIm2col(1, 2, std.math.maxInt(i32), 3, 2, 1));
+    var module = KernelModule{ .im2col_nct_k3_s2_p1_f32 = @ptrFromInt(8) };
+    var ctx: context_mod.CudaContext = undefined;
+    const input = buffer_mod.DeviceBuffer{ .ptr = 0x10000, .len = 64 };
+    const output = buffer_mod.DeviceBuffer{ .ptr = 0x20000, .len = 96 };
+    try std.testing.expectError(error.InvalidCudaState, module.launchConv1dIm2col(&ctx, output, .{ .ptr = input.ptr, .len = 63 }, 2, 2, 4, 3, 2, 1, false));
+    try std.testing.expectError(error.InvalidCudaState, module.launchConv1dIm2col(&ctx, .{ .ptr = input.ptr, .len = 96 }, input, 2, 2, 4, 3, 2, 1, false));
+    try std.testing.expectError(error.InvalidCudaState, module.launchConv1dIm2col(&ctx, output, .{ .ptr = std.math.maxInt(driver_mod.CUdeviceptr) - 3, .len = 64 }, 2, 2, 4, 3, 2, 1, false));
+    try std.testing.expectError(error.CudaKernelUnavailable, module.launchConv1dIm2col(&ctx, output, input, 2, 2, 4, 5, 2, 1, false));
 }

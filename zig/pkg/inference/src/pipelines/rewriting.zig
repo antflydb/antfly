@@ -240,6 +240,19 @@ fn testRewriteScheduling(io: std.Io, wait_us: u64, inline_only: bool) !void {
             try std.testing.expectEqualSlices(i32, &.{ 0, 2 }, ids);
             return allocator.dupe(u8, "rewritten");
         }
+        fn encoderInputs(_: *anyopaque) []const backends.TensorInfo {
+            return &.{
+                .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, -1 } },
+                .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ -1, -1 } },
+            };
+        }
+        fn decoderInputs(_: *anyopaque) []const backends.TensorInfo {
+            return &.{
+                .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, -1 } },
+                .{ .name = "encoder_attention_mask", .dtype = .i64, .shape = &.{ -1, -1 } },
+                .{ .name = "encoder_hidden_states", .dtype = .f32, .shape = &.{ -1, -1, 1 } },
+            };
+        }
         fn info(_: *anyopaque) []const backends.TensorInfo {
             return &.{.{ .name = "hidden", .dtype = .f32, .shape = &.{ -1, -1, -1 } }};
         }
@@ -289,10 +302,11 @@ fn testRewriteScheduling(io: std.Io, wait_us: u64, inline_only: bool) !void {
     };
     var probe = Probe{ .broker = micro.Broker.init(std.testing.allocator), .io = io, .wait_us = wait_us };
     defer probe.broker.deinit();
-    const session = backends.Session{ .ptr = &probe, .vtable = &.{ .run = Probe.forward, .runWithControl = Probe.controlled, .inputInfo = Probe.info, .outputInfo = Probe.info, .backend = Probe.backend, .close = Probe.close, .independentBatchRows = Probe.independent } };
+    const session = backends.Session{ .ptr = &probe, .vtable = &.{ .run = Probe.forward, .runWithControl = Probe.controlled, .inputInfo = Probe.encoderInputs, .outputInfo = Probe.info, .backend = Probe.backend, .close = Probe.close, .independentBatchRows = Probe.independent } };
+    const decoder = backends.Session{ .ptr = &probe, .vtable = &.{ .run = Probe.forward, .runWithControl = Probe.controlled, .inputInfo = Probe.decoderInputs, .outputInfo = Probe.info, .backend = Probe.backend, .close = Probe.close, .independentBatchRows = Probe.independent } };
     var pipeline = RewritingPipeline{
         .allocator = std.testing.allocator,
-        .enc_dec = .{ .allocator = std.testing.allocator, .encoder = session, .decoder = session, .config = .{ .vocab_size = 4, .max_length = 4, .decoder_start_token_id = 0, .eos_token_id = 1 }, .batch_dispatch = .{ .ptr = &probe, .task = .rewrite, .run_fn = Probe.dispatch } },
+        .enc_dec = .{ .allocator = std.testing.allocator, .encoder = session, .decoder = decoder, .config = .{ .vocab_size = 4, .max_length = 4, .decoder_start_token_id = 0, .eos_token_id = 1 }, .batch_dispatch = .{ .ptr = &probe, .task = .rewrite, .run_fn = Probe.dispatch } },
         .tokenizer = .{ .ptr = &probe, .vtable = &.{ .encode = Probe.encode, .decode = Probe.decode, .encodeInto = undefined, .encodeForModel = undefined, .encodeGeneration = undefined, .specialTokens = undefined, .vocabSize = undefined, .deinit = undefined } },
         .config = .{ .max_length = 4 },
     };
@@ -329,7 +343,9 @@ fn testRewriteScheduling(io: std.Io, wait_us: u64, inline_only: bool) !void {
         .check_live_memory = false,
     };
     pipeline.enc_dec.encoder = bounded;
-    pipeline.enc_dec.decoder = bounded;
+    var bounded_decoder = decoder;
+    bounded_decoder.run_admission = bounded.run_admission;
+    pipeline.enc_dec.decoder = bounded_decoder;
     probe.calls = 0;
     probe.stage_rows = 0;
     probe.largest = 0;
@@ -347,7 +363,8 @@ fn testRewriteScheduling(io: std.Io, wait_us: u64, inline_only: bool) !void {
     bounded.run_admission.?.limits.host_limit_bytes = 3 * 1024 * 1024;
     bounded.run_admission.?.static_workspace_bytes = 1024 * 1024;
     pipeline.enc_dec.encoder = bounded;
-    pipeline.enc_dec.decoder = bounded;
+    bounded_decoder.run_admission = bounded.run_admission;
+    pipeline.enc_dec.decoder = bounded_decoder;
     try std.testing.expect(try pipeline.enc_dec.fitsWindow(8, 2, 4096));
     probe.calls = 0;
     probe.stage_rows = 0;

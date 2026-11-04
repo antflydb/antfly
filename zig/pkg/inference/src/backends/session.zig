@@ -405,7 +405,13 @@ pub const RunAdmission = struct {
         kv_width: usize = 0,
     };
 
+    pub const DenialObserver = struct {
+        context: *anyopaque,
+        record: *const fn (*anyopaque, anyerror, ?memory.AdmissionPressure, memory.AdmissionRequest) void,
+    };
+
     controller: *memory.AdmissionController,
+    denial_observer: ?DenialObserver = null,
     backend_class: memory.BackendClass,
     limits: memory.Limits,
     /// Preserve explicit caller envelopes unless the producer identifies a
@@ -450,16 +456,50 @@ pub const RunAdmission = struct {
         self: RunAdmission,
         amounts: memory.AdmissionAmounts,
     ) !memory.AdmissionLease {
+        var pressure: ?memory.AdmissionPressure = null;
+        return self.acquireAmountsWithPressure(amounts, &pressure);
+    }
+
+    fn acquireAmountsWithPressure(self: RunAdmission, amounts: memory.AdmissionAmounts, pressure: *?memory.AdmissionPressure) !memory.AdmissionLease {
+        pressure.* = null;
         if (self.controller.consumeForcedRunDenialForTesting()) {
             std.log.warn("test-only forced inference run admission denial", .{});
             return error.ResourceTemporarilyUnavailable;
         }
-        return self.controller.tryAcquire(
+        return self.controller.tryAcquireWithPressure(
             self.backend_class,
             self.limits,
             amounts,
             self.check_live_memory,
-        );
+            pressure,
+        ) catch |err| {
+            // Controller locks are released before inspecting OS memory or
+            // emitting diagnostics. Sessions share the manager's sampler gate.
+            if (self.denial_observer) |observer| observer.record(observer.context, err, pressure.*, .{
+                .backend_class = self.backend_class,
+                .limits = self.limits,
+                .amounts = amounts,
+            });
+            return err;
+        };
+    }
+
+    /// Validate all host scratch already owned by one request before acquiring
+    /// a delta. Independent leases must not hide its intrinsic policy limit.
+    pub fn validateOwnedHostScratch(self: RunAdmission, bytes: usize) !void {
+        const amounts = memory.AdmissionAmounts{ .host_scratch_bytes = bytes };
+        const shared = self.controller.sharedLimitsSnapshot();
+        if ((amounts.firstLimitExceeded(self.limits) catch return error.ResourceLimitExceeded) != null or
+            (shared.host_limit_bytes != 0 and bytes > shared.host_limit_bytes) or
+            (shared.unified_limit_bytes != 0 and bytes > shared.unified_limit_bytes))
+        {
+            if (self.denial_observer) |observer| observer.record(observer.context, error.ResourceLimitExceeded, null, .{
+                .backend_class = self.backend_class,
+                .limits = self.limits,
+                .amounts = amounts,
+            });
+            return error.ResourceLimitExceeded;
+        }
     }
 
     fn estimateResidentAmounts(
@@ -1730,7 +1770,6 @@ pub const Session = struct {
         }
         var physical_credit = memory.AdmissionAmounts{};
         const lease = if (self.run_admission) |admission| blk: {
-            if (admission.controller.consumeForcedRunDenialForTesting()) return error.ResourceTemporarilyUnavailable;
             const plan = try admission.planRequest(request, self.outputInfo());
             var required = plan.required;
             if (permit.prepared) |*prepared| {
@@ -1757,7 +1796,7 @@ pub const Session = struct {
                 physical_credit = .{ .host_scratch_bytes = fresh.host_scratch_bytes, .backend_scratch_bytes = fresh.backend_scratch_bytes };
                 required = try base.merge(fresh);
             }
-            break :blk admission.controller.tryAcquire(admission.backend_class, admission.limits, required, admission.check_live_memory) catch |err| retry: {
+            break :blk admission.acquireAmounts(required) catch |err| retry: {
                 if (err != error.ResourceTemporarilyUnavailable) return err;
                 const prepared = if (permit.prepared) |*value| value else return err;
                 const reclaimed = if (ready_guard != null)
@@ -1770,7 +1809,7 @@ pub const Session = struct {
                     return err;
                 if (!reclaimed) return err;
                 if (control) |active| try active.check();
-                break :retry try admission.controller.tryAcquire(admission.backend_class, admission.limits, required, admission.check_live_memory);
+                break :retry try admission.acquireAmounts(required);
             };
         } else null;
         permit.request = request;
@@ -1911,8 +1950,7 @@ pub const Session = struct {
         const extra = try self.supplementPairDeficit(base, other, target);
         const admission = self.run_admission orelse return self.retainPermit(.{ .session = self, .lease = null });
         if (std.meta.eql(extra, memory.AdmissionAmounts{})) return self.retainPermit(.{ .session = self, .lease = null });
-        if (admission.controller.consumeForcedRunDenialForTesting()) return error.ResourceTemporarilyUnavailable;
-        return self.retainPermit(.{ .session = self, .lease = try admission.controller.tryAcquireWithPressure(admission.backend_class, admission.limits, extra, admission.check_live_memory, pressure) });
+        return self.retainPermit(.{ .session = self, .lease = try admission.acquireAmountsWithPressure(extra, pressure) });
     }
 
     /// Preserve the exact denial constraint for bounded batch planning. A
@@ -1923,8 +1961,7 @@ pub const Session = struct {
             .session = self,
             .request = request,
             .lease = if (self.run_admission) |admission| blk: {
-                if (admission.controller.consumeForcedRunDenialForTesting()) return error.ResourceTemporarilyUnavailable;
-                break :blk try admission.controller.tryAcquireWithPressure(admission.backend_class, admission.limits, try admission.estimateRequest(request, self.outputInfo()), admission.check_live_memory, pressure);
+                break :blk try admission.acquireAmountsWithPressure(try admission.estimateRequest(request, self.outputInfo()), pressure);
             } else null,
         });
     }
@@ -2074,8 +2111,7 @@ pub const Session = struct {
         return self.retainPermit(.{
             .session = self,
             .lease = if (self.run_admission) |admission| blk: {
-                if (admission.controller.consumeForcedRunDenialForTesting()) return error.ResourceTemporarilyUnavailable;
-                break :blk try admission.controller.tryAcquireWithPressure(admission.backend_class, admission.limits, .{ .host_scratch_bytes = host_scratch_bytes }, admission.check_live_memory, pressure);
+                break :blk try admission.acquireAmountsWithPressure(.{ .host_scratch_bytes = host_scratch_bytes }, pressure);
             } else null,
         });
     }
@@ -2521,12 +2557,14 @@ pub const PreparedSource = struct {
     control: ?InferenceExecutionControl = null,
     scheduling_session: ?Session = null,
     permit: ?RunPermit = null,
+    shape_scope: ?@import("admitted_allocator.zig").AdmittedAllocator.RunScope = null,
     cleanup: Owner = .{},
     waiter: Waiter = .{},
     source_model: ?*Session.ModelLifetime = null,
     scheduling_model: ?*Session.ModelLifetime = null,
     phase: Phase = .empty,
     executed: bool = false,
+    synchronous_consumers: usize = 0,
 
     pub fn initBeforeExecutionInto(self: *PreparedSource, source: Session, fallback_scheduling: Session, fallback_gate: ?*std.atomic.Mutex, inputs: invocation.Inputs, declared: RunRequest, supplied_preprocess: ?*RunPermit, placement: Placement, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !void {
         if (self.phase != .empty) return error.SourceInvocationAlreadyInitialized;
@@ -2588,6 +2626,141 @@ pub const PreparedSource = struct {
         self.phase = .ready;
     }
 
+    /// Shape reservation precedes caller input materialization. This retains
+    /// the caller's compact geometry and explicit output/workspace envelope;
+    /// binding actual inputs selects an execution without reinterpreting it.
+    pub fn initShapesBeforeExecutionInto(self: *PreparedSource, source: Session, fallback_scheduling: Session, fallback_gate: ?*std.atomic.Mutex, shapes: ShapeInputs, request: RunRequest, workspace: ?*@import("admitted_allocator.zig").AdmittedAllocator, placement: Placement, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !void {
+        if (self.phase != .empty) return error.SourceInvocationAlreadyInitialized;
+        self.allocator = allocator;
+        self.control = control;
+        const scheduling = if (source.execution_gate != null) source else fallback_scheduling;
+        self.scheduling_session = scheduling;
+        self.phase = .preparing;
+        self.source_model = if (source.model_lifetime) |model| model.retain() else null;
+        if (scheduling.model_lifetime) |model| if (model != self.source_model) {
+            self.scheduling_model = model.retain();
+        };
+        errdefer self.deinit();
+        self.cleanup = if (placement == .resident_consumer or source.preparesInvocation()) try Owner.beginResident(source) else try Owner.beginAdmitted(source);
+        try scheduling.selectReadyCohort(source.execution_gate orelse fallback_gate, control orelse .{}, &self.waiter);
+        if (workspace) |owner| {
+            const actual = owner.session orelse return error.InvalidSourceWorkspace;
+            if (actual.ptr != source.ptr or actual.vtable != source.vtable or source.preparesInvocation()) return error.InvalidSourceWorkspace;
+            // Resolve the selected numerical geometry BEFORE the allocator
+            // lends this lease and BEFORE any model/provider lane is acquired.
+            // Output shapes/metadata are real protected bytes, not just the
+            // payload estimate. Keep every explicit adapter envelope/floor.
+            var planned = request;
+            try source.resolveRunGeometry(shapes, &planned);
+            planned.sequence = @max(planned.sequence, request.sequence);
+            planned.workspace_bytes = @max(planned.workspace_bytes, request.workspace_bytes);
+            if (request.output_bytes) |bytes| planned.output_bytes = @max(planned.output_bytes orelse 0, bytes);
+            planned.output_kv_bytes = @max(planned.output_kv_bytes, request.output_kv_bytes);
+            self.shape_scope = try owner.admitRun(planned);
+        } else {
+            self.shape_scope = .{ .permit = try source.admitShapeRequestBeforeExecution(shapes, request, allocator, control) };
+        }
+    }
+
+    pub fn bindInputsBeforeExecution(self: *PreparedSource, inputs: invocation.Inputs, placement: Placement) !void {
+        if (self.phase != .preparing or self.shape_scope == null) return error.SourceInvocationNotPreparing;
+        const initial = &self.shape_scope.?.permit;
+        if (initial.session.preparesInvocation()) {
+            _ = try initial.yieldExecution();
+            self.permit = try initial.acquireExecutionInputsBeforeExecution(inputs, self.allocator, self.control);
+        }
+        const selected = self.selectedPermit();
+        if (placement == .resident_consumer) try selected.prepareResidentOutputRetirement();
+        try selected.preparePhysicalStorage(self.allocator);
+        if (self.epoch()) |b| try selected.bindPhysicalCleanupEpoch(b);
+        self.phase = .ready;
+    }
+
+    /// Borrowed only through this final-address owner's lifetime. The source
+    /// owner remains responsible for retiring execution and funding after unlock.
+    fn selectedPermit(self: *PreparedSource) *RunPermit {
+        if (self.permit) |*value| return value;
+        return &self.shape_scope.?.permit;
+    }
+
+    /// Borrow a single invocation dispatch. The task may select resident or
+    /// same-result host fallback within it, but cannot start a second encoder.
+    pub fn beginExecutionDispatch(self: *PreparedSource) !*RunPermit {
+        if (self.phase != .executing or self.executed) return error.SourceInvocationAlreadyExecuted;
+        self.executed = true;
+        return self.selectedPermit();
+    }
+
+    fn usesPrepaidWorkspace(self: *const PreparedSource) bool {
+        return if (self.shape_scope) |scope| scope.owner != null else false;
+    }
+
+    /// Synchronous consumer ownership. Prepaid Native funding remains solely
+    /// in this source's RunScope and is never published as an owned output.
+    /// Every consumer must close before source deinit/allocator adoption.
+    pub const SynchronousResident = struct {
+        outputs: ResidentOutputs,
+        source: ?*PreparedSource,
+        live: bool = true,
+
+        pub fn close(self: *@This(), current: @import("../execution/cleanup_context.zig").Context) void {
+            if (!self.live) return;
+            self.outputs.deinitWithCleanup(current);
+            self.live = false;
+            if (self.source) |source| {
+                std.debug.assert(source.synchronous_consumers != 0);
+                source.synchronous_consumers -= 1;
+            }
+            self.source = null;
+        }
+    };
+
+    /// LAST infallible move follows all owner/funding validation. The original
+    /// lease remains untouched on refusal and output ownership never duplicates.
+    pub fn adoptSynchronousResident(self: *PreparedSource, outputs: *?ResidentOutputs) !SynchronousResident {
+        if (self.phase != .executing or !self.executed) return error.SourceInvocationNotExecuted;
+        const value = if (outputs.*) |*actual| actual else return error.MissingSourceOutputs;
+        if (self.usesPrepaidWorkspace()) {
+            if (comptime !@import("build_options").enable_native) return error.InvalidSourceWorkspace;
+            if (value.backend.vtable != &@import("../ops/native_compute.zig").vtable_impl or value.backend.operationToken() != null) return error.InvalidSourceWorkspace;
+            if (self.selectedPermit().lease == null or value.resource_lease != null) return error.InvalidSourceWorkspace;
+            const model = self.source_model orelse return error.MissingSourceModelLifetime;
+            if (value.model_retention != model) return error.ResidentOutputsOwnerChanged;
+        } else {
+            try self.selectedPermit().attachResidentOutputs(value);
+        }
+        const moved = value.*;
+        outputs.* = null;
+        self.synchronous_consumers += 1;
+        return .{ .outputs = moved, .source = self };
+    }
+
+    pub fn attachSynchronousHost(self: *PreparedSource, outputs: []Tensor) ![]Tensor {
+        if (self.phase != .released or !self.executed) return error.SourceInvocationNotExecuted;
+        if (self.usesPrepaidWorkspace()) return outputs;
+        return self.selectedPermit().attachHostOutputs(outputs, self.allocator);
+    }
+
+    /// End prepared/physical input bindings before the caller destroys its
+    /// inputs, including bind/retirement preparation/enter cancellation errors.
+    /// Retire no source funding here: leases remain with the source until its
+    /// final consumer/allocator adoption after numerical unlock.
+    pub fn finishInputLifetime(self: *PreparedSource) void {
+        switch (self.phase) {
+            .preparing, .ready, .executing => self.finishSourceNumerical(),
+            else => {},
+        }
+    }
+
+    pub fn leaveExecution(self: *PreparedSource) void {
+        if (self.phase == .executing) self.finishSourceNumerical();
+    }
+
+    pub fn releaseForConsumer(self: *PreparedSource) !void {
+        if (self.phase != .executing) return error.SourceInvocationNotExecuting;
+        self.finishSourceNumerical();
+    }
+
     pub fn epoch(self: *const PreparedSource) ?*const @import("../execution/retirement_sink.zig").Epoch {
         return self.cleanup.epoch();
     }
@@ -2600,18 +2773,22 @@ pub const PreparedSource = struct {
 
     pub fn runResident(self: *PreparedSource, inputs: invocation.Inputs) !?ResidentOutputs {
         if (self.phase != .executing or self.executed) return error.SourceInvocationAlreadyExecuted;
+        // A prepaid allocator still owns the exact execution lease. Its raw
+        // host route preserves that owner; resident lease transfer needs a
+        // separately partitioned output reservation before dispatch.
+        if (self.shape_scope) |scope| if (scope.owner != null) return null;
         // An error may follow committed numerical work. Only an explicit
         // pre-numerical null permits the same source's host dispatch.
         self.executed = true;
         var outputs = (try switch (inputs) {
-            .host => |host| self.permit.?.runResidentWithControl(host, self.allocator, self.control),
-            .resident => |resident| self.permit.?.runResidentInputsWithControl(resident, self.allocator, self.control),
+            .host => |host| self.selectedPermit().runResidentWithControl(host, self.allocator, self.control),
+            .resident => |resident| self.selectedPermit().runResidentInputsWithControl(resident, self.allocator, self.control),
         }) orelse {
             self.executed = false;
             return null;
         };
         errdefer outputs.deinitWithBoundary(self.epoch());
-        try self.permit.?.attachResidentOutputs(&outputs);
+        try self.selectedPermit().attachResidentOutputs(&outputs);
         return outputs;
     }
 
@@ -2638,17 +2815,19 @@ pub const PreparedSource = struct {
     pub fn runHost(self: *PreparedSource, inputs: []const Tensor) ![]Tensor {
         if (self.phase != .executing or self.executed) return error.SourceInvocationAlreadyExecuted;
         self.executed = true;
-        var outputs = try self.permit.?.runWithControl(inputs, self.allocator, self.control);
+        var outputs = try self.selectedPermit().runWithControl(inputs, self.allocator, self.control);
         errdefer deinitTensorSlice(outputs, self.allocator);
         self.finishSourceNumerical();
-        outputs = try self.permit.?.attachHostOutputs(outputs, self.allocator);
-        self.permit.?.deinitWithCleanup(.{ .boundary = self.epoch() });
+        if (self.shape_scope) |scope| if (scope.owner != null) return outputs;
+        outputs = try self.selectedPermit().attachHostOutputs(outputs, self.allocator);
+        self.selectedPermit().deinitWithCleanup(.{ .boundary = self.epoch() });
         return outputs;
     }
 
     fn finishSourceNumerical(self: *PreparedSource) void {
         const current = @import("../execution/cleanup_context.zig").Context{ .boundary = self.epoch() };
         if (self.permit) |*permit| permit.retireExecutionWithCleanup(current);
+        if (self.shape_scope) |*scope| scope.permit.retireExecutionWithCleanup(current);
         const scheduling = self.scheduling_session orelse return;
         scheduling.releaseSelectedCohortGate(&self.waiter);
         scheduling.leaveSelectedCohort(&self.waiter);
@@ -2657,8 +2836,11 @@ pub const PreparedSource = struct {
 
     pub fn deinit(self: *PreparedSource) void {
         if (self.phase == .empty or self.phase == .closed) return;
+        if (self.synchronous_consumers != 0)
+            @import("antfly_platform").inference_process_supervisor.restartWorker();
         const b = self.epoch();
         if (self.permit) |*permit| permit.retireExecutionWithCleanup(.{ .boundary = b });
+        if (self.shape_scope) |*scope| scope.permit.retireExecutionWithCleanup(.{ .boundary = b });
         if (self.scheduling_session) |scheduling| {
             scheduling.releaseSelectedCohortGate(&self.waiter);
             scheduling.leaveSelectedCohort(&self.waiter);
@@ -2666,6 +2848,8 @@ pub const PreparedSource = struct {
         // All numerical/provider ownership has ended before external callbacks.
         if (self.permit) |*permit| permit.deinitWithCleanup(.{ .boundary = b });
         self.permit = null;
+        if (self.shape_scope) |*scope| scope.deinitWithCleanup(.{ .boundary = b });
+        self.shape_scope = null;
         if (self.scheduling_model) |model| {
             if (b != null) model.releaseWithBoundary(b) else model.release();
         }
@@ -2967,6 +3151,11 @@ pub const RunPermit = struct {
         if (request.output_bytes) |bytes| {
             if (bytes >= plan.output_bytes.? and request.output_kv_bytes >= plan.output_kv_bytes and request.workspace_bytes >= plan.workspace_bytes and request.sequence >= plan.sequence) return;
         }
+        // Managed entry bound B only after its actual cold preparation.
+        // New geometry cannot retire/re-admit through an empty cleanup context
+        // or call a supplier while its model/provider lane is held. The owner
+        // must perform another explicit outside-execution preparation instead.
+        if (self.dispatch_cleanup_epoch != null) return error.PreparedAdmissionRequiresReadyTurn;
         if (!self.execution_yielded) _ = try self.yieldExecution();
         self.request.?.output_bytes = @max(request.output_bytes orelse 0, plan.output_bytes.?);
         self.request.?.output_kv_bytes = @max(request.output_kv_bytes, plan.output_kv_bytes);
@@ -6073,7 +6262,7 @@ test "prepared source cancellation before producer releases exact selected FIFO 
     gate.unlock();
 }
 
-fn preparedNativeSourceAllocationCase(injected: std.mem.Allocator, supplied: bool) !void {
+fn preparedNativeSourceAllocationCase(injected: std.mem.Allocator, supplied: bool, two_phase: bool, cancel_after_bind: bool) !void {
     const a = std.testing.allocator;
     const ml = @import("ml");
     const imported = @import("imported_onnx_session.zig");
@@ -6123,7 +6312,42 @@ fn preparedNativeSourceAllocationCase(injected: std.mem.Allocator, supplied: boo
         std.testing.expect(gate.tryLock()) catch @panic("prepared source gate leak");
         gate.unlock();
     }
-    try prepared.initBeforeExecutionInto(source, source, &gate, .{ .host = &.{input} }, .{ .batch = 1, .sequence = 2, .input_bytes = 8 }, if (preprocessing) |*permit| permit else null, .host, injected, null);
+    const Cancellation = struct {
+        cancelled: bool = false,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancelled) return error.Cancelled;
+        }
+    };
+    var cancellation = Cancellation{};
+    const control: InferenceExecutionControl = .{ .ptr = &cancellation, .check_fn = Cancellation.check, .native_call_policy = .in_process };
+    // Reproduce the task's order: source shape scope, owned actual inputs,
+    // then an input-bound retirement defer placed BEFORE any fallible bind.
+    var actual_input: ?Tensor = null;
+    defer if (actual_input) |*value| value.deinit();
+    defer prepared.finishInputLifetime();
+    if (two_phase) {
+        try prepared.initShapesBeforeExecutionInto(source, source, &gate, .{ .tensors = &.{input} }, .{ .batch = 1, .sequence = 2, .input_bytes = 8 }, null, .host, injected, control);
+        try std.testing.expect(gate.tryLock());
+        gate.unlock();
+        try std.testing.expectEqual(@as(u64, 0), imported.executionStats(source).?.executions);
+        actual_input = try Tensor.initFloat32(injected, "value", &.{ 1, 2 }, &.{ -2, 3 });
+        try prepared.bindInputsBeforeExecution(.{ .host = &.{actual_input.?} }, .host);
+        try std.testing.expectError(error.SourceInvocationNotPreparing, prepared.bindInputsBeforeExecution(.{ .host = &.{actual_input.?} }, .host));
+        if (cancel_after_bind) {
+            cancellation.cancelled = true;
+            try std.testing.expectError(error.Cancelled, prepared.enter());
+            prepared.finishInputLifetime();
+            try std.testing.expect(prepared.permit.?.prepared == null and prepared.permit.?.physical_storage == null);
+            try std.testing.expect(prepared.shape_scope.?.permit.lease != null);
+            try std.testing.expectEqualSlices(f32, &.{ -2, 3 }, actual_input.?.asFloat32());
+            try std.testing.expectEqual(@as(u64, 0), imported.executionStats(source).?.executions);
+            try std.testing.expect(scheduler.head == null);
+            return;
+        }
+    } else {
+        try prepared.initBeforeExecutionInto(source, source, &gate, .{ .host = &.{input} }, .{ .batch = 1, .sequence = 2, .input_bytes = 8 }, if (preprocessing) |*permit| permit else null, .host, injected, null);
+    }
     if (preprocessing) |permit| {
         try std.testing.expect(permit.execution_yielded);
         try std.testing.expectEqual(@as(usize, 24), permit.lease.?.amounts.host_scratch_bytes);
@@ -6131,7 +6355,7 @@ fn preparedNativeSourceAllocationCase(injected: std.mem.Allocator, supplied: boo
     }
     try std.testing.expect(scheduler.head == &prepared.waiter);
     try prepared.enter();
-    const outputs = try prepared.runHost(&.{input});
+    const outputs = try prepared.runHost(&.{actual_input orelse input});
     defer deinitTensorSlice(outputs, injected);
     try std.testing.expectEqual(@as(usize, 1), outputs.len);
     try std.testing.expectEqualSlices(f32, &.{ 2, 3 }, outputs[0].asFloat32());
@@ -6142,6 +6366,129 @@ fn preparedNativeSourceAllocationCase(injected: std.mem.Allocator, supplied: boo
 
 test "actual Native prepared source host output lifecycle survives all owner allocation failures" {
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, preparedNativeSourceAllocationCase, .{false});
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, preparedNativeSourceAllocationCase, .{true});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, preparedNativeSourceAllocationCase, .{ false, false, false });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, preparedNativeSourceAllocationCase, .{ true, false, false });
+}
+
+test "actual Native two-phase source binds once outside lanes across all allocation failures" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, preparedNativeSourceAllocationCase, .{ false, true, false });
+}
+
+test "actual Native two-phase source cancellation retires ready input binding before owned input destruction" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, preparedNativeSourceAllocationCase, .{ false, true, true });
+}
+
+test "run admission observer preserves session refusal identity outside controller lock" {
+    const Observer = struct {
+        controller: *memory.AdmissionController,
+        calls: usize = 0,
+        failure: ?anyerror = null,
+        pressure: ?memory.AdmissionPressure = null,
+        bytes: usize = 0,
+        fn record(raw: *anyopaque, err: anyerror, pressure: ?memory.AdmissionPressure, request: memory.AdmissionRequest) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.controller.snapshot(); // Must not deadlock on the controller.
+            self.calls += 1;
+            self.failure = err;
+            self.pressure = pressure;
+            self.bytes = request.amounts.host_scratch_bytes;
+        }
+    };
+    var controller: memory.AdmissionController = .{};
+    var observer = Observer{ .controller = &controller };
+    const session = Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{
+        .controller = &controller,
+        .backend_class = .cpu,
+        .limits = .{ .host_limit_bytes = 100 },
+        .static_workspace_bytes = 0,
+        .check_live_memory = false,
+        .denial_observer = .{ .context = &observer, .record = Observer.record },
+    } };
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admitHostPreprocess(101));
+    try std.testing.expectEqual(@as(?anyerror, error.ResourceLimitExceeded), observer.failure);
+    try std.testing.expect(observer.pressure == null);
+    try std.testing.expectEqual(@as(usize, 101), observer.bytes);
+    var held = try session.admitHostPreprocess(80);
+    defer held.deinit();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admitHostPreprocess(30));
+    try std.testing.expectEqual(@as(?anyerror, error.ResourceTemporarilyUnavailable), observer.failure);
+    try std.testing.expect(observer.pressure != null);
+    try std.testing.expectEqual(@as(usize, 2), observer.calls);
+}
+
+test "prepared exact amount admission observer preserves warm credit and both reclaim retry denials" {
+    const Probe = struct {
+        controller: *memory.AdmissionController,
+        model: *Session.ModelLifetime,
+        held: ?memory.AdmissionLease = null,
+        release_on_reclaim: bool = false,
+        observations: usize = 0,
+        reclaims: usize = 0,
+        observed: memory.AdmissionAmounts = .{},
+        pressure: ?memory.AdmissionPressure = null,
+        failure: ?anyerror = null,
+        fn accepts(session: Session) bool {
+            return session.vtable == &DeadlineProbeSession.vtable;
+        }
+        fn prepare(session: Session, _: ShapeInputs, _: std.mem.Allocator, _: ?InferenceExecutionControl) !invocation.PreparedInvocation {
+            const self: *@This() = @ptrCast(@alignCast(session.ptr));
+            return .{ .published = session, .target = self, .root_lifetime = self.model.retain(), .dispatch = unexpected, .reclaim_idle = reclaim, .requirement = .{ .physical = .{ .host_scratch_bytes = 64 }, .warm_credit = .{ .host_scratch_bytes = 16 } } };
+        }
+        fn unexpected(_: *invocation.PreparedInvocation, _: invocation.Inputs, _: invocation.Placement, _: std.mem.Allocator, _: ?InferenceExecutionControl, _: ?@import("../execution/storage_admission.zig").Capability) !invocation.Result {
+            return error.UnexpectedNumericalSubmission;
+        }
+        fn reclaim(prepared: *invocation.PreparedInvocation, _: ?InferenceExecutionControl) !bool {
+            const self: *@This() = @ptrCast(@alignCast(prepared.target));
+            self.reclaims += 1;
+            if (self.release_on_reclaim) {
+                self.held.?.release();
+                self.held = null;
+            }
+            return true;
+        }
+        fn observe(raw: *anyopaque, err: anyerror, pressure: ?memory.AdmissionPressure, request: memory.AdmissionRequest) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observations += 1;
+            self.observed = request.amounts;
+            self.pressure = pressure;
+            if (err != error.ResourceTemporarilyUnavailable) self.failure = error.ChangedAdmissionFailure;
+            // Both original and retry observers run outside accounting/model
+            // ownership; they can inspect the controller and actual gate.
+            _ = self.controller.snapshot();
+            if (!self.model.execution_gate.tryLock()) self.failure = error.ObserverUnderModelGate else self.model.execution_gate.unlock();
+        }
+        const services = invocation.Services{ .accepts = accepts, .prepare = prepare };
+    };
+    inline for (.{ false, true }) |release_on_reclaim| {
+        var controller: memory.AdmissionController = .{};
+        defer controller.deinit();
+        var model: Session.ModelLifetime = .{ .owner = &controller, .destroy_fn = DeadlineProbeSession.close };
+        defer model.release();
+        var warm = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 16 }, false);
+        defer warm.release();
+        var probe = Probe{ .controller = &controller, .model = &model, .release_on_reclaim = release_on_reclaim, .held = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 64 }, false) };
+        defer if (probe.held) |*lease| lease.release();
+        const session = Session{ .ptr = &probe, .vtable = &DeadlineProbeSession.vtable, .invocation_services = &Probe.services, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 128 }, .static_workspace_bytes = 0, .check_live_memory = false, .denial_observer = .{ .context = &probe, .record = Probe.observe } } };
+        const before = controller.snapshot();
+        const request = RunRequest{ .workspace_bytes = 16, .workspace_planned = true, .input_bytes = 0, .backend_input_bytes = 0, .output_bytes = 0 };
+        if (release_on_reclaim) {
+            var permit = try session.admitShapeRequest(.{ .shapes = &.{} }, request, std.testing.allocator, null);
+            defer permit.deinit();
+            try std.testing.expectEqual(@as(usize, 64), permit.lease.?.amounts.host_scratch_bytes);
+            try std.testing.expectEqual(@as(usize, 48), permit.physical_credit.host_scratch_bytes);
+            try std.testing.expectEqual(@as(usize, 16), permit.prepared.?.requirement.warm_credit.host_scratch_bytes);
+            try std.testing.expectEqual(@as(usize, 1), probe.observations);
+        } else {
+            try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admitShapeRequest(.{ .shapes = &.{} }, request, std.testing.allocator, null));
+            try std.testing.expectEqual(@as(usize, 2), probe.observations);
+            try std.testing.expectEqualDeep(before, controller.snapshot());
+        }
+        if (probe.failure) |err| return err;
+        try std.testing.expectEqual(@as(usize, 1), probe.reclaims);
+        try std.testing.expectEqual(@as(usize, 64), probe.observed.host_scratch_bytes);
+        try std.testing.expect(probe.pressure != null);
+        try std.testing.expectEqual(@as(usize, 1), model.references.load(.acquire));
+    }
 }

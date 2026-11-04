@@ -1097,7 +1097,7 @@ test "registry resolves unknown directory entry kinds" {
     );
 }
 
-fn isLegacyTaskDir(name: []const u8) bool {
+pub fn isLegacyTaskDir(name: []const u8) bool {
     return std.mem.eql(u8, name, "embedders") or
         std.mem.eql(u8, name, "chunkers") or
         std.mem.eql(u8, name, "rerankers") or
@@ -1483,7 +1483,10 @@ fn appendManifestTasks(
         .classifier => if (!manifest.laya_declared) try appendUniqueOwnedString(allocator, tasks, "classify"),
         .rewriter => try appendUniqueOwnedString(allocator, tasks, "rewrite"),
         .reader => try appendUniqueOwnedString(allocator, tasks, "read"),
-        .transcriber => try appendUniqueOwnedString(allocator, tasks, "transcribe"),
+        .transcriber => {
+            try appendUniqueOwnedString(allocator, tasks, "transcribe");
+            try appendUniqueOwnedString(allocator, tasks, "read");
+        },
     }
 
     try appendSupplementalTasks(allocator, manifest, tasks, qualified_boundary);

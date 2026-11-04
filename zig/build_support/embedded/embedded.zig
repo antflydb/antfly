@@ -527,6 +527,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi lite standalone snapshots",
         "issue1015",
         "capi SQL",
+        "capi path gate",
         "storage owner runtime status",
         "storage owner remote content source",
         "capi relational expression errors preserve public status semantics",

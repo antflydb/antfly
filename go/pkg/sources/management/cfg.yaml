@@ -1,0 +1,7 @@
+package: management
+generate:
+  models: true
+output-options:
+  skip-prune: true
+  prefer-skip-optional-pointer: true
+  prefer-skip-optional-pointer-with-omitzero: true

@@ -238,6 +238,28 @@ model failures remain separate from the zero added compaction/codec failures.
 Automatic mid-generation compaction, graph execution, extended stress profiles
 and other models/backends require separate qualification.
 
+### KV lifetime across requests
+
+Ordinary generation is stateless across independent requests. Each request owns
+its decode sequence and releases it at completion; without prefix reuse, CUDA
+sequence teardown frees its K/V allocations. Model weights and bounded temporary
+allocation caches can remain resident, so device memory need not return to zero.
+
+Optional prompt-prefix caching retains reusable blocks when a request supplies
+`prompt_cache_key` and the route is eligible. The resident server currently
+disables prefix reuse for streaming generation. The default prefix-cache target
+is 512 MiB with a five-minute idle TTL, shared across participating model caches
+within a Node/ModelManager. It is an estimated-byte eviction target, not a hard
+RSS/VRAM cap: foreign model caches apply changed shares at safe request boundaries.
+TTL/LRU eviction releases retained entries; it does not summarize their content.
+
+Memory pressure does not automatically compact or truncate an active request.
+Admission enforces the configured model, KV and scratch budgets; oversized
+requests can return `507`, while transient resource contention can return `503`.
+Context preparation and windowing below are explicit caller policies. The
+resident generation endpoint rejects the legacy `cache_compaction_ratio` option;
+native KV checkpoint compaction has its own separately qualified backend limits.
+
 ### Context preparation and bounded chat
 
 Context preparation is an Antfly extension rather than an OpenAI API field. Use the canonical inference endpoints:

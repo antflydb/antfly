@@ -351,6 +351,7 @@ pub const EmbeddingPipeline = struct {
     /// parallel; only device/session execution is serialized.
     execution_lock: ?*std.atomic.Mutex = null,
     execution_gate_held: bool = false,
+    gemma_workspace: ?*@import("../backends/admitted_allocator.zig").AdmittedAllocator = null,
     execution_lane: ?*@import("../execution_control.zig").ExecutionLane = null,
     execution_lane_held: bool = false,
     interactive: bool = false,
@@ -445,18 +446,27 @@ pub const EmbeddingPipeline = struct {
             // Request arenas retain logical frees. Encoder temporaries need a
             // reclaiming owner with an admitted physical allocation ceiling.
             const limit = 512 * 1024 * 1024;
-            var permit = try self.session.admit(.{ .batch = 1, .sequence = 1, .host_preprocess_bytes = limit, .output_bytes = texts.len * 768 * @sizeOf(f32) * 2 });
-            defer permit.deinit();
-            var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = std.heap.smp_allocator, .limit = limit };
+            // The ceiling is a guard, not live residency. Charging all 512 MiB
+            // rejects even one short CPU row under the default scratch budget.
+            // Admit physical allocations in chunks before touching backing RAM.
+            var admitted = @import("../backends/admitted_allocator.zig").AdmittedAllocator{
+                .backing = @import("embedding_gemma2.zig").workspaceBackingAllocator(self.session.backend()),
+                .session = self.session,
+            };
+            defer admitted.deinit();
+            var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = admitted.allocator(), .limit = limit };
             defer std.debug.assert(bounded.live == 0);
             var scoped = self.*;
             scoped.allocator = bounded.allocator();
+            scoped.gemma_workspace = &admitted;
             // Length buckets retain the admitted physical allocation ceiling.
-            const temporary = (if (self.residentTextEncoderEnabled() and self.config.normalize and self.config.pooling == .mean and self.text_projection == null and (self.session.backend() == .native or self.session.backend() == .metal)) scoped.embedGemma2Texts(texts) else scoped.embedWithBatchPlan(texts, .{ .batch_size = 1, .pad_final_batch = false })) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.MemoryBudgetExceeded else err;
+            const temporary = (if (self.residentTextEncoderEnabled() and self.config.normalize and self.config.pooling == .mean and self.text_projection == null and (self.session.backend() == .native or self.session.backend() == .metal)) scoped.embedGemma2Texts(texts) else scoped.embedWithBatchPlan(texts, .{ .batch_size = 1, .pad_final_batch = false })) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.MemoryBudgetExceeded else if (err == error.OutOfMemory) admitted.admission_error orelse err else err;
             defer {
                 for (temporary) |vector| scoped.allocator.free(vector);
                 scoped.allocator.free(temporary);
             }
+            var output_permit = try self.session.admitHostPreprocess(try std.math.mul(usize, temporary.len, 768 * @sizeOf(f32) * 2 + @sizeOf([]f32)));
+            defer output_permit.deinit();
             const output = try self.allocator.alloc([]f32, temporary.len);
             var count: usize = 0;
             errdefer {
@@ -515,7 +525,7 @@ pub const EmbeddingPipeline = struct {
                 const seq = lengths[order[cursor + count - 1]];
                 var cohort_rows: usize = 0;
                 for (sorted_lengths[0..count]) |length| cohort_rows += length;
-                const request = session_mod.RunRequest{ .batch = if (compact_policy) 1 else count, .sequence = if (compact_policy) cohort_rows else seq, .input_bytes = count * seq * 24, .host_preprocess_bytes = count * seq * 32, .workspace_bytes = 256 * 1024 * 1024 + (if (compact_policy) cohort_rows else count * seq) * 192 * 1024, .output_bytes = count * self.config.embedding_gemma2_dimensions * @sizeOf(f32) };
+                const request = session_mod.RunRequest{ .batch = if (compact_policy) 1 else count, .sequence = if (compact_policy) cohort_rows else seq, .input_bytes = count * seq * 24, .host_preprocess_bytes = count * seq * 32, .workspace_bytes = try @import("embedding_gemma2.zig").textEncoderWorkspace(if (compact_policy) cohort_rows else count * seq), .output_bytes = count * self.config.embedding_gemma2_dimensions * @sizeOf(f32) };
                 if (count > 1 and !try self.session.fitsRun(request)) {
                     count -= 1;
                     continue;
@@ -678,22 +688,40 @@ pub const EmbeddingPipeline = struct {
         defer preprocess_permit.deinit();
         if (comptime build_options.enable_cuda) {
             if (self.session.backend() == .cuda) {
-                try self.lockExecution();
-                defer self.unlockExecution();
-                var managed = try compute_provider.acquireWithControl(self.session, allocator, self.execution_control);
-                defer managed.deinit();
-                const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(managed.backend.ptr));
-                const request: @import("../backends/session.zig").RunRequest = .{ .batch = 1, .sequence = self.config.max_length, .workspace_bytes = 1536 * 1024 * 1024, .output_bytes = 768 * 4 };
-                var permit = self.session.admit(request) catch |err| retry: {
-                    if (err != error.ResourceTemporarilyUnavailable and err != error.ResourceLimitExceeded) return err;
-                    try compute.evictEmbeddingGemma2Caches();
-                    break :retry try self.session.admit(request);
-                };
+                const Stage = @import("../execution/architecture_session.zig").StagedExecution;
+                var permit = session_mod.RunPermit{ .session = self.session, .lease = null };
                 defer permit.deinit();
-                var prepared = try gemma2_content.prepareResident(&managed.backend, allocator, self.tok, self.config.text_prefix, parts, self.config.max_length, self.config.max_audio_decode_working_bytes, self.execution_control);
+                var waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter{};
+                var stage = Stage{
+                    .session = self.session,
+                    .gate = self.execution_lock,
+                    .waiter = &waiter,
+                    .cb = undefined,
+                    .control = self.execution_control orelse .{},
+                    .active = false,
+                    .permit = &permit,
+                    .idle_backend = 0,
+                    .scheduling_enabled = false,
+                };
+                defer stage.deinit();
+                try stage.prepareBeforeExecution();
+                // Keep the existing mixed-content envelope and renderer. The
+                // runtime supplies cold admission/cache pressure outside lanes.
+                const request: session_mod.RunRequest = .{ .batch = 1, .sequence = self.config.max_length, .workspace_bytes = 1536 * 1024 * 1024, .output_bytes = 768 * 4 };
+                try stage.admitInitialCuda(allocator, request, null);
+                try stage.enterInitial(allocator, self.execution_control);
+                const backend = stage.backend();
+                var prepared = try gemma2_content.prepareResident(backend, allocator, self.tok, self.config.text_prefix, parts, self.config.max_length, self.config.max_audio_decode_working_bytes, self.execution_control);
                 defer prepared.deinit();
                 const cfg = session_factory.getEmbeddingGemma2Config(self.session) orelse return error.UnsupportedEmbeddingGemma2Backend;
-                const result = try compute.runEmbeddingGemma2(allocator, cfg.resident orelse return error.UnsupportedEmbeddingGemma2Backend, .{ .resident_embeddings = prepared.resident_embeddings.? }, prepared.attention_mask, 1, prepared.sequence, 768, self.execution_control);
+                if (prepared.resident_embeddings) |*resident_input| try stage.prepareCudaInputHandoff(resident_input);
+                // Exact expanded input state may cross the quota phase only
+                // after its real owner has certified/snapshotted independence.
+                var expanded = request;
+                expanded.sequence = prepared.sequence;
+                expanded.preprocessing_complete = true;
+                try stage.retain(expanded);
+                const result = try stage.runResidentEmbeddingEncoder(allocator, cfg.resident orelse return error.UnsupportedEmbeddingGemma2Backend, prepared.resident_embeddings.?, prepared.attention_mask, 1, prepared.sequence, 768, false);
                 self.last_input_tokens +|= prepared.sequence;
                 return result;
             }
@@ -716,18 +744,24 @@ pub const EmbeddingPipeline = struct {
         const mask_i32 = try allocator.alloc(i32, prepared.sequence);
         defer allocator.free(mask_i32);
         for (prepared.attention_mask, 0..) |value, index| mask_i32[index] = @intCast(value);
-        var cleanup_owner: @import("../execution/cleanup_owner.zig").Owner = .{};
-        defer cleanup_owner.finishAfterUnlock();
-        if (self.usesResidentTextOutputs()) {
-            if (self.execution_gate_held) return error.MissingCurrentCleanupEpoch;
-            cleanup_owner = try @import("../execution/cleanup_owner.zig").Owner.beginResident(self.session);
-        }
+        if (self.execution_gate_held) return error.PreparedAdmissionRequiresReadyTurn;
+        var source: session_mod.PreparedSource = .{};
+        defer source.deinit();
         var projection_execution: ?session_mod.RunPermit = null;
-        defer if (projection_execution) |*owned| owned.deinitWithCleanup(.{ .boundary = cleanup_owner.epoch() });
-        var permit = try self.session.admitInputs(&.{ ids, mask, values }, allocator, self.execution_control);
-        defer permit.deinitWithCleanup(.{ .boundary = cleanup_owner.epoch() });
-        if (cleanup_owner.epoch()) |epoch| try permit.bindCurrentCleanupEpoch(epoch);
-        const embeddings = try self.embedPreparedTextInputs(&.{ ids, mask, values }, mask_i32, prepared.input_ids, 1, prepared.sequence, &permit, null, .{ .boundary = cleanup_owner.epoch() }, &projection_execution, null);
+        defer if (projection_execution) |*owned| owned.deinitWithCleanup(.{ .boundary = source.epoch() });
+        const inputs = [_]Tensor{ ids, mask, values };
+        try source.initBeforeExecutionInto(self.session, self.session, self.execution_lock, .{ .host = &inputs }, try session_mod.RunRequest.fromTensors(&inputs), null, if (self.usesResidentTextOutputs()) .resident_consumer else .host, allocator, self.execution_control);
+        defer source.finishInputLifetime();
+        var projection_shell = if (self.text_projection) |projection| try projection.prepareResidentRetirement() else null;
+        defer if (projection_shell) |*shell| shell.destroyUnused();
+        try source.enter();
+        const permit = try source.beginExecutionDispatch();
+        self.execution_gate_held = true;
+        defer {
+            source.leaveExecution();
+            self.execution_gate_held = false;
+        }
+        const embeddings = try self.embedPreparedTextInputs(&inputs, mask_i32, prepared.input_ids, 1, prepared.sequence, permit, &projection_shell, .{ .boundary = source.epoch() }, &projection_execution, .{ .prepared = &source });
         defer allocator.free(embeddings);
         if (embeddings.len != 1) {
             for (embeddings) |embedding| allocator.free(embedding);
@@ -1044,31 +1078,19 @@ pub const EmbeddingPipeline = struct {
         // batches to reserve 8K-token attention/FFN scratch.
         const text_plan = try text_inputs.Plan.init(input_info, &.{ @intCast(batch), @intCast(effective_len) }, .{ .attention_heads = text_session.model_contract.text_attention_heads });
         if (self.execution_control) |control| try control.check();
-        // A FIFO ready turn bounds admitted backend workspace without
-        // holding the actual model/provider gate through supplier callbacks.
-        const owns_gate = !self.execution_gate_held;
-        if (!owns_gate and text_session.preparesInvocation() and text_session.run_admission != null)
-            return error.PreparedAdmissionRequiresReadyTurn;
-        var admission_waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter{};
-        if (owns_gate) try self.session.selectReadyCohort(self.execution_lock, self.execution_control orelse .{}, &admission_waiter);
-        defer if (owns_gate) self.session.leaveSelectedCohort(&admission_waiter);
-        var cleanup_owner: @import("../execution/cleanup_owner.zig").Owner = .{};
-        defer cleanup_owner.finishAfterUnlock();
-        const resident_cleanup = self.usesResidentTextOutputs();
-        if (resident_cleanup) {
-            if (!owns_gate) return error.MissingCurrentCleanupEpoch;
-            cleanup_owner = try @import("../execution/cleanup_owner.zig").Owner.beginResident(text_session);
-        }
+        // The runtime source owns its exact FIFO/model lane and whole-consumer B.
+        if (self.execution_gate_held) return error.PreparedAdmissionRequiresReadyTurn;
+        var source: session_mod.PreparedSource = .{};
+        defer source.deinit();
         var projection_execution: ?session_mod.RunPermit = null;
-        defer if (projection_execution) |*permit| permit.deinitWithCleanup(.{ .boundary = cleanup_owner.epoch() });
+        defer if (projection_execution) |*permit| permit.deinitWithCleanup(.{ .boundary = source.epoch() });
         const signature = text_plan.signature();
-        var run_permit = try text_session.admitShapeRequestBeforeExecution(.{ .host_shapes = signature.slice() }, .{
+        try self.prepareTextSource(&source, text_session, .{ .host_shapes = signature.slice() }, .{
             .batch = batch,
             .sequence = effective_len,
             .input_bytes = text_plan.input_bytes,
             .host_preprocess_bytes = text_plan.temporary_bytes,
-        }, alloc, self.execution_control);
-        defer run_permit.deinitWithCleanup(.{ .boundary = cleanup_owner.epoch() });
+        });
         if (self.execution_control) |control| try control.check();
 
         const all_ids = try alloc.alloc(i32, batch * effective_len);
@@ -1105,28 +1127,17 @@ pub const EmbeddingPipeline = struct {
 
         var input_set = try text_plan.materialize(alloc, input_ids_tensor, attention_mask_tensor, .{});
         defer input_set.deinit();
-        var exact_execution: ?session_mod.RunPermit = null;
-        defer if (exact_execution) |*permit| permit.deinitWithCleanup(.{ .boundary = cleanup_owner.epoch() });
-        if (text_session.preparesInvocation()) {
-            _ = try run_permit.yieldExecution();
-            exact_execution = try run_permit.acquireExecutionInputsBeforeExecution(.{ .host = input_set.slice() }, alloc, self.execution_control);
-        }
-        const active_permit = if (exact_execution) |*permit| permit else &run_permit;
-        if (self.text_projection != null or self.residentTextEncoderEnabled())
-            try active_permit.prepareResidentOutputRetirement();
-        try active_permit.preparePhysicalStorage(alloc);
+        defer source.finishInputLifetime();
+        try source.bindInputsBeforeExecution(.{ .host = input_set.slice() }, if (self.usesResidentTextOutputs()) .resident_consumer else .host);
         var projection_shell = if (self.text_projection) |projection| try projection.prepareResidentRetirement() else null;
         defer if (projection_shell) |*shell| shell.destroyUnused();
-        if (owns_gate and !resident_cleanup) cleanup_owner = try @import("../execution/cleanup_owner.zig").Owner.beginAdmitted(text_session);
-        if (cleanup_owner.epoch()) |epoch| try active_permit.bindPhysicalCleanupEpoch(epoch);
-        if (owns_gate) {
-            try self.session.acquireSelectedCohort(self.execution_control orelse .{}, &admission_waiter);
-            self.execution_gate_held = true;
-        }
-        defer if (owns_gate) {
+        try source.enter();
+        const active_permit = try source.beginExecutionDispatch();
+        self.execution_gate_held = true;
+        defer {
+            source.leaveExecution();
             self.execution_gate_held = false;
-            self.session.releaseSelectedCohortGate(&admission_waiter);
-        };
+        }
         const vectors = try self.embedPreparedTextInputs(
             input_set.slice(),
             all_mask,
@@ -1135,9 +1146,9 @@ pub const EmbeddingPipeline = struct {
             effective_len,
             active_permit,
             &projection_shell,
-            .{ .boundary = cleanup_owner.epoch() },
+            .{ .boundary = source.epoch() },
             &projection_execution,
-            if (owns_gate) &admission_waiter else null,
+            .{ .prepared = &source },
         );
         for (all_mask[0 .. texts.len * effective_len]) |valid| if (valid != 0) {
             self.last_input_tokens +|= 1;
@@ -1193,68 +1204,72 @@ pub const EmbeddingPipeline = struct {
             active_rows += @intFromBool(value != 0);
         }
         if (compact_policy and (active_rows == 0 or active_rows > 8192)) return error.EmbeddingInputTooLong;
-        // A FIFO ready turn bounds admitted backend workspace without
-        // holding the actual model/provider gate through supplier callbacks.
-        const owns_gate = !self.execution_gate_held;
-        if (!owns_gate and text_session.preparesInvocation() and text_session.run_admission != null)
-            return error.PreparedAdmissionRequiresReadyTurn;
-        var admission_waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter{};
-        if (owns_gate) try self.session.selectReadyCohort(self.execution_lock, self.execution_control orelse .{}, &admission_waiter);
-        defer if (owns_gate) self.session.leaveSelectedCohort(&admission_waiter);
-        var cleanup_owner: @import("../execution/cleanup_owner.zig").Owner = .{};
-        defer cleanup_owner.finishAfterUnlock();
-        const resident_cleanup = self.usesResidentTextOutputs();
-        if (resident_cleanup) {
-            if (!owns_gate) return error.MissingCurrentCleanupEpoch;
-            cleanup_owner = try @import("../execution/cleanup_owner.zig").Owner.beginResident(text_session);
-        }
+        // The runtime source owns its exact FIFO/model lane and whole-consumer B.
+        if (self.execution_gate_held) return error.PreparedAdmissionRequiresReadyTurn;
+        var source: session_mod.PreparedSource = .{};
+        defer source.deinit();
         var projection_execution: ?session_mod.RunPermit = null;
-        defer if (projection_execution) |*permit| permit.deinitWithCleanup(.{ .boundary = cleanup_owner.epoch() });
+        defer if (projection_execution) |*permit| permit.deinitWithCleanup(.{ .boundary = source.epoch() });
         const signature = text_plan.signature();
-        var run_permit = try text_session.admitShapeRequestBeforeExecution(.{ .host_shapes = signature.slice() }, .{
+        try self.prepareTextSource(&source, text_session, .{ .host_shapes = signature.slice() }, .{
             .batch = if (compact_policy) 1 else batch,
             .sequence = if (compact_policy) active_rows else seq_len,
             .output_bytes = if (compact_policy) batch * self.config.embedding_gemma2_dimensions * @sizeOf(f32) else null,
             .input_bytes = text_plan.input_bytes,
             .host_preprocess_bytes = if (preprocess_permit != null) text_plan.temporary_bytes else try std.math.add(usize, try std.math.mul(usize, total, 32), text_plan.temporary_bytes),
             .workspace_bytes = if (session_factory.getEmbeddingGemma2Config(self.session) != null)
-                try std.math.add(usize, 256 * 1024 * 1024, try std.math.mul(usize, if (compact_policy) active_rows else total, 192 * 1024))
+                try @import("embedding_gemma2.zig").textEncoderWorkspace(if (compact_policy) active_rows else total)
             else
                 0,
-        }, alloc, self.execution_control);
-        defer run_permit.deinitWithCleanup(.{ .boundary = cleanup_owner.epoch() });
+        });
         if (self.execution_control) |control| try control.check();
         var input_set = try text_plan.materialize(alloc, input_ids_tensor, attention_mask_tensor, .{});
         defer input_set.deinit();
-        var exact_execution: ?session_mod.RunPermit = null;
-        defer if (exact_execution) |*permit| permit.deinitWithCleanup(.{ .boundary = cleanup_owner.epoch() });
-        if (text_session.preparesInvocation()) {
-            _ = try run_permit.yieldExecution();
-            exact_execution = try run_permit.acquireExecutionInputsBeforeExecution(.{ .host = input_set.slice() }, alloc, self.execution_control);
-        }
-        const active_permit = if (exact_execution) |*permit| permit else &run_permit;
-        if (self.text_projection != null or self.residentTextEncoderEnabled())
-            try active_permit.prepareResidentOutputRetirement();
-        try active_permit.preparePhysicalStorage(alloc);
+        defer source.finishInputLifetime();
+        try source.bindInputsBeforeExecution(.{ .host = input_set.slice() }, if (self.usesResidentTextOutputs()) .resident_consumer else .host);
         var projection_shell = if (self.text_projection) |projection| try projection.prepareResidentRetirement() else null;
         defer if (projection_shell) |*shell| shell.destroyUnused();
-        if (owns_gate and !resident_cleanup) cleanup_owner = try @import("../execution/cleanup_owner.zig").Owner.beginAdmitted(text_session);
-        if (cleanup_owner.epoch()) |epoch| try active_permit.bindPhysicalCleanupEpoch(epoch);
-        if (owns_gate) {
-            try self.session.acquireSelectedCohort(self.execution_control orelse .{}, &admission_waiter);
-            self.execution_gate_held = true;
-        }
-        defer if (owns_gate) {
+        try source.enter();
+        const active_permit = try source.beginExecutionDispatch();
+        self.execution_gate_held = true;
+        defer {
+            source.leaveExecution();
             self.execution_gate_held = false;
-            self.session.releaseSelectedCohortGate(&admission_waiter);
-        };
-        return self.embedPreparedTextInputs(input_set.slice(), mask_i32, input_ids, batch, seq_len, active_permit, &projection_shell, .{ .boundary = cleanup_owner.epoch() }, &projection_execution, if (owns_gate) &admission_waiter else null);
+        }
+        return self.embedPreparedTextInputs(input_set.slice(), mask_i32, input_ids, batch, seq_len, active_permit, &projection_shell, .{ .boundary = source.epoch() }, &projection_execution, .{ .prepared = &source });
     }
 
     /// Returns backend telemetry for the most recent successful resident
     /// encoder request. Consumers must read this before starting another run.
     pub fn lastResidentBackendTiming(self: *const EmbeddingPipeline) ?ops_mod.BackendDebugTimingSnapshot {
         return self.last_resident_backend_timing;
+    }
+
+    fn prepareTextSource(self: *EmbeddingPipeline, source: *session_mod.PreparedSource, session: session_mod.Session, shapes: session_mod.ShapeInputs, request: session_mod.RunRequest) !void {
+        // Native prepaid funding stays in the source owner throughout its
+        // synchronous head consumer, then adopts any surviving host arrays.
+        if (session.backend() == .native and !session.preparesInvocation()) if (self.gemma_workspace) |workspace| {
+            // Resolve the full encoder output before lending its workspace.
+            // Generic/non-pooled paths must not later yield this borrowed
+            // permit merely to discover the fixed Gemma output geometry.
+            const cfg = session_factory.getEmbeddingGemma2Config(session) orelse return error.InvalidAdmissionLeaseReduction;
+            const rows = std.math.mul(usize, request.batch, request.sequence) catch return error.ResourceLimitExceeded;
+            var planned = request;
+            planned.output_bytes = @max(request.output_bytes orelse 0, std.math.mul(usize, rows, cfg.embedding_dim * @sizeOf(f32)) catch return error.ResourceLimitExceeded);
+            planned.workspace_bytes = @max(request.workspace_bytes, try @import("embedding_gemma2.zig").textEncoderWorkspace(rows));
+            // This adapter already selected the actual token-row execution
+            // geometry. Compact preparedTexts uses flattened active rows,
+            // while full-prefix/headed execution retains the padded geometry.
+            // Query numerical geometry with that selected plane; protected host
+            // input/preprocess bytes and the real materialized IDs stay intact.
+            const token_shape = [_]i64{ @intCast(planned.batch), @intCast(planned.sequence) };
+            const numerical_inputs = [_]backends.TensorInfo{
+                .{ .name = "input_ids", .dtype = .i64, .shape = &token_shape },
+                .{ .name = "attention_mask", .dtype = .i64, .shape = &token_shape },
+            };
+            return source.initShapesBeforeExecutionInto(session, self.session, self.execution_lock, .{ .shapes = &numerical_inputs }, planned, workspace, if (self.usesResidentTextOutputs()) .resident_consumer else .host, self.allocator, self.execution_control);
+        };
+        return source.initShapesBeforeExecutionInto(session, self.session, self.execution_lock, shapes, request, null, if (self.usesResidentTextOutputs()) .resident_consumer else .host, self.allocator, self.execution_control);
     }
 
     fn embedPreparedTextInputs(
@@ -1268,7 +1283,7 @@ pub const EmbeddingPipeline = struct {
         supplied_projection_shell: ?*?@import("../execution/resource_retirement.zig").PreparedCharge,
         cleanup: CleanupContext,
         projection_execution: *?session_mod.RunPermit,
-        source_cohort: ?*@import("../runtime/embedding_scheduler.zig").Scheduler.Waiter,
+        source_cohort: ?TextSourceCohort,
     ) ![][]f32 {
         if (self.usesResidentTextOutputs() and cleanup.boundary == null) return error.MissingCurrentCleanupEpoch;
         const alloc = self.allocator;
@@ -1360,8 +1375,11 @@ pub const EmbeddingPipeline = struct {
         if (self.text_projection != null) {
             run_permit.retireExecutionWithCleanup(cleanup);
             try self.releaseTextSourceCohort(source_cohort);
-            outputs = try run_permit.attachHostOutputs(outputs, alloc);
-            run_permit.deinitWithCleanup(cleanup);
+            outputs = if (source_cohort) |cohort| switch (cohort) {
+                .prepared => |owner| try owner.attachSynchronousHost(outputs),
+                .legacy => try run_permit.attachHostOutputs(outputs, alloc),
+            } else try run_permit.attachHostOutputs(outputs, alloc);
+            if (source_cohort == null or std.meta.activeTag(source_cohort.?) == .legacy) run_permit.deinitWithCleanup(cleanup);
         }
         return self.finishTextHostOutputs(outputs, all_mask, batch, effective_len);
     }
@@ -3072,8 +3090,21 @@ pub const EmbeddingPipeline = struct {
         return remaining.finishTextHostOutputs(host, mask, batch, sequence);
     }
 
-    fn releaseTextSourceCohort(self: *EmbeddingPipeline, source: ?*@import("../runtime/embedding_scheduler.zig").Scheduler.Waiter) !void {
-        const waiter = source orelse return error.ProjectionAdmissionRequiresStageBoundary;
+    const TextSourceCohort = union(enum) {
+        prepared: *session_mod.PreparedSource,
+        legacy: *@import("../runtime/embedding_scheduler.zig").Scheduler.Waiter,
+    };
+
+    fn releaseTextSourceCohort(self: *EmbeddingPipeline, source: ?TextSourceCohort) !void {
+        const selected = source orelse return error.ProjectionAdmissionRequiresStageBoundary;
+        const waiter = switch (selected) {
+            .prepared => |owner| {
+                try owner.releaseForConsumer();
+                self.execution_gate_held = false;
+                return;
+            },
+            .legacy => |value| value,
+        };
         // A missing/acquired-false waiter is not authority over an ambient gate.
         if (waiter.gate == null and waiter.owner == null and self.execution_lock == null) {
             self.execution_gate_held = false;
@@ -3110,7 +3141,7 @@ pub const EmbeddingPipeline = struct {
         projection_shell: *?@import("../execution/resource_retirement.zig").PreparedCharge,
         cleanup: CleanupContext,
         projection_execution: *?session_mod.RunPermit,
-        source_cohort: ?*@import("../runtime/embedding_scheduler.zig").Scheduler.Waiter,
+        source_cohort: ?TextSourceCohort,
     ) !?[][]f32 {
         const expected_dim = projectionInputDim(proj) orelse
             return self.residentProjectionFallback(
@@ -3122,14 +3153,28 @@ pub const EmbeddingPipeline = struct {
         try permit.validateResidentOutputRetirement();
         if (proj.run_admission != null and projection_shell.* == null) return error.UnpreparedOutputRetirement;
         const encoder_start = embedTimingStart(self.print_timing);
-        var encoder_outputs = (try permit.runResidentWithControl(inputs, self.allocator, self.execution_control)) orelse
+        const pending_outputs = (try permit.runResidentWithControl(inputs, self.allocator, self.execution_control)) orelse
             return self.residentProjectionFallback(.text, "text.encoder.resident", batch, "unsupported");
         logEmbedTiming("text.encoder.resident", batch, encoder_start);
-        var encoder_live = true;
-        defer if (encoder_live) encoder_outputs.deinitWithBoundary(cleanup.boundary);
+        var pending: ?session_mod.ResidentOutputs = pending_outputs;
+        errdefer if (pending) |*outputs| outputs.deinitWithBoundary(cleanup.boundary);
+        var consumer: session_mod.PreparedSource.SynchronousResident = if (source_cohort) |cohort| switch (cohort) {
+            .prepared => |owner| try owner.adoptSynchronousResident(&pending),
+            .legacy => legacy: {
+                try permit.attachResidentOutputs(&pending.?);
+                const moved = pending.?;
+                pending = null;
+                break :legacy .{ .outputs = moved, .source = null };
+            },
+        } else legacy: {
+            try permit.attachResidentOutputs(&pending.?);
+            const moved = pending.?;
+            pending = null;
+            break :legacy .{ .outputs = moved, .source = null };
+        };
+        defer consumer.close(cleanup);
+        const encoder_outputs = &consumer.outputs;
         if (encoder_outputs.outputs.len == 0) return error.NoOutputTensors;
-
-        try permit.attachResidentOutputs(&encoder_outputs);
 
         // Promotion validates the COMPLETE original output set, exact model,
         // concrete backend/table, live operation and current B before a derived
@@ -3143,11 +3188,10 @@ pub const EmbeddingPipeline = struct {
                 for (host) |*value| value.deinit();
                 self.allocator.free(host);
             }
-            encoder_outputs.deinitWithBoundary(cleanup.boundary);
-            encoder_live = false;
+            consumer.close(cleanup);
             permit.retireExecutionWithCleanup(cleanup);
             try self.releaseTextSourceCohort(source_cohort);
-            permit.deinitWithCleanup(cleanup);
+            if (source_cohort == null or std.meta.activeTag(source_cohort.?) == .legacy) permit.deinitWithCleanup(cleanup);
             return try self.finishTextHostOutputs(host, mask, batch, seq_len);
         }
         // The original Engine/provider has retired; the payload/model/quota
@@ -3155,8 +3199,8 @@ pub const EmbeddingPipeline = struct {
         // caller's exact selected model cohort, and never replay the encoder.
         permit.retireExecutionWithCleanup(cleanup);
         try self.releaseTextSourceCohort(source_cohort);
-        permit.deinitWithCleanup(cleanup);
-        var pooled = self.residentPoolTextOutput(&encoder_outputs, mask, batch, seq_len) catch |err| switch (err) {
+        if (source_cohort == null or std.meta.activeTag(source_cohort.?) == .legacy) permit.deinitWithCleanup(cleanup);
+        var pooled = self.residentPoolTextOutput(encoder_outputs, mask, batch, seq_len) catch |err| switch (err) {
             error.UnsupportedResidentTextPooling, error.UnsupportedPrimitiveOp, error.UnsupportedOperation, error.UnsupportedShape => {
                 self.recordResidentProjection(.text, .fallback, "text.pool.resident", batch, @errorName(err));
                 if (self.residentProjectionRequired()) return error.ResidentEmbeddingFallback;
@@ -5929,7 +5973,7 @@ fn checkPreparedTextProjectionBoundary(backend_kind: backends.BackendType) !void
                 source.releaseSelectedCohortGate(&waiter);
                 pipeline.execution_gate_held = false;
             }
-            const result = pipeline.tryEmbedTextResidentProjection(&.{ids_tensor}, &.{ 1, 1 }, 1, 2, projection, &permit, &projection_shell, .{ .boundary = cleanup.epoch() }, &projection_execution, &waiter);
+            const result = pipeline.tryEmbedTextResidentProjection(&.{ids_tensor}, &.{ 1, 1 }, 1, 2, projection, &permit, &projection_shell, .{ .boundary = cleanup.epoch() }, &projection_execution, .{ .legacy = &waiter });
             if (mode == 0) {
                 const outputs = (try result) orelse return error.SourceNotAttempted;
                 defer freeEmbeddingSlices(a, outputs);

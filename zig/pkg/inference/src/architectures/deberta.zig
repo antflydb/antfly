@@ -725,6 +725,7 @@ pub fn forwardFromHiddenRange(
 
     const shape = [_]i32{ @intCast(total), @intCast(H) };
     var hidden = try cb.fromFloat32Shape(hidden_in, &shape);
+    errdefer cb.free(hidden);
     const rel_emb = try buildRelativePositionEmbInfo(cb, allocator, config, seq_len);
     defer cb.free(rel_emb.embeddings);
     defer if (rel_emb.full_to_unique) |ids| allocator.free(ids);
@@ -803,6 +804,19 @@ fn buildRelativePositionEmbInfo(
     config: Config,
     seq_len: usize,
 ) !RelativePositionEmb {
+    const num_rel = 2 * seq_len - 1;
+    const compact_relative = (cb.kind() == .metal and uniqueRelativePositionProjectionEnabled()) or
+        (cb.kind() == .native and num_rel > config.max_position_embeddings);
+    return buildRelativePositionEmbInfoWithLayout(cb, allocator, config, seq_len, compact_relative);
+}
+
+fn buildRelativePositionEmbInfoWithLayout(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    seq_len: usize,
+    compact_relative: bool,
+) !RelativePositionEmb {
     const H = config.hidden_size;
     const num_buckets = config.position_buckets;
     const max_pos = config.max_position_embeddings;
@@ -823,7 +837,11 @@ fn buildRelativePositionEmbInfo(
     const num_rel = 2 * seq_len - 1;
     const bucket_ids = try allocator.alloc(i64, num_rel);
     defer allocator.free(bucket_ids);
-    if (cb.kind() != .metal or !uniqueRelativePositionProjectionEnabled()) {
+    // Native requests have a bounded host heap. Beyond the embedding table's
+    // row count, full relative positions necessarily repeat buckets: project
+    // each unique row once, then gather into the attention layout. Short native
+    // inputs retain their existing layout without deduplication overhead.
+    if (!compact_relative) {
         for (0..num_rel) |i| {
             const rel_pos: i64 = @as(i64, @intCast(i)) - @as(i64, @intCast(seq_len - 1));
             bucket_ids[i] = @intCast(deberta_config.relativePositionBucket(rel_pos, num_buckets, max_pos));
@@ -858,9 +876,11 @@ fn buildRelativePositionEmbInfo(
     }
 
     if (unique_count == num_rel) {
+        const gathered = try normalizedRelativeEmbeddingLookup(cb, allocator, rel_weight, ln_w, ln_b, bucket_ids, H, config.layer_norm_eps);
+        // Keep the error cleanup's ownership until the last fallible operation.
         allocator.free(full_to_unique);
         return .{
-            .embeddings = try normalizedRelativeEmbeddingLookup(cb, allocator, rel_weight, ln_w, ln_b, bucket_ids, H, config.layer_norm_eps),
+            .embeddings = gathered,
             .full_to_unique = null,
             .unique_count = num_rel,
             .full_count = num_rel,
@@ -1022,9 +1042,10 @@ fn encoderLayer(
     const Q = qkv.first;
     const K = qkv.second;
     const V = qkv.third;
-    defer cb.free(Q);
-    defer cb.free(K);
-    defer cb.free(V);
+    var content_live = true;
+    defer if (content_live) cb.free(Q);
+    defer if (content_live) cb.free(K);
+    defer if (content_live) cb.free(V);
     if (profile) |p| p.qkv_ns += profileElapsed(timer);
 
     // Disentangled attention: compute attention scores with relative position
@@ -1058,6 +1079,9 @@ fn encoderLayer(
     };
     var Q_r = rel_qk.first;
     var K_r = rel_qk.second;
+    var relative_live = true;
+    defer if (relative_live) cb.free(Q_r);
+    defer if (relative_live) cb.free(K_r);
     if (rel_emb.full_to_unique) |ids| {
         const Q_expanded = try cb.embeddingLookup(Q_r, ids, num_rel, H);
         errdefer cb.free(Q_expanded);
@@ -1067,13 +1091,24 @@ fn encoderLayer(
         Q_r = Q_expanded;
         K_r = K_expanded;
     }
-    defer cb.free(Q_r);
-    defer cb.free(K_r);
     if (profile) |p| p.relative_qk_ns += profileElapsed(timer);
 
     timer = profileStart(profile);
     const attn_out = try cb.disentangledRelativeAttention(Q, K, V, Q_r, K_r, attention_mask, batch, seq_len, local_num_heads, head_dim);
-    defer cb.free(attn_out);
+    var attention_live = true;
+    defer if (attention_live) cb.free(attn_out);
+    // Native execution is synchronous. Its projection buffers are dead here;
+    // retaining them through the FFN needlessly overlaps both phase peaks.
+    // Device backends preserve their existing command-frame lifetimes.
+    if (cb.kind() == .native) {
+        cb.free(Q);
+        cb.free(K);
+        cb.free(V);
+        content_live = false;
+        cb.free(Q_r);
+        cb.free(K_r);
+        relative_live = false;
+    }
     if (profile) |p| p.attention_ns += profileElapsed(timer);
 
     // Attention output projection + residual + LayerNorm
@@ -1155,6 +1190,10 @@ fn encoderLayer(
     // attn_normed feeds every FFN branch as input/residual; one deferred
     // free covers success and error paths alike (mirrors bert.zig).
     defer cb.free(attn_normed);
+    if (cb.kind() == .native) {
+        cb.free(attn_out);
+        attention_live = false;
+    }
 
     // FFN
     timer = profileStart(profile);
@@ -1317,4 +1356,131 @@ test "allAttentionMaskOnes recognizes all-one prefix" {
     try std.testing.expect(allAttentionMaskOnes(&.{ 1, 1, 0 }, 2));
     try std.testing.expect(!allAttentionMaskOnes(&.{ 1, 0, 1 }, 3));
     try std.testing.expect(!allAttentionMaskOnes(&.{ 1, 1 }, 3));
+}
+
+test "DeBERTa native bucketed relative projections preserve values and clean up allocation failures" {
+    const native = @import("../ops/native_compute.zig");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    const a = std.testing.allocator;
+    const config = Config{ .vocab_size = 16, .hidden_size = 4, .num_attention_heads = 1, .intermediate_size = 8, .num_hidden_layers = 1, .max_position_embeddings = 512, .position_buckets = 256 };
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    const definitions = [_]struct { name: []const u8, shape: []const i64 }{
+        .{ .name = "embeddings.word_embeddings.weight", .shape = &.{ 16, 4 } },
+        .{ .name = "embeddings.LayerNorm.weight", .shape = &.{4} },
+        .{ .name = "embeddings.LayerNorm.bias", .shape = &.{4} },
+        .{ .name = "encoder.rel_embeddings.weight", .shape = &.{ 512, 4 } },
+        .{ .name = "encoder.LayerNorm.weight", .shape = &.{4} },
+        .{ .name = "encoder.LayerNorm.bias", .shape = &.{4} },
+        .{ .name = "encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 4, 4 } },
+        .{ .name = "encoder.layer.0.attention.self.query_proj.bias", .shape = &.{4} },
+        .{ .name = "encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 4, 4 } },
+        .{ .name = "encoder.layer.0.attention.self.key_proj.bias", .shape = &.{4} },
+        .{ .name = "encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 4, 4 } },
+        .{ .name = "encoder.layer.0.attention.self.value_proj.bias", .shape = &.{4} },
+        .{ .name = "encoder.layer.0.attention.output.dense.weight", .shape = &.{ 4, 4 } },
+        .{ .name = "encoder.layer.0.attention.output.dense.bias", .shape = &.{4} },
+        .{ .name = "encoder.layer.0.attention.output.LayerNorm.weight", .shape = &.{4} },
+        .{ .name = "encoder.layer.0.attention.output.LayerNorm.bias", .shape = &.{4} },
+        .{ .name = "encoder.layer.0.intermediate.dense.weight", .shape = &.{ 8, 4 } },
+        .{ .name = "encoder.layer.0.intermediate.dense.bias", .shape = &.{8} },
+        .{ .name = "encoder.layer.0.output.dense.weight", .shape = &.{ 4, 8 } },
+        .{ .name = "encoder.layer.0.output.dense.bias", .shape = &.{4} },
+        .{ .name = "encoder.layer.0.output.LayerNorm.weight", .shape = &.{4} },
+        .{ .name = "encoder.layer.0.output.LayerNorm.bias", .shape = &.{4} },
+    };
+    for (definitions) |definition| {
+        const name = try a.dupe(u8, definition.name);
+        errdefer a.free(name);
+        var count: usize = 1;
+        for (definition.shape) |dimension| count *= @intCast(dimension);
+        const values = try a.alloc(f32, count);
+        defer a.free(values);
+        for (values, 0..) |*value, i| value.* = if (std.mem.endsWith(u8, name, "LayerNorm.weight")) 1 else if (std.mem.endsWith(u8, name, "LayerNorm.bias")) 0 else @sin(@as(f32, @floatFromInt(i)) * 0.03125);
+        var tensor = try Tensor.initFloat32(a, name, definition.shape, values);
+        errdefer tensor.deinit();
+        try store.resident_weights.put(a, name, .{ .tensor = tensor });
+    }
+    {
+        var backend = native.NativeCompute.init(a, &store, null);
+        defer backend.deinit();
+        const cb = backend.computeBackend();
+        const eager = try buildRelativePositionEmbInfoWithLayout(&cb, a, config, 300, false);
+        defer cb.free(eager.embeddings);
+        const compact = try buildRelativePositionEmbInfo(&cb, a, config, 300);
+        defer cb.free(compact.embeddings);
+        defer a.free(compact.full_to_unique.?);
+        try std.testing.expect(compact.unique_count < eager.unique_count);
+        const weight = try cb.fromFloat32Shape(&.{ 0.1, -0.2, 0.3, 0.4, -0.5, 0.6, 0.7, -0.8, 0.9, 0.2, -0.3, 0.1, -0.4, 0.8, 0.2, -0.1 }, &.{ 4, 4 });
+        defer cb.free(weight);
+        const bias = try cb.fromFloat32Shape(&.{ 0, 0, 0, 0 }, &.{4});
+        defer cb.free(bias);
+        const expected = try cb.linear(eager.embeddings, weight, bias, eager.unique_count, 4, 4);
+        defer cb.free(expected);
+        const projected = try cb.linear(compact.embeddings, weight, bias, compact.unique_count, 4, 4);
+        defer cb.free(projected);
+        const expanded = try cb.embeddingLookup(projected, compact.full_to_unique.?, compact.full_count, 4);
+        defer cb.free(expanded);
+        const expected_values = try cb.toFloat32(expected, a);
+        defer a.free(expected_values);
+        const actual_values = try cb.toFloat32(expanded, a);
+        defer a.free(actual_values);
+        try std.testing.expectEqual(expected_values.len, actual_values.len);
+        for (expected_values, actual_values) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-5);
+        const short = try buildRelativePositionEmbInfo(&cb, a, config, 7);
+        defer cb.free(short.embeddings);
+        try std.testing.expect(short.full_to_unique == null);
+    }
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator, weights: *native.WeightStore, cfg: Config) !void {
+            var backend = native.NativeCompute.init(allocator, weights, null);
+            defer backend.deinit();
+            const cb = backend.computeBackend();
+            const relative = try buildRelativePositionEmbInfo(&cb, allocator, cfg, 300);
+            defer cb.free(relative.embeddings);
+            defer allocator.free(relative.full_to_unique.?);
+        }
+    };
+    try platform.allocator.checkAllAllocationFailures(a, Check.run, .{ &store, config });
+    const UniqueCheck = struct {
+        fn run(allocator: std.mem.Allocator, weights: *native.WeightStore, cfg: Config) !void {
+            var backend = native.NativeCompute.init(allocator, weights, null);
+            defer backend.deinit();
+            const cb = backend.computeBackend();
+            // Metal selects compact layout for short inputs too. Exercise its
+            // all-unique host cleanup using the native backend's fallible ops.
+            const relative = try buildRelativePositionEmbInfoWithLayout(&cb, allocator, cfg, 7, true);
+            defer cb.free(relative.embeddings);
+            try std.testing.expect(relative.full_to_unique == null);
+        }
+    };
+    try platform.allocator.checkAllAllocationFailures(a, UniqueCheck.run, .{ &store, config });
+    const HiddenRangeCheck = struct {
+        fn run(allocator: std.mem.Allocator, weights: *native.WeightStore, cfg: Config) !void {
+            var backend = native.NativeCompute.init(allocator, weights, null);
+            defer backend.deinit();
+            const cb = backend.computeBackend();
+            const hidden: [1200]f32 = @splat(0.5);
+            const mask: [300]i64 = @splat(1);
+            const states = try forwardFromHiddenRange(&cb, allocator, cfg, &hidden, &mask, 1, 300, 0, 1);
+            defer allocator.free(states);
+            for (states) |value| try std.testing.expect(std.math.isFinite(value));
+        }
+    };
+    try platform.allocator.checkAllAllocationFailures(a, HiddenRangeCheck.run, .{ &store, config });
+    const EncoderCheck = struct {
+        fn run(allocator: std.mem.Allocator, weights: *native.WeightStore, cfg: Config) !void {
+            var backend = native.NativeCompute.init(allocator, weights, null);
+            defer backend.deinit();
+            const cb = backend.computeBackend();
+            const ids: [300]i64 = @splat(1);
+            const mask: [300]i64 = @splat(1);
+            const states = try forward(&cb, allocator, cfg, &ids, &mask, 1, 300);
+            defer allocator.free(states);
+            for (states) |value| try std.testing.expect(std.math.isFinite(value));
+        }
+    };
+    // Includes failure of either expanded relative projection and failures
+    // after the native attention buffers have been released before the FFN.
+    try platform.allocator.checkAllAllocationFailures(a, EncoderCheck.run, .{ &store, config });
 }

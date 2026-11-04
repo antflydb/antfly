@@ -18,6 +18,7 @@ class Error:
         error (str): Legacy human-readable error text. Example: An error message.
         code (str | Unset): Optional stable machine-readable error code for programmatic handling.
         message (str | Unset): Human-readable error description when supplied by the endpoint.
+        pointer (str | Unset): Optional RFC 6901 JSON Pointer identifying the invalid request field.
         retryable (bool | Unset): Whether retrying the operation may succeed without changing the request.
         retry_after_ms (int | Unset): Suggested minimum retry delay in milliseconds.
     """
@@ -25,6 +26,7 @@ class Error:
     error: str
     code: str | Unset = UNSET
     message: str | Unset = UNSET
+    pointer: str | Unset = UNSET
     retryable: bool | Unset = UNSET
     retry_after_ms: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -35,6 +37,8 @@ class Error:
         code = self.code
 
         message = self.message
+
+        pointer = self.pointer
 
         retryable = self.retryable
 
@@ -51,6 +55,8 @@ class Error:
             field_dict["code"] = code
         if message is not UNSET:
             field_dict["message"] = message
+        if pointer is not UNSET:
+            field_dict["pointer"] = pointer
         if retryable is not UNSET:
             field_dict["retryable"] = retryable
         if retry_after_ms is not UNSET:
@@ -67,6 +73,8 @@ class Error:
 
         message = d.pop("message", UNSET)
 
+        pointer = d.pop("pointer", UNSET)
+
         retryable = d.pop("retryable", UNSET)
 
         retry_after_ms = d.pop("retry_after_ms", UNSET)
@@ -75,6 +83,7 @@ class Error:
             error=error,
             code=code,
             message=message,
+            pointer=pointer,
             retryable=retryable,
             retry_after_ms=retry_after_ms,
         )

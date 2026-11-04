@@ -1,0 +1,2284 @@
+{
+  "cases": [
+    {
+      "id": "short_entities",
+      "path": "/ai/v1/extract",
+      "request": {
+        "schema_version": 2,
+        "model": "fastino/gliner2.5-base-v1",
+        "options": {
+          "include_confidence": true,
+          "include_spans": true
+        },
+        "schema": {
+          "entities": [
+            "person",
+            "organization",
+            "location"
+          ]
+        },
+        "inputs": [
+          {
+            "content": "Alice works at Google in London."
+          }
+        ]
+      },
+      "expected": {
+        "object": "extraction",
+        "model": "fastino/gliner2.5-base-v1",
+        "schema_version": 2,
+        "data": [
+          {
+            "offset_unit": "utf8_bytes",
+            "entities": [
+              {
+                "label": "person",
+                "text": "Alice",
+                "score": 0.997919499874115,
+                "start": 0,
+                "end": 5
+              },
+              {
+                "label": "organization",
+                "text": "Google",
+                "score": 0.9980289340019226,
+                "start": 15,
+                "end": 21
+              },
+              {
+                "label": "location",
+                "text": "London",
+                "score": 0.9972013235092163,
+                "start": 25,
+                "end": 31
+              }
+            ]
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 21,
+          "completion_tokens": 0,
+          "total_tokens": 21
+        }
+      },
+      "confidence_tolerance": 0.002
+    },
+    {
+      "id": "reference_windows",
+      "path": "/ai/v1/extract",
+      "request": {
+        "schema_version": 2,
+        "model": "fastino/gliner2.5-base-v1",
+        "options": {
+          "include_confidence": true,
+          "include_spans": true,
+          "long_document": {
+            "mode": "window",
+            "window_words": 128,
+            "overlap_words": 16
+          }
+        },
+        "schema": {
+          "entities": [
+            "concept"
+          ]
+        },
+        "inputs": [
+          {
+            "content": "The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. "
+          }
+        ]
+      },
+      "expected": {
+        "object": "extraction",
+        "model": "fastino/gliner2.5-base-v1",
+        "schema_version": 2,
+        "data": [
+          {
+            "offset_unit": "utf8_bytes",
+            "entities": [
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.979544997215271,
+                "start": 1440,
+                "end": 1454
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9781491160392761,
+                "start": 712,
+                "end": 726
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9781491160392761,
+                "start": 2784,
+                "end": 2798
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.976885974407196,
+                "start": 3492,
+                "end": 3499
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9752301573753357,
+                "start": 3456,
+                "end": 3470
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9750306606292725,
+                "start": 96,
+                "end": 110
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9750306606292725,
+                "start": 2168,
+                "end": 2182
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9717267751693726,
+                "start": 1384,
+                "end": 1398
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9713522791862488,
+                "start": 3476,
+                "end": 3483
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9710609316825867,
+                "start": 768,
+                "end": 782
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9710609316825867,
+                "start": 2840,
+                "end": 2854
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.970990002155304,
+                "start": 656,
+                "end": 670
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.970990002155304,
+                "start": 2728,
+                "end": 2742
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9697245359420776,
+                "start": 488,
+                "end": 502
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9697245359420776,
+                "start": 2560,
+                "end": 2574
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9694783091545105,
+                "start": 544,
+                "end": 558
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9694783091545105,
+                "start": 2616,
+                "end": 2630
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9693334698677063,
+                "start": 152,
+                "end": 166
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9693334698677063,
+                "start": 2224,
+                "end": 2238
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9692710041999817,
+                "start": 636,
+                "end": 643
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9692710041999817,
+                "start": 2708,
+                "end": 2715
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9690672159194946,
+                "start": 1496,
+                "end": 1510
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9688906669616699,
+                "start": 600,
+                "end": 614
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9688906669616699,
+                "start": 2672,
+                "end": 2686
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9688099026679993,
+                "start": 376,
+                "end": 390
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9688099026679993,
+                "start": 2448,
+                "end": 2462
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9687701463699341,
+                "start": 264,
+                "end": 278
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9687701463699341,
+                "start": 2336,
+                "end": 2350
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9687509536743164,
+                "start": 432,
+                "end": 446
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9687509536743164,
+                "start": 2504,
+                "end": 2518
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9679732322692871,
+                "start": 320,
+                "end": 334
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9679732322692871,
+                "start": 2392,
+                "end": 2406
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9674518704414368,
+                "start": 208,
+                "end": 222
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9674518704414368,
+                "start": 2280,
+                "end": 2294
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9673804640769958,
+                "start": 524,
+                "end": 531
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9673804640769958,
+                "start": 2596,
+                "end": 2603
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9671692252159119,
+                "start": 580,
+                "end": 587
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9671692252159119,
+                "start": 2652,
+                "end": 2659
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9658785462379456,
+                "start": 1420,
+                "end": 1427
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9657210111618042,
+                "start": 1364,
+                "end": 1371
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9657210111618042,
+                "start": 3436,
+                "end": 3443
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9653293490409851,
+                "start": 76,
+                "end": 83
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9653293490409851,
+                "start": 2148,
+                "end": 2155
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9652480483055115,
+                "start": 468,
+                "end": 475
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9652480483055115,
+                "start": 2540,
+                "end": 2547
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9650745987892151,
+                "start": 748,
+                "end": 755
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9650745987892151,
+                "start": 2820,
+                "end": 2827
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9639371633529663,
+                "start": 1308,
+                "end": 1315
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9639371633529663,
+                "start": 3380,
+                "end": 3387
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9630925059318542,
+                "start": 412,
+                "end": 419
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9630925059318542,
+                "start": 2484,
+                "end": 2491
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9630648493766785,
+                "start": 1664,
+                "end": 1678
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9629215002059937,
+                "start": 1608,
+                "end": 1622
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9627715349197388,
+                "start": 1252,
+                "end": 1259
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9627715349197388,
+                "start": 3324,
+                "end": 3331
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9624143242835999,
+                "start": 3548,
+                "end": 3555
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9618712663650513,
+                "start": 1832,
+                "end": 1846
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9618278741836548,
+                "start": 1196,
+                "end": 1203
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9618278741836548,
+                "start": 3268,
+                "end": 3275
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9617927074432373,
+                "start": 356,
+                "end": 363
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9617927074432373,
+                "start": 2428,
+                "end": 2435
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9617465138435364,
+                "start": 1888,
+                "end": 1902
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9615378379821777,
+                "start": 2000,
+                "end": 2014
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9613771438598633,
+                "start": 1776,
+                "end": 1790
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9613741040229797,
+                "start": 1552,
+                "end": 1566
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9611000418663025,
+                "start": 1140,
+                "end": 1147
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9611000418663025,
+                "start": 3212,
+                "end": 3219
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.960910439491272,
+                "start": 824,
+                "end": 838
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.960910439491272,
+                "start": 2896,
+                "end": 2910
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9606726765632629,
+                "start": 2092,
+                "end": 2099
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9601127505302429,
+                "start": 1328,
+                "end": 1342
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9601127505302429,
+                "start": 3400,
+                "end": 3414
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9600216746330261,
+                "start": 2036,
+                "end": 2043
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9598878622055054,
+                "start": 300,
+                "end": 307
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9598878622055054,
+                "start": 2372,
+                "end": 2379
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9596897959709167,
+                "start": 1720,
+                "end": 1734
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9594607949256897,
+                "start": 1944,
+                "end": 1958
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9593664407730103,
+                "start": 452,
+                "end": 459
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9593664407730103,
+                "start": 2524,
+                "end": 2531
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9589871764183044,
+                "start": 1216,
+                "end": 1230
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9589871764183044,
+                "start": 3288,
+                "end": 3302
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9587494730949402,
+                "start": 2056,
+                "end": 2070
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9583038687705994,
+                "start": 1272,
+                "end": 1286
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9583038687705994,
+                "start": 3344,
+                "end": 3358
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9582774043083191,
+                "start": 880,
+                "end": 894
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9582774043083191,
+                "start": 2952,
+                "end": 2966
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.958244800567627,
+                "start": 1160,
+                "end": 1174
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.958244800567627,
+                "start": 3232,
+                "end": 3246
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9581987857818604,
+                "start": 992,
+                "end": 1006
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9581987857818604,
+                "start": 3064,
+                "end": 3078
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9577093720436096,
+                "start": 1104,
+                "end": 1118
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9577093720436096,
+                "start": 3176,
+                "end": 3190
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9575029015541077,
+                "start": 1084,
+                "end": 1091
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9575029015541077,
+                "start": 3156,
+                "end": 3163
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9574043154716492,
+                "start": 396,
+                "end": 403
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9574043154716492,
+                "start": 2468,
+                "end": 2475
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9572357535362244,
+                "start": 1048,
+                "end": 1062
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9572357535362244,
+                "start": 3120,
+                "end": 3134
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9566619396209717,
+                "start": 1028,
+                "end": 1035
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9566619396209717,
+                "start": 3100,
+                "end": 3107
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9563830494880676,
+                "start": 188,
+                "end": 195
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9563830494880676,
+                "start": 2260,
+                "end": 2267
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9563309550285339,
+                "start": 340,
+                "end": 347
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9563309550285339,
+                "start": 2412,
+                "end": 2419
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9559722542762756,
+                "start": 132,
+                "end": 139
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9559722542762756,
+                "start": 2204,
+                "end": 2211
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9559493064880371,
+                "start": 244,
+                "end": 251
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9559493064880371,
+                "start": 2316,
+                "end": 2323
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9558919072151184,
+                "start": 936,
+                "end": 950
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9558919072151184,
+                "start": 3008,
+                "end": 3022
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9553919434547424,
+                "start": 284,
+                "end": 291
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9553919434547424,
+                "start": 2356,
+                "end": 2363
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9553357362747192,
+                "start": 1980,
+                "end": 1987
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9548812508583069,
+                "start": 3512,
+                "end": 3526
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9548041224479675,
+                "start": 1924,
+                "end": 1931
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9540234804153442,
+                "start": 972,
+                "end": 979
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9540234804153442,
+                "start": 3044,
+                "end": 3051
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9523388147354126,
+                "start": 916,
+                "end": 923
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9523388147354126,
+                "start": 2988,
+                "end": 2995
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9519532322883606,
+                "start": 228,
+                "end": 235
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9519532322883606,
+                "start": 2300,
+                "end": 2307
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9513975381851196,
+                "start": 1868,
+                "end": 1875
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9501712918281555,
+                "start": 804,
+                "end": 811
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9501712918281555,
+                "start": 2876,
+                "end": 2883
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9492756128311157,
+                "start": 1812,
+                "end": 1819
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9487389922142029,
+                "start": 172,
+                "end": 179
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9487389922142029,
+                "start": 2244,
+                "end": 2251
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.948525071144104,
+                "start": 860,
+                "end": 867
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.948525071144104,
+                "start": 2932,
+                "end": 2939
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9483503103256226,
+                "start": 1124,
+                "end": 1131
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9483503103256226,
+                "start": 3196,
+                "end": 3203
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9471073150634766,
+                "start": 1756,
+                "end": 1763
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9466959834098816,
+                "start": 1476,
+                "end": 1483
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9465849995613098,
+                "start": 3532,
+                "end": 3539
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9462860226631165,
+                "start": 1068,
+                "end": 1075
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9462860226631165,
+                "start": 3140,
+                "end": 3147
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9459018707275391,
+                "start": 2112,
+                "end": 2126
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9453951120376587,
+                "start": 1012,
+                "end": 1019
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9453951120376587,
+                "start": 3084,
+                "end": 3091
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9444658756256104,
+                "start": 3568,
+                "end": 3582
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9428141713142395,
+                "start": 1700,
+                "end": 1707
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9424824118614197,
+                "start": 1644,
+                "end": 1651
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9422535300254822,
+                "start": 956,
+                "end": 963
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9422535300254822,
+                "start": 3028,
+                "end": 3035
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9421207308769226,
+                "start": 1796,
+                "end": 1803
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9377194046974182,
+                "start": 1532,
+                "end": 1539
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9376667737960815,
+                "start": 1588,
+                "end": 1595
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9374692440032959,
+                "start": 1740,
+                "end": 1747
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9364283084869385,
+                "start": 1684,
+                "end": 1691
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9291815161705017,
+                "start": 1628,
+                "end": 1635
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9270936846733093,
+                "start": 1572,
+                "end": 1579
+              }
+            ],
+            "long_document": {
+              "version": 1,
+              "window_count": 6,
+              "window_policy": "source_words_midpoint_ownership",
+              "classification_aggregation": "owned_word_weighted_mean_raw_logits",
+              "duplicate_score": "maximum_calibrated_score",
+              "natural_record_identity": "exact_source_anchor",
+              "other_record_identity": "occurrence",
+              "solver_optimality_scope": "retained_candidate_graph"
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 716,
+          "completion_tokens": 0,
+          "total_tokens": 716
+        }
+      },
+      "confidence_tolerance": 0.002
+    },
+    {
+      "id": "composed_windows",
+      "path": "/ai/v1/extract",
+      "request": {
+        "schema_version": 2,
+        "model": "fastino/gliner2.5-base-v1",
+        "options": {
+          "include_confidence": true,
+          "include_spans": true,
+          "long_document": {
+            "mode": "window",
+            "window_words": 128,
+            "overlap_words": 16
+          }
+        },
+        "schema": {
+          "entities": [
+            "concept"
+          ],
+          "entity_definitions": {
+            "concept": {
+              "description": "A concept"
+            }
+          }
+        },
+        "inputs": [
+          {
+            "content": "The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. "
+          }
+        ]
+      },
+      "expected": {
+        "object": "extraction",
+        "model": "fastino/gliner2.5-base-v1",
+        "schema_version": 2,
+        "data": [
+          {
+            "offset_unit": "utf8_bytes",
+            "entities": [
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9910826683044434,
+                "start": 636,
+                "end": 643
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9910826683044434,
+                "start": 2708,
+                "end": 2715
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9910632371902466,
+                "start": 692,
+                "end": 699
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9910632371902466,
+                "start": 2764,
+                "end": 2771
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9910349249839783,
+                "start": 524,
+                "end": 531
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9910349249839783,
+                "start": 2596,
+                "end": 2603
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9909414649009705,
+                "start": 580,
+                "end": 587
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9909414649009705,
+                "start": 2652,
+                "end": 2659
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9908787608146667,
+                "start": 468,
+                "end": 475
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9908787608146667,
+                "start": 2540,
+                "end": 2547
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9902170896530151,
+                "start": 412,
+                "end": 419
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9902170896530151,
+                "start": 2484,
+                "end": 2491
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9900487661361694,
+                "start": 1440,
+                "end": 1454
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9899195432662964,
+                "start": 356,
+                "end": 363
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9899195432662964,
+                "start": 2428,
+                "end": 2435
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9896127581596375,
+                "start": 1384,
+                "end": 1398
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9893631339073181,
+                "start": 300,
+                "end": 307
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9893631339073181,
+                "start": 2372,
+                "end": 2379
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9893123507499695,
+                "start": 76,
+                "end": 83
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9893123507499695,
+                "start": 2148,
+                "end": 2155
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9892527461051941,
+                "start": 1364,
+                "end": 1371
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9892527461051941,
+                "start": 3436,
+                "end": 3443
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9890418648719788,
+                "start": 1308,
+                "end": 1315
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9890418648719788,
+                "start": 3380,
+                "end": 3387
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9888291954994202,
+                "start": 1420,
+                "end": 1427
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9888291954994202,
+                "start": 3492,
+                "end": 3499
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9888200163841248,
+                "start": 748,
+                "end": 755
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9888200163841248,
+                "start": 2820,
+                "end": 2827
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9887728095054626,
+                "start": 1196,
+                "end": 1203
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9887728095054626,
+                "start": 3268,
+                "end": 3275
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9887152314186096,
+                "start": 1252,
+                "end": 1259
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9887152314186096,
+                "start": 3324,
+                "end": 3331
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9886711835861206,
+                "start": 1140,
+                "end": 1147
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9886711835861206,
+                "start": 3212,
+                "end": 3219
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9885177612304688,
+                "start": 244,
+                "end": 251
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9885177612304688,
+                "start": 2316,
+                "end": 2323
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.988191545009613,
+                "start": 188,
+                "end": 195
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.988191545009613,
+                "start": 2260,
+                "end": 2267
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9879264831542969,
+                "start": 1084,
+                "end": 1091
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9879264831542969,
+                "start": 3156,
+                "end": 3163
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9878578186035156,
+                "start": 132,
+                "end": 139
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9878578186035156,
+                "start": 2204,
+                "end": 2211
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9874916076660156,
+                "start": 1028,
+                "end": 1035
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9874916076660156,
+                "start": 3100,
+                "end": 3107
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9872271418571472,
+                "start": 1496,
+                "end": 1510
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9865259528160095,
+                "start": 972,
+                "end": 979
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9865259528160095,
+                "start": 3044,
+                "end": 3051
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9863508343696594,
+                "start": 488,
+                "end": 502
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9863508343696594,
+                "start": 2560,
+                "end": 2574
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9863481521606445,
+                "start": 544,
+                "end": 558
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9863481521606445,
+                "start": 2616,
+                "end": 2630
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9862680435180664,
+                "start": 600,
+                "end": 614
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9862680435180664,
+                "start": 2672,
+                "end": 2686
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9861980080604553,
+                "start": 2092,
+                "end": 2099
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9860792756080627,
+                "start": 916,
+                "end": 923
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9860792756080627,
+                "start": 2988,
+                "end": 2995
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9860650300979614,
+                "start": 2036,
+                "end": 2043
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9859548211097717,
+                "start": 96,
+                "end": 110
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9859548211097717,
+                "start": 2168,
+                "end": 2182
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9859308004379272,
+                "start": 432,
+                "end": 446
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9859308004379272,
+                "start": 2504,
+                "end": 2518
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.985870897769928,
+                "start": 376,
+                "end": 390
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.985870897769928,
+                "start": 2448,
+                "end": 2462
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9854828119277954,
+                "start": 1980,
+                "end": 1987
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.985468327999115,
+                "start": 320,
+                "end": 334
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.985468327999115,
+                "start": 2392,
+                "end": 2406
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9853538274765015,
+                "start": 1924,
+                "end": 1931
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9853401780128479,
+                "start": 264,
+                "end": 278
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9853401780128479,
+                "start": 2336,
+                "end": 2350
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9850518703460693,
+                "start": 1608,
+                "end": 1622
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9849687814712524,
+                "start": 860,
+                "end": 867
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9849687814712524,
+                "start": 2932,
+                "end": 2939
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9849510192871094,
+                "start": 1664,
+                "end": 1678
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9849250912666321,
+                "start": 152,
+                "end": 166
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9849250912666321,
+                "start": 2224,
+                "end": 2238
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9848588109016418,
+                "start": 208,
+                "end": 222
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9848588109016418,
+                "start": 2280,
+                "end": 2294
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9847843647003174,
+                "start": 804,
+                "end": 811
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9847843647003174,
+                "start": 2876,
+                "end": 2883
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9846823215484619,
+                "start": 1868,
+                "end": 1875
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9844124913215637,
+                "start": 1832,
+                "end": 1846
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9844052195549011,
+                "start": 1552,
+                "end": 1566
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9843789935112,
+                "start": 1776,
+                "end": 1790
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9842174053192139,
+                "start": 1812,
+                "end": 1819
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9841859936714172,
+                "start": 1888,
+                "end": 1902
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9835624098777771,
+                "start": 1756,
+                "end": 1763
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.983496904373169,
+                "start": 1720,
+                "end": 1734
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9834222197532654,
+                "start": 2000,
+                "end": 2014
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9831772446632385,
+                "start": 3456,
+                "end": 3470
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.983004093170166,
+                "start": 452,
+                "end": 459
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.983004093170166,
+                "start": 2524,
+                "end": 2531
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9828864932060242,
+                "start": 1476,
+                "end": 1483
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9828864932060242,
+                "start": 3548,
+                "end": 3555
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9827080368995667,
+                "start": 1944,
+                "end": 1958
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9826486110687256,
+                "start": 396,
+                "end": 403
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9826486110687256,
+                "start": 2468,
+                "end": 2475
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9825624227523804,
+                "start": 1700,
+                "end": 1707
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9824004173278809,
+                "start": 340,
+                "end": 347
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9824004173278809,
+                "start": 2412,
+                "end": 2419
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9820303320884705,
+                "start": 284,
+                "end": 291
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9820303320884705,
+                "start": 2356,
+                "end": 2363
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9820274114608765,
+                "start": 1644,
+                "end": 1651
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9817646145820618,
+                "start": 2056,
+                "end": 2070
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.981402575969696,
+                "start": 228,
+                "end": 235
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.981402575969696,
+                "start": 2300,
+                "end": 2307
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.980774998664856,
+                "start": 1588,
+                "end": 1595
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.980404794216156,
+                "start": 172,
+                "end": 179
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.980404794216156,
+                "start": 2244,
+                "end": 2251
+              },
+              {
+                "label": "concept",
+                "text": "records",
+                "score": 0.9802056550979614,
+                "start": 1532,
+                "end": 1539
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9776532649993896,
+                "start": 768,
+                "end": 782
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9776532649993896,
+                "start": 2840,
+                "end": 2854
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9768961071968079,
+                "start": 1328,
+                "end": 1342
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9768961071968079,
+                "start": 3400,
+                "end": 3414
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9759708642959595,
+                "start": 1216,
+                "end": 1230
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9759708642959595,
+                "start": 3288,
+                "end": 3302
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9759646058082581,
+                "start": 1272,
+                "end": 1286
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9759646058082581,
+                "start": 3344,
+                "end": 3358
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9756357669830322,
+                "start": 1160,
+                "end": 1174
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9756357669830322,
+                "start": 3232,
+                "end": 3246
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9753273129463196,
+                "start": 824,
+                "end": 838
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9753273129463196,
+                "start": 2896,
+                "end": 2910
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9752693772315979,
+                "start": 1104,
+                "end": 1118
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9752693772315979,
+                "start": 3176,
+                "end": 3190
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.975166916847229,
+                "start": 992,
+                "end": 1006
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.975166916847229,
+                "start": 3064,
+                "end": 3078
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9750939011573792,
+                "start": 1048,
+                "end": 1062
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9750939011573792,
+                "start": 3120,
+                "end": 3134
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9749019145965576,
+                "start": 880,
+                "end": 894
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9749019145965576,
+                "start": 2952,
+                "end": 2966
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9740839004516602,
+                "start": 2112,
+                "end": 2126
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.974053680896759,
+                "start": 936,
+                "end": 950
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.974053680896759,
+                "start": 3008,
+                "end": 3022
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9737183451652527,
+                "start": 1068,
+                "end": 1075
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9737183451652527,
+                "start": 3140,
+                "end": 3147
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9729317426681519,
+                "start": 1012,
+                "end": 1019
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9729317426681519,
+                "start": 3084,
+                "end": 3091
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.972082257270813,
+                "start": 956,
+                "end": 963
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.972082257270813,
+                "start": 3028,
+                "end": 3035
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9714871644973755,
+                "start": 1740,
+                "end": 1747
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.970511794090271,
+                "start": 1684,
+                "end": 1691
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9703191518783569,
+                "start": 900,
+                "end": 907
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9703191518783569,
+                "start": 2972,
+                "end": 2979
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9679962396621704,
+                "start": 1628,
+                "end": 1635
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9679352641105652,
+                "start": 3512,
+                "end": 3526
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9667292237281799,
+                "start": 1572,
+                "end": 1579
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9652941823005676,
+                "start": 3568,
+                "end": 3582
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9605528712272644,
+                "start": 3476,
+                "end": 3483
+              },
+              {
+                "label": "concept",
+                "text": "library",
+                "score": 0.9447558522224426,
+                "start": 3532,
+                "end": 3539
+              }
+            ],
+            "long_document": {
+              "version": 1,
+              "window_count": 6,
+              "window_policy": "source_words_midpoint_ownership",
+              "classification_aggregation": "owned_word_weighted_mean_raw_logits",
+              "duplicate_score": "maximum_calibrated_score",
+              "natural_record_identity": "exact_source_anchor",
+              "other_record_identity": "occurrence",
+              "solver_optimality_scope": "retained_candidate_graph"
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 746,
+          "completion_tokens": 0,
+          "total_tokens": 746
+        }
+      },
+      "confidence_tolerance": 0.002
+    }
+  ],
+  "artifacts": [
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-local-baseline/zig/zig-out/bin/antfly-inference-http-server",
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/zig-out/bin/antfly-inference-http-server",
+    "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/config.json",
+    "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/encoder_config/config.json",
+    "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/model.safetensors",
+    "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/tokenizer.json",
+    "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/tokenizer_config.json"
+  ]
+}

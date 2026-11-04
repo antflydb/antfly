@@ -185,7 +185,7 @@ For decision question types and examples, see the
 [typed decision guide](../../../docs/reference/decisions.md).
 
 - **Calls**: `embed`, `rerank`, `chunk`, `generate`, `generateBatch`,
-  `rewrite`, `decide`, `extract`, `read` (OCR), `transcribe`, `listModels` -- each with
+  `rewrite`, `decide`, `extract`, `read` (documents, images, audio), `listModels` -- each with
   a bare form (parsed JSON) and a `...Raw` form (raw `Buffer`), following the
   same convention as `Database`. Binary inputs (images, audio) go inline in
   the request JSON, as base64 or `data:` URIs. Responses are always
@@ -315,7 +315,8 @@ Every failed call rejects with an `AntflyError` subclass carrying:
 Subclasses: `InvalidArgumentError` (1), `NotFoundError` (2),
 `VersionConflictError` (3), `IntentConflictError` (4), `TxnNotFoundError` (5),
 `BusyError` (6), `OutcomeUnknownError` (7, not safe to retry automatically --
-publication may have succeeded but crash durability could not be confirmed),
+the operation may have taken effect, but whether it applied or became durable
+could not be confirmed),
 `UnsupportedError` (8, not transient), `StalledError` (9, a bounded drain
 like `runUntilIdle` made no progress and gave up), `CancelledError` (10, the
 caller returned `false` from an `Inference.pull()` `onProgress` or
@@ -351,7 +352,7 @@ Mirrors `go/pkg/embedded`'s surface idiomatically:
   `decodeArtifactId`, `abiVersion`, `threadingMode`, `validateAbi`.
 - **`Inference`**: `Inference.open(options?)`, `close()`,
   `[Symbol.asyncDispose]`; `embed`/`rerank`/`chunk`/`generate`/
-  `generateBatch`/`rewrite`/`extract`/`read`/`transcribe`/`listModels`
+  `generateBatch`/`rewrite`/`extract`/`read`/`listModels`
   (each with a `...Raw` form); `generateStream(request, onChunk)` /
   `generateStreamRaw`; `pull(request, onProgress?, signal?)`; plus
   `InferenceOptions`, `PullProgress`, `CancelledError`,

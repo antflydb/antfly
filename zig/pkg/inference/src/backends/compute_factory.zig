@@ -135,6 +135,7 @@ test "backend factory native construction and outputs unwind every allocation fa
 
 pub fn acquireCuda(compute: *if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig").CudaCompute else void, budget: ?*memory.RunBudget) !ops.ComputeBackend {
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+    if (compute.cacheRetirementPending()) return error.QueueFull;
     // Shared compute never retains a pointer into an expired request budget.
     return if (budget) |active| compute.computeBackendWithScopedRunBudget(active) else compute.computeBackend();
 }
@@ -142,6 +143,7 @@ pub fn acquireCuda(compute: *if (build_options.enable_cuda) @import("../ops/cuda
 pub fn beginRequest(session: @import("session.zig").Session, backend: *const ops.ComputeBackend) !void {
     if (comptime build_options.enable_cuda) {
         if (backend.kind() == .cuda) {
+            try @import("../ops/cuda/cuda_compute.zig").CudaCompute.checkRequestCacheRetirement(backend);
             const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(backend.ptr));
             try compute.configureEmbeddingGemma2Admission(if (session.run_admission) |admission| .{
                 .controller = admission.controller,

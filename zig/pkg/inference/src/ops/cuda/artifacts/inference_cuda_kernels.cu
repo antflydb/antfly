@@ -1496,6 +1496,65 @@ extern "C" __global__ void termite_linear_triple_bias_f32_tile4_r2(ANTFLY_CUDA_L
 // One RMS reduction schedule; epilogues specialize before device code generation.
 // ScaleStage: 0=none, 1=scale normalized value before residual, 2=scale final sum.
 // tile-codegen:begin normalization.epilogue family (do not edit; run: zig build tile-kernel-codegen -- --write)
+// Keep the original 256-thread reduction tree, but publish its final five
+// levels with warp shuffles instead of block-wide barriers.
+__device__ __forceinline__ float termite_rms_sum_tree_256_f32(float value, float* partial) {
+    const unsigned tid = threadIdx.x;
+    partial[tid] = value;
+    __syncthreads();
+    if (tid < 32u) {
+        const float a = partial[tid] + partial[tid + 128u];
+        const float b = partial[tid + 64u] + partial[tid + 192u];
+        const float c = partial[tid + 32u] + partial[tid + 160u];
+        const float d = partial[tid + 96u] + partial[tid + 224u];
+        float sum = (a + b) + (c + d);
+        for (unsigned offset = 16u; offset != 0u; offset >>= 1u) {
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        }
+        if (tid == 0u) partial[0] = sum;
+    }
+    __syncthreads();
+    return partial[0];
+}
+
+// Short register-row norms cannot hide dependent global loads behind
+// other rows. Retain the strided inputs/weights/residuals in registers across
+// the reduction. Each lane accumulates in exactly the original order.
+// Op 0: weighted RMS; 1: weighted RMS + residual; 2: scale after residual.
+template <unsigned Op>
+__device__ __forceinline__ void termite_rms_register_2560_f32(
+    float* dst, const float* input, const float* weight,
+    const float* residual, const float* scalar, float eps
+) {
+    const unsigned tid = threadIdx.x;
+    const unsigned base = blockIdx.x * 2560u;
+    __shared__ float partial[256];
+    float values[10], weights[10], residuals[10];
+#pragma unroll
+    for (unsigned j = 0u; j < 10u; ++j) {
+        const unsigned i = tid + j * 256u;
+        values[j] = input[base + i];
+        weights[j] = weight[i];
+        if (Op != 0u) residuals[j] = residual[base + i];
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (unsigned j = 0u; j < 10u; ++j) sum += values[j] * values[j];
+    const float sumsq = termite_rms_sum_tree_256_f32(sum, partial);
+    // Match the historical runtime-divisor rounding, even though this shape
+    // is specialized: a constant reciprocal multiply is not equivalent.
+    float mean;
+    asm volatile("div.rn.f32 %0, %1, %2;" : "=f"(mean) : "f"(sumsq), "f"(2560.0f));
+    const float scale = rsqrtf(mean + eps);
+    const float output_scale = Op == 2u ? scalar[0] : 1.0f;
+#pragma unroll
+    for (unsigned j = 0u; j < 10u; ++j) {
+        float value = values[j] * scale * weights[j];
+        if (Op != 0u) value += residuals[j];
+        if (Op == 2u) value *= output_scale;
+        dst[base + tid + j * 256u] = value;
+    }
+}
 template<bool Weighted, bool Residual, bool Bf16, int ScaleStage>
 __device__ __forceinline__ void termite_rms_norm_impl(
     float* dst, unsigned short* dst_bf16, const float* input,
@@ -1526,6 +1585,11 @@ __device__ __forceinline__ void termite_rms_norm_impl(
 
 // tile-codegen:begin rms_norm.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_rms_norm_f32(ANTFLY_CUDA_RMS_NORM_PARAMS) {
+    if (blockIdx.x >= rows) return;
+    if (dim == 2560u && blockDim.x == 256u) {
+        termite_rms_register_2560_f32<0u>(dst, input, weight, nullptr, nullptr, eps);
+        return;
+    }
     termite_rms_norm_impl<true, false, false, 0>(dst, nullptr, input, weight, nullptr, nullptr, rows, dim, eps);
 }
 
@@ -1534,6 +1598,11 @@ extern "C" __global__ void termite_rms_norm_f32_bf16(ANTFLY_CUDA_RMS_NORM_F32_BF
 }
 
 extern "C" __global__ void termite_rms_norm_add_f32(ANTFLY_CUDA_RMS_NORM_ADD_PARAMS) {
+    if (blockIdx.x >= rows) return;
+    if (dim == 2560u && blockDim.x == 256u) {
+        termite_rms_register_2560_f32<1u>(dst, input, weight, residual, nullptr, eps);
+        return;
+    }
     termite_rms_norm_impl<true, true, false, 0>(dst, nullptr, input, weight, residual, nullptr, rows, dim, eps);
 }
 
@@ -1546,6 +1615,11 @@ extern "C" __global__ void termite_rms_norm_add_mul_scalar_f32(ANTFLY_CUDA_RMS_N
 }
 
 extern "C" __global__ void termite_rms_norm_add_output_scale_f32(ANTFLY_CUDA_RMS_NORM_ADD_MUL_SCALAR_PARAMS) {
+    if (blockIdx.x >= rows) return;
+    if (dim == 2560u && blockDim.x == 256u) {
+        termite_rms_register_2560_f32<2u>(dst, input, weight, residual, scalar, eps);
+        return;
+    }
     termite_rms_norm_impl<true, true, false, 2>(dst, nullptr, input, weight, residual, scalar, rows, dim, eps);
 }
 
@@ -1660,7 +1734,7 @@ __device__ __forceinline__ void termite_layer_norm_impl(
         });
 }
 
-// tile-codegen:begin layer_norm family (do not edit; run: zig build tile-kernel-codegen -- --write)
+// tile-codegen:begin layer_norm.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_layer_norm_f32(ANTFLY_CUDA_LAYER_NORM_PARAMS) {
     termite_layer_norm_impl<false>(dst, input, nullptr, gamma, beta, rows, dim, eps);
 }
@@ -1668,7 +1742,7 @@ extern "C" __global__ void termite_layer_norm_f32(ANTFLY_CUDA_LAYER_NORM_PARAMS)
 extern "C" __global__ void termite_add_layer_norm_f32(ANTFLY_CUDA_ADD_LAYER_NORM_PARAMS) {
     termite_layer_norm_impl<true>(dst, a, b, gamma, beta, rows, dim, eps);
 }
-// tile-codegen:end layer_norm family
+// tile-codegen:end layer_norm.0 family
 
 // tile-codegen:begin elementwise.direct.10 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_elementwise_f32(
@@ -15627,3 +15701,245 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attent
 #include "../../../graph/templates/cuda_gqa_repeat_split_f16.cuh"
 // Append inference-only kernels so existing kernel numbering stays stable.
 #include "../kernels/encoder_fused_programs.cuh"
+
+// Additional tuned operation schedules retain their historical device entry points.
+#include "../kernels/rms_q8_1_register_rows.cuh"
+#include "../kernels/quant_rows_prefetch_l2.cuh"
+
+// tile-codegen:begin attention.cross_split_hd64.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+#include <cuda_fp16.h>
+// Dense BSHD layout and KV dtype are static program properties. The key tile
+// is 128 and its four warps retain the tuned two-lane dot/reduction order.
+// No runtime dtype/layout switch occurs in the arithmetic body.
+template<typename Kv> struct AntflyCrossKvLoad;
+template<> struct AntflyCrossKvLoad<float> {
+    __device__ static float get(const float* data, size_t index) { return data[index]; }
+};
+template<> struct AntflyCrossKvLoad<__half> {
+    __device__ static float get(const __half* data, size_t index) { return __half2float(data[index]); }
+};
+struct AntflyCrossBshd64 {
+    __device__ static size_t row(unsigned batch, unsigned token, unsigned tokens, unsigned head, unsigned heads) {
+        return ((size_t(batch) * tokens + token) * heads + head) * 64;
+    }
+};
+template<typename Kv, typename Layout, unsigned KeyTile>
+__device__ void antfly_cross_split_hd64_impl(float* partial, const float* q,
+    const Kv* k, const Kv* v, const long long* mask,
+    unsigned queries, unsigned keys, unsigned heads, unsigned splits,
+    float* scores, float* weights) {
+    static_assert(KeyTile == 128, "qualified four-warp key schedule");
+    const unsigned t = threadIdx.x, lane = t % 32, warp = t / 32;
+    const unsigned h = blockIdx.x % heads, row = blockIdx.x / heads;
+    const unsigned b = row / queries, qi = row % queries, start = blockIdx.y * KeyTile;
+    const float* qr = q + Layout::row(b, qi, queries, h, heads);
+    for (unsigned j = warp; j < KeyTile; j += 4) {
+        const unsigned key = start + j;
+        float dot = 0;
+        if (key < keys && (!mask || mask[size_t(b) * keys + key])) {
+            const size_t base = Layout::row(b, key, keys, h, heads);
+            dot = qr[lane] * AntflyCrossKvLoad<Kv>::get(k, base + lane)
+                + qr[lane + 32] * AntflyCrossKvLoad<Kv>::get(k, base + lane + 32);
+            for (unsigned offset = 16; offset; offset >>= 1)
+                dot += __shfl_down_sync(0xffffffff, dot, offset);
+        }
+        if (lane == 0)
+            scores[j] = key < keys && (!mask || mask[size_t(b) * keys + key]) ? dot * 0.125f : -INFINITY;
+    }
+    __syncthreads();
+    float maximum = scores[t];
+    for (unsigned off = 16; off; off >>= 1)
+        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, off));
+    if (lane == 0) weights[warp] = maximum;
+    __syncthreads();
+    maximum = fmaxf(fmaxf(weights[0], weights[1]), fmaxf(weights[2], weights[3]));
+    float weight = isfinite(maximum) ? expf(scores[t] - maximum) : 0;
+    __syncthreads();
+    weights[t] = weight;
+    __syncthreads();
+    float* out = partial + (size_t(blockIdx.x) * splits + blockIdx.y) * 66;
+    if (t < 64) {
+        float sum = 0;
+        for (unsigned j = 0; j < KeyTile && start + j < keys; ++j)
+            sum += weights[j] * AntflyCrossKvLoad<Kv>::get(v, Layout::row(b, start + j, keys, h, heads) + t);
+        out[t + 2] = sum;
+    }
+    for (unsigned off = 16; off; off >>= 1)
+        weight += __shfl_down_sync(0xffffffff, weight, off);
+    if (lane == 0) scores[warp] = weight;
+    __syncthreads();
+    if (t == 0) { out[0] = maximum; out[1] = scores[0] + scores[1] + scores[2] + scores[3]; }
+}
+extern "C" __global__ void termite_cross_split_hd64_f32(float* partial,
+    const float* q, const float* k, const float* v, const long long* mask,
+    unsigned queries, unsigned keys, unsigned heads, unsigned splits) {
+    __shared__ float scores[128], weights[128];
+    antfly_cross_split_hd64_impl<float, AntflyCrossBshd64, 128>(partial, q, k, v, mask,
+        queries, keys, heads, splits, scores, weights);
+}
+// tile-codegen:end attention.cross_split_hd64.0 family
+
+// tile-codegen:begin attention.cross_split_hd64.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+extern "C" __global__ void termite_cross_split_hd64_f16(float* partial,
+    const float* q, const __half* k, const __half* v, const long long* mask,
+    unsigned queries, unsigned keys, unsigned heads, unsigned splits) {
+    __shared__ float scores[128], weights[128];
+    antfly_cross_split_hd64_impl<__half, AntflyCrossBshd64, 128>(partial, q, k, v, mask,
+        queries, keys, heads, splits, scores, weights);
+}
+// tile-codegen:end attention.cross_split_hd64.1 family
+
+// tile-codegen:begin attention.cross_split_hd64.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+extern "C" __global__ void termite_cross_split_hd64_merge_f32(float* out,
+    const float* partial, unsigned splits) {
+    const unsigned c = threadIdx.x;
+    const float* base = partial + size_t(blockIdx.x) * splits * 66;
+    float maximum = -INFINITY;
+    for (unsigned s = 0; s < splits; ++s) maximum = fmaxf(maximum, base[s * 66]);
+    float numerator = 0, denominator = 0;
+    for (unsigned s = 0; s < splits; ++s) {
+        const float* p = base + s * 66;
+        const float scale = isfinite(p[0]) ? expf(p[0] - maximum) : 0;
+        numerator += p[c + 2] * scale;
+        denominator += p[1] * scale;
+    }
+    out[size_t(blockIdx.x) * 64 + c] = denominator > 0 ? numerator / denominator : 0;
+}
+// tile-codegen:end attention.cross_split_hd64.2 family
+
+// tile-codegen:begin layer_norm.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+extern "C" __global__ void termite_add_layer_norm_sum_f32(
+    float* dst, float* sum_out, const float* a, const float* b,
+    const float* gamma, const float* beta, unsigned rows, unsigned dim, float eps) {
+    const unsigned row = blockIdx.x;
+    if (row >= rows) return;
+    const unsigned base = row * dim;
+    __shared__ float sums[256], sumsq[256];
+    antfly_row_layer_norm(dim, eps, sums, sumsq,
+        [&](unsigned i) { return a[base + i] + b[base + i]; },
+        [&](unsigned i, float x, float mean, float inv) {
+            sum_out[base + i] = x;
+            dst[base + i] = (x - mean) * inv * gamma[i] + beta[i];
+        });
+}
+// tile-codegen:end layer_norm.1 family
+
+// tile-codegen:begin projection.f16_rowpair.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+#include <cuda_fp16.h>
+// One warp reduces two rows. Shared by plain/bias/GELU and three-output
+// projection entrypoints; static epilogue, no duplicated dot/reduction body.
+template<bool Gelu>
+__device__ void antfly_f16_rowpair_impl(float* out, const float* input,
+    const __half* weight, const float* bias, unsigned inputs, unsigned outputs) {
+    const unsigned lane = threadIdx.x % 32;
+    const unsigned row = blockIdx.x * 8 + (threadIdx.x / 32) * 2;
+    float a = 0, b = 0;
+    if ((inputs & 1) == 0) {
+        float a1 = 0, b1 = 0;
+        for (unsigned c = lane * 2; c < inputs; c += 64) {
+            const float x = __half2float(__float2half_rn(input[c]));
+            const float y = __half2float(__float2half_rn(input[c + 1]));
+            if (row < outputs) {
+                const float2 w = __half22float2(*reinterpret_cast<const __half2*>(weight + size_t(row) * inputs + c));
+                a = fmaf(x, w.x, a); a1 = fmaf(y, w.y, a1);
+            }
+            if (row + 1 < outputs) {
+                const float2 w = __half22float2(*reinterpret_cast<const __half2*>(weight + size_t(row + 1) * inputs + c));
+                b = fmaf(x, w.x, b); b1 = fmaf(y, w.y, b1);
+            }
+        }
+        a += a1; b += b1;
+    } else {
+        for (unsigned c = lane; c < inputs; c += 32) {
+            const float x = __half2float(__float2half_rn(input[c]));
+            if (row < outputs) a = fmaf(x, __half2float(weight[size_t(row) * inputs + c]), a);
+            if (row + 1 < outputs) b = fmaf(x, __half2float(weight[size_t(row + 1) * inputs + c]), b);
+        }
+    }
+    for (unsigned offset = 16; offset; offset >>= 1) {
+        a += __shfl_down_sync(0xffffffff, a, offset);
+        b += __shfl_down_sync(0xffffffff, b, offset);
+    }
+    if (lane == 0) {
+        if (row < outputs) {
+            const float x = a + (bias ? bias[row] : 0);
+            out[row] = Gelu ? termite_decoder_activation_f32(x, 0u) : x;
+        }
+        if (row + 1 < outputs) {
+            const float x = b + (bias ? bias[row + 1] : 0);
+            out[row + 1] = Gelu ? termite_decoder_activation_f32(x, 0u) : x;
+        }
+    }
+}
+extern "C" __global__ void termite_linear_f16_rowpair_f32(float* dst,
+    const float* input, const __half* weight, const float* bias, unsigned inputs, unsigned outputs) {
+    antfly_f16_rowpair_impl<false>(dst, input, weight, bias, inputs, outputs);
+}
+// tile-codegen:end projection.f16_rowpair.0 family
+
+// tile-codegen:begin projection.f16_rowpair.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+extern "C" __global__ void termite_linear_f16_rowpair_gelu_f32(float* dst,
+    const float* input, const __half* weight, const float* bias, unsigned inputs, unsigned outputs) {
+    antfly_f16_rowpair_impl<true>(dst, input, weight, bias, inputs, outputs);
+}
+// tile-codegen:end projection.f16_rowpair.1 family
+
+// tile-codegen:begin projection.f16_rowpair.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+extern "C" __global__ void termite_linear_f16_rowpair_qkv_f32(float* q, float* k, float* v,
+    const float* input, const __half* qw, const __half* kw, const __half* vw,
+    const float* qb, const float* kb, const float* vb, unsigned inputs, unsigned q_outputs, unsigned kv_outputs) {
+    float* out = blockIdx.y == 0 ? q : (blockIdx.y == 1 ? k : v);
+    const __half* weight = blockIdx.y == 0 ? qw : (blockIdx.y == 1 ? kw : vw);
+    const float* bias = blockIdx.y == 0 ? qb : (blockIdx.y == 1 ? kb : vb);
+    const unsigned outputs = blockIdx.y == 0 ? q_outputs : kv_outputs;
+    antfly_f16_rowpair_impl<false>(out, input, weight, bias, inputs, outputs);
+}
+// tile-codegen:end projection.f16_rowpair.2 family
+
+// tile-codegen:begin projection.f16_rowpair.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+extern "C" __global__ void termite_add_bias_gelu_rows_f32(float* dst,
+    const float* bias, unsigned rows, unsigned outputs) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * outputs) dst[i] = termite_decoder_activation_f32(dst[i] + bias[i % outputs], 0u);
+}
+// tile-codegen:end projection.f16_rowpair.3 family
+
+// tile-codegen:begin layout.im2col family (do not edit; run: zig build tile-kernel-codegen -- --write)
+struct antfly_tile_im2col_params { unsigned int channels; unsigned int t_in; unsigned int t_out; };
+extern "C" __global__ void __launch_bounds__(256) termite_im2col_nct_k3_s1_p1_f32(const float *__restrict__ x, float *out, const antfly_tile_im2col_params p) {
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int width = p.channels * 3u;
+    if (gid >= p.t_out * width) return;
+    const unsigned int t = gid / width; const unsigned int rem = gid % width;
+    const unsigned int ch = rem / 3u; const unsigned int j = rem % 3u;
+    const int src = (int)(t * 1u + j) - 1;
+    out[gid] = (src < 0 || src >= (int)p.t_in) ? 0.0f : x[ch * p.t_in + (unsigned int)src];
+}
+extern "C" __global__ void __launch_bounds__(256) termite_im2col_ntc_k3_s1_p1_f32(const float *__restrict__ x, float *out, const antfly_tile_im2col_params p) {
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int width = p.channels * 3u;
+    if (gid >= p.t_out * width) return;
+    const unsigned int t = gid / width; const unsigned int rem = gid % width;
+    const unsigned int ch = rem / 3u; const unsigned int j = rem % 3u;
+    const int src = (int)(t * 1u + j) - 1;
+    out[gid] = (src < 0 || src >= (int)p.t_in) ? 0.0f : x[(unsigned int)src * p.channels + ch];
+}
+extern "C" __global__ void __launch_bounds__(256) termite_im2col_nct_k3_s2_p1_f32(const float *__restrict__ x, float *out, const antfly_tile_im2col_params p) {
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int width = p.channels * 3u;
+    if (gid >= p.t_out * width) return;
+    const unsigned int t = gid / width; const unsigned int rem = gid % width;
+    const unsigned int ch = rem / 3u; const unsigned int j = rem % 3u;
+    const int src = (int)(t * 2u + j) - 1;
+    out[gid] = (src < 0 || src >= (int)p.t_in) ? 0.0f : x[ch * p.t_in + (unsigned int)src];
+}
+extern "C" __global__ void __launch_bounds__(256) termite_im2col_ntc_k3_s2_p1_f32(const float *__restrict__ x, float *out, const antfly_tile_im2col_params p) {
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int width = p.channels * 3u;
+    if (gid >= p.t_out * width) return;
+    const unsigned int t = gid / width; const unsigned int rem = gid % width;
+    const unsigned int ch = rem / 3u; const unsigned int j = rem % 3u;
+    const int src = (int)(t * 2u + j) - 1;
+    out[gid] = (src < 0 || src >= (int)p.t_in) ? 0.0f : x[(unsigned int)src * p.channels + ch];
+}
+// tile-codegen:end layout.im2col family

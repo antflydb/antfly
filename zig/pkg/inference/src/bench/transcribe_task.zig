@@ -20,7 +20,21 @@ fn waitRetired(controller: *memory.AdmissionController, initial: memory.Admissio
     }
 }
 
-fn actualCudaStatsPolicy(session: anytype) !?bool {
+const ActualCudaPolicy = struct {
+    row_selection_stats: bool,
+    projections: []const u8,
+    projection_schedule: []const u8,
+    encoder_attention: []const u8,
+    cross_kv: []const u8,
+    residual_sum: bool,
+    im2col: bool,
+    f16_vendor_linear_calls: usize,
+    f16_vendor_qkv_calls: usize,
+    f16_scalar_linear_calls: usize,
+    decoder_qkv_slot_hits: usize,
+};
+
+fn actualCudaPolicy(session: anytype) !?ActualCudaPolicy {
     if (comptime !@import("build_options").enable_cuda) return null;
     if (session.backend() != .cuda) return null;
     const binding = session.invocation_diagnostics orelse return error.TranscriptionPolicyUnavailable;
@@ -30,7 +44,20 @@ fn actualCudaStatsPolicy(session: anytype) !?bool {
     // are immutable construction/publication metadata pinned by model lifetime.
     if (Cuda.foreignTensorCopyTarget(&stable) == null) return error.TranscriptionPolicyUnavailable;
     const actual: *Cuda.CudaCompute = @ptrCast(@alignCast(stable.ptr));
-    return actual.row_selection_stats_enabled;
+    const policy = actual.runtime_policy.seq2seq;
+    return .{
+        .row_selection_stats = actual.row_selection_stats_enabled,
+        .projections = @tagName(policy.projections),
+        .projection_schedule = @tagName(policy.projection_schedule),
+        .encoder_attention = @tagName(policy.encoder_attention),
+        .cross_kv = @tagName(policy.cross_kv),
+        .residual_sum = policy.residual_sum,
+        .im2col = policy.im2col,
+        .f16_vendor_linear_calls = actual.stats.f16_cublaslt_linear_calls,
+        .f16_vendor_qkv_calls = actual.stats.f16_cublaslt_qkv_calls,
+        .f16_scalar_linear_calls = actual.stats.f16_scalar_linear_calls,
+        .decoder_qkv_slot_hits = actual.stats.decoder_runtime_linear_qkv_apply_hits,
+    };
 }
 
 const Transcription = inference.pipelines.transcription;
@@ -125,7 +152,8 @@ pub fn run(init: std.process.Init, model: anytype, allocator: std.mem.Allocator,
     const actual_backend = session.backend();
     if (!std.mem.eql(u8, @tagName(actual_backend), @tagName(options.backend))) return error.TranscriptionBackendSelectionMismatch;
     const config = inference.execution.architecture_session.getWhisperConfig(session) orelse return error.WhisperModelRequired;
-    const stats_policy = try actualCudaStatsPolicy(session);
+    const initial_cuda_policy = try actualCudaPolicy(session);
+    const stats_policy: ?bool = if (initial_cuda_policy) |policy| policy.row_selection_stats else null;
     std.debug.print("transcription_task_policy backend={s} cuda_row_selection_stats={s} source=cached_compute_construction\n", .{ @tagName(actual_backend), if (stats_policy) |enabled| if (enabled) "device" else "reference" else "not_applicable" });
     const prompt = if (model.whisper_prompt_cache) |*cache| cache else return error.WhisperPromptCacheRequired;
     const lifetime = session.model_lifetime orelse return error.TranscriptionModelLifetimeRequired;
@@ -227,6 +255,8 @@ pub fn run(init: std.process.Init, model: anytype, allocator: std.mem.Allocator,
             .persistent_model_load_in_lifecycle = false,
             .cuda_row_selection_stats_policy = if (stats_policy) |enabled| if (enabled) "device" else "reference" else "not_applicable",
             .cuda_row_selection_stats_policy_scope = "cached_actual_compute_construction_not_per_step_dispatch_proof",
+            .cuda_seq2seq_policy = try actualCudaPolicy(session),
+            .cuda_seq2seq_policy_scope = "actual_compute_policy_and_cumulative_completed_task_dispatch_counters",
             .encoder_input_frames = inference.pipelines.audio.whisperFramesForSeconds(inference.pipelines.audio.WHISPER_CHUNK_LENGTH),
             .mel_bins = config.num_mel_bins,
             .timestamps_requested = options.transcribe_timestamps,

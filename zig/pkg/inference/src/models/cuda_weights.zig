@@ -317,6 +317,56 @@ test "gemma4 CUDA text training excludes unreachable unified modality weights" {
     try std.testing.expect(gemma4CudaTrainingUsesWeight(text_only, "model.layers.0.self_attn.q_proj.weight"));
 }
 
+const seq2seq_policy = @import("../ops/cuda/runtime_policy.zig");
+
+/// Compatibility names are resolved only by the model adapter, once before
+/// publication. Generic compute policy never consults model-named variables.
+fn resolveSeq2seqPolicy(architecture: ArchConfig, initial: seq2seq_policy.Seq2seq) seq2seq_policy.Seq2seq {
+    var policy = initial;
+    if (architecture != .whisper) return policy;
+    if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_SEQ2SEQ_F16") == null and
+        platform.env.getenv("ANTFLY_CUDA_WHISPER_F16_WEIGHTS") != null)
+    {
+        const enabled = platform.env.getenvBool("ANTFLY_CUDA_WHISPER_F16_WEIGHTS");
+        policy.projections = if (enabled) .f16 else .f32;
+        policy.residual_sum = enabled;
+        if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_SEQ2SEQ_IM2COL") == null) policy.im2col = enabled;
+        policy.projection_schedule = if (enabled) .rowpair_epilogue else .legacy;
+        policy.cross_kv = if (enabled) .f16 else .f32;
+        policy.cross_schedule = if (enabled) .split_kv_128 else .legacy;
+        policy.encoder_attention = if (enabled) .f16 else .f32;
+    }
+    if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_SEQ2SEQ_CUDNN") == null and
+        platform.env.getenv("ANTFLY_CUDA_WHISPER_CUDNN") != null)
+    {
+        policy.vendor_attention = platform.env.getenvBool("ANTFLY_CUDA_WHISPER_CUDNN");
+        if (policy.vendor_attention and platform.env.getenv("ANTFLY_INFERENCE_CUDA_SEQ2SEQ_F16") == null)
+            policy.encoder_attention = .f16;
+    }
+    return policy;
+}
+
+fn uploadSeq2seqCudaWeight(compute: anytype, name: []const u8, loaded: *const LoadedWeight, precision: seq2seq_policy.Seq2seq.Precision) !void {
+    if (precision == .f32 or loaded.tensor.shape.len != 2 or !std.mem.endsWith(u8, name, ".weight"))
+        return compute.insertWeightFromLoaded(try compute.allocator.dupe(u8, name), loaded);
+    if (loaded.quantized or loaded.quantized_storage != null) return error.UnsupportedTensorType;
+    if (loaded.tensor.dtype == .f16)
+        return compute.insertF16WeightFromTensor(try compute.allocator.dupe(u8, name), &loaded.tensor);
+    if (loaded.tensor.dtype != .f32) return error.UnsupportedTensorType;
+    const values = loaded.tensor.asFloat32();
+    const half = try compute.allocator.alloc(f16, values.len);
+    defer compute.allocator.free(half);
+    for (values, half) |value, *destination| {
+        destination.* = @floatCast(value);
+        if (!std.math.isFinite(destination.*)) return error.InvalidModelWeights;
+    }
+    var converted = loaded.tensor;
+    converted.dtype = .f16;
+    converted.data = std.mem.sliceAsBytes(half);
+    converted.mmap_source_bytes = null;
+    return compute.insertF16WeightFromTensor(try compute.allocator.dupe(u8, name), &converted);
+}
+
 fn uploadGlinerCudaWeight(compute: anytype, name: []const u8, loaded: *const LoadedWeight, precision: GlinerCudaPrecision) !void {
     // Packed-only weights have no dense tensor shape. Check the requested
     // policy before the rank gate so explicit mixed precision cannot silently
@@ -553,6 +603,12 @@ pub fn prepare(
 
     if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
     try cuda_compute.requireProfile(cuda_profile);
+    if (cuda_profile == .transformer_seq2seq) {
+        const precision = resolveSeq2seqPolicy(host_weights_owner.architecture, cuda_compute.runtime_policy.seq2seq);
+        if (precision.encoder_attention == .f16 and host_weights_owner.architecture == .whisper and host_weights_owner.architecture.whisper.max_source_positions > 1500)
+            return error.UnsupportedCudaArchitecture;
+        try cuda_compute.configureSeq2seqPolicy(precision);
+    }
     cuda_compute.strict_f32_weights = cuda_profile == .laya or cuda_profile == .gliner25_boundary or cuda_profile == .gliner25_modern_bert or model_manifest.gliner_specialty_profile != null;
     cuda_compute.qualified_span_fp32 = model_manifest.gliner_specialty_profile != null;
     if (model_manifest.gliner_specialty_profile) |profile| {
@@ -607,7 +663,10 @@ pub fn prepare(
     }
     for (resident_uploads.items) |upload| {
         if (upload.mmap_bytes) |bytes| c_file.MmapRegion.adviseBytesSequential(bytes);
-        try uploadGlinerCudaWeight(cuda_compute, upload.key, upload.loaded, gliner_precision);
+        if (cuda_profile == .transformer_seq2seq)
+            try uploadSeq2seqCudaWeight(cuda_compute, upload.key, upload.loaded, cuda_compute.runtime_policy.seq2seq.projections)
+        else
+            try uploadGlinerCudaWeight(cuda_compute, upload.key, upload.loaded, gliner_precision);
     }
     std.log.info("inference_model_load backend=cuda phase=weight_upload weights={d} elapsed_ms={d}", .{ resident_uploads.items.len, (platform.time.monotonicNs() -| dense_upload_start_ns) / std.time.ns_per_ms });
     if (a4b_inference != null) {
@@ -704,4 +763,122 @@ test "CUDA dense seq2seq bundle profile checks actual encoder decoder geometry" 
         invalid.max_source_positions = 4097;
         try std.testing.expect(cudaProfileForArch(.{ .whisper = invalid }, .generic, &manifest) == null);
     }
+}
+
+test "CUDA dense seq2seq explicit matrix precision preserves F32 bias and actual linear rounding" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const matrix = [_]f32{ 1.0003, -0.3333, 2.9997, 0.1251 };
+    const bias = [_]f32{ 0.125123, -0.5 };
+    const input = [_]f32{ 1.5, -0.75 };
+    const matrix_loaded = LoadedWeight{ .tensor = .{ .data = @constCast(std.mem.sliceAsBytes(&matrix)), .dtype = .f32, .shape = &.{ 2, 2 }, .name = "matrix.weight", .allocator = a, .owns_data = false, .owns_shape = false } };
+    const bias_loaded = LoadedWeight{ .tensor = .{ .data = @constCast(std.mem.sliceAsBytes(&bias)), .dtype = .f32, .shape = &.{2}, .name = "norm.bias", .allocator = a, .owns_data = false, .owns_shape = false } };
+    for ([_]seq2seq_policy.Seq2seq.Precision{ .f32, .f16 }) |precision| {
+        var compute = cuda_compute_mod.CudaCompute.init(a) catch |err| switch (err) {
+            error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+            else => return err,
+        };
+        defer compute.deinit();
+        compute.capability_profile = .transformer_seq2seq;
+        compute.configureSeq2seqPolicy(.{ .projections = precision }) catch |err| switch (err) {
+            error.CudaKernelUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        try uploadSeq2seqCudaWeight(&compute, "matrix.weight", &matrix_loaded, precision);
+        try uploadSeq2seqCudaWeight(&compute, "norm.bias", &bias_loaded, precision);
+        const cb = compute.computeBackend();
+        const weight = try cb.getWeight("matrix.weight");
+        defer cb.free(weight);
+        const offset = try cb.getWeight("norm.bias");
+        defer cb.free(offset);
+        const stored: *cuda_compute_mod.CudaTensor = @ptrCast(@alignCast(weight));
+        const stored_bias: *cuda_compute_mod.CudaTensor = @ptrCast(@alignCast(offset));
+        try std.testing.expectEqual(if (precision == .f16) @import("../backends/tensor.zig").DType.f16 else .f32, stored.dtype);
+        try std.testing.expectEqual(@import("../backends/tensor.zig").DType.f32, stored_bias.dtype);
+        const x = try cb.fromFloat32Shape(&input, &.{ 1, 2 });
+        defer cb.free(x);
+        const output = try cb.linear(x, weight, offset, 1, 2, 2);
+        defer cb.free(output);
+        const actual = try cb.toFloat32(output, a);
+        defer a.free(actual);
+        for (actual, 0..) |value, row| {
+            var expected = bias[row];
+            for (input, 0..) |item, column| {
+                const raw = matrix[row * 2 + column];
+                const selected: f32 = if (precision == .f16) @floatCast(@as(f16, @floatCast(raw))) else raw;
+                expected += selected * item;
+            }
+            try std.testing.expectApproxEqAbs(expected, value, 1e-5);
+        }
+        try std.testing.expectError(error.InvalidCudaState, compute.configureSeq2seqPolicy(.{}));
+        if (precision == .f16) {
+            const before = compute.ctx.device_allocations.snapshot();
+            const invalid = [_]f32{ std.math.inf(f32), 1, 2, 3 };
+            var invalid_loaded = matrix_loaded;
+            invalid_loaded.tensor.data = @constCast(std.mem.sliceAsBytes(&invalid));
+            try std.testing.expectError(error.InvalidModelWeights, uploadSeq2seqCudaWeight(&compute, "bad.weight", &invalid_loaded, precision));
+            try std.testing.expectEqualDeep(before, compute.ctx.device_allocations.snapshot());
+            try std.testing.expect(!compute.resident_weights.contains("bad.weight"));
+        }
+    }
+}
+
+test "CUDA dense seq2seq cold conversion unwinds every metadata OOM before publication" {
+    const Probe = struct {
+        allocator: std.mem.Allocator,
+        uploads: usize = 0,
+        fn insertWeightFromLoaded(self: *@This(), key: []const u8, _: *const LoadedWeight) !void {
+            self.allocator.free(key);
+            return error.UnexpectedUpload;
+        }
+        fn insertF16WeightFromTensor(self: *@This(), key: []const u8, tensor: *const Tensor) !void {
+            defer self.allocator.free(key);
+            try std.testing.expectEqual(@import("../backends/tensor.zig").DType.f16, tensor.dtype);
+            try std.testing.expectEqualStrings("matrix.weight", key);
+            try std.testing.expectEqual(@as(usize, 8), tensor.data.len);
+            for (0..4) |index| try std.testing.expectEqual(@as(u16, 0x3c00), std.mem.readInt(u16, tensor.data[index * 2 ..][0..2], .little));
+            self.uploads += 1;
+        }
+        fn run(allocator: std.mem.Allocator) !void {
+            var self = @This(){ .allocator = allocator };
+            const values = [_]f32{ 1, 1, 1, 1 };
+            const loaded = LoadedWeight{ .tensor = .{ .data = @constCast(std.mem.sliceAsBytes(&values)), .dtype = .f32, .shape = &.{ 2, 2 }, .name = "matrix.weight", .allocator = allocator, .owns_data = false, .owns_shape = false } };
+            try uploadSeq2seqCudaWeight(&self, "matrix.weight", &loaded, .f16);
+            try std.testing.expectEqual(@as(usize, 1), self.uploads);
+        }
+    };
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "CUDA reduced cold temporary half upload retries failed SDK wait before returning ownership" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const driver = @import("../ops/cuda/driver.zig");
+    const Probe = struct {
+        var actual: *const fn (driver.CUstream) callconv(.c) driver.CUresult = undefined;
+        var calls: usize = 0;
+        fn synchronize(stream: driver.CUstream) callconv(.c) driver.CUresult {
+            calls += 1;
+            if (calls == 1) return 1;
+            return actual(stream);
+        }
+    };
+    const a = std.testing.allocator;
+    var compute = cuda_compute_mod.CudaCompute.init(a) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer compute.deinit();
+    const values = [_]f32{ 1.001, 2.002, 3.003, 4.004 };
+    const loaded = LoadedWeight{ .tensor = .{ .data = @constCast(std.mem.sliceAsBytes(&values)), .dtype = .f32, .shape = &.{ 2, 2 }, .name = "matrix.weight", .allocator = a, .owns_data = false, .owns_shape = false } };
+    const before = compute.ctx.device_allocations.snapshot();
+    Probe.actual = compute.ctx.driver.fns.cuStreamSynchronize;
+    Probe.calls = 0;
+    compute.ctx.driver.fns.cuStreamSynchronize = Probe.synchronize;
+    defer compute.ctx.driver.fns.cuStreamSynchronize = Probe.actual;
+    // The injected first SDK wait logs its expected driver failure.
+    @import("../test_error_logs.zig").expectErrorLogs(1);
+    try std.testing.expectError(error.CudaDriverError, uploadSeq2seqCudaWeight(&compute, "matrix.weight", &loaded, .f16));
+    try std.testing.expect(Probe.calls >= 2);
+    try std.testing.expect(!compute.resident_weights.contains("matrix.weight"));
+    try std.testing.expectEqual(before.live, compute.ctx.device_allocations.snapshot().live);
 }

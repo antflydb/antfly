@@ -377,19 +377,40 @@ pub fn suppressTokens(logits: []f32, tokens: []const i32) void {
     }
 }
 
+pub const Granularity = enum { phrase, window };
+
 pub const TokenSegment = struct {
     /// Token index range `[start, end)` into the generated token slice,
     /// covering text tokens only.
     token_start: usize,
     token_end: usize,
+    granularity: Granularity,
     start_ms: u64,
     end_ms: u64,
 };
 
-/// Split generated tokens into timestamped phrase segments. Text without a
-/// closing timestamp (the model hit EOT or the length cap) is closed at
-/// `window_ms`. Tokens before the first timestamp are attached to a segment
-/// starting at zero.
+const OpenSegment = struct {
+    token_start: usize,
+    token_end: usize,
+    start_ms: ?u64 = null,
+
+    fn finish(self: @This(), end_ms: ?u64, window_ms: u64) TokenSegment {
+        // Both boundaries must come from the recognizer to claim phrase
+        // alignment. Otherwise retain the text with the full window bounds.
+        const phrase = self.start_ms != null and end_ms != null;
+        return .{
+            .token_start = self.token_start,
+            .token_end = self.token_end,
+            .granularity = if (phrase) .phrase else .window,
+            .start_ms = if (phrase) self.start_ms.? else 0,
+            .end_ms = if (phrase) @max(end_ms.?, self.start_ms.?) else window_ms,
+        };
+    }
+};
+
+/// Split generated tokens without inventing phrase clocks. Text missing an
+/// opening or closing timestamp (including EOT and budget cutoffs) retains
+/// only recognition-window bounds and is explicitly marked window-granular.
 pub fn parseSegments(
     allocator: std.mem.Allocator,
     rules: Rules,
@@ -398,28 +419,25 @@ pub fn parseSegments(
 ) ![]TokenSegment {
     var out = std.ArrayListUnmanaged(TokenSegment).empty;
     errdefer out.deinit(allocator);
-    var open: ?TokenSegment = null;
+    var open: ?OpenSegment = null;
     for (tokens, 0..) |token, index| {
         if (token == rules.eot) break;
         if (rules.isTimestamp(token)) {
             const ms = @as(u64, @intCast(token - rules.timestamp_begin)) * step_ms;
-            if (open) |*segment| {
+            if (open) |segment| {
                 if (segment.token_end > segment.token_start) {
-                    segment.end_ms = @max(ms, segment.start_ms);
-                    try out.append(allocator, segment.*);
+                    try out.append(allocator, segment.finish(ms, window_ms));
                 }
                 open = null;
             }
-            open = .{ .token_start = index + 1, .token_end = index + 1, .start_ms = ms, .end_ms = ms };
+            open = .{ .token_start = index + 1, .token_end = index + 1, .start_ms = ms };
             continue;
         }
-        if (open == null) open = .{ .token_start = index, .token_end = index, .start_ms = 0, .end_ms = 0 };
+        if (open == null) open = .{ .token_start = index, .token_end = index };
         open.?.token_end = index + 1;
     }
     if (open) |segment| if (segment.token_end > segment.token_start) {
-        var closed = segment;
-        closed.end_ms = @max(window_ms, closed.start_ms);
-        try out.append(allocator, closed);
+        try out.append(allocator, segment.finish(null, window_ms));
     };
     return out.toOwnedSlice(allocator);
 }
@@ -523,7 +541,7 @@ test "timestamp mass overrides a weak text token" {
     try std.testing.expectEqual(@as(f32, 0.9), logits[110]);
 }
 
-test "parse segments pairs timestamps with text and closes an open tail" {
+test "parse segments preserves measured pairs and marks missing boundaries as window evidence" {
     const allocator = std.testing.allocator;
     // <|0.00|> a b <|1.00|> <|1.00|> c <|EOT|>
     const tokens = [_]i32{ 100, 7, 8, 150, 150, 9, 3, 11 };
@@ -534,7 +552,9 @@ test "parse segments pairs timestamps with text and closes an open tail" {
     try std.testing.expectEqual(@as(usize, 3), segments[0].token_end);
     try std.testing.expectEqual(@as(u64, 0), segments[0].start_ms);
     try std.testing.expectEqual(@as(u64, 1000), segments[0].end_ms);
-    try std.testing.expectEqual(@as(u64, 1000), segments[1].start_ms);
+    try std.testing.expectEqual(Granularity.phrase, segments[0].granularity);
+    try std.testing.expectEqual(Granularity.window, segments[1].granularity);
+    try std.testing.expectEqual(@as(u64, 0), segments[1].start_ms);
     try std.testing.expectEqual(@as(u64, 30_000), segments[1].end_ms);
     try std.testing.expectEqual(@as(usize, 5), segments[1].token_start);
     try std.testing.expectEqual(@as(usize, 6), segments[1].token_end);
@@ -545,7 +565,20 @@ test "parse segments pairs timestamps with text and closes an open tail" {
     defer allocator.free(bare_segments);
     try std.testing.expectEqual(@as(usize, 1), bare_segments.len);
     try std.testing.expectEqual(@as(u64, 0), bare_segments[0].start_ms);
-    try std.testing.expectEqual(@as(u64, 400), bare_segments[0].end_ms);
+    try std.testing.expectEqual(@as(u64, 5000), bare_segments[0].end_ms);
+    try std.testing.expectEqual(Granularity.window, bare_segments[0].granularity);
+
+    // Budget exhaustion, EOT, and a missing opening stamp must all retain
+    // text without promoting a single boundary into a measured phrase.
+    const tails = [_][]const i32{ &.{ 105, 7 }, &.{ 105, 7, 3 }, &.{7}, &.{ 7, 120 } };
+    for (tails) |tail| {
+        const coarse = try parseSegments(allocator, test_rules, tail, 30_000);
+        defer allocator.free(coarse);
+        try std.testing.expectEqual(@as(usize, 1), coarse.len);
+        try std.testing.expectEqual(Granularity.window, coarse[0].granularity);
+        try std.testing.expectEqual(@as(u64, 0), coarse[0].start_ms);
+        try std.testing.expectEqual(@as(u64, 30_000), coarse[0].end_ms);
+    }
 }
 
 test "split words distributes a phrase by word length" {

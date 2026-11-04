@@ -2625,7 +2625,9 @@ fn retryBudgetAllowsYield(consecutive_retry_count: u32, max_attempts: u32) bool 
 /// surfacing as repair debt. This ceiling is independent of
 /// `worker_retry_max_attempts` and deliberately generous: ordinary admission
 /// contention clears in a handful of backoffs.
-const admission_wait_max_attempts: u32 = 1000;
+// With capped backoff this parks sustained contention after about five
+// minutes of scheduled waits, instead of more than eight hours.
+const admission_wait_max_attempts: u32 = 16;
 
 fn admissionWaitBudgetAllowsYield(waited_attempts: u32) bool {
     return retryBudgetAllowsYield(waited_attempts, admission_wait_max_attempts);
@@ -3445,6 +3447,7 @@ fn runtimeStatusSnapshot(runtime: *EnrichmentRuntime) enrichment_state.RuntimeSt
         .next_retry_at_ms = runtime.next_retry_at_ms,
         .retry_failure_fingerprint = runtime.retry_failure_fingerprint,
         .retry_failure_count = runtime.retry_failure_count,
+        .admission_wait_count = runtime.transient_retry_count,
         .terminal_failure_min_sequence = runtime.terminal_failure_min_sequence,
         .terminal_failure_max_sequence = runtime.terminal_failure_max_sequence,
         .retrying = runtime.retrying,
@@ -3468,6 +3471,7 @@ fn restorePersistedRuntimeStatus(runtime: anytype, persisted_status: enrichment_
     runtime.consecutive_retry_count = persisted_status.consecutive_retry_count;
     runtime.retry_failure_fingerprint = persisted_status.retry_failure_fingerprint;
     runtime.retry_failure_count = persisted_status.retry_failure_count;
+    if (@hasField(@TypeOf(runtime.*), "transient_retry_count")) runtime.transient_retry_count = persisted_status.admission_wait_count;
     runtime.terminal_failure_min_sequence = persisted_status.terminal_failure_min_sequence;
     runtime.terminal_failure_max_sequence = persisted_status.terminal_failure_max_sequence;
     runtime.active_failure_fingerprint = 0;
@@ -3574,6 +3578,7 @@ test "enrichment runtime restore preserves retry target across restart" {
         next_retry_at_ms: u64 = 0,
         retry_failure_fingerprint: u64 = 0,
         retry_failure_count: u32 = 0,
+        transient_retry_count: u32 = 0,
         terminal_failure_min_sequence: u64 = 0,
         terminal_failure_max_sequence: u64 = 0,
         active_failure_fingerprint: u64 = 0,
@@ -3590,6 +3595,7 @@ test "enrichment runtime restore preserves retry target across restart" {
         .next_retry_at_ms = 1234,
         .retry_failure_fingerprint = 77,
         .retry_failure_count = 2,
+        .admission_wait_count = 15,
         .terminal_failure_min_sequence = 8,
         .terminal_failure_max_sequence = 9,
         .retrying = true,
@@ -3606,6 +3612,8 @@ test "enrichment runtime restore preserves retry target across restart" {
     try std.testing.expectEqual(@as(u64, 8), runtime.terminal_failure_min_sequence);
     try std.testing.expectEqual(@as(u64, 9), runtime.terminal_failure_max_sequence);
     try std.testing.expectEqual(@as(u64, 0), runtime.active_failure_fingerprint);
+    try std.testing.expectEqual(@as(u32, 15), runtime.transient_retry_count);
+    try std.testing.expect(!admissionWaitBudgetAllowsYield(runtime.transient_retry_count));
     try std.testing.expect(runtime.retrying);
     try std.testing.expect(!runtime.worker_failed);
 }

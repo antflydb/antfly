@@ -25,6 +25,34 @@ spec.loader.exec_module(poc)
 
 
 class LakeMetricEvidenceTests(unittest.TestCase):
+    def test_publication_counters_distinguish_unavailable_reset_and_resumed_work(self):
+        before = {
+            "antfly_objectstore_put_calls_total": 7,
+            "antfly_objectstore_put_input_bytes_total": 100,
+            "antfly_objectstore_put_max_nanoseconds": 900,
+        }
+        after = dict(
+            before,
+            antfly_objectstore_put_calls_total=10,
+            antfly_objectstore_put_input_bytes_total=250,
+        )
+        profile = poc.publication_profile(before, after, 1.2345, True)
+        self.assertTrue(profile["counters_available"])
+        self.assertTrue(profile["fresh_registration"])
+        self.assertEqual(
+            profile["object_operations"],
+            {
+                "antfly_objectstore_put_calls_total": 3,
+                "antfly_objectstore_put_input_bytes_total": 150,
+            },
+        )
+        resumed = poc.publication_profile(before, after, 1, False)
+        self.assertFalse(resumed["fresh_registration"])
+        for missing, reset in (({}, {}), (after, before)):
+            invalid = poc.publication_profile(missing, reset, 1, False)
+            self.assertFalse(invalid["counters_available"])
+            self.assertIsNone(invalid["object_operations"])
+
     def test_process_cpu_time_keeps_days_hours_and_fractional_seconds(self):
         self.assertEqual(poc.process_cpu_seconds("  1:02.34\n"), 62.34)
         self.assertEqual(poc.process_cpu_seconds("2:03:04.50"), 7384.5)

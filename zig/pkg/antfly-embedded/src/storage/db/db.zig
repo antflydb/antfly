@@ -7475,6 +7475,47 @@ pub const DB = struct {
         }
     }
 
+    /// Like `batch`, also reporting whether the primary write became durable.
+    /// Callers classify a failure from the flag: after the primary write it
+    /// is committed (pending or needing repair); before it, the batch was not
+    /// applied unless the error is an unknown outcome. Keeps `batch`'s
+    /// ANTFLY_BENCH_METRICS phase profile.
+    pub fn batchTracked(self: *DB, req: types.BatchRequest, primary_committed: *bool) anyerror!void {
+        primary_committed.* = false;
+        // Storage commits keep their original error; this records whether a
+        // failed commit may still have applied (for example, LSM WAL appended
+        // and then a sync or flush failed). For an exported call that is an
+        // unknown outcome, never "not applied".
+        var progress: backend_types.CommitProgress = .{};
+        const previous = backend_types.commit_progress;
+        backend_types.commit_progress = &progress;
+        defer backend_types.commit_progress = previous;
+        self.batchTrackedProfiled(req, primary_committed) catch |err| {
+            if (progress.maybe_applied and !primary_committed.* and !isOutcomeUnknownError(err)) {
+                std.log.warn("batch failed after its write may have applied: {s}", .{@errorName(err)});
+                return error.OutcomeUnknown;
+            }
+            return err;
+        };
+    }
+
+    fn isOutcomeUnknownError(err: anyerror) bool {
+        return switch (err) {
+            error.OutcomeUnknown, error.WriteOutcomeUnknown, error.DurabilityOutcomeUnknown, error.CommitDecisionUnknown => true,
+            else => false,
+        };
+    }
+
+    fn batchTrackedProfiled(self: *DB, req: types.BatchRequest, primary_committed: *bool) anyerror!void {
+        if (benchMetricsEnabled()) {
+            var profile = BatchProfile{};
+            try self.batchInternal(req, &profile, .{ .primary_committed = primary_committed });
+            logBatchProfile(req, profile);
+        } else {
+            try self.batchInternal(req, null, .{ .primary_committed = primary_committed });
+        }
+    }
+
     pub fn batchWithVisibilityCancellation(self: *DB, req: types.BatchRequest, cancellation: types.CancellationToken) anyerror!void {
         if (benchMetricsEnabled()) {
             var profile = BatchProfile{};
@@ -8652,6 +8693,9 @@ pub const DB = struct {
                 error.EnrichmentWaitTimeout,
                 error.EnrichmentRetryInProgress,
                 => return error.CommitVisibilityNotSatisfied,
+                // Other errors keep their identity for internal callers that
+                // act on them. Exported calls classify a failure after the
+                // primary write from `batchTracked`'s flag, not from its name.
                 else => {},
             };
             return err;
@@ -145868,4 +145912,111 @@ test "transient leann re-embedding renders templates through content parts like 
     try std.testing.expect(found[0]);
     try std.testing.expectEqual(@as(usize, 1), probe.batch_calls);
     try std.testing.expectEqual(@as(f32, 2), out[0]);
+}
+
+test "db minimum chunk content retires stale vectors and skips embedding page scraps" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var counting = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{ .owner_id = "worker-a", .dense_embedder = counting.interface() },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"generator":{"kind":"dense_embedding","source_field":"body","chunk_name":"body_chunks_v1","embedding_name":"chunk_dense_v1","chunker":{"provider":"antfly","store_chunks":true,"text":{"target_tokens":128,"overlap_tokens":0,"min_chars":16}}}}
+        ,
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"replace all six gyroscopes\"}" }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(@as(u64, 1), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+    const before = counting.calls;
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"C-8\\n)\\n\"}" }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(before, counting.calls);
+    try std.testing.expectEqual(@as(u64, 0), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+    try std.testing.expectEqual(@as(usize, 0), try testChunkArtifactCount(alloc, &db, "doc:a", "body_chunks_v1"));
+    // The same empty replacement must work in background replay, too.
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"searchable guidance sensor evidence\"}" }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(u64, 1), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+    const replay_before = counting.calls;
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"C-9\"}" }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(replay_before, counting.calls);
+    try std.testing.expectEqual(@as(u64, 0), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+}
+
+test "db document quality policy reprocess retires text and vectors across reopen" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("db");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var counting = CountingDenseEmbedder{};
+    const chunks = types.EnrichmentConfig{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .full_text_index = true,
+        .chunker_json = "{\"provider\":\"antfly\",\"store_chunks\":true,\"text\":{\"target_tokens\":128,\"overlap_tokens\":0}}",
+    };
+    var filtered = chunks;
+    filtered.chunker_json = "{\"provider\":\"antfly\",\"store_chunks\":true,\"text\":{\"target_tokens\":128,\"overlap_tokens\":0,\"min_chars\":16}}";
+    {
+        var db = try DB.open(a, std.mem.span(path), .{ .enrichment = .{ .owner_id = "quality", .dense_embedder = counting.interface() } });
+        defer db.close();
+        try db.addEnrichment(.{ .name = "document_units_v1", .kind = .asset, .field = "url", .content_type = "application/json", .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}" });
+        try db.addEnrichment(chunks);
+        try db.addEnrichment(.{ .name = "document_chunk_dense_v1", .kind = .embedding, .field = "text", .source_artifact_name = "document_chunks_v1", .expected_dims = 3 });
+        try db.addIndex(.{ .name = "dv_v1", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}" });
+        try db.addIndex(.{ .name = "ft_default", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"document_chunks_v1\"}]}" });
+        try db.batch(.{ .writes = &.{
+            .{ .key = "scrap", .value = "{\"url\":\"data:text/plain,scrap\"}" },
+            .{ .key = "real", .value = "{\"url\":\"data:text/plain,searchable%20guidance%20sensor%20evidence\"}" },
+        }, .sync_level = .full_index });
+        try db.runUntilIdle();
+        try std.testing.expectEqual(@as(u64, 2), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+        try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(a, &db, "scrap"));
+        _ = try db.upsertEnrichment(filtered);
+        // Reprocess the same source bytes: a policy change alone must retire
+        // both full-text rows and vectors, including after reopening the DB.
+        for ([_][]const u8{ "scrap", "real" }) |key| try std.testing.expect(try db.reprocessDocumentArtifact(a, key, "document_units_v1"));
+        try db.runUntilIdle();
+        try std.testing.expectEqual(@as(u64, 1), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+        try std.testing.expectEqual(@as(u32, 0), try testDefaultTextHitCount(a, &db, "scrap"));
+        try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(a, &db, "guidance"));
+        try std.testing.expectEqual(@as(usize, 0), try testChunkArtifactCount(a, &db, "scrap", "document_chunks_v1"));
+    }
+    {
+        var db = try DB.open(a, std.mem.span(path), .{ .enrichment = .{ .owner_id = "quality", .dense_embedder = counting.interface() } });
+        defer db.close();
+        try db.runUntilIdle();
+        try std.testing.expectEqual(@as(u64, 1), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+        try std.testing.expectEqual(@as(u32, 0), try testDefaultTextHitCount(a, &db, "scrap"));
+        _ = try db.upsertEnrichment(chunks);
+        try std.testing.expect(try db.reprocessDocumentArtifact(a, "scrap", "document_units_v1"));
+        try db.runUntilIdle();
+        try std.testing.expectEqual(@as(u64, 2), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+        try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(a, &db, "scrap"));
+        const original = (try db.get(a, "scrap")).?;
+        defer a.free(original);
+        try std.testing.expectEqualStrings("{\"url\":\"data:text/plain,scrap\"}", original);
+    }
 }

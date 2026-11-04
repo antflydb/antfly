@@ -1348,6 +1348,8 @@ pub const TextRun = struct {
     ascent: f64 = 0,
     descent: f64 = 0,
     paint_order: usize = 0,
+    /// Opening BT paint position; null for caller-constructed runs.
+    text_object_id: ?usize = null,
     /// Consistent TJ positioning measured on both sides of authored whitespace.
     /// Only matching local gaps between glyph fragments count as tracking.
     text_show_tracking_gap: ?f64 = null,
@@ -1403,6 +1405,8 @@ const LayoutTextRun = struct {
     ascent: f64 = 0,
     descent: f64 = 0,
     paint_order: usize = 0,
+    text_object_id: ?usize = null,
+    render_mode: i64 = 0,
     text_show_tracking_gap: ?f64 = null,
     output_span: ?TextOutputSpan = null,
 
@@ -2086,6 +2090,7 @@ pub const PageRenderRuns = struct {
 
 const TextRunState = struct {
     current_font_index: ?usize = null,
+    text_object_id: ?usize = null,
     font_size: f64 = 12,
     alpha: u8 = 0xff,
     stroke_alpha: u8 = 0xff,
@@ -15751,6 +15756,7 @@ fn applyTextRunOperator(
         return;
     }
     if (std.mem.eql(u8, op, "BT")) {
+        state.text_object_id = paint_order.*;
         state.x = 0;
         state.y = 0;
         state.line_x = 0;
@@ -17526,7 +17532,11 @@ fn appendTextRunDecodedString(
         .layout, .analysis => state.render_mode,
         .render => try effectiveTextRenderMode(state.*),
     };
-    if (render_mode != 3) switch (out) {
+    // Invisible text is commonly the searchable OCR layer of a scanned PDF.
+    // Extraction needs its positions to reconstruct spaces and line breaks;
+    // only paint runs omit it. Otherwise the preservation check falls back to
+    // concatenated canonical bytes for the entire page (including visible text).
+    if (render_mode != 3 or out.isTextOnly()) switch (out) {
         .layout => |layout_out| {
             const text = try alloc.dupe(u8, decoded);
             errdefer alloc.free(text);
@@ -17544,6 +17554,8 @@ fn appendTextRunDecodedString(
                 .ascent = metrics.ascent,
                 .descent = metrics.descent,
                 .paint_order = paint_order,
+                .text_object_id = state.text_object_id,
+                .render_mode = render_mode,
             });
         },
         .analysis, .render => {
@@ -17594,6 +17606,7 @@ fn appendTextRunDecodedString(
                 .ascent = metrics.ascent,
                 .descent = metrics.descent,
                 .paint_order = paint_order,
+                .text_object_id = state.text_object_id,
                 .blend_mode = state.blend_mode,
                 .group_id = state.group_id,
                 .group_parent_id = state.group_parent_id,
@@ -18334,9 +18347,8 @@ fn appendOriginalTextRunIndices(alloc: Allocator, out: *std.ArrayList(usize), in
     try out.appendSlice(alloc, indices);
 }
 
-fn textLayoutNeedsColumnReordering(
+fn textLayoutHasProseColumns(
     runs: anytype,
-    indices: []const usize,
     lines: []const TextLayoutLine,
     metrics: TextLayoutMetrics,
     gutter: TextLayoutGutter,
@@ -18359,15 +18371,29 @@ fn textLayoutNeedsColumnReordering(
     var left_prose_lines: usize = 0;
     var right_prose_lines: usize = 0;
     for (lines) |line| {
-        var left_words: usize = 0;
-        var right_words: usize = 0;
-        var previous_left: ?usize = null;
-        var previous_right_run: ?usize = null;
-        for (line.run_indices.items) |index| {
+        // Overprinted copies cannot turn a two-word table cell into prose.
+        var left_words = [_]usize{ 0, 0 };
+        var right_words = [_]usize{ 0, 0 };
+        var previous_left = [_]?usize{ null, null };
+        var previous_right_run = [_]?usize{ null, null };
+        var covered_x = [_]f64{ -std.math.inf(f64), -std.math.inf(f64) };
+        for (line.run_indices.items, 0..) |index, position| {
             const bounds = textRunBounds(runs[index]);
             const is_left = bounds.max_x <= gutter.left;
             const is_right = bounds.min_x >= gutter.right;
-            const previous = if (is_left) previous_left else previous_right_run;
+            const layer: usize = @intFromBool(invisibleTextRun(runs[index]));
+            // Independent invisible copies must not inflate the prose test.
+            // X-sorted disjoint words avoid the optional backwards scan.
+            const may_duplicate = layer == 1 and bounds.min_x < covered_x[layer];
+            covered_x[layer] = @max(covered_x[layer], bounds.max_x);
+            if (may_duplicate) {
+                const duplicate = for (line.run_indices.items[0..position]) |prior| {
+                    if (invisibleTextRun(runs[prior]) and independentTextCopies(runs[prior], runs[index]) and
+                        textBoundsOverlap(textRunBounds(runs[prior]), bounds)) break true;
+                } else false;
+                if (duplicate) continue;
+            }
+            const previous = if (is_left) previous_left[layer] else previous_right_run[layer];
             var first = true;
             var words = std.mem.tokenizeAny(u8, runs[index].text, &std.ascii.whitespace);
             while (words.next()) |word| {
@@ -18383,21 +18409,23 @@ fn textLayoutNeedsColumnReordering(
                 for (word) |byte| has_letter = has_letter or std.ascii.isAlphabetic(byte) or byte >= 0x80;
                 const numeric = (std.fmt.parseFloat(f64, word) catch null) != null;
                 if (has_letter and !numeric and !joins_previous) {
-                    if (is_left) left_words += 1;
-                    if (is_right) right_words += 1;
+                    if (is_left) left_words[layer] += 1;
+                    if (is_right) right_words[layer] += 1;
                 }
                 first = false;
             }
-            if (is_left) previous_left = index;
-            if (is_right) previous_right_run = index;
+            if (is_left) previous_left[layer] = index;
+            if (is_right) previous_right_run[layer] = index;
         }
         const center_y = (line.bounds.min_y + line.bounds.max_y) * 0.5;
         if (center_y < gutter.body_bottom or center_y > gutter.body_top) continue;
-        if (left_words >= 3) left_prose_lines += 1;
-        if (right_words >= 3) right_prose_lines += 1;
+        if (@max(left_words[0], left_words[1]) >= 3) left_prose_lines += 1;
+        if (@max(right_words[0], right_words[1]) >= 3) right_prose_lines += 1;
     }
-    if (left_prose_lines < 3 or right_prose_lines < 3) return false;
+    return left_prose_lines >= 3 and right_prose_lines >= 3;
+}
 
+fn textLayoutColumnsAreInterleaved(runs: anytype, indices: []const usize, metrics: TextLayoutMetrics, gutter: TextLayoutGutter) bool {
     // Repair demonstrably interleaved columns, not already grouped streams.
     // A return from the right column to a later left-column row identifies
     // row-major painting. Require repeated evidence; isolated margin text
@@ -18443,6 +18471,7 @@ fn appendPartitionedTextRunOrder(
     metrics: TextLayoutMetrics,
     depth: usize,
     cancellation: CancellationProbe,
+    break_before: ?[]bool,
 ) !void {
     try cancellation.check();
     if (indices.len <= 1) return appendOriginalTextRunIndices(alloc, out, indices);
@@ -18454,9 +18483,12 @@ fn appendPartitionedTextRunOrder(
     // Without positive evidence of interleaved columns, retain content order.
     // Sorting an unpartitioned leaf can interleave overprinted glyphs or move
     // marginal annotations into otherwise intact sentences.
-    const gutter = gutter_search.best orelse return appendOriginalTextRunIndices(alloc, out, indices);
-    if (!textLayoutNeedsColumnReordering(runs, indices, lines, metrics, gutter))
-        return appendOriginalTextRunIndices(alloc, out, indices);
+    const gutter = gutter_search.best orelse return appendTextLayerRegions(alloc, out, runs, indices, lines, metrics, cancellation, break_before);
+    // Mixed layers require independent column regions even when each layer
+    // was already painted column-by-column. Tables still retain row groups.
+    if (!textLayoutHasProseColumns(runs, lines, metrics, gutter) or
+        (!textRunsNeedTrackRepair(runs, indices) and !textLayoutColumnsAreInterleaved(runs, indices, metrics, gutter)))
+        return appendTextLayerRegions(alloc, out, runs, indices, lines, metrics, cancellation, break_before);
 
     var headings = std.ArrayList(usize).empty;
     defer headings.deinit(alloc);
@@ -18482,17 +18514,401 @@ fn appendPartitionedTextRunOrder(
     }
     if (left.items.len == 0 or right.items.len == 0)
         return appendOriginalTextRunIndices(alloc, out, indices);
-    try appendPartitionedTextRunOrder(alloc, out, runs, headings.items, metrics, depth + 1, cancellation);
-    try appendPartitionedTextRunOrder(alloc, out, runs, left.items, metrics, depth + 1, cancellation);
-    try appendPartitionedTextRunOrder(alloc, out, runs, right.items, metrics, depth + 1, cancellation);
-    try appendPartitionedTextRunOrder(alloc, out, runs, footers.items, metrics, depth + 1, cancellation);
+    try appendPartitionedTextRunOrder(alloc, out, runs, headings.items, metrics, depth + 1, cancellation, break_before);
+    try appendPartitionedTextRunOrder(alloc, out, runs, left.items, metrics, depth + 1, cancellation, break_before);
+    try appendPartitionedTextRunOrder(alloc, out, runs, right.items, metrics, depth + 1, cancellation, break_before);
+    try appendPartitionedTextRunOrder(alloc, out, runs, footers.items, metrics, depth + 1, cancellation, break_before);
 }
 
 fn orderedTextRunIndicesAlloc(alloc: Allocator, runs: anytype) ![]usize {
     return orderedTextRunIndicesCancelableAlloc(alloc, runs, .{});
 }
 
+fn invisibleTextRun(run: anytype) bool {
+    const mode = @mod(run.render_mode, 8);
+    return mode == 3 or mode == 7;
+}
+
+fn textBoundsOverlap(left: TextRunBounds, right: TextRunBounds) bool {
+    const width = @min(left.max_x, right.max_x) - @max(left.min_x, right.min_x);
+    const height = @min(left.max_y, right.max_y) - @max(left.min_y, right.min_y);
+    return width > @min(left.max_x - left.min_x, right.max_x - right.min_x) * 0.5 and
+        height > @min(left.max_y - left.min_y, right.max_y - right.min_y) * 0.5;
+}
+
+const TextLayerRegion = struct {
+    indices: []const usize,
+    bounds: TextRunBounds,
+    overlapping: bool,
+    isolated_line: bool,
+    parent: usize,
+    next: ?usize = null,
+    head: ?usize = null,
+    tail: ?usize = null,
+    emitted: bool = false,
+};
+
+fn textLayerRegionRoot(regions: []TextLayerRegion, index: usize) usize {
+    var root = index;
+    while (regions[root].parent != root) root = regions[root].parent;
+    var cursor = index;
+    while (regions[cursor].parent != cursor) {
+        const next = regions[cursor].parent;
+        regions[cursor].parent = root;
+        cursor = next;
+    }
+    return root;
+}
+
+fn textRunsHaveMixedLayers(runs: anytype, indices: []const usize) bool {
+    var visible = false;
+    var invisible = false;
+    for (indices) |index| {
+        if (invisibleTextRun(runs[index])) invisible = true else visible = true;
+        if (visible and invisible) return true;
+    }
+    return false;
+}
+
+/// Render mode distinguishes visible/OCR transcriptions. Independent invisible
+/// BT objects may also be separate copies; glyph fragments in the same object
+/// remain one authored sequence, including deliberate negative kerning.
+fn independentTextCopies(left: anytype, right: anytype) bool {
+    if (invisibleTextRun(left) != invisibleTextRun(right)) return true;
+    return invisibleTextRun(left) and left.text_object_id != null and
+        right.text_object_id != null and left.text_object_id.? != right.text_object_id.?;
+}
+
+fn textRunsNeedTrackRepair(runs: anytype, indices: []const usize) bool {
+    if (textRunsHaveMixedLayers(runs, indices)) return true;
+    var first_object: ?usize = null;
+    for (indices) |index| {
+        if (!invisibleTextRun(runs[index])) continue;
+        if (runs[index].text_object_id) |id| {
+            if (first_object) |first| {
+                if (first != id) return true;
+            } else first_object = id;
+        }
+    }
+    return false;
+}
+
+const TextTrackRun = struct {
+    bounds: TextRunBounds,
+    cohort: usize = 0,
+    next: ?usize = null,
+};
+const TextTrack = struct {
+    invisible: bool,
+    blocked: bool = false,
+    head: ?usize = null,
+    tail: ?usize = null,
+};
+
+const TextSourceKey = struct {
+    object: ?usize,
+    invisible: bool,
+};
+fn textSourceKey(run: anytype) TextSourceKey {
+    return .{ .object = run.text_object_id, .invisible = invisibleTextRun(run) };
+}
+const TextSourceCohort = struct {
+    head: usize,
+    tail: usize,
+    linked: bool = false,
+    track: ?usize = null,
+    first_spatial: usize = std.math.maxInt(usize),
+    last_spatial: usize = 0,
+};
+
+/// Color source cohorts into independent tracks. Once a text object is tied
+/// to an overlapping transcription, all its words retain that membership.
+/// Unanchored words trigger an authored-object fallback rather than a guessed
+/// sentence. Every run is emitted once with its original span.
+/// Pair discovery and coloring are O(n^2), bounded by the layout run ceiling;
+/// linked output lists make emission O(n), even for many coincident copies.
+fn appendTextRegionTracks(
+    alloc: Allocator,
+    out: *std.ArrayList(usize),
+    runs: anytype,
+    regions: []const TextLayerRegion,
+    head: ?usize,
+    info: []TextTrackRun,
+    track_scratch: *?[]TextTrack,
+    cancellation: CancellationProbe,
+    break_before: ?[]bool,
+) !void {
+    var spatial = std.ArrayList(usize).empty;
+    defer spatial.deinit(alloc);
+    var cursor = head;
+    while (cursor) |region| : (cursor = regions[region].next)
+        try spatial.appendSlice(alloc, regions[region].indices);
+    const authored = try alloc.dupe(usize, spatial.items);
+    defer alloc.free(authored);
+    std.mem.sort(usize, authored, {}, std.sort.asc(usize));
+    var sources = std.AutoHashMap(TextSourceKey, usize).init(alloc);
+    defer sources.deinit();
+    var cohorts = std.ArrayList(TextSourceCohort).empty;
+    defer cohorts.deinit(alloc);
+    for (authored) |index| {
+        const entry = try sources.getOrPut(textSourceKey(runs[index]));
+        if (!entry.found_existing) {
+            entry.value_ptr.* = cohorts.items.len;
+            try cohorts.append(alloc, .{ .head = index, .tail = index });
+        } else {
+            const source = &cohorts.items[entry.value_ptr.*];
+            info[source.tail].next = index;
+            source.tail = index;
+        }
+        info[index] = .{ .bounds = textRunBounds(runs[index]), .cohort = entry.value_ptr.* };
+    }
+    for (spatial.items, 0..) |index, position| {
+        const source = &cohorts.items[info[index].cohort];
+        source.first_spatial = @min(source.first_spatial, position);
+        source.last_spatial = @max(source.last_spatial, position);
+    }
+    for (authored, 0..) |left, i| {
+        try cancellation.check();
+        for (authored[i + 1 ..]) |right| {
+            if (independentTextCopies(runs[left], runs[right]) and textBoundsOverlap(info[left].bounds, info[right].bounds)) {
+                cohorts.items[info[left].cohort].linked = true;
+                cohorts.items[info[right].cohort].linked = true;
+            }
+        }
+    }
+    const ambiguous = for (cohorts.items) |cohort| {
+        if (!cohort.linked) break true;
+    } else false;
+    if (ambiguous) {
+        // Geometry cannot establish which transcription owns an unanchored
+        // word. Preserve complete authored objects instead of guessing a
+        // synthesized sentence. This also handles interleaved Form content.
+        for (cohorts.items) |cohort| {
+            try cancellation.check();
+            if (break_before) |flags| flags[cohort.head] = true;
+            cursor = cohort.head;
+            while (cursor) |index| : (cursor = info[index].next) try out.append(alloc, index);
+        }
+        return;
+    }
+    if (track_scratch.* == null) track_scratch.* = try alloc.alloc(TextTrack, runs.len);
+    const tracks = track_scratch.*.?;
+    var count: usize = 0;
+    for (cohorts.items) |*cohort| {
+        try cancellation.check();
+        for (tracks[0..count]) |*track| track.blocked = false;
+        // Disjoint glyph boxes can still interleave an authored phrase. Those
+        // source cohorts must not share a track just because the words moved.
+        for (cohorts.items) |prior| {
+            const assigned = prior.track orelse continue;
+            if (cohort.first_spatial < prior.last_spatial and prior.first_spatial < cohort.last_spatial)
+                tracks[assigned].blocked = true;
+        }
+        var member: ?usize = cohort.head;
+        while (member) |index| : (member = info[index].next) {
+            // Each run scans previously colored cohorts once: O(n^2) in total.
+            for (authored) |prior| {
+                const assigned = cohorts.items[info[prior].cohort].track orelse continue;
+                if (independentTextCopies(runs[prior], runs[index]) and
+                    textBoundsOverlap(info[prior].bounds, info[index].bounds)) tracks[assigned].blocked = true;
+            }
+        }
+        const invisible = invisibleTextRun(runs[cohort.head]);
+        const selected = for (tracks[0..count], 0..) |track, t| {
+            if (track.invisible == invisible and !track.blocked) break t;
+        } else blk: {
+            tracks[count] = .{ .invisible = invisible };
+            count += 1;
+            break :blk count - 1;
+        };
+        cohort.track = selected;
+    }
+    std.debug.assert(count > 0);
+    // Cohort links are no longer needed; reuse them for the output lists.
+    for (spatial.items) |index| info[index].next = null;
+    for (spatial.items) |index| {
+        const track = cohorts.items[info[index].cohort].track.?;
+        if (tracks[track].tail) |tail| info[tail].next = index else tracks[track].head = index;
+        tracks[track].tail = index;
+    }
+    // Emit tracks in stable authored order.
+    for (0..count) |t| {
+        cursor = tracks[t].head;
+        if (t != 0) if (break_before) |flags| {
+            flags[cursor.?] = true;
+        };
+        while (cursor) |index| : (cursor = info[index].next) try out.append(alloc, index);
+    }
+}
+
+/// Build transcription regions from contiguous portions of layout lines.
+/// Wide gaps use the same geometric floor as column detection, so OCR in one
+/// column cannot pull unrelated cells or an adjacent column into its layer.
+/// Splice each region at its first authored occurrence; all other runs retain
+/// the order selected by column repair. All transcriptions keep their spans.
+fn appendTextLayerRegions(
+    alloc: Allocator,
+    out: *std.ArrayList(usize),
+    runs: anytype,
+    indices: []const usize,
+    lines: []const TextLayoutLine,
+    metrics: TextLayoutMetrics,
+    cancellation: CancellationProbe,
+    break_before: ?[]bool,
+) !void {
+    if (runs.len > 2048) return appendOriginalTextRunIndices(alloc, out, indices);
+    if (!textRunsNeedTrackRepair(runs, indices)) return appendOriginalTextRunIndices(alloc, out, indices);
+
+    const anchored = try alloc.alloc(bool, runs.len);
+    defer alloc.free(anchored);
+    @memset(anchored, false);
+    var anchored_sources = std.AutoHashMap(TextSourceKey, usize).init(alloc);
+    defer anchored_sources.deinit();
+    for (lines) |line| {
+        for (line.run_indices.items, 0..) |left, i| {
+            try cancellation.check();
+            const left_bounds = textRunBounds(runs[left]);
+            for (line.run_indices.items[i + 1 ..]) |right| {
+                const right_bounds = textRunBounds(runs[right]);
+                if (right_bounds.min_x >= left_bounds.max_x) break;
+                if (!independentTextCopies(runs[left], runs[right]) or !textBoundsOverlap(left_bounds, right_bounds)) continue;
+                for ([_]usize{ left, right }) |index| {
+                    if (!anchored[index] and runs[index].text_object_id != null)
+                        try anchored_sources.put(textSourceKey(runs[index]), std.math.maxInt(usize));
+                    anchored[index] = true;
+                }
+            }
+        }
+    }
+    for (indices) |index| {
+        if (runs[index].text_object_id != null and anchored_sources.contains(textSourceKey(runs[index]))) anchored[index] = true;
+    }
+
+    var regions = std.ArrayList(TextLayerRegion).empty;
+    defer regions.deinit(alloc);
+    const membership = try alloc.alloc(usize, runs.len);
+    defer alloc.free(membership);
+    @memset(membership, std.math.maxInt(usize));
+    const maximum_gap = @max(metrics.median_height * 2.0, metrics.median_space_advance * 4.0);
+    for (lines) |line| {
+        try cancellation.check();
+        const first_region = regions.items.len;
+        var overlapping_members: usize = 0;
+        var start: usize = 0;
+        while (start < line.run_indices.items.len) {
+            var end = start + 1;
+            var bounds = textRunBounds(runs[line.run_indices.items[start]]);
+            while (end < line.run_indices.items.len) : (end += 1) {
+                const next = textRunBounds(runs[line.run_indices.items[end]]);
+                if (next.min_x - bounds.max_x >= maximum_gap) break;
+                bounds.include(next);
+            }
+            const region_indices = line.run_indices.items[start..end];
+            var has_visible = false;
+            var has_invisible = false;
+            for (region_indices) |index| {
+                if (invisibleTextRun(runs[index])) has_invisible = true else has_visible = true;
+            }
+            const overlapping = for (region_indices) |index| {
+                if (anchored[index]) break true;
+            } else false;
+            if ((has_visible and has_invisible) or overlapping) {
+                if (overlapping) overlapping_members += region_indices.len;
+                for (region_indices) |index| membership[index] = regions.items.len;
+                try regions.append(alloc, .{
+                    .indices = region_indices,
+                    .overlapping = overlapping,
+                    .isolated_line = start == 0 and end == line.run_indices.items.len,
+                    .bounds = bounds,
+                    .parent = regions.items.len,
+                });
+            }
+            start = end;
+        }
+        if (regions.items.len > first_region + 1 and overlapping_members == line.run_indices.items.len) {
+            // Fully overprinted table cells are alternate copies of one row.
+            // Keep each row association intact, rather than joining columns.
+            regions.shrinkRetainingCapacity(first_region + 1);
+            regions.items[first_region] = .{
+                .indices = line.run_indices.items,
+                .bounds = line.bounds,
+                .overlapping = true,
+                .isolated_line = false,
+                .parent = first_region,
+            };
+            for (line.run_indices.items) |index| membership[index] = first_region;
+        }
+    }
+    // Source membership spans line and gap boundaries. Joining only the
+    // colliding words would strand the rest of that authored transcription.
+    for (indices) |index| {
+        if (!anchored[index] or runs[index].text_object_id == null) continue;
+        const first = anchored_sources.getPtr(textSourceKey(runs[index])).?;
+        const region = membership[index];
+        std.debug.assert(region != std.math.maxInt(usize));
+        if (first.* == std.math.maxInt(usize)) {
+            first.* = region;
+        } else {
+            const root = textLayerRegionRoot(regions.items, first.*);
+            const other = textLayerRegionRoot(regions.items, region);
+            regions.items[other].parent = root;
+        }
+    }
+    // Join adjacent overlapping lines into a transcription region. A header
+    // overlap cannot capture complementary OCR words or an unrelated footer.
+    // The caller's 2048-run ceiling bounds this optional component search.
+    for (regions.items, 0..) |left, i| {
+        try cancellation.check();
+        if (!left.overlapping or !left.isolated_line) continue;
+        for (i + 1..regions.items.len) |j| {
+            const right = regions.items[j];
+            if (!right.overlapping or !right.isolated_line) continue;
+            const horizontal = @min(left.bounds.max_x, right.bounds.max_x) - @max(left.bounds.min_x, right.bounds.min_x);
+            const vertical_gap = @max(left.bounds.min_y, right.bounds.min_y) - @min(left.bounds.max_y, right.bounds.max_y);
+            if (horizontal <= @min(left.bounds.max_x - left.bounds.min_x, right.bounds.max_x - right.bounds.min_x) * 0.5 or
+                vertical_gap > metrics.median_height) continue;
+            const left_root = textLayerRegionRoot(regions.items, i);
+            const right_root = textLayerRegionRoot(regions.items, j);
+            regions.items[right_root].parent = left_root;
+        }
+    }
+    // Build each component's list in geometric line order once. Emitting all
+    // components then costs O(number of retained runs), without rescanning.
+    for (0..regions.items.len) |i| {
+        const root_index = textLayerRegionRoot(regions.items, i);
+        const root = &regions.items[root_index];
+        if (root.tail) |tail| regions.items[tail].next = i else root.head = i;
+        root.tail = i;
+    }
+    var track_runs: ?[]TextTrackRun = null;
+    defer if (track_runs) |scratch| alloc.free(scratch);
+    var tracks: ?[]TextTrack = null;
+    defer if (tracks) |scratch| alloc.free(scratch);
+    for (indices) |index| {
+        const region_index = membership[index];
+        if (region_index == std.math.maxInt(usize)) {
+            try out.append(alloc, index);
+            continue;
+        }
+        const root_index = textLayerRegionRoot(regions.items, region_index);
+        const root = &regions.items[root_index];
+        if (root.emitted) continue;
+        root.emitted = true;
+        if (root.overlapping) {
+            if (track_runs == null) track_runs = try alloc.alloc(TextTrackRun, runs.len);
+            try appendTextRegionTracks(alloc, out, runs, regions.items, root.head, track_runs.?, &tracks, cancellation, break_before);
+        } else {
+            // Complementary OCR words belong in their geometric sentence.
+            try out.appendSlice(alloc, root.indices);
+        }
+    }
+}
+
 fn orderedTextRunIndicesCancelableAlloc(alloc: Allocator, runs: anytype, cancellation: CancellationProbe) ![]usize {
+    return orderedTextRunIndicesWithBreaksAlloc(alloc, runs, cancellation, null);
+}
+
+fn orderedTextRunIndicesWithBreaksAlloc(alloc: Allocator, runs: anytype, cancellation: CancellationProbe, break_before: ?[]bool) ![]usize {
     var original = std.ArrayList(usize).empty;
     defer original.deinit(alloc);
     var ordering_supported = true;
@@ -18520,7 +18936,7 @@ fn orderedTextRunIndicesCancelableAlloc(alloc: Allocator, runs: anytype, cancell
     const metrics = try textLayoutMetricsAlloc(alloc, runs, original.items);
     var ordered = std.ArrayList(usize).empty;
     errdefer ordered.deinit(alloc);
-    try appendPartitionedTextRunOrder(alloc, &ordered, runs, original.items, metrics, 0, cancellation);
+    try appendPartitionedTextRunOrder(alloc, &ordered, runs, original.items, metrics, 0, cancellation, break_before);
     std.debug.assert(ordered.items.len == original.items.len);
     return try ordered.toOwnedSlice(alloc);
 }
@@ -18591,7 +19007,9 @@ fn reconstructTextFromRunsAlloc(alloc: Allocator, runs: anytype) ![]u8 {
 fn reconstructTextFromRunsCancelableAlloc(alloc: Allocator, runs: anytype, cancellation: CancellationProbe) ![]u8 {
     try cancellation.check();
     clearTextRunOutputSpans(runs);
-    const ordered_indices = try orderedTextRunIndicesCancelableAlloc(alloc, runs, cancellation);
+    var boundary_storage: [2048]bool = @splat(false);
+    const boundaries: ?[]bool = if (runs.len <= boundary_storage.len) boundary_storage[0..runs.len] else null;
+    const ordered_indices = try orderedTextRunIndicesWithBreaksAlloc(alloc, runs, cancellation, boundaries);
     defer alloc.free(ordered_indices);
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
@@ -18601,7 +19019,15 @@ fn reconstructTextFromRunsCancelableAlloc(alloc: Allocator, runs: anytype, cance
         const run = &runs[run_index];
         if (previous_index) |prior_index| {
             const prior = runs[prior_index];
-            if (!textRunsShareLine(prior, run.*)) {
+            const layer_boundary = invisibleTextRun(prior) != invisibleTextRun(run.*) and
+                (textRunForwardGap(prior, run.*) < 0 or
+                    textBoundsOverlap(textRunBounds(prior), textRunBounds(run.*)));
+            const authored_ocr_boundary = invisibleTextRun(prior) and invisibleTextRun(run.*) and
+                independentTextCopies(prior, run.*) and
+                textRunForwardGap(prior, run.*) < 0 and
+                textBoundsOverlap(textRunBounds(prior), textRunBounds(run.*));
+            const track_boundary = if (boundaries) |flags| flags[run_index] else false;
+            if (track_boundary or authored_ocr_boundary or layer_boundary or !textRunsShareLine(prior, run.*)) {
                 try appendLayoutNewline(alloc, &out, runs, ordered_indices[0..emitted_index]);
             } else if (!std.ascii.isWhitespace(out.items[out.items.len - 1]) and
                 !std.ascii.isWhitespace(run.text[0]))
@@ -32004,13 +32430,14 @@ test "document bounded PDF runs share one allowance across consumes and nested f
         for (runs.items) |*run| run.deinit(a);
         runs.deinit(a);
     }
-    var parser = try PositionedTextParser.init(a, .{ .analysis = .{ .runs = &runs, .max_runs = 2 } }, .{}, &.{}, .nonzero);
+    var parser = try PositionedTextParser.init(a, .{ .analysis = .{ .runs = &runs, .max_runs = 3 } }, .{}, &.{}, .nonzero);
     defer parser.deinit();
     try parser.consume("BT 3 Tr (Invisible) Tj 0 Tr (First) Tj ET", &.{}, &.{}, &.{});
     const form = PageForm{ .name = @constCast("Fm"), .content = @constCast("BT (Second) Tj (Excess) Tj ET") };
     try std.testing.expectError(error.TextRunLimitExceeded, parser.consume("/Fm Do", &.{}, &.{}, &.{form}));
-    try std.testing.expectEqual(@as(usize, 2), runs.items.len);
-    try std.testing.expectEqualStrings("Second", runs.items[1].text);
+    try std.testing.expectEqual(@as(usize, 3), runs.items.len);
+    try std.testing.expectEqualStrings("Invisible", runs.items[0].text);
+    try std.testing.expectEqualStrings("Second", runs.items[2].text);
 }
 
 test "document bounded PDF run allocation failures release partially collected text" {
@@ -32062,4 +32489,194 @@ test "document PDF static annotation states composite through Form geometry and 
     const center = ((raster.height / 2) * raster.width + raster.width / 2) * 4;
     try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, raster.rgba[center..][0..4]);
     try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, raster.rgba[0..4]);
+}
+
+test "reader reconstructs invisible OCR spacing without painting the OCR layer" {
+    const alloc = std.testing.allocator;
+    const content = "BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (replace) Tj 1 0 0 1 60 50 Tm (all) Tj 1 0 0 1 85 50 Tm (six) Tj 1 0 0 1 110 50 Tm (gyroscopes) Tj ET";
+    const fonts = [_]PageFont{.{ .name = try alloc.dupe(u8, "F1"), .decoder = .{} }};
+    defer {
+        var font = fonts[0];
+        font.deinit(alloc);
+    }
+    var runs = std.ArrayList(TextRun).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+    }
+    var parser = try PositionedTextParser.init(alloc, .{ .analysis = .{ .runs = &runs, .max_runs = 4 } }, .{}, &.{}, .nonzero);
+    defer parser.deinit();
+    try parser.consume(content, &fonts, &.{}, &.{});
+    try std.testing.expectEqual(@as(usize, 4), runs.items.len);
+    const text = try reconstructTextFromRunsAlloc(alloc, runs.items);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("replace all six gyroscopes\n", text);
+    for (runs.items) |run| {
+        try std.testing.expectEqual(@as(i64, 3), run.render_mode);
+        try std.testing.expectEqualStrings(run.text, text[run.output_span.?.start..run.output_span.?.end]);
+    }
+    var painted = std.ArrayList(TextRun).empty;
+    defer painted.deinit(alloc);
+    try extractTextRunsFromContentAppend(alloc, &painted, content, &fonts, &.{}, &.{});
+    try std.testing.expectEqual(@as(usize, 0), painted.items.len);
+}
+
+test "reader NASA SM3A OCR report retains searchable words in both extraction APIs" {
+    const a = std.testing.allocator;
+    var reader = try Reader.init(a, @embedFile("testdata/nasa-hubble-sm3a.pdf"));
+    defer reader.deinit();
+    const text = try reader.extractPageTextAlloc(1);
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "replace all six gyroscopes") != null);
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expectEqualStrings(text, analysis.text);
+    try std.testing.expect(analysis.runs.len > 100);
+    for (analysis.runs) |run| {
+        if (run.output_span) |span| try std.testing.expectEqualStrings(run.text, analysis.text[span.start..span.end]);
+    }
+    // OCR runs still observe the caller's working-set bound.
+    try std.testing.expectError(error.TextRunLimitExceeded, reader.extractPageTextAnalysisWithRunLimitAlloc(1, 10));
+}
+
+test "reader mixed OCR layers preserve words phrases and nonoverlapping reading order" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { content: []const u8, expected: []const u8 }{
+        .{ .content = "BT /F1 12 Tf 10 50 Td (The) Tj ET BT /F1 12 Tf 40 50 Td (cat) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (The) Tj ET BT /F1 12 Tf 3 Tr 70 50 Td (dog) Tj ET", .expected = "The\ncat\nThe\ndog\n" },
+        .{ .content = "BT /F1 12 Tf 1 0 0 1 10 50 Tm (The ) Tj 1 0 0 1 40 50 Tm (cat) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 10 50 Tm (The ) Tj 1 0 0 1 70 50 Tm (dog) Tj ET", .expected = "The cat\nThe dog\n" },
+        .{ .content = "BT /F1 12 Tf 3 Tr 1 0 0 1 10 50 Tm (The ) Tj 1 0 0 1 40 50 Tm (cat) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 10 50 Tm (The ) Tj 1 0 0 1 70 50 Tm (dog) Tj ET", .expected = "The cat\nThe dog\n" },
+        .{ .content = "BT /F1 12 Tf 1 0 0 1 10 50 Tm (The) Tj 1 0 0 1 40 50 Tm (cat) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 10 50 Tm (The) Tj 1 0 0 1 200 50 Tm (dog) Tj ET", .expected = "The cat\nThe dog\n" },
+        .{ .content = "BT /F1 12 Tf 10 90 Td (The) Tj 1 0 0 1 10 70 Tm (cat) Tj ET BT /F1 12 Tf 3 Tr 10 90 Td (The) Tj 1 0 0 1 10 50 Tm (dog) Tj ET", .expected = "The\ncat\nThe\ndog\n" },
+        .{ .content = "BT /F1 12 Tf 10 50 Td (replace) Tj ET BT /F1 12 Tf 110 50 Td (gyroscopes) Tj ET BT /F1 12 Tf 3 Tr 55 50 Td (all six gyroscopes) Tj ET", .expected = "replace\ngyroscopes\nall six gyroscopes\n" },
+        .{ .content = "BT /F1 12 Tf 10 50 Td (The) Tj 1 0 0 1 80 50 Tm (cat) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (The) Tj 1 0 0 1 80 50 Tm (dog) Tj ET BT /F1 12 Tf 3 Tr 40 50 Td (very) Tj ET", .expected = "The cat\nThe dog\nvery\n" },
+        .{ .content = "BT /F1 10 Tf 3 Tr 1 0 0 1 10 90 Tm (First name) Tj 1 0 0 1 200 90 Tm (Alice Smith) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 70 Tm (Home city) Tj 1 0 0 1 200 70 Tm (Paris France) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (Job title) Tj 1 0 0 1 200 50 Tm (Chief Engineer) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 90 Tm (First name) Tj 1 0 0 1 200 90 Tm (Alice Smith) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 70 Tm (Home city) Tj 1 0 0 1 200 70 Tm (Paris France) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (Job title) Tj 1 0 0 1 200 50 Tm (Chief Engineer) Tj ET ", .expected = "First name Alice Smith\nFirst name Alice Smith\nHome city Paris France\nHome city Paris France\nJob title Chief Engineer\nJob title Chief Engineer\n" },
+        .{ .content = "BT /F1 10 Tf 3 Tr 1 0 0 1 10 90 Tm (Left prose one) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 70 Tm (Left prose two) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (Left prose three) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 90 Tm (Right prose one) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 70 Tm (Right prose two) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 50 Tm (Right prose three) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 90 Tm (Left prose one) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 70 Tm (Left prose two) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (Left prose three) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 90 Tm (Right prose one) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 70 Tm (Right prose two) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 50 Tm (Right prose three) Tj ET ", .expected = "Left prose one\nLeft prose two\nLeft prose three\nLeft prose one\nLeft prose two\nLeft prose three\nRight prose one\nRight prose two\nRight prose three\nRight prose one\nRight prose two\nRight prose three\n" },
+        .{ .content = "BT /F1 12 Tf 1 0 0 1 10 50 Tm (replace) Tj 1 0 0 1 110 50 Tm (gyroscopes) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 55 50 Tm (all) Tj 1 0 0 1 80 50 Tm (six) Tj 1 0 0 1 110 50 Tm (gyroscopes) Tj ET", .expected = "replace gyroscopes\nall six gyroscopes\n" },
+        .{ .content = "BT /F1 12 Tf 1 0 0 1 10 50 Tm (replace) Tj 1 0 0 1 110 50 Tm (gyroscopes) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 55 50 Tm (all six gyroscopes) Tj ET", .expected = "replace gyroscopes\nall six gyroscopes\n" },
+        .{ .content = "BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET", .expected = "needle\nneedle\n" },
+        .{ .content = "BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET", .expected = "needle\nneedle\nneedle\n" },
+        .{ .content = "BT /F1 12 Tf 3 Tr 1 0 0 1 10 50 Tm (f) Tj 1 0 0 1 11 50 Tm (i) Tj ET", .expected = "fi\n" },
+        .{ .content = "BT /F1 12 Tf 3 Tr 10 90 Td (first line) Tj 1 0 0 1 10 70 Tm (second line) Tj ET BT /F1 12 Tf 3 Tr 10 90 Td (first line) Tj 1 0 0 1 10 70 Tm (second line) Tj ET", .expected = "first line\nsecond line\nfirst line\nsecond line\n" },
+        .{ .content = "BT /F1 10 Tf 0 Tr 1 0 0 1 10 90 Tm (First name) Tj 1 0 0 1 200 90 Tm (Alice Smith) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 10 70 Tm (Home city) Tj 1 0 0 1 200 70 Tm (Paris France) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 10 50 Tm (Job title) Tj 1 0 0 1 200 50 Tm (Chief Engineer) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 90 Tm (First name) Tj 1 0 0 1 200 90 Tm (Alice Smith) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 70 Tm (Home city) Tj 1 0 0 1 200 70 Tm (Paris France) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (Job title) Tj 1 0 0 1 200 50 Tm (Chief Engineer) Tj ET ", .expected = "First name Alice Smith\nFirst name Alice Smith\nHome city Paris France\nHome city Paris France\nJob title Chief Engineer\nJob title Chief Engineer\n" },
+        .{ .content = "BT /F1 10 Tf 0 Tr 1 0 0 1 10 90 Tm (Left prose one) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 10 70 Tm (Left prose two) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 10 50 Tm (Left prose three) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 200 90 Tm (Right prose one) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 200 70 Tm (Right prose two) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 200 50 Tm (Right prose three) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 90 Tm (Left prose one) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 70 Tm (Left prose two) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (Left prose three) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 90 Tm (Right prose one) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 70 Tm (Right prose two) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 50 Tm (Right prose three) Tj ET ", .expected = "Left prose one\nLeft prose two\nLeft prose three\nLeft prose one\nLeft prose two\nLeft prose three\nRight prose one\nRight prose two\nRight prose three\nRight prose one\nRight prose two\nRight prose three\n" },
+        .{ .content = "BT /F1 12 Tf 10 90 Td (Heading) Tj ET BT /F1 12 Tf 0 Tr 10 70 Td (replace) Tj 1 0 0 1 150 70 Tm (gyroscopes) Tj ET BT /F1 12 Tf 0 Tr 10 50 Td (Footer) Tj ET BT /F1 12 Tf 3 Tr 10 90 Td (Heading) Tj ET BT /F1 12 Tf 3 Tr 70 70 Td (all six) Tj ET", .expected = "Heading\nHeading\nreplace all six gyroscopes\nFooter\n" },
+        .{ .content = "BT /F1 12 Tf 10 90 Td (first line) Tj 1 0 0 1 10 70 Tm (second line) Tj ET BT /F1 12 Tf 3 Tr 10 90 Td (first line) Tj 1 0 0 1 10 70 Tm (second line) Tj ET", .expected = "first line\nsecond line\nfirst line\nsecond line\n" },
+        .{ .content = "BT /F1 12 Tf 10 50 Td (left) Tj 1 0 0 1 200 50 Tm (right) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (left) Tj 1 0 0 1 200 50 Tm (other) Tj ET", .expected = "left right\nleft other\n" },
+        .{ .content = "BT /F1 12 Tf 10 50 Td (needle) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET", .expected = "needle\nneedle\n" },
+        .{ .content = "BT /F1 12 Tf 1 0 0 1 10 50 Tm (alpha) Tj 1 0 0 1 60 50 Tm (beta) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 10 50 Tm (alpha) Tj 1 0 0 1 60 50 Tm (gamma) Tj ET", .expected = "alpha beta\nalpha gamma\n" },
+        .{ .content = "BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET BT /F1 12 Tf 0 Tr 10 50 Td (visible) Tj ET", .expected = "needle\nvisible\n" },
+        .{ .content = "BT /F1 12 Tf 10 90 Td (Heading) Tj ET BT /F1 12 Tf 3 Tr 10 70 Td (body words) Tj ET BT /F1 12 Tf 0 Tr 10 50 Td (Footer) Tj ET", .expected = "Heading\nbody words\nFooter\n" },
+    };
+    for (cases) |case| {
+        const bytes = try buildTextOrderingTestPdfAlloc(a, case.content);
+        defer a.free(bytes);
+        var reader = try Reader.init(a, bytes);
+        defer reader.deinit();
+        const text = try reader.extractPageTextAlloc(1);
+        defer a.free(text);
+        try std.testing.expectEqualStrings(case.expected, text);
+        var analysis = try reader.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        try std.testing.expectEqualStrings(text, analysis.text);
+        for (analysis.runs) |run| if (run.output_span) |span| {
+            try std.testing.expectEqualStrings(run.text, text[span.start..span.end]);
+        };
+    }
+}
+
+test "reader mixed OCR layer reconstruction bounds work and remains cancellable" {
+    const a = std.testing.allocator;
+    const runs = try a.alloc(TextRun, 2050);
+    defer a.free(runs);
+    for (runs, 0..) |*run, i| run.* = .{
+        .text = "word",
+        .x = 10,
+        .y = 50,
+        .font_size = 12,
+        .advance_width = 24,
+        .ascent = 10,
+        .descent = 2,
+        .render_mode = if (i % 2 == 0) 0 else 3,
+    };
+    const order = try orderedTextRunIndicesAlloc(a, runs);
+    defer a.free(order);
+    for (order, 0..) |index, i| try std.testing.expectEqual(i, index);
+    const text = try reconstructTextFromRunsAlloc(a, runs);
+    defer a.free(text);
+    try std.testing.expectEqual(@as(usize, runs.len * "word\n".len), text.len);
+    for (runs) |run| {
+        const span = run.output_span.?;
+        try std.testing.expectEqualStrings(run.text, text[span.start..span.end]);
+    }
+    const Cancelled = struct {
+        fn check(_: ?*const anyopaque) bool {
+            return true;
+        }
+    };
+    // Also exercise cancellation in the bounded overlapping-layer search.
+    try std.testing.expectError(error.Canceled, orderedTextRunIndicesCancelableAlloc(a, runs[0..2048], .{ .is_cancelled_fn = Cancelled.check }));
+}
+
+test "reader transcription tracks release every partial allocation" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            var runs = [_]TextRun{
+                .{ .text = "replace", .x = 10, .y = 50, .font_size = 12, .advance_width = 36, .ascent = 10, .descent = 2, .text_object_id = 0 },
+                .{ .text = "gyroscopes", .x = 110, .y = 50, .font_size = 12, .advance_width = 60, .ascent = 10, .descent = 2, .text_object_id = 0 },
+                .{ .text = "all", .x = 55, .y = 50, .font_size = 12, .advance_width = 18, .ascent = 10, .descent = 2, .text_object_id = 1, .render_mode = 3 },
+                .{ .text = "six", .x = 80, .y = 50, .font_size = 12, .advance_width = 18, .ascent = 10, .descent = 2, .text_object_id = 1, .render_mode = 3 },
+                .{ .text = "gyroscopes", .x = 110, .y = 50, .font_size = 12, .advance_width = 60, .ascent = 10, .descent = 2, .text_object_id = 1, .render_mode = 3 },
+            };
+            const text = try reconstructTextFromRunsAlloc(a, &runs);
+            defer a.free(text);
+            try std.testing.expectEqualStrings("replace gyroscopes\nall six gyroscopes\n", text);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "reader invisible copy boundaries survive the dense page fallback" {
+    const a = std.testing.allocator;
+    const runs = try a.alloc(TextRun, 2050);
+    defer a.free(runs);
+    for (runs, 0..) |*run, i| run.* = .{
+        .text = "needle",
+        .x = 10,
+        .y = 50,
+        .font_size = 12,
+        .advance_width = 36,
+        .ascent = 10,
+        .descent = 2,
+        .render_mode = 3,
+        .text_object_id = i,
+    };
+    const text = try reconstructTextFromRunsAlloc(a, runs);
+    defer a.free(text);
+    try std.testing.expectEqual(runs.len * "needle\n".len, text.len);
+    for (runs) |run| {
+        const span = run.output_span.?;
+        try std.testing.expectEqualStrings(run.text, text[span.start..span.end]);
+    }
+}
+
+test "reader ambiguous overlap keeps interleaved text objects coherent" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            var runs = [_]TextRun{
+                .{ .text = "The", .x = 10, .y = 50, .font_size = 12, .advance_width = 18, .ascent = 10, .descent = 2, .text_object_id = 0 },
+                .{ .text = "very", .x = 40, .y = 50, .font_size = 12, .advance_width = 24, .ascent = 10, .descent = 2, .text_object_id = 1, .render_mode = 3 },
+                .{ .text = "cat", .x = 80, .y = 50, .font_size = 12, .advance_width = 18, .ascent = 10, .descent = 2, .text_object_id = 0 },
+                .{ .text = "The", .x = 10, .y = 50, .font_size = 12, .advance_width = 18, .ascent = 10, .descent = 2, .text_object_id = 2, .render_mode = 3 },
+                .{ .text = "dog", .x = 80, .y = 50, .font_size = 12, .advance_width = 18, .ascent = 10, .descent = 2, .text_object_id = 2, .render_mode = 3 },
+            };
+            const text = try reconstructTextFromRunsAlloc(a, &runs);
+            defer a.free(text);
+            try std.testing.expectEqualStrings("The cat\nvery\nThe dog\n", text);
+            for (runs) |source_run| {
+                const span = source_run.output_span.?;
+                try std.testing.expectEqualStrings(source_run.text, text[span.start..span.end]);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

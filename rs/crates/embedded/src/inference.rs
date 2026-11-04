@@ -15,7 +15,7 @@
 
 //! Embedded inference without a database: `antfly_inference_open`/`close`
 //! plus the `/ai/v1`-mirroring JSON call surface (embed, rerank, chunk,
-//! generate, generate/batch, rewrite, decide, extract, read, transcribe, models,
+//! generate, generate/batch, rewrite, decide, extract, read, models,
 //! pull). See `zig/CAPI.md`'s "Inference" and "Inference In Process"
 //! sections and the `Embedded inference without a database` block in
 //! `zig/pkg/antfly-embedded/include/antfly.h`.
@@ -547,19 +547,13 @@ impl Inference {
         })
     }
 
-    /// `POST /read` (OCR).
+    /// `POST /read` for images, documents, or audio.
     pub fn read(&self, request: impl AsRef<[u8]>) -> InferenceResult<Vec<u8>> {
         self.call_json(request.as_ref(), |h, req, out| unsafe {
             sys::antfly_inference_read_json(h, req, out)
         })
     }
 
-    /// `POST /transcribe`.
-    pub fn transcribe(&self, request: impl AsRef<[u8]>) -> InferenceResult<Vec<u8>> {
-        self.call_json(request.as_ref(), |h, req, out| unsafe {
-            sys::antfly_inference_transcribe_json(h, req, out)
-        })
-    }
 
     /// `GET /models`: the installed models.
     pub fn list_models(&self) -> InferenceResult<Vec<u8>> {

@@ -2556,6 +2556,48 @@ pub const AudioChunkOptions = struct {
     }
 };
 
+/// Recognition options, checked against every selected backend and fallback before inference. Whisper supports all options and pause-aware windowing of long recordings. Gemma supports transcription up to 30 seconds and rejects language, timestamps and diarization requests. No backend is substituted to satisfy an option.
+pub const AudioReadOptions = struct {
+    /// Force recognition in this language (e.g. en). Omitted means detect language where supported; this is not a translation or cleanup request. Gemma does not support language control or detection metadata.
+    language: ?[]const u8 = null,
+    /// Request phrase timestamps in milliseconds relative to the original source recording. Defaults to false. Does not imply word alignment.
+    timestamps: ?bool = null,
+    /// Request speaker labels and temporal segments. Defaults to false. Whisper requires the local speaker embedding model; unavailable models cause an explicit error. Implies timestamp decoding.
+    diarization: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "language", "language", true },
+        .{ "timestamps", "timestamps", true },
+        .{ "diarization", "diarization", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.timestamps) |value| {
+            try jw.objectField("timestamps");
+            try jw.write(value);
+        }
+        if (self.diarization) |value| {
+            try jw.objectField("diarization");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const AuthSubject = struct {
     /// Casbin subject name.
     subject: []const u8,
@@ -12742,7 +12784,7 @@ pub const DocumentSource = struct {
     /// Inline data URI or location allowed by the deployment content security policy.
     url: []const u8,
     media_type: []const u8,
-    /// Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide.
+    /// Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide. Audio/video recordings are one source unit and do not accept page selection.
     pages: ?[]const i64 = null,
     /// Include slide speaker notes as separate evidence, never silently as visible slide text.
     include_notes: ?bool = null,
@@ -15316,6 +15358,8 @@ pub const Error = struct {
     @"error": []const u8,
     /// Human-readable error description when supplied by the endpoint.
     message: ?[]const u8 = null,
+    /// Optional RFC 6901 JSON Pointer identifying the invalid request field.
+    pointer: ?[]const u8 = null,
     /// Whether retrying the operation may succeed without changing the request.
     retryable: ?bool = null,
     /// Suggested minimum retry delay in milliseconds.
@@ -15326,6 +15370,7 @@ pub const Error = struct {
         .{ "code", "code", true },
         .{ "error", "error", false },
         .{ "message", "message", true },
+        .{ "pointer", "pointer", true },
         .{ "retryable", "retryable", true },
         .{ "retry_after_ms", "retry_after_ms", true },
     };
@@ -15348,6 +15393,10 @@ pub const Error = struct {
         try jw.write(self.@"error");
         if (self.message) |value| {
             try jw.objectField("message");
+            try jw.write(value);
+        }
+        if (self.pointer) |value| {
+            try jw.objectField("pointer");
             try jw.write(value);
         }
         if (self.retryable) |value| {
@@ -17160,6 +17209,7 @@ pub const ExtractionInputRequest = union(enum) {
             if (try parseStructuralVariant(GeneratedExtractionRequest, allocator, source, options)) |parsed| return .{ .generated_extraction_request = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
+            "audio_options",
             "model",
             "schema_version",
             "read_artifact",
@@ -18288,11 +18338,12 @@ pub const ExtractionRelationSchema = struct {
 
 /// Atomic extraction request. Supply exactly one of inputs, documents or read_artifact. Every input is validated before inference; failures return no partial data.
 pub const ExtractionRequest = struct {
+    audio_options: ?AudioReadOptions = null,
     model: []const u8,
     schema_version: ?std.json.Value = null,
     /// Opaque handle returned by read with retain_artifact. Mutually exclusive with inputs and documents. Reuses the immutable complete reading without downloading or running OCR again. Handles expire and are local to the serving process.
     read_artifact: ?[]const u8 = null,
-    /// Complete PDF/PPTX/image sources. Mutually exclusive with inputs. Reading and extraction share document adapters and preserve independent source grouping.
+    /// Complete PDF/PPTX/image/audio sources. Mutually exclusive with inputs. Reading and extraction share document adapters and preserve independent source grouping.
     documents: ?[]const DocumentSource = null,
     inputs: ?[]const ExtractionInput = null,
     schema: ExtractionSchema,
@@ -18300,6 +18351,7 @@ pub const ExtractionRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "audio_options", "audio_options", true },
         .{ "model", "model", false },
         .{ "schema_version", "schema_version", true },
         .{ "read_artifact", "read_artifact", true },
@@ -18319,6 +18371,10 @@ pub const ExtractionRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.audio_options) |value| {
+            try jw.objectField("audio_options");
+            try jw.write(value);
+        }
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.schema_version) |value| {
@@ -27851,6 +27907,168 @@ pub const InferenceAudioContext = enum {
     }
 };
 
+pub const InferenceAudioReadCapabilities = struct {
+    forced_language: bool,
+    detected_language: bool,
+    timestamps: bool,
+    diarization: bool,
+    windowing: bool,
+    /// Maximum duration for this backend in milliseconds. Null means windowed recognition bounded by source and execution budgets.
+    max_duration_ms: OpenApiOptionalNullable(i64) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("forced_language");
+        try jw.write(self.forced_language);
+        try jw.objectField("detected_language");
+        try jw.write(self.detected_language);
+        try jw.objectField("timestamps");
+        try jw.write(self.timestamps);
+        try jw.objectField("diarization");
+        try jw.write(self.diarization);
+        try jw.objectField("windowing");
+        try jw.write(self.windowing);
+        switch (self.max_duration_ms) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("max_duration_ms");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("max_duration_ms");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+/// Recognition evidence for the audio track only. Video frames are not captioned. Absent segments and speakers make no alignment or speaker claim.
+pub const InferenceAudioReadMetadata = struct {
+    /// Decoded recording duration in milliseconds. Null when a remote recognition provider does not report duration.
+    duration_ms: ?i64,
+    language: OpenApiOptionalNullable([]const u8) = .absent,
+    language_source: ?[]const u8 = null,
+    segments: OpenApiOptionalNullable([]const InferenceAudioReadSegment) = .absent,
+    speakers: OpenApiOptionalNullable([]const []const u8) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "duration_ms", "duration_ms", false },
+        .{ "language", "language", false },
+        .{ "language_source", "language_source", true },
+        .{ "segments", "segments", false },
+        .{ "speakers", "speakers", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("duration_ms");
+        try jw.write(self.duration_ms);
+        switch (self.language) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("language");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("language");
+                try jw.write(value);
+            },
+        }
+        if (self.language_source) |value| {
+            try jw.objectField("language_source");
+            try jw.write(value);
+        }
+        switch (self.segments) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("segments");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("segments");
+                try jw.write(value);
+            },
+        }
+        switch (self.speakers) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("speakers");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("speakers");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const InferenceAudioReadOptions = AudioReadOptions;
+
+pub const InferenceAudioReadSegment = struct {
+    text: []const u8,
+    /// phrase uses recognizer-supplied phrase clocks; window provides only the original recognition-window bounds. Neither claims word alignment. Absent means unspecified.
+    granularity: OpenApiOptionalNullable([]const u8) = .absent,
+    /// Start in milliseconds relative to the original recording.
+    start_ms: i64,
+    /// Exclusive end in milliseconds relative to the original recording.
+    end_ms: i64,
+    /// Start UTF-8 byte offset in the containing read result text.
+    text_start: i64,
+    /// Exclusive end UTF-8 byte offset in the containing read result text.
+    text_end: i64,
+    /// Speaker label when diarization was requested and established.
+    speaker: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("text");
+        try jw.write(self.text);
+        switch (self.granularity) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("granularity");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("granularity");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("start_ms");
+        try jw.write(self.start_ms);
+        try jw.objectField("end_ms");
+        try jw.write(self.end_ms);
+        try jw.objectField("text_start");
+        try jw.write(self.text_start);
+        try jw.objectField("text_end");
+        try jw.write(self.text_end);
+        switch (self.speaker) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("speaker");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("speaker");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
 /// Runtime backends compiled into this inference server.
 pub const InferenceBackendRuntimes = struct {
     /// Whether the native CPU backend is built into this runtime
@@ -29564,7 +29782,7 @@ pub const InferenceDictateRequest = struct {
     audio: []const u8,
     /// Force the transcript language (ISO 639-1). Omit for automatic detection.
     language: ?[]const u8 = null,
-    /// Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate).
+    /// Enable timestamp-aware decoding. Omitted preserves the dictation default (on).
     timestamps: ?bool = null,
     /// Generator model from models_dir/generators/ that rewrites the transcript. Omit to return the raw transcript.
     cleanup_model: ?[]const u8 = null,
@@ -31428,8 +31646,10 @@ pub const InferenceGenerateUsage = struct {
     prompt_tokens: i64,
     /// Number of tokens in the completion
     completion_tokens: i64,
-    /// Total tokens used (prompt + completion)
+    /// Total token budget consumed (measured prompt and completion tokens plus unmeasured allowances).
     total_tokens: i64,
+    /// Conservative provider-declared token allowance spent on document calls without measurements. Included in total_tokens; not measured or billable usage.
+    unmeasured_tokens: ?i64 = null,
     /// Cumulative logical child invocations for a document run.
     model_calls: ?i64 = null,
     /// Physical child operation invocations, separate from logical composite calls.
@@ -31450,6 +31670,7 @@ pub const InferenceGenerateUsage = struct {
         .{ "prompt_tokens", "prompt_tokens", false },
         .{ "completion_tokens", "completion_tokens", false },
         .{ "total_tokens", "total_tokens", false },
+        .{ "unmeasured_tokens", "unmeasured_tokens", true },
         .{ "model_calls", "model_calls", true },
         .{ "physical_model_calls", "physical_model_calls", true },
         .{ "rendered_pixels", "rendered_pixels", true },
@@ -31475,6 +31696,10 @@ pub const InferenceGenerateUsage = struct {
         try jw.write(self.completion_tokens);
         try jw.objectField("total_tokens");
         try jw.write(self.total_tokens);
+        if (self.unmeasured_tokens) |value| {
+            try jw.objectField("unmeasured_tokens");
+            try jw.write(value);
+        }
         if (self.model_calls) |value| {
             try jw.objectField("model_calls");
             try jw.write(value);
@@ -31644,6 +31869,7 @@ pub const InferenceModelBackend = enum {
 
 /// Information about a model including its capabilities
 pub const InferenceModelInfo = struct {
+    audio_read: ?InferenceAudioReadCapabilities = null,
     /// Effective model-aware chunk operational ceilings for working/output/event bytes, chunk/dependency/index counts and remote fetched bytes, requests and cache bytes. Independent of model token limits and object length. Configure through NodeConfig.chunking_limits or ANTFLY_CHUNK_<NAME>. Scoped and unscoped embedding discovery expose the same values.
     chunking_limits: ?std.json.ArrayHashMap(i64) = null,
     /// Resolved executor/task facts; generation bits are false when the selected executor does not implement them.
@@ -31667,6 +31893,7 @@ pub const InferenceModelInfo = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "audio_read", "audio_read", true },
         .{ "chunking_limits", "chunking_limits", true },
         .{ "inference_capabilities", "inference_capabilities", true },
         .{ "dense_output", "dense_output", true },
@@ -31689,6 +31916,10 @@ pub const InferenceModelInfo = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.audio_read) |value| {
+            try jw.objectField("audio_read");
+            try jw.write(value);
+        }
         if (self.chunking_limits) |value| {
             try jw.objectField("chunking_limits");
             try jw.write(value);
@@ -32143,6 +32374,7 @@ pub const InferenceProviderType = enum {
 };
 
 pub const InferenceReadObject = struct {
+    audio: OpenApiOptionalNullable(InferenceAudioReadMetadata) = .absent,
     /// Original document source ID.
     source_id: ?[]const u8 = null,
     /// One-based original page or slide number.
@@ -32177,6 +32409,7 @@ pub const InferenceReadObject = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "audio", "audio", false },
         .{ "source_id", "source_id", true },
         .{ "number", "number", true },
         .{ "kind", "kind", true },
@@ -32207,6 +32440,17 @@ pub const InferenceReadObject = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        switch (self.audio) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("audio");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("audio");
+                try jw.write(value);
+            },
+        }
         if (self.source_id) |value| {
             try jw.objectField("source_id");
             try jw.write(value);
@@ -32291,10 +32535,13 @@ pub const InferenceReadObject = struct {
     }
 };
 
-/// Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference.
+/// Read exactly one of images, documents, or audio using capability-aware reader dispatch, with provenance and completion status. Supported video containers are read from their audio track only.
 pub const InferenceReadRequest = struct {
-    /// Name of reader model from models_dir/readers/
+    /// Explicit reader, ASR, audio-capable generator, named target, or composed document model. ASR storage remains models_dir/transcribers/.
     model: []const u8,
+    audio_options: ?InferenceAudioReadOptions = null,
+    /// Base64-encoded audio, a data URI, or a supported source URL, mutually exclusive with images and documents. Audio tracks in supported video containers are transcribed; frames are not captioned. Whisper preserves long-recording windowing; Gemma is bounded to 30 seconds. All audio reads use document orchestration, artifacts and durable jobs.
+    audio: ?[]const u8 = null,
     /// Request an opaque, process-local reading handle for extraction reuse. Retention is best effort; inspect document.artifact_id and artifact_ttl_ms.
     retain_artifact: ?bool = null,
     /// Complete documents, mutually exclusive with images. Each source is independent; selected pages are read in original source order.
@@ -32303,12 +32550,14 @@ pub const InferenceReadRequest = struct {
     images: ?[]const InferenceImageURL = null,
     /// Optional task prompt for document understanding models. - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning - Pix2Struct: "What type of document is this?" - Moondream: "Describe this image."
     prompt: ?[]const u8 = null,
-    /// Maximum output tokens per page. When omitted, the selected reader model supplies its default, bounded by deployment limits. Explicit values override the model default and must fit model and server limits.
+    /// Maximum output tokens per page. When omitted, the selected reader model supplies its default, bounded by deployment limits. Explicit values override the model default and must fit model and server limits. Audio generator backends accept this option; Whisper uses its recognition and execution budgets and rejects an explicit max_tokens.
     max_tokens: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
+        .{ "audio_options", "audio_options", true },
+        .{ "audio", "audio", true },
         .{ "retain_artifact", "retain_artifact", true },
         .{ "documents", "documents", true },
         .{ "images", "images", true },
@@ -32328,6 +32577,14 @@ pub const InferenceReadRequest = struct {
         try jw.beginObject();
         try jw.objectField("model");
         try jw.write(self.model);
+        if (self.audio_options) |value| {
+            try jw.objectField("audio_options");
+            try jw.write(value);
+        }
+        if (self.audio) |value| {
+            try jw.objectField("audio");
+            try jw.write(value);
+        }
         if (self.retain_artifact) |value| {
             try jw.objectField("retain_artifact");
             try jw.write(value);
@@ -32363,7 +32620,8 @@ pub const InferenceReadResponse = struct {
     events: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
     /// Name of model used for reading
     model: []const u8,
-    usage: ?InferenceGenerateUsage = null,
+    /// Token measurements and any explicit unmeasured document allowances, or null when neither is available.
+    usage: OpenApiOptionalNullable(InferenceGenerateUsage) = .absent,
     /// Observed execution path. Omitted by older compatible servers.
     execution: ?InferenceBatchExecutionReport = null,
 
@@ -32374,7 +32632,7 @@ pub const InferenceReadResponse = struct {
         .{ "document", "document", true },
         .{ "events", "events", true },
         .{ "model", "model", false },
-        .{ "usage", "usage", true },
+        .{ "usage", "usage", false },
         .{ "execution", "execution", true },
     };
 
@@ -32402,9 +32660,16 @@ pub const InferenceReadResponse = struct {
         }
         try jw.objectField("model");
         try jw.write(self.model);
-        if (self.usage) |value| {
-            try jw.objectField("usage");
-            try jw.write(value);
+        switch (self.usage) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("usage");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("usage");
+                try jw.write(value);
+            },
         }
         if (self.execution) |value| {
             try jw.objectField("execution");
@@ -32415,6 +32680,7 @@ pub const InferenceReadResponse = struct {
 };
 
 pub const InferenceReadResult = struct {
+    audio: OpenApiOptionalNullable(InferenceAudioReadMetadata) = .absent,
     /// Original document source ID.
     source_id: ?[]const u8 = null,
     /// One-based original page or slide number.
@@ -32446,6 +32712,7 @@ pub const InferenceReadResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "audio", "audio", false },
         .{ "source_id", "source_id", true },
         .{ "number", "number", true },
         .{ "kind", "kind", true },
@@ -32474,6 +32741,17 @@ pub const InferenceReadResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        switch (self.audio) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("audio");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("audio");
+                try jw.write(value);
+            },
+        }
         if (self.source_id) |value| {
             try jw.objectField("source_id");
             try jw.write(value);
@@ -33065,160 +33343,6 @@ pub const InferenceToolChoice = std.json.Value;
 pub const InferenceToolChoiceFunction = struct {
     /// The name of the function to call
     name: []const u8,
-};
-
-pub const InferenceTranscribeObject = struct {
-    object: []const u8,
-    /// Input audio index.
-    index: i64,
-    /// Transcribed text from the audio
-    text: []const u8,
-    /// Detected or forced language
-    language: ?[]const u8 = null,
-    /// Decoded clip duration in milliseconds.
-    duration_ms: ?i64 = null,
-    /// Timestamped phrases in clip order, so a transcript can be indexed and linked back to a moment in the recording. Clips longer than 30 s are transcribed in windows; segment offsets are relative to the whole clip.
-    segments: ?[]const InferenceDictationSegment = null,
-    /// Speaker labels found by diarization, in order of first appearance. Present only when `diarization` was requested.
-    speakers: ?[]const []const u8 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "object", "object", false },
-        .{ "index", "index", false },
-        .{ "text", "text", false },
-        .{ "language", "language", true },
-        .{ "duration_ms", "duration_ms", true },
-        .{ "segments", "segments", true },
-        .{ "speakers", "speakers", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("object");
-        try jw.write(self.object);
-        try jw.objectField("index");
-        try jw.write(self.index);
-        try jw.objectField("text");
-        try jw.write(self.text);
-        if (self.language) |value| {
-            try jw.objectField("language");
-            try jw.write(value);
-        }
-        if (self.duration_ms) |value| {
-            try jw.objectField("duration_ms");
-            try jw.write(value);
-        }
-        if (self.segments) |value| {
-            try jw.objectField("segments");
-            try jw.write(value);
-        }
-        if (self.speakers) |value| {
-            try jw.objectField("speakers");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const InferenceTranscribeRequest = struct {
-    /// Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and distributed execution resolve the same model.
-    model: []const u8,
-    /// Base64-encoded audio data (WAV, MP3, AAC/M4A, MP4/MOV audio, Ogg/Opus, WebM/Matroska, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
-    audio: []const u8,
-    /// Force specific language for transcription (optional, model-dependent)
-    language: ?[]const u8 = null,
-    /// Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate).
-    timestamps: ?bool = null,
-    /// Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance.
-    diarization: ?bool = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
-        .{ "audio", "audio", false },
-        .{ "language", "language", true },
-        .{ "timestamps", "timestamps", true },
-        .{ "diarization", "diarization", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
-        try jw.objectField("audio");
-        try jw.write(self.audio);
-        if (self.language) |value| {
-            try jw.objectField("language");
-            try jw.write(value);
-        }
-        if (self.timestamps) |value| {
-            try jw.objectField("timestamps");
-            try jw.write(value);
-        }
-        if (self.diarization) |value| {
-            try jw.objectField("diarization");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const InferenceTranscribeResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// Transcription result objects.
-    data: []const InferenceTranscribeObject,
-    /// Name of model used for transcription
-    model: []const u8,
-    usage: ?InferenceGenerateUsage = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "object", "object", false },
-        .{ "data", "data", false },
-        .{ "model", "model", false },
-        .{ "usage", "usage", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("object");
-        try jw.write(self.object);
-        try jw.objectField("data");
-        try jw.write(self.data);
-        try jw.objectField("model");
-        try jw.write(self.model);
-        if (self.usage) |value| {
-            try jw.objectField("usage");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
 };
 
 pub const InferenceTranscriptionAudioAppend = struct {
@@ -53089,6 +53213,8 @@ pub const STTConfig = struct {
     timestamps: ?bool = null,
     /// Explicitly permit preparing and installing the selected Speech assets.
     download_assets: ?bool = null,
+    /// Provider-declared hard per-call token bound. Required for hosted document reading when measurements are unavailable; the full allowance is charged against the document budget, never as measured usage.
+    max_total_tokens: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -53108,6 +53234,7 @@ pub const STTConfig = struct {
         .{ "api_url", "api_url", true },
         .{ "timestamps", "timestamps", true },
         .{ "download_assets", "download_assets", true },
+        .{ "max_total_tokens", "max_total_tokens", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -53182,6 +53309,10 @@ pub const STTConfig = struct {
         }
         if (self.download_assets) |value| {
             try jw.objectField("download_assets");
+            try jw.write(value);
+        }
+        if (self.max_total_tokens) |value| {
+            try jw.objectField("max_total_tokens");
             try jw.write(value);
         }
         try jw.endObject();
@@ -56699,6 +56830,8 @@ pub const TextChunkOptions = struct {
     target_tokens: ?i64 = null,
     /// Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers.
     overlap_tokens: ?i64 = null,
+    /// Minimum non-whitespace Unicode scalar values in a fixed text chunk. Shorter chunks are omitted before storage and embedding; original source offsets are preserved. Zero disables filtering (default). Does not filter model-aware media windows or image/audio chunks.
+    min_chars: ?i64 = null,
     /// Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size chunkers.
     separator: ?[]const u8 = null,
 
@@ -56706,6 +56839,7 @@ pub const TextChunkOptions = struct {
     pub const openApiFieldMetadata = .{
         .{ "target_tokens", "target_tokens", true },
         .{ "overlap_tokens", "overlap_tokens", true },
+        .{ "min_chars", "min_chars", true },
         .{ "separator", "separator", true },
     };
 
@@ -56725,6 +56859,10 @@ pub const TextChunkOptions = struct {
         }
         if (self.overlap_tokens) |value| {
             try jw.objectField("overlap_tokens");
+            try jw.write(value);
+        }
+        if (self.min_chars) |value| {
+            try jw.objectField("min_chars");
             try jw.write(value);
         }
         if (self.separator) |value| {

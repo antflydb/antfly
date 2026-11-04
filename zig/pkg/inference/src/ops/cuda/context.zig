@@ -84,6 +84,10 @@ pub const GraphExecUpdateOutcome = struct {
 };
 
 pub const CudaContext = struct {
+    /// Borrowed only during an explicitly bound actual Stage numerical lane.
+    /// Stage clears it before any model unlock; no constructor epoch is cached.
+    prepared_cache_funding: ?*@import("prepared_cache.zig").Funding = null,
+
     driver: CudaDriver,
     device: CUdevice,
     ctx: CUcontext,
@@ -425,6 +429,24 @@ pub const CudaContext = struct {
         try self.recordProfileEnd(pair);
         try self.driver.check(self.synchronizeEventResult(pair.end));
         return self.readProfileEventPairUs(pair);
+    }
+
+    /// Retained-cache payload owners keep failed handles/quota. Observation
+    /// retires only after the actual SDK destruction succeeds.
+    pub fn destroyGraphExecChecked(self: *CudaContext, exec: *CUgraphExec) !void {
+        const value = exec.*;
+        if (value == null) return;
+        try self.makeCurrent();
+        try self.driver.check(self.driver.fns.cuGraphExecDestroy(value));
+        if (self.observation.load(.acquire)) |state| state.retire(value);
+        exec.* = null;
+    }
+    pub fn destroyEventChecked(self: *CudaContext, event: *CUevent) !void {
+        const value = event.*;
+        if (value == null) return;
+        try self.makeCurrent();
+        try self.driver.check(self.driver.fns.cuEventDestroy(value));
+        event.* = null;
     }
 
     pub fn destroyGraphExec(self: *CudaContext, exec: CUgraphExec) void {

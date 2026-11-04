@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.stt_provider import STTProvider
+from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="STTConfig")
 
@@ -34,13 +35,19 @@ class STTConfig:
 
         Attributes:
             provider (STTProvider): The STT provider to use.
+            max_total_tokens (int | Unset): Provider-declared hard per-call token bound. Required for hosted document
+                reading when measurements are unavailable; the full allowance is charged against the document budget, never as
+                measured usage.
     """
 
     provider: STTProvider
+    max_total_tokens: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         provider = self.provider.value
+
+        max_total_tokens = self.max_total_tokens
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -49,6 +56,8 @@ class STTConfig:
                 "provider": provider,
             }
         )
+        if max_total_tokens is not UNSET:
+            field_dict["max_total_tokens"] = max_total_tokens
 
         return field_dict
 
@@ -57,8 +66,11 @@ class STTConfig:
         d = dict(src_dict)
         provider = STTProvider(d.pop("provider"))
 
+        max_total_tokens = d.pop("max_total_tokens", UNSET)
+
         stt_config = cls(
             provider=provider,
+            max_total_tokens=max_total_tokens,
         )
 
         stt_config.additional_properties = d

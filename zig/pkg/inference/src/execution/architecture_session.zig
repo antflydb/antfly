@@ -3765,12 +3765,12 @@ pub fn getMetalExactJitDispatchStats(session: Session) ?MetalExactJitDispatchSta
 pub fn recommendedKvDTypeForGptConfig(config: gpt_mod.Config, backend_kind: runtime.kv.pool.BackendKind) runtime.kv.pool.KvDType {
     return switch (backend_kind) {
         .native => .f32,
-        .cuda => if (shouldDefaultGemmaCudaKvDTypeToPolar4(config)) .polar4 else if (config.family == .gemma) .f32 else .f16,
+        .cuda => if (config.family == .gemma and !isGemma4KvArchitecture(config)) .f32 else .f16,
         .metal => if (config.family == .gemma) metalGemmaKvDTypeOverride() orelse .f16 else .f16,
     };
 }
 
-fn shouldDefaultGemmaCudaKvDTypeToPolar4(config: gpt_mod.Config) bool {
+fn isGemma4KvArchitecture(config: gpt_mod.Config) bool {
     if (config.family != .gemma) return false;
     return config.num_kv_shared_layers > 0 or
         config.global_head_dim > 0 or
@@ -3800,7 +3800,7 @@ test "recommendedKvDTypeForGptConfig keeps backend defaults without a session" {
     const llama = gpt_mod.Config{ .family = .llama };
     try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, recommendedKvDTypeForGptConfig(gemma, .native));
     try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, recommendedKvDTypeForGptConfig(gemma, .cuda));
-    try std.testing.expectEqual(runtime.kv.pool.KvDType.polar4, recommendedKvDTypeForGptConfig(gemma4, .cuda));
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, recommendedKvDTypeForGptConfig(gemma4, .cuda));
     try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, recommendedKvDTypeForGptConfig(llama, .metal));
 }
 
@@ -10020,6 +10020,167 @@ test "native media geometry protects actual projected rows for both text and ima
 /// Suspending retires all request-local caches; outputs crossing stages must be
 /// copied into independent buffers. CPU/CUDA retain established lease policy.
 pub const StagedExecution = struct {
+    // WORKING owner fragment. This scope must reach its final caller address
+    // before initInto; borrowed Workload remains live through close. It is not
+    // a persistent backend/lease owner and stores no creation operation/epoch.
+    const PreparedCache = if (build_options.enable_cuda) @import("../ops/cuda/prepared_cache.zig") else struct {};
+    pub const CachePhase = if (build_options.enable_cuda) struct {
+        stage: *StagedExecution,
+        work: PreparedCache.Workload,
+        // Official supported topology uses49 encoder requests; vision uses33.
+        // Inline values keep warm phases allocator-free and names owned.
+        request_storage: [128]PreparedCache.Request = undefined,
+        warm: PreparedCache.Funding = PreparedCache.Funding.empty(),
+        cold: ?*PreparedCache.Funding = null,
+        bound: bool = false,
+        live: bool = false,
+
+        fn initInto(self: *@This(), stage: *StagedExecution, work: PreparedCache.Workload) !void {
+            if (stage.cache_scope != null or !stage.cold_prepared or !stage.active) return error.InvalidPreparedCacheState;
+            self.* = .{ .stage = stage, .work = work };
+            try self.prepare();
+            stage.cache_scope = self;
+            self.live = true;
+        }
+        pub fn initEncoderInto(self: *@This(), stage: *StagedExecution, config: embedding_gemma2_model.Config, batch: usize, sequence: usize, mask: []const i64) !void {
+            if (stage.cache_scope != null or !stage.cold_prepared or !stage.active) return error.InvalidPreparedCacheState;
+            self.* = .{ .stage = stage, .work = .{ .requests = &.{} } };
+            const compute = try stage.cudaStageCompute();
+            var builder = PreparedCache.Builder{ .storage = &self.request_storage };
+            try compute.appendEncoderCacheWorkload(config, batch, sequence, mask, &builder);
+            self.work = builder.workload();
+            try self.prepare();
+            stage.cache_scope = self;
+            self.live = true;
+        }
+        fn binding(self: *@This()) *PreparedCache.Funding {
+            return self.cold orelse &self.warm;
+        }
+        fn unbindLocked(self: *@This()) void {
+            if (!self.bound) return;
+            const compute = self.stage.cudaStageCompute() catch platform.inference_process_supervisor.restartWorker();
+            cuda_compute_mod.CudaCompute.unbindCacheFunding(self.stage.cb, compute, self.binding());
+            self.bound = false;
+            if (self.cold) |cold| {
+                if (self.stage.cache_pending != null) platform.inference_process_supervisor.restartWorker();
+                self.stage.cache_pending = cold;
+                self.cold = null;
+            }
+            self.warm = PreparedCache.Funding.empty();
+        }
+        /// All producer TAKEN tokens have published/failed before their call
+        /// returns. READY leftovers own no SDK roots. Unbind is metadata only;
+        /// the Stage's existing real yield supplies its normal checked fence.
+        pub fn close(self: *@This()) void {
+            if (!self.live) return;
+            if (self.stage.cache_scope != self or (self.bound and !self.stage.active)) platform.inference_process_supervisor.restartWorker();
+            self.unbindLocked();
+            self.stage.cache_scope = null;
+            self.live = false;
+        }
+        fn prepare(self: *@This()) anyerror!void {
+            const stage = self.stage;
+            errdefer stage.restoreAfterQuotaForCleanup();
+            for (0..8) |_| {
+                try stage.control.check();
+                var compute = try stage.cudaStageCompute();
+                if (!try cuda_compute_mod.CudaCompute.cacheWorkloadNeedsFunding(stage.cb, compute, self.work)) {
+                    try cuda_compute_mod.CudaCompute.bindCacheFunding(stage.cb, compute, self.work, &self.warm, stage.epoch() orelse return error.MissingCurrentCleanupEpoch);
+                    self.bound = true;
+                    return;
+                }
+                // Preserve the existing Stage fence/suspend. Cold metadata and
+                // supplier callbacks are created only after that real unlock.
+                _ = try stage.suspendForQuota();
+                const funding = try PreparedCache.Funding.create(self.work);
+                var owned = true;
+                defer if (owned) {
+                    if (stage.active) stage.leaveCudaModel();
+                    funding.finishOutsideExecution();
+                };
+                try stage.enter(stage.control, false);
+                try stage.establishCudaPolicy(stage.cuda_policy);
+                compute = try stage.cudaStageCompute();
+                const victims = try cuda_compute_mod.CudaCompute.cacheWorkloadVictims(stage.cb, compute, self.work);
+                switch (victims) {
+                    .all => return error.InvalidPreparedCacheState,
+                    .geometry => |geometry| if (geometry.resize_plans != 0 or geometry.resize_sources != 0 or geometry.execution_arenas != 0) {
+                        stage.retireCudaCachesSelected(victims) catch |err| {
+                            if (!retirementSnapshotChanged(err)) return err;
+                            if (stage.active) stage.leaveCudaModel();
+                            funding.finishOutsideExecution();
+                            owned = false;
+                            try stage.enter(stage.control, false);
+                            try stage.establishCudaPolicy(stage.cuda_policy);
+                            continue;
+                        };
+                        try stage.enter(stage.control, false);
+                        try stage.establishCudaPolicy(stage.cuda_policy);
+                        compute = try stage.cudaStageCompute();
+                    },
+                }
+                cuda_compute_mod.CudaCompute.snapshotCacheFunding(stage.cb, compute, funding) catch |err| {
+                    if (err != error.CacheVictimsRequireRetirement) return err;
+                    stage.leaveCudaModel();
+                    funding.finishOutsideExecution();
+                    owned = false;
+                    try stage.enter(stage.control, false);
+                    try stage.establishCudaPolicy(stage.cuda_policy);
+                    continue;
+                };
+                stage.leaveCudaModel();
+                const model = stage.model_retention orelse return error.MissingModelLifetime;
+                var pin = if (funding.admission) |admission| model.retainAdmissionDomain(admission.controller) else null;
+                defer if (pin) |held| held.release();
+                funding.fundOutsideExecution(if (pin) |*held| held else null) catch |err| {
+                    if (err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable) return err;
+                    // These are optional cache roots. Keep the fully admitted
+                    // numerical run/floors and use the existing eager/uncached
+                    // body when only the separate cache reservation declines.
+                    // Chosen obsolete geometry may already have retired, just
+                    // as the original discard/recreate cache policy required.
+                    funding.finishOutsideExecution();
+                    owned = false;
+                    try stage.enter(stage.control, false);
+                    try stage.establishCudaPolicy(stage.cuda_policy);
+                    compute = try stage.cudaStageCompute();
+                    self.warm = PreparedCache.Funding.compatibility();
+                    try cuda_compute_mod.CudaCompute.bindCacheFunding(stage.cb, compute, self.work, &self.warm, stage.epoch() orelse return error.MissingCurrentCleanupEpoch);
+                    self.bound = true;
+                    return;
+                };
+                try stage.enter(stage.control, false);
+                try stage.establishCudaPolicy(stage.cuda_policy);
+                compute = try stage.cudaStageCompute();
+                cuda_compute_mod.CudaCompute.bindCacheFunding(stage.cb, compute, self.work, funding, stage.epoch() orelse return error.MissingCurrentCleanupEpoch) catch |err| {
+                    if (err != error.PreparedCachePlanChanged) return err;
+                    stage.leaveCudaModel();
+                    funding.finishOutsideExecution();
+                    owned = false;
+                    try stage.enter(stage.control, false);
+                    try stage.establishCudaPolicy(stage.cuda_policy);
+                    continue;
+                };
+                self.cold = funding;
+                owned = false;
+                self.bound = true;
+                return;
+            }
+            return error.ResourceTemporarilyUnavailable;
+        }
+    } else struct {};
+
+    fn unbindCachePhase(self: *StagedExecution) void {
+        if (comptime build_options.enable_cuda) if (self.cache_scope) |scope| scope.unbindLocked();
+    }
+    fn finishCacheFundingOutsideExecution(self: *StagedExecution) void {
+        if (comptime build_options.enable_cuda) if (self.cache_pending) |funding| {
+            if (self.active) platform.inference_process_supervisor.restartWorker();
+            self.cache_pending = null;
+            funding.finishOutsideExecution();
+        };
+    }
+
     const RunPermit = @import("../backends/session.zig").RunPermit;
     const CudaPolicy = struct {
         present: bool = false,
@@ -10029,6 +10190,10 @@ pub const StagedExecution = struct {
         fn from(value: ?@import("../ops/cuda/video_cache_budget.zig").Admission) CudaPolicy {
             const admission = value orelse return .{};
             return .{ .present = true, .controller = admission.controller, .limits = admission.limits, .check_live_memory = admission.check_live_memory };
+        }
+        fn toAdmission(self: CudaPolicy) ?@import("../ops/cuda/video_cache_budget.zig").Admission {
+            if (!self.present) return null;
+            return .{ .controller = self.controller.?, .limits = self.limits, .check_live_memory = self.check_live_memory };
         }
         fn same(a: CudaPolicy, b: CudaPolicy) bool {
             if (a.present != b.present) return false;
@@ -10065,6 +10230,8 @@ pub const StagedExecution = struct {
         const held = gate orelse return;
         if (waiter.owner != null) Scheduler.leave(waiter) else held.unlock();
     }
+    cache_scope: if (build_options.enable_cuda) ?*CachePhase else void = if (build_options.enable_cuda) null else {},
+    cache_pending: if (build_options.enable_cuda) ?*PreparedCache.Funding else void = if (build_options.enable_cuda) null else {},
     cuda_policy: CudaPolicy = .{},
     cuda_policy_set: bool = false,
     cleanup_owner: @import("cleanup_owner.zig").Owner = .{},
@@ -10084,6 +10251,7 @@ pub const StagedExecution = struct {
     active: bool = true,
     scheduling_enabled: bool = true,
     permit: *RunPermit,
+    owns_initial_permit: bool = false,
     timings: ?*MediaTimings = null,
     idle_backend: usize,
     extra: ?RunPermit = null,
@@ -10170,17 +10338,169 @@ pub const StagedExecution = struct {
     }
     /// The numerical/provider header stays at this owner's final address.
     /// No task callback acquires or releases a provider/model gate.
+    fn acquireCudaRetirementOnly(session: Session, allocator: std.mem.Allocator, options: @import("../backends/session.zig").ComputeBackendOptions) !ops.ComputeBackend {
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+        if (session.vtable != &arch_vtable or options.run_budget != null or options.borrow_shared_provider) return error.UnsupportedEmbeddingStage;
+        const actual: *ArchSession = @ptrCast(@alignCast(session.ptr));
+        if (actual.backend_type != .cuda or actual.arch_config != .embedding_gemma2) return error.UnsupportedEmbeddingStage;
+        // Cache retirement must not run request-boundary policy replacement.
+        return makeComputeBackend(actual, allocator, null);
+    }
+    fn leaveCudaModel(self: *StagedExecution) void {
+        std.debug.assert(self.active);
+        self.unbindCachePhase();
+        leaveModel(self.gate, self.waiter);
+        self.active = false;
+        self.finishCacheFundingOutsideExecution();
+    }
+    fn enterCudaRetirementOnly(self: *StagedExecution, allocator: std.mem.Allocator) !void {
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+        if (!self.cold_prepared or self.managed != null or self.active or self.session.vtable != &arch_vtable) return error.InvalidStageCohort;
+        try enterModel(self.session, self.gate, self.control, self.waiter);
+        self.active = true;
+        errdefer if (self.active) self.leaveCudaModel();
+        self.managed = try @import("../backends/compute_provider.zig").acquireWith(self.session, allocator, null, self.control, acquireCudaRetirementOnly);
+        errdefer {
+            self.managed.?.deinitWithCleanup(.{ .boundary = self.epoch() });
+            self.managed = null;
+        }
+        self.cb = &self.managed.?.backend;
+        _ = try self.cudaStageCompute();
+    }
+    fn retirementSnapshotChanged(err: anyerror) bool {
+        return switch (err) {
+            error.CacheRetirementChanged, error.CacheRetirementCapacityChanged, error.QueueFull => true,
+            else => false,
+        };
+    }
+    /// Entered under this owner's actual model cohort. Every SDK free finishes
+    /// outside that cohort; pending clears before quota callbacks can reenter.
+    /// Returns with the model lane released, including every error path.
+    fn retireCudaCaches(self: *StagedExecution) !void {
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+        return self.retireCudaCachesSelected(.all);
+    }
+    fn retireCudaCachesSelected(self: *StagedExecution, selection: if (build_options.enable_cuda) cuda_compute_mod.CudaCompute.CacheRetirementSelection else void) !void {
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+        errdefer if (self.active) self.leaveCudaModel();
+        const model = self.model_retention orelse return error.MissingModelLifetime;
+        for (0..8) |_| {
+            try self.control.check();
+            const compute = try self.cudaStageCompute();
+            const required = try cuda_compute_mod.CudaCompute.cacheRetirementRequirements(self.cb, compute, selection);
+            self.leaveCudaModel();
+            var old_domain = if (required.old_controller) |controller| model.retainAdmissionDomain(controller) else null;
+            defer if (old_domain) |pin| pin.release();
+            const carrier = try cuda_compute_mod.CudaCompute.CacheRetirement.prepare(required, model, if (old_domain) |*pin| pin else null);
+            if (old_domain) |pin| pin.release();
+            old_domain = null;
+            var consumed = false;
+            defer if (!consumed) carrier.deinitUnused();
+            try self.control.check();
+            try enterModel(self.session, self.gate, self.control, self.waiter);
+            self.active = true;
+            carrier.detachFenced(self.cb, compute) catch |err| {
+                self.leaveCudaModel();
+                if (!retirementSnapshotChanged(err)) return err;
+                // A mask is derived from one actual cache snapshot. Its
+                // caller must recompute victims after a competing mutation.
+                switch (selection) {
+                    .geometry => return err,
+                    .all => {},
+                }
+                carrier.deinitUnused();
+                consumed = true;
+                try self.control.check();
+                try enterModel(self.session, self.gate, self.control, self.waiter);
+                self.active = true;
+                continue;
+            };
+            self.leaveCudaModel();
+            // Ownership moved. Cancellation cannot abandon a detached cache or
+            // replay numerical work after uncertain SDK completion.
+            carrier.retireOutsideExecution(self.epoch()) catch platform.inference_process_supervisor.restartWorker();
+            consumed = true;
+            carrier.destroy();
+            return;
+        }
+        return error.ResourceTemporarilyUnavailable;
+    }
+    fn establishCudaPolicy(self: *StagedExecution, desired: CudaPolicy) !void {
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+        for (0..8) |_| {
+            try self.control.check();
+            const compute = try self.cudaStageCompute();
+            if (CudaPolicy.same(desired, CudaPolicy.from(compute.ctx.video_cache_budget.admission))) return;
+            try self.retireCudaCaches();
+            try self.control.check();
+            try enterModel(self.session, self.gate, self.control, self.waiter);
+            self.active = true;
+            cuda_compute_mod.CudaCompute.installEmptyEmbeddingGemma2Policy(self.cb, compute, desired.toAdmission()) catch |err| {
+                if (err == error.CachePolicyNotEmpty) continue;
+                return err;
+            };
+            return;
+        }
+        return error.ResourceTemporarilyUnavailable;
+    }
+    /// Called while the actual source owns its model lane. Preserve ordinary
+    /// owned inputs; snapshot only borrowed/pinned representations byte-for-byte.
+    pub fn prepareCudaInputHandoff(self: *StagedExecution, value: *ops.CT) !void {
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+        const compute = try self.cudaStageCompute();
+        if (try cuda_compute_mod.CudaCompute.keepEmbeddingStageInput(self.cb, compute, value.*)) return;
+        const snapshot_value = try cuda_compute_mod.CudaCompute.escapeEmbeddingStage(self.cb, value.*, null);
+        const original = value.*;
+        value.* = snapshot_value;
+        self.cb.freeWithCleanup(original, .{ .boundary = self.epoch() });
+    }
+
+    pub fn admitInitialCuda(self: *StagedExecution, allocator: std.mem.Allocator, request: @import("../backends/session.zig").RunRequest, supplied_pressure: ?*?runtime.tier.memory.AdmissionPressure) !void {
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+        if (!self.cold_prepared or self.active or self.managed != null or self.permit.lease != null or self.permit.resource_pin != null or self.session.backend() != .cuda) return error.InvalidStageCohort;
+        var own_pressure: ?runtime.tier.memory.AdmissionPressure = null;
+        const pressure = supplied_pressure orelse &own_pressure;
+        try self.control.check();
+        self.permit.* = self.session.admitWithPressure(request, pressure) catch |err| retry: {
+            if (err != error.ResourceTemporarilyUnavailable and err != error.ResourceLimitExceeded) return err;
+            try self.enterCudaRetirementOnly(allocator);
+            defer {
+                if (self.active) self.leaveCudaModel();
+                self.managed.?.deinitWithCleanup(.{ .boundary = self.epoch() });
+                self.managed = null;
+                self.cb = undefined;
+            }
+            try self.retireCudaCaches();
+            try self.control.check();
+            break :retry try self.session.admitWithPressure(request, pressure);
+        };
+        // This entry created the actual primary lease. The SAME owner returns
+        // it only after actual lane unlock, while whole-task B is still live.
+        self.owns_initial_permit = true;
+    }
+
     pub fn enterInitial(self: *StagedExecution, allocator: std.mem.Allocator, control: ?Control) !void {
         if (!self.cold_prepared or self.managed != null) return error.EmbeddingStageNotPrepared;
         try enterModel(self.session, self.gate, self.control, self.waiter);
-        errdefer leaveModel(self.gate, self.waiter);
-        self.managed = try @import("../backends/compute_provider.zig").acquire(self.session, allocator, null, control);
+        self.active = true;
+        errdefer if (self.active) self.leaveCudaModel();
+        self.managed = if (self.session.backend() == .cuda)
+            try @import("../backends/compute_provider.zig").acquireWith(self.session, allocator, null, control, acquireCudaRetirementOnly)
+        else
+            try @import("../backends/compute_provider.zig").acquire(self.session, allocator, null, control);
         errdefer {
             self.managed.?.deinitWithCleanup(.{ .boundary = self.epoch() });
             self.managed = null;
         }
         self.cb = &self.managed.?.backend;
         self.active = true;
+        if (self.session.backend() == .cuda) {
+            if (comptime build_options.enable_cuda) {
+                const desired = CudaPolicy.from(if (self.session.run_admission) |admission| .{ .controller = admission.controller, .limits = admission.limits, .check_live_memory = admission.check_live_memory } else null);
+                try self.establishCudaPolicy(desired);
+                try @import("../backends/compute_factory.zig").beginRequest(self.session, self.cb);
+            } else return error.CudaNotEnabled;
+        }
         try self.attach();
     }
     pub fn backend(self: *StagedExecution) *ComputeBackend {
@@ -10191,6 +10511,8 @@ pub const StagedExecution = struct {
         self.flushEndedPhases();
         if (self.extra) |*extra| extra.deinitWithCleanup(.{ .boundary = self.cleanup_owner.epoch() });
         self.extra = null;
+        if (self.owns_initial_permit) self.permit.deinitWithCleanup(.{ .boundary = self.epoch() });
+        self.owns_initial_permit = false;
         if (self.model_retention) |model| model.releaseWithBoundary(self.cleanup_owner.epoch());
         self.model_retention = null;
         self.cleanup_owner.finishAfterUnlock();
@@ -10254,8 +10576,10 @@ pub const StagedExecution = struct {
             } else return error.CudaNotEnabled;
         } else try @import("../ops/metal_compute.zig").MetalCompute.embeddingStageLeaseWithCleanup(self.cb, false, self.current());
         if (self.timings) |t| t.stage_retire_ns += mediaNow() - retired_at;
+        self.unbindCachePhase();
         leaveModel(self.gate, self.waiter);
         self.active = false;
+        self.finishCacheFundingOutsideExecution();
         if (self.extra) |*extra| extra.deinitWithCleanup(.{ .boundary = self.cleanup_owner.epoch() });
         self.extra = null;
         if (self.permit.lease) |*lease| {
@@ -10275,14 +10599,17 @@ pub const StagedExecution = struct {
             self.extra = null;
         }
         try enterModel(self.session, self.gate, control, self.waiter);
-        errdefer leaveModel(self.gate, self.waiter);
+        self.active = true;
+        errdefer if (self.active) self.leaveCudaModel();
         const acquired_at = if (self.timings != null) mediaNow() else 0;
         if (self.cb.kind() == .cuda) {
             if (comptime build_options.enable_cuda) {
-                self.active = true;
-                errdefer self.active = false;
                 _ = try self.cudaStageCompute();
-                if (execution) try self.requireCudaPolicy();
+                if (execution) {
+                    try self.establishCudaPolicy(self.cuda_policy);
+                    try self.requireCudaPolicy();
+                    if (self.cache_scope) |scope| if (!scope.bound) try scope.prepare();
+                }
             } else return error.CudaNotEnabled;
         } else try @import("../ops/metal_compute.zig").MetalCompute.embeddingStageLeaseWithCleanup(self.cb, true, .{ .boundary = self.cleanup_owner.epoch() });
         if (self.timings) |t| t.stage_rebind_ns += mediaNow() - acquired_at;
@@ -10350,8 +10677,10 @@ pub const StagedExecution = struct {
             if (self.timings) |counters| counters.stage_retire_ns += mediaNow() - started;
             self.phase_provider_suspended = true;
         }
+        self.unbindCachePhase();
         leaveModel(self.gate, self.waiter);
         self.active = false;
+        self.finishCacheFundingOutsideExecution();
         return true;
     }
     fn restoreAfterQuotaForCleanup(self: *StagedExecution) void {
@@ -10368,7 +10697,11 @@ pub const StagedExecution = struct {
         self.restoreAfterQuotaForCleanup();
         // Cleanup may reacquire solely to destroy owned values under the real
         // model lane. A successful numerical continuation needs its own policy.
+        if (self.session.backend() == .cuda) {
+            if (comptime build_options.enable_cuda) try self.establishCudaPolicy(self.cuda_policy) else return error.CudaNotEnabled;
+        }
         try self.requireCudaPolicy();
+        if (comptime build_options.enable_cuda) if (self.cache_scope) |scope| if (!scope.bound) try scope.prepare();
     }
     fn admitPhase(self: *StagedExecution, target: @import("../runtime/tier/memory.zig").AdmissionAmounts, other: ?*const RunPermit) !RunPermit {
         if (self.session.backend() == .cuda) try self.control.check();
@@ -10435,7 +10768,12 @@ pub const StagedExecution = struct {
     }
     fn acquire(raw: *anyopaque) !void {
         const self: *StagedExecution = @ptrCast(@alignCast(raw));
-        try self.enter(self.control, true);
+        self.enter(self.control, true) catch |err| {
+            // A failed numerical resume still returns the actual cleanup lane
+            // to the source owner before its caller destroys live input CTs.
+            cleanup(self);
+            return err;
+        };
     }
     fn cleanup(raw: *anyopaque) void {
         const self: *StagedExecution = @ptrCast(@alignCast(raw));
@@ -10446,20 +10784,24 @@ pub const StagedExecution = struct {
     pub fn deinit(self: *StagedExecution) void {
         if (self.cold_prepared) {
             if (self.managed) |*managed| {
-                if (self.cb.embedding_stage == &self.hook) {
-                    cleanup(self);
-                    self.cb.embedding_stage = null;
-                }
+                if (!self.active) cleanup(self);
+                if (self.cb.embedding_stage == &self.hook) self.cb.embedding_stage = null;
                 if (self.cb.kind() == .cuda) {
                     if (comptime build_options.enable_cuda) {
                         const compute = self.cudaStageCompute() catch platform.inference_process_supervisor.restartWorker();
                         cuda_compute_mod.CudaCompute.quiesceEmbeddingStage(self.cb, compute) catch platform.inference_process_supervisor.restartWorker();
                     } else platform.inference_process_supervisor.restartWorker();
                 }
+                self.unbindCachePhase();
+                if (comptime build_options.enable_cuda) if (self.cache_scope) |scope| {
+                    scope.live = false;
+                    self.cache_scope = null;
+                };
                 managed.deinitWithCleanup(.{ .boundary = self.epoch() });
                 self.managed = null;
                 leaveModel(self.gate, self.waiter);
                 self.active = false;
+                self.finishCacheFundingOutsideExecution();
             }
             self.finishAfterUnlock();
             return;
@@ -10469,6 +10811,23 @@ pub const StagedExecution = struct {
     pub fn credit(self: *StagedExecution) ?*const RunPermit {
         return if (self.extra) |*extra| extra else null;
     }
+    /// Execute the already-admitted resident source on this actual private
+    /// backend. Task callers supply ordering/masks/requested dimensions; the
+    /// runtime owns capability/policy selection and the concrete CUDA cast.
+    pub fn runResidentEmbeddingEncoder(self: *StagedExecution, allocator: std.mem.Allocator, config: embedding_gemma2_model.Config, input: ops.CT, mask: []const i64, batch: usize, sequence: usize, dimensions: usize, record_media_batch: bool) ![]f32 {
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+        if (!self.cold_prepared or !self.active) return error.EmbeddingStageNotPrepared;
+        try self.requireCudaPolicy();
+        const original_compute = try self.cudaStageCompute();
+        if (!try cuda_compute_mod.CudaCompute.keepEmbeddingStageInput(self.cb, original_compute, input)) return error.CudaStageInputRequiresHandoff;
+        if (record_media_batch and batch > 1) (try self.cudaStageCompute()).embedding_gemma2_media_batches += 1;
+        var caches: CachePhase = undefined;
+        try caches.initEncoderInto(self, config, batch, sequence, mask);
+        defer caches.close();
+        const compute = try self.cudaStageCompute();
+        return compute.runEmbeddingGemma2(allocator, config, .{ .resident_embeddings = input }, mask, batch, sequence, dimensions, self.control);
+    }
+
     pub fn retain(self: *StagedExecution, request: @import("../backends/session.zig").RunRequest) !void {
         const restore = try self.suspendForQuota();
         errdefer if (restore) self.restoreAfterQuotaForCleanup();
@@ -11036,143 +11395,312 @@ test "actual Metal staged fresh output keeps physical identity and quota through
 
 test "actual CUDA staged quota boundaries let same model reenter while owned snapshots survive" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
-    const a = std.testing.allocator;
-    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
-    const memory = runtime.tier.memory;
-    const compute = try a.create(cuda_compute_mod.CudaCompute);
-    var compute_open = false;
-    defer if (compute_open) {
-        compute.deinit();
-        a.destroy(compute);
-    };
-    compute.* = cuda_compute_mod.CudaCompute.init(a) catch |err| {
-        a.destroy(compute);
-        switch (err) {
-            error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
-            else => return err,
-        }
-    };
-    compute_open = true;
-    // This is an ownership fixture, not a model numerical oracle: no encoder
-    // uses these zero geometry facts. Numerical callbacks are the real CUDA
-    // elementwise programs on the exact model-owned context and table.
-    const owner = try a.create(ArchSession);
-    owner.* = .{ .allocator = a, .arch_config = .{ .embedding_gemma2 = std.mem.zeroes(@import("../architectures/embedding_gemma2_config.zig").Config) }, .backend_type = .cuda, .backend_data = .{ .cuda = .{ .compute = compute } } };
-    owner.model_lifetime.prepareFinalResources() catch |err| {
-        a.destroy(owner);
-        return err;
-    };
-    var session = archSessionHandle(owner);
-    compute_open = false;
-    defer session.close();
-    try session.installOwnedExecutionGate(a);
-    const domain = try Domain.create();
-    defer domain.release();
-    session.model_lifetime.?.admission_domain = domain.pin();
-    session.run_admission = .{ .controller = &domain.controller, .backend_class = .gpu, .limits = .{ .backend_limit_bytes = 64 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false };
-    const Probe = struct {
-        session: Session,
-        calls: usize = 0,
-        failure: ?anyerror = null,
-        change_policy: bool = false,
-        fn check(self: *@This()) void {
-            self.calls += 1;
-            self.reenter() catch |err| {
-                self.failure = err;
+    const Case = struct {
+        fn run(scheduling: bool) !void {
+            const a = std.testing.allocator;
+            const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+            const memory = runtime.tier.memory;
+            const compute = try a.create(cuda_compute_mod.CudaCompute);
+            var compute_open = false;
+            defer if (compute_open) {
+                compute.deinit();
+                a.destroy(compute);
             };
-        }
-        fn reenter(self: *@This()) !void {
-            const gate = self.session.execution_gate.?;
-            if (!gate.tryLock()) return error.SourceModelStillOwnedDuringSupplier;
-            defer gate.unlock();
-            var managed = try getComputeBackendWithControl(self.session, std.testing.allocator, .{ .native_call_policy = .in_process });
-            defer managed.deinit();
-            const cb = &managed.backend;
-            if (self.change_policy) {
-                self.change_policy = false;
-                var peer = self.session;
-                peer.run_admission.?.check_live_memory = !peer.run_admission.?.check_live_memory;
-                // Actual published request entry replaces the context policy;
-                // no borrowed test callback or raw field mutation fakes it.
-                try @import("../backends/compute_factory.zig").beginRequest(peer, cb);
+            compute.* = cuda_compute_mod.CudaCompute.initWithKernelJitForProfile(a, .{}, .embedding_gemma2) catch |err| {
+                a.destroy(compute);
+                switch (err) {
+                    error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+                    else => return err,
+                }
+            };
+            compute_open = true;
+            // This is an ownership fixture, not a model numerical oracle: no encoder
+            // uses these zero geometry facts. Numerical callbacks are the real CUDA
+            // elementwise programs on the exact model-owned context and table.
+            const owner = try a.create(ArchSession);
+            owner.* = .{ .allocator = a, .arch_config = .{ .embedding_gemma2 = std.mem.zeroes(embedding_gemma2_arch.Config) }, .backend_type = .cuda, .backend_data = .{ .cuda = .{ .compute = compute } } };
+            owner.model_lifetime.prepareFinalResources() catch |err| {
+                a.destroy(owner);
+                return err;
+            };
+            var session = archSessionHandle(owner);
+            compute_open = false;
+            defer session.close();
+            try session.installOwnedExecutionGate(a);
+            var cache_scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+            session.cohort_scheduler = &cache_scheduler;
+            const domain = try Domain.create();
+            defer domain.release();
+            session.model_lifetime.?.admission_domain = domain.pin();
+            session.run_admission = .{ .controller = &domain.controller, .backend_class = .gpu, .limits = .{ .backend_limit_bytes = 64 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false };
+            const Probe = struct {
+                session: Session,
+                calls: usize = 0,
+                failure: ?anyerror = null,
+                change_policy: bool = false,
+                deny_first: bool = false,
+                reserve_calls: usize = 0,
+                changing_policy: bool = false,
+                failure_during_policy: bool = false,
+                failure_callback: ?Callback = null,
+                const Callback = enum { reserve, retain, release };
+                fn check(self: *@This(), callback: Callback) void {
+                    self.calls += 1;
+                    self.reenter() catch |err| {
+                        if (self.failure == null) {
+                            self.failure = err;
+                            self.failure_during_policy = self.changing_policy;
+                            self.failure_callback = callback;
+                        }
+                    };
+                }
+                fn reenter(self: *@This()) !void {
+                    const gate = self.session.execution_gate.?;
+                    if (!gate.tryLock()) return error.SourceModelStillOwnedDuringSupplier;
+                    defer gate.unlock();
+                    var managed = try getComputeBackendWithControl(self.session, std.testing.allocator, .{ .native_call_policy = .in_process });
+                    defer managed.deinit();
+                    const cb = &managed.backend;
+                    if (self.change_policy) {
+                        self.change_policy = false;
+                        var peer = self.session;
+                        peer.run_admission.?.check_live_memory = !peer.run_admission.?.check_live_memory;
+                        // Actual published request entry replaces the context policy;
+                        // no borrowed test callback or raw field mutation fakes it.
+                        self.changing_policy = true;
+                        defer self.changing_policy = false;
+                        try @import("../backends/compute_factory.zig").beginRequest(peer, cb);
+                    }
+                    const input = try cb.fromFloat32(&.{ 2, 5 });
+                    defer cb.free(input);
+                    const result = try cb.add(input, input);
+                    defer cb.free(result);
+                    const host = try cb.toFloat32(result, std.testing.allocator);
+                    defer std.testing.allocator.free(host);
+                    try std.testing.expectEqualSlices(f32, &.{ 4, 10 }, host);
+                }
+                fn reserve(raw: *anyopaque, _: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.reserve_calls += 1;
+                    self.check(.reserve);
+                    if (self.deny_first) {
+                        self.deny_first = false;
+                        return error.ResourceTemporarilyUnavailable;
+                    }
+                    return 1;
+                }
+                fn retain(raw: *anyopaque, _: usize, _: memory.AdmissionAmounts) memory.AdmissionResourceError!void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.check(.retain);
+                }
+                fn release(raw: *anyopaque, _: usize) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.check(.release);
+                }
+            };
+            var probe = Probe{ .session = session };
+            try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+            var base = @import("../backends/session.zig").RunPermit{ .session = session, .lease = null };
+            var base_open = true;
+            defer if (base_open) base.deinit();
+            var waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter{};
+            var stage = StagedExecution{ .session = session, .gate = session.execution_gate, .waiter = &waiter, .cb = undefined, .control = .{ .native_call_policy = .in_process }, .permit = &base, .idle_backend = 8192, .active = false, .scheduling_enabled = scheduling };
+            var stage_open = true;
+            defer if (stage_open) stage.deinit();
+            try stage.prepareBeforeExecution();
+            const seed_backend = compute.computeBackend();
+            var held_constant: ?ops.CT = null;
+            defer if (held_constant) |value| seed_backend.freeWithCleanup(value, .{ .boundary = stage.epoch() });
+            // Real cache construction is cold, supervised, and outside BOTH
+            // actual lanes. Supplier callbacks reenter the same loaded owner.
+            {
+                var guard = try stage.control.enterUninterruptible(session.interruption());
+                defer guard.deinit();
+                compute.temp_slot_config = .{};
+                try compute.configureEmbeddingGemma2Admission(.{ .controller = &domain.controller, .limits = session.run_admission.?.limits, .check_live_memory = false });
+                _ = try compute.embedding_gemma2_resize.plan(a, &compute.ctx, .{ .width = 2, .height = 2, .target_width = 2, .target_height = 2, .resident = false });
+                const prepared_rows = (try compute.embedding_gemma2_execution.allocatePacked(a, &compute.ctx, "stage-packed", 256)) orelse return error.MissingActualPackedCache;
+                const bytes: [32]u8 = @splat(7);
+                try compute.embedding_gemma2_resize.uploadSource(&compute.ctx, prepared_rows, &bytes);
+                _ = (try compute.embedding_gemma2_execution.arena(&compute.ctx, 1, 1, 0, .{ 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 })) orelse return error.MissingActualExecutionArena;
+                const source_value = try seed_backend.fromFloat32(&.{ 1, 2, 3, 4 });
+                defer seed_backend.free(source_value);
+                held_constant = (try seed_backend.modelConstant("audio_tower.prepared.stage-ownership-fixture", source_value)) orelse return error.MissingActualModelConstant;
             }
-            const input = try cb.fromFloat32(&.{ 2, 5 });
-            defer cb.free(input);
-            const result = try cb.add(input, input);
-            defer cb.free(result);
-            const host = try cb.toFloat32(result, std.testing.allocator);
-            defer std.testing.allocator.free(host);
-            try std.testing.expectEqualSlices(f32, &.{ 4, 10 }, host);
-        }
-        fn reserve(raw: *anyopaque, _: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.check();
-            return 1;
-        }
-        fn retain(raw: *anyopaque, _: usize, _: memory.AdmissionAmounts) memory.AdmissionResourceError!void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.check();
-        }
-        fn release(raw: *anyopaque, _: usize) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.check();
+            const cache_usage = domain.controller.snapshot();
+            try std.testing.expect(cache_usage.backend_scratch_bytes > 16 and cache_usage.host_scratch_bytes > 0);
+            const attempts = probe.reserve_calls;
+            probe.deny_first = true;
+            try stage.admitInitialCuda(a, .{ .workspace_bytes = 8192, .workspace_planned = true, .backend_input_bytes = 0, .output_bytes = 16 }, null);
+            try std.testing.expectEqual(attempts + 2, probe.reserve_calls);
+            // Ordinary old payloads really refunded BEFORE retry. Only the
+            // held physical constant retains its exact old16-byte charge.
+            const expected_after_retry = try base.lease.?.amounts.merge(.{ .backend_scratch_bytes = 16 });
+            try std.testing.expectEqualDeep(expected_after_retry, domain.controller.snapshot());
+            try std.testing.expectEqual(@as(usize, 0), compute.embedding_gemma2_constants.count());
+            try std.testing.expectEqual(@as(usize, 0), compute.embedding_gemma2_execution.weights.count());
+            try std.testing.expect(stage.managed == null and !stage.active);
+            try stage.enterInitial(a, .{ .native_call_policy = .in_process });
+            const cb = stage.backend();
+            const Cache = @import("../ops/cuda/prepared_cache.zig");
+            const cache_requests = [_]Cache.Request{try Cache.Request.packedSpan("stage.prepared.scope", 64)};
+            const cache_work: Cache.Workload = .{ .requests = &cache_requests };
+            var cold_packed_ptr: u64 = 0;
+            {
+                var cache_phase: StagedExecution.CachePhase = undefined;
+                try cache_phase.initInto(&stage, cache_work);
+                defer cache_phase.close();
+                try std.testing.expect(cache_phase.cold != null and compute.ctx.prepared_cache_funding == cache_phase.binding());
+                const calls = probe.calls;
+                const packed_span = (try compute.embedding_gemma2_execution.allocatePacked(a, &compute.ctx, "stage.prepared.scope", 64)) orelse return error.MissingActualPackedCache;
+                try std.testing.expect(packed_span.ptr != 0 and probe.calls == calls);
+                cold_packed_ptr = packed_span.ptr;
+                cache_phase.close();
+                try std.testing.expect(compute.ctx.prepared_cache_funding == null and stage.cache_pending != null);
+                // Metadata close cannot invoke a supplier under this real Model.
+                try std.testing.expectEqual(calls, probe.calls);
+            }
+            try StagedExecution.pause(&stage);
+            try std.testing.expect(stage.cache_pending == null and !stage.active);
+            try StagedExecution.acquire(&stage);
+            const warm_allocations = compute.ctx.device_allocations.snapshot();
+            {
+                var warm: StagedExecution.CachePhase = undefined;
+                try warm.initInto(&stage, cache_work);
+                defer warm.close();
+                try std.testing.expect(warm.cold == null and compute.ctx.prepared_cache_funding == &warm.warm);
+                const calls = probe.calls;
+                // Match the actual numerical producer: reuse an existing key
+                // before invoking the cold-only allocating admission path.
+                const packed_span = compute.embedding_gemma2_execution.findPacked("stage.prepared.scope") orelse
+                    (try compute.embedding_gemma2_execution.allocatePacked(a, &compute.ctx, "stage.prepared.scope", 64)) orelse return error.MissingActualPackedCache;
+                try std.testing.expectEqual(cold_packed_ptr, packed_span.ptr);
+                try std.testing.expectEqual(calls, probe.calls);
+                warm.close();
+                try std.testing.expectEqualDeep(warm_allocations, compute.ctx.device_allocations.snapshot());
+            }
+            // Only optional cache quota denial declines to the existing
+            // numerical compatibility route. No cold SDK allocation follows.
+            const declined_requests = [_]Cache.Request{try Cache.Request.packedSpan("stage.optional.declined", 64)};
+            probe.deny_first = true;
+            {
+                var declined: StagedExecution.CachePhase = undefined;
+                try declined.initInto(&stage, .{ .requests = &declined_requests });
+                defer declined.close();
+                try std.testing.expect(declined.cold == null and declined.warm.deny_cold_misses);
+                const before_cache = compute.ctx.device_allocations.snapshot();
+                try std.testing.expect((try compute.embedding_gemma2_execution.allocatePacked(a, &compute.ctx, "stage.optional.declined", 64)) == null);
+                try std.testing.expectEqualDeep(before_cache, compute.ctx.device_allocations.snapshot());
+            }
+            const source = try cb.fromFloat32(&.{ 1, -2, 3, 4 });
+            var source_open = true;
+            defer if (source_open) cb.free(source);
+            const snapshot = try stage.escape(source);
+            var snapshot_open = true;
+            defer if (snapshot_open) cb.free(snapshot);
+            // Only the actual independent snapshot crosses the peer boundary.
+            cb.free(source);
+            source_open = false;
+            const before = probe.calls;
+            var phase = try stage.admitPhaseScoped(.{ .backend_scratch_bytes = base.lease.?.amounts.backend_scratch_bytes + 4096 }, null);
+            defer phase.deinit();
+            try std.testing.expect(probe.calls > before);
+            try std.testing.expect(stage.active);
+            try std.testing.expect((cb.embedding_stage != null) == scheduling);
+            const held = probe.calls;
+            phase.deinit();
+            try std.testing.expectEqual(held, probe.calls); // Ticket cannot refund in lane.
+            try stage.reserve(0); // Real checked stream handoff, then outside refund.
+            try std.testing.expect(probe.calls > held);
+            const host = try cb.toFloat32(snapshot, a);
+            defer a.free(host);
+            try std.testing.expectEqualSlices(f32, &.{ 1, -2, 3, 4 }, host);
+            const Cancel = struct {
+                fn check(_: ?*anyopaque) !void {
+                    return error.Cancelled;
+                }
+            };
+            stage.control.check_fn = Cancel.check;
+            try std.testing.expectError(error.Cancelled, stage.admitPhaseScoped(.{ .backend_scratch_bytes = 16384 }, null));
+            stage.control.check_fn = null;
+            try std.testing.expect(stage.active);
+            probe.change_policy = true;
+            var restored = try stage.admitPhaseScoped(.{ .backend_scratch_bytes = 16384 }, null);
+            defer restored.deinit();
+            try std.testing.expect(stage.active);
+            try std.testing.expect(StagedExecution.CudaPolicy.same(stage.cuda_policy, StagedExecution.CudaPolicy.from(compute.ctx.video_cache_budget.admission)));
+            const doubled = try cb.add(snapshot, snapshot);
+            var doubled_live = true;
+            defer if (doubled_live) cb.free(doubled);
+            const resumed = try cb.toFloat32(doubled, a);
+            defer a.free(resumed);
+            try std.testing.expectEqualSlices(f32, &.{ 2, -4, 6, 8 }, resumed);
+            cb.free(doubled);
+            doubled_live = false;
+            restored.deinit();
+            if (!scheduling) {
+                try StagedExecution.pause(&stage);
+                stage.control.check_fn = Cancel.check;
+                try std.testing.expectError(error.Cancelled, StagedExecution.acquire(&stage));
+                stage.control.check_fn = null;
+                try std.testing.expect(stage.active and stage.waiter.acquired);
+                try std.testing.expect(cb.embedding_stage == null);
+                // A REAL detached carrier owns the pending SDK interval. Failed
+                // reentry must release the actual model turn, not just a flag.
+                const required = try cuda_compute_mod.CudaCompute.cacheRetirementRequirements(cb, compute, .all);
+                try StagedExecution.pause(&stage);
+                var pin = if (required.old_controller) |controller| session.model_lifetime.?.retainAdmissionDomain(controller) else null;
+                defer if (pin) |value| value.release();
+                const carrier = try cuda_compute_mod.CudaCompute.CacheRetirement.prepare(required, session.model_lifetime.?, if (pin) |*value| value else null);
+                var detached = false;
+                var finished = false;
+                defer if (!finished) {
+                    if (stage.active) stage.leaveCudaModel();
+                    if (detached) {
+                        carrier.retireOutsideExecution(stage.epoch()) catch platform.inference_process_supervisor.restartWorker();
+                        carrier.destroy();
+                    } else carrier.deinitUnused();
+                    StagedExecution.cleanup(&stage);
+                };
+                try stage.enter(stage.control, false);
+                try carrier.detachFenced(cb, compute);
+                detached = true;
+                stage.leaveCudaModel();
+                const before_pending = compute.ctx.device_allocations.snapshot();
+                try std.testing.expectError(error.QueueFull, stage.enter(stage.control, false));
+                try std.testing.expect(!stage.active and !stage.waiter.acquired);
+                try std.testing.expect(session.execution_gate.?.tryLock());
+                session.execution_gate.?.unlock();
+                try std.testing.expectError(error.QueueFull, @import("../backends/compute_factory.zig").acquireCuda(compute, null));
+                try std.testing.expectError(error.QueueFull, @import("../backends/compute_factory.zig").beginRequest(session, cb));
+                try std.testing.expectEqualDeep(before_pending, compute.ctx.device_allocations.snapshot());
+                carrier.retireOutsideExecution(stage.epoch()) catch platform.inference_process_supervisor.restartWorker();
+                carrier.destroy();
+                finished = true;
+                StagedExecution.cleanup(&stage);
+                try std.testing.expect(stage.active);
+            }
+            cb.free(snapshot);
+            snapshot_open = false;
+            cb.freeWithCleanup(held_constant.?, .{ .boundary = stage.epoch() });
+            held_constant = null;
+            // Final SDK death has occurred; exact quota remains funded until
+            // THIS final consumer B seals, rather than any creation epoch.
+            try std.testing.expect(domain.controller.snapshot().backend_scratch_bytes >= 16);
+            stage.deinit();
+            stage_open = false;
+            base.deinit();
+            base_open = false;
+            _ = @import("resource_retirement.zig").pollRawController(&domain.controller);
+            if (probe.failure) |err| {
+                std.debug.print("CUDA_STAGE_SUPPLIER_FAILURE callback={s} peer_policy_change={any} scheduling={any} error={s}\n", .{ @tagName(probe.failure_callback.?), probe.failure_during_policy, scheduling, @errorName(err) });
+                return err;
+            }
+            try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
         }
     };
-    var probe = Probe{ .session = session };
-    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
-    var base = try session.admit(.{ .workspace_bytes = 8192, .workspace_planned = true, .backend_input_bytes = 0, .output_bytes = 16 });
-    var base_open = true;
-    defer if (base_open) base.deinit();
-    var waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter{};
-    var stage = StagedExecution{ .session = session, .gate = session.execution_gate, .waiter = &waiter, .cb = undefined, .control = .{ .native_call_policy = .in_process }, .permit = &base, .idle_backend = 8192 };
-    var stage_open = true;
-    defer if (stage_open) stage.deinit();
-    try stage.prepareBeforeExecution();
-    try stage.enterInitial(a, .{ .native_call_policy = .in_process });
-    const cb = stage.backend();
-    const source = try cb.fromFloat32(&.{ 1, -2, 3, 4 });
-    var source_open = true;
-    defer if (source_open) cb.free(source);
-    const snapshot = try stage.escape(source);
-    var snapshot_open = true;
-    defer if (snapshot_open) cb.free(snapshot);
-    const before = probe.calls;
-    var phase = try stage.admitPhaseScoped(.{ .backend_scratch_bytes = base.lease.?.amounts.backend_scratch_bytes + 4096 }, null);
-    defer phase.deinit();
-    try std.testing.expect(probe.calls > before);
-    try std.testing.expect(stage.active and cb.embedding_stage != null);
-    const held = probe.calls;
-    phase.deinit();
-    try std.testing.expectEqual(held, probe.calls); // Ticket cannot refund in lane.
-    try stage.reserve(0); // Real checked stream handoff, then outside refund.
-    try std.testing.expect(probe.calls > held);
-    const host = try cb.toFloat32(snapshot, a);
-    defer a.free(host);
-    try std.testing.expectEqualSlices(f32, &.{ 1, -2, 3, 4 }, host);
-    const Cancel = struct {
-        fn check(_: ?*anyopaque) !void {
-            return error.Cancelled;
-        }
-    };
-    stage.control.check_fn = Cancel.check;
-    try std.testing.expectError(error.Cancelled, stage.admitPhaseScoped(.{ .backend_scratch_bytes = 16384 }, null));
-    stage.control.check_fn = null;
-    try std.testing.expect(stage.active);
-    probe.change_policy = true;
-    try std.testing.expectError(error.BackendAdmissionPolicyChanged, stage.admitPhaseScoped(.{ .backend_scratch_bytes = 16384 }, null));
-    try std.testing.expect(stage.active); // Actual lane retained for cleanup.
-    try std.testing.expect(stage.pending_phases[0] != null);
-    cb.free(snapshot);
-    snapshot_open = false;
-    cb.free(source);
-    source_open = false;
-    stage.deinit();
-    stage_open = false;
-    base.deinit();
-    base_open = false;
-    _ = @import("resource_retirement.zig").pollRawController(&domain.controller);
-    if (probe.failure) |err| return err;
-    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
+    try Case.run(true);
+    try Case.run(false);
 }
 
 test "CUDA staged policy equality uses quota identity and semantic limits not descriptor addresses" {
@@ -11207,6 +11735,8 @@ test "actual Metal nested stage retain preserves model before provider ordering 
     const stage_owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
     stage_owner.arch_config = .{ .embedding_gemma2 = std.mem.zeroes(@import("../architectures/embedding_gemma2_config.zig").Config) };
     try session.installOwnedExecutionGate(a);
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    session.cohort_scheduler = &scheduler;
     const domain = try Domain.create();
     defer domain.release();
     session.model_lifetime.?.admission_domain = domain.pin();
@@ -11328,8 +11858,8 @@ test "actual Metal nested stage retain preserves model before provider ordering 
     probe.release_peer.store(true, .release);
     thread.join();
     joined = true;
-    if (probe.failure) |err| return err;
     if (probe.peer_error) |err| return err;
+    if (probe.failure) |err| return err;
     try std.testing.expect(!probe.armed and stage.active);
     stage.deinit();
     stage_open = false;
@@ -11337,4 +11867,242 @@ test "actual Metal nested stage retain preserves model before provider ordering 
     base_open = false;
     _ = @import("resource_retirement.zig").pollRawController(&domain.controller);
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
+}
+
+test "Gemma 4 CUDA KV defaults preserve full precision across architecture variants" {
+    const configs = [_]gpt_mod.Config{
+        .{ .family = .gemma, .num_kv_shared_layers = 20 },
+        .{ .family = .gemma, .global_head_dim = 512 },
+        .{ .family = .gemma, .ple_hidden_size = 256 },
+        .{ .family = .gemma, .gemma4_mtp_assistant = true },
+        .{ .family = .gemma, .attention_k_eq_v = true },
+        .{ .family = .gemma, .rope_dim_override = 128 },
+    };
+    for (configs) |config| {
+        try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, recommendedKvDTypeForGptConfig(config, .cuda));
+        try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, recommendedKvDTypeForGptConfig(config, .native));
+    }
+}
+
+test "actual Native media source prepaid lease funds synchronous consumers then surviving host arrays" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const source_mod = @import("../backends/session.zig");
+    const Admitted = @import("../backends/admitted_allocator.zig").AdmittedAllocator;
+    const memory = runtime.tier.memory;
+    const a = std.testing.allocator;
+    const Probe = struct {
+        gate: *std.atomic.Mutex,
+        consumer_phase: bool = false,
+        consumer_reserves: usize = 0,
+        live: usize = 0,
+        callbacks: usize = 0,
+        failure: bool = false,
+        fn reserve(raw: *anyopaque, _: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.callbacks += 1;
+            if (!self.gate.tryLock()) self.failure = true else self.gate.unlock();
+            if (self.consumer_phase) self.consumer_reserves += 1;
+            self.live += 1;
+            return self.live;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: memory.AdmissionAmounts) memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.callbacks += 1;
+            if (!self.gate.tryLock()) self.failure = true else self.gate.unlock();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.callbacks += 1;
+            if (!self.gate.tryLock()) self.failure = true else self.gate.unlock();
+            self.live -= 1;
+        }
+        fn consume(backend: *const ops.ComputeBackend, value: ops.CT, allocator: std.mem.Allocator) ![]f32 {
+            const doubled = try backend.add(value, value);
+            defer backend.free(doubled);
+            return backend.toFloat32(doubled, allocator);
+        }
+    };
+    for ([_]bool{ false, true }) |clap| {
+        var session = try mediaTextEntryFixtureSession(a, clap);
+        defer session.close();
+        try session.installOwnedExecutionGate(a);
+        var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+        session.cohort_scheduler = &scheduler;
+        var probe = Probe{ .gate = session.execution_gate.? };
+        const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+        defer domain.release();
+        session.model_lifetime.?.admission_domain = domain.pin();
+        const controller = &domain.controller;
+        try controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+        session.run_admission = .{ .controller = controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 8 * 1024 * 1024 }, .static_workspace_bytes = 4096, .check_live_memory = false };
+        var workspace = Admitted{ .backing = a, .session = session };
+        defer workspace.deinit();
+        const admitted = workspace.allocator();
+        var ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 4 }, &.{ 0, 7, 7, 1 });
+        defer ids.deinit();
+        var mask = try Tensor.initInt64(a, "attention_mask", &.{ 1, 4 }, &.{ 1, 1, 1, 0 });
+        defer mask.deinit();
+        const inputs = [_]Tensor{ ids, mask };
+        const foreign_session = try mediaTextEntryFixtureSession(a, !clap);
+        defer foreign_session.close();
+        var source: source_mod.PreparedSource = .{};
+        defer source.deinit();
+        try source.initShapesBeforeExecutionInto(session, session, session.execution_gate, .{ .tensors = &inputs }, .{ .batch = 1, .sequence = 4, .input_bytes = 64, .output_bytes = 12, .workspace_bytes = 512 * 1024 }, &workspace, .resident_consumer, admitted, .{ .native_call_policy = .in_process });
+        try std.testing.expectEqual(@as(usize, 12 + 3 * @sizeOf(i64)), source.shape_scope.?.permit.request.?.output_bytes.?);
+        try std.testing.expect(!source.shape_scope.?.permit.execution_yielded);
+        try source.bindInputsBeforeExecution(.{ .host = &inputs }, .resident_consumer);
+        try source.enter();
+        const permit = try source.beginExecutionDispatch();
+        try std.testing.expectError(error.SourceInvocationAlreadyExecuted, source.beginExecutionDispatch());
+        // A changed managed declaration refuses BEFORE numerical dispatch or
+        // any supplier/refund. The real cold geometry and B remain owned.
+        const planned = permit.request.?;
+        const amounts_before = permit.lease.?.amounts;
+        const controller_before = controller.snapshot();
+        const callbacks_before = probe.callbacks;
+        const epoch_before = permit.dispatch_cleanup_epoch.?.record;
+        permit.request.?.output_bytes = 0;
+        const late_growth = permit.runResidentWithControl(&inputs, admitted, .{ .native_call_policy = .in_process });
+        permit.request = planned;
+        if (late_growth) |unexpected| {
+            if (unexpected) |value| {
+                var owned = value;
+                owned.deinitWithBoundary(source.epoch());
+            }
+            return error.UnexpectedManagedGeometryGrowth;
+        } else |err| try std.testing.expectEqual(error.PreparedAdmissionRequiresReadyTurn, err);
+        try std.testing.expectEqualDeep(amounts_before, permit.lease.?.amounts);
+        try std.testing.expectEqualDeep(controller_before, controller.snapshot());
+        try std.testing.expectEqual(callbacks_before, probe.callbacks);
+        try std.testing.expect(!permit.execution_yielded and permit.dispatch_cleanup_epoch.?.record == epoch_before);
+        try std.testing.expect(source.waiter.acquired and scheduler.head == &source.waiter);
+        var pending = try permit.runResidentWithControl(&inputs, admitted, .{ .native_call_policy = .in_process });
+        errdefer if (pending) |*outputs| outputs.deinitWithBoundary(source.epoch());
+        // Actual canonical Native is necessary but not authority to borrow
+        // another model's quota. Both declines preserve the SAME pending value.
+        const original_model = source.source_model.?;
+        try std.testing.expect(pending.?.model_retention == original_model);
+        const original_outputs = pending.?.outputs.ptr;
+        const original_amounts = permit.lease.?.amounts;
+        source.source_model = null;
+        const missing_model = source.adoptSynchronousResident(&pending);
+        source.source_model = original_model;
+        if (missing_model) |unexpected| {
+            var owned = unexpected;
+            owned.close(.{ .boundary = source.epoch() });
+            return error.UnexpectedSourceModelAcceptance;
+        } else |err| try std.testing.expectEqual(error.MissingSourceModelLifetime, err);
+        try std.testing.expect(pending != null and pending.?.outputs.ptr == original_outputs);
+        try std.testing.expectEqualDeep(original_amounts, permit.lease.?.amounts);
+        source.source_model = foreign_session.model_lifetime.?;
+        const foreign_model = source.adoptSynchronousResident(&pending);
+        source.source_model = original_model;
+        if (foreign_model) |unexpected| {
+            var owned = unexpected;
+            owned.close(.{ .boundary = source.epoch() });
+            return error.UnexpectedSourceModelAcceptance;
+        } else |err| try std.testing.expectEqual(error.ResidentOutputsOwnerChanged, err);
+        try std.testing.expect(pending != null and pending.?.outputs.ptr == original_outputs and pending.?.resource_lease == null);
+        try std.testing.expectEqualDeep(original_amounts, permit.lease.?.amounts);
+        try std.testing.expectEqual(@as(usize, 0), source.synchronous_consumers);
+        var consumer = try source.adoptSynchronousResident(&pending);
+        defer consumer.close(.{ .boundary = source.epoch() });
+        try std.testing.expect(pending == null and consumer.outputs.resource_lease == null);
+        try std.testing.expect(permit.lease != null and workspace.prepaid_host_bytes > 0);
+        try std.testing.expectEqual(@as(usize, 1), source.synchronous_consumers);
+        const host = try consumer.outputs.materializeFloat32(admitted, &.{}, null);
+        var host_live = true;
+        defer if (host_live) {
+            for (host) |*value| value.deinit();
+            admitted.free(host);
+        };
+        try std.testing.expect(try consumer.outputs.prepareResidentConsumer(.{ .boundary = source.epoch() }));
+        try source.releaseForConsumer();
+        try std.testing.expect(session.execution_gate.?.tryLock());
+        session.execution_gate.?.unlock();
+        probe.consumer_phase = true;
+        var destination = try session.admitHostPreprocess(16);
+        defer destination.deinit();
+        try std.testing.expect(probe.consumer_reserves > 0 and controller.snapshot().host_scratch_bytes >= workspace.prepaid_host_bytes);
+        const actual = try @import("backend_operation.zig").callOpaque(consumer.outputs.backend.*, null, Probe.consume, .{ consumer.outputs.backend, consumer.outputs.outputs[0], admitted });
+        var actual_live = true;
+        defer if (actual_live) admitted.free(actual);
+        for (actual, host[0].asFloat32()) |got, expected| try std.testing.expectApproxEqAbs(expected * 2, got, 1e-6);
+        for (host) |*value| value.deinit();
+        admitted.free(host);
+        host_live = false;
+        consumer.close(.{ .boundary = source.epoch() });
+        try std.testing.expectEqual(@as(usize, 0), source.synchronous_consumers);
+        try std.testing.expect(permit.lease != null);
+        source.deinit();
+        try std.testing.expectEqual(@as(usize, 0), workspace.prepaid_host_bytes);
+        try std.testing.expect(workspace.live_bytes > 0 and controller.snapshot().host_scratch_bytes >= workspace.live_bytes);
+        for (actual) |value| try std.testing.expect(std.math.isFinite(value));
+        admitted.free(actual);
+        actual_live = false;
+        destination.deinit();
+        try workspace.trim();
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+        try std.testing.expect(probe.live == 0 and !probe.failure);
+    }
+}
+
+test "resident encoder source refuses unprepared stage before inspecting backend or payload" {
+    var permit = @import("../backends/session.zig").RunPermit{ .session = undefined, .lease = null };
+    var waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter{};
+    var stage = StagedExecution{ .session = undefined, .gate = null, .waiter = &waiter, .cb = undefined, .control = .{}, .active = false, .permit = &permit, .idle_backend = 0 };
+    try std.testing.expectError(if (build_options.enable_cuda) error.EmbeddingStageNotPrepared else error.CudaNotEnabled, stage.runResidentEmbeddingEncoder(std.testing.allocator, undefined, undefined, &.{}, 1, 1, 768, false));
+}
+
+test "actual Native source geometry preserves declared packed rows and refuses unfunded full padded execution" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const source_mod = @import("../backends/session.zig");
+    const Admitted = @import("../backends/admitted_allocator.zig").AdmittedAllocator;
+    const a = std.testing.allocator;
+    var session = try mediaTextEntryFixtureSession(a, false);
+    defer session.close();
+    // Metadata-only ownership fixture: actual canonical architecture geometry,
+    // no claim that the tiny CLIP weights are a numerical Gemma checkpoint.
+    const actual: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    actual.arch_config = .{ .embedding_gemma2 = .{} };
+    try session.installOwnedExecutionGate(a);
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    session.cohort_scheduler = &scheduler;
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    session.model_lifetime.?.admission_domain = domain.pin();
+    const controller = &domain.controller;
+    session.run_admission = .{ .controller = controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 341 * 1024 * 1024, .scratch_limit_bytes = 341 * 1024 * 1024 }, .static_workspace_bytes = 128 * 1024 * 1024, .check_live_memory = false };
+    var workspace = Admitted{ .backing = a, .session = session };
+    defer workspace.deinit();
+    const declared: source_mod.RunRequest = .{ .batch = 1, .sequence = 2, .input_bytes = 8192 * 2 * @sizeOf(i64), .output_bytes = 2 * 768 * @sizeOf(f32), .workspace_bytes = try @import("../pipelines/embedding_gemma2_admission.zig").textEncoderWorkspace(2) };
+    const full_info = [_]TensorInfo{
+        .{ .name = "input_ids", .dtype = .i64, .shape = &.{ 1, 8192 } },
+        .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ 1, 8192 } },
+    };
+    {
+        var full: source_mod.PreparedSource = .{};
+        defer full.deinit();
+        try std.testing.expectError(error.ResourceLimitExceeded, full.initShapesBeforeExecutionInto(session, session, session.execution_gate, .{ .shapes = &full_info }, declared, &workspace, .host, a, .{ .native_call_policy = .in_process }));
+    }
+    try std.testing.expect(scheduler.head == null);
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, controller.snapshot());
+    const packed_info = [_]TensorInfo{
+        .{ .name = "input_ids", .dtype = .i64, .shape = &.{ 1, 2 } },
+        .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ 1, 2 } },
+    };
+    {
+        var packed_source: source_mod.PreparedSource = .{};
+        defer packed_source.deinit();
+        try packed_source.initShapesBeforeExecutionInto(session, session, session.execution_gate, .{ .shapes = &packed_info }, declared, &workspace, .host, a, .{ .native_call_policy = .in_process });
+        const request = packed_source.shape_scope.?.permit.request.?;
+        try std.testing.expectEqual(@as(usize, 2), request.sequence);
+        try std.testing.expectEqual(declared.input_bytes, request.input_bytes);
+        try std.testing.expectEqual(declared.workspace_bytes, request.workspace_bytes);
+        try std.testing.expectEqual(@as(usize, 2 * 768 * @sizeOf(f32) + 3 * @sizeOf(i64)), request.output_bytes.?);
+        try std.testing.expect(session.execution_gate.?.tryLock());
+        session.execution_gate.?.unlock();
+    }
+    try std.testing.expect(scheduler.head == null);
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, controller.snapshot());
 }

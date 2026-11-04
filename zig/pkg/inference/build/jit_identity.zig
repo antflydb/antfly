@@ -71,6 +71,8 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         },
         .cuda => &.{
             "src/ops/cuda/kernels.zig",
+            "src/ops/cuda/kernels/rms_q8_1_register_rows.cuh",
+            "src/ops/cuda/kernels/quant_rows_prefetch_l2.cuh",
             "src/graph/kernel_jit.zig",
             "src/graph/quant_kernel_compiler.zig",
             "src/graph/quant_kernel_cuda_renderer.zig",
@@ -221,6 +223,8 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
             "src/ops/cuda/kernels/kernel_abi.cuh",
             "src/ops/kernel_descriptor.zig",
             "src/ops/kernel_geometry.zig",
+            "src/ops/cuda/kernels/rms_q8_1_register_rows.cuh",
+            "src/ops/cuda/kernels/quant_rows_prefetch_l2.cuh",
             "src/graph/quant_kernel_compiler.zig",
             "src/graph/quant_matmul.zig",
             "src/gguf/tensor_types.zig",

@@ -322,7 +322,15 @@ fn convViaIm2col(
     time_major: bool,
 ) !?CT {
     const trace = whisperMetalProfileEnabled();
+    const availability = try cb.conv1dIm2colAvailability(&.{ .batch = batch, .channels = in_channels, .time = time_steps, .kernel = kernel_size, .stride = stride, .padding = padding, .time_major = time_major });
+    const certified = availability orelse false;
+    var selected_slot: ?usize = null;
+    if (availability) |enabled| {
+        if (!enabled) return null;
+        selected_slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = weight, .bias = bias, .in_dim = in_channels * kernel_size, .out_dim = out_channels })) orelse return null;
+    }
     const cols = try cb.conv1dIm2col(input, batch, in_channels, time_steps, kernel_size, stride, padding, time_major) orelse {
+        if (certified) return error.PreparedConvolutionCapabilityChanged;
         if (trace) std.debug.print("whisper_metal_conv: im2col unavailable in={d} k={d}\n", .{ in_channels, kernel_size });
         return null;
     };
@@ -331,11 +339,12 @@ fn convViaIm2col(
     // The conv weight `[out, in, kernel]` is already the row-major
     // `[out, in * kernel]` matrix the linear slot wants; the slot
     // preparation relabels it.
-    const slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = weight, .bias = bias, .in_dim = in_dim, .out_dim = out_channels })) orelse {
+    const slot = if (selected_slot) |ready| ready else (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = weight, .bias = bias, .in_dim = in_dim, .out_dim = out_channels })) orelse {
         if (trace) std.debug.print("whisper_metal_conv: no linear slot in={d} out={d}\n", .{ in_dim, out_channels });
         return null;
     };
     const out = try cb.decoderRuntimeApplyLinear(&.{ .slot = slot, .input = cols, .in_dim = in_dim, .out_dim = out_channels });
+    if (out == null and certified) return error.PreparedConvolutionCapabilityChanged;
     if (out == null and trace) std.debug.print("whisper_metal_conv: linear declined slot={d} in={d} out={d}\n", .{ slot, in_dim, out_channels });
     return out;
 }
@@ -938,9 +947,16 @@ pub const DecodeCache = struct {
             const v_b = try fetcher.fetchOptional(std.fmt.bufPrint(&buf, "model.decoder.layers.{d}.encoder_attn.v_proj.bias", .{layer}) catch return error.NameTooLong);
             // Every later step reads these from the device; keep them there
             // rather than re-uploading megabytes per layer per token.
-            const k_cross = try residentProjection(cb, try (Linear{ .w = k, .b = k_b }).apply(cb, encoder_hidden, enc_seq, d_model, d_model));
+            var k_cross = try residentProjection(cb, try (Linear{ .w = k, .b = k_b }).apply(cb, encoder_hidden, enc_seq, d_model, d_model));
             errdefer cb.free(k_cross);
-            const v_cross = try residentProjection(cb, try (Linear{ .w = v, .b = v_b }).apply(cb, encoder_hidden, enc_seq, d_model, d_model));
+            var v_cross = try residentProjection(cb, try (Linear{ .w = v, .b = v_b }).apply(cb, encoder_hidden, enc_seq, d_model, d_model));
+            errdefer cb.free(v_cross);
+            if (try cb.prepareCrossAttentionKv(k_cross, v_cross)) |prepared| {
+                cb.free(k_cross);
+                cb.free(v_cross);
+                k_cross = prepared.first;
+                v_cross = prepared.second;
+            }
             layers[layer] = .{ .k_cross = k_cross, .v_cross = v_cross };
             built += 1;
         }
@@ -1508,10 +1524,21 @@ fn decoderBlockCached(
     profile.mark(cb, .cross_out);
 
     // --- FFN ---
-    const fc1_out = try w.fc1.apply(cb, after_cross.normed, dec_seq, d_model, ffn_dim);
-    defer cb.free(fc1_out);
-    profile.mark(cb, .fc1);
-    const activated = try cb.gelu(fc1_out);
+    var fc1_out: ?CT = null;
+    defer if (fc1_out) |tensor| cb.free(tensor);
+    const activated = activation: {
+        if (cb.kind() == .cuda) {
+            if (w.fc1.b) |bias| {
+                if (try cb.linearGelu(after_cross.normed, w.fc1.w, bias, dec_seq, d_model, ffn_dim)) |fused| {
+                    profile.mark(cb, .fc1);
+                    break :activation fused;
+                }
+            }
+        }
+        fc1_out = try w.fc1.apply(cb, after_cross.normed, dec_seq, d_model, ffn_dim);
+        profile.mark(cb, .fc1);
+        break :activation try cb.gelu(fc1_out.?);
+    };
     defer cb.free(activated);
     profile.mark(cb, .gelu);
     const fc2_out = try w.fc2.apply(cb, activated, dec_seq, ffn_dim, d_model);
@@ -1594,4 +1621,56 @@ test "incremental canonical cache geometry bounds full encoder constructor and r
     try std.testing.expectEqual(@as(usize, 8), geometry.self_mask_elements);
     try std.testing.expectError(error.ResourceLimitExceeded, CacheGeometry.init(config, std.math.maxInt(usize)));
     try std.testing.expectError(error.InvalidInputShape, CacheGeometry.init(config, 0));
+}
+
+test "CUDA optional convolution preflight preserves direct default and composes actual unfolded dense slots" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    const a = std.testing.allocator;
+    var compute = @import("../ops/cuda/cuda_compute.zig").CudaCompute.init(a) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer compute.deinit();
+    compute.capability_profile = .transformer_seq2seq;
+    try compute.configureSeq2seqPolicy(.{});
+    const cb = compute.computeBackend();
+    const before = compute.ctx.device_allocations.snapshot();
+    const slots = compute.decoder_runtime_linear_slots.count();
+    try std.testing.expect((try convViaIm2col(&cb, @ptrFromInt(8), @ptrFromInt(16), @ptrFromInt(24), 2, 2, 2, 4, 3, 2, 1, false)) == null);
+    try std.testing.expectEqual(slots, compute.decoder_runtime_linear_slots.count());
+    try std.testing.expectEqualDeep(before, compute.ctx.device_allocations.snapshot());
+    try compute.configureSeq2seqPolicy(.{ .im2col = true });
+    const weights = [_]f32{ 1, 0, -1, 0.5, 1, -0.5, -1, 2, 0, 0, 0.25, 0.75 };
+    const biases = [_]f32{ 0.25, -0.75 };
+    const input = [_]f32{ 1, 2, 3, 4, 11, 12, 13, 14, 101, 102, 103, 104, 111, 112, 113, 114 };
+    const wt = Tensor{ .data = @constCast(std.mem.sliceAsBytes(&weights)), .dtype = .f32, .shape = &.{ 2, 2, 3 }, .name = "conv.weight", .allocator = a, .owns_data = false, .owns_shape = false };
+    const bt = Tensor{ .data = @constCast(std.mem.sliceAsBytes(&biases)), .dtype = .f32, .shape = &.{2}, .name = "conv.bias", .allocator = a, .owns_data = false, .owns_shape = false };
+    try compute.insertWeightFromTensor(try a.dupe(u8, "conv.weight"), &wt);
+    try compute.insertWeightFromTensor(try a.dupe(u8, "conv.bias"), &bt);
+    const w = try cb.getWeight("conv.weight");
+    defer cb.free(w);
+    const b = try cb.getWeight("conv.bias");
+    defer cb.free(b);
+    const x = try cb.fromFloat32Shape(&input, &.{ 2, 2, 4 });
+    defer cb.free(x);
+    const direct = try cb.conv1d(x, w, b, 2, 2, 2, 4, 3, 2, 1);
+    defer cb.free(direct);
+    const unfolded = (try convViaIm2col(&cb, w, b, x, 2, 2, 2, 4, 3, 2, 1, false)) orelse return error.ExpectedUnfoldedConvolution;
+    defer cb.free(unfolded);
+    const direct_values = try cb.toFloat32(direct, a);
+    defer a.free(direct_values);
+    const rows = try cb.toFloat32(unfolded, a);
+    defer a.free(rows);
+    for (0..2) |batch| for (0..2) |time| for (0..2) |channel| {
+        var expected = biases[channel];
+        for (0..2) |source_channel| for (0..3) |tap| {
+            const position = @as(isize, @intCast(time * 2 + tap)) - 1;
+            if (position < 0 or position >= 4) continue;
+            expected += input[(batch * 2 + source_channel) * 4 + @as(usize, @intCast(position))] * weights[(channel * 2 + source_channel) * 3 + tap];
+        };
+        try std.testing.expectEqual(expected, rows[(batch * 2 + time) * 2 + channel]);
+        try std.testing.expectEqual(expected, direct_values[(batch * 2 + channel) * 2 + time]);
+    };
+    try std.testing.expect(compute.decoder_runtime_linear_slots.count() > slots);
 }
