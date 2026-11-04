@@ -31,9 +31,10 @@ const (
 	IntentConflict  ErrorCode = 4
 	TxnNotFound     ErrorCode = 5
 	Busy            ErrorCode = 6
-	// OutcomeUnknown means publication succeeded in the running process, but
-	// crash durability could not be confirmed. Inspect the destination and do
-	// not retry the operation automatically.
+	// OutcomeUnknown means the operation may have taken effect: either it
+	// was published but crash durability could not be confirmed, or a failure
+	// left it unknown whether it applied at all. Inspect the affected data
+	// and do not retry the operation automatically.
 	OutcomeUnknown ErrorCode = 7
 	// Unsupported means the operation requires a platform or filesystem
 	// capability that is unavailable. Retrying unchanged will not succeed.
@@ -79,7 +80,7 @@ var errorCodeDescriptions = map[ErrorCode]string{
 	IntentConflict:                   "a transaction intent conflicts with the requested operation",
 	TxnNotFound:                      "the requested transaction was not found",
 	Busy:                             "the requested resource is temporarily busy or changed during streaming; stabilize it and retry",
-	OutcomeUnknown:                   "the operation was published, but crash durability could not be confirmed; inspect the destination and do not retry automatically",
+	OutcomeUnknown:                   "the operation may have taken effect, but whether it applied or became durable could not be confirmed; inspect the affected data and do not retry automatically",
 	Unsupported:                      "the operation requires a capability that is not supported by this platform or filesystem",
 	Stalled:                          "derived work stalled or failed; inspect pending-work diagnostics and repair or reopen the database",
 	Cancelled:                        "the caller cancelled the operation",
