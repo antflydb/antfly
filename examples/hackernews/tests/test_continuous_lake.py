@@ -16,6 +16,7 @@
 """Qualification must preserve evidence and reject unsafe or misleading results."""
 
 import copy
+from http.client import IncompleteRead
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -59,6 +60,66 @@ def test_retry_preserves_pending_intent_until_durable_ack(run, monkeypatch):
     assert calls[0] == calls[1]
     assert run.expected == {42: row}
     assert not (run.state / (lake.TABLES[1] + "-pending.json")).exists()
+
+
+@pytest.mark.parametrize(
+    "error", [TimeoutError("PRIVATE"), IncompleteRead(b"PRIVATE", 10)]
+)
+def test_response_body_transport_evidence_preserves_stage_and_status(
+    run, monkeypatch, error
+):
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def read(self, *_):
+            raise error
+
+    monkeypatch.setattr(lake, "open_request", lambda *_, **__: Response())
+    with pytest.raises(lake.RequestFailure) as caught:
+        run.call("POST", "/query", {})
+    assert caught.value.record["transport_phase"] == "response_body"
+    assert caught.value.record["response_status"] == 200
+    assert "http_status" not in caught.value.record
+    assert caught.value.record["code"] == "transport_error"
+    assert "PRIVATE" not in (run.state / "events.jsonl").read_text()
+
+
+def test_before_headers_transport_evidence_does_not_invent_status(run, monkeypatch):
+    def fail(*_, **__):
+        raise TimeoutError("PRIVATE")
+
+    monkeypatch.setattr(lake, "open_request", fail)
+    with pytest.raises(lake.RequestFailure) as caught:
+        run.call("POST", "/query", {})
+    assert caught.value.record["transport_phase"] == "connect_or_headers"
+    assert "response_status" not in caught.value.record
+    assert "PRIVATE" not in (run.state / "events.jsonl").read_text()
+
+
+def test_error_body_timeout_retains_a_transport_record(run, monkeypatch):
+    class Body:
+        def read(self, *_):
+            raise TimeoutError("PRIVATE")
+
+        def close(self):
+            pass
+
+    def fail(*_, **__):
+        raise lake.HTTPError("http://127.0.0.1/private", 503, "PRIVATE", None, Body())
+
+    monkeypatch.setattr(lake, "open_request", fail)
+    with pytest.raises(lake.RequestFailure) as caught:
+        run.call("POST", "/query", {})
+    assert caught.value.record["code"] == "transport_error"
+    assert caught.value.record["transport_phase"] == "response_body"
+    assert caught.value.record["response_status"] == 503
+    assert "PRIVATE" not in (run.state / "events.jsonl").read_text()
 
 
 def test_failed_admission_retains_intent_without_acknowledging(run, monkeypatch):

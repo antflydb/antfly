@@ -83,6 +83,14 @@ search failures. An independent deadline owner stops the engine if foreground
 observation stalls; teardown allows bounded termination/drain grace. Credential
 helper execution is bounded separately.
 
+Transport records distinguish failures before response headers from failures
+reading a response body. A known header status is stored as `response_status`,
+separately from an HTTP-error `http_status`, so a broken 200 body cannot be
+mistaken for an acknowledged write. Error-body timeouts and truncated responses
+retain the same structured evidence; response bodies and exception messages are
+discarded. Older records without these fields cannot establish the transport
+stage retrospectively.
+
 Catalog and publication lag are measured from the acceptance ACK to first sampled
 visibility. They are sampling upper bounds. Superseded changes and deletes without
 an observed row image remain censored, rather than receiving zero latency.

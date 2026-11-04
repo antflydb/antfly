@@ -24,6 +24,7 @@ search while vacuum runs against both exclusively owned qualification tables.
 import argparse
 import errno
 import hashlib
+from http.client import HTTPException
 import io
 import json
 import math
@@ -347,24 +348,45 @@ class Run:
             headers={"Content-Type": "application/json"},
             method=method,
         )
+        phase = "connect_or_headers"
+        response_status = None
         try:
             with open_request(
                 request, timeout=max(0.1, min(timeout, self.deadline - started))
             ) as response:
+                phase = "response_body"
+                response_status = response.status
                 result = json.load(response) if response.status != 204 else None
         except HTTPError as error:
-            failure = RequestFailure.http(
-                method,
-                route,
-                error.code,
-                error.read(65536),
-                (time.monotonic() - started) * 1000,
-            )
+            try:
+                error_body = error.read(65536)
+            except (URLError, OSError, HTTPException) as body_error:
+                failure = RequestFailure.transport(
+                    method,
+                    route,
+                    body_error,
+                    (time.monotonic() - started) * 1000,
+                    phase="response_body",
+                    response_status=error.code,
+                )
+            else:
+                failure = RequestFailure.http(
+                    method,
+                    route,
+                    error.code,
+                    error_body,
+                    (time.monotonic() - started) * 1000,
+                )
             self.event("request_failure", request_id=request_id, **failure.record)
             raise failure from None
-        except (URLError, TimeoutError, ConnectionError, OSError) as error:
+        except (URLError, OSError, HTTPException) as error:
             failure = RequestFailure.transport(
-                method, route, error, (time.monotonic() - started) * 1000
+                method,
+                route,
+                error,
+                (time.monotonic() - started) * 1000,
+                phase=phase,
+                response_status=response_status,
             )
             self.event("request_failure", request_id=request_id, **failure.record)
             raise failure from None
