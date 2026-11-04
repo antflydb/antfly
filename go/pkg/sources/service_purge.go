@@ -120,12 +120,34 @@ func (s *Service) purgeSourcesLocked(ctx context.Context, profile Profile) error
 		if err := s.purgeMediaFiles(ctx, removed); err != nil {
 			return err
 		}
-		queue.Sources = queue.Sources[completed:]
-		if err := writeJSON(s.purgePath(), queue, 1<<20); err != nil {
+		if err := s.commitPurgeCompletion(queue, completed, removed); err != nil {
 			return err
 		}
 	}
 	return purgeErr
+}
+
+// Profile removal must be durable before its tombstone can disappear. Use the
+// live profile under the control mutex: credential revocation is allowed while
+// purge jobs run and must not be overwritten by the job's admission snapshot.
+func (s *Service) commitPurgeCompletion(queue sourcePurges, completed int, removed map[string]bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := cloneProfile(s.profile)
+	kept := next.Sources[:0]
+	for _, source := range next.Sources {
+		if !removed[source.ID] {
+			kept = append(kept, source)
+		}
+	}
+	next.Sources = kept
+	if err := writeJSON(s.profilePath(), next, 1<<20); err != nil {
+		return err
+	}
+	s.profile = next
+	s.refreshMediaRegistry()
+	queue.Sources = queue.Sources[completed:]
+	return writeJSON(s.purgePath(), queue, 1<<20)
 }
 
 // Validate durable identity before issuing any destructive database operation.

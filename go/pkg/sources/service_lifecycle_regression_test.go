@@ -102,26 +102,30 @@ func TestImmutableMediaStreamsAndNoOpPinsAreReused(t *testing.T) {
 	t.Logf("8 MiB full response provider GETs: %d; bytes: %d", counted.opens.Load(), counted.bytes.Load())
 	require.EqualValues(t, 1, counted.opens.Load())
 }
-func TestGoogleMediaUsesOperationDeadline(t *testing.T) {
+func TestGoogleMediaUsesOperationAndIdleDeadlines(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Length", "2")
+		w.Header().Set("Content-Length", "5")
 		w.Header().Set("X-Goog-Generation", "1")
 		w.WriteHeader(200)
-		_, _ = io.WriteString(w, "a")
-		w.(http.Flusher).Flush()
-		select {
-		case <-r.Context().Done():
-		case <-time.After(100 * time.Millisecond):
+		for i := range 5 {
+			if i > 0 {
+				select {
+				case <-r.Context().Done():
+					return
+				case <-time.After(40 * time.Millisecond):
+				}
+			}
+			_, _ = io.WriteString(w, "a")
+			w.(http.Flusher).Flush()
 		}
-		_, _ = io.WriteString(w, "b")
 	}))
 	defer server.Close()
 	client := server.Client()
-	client.Timeout = 50 * time.Millisecond
+	client.Timeout = 100 * time.Millisecond
 	connector := &GoogleConnector{ProviderName: ProviderGCS, HTTPClient: client, APIBase: server.URL}
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	body, err := connector.OpenMedia(ctx, Request{Config: json.RawMessage(`{"bucket":"docs"}`)}, Item{Path: "file", Revision: "1", Size: 2, Metadata: map[string]any{"bucket": "docs"}}, MediaRange{0, 2})
+	body, err := connector.OpenMedia(ctx, Request{Config: json.RawMessage(`{"bucket":"docs"}`)}, Item{Path: "file", Revision: "1", Size: 5, Metadata: map[string]any{"bucket": "docs"}}, MediaRange{0, 5})
 	require.NoError(t, err)
 	_, err = io.ReadAll(body)
 	require.NoError(t, err)
@@ -129,7 +133,7 @@ func TestGoogleMediaUsesOperationDeadline(t *testing.T) {
 	require.NoError(t, ctx.Err())
 	short, stop := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	defer stop()
-	body, err = connector.OpenMedia(short, Request{Config: json.RawMessage(`{"bucket":"docs"}`)}, Item{Path: "file", Revision: "1", Size: 2, Metadata: map[string]any{"bucket": "docs"}}, MediaRange{0, 2})
+	body, err = connector.OpenMedia(short, Request{Config: json.RawMessage(`{"bucket":"docs"}`)}, Item{Path: "file", Revision: "1", Size: 5, Metadata: map[string]any{"bucket": "docs"}}, MediaRange{0, 5})
 	require.NoError(t, err)
 	_, err = io.ReadAll(body)
 	_ = body.Close()
@@ -204,6 +208,10 @@ func TestPurgeHonorsRunnerLock(t *testing.T) {
 	job = waitServiceJob(t, s, job.ID)
 	require.Equal(t, "completed", job.State)
 	require.Equal(t, 1, job.PurgedSourceCount)
+	var persisted Profile
+	require.NoError(t, loadJSON(s.profilePath(), &persisted, 1<<20))
+	require.NotContains(t, persisted.Connections, "docs", "purge commit must preserve concurrent connection revocation")
+	require.Empty(t, persisted.Sources)
 }
 
 func TestDriveResumeRejectsChangedRevisionWithCachedDigest(t *testing.T) {

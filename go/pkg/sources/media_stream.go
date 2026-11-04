@@ -231,9 +231,7 @@ func (c *GoogleConnector) OpenMedia(ctx context.Context, r Request, item Item, s
 	if ranged {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", span.Offset, span.Offset+span.Length-1))
 	}
-	streamClient := *client
-	streamClient.Timeout = 0 // Streaming is bounded by the caller's operation deadline.
-	response, err := streamClient.Do(req)
+	response, err := doGoogleStream(client, req)
 	if err != nil {
 		return nil, googleRequestError(err)
 	}

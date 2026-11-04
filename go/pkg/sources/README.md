@@ -541,8 +541,11 @@ releasing bytes. There are four active requests and a two-minute request deadlin
 Socket write deadlines also release slots when clients stop reading. When embedding
 the handler, response-writer middleware must expose `Unwrap() http.ResponseWriter`
 for `http.ResponseController` to reach the server connection.
-Google streaming responses use this operation deadline rather than the metadata
-client's 60-second timeout; initial hash verification allows 30 minutes.
+Google streaming responses use the caller's operation deadline for the complete
+transfer. The HTTP client's timeout (60 seconds by default) bounds response
+headers and each blocked body read, without counting consumer backpressure or
+limiting the total duration of a progressing transfer. One timer is reused per
+response, with no allocation per read; initial hash verification allows 30 minutes.
 The reusable Google `OpenSource` reader also streams original files directly into
 application-owned staging. Callers must check both copy and close errors before
 accepting staged bytes; native Workspace exports retain bounded acquisition.
@@ -562,8 +565,10 @@ reading acquisition journals on each request. Pending inventories are reconciled
 once after restart. Signed descriptors survive restart and are pruned after
 successful full syncs. Explicit purges remove descriptors and unreferenced digest
 receipts before committing deletion completion, including purge-only jobs. Receipts
-shared with other sources survive. Failed runs keep pending/published generations
-for recovery.
+shared with other sources survive. Completion persists source removal in the live
+profile before clearing the purge intent, so a failed earlier profile write cannot
+resurrect a deleted source after restart. Concurrent credential revocations are
+preserved. Failed runs keep pending/published generations for recovery.
 
 Media publication computes `metadata.sha256` from verified original bytes.
 Signed receipts bind that digest to provider URI, version, endpoint and exact
