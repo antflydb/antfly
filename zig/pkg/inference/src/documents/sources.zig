@@ -51,11 +51,30 @@ pub fn audioInput(a: A, value: []const u8) !Input {
         const declared = parsed.effectiveMediaTypeEssence();
         if (!std.mem.eql(u8, declared, "application/octet-stream")) {
             if (!isAudioMediaType(declared)) return error.UnsupportedInferenceMimeType;
-            mime = declared;
+            mime = parsed.media_type;
         }
         _ = try parsed.decodedSize();
     }
     return .{ .id = "audio-0", .url = url, .media_type = mime };
+}
+
+/// MIME may describe a container or a codec. Ogg is a container for both
+/// Vorbis and Opus, while audio/opus and audio/vorbis are codec-specific.
+fn audioMediaTypeMatches(mime: []const u8, detected: audio.EncodedFormat) !bool {
+    const data_uri = @import("antfly_scraping").data_uri;
+    const declared = try data_uri.parseMediaType(mime);
+    const expected = audio.detectFormatFromMime(mime) orelse return false;
+    const ogg_container = std.ascii.eqlIgnoreCase(declared.essence, "audio/ogg") or std.ascii.eqlIgnoreCase(declared.essence, "application/ogg");
+    if (ogg_container and detected == .opus) {
+        if (try declared.parameter("codecs") != null) {
+            const opus = try data_uri.parseMediaType("audio/ogg;codecs=opus");
+            var alias = declared;
+            alias.essence = opus.essence;
+            return opus.isCompatibleDeclaration(alias);
+        }
+        return true;
+    }
+    return expected == detected;
 }
 
 pub fn audioMime(bytes: []const u8) ![]const u8 {
@@ -181,9 +200,9 @@ pub const Source = struct {
             result = .{ .input = normalized, .bytes = bytes, .fingerprint = fingerprint, .parsed = .{ .slides = .{ .archive = archive, .slides = try slides.toOwnedSlice(a), .size = slide_size, .inheritance = inheritance } } };
         } else if (isAudioMediaType(normalized.media_type)) {
             if (input.pages != null or input.include_notes or input.include_hidden) return error.InvalidDocumentSelection;
-            const expected = audio.detectFormatFromMime(normalized.media_type).?;
-            if (audio.detectFormat(bytes) != expected) return error.DocumentMediaTypeMismatch;
-            if (!audio.canDecodeFormat(expected)) return error.UnsupportedDocumentFormat;
+            const detected = audio.detectFormat(bytes) orelse return error.DocumentMediaTypeMismatch;
+            if (!try audioMediaTypeMatches(input.media_type, detected)) return error.DocumentMediaTypeMismatch;
+            if (!audio.canDecodeFormat(detected)) return error.UnsupportedDocumentFormat;
             // Pins and published run identities use the container's canonical
             // MIME, including when a durable attachment resumes without its
             // original transport declaration (for example audio/x-wav).
@@ -806,4 +825,24 @@ test "document audio source keeps recording identity without fabricated page geo
     var run = c.Run{ .limits = .{} };
     defer run.deinit();
     try std.testing.expectError(error.DocumentCapabilityMismatch, source.render(a, 1, &run));
+}
+
+test "document Ogg container MIME accepts Opus and preserves explicit codec declarations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Source admission sniffs the container header; decoder integrity checks
+    // remain at the bounded audio decoder. No PCM is allocated by admission.
+    const bytes = "OggS" ++ "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++ "OpusHead";
+    for ([_][]const u8{ "audio/ogg", "application/ogg", "audio/ogg;codecs=opus", "audio/ogg; codecs=\"opus\"", "audio/opus" }) |mime| {
+        var source = try Source.init(a, .{ .id = "recording", .url = "fixture", .media_type = mime }, bytes, .{}, .{});
+        defer source.deinit();
+        try std.testing.expect(source.parsed == .audio);
+        try std.testing.expectEqualStrings("audio/opus", source.input.media_type);
+    }
+    for ([_][]const u8{ "audio/vorbis", "audio/wav", "audio/ogg;codecs=vorbis" }) |mime| {
+        try std.testing.expectError(error.DocumentMediaTypeMismatch, Source.init(a, .{ .id = "recording", .url = "fixture", .media_type = mime }, bytes, .{}, .{}));
+    }
+    const declared = try audioInput(a, "data:audio/ogg;codecs=vorbis;base64,T2dnUwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE9wdXNIZWFk");
+    try std.testing.expectEqualStrings("audio/ogg;codecs=vorbis", declared.media_type);
 }

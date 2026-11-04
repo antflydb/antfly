@@ -48805,3 +48805,25 @@ test "hosted audio document sources reuse one persistent provider connection" {
     try group.await(io);
     if (failure) |err| return err;
 }
+
+test "hosted audio document equivalent URL aliases fail verifier preflight before source IO" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "readers/test/plan");
+    try tmp.dir.writeFile(io, .{ .sub_path = "readers/test/plan/config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "readers/test/plan/document_agent.json", .data =
+        \\{"allow_remote":true,"models":[{"name":"reader","model":"transcribers/implicit","operation":"read","input":"audio"},{"name":"verifier","model":"transcribers/explicit","operation":"read","input":"audio"}],"read":{"reader":"reader","verification_reader":"verifier"}}
+    });
+    const models = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(models);
+    const configs = [_]transcribing_api.NamedConfig{
+        .{ .name = "implicit", .config = .{ .provider = .openai, .model = "whisper-1", .max_total_tokens = 100 } },
+        .{ .name = "explicit", .config = .{ .provider = .openai, .model = "whisper-1", .max_total_tokens = 100, .base_url = "HTTPS://API.OPENAI.COM:443/v1/" } },
+    };
+    var node = try Node.init(a, .{ .models_dir = models, .audio_readers = &configs });
+    defer node.deinit();
+    try node.attachIo(io);
+    try std.testing.expectError(error.InvalidDocumentDefinition, node.readDocumentsJsonWithControl(a, "{\"model\":\"readers/test/plan\",\"audio\":\"AAAA\"}", .{ .io = io }));
+}

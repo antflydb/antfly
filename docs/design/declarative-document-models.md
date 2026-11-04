@@ -107,7 +107,10 @@ A recording is one bounded source unit with `kind: "audio"` and
 The planner preserves source identity, model revisions, completion status,
 measured usage, events, and the same deadline/call/token/output limits as
 image and document reads. Audio/video sources reject page selection and slide
-options. Each source must match its reader's declared input modality.
+options. Each source must match its reader's declared input modality. Ogg
+container declarations also accept Opus; codec-specific declarations are not
+treated as generic Ogg aliases. Source identity records the
+canonical detected media type, including across inline, framed and durable reads.
 
 Only exact decoded digital silence can produce an empty completed reading.
 Quiet nonzero audio is recognized even below the VAD energy threshold; VAD
@@ -120,7 +123,10 @@ Durable execution pins effective recognition options separately from physical
 model identity. Provider defaults and output-affecting settings, together with
 the speaker-model artifact revision when diarization is enabled, must match
 before cached results can replay. Credential changes do not make a verifier
-independent. `run_sha256` includes audio options and execution pins. The adapter
+independent. Provider identity and dispatch share URL normalization: scheme and
+host case, default ports, fragments and base-path trailing separators cannot
+make one recognizer act as its own verifier. Distinct ports, paths and queries
+remain distinct. `run_sha256` includes audio options and execution pins. The adapter
 revision changes when this checkpoint contract changes, so older incompatible
 runs fail with a revision mismatch instead of mixing execution policies.
 

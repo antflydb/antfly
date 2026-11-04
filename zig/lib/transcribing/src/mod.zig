@@ -136,13 +136,15 @@ pub const Config = struct {
 
     /// Owned endpoint with provider-specific defaults resolved by transport.
     pub fn effectiveEndpointAlloc(self: Config, alloc: Allocator) !?[]u8 {
-        if (self.provider == .cloudflare) return try @import("antfly_cloudflare").nativeEndpointAlloc(alloc, .{
+        const native = if (self.provider == .cloudflare) try @import("antfly_cloudflare").nativeEndpointAlloc(alloc, .{
             .account_id = self.account_id orelse return error.InvalidCloudflareConfig,
             .model = self.effectiveModel() orelse return error.UnsupportedCloudflareModel,
             .api_key = "",
             .url = self.effectiveEndpoint(),
-        });
-        return if (self.effectiveEndpoint()) |url| try alloc.dupe(u8, url) else null;
+        }) else null;
+        defer if (native) |value| alloc.free(value);
+        const endpoint = native orelse self.effectiveEndpoint() orelse return null;
+        return try canonicalEndpointAlloc(alloc, endpoint, self.provider != .cloudflare);
     }
 
     /// Only routing fields consumed by the adapter may distinguish physical
@@ -180,6 +182,35 @@ pub const Config = struct {
         return self.url orelse self.api_url;
     }
 };
+
+/// Canonicalize the URL consumed by transport, rather than maintaining a
+/// separate identity-only interpretation. Preserve routing paths and queries;
+/// scheme/host case, default ports and fragments cannot distinguish models.
+fn canonicalEndpointAlloc(a: Allocator, endpoint: []const u8, base: bool) ![]u8 {
+    var uri = std.Uri.parse(endpoint) catch return error.InvalidTranscribingConfig;
+    const secure = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+    if (!secure and !std.ascii.eqlIgnoreCase(uri.scheme, "http")) return error.InvalidTranscribingConfig;
+    if (uri.user != null or uri.password != null) return error.InvalidTranscribingConfig;
+    const host = uri.host orelse return error.InvalidTranscribingConfig;
+    if (host.isEmpty()) return error.InvalidTranscribingConfig;
+    const lower_host = try std.ascii.allocLowerString(a, host.percent_encoded);
+    defer a.free(lower_host);
+    uri.scheme = if (secure) "https" else "http";
+    uri.host = .{ .percent_encoded = lower_host };
+    if (uri.port == @as(u16, if (secure) 443 else 80)) uri.port = null;
+    var output = std.Io.Writer.Allocating.init(a);
+    defer output.deinit();
+    try uri.writeToStream(&output.writer, .{ .scheme = true, .authentication = true, .authority = true });
+    // Base endpoints are prefixes for /read, /audio/transcriptions or the
+    // Vertex resource path. Trim separators here before adapters append them.
+    const path = uri.path.percent_encoded;
+    try output.writer.writeAll(if (base) std.mem.trimEnd(u8, path, "/") else if (path.len == 0) "/" else path);
+    if (uri.query) |query| {
+        try output.writer.writeByte('?');
+        try query.formatQuery(&output.writer);
+    }
+    return output.toOwnedSlice();
+}
 
 /// A one hour recording is about 30 MB as 64 kbps AAC (a phone voice memo)
 /// and about 58 MB as 128 kbps MP3 (a podcast), so the default fetch ceiling
@@ -783,7 +814,7 @@ const AntflyTranscriberState = struct {
         const state = try alloc.create(AntflyTranscriberState);
         errdefer alloc.destroy(state);
 
-        const api_url = try alloc.dupe(u8, cfg.effectiveEndpoint().?);
+        const api_url = (try cfg.effectiveEndpointAlloc(alloc)).?;
         errdefer alloc.free(api_url);
         const model = try alloc.dupe(u8, model_name);
         errdefer alloc.free(model);
@@ -1151,12 +1182,13 @@ const CloudflareTranscriberState = struct {
             .language = req.language orelse self.cfg.language_code,
         }, .{ .emit_null_optional_fields = false });
         const payload = try std.json.parseFromSliceLeaky(std.json.Value, work, wire, .{ .parse_numbers = false });
+        const endpoint = try self.cfg.effectiveEndpointAlloc(work);
         const value = try cf.invokeNative(self.http, work, .{
             .account_id = self.cfg.account_id.?,
             .model = self.cfg.model.?,
             .api_key = self.cfg.bearer_token orelse self.cfg.api_key orelse return error.MissingCloudflareCredentials,
             .gateway_id = self.cfg.gateway_id,
-            .url = self.cfg.effectiveEndpoint(),
+            .url = endpoint,
         }, payload, .{
             .max_response_bytes = self.cfg.max_response_bytes orelse httpx.types.default_max_body_size,
             .timeout_ms = try control.remainingTimeoutMs(),
@@ -1246,7 +1278,7 @@ const OpenAiTranscriberState = struct {
             .alloc = alloc,
             .options = options,
             .http = http,
-            .base_url = try alloc.dupe(u8, cfg.effectiveEndpoint().?),
+            .base_url = (try cfg.effectiveEndpointAlloc(alloc)).?,
             .model = try alloc.dupe(u8, cfg.effectiveModel().?),
             .language_code = try dupOpt(alloc, cfg.language_code),
             .max_response_bytes = cfg.max_response_bytes,
@@ -1398,7 +1430,7 @@ const VertexTranscriberState = struct {
             .alloc = alloc,
             .options = options,
             .http = http,
-            .base_url = try alloc.dupe(u8, cfg.effectiveEndpoint().?),
+            .base_url = (try cfg.effectiveEndpointAlloc(alloc)).?,
             .project_id = try cfg.effectiveProjectId(alloc) orelse return error.InvalidTranscribingConfig,
             .location = try alloc.dupe(u8, cfg.effectiveLocation().?),
             .model = try alloc.dupe(u8, cfg.effectiveModel().?),
@@ -2308,7 +2340,9 @@ test "transcribing runtime loads openai provider and transcribes data uri input"
     });
     defer server.deinit();
 
-    const base_url = try std.fmt.allocPrint(alloc, "{s}", .{server.baseUrl()});
+    // Normalization must also reach transport, so the fixture still sees
+    // /audio/transcriptions rather than a doubled path separator.
+    const base_url = try std.fmt.allocPrint(alloc, "{s}/", .{server.baseUrl()});
     defer alloc.free(base_url);
     const cfg_json = try std.fmt.allocPrint(
         alloc,
@@ -2665,4 +2699,32 @@ test "audio read Vertex duration remains unknown while evidence clocks survive" 
     const metadata = parsed.value.object.get("data").?.array.items[0].object.get("audio").?.object;
     try std.testing.expect(metadata.get("duration_ms").? == .null);
     try std.testing.expectEqual(@as(i64, 2000), metadata.get("segments").?.array.items[0].object.get("end_ms").?.integer);
+}
+
+test "audio read endpoint identity and dispatch share canonical URL resolution" {
+    const a = std.testing.allocator;
+    const openai = Config{ .provider = .openai };
+    const expected = try openai.modelIdentity(a);
+    for ([_][]const u8{ "https://api.openai.com:443/v1", "HTTPS://API.OPENAI.COM/v1/", "https://api.openai.com:443/v1/#ignored" }) |url| {
+        const config = Config{ .provider = .openai, .base_url = url };
+        try std.testing.expectEqual(expected, try config.modelIdentity(a));
+        const endpoint = (try config.effectiveEndpointAlloc(a)).?;
+        defer a.free(endpoint);
+        try std.testing.expectEqualStrings("https://api.openai.com/v1", endpoint);
+    }
+    const vertex = Config{ .provider = .vertex, .project_id = "project" };
+    try std.testing.expectEqual(try vertex.modelIdentity(a), try (Config{ .provider = .vertex, .project_id = "project", .base_url = "HTTPS://SPEECH.GOOGLEAPIS.COM:443/v2/" }).modelIdentity(a));
+    const antfly = Config{ .provider = .antfly, .model = "speech", .url = "http://localhost/ai/v1" };
+    try std.testing.expectEqual(try antfly.modelIdentity(a), try (Config{ .provider = .antfly, .model = "speech", .url = "HTTP://LOCALHOST:80/ai/v1/" }).modelIdentity(a));
+    const cf_config = Config{ .provider = .cloudflare, .account_id = "account", .model = "@cf/openai/whisper-large-v3-turbo" };
+    try std.testing.expectEqual(try cf_config.modelIdentity(a), try (Config{ .provider = .cloudflare, .account_id = "account", .model = "@cf/openai/whisper-large-v3-turbo", .base_url = "HTTPS://API.CLOUDFLARE.COM:443/client/v4/accounts/account/ai/run/@cf/openai/whisper-large-v3-turbo#ignored" }).modelIdentity(a));
+    for ([_][]const u8{ "http://api.openai.com/v1", "https://api.openai.com:8443/v1", "https://api.openai.com/v2", "https://other.example/v1" }) |url| {
+        try std.testing.expect(!std.mem.eql(u8, &expected, &try (Config{ .provider = .openai, .base_url = url }).modelIdentity(a)));
+    }
+    const ipv6 = (try (Config{ .provider = .openai, .base_url = "HTTP://[::1]:8080/v1/" }).effectiveEndpointAlloc(a)).?;
+    defer a.free(ipv6);
+    try std.testing.expectEqualStrings("http://[::1]:8080/v1", ipv6);
+    for ([_][]const u8{ "file:///tmp/speech", "https:///v1", "https://user:password@example.com/v1" }) |url| {
+        try std.testing.expectError(error.InvalidTranscribingConfig, (Config{ .provider = .openai, .base_url = url }).effectiveEndpointAlloc(a));
+    }
 }
