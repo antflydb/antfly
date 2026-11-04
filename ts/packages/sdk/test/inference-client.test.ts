@@ -51,7 +51,7 @@ describe("InferenceClient", () => {
     expect(typeof client.classify).toBe("function");
     expect(typeof client.extractEntities).toBe("function");
     expect(typeof client.rewrite).toBe("function");
-    expect(typeof client.transcribe).toBe("function");
+    expect(typeof client.readAudio).toBe("function");
     expect(typeof client.listModels).toBe("function");
     expect(typeof client.getRawClient).toBe("function");
   });
@@ -1555,11 +1555,13 @@ describe("InferenceClient with mock fetch", () => {
     });
   });
 
-  describe("transcribe", () => {
+  describe("readAudio", () => {
     it("should transcribe audio", async () => {
       const mockResponse = {
         model: "openai/whisper-tiny",
-        text: "Hello, how are you today?",
+        object: "list",
+        data: [{object: "read", index: 0, text: "Hello, how are you today?"}],
+        usage: {prompt_tokens: 0, completion_tokens: 0, total_tokens: 0},
       };
 
       vi.mocked(fetch).mockResolvedValueOnce({
@@ -1571,13 +1573,13 @@ describe("InferenceClient with mock fetch", () => {
       } as Response);
 
       const client = new InferenceClient({ baseUrl: "http://localhost:8080/api" });
-      const result = await client.transcribe("base64audiodata", {
+      const result = await client.readAudio("base64audiodata", {
         model: "openai/whisper-tiny",
-        language: "en",
+        audio_options: { language: "en" },
       });
 
       expect(result.model).toBe("openai/whisper-tiny");
-      expect(result.text).toBe("Hello, how are you today?");
+      expect(result.data[0]?.text).toBe("Hello, how are you today?");
       expect(fetch).toHaveBeenCalled();
     });
 
@@ -1588,18 +1590,14 @@ describe("InferenceClient with mock fetch", () => {
         })
       );
       const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
-      await client.transcribe("audio", {
+      await client.readAudio("audio", {
         model: "transcribers/speech",
-        language: "de",
-        timestamps: false,
-        diarization: false,
+        audio_options: { language: "de", timestamps: false, diarization: false },
       });
       expect(await lastFetchJSONBody()).toEqual({
         model: "transcribers/speech",
         audio: "audio",
-        language: "de",
-        timestamps: false,
-        diarization: false,
+        audio_options: { language: "de", timestamps: false, diarization: false },
       });
     });
 
@@ -1614,7 +1612,7 @@ describe("InferenceClient with mock fetch", () => {
 
       const client = new InferenceClient({ baseUrl: "http://localhost:8080/api" });
       await expect(
-        client.transcribe("bad-data", { model: "openai/whisper-tiny" })
+        client.readAudio("bad-data", { model: "openai/whisper-tiny" })
       ).rejects.toMatchObject({
         status: 400,
         code: "Invalid audio",

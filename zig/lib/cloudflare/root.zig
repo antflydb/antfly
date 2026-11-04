@@ -27,6 +27,18 @@ pub const Config = struct {
     url: ?[]const u8 = null,
 };
 
+/// Resolve the exact endpoint used by native transport and physical model
+/// identity. Gateway headers and unused account fields on an explicit URL do
+/// not identify a different recognizer. Caller owns the result.
+pub fn nativeEndpointAlloc(a: A, config: Config) ![]u8 {
+    const canonical = try routing.nativeUrl(a, config.account_id, config.model);
+    if (config.url) |url| {
+        defer a.free(canonical);
+        return a.dupe(u8, url);
+    }
+    return canonical;
+}
+
 /// Reuses the caller's pooled HTTP client, secret resolution, deadline and
 /// cancellation. One task call is exactly one upstream attempt.
 pub fn invoke(client: anytype, a: A, config: Config, payload: V, options: anytype) !V {
@@ -60,8 +72,8 @@ pub fn postNative(client: anytype, a: A, config: Config, payload: V, options: an
         if (id.len == 0 or id.len > 256) return error.InvalidCloudflareConfig;
         for (id) |ch| if (ch < 0x21 or ch > 0x7e) return error.InvalidCloudflareConfig;
     }
-    const canonical = try routing.nativeUrl(a, config.account_id, config.model);
-    const url = config.url orelse canonical;
+    const url = try nativeEndpointAlloc(a, config);
+    defer a.free(url);
     const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{config.api_key});
     var headers = std.ArrayList([2][]const u8).empty;
     try headers.append(a, .{ "Authorization", auth });

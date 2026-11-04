@@ -717,7 +717,7 @@ fn primaryOperationSuffix(task: work.Task) []const u8 {
         .chunk => "/chunk",
         .extract => "/extract",
         .rewrite => "/rewrite",
-        .transcribe => "/transcribe",
+        .transcribe => "/read",
     };
 }
 

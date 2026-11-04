@@ -41,8 +41,6 @@ import type {
   RerankDocument,
   RerankResponse,
   RewriteResponse,
-  TranscribeRequest,
-  TranscribeResponse,
   TransientCapacityError,
 } from "./inference-types.js";
 import type { components, paths } from "./public-api.js";
@@ -642,7 +640,7 @@ export class InferenceClient {
     });
   }
 
-  /** Read images or complete PDF/PPTX documents with a registered reader/composite. */
+  /** Read images, complete PDF/PPTX documents, or audio with a capable model. */
   async read(
     request: components["schemas"]["InferenceReadRequest"]
   ): Promise<components["schemas"]["InferenceReadResponse"]> {
@@ -807,45 +805,9 @@ export class InferenceClient {
     return data;
   }
 
-  /**
-   * Transcribe audio to text (speech-to-text)
-   *
-   * @param audio - Base64-encoded audio data (WAV, MP3, FLAC, etc.)
-   * @param options - Transcription parameters
-   * @param options.model - Required transcriber model name (e.g., "openai/whisper-tiny")
-   * @param options.language - Force specific language for transcription
-   * @returns TranscribeResponse with transcribed text and metadata
-   *
-   * @example Basic transcription
-   * ```typescript
-   * const audioBase64 = fs.readFileSync('audio.wav').toString('base64');
-   * const result = await client.transcribe(audioBase64, {
-   *   model: "openai/whisper-tiny"
-   * });
-   * console.log(result.text); // "Hello, how are you today?"
-   * ```
-   *
-   * @example With specific model and language
-   * ```typescript
-   * const result = await client.transcribe(audioBase64, {
-   *   model: "openai/whisper-tiny",
-   *   language: "en"
-   * });
-   * ```
-   */
-  async transcribe(
-    audio: string,
-    options: Omit<TranscribeRequest, "audio">
-  ): Promise<TranscribeResponse> {
-    const { data, error, response } = await this.client.POST("/ai/v1/transcribe", {
-      body: {
-        audio,
-        ...options,
-      },
-    });
-    if (!response.ok) throw inferenceAPIError(response.status, error);
-    if (!data) throw new Error("Transcribe failed: unexpected empty response");
-    return data;
+  /** Read source audio with backend-specific recognition options. */
+  async readAudio(audio: string, options: Omit<components["schemas"]["InferenceReadRequest"], "audio">): Promise<components["schemas"]["InferenceReadResponse"]> {
+    return this.read({ ...options, audio });
   }
 
   /**
