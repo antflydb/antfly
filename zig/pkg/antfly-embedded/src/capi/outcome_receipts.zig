@@ -51,6 +51,9 @@ pub const Writer = struct {
     marker_written: bool = false,
     /// Directory handles: unknown receipts stay pending until close.
     pending_until_close: bool = false,
+    /// Receipts of this writer that could not be recorded as pending. While
+    /// any exist, every receipt in the process reads as pending.
+    unregistered: usize = 0,
 
     fn lock(self: *Writer) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -155,6 +158,11 @@ const Pending = struct { writer: [writer_len]u8, owner: *Writer };
 
 var registry_mutex: std.atomic.Mutex = .unlocked;
 var registry: std.ArrayListUnmanaged(Pending) = .empty;
+var registry_allocator: std.mem.Allocator = std.heap.page_allocator;
+/// Pending receipts that could not be recorded (allocation failure). A
+/// receipt that is not provably settled must never read as settled, so while
+/// this is nonzero every receipt reads as pending.
+var unregistered_pending: usize = 0;
 
 fn lockRegistry() void {
     while (!registry_mutex.tryLock()) std.atomic.spinLoopHint();
@@ -163,14 +171,19 @@ fn lockRegistry() void {
 fn registerPending(writer: [writer_len]u8, owner: *Writer) void {
     lockRegistry();
     defer registry_mutex.unlock();
-    // Best effort: without memory the receipt reads settled one call early,
-    // which the caller sees as a not-yet-reopened handle's current view.
-    registry.append(std.heap.page_allocator, .{ .writer = writer, .owner = owner }) catch {};
+    registry.append(registry_allocator, .{ .writer = writer, .owner = owner }) catch {
+        // Fall back conservatively without allocating: until this handle
+        // closes, no receipt in the process can be reported as settled.
+        owner.unregistered += 1;
+        unregistered_pending += 1;
+    };
 }
 
 fn releasePending(owner: *Writer) void {
     lockRegistry();
     defer registry_mutex.unlock();
+    unregistered_pending -= owner.unregistered;
+    owner.unregistered = 0;
     var i: usize = 0;
     while (i < registry.items.len) {
         if (registry.items[i].owner == owner) {
@@ -178,7 +191,7 @@ fn releasePending(owner: *Writer) void {
         } else i += 1;
     }
     if (registry.items.len == 0) {
-        registry.deinit(std.heap.page_allocator);
+        registry.deinit(registry_allocator);
         registry = .empty;
     }
 }
@@ -188,6 +201,7 @@ fn releasePending(owner: *Writer) void {
 pub fn isPending(writer: [writer_len]u8) bool {
     lockRegistry();
     defer registry_mutex.unlock();
+    if (unregistered_pending != 0) return true;
     for (registry.items) |entry| if (std.mem.eql(u8, &entry.writer, &writer)) return true;
     return false;
 }
@@ -221,5 +235,24 @@ test "capi SQL outcome receipt writer retires after an unknown outcome and track
     try std.testing.expectEqual(@as(u64, 1), third.sequence);
     writer.deinit();
     try std.testing.expect(!isPending(second.writer));
+    clearLast();
+}
+
+test "capi SQL outcome receipt that cannot be recorded as pending never reads as settled" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const previous = registry_allocator;
+    registry_allocator = failing.allocator();
+    defer registry_allocator = previous;
+
+    var writer: Writer = .{ .pending_until_close = true };
+    const marker = writer.next();
+    writer.retire(marker);
+    // Not recorded, yet still pending: and conservatively, so is any other.
+    try std.testing.expect(isPending(marker.writer));
+    try std.testing.expect(isPending(@splat(0x11)));
+    // Closing the issuing handle settles its commits.
+    writer.deinit();
+    try std.testing.expect(!isPending(marker.writer));
+    try std.testing.expect(!isPending(@splat(0x11)));
     clearLast();
 }
