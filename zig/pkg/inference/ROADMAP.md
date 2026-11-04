@@ -23,7 +23,7 @@ Repository-wide open work lives in [zig/TODO.md](../../TODO.md) and
 - Endpoints `/embed`, `/embeddings`, `/rerank`, `/generate`,
   `/generate/batch`, `/chat/completions`, `/chunk`, `/extract` (canonical
   NER/relations/text and token classification), `/decisions`, `/rewrite`,
-  `/read`, `/transcribe`, `/dictate`, `/transcription/sessions/*`, `/models`,
+  `/read`, `/read`, `/dictate`, `/transcription/sessions/*`, `/models`,
   `/predict`, `/predictors`, and `/ml/v1/metrics`: all registered through the
   generated router and covered by handler tests in `src/server/server.zig`;
   most also have Python E2E in [zig/e2e/inference](../../e2e/inference).

@@ -798,7 +798,7 @@ test "linked API route manifest preserves internal scan response streaming" {
         }
     }
     try std.testing.expect(found_scan and found_query);
-    try std.testing.expectEqual(@as(usize, 24), gateway_routes);
+    try std.testing.expectEqual(@as(usize, 23), gateway_routes);
     try std.testing.expectEqual(@as(usize, 3), public_queries);
 }
 

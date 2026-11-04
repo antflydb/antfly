@@ -929,8 +929,9 @@ pub const MetalKvStorage = struct {
         }
     }
 
-    fn hookDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+    fn hookDeinit(ctx: *anyopaque, _: std.mem.Allocator) void {
         const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        const allocator = self.allocator;
         var binding_it = self.slot_map.valueIterator();
         while (binding_it.next()) |binding| {
             if (binding.selected_positions) |positions| allocator.free(positions);
@@ -1318,6 +1319,18 @@ const hook_vtable: storage_runtime.DeviceWriteHook.VTable = .{
     .supportsSelectedGlobalKv = MetalKvStorage.supportsSelectedGlobalKv,
     .deinit = MetalKvStorage.hookDeinit,
 };
+
+test "Metal KV hook teardown uses its allocation owner instead of the request allocator" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const Bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
+    var owner = Bounded{ .backing = std.testing.allocator, .limit = 128 * 1024 };
+    var request = Bounded{ .backing = std.testing.allocator, .limit = 128 * 1024 };
+    const runtime: *metal_runtime.RawMetalDecodeRuntime = @ptrFromInt(@alignOf(usize));
+    const storage = try MetalKvStorage.create(owner.allocator(), runtime, .f16, 2, 256, 16);
+    storage.deviceWriteHook().deinit(request.allocator());
+    try std.testing.expectEqual(@as(usize, 0), owner.live);
+    try std.testing.expectEqual(@as(usize, 0), request.live);
+}
 
 test "MetalKvStorage.create rejects unsupported dtype" {
     if (!build_options.enable_metal) return error.SkipZigTest;
