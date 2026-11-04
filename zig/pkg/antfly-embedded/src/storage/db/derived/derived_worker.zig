@@ -842,7 +842,11 @@ const ReplayChunkBuilder = struct {
     }
 
     fn wouldOverflowWithRecord(self: *@This(), record: change_journal_mod.Record) bool {
-        if (self.tracked_bytes == 0 and self.item_count == 0) return false;
+        // Only a window with no records yet admits a record over its limits.
+        // Records with no work for this index leave the window without bytes
+        // or items, but still count: an oversized record behind them must
+        // start its own window, where bounded replay can yield inside it.
+        if (self.accepted_records == 0) return false;
         if (self.max_chunk_bytes > 0 or self.max_work_chunk_bytes != 0) {
             const incoming_bytes = recordEstimatedBytesForIndex(record, self.index_ref.kind, self.estimatedDenseVectorBytes());
             if (self.max_chunk_bytes > 0 and self.tracked_bytes +| incoming_bytes > self.max_chunk_bytes) return true;
@@ -1962,6 +1966,50 @@ test "catchUpIndex yields inside an oversized full text record and resumes at it
     // and the resume point dropped.
     try std.testing.expectEqual(@as(usize, 5), applied_total);
     try std.testing.expectEqual(@as(?u64, 1), store.persisted);
+    try std.testing.expectEqual(@as(?PartialCursor, null), store.cursor);
+}
+
+test "catchUpIndex isolates an oversized full text record behind a no-op record" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-full-text-noop-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
+    defer alloc.free(journal_path_z);
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
+    defer journal.close();
+    // A matching record with no full-text work, then an oversized one.
+    try appendChangeJournalRecord(&journal, alloc, .{ .sequence = 1, .target_hints = &.{.full_text} });
+    const keys = [_][]const u8{ "doc:a", "doc:b", "doc:c", "doc:d", "doc:e" };
+    try appendChangeJournalRecord(&journal, alloc, .{ .sequence = 2, .changed_doc_keys = &keys, .target_hints = &.{.full_text} });
+    var store: TestPartialStore = .{};
+    const options: CatchUpOptions = .{
+        .max_items_per_window = 2,
+        .max_chunk_bytes = 512,
+        // Already past: every call may apply at most one subchunk.
+        .max_call_ns = 1,
+        .persist_ctx = &store,
+        .persist_progress_fn = TestPartialStore.persist,
+        .partial_ctx = &store,
+        .load_partial_fn = TestPartialStore.load,
+        .save_partial_fn = TestPartialStore.save,
+    };
+    var applied_total: usize = 0;
+    var yields: u64 = 0;
+    var calls: usize = 0;
+    while (store.persisted != @as(?u64, 2)) : (calls += 1) {
+        var capture = TestApplyCapture{ .alloc = alloc };
+        defer capture.deinit();
+        const stats = try catchUpIndexWithOptions(alloc, replay_source_mod.Source.fromJournal(&journal), .{ .name = "text", .kind = .full_text }, store.persisted orelse 0, &capture, testApplyCapture, options);
+        // The no-op record must not let the large one bypass its subchunks.
+        try std.testing.expect(capture.applied_documents <= 2);
+        applied_total += capture.applied_documents;
+        yields += stats.partial_yields;
+        try std.testing.expect(calls < 10);
+    }
+    try std.testing.expect(yields > 0);
+    try std.testing.expectEqual(keys.len, applied_total);
     try std.testing.expectEqual(@as(?PartialCursor, null), store.cursor);
 }
 
