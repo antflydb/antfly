@@ -147,7 +147,9 @@ pub const WorkingSet = struct {
             defer state.lifetime_mutex.unlock();
             if (state.marker == null or state.resources_closed.load(.monotonic)) continue;
             const overhead = state.source().ranges.retention_overhead_bytes;
-            const charge = state.value.length +| overhead;
+            // File ranges and resident memory have independent bounds.
+            // The overhead reserves both source and decoded cache capacity.
+            const charge = overhead;
             if (charge > max_bytes -| self.bytes or state.value.length > generation_bytes -| self.range_bytes) continue;
             state.source_references += 1;
             state.active_uses += 1;

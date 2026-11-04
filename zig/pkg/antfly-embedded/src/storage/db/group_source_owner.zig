@@ -26,6 +26,8 @@ pub const State = struct {
     /// Rotate independent consumers, producers and dependent consumers across
     /// interrupted turns; a slow stage must not always occupy the deadline.
     source_replay_stage: std.atomic.Value(u32) = .init(0),
+    control_maintenance_slot: u3 = 0,
+    control_maintenance_changed: bool = false,
     replay_retirement: @import("../docstore.zig").ReplayRetirement = .{},
     replay_budget: @import("derived/replay_budget.zig").Controller = .{},
     producer_replay_budget: @import("derived/replay_budget.zig").Controller = .{

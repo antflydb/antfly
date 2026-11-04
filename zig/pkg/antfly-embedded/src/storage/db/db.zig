@@ -33976,7 +33976,7 @@ pub const DB = struct {
         try self.flushAppliedSequencesForIdle();
     }
 
-    fn runUntilIdleWithReplayDrainOptions(self: *DB, options: ReplayDrainOptions) !void {
+    fn runReplayServiceWithOptions(self: *DB, options: ReplayDrainOptions) !void {
         _ = try self.retryPortableRuntimeActivationIfNeeded();
         // Manual owners need synchronous resolver drivers both during shadow
         // construction and after a crash between activation and promotion.
@@ -34009,6 +34009,10 @@ pub const DB = struct {
                 if (!group_pending or options.bounded_replay) break;
             }
         }
+    }
+
+    fn runUntilIdleWithReplayDrainOptions(self: *DB, options: ReplayDrainOptions) !void {
+        try self.runReplayServiceWithOptions(options);
         if (options.drain_graph_replacements) {
             const replacement_catalog_generation = self.core.index_manager.write_plan_generation.load(.acquire);
             if (options.drain_relational_indexes) {
@@ -34061,6 +34065,34 @@ pub const DB = struct {
         if (options.source_work_only) {
             _ = try self.runSourcePinCleanupStep();
         } else _ = try self.runLsmMaintenanceUntilIdle();
+    }
+
+    /// Optional control work has its own continuation, retained by the file
+    /// owner across runtime reopen. Each visit executes one service, never an
+    /// idle drain. It runs after the source epoch has been released.
+    fn runBackgroundControlMaintenance(self: *DB, cancellation: types.CancellationToken) !bool {
+        try ensureSnapshotActive(cancellation);
+        const state = self.borrowed_group_source_state orelse &self.group_source_owner.state;
+        const slot = state.control_maintenance_slot;
+        var more = false;
+        switch (slot) {
+            0 => more = try self.evaluateAlgebraicAdaptiveCandidates() != 0,
+            1 => more = try self.runAlgebraicAdaptiveWork() != 0,
+            2 => more = try self.runArtifactRepairMetadataMaintenancePass(),
+            3 => more = try self.runRelationalIndexMaintenancePass(),
+            4 => more = try self.runDensePostingMaintenanceForIdle() != 0,
+            5 => more = try self.runGraphMetricMaintenanceForIdle() != 0,
+            6 => more = try self.finalizeDenseProjectionLifecycleForIdle(),
+            7 => more = try self.runSourcePinCleanupStep(),
+        }
+        // Retry an interrupted service instead of skipping it. An entire
+        // clean sweep is required before this lane advertises quiescence.
+        state.control_maintenance_changed = state.control_maintenance_changed or more;
+        state.control_maintenance_slot = slot +% 1;
+        if (state.control_maintenance_slot != 0) return true;
+        const changed = state.control_maintenance_changed;
+        state.control_maintenance_changed = false;
+        return changed;
     }
 
     pub fn runGraphMetricMaintenanceForIdle(self: *DB) !usize {
@@ -34596,7 +34628,8 @@ pub const DB = struct {
             // Otherwise each fresh runtime's local cleanup schedules another
             // replay turn even though its durable inputs are already settled.
             self.core.index_manager.refreshLsmMaintenanceDebtHint();
-            return merged != 0 or self.core.index_manager.lsmMaintenanceScore() != 0 or
+            const control_pending = if (phase == .index_storage) try self.runBackgroundControlMaintenance(cancellation) else false;
+            return control_pending or merged != 0 or self.core.index_manager.lsmMaintenanceScore() != 0 or
                 (phase == .pressure_artifacts and self.core.index_manager.textMergeStatsSnapshot().pending_indexes != 0);
         }
         if (phase == .shadow) {
@@ -34607,14 +34640,30 @@ pub const DB = struct {
             return self.advanceGraphReplacementForIdentityUntil(null, null, .detached);
         }
         const before = self.core.nextDerivedSequence();
-        try self.runUntilIdleWithReplayDrainOptions(.{
+        const replay_options: ReplayDrainOptions = .{
             .cancellation = cancellation,
             .drain_relational_indexes = false,
             .drain_graph_replacements = false,
             .bounded_replay = true,
             .source_work_only = phase == .replay,
             .max_windows_per_index = 1,
-        });
+        };
+        if (phase == .replay) try self.runReplayServiceWithOptions(replay_options) else try self.runUntilIdleWithReplayDrainOptions(replay_options);
+        // Commit the complete-record watermarks before releasing the captured
+        // source. Optional maintenance runs only after the owner drops that
+        // primary epoch, through the index-storage service below.
+        try self.flushAppliedSequencesForIdle();
+        try self.saveAllLiveIndexStatusSnapshotsWithMode(self.alloc, true);
+        if (phase == .replay) {
+            const enrichment_pending = if (self.enrichment_runtime) |runtime| pending: {
+                const runtime_stats = runtime.stats();
+                break :pending runtime_stats.applied_sequence < runtime_stats.target_sequence or runtime_stats.retrying;
+            } else false;
+            return enrichment_pending or self.core.nextDerivedSequence() > before or
+                self.executor.snapshotStats().workers_with_replay_debt != 0 or
+                self.resolutionStageStats().catch_up_required or self.promotionStageStats().catch_up_required or
+                self.hasPendingGraphReplacements();
+        }
         const finalized = try self.finalizeDenseProjectionLifecycleForIdle();
         // Primary LSM/source maintenance still belongs to the source phase.
         // Deferring only index work must not strand this lane at idle.
@@ -76815,6 +76864,29 @@ test "db algebraic bulk ingest survives reopen with durable lsm primary backend"
         defer alloc.free(bob_group);
         try std.testing.expectEqual(@as(f64, 7), (try entry.index.numericValue(reopened.core.store, "sum_by_customer", bob_group)).?);
     }
+}
+
+test "db detached replay leaves optional maintenance to its retained continuation" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("db-bounded-replay-service");
+    defer directory.cleanup();
+    var database = try DB.open(alloc, std.mem.span(directory.path().ptr), .{ .start_index_workers = false });
+    defer database.close();
+    var state: DB.GroupSourceMaintenanceState = .{};
+    defer state.deinit();
+    database.borrowed_group_source_state = &state;
+    defer database.borrowed_group_source_state = null;
+    state.control_maintenance_slot = 3;
+    _ = try database.runBackgroundTurnWithCancellation(.none, .replay);
+    try std.testing.expectEqual(@as(u3, 3), state.control_maintenance_slot);
+    // Optional work advances exactly one service and cannot report the whole
+    // sweep clean simply because that individual service has no work.
+    try std.testing.expect(try database.runBackgroundControlMaintenance(.none));
+    try std.testing.expectEqual(@as(u3, 4), state.control_maintenance_slot);
+    state.control_maintenance_slot = 7;
+    state.control_maintenance_changed = false;
+    _ = try database.runBackgroundControlMaintenance(.none);
+    try std.testing.expectEqual(@as(u3, 0), state.control_maintenance_slot);
 }
 
 test "db batch appends only thin replay stream records" {
