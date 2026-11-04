@@ -1046,8 +1046,10 @@ pub const Owner = struct {
                 // for every immutable input while foreground traffic waits.
                 try current.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(probe.header);
                 if (self.maintenance_snapshot) |snapshot| try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
-                if (self.options.profile == .native and self.options.open_mode == .writer and !file.free_pages_verified)
+                if (self.options.profile == .native and self.options.open_mode == .writer and !file.free_pages_verified) {
+                    _ = try self.copyIdleSnapshotLedger(file);
                     _ = try file.inheritAllocatorCertificate();
+                }
                 return current;
             }
             if (self.maintenance_snapshot) |snapshot| {
@@ -1075,6 +1077,7 @@ pub const Owner = struct {
                     previous.allocator_verification_references == 0 and previous.sql_cursors.count() == 0)
                     _ = try certified.?.takeAllocatorRebaseBase(&previous.owned_lite_backend.?.native_docstore.?.file);
             }
+            _ = try self.copyIdleSnapshotLedger(&certified.?);
             if (try certified.?.inheritAllocatorCertificate()) {
                 options.allocator_verification_owner = &certified.?;
                 options.allocator_state_donor = &certified.?;
@@ -1457,6 +1460,8 @@ pub const Owner = struct {
             else => return err,
         };
         errdefer lease.close();
+        // The hold starts here: admission checks and rebases run under it.
+        const held_from = nowNs();
         var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
         defer probe.close();
         const file = &root.owned_lite_backend.?.native_docstore.?.file;
@@ -1479,11 +1484,11 @@ pub const Owner = struct {
             // and publication. Unchanged physical index inputs and catalog
             // identity keep detached computations valid; transactions opened
             // after this admission read the current primary checkpoint.
-            var latest = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
-            defer latest.close();
-            if ((try latest.file.stat(latest.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
+            // The probe was opened under this same exclusive lease, so it is
+            // still the latest checkpoint; no second open is needed.
+            const latest = &probe;
             if (file.activeCheckpoint().index_catalog_root_page != latest.activeCheckpoint().index_catalog_root_page) {
-                if (!try publication.indexInputsUnchanged(file, &latest)) {
+                if (!try publication.indexInputsUnchanged(file, latest)) {
                     publication.index_inputs_changed = true;
                     if (scope == .index) {
                         self.publication_stats.index_input_refusals +|= 1;
@@ -1505,7 +1510,7 @@ pub const Owner = struct {
         root.maintenance_writer_lease = lease;
         root.maintenance_writer_references = 1;
         root.maintenance_writer_scope = @backingInt(scope);
-        root.maintenance_writer_held_from = nowNs();
+        root.maintenance_writer_held_from = held_from;
     }
 
     fn leaveMaintenanceWriter(ptr: *anyopaque) void {
@@ -1553,6 +1558,21 @@ pub const Owner = struct {
         store.maintenance_policy.options.retirement_work_pages = self.publication_stats.retirement_work_pages;
     }
 
+    /// A serving runtime whose allocator cache no other thread can touch.
+    fn idleServingRuntime(handle: *h.Handle) bool {
+        return handle.query_borrows == 0 and handle.maintenance_references == 0 and
+            handle.allocator_verification_references == 0 and handle.sql_cursors.count() == 0;
+    }
+
+    /// Copy an idle maintenance snapshot's warm ledger into a cold `file` as
+    /// a rebase base. Detached work mutates a referenced snapshot's ledger
+    /// without the gate, so only an unreferenced snapshot may donate.
+    fn copyIdleSnapshotLedger(self: *Owner, file: *native.NativeFile) !bool {
+        const snapshot = self.maintenance_snapshot orelse return false;
+        if (snapshot.maintenance_references != 0 or snapshot.allocator_verification_references != 0) return false;
+        return file.copyAllocatorRebaseBase(&snapshot.owned_lite_backend.?.native_docstore.?.file);
+    }
+
     fn refreshMaintenanceSnapshot(self: *Owner, foreground: *h.Handle, need_database: bool) !*h.Handle {
         const file = &foreground.owned_lite_backend.?.native_docstore.?.file;
         if (self.maintenance_snapshot) |snapshot| {
@@ -1571,6 +1591,26 @@ pub const Owner = struct {
         // detached computation, even when it touches unrelated pages.
         options.artifact_reader_fence = false;
         options.allocator_verification_owner = file;
+        // Opening a database runtime commits (root incarnation, index
+        // admissions), which loads the allocator. Hand it a certified warm
+        // ledger first, as the serving refresh does, so the open rebases
+        // instead of loading and hashing the whole ledger under the lease.
+        var certified: ?native.NativeFile = null;
+        defer if (certified) |*donor| donor.close();
+        if (need_database and file.header.indexed_reclamation) {
+            certified = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
+            certified.?.allocator_cancel_token = &self.verification_cancel;
+            certified.?.allocator_certificate_on_commit = true;
+            if (self.maintenance_snapshot) |old| if (old.maintenance_references == 0 and old.allocator_verification_references == 0) {
+                _ = try certified.?.takeAllocatorRebaseBase(&old.owned_lite_backend.?.native_docstore.?.file);
+            };
+            if (certified.?.ledger == null and idleServingRuntime(foreground))
+                _ = try certified.?.copyAllocatorRebaseBase(&foreground.owned_lite_backend.?.native_docstore.?.file);
+            if (certified.?.ledger != null and try certified.?.inheritAllocatorCertificate()) {
+                options.allocator_verification_owner = &certified.?;
+                options.allocator_state_donor = &certified.?;
+            }
+        }
         const snapshot = if (need_database) blk: {
             const opened = try api.openLiteHandleAllocWithSharedInference(alloc, self.path, options, false, h.handleLockIo(), null, foreground);
             if (comptime h.builtin.is_test) self.test_runtime_snapshot_opens += 1;
@@ -1595,9 +1635,26 @@ pub const Owner = struct {
         snapshot.sql_ddl_recovery_generation = foreground.sql_ddl_recovery_generation;
         const store = snapshot.owned_lite_backend.?.native_docstore.?;
         store.file.reader_coordinator = self.reader_coordinator;
+        if (self.maintenance_snapshot) |old| {
+            // Carry the old snapshot's warm, verified ledger as a rebase base,
+            // as the serving-runtime refresh does. Otherwise every replacement
+            // starts cold, and the first allocator use under the lease pays a
+            // full ledger load and digest. The base grants no authority: the
+            // certificate check authenticates the rebased ledger. Take it
+            // before inheriting verification flags, which it resets.
+            if (old.maintenance_references == 0 and old.allocator_verification_references == 0) {
+                if (try store.file.takeAllocatorRebaseBase(&old.owned_lite_backend.?.native_docstore.?.file))
+                    _ = try store.file.inheritAllocatorCertificate();
+            }
+        }
+        if (store.file.ledger == null and !store.file.free_pages_verified and idleServingRuntime(foreground)) {
+            if (try store.file.copyAllocatorRebaseBase(&foreground.owned_lite_backend.?.native_docstore.?.file))
+                _ = try store.file.inheritAllocatorCertificate();
+        }
         try store.file.inheritAllocatorVerification(file);
         if (self.maintenance_snapshot) |old| {
-            try store.file.inheritAllocatorVerification(&old.owned_lite_backend.?.native_docstore.?.file);
+            const old_file = &old.owned_lite_backend.?.native_docstore.?.file;
+            try store.file.inheritAllocatorVerification(old_file);
             // Policy scheduling and telemetry belong to this connection;
             // assessment caches and page roots belong to the new generation.
             store.maintenance_policy = old.owned_lite_backend.?.native_docstore.?.maintenance_policy;
@@ -2205,6 +2262,11 @@ pub const Owner = struct {
                 }
             }
         }
+        // An idle maintenance snapshot usually holds a warm, verified ledger
+        // for an ancestor of this tip. Copying it turns the proof walk the
+        // caller would wait on into a journal rebase plus certificate check.
+        if (try self.copyIdleSnapshotLedger(file) and try file.inheritAllocatorCertificate() and file.free_pages_verified)
+            return;
         foreground.allocator_verification_references += 1;
         defer {
             foreground.allocator_verification_references -= 1;
@@ -4843,6 +4905,54 @@ test "capi native allocator proof issue1431 bounded allocator service rebases a 
     try std.testing.expect((try file.check()).valid);
     Owner.leaveMaintenanceWriter(detached);
     held = false;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.read));
+    try fixture.expectWritten(.batch, true);
+}
+
+test "capi native logical generations maintenance snapshot replacement carries the warm allocator ledger" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("snapshot-ledger-handoff", 1000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    const owner = fixture.connection.owner;
+    const refreshSnapshot = struct {
+        fn run(f: *AdmissionFollowupFixture) !*h.Handle {
+            var lease = try f.connection.acquire();
+            defer {
+                lease.close();
+                f.connection.gate.mutex.unlock(h.handleLockIo());
+            }
+            return f.connection.owner.refreshMaintenanceSnapshot(f.connection.owner.current.?, false);
+        }
+    }.run;
+    const first = try refreshSnapshot(&fixture);
+    first.maintenance_owner = owner;
+    // Warm and verify the first snapshot's ledger under allocator service.
+    try Owner.enterMaintenanceWriter(first, .allocator_service);
+    _ = try first.owned_lite_backend.?.native_docstore.?.file.reclaimPagesForMaintenanceWithCancel(8, null);
+    Owner.leaveMaintenanceWriter(first);
+    first.maintenance_owner = null;
+    const first_file = &first.owned_lite_backend.?.native_docstore.?.file;
+    try std.testing.expect(first_file.free_pages_verified and first_file.ledger != null);
+    const full_loads = first_file.allocator_work.full_loads;
+    const transfers = first_file.allocator_work.cache_transfers;
+
+    // A foreground write moves the tip, so the next capture replaces the
+    // snapshot. Its allocator must rebase the donated ledger, not reload it.
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    const second = try refreshSnapshot(&fixture);
+    try std.testing.expect(second != first);
+    const file = &second.owned_lite_backend.?.native_docstore.?.file;
+    try std.testing.expect(file.free_pages_verified);
+    try std.testing.expectEqual(transfers + 1, file.allocator_work.cache_transfers);
+    try std.testing.expectEqual(full_loads, file.allocator_work.full_loads);
+    second.maintenance_owner = owner;
+    defer second.maintenance_owner = null;
+    try Owner.enterMaintenanceWriter(second, .allocator_service);
+    _ = try file.reclaimPagesForMaintenanceWithCancel(8, null);
+    try std.testing.expect((try file.check()).valid);
+    Owner.leaveMaintenanceWriter(second);
+    try std.testing.expectEqual(full_loads, file.allocator_work.full_loads);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.read));
     try fixture.expectWritten(.batch, true);
 }
