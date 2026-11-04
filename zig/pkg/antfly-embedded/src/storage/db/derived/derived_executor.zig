@@ -412,9 +412,9 @@ const ManualRuntime = struct {
         const started = @import("antfly_platform").time.monotonicNs();
         const waited_before = if (wait.publication_overhead_ns) |counter| counter.load(.monotonic) else 0;
         const preparation_before = if (wait.full_text_preparation_ns) |counter| counter.load(.monotonic) else 0;
-        var pressure_failure = false;
+        var failure: ?anyerror = null;
         var completed = false;
-        defer if (!completed) if (wait.replay_budget) |controller| controller.observe(lane, budget, replayWorkElapsedNs(wait, worker.kind.kind, started, waited_before, preparation_before), 0, pressure_failure);
+        defer if (!completed) if (wait.replay_budget) |controller| controller.observeFailure(lane, budget, replayWorkElapsedNs(wait, worker.kind.kind, started, waited_before, preparation_before), failure);
         const stats = derived_worker.catchUpIndexWithOptions(
             self.alloc,
             self.replay_source,
@@ -438,7 +438,7 @@ const ManualRuntime = struct {
                 .target_sequence = if (wait.replay_budget != null) @min(worker.target_sequence, wait.replay_target_cap) else 0,
             },
         ) catch |err| {
-            pressure_failure = err == error.ResourceBudgetExceeded or err == error.OutOfMemory;
+            failure = err;
             return err;
         };
         completed = true;

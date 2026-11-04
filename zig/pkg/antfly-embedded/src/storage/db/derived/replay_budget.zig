@@ -95,7 +95,35 @@ pub const Controller = struct {
     pub fn observePreparation(self: *Controller, lane: usize, used: Budget, elapsed_ns: u64, publication_ns: u64, scanned: usize, failed: bool) void {
         self.observe(lane, used, elapsed_ns -| publication_ns, scanned, failed);
     }
+
+    /// A stale publication or cooperative cancellation says nothing about
+    /// preparation capacity. Keep measured slow work, but treat only memory
+    /// admission failures as evidence that the next window must be smaller.
+    pub fn observeFailure(self: *Controller, lane: usize, used: Budget, preparation_ns: u64, failure: ?anyerror) void {
+        const memory_pressure = if (failure) |err| err == error.ResourceBudgetExceeded or err == error.OutOfMemory else false;
+        self.observe(lane, used, preparation_ns, 0, memory_pressure);
+    }
 };
+
+test "replay budget preserves capacity across cooperative aborts and recovers after memory pressure" {
+    var state: Controller = .{};
+    const initial = state.budget(0);
+    for (0..32) |_| {
+        state.observeFailure(0, state.budget(0), 1, error.EnrichmentWaitCanceled);
+        state.observeFailure(0, state.budget(0), 1, error.EnrichmentSourceChanged);
+    }
+    try std.testing.expectEqualDeep(initial, state.budget(0));
+    state.observeFailure(0, initial, Controller.quantum_ns + 1, error.EnrichmentWaitCanceled);
+    try std.testing.expectEqual(@as(usize, 32), state.budget(0).records);
+    state.observeFailure(0, state.budget(0), 1, error.ResourceBudgetExceeded);
+    try std.testing.expectEqual(@as(usize, 16), state.budget(0).records);
+    state.observeFailure(0, state.budget(0), 1, error.OutOfMemory);
+    try std.testing.expectEqual(@as(usize, 8), state.budget(0).records);
+    const reduced = state.budget(0);
+    state.observe(0, reduced, 1, reduced.records, false);
+    try std.testing.expectEqual(@as(usize, 16), state.budget(0).records);
+    try std.testing.expectEqualDeep(initial, state.budget(1));
+}
 
 test "replay budget excludes publication contention without hiding slow preparation or failure" {
     var state: Controller = .{};

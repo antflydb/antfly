@@ -201,6 +201,7 @@ pub const SegmentShared = struct {
     // reusable page number. New segments seek their persisted lookup instead.
     identity_lookup_mutex: std.atomic.Mutex = .unlocked,
     identity_lookup_entries: ?[]@import("document_identity_lookup.zig").Entry = null,
+    identity_lookup_decoded: ?@import("segment_source.zig").Decoded = null,
     identity_lookup_reads: u64 = 0,
     identity_lookup_reservation: ?resource_manager_mod.Reservation = null,
 
@@ -258,15 +259,51 @@ pub const SegmentShared = struct {
             return &.{};
         }
         const source = reader.immutableSource();
+        if (source == .ranges and source.ranges.acquire_decoded != null) {
+            const Payload = struct { entries: []lookup.Entry };
+            const Loader = struct {
+                shared: *SegmentShared,
+                reader: *const SegmentReader,
+                fn decode(raw: *anyopaque, a: Allocator) !*const anyopaque {
+                    const context: *@This() = @ptrCast(@alignCast(raw));
+                    const payload = try a.create(Payload);
+                    payload.* = .{ .entries = try context.shared.buildIdentityLookup(a, context.reader) };
+                    return payload;
+                }
+            };
+            var loader: Loader = .{ .shared = self, .reader = reader };
+            var digest = std.crypto.hash.sha2.Sha256.init(.{});
+            digest.update("antfly legacy document identity routing v1");
+            var bounds: [28]u8 = undefined;
+            std.mem.writeInt(u32, bounds[0..4], reader.doc_count, .little);
+            std.mem.writeInt(u64, bounds[4..12], reader.stored_offset, .little);
+            std.mem.writeInt(u64, bounds[12..20], reader.stored_length, .little);
+            std.mem.writeInt(u64, bounds[20..28], reader.stored_metadata_length, .little);
+            digest.update(&bounds);
+            if (try source.acquireDecoded(.{ .offset = 0, .length = source.len(), .interpretation = digest.finalResult(), .context = &loader, .decode = Loader.decode })) |held| {
+                const payload: *const Payload = @ptrCast(@alignCast(held.value));
+                self.identity_lookup_decoded = held;
+                self.identity_lookup_entries = payload.entries;
+                return payload.entries;
+            }
+        }
         const manager = if (source == .ranges) source.ranges.resource_manager else self.residency_manager;
         var reservation: ?resource_manager_mod.Reservation = if (manager) |owner|
             try owner.reserveWithoutReclaim(.full_text_segment_residency, @as(u64, reader.doc_count) * @sizeOf(lookup.Entry))
         else
             null;
         errdefer if (reservation) |*owned| owned.release();
+        self.identity_lookup_entries = try self.buildIdentityLookup(self.allocator, reader);
+        if (reservation) |*owned| owned.shrink((@as(u64, reader.doc_count) - self.identity_lookup_entries.?.len) * @sizeOf(lookup.Entry));
+        self.identity_lookup_reservation = reservation;
+        return self.identity_lookup_entries.?;
+    }
+
+    fn buildIdentityLookup(self: *SegmentShared, a: Allocator, reader: *const SegmentReader) ![]@import("document_identity_lookup.zig").Entry {
+        const lookup = @import("document_identity_lookup.zig");
         var entries: std.ArrayListUnmanaged(lookup.Entry) = .empty;
-        errdefer entries.deinit(self.allocator);
-        try entries.ensureTotalCapacityPrecise(self.allocator, reader.doc_count);
+        errdefer entries.deinit(a);
+        try entries.ensureTotalCapacityPrecise(a, reader.doc_count);
         var scratch = @import("segment_source.zig").Scratch.init(self.allocator, 64 * 1024);
         defer scratch.deinit();
         for (0..reader.doc_count) |local| {
@@ -276,14 +313,14 @@ pub const SegmentShared = struct {
             entries.appendAssumeCapacity(.{ .hash = lookup.hash(id), .doc = @intCast(local) });
         }
         lookup.sort(entries.items);
-        self.identity_lookup_entries = try entries.toOwnedSlice(self.allocator);
-        if (reservation) |*owned| owned.shrink((@as(u64, reader.doc_count) - self.identity_lookup_entries.?.len) * @sizeOf(lookup.Entry));
-        self.identity_lookup_reservation = reservation;
-        return self.identity_lookup_entries.?;
+        return entries.toOwnedSlice(a);
     }
 
     fn releaseIdentityLookup(self: *SegmentShared) void {
-        if (self.identity_lookup_entries) |entries| self.allocator.free(entries);
+        if (self.identity_lookup_decoded) |held| {
+            self.identity_lookup_decoded = null;
+            held.release();
+        } else if (self.identity_lookup_entries) |entries| self.allocator.free(entries);
         self.identity_lookup_entries = null;
         if (self.identity_lookup_reservation) |*owned| owned.release();
         self.identity_lookup_reservation = null;
@@ -3861,6 +3898,66 @@ test "identity lookup legacy routing is built once and verifies hash collisions"
     const results = try writer.snapshot().search(a, "body", &.{"beta"}, 10);
     defer a.free(results.hits);
     try std.testing.expectEqual(@as(usize, 1), results.hits.len);
+}
+
+test "identity lookup source ownership reuses legacy routing across independent visibility runtimes" {
+    const source_module = @import("segment_source.zig");
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithIds(a, &.{
+        .{ .id = "a", .terms = &.{.{ .term = "alpha", .freq = 1 }} },
+        .{ .id = "b", .terms = &.{.{ .term = "beta", .freq = 1 }} },
+    });
+    defer a.free(bytes);
+    const State = struct {
+        bytes: []const u8,
+        cache: *source_module.ImmutableDecodeCache,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+        fn release(raw: *anyopaque, item: *anyopaque) void {
+            (source_module.ImmutableDecodeCache.Lease{ .cache = @ptrCast(@alignCast(raw)), .entry = @ptrCast(@alignCast(item)) }).release();
+        }
+        fn acquire(raw: *anyopaque, request: source_module.DecodeRequest) !?source_module.Decoded {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const held = (try self.cache.acquire(request)) orelse return null;
+            return .{ .owner = self.cache, .item = held.entry, .value = held.entry.value.?, .release_fn = release };
+        }
+        fn source(self: *@This()) SegmentSource {
+            return .{ .ranges = .{ .ptr = self, .length = self.bytes.len, .read_into = read, .close = close, .acquire_decoded = acquire } };
+        }
+    };
+    const cache = try source_module.ImmutableDecodeCache.create(a, null, 1024 * 1024);
+    defer cache.deinit();
+    var state: State = .{ .bytes = bytes, .cache = cache };
+    var original_rows: [*]const @import("document_identity_lookup.zig").Entry = undefined;
+    for (0..2) |turn| {
+        var writer = try IndexWriter.init(a);
+        defer writer.deinit();
+        try writer.addSegmentWithIdData(1, .fromNative(state.source()));
+        const entry = &writer.snapshot().segments[0];
+        // Exercise legacy metadata without changing the immutable payload.
+        for (entry.reader.fields) |field| for (field.sections) |*section| {
+            if (section.section_type == .doc_id_lookup) section.section_type = .doc_key_range;
+        };
+        try std.testing.expect(!try writer.deleteById("absent"));
+        try std.testing.expect(entry.shared.identity_lookup_decoded != null);
+        if (turn == 0) {
+            try std.testing.expectEqual(@as(u64, 2), entry.shared.identity_lookup_reads);
+            original_rows = entry.shared.identity_lookup_entries.?.ptr;
+            try std.testing.expect(try writer.deleteById("a"));
+        } else {
+            try std.testing.expectEqual(@as(u64, 0), entry.shared.identity_lookup_reads);
+            try std.testing.expectEqual(original_rows, entry.shared.identity_lookup_entries.?.ptr);
+            try std.testing.expectEqual(@as(u32, 2), writer.snapshot().liveDocCount());
+            try std.testing.expect(try writer.deleteById("b"));
+            const found = try writer.snapshot().search(a, "body", &.{"alpha"}, 10);
+            defer a.free(found.hits);
+            try std.testing.expectEqual(@as(usize, 1), found.hits.len);
+        }
+        try std.testing.expectEqual(@as(u32, 1), writer.snapshot().liveDocCount());
+    }
 }
 
 test "identity lookup allocation failures preserve ownership and deletion rollback" {

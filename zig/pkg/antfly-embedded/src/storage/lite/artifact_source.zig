@@ -21,12 +21,14 @@ const std = @import("std");
 const native = @import("native.zig");
 const docs = @import("docstore.zig");
 const Source = @import("../../segment_source.zig").Source;
+const DecodedCache = @import("../../segment_source.zig").ImmutableDecodeCache;
 const limits = @import("antfly_runtime_fs").threaded_io_limits;
 const Allocator = std.mem.Allocator;
 
 const key_prefix = native.NativeFile.artifact_lease_key_prefix;
 const marker_prefix = ".aflite-lease-";
 const source_cache_bytes = 160 * 1024;
+const decoded_cache_bytes = 1024 * 1024;
 
 const ArtifactIdentity = struct {
     path: []const u8,
@@ -621,6 +623,7 @@ const State = struct {
     retired_size: u64 = 0,
     retired_claim: u64 = 0,
     cache: ?@import("../../segment_source.zig").ConcurrentBlockCache = null,
+    decoded_cache: ?*DecodedCache = null,
     lifetime_mutex: std.atomic.Mutex = .unlocked,
     active_uses: usize = 0,
     idle_expiry: bool = false,
@@ -632,11 +635,13 @@ const State = struct {
     resource_manager: ?*@import("../resource_manager.zig").ResourceManager = null,
 
     fn source(self: *State) Source {
-        return .{ .ranges = .{ .ptr = self, .length = self.value.length, .read_into = read, .visit_range = visit, .checksum = checksum, .read_authenticated = authenticate, .close = close, .retained_bytes = retainedBytes, .retention_overhead_bytes = 2 * source_cache_bytes + 64 * 1024 + @sizeOf(State) + self.value.inline_bytes.len + self.artifact_key.len + self.lease_key.len + self.marker_path.len, .retention_artifact_only = self.marker != null, .resource_manager = self.resource_manager, .acquire_use = acquireUse, .release_use = releaseUse, .enable_idle_expiry = enableIdleExpiry, .immutable_identity = self.immutable_identity } };
+        return .{ .ranges = .{ .ptr = self, .length = self.value.length, .read_into = read, .visit_range = visit, .checksum = checksum, .read_authenticated = authenticate, .close = close, .retained_bytes = retainedBytes, .retention_overhead_bytes = 2 * source_cache_bytes + decoded_cache_bytes + DecodedCache.metadata_overhead + 64 * 1024 + @sizeOf(State) + self.value.inline_bytes.len + self.artifact_key.len + self.lease_key.len + self.marker_path.len, .retention_artifact_only = self.marker != null, .resource_manager = self.resource_manager, .acquire_use = acquireUse, .release_use = releaseUse, .enable_idle_expiry = enableIdleExpiry, .immutable_identity = self.immutable_identity, .acquire_decoded = acquireDecoded, .lookup_decoded = lookupDecoded } };
     }
 
     fn closeResources(self: *State) void {
         if (self.resources_closed.load(.monotonic)) return;
+        if (self.decoded_cache) |cache| cache.deinit();
+        self.decoded_cache = null;
         self.cache.?.deinit();
         self.cache = null;
         self.reader.close();
@@ -705,7 +710,55 @@ const State = struct {
         const self: *State = @ptrCast(@alignCast(ptr));
         @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
         defer self.lifetime_mutex.unlock();
-        return if (self.cache) |*cache| cache.retainedBytes() else 0;
+        return (if (self.cache) |*cache| cache.retainedBytes() else 0) +| (if (self.decoded_cache) |cache| cache.retainedBytes() else 0);
+    }
+
+    fn pinDecoded(self: *State) bool {
+        @import("antfly_platform").sync.lockYielding(&source_pool_mutex);
+        defer source_pool_mutex.unlock();
+        if (!acquireUse(self)) return false;
+        // A decoded lease may outlive its caller's Source. Its use prevents
+        // idle expiry, and its reference keeps this provider/accounting owner.
+        self.source_references += 1;
+        return true;
+    }
+
+    fn releaseDecodedPin(self: *State) void {
+        releaseUse(self);
+        close(self);
+    }
+
+    fn releaseDecoded(raw: *anyopaque, item: *anyopaque) void {
+        const self: *State = @ptrCast(@alignCast(raw));
+        (DecodedCache.Lease{ .cache = self.decoded_cache.?, .entry = @ptrCast(@alignCast(item)) }).release();
+        self.releaseDecodedPin();
+    }
+
+    fn lookupDecoded(raw: *anyopaque, key: @import("../../segment_source.zig").DecodeKey) !?@import("../../segment_source.zig").Decoded {
+        const self: *State = @ptrCast(@alignCast(raw));
+        if (!self.pinDecoded()) return null;
+        var transferred = false;
+        defer if (!transferred) self.releaseDecodedPin();
+        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
+        const cache = self.decoded_cache;
+        self.lifetime_mutex.unlock();
+        const lease = (cache orelse return null).lookup(key) orelse return null;
+        transferred = true;
+        return .{ .value = lease.entry.value.?, .owner = self, .item = lease.entry, .release_fn = releaseDecoded, .retained_bytes = lease.entry.arena.queryCapacity() };
+    }
+
+    fn acquireDecoded(raw: *anyopaque, request: @import("../../segment_source.zig").DecodeRequest) !?@import("../../segment_source.zig").Decoded {
+        const self: *State = @ptrCast(@alignCast(raw));
+        if (!self.pinDecoded()) return null;
+        var transferred = false;
+        defer if (!transferred) self.releaseDecodedPin();
+        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
+        if (self.decoded_cache == null) self.decoded_cache = DecodedCache.create(self.registry.allocator, self.resource_manager, decoded_cache_bytes) catch null;
+        const cache = self.decoded_cache;
+        self.lifetime_mutex.unlock();
+        const lease = (try (cache orelse return null).acquire(request)) orelse return null;
+        transferred = true;
+        return .{ .value = lease.entry.value.?, .owner = self, .item = lease.entry, .release_fn = releaseDecoded, .retained_bytes = lease.entry.arena.queryCapacity() };
     }
 
     fn visit(ptr: *anyopaque, offset: u64, length: u64, visitor_port: @import("../../segment_source.zig").SourceVisitor) !void {

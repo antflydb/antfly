@@ -221,9 +221,17 @@ Text upserts use a persisted external-ID lookup in segment version 6. Sorted
 hash/local-document rows support bounded seeks, followed by exact stored-ID
 comparison on every hash hit. Deletion still visits every live duplicate and
 preserves atomic bitmap rollback. Merges rebuild output coordinates with bounded
-spill sorting. Older v4/v5 segments build a resource-admitted compatibility lookup
-once per physical reader; this lifetime cache is not a persistent migration.
-Compaction rewrites those inputs to the current format.
+spill sorting. Older v4/v5 segments first seek a source-owned compatibility
+lookup. Each native immutable value admits at most 16 decoded metadata entries
+and 1 MiB of their arena capacity, charged to full-text residency. Values own all
+their bytes and no request or reader context. Reconstruction can therefore reuse
+ID routing without sharing another runtime's deletion visibility. Decode leases
+retain both a source reference and an active use, including its accounting owner
+after the DB closes. Loading occurs outside the cache lock, and nested or
+concurrent misses use the caller's normal fallback rather than waiting on another
+decode. If optional admission declines, the existing resource-admitted per-reader
+lookup remains available. This lifetime cache is not a persistent migration;
+compaction rewrites old segments to the current format.
 
 Text consumers size preparation windows from explicitly measured collection,
 projection and segment preparation, including when benchmark logging is off.
@@ -234,6 +242,12 @@ preparation windows and multiply admission and sync work. Registered manual
 workers and workerless replay both publish durable document-fragment progress
 before continuing. Complete-record progress and retirement never advance on a
 partial output or failed continuation write.
+
+Replay feedback treats cooperative cancellation and changed-input refusals as
+independent of memory pressure. Actual preparation exceeding the quantum still
+shrinks the next window; memory admission failures also reduce it. A canceled
+or stale publication with cheap preparation cannot repeatedly halve the window.
+Registered manual workers and workerless replay share this classification.
 
 Automatic full-generation format conversion follows the same replay/quiet
 admission and primary-publication preemption as automatic shrinking. A legacy

@@ -56099,12 +56099,13 @@ fn replayPendingDerivedBatches(
         const preparation_before = self.async_context.full_text_preparation_ns.load(.monotonic);
         const publication_before = replay_state.publication_overhead_ns.load(.monotonic);
         var replay_completed = false;
+        var replay_failure: ?anyerror = null;
         defer if (options.bounded_replay and !replay_completed)
-            replay_state.replay_budget.observe(replay_lane, adaptive_budget, if (fragment_replay)
+            replay_state.replay_budget.observeFailure(replay_lane, adaptive_budget, if (fragment_replay)
                 self.async_context.full_text_preparation_ns.load(.monotonic) -| preparation_before
             else
-                (monotonicTimeNs() -| replay_started) -| (replay_state.publication_overhead_ns.load(.monotonic) -| publication_before), 0, true);
-        const stats = try derived_worker.catchUpIndexWithOptions(
+                (monotonicTimeNs() -| replay_started) -| (replay_state.publication_overhead_ns.load(.monotonic) -| publication_before), replay_failure);
+        const stats = derived_worker.catchUpIndexWithOptions(
             self.alloc,
             resources.replay_source,
             index_ref,
@@ -56139,7 +56140,10 @@ fn replayPendingDerivedBatches(
                 .max_call_bytes = if (options.bounded_replay) adaptive_budget.bytes else 0,
                 .deadline_ns = options.deadline_ns,
             },
-        );
+        ) catch |err| {
+            replay_failure = err;
+            return err;
+        };
         if (openProfileEnabled()) logReplayCatchUpProfile(index_ref, applied, stats);
         if (use_dense_catch_up) {
             _ = try resources.index_manager.runDenseLsmMaintenanceByName(index_ref.name, denseCatchUpMaintenanceSteps());

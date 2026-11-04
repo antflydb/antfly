@@ -8763,6 +8763,55 @@ test "capi native foreground namespace refresh retains predecessor inputs only t
     h.capi.clearLastError();
 }
 
+test "capi native decoded artifact lease retains physical inputs and accounting after runtime close" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const source_module = @import("../segment_source.zig");
+    var held: ?source_module.Decoded = null;
+    defer if (held) |lease| lease.release();
+    var backing: source_module.Source = undefined;
+    var original: [8]u8 = undefined;
+    var calls: usize = 0;
+    const Loader = struct {
+        fn decode(raw: *anyopaque, a: std.mem.Allocator) !*const anyopaque {
+            const count: *usize = @ptrCast(@alignCast(raw));
+            count.* += 1;
+            const value = try a.create(u64);
+            value.* = 0x12345678;
+            return value;
+        }
+    };
+    {
+        var fixture = try AdmissionFollowupFixture.init("native-decoded-source-owner", 5000, .batch);
+        defer fixture.deinit();
+        var lease = try fixture.connection.acquire();
+        defer {
+            lease.close();
+            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        const root = try fixture.connection.owner.refresh();
+        try root.db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+        try root.db.batch(.{ .writes = &.{.{ .key = "one", .value = "{\"text\":\"owned immutable source\"}" }}, .sync_level = .full_text });
+        const inventory = root.db.core.index_manager.textIndex("text").?.acquireSnapshot();
+        defer inventory.release();
+        backing = inventory.segments[0].reader.immutableSource();
+        try backing.readInto(0, &original);
+        const request: source_module.DecodeRequest = .{ .offset = 0, .length = 8, .interpretation = @splat(91), .context = &calls, .decode = Loader.decode };
+        held = (try backing.acquireDecoded(request)) orelse return error.TestUnexpectedResult;
+        const reused = (try backing.acquireDecoded(request)) orelse return error.TestUnexpectedResult;
+        defer reused.release();
+        try std.testing.expectEqual(held.?.value, reused.value);
+        try std.testing.expectEqual(@as(usize, 1), calls);
+    }
+    // Every DB, runtime and ordinary Source reference has closed. The decode
+    // lease alone keeps the exact native input and its resource owner alive.
+    try std.testing.expectEqual(@as(u64, 0x12345678), @as(*const u64, @ptrCast(@alignCast(held.?.value))).*);
+    var after: [8]u8 = undefined;
+    try backing.readInto(0, &after);
+    try std.testing.expectEqualSlices(u8, &original, &after);
+    held.?.release();
+    held = null;
+}
+
 test "capi native named runtime replacement hands off immutable artifact sources before closing" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("named-runtime-artifact-handoff", 5000, .batch);
