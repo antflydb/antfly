@@ -65,22 +65,18 @@ completed result or a pending commit decode into `MutationOutcome<T>`
 (e.g. `QueryResponses`, `QueryHit`) while keeping its own blocking HTTP
 client, since Postgres extensions cannot run an async runtime.
 
-## Source sync and private media
+## Optional source management
 
-`SourcesClient` targets the optional `antfly-source serve` companion, using its
-operator token on your application backend. It shares the Go ingestion engine
-rather than reimplementing provider enumeration or deletion tracking:
+Enable the `sources` Cargo feature and use the explicit module:
 
-```rust,ignore
-use antfly_sdk::SourcesClient;
-let sources = SourcesClient::new("https://sources.example.com", &source_operator_token)?;
-sources.put_secret("photos.secret", &secret_from_your_credential_flow).await?;
-sources.put_connection("photos", &connection_with_secret_references).await?;
-sources.put_source(&source_definition).await?;
-let job = sources.sync(false).await?;
-let status = sources.job(&job.id).await?;
+```rust
+use antfly_sdk::sources::{SourcesClient, types::RunInput};
+let sources = SourcesClient::new("https://sources.example.com/sources/v1", &management_token)?;
+let run = sources.start_run(&source_id, &submission_key,
+    &RunInput { restart: None, operation: None }).await?;
 ```
 
-Profile inspection, current-job recovery, cancellation, connection/secret
-revocation, and source removal use the same versioned protocol. See the
-[source-service setup and limits](../../../go/pkg/sources/README.md#media-and-runtime-source-registration).
+The base URL is the Go server or Colony instance management mount, not Antfly's
+database listener. Reuse a submission key after an ambiguous response. Provider
+credentials, acquisition and media proxying stay in Go/Colony.
+`StandaloneSourcesClient` preserves standalone-only legacy control operations.

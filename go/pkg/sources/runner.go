@@ -58,6 +58,10 @@ type Source struct {
 	PermissionTTLSeconds int             `json:"permission_ttl_seconds,omitempty"`
 }
 type Runner struct {
+	// SourceID selects one source while retaining the complete profile/catalog.
+	// Filtering Profile.Sources would incorrectly retire unrelated bindings.
+	SourceID string
+
 	// Only Service's resolver opts in: checkMediaAccess proves current access
 	// and revision, including any policy imposed by an injected connector.
 	mediaReferenceAuthorizes bool
@@ -197,6 +201,9 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 		return err
 	}
 	for i, source := range r.Profile.Sources {
+		if r.SourceID != "" && source.ID != r.SourceID {
+			continue
+		}
 		catalog.Sources[i].Status = "syncing"
 		catalog.Sources[i].PublishedRevision = ""
 		catalog.Sources[i].ValidUntil = nil
@@ -723,4 +730,10 @@ func (c *driveMediaConnector) Enumerate(ctx context.Context, request Request) (I
 		inventory.Objects[i].SourceKind = ProviderGoogleWorkspace
 	}
 	return inventory, err
+}
+
+// PublicationConnector selects original-binary acquisition for media sources.
+// Provider authentication and resource allowlists remain the runtime's job.
+func PublicationConnector(connector Connector, source Source) (Connector, error) {
+	return publicationConnector(connector, source)
 }

@@ -71,6 +71,11 @@ type ServiceOptions struct {
 }
 
 type SyncJob struct {
+	SourceID    string `json:"source_id,omitempty"`
+	PreviousID  string `json:"previous_id,omitempty"`
+	RequestKey  string `json:"request_key,omitempty"`
+	RequestHash string `json:"request_hash,omitempty"`
+
 	Version           int          `json:"version"`
 	Operation         string       `json:"operation,omitempty"`
 	PurgedSourceCount int          `json:"purged_source_count,omitempty"`
@@ -260,6 +265,10 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		serviceError(w, 401, "unauthorized")
 		return
 	}
+	if r.URL.Path == "/sources/v1" || strings.HasPrefix(r.URL.Path, "/sources/v1/") {
+		s.serveManagement(w, r)
+		return
+	}
 	// Authentication happens before decoding, but no service lock is held
 	// while a caller sends its request body or a provider builds a client.
 	if r.Method == http.MethodPut || r.Method == http.MethodPost {
@@ -314,13 +323,11 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/v1/sync" && r.Method == http.MethodPost {
-		if s.cancel != nil {
-			serviceError(w, 409, "sync_in_progress")
-			return
-		}
 		var input struct {
-			Restart   bool `json:"restart"`
-			PurgeOnly bool `json:"purge_only"`
+			RequestKey string `json:"request_key"`
+			SourceID   string `json:"source_id"`
+			Restart    bool   `json:"restart"`
+			PurgeOnly  bool   `json:"purge_only"`
 		}
 		if err := serviceDecode(w, r, &input); err != nil {
 			serviceError(w, 400, "invalid_request")
@@ -330,13 +337,57 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			serviceError(w, 400, "invalid_source_profile")
 			return
 		}
+		if input.RequestKey != "" {
+			old, found, err := s.idempotentJob(input.RequestKey)
+			if err != nil {
+				serviceError(w, 500, "state_read_failed")
+				return
+			}
+			if found {
+				if old.RequestHash != jobRequestHash(input.SourceID, input.Restart, input.PurgeOnly) {
+					serviceError(w, 409, "idempotency_conflict")
+					return
+				}
+				serviceJSON(w, 202, old)
+				return
+			}
+		}
+		if s.cancel != nil {
+			serviceError(w, 409, "sync_in_progress")
+			return
+		}
 		queue, err := s.readPurges()
 		if err != nil {
 			serviceError(w, 500, "state_read_failed")
 			return
 		}
+		if input.SourceID != "" {
+			found := false
+			if input.PurgeOnly {
+				for _, source := range queue.Sources {
+					if source.ID == input.SourceID {
+						found = true
+						break
+					}
+				}
+			} else {
+				for _, source := range s.profile.Sources {
+					if source.ID == input.SourceID {
+						found = true
+						break
+					}
+				}
+			}
+			if !found {
+				serviceError(w, 404, "source_not_found")
+				return
+			}
+		}
 		if !input.PurgeOnly && len(queue.Sources) == 0 {
 			for _, source := range s.profile.Sources {
+				if input.SourceID != "" && source.ID != input.SourceID {
+					continue
+				}
 				if _, exists := s.profile.Connections[source.Connection]; !exists {
 					serviceError(w, 400, "source_connection_revoked")
 					return
@@ -349,14 +400,32 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if input.PurgeOnly {
 			operation = "purge"
 		}
-		job := SyncJob{Version: 1, Operation: operation, ID: rand.Text(), State: "running", StartedAt: time.Now().Unix()}
+		previous := ""
+		if s.job != nil {
+			// Archive before replacing the latest receipt. This also migrates the
+			// legacy singleton receipt without losing its terminal outcome.
+			if err := writeJSON(s.historyPath(s.job.ID), s.job, 4096); err != nil {
+				cancel()
+				serviceError(w, 500, "state_write_failed")
+				return
+			}
+			if s.job.RequestKey != "" {
+				if err := writeJSON(s.requestPath(s.job.RequestKey), map[string]string{"id": s.job.ID}, 4096); err != nil {
+					cancel()
+					serviceError(w, 500, "state_write_failed")
+					return
+				}
+			}
+			previous = s.job.ID
+		}
+		job := SyncJob{Version: 1, SourceID: input.SourceID, PreviousID: previous, RequestKey: input.RequestKey, RequestHash: jobRequestHash(input.SourceID, input.Restart, input.PurgeOnly), Operation: operation, ID: rand.Text(), State: "running", StartedAt: time.Now().Unix()}
 		if err := writeJSON(s.jobPath(), job, 4096); err != nil {
 			cancel()
 			serviceError(w, 500, "state_write_failed")
 			return
 		}
 		s.job, s.cancel, s.done = &job, cancel, make(chan struct{})
-		go s.run(ctx, profile, input.Restart, input.PurgeOnly, s.done)
+		go s.run(ctx, profile, input.Restart, input.PurgeOnly, s.done, input.SourceID)
 		w.Header().Set("Location", "/v1/jobs/"+job.ID)
 		serviceJSON(w, 202, job)
 		return
@@ -600,8 +669,12 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	serviceError(w, 404, "not_found")
 }
-func (s *Service) run(ctx context.Context, profile Profile, restart, purgeOnly bool, done chan struct{}) {
+func (s *Service) run(ctx context.Context, profile Profile, restart, purgeOnly bool, done chan struct{}, selection ...string) {
 	defer close(done)
+	sourceID := ""
+	if len(selection) > 0 {
+		sourceID = selection[0]
+	}
 	keep := map[string]bool{}
 	resolver := func(ctx context.Context, source Source, request Request, item Item) (MediaReference, error) {
 		ref, err := s.pinMedia(ctx, source, request, item)
@@ -611,14 +684,17 @@ func (s *Service) run(ctx context.Context, profile Profile, restart, purgeOnly b
 		}
 		return ref, err
 	}
-	runner := Runner{mediaReferenceAuthorizes: true, Profile: profile, StateDir: s.runnerPath(), CatalogPath: filepath.Join(s.runnerPath(), "catalog.json"), Factory: s.providerConnector, Restart: restart, MediaReference: resolver, MediaInventory: s.publishMediaAuthority}
+	runner := Runner{SourceID: sourceID, mediaReferenceAuthorizes: true, Profile: profile, StateDir: s.runnerPath(), CatalogPath: filepath.Join(s.runnerPath(), "catalog.json"), Factory: s.providerConnector, Restart: restart, MediaReference: resolver, MediaInventory: s.publishMediaAuthority}
 	purged := []string{}
 	err := runner.withStateLock(ctx, func() error {
 		before, err := s.readPurges()
 		if err != nil {
 			return err
 		}
-		purgeErr := s.purgeSourcesLocked(ctx, profile)
+		var purgeErr error
+		if sourceID == "" || purgeOnly {
+			purgeErr = s.purgeSourcesLocked(ctx, profile, sourceID)
+		}
 		after, err := s.readPurges()
 		if err != nil {
 			return err
@@ -639,6 +715,9 @@ func (s *Service) run(ctx context.Context, profile Profile, restart, purgeOnly b
 			return nil
 		}
 		for _, source := range profile.Sources {
+			if sourceID != "" && source.ID != sourceID {
+				continue
+			}
 			if _, ok := profile.Connections[source.Connection]; !ok {
 				return &sourceSyncError{sourceID: source.ID, phase: "connect", cause: fmt.Errorf("%w: source connection revoked", ErrInvalidInput)}
 			}
@@ -650,9 +729,13 @@ func (s *Service) run(ctx context.Context, profile Profile, restart, purgeOnly b
 	})
 	var cleanupErr error
 	if err == nil && !purgeOnly {
-		cleanupErr = s.pruneMediaPins(keep)
-		if cleanupErr == nil {
-			cleanupErr = s.pruneMediaDigests(keep)
+		if sourceID != "" {
+			cleanupErr = s.pruneSourceMedia(keep, sourceID)
+		} else {
+			cleanupErr = s.pruneMediaPins(keep)
+			if cleanupErr == nil {
+				cleanupErr = s.pruneMediaDigests(keep)
+			}
 		}
 	}
 	s.mu.Lock()
@@ -772,6 +855,9 @@ func (s *Service) cancelConnectionAcquisition(name string) {
 		return
 	}
 	for _, source := range s.profile.Sources {
+		if s.job.SourceID != "" && source.ID != s.job.SourceID {
+			continue
+		}
 		if source.Connection == name {
 			s.cancel()
 			return
@@ -783,6 +869,9 @@ func (s *Service) cancelSecretAcquisition(key string) {
 		return
 	}
 	for _, source := range s.profile.Sources {
+		if s.job.SourceID != "" && source.ID != s.job.SourceID {
+			continue
+		}
 		connection := s.profile.Connections[source.Connection]
 		for _, ref := range connection.SecretRefs {
 			if ref == key {

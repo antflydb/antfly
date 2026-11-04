@@ -1,14 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
-import { SourceServiceError, SourcesClient } from "../src/sources-client.js";
+import { SourceServiceError, StandaloneSourcesClient } from "../src/sources-client.js";
 
-describe("SourcesClient", () => {
+describe("StandaloneSourcesClient", () => {
   it("uses the companion protocol and prevents credential forwarding through redirects", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
       new Response(JSON.stringify({ version: 1, id: "job", state: "running", started_at: 1 }), {
         status: 202,
       })
     );
-    const client = new SourcesClient({
+    const client = new StandaloneSourcesClient({
       baseUrl: "https://sources.example",
       token: "operator-token",
       fetch: fetcher,
@@ -29,7 +29,7 @@ describe("SourcesClient", () => {
       .mockImplementation(
         async () => new Response('{"version":1,"code":"sync_in_progress"}', { status: 409 })
       );
-    const client = new SourcesClient({
+    const client = new StandaloneSourcesClient({
       baseUrl: "https://sources.example",
       token: "operator-token",
       fetch: fetcher,
@@ -41,7 +41,7 @@ describe("SourcesClient", () => {
     const fetcher = vi
       .fn<typeof fetch>()
       .mockImplementation(async () => new Response('{"version":1,"state":"updated"}'));
-    const client = new SourcesClient({
+    const client = new StandaloneSourcesClient({
       baseUrl: "https://sources.example",
       token: "operator-token",
       fetch: fetcher,
@@ -62,6 +62,22 @@ describe("SourcesClient", () => {
     "https://user:pass@example.com",
     "https://example.com?token=x",
   ])("rejects unsafe endpoint %s", (baseUrl) => {
-    expect(() => new SourcesClient({ baseUrl, token: "token" })).toThrow();
+    expect(() => new StandaloneSourcesClient({ baseUrl, token: "token" })).toThrow();
   });
+});
+
+it("targets the common hosted mount and sends a stable idempotency key", async () => {
+  const { SourcesClient } = await import("../src/sources-client.js");
+  const fetcher = vi
+    .fn<typeof fetch>()
+    .mockImplementation(async () => new Response('{"id":"run"}'));
+  const baseUrl =
+    "https://colony.example/api/v1/organizations/org/cloud/instances/instance/sources/v1";
+  const client = new SourcesClient({ baseUrl, token: "hosted-token", fetch: fetcher });
+  await client.startRun("source", "submission-1");
+  await client.runs("source", { cursor: "opaque/cursor" });
+  expect(fetcher.mock.calls[0]?.[0]).toBe(`${baseUrl}/sources/source/runs`);
+  expect(fetcher.mock.calls[0]?.[1]?.headers).toMatchObject({ "Idempotency-Key": "submission-1" });
+  expect(fetcher.mock.calls[1]?.[0]).toBe(`${baseUrl}/sources/source/runs?cursor=opaque%2Fcursor`);
+  expect(fetcher).toHaveBeenCalledTimes(2);
 });

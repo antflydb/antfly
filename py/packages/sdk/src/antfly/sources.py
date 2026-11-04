@@ -13,7 +13,7 @@ class SourceServiceError(Exception):
         super().__init__(f"Source service returned {status}: {code}")
 
 
-class SourcesClient:
+class _SourceTransport:
     """Thin transport; enumeration, retries and deletion stay in the shared engine.
 
     The token is a source-service operator token. Use this client on your backend,
@@ -52,8 +52,10 @@ class SourcesClient:
     def __exit__(self, *args: Any) -> None:
         self.close()
 
-    def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
-        response = self._client.request(method, path, json=body)
+    def _request(
+        self, method: str, path: str, body: dict[str, Any] | None = None, *, headers: dict[str, str] | None = None
+    ) -> dict[str, Any]:
+        response = self._client.request(method, path, json=body, headers=headers)
         if not response.is_success:
             code = "request_failed"
             try:
@@ -67,6 +69,10 @@ class SourcesClient:
         if not isinstance(value, dict):
             raise ValueError("Invalid source service response")
         return value
+
+
+class StandaloneSourcesClient(_SourceTransport):
+    """Standalone-only credential and legacy profile operations."""
 
     def put_secret(self, key: str, value: str) -> dict[str, Any]:
         return self._request("PUT", f"/v1/secrets/{quote(key, safe='')}", {"value": value})
@@ -106,3 +112,41 @@ class SourcesClient:
 
     def cancel_job(self, job_id: str) -> dict[str, Any]:
         return self._request("DELETE", f"/v1/jobs/{quote(job_id, safe='')}")
+
+
+class SourcesClient(_SourceTransport):
+    """Common management API; base_url includes the runtime's /sources/v1 mount."""
+
+    def capabilities(self) -> dict[str, Any]:
+        return self._request("GET", "/capabilities")
+
+    def sources(self, *, limit: int = 20, cursor: str = "") -> dict[str, Any]:
+        return self._request("GET", f"/sources?limit={limit}&cursor={quote(cursor, safe='')}")
+
+    def source(self, source_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/sources/{quote(source_id, safe='')}")
+
+    def put_source(self, source: dict[str, Any]) -> dict[str, Any]:
+        return self._request("PUT", f"/sources/{quote(source['id'], safe='')}", source)
+
+    def remove_source(self, source_id: str, *, purge: bool = False) -> dict[str, Any]:
+        return self._request("DELETE", f"/sources/{quote(source_id, safe='')}?purge={str(purge).lower()}")
+
+    def runs(self, source_id: str, *, limit: int = 20, cursor: str = "") -> dict[str, Any]:
+        return self._request(
+            "GET", f"/sources/{quote(source_id, safe='')}/runs?limit={limit}&cursor={quote(cursor, safe='')}"
+        )
+
+    def run(self, source_id: str, run_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/sources/{quote(source_id, safe='')}/runs/{quote(run_id, safe='')}")
+
+    def start_run(self, source_id: str, key: str, *, restart: bool = False, operation: str = "sync") -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/sources/{quote(source_id, safe='')}/runs",
+            {"restart": restart, "operation": operation},
+            headers={"Idempotency-Key": key},
+        )
+
+    def cancel_run(self, source_id: str, run_id: str) -> dict[str, Any]:
+        return self._request("POST", f"/sources/{quote(source_id, safe='')}/runs/{quote(run_id, safe='')}/cancel", {})

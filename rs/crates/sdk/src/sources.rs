@@ -63,12 +63,12 @@ pub struct SourceSyncFailure {
 
 // Deliberately has no Debug implementation: its operator token is private.
 #[derive(Clone)]
-pub struct SourcesClient {
+pub struct StandaloneSourcesClient {
     client: Client,
     base: Url,
     token: String,
 }
-impl SourcesClient {
+impl StandaloneSourcesClient {
     pub fn new(base_url: &str, token: &str) -> Result<Self, SourceServiceError> {
         let base = Url::parse(base_url)
             .map_err(|_| SourceServiceError::InvalidConfiguration("invalid source service URL"))?;
@@ -238,9 +238,9 @@ mod tests {
             "https://user:pass@example.com",
             "https://example.com?token=x",
         ] {
-            assert!(SourcesClient::new(url, "token").is_err());
+            assert!(StandaloneSourcesClient::new(url, "token").is_err());
         }
-        assert!(SourcesClient::new("http://localhost:8082", "token").is_ok());
+        assert!(StandaloneSourcesClient::new("http://localhost:8082", "token").is_ok());
     }
     #[test]
     fn interrupted_job_receipts_keep_optional_fields_optional() {
@@ -253,4 +253,156 @@ mod tests {
         assert_eq!(purge.operation.as_deref(), Some("purge"));
         assert_eq!(purge.purged_source_count, Some(2));
     }
+}
+
+#[path = "sources_types.rs"]
+pub mod types;
+
+/// Common source-management client. The base URL includes /sources/v1 and,
+/// for hosted instances, the organization/instance prefix.
+#[derive(Clone)]
+pub struct SourcesClient {
+    transport: StandaloneSourcesClient,
+}
+impl SourcesClient {
+    pub fn new(base_url: &str, token: &str) -> Result<Self, SourceServiceError> {
+        Ok(Self {
+            transport: StandaloneSourcesClient::new(base_url, token)?,
+        })
+    }
+    async fn request<T: serde::de::DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &[&str],
+        body: Option<&Value>,
+    ) -> Result<T, SourceServiceError> {
+        decode_model(self.transport.request(method, path, body).await?)
+    }
+    async fn page<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &[&str],
+        limit: usize,
+        cursor: &str,
+    ) -> Result<T, SourceServiceError> {
+        let mut url = self.transport.base.clone();
+        url.path_segments_mut()
+            .map_err(|_| SourceServiceError::InvalidConfiguration("invalid management URL"))?
+            .pop_if_empty()
+            .extend(path);
+        url.query_pairs_mut()
+            .append_pair("limit", &limit.to_string())
+            .append_pair("cursor", cursor);
+        let response = self
+            .transport
+            .client
+            .get(url)
+            .bearer_auth(&self.transport.token)
+            .send()
+            .await?;
+        decode_model(decode_response(response).await?)
+    }
+    pub async fn capabilities(&self) -> Result<types::Capabilities, SourceServiceError> {
+        self.request(Method::GET, &["capabilities"], None).await
+    }
+    pub async fn sources(&self) -> Result<types::SourcePage, SourceServiceError> {
+        self.sources_page(20, "").await
+    }
+    pub async fn sources_page(
+        &self,
+        limit: usize,
+        cursor: &str,
+    ) -> Result<types::SourcePage, SourceServiceError> {
+        self.page(&["sources"], limit, cursor).await
+    }
+    pub async fn source(&self, id: &str) -> Result<types::Source, SourceServiceError> {
+        self.request(Method::GET, &["sources", id], None).await
+    }
+    pub async fn put_source(
+        &self,
+        source: &types::Source,
+    ) -> Result<types::Source, SourceServiceError> {
+        let body = serde_json::to_value(source)
+            .map_err(|_| SourceServiceError::InvalidConfiguration("invalid source"))?;
+        self.request(Method::PUT, &["sources", &source.id], Some(&body))
+            .await
+    }
+    pub async fn remove_source(
+        &self,
+        id: &str,
+        purge: bool,
+    ) -> Result<types::Mutation, SourceServiceError> {
+        decode_model(
+            self.transport
+                .request_with_purge(Method::DELETE, &["sources", id], None, purge)
+                .await?,
+        )
+    }
+    pub async fn runs(&self, id: &str) -> Result<types::RunPage, SourceServiceError> {
+        self.runs_page(id, 20, "").await
+    }
+    pub async fn runs_page(
+        &self,
+        id: &str,
+        limit: usize,
+        cursor: &str,
+    ) -> Result<types::RunPage, SourceServiceError> {
+        self.page(&["sources", id, "runs"], limit, cursor).await
+    }
+    pub async fn run(&self, source: &str, id: &str) -> Result<types::Run, SourceServiceError> {
+        self.request(Method::GET, &["sources", source, "runs", id], None)
+            .await
+    }
+    pub async fn start_run(
+        &self,
+        source: &str,
+        key: &str,
+        input: &types::RunInput,
+    ) -> Result<types::Run, SourceServiceError> {
+        let mut url = self.transport.base.clone();
+        url.path_segments_mut()
+            .map_err(|_| SourceServiceError::InvalidConfiguration("invalid management URL"))?
+            .pop_if_empty()
+            .extend(["sources", source, "runs"]);
+        let response = self
+            .transport
+            .client
+            .post(url)
+            .bearer_auth(&self.transport.token)
+            .header("Idempotency-Key", key)
+            .json(input)
+            .send()
+            .await?;
+        decode_model(decode_response(response).await?)
+    }
+    pub async fn cancel_run(
+        &self,
+        source: &str,
+        id: &str,
+    ) -> Result<types::Run, SourceServiceError> {
+        self.request(
+            Method::POST,
+            &["sources", source, "runs", id, "cancel"],
+            Some(&json!({})),
+        )
+        .await
+    }
+}
+fn decode_model<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, SourceServiceError> {
+    serde_json::from_value(value)
+        .map_err(|_| SourceServiceError::InvalidConfiguration("invalid source-management response"))
+}
+async fn decode_response(response: reqwest::Response) -> Result<Value, SourceServiceError> {
+    let status = response.status();
+    if !status.is_success() {
+        let value: Value = response.json().await.unwrap_or(Value::Null);
+        return Err(SourceServiceError::Http {
+            status,
+            code: value
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("request_failed")
+                .into(),
+        });
+    }
+    Ok(response.json().await?)
 }

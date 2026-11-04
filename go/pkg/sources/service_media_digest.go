@@ -93,23 +93,11 @@ func (s *Service) verifiedMediaDigest(ctx context.Context, source Source, connec
 	if loadJSON(s.digestPath(key), &receipt, 4096) == nil && receipt.Version == 1 && receipt.Identity == key && validContentSHA(receipt.SHA256) && hmac.Equal([]byte(receipt.MAC), []byte(s.receiptMAC(receipt))) {
 		return receipt.SHA256, nil
 	}
-	body, err := media.OpenMedia(ctx, request, item, MediaRange{0, item.Size})
+	digest, err := VerifyMediaDigest(ctx, media, request, item)
 	if err != nil {
-		return "", mediaProviderError(err)
+		return "", err
 	}
-	hash := sha256.New()
-	copied, copyErr := io.CopyBuffer(hash, io.LimitReader(body, item.Size), make([]byte, 64<<10))
-	closeErr := body.Close()
-	if copyErr != nil {
-		return "", copyErr
-	}
-	if closeErr != nil {
-		return "", mediaProviderError(closeErr)
-	}
-	if copied != item.Size {
-		return "", io.ErrUnexpectedEOF
-	}
-	receipt = contentReceipt{Version: 1, Identity: key, SHA256: hex.EncodeToString(hash.Sum(nil))}
+	receipt = contentReceipt{Version: 1, Identity: key, SHA256: digest}
 	receipt.MAC = s.receiptMAC(receipt)
 	if err := writeJSON(s.digestPath(key), receipt, 4096); err != nil {
 		return "", err

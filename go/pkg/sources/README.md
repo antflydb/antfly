@@ -660,3 +660,46 @@ Python has equivalent snake-case methods (`put_secret`, `put_connection`,
 `put_source`, `sync`, `job`, `current_job`, `cancel_job`) on a context-managed client.
 Rust exposes the same methods asynchronously. Neither SDK retries sync implicitly
 or forwards its operator token through HTTP redirects.
+
+## Common source-management API
+
+The standalone server mounts the shared contract at `/sources/v1`. Colony mounts
+it beneath its organization/instance scope. The source of truth is
+`specs/openapi/sources/management.yaml`; provider authorization/installation remains
+a runtime-specific extension. Existing `/v1` standalone control routes remain
+available for compatibility, including whole-profile synchronization.
+
+The common API supports source GET/PUT/retirement and per-source runs, durable
+history, idempotent submission, cancellation and explicit purge execution.
+`POST /sources/{id}/runs` takes `{ "operation": "sync", "restart": false }` and an
+`Idempotency-Key` of up to 128 ASCII letters/digits/underscores/hyphens. A key is
+scoped to one source and retained with its receipts. Reusing it with different
+input returns a conflict. Resolve lost responses using that key or run history;
+do not blindly launch another mutation. Run state and publication completeness
+are separate. Standalone execution is serialized.
+
+The optional Go client lives in `sources/management`; TypeScript uses
+`@antfly/sdk/sources`, Python `antfly.sources`, and Rust the `sources` feature/module.
+Always specify the complete management base URL. The common client does not send
+provider secrets to the Antfly database listener.
+
+A source-scoped run retains the full profile/catalog context. It neither retires
+sibling bindings nor prunes their media references. History survives restarts;
+control pages bound disk scanning and can return an empty page with a next cursor
+when sibling runs intervene. Follow cursors until absent. Receipts/idempotency
+bindings are retained with service state; deleting that state loses both history
+and ingestion ownership and is not routine history cleanup.
+
+Retirement retains rows by default. `DELETE /sources/{id}?purge=true` persists a
+purge intent; a run with `operation: purge` executes only that source's deletion
+without provider credentials. Other queued purges are left untouched.
+
+Original media uses the Go/Colony proxy as the intended delivery path. Shared
+`PublicationConnector`, `VerifyMediaDigest` and `ServeMedia` provide provider/version
+acquisition, bounded original-byte hashing and HTTP range/conditional delivery.
+The hosting adapter must validate its capability and current source/object/provider
+authority before delivery. Standalone persists signed receipts and authority on its
+single-writer filesystem; Colony uses protected hosted credentials and PostgreSQL.
+This does not require native Drive/email/chat connectors or durable byte staging.
+Proxy and provider availability remain dependencies for later processing/retries;
+stale historical representations fail rather than silently returning newer bytes.

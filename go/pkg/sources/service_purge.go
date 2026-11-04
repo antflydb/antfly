@@ -87,7 +87,11 @@ func (s *Service) purgeSources(ctx context.Context, profile Profile) error {
 	runner := Runner{StateDir: s.runnerPath()}
 	return runner.withStateLock(ctx, func() error { return s.purgeSourcesLocked(ctx, profile) })
 }
-func (s *Service) purgeSourcesLocked(ctx context.Context, profile Profile) error {
+func (s *Service) purgeSourcesLocked(ctx context.Context, profile Profile, selection ...string) error {
+	selected := ""
+	if len(selection) > 0 {
+		selected = selection[0]
+	}
 	queue, err := s.readPurges()
 	if err != nil {
 		return err
@@ -108,6 +112,9 @@ func (s *Service) purgeSourcesLocked(ctx context.Context, profile Profile) error
 	removed := map[string]bool{}
 	var purgeErr error
 	for _, source := range queue.Sources {
+		if selected != "" && source.ID != selected {
+			continue
+		}
 		if err := s.purgeSource(ctx, publisher, profile, source); err != nil {
 			purgeErr = &sourceSyncError{sourceID: source.ID, phase: "purge", cause: err}
 			break
@@ -146,7 +153,13 @@ func (s *Service) commitPurgeCompletion(queue sourcePurges, completed int, remov
 	}
 	s.profile = next
 	s.refreshMediaRegistry()
-	queue.Sources = queue.Sources[completed:]
+	retained := queue.Sources[:0]
+	for _, source := range queue.Sources {
+		if !removed[source.ID] {
+			retained = append(retained, source)
+		}
+	}
+	queue.Sources = retained
 	return writeJSON(s.purgePath(), queue, 1<<20)
 }
 

@@ -18,6 +18,7 @@ package sources
 import (
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -326,4 +327,35 @@ func parseMediaRanges(header string, size int64) ([]MediaRange, error) {
 		return nil, ErrInvalidInput
 	}
 	return ranges, nil
+}
+
+// VerifyMediaDigest streams original bytes with bounded memory and requires both
+// the exact length and the connector's successful Close/version postconditions.
+func VerifyMediaDigest(ctx context.Context, media MediaConnector, request Request, item Item) (string, error) {
+	if media == nil || item.Size < 1 {
+		return "", fmt.Errorf("%w: invalid media representation", ErrInvalidInput)
+	}
+	if upper, _ := item.Metadata["size_is_upper_bound"].(bool); upper || configString(item.Metadata, "export_mime_type") != "" {
+		return "", fmt.Errorf("%w: original binary representation required", ErrInvalidInput)
+	}
+	if err := media.CheckMedia(ctx, request, item); err != nil {
+		return "", mediaProviderError(err)
+	}
+	body, err := media.OpenMedia(ctx, request, item, MediaRange{0, item.Size})
+	if err != nil {
+		return "", mediaProviderError(err)
+	}
+	hash := sha256.New()
+	copied, copyErr := io.CopyBuffer(hash, io.LimitReader(body, item.Size), make([]byte, 64<<10))
+	closeErr := body.Close()
+	if copyErr != nil {
+		return "", copyErr
+	}
+	if closeErr != nil {
+		return "", mediaProviderError(closeErr)
+	}
+	if copied != item.Size {
+		return "", io.ErrUnexpectedEOF
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }

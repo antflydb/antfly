@@ -21,8 +21,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/minio/minio-go/v7"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -238,51 +240,27 @@ func (s *Service) serveMediaStream(w http.ResponseWriter, r *http.Request) {
 		serviceError(w, 410, "media_revoked")
 		return
 	}
-	etag := `"` + pin.SHA256 + `"`
-	w.Header().Set("Content-Type", mediaMIME(pin.Item))
-	w.Header().Set("ETag", etag)
-	w.Header().Set("Cache-Control", "private, no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	if match := r.Header.Get("If-Match"); match != "" && !etagListContains(match, etag, false) {
-		w.WriteHeader(http.StatusPreconditionFailed)
-		return
-	}
-	if etagListContains(r.Header.Get("If-None-Match"), etag, true) {
-		w.Header().Del("Content-Type")
-		w.WriteHeader(http.StatusNotModified)
-		return
-	}
-	effectiveRange := r.Header.Get("Range")
-	if ifRange := r.Header.Get("If-Range"); ifRange != "" && ifRange != etag {
-		effectiveRange = ""
-	}
-	spans, err := parseMediaRanges(effectiveRange, pin.Item.Size)
-	if err != nil {
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", pin.Item.Size))
-		serviceError(w, 416, "invalid_range")
-		return
-	}
-	seeker := &mediaSeeker{ctx: ctx, connector: media, request: request, item: pin.Item, ranges: spans}
-	defer seeker.Close()
-	// Validate the first bounded window before committing HTTP success headers.
-	// Conditional responses and HEAD must not fetch the object body.
-	if r.Method == http.MethodGet {
-		if len(spans) > 0 {
-			seeker.offset = spans[0].Offset
-		}
-		if _, err := seeker.Read(make([]byte, 1)); err != nil {
-			serveMediaError(w, err)
-			return
-		}
-		seeker.offset = 0
-	}
-	http.ServeContent(w, r, pin.Item.Filename, time.Time{}, seeker)
+	ServeMedia(w, r.WithContext(ctx), media, request, pin.Item, pin.SHA256)
 }
+
 func serveMediaError(w http.ResponseWriter, err error) {
 	var changed *RevisionChangedError
+	var google *GoogleHTTPError
+	provider := minio.ToErrorResponse(err)
+	if errors.As(err, &google) && google.Retryable() {
+		if delay := time.Until(google.AntflyRetryAfter()); delay > 0 {
+			w.Header().Set("Retry-After", strconv.FormatInt(int64(delay/time.Second)+1, 10))
+		}
+		serviceError(w, 503, "source_temporarily_unavailable")
+		return
+	}
 	switch {
 	case errors.As(err, &changed):
 		serviceError(w, 412, "source_version_changed")
+	case errors.As(err, &google) && (google.Status == 401 || google.Status == 403 || google.Status == 404):
+		serviceError(w, 410, "source_access_revoked")
+	case provider.StatusCode == 401 || provider.StatusCode == 403 || provider.Code == "NoSuchKey" || provider.Code == "NoSuchBucket":
+		serviceError(w, 410, "source_access_revoked")
 	case errors.Is(err, context.DeadlineExceeded):
 		serviceError(w, 504, "source_fetch_timeout")
 	case errors.Is(err, context.Canceled):

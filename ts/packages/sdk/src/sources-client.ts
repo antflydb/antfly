@@ -60,7 +60,7 @@ export class SourceServiceError extends Error {
   }
 }
 
-export class SourcesClient {
+class SourceTransport {
   private readonly baseUrl: string;
   readonly #token: string;
   private readonly fetcher: typeof fetch;
@@ -83,15 +83,20 @@ export class SourcesClient {
     this.fetcher = options.fetch ?? globalThis.fetch;
   }
 
-  private async request<T>(
+  protected async request<T>(
     method: string,
     path: string,
     body?: unknown,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    headers: Record<string, string> = {}
   ): Promise<T> {
     const response = await this.fetcher(`${this.baseUrl}${path}`, {
       method,
-      headers: { Authorization: `Bearer ${this.#token}`, "Content-Type": "application/json" },
+      headers: {
+        ...headers,
+        Authorization: `Bearer ${this.#token}`,
+        "Content-Type": "application/json",
+      },
       body: body === undefined ? undefined : JSON.stringify(body),
       redirect: "error",
       signal: signal ?? AbortSignal.timeout(30_000),
@@ -108,7 +113,10 @@ export class SourcesClient {
     }
     return response.json() as Promise<T>;
   }
+}
 
+/** Standalone-only credential and legacy profile operations. */
+export class StandaloneSourcesClient extends SourceTransport {
   putSecret(
     key: string,
     value: string,
@@ -166,5 +174,97 @@ export class SourcesClient {
   }
   cancelJob(id: string, signal?: AbortSignal): Promise<SourceSyncJob> {
     return this.request("DELETE", `/v1/jobs/${encodeURIComponent(id)}`, undefined, signal);
+  }
+}
+
+export type {
+  Capabilities,
+  Mutation,
+  Run,
+  RunInput,
+  RunPage,
+  Source,
+  SourcePage,
+} from "./sources-types.js";
+
+import type {
+  Capabilities,
+  Mutation,
+  Run,
+  RunInput,
+  RunPage,
+  Source,
+  SourcePage,
+} from "./sources-types.js";
+
+/** Common management API. baseUrl includes the runtime's /sources/v1 mount. */
+export class SourcesClient extends SourceTransport {
+  capabilities(signal?: AbortSignal): Promise<Capabilities> {
+    return this.request("GET", "/capabilities", undefined, signal);
+  }
+  sources(
+    options: { limit?: number; cursor?: string; signal?: AbortSignal } = {}
+  ): Promise<SourcePage> {
+    const query = new URLSearchParams();
+    if (options.limit !== undefined) query.set("limit", String(options.limit));
+    if (options.cursor) query.set("cursor", options.cursor);
+    return this.request("GET", `/sources?${query}`, undefined, options.signal);
+  }
+  source(id: string, signal?: AbortSignal): Promise<Source> {
+    return this.request("GET", `/sources/${encodeURIComponent(id)}`, undefined, signal);
+  }
+  putSource(source: Source, signal?: AbortSignal): Promise<Source> {
+    return this.request("PUT", `/sources/${encodeURIComponent(source.id)}`, source, signal);
+  }
+  removeSource(
+    id: string,
+    options: { purge?: boolean; signal?: AbortSignal } = {}
+  ): Promise<Mutation> {
+    return this.request(
+      "DELETE",
+      `/sources/${encodeURIComponent(id)}?purge=${options.purge ?? false}`,
+      undefined,
+      options.signal
+    );
+  }
+  runs(
+    id: string,
+    options: { limit?: number; cursor?: string; signal?: AbortSignal } = {}
+  ): Promise<RunPage> {
+    const query = new URLSearchParams();
+    if (options.limit !== undefined) query.set("limit", String(options.limit));
+    if (options.cursor) query.set("cursor", options.cursor);
+    return this.request(
+      "GET",
+      `/sources/${encodeURIComponent(id)}/runs?${query}`,
+      undefined,
+      options.signal
+    );
+  }
+  run(sourceId: string, runId: string, signal?: AbortSignal): Promise<Run> {
+    return this.request(
+      "GET",
+      `/sources/${encodeURIComponent(sourceId)}/runs/${encodeURIComponent(runId)}`,
+      undefined,
+      signal
+    );
+  }
+  startRun(
+    sourceId: string,
+    key: string,
+    input: RunInput = {},
+    signal?: AbortSignal
+  ): Promise<Run> {
+    return this.request("POST", `/sources/${encodeURIComponent(sourceId)}/runs`, input, signal, {
+      "Idempotency-Key": key,
+    });
+  }
+  cancelRun(sourceId: string, runId: string, signal?: AbortSignal): Promise<Run> {
+    return this.request(
+      "POST",
+      `/sources/${encodeURIComponent(sourceId)}/runs/${encodeURIComponent(runId)}/cancel`,
+      {},
+      signal
+    );
   }
 }
