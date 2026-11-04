@@ -18615,14 +18615,16 @@ schema's presence rather than its numeric version. COMMIT/ROLLBACK retain the
 command loan while draining the exact durable completion acknowledgement; a
 caller deadline leaves the same decision in recovery rather than replaying SQL.
 
-Qualification: the complete native public Debug executable passed **22 tests,
-zero skips, failures or leaks**. The dedicated campaign executes all seven exact
+Qualification: after merging origin/main, the native public Debug gate passed
+**11 campaigns, zero skips, failures or leaks**. The dedicated campaign executes all seven exact
 statements, independent connection conflicts, NOWAIT SQLSTATE 55P03, SKIP LOCKED
 refill, COMMIT/ROLLBACK release and complete metadata/session/data cold restart.
 The final compiler/runtime selection passed **212 tests** including policy
 context, invalid OF targets, spill admission and allocation-failure cleanup.
-The native LSM/WAL Debug gate separately passed **14 tests**; PostgreSQL 18 passed
-**134 matrix, MVCC, key-update, reentrance and savepoint assertions**. Evidence is
+The native LSM/WAL Debug gate separately passed **18 tests** and the durable
+source/connection recovery gate passed **52 tests** after the merge. PostgreSQL
+18 passed **134 matrix, MVCC, key-update, reentrance and savepoint assertions**
+and **241 advisory scalar/void and failure-release assertions**. Evidence is
 registered under `sql-qualified-table-row-locks-native-debug` and
 `sql-qualified-lock-matrix-postgres`; inventory integrity still checks all 1,586
 unchanged originals.
@@ -18641,7 +18643,10 @@ advisory grants and savepoint parents. A bounded command/effect binding survives
 lost control replies without guessing a new effect sequence. Waiters poll
 resource generations/revisions or native write-intent ownership read-only, and
 re-propose only after relevant state changes. Request-local table admissions
-reuse their pinned ranges across repeated operators.
+reuse their pinned ranges across repeated operators. The pgwire qualification
+waits for the existing completion-safe disconnect proof before testing another
+owner's acquisition: disconnect can leave bounded cleanup with durable upkeep,
+and a lost reply never authorizes replaying advisory SQL.
 
 Native range activation distinguishes pure lock ownership from outstanding row
 work. Terminal externally coordinated participants do not retain fake native

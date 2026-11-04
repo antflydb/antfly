@@ -224,6 +224,21 @@ const AdvisoryCampaign = struct {
         }
         try std.testing.expectEqual(@as(usize, 3), descriptions);
         try std.testing.expectEqual(@as(usize, 3), rows);
+        // Disconnect makes bounded durable progress, and can hand remaining
+        // control to upkeep after a lost reply or concurrent metadata write.
+        // Observe that completion before asserting reuse from another owner;
+        // never retry the advisory SQL to wait for cleanup.
+        const identity = session.identity orelse return error.MissingWireIdentity;
+        const backend = adapter.backend();
+        const complete = backend.vtable.completion_safe orelse return error.MissingWireCompletion;
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s;
+        while (true) {
+            backend.vtable.disconnect(backend.context, identity, session.session_id);
+            if (complete(backend.context, identity)) break;
+            try ctx.checkDrivers();
+            if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.WireDisconnectNotRetired;
+            try ctx.io.sleep(.fromMilliseconds(5), .awake);
+        }
     }
 
     pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
