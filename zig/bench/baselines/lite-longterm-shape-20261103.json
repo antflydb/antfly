@@ -168,7 +168,7 @@
     }
   ],
   "remaining": [
-    "Validate integration with landed #1479 and cooperative format conversion; complete unchanged-importer current-format diagnosis before optimized qualification.",
+    "Validate the #1479 integration and conversion preemption. Diagnose low runtime reuse and publication amplification from the fresh format-9 failure; require an unchanged-importer pass before optimized qualification.",
     "Candidate-only optimized final qualification on wolfspider, including full frozen corpus, importer contention, and ten-minute active-write storage/visibility qualification.",
     "Applicable CI/model gates; full factory qualification remains with Beads."
   ],
@@ -278,6 +278,389 @@
         "local_gate": 1
       },
       "attribution": "Legacy format conversion takes the full-generation vacuum branch before ordinary maintenance; this fixture never adopted revision 9. The failed run is not evidence of current-format replay service capacity. A fresh revision-9 run is in progress."
+    },
+    "fresh_current_format_import": {
+      "source_commit": "a6f3d4afed948bcc35547e86dce8437ebf4d1452",
+      "format_revision": 9,
+      "input_index": 7,
+      "importer_exit_code": 1,
+      "censored": false,
+      "importer_succeeded": false,
+      "summary": [
+        0,
+        0,
+        1
+      ],
+      "seconds": 568.2983196249697,
+      "peak_native_builds": 5,
+      "metrics_enabled": true,
+      "library_sha256": "4cffa2602385174036b912bd05926a78af6e99dc7131d3a348dfa4bc6e38d11c",
+      "public_errors": [
+        "LiteReplayBacklogExceeded"
+      ],
+      "seed_sha256": null,
+      "seed_copy_method": null,
+      "scope": "Local diagnosis only. Metrics and any overlapping compilation prevent clean performance attribution.",
+      "numeric_stage_evidence": {
+        "qualification": false,
+        "scope": "Diagnostic counters; completed-operation profiles exclude failed operations; nested/concurrent counters are not additive wall time.",
+        "events": {
+          "antfly_bench_derived_worker": {
+            "count": 101,
+            "sum": {
+              "sequence": 2071,
+              "documents": 27506,
+              "deletes": 0,
+              "overwritten": 54,
+              "dense_embeddings": 0,
+              "sparse_embeddings": 0,
+              "graph_writes": 0,
+              "graph_deletes": 0,
+              "total_ms": 107318,
+              "full_text_apply_ms": 107311,
+              "full_text_plan_ms": 3225,
+              "full_text_prepare_ms": 38350,
+              "full_text_apply_lock_wait_ms": 0,
+              "full_text_apply_lock_held_ms": 28763,
+              "dense_apply_ms": 0,
+              "dense_delete_ms": 0,
+              "dense_doc_index_ms": 0,
+              "dense_embedding_apply_ms": 0,
+              "sparse_apply_ms": 0,
+              "graph_apply_ms": 0,
+              "index_sync_ms": 0
+            },
+            "max": {
+              "sequence": 77,
+              "documents": 1024,
+              "deletes": 0,
+              "overwritten": 3,
+              "dense_embeddings": 0,
+              "sparse_embeddings": 0,
+              "graph_writes": 0,
+              "graph_deletes": 0,
+              "total_ms": 5560,
+              "full_text_apply_ms": 5560,
+              "full_text_plan_ms": 257,
+              "full_text_prepare_ms": 3860,
+              "full_text_apply_lock_wait_ms": 0,
+              "full_text_apply_lock_held_ms": 815,
+              "dense_apply_ms": 0,
+              "dense_delete_ms": 0,
+              "dense_doc_index_ms": 0,
+              "dense_embedding_apply_ms": 0,
+              "sparse_apply_ms": 0,
+              "graph_apply_ms": 0,
+              "index_sync_ms": 0
+            }
+          },
+          "antfly_bench_row_pipeline": {
+            "count": 77,
+            "sum": {
+              "writes": 78848,
+              "prepared_rows": 0,
+              "logical_bytes": 0,
+              "encoded_bytes": 0,
+              "prepare_ms": 0,
+              "apply_lock_wait_ms": 0,
+              "apply_lock_held_ms": 68264
+            },
+            "max": {
+              "writes": 1024,
+              "prepared_rows": 0,
+              "logical_bytes": 0,
+              "encoded_bytes": 0,
+              "prepare_ms": 0,
+              "apply_lock_wait_ms": 0,
+              "apply_lock_held_ms": 1360
+            }
+          },
+          "antfly_bench_batch": {
+            "count": 77,
+            "sum": {
+              "sequence": 3003,
+              "writes": 78848,
+              "deletes": 0,
+              "graph_writes": 0,
+              "graph_deletes": 0,
+              "transforms": 0,
+              "total_ms": 68635,
+              "resolve_ms": 77,
+              "merge_ms": 0,
+              "predicates_ms": 0,
+              "range_ms": 0,
+              "extract_ms": 13802,
+              "delete_artifacts_ms": 0,
+              "precompute_ms": 0,
+              "identity_capacity_ms": 0,
+              "identity_metadata_ms": 4332,
+              "identity_metadata_writes": 394551,
+              "store_ms": 45211,
+              "split_delta_ms": 0,
+              "build_derived_ms": 85,
+              "shadow_ms": 0,
+              "collect_sync_ms": 0,
+              "backlog_admission_ms": 0,
+              "append_replay_journal_ms": 0,
+              "backlog_pressure_ms": 0,
+              "executor_notify_ms": 0,
+              "sync_wait_ms": 0,
+              "wait_sync_ms": 0,
+              "notify_enrichment_ms": 0
+            },
+            "max": {
+              "sequence": 77,
+              "writes": 1024,
+              "deletes": 0,
+              "graph_writes": 0,
+              "graph_deletes": 0,
+              "transforms": 0,
+              "total_ms": 1365,
+              "resolve_ms": 1,
+              "merge_ms": 0,
+              "predicates_ms": 0,
+              "range_ms": 0,
+              "extract_ms": 237,
+              "delete_artifacts_ms": 0,
+              "precompute_ms": 0,
+              "identity_capacity_ms": 0,
+              "identity_metadata_ms": 121,
+              "identity_metadata_writes": 5126,
+              "store_ms": 1055,
+              "split_delta_ms": 0,
+              "build_derived_ms": 2,
+              "shadow_ms": 0,
+              "collect_sync_ms": 0,
+              "backlog_admission_ms": 0,
+              "append_replay_journal_ms": 0,
+              "backlog_pressure_ms": 0,
+              "executor_notify_ms": 0,
+              "sync_wait_ms": 0,
+              "wait_sync_ms": 0,
+              "notify_enrichment_ms": 0
+            }
+          },
+          "antfly_bench_batch_derived": {
+            "count": 77,
+            "sum": {
+              "writes": 78848,
+              "total_ms": 68635,
+              "derived_apply_ms": 0,
+              "full_text_apply_ms": 0,
+              "full_text_plan_ms": 0,
+              "full_text_prepare_ms": 0,
+              "full_text_apply_lock_wait_ms": 0,
+              "full_text_apply_lock_held_ms": 0,
+              "dense_apply_ms": 0,
+              "dense_delete_ms": 0,
+              "dense_doc_index_ms": 0,
+              "dense_embedding_apply_ms": 0,
+              "sparse_apply_ms": 0,
+              "graph_apply_ms": 0,
+              "index_sync_ms": 0,
+              "applied_sequence_save_ms": 0,
+              "replay_journal_truncate_ms": 0
+            },
+            "max": {
+              "writes": 1024,
+              "total_ms": 1365,
+              "derived_apply_ms": 0,
+              "full_text_apply_ms": 0,
+              "full_text_plan_ms": 0,
+              "full_text_prepare_ms": 0,
+              "full_text_apply_lock_wait_ms": 0,
+              "full_text_apply_lock_held_ms": 0,
+              "dense_apply_ms": 0,
+              "dense_delete_ms": 0,
+              "dense_doc_index_ms": 0,
+              "dense_embedding_apply_ms": 0,
+              "sparse_apply_ms": 0,
+              "graph_apply_ms": 0,
+              "index_sync_ms": 0,
+              "applied_sequence_save_ms": 0,
+              "replay_journal_truncate_ms": 0
+            }
+          },
+          "antfly_bench_batch_extract": {
+            "count": 77,
+            "sum": {
+              "writes": 78848,
+              "total_extract_ms": 13802,
+              "vector_field_names_ms": 0,
+              "mapper_ms": 4365,
+              "graph_fields_ms": 3481,
+              "index_field_embeddings_ms": 0,
+              "embedding_artifacts_ms": 0,
+              "graph_artifacts_ms": 0,
+              "strip_store_value_ms": 0,
+              "timestamp_ms": 0,
+              "overwrite_probe_ms": 154,
+              "identity_upserts": 78848,
+              "identity_deletes": 0,
+              "store_writes": 646615,
+              "store_deletes": 78
+            },
+            "max": {
+              "writes": 1024,
+              "total_extract_ms": 237,
+              "vector_field_names_ms": 0,
+              "mapper_ms": 81,
+              "graph_fields_ms": 65,
+              "index_field_embeddings_ms": 0,
+              "embedding_artifacts_ms": 0,
+              "graph_artifacts_ms": 0,
+              "strip_store_value_ms": 0,
+              "timestamp_ms": 0,
+              "overwrite_probe_ms": 2,
+              "identity_upserts": 1024,
+              "identity_deletes": 0,
+              "store_writes": 8580,
+              "store_deletes": 2
+            }
+          },
+          "antfly_bench_replay_refusal": {
+            "count": 2,
+            "sum": {
+              "bytes_before": 33601974,
+              "bytes_after": 34102334,
+              "records_before": 798,
+              "records_after": 806,
+              "byte_limit": 33554432,
+              "record_limit": 8192
+            },
+            "max": {
+              "bytes_before": 16802247,
+              "bytes_after": 17052427,
+              "records_before": 399,
+              "records_after": 403,
+              "byte_limit": 16777216,
+              "record_limit": 4096
+            }
+          },
+          "antfly_bench_native_owner": {
+            "count": 1,
+            "sum": {
+              "source_turns": 160,
+              "capture_ns": 13647092000,
+              "replay_ns": 287674460000,
+              "artifacts_ns": 145140819000,
+              "storage_ns": 76729371000,
+              "runtime_refreshes": 592,
+              "maintenance_errors": 146,
+              "maintenance_timeouts": 0,
+              "merge_started": 37,
+              "merge_applied": 36,
+              "merge_discarded": 1,
+              "merge_prepare_ns": 13763049000,
+              "merge_staging_ns": 1283172000,
+              "merge_staged_bytes": 49363957,
+              "merge_publication_ns": 50367462000,
+              "sql_overlay_hits": 789,
+              "sql_overlay_rebuilds": 259,
+              "sql_overlay_rebuild_entries": 25074,
+              "sql_overlay_evictions": 0,
+              "sql_staged_statements": 524,
+              "replay_waits": 2,
+              "replay_refused_prepare_ns": 1351879958
+            },
+            "max": {
+              "source_turns": 160,
+              "capture_ns": 13647092000,
+              "replay_ns": 287674460000,
+              "artifacts_ns": 145140819000,
+              "storage_ns": 76729371000,
+              "runtime_refreshes": 592,
+              "maintenance_errors": 146,
+              "maintenance_timeouts": 0,
+              "merge_started": 37,
+              "merge_applied": 36,
+              "merge_discarded": 1,
+              "merge_prepare_ns": 13763049000,
+              "merge_staging_ns": 1283172000,
+              "merge_staged_bytes": 49363957,
+              "merge_publication_ns": 50367462000,
+              "sql_overlay_hits": 789,
+              "sql_overlay_rebuilds": 259,
+              "sql_overlay_rebuild_entries": 25074,
+              "sql_overlay_evictions": 0,
+              "sql_staged_statements": 524,
+              "replay_waits": 2,
+              "replay_refused_prepare_ns": 1351879958
+            }
+          },
+          "antfly_bench_native_runtime": {
+            "count": 1,
+            "sum": {
+              "maintenance_opens": 202,
+              "namespace_opens": 216,
+              "source_reuses": 21
+            },
+            "max": {
+              "maintenance_opens": 202,
+              "namespace_opens": 216,
+              "source_reuses": 21
+            }
+          },
+          "antfly_bench_native_service": {
+            "count": 1,
+            "sum": {
+              "refresh_ns": 5560495000,
+              "replay_publication_overhead_ns": 240744559120,
+              "index_admission_ns": 28137479000,
+              "metadata_admission_ns": 43977825000,
+              "publication_hold_ns": 104438158779
+            },
+            "max": {
+              "refresh_ns": 5560495000,
+              "replay_publication_overhead_ns": 240744559120,
+              "index_admission_ns": 28137479000,
+              "metadata_admission_ns": 43977825000,
+              "publication_hold_ns": 104438158779
+            }
+          },
+          "antfly_bench_native_owner_failures": {
+            "count": 1,
+            "sum": {
+              "capture": 0,
+              "source": 13,
+              "retirement": 11,
+              "artifacts": 0,
+              "storage": 122
+            },
+            "max": {
+              "capture": 0,
+              "source": 13,
+              "retirement": 11,
+              "artifacts": 0,
+              "storage": 122
+            }
+          },
+          "antfly_bench_native_path_leases": {
+            "count": 1,
+            "sum": {
+              "leases": 4030,
+              "admission_ns": 463791627,
+              "admission_max_ns": 2364458,
+              "hold_ns": 545913843960,
+              "hold_max_ns": 4233796417
+            },
+            "max": {
+              "leases": 4030,
+              "admission_ns": 463791627,
+              "admission_max_ns": 2364458,
+              "hold_ns": 545913843960,
+              "hold_max_ns": 4233796417
+            }
+          }
+        },
+        "admission_refusals": {},
+        "maintenance_failure_phases": {
+          "storage": 122,
+          "source": 13,
+          "retirement": 11
+        }
+      },
+      "attribution": "Current-format replay progresses but still exhausts the quota. Instrumentation and overlapping compilation prevent a clean throughput comparison. Runtime reuse is low: 202 maintenance opens and 216 namespace opens versus 21 reuses. Publication overhead remains large; this is an unresolved service-capacity failure, not a passing E2E result."
     }
   },
   "integration_pending_validation": {

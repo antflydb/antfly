@@ -3901,6 +3901,11 @@ pub const PathWriterLock = struct {
 
 const LockFile = struct {
     file: std.Io.File,
+
+    fn close(self: *LockFile, io: std.Io) void {
+        self.file.close(io);
+        self.* = undefined;
+    }
 };
 
 pub const CreateOptions = struct {
