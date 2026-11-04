@@ -1,12 +1,11 @@
 # Continuous writable-lake qualification — 2026-11-04 UTC
 
-**Through `8bdf82339e`, three fresh full optimized filesystem runs passed; GCS had
-no query failures in the latest runs but still failed bounded vacuum recovery.** Both the baseline and
-first follow-up optimized runs failed qualification on each provider. The catalog-history
-changes in #1480 work in this workload, and indexed acknowledged rows survived
-searchable publication and restart. GCS maintenance completion remains a
-release/deployment qualification gap; the later results below do not qualify
-full-archive performance or Antfly Cloud deployment.
+**Fresh full ReleaseFast filesystem and GCS runs at `eca0684354` passed all
+qualification checks with zero query failures.** Earlier failed runs and their
+recovery attempts remain recorded below. Later text-only reconciliation and
+cancellation changes have separate Debug checks; final-source optimized
+qualification remains outstanding. This 128-row dense-match workload does not
+qualify full-archive performance, DuckDB parity or Antfly Cloud deployment.
 
 ## Revision and workload
 
@@ -754,6 +753,43 @@ filesystem and GCS default-workload controls are running against that exact
 or ingress cancellation fixes. An initial filesystem launch was prevented from
 binding local ports by the sandbox, before engine work; the host-permitted run
 uses a separate evidence directory and preserves that failed launch record.
+
+Fresh default controls using the frozen bounded-cleanup `eca0684354` ReleaseFast
+binary (SHA-256
+`db22a561b9e9270b7e11fbe6d2cdb57e0e15e43e4823958ac3e8aa856be33764`)
+subsequently passed every qualification check on both providers. The filesystem
+run completed in 1,110.426 seconds, verified 102 final indexed rows, reported
+384 deletions, and recorded 356 successful searches per visibility. GCS completed
+in 1,855.991 seconds, verified 103 final indexed rows, reported 32 deletions, and
+recorded 139 successful searches per visibility. Both exercised retention,
+manifest merging, group commit, deletion during continuous changes, bounded
+restart recovery and independent deletion checks. Neither had a query failure.
+The providers completed different numbers of changes under host contention;
+these are functional qualifications, not matched throughput comparisons.
+
+The combined `0ac3e0ad86` Debug engine built successfully and passed its
+48.860-second smoke. A separate 100.573-second GCS restart verification checked
+103 row images, 94 current manifests and 292 Parquet files, five absent expired
+manifest lists, and reopening of the already-completed 109-snapshot vacuum job.
+Its accepted search took 2.303 seconds with persisted cache state; this is not
+a controlled cold speedup comparison. The sampler missed listener startup, so
+no stack attribution is claimed for that probe. Its optimized build and fresh
+controls run separately from the earlier bounded-cleanup qualification.
+
+A fresh review then reproduced a deadline-classification regression in
+`0ac3e0ad86`: connected clients with `x-antfly-timeout-ms` set to 1, 5 or 10 ms
+received HTTP 499 rather than retryable `504 query_timeout`; queries without
+that header succeeded before and after. The boolean cancellation probe lost
+`DeadlineExceeded` inside fallible operation checks. The correction uses the
+authoritative semantic checkpoint at those checks, rechecks cancellation at the
+native query retry boundary, retains semantic checkpoints through NDJSON/composed
+query and cursor dispatch, and checks the native read context before accepting
+an object-runtime read response. Boolean transport probes stay separate, and
+admitted mutation outcomes retain their existing handling. Public single-table,
+global, NDJSON and composed-union route controls cover expiry versus real listener cancellation;
+the route regression failed before the correction. All 18 execution-budget tests passed with no skips or leaks, including foreign
+deadline dispatch and operation/transport probe separation. The broader lake and metadata-admission checks are still running. Their results
+are separate from earlier optimized runs, which exclude this correction.
 
 Next work should:
 

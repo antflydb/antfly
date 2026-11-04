@@ -5426,7 +5426,7 @@ pub const ApiHttpServer = struct {
 
     fn joinCtxBuildOwnedSearchRequest(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value, execution_deadline_ns: ?u64, cancellation: ?CancellationToken) anyerror!query_api.OwnedQueryRequest {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
+        try ensureRequestActive(cancellation);
         return try self.buildOwnedSearchRequestFromQueryValue(
             alloc,
             table_name,
@@ -14892,6 +14892,12 @@ pub const ApiHttpServer = struct {
                     try sleepNsCancellable(retry_io, sleep_ns, cancellation);
                     continue;
                 },
+                error.Cancelled, error.Canceled => {
+                    // Provider adapters can expose cancellation as a boolean.
+                    // Recheck the owning token before classifying the failure.
+                    try ensureRequestActive(cancellation);
+                    return err;
+                },
                 error.Timeout => {
                     return error.Timeout;
                 },
@@ -22984,7 +22990,7 @@ pub const ApiHttpServer = struct {
                 cancellation: ?*const http_common.RequestCancellation,
                 fn checkpoint(raw: *anyopaque) !void {
                     const runner: *@This() = @ptrCast(@alignCast(raw));
-                    if (runner.cancellation) |cancel| if (cancel.isCancelled()) return error.Cancelled;
+                    try ensureRequestActive(if (runner.cancellation) |cancel| cancel.token() else null);
                     try ensureRequestDeadline(runner.deadline);
                 }
                 fn execute(raw: *anyopaque, a: std.mem.Allocator, name: []const u8, query: []const u8) !contextual_operations.OwnedResponse {
@@ -23053,10 +23059,6 @@ pub const ApiHttpServer = struct {
                     response.body = encoded;
                     return response;
                 }
-                fn cursorCancelled(raw: *const anyopaque) bool {
-                    const cancel: *const http_common.RequestCancellation = @ptrCast(@alignCast(raw));
-                    return cancel.isCancelled();
-                }
                 fn saveCursor(raw: *anyopaque, a: std.mem.Allocator, bytes: []const u8) ![]const u8 {
                     const runner: *@This() = @ptrCast(@alignCast(raw));
                     const started = @import("antfly_platform").time.monotonicNs();
@@ -23065,7 +23067,7 @@ pub const ApiHttpServer = struct {
                     var store = try @import("lake_index_store.zig").Store.openNative(a, runner.server.cfg.node_config, runner.server.cfg.secret_store, false, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
                     defer store.deinit();
                     var artifacts = store.artifactStore();
-                    return @import("lake_retained_cut.zig").saveCursor(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), runner.server.embedding_provider_runtime.io, bytes, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, if (runner.cancellation) |cancel| .{ .ptr = cancel, .is_cancelled_fn = cursorCancelled } else .none);
+                    return @import("lake_retained_cut.zig").saveCursor(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), runner.server.embedding_provider_runtime.io, bytes, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, if (runner.cancellation) |cancel| cancel.token() else .none);
                 }
                 fn loadCursor(raw: *anyopaque, a: std.mem.Allocator, token: []const u8) ![]const u8 {
                     const runner: *@This() = @ptrCast(@alignCast(raw));
@@ -23075,7 +23077,7 @@ pub const ApiHttpServer = struct {
                     var store = try @import("lake_index_store.zig").Store.openNative(a, runner.server.cfg.node_config, runner.server.cfg.secret_store, true, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
                     defer store.deinit();
                     var artifacts = store.artifactStore();
-                    return @import("lake_retained_cut.zig").loadCursor(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), token, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, if (runner.cancellation) |cancel| .{ .ptr = cancel, .is_cancelled_fn = cursorCancelled } else .none);
+                    return @import("lake_retained_cut.zig").loadCursor(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), token, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, if (runner.cancellation) |cancel| cancel.token() else .none);
                 }
                 fn localDigest(bytes: []const u8) [64]u8 {
                     return @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.digestHex(bytes);
@@ -23326,15 +23328,9 @@ pub const ApiHttpServer = struct {
 
         var lines = std.mem.splitScalar(u8, body, '\n');
         while (lines.next()) |raw_line| {
-            if (cancellation) |value| {
-                if (value.isCancelled()) {
-                    return try self.publicQueryOperationErrorResponse(
-                        route_table_name orelse "",
-                        raw_line,
-                        error.Cancelled,
-                    );
-                }
-            }
+            ensureRequestActive(if (cancellation) |value| value.token() else null) catch |err| {
+                return try self.publicQueryOperationErrorResponse(route_table_name orelse "", raw_line, err);
+            };
             const line = std.mem.trim(u8, raw_line, " \t\r");
             if (line.len == 0) continue;
 
@@ -26703,9 +26699,10 @@ fn ensureRequestDeadline(deadline_ns: ?u64) !void {
 }
 
 fn ensureRequestActive(cancellation: ?CancellationToken) !void {
-    if (cancellation) |value| {
-        if (value.isCancelled()) return error.Cancelled;
-    }
+    if (cancellation) |value| value.check() catch |err| return switch (err) {
+        error.DeadlineExceeded => error.DeadlineExceeded,
+        else => error.Cancelled,
+    };
 }
 
 fn ensureTableOperationActive(request: api_operation.RequestContext) error{ Canceled, DeadlineExceeded }!void {
@@ -62140,4 +62137,19 @@ test "admission routing table creation preserves permanent validation refusals o
             try std.testing.expect(!parsed.value.object.get("retryable").?.bool);
         }
     }
+}
+
+test "public execution native query checkpoints preserve scoped deadline errors" {
+    const Check = struct {
+        fn expired(_: *const anyopaque) !void {
+            return error.DeadlineExceeded;
+        }
+        fn probe(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    var state: u8 = 0;
+    try std.testing.expectError(error.DeadlineExceeded, ensureRequestActive(.{ .ptr = &state, .is_cancelled_fn = Check.probe, .check_fn = Check.expired }));
+    var disconnected = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, ensureRequestActive(CancellationToken.fromAtomic(&disconnected)));
 }

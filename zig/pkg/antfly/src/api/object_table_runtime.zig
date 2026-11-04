@@ -165,11 +165,17 @@ pub const Manager = struct {
         }
         const path = try std.fmt.allocPrint(a, "/tables/data/{s}", .{suffix});
         defer a.free(path);
-        return entry.stack.handler.handle(.{ .method = method, .path = path, .body = body, .cancellation = context.cancellation, .deadline_ns = guard.context.deadline_ns }) catch |err| {
+        var response = entry.stack.handler.handle(.{ .method = method, .path = path, .body = body, .cancellation = context.cancellation, .deadline_ns = guard.context.deadline_ns }) catch |err| {
             // Transport-only cancellation adapters may report Canceled when
             // the request deadline expired. Preserve the native error kind.
             if (method == .get or std.mem.eql(u8, suffix, "query")) try guard.context.ensureActive();
             return err;
         };
+        errdefer response.deinit(a);
+        // The embedded HTTP adapter can encode generic cancellation as a
+        // response. Reads still belong to this native request's precise budget.
+        // Mutation responses retain their admitted durable outcome unchanged.
+        if (method == .get or std.mem.eql(u8, suffix, "query")) try guard.context.ensureActive();
+        return response;
     }
 };

@@ -21067,6 +21067,49 @@ test "public execution query cancellation preserves ingress deadline and clock" 
     try std.testing.expectError(error.Canceled, cancellation.token().check());
 }
 
+test "public execution query routes distinguish ingress expiry from client cancellation" {
+    const a = std.testing.allocator;
+    const Source = struct {
+        fn catalog(_: *anyopaque, _: std.mem.Allocator, context: operation_contract.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            try context.ensureActive();
+            return error.TestUnexpectedResult;
+        }
+    };
+    var unused: u8 = 0;
+    var server = ApiHttpServer.init(a, .{}, .{ .ptr = &unused, .vtable = &.{ .status = undefined, .system_catalog = Source.catalog } }, null, null);
+    defer server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &server };
+    const Route = enum { table, global, ndjson, composed };
+    for ([_]Route{ .table, .global, .ndjson, .composed }) |route| {
+        for ([_]bool{ false, true }) |disconnected| {
+            var request = try httpx.Request.init(a, .POST, if (route == .global or route == .composed) "http://node/db/v1/query" else "http://node/db/v1/tables/docs/query");
+            defer request.deinit();
+            request.body = switch (route) {
+                .global => "{\"table\":\"docs\"}",
+                .composed => "{\"source\":{\"union\":[{\"table\":\"docs\"},{\"table\":\"docs\"}]},\"source_ranking\":\"rrf\"}",
+                else => "{}",
+            };
+            if (route == .ndjson) try request.setHeader("content-type", "application/x-ndjson");
+            var ctx = httpx.Context.init(a, std.testing.io, &request);
+            defer ctx.deinit();
+            var listener = std.atomic.Value(bool).init(disconnected);
+            ctx.cancellation = &listener;
+            // No socket has disconnected in the expiry case. Only the
+            // ingress budget ends, before native catalog admission begins.
+            if (!disconnected) ctx.application_deadline_ns = 0;
+            var response = if (route == .global or route == .composed) try handler.globalQuery(&ctx) else try handler.queryTable(&ctx, "docs");
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, if (disconnected) 499 else 504), response.status.code);
+            if (!disconnected) {
+                var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+                defer parsed.deinit();
+                try std.testing.expectEqualStrings("query_timeout", parsed.value.object.get("code").?.string);
+                try std.testing.expect(parsed.value.object.get("retryable").?.bool);
+            }
+        }
+    }
+}
+
 test "public execution request cancellation retains foreign checkpoints without probing them" {
     const abi = @import("antfly_runtime_abi");
     const Foreign = struct {
@@ -21089,6 +21132,13 @@ test "public execution request cancellation retains foreign checkpoints without 
     });
     try std.testing.expect(!cancellation.isCancelled());
     try std.testing.expectError(error.DeadlineExceeded, cancellation.token().check());
+    const operation: operation_contract.RequestContext = .{ .cancellation = cancellation.token() };
+    // A transport probe must not execute the fallible foreign checkpoint.
+    try std.testing.expect(!operation.isCancellationRequested());
+    const guard: @import("../serverless/api/http_types.zig").RequestGuard = .{ .context = operation };
+    try std.testing.expect(!guard.token().isCancelled());
+    try std.testing.expectError(error.DeadlineExceeded, guard.token().check());
+    try std.testing.expectError(error.DeadlineExceeded, operation.ensureActive());
     cancellation.cancel();
     try std.testing.expect(cancellation.isCancelled());
     try std.testing.expectError(error.Canceled, cancellation.token().check());
