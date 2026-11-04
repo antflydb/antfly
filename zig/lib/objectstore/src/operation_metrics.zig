@@ -20,17 +20,25 @@
 const std = @import("std");
 pub const Operation = enum { bucket_probe, bucket_create, get, get_batch, put, put_batch, stat, attributes, list, list_versions, delete, conditional_put, conditional_delete, provider_time, retention, version_support };
 const count = @typeInfo(Operation).@"enum".field_names.len;
-pub const Snapshot = struct { calls: [count]u64, errors: [count]u64, nanoseconds: [count]u64, max_nanoseconds: [count]u64, retries: u64 };
+pub const Snapshot = struct { calls: [count]u64, errors: [count]u64, nanoseconds: [count]u64, max_nanoseconds: [count]u64, input_bytes: [count]u64 = @splat(0), output_bytes: [count]u64 = @splat(0), retries: u64 };
 pub const Metrics = struct {
     calls: [count]std.atomic.Value(u64) = @splat(.init(0)),
     errors: [count]std.atomic.Value(u64) = @splat(.init(0)),
     nanoseconds: [count]std.atomic.Value(u64) = @splat(.init(0)),
     max_nanoseconds: [count]std.atomic.Value(u64) = @splat(.init(0)),
+    input_bytes: [count]std.atomic.Value(u64) = @splat(.init(0)),
+    output_bytes: [count]std.atomic.Value(u64) = @splat(.init(0)),
     retries: std.atomic.Value(u64) = .init(0),
     pub const Timer = struct {
         metrics: *Metrics,
         op: Operation,
         started: u64,
+        pub fn input(self: Timer, bytes: usize) void {
+            _ = self.metrics.input_bytes[@backingInt(self.op)].fetchAdd(bytes, .monotonic);
+        }
+        pub fn output(self: Timer, bytes: usize) void {
+            _ = self.metrics.output_bytes[@backingInt(self.op)].fetchAdd(bytes, .monotonic);
+        }
         pub fn failed(self: Timer) void {
             _ = self.metrics.errors[@backingInt(self.op)].fetchAdd(1, .monotonic);
         }
@@ -48,6 +56,8 @@ pub const Metrics = struct {
     pub fn snapshot(self: *Metrics) Snapshot {
         var result: Snapshot = .{ .calls = undefined, .errors = undefined, .nanoseconds = undefined, .max_nanoseconds = undefined, .retries = self.retries.load(.monotonic) };
         for (0..count) |i| {
+            result.input_bytes[i] = self.input_bytes[i].load(.monotonic);
+            result.output_bytes[i] = self.output_bytes[i].load(.monotonic);
             result.calls[i] = self.calls[i].load(.monotonic);
             result.errors[i] = self.errors[i].load(.monotonic);
             result.nanoseconds[i] = self.nanoseconds[i].load(.monotonic);
@@ -60,11 +70,15 @@ pub var runtime: Metrics = .{};
 test "objectstore operation diagnostics retain errors and maximum without identifiers" {
     var metrics: Metrics = .{};
     const timer = metrics.start(.get);
+    timer.input(17);
     timer.failed();
     timer.finish();
     const next = metrics.start(.get);
+    next.output(23);
     next.finish();
     const snapshot = metrics.snapshot();
+    try std.testing.expectEqual(@as(u64, 17), snapshot.input_bytes[@backingInt(Operation.get)]);
+    try std.testing.expectEqual(@as(u64, 23), snapshot.output_bytes[@backingInt(Operation.get)]);
     try std.testing.expectEqual(@as(u64, 2), snapshot.calls[@backingInt(Operation.get)]);
     try std.testing.expectEqual(@as(u64, 1), snapshot.errors[@backingInt(Operation.get)]);
     try std.testing.expect(snapshot.max_nanoseconds[@backingInt(Operation.get)] <= snapshot.nanoseconds[@backingInt(Operation.get)]);

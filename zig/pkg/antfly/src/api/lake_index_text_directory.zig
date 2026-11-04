@@ -163,18 +163,12 @@ const Reader = struct {
     publication: bool = false,
     pages: pages_mod.PageStore = undefined,
     fn init(self: *@This(), domain: Id) void {
-        self.pages = .{ .domain = domain, .artifacts = &self.store, .cancellation = self.token, .remaining_read_bytes = self.external_budget orelse &self.reads, .remaining_write_bytes = &self.writes, .read_cache = if (self.cached != null) .{ .ptr = self, .read = readPage } else null };
+        self.pages = .{ .domain = domain, .artifacts = &self.store, .cancellation = self.token, .remaining_read_bytes = self.external_budget orelse &self.reads, .remaining_write_bytes = &self.writes, .read_cache = if (self.cached) |*cached| @import("lake_index_navigation_pages.zig").cacheBinding(cached) else null };
         if (self.publication) self.pages.admitPublication();
     }
     fn check(self: *@This()) !void {
         try self.token.check();
         if (self.cached) |cached| try cached.context.ensureActive();
-    }
-    fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, digest: Id, token: Cancellation, budget: *u64) ![]u8 {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        try self.check();
-        try stores.chargeReadBudget(budget, length);
-        return artifacts.readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, digest, token, self.cached);
     }
 };
 fn key(id: Id, offset: usize) [36]u8 {
@@ -861,6 +855,10 @@ test "external lake exact segment admission skips missing unrelated descriptors 
     const navigation = @import("lake_index_navigation_warming.zig");
     const warmed = try navigation.warmRoots(store, cached, &.{.{ .domain = root.domain, .ref = roots.routing.? }}, .none);
     try std.testing.expect(warmed > 0 and warmed <= navigation.max_pages);
+    const shared_pages: @import("lake_index_navigation_pages.zig").Reader = .{ .store = store, .domain = root.domain, .cached = cached, .token = .none };
+    var warmed_page = (try shared_pages.lookup(roots.routing.?)) orelse return error.WarmingDidNotRetainDecodedNavigation;
+    warmed_page.deinit(a);
+
     try std.testing.expectError(error.DeadlineExceeded, navigation.warmRoots(store, expired, &.{.{ .domain = root.domain, .ref = roots.routing.? }}, .none));
     var windows = try RoutingCursor.create(a, window_root, store, cached, .none);
     defer windows.deinit();

@@ -652,6 +652,9 @@ test "external lake global frontier native GC retains shared aggregate blocks na
     nav_source.verified_files = null;
     nav_source.prepared_deletes = null;
     nav_source.scanner.iceberg_delete_plan = null;
+    // catalog() reads these; leaving them undefined is illegal behavior.
+    nav_source.selected_catalog_view = false;
+    nav_source.plan_lease = null;
     var nav_provider: @import("lake_index_row_source.zig").Provider = .{ .source = &nav_source, .context = .{ .io = std.testing.io } };
     const nav_old = try navigation_api.build(a, ca, &store, &nav_provider, null, .none);
     const nav_old_root = try navigation_api.load(ca, store, nav_old.ref, .none, null);

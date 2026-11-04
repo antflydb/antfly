@@ -55,6 +55,7 @@ def summarize(report):
     return {
         "rows": report["row_count"],
         "publication_seconds": report["ready_seconds"],
+        "publication_io": report.get("publication_io"),
         "cold_ms": report["first_search_ms"],
         "warm": distribution(report["warm_samples_ms"]),
         "restart_ms": report["after_restart_ms"],
