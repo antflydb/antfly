@@ -39,32 +39,39 @@ pub const Marker = apply_receipts.OutcomeMarker;
 pub const writer_len = apply_receipts.outcome_writer_len;
 
 /// Text form: `or1:<32 hex writer>:<decimal sequence>`, followed by
-/// `:<hex table name>` when the marker lives in a named SQL table's database
-/// rather than the handle's root (`default`) database.
+/// `:<hex table name>:<decimal table id>` when the marker lives in a named SQL
+/// table's database rather than the handle's root (`default`) database. Table
+/// ids are never reused, so a receipt never resolves against a later table
+/// that took the same name.
 pub const text_prefix = "or1:";
 /// Matches the SQL table name limit (`tables.create`).
 pub const max_table_len = 1024;
-pub const max_text_len = text_prefix.len + 2 * writer_len + 1 + 20 + 1 + 2 * max_table_len;
+pub const max_text_len = text_prefix.len + 2 * writer_len + 1 + 20 + 1 + 2 * max_table_len + 1 + 20;
+
+/// The named table a write committed to: its name and durable table id.
+pub const TableRef = struct { name: []const u8, id: u64 };
 
 /// A receipt: the marker plus the database (table) that holds it.
 pub const Receipt = struct {
     marker: Marker,
     table_buf: [max_table_len]u8 = undefined,
     table_len: ?usize = null,
+    table_id: u64 = 0,
 
-    pub fn init(marker: Marker, table_name: ?[]const u8) Receipt {
+    pub fn init(marker: Marker, target: ?TableRef) Receipt {
         var receipt: Receipt = .{ .marker = marker };
-        if (table_name) |name| {
-            std.debug.assert(name.len <= max_table_len);
-            @memcpy(receipt.table_buf[0..name.len], name);
-            receipt.table_len = name.len;
+        if (target) |ref| {
+            std.debug.assert(ref.name.len <= max_table_len);
+            @memcpy(receipt.table_buf[0..ref.name.len], ref.name);
+            receipt.table_len = ref.name.len;
+            receipt.table_id = ref.id;
         }
         return receipt;
     }
 
     /// The named table holding the marker; null for the root database.
-    pub fn table(self: *const Receipt) ?[]const u8 {
-        return if (self.table_len) |len| self.table_buf[0..len] else null;
+    pub fn table(self: *const Receipt) ?TableRef {
+        return if (self.table_len) |len| .{ .name = self.table_buf[0..len], .id = self.table_id } else null;
     }
 };
 
@@ -117,7 +124,7 @@ pub const Writer = struct {
     /// The call holding `marker` (committed to `table_name`) ended with an
     /// unknown outcome: publish its receipt and retire the writer so its
     /// marker never moves again.
-    pub fn retire(self: *Writer, marker: Marker, table_name: ?[]const u8) void {
+    pub fn retire(self: *Writer, marker: Marker, target: ?TableRef) void {
         self.lock();
         const pending = self.pending_until_close;
         if (self.id) |id| if (std.mem.eql(u8, &id, &marker.writer)) {
@@ -128,7 +135,7 @@ pub const Writer = struct {
             self.clearTables();
         };
         self.mutex.unlock();
-        last_receipt = Receipt.init(marker, table_name);
+        last_receipt = Receipt.init(marker, target);
         if (pending) registerPending(marker.writer, self);
     }
 
@@ -214,8 +221,8 @@ pub fn lastReceipt() ?*const Receipt {
 
 pub fn format(receipt: *const Receipt, buf: *[max_text_len]u8) []const u8 {
     const marker = receipt.marker;
-    if (receipt.table()) |name|
-        return std.fmt.bufPrint(buf, "{s}{x}:{d}:{x}", .{ text_prefix, &marker.writer, marker.sequence, name }) catch unreachable;
+    if (receipt.table()) |ref|
+        return std.fmt.bufPrint(buf, "{s}{x}:{d}:{x}:{d}", .{ text_prefix, &marker.writer, marker.sequence, ref.name, ref.id }) catch unreachable;
     return std.fmt.bufPrint(buf, "{s}{x}:{d}", .{ text_prefix, &marker.writer, marker.sequence }) catch unreachable;
 }
 
@@ -232,10 +239,14 @@ pub fn parse(text: []const u8) !Receipt {
         .{ tail, @as(?[]const u8, null) };
     receipt.marker.sequence = std.fmt.parseInt(u64, sequence_text, 10) catch return error.InvalidOutcomeReceipt;
     if (receipt.marker.sequence == 0) return error.InvalidOutcomeReceipt;
-    if (table_hex) |hex| {
+    if (table_hex) |table_text| {
+        // A named table needs both its name and its id.
+        const colon = std.mem.indexOfScalar(u8, table_text, ':') orelse return error.InvalidOutcomeReceipt;
+        const hex = table_text[0..colon];
         if (hex.len == 0 or hex.len % 2 != 0 or hex.len / 2 > max_table_len) return error.InvalidOutcomeReceipt;
         const name = std.fmt.hexToBytes(receipt.table_buf[0 .. hex.len / 2], hex) catch return error.InvalidOutcomeReceipt;
         receipt.table_len = name.len;
+        receipt.table_id = std.fmt.parseInt(u64, table_text[colon + 1 ..], 10) catch return error.InvalidOutcomeReceipt;
     }
     return receipt;
 }
@@ -303,16 +314,18 @@ test "capi SQL outcome receipt text round-trips and rejects malformed input" {
     const parsed = try parse(text);
     try std.testing.expectEqualSlices(u8, &marker.writer, &parsed.marker.writer);
     try std.testing.expectEqual(marker.sequence, parsed.marker.sequence);
-    try std.testing.expectEqual(@as(?[]const u8, null), parsed.table());
-    // A named table's receipt names the database that holds its marker.
-    const named = Receipt.init(marker, "orders:2026");
+    try std.testing.expect(parsed.table() == null);
+    // A named table's receipt names the database that holds its marker, and
+    // the table's durable id.
+    const named = Receipt.init(marker, .{ .name = "orders:2026", .id = 7 });
     var named_buf: [max_text_len]u8 = undefined;
     const named_text = format(&named, &named_buf);
-    try std.testing.expectEqualStrings("or1:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a:42:6f72646572733a32303236", named_text);
+    try std.testing.expectEqualStrings("or1:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a:42:6f72646572733a32303236:7", named_text);
     const named_parsed = try parse(named_text);
-    try std.testing.expectEqualStrings("orders:2026", named_parsed.table().?);
+    try std.testing.expectEqualStrings("orders:2026", named_parsed.table().?.name);
+    try std.testing.expectEqual(@as(u64, 7), named_parsed.table().?.id);
     try std.testing.expectEqual(marker.sequence, named_parsed.marker.sequence);
-    for ([_][]const u8{ "", "or1:", "or2:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a:1", "or1:5a5a:1", "or1:zz5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a:1", "or1:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a:0", "or1:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a:x", "or1:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a:1:", "or1:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a:1:abc", "or1:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a:1:zz" }) |bad| {
+    for ([_][]const u8{ "", "or1:", "or2:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a:1", "or1:5a5a:1", "or1:zz5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a:1", "or1:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a:0", "or1:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a:x", "or1:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a:1:", "or1:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a:1:abc", "or1:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a:1:zz", "or1:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a:1:6f72", "or1:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a:1:6f72:", "or1:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a:1:6f72:x" }) |bad| {
         try std.testing.expectError(error.InvalidOutcomeReceipt, parse(bad));
     }
 }
@@ -325,9 +338,9 @@ test "capi SQL outcome receipt writer retires after an unknown outcome and track
     try std.testing.expectEqualSlices(u8, &first.writer, &second.writer);
     try std.testing.expectEqual(first.sequence + 1, second.sequence);
     try std.testing.expect(writer.hasCloseCleanup());
-    writer.retire(second, "orders");
+    writer.retire(second, .{ .name = "orders", .id = 3 });
     try std.testing.expectEqual(second.sequence, lastReceipt().?.marker.sequence);
-    try std.testing.expectEqualStrings("orders", lastReceipt().?.table().?);
+    try std.testing.expectEqualStrings("orders", lastReceipt().?.table().?.name);
     try std.testing.expect(isPending(second.writer));
     // A retired writer is never reused, and is not cleaned up at close.
     try std.testing.expect(!writer.hasCloseCleanup());

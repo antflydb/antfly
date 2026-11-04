@@ -563,6 +563,14 @@ const OutcomeFixture = struct {
 
 const insert_one = "{\"statement\":\"INSERT INTO t (_id,n) VALUES ('r',1)\"}";
 
+/// Table `t` as a receipt names it: its name and current durable id.
+fn tableT(id: ?*anyopaque) !@import("outcome_receipts.zig").TableRef {
+    const guard = @import("db.zig").enterHandle(id, .read).?;
+    defer guard.leave();
+    const database = try @import("tables.zig").get(guard.handle, "t");
+    return .{ .name = "t", .id = database.core.identity_namespace.table_id };
+}
+
 /// Arms one primary-commit fault: fail before the decision with `err`, or
 /// (with `publication`) fail inside the decision's checkpoint publication.
 const PrimaryFault = struct {
@@ -860,9 +868,11 @@ test "capi SQL outcome receipt resolves a Lite autocommit write of unknown outco
         try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, reply.code);
         const receipt = try lastReceiptAlloc();
         // The SQL error body carries the same receipt, naming table `t`
-        // (hex 74), whose database holds the marker.
+        // and its durable id, whose database holds the marker.
         try std.testing.expectEqualStrings(receipt, reply.parsed.?.value.object.get("outcome_receipt").?.string);
-        try std.testing.expect(std.mem.endsWith(u8, receipt, ":74"));
+        const parsed_receipt = try @import("outcome_receipts.zig").parse(receipt);
+        const target = parsed_receipt.table().?;
+        try std.testing.expectEqualStrings("t", target.name);
         break :blk receipt;
     };
     defer std.testing.allocator.free(receipt);
@@ -889,7 +899,7 @@ test "capi SQL outcome receipt resolves against the named table that holds its m
     const writer = &f.wrapper.outcome_writer;
     const marker: receipts.Marker = .{ .writer = writer.id.?, .sequence = writer.sequence };
     var buf: [receipts.max_text_len]u8 = undefined;
-    const named = receipts.Receipt.init(marker, "t");
+    const named = receipts.Receipt.init(marker, try tableT(f.id));
     const applied = try receiptStatus(f.id, receipts.format(&named, &buf));
     try std.testing.expectEqual(h.capi.ErrorCode.ok, applied.code);
     try std.testing.expectEqual(@import("db.zig").ANTFLY_OUTCOME_RECEIPT_APPLIED, applied.status);
@@ -900,8 +910,31 @@ test "capi SQL outcome receipt resolves against the named table that holds its m
     try std.testing.expectEqual(@import("db.zig").ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED, (try receiptStatus(f.id, receipts.format(&root, &root_buf))).status);
     // An unknown table is an error, not "not applied".
     var missing_buf: [receipts.max_text_len]u8 = undefined;
-    const missing = receipts.Receipt.init(marker, "no_such_table");
+    const missing = receipts.Receipt.init(marker, .{ .name = "no_such_table", .id = 1 });
     try std.testing.expect((try receiptStatus(f.id, receipts.format(&missing, &missing_buf))).code != .ok);
+}
+
+test "capi SQL outcome receipt for a dropped and recreated table fails closed" {
+    const receipts = @import("outcome_receipts.zig");
+    var f = try OutcomeFixture.init("receipt-recreated-table");
+    defer f.deinit();
+    try f.expectOk(insert_one);
+    const writer = &f.wrapper.outcome_writer;
+    const marker: receipts.Marker = .{ .writer = writer.id.?, .sequence = writer.sequence };
+    const original = try tableT(f.id);
+    var buf: [receipts.max_text_len]u8 = undefined;
+    const text = receipts.format(&receipts.Receipt.init(marker, original), &buf);
+    try std.testing.expectEqual(@import("db.zig").ANTFLY_OUTCOME_RECEIPT_APPLIED, (try receiptStatus(f.id, text)).status);
+    // The write applied to the old `t`. A new `t` holds no marker for it, so
+    // reading there would wrongly answer "not applied" and invite a retry.
+    try f.expectOk("{\"statement\":\"DROP TABLE t\"}");
+    try std.testing.expect((try receiptStatus(f.id, text)).code != .ok);
+    try f.expectOk("{\"statement\":\"CREATE TABLE t (n BIGINT)\"}");
+    try std.testing.expect((try tableT(f.id)).id != original.id);
+    const replaced = try receiptStatus(f.id, text);
+    try std.testing.expect(replaced.code != .ok);
+    try std.testing.expectEqual(@as(u8, 0), replaced.status);
+    try std.testing.expect(@import("db.zig").antfly_db_outcome_receipt_forget(f.id, .fromSlice(text)) != .ok);
 }
 
 test "capi SQL outcome receipt markers in named tables are removed at a clean close" {
@@ -940,7 +973,7 @@ test "capi SQL outcome receipt from a table handle batch names that table" {
     const writer = &f.wrapper.outcome_writer;
     const marker: receipts.Marker = .{ .writer = writer.id.?, .sequence = writer.sequence };
     var buf: [receipts.max_text_len]u8 = undefined;
-    const named = receipts.Receipt.init(marker, "t");
+    const named = receipts.Receipt.init(marker, try tableT(f.id));
     const status = try receiptStatus(f.id, receipts.format(&named, &buf));
     try std.testing.expectEqual(h.capi.ErrorCode.ok, status.code);
     try std.testing.expectEqual(api.ANTFLY_OUTCOME_RECEIPT_APPLIED, status.status);
@@ -960,7 +993,7 @@ test "capi SQL outcome receipt resolves the same through a table handle as throu
     const root_receipt = receipts.format(&receipts.Receipt.init(.{ .writer = writer.id.?, .sequence = writer.sequence }, null), &root_buf);
     try f.expectOk(insert_one);
     var named_buf: [receipts.max_text_len]u8 = undefined;
-    const named_receipt = receipts.format(&receipts.Receipt.init(.{ .writer = writer.id.?, .sequence = writer.sequence }, "t"), &named_buf);
+    const named_receipt = receipts.format(&receipts.Receipt.init(.{ .writer = writer.id.?, .sequence = writer.sequence }, try tableT(f.id)), &named_buf);
 
     var table_id: ?*anyopaque = null;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, @import("tables.zig").antfly_db_open_table(f.id, .fromSlice("t"), &table_id));
@@ -1001,7 +1034,9 @@ test "capi SQL outcome receipt for a named table on a directory handle resolves 
     try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, code);
     const receipt = try lastReceiptAlloc();
     defer std.testing.allocator.free(receipt);
-    try std.testing.expect(std.mem.endsWith(u8, receipt, ":74"));
+    const parsed_receipt = try receipts.parse(receipt);
+    const target = parsed_receipt.table().?;
+    try std.testing.expectEqualStrings("t", target.name);
     api.antfly_db_close(id);
     open = false;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open(path, &id));
