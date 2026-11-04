@@ -173,6 +173,10 @@ independently established implementation problems:
   proofs publish only after the nodes are durable. Retirement still requires an
   exact-metadata reachability proof and catalog HEAD CAS; cancellation cannot
   authorize deletion through an unpublished partial root.
+  Vacuum traversal now batches its visited-set updates too. Parent frames stay
+  in memory until checkpointing, which persists only the surviving parent chain
+  before returning the cursor. The cursor format is unchanged; failed or
+  cancelled publication cannot expose an incomplete closure.
 - A reachability turn discarded its partial checkpoint if HEAD changed during
   traversal, so frequent appends could repeatedly erase useful work. An
   interleaving test reproduced the missing checkpoint. Progress now persists
@@ -212,6 +216,17 @@ reached. A Debug stack sample and object counters identified substantial remote
 reachability/inventory work. The immutable-read probe removal is under separate
 Debug validation; it was not present in that continuation. ReleaseFast
 requalification remains outstanding.
+
+The continuation at `e2a67d7103`, with direct trie reads, also reached its bound:
+41 acknowledged turns and 546.96 seconds, with 19 reported deletions and 76
+retained objects. It checked 103 accepted row images before maintenance, but did
+not reach its post-maintenance checks. The next measured amplification was the
+traversal visited set and parent frames, which still wrote intermediate objects.
+Their checkpoint batching passes 21 focused vacuum tests, including lost frontier
+acknowledgments, cancellation, shared roots and cold recovery through a
+512-level inventory graph. A further Debug continuation is required before
+optimized qualification. Logical operation counters include concurrent artifact
+GC and must not be attributed entirely to this vacuum job.
 
 Next work should:
 

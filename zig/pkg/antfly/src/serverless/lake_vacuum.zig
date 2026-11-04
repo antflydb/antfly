@@ -315,7 +315,7 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
                 }
                 progress.approved = selected.items;
                 progress.approved_index = 0;
-                progress.cursor = walker.checkpoint();
+                progress.cursor = try walker.checkpoint();
                 progress.exhausted = exhausted;
             }
             // Save the fenced deletion batch before any physical deletion.
