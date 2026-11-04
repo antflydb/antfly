@@ -12019,6 +12019,11 @@ test "lite reclamation cooperative conversion defers replay and yields to primar
     // Revision 8 has the same checkpoint representation, but lacks the
     // revision-9 semantic publication contract and needs a replacement.
     store.file.header.indexed_revision = 8;
+    // Transaction publication changes checkpoint slots, not file-format bytes.
+    // Establish a real legacy header before exercising ordinary mutations.
+    var legacy_header: [native.header_size]u8 = undefined;
+    native.encodeHeader(&legacy_header, store.file.header);
+    try store.file.file.writePositionalAll(std.testing.io, &legacy_header, 0);
     try store.file.putDocument("retained", "original");
     try store.appendReplayOpaque(a, 1, "pending replay");
     for (0..3) |_| {

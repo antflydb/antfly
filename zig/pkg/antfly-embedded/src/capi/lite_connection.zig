@@ -3661,9 +3661,9 @@ pub const Owner = struct {
         // Numeric/enum diagnostics only: no path, SQL, model or document data.
         // Preparation overlaps actor service; durations are not additive.
         std.log.info("antfly_bench_native_owner source_turns={d} capture_ns={d} replay_ns={d} artifacts_ns={d} storage_ns={d} runtime_refreshes={d} maintenance_errors={d} maintenance_timeouts={d} merge_started={d} merge_applied={d} merge_discarded={d} merge_prepare_ns={d} merge_staging_ns={d} merge_staged_bytes={d} merge_publication_ns={d} sql_overlay_hits={d} sql_overlay_rebuilds={d} sql_overlay_rebuild_entries={d} sql_overlay_evictions={d} sql_staged_statements={d} replay_waits={d} replay_refused_prepare_ns={d} last_failure={s}", .{ p.maintenance_source_turns, p.maintenance_capture_ns, p.maintenance_replay_ns, p.maintenance_artifacts_ns, p.maintenance_storage_ns, p.serving_runtime_refreshes, p.maintenance_errors, p.maintenance_queue_timeouts, p.text_merge_jobs_started, p.text_merge_jobs_applied, p.text_merge_jobs_discarded, p.text_merge_prepare_ns, p.text_merge_staging_ns, p.text_merge_staged_bytes, p.text_merge_publication_ns, p.sql_constraint_overlay_hits, p.sql_constraint_overlay_rebuilds, p.sql_constraint_overlay_rebuild_entries, p.sql_constraint_overlay_evictions, p.sql_constraint_staged_statements, p.replay_backpressure_waits, p.replay_refused_preparation_ns, p.last_maintenance_failure orelse "none" });
-        inline for (std.meta.fields(TextRuntimeCacheDiagnostics)) |field| {
-            const count = @field(p.text_runtime_cache, field.name);
-            if (count != 0) std.log.info("antfly_bench_native_runtime_cache_{s} count={d}", .{ field.name, count });
+        inline for (@typeInfo(TextRuntimeCacheDiagnostics).@"struct".field_names) |field_name| {
+            const count = @field(p.text_runtime_cache, field_name);
+            if (count != 0) std.log.info("antfly_bench_native_runtime_cache_{s} count={d}", .{ field_name, count });
         }
         if (self.current) |current| {
             const work = current.owned_lite_backend.?.native_docstore.?.file.allocatorWorkSnapshot();
