@@ -2128,12 +2128,13 @@ pub const Owner = struct {
     /// on the serving wrapper before retiring cached immutable readers.
     fn preserveMaintenanceOutcomeFence(self: *Owner) void {
         const current = self.current orelse return;
+        const current_store = current.owned_lite_backend.?.native_docstore.?;
         for ([_]?*h.Handle{ self.maintenance_snapshot, if (self.pending_text_merge) |pending| pending.root else null }) |maybe_root| {
             const root = maybe_root orelse continue;
+            const source_store = root.owned_lite_backend.?.native_docstore.?;
             current.sql_decision_uncertain = current.sql_decision_uncertain or root.sql_decision_uncertain;
-            current.secret_store_uncertain = current.secret_store_uncertain or root.secret_store_uncertain;
-            const file = &current.owned_lite_backend.?.native_docstore.?.file;
-            file.checkpoint_publication_uncertain = file.checkpoint_publication_uncertain or root.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain;
+            current_store.secret_store_uncertain = current_store.secret_store_uncertain or source_store.secret_store_uncertain;
+            current_store.file.checkpoint_publication_uncertain = current_store.file.checkpoint_publication_uncertain or source_store.file.checkpoint_publication_uncertain;
         }
     }
 
@@ -8249,12 +8250,12 @@ test "capi native maintenance retires uncertain cached readers without clearing 
         try std.testing.expect(!Owner.needsOutcomeReconciliation(owner.current.?));
         const peer_turn = (try owner.acquireMaintenanceTurnGuard()) orelse return error.TestUnexpectedResult;
         defer peer_turn.close(h.handleLockIo());
-        if (comptime std.mem.eql(u8, kind, "sql")) source.sql_decision_uncertain = true else if (comptime std.mem.eql(u8, kind, "checkpoint")) source.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain = true else source.secret_store_uncertain = true;
+        if (comptime std.mem.eql(u8, kind, "sql")) source.sql_decision_uncertain = true else if (comptime std.mem.eql(u8, kind, "checkpoint")) source.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain = true else source.owned_lite_backend.?.native_docstore.?.secret_store_uncertain = true;
         defer {
             // These flags model uncertainty without changing the fixture's
             // durable state. Clear the propagated fence only for teardown.
             owner.current.?.sql_decision_uncertain = false;
-            owner.current.?.secret_store_uncertain = false;
+            owner.current.?.owned_lite_backend.?.native_docstore.?.secret_store_uncertain = false;
             owner.current.?.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain = false;
         }
         owner.maintenance_storage_pending = true;
