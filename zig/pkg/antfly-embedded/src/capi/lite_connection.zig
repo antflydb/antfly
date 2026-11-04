@@ -2176,16 +2176,15 @@ pub const Owner = struct {
 
     /// Caller owns the gate and a quiescent local turn. A merge owns its own
     /// reference, so retiring this cache cannot close its inputs.
-    fn discardTextSourceRuntime(self: *Owner) void {
-        const cache = self.text_source_runtime_cache orelse return;
-        const root = cache.root;
+    fn discardMaintenanceRuntime(self: *Owner) void {
         self.clearTextSourceRuntimeCache();
         self.maintenance_retained_logical = null;
-        if (self.maintenance_snapshot == root) {
-            self.maintenance_snapshot = null;
-            closeMaintenanceSnapshot(root);
-            if (self.reader_coordinator.hasArtifactReleases()) self.maintenance_storage_pending = true;
-        }
+        // A failed physical publication can already have cleared its source
+        // witness while leaving the detached DB and its artifact readers live.
+        const root = self.maintenance_snapshot orelse return;
+        self.maintenance_snapshot = null;
+        closeMaintenanceSnapshot(root);
+        if (self.reader_coordinator.hasArtifactReleases()) self.maintenance_storage_pending = true;
     }
 
     /// Caller owns the path gate and writer lease. Mutable allocator state is
@@ -2656,7 +2655,7 @@ pub const Owner = struct {
             // the refusal on the serving wrapper after its source is retired,
             // including when refresh() would throw before returning a wrapper.
             self.preserveMaintenanceOutcomeFence();
-            if (self.maintenance_turn_references == 0) self.discardTextSourceRuntime();
+            if (self.maintenance_turn_references == 0) self.discardMaintenanceRuntime();
             self.maintenance_turn_deferred = true;
             self.gate.mutex.unlock(turn_io);
             return error.OutcomeReconciliationRequired;
@@ -2733,7 +2732,8 @@ pub const Owner = struct {
         defer if (lease_held) lease.close();
         const foreground = try self.refresh();
         if (needsOutcomeReconciliation(foreground)) {
-            self.discardTextSourceRuntime();
+            self.discardMaintenanceRuntime();
+            self.maintenance_turn_deferred = true;
             return false;
         }
         const foreground_file = &foreground.owned_lite_backend.?.native_docstore.?.file;
@@ -2743,7 +2743,7 @@ pub const Owner = struct {
         // source mutation or waiting for the periodic database audit.
         if (self.text_source_runtime_cache) |cache| {
             if (!try cache.matchesObserved(foreground_file, &self.publication_stats.text_runtime_cache))
-                self.discardTextSourceRuntime();
+                self.discardMaintenanceRuntime();
         }
         // Marker service is directory-bounded and needs no allocator proof.
         // Reap crash/normal-exit leftovers even if this short-lived owner is
@@ -8233,46 +8233,50 @@ test "capi native maintenance keeps settled text inputs warm across artifact tur
 
 test "capi native maintenance retires uncertain cached readers without clearing the owner fence" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
-    inline for (.{ "sql", "checkpoint", "secret" }) |kind| {
-        var fixture = try AdmissionFollowupFixture.init("uncertain-cache-" ++ kind, 5000, .batch);
-        defer fixture.deinit();
-        try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
-        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
-        const owner = fixture.connection.owner;
-        const key: Owner.MaintenanceKey = .{ .table_id = owner.current.?.db.core.identity_namespace.table_id, .incarnation = owner.current.?.db.root_incarnation };
-        for (0..64) |_| {
-            _ = try owner.maintenanceTurnForTest();
-            if (owner.maintenance_schedules.getPtr(key)) |schedule| {
-                if (!schedule.database_pending and schedule.next_database_audit_ns != 0 and !owner.maintenance_storage_pending) break;
+    inline for (.{ true, false }) |has_witness| {
+        inline for (.{ "sql", "checkpoint", "secret" }) |kind| {
+            var fixture = try AdmissionFollowupFixture.init("uncertain-cache-" ++ kind ++ (if (has_witness) "-witness" else "-without-witness"), 5000, .batch);
+            defer fixture.deinit();
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
+            const owner = fixture.connection.owner;
+            const key: Owner.MaintenanceKey = .{ .table_id = owner.current.?.db.core.identity_namespace.table_id, .incarnation = owner.current.?.db.root_incarnation };
+            for (0..64) |_| {
+                _ = try owner.maintenanceTurnForTest();
+                if (owner.maintenance_schedules.getPtr(key)) |schedule| {
+                    if (!schedule.database_pending and schedule.next_database_audit_ns != 0 and !owner.maintenance_storage_pending) break;
+                }
             }
+            const source = (owner.text_source_runtime_cache orelse return error.TestUnexpectedResult).root;
+            if (!has_witness) owner.clearTextSourceRuntimeCache();
+            try std.testing.expect(!Owner.needsOutcomeReconciliation(owner.current.?));
+            const peer_turn = (try owner.acquireMaintenanceTurnGuard()) orelse return error.TestUnexpectedResult;
+            defer peer_turn.close(h.handleLockIo());
+            if (comptime std.mem.eql(u8, kind, "sql")) source.sql_decision_uncertain = true else if (comptime std.mem.eql(u8, kind, "checkpoint")) source.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain = true else source.owned_lite_backend.?.native_docstore.?.secret_store_uncertain = true;
+            defer {
+                // These flags model uncertainty without changing the fixture's
+                // durable state. Clear the propagated fence only for teardown.
+                owner.current.?.sql_decision_uncertain = false;
+                owner.current.?.owned_lite_backend.?.native_docstore.?.secret_store_uncertain = false;
+                owner.current.?.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain = false;
+            }
+            owner.maintenance_storage_pending = true;
+            try std.testing.expectError(error.OutcomeReconciliationRequired, owner.maintenanceTurnForTest());
+            try std.testing.expect(owner.text_source_runtime_cache == null);
+            try std.testing.expect(owner.maintenance_snapshot == null);
+            try std.testing.expect(Owner.needsOutcomeReconciliation(owner.current.?));
+            try std.testing.expectEqual(@as(usize, 0), owner.maintenance_turn_references);
+            owner.maintenance_storage_pending = true;
+            try std.testing.expect(owner.maintenanceWaitMillisForTest(true) > 0);
+            const refused = blk: {
+                owner.gate.mutex.lockUncancelable(h.handleLockIo());
+                defer owner.gate.mutex.unlock(h.handleLockIo());
+                var lease = try native.lockWriterPathWithIo(alloc, h.handleLockIo(), fixture.path);
+                defer lease.close();
+                break :blk owner.refresh();
+            };
+            try std.testing.expectError(error.OutcomeReconciliationRequired, refused);
         }
-        const source = (owner.text_source_runtime_cache orelse return error.TestUnexpectedResult).root;
-        try std.testing.expect(!Owner.needsOutcomeReconciliation(owner.current.?));
-        const peer_turn = (try owner.acquireMaintenanceTurnGuard()) orelse return error.TestUnexpectedResult;
-        defer peer_turn.close(h.handleLockIo());
-        if (comptime std.mem.eql(u8, kind, "sql")) source.sql_decision_uncertain = true else if (comptime std.mem.eql(u8, kind, "checkpoint")) source.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain = true else source.owned_lite_backend.?.native_docstore.?.secret_store_uncertain = true;
-        defer {
-            // These flags model uncertainty without changing the fixture's
-            // durable state. Clear the propagated fence only for teardown.
-            owner.current.?.sql_decision_uncertain = false;
-            owner.current.?.owned_lite_backend.?.native_docstore.?.secret_store_uncertain = false;
-            owner.current.?.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain = false;
-        }
-        owner.maintenance_storage_pending = true;
-        try std.testing.expectError(error.OutcomeReconciliationRequired, owner.maintenanceTurnForTest());
-        try std.testing.expect(owner.text_source_runtime_cache == null);
-        try std.testing.expect(Owner.needsOutcomeReconciliation(owner.current.?));
-        try std.testing.expectEqual(@as(usize, 0), owner.maintenance_turn_references);
-        owner.maintenance_storage_pending = true;
-        try std.testing.expect(owner.maintenanceWaitMillisForTest(true) > 0);
-        const refused = blk: {
-            owner.gate.mutex.lockUncancelable(h.handleLockIo());
-            defer owner.gate.mutex.unlock(h.handleLockIo());
-            var lease = try native.lockWriterPathWithIo(alloc, h.handleLockIo(), fixture.path);
-            defer lease.close();
-            break :blk owner.refresh();
-        };
-        try std.testing.expectError(error.OutcomeReconciliationRequired, refused);
     }
 }
 
