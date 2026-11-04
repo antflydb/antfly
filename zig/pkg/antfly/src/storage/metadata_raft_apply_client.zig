@@ -353,7 +353,7 @@ pub const RaftApplyStore = struct {
         var encoded: std.Io.Writer.Allocating = .init(self.alloc);
         defer encoded.deinit();
         var stream: std.json.Stringify = .{ .writer = &encoded.writer, .options = .{} };
-        try @import("antfly_local_sources").storage_db_relational_integrity_json.write(update, &stream);
+        try @import("antfly_local_sources").storage_db_relational_integrity_json.writeCompact(update, &stream);
         _ = try self.projection(bool, .{ .kind = .replace_standalone_catalog, .group_id = group_id, .arg0 = expected_revision, .key = .fromSlice(encoded.written()) });
     }
 

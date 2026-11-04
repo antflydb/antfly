@@ -1889,7 +1889,10 @@ pub fn metadataApplyStoreProjection(
             const Input = antfly.capi_dependencies.metadata_storage_raft_apply_contract.StandaloneCatalogUpdate;
             var input = std.json.parseFromSlice(Input, alloc, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
             defer input.deinit();
-            handle.store.updateStandaloneCatalog(request.group_id, request.arg0, input.value) catch |err| break :blk storageOwnerStatusFromError(err);
+            handle.store.updateStandaloneCatalog(request.group_id, request.arg0, input.value) catch |err| {
+                std.log.warn("standalone catalog update failed bytes={} err={s}", .{ request.key.len, @errorName(err) });
+                break :blk storageOwnerStatusFromError(err);
+            };
             break :blk metadataProjectionJson(alloc, out_json, true);
         },
         .system_catalog => blk: {
@@ -2529,6 +2532,8 @@ pub fn dataApplyStoreOpen(
         .read_only = request.read_only != 0,
         .native_source_delegate = request.native_source_delegate != 0,
         .resource_manager = if (context) |value| &value.resources.resource_manager else null,
+        .backend_runtime = if (context) |value| value.backend_runtime.ptr() else null,
+        .io = if (context) |value| value.backend_runtime.ptr().filesystemIo() else null,
     }) catch |err| return storageOwnerStatusFromError(err);
     errdefer store.deinit();
     const handle = alloc.create(DataApplyStoreHandle) catch return .out_of_memory;

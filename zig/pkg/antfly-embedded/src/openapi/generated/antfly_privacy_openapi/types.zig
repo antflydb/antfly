@@ -407,6 +407,7 @@ pub const PrivacyScan = struct {
     verification_pending: ?u64 = null,
     verification_failed: ?u64 = null,
     verification_blocked: ?u64 = null,
+    /// Optional failure examples, limited to 100 entries and 1 MiB of serialized JSON. Failure counts include rows whose identifiers exceed this detail budget.
     failures: OpenApiOptionalNullable([]const std.json.ArrayHashMap(std.json.Value)) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.

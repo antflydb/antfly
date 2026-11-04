@@ -542,7 +542,8 @@ pub const ApiHttpClient = struct {
         const special = group_source_query_json.len != 0 or relational_integrity_catalog or relational_integrity_action or relational_integrity_jobs_json.len != 0 or relational_activation_json.len != 0 or relational_topology_json.len != 0 or relational_index_status_json.len != 0;
         // Routing uses the actual logical key, including empty first-range
         // boundaries. Only the already-routed HTTP path needs a placeholder.
-        const encoded_key = try percentEncodePathComponent(self.alloc, if (special and key.len == 0) "\x00relational_control" else key);
+        const key_in_body = documentKeyNeedsBody(key);
+        const encoded_key = try percentEncodePathComponent(self.alloc, if (key_in_body) "" else if (special and key.len == 0) "\x00relational_control" else key);
         defer self.alloc.free(encoded_key);
         const encoded_consistency = try percentEncodePathComponent(self.alloc, read_consistency);
         defer self.alloc.free(encoded_consistency);
@@ -601,12 +602,18 @@ pub const ApiHttpClient = struct {
         defer if (privacy_path) |value| self.alloc.free(value);
         const policy_path = if (privacy_policy_version) |version| try std.fmt.allocPrint(self.alloc, "{s}&_privacy_policy_version={s}", .{ privacy_path orelse ordinary_path, if (std.mem.allEqual(u8, &version, 0)) "none" else &version }) else null;
         defer if (policy_path) |value| self.alloc.free(value);
-        const uri = try self.joinRoute(base_uri, policy_path orelse privacy_path orelse ordinary_path);
+        const legacy_path = policy_path orelse privacy_path orelse ordinary_path;
+        const body = if (key_in_body) try @import("http_routes.zig").DocumentReadRequest.encode(self.alloc, .lookup, key, legacy_path[(std.mem.indexOfScalar(u8, legacy_path, '?') orelse return error.InvalidArgument) + 1 ..], "") else null;
+        defer if (body) |value| self.alloc.free(value);
+        const target = if (key_in_body) try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}/document-read", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_table_name }) else null;
+        defer if (target) |value| self.alloc.free(value);
+        const uri = try self.joinRoute(base_uri, target orelse legacy_path);
         defer self.alloc.free(uri);
 
         var resp = try self.executeRequest(.{
-            .method = .GET,
+            .method = if (key_in_body) .POST else .GET,
             .uri = uri,
+            .body = body orelse "",
             .timeout_ms = timeout_ms,
             .cancellation = cancellation,
         });
@@ -2834,6 +2841,27 @@ pub const ApiHttpClient = struct {
         return response;
     }
 
+    fn fetchDocumentRead(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, op: @import("http_routes.zig").DocumentReadRequest.Operation, key: []const u8, artifact: []const u8) !QueryResponse {
+        const encoded_table = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_table);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}/document-read", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_table });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try @import("http_routes.zig").DocumentReadRequest.encode(self.alloc, op, key, "", artifact);
+        defer self.alloc.free(body);
+        var resp = try self.executeRequest(.{ .method = .POST, .uri = uri, .body = body });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
+            404 => return error.NotFound,
+            408, 504 => return error.Timeout,
+            409 => return remoteGroupConflictError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+    }
+
     pub fn fetchGroupDocumentArtifactManifest(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -2842,6 +2870,10 @@ pub const ApiHttpClient = struct {
         doc_key: []const u8,
         artifact_name: []const u8,
     ) !QueryResponse {
+        if (documentKeyNeedsBody(doc_key)) {
+            const response = try self.fetchDocumentRead(base_uri, group_id, table_name, .manifest, doc_key, artifact_name);
+            return response;
+        }
         const escaped_key = try percentEncodePathComponent(self.alloc, doc_key);
         defer self.alloc.free(escaped_key);
         const escaped_artifact_name = try percentEncodePathComponent(self.alloc, artifact_name);
@@ -2881,6 +2913,10 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         doc_key: []const u8,
     ) !QueryResponse {
+        if (documentKeyNeedsBody(doc_key)) {
+            const response = try self.fetchDocumentRead(base_uri, group_id, table_name, .manifests, doc_key, "");
+            return response;
+        }
         const escaped_key = try percentEncodePathComponent(self.alloc, doc_key);
         defer self.alloc.free(escaped_key);
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}{s}", .{
@@ -6710,4 +6746,15 @@ test "public graph metric borrowed wire edge batch endpoint capability" {
     var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
     try std.testing.expectError(error.GraphEdgesBatchUnsupported, client.fetchGroupGraphEdgesBatchWithControl("http://example.test", 7, "docs", "{}", null, null));
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+/// Stop counting early and avoid constructing a potentially enormous escaped
+/// URL. Small keys retain the legacy GET transport during rolling upgrades.
+fn documentKeyNeedsBody(key: []const u8) bool {
+    var bytes: usize = 0;
+    for (key) |c| {
+        bytes += if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') @as(usize, 1) else 3;
+        if (bytes > 1024) return true;
+    }
+    return false;
 }

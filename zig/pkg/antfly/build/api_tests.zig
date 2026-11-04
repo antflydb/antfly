@@ -73,8 +73,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     });
     test_imports.configure(b, privacy_mod, true, true);
-    const privacy_tests = b.addTest(.{ .root_module = privacy_mod, .filters = &.{"privacy"} });
-    b.step("antfly-privacy-test", "Run privacy scan, evidence and transport fence contracts").dependOn(&b.addRunArtifact(privacy_tests).step);
+    const privacy_tests = b.addTest(.{ .root_module = privacy_mod, .filters = &.{ "privacy", "artifact publication upload", "ordered artifact inventory publication queue", "snappy", "lsm.table_file" } });
+    const privacy_step = b.step("antfly-privacy-test", "Run privacy scan, evidence and transport fence contracts");
+    privacy_step.dependOn(&b.addRunArtifact(privacy_tests).step);
     const public_api_parity_default_filters = [_][]const u8{
         "empty activation page validates source catalog without probing external parents",
         "SQL API cross-table MERGE retains both source and target range proofs",
@@ -2171,11 +2172,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     pk_failure_identity_mod.addImport("runtime_failure_abi", pk_failure_abi_mod);
     const pk_failure_identity_tests = b.addTest(.{
         .root_module = pk_failure_identity_mod,
-        .filters = &.{"registered storage-kernel errors are unique and round trip without losing identity"},
+        .filters = &.{ "registered storage-kernel errors are unique and round trip without losing identity", "privacy committed Raft contention survives the active storage owner ABI" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const pk_failure_identity_run = addFilteredTestRunArtifact(b, pk_failure_identity_tests);
     b.step("antfly-api-pk-restore-error-identity-test", "Run exact native invalid-row restore error identity regression")
-        .dependOn(&addFilteredTestRunArtifact(b, pk_failure_identity_tests).step);
+        .dependOn(&pk_failure_identity_run.step);
+    privacy_step.dependOn(&pk_failure_identity_run.step);
     const sql_primary_key_rewrite_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_sql_primary_key_rewrite_test_root.zig"),
         .target = target,

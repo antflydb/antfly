@@ -44,9 +44,11 @@ pub fn create(ctx: Context) Suite {
         // Zig 0.17's focused CUDA serving suite reached 19.57 GB on aarch64
         // Linux. Reserve 24 GiB so the scheduler admits its measured compiler
         // footprint and leaves room for the socket/reference coverage.
+        // Native aarch64 Linux CPU document orchestration (Zig 0.17,
+        // ReleaseFast) peaked at 14.26 GB. Reserve 16 GiB for this closure.
         // The focused native CPU ReleaseFast suite peaked at 10,032,644,096
         // bytes. Its old 9 GiB declaration rejected a successful compilation.
-        .max_rss = if (native_cpu and ctx.optimize == .debug) 12_672 * 1024 * 1024 else @as(usize, if (native_cpu) 11 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
+        .max_rss = if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and ctx.target.result.os.tag == .linux and ctx.target.result.cpu.arch == .aarch64 and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt) 16 * 1024 * 1024 * 1024 else if (native_cpu and ctx.optimize == .debug) 12_672 * 1024 * 1024 else @as(usize, if (native_cpu) 11 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,

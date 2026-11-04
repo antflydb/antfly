@@ -444,7 +444,7 @@ pub fn prepare(alloc: std.mem.Allocator, txn: anytype, root: u128, plan: *const 
     while (state.next < state.total) {
         const node = &plan.nodes[state.next];
         const cost = node.byteCost() +| document.len +| @sizeOf(Witness);
-        if (cost > publication.max_payload_bytes) return error.ResourceBudgetExceeded;
+        if (cost > publication.max_identity_bytes) return error.ResourceBudgetExceeded;
         if (witnesses.items.len != 0 and (witnesses.items.len >= limits.visits or bytes +| cost > limits.bytes or @import("antfly_platform").time.monotonicNs() >= deadline)) break;
         var witness = (try verifier.verify(alloc, txn, root, document, node)) orelse break;
         errdefer witness.deinit();
@@ -637,7 +637,7 @@ pub fn refreshProjectionsWithAdoption(alloc: std.mem.Allocator, store: anytype, 
         for (initial.state.next..plan.nodes.len) |ordinal| {
             const node = &plan.nodes[ordinal];
             const cost = node.byteCost() +| document.len +| @sizeOf(StreamVerifier.Witness);
-            if (cost > publication.max_payload_bytes) return error.ResourceBudgetExceeded;
+            if (cost > publication.max_identity_bytes) return error.ResourceBudgetExceeded;
             if (visits != 0 and (visits >= limits.visits or bytes +| cost > limits.bytes)) break;
             visits += 1;
             bytes +|= cost;
@@ -721,7 +721,7 @@ pub fn groupReady(alloc: std.mem.Allocator, txn: anytype, root: u128, document: 
 pub fn groupReadiness(alloc: std.mem.Allocator, txn: anytype, root: u128, document: []const u8) !GroupReadiness {
     if (root == 0) return .{ .phase = .inactive };
     const active = (try publication.authority(txn)) orelse return .{ .phase = .inactive };
-    const progress = (try obligations.load(txn)) orelse return .{ .phase = .inactive };
+    const progress = (try obligations.loadMetadata(txn)) orelse return .{ .phase = .inactive };
     try progress.requireAuthority(active);
     if (!progress.baseline_complete) return .{ .phase = .baseline_pending };
     const work = (try obligations.lookupWork(alloc, txn, active, document)) orelse return .{ .phase = .ready };

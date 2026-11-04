@@ -164,7 +164,87 @@ HTTP request-line limit. Versioned binary cursors avoid JSON-escape growth;
 issuance and decoding share a bound derived from the document-write budget.
 The findings POST body allowance covers that cursor plus document/field filters,
 while other endpoint limits remain unchanged. Legacy JSON cursors remain readable.
+Large internal lookup and manifest keys use a private document-read POST with
+base64 key bytes, preserving binary namespaces without URL or JSON escaping
+amplification. Short keys retain legacy GET compatibility. Body and response
+budgets derive from the admitted document size and apply only to the relevant
+endpoints; native and linked-kernel registrars use the same body limits. Lookup
+controls, service-identity checks, policy acknowledgments, deadlines and read
+consistency follow the same handler as the GET form.
+Coverage status rows admit a maximum document ID plus its bounded status
+envelope and are parsed once into per-row scratch. Failure counts include every
+observed failure; examples retain at most 100 entries and 1 MiB of encoded JSON
+across pages, so unusually large IDs cannot inflate the durable failure list.
+Findings retain the ordinary 8 MiB page budget with one oversized-entry
+allowance; the TypeScript SDK accounts separately for that entry, escaped key,
+producer revision and continuation instead of imposing its generic response cap.
 
+Ordered producer commands account for document identities separately from the
+64 MiB artifact-value budget. Baseline, validation, completion and readiness
+cursors share the admitted-key limit. Unit-worker directory probes, persisted
+unit jobs and chunk scan/retirement cursors use that same limit; producer and
+child names retain their separate smaller budget. Scan progress stores either
+the shard resumes or a legacy global cursor, avoiding duplicate large keys;
+an empty shard list correctly falls back to the legacy cursor. Public scan
+status omits the private shard checkpoints, keeping polling responses small
+while those native continuations remain durable. Ordinary pages keep their small work
+quantum; one oversized identity can advance a page without starving forever.
+Large control commands borrow bounded shared staging capacity while small
+controls retain reserved headroom. Upload chunks remain 1 MiB. Progress records
+preserve APP1 encoding through 128 chunks and use APP2 above that boundary.
+Pending baseline commands coalesce per owner until apply; a changing observed
+Raft watermark cannot fill the queue with repeated large upper bounds. Full-text
+rebuild cursors use the same admitted identity limit. Standalone catalog updates
+use compact UTF-8 text with a binary-safe fallback on the process-local transport;
+canonical command encoding remains unchanged. Unavailable census pages retain
+null counts and reduce the work quantum without advancing their cursor. The
+census yields at a complete row boundary after its soft work quantum and commits
+that validated prefix with a continuation. Routing/setup and one oversized row
+have a separate bounded hard deadline; caller deadlines still take precedence.
+Completed rows preceding a hard timeout also form a resumable prefix, while an
+incomplete row is discarded and retried. Storage compares long binary key
+prefixes in vector-sized chunks. Snappy match extension uses the same exact
+vectorized prefix comparison, full-width copy tags use bulk repetition, and
+overlap expansion uses bulk copies (with a single-byte repeat fast path).
+Differential tests retain byte-identical compressed output. Ordering and encoded
+formats remain unchanged, avoiding scalar byte loops during large-key SST
+reads/compaction.
+Ordered Raft receipt preflight, document commit, artifact publication, catalog
+installation and upload staging use nonblocking apply admission. Storage reports
+the existing stable `WriterLocked` identity; the server adapter normalizes it to
+Raft deferral, whose retry identity also survives the outer compiled owner ABI.
+Contention defers the committed entry so its owner releases the Raft progress
+lock before retrying; the receipt is rechecked under the mutation fence. This
+prevents an apply reader waiting for quorum progress from cycling with a Raft
+owner waiting for exclusive apply admission.
+Producer-readiness scans retain disposable snapshots outside apply. Their short
+counter/revision transactions share primary mutation admission, preventing lost
+read-modify-write updates between background settlement and new enrollment.
+The v2 derived-summary namespace rebuilds older potentially undercounted caches
+from durable obligations and publication witnesses. Legacy summaries retire in
+bounded pages, with one oversized identity allowed to advance each page.
+Enrollment and serving-status checks read a compact descriptor and point
+counters. A separate root-scoped revision counter avoids rewriting large scan
+checkpoints per document; only background checkpoint progress persists cursor
+bytes. The enrollment descriptor has an independent small size/shape bound.
+Durable producer obligations similarly separate a fixed 122-byte count/revision
+record from the potentially large baseline cursor. Legacy APO2 records migrate
+atomically on the first write; APO3 checkpoints require the new metadata and
+older readers reject the new format rather than trusting stale counts.
+Internal publication batches also use compact UTF-8 identities with a binary
+fallback; the canonical command writer/digest and legacy JSON decoder remain
+compatible. Publication decoding budgets identities separately from values.
+Raft checkpoint byte targets amortize against the prior retained-log image,
+avoiding a full-log rewrite for every large control entry. The configured
+replay-record limit and durable Ready append/watermark ordering remain intact;
+recovery restores the prior image-size estimate from its checkpoint.
+The raw apply store syncs each commit to the WAL and batches SST publication at
+8 MiB with a bounded 64 MiB deferred queue and 32 MiB flush windows. Shared
+background maintenance keeps compaction off the Raft progress worker when
+capacity is available; bounded foreground assistance remains for pressure.
+Compaction domains separate mutable metadata from append-only command history.
+Read-only inspection replays durable WAL state before writer shutdown, and
+reopen retains exact replay/conflict detection.
 
 Background work selection uses one ordered due entry per privacy-enabled table.
 Standalone maintains a replaceable in-memory tree rebuilt by catalog replay;
@@ -238,7 +318,36 @@ allocation accounting and failure injection beneath request arenas.
 
 ## Validation
 
-### Current review fixes (2026-11-03)
+### Current boundary and performance fixes (2026-11-04)
+
+- Merged main at `ab58a77e24` and regenerated the API, SDKs and dashboard types.
+- Focused contracts pass 145 native tests without leaks, 37 API tests and two
+  active runtime error-registry checks. The full active registry passes 11 tests;
+  the WAL replica suite passes 28 tests.
+- Raw Raft apply-store suite: 34 tests pass without leaks, including shared
+  background runtime wiring, live read-only WAL visibility, replay conflicts,
+  snapshots, overlap recovery and compaction-domain boundaries.
+- Regressions cover large binary internal reads, large coverage rows and cursor
+  round trips, bounded failure examples, producer/readiness checkpoint migration,
+  stale completion fences, concurrent writer admission, compact publication wire
+  encoding, amortized Raft checkpoints, and byte-identical Snappy encoding.
+- TypeScript SDK: 543 passed, one unrelated skip; TypeScript type checking and
+  generated Go SDK tests pass. Generation, formatting and license checks pass.
+- A local Debug microbenchmark encoding a repeated 5 MiB input improved from
+  21 ms to 3 ms with identical compressed bytes. This measures the encoder only.
+- Standalone HTTP: 16 passed, one optional model-weight test skipped (354.20 s).
+- Raft 5 MB identifier boundary regression: passed (128.89 s total, 109.91 s
+  call), with all 101 roots current, a completed resumed scan, signed lookup,
+  manifest and manifest-list body reads, and rejection of unsigned originals.
+  Remaining Raft HTTP cases: 15 passed, one optional model-weight test skipped
+  (521.71 s); together the two Raft runs cover all 17 cases with 16 passes and
+  one skip on the same binary. Cases include one/two shards, policy replacement,
+  restart, resumed coverage, membership changes and large/escaped identifiers.
+- Qualified server binary SHA-256:
+  `a25e75266da97d87c62e3659eadf2d2f5e820806b050c1a5613a04a2c42416c8`.
+  This review does not repeat model-weight, Metal or CUDA qualification.
+
+### Previous review validation (2026-11-03)
 
 - Merged main at `e6144685f8` and regenerated the public API and all SDKs.
 - Focused privacy build: 121/121 steps and 25/25 API/metadata tests passed;

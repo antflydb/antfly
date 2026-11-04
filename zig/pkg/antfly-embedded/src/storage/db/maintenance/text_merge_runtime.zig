@@ -958,6 +958,7 @@ const PlatformTextMergeRuntime = struct {
                     switch (err) {
                         error.OutOfMemory,
                         error.OutcomeUnknown,
+                        error.OutcomeReconciliationRequired,
                         error.DurabilityOutcomeUnknown,
                         error.WriteOutcomeUnknown,
                         error.SqlTransactionOutcomeUnknown,

@@ -26,6 +26,7 @@ const cuda_artifact = @import("ops/cuda/artifact.zig");
 const cuda_buffer = @import("ops/cuda/buffer.zig");
 const cuda_context = @import("ops/cuda/context.zig");
 const cuda_driver = @import("ops/cuda/driver.zig");
+const cuda_kernels = @import("ops/cuda/kernels.zig");
 const cuda_renderer = @import("graph/quant_kernel_cuda_renderer.zig");
 const kv_pool = @import("runtime/kv/pool.zig");
 
@@ -193,6 +194,8 @@ const Config = struct {
     candidate_hd256: ?[]const u8 = null,
     candidate_hd512: ?[]const u8 = null,
     production_oracle: bool = false,
+    warp_f16: bool = false,
+    graph_replay: bool = false,
     json: bool = false,
     help: bool = false,
 };
@@ -548,6 +551,10 @@ fn parseConfig(args: []const []const u8) !Config {
             cfg.candidate_hd512 = args[index];
         } else if (std.mem.eql(u8, arg, "--production-oracle")) {
             cfg.production_oracle = true;
+        } else if (std.mem.eql(u8, arg, "--graph-replay")) {
+            cfg.graph_replay = true;
+        } else if (std.mem.eql(u8, arg, "--warp-f16")) {
+            cfg.warp_f16 = true;
         } else if (std.mem.eql(u8, arg, "--json")) {
             cfg.json = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -578,6 +585,10 @@ fn validateConfig(cfg: Config) !void {
     if (cfg.num_kv_heads == 0 or cfg.num_heads % cfg.num_kv_heads != 0) return error.InvalidKvHeadCount;
     if (cfg.num_heads / cfg.num_kv_heads > cuda_renderer.generated_attention_query_heads_per_kv_head) return error.InvalidGqaRatio;
     if (cfg.iterations > 1_000_000) return error.InvalidIterations;
+    if (cfg.graph_replay and !cfg.warp_f16) return error.InvalidWarpF16Configuration;
+    if (cfg.warp_f16 and (!cfg.production_oracle or cfg.num_heads != 8 or
+        cfg.num_kv_heads != 2 or cfg.key_format != .f16 or cfg.value_format != .f16))
+        return error.InvalidWarpF16Configuration;
     if (!cfg.production_oracle) {
         if (cfg.value_format == .int8) return error.InvalidValueFormat;
         if ((cfg.head_dim == null or cfg.head_dim.? == 256) and cfg.candidate_hd256 == null) return error.MissingHd256Candidate;
@@ -1133,6 +1144,7 @@ fn runProductionOracleCase(
     allocator: std.mem.Allocator,
     ctx: *cuda_context.CudaContext,
     baseline_function: cuda_driver.CUfunction,
+    warp_module: ?*cuda_kernels.KernelModule,
     cfg: Config,
     head_dim: u16,
     pattern: Pattern,
@@ -1204,23 +1216,65 @@ fn runProductionOracleCase(
     try d_scalars.copyFromHost(ctx, std.mem.sliceAsBytes(&scalars));
     try d_out_image.copyFromHost(ctx, initial_image);
     const identity = page_order == .identity_null;
-    try launchBaseline(ctx, baseline_function, d_out, d_q, d_k, d_v, if (identity) .{} else d_table, d_scalars, .{
-        .kv_seq_len = kv_len,
-        .num_heads = @intCast(cfg.num_heads),
-        .num_kv_heads = @intCast(cfg.num_kv_heads),
-        .head_dim = head_dim,
-        .query_position_offset = query_position,
-        .sliding_window = cfg.sliding_window,
-        .total_sequence_len = kv_len,
-        .key_row_bytes = @intCast(key_row_bytes),
-        .value_row_bytes = @intCast(value_row_bytes),
-        .block_count = if (identity) 0 else @intCast(block_count),
-        .page_size_tokens = @intCast(cfg.page_size),
-        .format = @backingInt(key_format),
-        .value_format = @backingInt(value_format),
-        .physical_token_capacity = @intCast(physical_capacity),
-        .score_capacity = 0,
-    });
+    if (warp_module) |module| {
+        // Exercise the production dispatch and both split stages, including
+        // fully masked chunks. Never accept its generic fallback as a warp test.
+        if (!module.e4bF16WarpSplitSelected(cfg.num_heads, cfg.num_kv_heads, dim, @backingInt(key_format), @backingInt(value_format)))
+            return error.CudaKernelUnavailable;
+        const chunk_size: usize = if (dim == 256) 64 else 128;
+        const split_capacity = if (cfg.sliding_window > 0) @min(physical_capacity, cfg.sliding_window) else physical_capacity;
+        const chunk_count = @max(2, ceilDiv(split_capacity, chunk_size));
+        var partial_acc = try cuda_buffer.DeviceBuffer.alloc(ctx, cfg.num_heads * chunk_count * dim * @sizeOf(f32));
+        defer partial_acc.free(ctx);
+        var partial_meta = try cuda_buffer.DeviceBuffer.alloc(ctx, cfg.num_heads * chunk_count * 2 * @sizeOf(f32));
+        defer partial_meta.free(ctx);
+        if (!try module.launchGqaAttentionDecodeTurboquantSplitF32(ctx, d_out, partial_acc, partial_meta, d_q, d_k, d_v, if (identity) .{} else d_table, q_count, cfg.kv_len, cfg.num_heads, cfg.num_kv_heads, dim, query_position, 0, cfg.sliding_window, key_row_bytes, value_row_bytes, if (identity) 0 else block_count, cfg.page_size, @backingInt(key_format), @backingInt(value_format), physical_capacity, d_scalars, chunk_size, chunk_count)) return error.CudaKernelUnavailable;
+        if (cfg.graph_replay) {
+            try ctx.synchronize();
+            try ctx.beginStreamCapture(cuda_driver.CU_STREAM_CAPTURE_MODE_RELAXED);
+            if (!try module.launchGqaAttentionDecodeTurboquantSplitF32(ctx, d_out, partial_acc, partial_meta, d_q, d_k, d_v, if (identity) .{} else d_table, q_count, cfg.kv_len, cfg.num_heads, cfg.num_kv_heads, dim, query_position, 0, cfg.sliding_window, key_row_bytes, value_row_bytes, if (identity) 0 else block_count, cfg.page_size, @backingInt(key_format), @backingInt(value_format), physical_capacity, d_scalars, chunk_size, chunk_count)) return error.CudaKernelUnavailable;
+            const graph = try ctx.endStreamCapture();
+            defer ctx.destroyGraph(graph);
+            const exec = try ctx.instantiateGraph(graph);
+            defer ctx.destroyGraphExec(exec);
+            // Replay the same captured host parameters with a one-token prefix,
+            // then the requested history. This catches stale device scalars
+            // and stale/fully masked split partials across persistent replay.
+            const prefix_scalars = [_]u32{ 0, 0, 1, 1, 0 };
+            try d_scalars.copyFromHost(ctx, std.mem.sliceAsBytes(&prefix_scalars));
+            try ctx.launchGraph(exec);
+            try d_out.copyToHost(ctx, std.mem.sliceAsBytes(actual));
+            try ctx.synchronize();
+            var prefix_cfg = cfg;
+            prefix_cfg.kv_len = 1;
+            prefix_cfg.query_position = 0;
+            try cpuPagedAttention(allocator, expected, q, paged_k, paged_v, table, prefix_cfg, dim, key_row_bytes, value_row_bytes, key_format, value_format);
+            const prefix_diff = try compareOutputs(expected, actual);
+            if (prefix_diff.non_finite_mismatch_count != 0 or prefix_diff.max_abs > 5e-4) return error.PagedAttentionDifferentialExceeded;
+            try cpuPagedAttention(allocator, expected, q, paged_k, paged_v, table, cfg, dim, key_row_bytes, value_row_bytes, key_format, value_format);
+            try d_scalars.copyFromHost(ctx, std.mem.sliceAsBytes(&scalars));
+            try ctx.launchGraph(exec);
+            try ctx.synchronize();
+        }
+    } else {
+        try launchBaseline(ctx, baseline_function, d_out, d_q, d_k, d_v, if (identity) .{} else d_table, d_scalars, .{
+            .kv_seq_len = kv_len,
+            .num_heads = @intCast(cfg.num_heads),
+            .num_kv_heads = @intCast(cfg.num_kv_heads),
+            .head_dim = head_dim,
+            .query_position_offset = query_position,
+            .sliding_window = cfg.sliding_window,
+            .total_sequence_len = kv_len,
+            .key_row_bytes = @intCast(key_row_bytes),
+            .value_row_bytes = @intCast(value_row_bytes),
+            .block_count = if (identity) 0 else @intCast(block_count),
+            .page_size_tokens = @intCast(cfg.page_size),
+            .format = @backingInt(key_format),
+            .value_format = @backingInt(value_format),
+            .physical_token_capacity = @intCast(physical_capacity),
+            .score_capacity = 0,
+        });
+    }
     try d_out.copyToHost(ctx, std.mem.sliceAsBytes(actual));
     try d_out_image.copyToHost(ctx, output_image);
     const q_after = try allocator.alloc(u8, q.len * @sizeOf(f32));
@@ -1644,6 +1698,8 @@ fn writeUsage(writer: anytype) !void {
         \\  --candidate-hd256 PATH    Generated HD256 score-prework cubin
         \\  --candidate-hd512 PATH    Generated HD512 score-prework cubin
         \\  --production-oracle       Compare production CUDA directly with an independent CPU oracle
+        \\  --warp-f16                Test E4B Flash-style split route (requires its opt-in environment flag)
+        \\  --graph-replay            Replay warp attention with changing device scalars
         \\  --head-dim 256|512|all    Default: all
         \\  --kv-len N                 Default: 1024; maximum: 16384 (candidate mode requires <=4096 visible keys)
         \\  --query-position N         Default: kv_len - 1
@@ -1692,10 +1748,12 @@ pub fn main(init: std.process.Init) !void {
     defer baseline_module.deinit(&ctx);
     const baseline_function = try loadFunction(&ctx, baseline_module.module, "termite_gqa_attention_decode_turboquant_fast_f32");
     if (cfg.production_oracle) {
+        var warp_module: ?cuda_kernels.KernelModule = if (cfg.warp_f16) try cuda_kernels.KernelModule.load(&ctx) else null;
+        defer if (warp_module) |*module| module.unload(&ctx);
         var all_pass = true;
         var case_count: usize = 0;
-        if (cfg.json) try stdout.print("{{\"schema\":\"antfly.cuda_paged_attention_production_oracle.v1\",\"device\":\"{s}\",\"compute_capability\":\"{d}.{d}\",\"results\":[", .{
-            ctx.info.nameSlice(), ctx.info.compute_major, ctx.info.compute_minor,
+        if (cfg.json) try stdout.print("{{\"schema\":\"antfly.cuda_paged_attention_production_oracle.v1\",\"device\":\"{s}\",\"compute_capability\":\"{d}.{d}\",\"route\":\"{s}\",\"graph_replay\":{s},\"results\":[", .{
+            ctx.info.nameSlice(), ctx.info.compute_major, ctx.info.compute_minor, if (cfg.warp_f16) "warp-f16-split" else "serial", if (cfg.graph_replay) "true" else "false",
         });
         const head_dim_count: usize = if (cfg.head_dim == null) 2 else 1;
         for (0..head_dim_count) |head_index| {
@@ -1708,7 +1766,7 @@ pub fn main(init: std.process.Init) !void {
                             const key_format = cfg.key_format.at(format_index);
                             const value_format = cfg.value_format.at(value_format_index);
                             const page_order = cfg.page_order.at(page_order_index);
-                            const diff = try runProductionOracleCase(std.heap.c_allocator, &ctx, baseline_function, cfg, head_dim, pattern, key_format, value_format, page_order);
+                            const diff = try runProductionOracleCase(std.heap.c_allocator, &ctx, baseline_function, if (warp_module) |*module| module else null, cfg, head_dim, pattern, key_format, value_format, page_order);
                             const pass = diff.non_finite_mismatch_count == 0 and diff.max_abs <= 5e-4;
                             all_pass = all_pass and pass;
                             if (cfg.json) {
@@ -1991,4 +2049,16 @@ test "paged attention diff JSON writer emits the complete v4 schema" {
     try std.testing.expectEqualStrings("alternating_serial_tiled", first.get("consumer_timing_order").?.string);
     try std.testing.expect(first.get("tiled64_output_guard_mutations") != null);
     try std.testing.expect(first.get("score_mutations") != null);
+}
+
+test "paged attention warp oracle requires exact E4B F16 topology" {
+    const cfg = try parseConfig(&.{ "--production-oracle", "--warp-f16", "--heads", "8", "--kv-heads", "2", "--key-format", "f16", "--value-format", "f16" });
+    try std.testing.expect(cfg.warp_f16);
+    try std.testing.expectError(error.InvalidWarpF16Configuration, parseConfig(&.{ "--production-oracle", "--warp-f16" }));
+    try std.testing.expectError(error.InvalidWarpF16Configuration, parseConfig(&.{ "--production-oracle", "--warp-f16", "--kv-heads", "2", "--key-format", "f16", "--value-format", "int8" }));
+}
+
+test "CUDA production dense primitive smoke including E4B norms (GPU opt-in)" {
+    if (!build_options.enable_cuda or !@import("antfly_platform").env.getenvBoolDefault("ANTFLY_TEST_CUDA_GPU", false)) return error.SkipZigTest;
+    try cuda_kernels.smokeDenseF32(std.testing.allocator);
 }

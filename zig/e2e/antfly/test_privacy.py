@@ -1090,3 +1090,114 @@ def test_privacy_rejects_relational_storage_before_mutation(stateful_api, mode):
             response.text
         )
     assert stateful_api.get(path)["configured"] is False
+
+
+@pytest.mark.parametrize("key_bytes", [100, 1_100_000, 5_000_000])
+def test_privacy_large_id_coverage_and_internal_reads(stateful_api, key_bytes):
+    import base64
+    from conftest import internal_service_headers
+    from urllib.parse import quote
+
+    table = f"privacy_large_id_{uuid4().hex[:8]}"
+    key = "x" * key_bytes
+    documents = {key: {"ordinal": 1}}
+    if key_bytes >= 5_000_000:
+        # Put a large ID at the hundred-row boundary so both backfill and
+        # coverage persist/resume a large cursor instead of only finishing a
+        # one-row page. The second large key must be observed on the next page.
+        documents.update({f"a{i:03}": {"ordinal": i} for i in range(99)})
+        documents[key + "z"] = {"ordinal": 2}
+    stateful_api.create_table(table)
+    stateful_api.batch_write(table, inserts=documents)
+    path = f"/tables/{table}/privacy"
+    installed = stateful_api.put(path, {"mode": "monitor", "fields": ["body"]})
+
+    def progress_diagnostic():
+        return json.dumps(
+            {
+                "coverage": {
+                    k: v
+                    for k, v in status["coverage"].items()
+                    if k not in ("failures", "fields", "categories")
+                },
+                "scan": {
+                    k: scan.get(k)
+                    for k in ("phase", "scanned", "reprocessed", "failed", "last_error")
+                },
+                "logs": stateful_api.debug_logs(),
+            }
+        )
+
+    # This exercises a bounded/backpressured publication pipeline, as do the
+    # bulk coverage tests above. Require advancing work rather than a fixed
+    # machine-throughput deadline for 101 roots after a multi-megabyte Raft entry.
+    deadline = time.monotonic() + 600
+    last_progress = time.monotonic()
+    best = (-1, -1, -1, -1, -1)
+    while time.monotonic() < deadline:
+        status = stateful_api.get(path)
+        scan = stateful_api.get(path + "/scans/" + installed["scan_id"])
+        # Checkpoint IDs remain durable server state, not polling payload.
+        assert len(json.dumps(scan)) < 1024 * 1024
+        assert scan["phase"] not in ("failed", "superseded"), progress_diagnostic()
+        coverage = status["coverage"]
+        score = (
+            scan.get("scanned", 0),
+            scan.get("reprocessed", 0),
+            int(coverage.get("total") == len(documents)),
+            coverage.get("current") or 0,
+            int(scan["phase"] == "succeeded"),
+        )
+        if score > best:
+            best = score
+            last_progress = time.monotonic()
+        assert time.monotonic() - last_progress < 90, progress_diagnostic()
+        if coverage["available"] and scan["phase"] == "succeeded":
+            break
+        time.sleep(0.25)
+    diagnostic = progress_diagnostic()
+    assert status["coverage"]["available"], diagnostic
+    assert status["coverage"]["total"] == len(documents), diagnostic
+    assert status["coverage"]["current"] == len(documents), diagnostic
+    assert scan["phase"] == "succeeded", diagnostic
+
+    # Force real HTTP dispatch even when this fixture's shard is resident.
+    ranges = stateful_api.get("/cluster")["data"]["ranges"]
+    assert len(ranges) == 1, ranges
+    owner = ranges[0]
+    root = stateful_api.url.split("/db/v1")[0]
+    uri = (
+        root
+        + f"/internal/v1/groups/{owner['group_id']}/tables/{quote(owner['table_name'], safe='')}/document-read"
+    )
+    headers = internal_service_headers()
+    for operation in ("lookup", "manifest", "manifests"):
+        response = stateful_api.s.post(
+            uri,
+            json={
+                "operation": operation,
+                "key_base64": base64.urlsafe_b64encode(key.encode())
+                .decode()
+                .rstrip("="),
+                "query": "read_consistency=read_index&_privacy_original=true",
+                "artifact_name": "_privacy_document",
+            },
+            headers=headers,
+            timeout=30,
+        )
+        assert response.status_code == 200, (
+            f"{operation}: {response.status_code}: {response.text[:1000]}"
+        )
+        if operation == "lookup":
+            assert response.json()["ordinal"] == 1
+    # A body request cannot grant the raw-lookup capability without a service identity.
+    denied = stateful_api.s.post(
+        uri,
+        json={
+            "operation": "lookup",
+            "key_base64": base64.urlsafe_b64encode(key.encode()).decode().rstrip("="),
+            "query": "_privacy_original=true",
+        },
+        timeout=30,
+    )
+    assert denied.status_code in (401, 403), denied.text[:1000]

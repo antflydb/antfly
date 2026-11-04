@@ -21,10 +21,13 @@ pub const storage_backend_erased = @import("antfly_local_sources").storage_backe
 pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
 test "privacy API and transport contracts" {
     _ = @import("api/privacy.zig");
+    _ = @import("antfly_local_sources").storage_db_relational_integrity_json;
     _ = @import("api/http_routes.zig");
     _ = @import("antfly_local_sources").privacy_catalog;
     _ = @import("metadata/storage/raft_apply_store.zig");
     _ = @import("metadata/service.zig");
     _ = @import("api/privacy_transport_test.zig");
     _ = @import("api/http_client.zig");
+    _ = @import("storage/hot_standby/mutation_inventory.zig");
+    _ = @import("storage/artifact_publication_dispatch.zig");
 }

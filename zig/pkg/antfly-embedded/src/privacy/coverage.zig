@@ -47,18 +47,45 @@ pub const State = struct {
 };
 const Page = struct {
     available: bool,
-    total: u64 = 0,
-    current: u64 = 0,
-    pending: u64 = 0,
-    failed_known: u64 = 0,
-    with_findings: u64 = 0,
-    protected_ready: u64 = 0,
-    protected_blocked: u64 = 0,
+    total: ?u64 = 0,
+    current: ?u64 = 0,
+    pending: ?u64 = 0,
+    failed_known: ?u64 = 0,
+    with_findings: ?u64 = 0,
+    protected_ready: ?u64 = 0,
+    protected_blocked: ?u64 = 0,
     categories: Value = .{ .object = .empty },
     fields: Value = .{ .object = .empty },
     failures: Value = .null,
     next_key: ?[]const u8 = null,
 };
+
+/// Failure counts are complete; optional examples have independent row and
+/// byte limits so large identifiers cannot inflate every metadata CAS.
+pub const max_failure_detail_bytes: usize = 1024 * 1024;
+pub fn failureDetailSize(entry: anytype) !usize {
+    var counter: std.Io.Writer.Discarding = .init(&.{});
+    try std.json.Stringify.value(entry, .{}, &counter.writer);
+    return std.math.cast(usize, counter.fullCount()) orelse error.Overflow;
+}
+pub fn appendFailures(a: A, prior: Value, incoming: Value) !Value {
+    var output: std.array_list.Managed(Value) = .init(a);
+    var bytes: usize = 2;
+    for ([_]Value{ prior, incoming }) |entries| {
+        if (entries != .array) continue;
+        for (entries.array.items) |entry| {
+            if (output.items.len == 100) break;
+            if (entry == .object) if (entry.object.get("key")) |key| {
+                if (key == .string and key.string.len > max_failure_detail_bytes) continue;
+            };
+            const size = try failureDetailSize(entry);
+            if (size +| bytes +| 1 > max_failure_detail_bytes) continue;
+            try output.append(entry);
+            bytes += size + 1;
+        }
+    }
+    return .{ .array = output };
+}
 
 /// Allocations belong to the caller's pass arena, which must live until the
 /// metadata CAS serializes this state. Failed pages never advance the cursor.
@@ -75,7 +102,7 @@ pub fn accept(a: A, state: *State, raw: []const u8, now: i64) !void {
         if (state.started_at_millis == 0) state.started_at_millis = now;
     }
     inline for (.{ "total", "current", "pending", "failed_known", "with_findings", "protected_ready", "protected_blocked" }) |name| {
-        @field(state.pending, name) = try std.math.add(u64, @field(state.pending, name), @field(page, name));
+        @field(state.pending, name) = try std.math.add(u64, @field(state.pending, name), @field(page, name) orelse return error.InvalidPrivacyReceipt);
     }
     inline for (.{ "categories", "fields" }) |name| {
         const source = @field(page, name);
@@ -93,10 +120,7 @@ pub fn accept(a: A, state: *State, raw: []const u8, now: i64) !void {
         }
         @field(state.pending, name) = target;
     }
-    var failures = std.array_list.Managed(Value).init(a);
-    if (state.pending.failures == .array) try failures.appendSlice(state.pending.failures.array.items);
-    if (page.failures == .array) try failures.appendSlice(page.failures.array.items[0..@min(100 - failures.items.len, page.failures.array.items.len)]);
-    state.pending.failures = .{ .array = failures };
+    state.pending.failures = try appendFailures(a, state.pending.failures, page.failures);
     state.cursor = page.next_key;
     state.retry_after_millis = 0;
     if (state.cursor == null) {
@@ -148,7 +172,7 @@ test "privacy coverage resumes pages, retains completed snapshots, and bounds sl
     try accept(a, &state, "{\"available\":true,\"total\":100,\"current\":80,\"pending\":20,\"categories\":{\"email\":4},\"fields\":{\"body\":4},\"next_key\":\"last\"}", 100);
     try std.testing.expectEqualStrings("last", state.cursor.?);
     try std.testing.expect(state.snapshot == null);
-    try accept(a, &state, "{\"available\":false}", 200);
+    try accept(a, &state, "{\"available\":false,\"total\":null,\"current\":null,\"pending\":null,\"failed\":null,\"with_findings\":null,\"protected_ready\":null,\"protected_blocked\":null}", 200);
     try std.testing.expectEqualStrings("last", state.cursor.?);
     try std.testing.expectEqual(@as(u32, 50), state.page_size);
     const partial = try std.json.Stringify.valueAlloc(a, state, .{});
@@ -171,4 +195,30 @@ test "privacy coverage resumes pages, retains completed snapshots, and bounds sl
     try accept(a, &state, "{\"available\":true}", 6100);
     try std.testing.expectEqual(@as(u64, 1), state.snapshot.?.counts.total);
     try std.testing.expectEqual(@as(u64, 0), state.snapshot.?.counts.pending);
+}
+
+test "privacy coverage bounds failure examples across pages including JSON escaping" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const huge = try a.alloc(u8, max_failure_detail_bytes + 1);
+    @memset(huge, 'x');
+    const escaped = try a.alloc(u8, 200000);
+    @memset(escaped, 0);
+    const raw = try std.json.Stringify.valueAlloc(a, .{ .available = true, .total = 3, .failed_known = 3, .next_key = "next", .failures = .{ .{ .key = huge, .error_code = "failed" }, .{ .key = escaped, .error_code = "failed" }, .{ .key = "small", .error_code = "failed" } } }, .{});
+    var state: State = .{};
+    try accept(a, &state, raw, 1);
+    try std.testing.expectEqual(@as(usize, 1), state.pending.failures.array.items.len);
+    try accept(a, &state, "{\"available\":true,\"total\":1,\"failed_known\":1,\"failures\":[{\"key\":\"another\",\"error_code\":\"failed\"}]}", 2);
+    try std.testing.expectEqual(@as(u64, 4), state.snapshot.?.counts.failed_known);
+    try std.testing.expectEqual(@as(usize, 2), state.snapshot.?.counts.failures.array.items.len);
+    try std.testing.expect(try failureDetailSize(state.snapshot.?.counts.failures) <= max_failure_detail_bytes);
+}
+
+test "privacy coverage rejects null counts on an available page" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var state: State = .{};
+    try std.testing.expectError(error.InvalidPrivacyReceipt, accept(arena.allocator(), &state, "{\"available\":true,\"total\":null}", 200));
+    try std.testing.expect(state.snapshot == null);
 }

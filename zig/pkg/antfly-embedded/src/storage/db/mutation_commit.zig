@@ -63,6 +63,14 @@ const row_policy_bundle_mod = @import("row_policy_bundle.zig");
 const runtime_failure_abi = @import("runtime_failure_abi");
 const schema_registry_mod = @import("schema_registry.zig");
 const std = @import("std");
+/// Fails the next primary batch just after it became durable, then disarms.
+/// Exercises every caller's committed-but-failed classification.
+pub var test_fail_after_primary_commit: if (@import("builtin").is_test) ?anyerror else void = if (@import("builtin").is_test) null else {};
+/// Runs once just before the next primary batch's durable store write
+/// (including transaction resolution), then disarms. Returning an error fails
+/// the batch before its decision; a hook may instead arm a storage fault.
+pub const TestHook = struct { ptr: *anyopaque, run: *const fn (*anyopaque) anyerror!void };
+pub var test_before_primary_commit: if (@import("builtin").is_test) ?TestHook else void = if (@import("builtin").is_test) null else {};
 const table_catalog_mod = @import("table_catalog.zig");
 const transactions_mod = @import("../transactions.zig");
 const types = @import("types.zig");
@@ -923,7 +931,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or opts.group_source_command != null))
                 preparation.write_plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
             const apply_lock_wait_start_ns = monotonicTimeNs();
-            try self.lockApplyForPortableRuntime();
+            if (opts.ordered_apply_receipt != null) {
+                // A committed Raft entry must yield its progress mutex when
+                // apply is busy, including a reader arriving after preflight.
+                try tryLockApplyForPortableRuntime(self);
+            } else {
+                try self.lockApplyForPortableRuntime();
+            }
             if (profile) |active_profile| active_profile.apply_lock_wait_ns += monotonicTimeNs() - apply_lock_wait_start_ns;
             if (S.ownerField(self, "local_execution").*.source_vectors.load(.acquire)) |source| source.recordBatchLockWait(monotonicTimeNs() -| apply_lock_wait_start_ns);
             var filtered_cleanup_edges: ?[]types.GraphEdgeDelete = null;
@@ -3039,6 +3053,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             );
             defer authored_acceptance.deinit();
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            if (comptime @import("builtin").is_test) if (test_before_primary_commit) |hook| {
+                test_before_primary_commit = null;
+                try hook.run(hook.ptr);
+            };
             const transaction_applied = if (opts.transaction_resolution) |resolution| blk: {
                 const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
                     resolution.txn_id,
@@ -3077,6 +3095,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             local_coverage_guard.release();
             if (opts.primary_committed) |committed| committed.* = true;
             if (graph_publication) |*lease| lease.release();
+            if (comptime @import("builtin").is_test) if (test_fail_after_primary_commit) |err| {
+                test_fail_after_primary_commit = null;
+                return err;
+            };
             if (!transaction_applied.applied) {
                 // Recovery may have committed this participant before the
                 // requesting owner retries it. Its visibility wait must yield
@@ -3686,6 +3708,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 std.mem.startsWith(u8, key, protection.index_writer_prefix);
         }
 
+        pub fn tryLockApplyForPortableRuntime(self: anytype) !void {
+            try self.enforcePortableRuntimeGate();
+            if (!S.ownerField(self, "core").*.tryLockApplyExclusive()) return error.WriterLocked;
+            errdefer S.ownerField(self, "core").*.unlockApply();
+            try self.enforcePortableRuntimeGate();
+        }
+
         pub fn lockApplyForPortableRuntime(self: anytype) !void {
             try self.enforcePortableRuntimeGate();
             lockApply(self);
@@ -3918,6 +3947,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         }
                         break :blk &.{orderedApplyReceiptWrite(identity, &marker_value_buf)};
                     } else &.{};
+                    if (comptime @import("builtin").is_test) if (test_before_primary_commit) |hook| {
+                        test_before_primary_commit = null;
+                        hook.run(hook.ptr) catch |err| {
+                            S.ownerField(self, "core").*.unlockApply();
+                            return err;
+                        };
+                    };
                     const outcome = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
                         txn_id,
                         status,

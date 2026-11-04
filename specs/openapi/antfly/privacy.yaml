@@ -109,7 +109,7 @@ components:
             categories: {type: object, additionalProperties: {type: integer, format: uint64}}
             fields: {type: object, additionalProperties: {type: integer, format: uint64}, description: Findings by field across current inspections; pending and failed sources contribute no counts.}
             failed_known: {type: integer, format: uint64, description: Source-bound failures observed so far; failed remains null while other work is unclassified.}
-            failures: {type: array, maxItems: 100, items: {type: object, additionalProperties: true}}
+            failures: {description: "Optional failure examples, limited to 100 entries and 1 MiB of serialized JSON. Failure counts include rows whose identifiers exceed this detail budget.", type: array, maxItems: 100, items: {type: object, additionalProperties: true}}
             next_key: {type: string, nullable: true, description: Reserved for bounded internal census pages; omitted from public coverage snapshots.}
     PrivacyPreviewRequest:
       type: object
@@ -176,7 +176,7 @@ components:
         verification_pending: {type: integer, format: uint64}
         verification_failed: {type: integer, format: uint64}
         verification_blocked: {type: integer, format: uint64}
-        failures: {type: array, nullable: true, maxItems: 100, items: {type: object, additionalProperties: true}}
+        failures: {description: "Optional failure examples, limited to 100 entries and 1 MiB of serialized JSON. Failure counts include rows whose identifiers exceed this detail budget.", type: array, nullable: true, maxItems: 100, items: {type: object, additionalProperties: true}}
     PrivacyFindingsRequest:
       type: object
       additionalProperties: false

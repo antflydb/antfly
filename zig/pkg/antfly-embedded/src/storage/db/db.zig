@@ -3338,6 +3338,7 @@ pub const DB = struct {
     /// owns one stable runtime-catalog generation without penalizing degraded
     /// requests with lock contention.
     pub const lockApplyForPortableRuntime = local_mutation.lockApplyForPortableRuntime;
+    pub const tryLockApplyForPortableRuntime = local_mutation.tryLockApplyForPortableRuntime;
 
     fn lockApplySharedForPortableRuntime(self: *DB) !void {
         try self.enforcePortableRuntimeGate();
@@ -7479,6 +7480,47 @@ pub const DB = struct {
         }
     }
 
+    /// Like `batch`, also reporting whether the primary write became durable.
+    /// Callers classify a failure from the flag: after the primary write it
+    /// is committed (pending or needing repair); before it, the batch was not
+    /// applied unless the error is an unknown outcome. Keeps `batch`'s
+    /// ANTFLY_BENCH_METRICS phase profile.
+    pub fn batchTracked(self: *DB, req: types.BatchRequest, primary_committed: *bool) anyerror!void {
+        primary_committed.* = false;
+        // Storage commits keep their original error; this records whether a
+        // failed commit may still have applied (for example, LSM WAL appended
+        // and then a sync or flush failed). For an exported call that is an
+        // unknown outcome, never "not applied".
+        var progress: backend_types.CommitProgress = .{};
+        const previous = backend_types.commit_progress;
+        backend_types.commit_progress = &progress;
+        defer backend_types.commit_progress = previous;
+        self.batchTrackedProfiled(req, primary_committed) catch |err| {
+            if (progress.maybe_applied and !primary_committed.* and !isOutcomeUnknownError(err)) {
+                std.log.warn("batch failed after its write may have applied: {s}", .{@errorName(err)});
+                return error.OutcomeUnknown;
+            }
+            return err;
+        };
+    }
+
+    fn isOutcomeUnknownError(err: anyerror) bool {
+        return switch (err) {
+            error.OutcomeUnknown, error.WriteOutcomeUnknown, error.DurabilityOutcomeUnknown, error.CommitDecisionUnknown => true,
+            else => false,
+        };
+    }
+
+    fn batchTrackedProfiled(self: *DB, req: types.BatchRequest, primary_committed: *bool) anyerror!void {
+        if (benchMetricsEnabled()) {
+            var profile = BatchProfile{};
+            try self.batchInternal(req, &profile, .{ .primary_committed = primary_committed });
+            logBatchProfile(req, profile);
+        } else {
+            try self.batchInternal(req, null, .{ .primary_committed = primary_committed });
+        }
+    }
+
     pub fn batchWithVisibilityCancellation(self: *DB, req: types.BatchRequest, cancellation: types.CancellationToken) anyerror!void {
         if (benchMetricsEnabled()) {
             var profile = BatchProfile{};
@@ -7866,7 +7908,12 @@ pub const DB = struct {
 
     pub fn orderedMutationAlreadyApplied(self: *DB, identity: OrderedApplyReceipt) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("orderedMutationAlreadyApplied", .{ self, identity });
-        lockApply(self);
+        // Raft invokes this preflight while holding its progress mutex. A
+        // reader may hold apply while resolving a quorum read through Raft;
+        // waiting here would invert that lock order. Defer the committed
+        // entry and let its owner release Raft before retrying. The actual
+        // mutation still rechecks the receipt under its own apply fence.
+        if (!self.core.tryLockApplyExclusive()) return error.WriterLocked;
         defer self.core.unlockApply();
         return switch (try orderedApplyDisposition(
             try readOrderedApplyReceipt(self.alloc, self.core.store),
@@ -8656,6 +8703,9 @@ pub const DB = struct {
                 error.EnrichmentWaitTimeout,
                 error.EnrichmentRetryInProgress,
                 => return error.CommitVisibilityNotSatisfied,
+                // Other errors keep their identity for internal callers that
+                // act on them. Exported calls classify a failure after the
+                // primary write from `batchTracked`'s flag, not from its name.
                 else => {},
             };
             return err;
@@ -19450,7 +19500,7 @@ pub const DB = struct {
                 const authority = try @import("artifact_publication.zig").authority(&read);
                 var complete = query.documents.len == 0 or authority != null;
                 if (authority) |active| {
-                    const progress = try @import("artifact_producer_obligations.zig").load(&read);
+                    const progress = try @import("artifact_producer_obligations.zig").loadMetadata(&read);
                     if (progress) |value| try value.requireAuthority(active);
                     complete = progress != null and progress.?.baseline_complete;
                 }
@@ -26792,7 +26842,7 @@ pub const DB = struct {
         defer if (chunk) |bytes| self.alloc.free(bytes);
         var mutation = self.core.snapshot_admission.acquireMutation();
         defer mutation.release();
-        try self.lockApplyForPortableRuntime();
+        try self.tryLockApplyForPortableRuntime();
         var apply_held = true;
         defer if (apply_held) self.core.unlockApply();
         if (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry) == .already_applied) return;
@@ -27106,7 +27156,7 @@ pub const DB = struct {
         }
         var mutation = self.core.snapshot_admission.acquireMutation();
         defer mutation.release();
-        try self.lockApplyForPortableRuntime();
+        try self.tryLockApplyForPortableRuntime();
         var apply_held = true;
         defer if (apply_held) self.core.unlockApply();
         if (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry) == .already_applied) return;
@@ -27234,7 +27284,7 @@ pub const DB = struct {
             const producer = (try publication.authority(&read)) orelse return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_catalog, &apply_held);
             if (producer.epoch != command.authority_epoch or !std.mem.eql(u8, &producer.namespace, &namespace) or
                 !std.mem.eql(u8, &producer.catalog_digest, &command.catalog_digest)) return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_catalog, &apply_held);
-            if (try @import("artifact_producer_obligations.zig").load(&read)) |obligations| {
+            if (try @import("artifact_producer_obligations.zig").loadMetadata(&read)) |obligations| {
                 try obligations.requireAuthority(producer);
                 if (obligations.sealed_attempt != null) return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .sealed_source, &apply_held);
             }
@@ -27401,7 +27451,7 @@ pub const DB = struct {
         {
             var admission = self.core.snapshot_admission.acquireMutation();
             defer admission.release();
-            try self.lockApplyForPortableRuntime();
+            try self.tryLockApplyForPortableRuntime();
             defer self.core.unlockApply();
             if (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry) == .already_applied) return;
             var namespace: [24]u8 = undefined;
@@ -33181,6 +33231,59 @@ pub const DB = struct {
         return true;
     }
 
+    // Readiness scans use disposable snapshots. Only their short metadata
+    // transactions share apply with primary enrollment, so counter/revision
+    // RMW cannot lose concurrent primary changes. Never wait for apply while
+    // holding a storage transaction or the Raft progress mutex.
+    const ProducerReadinessStore = struct {
+        db: *DB,
+
+        pub fn beginReadTxn(self: *@This()) !docstore_mod.DocStore.Txn {
+            return self.db.core.store.beginReadTxn();
+        }
+        pub fn beginReadTxnWithBlockCacheAdmission(self: *@This(), admission: backend_types.Namespace.BlockCacheAdmission) !docstore_mod.DocStore.Txn {
+            return self.db.core.store.beginReadTxnWithBlockCacheAdmission(admission);
+        }
+        pub fn beginWriteTxn(self: *@This()) !WriteTxn {
+            try self.db.tryLockApplyForPortableRuntime();
+            errdefer self.db.core.unlockApply();
+            return .{ .db = self.db, .inner = try self.db.core.store.beginWriteTxn() };
+        }
+        const WriteTxn = struct {
+            db: *DB,
+            inner: docstore_mod.DocStore.Txn,
+            held: bool = true,
+
+            fn release(self: *@This()) void {
+                if (self.held) {
+                    self.held = false;
+                    self.db.core.unlockApply();
+                }
+            }
+            pub fn abort(self: *@This()) void {
+                if (!self.held) return;
+                self.inner.abort();
+                self.release();
+            }
+            pub fn commit(self: *@This()) !void {
+                try self.inner.commit();
+                self.release();
+            }
+            pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                return self.inner.get(key);
+            }
+            pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+                return self.inner.put(key, value);
+            }
+            pub fn delete(self: *@This(), key: []const u8) !void {
+                return self.inner.delete(key);
+            }
+            pub fn openPhysicalCursorAdapter(self: *@This()) !docstore_mod.DocStore.Txn.CursorAdapter {
+                return self.inner.openPhysicalCursorAdapter();
+            }
+        };
+    };
+
     fn advanceArtifactProducerWorkPageWithAllocator(self: *DB, scratch: Allocator) !bool {
         const has_ordered_authority = blk: {
             var read = try self.core.store.beginReadTxn();
@@ -33204,14 +33307,15 @@ pub const DB = struct {
         }
         var plan = try self.core.index_manager.acquireWritePlanSnapshot();
         defer plan.release();
-        const readiness_progress = try @import("artifact_producer_readiness.zig").advance(scratch, self.core.store, self.root_incarnation, plan.plan());
+        var readiness_store: ProducerReadinessStore = .{ .db = self };
+        const readiness_progress = try @import("artifact_producer_readiness.zig").advance(scratch, &readiness_store, self.root_incarnation, plan.plan());
         const obligations = @import("artifact_producer_obligations.zig");
         var page = blk: {
             var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
             defer read.abort();
             const authority = (try @import("artifact_publication.zig").authority(&read)) orelse return false;
             // Protocol-14 owners have no required-stream work registry.
-            const state = (try obligations.load(&read)) orelse {
+            const state = (try obligations.loadMetadata(&read)) orelse {
                 var ordered = (try @import("artifact_inventory.zig").load(scratch, &read)) orelse return error.ArtifactCatalogDrift;
                 defer ordered.deinit();
                 if (ordered.value.command.binding.effect_protocol >= 15) return error.ArtifactCatalogCorrupt;
@@ -146401,4 +146505,113 @@ test "privacy local completed source replay rearms missing consumer receipts wit
     try std.testing.expect(try db.privacyLocalIndexSourcesComplete(a, &read, left.name, left.kind, final_plan.plan()));
     try std.testing.expect(try db.privacyLocalIndexSourcesComplete(a, &read, right.name, right.kind, final_plan.plan()));
     try std.testing.expectEqual(generation, db.core.index_manager.coverageGenerationForIndex(left.name).?);
+}
+
+test "privacy ordered apply preflight defers contended readers and preserves replay receipts" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("privacy-ordered-preflight");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const entry: OrderedApplyReceipt = .{ .term = 1, .index = 1 };
+    {
+        db.core.lockApplyShared();
+        defer db.core.unlockApplyShared();
+        try std.testing.expectError(error.WriterLocked, db.orderedMutationAlreadyApplied(entry));
+        try std.testing.expectError(error.WriterLocked, db.tryLockApplyForPortableRuntime());
+        try std.testing.expectError(error.WriterLocked, db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "doc", .value = "{}" }} }, entry, true));
+    }
+    try std.testing.expect(!try db.orderedMutationAlreadyApplied(entry));
+    try db.recordOrderedApplyReceipt(entry);
+    {
+        db.core.lockApplyExclusive();
+        defer db.core.unlockApplyExclusive();
+        try std.testing.expectError(error.WriterLocked, db.orderedMutationAlreadyApplied(entry));
+    }
+    try std.testing.expect(try db.orderedMutationAlreadyApplied(entry));
+    try std.testing.expect(!try db.orderedMutationAlreadyApplied(.{ .term = 1, .index = 2 }));
+}
+
+test "privacy readiness metadata writes share primary admission and release on commit and abort" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("privacy-readiness-admission");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    var store: DB.ProducerReadinessStore = .{ .db = &db };
+    {
+        db.core.lockApplyShared();
+        defer db.core.unlockApplyShared();
+        try std.testing.expectError(error.WriterLocked, store.beginWriteTxn());
+    }
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        try std.testing.expectError(error.WriterLocked, db.orderedMutationAlreadyApplied(.{ .term = 1, .index = 1 }));
+        try write.put("readiness-admission", "committed");
+        try write.commit();
+    }
+    {
+        var write = try store.beginWriteTxn();
+        try std.testing.expect(!db.core.tryLockApplyShared());
+        try write.put("readiness-admission", "aborted");
+        write.abort();
+    }
+    try std.testing.expect(db.core.tryLockApplyExclusive());
+    db.core.unlockApplyExclusive();
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqualStrings("committed", try read.get("readiness-admission"));
+}
+
+test "privacy readiness upgrade retires legacy summaries in bounded large-identity pages" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("privacy-readiness-upgrade");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    var store: DB.ProducerReadinessStore = .{ .db = &db };
+    const prefix = "\x00\x00__artifact_publication__:producer-readiness:";
+    const old_registry = prefix ++ "registry";
+    const new_registry = prefix ++ "v2:registry";
+    const document = try a.alloc(u8, 1_100_000);
+    defer a.free(document);
+    @memset(document, 'x');
+    const scope: [80]u8 = @splat(1);
+    const first = try std.mem.concat(a, u8, &.{ prefix ++ "pending:", &scope, document });
+    defer a.free(first);
+    const second = try std.mem.concat(a, u8, &.{ first, "z" });
+    defer a.free(second);
+    const counter = try std.mem.concat(a, u8, &.{ prefix ++ "count:", &scope });
+    defer a.free(counter);
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        try write.put(old_registry, "superseded");
+        try write.put(new_registry, "current");
+        try write.put(first, &@as([8]u8, @splat(0)));
+        try write.put(second, &@as([8]u8, @splat(0)));
+        try write.put(counter, &@as([8]u8, @splat(0)));
+        try write.commit();
+    }
+    const readiness = @import("artifact_producer_readiness.zig");
+    {
+        db.core.lockApplyShared();
+        defer db.core.unlockApplyShared();
+        try std.testing.expectError(error.WriterLocked, readiness.collectLegacyPage(a, &store));
+    }
+    try readiness.collectLegacyPage(a, &store);
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.NotFound, read.get(first));
+        _ = try read.get(second);
+        _ = try read.get(counter);
+        try std.testing.expectEqualStrings("current", try read.get(new_registry));
+    }
+    for (0..3) |_| try readiness.collectLegacyPage(a, &store);
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    for ([_][]const u8{ old_registry, first, second, counter }) |key| try std.testing.expectError(error.NotFound, read.get(key));
+    try std.testing.expectEqualStrings("current", try read.get(new_registry));
 }

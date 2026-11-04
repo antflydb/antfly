@@ -39,7 +39,8 @@ class PrivacyStatusCoverage:
             sources contribute no counts.
         failed_known (int | Unset): Source-bound failures observed so far; failed remains null while other work is
             unclassified.
-        failures (list[PrivacyStatusCoverageFailuresItem] | Unset):
+        failures (list[PrivacyStatusCoverageFailuresItem] | Unset): Optional failure examples, limited to 100 entries
+            and 1 MiB of serialized JSON. Failure counts include rows whose identifiers exceed this detail budget.
         next_key (None | str | Unset): Reserved for bounded internal census pages; omitted from public coverage
             snapshots.
     """

@@ -1472,7 +1472,6 @@ pub const AntflyApiHandler = struct {
         try root_server.postResponseStreaming("/ai/v1/read", httpx.Handler.bind(self, gatewayRead));
         try root_server.postResponseStreaming("/ai/v1/extract", httpx.Handler.bind(self, gatewayExtract));
         try root_server.postResponseStreaming("/ai/v1/rewrite", httpx.Handler.bind(self, gatewayRewrite));
-        try root_server.postResponseStreaming("/ai/v1/transcribe", httpx.Handler.bind(self, gatewayTranscribe));
         try root_server.postResponseStreaming("/ai/v1/synthesize", httpx.Handler.bind(self, gatewaySynthesize));
         try root_server.postResponseStreaming("/ai/v1/rerank", httpx.Handler.bind(self, gatewayRerank));
         try root_server.postResponseStreaming("/ai/v1/chunk", httpx.Handler.bind(self, gatewayChunk));
@@ -1600,6 +1599,13 @@ pub const AntflyApiHandler = struct {
         try server.get(routes.internal_capabilities, httpx.Handler.bind(self, internalCapabilities));
         try server.get(group_prefix ++ routes.group_db_median_key_suffix, httpx.Handler.bind(self, internalGroupMedianKey));
         try server.post(group_prefix ++ routes.group_db_index_activation_suffix, httpx.Handler.bind(self, internalGroupIndexActivation));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ "/document-read", @import("antfly_public_limits").max_document_read_body_bytes, httpx.Handler.bind(self, internalDocumentRead));
+        } else {
+            // Linked-kernel registration applies the same route budget when
+            // materializing its recorded route manifest.
+            try server.post(table_prefix ++ "/document-read", httpx.Handler.bind(self, internalDocumentRead));
+        }
         try server.get(table_prefix ++ routes.documents_marker ++ ":key", httpx.Handler.bind(self, internalGroupLookup));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_suffix, httpx.Handler.bind(self, internalDocumentArtifactManifests));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_marker ++ ":artifact_name", httpx.Handler.bind(self, internalDocumentArtifactManifest));
@@ -2967,6 +2973,33 @@ pub const AntflyApiHandler = struct {
         };
     }
 
+    fn internalDocumentRead(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing document read body");
+        var input = std.json.parseFromSlice(@import("http_routes.zig").DocumentReadRequest, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid document read body");
+        defer input.deinit();
+        const key = input.value.decodeKey(ctx.allocator) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return textResponse(ctx, 400, "invalid document read key");
+        };
+        defer ctx.allocator.free(key);
+        if (input.value.query.len > @import("antfly_public_limits").max_request_body_bytes) return textResponse(ctx, 400, "document read exceeds byte limit");
+        switch (input.value.operation) {
+            .lookup => return self.internalGroupLookupKey(ctx, params.group_id, params.table_name, key, input.value.query),
+            .manifest => {
+                var result = self.internalGroupOperations().documentArtifactManifest(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, key, input.value.artifact_name) catch |err| return internalGroupErrorResponse(ctx, err);
+                defer result.deinit(ctx.allocator);
+                return ctx.json(result);
+            },
+            .manifests => {
+                var result = self.internalGroupOperations().documentArtifactManifests(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, key) catch |err| return internalGroupErrorResponse(ctx, err);
+                defer result.deinit(ctx.allocator);
+                return ctx.json(result);
+            },
+        }
+    }
+
     fn internalGroupLookup(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
@@ -2974,10 +3007,11 @@ pub const AntflyApiHandler = struct {
         const key = (try decodePathParamOrBadRequest(ctx, encoded_key)) orelse
             return textResponse(ctx, 400, "invalid path parameter");
         defer ctx.allocator.free(key);
-        var lookup_options = http_route_helpers.parseInternalLookupOptions(
-            ctx.allocator,
-            ctx.request.uri.query orelse "",
-        ) catch return textResponse(ctx, 400, "invalid lookup options");
+        return self.internalGroupLookupKey(ctx, params.group_id, params.table_name, key, ctx.request.uri.query orelse "");
+    }
+
+    fn internalGroupLookupKey(self: *AntflyApiHandler, ctx: *httpx.Context, group_id: u64, table_name: []const u8, key: []const u8, query: []const u8) !httpx.Response {
+        var lookup_options = http_route_helpers.parseInternalLookupOptions(ctx.allocator, query) catch return textResponse(ctx, 400, "invalid lookup options");
         defer lookup_options.deinit(ctx.allocator);
         if (lookup_options.opts.privacy_original or std.mem.eql(u8, lookup_options.opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") or
             std.mem.eql(u8, lookup_options.opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}"))
@@ -2992,14 +3026,14 @@ pub const AntflyApiHandler = struct {
         }
         const control_lookup = lookup_options.opts.group_source_query_json.len != 0 or lookup_options.opts.relational_integrity_catalog or lookup_options.opts.relational_integrity_jobs_json.len != 0 or lookup_options.opts.relational_index_status_json.len != 0 or lookup_options.opts.relational_activation_json.len != 0 or lookup_options.opts.relational_topology_json.len != 0;
         const logical_key = if (control_lookup and std.mem.eql(u8, key, "\x00relational_control")) "" else key;
-        const consistency = http_server_mod.parseLookupReadConsistency(ctx.request.uri.query orelse "") catch
+        const consistency = http_server_mod.parseLookupReadConsistency(query) catch
             return textResponse(ctx, 400, "invalid read consistency");
         var result = self.internalGroupOperations().lookup(
             ctx.allocator,
             operationContext(ctx, null),
             .{
-                .group_id = params.group_id,
-                .table_name = params.table_name,
+                .group_id = group_id,
+                .table_name = table_name,
                 .key = logical_key,
                 .options = lookup_options.opts,
                 .consistency = consistency,
@@ -4574,9 +4608,6 @@ pub const AntflyApiHandler = struct {
     fn gatewayRead(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.gatewayRequest(ctx, .read);
     }
-    fn gatewayTranscribe(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
-        return self.gatewayRequest(ctx, .transcribe);
-    }
     fn gatewaySynthesize(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.gatewayRequest(ctx, .synthesize);
     }
@@ -5038,8 +5069,9 @@ pub const AntflyApiHandler = struct {
             error.DocumentStorageNotConfigured, error.NotLeader => 503,
             error.TooManyActiveJobs => 429,
             error.InlineCredentialNotAllowed => 400,
+            error.InvalidTranscriptionLanguage => 400,
             error.Canceled, error.Cancelled => return error.Canceled,
-            error.ProviderTokenBudgetExceeded, error.UnsupportedMediaTokenBudget, error.UnsupportedBedrockContentPart, error.UnsupportedBedrockGenerationOptions, error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.InvalidGeneratorConfig, error.UnsupportedDecisionKind, error.InvalidDecisionSpecification, error.InvalidInferenceMedia, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature => 400,
+            error.ProviderTokenBudgetExceeded, error.UnsupportedMediaTokenBudget, error.UnsupportedBedrockContentPart, error.UnsupportedBedrockGenerationOptions, error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.InvalidGeneratorConfig, error.UnsupportedDecisionKind, error.InvalidDecisionSpecification, error.InvalidInferenceMedia, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature, error.UnsupportedAudioReadCapability => 400,
             else => 502,
         };
         _ = ctx.status(status);
@@ -20337,6 +20369,7 @@ test "httpx inference gateway preserves framed media through raw and named nativ
         operation: []const u8 = "",
         calls: usize = 0,
         chunk: bool = false,
+        expected_model: []const u8 = "backend",
         fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
             check(context) catch |err| return inference_connection_abi.statusFromError(err);
             return .ok;
@@ -20355,13 +20388,13 @@ test "httpx inference gateway preserves framed media through raw and named nativ
             const parsed = try std.json.parseFromSlice(std.json.Value, a, envelope.metadata, .{});
             defer parsed.deinit();
             const model = if (self.chunk) parsed.value.object.get("config").?.object.get("model").? else parsed.value.object.get("model").?;
-            try std.testing.expectEqualStrings(if (self.chunk) "fixed" else "backend", model.string);
+            try std.testing.expectEqualStrings(if (self.chunk) "fixed" else self.expected_model, model.string);
             context.out_response.* = .{ .status = 200, .body = .{ .ptr = (try a.dupe(u8, "{}")).ptr, .len = 2 } };
         }
     };
     const a = std.testing.allocator;
     var config = try common_config.Config.parseFromSlice(a,
-        \\{"public_inference":{"enabled":true},"inference_capabilities":{"generators/native":{"images":"supported"}},"chunkers":{"paragraphs":{"provider":"antfly","model":"fixed"}},"extractors":{"entities":{"connection":"local-inference","model":"backend"}},"generators":{"native":{"provider":"antfly","model":"backend"}}}
+        \\{"public_inference":{"enabled":true},"inference_capabilities":{"generators/native":{"images":"supported","audio":"supported"}},"transcribers":{"speech":{"provider":"openai","model":"whisper-1"}},"chunkers":{"paragraphs":{"provider":"antfly","model":"fixed"}},"extractors":{"entities":{"connection":"local-inference","model":"backend"}},"generators":{"native":{"provider":"antfly","model":"backend"}}}
     );
     defer config.deinit();
     var state: State = .{};
@@ -20369,14 +20402,18 @@ test "httpx inference gateway preserves framed media through raw and named nativ
     var server = ApiHttpServer.init(a, .{ .node_config = &config, .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &state, .invoke = State.invoke } }, source.iface(), null, null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
-    const Case = struct { path: []const u8, operation: []const u8, body: []const u8 };
+    const Case = struct { path: []const u8, operation: []const u8, body: []const u8, model: []const u8 = "backend" };
     for ([_]Case{
+        .{ .path = "read", .operation = "read", .model = "transcribers/speech", .body = "{\"model\":\"transcribers/speech\",\"audio\":\"attachment:0\",\"retain_artifact\":true}" },
         .{ .path = "read", .operation = "read", .body = "{\"model\":\"local/backend\",\"images\":[{\"url\":\"attachment:0\"}]}" },
-        .{ .path = "transcribe", .operation = "transcribe", .body = "{\"model\":\"local/backend\",\"audio\":\"attachment:0\"}" },
+        .{ .path = "read", .operation = "read", .body = "{\"model\":\"generators/native\",\"images\":[{\"url\":\"attachment:0\"}]}" },
+        .{ .path = "read", .operation = "read", .body = "{\"model\":\"generators/native\",\"audio\":\"attachment:0\"}" },
+        .{ .path = "read", .operation = "read", .body = "{\"model\":\"local/backend\",\"audio\":\"attachment:0\",\"audio_options\":{\"timestamps\":true}}" },
         .{ .path = "extract", .operation = "extract", .body = "{\"model\":\"extractors/entities\",\"input\":[{\"type\":\"media\",\"data\":\"attachment:0\",\"mime_type\":\"image/png\"}]}" },
         .{ .path = "chunk", .operation = "chunk", .body = "{\"model\":\"chunkers/paragraphs\",\"input\":{\"type\":\"media\",\"data\":\"attachment:0\",\"mime_type\":\"image/png\"}}" },
         .{ .path = "generate", .operation = "generate", .body = "{\"model\":\"generators/native\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"media\",\"data\":\"attachment:0\",\"mime_type\":\"image/png\"}]}]}" },
     }) |case| {
+        state.expected_model = case.model;
         state.operation = case.operation;
         state.chunk = std.mem.eql(u8, case.path, "chunk");
         const url = try std.fmt.allocPrint(a, "http://localhost/ai/v1/{s}", .{case.path});
@@ -21021,7 +21058,7 @@ test "httpx inference gateway request errors remain client errors without reclas
         .{ Task.embed, "/ai/v1/embeddings", "{\"model\":\"x\",\"model\":\"y\"}" },
         .{ Task.embed, "/ai/v1/embeddings", "{\"model\":\"embedders/dense\",\"input\":[{\"type\":\"media\",\"mime_type\":\"image/png\",\"data\":\"!\"}]}" },
         .{ Task.synthesize, "/ai/v1/synthesize", "{\"model\":\"synthesizers/voice\",\"text\":\"hello\",\"format\":\"invalid\"}" },
-        .{ Task.transcribe, "/ai/v1/transcribe", "{\"model\":\"transcribers/speech\",\"audio\":\"AAAA\",\"diarization\":true}" },
+        .{ Task.read, "/ai/v1/read", "{\"model\":\"transcribers/speech\",\"audio\":\"AAAA\",\"audio_options\":{\"diarization\":true}}" },
     };
     inline for (cases) |case| {
         var request = try httpx.Request.init(a, .POST, "http://localhost" ++ case[1]);
@@ -21426,6 +21463,52 @@ test "httpx inference gateway document jobs persist before dispatch and publish 
     var submitted_json = try std.json.parseFromSlice(std.json.Value, a, submitted.body.?, .{});
     defer submitted_json.deinit();
     try store.cancel(work, submitted_json.value.object.get("id").?.string, "anonymous");
+
+    // Job submission shares synchronous read planning, including namespaces
+    // that collide, hosted leaves, caller overrides and recognition defaults.
+    try config.readers.registerConfig("same", .{ .provider = .antfly, .model = "ocr-backend" });
+    try config.transcribers.registerConfig("same", .{ .provider = .antfly, .model = "whisper-backend", .language_code = "fr", .timestamps = true });
+    try config.registry.registerGeneratorConfig("same", .{ .provider = .antfly, .model = "gemma-backend", .url = "" });
+    try config.transcribers.registerConfig("hosted", .{ .provider = .openai, .model = "whisper-1", .language_code = "fr", .timestamps = true, .max_total_tokens = 100 });
+    const Case = struct { selector: []const u8, backend: []const u8, connection: []const u8, language: bool = false };
+    for ([_]Case{
+        .{ .selector = "readers/same", .backend = "ocr-backend", .connection = "readers/same" },
+        .{ .selector = "transcribers/same", .backend = "whisper-backend", .connection = "transcribers/same", .language = true },
+        .{ .selector = "generators/same", .backend = "gemma-backend", .connection = "generators/same" },
+        .{ .selector = "transcribers/hosted", .backend = "transcribers/hosted", .connection = common_config.local_inference_connection_id, .language = true },
+    }, 0..) |case, index| {
+        var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/read/jobs");
+        defer request.deinit();
+        const body = try std.json.Stringify.valueAlloc(a, .{ .request = .{
+            .model = case.selector,
+            .audio = "AAAA",
+            .audio_options = .{ .timestamps = false, .diarization = false },
+        } }, .{});
+        defer a.free(body);
+        request.body = body;
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.documentReadCreate(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 202), response.status.code);
+        const status = try std.json.parseFromSliceLeaky(std.json.Value, work, response.body.?, .{});
+        const job_id = status.object.get("id").?.string;
+        const queued = try store.load(work, job_id, "anonymous");
+        try std.testing.expectEqualStrings(case.connection, queued.connection);
+        const saved = try store.read(work, queued.inputs[0], 1024 * 1024);
+        const effective = try std.json.parseFromSliceLeaky(std.json.Value, work, saved, .{});
+        try std.testing.expectEqualStrings(case.backend, effective.object.get("model").?.string);
+        const options = effective.object.get("audio_options").?.object;
+        try std.testing.expect(!options.get("timestamps").?.bool);
+        try std.testing.expect(!options.get("diarization").?.bool);
+        if (case.language) try std.testing.expectEqualStrings("fr", options.get("language").?.string);
+        try server.scheduleDocumentsOnce();
+        const expected = index + 2;
+        const deadline = research_jobs.nowMillis() + 5000;
+        while (target.calls.load(.acquire) < expected and research_jobs.nowMillis() < deadline) try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+        try std.testing.expectEqual(expected, target.calls.load(.acquire));
+        try std.testing.expectEqual(.succeeded, (try store.load(work, job_id, "anonymous")).state);
+    }
 }
 
 test "httpx inference gateway typed consumers retain errors and legacy original array positions" {

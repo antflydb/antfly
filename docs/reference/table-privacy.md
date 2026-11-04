@@ -60,6 +60,9 @@ in a JSON body for large cursors or filters that exceed URL limits. The TypeScri
 and Privacy tab use this body form. Explicit
 `policy_version` requests for a superseded policy return `410`.
 
+Failure examples are limited to 100 entries and 1 MiB of serialized JSON.
+Coverage and scan failure counts include documents omitted from those examples.
+
 Start a bounded retry or rescan with `POST /tables/customers/privacy/scans`,
 optionally supplying `from_key`, `to_key`, and a page `limit` from 1 to 1000.
 Source updates also schedule inspection through the ordinary producer pipeline.

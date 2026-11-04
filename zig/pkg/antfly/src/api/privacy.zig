@@ -114,48 +114,72 @@ fn statusResponse(server: anytype, a: A, table: []const u8, resource: ?catalog.R
     return result;
 }
 
+const CoverageCensus = struct {
+    const status = local.privacy_status;
+    a: A,
+    version: [64]u8,
+    totals: status.Totals = .{},
+    buffer: std.ArrayListUnmanaged(u8) = .empty,
+    last_key: std.ArrayListUnmanaged(u8) = .empty,
+    line_arena: std.heap.ArenaAllocator,
+    failures: std.ArrayListUnmanaged(Failure) = .empty,
+    failure_bytes: usize = 2,
+    soft_deadline_ns: u64 = 0,
+    yielded: bool = false,
+    const Failure = struct { key: []const u8, error_code: []const u8 };
+    fn start(_: ?*anyopaque) !void {}
+    fn write(raw: ?*anyopaque, bytes: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        while (lines.next()) |line| {
+            if (self.buffer.items.len +| line.len > @import("antfly_public_limits").max_privacy_status_row_bytes) return error.InvalidPrivacyReceipt;
+            try self.buffer.appendSlice(self.a, line);
+            if (lines.index == null) break;
+            if (self.buffer.items.len != 0) {
+                defer _ = self.line_arena.reset(.retain_capacity);
+                const scratch = self.line_arena.allocator();
+                const envelope = try std.json.parseFromSliceLeaky(std.json.Value, scratch, self.buffer.items, .{});
+                const parsed = (try std.json.parseFromValue(status.Wire, scratch, envelope, .{ .ignore_unknown_fields = true })).value;
+                const id = if (envelope == .object) envelope.object.get("_id") orelse return error.InvalidPrivacyReceipt else return error.InvalidPrivacyReceipt;
+                if (id != .string) return error.InvalidPrivacyReceipt;
+                try self.totals.add(self.a, self.version, parsed);
+                self.last_key.clearRetainingCapacity();
+                try self.last_key.appendSlice(self.a, id.string);
+                if (parsed.failed and self.failures.items.len < 100 and id.string.len <= catalog.coverage.max_failure_detail_bytes) {
+                    const detail = Failure{ .key = id.string, .error_code = parsed.error_code orelse "PrivacyInspectionFailed" };
+                    const size = try catalog.coverage.failureDetailSize(detail);
+                    if (size +| self.failure_bytes +| 1 <= catalog.coverage.max_failure_detail_bytes) {
+                        try self.failures.append(self.a, .{ .key = try self.a.dupe(u8, detail.key), .error_code = try self.a.dupe(u8, detail.error_code) });
+                        self.failure_bytes += size + 1;
+                    }
+                }
+                const now = platform_time.monotonicNs();
+                if (self.soft_deadline_ns == 0) {
+                    self.soft_deadline_ns = now +| 2 * std.time.ns_per_s;
+                } else if (now >= self.soft_deadline_ns) {
+                    self.buffer.clearRetainingCapacity();
+                    self.yielded = true;
+                    return error.Canceled;
+                }
+            }
+            self.buffer.clearRetainingCapacity();
+        }
+    }
+};
+
+fn scanResponse(a: A, code: u16, scan: catalog.Scan) !Response {
+    // Shard checkpoints are private native continuation state. Polling a
+    // public job must not copy every retained document key into its response.
+    var summary = scan;
+    summary.shard_cursors = .null;
+    return json(a, code, summary);
+}
+
 fn coverageForRange(server: anytype, a: A, table: []const u8, resource: catalog.Resource, collect: bool, request: operation.RequestContext, from_key: []const u8, to_key: []const u8, limit: u32) ![]const u8 {
     const unknown = "{\"available\":false,\"total\":null,\"current\":null,\"pending\":null,\"failed\":null,\"with_findings\":null,\"protected_ready\":null,\"protected_blocked\":null}";
     if (!collect) return unknown;
     const reads = server.table_reads orelse return unknown;
-    const status = local.privacy_status;
-    const Census = struct {
-        a: A,
-        version: [64]u8,
-        totals: status.Totals = .{},
-        buffer: std.ArrayListUnmanaged(u8) = .empty,
-        last_key: std.ArrayListUnmanaged(u8) = .empty,
-        line_arena: std.heap.ArenaAllocator,
-        failures: std.ArrayListUnmanaged(Failure) = .empty,
-        const Failure = struct { key: []const u8, error_code: []const u8 };
-        fn start(_: ?*anyopaque) !void {}
-        fn write(raw: ?*anyopaque, bytes: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            var lines = std.mem.splitScalar(u8, bytes, '\n');
-            while (lines.next()) |line| {
-                if (self.buffer.items.len +| line.len > 1024 * 1024) return error.InvalidPrivacyReceipt;
-                try self.buffer.appendSlice(self.a, line);
-                if (lines.index == null) break;
-                if (self.buffer.items.len != 0) {
-                    defer _ = self.line_arena.reset(.retain_capacity);
-                    const scratch = self.line_arena.allocator();
-                    const parsed = try std.json.parseFromSliceLeaky(status.Wire, scratch, self.buffer.items, .{ .ignore_unknown_fields = true });
-                    const envelope = try std.json.parseFromSliceLeaky(std.json.Value, scratch, self.buffer.items, .{});
-                    const id = if (envelope == .object) envelope.object.get("_id") orelse return error.InvalidPrivacyReceipt else return error.InvalidPrivacyReceipt;
-                    if (id != .string) return error.InvalidPrivacyReceipt;
-                    try self.totals.add(self.a, self.version, parsed);
-                    self.last_key.clearRetainingCapacity();
-                    try self.last_key.appendSlice(self.a, id.string);
-                    if (parsed.failed and self.failures.items.len < 100) try self.failures.append(self.a, .{
-                        .key = try self.a.dupe(u8, id.string),
-                        .error_code = try self.a.dupe(u8, parsed.error_code orelse "PrivacyInspectionFailed"),
-                    });
-                }
-                self.buffer.clearRetainingCapacity();
-            }
-        }
-    };
-    var census = Census{ .a = a, .version = resource.policy_version, .line_arena = std.heap.ArenaAllocator.init(platform_allocator.reclaimingScratch(a)) };
+    var census = CoverageCensus{ .a = a, .version = resource.policy_version, .line_arena = std.heap.ArenaAllocator.init(platform_allocator.reclaimingScratch(a)) };
     defer census.totals.deinit(a);
     defer census.buffer.deinit(a);
     defer census.line_arena.deinit();
@@ -167,7 +191,9 @@ fn coverageForRange(server: anytype, a: A, table: []const u8, resource: catalog.
         }
         census.failures.deinit(a);
     }
-    const budget = platform_time.monotonicNs() +| 2 * std.time.ns_per_s;
+    // The census yields only after a complete row. Keep a separate hard
+    // deadline for routing, setup and an oversized row; caller deadlines win.
+    const budget = platform_time.monotonicNs() +| 30 * std.time.ns_per_s;
     const complete = reads.scanStream(a, table, from_key, to_key, .{
         .privacy_original = true,
         .privacy_status = true,
@@ -176,15 +202,27 @@ fn coverageForRange(server: anytype, a: A, table: []const u8, resource: catalog.
         .limit = limit,
         .execution_deadline_ns = if (request.deadline_ns) |deadline| @min(deadline, budget) else budget,
         .cancellation = request.cancellation,
-    }, .read_index, .{ .context = &census, .start_fn = Census.start, .write_fn = Census.write }) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        error.Canceled, error.Cancelled => return err,
-        else => {
-            std.log.debug("privacy coverage unavailable err={s}", .{@errorName(err)});
-            return unknown;
-        },
+    }, .read_index, .{ .context = &census, .start_fn = CoverageCensus.start, .write_fn = CoverageCensus.write }) catch |err| blk: {
+        if (census.yielded) break :blk false;
+        switch (err) {
+            error.OutOfMemory => return err,
+            error.Canceled, error.Cancelled => return err,
+            error.DeadlineExceeded => {
+                // Fully validated rows preceding a slow/incomplete row still
+                // form a resumable prefix. Discard that row's partial bytes.
+                if (census.totals.total != 0) {
+                    census.yielded = true;
+                    census.buffer.clearRetainingCapacity();
+                    break :blk false;
+                }
+            },
+            else => {},
+        }
+        std.log.debug("privacy coverage unavailable limit={} cursor_bytes={} err={s}", .{ limit, from_key.len, @errorName(err) });
+        return unknown;
     };
-    if (!complete or census.buffer.items.len != 0) return unknown;
+    try request.ensureActive();
+    if ((!complete and !census.yielded) or census.buffer.items.len != 0) return unknown;
     var categories: std.json.Value = .{ .object = .empty };
     var iterator = census.totals.categories.iterator();
     while (iterator.next()) |entry| try categories.object.put(a, entry.key_ptr.*, .{ .number_string = try std.fmt.allocPrint(a, "{d}", .{entry.value_ptr.*}) });
@@ -207,7 +245,7 @@ fn coverageForRange(server: anytype, a: A, table: []const u8, resource: catalog.
         .fields = fields,
         .failed_known = total.failed,
         .failures = census.failures.items,
-        .next_key = if (total.total >= limit) @as(?[]const u8, census.last_key.items) else null,
+        .next_key = if (census.yielded or total.total >= limit) @as(?[]const u8, census.last_key.items) else null,
     }, .{});
     return raw;
 }
@@ -279,7 +317,7 @@ fn executeAttempt(server: anytype, a: A, table: []const u8, action: Action, args
         for (current.scans) |scan| if (std.mem.eql(u8, &scan.scan_id, args.scan_id)) {
             var result = scan;
             if (!std.mem.eql(u8, &scan.policy_version, &current.policy_version)) result.phase = .superseded;
-            return json(a, 200, result);
+            return scanResponse(a, 200, result);
         };
         return failure(a, 404, "privacy_scan_not_found", "Scan not found or outside its retention period.");
     }
@@ -300,7 +338,7 @@ fn executeAttempt(server: anytype, a: A, table: []const u8, action: Action, args
             if (err == error.TableGenerationChanged) return error.PrivacyCatalogRetry;
             return err;
         };
-        return json(a, 202, scan);
+        return scanResponse(a, 202, scan);
     }
     if (args.body.len != 0) {
         var input = try std.json.parseFromSlice(FindingsRequest, a, args.body, .{});
@@ -552,7 +590,7 @@ fn findings(server: anytype, a: A, table: []const u8, resource: catalog.Resource
     var pending: usize = 0;
     var continuation: ?[]const u8 = null;
     var processed_bytes: usize = 0;
-    const page_byte_budget = 8 * 1024 * 1024;
+    const page_byte_budget = @import("antfly_public_limits").privacy_findings_page_bytes;
     var output_bytes: usize = 0;
     for (documents.items) |key| {
         if (examined != 0 and processed_bytes >= page_byte_budget) {
@@ -706,10 +744,16 @@ pub fn advanceOnce(server: anytype, a: A) !void {
     if (server.cfg.deployment_mode != .standalone and !server.cfg.privacy_scan_coordinator) return;
     const writes = server.table_writes orelse return;
     const now: i64 = @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_ms));
-    const work = (try server.source.nextPrivacyWork(a, now)) orelse return;
+    const work = (server.source.nextPrivacyWork(a, now) catch |err| {
+        std.log.warn("privacy progress selection failed err={s}", .{@errorName(err)});
+        return err;
+    }) orelse return;
     const table = work.table;
     defer metadata.freeTable(a, table);
-    var current = try load(a, table.indexes_json) orelse return error.InvalidPrivacyCatalog;
+    var current = (load(a, table.indexes_json) catch |err| {
+        std.log.warn("privacy progress decode failed bytes={} err={s}", .{ table.indexes_json.len, @errorName(err) });
+        return err;
+    }) orelse return error.InvalidPrivacyCatalog;
     defer current.deinit();
     var resource = current.value;
     var chosen = .{ .scan = nextRunnableScan(resource.scans, now) };
@@ -773,11 +817,12 @@ pub fn advanceOnce(server: anytype, a: A) !void {
                 const Resumes = []const local.storage_db_selected_root.db.types.DocumentArtifactReprocessShardResume;
                 var parsed_resumes = if (scan.shard_cursors == .null) null else try std.json.parseFromValue(Resumes, a, scan.shard_cursors, .{ .ignore_unknown_fields = true });
                 defer if (parsed_resumes) |*value| value.deinit();
+                const shard_resumes = if (parsed_resumes) |value| value.value else &.{};
                 const result = writes.reprocessDocumentArtifactRange(a, table.name, resource.artifact_name, .{
-                    .from_key = if (parsed_resumes != null) "" else scan.next_key orelse scan.from_key,
+                    .from_key = if (shard_resumes.len != 0) "" else scan.next_key orelse scan.from_key,
                     .to_key = scan.to_key,
                     .limit = scan.limit,
-                    .shard_cursors = if (parsed_resumes) |value| value.value else &.{},
+                    .shard_cursors = shard_resumes,
                 }) catch |err| {
                     switch (err) {
                         error.Canceled, error.Cancelled, error.OutOfMemory => return err,
@@ -809,7 +854,9 @@ pub fn advanceOnce(server: anytype, a: A) !void {
                 updated.reprocessed +|= pass.reprocessed;
                 updated.skipped +|= pass.skipped;
                 updated.failed +|= pass.failed;
-                updated.next_key = pass.next_key;
+                // Shard resumes are authoritative when present. Do not also
+                // retain a second copy of an oversized global document key.
+                updated.next_key = if (pass.shard_cursors.len == 0) pass.next_key else null;
                 const resumes_raw = try std.json.Stringify.valueAlloc(a, pass.shard_cursors, .{});
                 defer a.free(resumes_raw);
                 var resumes = try std.json.parseFromSlice(std.json.Value, a, resumes_raw, .{});
@@ -819,11 +866,7 @@ pub fn advanceOnce(server: anytype, a: A) !void {
                 defer a.free(failures_raw);
                 var failures = try std.json.parseFromSlice(std.json.Value, a, failures_raw, .{});
                 defer failures.deinit();
-                var retained = std.json.Value{ .array = std.array_list.Managed(std.json.Value).init(a) };
-                if (updated.failures == .array) try retained.array.appendSlice(updated.failures.array.items[0..@min(updated.failures.array.items.len, 100)]);
-                const remaining = 100 - retained.array.items.len;
-                try retained.array.appendSlice(failures.value.array.items[0..@min(remaining, failures.value.array.items.len)]);
-                updated.failures = retained;
+                updated.failures = try catalog.coverage.appendFailures(a, updated.failures, failures.value);
                 updated.phase = if (pass.next_key != null or pass.shard_cursors.len != 0) .running else if (updated.failed != 0) .failed else .processing;
                 try persistScan(server, a, table, resource, work.term);
                 return;
@@ -902,11 +945,7 @@ fn acceptVerification(a: A, updated: *catalog.Scan, object: std.json.ObjectMap, 
     const cursor = object.get("next_key").?;
     updated.verification_cursor = if (cursor == .string) cursor.string else null;
     if (object.get("failed_known").?.integer != 0) {
-        var retained_failures = std.json.Value{ .array = std.array_list.Managed(std.json.Value).init(a) };
-        if (updated.failures == .array) try retained_failures.array.appendSlice(updated.failures.array.items[0..@min(updated.failures.array.items.len, 100)]);
-        const page_failures = object.get("failures").?.array.items;
-        try retained_failures.array.appendSlice(page_failures[0..@min(100 - retained_failures.array.items.len, page_failures.len)]);
-        updated.failures = retained_failures;
+        updated.failures = try catalog.coverage.appendFailures(a, updated.failures, object.get("failures").?);
     }
     return true;
 }
@@ -922,7 +961,10 @@ fn persistScan(server: anytype, a: A, table: metadata.TableRecord, resource: cat
     defer a.free(raw);
     var replacement = table;
     replacement.indexes_json = raw;
-    try server.source.replaceTableDefinition(table, replacement);
+    server.source.replaceTableDefinition(table, replacement) catch |err| {
+        std.log.warn("privacy progress persistence failed bytes={} err={s}", .{ raw.len, @errorName(err) });
+        return err;
+    };
 }
 
 fn scanError(scan: *catalog.Scan, now: i64, code: []const u8) void {
@@ -1131,7 +1173,9 @@ test "privacy readiness transport failures persist backoff and release the globa
     };
     const Writes = struct {
         failure: ?anyerror,
-        fn reprocessDocumentArtifactRange(self: *@This(), _: A, _: []const u8, _: []const u8, _: Types.DocumentArtifactTableReprocessRequest) !?Types.DocumentArtifactTableReprocessResult {
+        fn reprocessDocumentArtifactRange(self: *@This(), _: A, _: []const u8, _: []const u8, request: Types.DocumentArtifactTableReprocessRequest) !?Types.DocumentArtifactTableReprocessResult {
+            try std.testing.expectEqualStrings("after", request.from_key);
+            try std.testing.expectEqual(@as(usize, 0), request.shard_cursors.len);
             if (self.failure) |err| return err;
             unreachable;
         }
@@ -1156,6 +1200,10 @@ test "privacy readiness transport failures persist backoff and release the globa
         _ = try catalog.startScan(a, &resource, "", "", 100);
         const scans = @constCast(resource.scans);
         scans[0].phase = phase;
+        if (phase == .running) {
+            scans[0].next_key = "after";
+            scans[0].shard_cursors = .{ .array = std.array_list.Managed(std.json.Value).init(a) };
+        }
         scans[0].updated_at_millis = 10;
         scans[0].verification_started_at_millis = 1;
         resource.coverage = .{ .updated_at_millis = 5000, .retry_after_millis = std.math.maxInt(i64), .snapshot = .{ .counts = .{}, .started_at_millis = 2, .completed_at_millis = 3 } };
@@ -1181,4 +1229,45 @@ test "privacy readiness transport failures persist backoff and release the globa
         try std.testing.expectEqual(@as(u8, 0), recovered.consecutive_errors);
         try std.testing.expect(recovered.last_error == null);
     };
+}
+
+test "privacy census yields a complete prefix and resumes without losing a buffered row" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const version: [64]u8 = @splat('a');
+    const first = try std.json.Stringify.valueAlloc(a, .{ ._id = "first", .policy_version = &version, .current = true, .failed = false, .protected_ready = true, .categories = &[_]local.privacy_status.CategoryCount{} }, .{});
+    const second = try std.json.Stringify.valueAlloc(a, .{ ._id = "second", .policy_version = &version, .current = true, .failed = false, .protected_ready = true, .categories = &[_]local.privacy_status.CategoryCount{} }, .{});
+    const both = try std.mem.concat(a, u8, &.{ first, "\n", second, "\n" });
+    var census: CoverageCensus = .{ .a = a, .version = version, .line_arena = std.heap.ArenaAllocator.init(std.testing.allocator), .soft_deadline_ns = 1 };
+    defer census.line_arena.deinit();
+    try std.testing.expectError(error.Canceled, CoverageCensus.write(&census, both));
+    try std.testing.expect(census.yielded);
+    try std.testing.expectEqual(@as(u64, 1), census.totals.total);
+    try std.testing.expectEqualStrings("first", census.last_key.items);
+    try std.testing.expectEqual(@as(usize, 0), census.buffer.items.len);
+    var resumed: CoverageCensus = .{ .a = a, .version = version, .line_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer resumed.line_arena.deinit();
+    try CoverageCensus.write(&resumed, try std.mem.concat(a, u8, &.{ second, "\n" }));
+    try std.testing.expectEqual(@as(u64, 1), resumed.totals.total);
+    try std.testing.expectEqualStrings("second", resumed.last_key.items);
+}
+
+test "privacy scan polling omits large private shard checkpoints without mutating durable state" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key = try a.alloc(u8, 1_100_000);
+    @memset(key, 'x');
+    var checkpoint: std.json.Value = .{ .object = .empty };
+    try checkpoint.object.put(a, "next_key", .{ .string = key });
+    var checkpoints: std.json.Value = .{ .array = std.array_list.Managed(std.json.Value).init(a) };
+    try checkpoints.array.append(checkpoint);
+    const scan: catalog.Scan = .{ .scan_id = @splat('a'), .policy_version = @splat('b'), .phase = .running, .shard_cursors = checkpoints };
+    const result = try scanResponse(a, 200, scan);
+    try std.testing.expect(result.response.body.len < 4096);
+    try std.testing.expectEqual(@as(usize, 1_100_000), scan.shard_cursors.array.items[0].object.get("next_key").?.string.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, result.response.body, .{});
+    try std.testing.expect(parsed.value.object.get("shard_cursors").? == .null);
+    try std.testing.expectEqualStrings("running", parsed.value.object.get("phase").?.string);
 }

@@ -818,7 +818,7 @@ pub fn stage(txn: anytype, root: u128, prepared: *const Prepared) !bool {
     if (root == 0 or root != prepared.record.root) return error.DurableRootIncarnationUnavailable;
     try prepared.record.progress.observation.requireCurrent(txn, prepared.document);
     const obligations = @import("artifact_producer_obligations.zig");
-    const work = (try obligations.load(txn)) orelse return error.ArtifactCoverageBaselinePending;
+    const work = (try obligations.loadMetadata(txn)) orelse return error.ArtifactCoverageBaselinePending;
     try work.requireAuthority(prepared.record.progress.observation.authority);
     if (work.sealed_attempt != null) return error.RetainedEffectsFenceMismatch;
     const raw = txn.get(&prepared.selected) catch |err| switch (err) {

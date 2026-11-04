@@ -151,8 +151,6 @@ export type {
   RewriteResponse,
   Style,
   TextContentPart,
-  TranscribeRequest,
-  TranscribeResponse,
   TransientCapacityError,
 } from "./inference-types.js";
 export { logLevels, logStyles } from "./inference-types.js";
@@ -567,3 +565,4 @@ export type {
   PrivacyScan,
   PrivacyFindingsPage,
 } from "./types.js";
+export type { AudioReadOptions, AudioReadMetadata, AudioReadSegment } from "./inference-types.js";

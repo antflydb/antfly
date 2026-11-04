@@ -308,6 +308,14 @@ export class HierarchyCursorStaleError extends Error {
 }
 
 export const DEFAULT_WRITE_MAX_REQUEST_BYTES = 64 << 20;
+// Match api/public_limits.zig. Findings carry a raw-key cursor and may return
+// one oversized finding; keep these allowances scoped to the findings endpoint.
+const MAX_PRIVACY_CURSOR_BYTES = 3 + Math.ceil(((DEFAULT_WRITE_MAX_REQUEST_BYTES + 137) * 4) / 3);
+const MAX_PRIVACY_FINDINGS_REQUEST_BYTES =
+  MAX_PRIVACY_CURSOR_BYTES + 6 * DEFAULT_WRITE_MAX_REQUEST_BYTES + 8192;
+const MAX_PRIVACY_FINDINGS_RESPONSE_BYTES =
+  MAX_PRIVACY_CURSOR_BYTES + 7 * DEFAULT_WRITE_MAX_REQUEST_BYTES + 8 * 1024 * 1024 + 8192;
+
 export const DEFAULT_WRITE_MAX_RESPONSE_BYTES = 1 << 20;
 const MAX_ERROR_RESPONSE_BYTES = 1 << 20;
 
@@ -842,7 +850,15 @@ export class AntflyClient {
         headers: this.requestHeaders(ifMatch === undefined ? undefined : { "If-Match": ifMatch }),
         ...(body === undefined
           ? {}
-          : { body: encodeBoundedJSON(body, DEFAULT_WRITE_MAX_REQUEST_BYTES, false) }),
+          : {
+              body: encodeBoundedJSON(
+                body,
+                suffix === "/findings"
+                  ? MAX_PRIVACY_FINDINGS_REQUEST_BYTES
+                  : DEFAULT_WRITE_MAX_REQUEST_BYTES,
+                false
+              ),
+            }),
         signal,
         credentials: "same-origin",
         redirect: "error",
@@ -850,7 +866,11 @@ export class AntflyClient {
     );
     const result = await readLimitedResponseText(
       response,
-      response.ok ? 32 * 1024 * 1024 : MAX_ERROR_RESPONSE_BYTES
+      response.ok
+        ? suffix === "/findings"
+          ? MAX_PRIVACY_FINDINGS_RESPONSE_BYTES
+          : 32 * 1024 * 1024
+        : MAX_ERROR_RESPONSE_BYTES
     );
     let parsed: unknown;
     try {
@@ -3953,7 +3973,6 @@ export type InferenceGatewayOperation =
   | "read"
   | "extract"
   | "rewrite"
-  | "transcribe"
   | "dictate"
   | "synthesize"
   | "predict"

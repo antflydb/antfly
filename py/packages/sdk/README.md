@@ -233,3 +233,19 @@ alongside `search_after`; `query()` exposes both.
 access. `request()` is the public authenticated transport for other `/db/v1/`
 and `/ai/v1/` operations. Use `close()` or a context manager to release the
 client's HTTP pool.
+
+## Optional source management
+
+```python
+from antfly.sources import SourcesClient
+
+with SourcesClient("https://sources.example.com/sources/v1", management_token) as sources:
+    run = sources.start_run(source_id, submission_key)
+    receipt = sources.run(source_id, run["id"])
+```
+
+The base URL is an explicit Go-server or Colony management mount. Credentials and
+ingestion stay there; these operations do not target the Antfly database listener.
+Reuse the same submission key when resolving an ambiguous response. Inspect run
+outcome/completeness as well as execution state. `StandaloneSourcesClient` in the
+same module provides standalone credential and legacy profile operations.

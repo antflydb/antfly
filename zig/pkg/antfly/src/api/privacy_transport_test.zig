@@ -152,3 +152,50 @@ test "privacy policy capture preserves errors through the foreign runtime dispat
     err = error.DeadlineExceeded;
     try std.testing.expectError(error.DeadlineExceeded, source.privacyPolicyVersion(std.testing.allocator, "docs", null));
 }
+
+test "privacy long document keys use bounded POST routes and preserve read controls" {
+    const a = std.testing.allocator;
+    const key = try a.alloc(u8, 36000);
+    defer a.free(key);
+    for (key, 0..) |*byte, i| byte.* = switch (i % 3) {
+        0 => 255,
+        1 => '"',
+        else => 'x',
+    };
+    const Fake = struct {
+        key: []const u8,
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, req: http.HttpRequest) !http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(req.method == .POST);
+            try std.testing.expect(req.uri.len < 200);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/internal/v1/groups/7/tables/docs/document-read"));
+            var input = try std.json.parseFromSlice(@import("http_routes.zig").DocumentReadRequest, alloc, req.body, .{});
+            defer input.deinit();
+            const decoded = try input.value.decodeKey(alloc);
+            defer alloc.free(decoded);
+            try std.testing.expectEqualStrings(self.key, decoded);
+            if (self.calls == 0) {
+                try std.testing.expect(input.value.operation == .lookup);
+                try std.testing.expect(std.mem.indexOf(u8, input.value.query, "read_consistency=stale") != null);
+                try std.testing.expect(std.mem.indexOf(u8, input.value.query, "_privacy_original=true") != null);
+                try std.testing.expect(std.mem.indexOf(u8, input.value.query, "fields=body") != null);
+                try std.testing.expectEqual(@as(?u32, 37), req.timeout_ms);
+            } else if (self.calls == 1) {
+                try std.testing.expect(input.value.operation == .manifest);
+                try std.testing.expectEqualStrings("_privacy_document", input.value.artifact_name);
+            } else try std.testing.expect(input.value.operation == .manifests);
+            self.calls += 1;
+            return .{ .status = 200, .body = try alloc.dupe(u8, "{}") };
+        }
+    };
+    var fake = Fake{ .key = key };
+    var client = @import("http_client.zig").ApiHttpClient.init(a, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    var lookup = try client.fetchGroupLookupWithMode("http://peer", 7, "docs", key, "body", "stale", 37, null, false, false, "", "", "", "", "", null, null, false, true, null);
+    defer lookup.deinit(a);
+    var manifest = try client.fetchGroupDocumentArtifactManifest("http://peer", 7, "docs", key, "_privacy_document");
+    defer manifest.deinit(a);
+    var manifests = try client.fetchGroupDocumentArtifactManifests("http://peer", 7, "docs", key);
+    defer manifests.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+}

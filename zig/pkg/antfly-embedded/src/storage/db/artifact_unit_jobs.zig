@@ -27,13 +27,15 @@ pub const Scope = [scope_bytes]u8;
 const ControlKey = [scope_bytes + 1]u8;
 pub const JobKey = [scope_bytes + 65]u8;
 const max_identity_bytes = 1024 * 1024;
+const max_document_identity_bytes = publication.max_cursor_bytes;
+const max_job_bytes = 80 + 2 * max_document_identity_bytes + max_identity_bytes;
 const directory_prefix = "\x00\x00__artifact_publication__:unit-worker:";
 const DocumentScope = [directory_prefix.len + 80]u8;
 const DirectoryKey = [@sizeOf(DocumentScope) + 33]u8;
 
 fn documentScope(root: u128, authority: publication.Authority, document: []const u8) !DocumentScope {
     if (root == 0) return error.DurableRootIncarnationUnavailable;
-    if (document.len == 0 or document.len > max_identity_bytes) return error.InvalidBatchRequest;
+    if (document.len == 0 or document.len > max_document_identity_bytes) return error.InvalidBatchRequest;
     var result: DocumentScope = undefined;
     @memcpy(result[0..directory_prefix.len], directory_prefix);
     @memcpy(result[directory_prefix.len..][0..24], &authority.namespace);
@@ -300,8 +302,8 @@ pub const Job = struct {
 
     fn encodeAlloc(self: Job, alloc: std.mem.Allocator, selected: JobKey) ![]u8 {
         var size: usize = 80;
-        for ([_][]const u8{ self.document, self.child, self.unit }) |name| {
-            if (name.len == 0 or name.len > max_identity_bytes) return error.ResourceBudgetExceeded;
+        for ([_][]const u8{ self.document, self.child, self.unit }, 0..) |name, i| {
+            if (name.len == 0 or name.len > (if (i == 1) max_identity_bytes else max_document_identity_bytes)) return error.ResourceBudgetExceeded;
             size += name.len;
         }
         const raw = try alloc.alloc(u8, size);
@@ -319,13 +321,13 @@ pub const Job = struct {
 
     /// Borrowed identities, bound to the root/scope, generation and unit key.
     pub fn decode(selected: JobKey, raw: []const u8) !Job {
-        if (raw.len < 83 or raw.len > 80 + 3 * max_identity_bytes or !std.mem.eql(u8, raw[0..4], "AUJ1") or
+        if (raw.len < 83 or raw.len > max_job_bytes or !std.mem.eql(u8, raw[0..4], "AUJ1") or
             !std.mem.eql(u8, raw[raw.len - 32 ..], &checksum(&selected, raw[0 .. raw.len - 32]))) return error.ArtifactCatalogCorrupt;
         var names: [3][]const u8 = undefined;
         var offset: usize = 48;
         for (&names, 0..) |*name, i| {
             const count: usize = std.mem.readInt(u32, raw[36 + i * 4 ..][0..4], .little);
-            if (count == 0 or count > max_identity_bytes or count > raw.len - 32 - offset) return error.ArtifactCatalogCorrupt;
+            if (count == 0 or count > (if (i == 1) max_identity_bytes else max_document_identity_bytes) or count > raw.len - 32 - offset) return error.ArtifactCatalogCorrupt;
             name.* = raw[offset..][0..count];
             offset += count;
         }
@@ -375,7 +377,7 @@ pub fn scan(alloc: std.mem.Allocator, txn: anytype, selected: Scope, after: ?Job
             at_end = true;
             break;
         }
-        if (found.key.len != @sizeOf(JobKey) or found.value.len > 80 + 3 * max_identity_bytes) return error.ArtifactCatalogCorrupt;
+        if (found.key.len != @sizeOf(JobKey) or found.value.len > max_job_bytes) return error.ArtifactCatalogCorrupt;
         const selected_job: JobKey = found.key[0..@sizeOf(JobKey)].*;
         // Validate borrowed framing before allocating. A single bounded large
         // identity may exceed the soft byte budget, so it cannot starve.
@@ -664,7 +666,7 @@ pub const Admission = struct {
         if (root == 0 or root != self.root) return error.DurableRootIncarnationUnavailable;
         if (!std.meta.eql(self.catalog_stamp, try catalogStamp(txn))) return error.ArtifactCatalogDrift;
         try self.page.requireCurrent(txn);
-        const obligations = (try @import("artifact_producer_obligations.zig").load(txn)) orelse return error.ArtifactCatalogDrift;
+        const obligations = (try @import("artifact_producer_obligations.zig").loadMetadata(txn)) orelse return error.ArtifactCatalogDrift;
         try obligations.requireAuthority(self.page.observation.authority);
         if (obligations.sealed_attempt != null) return error.RetainedEffectsFenceMismatch;
         const old = try metadata(txn, self.selected);
@@ -896,4 +898,21 @@ test "ordered artifact inventory document worker fairly resumes nonempty childre
     try std.testing.expectError(error.NotFound, read.get(&first_key));
     try std.testing.expectError(error.NotFound, read.get(&document));
     try std.testing.expectError(error.NotFound, read.get(&controlKey(first, 0)));
+}
+
+test "privacy unit directory and persisted jobs admit large document identities" {
+    const a = std.testing.allocator;
+    const document = try a.alloc(u8, 1_100_000);
+    defer a.free(document);
+    @memset(document, 'x');
+    const authority: publication.Authority = .{ .namespace = @splat(1), .epoch = 3, .catalog_digest = @splat(4) };
+    _ = try documentScope(7, authority, document);
+    const selected = try scope(7, authority, @splat(5));
+    const job: Job = .{ .generation = @splat(6), .document = document, .child = "child", .unit = document };
+    const key = jobKey(selected, job.generation, job.unit);
+    const raw = try job.encodeAlloc(a, key);
+    defer a.free(raw);
+    const restored = try Job.decode(key, raw);
+    try std.testing.expectEqualSlices(u8, document, restored.document);
+    try std.testing.expectEqualSlices(u8, document, restored.unit);
 }

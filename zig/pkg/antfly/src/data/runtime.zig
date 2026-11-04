@@ -7247,7 +7247,7 @@ pub const DataServer = struct {
                 const offset = ordinal * codec.chunk_bytes;
                 hashes[ordinal] = transport.chunkDigest(ordinal, job.proposal.command[offset..@min(offset + codec.chunk_bytes, job.proposal.command.len)]);
             }
-            const begin: transport.Request = .{ .action = .begin, .namespace = command.namespace, .publication_digest = command.publication_digest, .command_digest = command.publication_digest, .encoded_len = @intCast(job.proposal.command.len), .chunk_hashes = hashes[0..count], .control = command.mode != .publish };
+            const begin: transport.Request = .{ .action = .begin, .namespace = command.namespace, .publication_digest = command.publication_digest, .command_digest = command.publication_digest, .encoded_len = @intCast(job.proposal.command.len), .chunk_hashes = hashes[0..count], .control = transport.usesReservedControl(command.mode, job.proposal.command.len) };
             try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = begin, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
             job.upload_root = begin.proposedManifest().root();
             job.publication_digest = command.publication_digest;

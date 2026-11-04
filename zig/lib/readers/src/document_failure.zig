@@ -38,7 +38,10 @@ const terminal = .{
     error.CloudflareAuthenticationFailed,     error.InvalidExtractorResponse,
     error.UnsupportedExtractionSchemaVersion, error.InvalidInferenceRequest,
     error.InferenceEndpointAccessDenied,      error.DocumentArtifactNotFound,
-    error.DocumentArtifactExpired,            error.ReadOutputTruncated,
+    error.DocumentArtifactExpired,            error.UnsupportedAudioReadCapability,
+    error.AudioTooLong,                       error.UnsupportedAudioInput,
+    error.InvalidTranscriptionLanguage,       error.SpeakerModelUnavailable,
+    error.ReadOutputTruncated,
 };
 const transient = .{
     error.CloudflareRateLimited,        error.InferenceUpstreamRateLimited,

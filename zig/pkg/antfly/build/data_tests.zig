@@ -282,6 +282,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, private_initial_owner_predicate_tests).step);
 
     const lib_data_storage_default_filters = [_][]const u8{
+        "privacy data raft apply batches WAL-durable commands without one SST per entry",
+        "privacy data raft apply compaction families are contiguous and separate hot metadata from history",
         "membership reducer",
         "FK retirement worker",
         "data raft online topology arbitration persists exact rejection and scopes release across reopen",

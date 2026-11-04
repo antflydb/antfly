@@ -38,7 +38,8 @@ class PrivacyScan:
         verification_pending (int | Unset):
         verification_failed (int | Unset):
         verification_blocked (int | Unset):
-        failures (list[PrivacyScanFailuresType0Item] | None | Unset):
+        failures (list[PrivacyScanFailuresType0Item] | None | Unset): Optional failure examples, limited to 100 entries
+            and 1 MiB of serialized JSON. Failure counts include rows whose identifiers exceed this detail budget.
     """
 
     scan_id: str

@@ -61,6 +61,38 @@ describe("table privacy", () => {
     });
   });
 
+  it("carries a server-issued cursor above both former client caps", async () => {
+    // A 49 MiB raw key produces a valid binary cursor above 65 MiB. Reuse that
+    // one token as the response and continuation to test the complete SDK path.
+    const header = Buffer.alloc(137);
+    header.fill("a", 0, 128);
+    const cursor =
+      "p1." + Buffer.concat([header, Buffer.alloc(49 * 1024 * 1024, "x")]).toString("base64url");
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      const input = JSON.parse(init?.body as string);
+      if (input.cursor) {
+        expect(input.cursor).toBe(cursor);
+        return Response.json({ findings: [], policy_version: "v", next_cursor: null });
+      }
+      return Response.json({ findings: [], policy_version: "v", next_cursor: cursor });
+    });
+    vi.stubGlobal("fetch", fetch);
+    const client = new AntflyClient({ baseUrl: "https://antfly.test" });
+    const first = await client.privacy.findings("private");
+    expect(first.data.next_cursor).toBe(cursor);
+    const second = await client.privacy.findings("private", { cursor: first.data.next_cursor! });
+    expect(second.data.next_cursor).toBeNull();
+    expect(fetch).toHaveBeenCalledTimes(2);
+    // Other privacy operations retain their ordinary write budget.
+    await expect(
+      client.privacy.preview("private", {
+        policy: { mode: "monitor", fields: ["body"] },
+        sample: { keys: [cursor] },
+      })
+    ).rejects.toThrow();
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
   it("surfaces precondition errors instead of silently overwriting a policy", async () => {
     vi.stubGlobal(
       "fetch",

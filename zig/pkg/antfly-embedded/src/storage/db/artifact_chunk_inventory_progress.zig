@@ -124,7 +124,7 @@ pub const Prepared = struct {
         const current = try load(txn, &self.selected);
         const actual: ?publication.Digest = if (current) |value| value.digest else null;
         if (!std.meta.eql(self.expected, actual)) return error.EnrichmentSourceChanged;
-        const state = (try @import("artifact_producer_obligations.zig").load(txn)) orelse return error.ArtifactCatalogDrift;
+        const state = (try @import("artifact_producer_obligations.zig").loadMetadata(txn)) orelse return error.ArtifactCatalogDrift;
         try state.requireAuthority(self.record.checkpoint.authority);
         if (state.sealed_attempt != null) return error.RetainedEffectsFenceMismatch;
         if (self.duplicate) {

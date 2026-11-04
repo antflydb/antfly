@@ -60,6 +60,14 @@ pub fn diagnostic(err: anyerror, out: *h.capi.Buffer) h.capi.ErrorCode {
 pub fn diagnosticCode(description: dependencies.sql_errors.Diagnostic) h.capi.ErrorCode {
     if (std.mem.eql(u8, description.code, "0A000")) return .unsupported;
     if (std.mem.eql(u8, description.code, "55P03")) return .busy;
+    // Retryable capacity refusals happen before execution; C callers retry
+    // on busy, so report them that way rather than as a bad request.
+    if (std.mem.eql(u8, description.code, "53300")) return .busy;
+    if (std.mem.eql(u8, description.code, "57014")) return .cancelled;
+    if (std.mem.eql(u8, description.code, "53100") or std.mem.eql(u8, description.code, "58000")) return .internal;
+    // Not applied, waiting on reconciliation; or committed with visibility
+    // pending. Neither is a request error or an unknown outcome.
+    if (std.mem.eql(u8, description.code, "55000") or std.mem.eql(u8, description.code, "AF001")) return .stalled;
     if (std.mem.eql(u8, description.code, "40001")) return .version_conflict;
     if (std.mem.eql(u8, description.code, "40003")) return .outcome_unknown;
     if (std.mem.eql(u8, description.code, "XX000") or std.mem.eql(u8, description.code, "53200")) return .internal;

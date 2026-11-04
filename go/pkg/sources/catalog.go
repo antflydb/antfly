@@ -27,6 +27,8 @@ type Catalog struct {
 	Principals []string  `json:"principals"`
 }
 type Binding struct {
+	Publication       string          `json:"publication,omitempty"`
+	DocumentVersion   int             `json:"document_version,omitempty"`
 	PublishedRevision string          `json:"published_revision,omitempty"`
 	ID                string          `json:"id"`
 	Alias             string          `json:"alias"`
