@@ -10,8 +10,6 @@ GO_MODULES := \
 	./go/pkg/embedded \
 	./go/pkg/sdk \
 	./go/pkg/docsaf \
-	./go/pkg/evalaf \
-	./go/pkg/evalaf/plugins/antfly \
 	./go/pkg/genkit/antfly \
 	./go/pkg/genkit/openrouter \
 	./go/pkg/sources

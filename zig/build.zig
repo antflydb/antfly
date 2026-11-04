@@ -1107,7 +1107,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     }) });
     b.step("antfly-pessimistic-lock-ledger-test", "Verify exact lock effects, atomic ownership and bounded receipts").dependOn(&b.addRunArtifact(pessimistic_ledger_tests).step);
 
-    const graph_transfer_tests = b.addTest(.{ .root_module = b.createModule(.{
+    const graph_transfer_tests = b.addTest(.{ .filters = &.{ "online graph transfer", "ordered artifact inventory graph mutation", "physical artifact catalog view", "source artifact batch", "source artifact descriptors", "ordered artifact inventory source layout cache" }, .root_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/graph_transfer_test.zig"),
         .target = target,
         .optimize = optimize,

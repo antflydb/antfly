@@ -89,6 +89,10 @@ Declare the shared chunk producer once. A dense enrichment consumes its primary 
 ]
 ```
 
+For standalone indexes, the source field may contain a plain HTTP, HTTPS, S3, or GCS URL. The enrichment runtime fetches it under `remote_content` policy and passes the response MIME type and bytes to the model-aware chunker. Related named-output consumers share the prepared source without another download or media copy. Ordinary passage strings remain text inputs.
+
+Use a versioned `source` object for large media that should stay on the range-based streaming path. HTTP sources in that form must honor byte ranges and the supplied strong ETag; an origin that only supports full downloads can use a plain URL within the configured download limit. A `media_output` asset must name an output declared by its upstream model-aware chunk producer.
+
 These are entries in an index's `enrichments` list. The embeddings index's `embedder` must match the primary embedding model, task, and dimensions; its source is `media_vectors`. A full-text index can select `transcript_chunks` as its source. Model-aware chunk rows always retain descriptors; `store_chunks` additionally retains their payloads. Output payloads are stored separately from chunk recipes.
 
 A `media_output` asset has `object: "media.output.list"`, its boundary `plan_id`, `source_fingerprint`, and `source_version`, per-parent output results, searchable `text`, and `transcript_spans`. Cached hydration checks that source identity before reusing any output payload. Spans retain UTF-8 byte offsets, exact nanosecond phrase clocks, parent ordinal, sub-index, and speaker index with its scope. Text chunks cut from that asset retain `_media.transcript_spans` with offsets relative to the text chunk, plus `_media.start_ns` and `_media.end_ns`. Cutting through a phrase preserves that phrase's timing envelope; it does not invent word timestamps. Transcript stamping validates offset ordering and uses a single sweep for ordered spans and cuts. Imported unordered offsets retain the general scan path. New diarized outputs and projected transcript spans carry `speaker_scope: "source"`: the same voice keeps its index across parent chunks and output sub-windows for this source and diarization recipe. Older receipts without that marker retain their parent/sub-window scope. Go SDK speaker indices are presence-aware: index `0` identifies the first voice, while an omitted index remains unassigned.
@@ -183,3 +187,7 @@ Waveform classifiers take one float32 `input_values` tensor and return float32 `
 Serverless deployments run the same media pass. Chunk descriptors, vectors, independent outputs, and transcript spans are stored in the derived document; unfinished outputs keep the document pending and retry up to three times per output recipe, and terminal failures remain visible in `media_outputs`.
 
 Checkpoint, cache, and repair internals are in the [media pass runtime notes](../design/media-pass.md).
+
+## Composed queries
+
+A query template such as `astronaut voice recording {{media url=this}}` is one ordered input group: the text and media produce one query vector. Index queries use the model's retrieval-query task and the request's cancellation and deadline controls. They do not require enabling the public inference endpoint. Independent media items used for index backfill remain separate batch rows.

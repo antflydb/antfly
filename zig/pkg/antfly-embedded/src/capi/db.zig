@@ -232,7 +232,7 @@ pub fn registerLiteIndexEnrichments(handle: *Handle, config_json: []const u8, ro
         &collected,
     );
     if (collected.items.len == 0) return;
-    indexes_api.sortArtifactEnrichmentsByDependency(collected.items);
+    try indexes_api.sortArtifactEnrichmentsByDependency(alloc, collected.items);
     for (collected.items) |cfg| {
         // Record the touch before mutating, so a mid-loop failure still rolls
         // back every enrichment this call may have changed.

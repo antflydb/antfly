@@ -14579,6 +14579,16 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        const execution = @import("../common/data_raft_protocol.zig").batch_execution_identity_protocol_version;
+        if (req.group_source) |command| if (command.action == .activate_catalog) return execution;
+        if (req.artifact_publication) |command| if (command.execution_identity != null) return execution;
+        if (req.artifact_catalog) |command| if (command.binding.effect_protocol >= 17) return execution;
+        if (req.online_source) |command| if (command == .admit) {
+            if (command.admit.artifact_catalog) |binding| if (binding.effect_protocol >= 17) return execution;
+        };
+        if (req.merge_page) |page| if (page.source.artifact_catalog) |binding| if (binding.effect_protocol >= 17) return execution;
+        if (req.merge_checkpoint) |checkpoint| if (checkpoint.page_source) |source| if (source.artifact_catalog) |binding| if (binding.effect_protocol >= 17) return execution;
+
         if (@import("../api/internal_batch_forwarding.zig").externalTransactionProtocol(req)) |version| return version;
         if (req.relational_topology) |command| if (command.sql_drop_control) return @import("../common/data_raft_protocol.zig").batch_sql_drop_control_protocol_version;
         if (req.relational_index_owner_control != null) return data_raft_batch.index_owner_control_protocol_version;
@@ -59778,12 +59788,32 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
 
 test "grouped source protocol dominates coexisting graph envelope features" {
     const protocol = @import("../common/data_raft_protocol.zig");
-    const request: antfly.db.types.BatchRequest = .{ .artifact_catalog = .{
+    var request: antfly.db.types.BatchRequest = .{ .artifact_catalog = .{
         .namespace = @splat(1),
         .catalogs = .{},
         .binding = .{ .epoch = 1, .digest = @splat(2), .semantic_digest = @splat(3), .effect_protocol = 16 },
     }, .graph_endpoint_cleanup = true };
     try std.testing.expectEqual(protocol.batch_group_source_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    request.artifact_catalog.?.binding.effect_protocol = 17;
+    try std.testing.expectEqual(protocol.batch_execution_identity_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    // Independently added SQL and execution payloads share one batch. Even a
+    // malformed private command must not lower the decoder chosen before
+    // native validation; a v31 SQL peer cannot decode grouped v17 effects.
+    const Lock = @typeInfo(@FieldType(antfly.db.types.BatchRequest, "sql_lock")).optional.child;
+    request.sql_lock = .{ .admission = std.mem.zeroes(@FieldType(Lock, "admission")), .operation = .begin };
+    try std.testing.expectEqual(protocol.batch_sql_lock_protocol_version, @import("../api/internal_batch_forwarding.zig").externalTransactionProtocol(request).?);
+    try std.testing.expectEqual(protocol.batch_execution_identity_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    request.artifact_catalog = null;
+    try std.testing.expectEqual(protocol.batch_sql_lock_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    request = .{ .group_source = .{ .action = .activate, .artifact = "turns", .definition = .{ .table_incarnation = 1, .configuration = @splat(2) }, .namespace = @splat(1), .backfill = .{ .route = .{ .value = "" } } } };
+    try std.testing.expectEqual(protocol.batch_group_source_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    request.group_source.?.action = .activate_catalog;
+    try std.testing.expectEqual(protocol.batch_execution_identity_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    const encoded = try data_raft_batch.encode(std.testing.allocator, "docs", request);
+    defer std.testing.allocator.free(encoded);
+    var decoded = try data_raft_batch.decode(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@TypeOf(request.group_source.?.action).activate_catalog, decoded.batch.req.group_source.?.action);
 }
 
 test "SQL drop retirement control retains ordered timestamps and requires every applying decoder" {

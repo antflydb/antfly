@@ -105,6 +105,7 @@ pub const json = @import("util/json.zig");
 pub const common = @import("util/common.zig");
 pub const attachment_envelope = @import("util/attachment_envelope.zig");
 pub const numeric_response = @import("util/numeric_response.zig");
+pub const embedding_revision = @import("util/embedding_revision.zig");
 
 pub const testing_mod = @import("testing.zig");
 

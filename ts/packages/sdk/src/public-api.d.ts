@@ -23875,6 +23875,8 @@ export interface components {
         };
         /** @description OpenAI-compatible embedding request with inference multimodal content-part extension. EmbeddingGemma 2 text encoding uses official task prefixes, a shared 8192-token limit, mean pooling including prompt tokens, and normalized vectors. */
         InferenceEmbedRequest: {
+            /** @description Optional immutable execution revision from model capabilities. Every acquired model, including recovery attempts, must match before inference. A mismatch returns 409 with X-Antfly-Capability-Stale true. Successful execution acknowledges the pin in X-Antfly-Model-Revision for JSON and numeric responses; callers requiring a pin must reject missing or different acknowledgements. */
+            model_revision?: string;
             /** @description Optional exact asset identity pin. A mismatch returns 409 before inference. */
             model_identity?: string;
             /** @description Model name to use for embedding generation */
@@ -24696,6 +24698,11 @@ export interface components {
                 /** Format: int64 */
                 minimum_dimensions: number;
             };
+            /**
+             * @description The embedding endpoint enforces model_revision and acknowledges successful execution in X-Antfly-Model-Revision for both JSON and numeric responses. An observed model_revision alone does not establish this support.
+             * @default false
+             */
+            model_revision_pinning?: boolean;
             /** @description Immutable resolved embedding or generator generation, returned for scoped model/task discovery without loading weights. */
             model_revision?: string;
             /**
@@ -42403,6 +42410,8 @@ export interface operations {
             /** @description Embeddings generated successfully */
             200: {
                 headers: {
+                    /** @description The acquired model revision, acknowledging model_revision after successful execution. Present for pinned JSON and numeric responses. */
+                    "X-Antfly-Model-Revision"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -42440,6 +42449,17 @@ export interface operations {
             /** @description Model not found */
             404: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The model identity or immutable revision pin does not match the acquired model. */
+            409: {
+                headers: {
+                    /** @description Present with value true for a stale model revision. Refresh capabilities and replan before retrying. */
+                    "X-Antfly-Capability-Stale"?: "true";
                     [name: string]: unknown;
                 };
                 content: {
@@ -43959,6 +43979,8 @@ export interface operations {
             /** @description Embedding response */
             200: {
                 headers: {
+                    /** @description The acquired model revision, acknowledging model_revision after successful execution. Present for pinned JSON and numeric responses. */
+                    "X-Antfly-Model-Revision"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -43996,6 +44018,17 @@ export interface operations {
             /** @description Model not found */
             404: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The model identity or immutable revision pin does not match the acquired model. */
+            409: {
+                headers: {
+                    /** @description Present with value true for a stale model revision. Refresh capabilities and replan before retrying. */
+                    "X-Antfly-Capability-Stale"?: "true";
                     [name: string]: unknown;
                 };
                 content: {

@@ -48,6 +48,7 @@ pub const Wave = struct {
     control: Control,
     kind: Kind,
     clap_policy: ?ClapPreprocessingPolicy = null,
+    max_decode_working_bytes: usize = audio.default_decode_working_bytes,
     bounded: bounded_mod.BoundedAllocator,
     allocation_exceeded_budget: bool = false,
     permit: ?@import("../backends/session.zig").RunPermit = null,
@@ -64,6 +65,12 @@ pub const Wave = struct {
     retained_bytes: usize = 0,
     prepare_ns: u64 = 0,
 
+    pub const Limits = struct { preparation_bytes: usize, decode_working_bytes: usize };
+    pub fn initWithLimits(session: Session, clips: []const Clip, errors: ?[]?anyerror, control: Control, kind: Kind, limits: Limits) Wave {
+        var wave = init(session, clips, errors, control, kind, limits.preparation_bytes);
+        wave.max_decode_working_bytes = limits.decode_working_bytes;
+        return wave;
+    }
     pub fn init(session: Session, clips: []const Clip, errors: ?[]?anyerror, control: Control, kind: Kind, budget: usize) Wave {
         return .{ .session = session, .clips = clips, .errors = errors, .control = control, .kind = kind, .bounded = .{ .backing = std.heap.smp_allocator, .limit = budget } };
     }
@@ -140,7 +147,7 @@ pub const Wave = struct {
             for (self.clips, 0..) |clip, index| {
                 try self.control.check();
                 self.allocation_exceeded_budget = false;
-                self.gemma[self.retained] = (if (clip.pcm) |pcm| projector.prepareEmbeddingGemma2AudioPcmWithPacking(self.allocator(), pcm, self.session.backend() != .native) else projector.prepareEmbeddingGemma2AudioWithPacking(self.allocator(), clip.bytes, clip.decode_options, self.session.backend() != .native)) catch |err| {
+                self.gemma[self.retained] = (if (clip.pcm) |pcm| projector.prepareEmbeddingGemma2AudioPcmWithPacking(self.allocator(), pcm, self.session.backend() != .native) else projector.prepareEmbeddingGemma2AudioWithPackingBounded(self.allocator(), clip.bytes, clip.decode_options, self.session.backend() != .native, self.max_decode_working_bytes)) catch |err| {
                     // Retained clips may occupy the space needed to decode the
                     // next one. Finish this wave without consuming that clip;
                     // the owner retries it after releasing the current wave.
@@ -260,6 +267,22 @@ test "audio preparation producer drains cancellation pressure and indexed codec 
     try std.testing.expectEqual(error.MemoryBudgetExceeded, denied.failure.?);
     denied.deinit();
     try std.testing.expectEqual(@as(usize, 0), denied.bounded.live);
+    const wav = try audio.wav.encodeInterleaved(std.testing.allocator, &samples, 1, .{ .audio_format = 3, .sample_rate = 16000, .bits_per_sample = 32 });
+    defer std.testing.allocator.free(wav);
+    const encoded = [_]Clip{.{ .bytes = wav }};
+    var limited = Wave.initWithLimits(session, &encoded, null, .{}, .gemma4, .{ .preparation_bytes = 64 * 1024 * 1024, .decode_working_bytes = 1 });
+    limited.bounded.backing = std.testing.allocator;
+    limited.run();
+    try std.testing.expectEqual(error.AudioTooLarge, limited.failure.?);
+    limited.deinit();
+    try std.testing.expectEqual(@as(usize, 0), limited.bounded.live);
+    var recovered = Wave.init(session, &encoded, null, .{}, .gemma4, 64 * 1024 * 1024);
+    recovered.bounded.backing = std.testing.allocator;
+    recovered.run();
+    try std.testing.expect(recovered.failure == null);
+    try std.testing.expectEqual(@as(usize, 1), recovered.retained);
+    recovered.deinit();
+    try std.testing.expectEqual(@as(usize, 0), recovered.bounded.live);
     var valid = Wave.init(session, &clips, &errors, .{}, .gemma4, 64 * 1024 * 1024);
     valid.bounded.backing = std.testing.allocator;
     _ = valid.start();

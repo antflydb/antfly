@@ -40,7 +40,11 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 31;
+pub const batch_protocol_version: u16 = 32;
+/// Version 32 combines execution-bound vector publications and grouped catalog
+/// activation with SQL's independently allocated v26-v31 barriers. A pre-merge
+/// SQL decoder advertising v31 does not implement these publication payloads.
+pub const batch_execution_identity_protocol_version: u16 = 32;
 /// Native row/table grants and their frozen 2PC references must be decoded by
 /// every applying replica before the first private lock command is admitted.
 pub const batch_sql_lock_protocol_version: u16 = 31;

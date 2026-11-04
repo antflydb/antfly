@@ -19,7 +19,6 @@
     "rs",
     "examples",
     "go/pkg/docsaf",
-    "go/pkg/evalaf",
     "go/pkg/genkit",
     "go/pkg/sdk",
     "go/pkg/sources",
