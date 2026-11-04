@@ -4841,7 +4841,12 @@ fn searchHitHierarchyJsonValue(alloc: std.mem.Allocator, req: db_mod.types.Searc
     // Positions and revisions are traversal state, not durable unit fields.
     // Relevance grouping deliberately omits them so re-extraction cannot leak
     // a cursor from an older artifact generation.
-    if (req.hierarchy_children != null) try appendHierarchyNavigationMetadata(alloc, &obj, hit);
+    if (req.hierarchy_children) |children| {
+        if (children.artifact_name != null) {
+            if (hit.sort_values.len != 2 or hit.sort_values[0] != .string) return error.InvalidQueryRequest;
+            try putJsonString(alloc, &obj, "position", hit.sort_values[0].string);
+        } else try appendHierarchyNavigationMetadata(alloc, &obj, hit);
+    }
 
     if (hit.chunk_hits.len > 0) {
         var chunks = try std.json.Array.initCapacity(alloc, hit.chunk_hits.len);
@@ -11643,7 +11648,10 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     freeOwnedStringSlice(alloc, req.hierarchy_match_fields);
     freeOwnedStringSlice(alloc, req.hierarchy_source_fields);
     freeOwnedStringSlice(alloc, req.hierarchy_unit_fields);
-    if (req.hierarchy_children) |children| alloc.free(@constCast(children.parent_id));
+    if (req.hierarchy_children) |children| {
+        alloc.free(@constCast(children.parent_id));
+        if (children.artifact_name) |name| alloc.free(@constCast(name));
+    }
     if (req.resolved_doc_filter_owned) {
         if (req.resolved_doc_filter) |ptr| db_mod.doc_filter_wire.destroyResolvedDocFilter(alloc, ptr);
     }
@@ -12612,6 +12620,7 @@ fn isInternalShardFieldName(name: []const u8) bool {
         "_index_name",
         "_primary_text_index_name",
         "_embedding_limits",
+        "_hierarchy_parent_admitted",
         "_defer_hierarchy_child_hydration",
         "_require_algebraic_filter_resolution",
         db_mod.doc_filter_wire.field_name,
@@ -12802,18 +12811,28 @@ fn applyPublicHierarchyControls(
             if (value != .object or req.hierarchy_children != null) return error.InvalidQueryRequest;
             const parent = value.object.get("parent") orelse return error.InvalidQueryRequest;
             const level = value.object.get("level") orelse return error.InvalidQueryRequest;
-            if (value.object.count() != 2 or parent != .object or level != .string) return error.InvalidQueryRequest;
-            if (!std.mem.eql(u8, level.string, "unit")) return error.UnsupportedQueryRequest;
+            if (parent != .object or level != .string) return error.InvalidQueryRequest;
+            const member = std.mem.eql(u8, level.string, "member");
+            if (!member and !std.mem.eql(u8, level.string, "unit")) return error.UnsupportedQueryRequest;
+            const artifact = value.object.get("artifact");
+            if (member) {
+                if (value.object.count() != 3 or artifact == null or artifact.? != .string or artifact.?.string.len == 0) return error.InvalidQueryRequest;
+            } else if (value.object.count() != 2) return error.InvalidQueryRequest;
             const parent_level = parent.object.get("level") orelse return error.InvalidQueryRequest;
             const parent_id = parent.object.get("id") orelse return error.InvalidQueryRequest;
             if (parent.object.count() != 2 or parent_level != .string or parent_id != .string or parent_id.string.len == 0) {
                 return error.InvalidQueryRequest;
             }
             if (!std.mem.eql(u8, parent_level.string, "source")) return error.UnsupportedQueryRequest;
-            req.hierarchy_children = .{
-                .parent_id = try alloc.dupe(u8, parent_id.string),
-                .parent_level = .source,
-                .level = .unit,
+            req.hierarchy_children = blk: {
+                const owned_parent = try alloc.dupe(u8, parent_id.string);
+                errdefer alloc.free(owned_parent);
+                break :blk .{
+                    .parent_id = owned_parent,
+                    .artifact_name = if (member) try alloc.dupe(u8, artifact.?.string) else null,
+                    .parent_level = .source,
+                    .level = .unit,
+                };
             };
         } else if (std.mem.eql(u8, key, "ancestors")) {
             if (value != .object or value.object.count() == 0) return error.InvalidQueryRequest;
@@ -12851,7 +12870,7 @@ fn applyPublicHierarchyControls(
     if (has_new_controls) {
         if (children_set) {
             if (group_by_set or hierarchy.object.get("ancestors") != null) return error.InvalidQueryRequest;
-            if (!objectHasNonNullField(parsed.value.object, "fields")) return error.InvalidQueryRequest;
+            if (!objectHasNonNullField(parsed.value.object, "fields") and req.hierarchy_children.?.artifact_name == null) return error.InvalidQueryRequest;
             var root_it = parsed.value.object.iterator();
             while (root_it.next()) |entry| {
                 if (entry.value_ptr.* == .null) continue;
@@ -12890,7 +12909,7 @@ fn applyPublicHierarchyControls(
                 return error.InvalidQueryRequest;
             }
             if (req.search_before.len > 0) return error.InvalidQueryRequest;
-            req.return_mode = .unit;
+            req.return_mode = if (req.hierarchy_children.?.artifact_name != null) .member else .unit;
         } else if (group_by_set) {
             // Group hits hydrate source documents, which may contain large
             // stored child materializations. Require an explicit projection
@@ -12966,6 +12985,7 @@ fn removeInternalShardFields(object: *std.json.ObjectMap) void {
         "_index_name",
         "_primary_text_index_name",
         "_embedding_limits",
+        "_hierarchy_parent_admitted",
         "_defer_hierarchy_child_hydration",
         "_require_algebraic_filter_resolution",
         db_mod.doc_filter_wire.field_name,
@@ -13406,6 +13426,10 @@ fn parseInternalDocIdConstraintsAlloc(
             return error.InvalidQueryRequest;
         }
         req.primary_text_index_name = try alloc.dupe(u8, value.string);
+    }
+    if (parsed.value.object.get("_hierarchy_parent_admitted")) |value| {
+        if (value != .bool or !value.bool or req.hierarchy_children == null or req.hierarchy_children.?.artifact_name == null) return error.InvalidQueryRequest;
+        req.hierarchy_parent_admitted = true;
     }
     if (parsed.value.object.get("_defer_hierarchy_child_hydration")) |value| {
         const is_unit_group = req.hierarchy_group_level == .unit and
@@ -20733,4 +20757,18 @@ test "hierarchy validation diagnostics name required fields and stay request sco
     inner_binding.deinit();
     try std.testing.expectEqualStrings("/hierarchy/group_by/matches/fields", takeValidationDiagnostic().?.pointer);
     try std.testing.expect(takeValidationDiagnostic() == null);
+}
+
+test "native member traversal requires producer and private parent admission" {
+    const alloc = std.testing.allocator;
+    const body = "{\"hierarchy\":{\"children\":{\"parent\":{\"level\":\"source\",\"id\":\"doc:a\"},\"level\":\"member\",\"artifact\":\"summary\"}},\"order_by\":[{\"field\":\"_hierarchy.position\"}],\"limit\":1}";
+    var parsed = try parseQueryRequest(alloc, null, "docs", body);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqualStrings("summary", parsed.req.hierarchy_children.?.artifact_name.?);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.member, parsed.req.return_mode);
+    try std.testing.expect(!parsed.req.hierarchy_parent_admitted);
+    var json = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer json.deinit();
+    try json.value.object.put("_hierarchy_parent_admitted", .{ .bool = true });
+    try std.testing.expect(objectHasInternalShardField(json.value.object));
 }

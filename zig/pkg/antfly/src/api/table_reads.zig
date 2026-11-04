@@ -10818,6 +10818,37 @@ fn queryProvisionedAcrossGroups(
     return try queryProvisionedAcrossGroupsAtGenerations(self, alloc, group_ids, req, table_name, consistency, null);
 }
 
+// Parent admission remains a source-row operation. Member owners may have no
+// local copy of that row, so carry only a private proof after this exact lookup.
+fn memberParentAdmissionRequest(req: db_mod.types.SearchRequest, parent: []const []const u8) db_mod.types.SearchRequest {
+    var probe = req;
+    probe.hierarchy_children = null;
+    probe.hierarchy_parent_admitted = false;
+    probe.defer_hierarchy_child_hydration = false;
+    probe.return_mode = .parent;
+    probe.order_by = &.{};
+    probe.search_after = &.{};
+    probe.limit = 1;
+    probe.fields = &.{};
+    probe.include_stored = false;
+    probe.include_all_fields = false;
+    probe.query = .{ .doc_id = .{ .ids = parent } };
+    return probe;
+}
+fn admittedMemberRequest(req: db_mod.types.SearchRequest) db_mod.types.SearchRequest {
+    var member = req;
+    member.hierarchy_parent_admitted = true;
+    member.filter_query_json = "";
+    member.exclusion_query_json = "";
+    member.authorization_filter_query_json = "";
+    member.filter_doc_ids = &.{};
+    member.filter_doc_ids_positive = false;
+    member.exclude_doc_ids = &.{};
+    member.resolved_doc_filter = null;
+    member.resolved_doc_filter_owned = false;
+    return member;
+}
+
 fn queryProvisionedAcrossGroupsAtGenerations(
     self: *ProvisionedTableReadSource,
     alloc: std.mem.Allocator,
@@ -10835,7 +10866,15 @@ fn queryProvisionedAcrossGroupsAtGenerations(
     const selected_generations = try alloc.alloc(?u64, group_ids.len);
     defer alloc.free(selected_generations);
     @memset(selected_generations, null);
-    var selected = try queryProvisionedAcrossGroupsPhase(self, alloc, group_ids, req, table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
+    var member_req = req;
+    if (req.hierarchy_children) |children| if (children.artifact_name != null) {
+        const parent_ids = [_][]const u8{children.parent_id};
+        var parent = try queryProvisionedAcrossGroupsPhase(self, alloc, group_ids, memberParentAdmissionRequest(req, &parent_ids), table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
+        defer parent.deinit();
+        if (parent.hits.len != 1 or !std.mem.eql(u8, parent.hits[0].id, children.parent_id)) return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
+        member_req = admittedMemberRequest(req);
+    };
+    var selected = try queryProvisionedAcrossGroupsPhase(self, alloc, group_ids, member_req, table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
     errdefer selected.deinit();
     if (req.hierarchy_children != null) {
         if (req.include_stored) try hydrateProvisionedHierarchyNavigationHits(self, alloc, table_name, req, &selected, consistency);
@@ -10971,7 +11010,15 @@ fn queryHostedAcrossGroupsAtGenerations(
     const selected_generations = try alloc.alloc(?u64, group_ids.len);
     defer alloc.free(selected_generations);
     @memset(selected_generations, null);
-    var selected = try queryHostedAcrossGroupsPhase(active_self, alloc, group_ids, req, table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
+    var member_req = req;
+    if (req.hierarchy_children) |children| if (children.artifact_name != null) {
+        const parent_ids = [_][]const u8{children.parent_id};
+        var parent = try queryHostedAcrossGroupsPhase(active_self, alloc, group_ids, memberParentAdmissionRequest(req, &parent_ids), table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
+        defer parent.deinit();
+        if (parent.hits.len != 1 or !std.mem.eql(u8, parent.hits[0].id, children.parent_id)) return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
+        member_req = admittedMemberRequest(req);
+    };
+    var selected = try queryHostedAcrossGroupsPhase(active_self, alloc, group_ids, member_req, table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
     errdefer selected.deinit();
     if (req.hierarchy_children != null) {
         if (req.include_stored) try hydrateHostedHierarchyNavigationHits(active_self, alloc, table_name, req, &selected, consistency);

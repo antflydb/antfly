@@ -126,11 +126,137 @@ fn scanStream(search: anytype, http: *httpx.Client, config: Config, table: Table
     if (stream.artifact == null) return scan(search, http, config, table, count, seen);
     const before = try streamReadiness(search, http, config, table, stream);
     defer search.a.free(before);
-    try scan(search, http, config, table, count, seen);
+    try scanArtifacts(search, http, config, table, count, seen);
     const after = try streamReadiness(search, http, config, table, stream);
     defer search.a.free(after);
     if (!std.mem.eql(u8, before, after)) return error.ArtifactDefinitionChanged;
 }
+fn scanArtifacts(search: anytype, http: *httpx.Client, config: Config, table: Table, count: *usize, seen: *Seen) !void {
+    const stream = table.selected_stream.?;
+    var setup = std.heap.ArenaAllocator.init(search.a);
+    defer setup.deinit();
+    const a = setup.allocator();
+    if (table.status) |status| if (!std.mem.eql(u8, status, "searchable")) return error.SourceNotSearchable;
+    const url = try std.fmt.allocPrint(a, "{s}/tables/{s}/query", .{ std.mem.trimEnd(u8, config.endpoint, "/"), try escape(a, table.table orelse table.name) });
+    const extra = if (search.options.table_filter) |raw| try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) else null;
+    const user = if (table.source_filter) |source| (if (extra) |filter| try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .conjuncts = .{ source, filter } }, .{}), .{}) else source) else extra;
+    const filter = try candidateFilter(a, search, table, user);
+    var parent_table = table;
+    parent_table.selected_stream = null;
+    var parents = Fetch{ .table = parent_table, .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .access_id = table.access_id, .source_id = table.source_id, .valid_until = table.valid_until, .document_field = table.document_field, .filter = filter, .http = http, .fields = try record_view.parentFields(a, table.fields.?) };
+    defer search.summary.index_requests += parents.summary.index_requests;
+    var children = Fetch{ .table = table, .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .access_id = table.access_id, .source_id = table.source_id, .valid_until = table.valid_until, .document_field = table.document_field, .filter = null, .http = http, .fields = try tableProjectionFields(a, search.options, table) };
+    defer search.summary.index_requests += children.summary.index_requests;
+    var continuation = std.heap.ArenaAllocator.init(search.a);
+    defer continuation.deinit();
+    var cursor: ?[]const std.json.Value = null;
+    var snapshot: ?[]const u8 = null;
+    var parent_count: usize = 0;
+    while (!search.stopped()) {
+        const page = try parents.load(.{ .cursor = cursor, .snapshot = snapshot, .page_size = @min(config.page_size, 100) });
+        defer page.deinit(search.a);
+        const result = try responseResult(page.parsed.value);
+        const cut = try document.string(result, "remote_snapshot");
+        if (cut.len == 0 or (snapshot != null and !std.mem.eql(u8, snapshot.?, cut))) return error.IndexSnapshotChanged;
+        const hits = document.at(result, "hits.hits") orelse return error.InvalidIndexResponse;
+        if (hits != .array or hits.array.items.len > page.page_size) return error.InvalidIndexResponse;
+        var previous_parent = cursor;
+        for (hits.array.items) |parent| {
+            const parent_sort = document.field(parent, "_sort") orelse return error.InvalidIndexCursor;
+            const parent_key = try document.string(parent, "_id");
+            if (parent_sort != .array or parent_sort.array.items.len != 1 or parent_sort.array.items[0] != .string or !std.mem.eql(u8, parent_key, parent_sort.array.items[0].string)) return error.InvalidIndexCursor;
+            if (previous_parent) |prior| if (std.mem.order(u8, prior[0].string, parent_key) != .lt) return error.InvalidIndexCursor;
+            previous_parent = parent_sort.array.items;
+            if (search.stopped()) return;
+            parent_count += 1;
+            if (parent_count > search.options.max_index_documents) return error.IndexDocumentBudgetExceeded;
+            const parent_id = try document.string(parent, "_id");
+            const source = document.field(parent, "_source") orelse return error.InvalidIndexResponse;
+            children.artifact_parent = parent_id;
+            var child_state = std.heap.ArenaAllocator.init(search.a);
+            defer child_state.deinit();
+            var child_cursor: ?[]const std.json.Value = null;
+            while (!search.stopped()) {
+                const members = try children.load(.{ .cursor = child_cursor, .snapshot = cut, .page_size = @min(config.page_size, 100) });
+                defer members.deinit(search.a);
+                const response = try responseResult(members.parsed.value);
+                if (!std.mem.eql(u8, cut, try document.string(response, "remote_snapshot"))) return error.IndexSnapshotChanged;
+                const rows = document.at(response, "hits.hits") orelse return error.InvalidIndexResponse;
+                if (rows != .array or rows.array.items.len > members.page_size) return error.InvalidIndexResponse;
+                var previous = child_cursor;
+                for (rows.array.items) |hit| {
+                    if (search.stopped()) return;
+                    if (count.* >= search.options.max_index_documents) return error.IndexDocumentBudgetExceeded;
+                    count.* += 1;
+                    const id = try document.string(hit, "_id");
+                    const sort = document.field(hit, "_sort") orelse return error.InvalidIndexCursor;
+                    if (sort != .array or sort.array.items.len != 2 or sort.array.items[0] != .string or sort.array.items[1] != .string or !std.mem.eql(u8, id, sort.array.items[1].string)) return error.InvalidIndexCursor;
+                    if (previous) |prior| if (std.mem.order(u8, prior[0].string, sort.array.items[0].string) != .lt) return error.InvalidIndexCursor;
+                    previous = sort.array.items;
+                    if (!std.mem.eql(u8, parent_id, try document.string(document.field(hit, "hierarchy") orelse return error.MissingArtifactSource, "parent_doc_key"))) return error.MissingArtifactSource;
+                    const artifact = document.at(hit, "hierarchy.artifact") orelse return error.MissingArtifactIdentity;
+                    if (!std.mem.eql(u8, stream.artifact.?, try document.string(artifact, "name"))) return error.ArtifactIndexBindingChanged;
+                    const member = document.field(hit, "_source") orelse if (metadataListing(search.options)) std.json.Value{ .object = .empty } else return error.InvalidIndexResponse;
+                    const content = if (metadataListing(search.options)) "" else try record_view.text(member, stream.field);
+                    const value = try record_view.view(members.arena.allocator(), source, table.fields.?, content);
+                    var doc = if (metadataListing(search.options)) try document.Document.parseListing(value, table.table orelse table.name, id, cut, std.Io.Clock.real.now(search.io).toSeconds()) else try document.Document.parse(value, table.table orelse table.name, id, cut, std.Io.Clock.real.now(search.io).toSeconds());
+                    doc.provenance.purpose = stream.purpose;
+                    doc.provenance.generated = stream.generated;
+                    doc.provenance.text_field = stream.field;
+                    doc.provenance.boundary = stream.boundary;
+                    doc.provenance.document_id = parent_id;
+                    doc.provenance.artifact_key = id;
+                    doc.provenance.artifact = artifact;
+                    doc.provenance.artifact_revision = try document.string(artifact, "revision");
+                    if (doc.provenance.artifact_revision.?.len == 0) return error.MissingArtifactRevision;
+                    doc.provenance.location = document.at(member, stream.location_field orelse "provenance");
+                    if (search.options.cloud_session == null and !document.allowed(value, config.principals)) {
+                        search.skipped();
+                        continue;
+                    }
+                    var identity = std.crypto.hash.sha2.Sha256.init(.{});
+                    for ([_][]const u8{ table.table orelse table.name, stream.name, id }) |part| {
+                        var length: [8]u8 = undefined;
+                        std.mem.writeInt(u64, &length, part.len, .little);
+                        identity.update(&length);
+                        identity.update(part);
+                    }
+                    var key: [32]u8 = undefined;
+                    identity.final(&key);
+                    if ((try seen.getOrPut(key)).found_existing) continue;
+                    doc.cache_scope = try sourceCacheScope(members.arena.allocator(), search.options, config, table, id, value);
+                    doc.path = try std.fmt.allocPrint(members.arena.allocator(), "{s}::{s}{s}/{s}", .{ doc.path, stream.name, if (stream.generated) "[generated]" else "", id });
+                    search.indexDocument(doc) catch |err| try search.reportError(doc.path, err);
+                }
+                if (rows.array.items.len < members.page_size) break;
+                var fresh = std.heap.ArenaAllocator.init(search.a);
+                errdefer fresh.deinit();
+                child_cursor = (try std.json.parseFromSlice([]const std.json.Value, fresh.allocator(), try std.json.Stringify.valueAlloc(members.arena.allocator(), previous orelse return error.InvalidIndexCursor, .{}), .{ .allocate = .alloc_always })).value;
+                child_state.deinit();
+                child_state = fresh;
+            }
+        }
+        if (hits.array.items.len < page.page_size) return;
+        const last = hits.array.items[hits.array.items.len - 1];
+        const sort = document.field(last, "_sort") orelse return error.InvalidIndexCursor;
+        if (sort != .array or sort.array.items.len != 1 or sort.array.items[0] != .string) return error.InvalidIndexCursor;
+        if (cursor) |prior| if (std.mem.order(u8, prior[0].string, sort.array.items[0].string) != .lt) return error.InvalidIndexCursor;
+        var fresh = std.heap.ArenaAllocator.init(search.a);
+        errdefer fresh.deinit();
+        cursor = (try std.json.parseFromSlice([]const std.json.Value, fresh.allocator(), try std.json.Stringify.valueAlloc(page.arena.allocator(), sort.array.items, .{}), .{ .allocate = .alloc_always })).value;
+        snapshot = try fresh.allocator().dupe(u8, cut);
+        continuation.deinit();
+        continuation = fresh;
+    }
+}
+fn responseResult(value: std.json.Value) !std.json.Value {
+    const responses = document.field(value, "responses") orelse return error.InvalidIndexResponse;
+    if (responses != .array or responses.array.items.len != 1) return error.InvalidIndexResponse;
+    const result = responses.array.items[0];
+    if (document.field(result, "error") != null) return error.IndexQueryFailed;
+    return result;
+}
+
 fn streamReadiness(search: anytype, http: *httpx.Client, config: Config, table: Table, stream: record_view.Stream) ![]const u8 {
     var arena = std.heap.ArenaAllocator.init(search.a);
     defer arena.deinit();
@@ -177,7 +303,9 @@ fn streamReadiness(search: anytype, http: *httpx.Client, config: Config, table: 
     }
     if (!found) return error.ArtifactIndexBindingChanged;
     const incarnation = document.field(readiness, "incarnation") orelse return error.ArtifactReadinessUnavailable;
-    return std.json.Stringify.valueAlloc(search.a, incarnation, .{});
+    const target = document.field(readiness, "target_revision") orelse return error.ArtifactReadinessUnavailable;
+    const published = document.field(readiness, "published_revision") orelse return error.ArtifactReadinessUnavailable;
+    return std.json.Stringify.valueAlloc(search.a, .{ .incarnation = incarnation, .target = target, .published = published }, .{});
 }
 // Resolve user-facing selectors once to a set of physical source identities.
 // Cloud IDs take precedence over aliases. Manual configs select alias-or-name
@@ -944,6 +1072,7 @@ const Fetch = struct {
     text_query: ?std.json.Value = null,
     fields: []const []const u8,
     ordered: bool = true,
+    artifact_parent: ?[]const u8 = null,
     media_selection: ?MediaSelection = null,
     http: *httpx.Client,
     summary: struct { index_requests: usize = 0 } = .{},
@@ -1051,7 +1180,7 @@ const Fetch = struct {
             const full_text_index = if (self.table.selected_stream) |stream| stream.index else null;
             const root_text = if (self.table.selected_stream) |stream| artifact and std.mem.eql(u8, stream.field, "$") else false;
             const hierarchy = if (artifact) try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .ancestors = .{ .source = .{ .fields = try record_view.parentFields(a, self.table.fields.?) } } }, .{}), .{}) else null;
-            const body = try std.json.Stringify.valueAlloc(a, .{ .full_text_index = full_text_index, .hierarchy = hierarchy, .full_text_search = if (artifact) try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}) else null, .select = selected, .query = if (artifact) @as(?std.json.Value, null) else self.text_query orelse try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}), .execution = if (self.ordered and (artifact or self.text_query != null)) @as(?Execution, self.config.execution) else null, .filter_query = self.filter, .fields = if (root_text) @as(?[]const []const u8, null) else source_fields.items, .order_by = if (self.ordered) @as(?[1]struct { field: []const u8, desc: bool }, .{.{ .field = "_id", .desc = false }}) else null, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
+            const body = if (self.artifact_parent) |parent| try std.json.Stringify.valueAlloc(a, .{ .hierarchy = .{ .children = .{ .parent = .{ .level = "source", .id = parent }, .level = "member", .artifact = self.table.selected_stream.?.artifact.? } }, .fields = if (root_text) @as(?[]const []const u8, null) else source_fields.items, .order_by = [_]struct { field: []const u8, desc: bool }{.{ .field = "_hierarchy.position", .desc = false }}, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false }) else try std.json.Stringify.valueAlloc(a, .{ .full_text_index = full_text_index, .hierarchy = hierarchy, .full_text_search = if (artifact) try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}) else null, .select = selected, .query = if (artifact) @as(?std.json.Value, null) else self.text_query orelse try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}), .execution = if (self.ordered) @as(?Execution, self.config.execution) else null, .filter_query = self.filter, .fields = if (root_text) @as(?[]const []const u8, null) else source_fields.items, .order_by = if (self.ordered) @as(?[1]struct { field: []const u8, desc: bool }, .{.{ .field = "_id", .desc = false }}) else null, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
             var refreshed = false;
             var attempt: usize = 0;
             const parsed = retry: while (true) {

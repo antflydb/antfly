@@ -1,0 +1,212 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package sources
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestNativeMemberNavigationIntegration(t *testing.T) {
+	endpoint := os.Getenv("ANTFLY_SOURCE_TEST_ENDPOINT")
+	binary := os.Getenv("ANTFLY_GREP_TEST_BINARY")
+	if endpoint == "" || binary == "" {
+		t.Skip("set native source endpoint and grep binary")
+	}
+	publisher := &Publisher{Endpoint: endpoint}
+	table := fmt.Sprintf("native_members_%d", time.Now().UnixNano())
+	indexes := map[string]any{
+		"copies": map[string]any{"type": "full_text", "sources": []any{map[string]any{"artifact": "copied"}}, "enrichments": []any{
+			map[string]any{"name": "copied", "kind": "asset", "template": "{{content.text}}", "producer_json": `{"type":"copy"}`},
+			map[string]any{"name": "pieces", "kind": "chunk", "field": "text", "chunk_size": 512, "chunk_overlap": 0},
+		}},
+		"pieces": map[string]any{"type": "full_text", "sources": []any{map[string]any{"artifact": "pieces", "field": "text"}}},
+	}
+	_, err := publisher.call(t.Context(), "POST", tablePath(table), map[string]any{"num_shards": 3, "indexes": indexes})
+	require.NoError(t, err)
+	defer publisher.call(context.Background(), "DELETE", tablePath(table), nil)
+	records := map[string]any{}
+	for i := 0; i < 13; i++ {
+		owner := "other"
+		if i == 0 {
+			owner = "selected"
+		}
+		records[fmt.Sprintf("doc-%02d", i)] = map[string]any{"source_id": owner, "source": map[string]any{"uri": fmt.Sprintf("gs://fixture/%d.txt", i), "path": fmt.Sprintf("%d.txt", i), "revision": "1", "indexed_at": time.Now().Unix()}, "content": map[string]any{"text": "needle " + strings.Repeat("alpha beta gamma delta ", 256)}, "text": "needle " + strings.Repeat("alpha beta gamma delta ", 256), "permissions": map[string]any{"public": true, "readers": []string{}}, "metadata": map[string]any{}}
+	}
+	require.NoError(t, publisher.Batch(t.Context(), table, records, nil))
+	for _, index := range []string{"copies", "pieces"} {
+		var last string
+		defer func() {
+			if t.Failed() {
+				t.Logf("readiness %s: %s", index, last)
+			}
+		}()
+		require.Eventually(t, func() bool {
+			raw, err := publisher.call(t.Context(), "GET", tablePath(table)+"/indexes/"+index, nil)
+			if err != nil {
+				return false
+			}
+			last = string(raw)
+			var body struct {
+				Status struct {
+					Readiness struct {
+						Complete bool `json:"complete"`
+					} `json:"readiness"`
+				} `json:"status"`
+			}
+			return json.Unmarshal(raw, &body) == nil && body.Status.Readiness.Complete
+		}, 30*time.Second, 50*time.Millisecond)
+	}
+	for _, stream := range []TextStream{{Name: "copy", Artifact: "copied", Index: "copies", Field: "$", Default: true}, {Name: "chunks", Artifact: "pieces", Index: "pieces", Field: "text", Default: true}} {
+		t.Run(stream.Name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "grep.json")
+			config := map[string]any{"version": 1, "endpoint": endpoint, "principals": []string{"user:self"}, "page_size": 1, "tables": []any{map[string]any{"name": "selected", "table": table, "fields": CanonicalDocumentFields(), "source_filter": map[string]any{"equals": "selected", "field": "source_id"}, "streams": []TextStream{stream}}}}
+			require.NoError(t, writeJSON(file, config, 1<<20))
+			output, err := exec.CommandContext(t.Context(), binary, "--table-config", file, "--json", "needle").CombinedOutput()
+			require.NoError(t, err, string(output))
+			require.Contains(t, string(output), `"complete":true`)
+			require.Equal(t, 1, strings.Count(string(output), `"type":"match"`), string(output))
+			require.Contains(t, string(output), `"document_id":"doc-00"`)
+		})
+	}
+	// A cursor without its retained capability must not capture a newer cut.
+	query := map[string]any{"hierarchy": map[string]any{"children": map[string]any{"parent": map[string]any{"level": "source", "id": "doc-00"}, "level": "member", "artifact": "copied"}}, "order_by": []any{map[string]any{"field": "_hierarchy.position"}}, "limit": 1}
+	raw, err := publisher.call(t.Context(), "POST", tablePath(table)+"/query", query)
+	require.NoError(t, err)
+	var first struct {
+		Responses []struct {
+			Hits struct {
+				Hits []struct {
+					Sort []any `json:"_sort"`
+				} `json:"hits"`
+			} `json:"hits"`
+		} `json:"responses"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &first))
+	require.Len(t, first.Responses, 1)
+	require.Len(t, first.Responses[0].Hits.Hits, 1)
+	query["search_after"] = first.Responses[0].Hits.Hits[0].Sort
+	_, err = publisher.call(t.Context(), "POST", tablePath(table)+"/query", query)
+	require.Error(t, err, "member continuation requires the retained snapshot")
+	// Public callers must never be able to manufacture the coordinator proof.
+	_, err = publisher.call(t.Context(), "POST", tablePath(table)+"/query", map[string]any{"_hierarchy_parent_admitted": true, "hierarchy": map[string]any{"children": map[string]any{"parent": map[string]any{"level": "source", "id": "doc-00"}, "level": "member", "artifact": "copied"}}, "order_by": []any{map[string]any{"field": "_hierarchy.position"}}, "limit": 1})
+	require.Error(t, err, "public requests must reject private parent admission")
+}
+
+// Current readiness must never certify a retained cut containing unfinished work.
+func TestNativeMemberSnapshotCompletionIntegration(t *testing.T) {
+	endpoint := os.Getenv("ANTFLY_SOURCE_TEST_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("set native source endpoint")
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startOnce, releaseOnce sync.Once
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		startOnce.Do(func() { close(started) })
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		content := `{"items":[{"item":0,"value":{"text":"finished summary"}}]}`
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "fixture", "object": "chat.completion", "model": "gpt-4o-mini", "choices": []any{map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "content": content}, "finish_reason": "stop"}}})
+	}))
+	defer func() {
+		releaseOnce.Do(func() { close(release) })
+		provider.Close()
+	}()
+	publisher := &Publisher{Endpoint: endpoint}
+	table := fmt.Sprintf("native_cut_%d", time.Now().UnixNano())
+	producer, _ := json.Marshal(map[string]any{"type": "generator", "config": map[string]any{"generator": map[string]any{"provider": "openai", "model": "gpt-4o-mini", "url": provider.URL + "/v1", "api_key": "fixture"}, "output": "json_schema", "output_schema": map[string]any{"type": "object", "properties": map[string]any{"text": map[string]any{"type": "string"}}, "required": []string{"text"}, "additionalProperties": false}}})
+	_, err := publisher.call(t.Context(), "POST", tablePath(table), map[string]any{"num_shards": 1, "indexes": map[string]any{"summaries": map[string]any{"type": "full_text", "sources": []any{map[string]any{"artifact": "summary", "field": "text"}}, "enrichments": []any{map[string]any{"name": "input", "kind": "asset", "template": "{{content.text}}", "producer_json": `{"type":"copy"}`}, map[string]any{"name": "summary", "kind": "asset", "source_artifact_name": "input", "content_type": "application/json", "producer_json": string(producer)}}}}})
+	require.NoError(t, err)
+	defer publisher.call(context.Background(), "DELETE", tablePath(table), nil)
+	require.NoError(t, publisher.Batch(t.Context(), table, map[string]any{"source-doc": map[string]any{"content": map[string]any{"text": "draft text"}}}, nil))
+	select {
+	case <-started:
+	case <-time.After(30 * time.Second):
+		t.Fatal("generator did not begin")
+	}
+	raw, err := publisher.call(t.Context(), "GET", tablePath(table)+"/indexes/summaries", nil)
+	require.NoError(t, err)
+	var initial struct {
+		Status struct {
+			Readiness struct {
+				Complete    bool   `json:"complete"`
+				Incarnation string `json:"incarnation"`
+			} `json:"readiness"`
+		} `json:"status"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &initial))
+	require.False(t, initial.Status.Readiness.Complete)
+	incarnation := initial.Status.Readiness.Incarnation
+	raw, err = publisher.call(t.Context(), "POST", tablePath(table)+"/query", map[string]any{"query": map[string]any{"match_all": map[string]any{}}, "fields": []string{}, "order_by": []any{map[string]any{"field": "_id"}}, "limit": 1})
+	require.NoError(t, err)
+	var captured struct {
+		Responses []struct {
+			Snapshot string `json:"remote_snapshot"`
+		} `json:"responses"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &captured))
+	require.Len(t, captured.Responses, 1)
+	require.NotEmpty(t, captured.Responses[0].Snapshot)
+	releaseOnce.Do(func() { close(release) })
+	require.Eventually(t, func() bool {
+		raw, err := publisher.call(t.Context(), "GET", tablePath(table)+"/indexes/summaries", nil)
+		if err != nil {
+			return false
+		}
+		var body struct {
+			Status struct {
+				Readiness struct {
+					Complete    bool   `json:"complete"`
+					Incarnation string `json:"incarnation"`
+				} `json:"readiness"`
+			} `json:"status"`
+		}
+		return json.Unmarshal(raw, &body) == nil && body.Status.Readiness.Complete && body.Status.Readiness.Incarnation == incarnation
+	}, 60*time.Second, 50*time.Millisecond)
+	query := map[string]any{"hierarchy": map[string]any{"children": map[string]any{"parent": map[string]any{"level": "source", "id": "source-doc"}, "level": "member", "artifact": "summary"}}, "fields": []string{"text"}, "order_by": []any{map[string]any{"field": "_hierarchy.position"}}, "limit": 1, "remote_snapshot": captured.Responses[0].Snapshot}
+	raw, err = publisher.call(t.Context(), "POST", tablePath(table)+"/query", query)
+	if err == nil {
+		var result struct {
+			Responses []struct {
+				Status int `json:"status"`
+			} `json:"responses"`
+		}
+		require.NoError(t, json.Unmarshal(raw, &result))
+		require.Len(t, result.Responses, 1)
+		require.NotEqual(t, 200, result.Responses[0].Status, "current completion certified an incomplete retained cut: %s", raw)
+	}
+	delete(query, "remote_snapshot")
+	raw, err = publisher.call(t.Context(), "POST", tablePath(table)+"/query", query)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "finished summary")
+}

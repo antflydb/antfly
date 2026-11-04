@@ -31,6 +31,7 @@ BINARY = str(Path(sys.argv.pop(1)).resolve())
 class NativeStreams(unittest.TestCase):
     def setUp(self):
         self.complete = True
+        self.revision = 1
         self.wrong_field = False
         self.requests = []
         self.readers = ["user:self"]
@@ -69,6 +70,8 @@ class NativeStreams(unittest.TestCase):
                             "readiness": {
                                 "queryable": True,
                                 "incarnation": "index-1",
+                                "target_revision": owner.revision,
+                                "published_revision": owner.revision,
                                 "sources": [
                                     {"artifact": artifact, "complete": owner.complete}
                                 ],
@@ -80,9 +83,6 @@ class NativeStreams(unittest.TestCase):
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 owner.requests.append(("POST", body))
-                artifact = (
-                    "summary" if body["full_text_index"] == "summary_text" else "speech"
-                )
                 parent = {
                     "source": {
                         "uri": "gs://originals/interview.wav",
@@ -93,10 +93,36 @@ class NativeStreams(unittest.TestCase):
                     "permissions": {"public": False, "readers": owner.readers},
                     "metadata": {},
                 }
+                children = body.get("hierarchy", {}).get("children")
+                if children is None:
+                    records = (
+                        []
+                        if body.get("search_after")
+                        else [
+                            {
+                                "_id": "recording",
+                                "_sort": ["recording"],
+                                "_source": parent,
+                            }
+                        ]
+                    )
+                    self.reply(
+                        {
+                            "responses": [
+                                {
+                                    "status": 200,
+                                    "remote_snapshot": "retained-1",
+                                    "hits": {"hits": records},
+                                }
+                            ]
+                        }
+                    )
+                    return
+                artifact = children["artifact"]
                 records = [
                     {
                         "_id": f"segment-{i}",
-                        "_sort": [f"segment-{i}"],
+                        "_sort": [f"position-{i}", f"segment-{i}"],
                         "_source": {
                             "text": text,
                             "provenance": {
@@ -125,9 +151,9 @@ class NativeStreams(unittest.TestCase):
                 ]
                 if artifact == "summary":
                     records = records[:1]
-                    records[0]["_source"] = "Tuesday summary"
+                    records[0]["_source"] = {"$": "Tuesday summary"}
                 cursor = body.get("search_after")
-                start = int(cursor[0].split("-")[-1]) + 1 if cursor else 0
+                start = int(cursor[1].split("-")[-1]) + 1 if cursor else 0
                 self.reply(
                     {
                         "responses": [
@@ -222,7 +248,11 @@ class NativeStreams(unittest.TestCase):
         posts = [body for method, body in self.requests if method == "POST"]
         self.assertTrue(any(body.get("search_after") for body in posts))
         self.assertTrue(
-            all(body["hierarchy"]["ancestors"]["source"]["fields"] for body in posts)
+            all(
+                body["hierarchy"]["children"]["parent"]["id"] == "recording"
+                for body in posts
+                if body.get("hierarchy")
+            )
         )
 
     def test_generated_selection_and_authorization_narrowing(self):
@@ -254,6 +284,20 @@ class NativeStreams(unittest.TestCase):
         result = self.run_grep("Tuesday")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertFalse(self.requests)
+
+    def test_data_revision_change_invalidates_scan(self):
+        handler = self.server.RequestHandlerClass
+        original = handler.do_POST
+        owner = self
+
+        def changing_post(request):
+            original(request)
+            owner.revision += 1
+
+        handler.do_POST = changing_post
+        result = self.run_grep("absent")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('"complete":false', result.stdout)
 
     def test_pending_unknown_and_budget_are_errors(self):
         self.complete = False

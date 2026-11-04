@@ -2086,6 +2086,9 @@ pub const SearchRequest = struct {
     /// Internal distributed-planning control. Parent-owned navigation and
     /// globally merged unit groups may return identity-only hits for payloads
     /// routed elsewhere; direct callers fail closed when payload is absent.
+    /// Private coordinator proof: source predicates were evaluated on the
+    /// same retained table cut before fanout to independent member owners.
+    hierarchy_parent_admitted: bool = false,
     defer_hierarchy_child_hydration: bool = false,
     hierarchy_source_fields: []const []const u8 = &.{},
     hierarchy_source_include_all_fields: bool = true,
@@ -2187,6 +2190,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "filter_query_json",
     "exclusion_query_json",
     "authorization_filter_query_json",
+    "hierarchy_parent_admitted",
     "defer_hierarchy_child_hydration",
     "defer_stored_projection",
     "filter_doc_ids",
@@ -2295,9 +2299,10 @@ fn auditHierarchyChildrenSearchRequestFields() void {
 pub fn canonicalHierarchyChildrenRequestIsValid(req: SearchRequest) bool {
     @setEvalBranchQuota(100_000);
     comptime auditHierarchyChildrenSearchRequestFields();
-    const children = req.hierarchy_children orelse return true;
+    const children = req.hierarchy_children orelse return !req.hierarchy_parent_admitted;
+    if (req.hierarchy_parent_admitted and children.artifact_name == null) return false;
     if (children.parent_id.len == 0 or children.parent_level != .source or children.level != .unit) return false;
-    if (req.return_mode != .unit or req.hierarchy_grouped_matches or req.max_chunks_per_parent != 0) return false;
+    if (req.return_mode != (if (children.artifact_name != null) ReturnMode.member else ReturnMode.unit) or req.hierarchy_grouped_matches or req.max_chunks_per_parent != 0) return false;
     // Traversal is deliberately not a retrieval operation. Reject every
     // scoring, ranking, or transform control at this final typed boundary so
     // embedded callers and worker envelopes cannot receive plausible-looking
@@ -2309,7 +2314,7 @@ pub fn canonicalHierarchyChildrenRequestIsValid(req: SearchRequest) bool {
     }
     if (req.limit == 0 or req.limit > max_canonical_hierarchy_groups) return false;
     if (req.offset != 0 or req.count_only or req.aggregations_json.len > 0) return false;
-    if (req.search_before.len > 0 or req.include_all_fields) return false;
+    if (req.search_before.len > 0 or (req.include_all_fields and children.artifact_name == null)) return false;
     if (req.order_by.len != 2 or
         !std.mem.eql(u8, req.order_by[0].field, "_hierarchy.position") or
         req.order_by[0].desc or
@@ -2477,6 +2482,7 @@ pub const HierarchyGroupLevel = enum {
 };
 
 pub const HierarchyChildrenRequest = struct {
+    artifact_name: ?[]const u8 = null,
     parent_id: []const u8,
     parent_level: HierarchyGroupLevel = .source,
     level: HierarchyGroupLevel = .unit,

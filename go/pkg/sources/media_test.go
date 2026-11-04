@@ -184,7 +184,6 @@ func TestNativeDocsAndSlidesExportPDFWithRevisionFence(t *testing.T) {
 			source := Source{Publication: "native", Config: json.RawMessage(`{"resource":"drive","folder_id":"folder"}`)}
 			connector, err := publicationConnector(&CollaborationConnector{ProviderName: ProviderGoogleWorkspace, HTTPClient: client, DriveBase: "https://fixture.test"}, source)
 			require.NoError(t, err)
-			connector = WithAcquisitionContentStore(connector, &FileAcquisitionContentStore{Directory: t.TempDir()})
 			request := Request{SourceNamespace: "job/" + testSourceID, Mode: ImportModeSource, Config: source.Config}
 			inventory, err := connector.Enumerate(t.Context(), request)
 			require.NoError(t, err)
@@ -195,10 +194,13 @@ func TestNativeDocsAndSlidesExportPDFWithRevisionFence(t *testing.T) {
 			require.Equal(t, "application/pdf", MediaMIME(item))
 			require.Equal(t, int64(len(pdf)), item.Size)
 			originalDigest := fmt.Sprintf("%x", sha256.Sum256(pdf))
-			pdf = append(append([]byte{}, pdf...), []byte("\n% regenerated representation")...)
 			digest, err := VerifyMediaDigest(t.Context(), connector.(MediaConnector), request, item)
 			require.NoError(t, err)
 			require.Equal(t, originalDigest, digest)
+			pdf = append(append([]byte{}, pdf...), []byte("\n% regenerated representation")...)
+			_, err = connector.(MediaConnector).OpenMedia(t.Context(), request, item, MediaRange{0, item.Size})
+			var representationChanged *RevisionChangedError
+			require.ErrorAs(t, err, &representationChanged)
 			revision = "8"
 			_, err = connector.(MediaConnector).OpenMedia(t.Context(), request, item, MediaRange{0, item.Size})
 			var changed *RevisionChangedError

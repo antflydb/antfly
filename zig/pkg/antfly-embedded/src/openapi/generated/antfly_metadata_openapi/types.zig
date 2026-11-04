@@ -5415,8 +5415,38 @@ pub const HierarchyChildParent = struct {
 
 pub const HierarchyChildren = struct {
     parent: HierarchyChildParent,
-    /// Child level to enumerate. Unit traversal reads the versioned extraction hierarchy rather than a relevance index, so empty and failed units are included.
+    /// Child level to enumerate. Unit traversal reads the versioned extraction hierarchy rather than a relevance index, so empty and failed units are included. Member traversal requires artifact and seeks that producer's native storage prefix within the selected source. It includes generic assets and chunks. Scalar member payloads are returned as {"$": value} in _source so every query hit retains an object-shaped projection. Continuation requires the remote_snapshot returned with the first page.
     level: []const u8,
+    /// Producer name; required for member traversal and omitted for unit traversal.
+    artifact: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "parent", "parent", false },
+        .{ "level", "level", false },
+        .{ "artifact", "artifact", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("parent");
+        try jw.write(self.parent);
+        try jw.objectField("level");
+        try jw.write(self.level);
+        if (self.artifact) |value| {
+            try jw.objectField("artifact");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The required public order for sequential hierarchy traversal. Specify `_hierarchy.position` ascending; Antfly appends `_id` ascending as the deterministic tie-breaker and returns both values in each hit's `_sort`.

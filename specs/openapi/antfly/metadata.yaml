@@ -9347,10 +9347,19 @@ components:
           $ref: "#/components/schemas/HierarchyChildParent"
         level:
           type: string
-          enum: [unit]
+          enum: [unit, member]
           description: |
             Child level to enumerate. Unit traversal reads the versioned extraction
             hierarchy rather than a relevance index, so empty and failed units are included.
+            Member traversal requires artifact and seeks that producer's native storage
+            prefix within the selected source. It includes generic assets and chunks.
+            Scalar member payloads are returned as {"$": value} in _source so
+            every query hit retains an object-shaped projection. Continuation
+            requires the remote_snapshot returned with the first page.
+        artifact:
+          type: string
+          minLength: 1
+          description: Producer name; required for member traversal and omitted for unit traversal.
 
     HierarchyChildrenOrderBy:
       type: array
@@ -9613,12 +9622,17 @@ components:
                     required: [group_by]
               - not:
                   required: [fields]
-          - description: Hierarchy child traversal requires an explicit top-level field projection.
+          - description: Unit child traversal requires an explicit top-level field projection.
             allOf:
               - required: [hierarchy]
                 properties:
                   hierarchy:
                     required: [children]
+                    properties:
+                      children:
+                        properties:
+                          level:
+                            enum: [unit]
               - not:
                   required: [fields]
           - description: Hierarchy child traversal requires its revision-bound ascending position order.

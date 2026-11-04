@@ -3417,6 +3417,7 @@ pub fn encodeQueryRequestWithGraphWireMode(
     if (req.identity_read_generation) |generation| {
         try appendJsonFieldU64(alloc, &out, &first, "_identity_read_generation", generation);
     }
+    if (req.hierarchy_parent_admitted) try appendJsonFieldBool(alloc, &out, &first, "_hierarchy_parent_admitted", true);
     if (req.hierarchy_children != null or req.defer_hierarchy_child_hydration) {
         try appendJsonFieldBool(alloc, &out, &first, "_defer_hierarchy_child_hydration", true);
     }
@@ -3907,7 +3908,11 @@ pub fn appendQueryHierarchyField(
     if (req.hierarchy_children) |children| {
         try out.appendSlice(alloc, "\"children\":{\"parent\":{\"level\":\"source\",\"id\":");
         try appendJsonString(alloc, out, children.parent_id);
-        try out.appendSlice(alloc, "},\"level\":\"unit\"}");
+        if (children.artifact_name) |name| {
+            try out.appendSlice(alloc, "},\"level\":\"member\",\"artifact\":");
+            try appendJsonString(alloc, out, name);
+            try out.append(alloc, '}');
+        } else try out.appendSlice(alloc, "},\"level\":\"unit\"}");
     } else {
         // `group_by` is its own opt-in control (grouped matches, or explicit
         // unit-level grouping); `ancestors` (hydrating a chunk hit's source/

@@ -731,14 +731,16 @@ Text/code/community bodies use `content.text` instead of `content.resource`.
 required. Catalog/document formats have separate version numbers.
 
 Publication defaults to `native`: S3/GCS binaries are streamed, collaboration
-attachments retain their original bytes, and Docs/Slides are exported as PDF
+attachments use their original bytes, and Docs/Slides are exported as PDF
 with before/after provider revision checks and an acquired representation hash.
-Drive identity remains the original document, not the export URL. The acquired PDF bytes are retained in private representation storage;
-serving a range never creates a fresh export. Current original access and
-revision are still checked, and missing/corrupt retained bytes fail explicitly. Exports
-and collaboration bundles retain their existing bounded acquisition limits;
-large S3/GCS originals use streaming. Unsupported whole-workbook export is
-rejected. Explicit `publication: text` retains the optional text-extractor path;
+Drive identity remains the original document, not the export URL. The proxy
+exports on demand and acquires each representation once per HTTP request. It
+checks current access, provider revision, size, and the pinned representation
+hash before exposing bytes, then serves request-local ranges without a durable
+copy or staging bucket. Changed export bytes require resynchronization even when
+the provider revision is unchanged. Exports and collaboration bundles retain
+bounded acquisition limits; large S3/GCS originals use streaming. Unsupported
+whole-workbook export is rejected. Explicit `publication: text` retains the optional text-extractor path;
 it is not required by native indexing. Standalone binary publication requires
 `antfly-source serve` (or an embedded revision-enforcing media resolver).
 

@@ -79,9 +79,6 @@ func (s *Service) verifiedMediaDigest(ctx context.Context, source Source, connec
 		return "", err
 	}
 	connector, err = publicationConnector(connector, source)
-	if err == nil {
-		connector = WithAcquisitionContentStore(connector, &FileAcquisitionContentStore{Directory: filepath.Join(s.runnerPath(), "content", source.ID)})
-	}
 	if err != nil {
 		return "", err
 	}

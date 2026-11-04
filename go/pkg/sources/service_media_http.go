@@ -24,7 +24,6 @@ import (
 	"github.com/minio/minio-go/v7"
 	"io"
 	"net/http"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -214,9 +213,6 @@ func (s *Service) serveMediaStream(w http.ResponseWriter, r *http.Request) {
 	connector, err := s.providerConnector(ctx, connection)
 	if err == nil {
 		connector, err = publicationConnector(connector, source)
-		if err == nil {
-			connector = WithAcquisitionContentStore(connector, &FileAcquisitionContentStore{Directory: filepath.Join(s.runnerPath(), "content", source.ID)})
-		}
 	}
 	var media MediaConnector
 	if err == nil {

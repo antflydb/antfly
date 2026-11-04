@@ -330,7 +330,7 @@ fn settle(txn: anytype, authority: publication.Authority, root: u128, selected: 
 
 /// Dependency closure comes from the pinned completion plan. A graph failure
 /// cannot block text whose producer requirements have already settled.
-pub fn sourceComplete(alloc: std.mem.Allocator, txn: anytype, plan: *const Manager.WritePlanSnapshot, root: u128, artifact: []const u8) !bool {
+pub fn sourceComplete(alloc: std.mem.Allocator, txn: anytype, plan: *const Manager.WritePlanSnapshot, root: u128, artifact: []const u8, inputs_empty: bool) !bool {
     const requirements = if (plan.completion_plan) |*value| value else return false;
     var relevant: std.StringHashMapUnmanaged(void) = .empty;
     defer relevant.deinit(alloc);
@@ -345,6 +345,10 @@ pub fn sourceComplete(alloc: std.mem.Allocator, txn: anytype, plan: *const Manag
     }
     const state = try load(alloc, txn);
     defer if (state) |value| value.deinit(alloc);
+    // A new empty owner has no registry until its first primary mutation.
+    // The caller proves absence through this same pinned transaction; a
+    // missing registry on any populated/unknown owner remains incomplete.
+    if (state == null and inputs_empty) return true;
     for (requirements.nodes) |node| {
         if ((node.kind != .generated and node.kind != .unit_children) or (!relevant.contains(node.artifact) and !relevant.contains(node.embedding))) continue;
         const current = state orelse return false;
@@ -476,12 +480,12 @@ test "ordered artifact inventory producer readiness isolates streams and fences 
     };
     var plan: Manager.WritePlanSnapshot = .{ .alloc = a, .generation = 1, .dense_fields = &.{}, .sparse_fields = &.{}, .graph_fields = &.{}, .generated_templates = &.{}, .chunk_dependents = &.{}, .artifact_catalogs = .{}, .catalog_empty = @splat(true), .completion_plan = .{ .arena = std.heap.ArenaAllocator.init(a), .catalog = authority.catalog_digest, .digest = authority.catalog_digest, .nodes = &nodes, .providers = &.{}, .definitions = .empty } };
     defer plan.completion_plan.?.deinit();
-    try std.testing.expect(try sourceComplete(a, &memory, &plan, 1, "text"));
-    try std.testing.expect(!try sourceComplete(a, &memory, &plan, 1, "relations"));
-    try std.testing.expect(!try sourceComplete(a, &memory, &plan, 2, "text"));
-    try std.testing.expect(try sourceComplete(a, &memory, &plan, 1, "authored"));
+    try std.testing.expect(try sourceComplete(a, &memory, &plan, 1, "text", false));
+    try std.testing.expect(!try sourceComplete(a, &memory, &plan, 1, "relations", false));
+    try std.testing.expect(!try sourceComplete(a, &memory, &plan, 2, "text", false));
+    try std.testing.expect(try sourceComplete(a, &memory, &plan, 1, "authored", false));
     try mark(a, &memory, authority, "doc");
-    try std.testing.expect(!try sourceComplete(a, &memory, &plan, 1, "text"));
+    try std.testing.expect(!try sourceComplete(a, &memory, &plan, 1, "text", false));
     try std.testing.expectEqual(@as(u64, 1), try count(&memory, &counterKey(authority, 1, ids[0])));
     try std.testing.expectEqual(@as(u64, 1), try count(&memory, &counterKey(authority, 1, ids[1])));
     try std.testing.expect(!try settle(&memory, authority, 1, graph, current));
@@ -490,6 +494,10 @@ test "ordered artifact inventory producer readiness isolates streams and fences 
     defer reloaded.deinit(a);
     try std.testing.expect(reloaded.baseline);
     try std.testing.expectEqual(@as(u64, 3), reloaded.revision);
+    try std.testing.expect(!try sourceComplete(a, &memory, &plan, 1, "text", true));
+    try memory.delete(registry_key);
+    try std.testing.expect(!try sourceComplete(a, &memory, &plan, 1, "text", false));
+    try std.testing.expect(try sourceComplete(a, &memory, &plan, 1, "text", true));
 }
 
 test "producer readiness local source receipts exclude upstream and sibling graph outputs" {

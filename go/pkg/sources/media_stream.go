@@ -209,21 +209,9 @@ func (c *GoogleConnector) OpenMedia(ctx context.Context, r Request, item Item, s
 		if err := span.validate(item.Size); err != nil {
 			return nil, err
 		}
-		if err := c.CheckMedia(ctx, r, item); err != nil {
-			return nil, err
-		}
-		if c.ContentStore == nil || !ValidContentRef(item.ContentRef) {
-			return nil, fmt.Errorf("native Drive export content storage unavailable")
-		}
-		data, found, err := c.ContentStore.Load(ctx, item.ContentRef)
+		data, err := c.exportMediaBytes(ctx, r, item)
 		if err != nil {
 			return nil, err
-		}
-		if !found {
-			return nil, fmt.Errorf("pinned Drive export is unavailable; synchronize this source again")
-		}
-		if int64(len(data)) != item.Size || fmt.Sprintf("%x", sha256.Sum256(data)) != configString(item.Metadata, "representation_sha256") {
-			return nil, &RevisionChangedError{Expected: item.Revision, Actual: "export bytes changed"}
 		}
 		return io.NopCloser(bytes.NewReader(data[span.Offset : span.Offset+span.Length])), nil
 	}

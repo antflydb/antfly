@@ -181,7 +181,7 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 		if binding.Publication == "" {
 			binding.Publication = "native"
 		}
-		if prior, ok := old[source.ID]; ok && prior.Table == source.Table {
+		if prior, ok := old[source.ID]; ok && prior.Table == source.Table && binding.SameRecordLayout(prior) {
 			binding.Status = prior.Status
 			binding.ValidUntil = prior.ValidUntil
 			binding.PublishedRevision = prior.PublishedRevision
@@ -396,7 +396,6 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if err != nil {
 		return 0, "", err
 	}
-	connector = WithAcquisitionContentStore(connector, &FileAcquisitionContentStore{Directory: filepath.Join(r.StateDir, "content", s.ID)})
 	if c, ok := connector.(*CollaborationConnector); ok {
 		// Pool immutable provider transports/token sources, never per-acquisition
 		// cursors, scope caches, or hydration state across logical sources.
@@ -645,13 +644,6 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 			}
 		}
 	}
-	if c, ok := connector.(*driveMediaConnector); ok {
-		if content, ok := c.ContentStore.(*FileAcquisitionContentStore); ok {
-			if err := content.Prune(state.Published.Objects); err != nil {
-				return 0, "", err
-			}
-		}
-	}
 	return state.StartedAt, revision, nil
 }
 func ownedID(id, namespace string) bool {
@@ -795,13 +787,6 @@ func (c *driveMediaConnector) Enumerate(ctx context.Context, request Request) (I
 		item.Size = int64(len(data))
 		item.Metadata["size_is_upper_bound"] = false
 		item.Metadata["representation_sha256"] = fmt.Sprintf("%x", sha256.Sum256(data))
-		if c.ContentStore == nil {
-			return Inventory{}, fmt.Errorf("native Drive exports require private acquisition content storage")
-		}
-		item.ContentRef = configString(item.Metadata, "representation_sha256")
-		if err := c.ContentStore.Save(ctx, item.ContentRef, data); err != nil {
-			return Inventory{}, err
-		}
 	}
 	return inventory, nil
 }

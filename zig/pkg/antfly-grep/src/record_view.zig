@@ -72,7 +72,7 @@ pub fn view(a: A, source: std.json.Value, fields: Fields, content: []const u8) !
 }
 
 pub fn text(source: std.json.Value, path: []const u8) ![]const u8 {
-    const value = if (std.mem.eql(u8, path, "$")) source else document.at(source, path) orelse return error.MissingArtifactText;
+    const value = if (std.mem.eql(u8, path, "$")) document.field(source, "$") orelse return error.MissingArtifactText else document.at(source, path) orelse return error.MissingArtifactText;
     if (value != .string) return error.InvalidArtifactText;
     return value.string;
 }

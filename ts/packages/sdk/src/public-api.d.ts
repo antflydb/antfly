@@ -12667,9 +12667,16 @@ export interface components {
             /**
              * @description Child level to enumerate. Unit traversal reads the versioned extraction
              *     hierarchy rather than a relevance index, so empty and failed units are included.
+             *     Member traversal requires artifact and seeks that producer's native storage
+             *     prefix within the selected source. It includes generic assets and chunks.
+             *     Scalar member payloads are returned as {"$": value} in _source so
+             *     every query hit retains an object-shaped projection. Continuation
+             *     requires the remote_snapshot returned with the first page.
              * @enum {string}
              */
-            level: "unit";
+            level: "unit" | "member";
+            /** @description Producer name; required for member traversal and omitted for unit traversal. */
+            artifact?: string;
         };
         /**
          * @description The required public order for sequential hierarchy traversal. Specify

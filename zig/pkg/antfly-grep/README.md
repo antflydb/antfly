@@ -5081,10 +5081,16 @@ boundary, producer purpose and available native locator data. Times and spatial
 coordinates retain the native producer's units/coordinate metadata; missing
 locators are not fabricated.
 
-Grep queries ordinary native artifact-backed full-text indexes with source
-ancestor hydration, retained snapshots and bounded ordered pagination. The regex
+Grep validates its ordinary native artifact-backed full-text index binding,
+then enumerates authorized source rows and seeks each selected producer through
+`hierarchy.children` member traversal. Parent and member pages share one retained
+snapshot; native prefix cursors bound page work without collecting or sorting
+the global artifact population. The regex
 runs locally over the actual selected text. Native stream readiness and index
-incarnation are checked before and after the scan. Pending/failed extraction,
+incarnation and target/published data revisions are checked before and after the scan.
+Each member page also requires producer completion on the retained storage cut,
+so current readiness cannot certify an older incomplete snapshot. Scalar artifact
+values use the transient `{"$": value}` query projection; stored artifacts are unchanged. Pending/failed extraction,
 missing mappings, stale definitions, exhausted work/memory/request limits and
 expired snapshots produce incomplete/error status (exit 2), never a complete
 no-match (exit 1). Source publication alone does not establish extraction
