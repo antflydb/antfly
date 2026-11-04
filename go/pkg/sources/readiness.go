@@ -28,7 +28,7 @@ import (
 // QueryDocumentFields covers the complete canonical metadata and the content
 // digest. Returning the original text again is unnecessary for readiness.
 func QueryDocumentFields() []string {
-	return []string{"grep.version", "grep.uri", "grep.path", "grep.revision", "grep.indexed_at", "grep.permissions", "grep.metadata"}
+	return []string{"grep.version", "grep.kind", "grep.media", "grep.uri", "grep.path", "grep.revision", "grep.indexed_at", "grep.permissions", "grep.metadata"}
 }
 
 func projectionDigest(doc Document) ([32]byte, error) {
@@ -73,8 +73,11 @@ func waitForDocuments(ctx context.Context, query func(context.Context, string, [
 	keys := make([]string, 0, len(documents))
 	expected := make(map[string][32]byte, len(documents))
 	for id, doc := range documents {
-		if id == "" || doc.Version != 1 || doc.URI == "" || doc.Path == "" || doc.Revision == "" || configString(doc.Metadata, "sha256") == "" {
+		if id == "" || doc.URI == "" || doc.Path == "" || doc.Revision == "" {
 			return fmt.Errorf("invalid canonical source readiness record")
+		}
+		if err := validateDocumentContent(doc); err != nil {
+			return err
 		}
 		digest, err := projectionDigest(doc)
 		if err != nil {

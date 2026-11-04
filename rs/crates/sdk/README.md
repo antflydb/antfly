@@ -64,3 +64,19 @@ completed result or a pending commit decode into `MutationOutcome<T>`
 [`antfly-postgres`](../postgres) depends on `antfly-sdk` for its generated types
 (e.g. `QueryResponses`, `QueryHit`) while keeping its own blocking HTTP
 client, since Postgres extensions cannot run an async runtime.
+
+## Optional source management
+
+Enable the `sources` Cargo feature and use the explicit module:
+
+```rust
+use antfly_sdk::sources::{SourcesClient, types::RunInput};
+let sources = SourcesClient::new("https://sources.example.com/sources/v1", &management_token)?;
+let run = sources.start_run(&source_id, &submission_key,
+    &RunInput { restart: None, operation: None }).await?;
+```
+
+The base URL is the Go server or Colony instance management mount, not Antfly's
+database listener. Reuse a submission key after an ambiguous response. Provider
+credentials, acquisition and media proxying stay in Go/Colony.
+`StandaloneSourcesClient` preserves standalone-only legacy control operations.
