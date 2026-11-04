@@ -508,7 +508,15 @@ fn retainedIds(a: A, root: V, extra: []const []const u8, keep_latest: usize, bef
     }
     return retained;
 }
-pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Binding, options: configured.BindingObjectStoreOpenOptions, context: catalog.types.Context, request: Options, protected: []const []const u8) !Result {
+pub fn run(backing: A, binding: local.serverless_external_source_catalog_binding.Binding, options: configured.BindingObjectStoreOpenOptions, parent_context: catalog.types.Context, request: Options, protected: []const []const u8) !Result {
+    // Provider transports allocate internally as well as through per-call
+    // result allocators. One shared wrapper protects all providers opened in
+    // this request, including when the caller supplied an unsynchronized arena.
+    // All clients/workers drain before this scope and its allocator can end.
+    var allocations: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = backing };
+    const a = allocations.allocator();
+    var context = parent_context;
+    context.parallel_object_io = true;
     if (request.max_plan_steps < 3 or request.max_plan_steps > 128 or request.operation_id.len == 0 or request.operation_id.len > 256 or request.retain_ms > std.math.maxInt(i64) or request.retain_ms < 10 * 60 * 1000 or request.keep_latest == 0 or request.keep_latest > 1024 or request.max_deleted == 0 or request.max_deleted > 4096 or request.max_expired == 0 or request.max_expired > 4096) return error.InvalidLakeMaintenanceLimits;
     // A local object-store retirement marker cannot fence commits or readers
     // admitted by an external catalog. An ownership assertion is insufficient:

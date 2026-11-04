@@ -1,10 +1,12 @@
 # Continuous writable-lake qualification — 2026-11-04 UTC
 
-**Both the baseline and first follow-up optimized runs failed qualification on
-each provider.** The catalog-history
+**At `79bba11f0b`, two fresh full optimized filesystem runs passed; GCS had no
+query failures but still failed bounded vacuum recovery.** Both the baseline and
+first follow-up optimized runs failed qualification on each provider. The catalog-history
 changes in #1480 work in this workload, and indexed acknowledged rows survived
-searchable publication and restart. Accepted-search availability and maintenance completion
-remain release/deployment qualification gaps.
+searchable publication and restart. GCS maintenance completion remains a
+release/deployment qualification gap; the later results below do not qualify
+full-archive performance or Antfly Cloud deployment.
 
 ## Revision and workload
 
@@ -490,6 +492,87 @@ failed with a missing hint before this change and passes afterward, alongside
 all 25 focused vacuum tests without leaks. Fresh optimized qualification remains
 required; the larger job's durations are not a controlled comparison with the
 earlier qualification workload.
+
+The heavier retained operation eventually completed across six bounded Debug
+attempts, with 308 reported deletions overall. Its final continuation at
+`79bba11f0b` took 105.87 seconds and required four maintenance turns. Independent
+validation preserved all 102 expected accepted and published row images, read
+all 98 current manifests and 296 referenced Parquet files with valid lengths and
+footers, and found six expired manifest lists absent. This establishes durable
+continuation and current-source safety for that operation; its multiple bounded
+attempts do not establish acceptable fresh-job throughput or a controlled speedup.
+
+The final production Debug binary at `79bba11f0b` passed its local HTTP smoke
+without query failures. Its SHA-256 is
+`d5c74211131fbbba9a7a11f8bfbcc0333241bf1743c0b54b5ccdbb6628aee266`.
+The matching stripped ReleaseFast build completed in 2,616.01 seconds and passed
+its local HTTP smoke without query failures. Its SHA-256 is
+`9d9fb43d5f4a7c91815f3a615809daa9661e2df5e32eb37163a861f505c2e207`.
+Fresh full local and GCS runs used this frozen binary and unchanged qualification
+bounds. The host was not isolated: the initial load
+averages were 5.66/6.14/6.59, and both profiles run concurrently with developer
+activity. These measurements must retain that qualification.
+
+At that revision both full filesystem attempts passed every check in 918.53 and
+934.02 seconds, with 1,486 continuous-phase queries and no failures. Each verified
+102 final row images before and after restart/vacuum, reported physical deletion
+during writes (11 and one objects), and independently found 16 expired manifest
+lists absent. Reported total deletions were 67 and 71. Accepted-query medians were
+49.84/49.83 ms, p95 values 79.75/68.28 ms, and maxima 207.74/1,435.11 ms. Published
+medians were 25.92 ms in both, p95 70.59/51.45 ms and maxima 1,764.41/1,878.65 ms.
+The earlier 60-second timeout did not recur; two passing attempts do not establish
+its exact original trigger. Publication catch-up took 5.19/10.62 seconds.
+
+The fresh GCS attempt still failed qualification after 2,171.34 seconds because
+vacuum exceeded the unchanged 300-second restart-recovery allowance. All 284
+continuous-phase queries succeeded. Published median/p95/maximum were
+1,333.65/1,847.50/4,297.73 ms; accepted values were
+1,957.73/2,526.61/4,931.29 ms. Publication catch-up took 225.99 seconds, and the
+first accepted query after restart took 8.49 seconds. All 103 expected accepted
+SQL and published row images were verified, including accepted visibility after
+restart, but the post-vacuum oracle and independent deletion checks were not
+reached. Two physical deletions were reported during continuous writes. Sampled
+publication lag remained high: median 197.12 seconds, p95 399.95 seconds. Successful
+accepted reads must not be represented as fast publication or fast cold serving.
+
+A separate Debug continuation of that same GCS operation completed after 40
+additional turns with 26 additional reported deletions. Validation and shutdown
+took 374.93 seconds overall. It preserved all 103 accepted/published row images,
+verified 94 current manifests and 292 referenced Parquet files, and found an
+expired indexed-table manifest list absent. This proves recovery of that saved
+operation, not a pass of the failed fresh-run bound. A read-only checkpoint sample
+located unfinished reachability at snapshot 100 of 111; its manifest hint covered
+all reachable completed-manifest nodes but stopped at 256 total nodes while using
+only 34,160 of the allowed 131,072 stored bytes. Debug samples also located
+sequential conditional PUTs in the visited-trie checkpoint. Further changes target
+those bounded-cache and upload costs; their qualification remains outstanding.
+
+The next change stages the final nodes of a bulk trie update, then uploads
+independent immutable nodes using up to four optional parallel slots per process.
+Each slot has a separate, caller-funded 1 MiB temporary buffer; buffer exhaustion
+falls back to the caller lane after workers drain. Cancellation and failure drain
+every worker, and a root cannot escape until all uploads are durably confirmed.
+Conditional writes and byte-for-byte canonical verification still resolve lost
+responses. Cache nodes staged before a failed upload remain unconfirmed.
+Providers must explicitly advertise concurrent request support, and the owner
+must opt in after synchronizing every client construction allocator in the
+scope. Vacuum shares the existing reclamation-aware allocator wrapper across its
+providers. Built-in GCS/S3 HTTP transports opt in; custom transports and memory
+clients remain serial by default. Tests exercise both missing opt-ins and buffer
+exhaustion during lost-response verification as well as during upload.
+
+Hints now select up to 2,048 nodes within the existing 1 MiB decoded and 128 KiB
+stored limits. Incompressible cohorts shrink deterministically until they fit;
+missing nodes retain required-read fallback. A cold two-tree control reproduced
+292 canonical GETs with the old node cap and now requires zero. Tests cover
+concurrent overlap, lost acknowledgments, cancellation/draining and retry,
+temporary-buffer fallback, excessive node/decoded size and incompressible input.
+All ten focused retirement tests passed without leaks. These are operation-count
+and safety controls, not yet a fresh optimized GCS qualification pass.
+The full Debug lake suite passed 703 tests, with one additional skip and no leaks.
+The object-store unit suite passed 210 tests with two live-provider tests skipped;
+its local mock GCS HTTP test required loopback permission. The final focused
+retirement controls also passed after exercising both concurrency opt-in gates.
 
 Next work should:
 
