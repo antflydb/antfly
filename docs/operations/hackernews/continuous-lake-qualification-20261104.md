@@ -712,6 +712,29 @@ for these fixes have not yet been qualified against GCS. The separately frozen
 `e7fc61d1d0` ReleaseFast engine passed its smoke and is running the original full
 filesystem/GCS controls; those results cannot qualify the newer cleanup code.
 
+Subsequent controls preserved two separate outcomes. The frozen `e7fc61d1d0`
+ReleaseFast filesystem run passed in 1,110.854 seconds with no query failures;
+the GCS run failed bounded vacuum recovery after 2,133.537 seconds, also with no
+query failures. Neither result qualifies the newer cleanup changes.
+
+With the bounded-cleanup Debug engine (`eca0684354`), a previously pending
+109-snapshot GCS vacuum completed in 271.799 seconds of maintenance work. The
+whole continuation took 348.137 seconds, including cold search and source
+verification: 103 expected rows, 94 current manifests and 292 Parquet files.
+The first attempt failed a cold accepted search with HTTP 504 after 31.671
+seconds. A restart and retry succeeded, with that search taking 21.782 seconds.
+The timeout remains a qualification failure; a successful retry does not erase it.
+
+Live stacks during the retry showed background recent-vector reconciliation
+opening and scanning Iceberg manifests for a text-only directory-backed
+publication. A directory is a storage representation, not evidence of an
+embedding index. Reconciliation now checks the authoritative index definition
+before acquiring serving leases or capturing WAL/source state. Dense and sparse
+embedding definitions retain the normal fenced preparation path. The new API
+regression failed before this change and both focused API controls pass after it;
+710 lake tests passed with one skip and no leaks. Provider validation is still
+needed to measure whether removing this competing work improves cold serving.
+
 Next work should:
 
 1. Monitor accepted searches with live public stages,

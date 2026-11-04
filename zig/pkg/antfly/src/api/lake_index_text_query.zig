@@ -75,6 +75,10 @@ pub fn reconcileRecent(a: A, server: *server_api.ApiHttpServer, table: local.com
     var state = try local.metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json);
     defer state.deinit();
     const publication = state.value.published orelse return;
+    // A directory describes storage, not whether any recent vector recipe
+    // exists. Skip before taking serving leases, capturing WAL or scanning an
+    // Iceberg snapshot when the current definition has no dense/sparse index.
+    if (!try @import("../serverless/build/lake_rebuild.zig").hasEmbeddingIndexesFromDefinition(a, table.indexes_json)) return;
     const needed = publication.directory != null or for (publication.declarations) |declaration| {
         if (declaration.artifact.kind == .vector_segment or declaration.artifact.kind == .sparse_segment) break true;
     } else false;
@@ -6047,4 +6051,31 @@ test "external lake recent reconciliation needs no serving owner before vector p
     // path must not touch credentials, a WAL owner or server runtime handles.
     try reconcileRecent(std.testing.allocator, undefined, table, .{});
     try std.testing.expectError(error.DeadlineExceeded, reconcileRecent(std.testing.allocator, undefined, table, .{ .deadline_ns = 0 }));
+}
+
+test "external lake recent reconciliation skips directory backed text definitions before serving admission" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var unused: u8 = 0;
+    var server = server_api.ApiHttpServer.init(a, .{}, .{ .ptr = &unused, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    const metadata = local.metadata_lake_index_catalog;
+    var table: local.common_topology_records.TableRecord = .{ .table_id = 4, .name = "text_only", .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","base_source":{"kind":"external","table_id":"text_only","format":"parquet","uri":"s3://archive/data","schema_fingerprint":"schema"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"}},"additionalProperties":true}}}}
+    , .indexes_json = "{\"body\":{\"type\":\"full_text\"}}" };
+    const publication: metadata.Publication = .{ .generation = 1, .token = @splat(1), .signature = .{ .desired = metadata.desiredFingerprint(table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) }, .published_at_ms = 1, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://archive/data", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = "inventory" } }, .inventory = .{ .artifact_id = "inventory", .kind = .external_base_source, .byte_len = 42, .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .directory = .{ .artifact_id = "directory", .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .byte_len = 1, .count = 1 } };
+    table.lake_index_catalog_json = try metadata.encode(scratch, .{ .generation = 1, .published = publication });
+    // No serving authority is installed. Text-only recent work must be a no-op
+    // even when declarations are stored in an immutable directory; dense and
+    // sparse definitions must still enter the normal fenced preparation path.
+    try reconcileRecent(a, &server, table, .{});
+    for ([_][]const u8{
+        "{\"semantic\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+        "{\"sparse\":{\"type\":\"embeddings\",\"field\":\"body\",\"sparse\":true}}",
+    }) |definition| {
+        table.indexes_json = definition;
+        try std.testing.expectError(error.ExternalLakeIndexUnavailable, reconcileRecent(a, &server, table, .{}));
+    }
 }
