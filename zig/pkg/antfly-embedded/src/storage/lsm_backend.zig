@@ -11399,6 +11399,9 @@ fn implementationTests() type {
                 const root_dir = "/lsm-commit-outcome";
                 const options = Options{ .flush_threshold = 1 << 20, .storage = storage.storage() };
                 var backend = try Backend.open(std.testing.allocator, root_dir, options);
+                // Close on every path, including a failed assertion.
+                var backend_open = true;
+                defer if (backend_open) backend.close();
                 {
                     var txn = try backend.beginWrite();
                     defer txn.abort();
@@ -11422,9 +11425,10 @@ fn implementationTests() type {
                     try std.testing.expectEqual(case.visible, got != null);
                 }
                 backend.options.backend.read_only = true;
+                backend_open = false;
                 backend.close();
                 backend = try Backend.open(std.testing.allocator, root_dir, options);
-                defer backend.close();
+                backend_open = true;
                 var read = try backend.beginRead();
                 defer read.abort();
                 const got = read.get(.{ .name = "docs" }, "doc:a") catch |err| switch (err) {
@@ -11448,6 +11452,9 @@ fn implementationTests() type {
                 const root_dir = "/lsm-torn-wal-tail";
                 const options = Options{ .flush_threshold = 1 << 20, .storage = storage.storage() };
                 var backend = try Backend.open(std.testing.allocator, root_dir, options);
+                // Close on every path, including a failed assertion.
+                var backend_open = true;
+                defer if (backend_open) backend.close();
                 {
                     var txn = try backend.beginWrite();
                     defer txn.abort();
@@ -11465,8 +11472,10 @@ fn implementationTests() type {
                 }
                 if (crash) {
                     backend.options.backend.read_only = true;
+                    backend_open = false;
                     backend.close();
                     backend = try Backend.open(std.testing.allocator, root_dir, options);
+                    backend_open = true;
                 }
                 // An acknowledged write after the failure.
                 {
@@ -11477,9 +11486,10 @@ fn implementationTests() type {
                 }
                 // Crash and recover: both acknowledged writes survive.
                 backend.options.backend.read_only = true;
+                backend_open = false;
                 backend.close();
                 backend = try Backend.open(std.testing.allocator, root_dir, options);
-                defer backend.close();
+                backend_open = true;
                 var read = try backend.beginRead();
                 defer read.abort();
                 try std.testing.expectEqualStrings("alpha", try read.get(.{ .name = "docs" }, "doc:a"));
@@ -11528,6 +11538,9 @@ fn implementationTests() type {
             const root_dir = "/lsm-deferred-repair-reset";
             const options = Options{ .flush_threshold = 1 << 20, .storage = storage.storage() };
             var backend = try Backend.open(std.testing.allocator, root_dir, options);
+            // Close on every path, including a failed assertion.
+            var backend_open = true;
+            defer if (backend_open) backend.close();
             {
                 var txn = try backend.beginWrite();
                 defer txn.abort();
@@ -11555,9 +11568,10 @@ fn implementationTests() type {
                 try txn.commit();
             }
             backend.options.backend.read_only = true;
+            backend_open = false;
             backend.close();
             backend = try Backend.open(std.testing.allocator, root_dir, options);
-            defer backend.close();
+            backend_open = true;
             var read = try backend.beginRead();
             defer read.abort();
             try std.testing.expectEqualStrings("alpha", try read.get(.{ .name = "docs" }, "doc:a"));
