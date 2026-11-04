@@ -101,6 +101,7 @@ func TestRunnerMediaRetainsOwnershipReadinessAndDeletion(t *testing.T) {
 func TestWorkspaceMediaReadsOriginalBytesWithRevisionFences(t *testing.T) {
 	binary := []byte{0xff, 0xd8, 0xff, 0x00, 0x01, 0x02}
 	afterRead := false
+	mediaChecks := 0
 	client := withDriveScopes(&http.Client{Transport: collaborationTransport(func(r *http.Request) (*http.Response, error) {
 		var payload []byte
 		switch {
@@ -112,6 +113,7 @@ func TestWorkspaceMediaReadsOriginalBytesWithRevisionFences(t *testing.T) {
 			payload = binary
 			afterRead = true
 		case r.URL.Path == "/files/photo":
+			mediaChecks++
 			version := "7"
 			if afterRead {
 				version = "8"
@@ -131,6 +133,8 @@ func TestWorkspaceMediaReadsOriginalBytesWithRevisionFences(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, inventory.Objects, 1)
 	require.Equal(t, ProviderGoogleWorkspace, inventory.Objects[0].SourceKind)
+	require.NoError(t, ValidateMediaInventory(t.Context(), c, request, inventory))
+	require.Equal(t, 1, mediaChecks, "one per-object audit, without repeating Drive inventory validation")
 	_, err = c.Read(t.Context(), request, inventory.Objects[0])
 	var changed *RevisionChangedError
 	require.ErrorAs(t, err, &changed)

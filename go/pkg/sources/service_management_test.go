@@ -19,8 +19,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/antflydb/antfly/go/pkg/sources/management"
@@ -143,4 +145,56 @@ func TestMediaProtocolSeparatesRevocationFromProviderOutage(t *testing.T) {
 		WriteMediaError(w, &GoogleHTTPError{Status: tc.status})
 		require.Equal(t, tc.want, w.Code)
 	}
+}
+
+func TestSourceScopedRunStartsAfterSiblingConnectionIsRevoked(t *testing.T) {
+	s, _, _ := serviceFixture(t)
+	require.Equal(t, 200, serviceCall(s, "PUT", "/v1/connections/sibling", Connection{Provider: ProviderS3}).Code)
+	sibling := s.profile.Sources[0]
+	sibling.ID = "00000000-0000-4000-8000-000000000099"
+	sibling.Connection = "sibling"
+	require.Equal(t, 200, serviceCall(s, "PUT", "/v1/sources/"+sibling.ID, sibling).Code)
+	require.Equal(t, 200, serviceCall(s, "DELETE", "/v1/connections/sibling", nil).Code)
+	response := managementCall(s, "POST", "/sources/"+testSourceID+"/runs", "selected-only", map[string]any{})
+	require.Equal(t, 202, response.Code, response.Body.String())
+	var run management.Run
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &run))
+	require.Equal(t, "completed", waitServiceJob(t, s, run.Id).State)
+}
+
+func TestManagementSourcePagesBoundEncodedBytes(t *testing.T) {
+	s, _, _ := serviceFixture(t)
+	s.mu.Lock()
+	template := s.profile.Sources[0]
+	s.profile.Sources = nil
+	for i := range 30 {
+		item := template
+		item.ID = fmt.Sprintf("00000000-0000-4000-8000-%012d", i+1)
+		item.Config = json.RawMessage(`{"bucket":"` + strings.Repeat("x", 100000) + `"}`)
+		s.profile.Sources = append(s.profile.Sources, item)
+	}
+	s.mu.Unlock()
+	seen := map[string]bool{}
+	cursor := ""
+	pages := 0
+	for {
+		response := managementCall(s, "GET", "/sources?limit=100&cursor="+cursor, "", nil)
+		require.Equal(t, 200, response.Code, response.Body.String())
+		require.LessOrEqual(t, response.Body.Len(), management.MaxResponseBytes)
+		var page management.SourcePage
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
+		require.NotEmpty(t, page.Data)
+		for _, item := range page.Data {
+			require.False(t, seen[item.Id])
+			seen[item.Id] = true
+		}
+		pages++
+		if page.NextCursor == "" {
+			break
+		}
+		require.NotEqual(t, cursor, page.NextCursor)
+		cursor = page.NextCursor
+	}
+	require.Len(t, seen, 30)
+	require.Greater(t, pages, 1)
 }

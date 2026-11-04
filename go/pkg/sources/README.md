@@ -686,7 +686,8 @@ provider secrets to the Antfly database listener.
 A source-scoped run retains the full profile/catalog context. It neither retires
 sibling bindings nor prunes their media references. History survives restarts;
 control pages bound disk scanning and can return an empty page with a next cursor
-when sibling runs intervene. Follow cursors until absent. Receipts/idempotency
+when sibling runs intervene. Source pages are also bounded to the common client’s
+2 MiB response limit; `limit` is an upper bound on item count. Follow cursors until absent. Receipts/idempotency
 bindings are retained with service state; deleting that state loses both history
 and ingestion ownership and is not routine history cleanup.
 

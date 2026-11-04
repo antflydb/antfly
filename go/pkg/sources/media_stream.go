@@ -359,3 +359,25 @@ func VerifyMediaDigest(ctx context.Context, media MediaConnector, request Reques
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
+
+// ValidateMediaInventory proves that an entire selected representation inventory
+// remains readable. Drive's native media adapter already performs the item audit
+// in ValidateInventory; do not issue the same remote checks a second time.
+func ValidateMediaInventory(ctx context.Context, connector Connector, request Request, inventory Inventory) error {
+	media, ok := connector.(MediaConnector)
+	if !ok {
+		return fmt.Errorf("%w: provider does not support media", ErrInvalidInput)
+	}
+	if err := connector.ValidateInventory(ctx, request, inventory); err != nil {
+		return err
+	}
+	if _, ok := connector.(*driveMediaConnector); ok {
+		return nil
+	}
+	for _, item := range inventory.Objects {
+		if err := media.CheckMedia(ctx, request, item); err != nil {
+			return err
+		}
+	}
+	return nil
+}

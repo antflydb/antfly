@@ -246,7 +246,11 @@ func (r *Runner) validate() error {
 		return err
 	}
 	seen := map[string]bool{}
+	selected := r.SourceID == ""
 	for _, s := range r.Profile.Sources {
+		if s.ID == r.SourceID {
+			selected = true
+		}
 		catalogTable := r.Profile.CatalogTable
 		if catalogTable == "" {
 			catalogTable = DefaultCatalogTable
@@ -260,16 +264,19 @@ func (r *Runner) validate() error {
 		if s.Publication != "" && s.Publication != "text" && s.Publication != "media" {
 			return fmt.Errorf("publication must be text or media")
 		}
-		if s.Publication == "media" && r.MediaReference == nil {
+		if s.Publication == "media" && r.MediaReference == nil && (r.SourceID == "" || r.SourceID == s.ID) {
 			return fmt.Errorf("media publication requires a revision-enforcing fetch resolver; use antfly-source serve")
 		}
 		seen[s.ID] = true
-		if _, ok := r.Profile.Connections[s.Connection]; !ok {
+		if _, ok := r.Profile.Connections[s.Connection]; !ok && (r.SourceID == "" || r.SourceID == s.ID) {
 			return fmt.Errorf("source connection is not configured")
 		}
 		if s.PermissionTTLSeconds != 0 && (s.PermissionTTLSeconds < 60 || s.PermissionTTLSeconds > 86400) {
 			return fmt.Errorf("permission TTL must be 60..86400 seconds")
 		}
+	}
+	if !selected {
+		return fmt.Errorf("selected source is not configured")
 	}
 	return nil
 }

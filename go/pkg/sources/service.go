@@ -803,7 +803,11 @@ func (s *Service) pinMedia(ctx context.Context, source Source, request Request, 
 func (s *Service) mediaReference(id string, pin mediaPinV2, item Item) MediaReference {
 	return MediaReference{ContentSHA256: pin.SHA256, Type: "source", URI: s.baseURL + "/v1/media/" + id + "/" + s.mediaSignature(id), MIMEType: mediaMIME(item), Version: `"` + pin.SHA256 + `"`, VersionKind: "strong_etag", Length: item.Size}
 }
-func mediaMIME(item Item) string {
+func mediaMIME(item Item) string { return MediaMIME(item) }
+
+// MediaMIME is shared by publication and delivery so a reference always names
+// the same representation MIME, including the filename fallback.
+func MediaMIME(item Item) string {
 	typ := configString(item.Metadata, "mime_type")
 	if typ == "" {
 		typ = mime.TypeByExtension(filepath.Ext(item.Path))

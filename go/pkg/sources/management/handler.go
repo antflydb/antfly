@@ -190,3 +190,21 @@ func Handler(b Backend) http.Handler {
 		WriteJSON(w, status, result)
 	})
 }
+
+// MaxResponseBytes is the common management transport bound. A page can contain
+// fewer than the requested item limit to fit it; callers follow next_cursor.
+const MaxResponseBytes = 2 << 20
+const SourcePageBudget = MaxResponseBytes - 1024
+
+// SourceBytes measures the actual wire representation, including JSON escaping.
+// Runtime adapters enforce the same budget before materializing a large page.
+func SourceBytes(source Source) (int, error) {
+	raw, err := json.Marshal(source)
+	if err != nil {
+		return 0, err
+	}
+	if len(raw)+1 > SourcePageBudget {
+		return 0, Failure(413, "source_response_too_large")
+	}
+	return len(raw) + 1, nil
+}

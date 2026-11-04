@@ -71,11 +71,11 @@ func (c *Client) call(ctx context.Context, method, path, key string, input, outp
 		return fmt.Errorf("source-management transport failed")
 	}
 	defer response.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(response.Body, 2<<20+1))
+	raw, err := io.ReadAll(io.LimitReader(response.Body, MaxResponseBytes+1))
 	if err != nil {
 		return fmt.Errorf("source-management response failed")
 	}
-	if len(raw) > 2<<20 {
+	if len(raw) > MaxResponseBytes {
 		return fmt.Errorf("source-management response exceeds limit")
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {

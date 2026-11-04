@@ -58,15 +58,22 @@ func (b localManagement) ListSources(ctx context.Context, limit int, cursor stri
 	b.s.mu.Unlock()
 	sort.Slice(profile.Sources, func(i, j int) bool { return profile.Sources[i].ID < profile.Sources[j].ID })
 	page := management.SourcePage{Data: []management.Source{}}
+	bytes := 0
 	for _, source := range profile.Sources {
 		if source.ID <= cursor {
 			continue
 		}
-		if len(page.Data) == limit {
+		item := managementSource(source)
+		size, err := management.SourceBytes(item)
+		if err != nil {
+			return page, err
+		}
+		if len(page.Data) == limit || bytes+size > management.SourcePageBudget {
 			page.NextCursor = page.Data[len(page.Data)-1].Id
 			break
 		}
-		page.Data = append(page.Data, managementSource(source))
+		page.Data = append(page.Data, item)
+		bytes += size
 	}
 	return page, nil
 }
