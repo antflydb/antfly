@@ -3,15 +3,23 @@
 This is an implementation record for explicit SQL locking. The PostgreSQL 18
 conflict matrices and lifetime rules are the semantic reference.
 
-Current status (2026-11-03): public HTTP and pgwire advisory execution is active
-and qualified against the three unchanged original advisory statements. The
-native ledger, durable command-source permits, shared prepared-decision
-integration, independent prepared lock home, ordered scalar/type layer,
-savepoints and DISCARD share native lifetime authority. Distributed row/table
-participant enrollment remains open; the seven original table/row locking cases
-are not closed by advisory coverage.
-The sections below retain earlier qualification records; the final sections
-describe the current implementation.
+Current status (2026-11-03): all ten valid original locking cases are implemented
+and qualified through authenticated public SQL and native durable owners. This
+includes three advisory cases (sql-0089–sql-0091), two table cases (sql-0080 and
+sql-0081), and five row cases (sql-0173 and sql-0433–sql-0436). The invalid OF target
+in sql-0437 is rejected before row access. No original locking case remains
+unresolved.
+
+Table/row participant enrollment, ordinary read/write conflict checks, savepoint
+and failed-statement cleanup, prepared custody, connection retirement and cold
+recovery now share the existing native transaction and command-source machinery.
+The [complete qualification record](sql-catalog-lifecycle-parity.md#original-table-and-row-locking-cohort-qualified-2026-11-03)
+describes the public campaigns and PostgreSQL reference checks. Arbitrary joined
+or derived LockRows execution and cross-group deadlock detection remain separate
+capability gaps; closing the original cases does not qualify those features.
+
+The sections below retain historical qualification records and their then-open
+work. Their old case counts and activation lists are not current status.
 
 ## Native resource contract
 
