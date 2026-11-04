@@ -8957,6 +8957,12 @@ test "capi native cooperative replay separates raw text from generated artifact 
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
     const background = @import("../storage/background_runtime.zig");
+    const QueuedOutput = struct {
+        fn commit(ptr: *anyopaque, batch: GeneratedBatch, promotions: Promotions, deletes: []const []const u8, guards: SourceGuards, fence: ?WriteFence) anyerror!@import("../storage/db/enrichment/enrichment_runtime.zig").GeneratedRecordCommit {
+            const db: *h.db_mod.DB = @ptrCast(@alignCast(ptr));
+            return db.enqueuePreparedGeneratedBatch(batch, promotions, deletes, guards, fence);
+        }
+    };
     for ([_]bool{ false, true }) |workers| {
         var host = try background.BackendRuntimeHandle.init(a, .{
             .backend = .manual,
@@ -8979,6 +8985,11 @@ test "capi native cooperative replay separates raw text from generated artifact 
         try db.addEnrichment(.{ .name = "copy", .kind = .asset, .field = "text", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
         try db.addIndex(.{ .name = "raw", .kind = .full_text, .config_json = "{}" });
         try db.addIndex(.{ .name = "generated", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"copy\"}]}" });
+        // Native maintenance queues generated output through its publication
+        // port. Match that contract here: the generic in-memory writer applies
+        // generated indexes eagerly and deliberately has no producer-cut fence.
+        db.enrichment_runtime.?.write_ctx = &db;
+        db.enrichment_runtime.?.write_fn = QueuedOutput.commit;
         try std.testing.expect(!try db.core.indexRequiresEnrichmentReplay("raw"));
         try std.testing.expect(try db.core.indexRequiresEnrichmentReplay("generated"));
         var names: [32][32]u8 = undefined;

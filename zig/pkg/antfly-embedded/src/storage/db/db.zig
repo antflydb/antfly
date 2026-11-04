@@ -146157,6 +146157,12 @@ test "db manual text producers merge capacity without optional workers visibilit
 }
 
 test "background enrichment turn fences artifact consumers at the producer prefix" {
+    const QueuedOutput = struct {
+        fn commit(ptr: *anyopaque, batch: enrichment_runtime_mod.GeneratedRecordBatch, promotions: []const enrichment_runtime_mod.GeneratedArtifactPromotion, deletes: []const []const u8, guards: []const enrichment_runtime_mod.GeneratedSourceGuard, fence: ?enrichment_runtime_mod.GeneratedWriteFence) anyerror!enrichment_runtime_mod.GeneratedRecordCommit {
+            const database: *DB = @ptrCast(@alignCast(ptr));
+            return database.enqueuePreparedGeneratedBatch(batch, promotions, deletes, guards, fence);
+        }
+    };
     const alloc = std.testing.allocator;
     var backend_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
@@ -146178,6 +146184,8 @@ test "background enrichment turn fences artifact consumers at the producer prefi
     defer db.close();
     try db.addEnrichment(.{ .name = "copy", .kind = .asset, .field = "text", .producer_json = "{\"type\":\"copy\"}" });
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"copy\"}]}" });
+    db.enrichment_runtime.?.write_ctx = &db;
+    db.enrichment_runtime.?.write_fn = QueuedOutput.commit;
     for (0..32) |i| {
         var key: [32]u8 = undefined;
         const name = try std.fmt.bufPrint(&key, "source-{d}", .{i});
