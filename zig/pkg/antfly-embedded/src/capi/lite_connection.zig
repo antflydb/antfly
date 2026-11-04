@@ -2224,6 +2224,16 @@ pub const Owner = struct {
         if (root.maintenance_writer_references != 0) return;
         var lease = root.maintenance_writer_lease.?;
         root.maintenance_writer_lease = null;
+        if (root.maintenance_publication_started_ns) |started| {
+            const held: u64 = @intCast(@max(0, std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds - started));
+            self.publication_stats.publication_hold_ns +|= held;
+            if (root.maintenance_publication) |publication| {
+                if (publication.publication_overhead_ns) |counter| {
+                    _ = counter.fetchAdd(held, .monotonic);
+                }
+            }
+            root.maintenance_publication_started_ns = null;
+        }
         // Admission alone is not a mutation. Reclamation probes also take
         // this lease; waking replay here makes each idle turn schedule itself.
         // Generated and replay publications notify at their commit boundary.
@@ -7079,6 +7089,7 @@ test "capi native maintenance nested admission preserves index and outcome fence
         }
         break :blk try owner.refreshMaintenanceSnapshot(try owner.refresh(), .source);
     };
+    var publication_overhead: std.atomic.Value(u64) = .init(0);
     var publication: PreparedPublication = .{
         .owner = owner,
         .name = "default",
@@ -7088,6 +7099,7 @@ test "capi native maintenance nested admission preserves index and outcome fence
         .index_prefix = "unused/",
         .snapshot_root = root,
         .snapshot_database = &root.db,
+        .publication_overhead_ns = &publication_overhead,
         .source_read = null,
         .relational_rows = false,
     };
@@ -7097,22 +7109,39 @@ test "capi native maintenance nested admission preserves index and outcome fence
         root.maintenance_owner = null;
         root.maintenance_publication = null;
     }
+    const hold_before = owner.publication_stats.publication_hold_ns;
+    const site_before = owner.publication_stats.maintenance_hold_sites.writer_primary.count;
     try Owner.enterMaintenanceWriter(root, .primary);
-    defer Owner.leaveMaintenanceWriter(root);
+    var held = true;
+    defer if (held) Owner.leaveMaintenanceWriter(root);
     publication.index_inputs_changed = true;
     for ([_]PublicationScope{ .index, .index_read }) |scope|
         try std.testing.expectError(error.EnrichmentWaitCanceled, Owner.enterMaintenanceWriter(root, scope));
     try std.testing.expectEqual(@as(usize, 1), root.maintenance_writer_references);
     // A completed primary publication may still record its replay watermark.
+    const before_nested_overhead = publication_overhead.load(.monotonic);
     try Owner.enterMaintenanceWriter(root, .primary);
     try std.testing.expectEqual(@as(usize, 2), root.maintenance_writer_references);
     Owner.leaveMaintenanceWriter(root);
+    try std.testing.expectEqual(hold_before, owner.publication_stats.publication_hold_ns);
+    try std.testing.expectEqual(before_nested_overhead, publication_overhead.load(.monotonic));
     const file = &root.owned_lite_backend.?.native_docstore.?.file;
     file.checkpoint_publication_uncertain = true;
     defer file.checkpoint_publication_uncertain = false;
     for ([_]PublicationScope{ .primary, .index, .index_read, .allocator_service, .reclamation }) |scope|
         try std.testing.expectError(error.OutcomeReconciliationRequired, Owner.enterMaintenanceWriter(root, scope));
     try std.testing.expectEqual(@as(usize, 1), root.maintenance_writer_references);
+    // Deterministic elapsed time verifies that only the outermost release
+    // charges both the aggregate controller feedback and per-site receipt.
+    root.maintenance_publication_started_ns = std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds - 5 * std.time.ns_per_ms;
+    const feedback_before_release = publication_overhead.load(.monotonic);
+    Owner.leaveMaintenanceWriter(root);
+    held = false;
+    const hold_delta = owner.publication_stats.publication_hold_ns - hold_before;
+    try std.testing.expect(hold_delta >= 5 * std.time.ns_per_ms);
+    try std.testing.expectEqual(hold_delta, publication_overhead.load(.monotonic) - feedback_before_release);
+    try std.testing.expectEqual(site_before + 1, owner.publication_stats.maintenance_hold_sites.writer_primary.count);
+    try std.testing.expectEqual(@as(?i96, null), root.maintenance_publication_started_ns);
 }
 
 test "capi native allocator proof live commits carry a checked peer certificate" {
