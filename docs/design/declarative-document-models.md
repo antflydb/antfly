@@ -139,7 +139,12 @@ ceiling, while explicit values above that ceiling remain errors. Hosted audio
 leaves borrow the same run-owned HTTP pool as routing, extraction and verification,
 including across sources and nested readers. Pool state outlives page scratch
 arenas and is released after all workers finish. Cancellation and deadlines remain
-per-call and poll the complete request checkpoint throughout provider I/O.
+per-call and poll the complete request checkpoint throughout provider I/O. Vertex
+OAuth sources and tokens belong to the runtime and are keyed by credential
+source and scope. They survive document-run teardown, share refreshes and expire
+under the existing credential-cache policy. Cached credentials never retain
+audio bytes or a caller's cancellation callback; each authentication attempt
+uses that call's remaining deadline and cancellation control.
 
 
 For conditional refinement, add another `operation: "read", input: "audio"`

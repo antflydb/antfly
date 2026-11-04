@@ -19,6 +19,7 @@ const audio = @import("antfly_audio_openapi");
 const httpx = @import("httpx");
 const inference_api = @import("inference_api");
 const google_auth = @import("antfly_google").auth;
+pub const CredentialManager = google_auth.CredentialManager;
 const scraping = @import("antfly_scraping");
 pub const apple_native = @import("antfly_apple_native");
 
@@ -587,6 +588,9 @@ fn deinitSpeaker(alloc: Allocator, speaker: *Speaker) void {
 }
 
 pub const RemoteOptions = struct {
+    /// Runtime-owned credential cache. Only credential identity and scope are
+    /// retained there; request buffers, deadlines and cancellation stay local.
+    credential_manager: ?*CredentialManager = null,
     /// Trusted caller-owned recording already resolved under the document source
     /// policy. Borrowed only for this invocation; never parsed from provider JSON.
     resolved_audio: ?[]const u8 = null,
@@ -1409,6 +1413,7 @@ const VertexTranscriberState = struct {
     base_url: []const u8,
     auth_header: ?[2][]const u8 = null,
     token_source: ?*google_auth.CachedTokenSource = null,
+    credentials_path: ?[]const u8 = null,
     project_id: []const u8,
     location: []const u8,
     model: []const u8,
@@ -1445,6 +1450,8 @@ const VertexTranscriberState = struct {
 
         if (cfg.bearer_token orelse cfg.api_key) |token| {
             try state.setBearer(token);
+        } else if (options.credential_manager != null) {
+            state.credentials_path = try dupOpt(alloc, cfg.credentials_path);
         } else {
             state.token_source = try initVertexTokenSource(alloc, cfg.credentials_path);
         }
@@ -1461,6 +1468,7 @@ const VertexTranscriberState = struct {
     fn deinitState(self: *VertexTranscriberState) void {
         self.alloc.free(self.base_url);
         self.alloc.free(self.project_id);
+        freeOpt(self.alloc, self.credentials_path);
         self.alloc.free(self.location);
         self.alloc.free(self.model);
         self.alloc.free(self.language_code);
@@ -1496,7 +1504,11 @@ const VertexTranscriberState = struct {
             try headers.append(alloc, header);
             return;
         }
-        if (self.token_source) |source| {
+        const token_source = if (self.options.credential_manager) |manager|
+            manager.tokenSourceWithControl(self.credentials_path, vertex_auth_scope, control) catch |err| return if (err == error.MissingGoogleCredentials) error.MissingVertexCredentials else err
+        else
+            self.token_source;
+        if (token_source) |source| {
             minted_auth.* = try source.authorizationValueAllocWithControl(alloc, control);
             try headers.append(alloc, .{ "Authorization", minted_auth.*.? });
         }
@@ -2727,4 +2739,71 @@ test "audio read endpoint identity and dispatch share canonical URL resolution" 
     for ([_][]const u8{ "file:///tmp/speech", "https:///v1", "https://user:password@example.com/v1" }) |url| {
         try std.testing.expectError(error.InvalidTranscribingConfig, (Config{ .provider = .openai, .base_url = url }).effectiveEndpointAlloc(a));
     }
+}
+
+test "audio read Vertex runtime credentials reuse tokens across calls and refresh without retaining cancellation" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var manager = CredentialManager.init(a, io);
+    defer manager.deinit();
+    var upstream = try httpx.TestServer.start(a, io, &.{
+        .{ .method = .POST, .path = "/token", .respond = .{ .body = "{\"access_token\":\"vertex-token\",\"expires_in\":3600,\"token_type\":\"Bearer\"}" } },
+        .{ .method = .POST, .path = "/projects/proj-from-json/locations/global/recognizers/_:recognize", .assert_request = expectVertexBearer, .respond = .{ .body = "{\"results\":[{\"alternatives\":[{\"transcript\":\"hello\"}],\"languageCode\":\"en-US\"}]}" } },
+    });
+    defer upstream.deinit();
+    const token_uri = try std.fmt.allocPrint(a, "{s}/token", .{upstream.baseUrl()});
+    defer a.free(token_uri);
+    const credentials = try fakeVertexCredentialsJsonAlloc(a, token_uri);
+    defer a.free(credentials);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "credentials.json", .data = credentials });
+    const path = try tmp.dir.realPathFileAlloc(io, "credentials.json", a);
+    defer a.free(path);
+    var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+    defer client.deinit();
+    const cfg = Config{ .provider = .vertex, .project_id = "proj-from-json", .base_url = upstream.baseUrl(), .credentials_path = path, .timestamps = false };
+    var cancelled = false;
+    const Cancel = struct {
+        fn check(raw: *const anyopaque) bool {
+            return @as(*const bool, @ptrCast(@alignCast(raw))).*;
+        }
+    };
+    var options = RemoteOptions{ .credential_manager = &manager, .resolved_audio = "recording", .timeout_ms = 5000, .cancellation = httpx.CancellationToken.fromCallback(&cancelled, Cancel.check) };
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    var failure: ?anyerror = null;
+    const Serve = struct {
+        fn run(server: *httpx.TestServer, err: *?anyerror) std.Io.Cancelable!void {
+            // Two OAuth exchanges (initial and expired), three recognitions.
+            for (0..5) |_| server.handleOne() catch |problem| {
+                err.* = problem;
+                return;
+            };
+        }
+    };
+    try group.concurrent(io, Serve.run, .{ &upstream, &failure });
+    for (0..3) |index| {
+        if (index == 1) {
+            cancelled = true;
+            try std.testing.expectError(error.Cancelled, transcribeWithConfig(a, &client, cfg, .{ .url = "antfly:resolved-audio" }, options));
+            // The previous request stays cancelled. The next request must not
+            // inherit its callback through the credential/token cache.
+            options.cancellation = null;
+        }
+        if (index == 2) {
+            const source = try manager.tokenSource(path, vertex_auth_scope);
+            source.cached_token.?.expires_at_s = 0;
+        }
+        var response = try transcribeWithConfig(a, &client, cfg, .{ .url = "antfly:resolved-audio" }, options);
+        defer deinitResponse(a, &response);
+        try std.testing.expectEqualStrings("hello", response.text.?);
+        try std.testing.expectEqual(@as(usize, if (index == 2) 2 else 1), upstream.routeHitCount(0));
+    }
+    try group.await(io);
+    if (failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 3), upstream.routeHitCount(1));
+    try std.testing.expectEqual(@as(usize, 1), manager.sources.count());
 }

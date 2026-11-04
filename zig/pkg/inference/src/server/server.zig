@@ -4176,6 +4176,8 @@ pub const Node = struct {
     native_checkpoint_active: std.atomic.Value(bool) = .init(false),
     config: NodeConfig,
     document_artifacts: @import("../documents/artifacts.zig").Store = .{},
+    provider_credentials: ?*ProviderCredentials = null,
+    provider_credentials_mutex: std.atomic.Mutex = .unlocked,
     fixed_chunk_runtime: lib_chunker.fixed_text.Runtime = .{},
     allocator: std.mem.Allocator,
     session_manager: backends_mod.SessionManager,
@@ -4464,6 +4466,11 @@ pub const Node = struct {
 
     pub fn deinit(self: *Node) void {
         self.document_artifacts.deinit(self.allocator);
+        if (self.provider_credentials) |credentials| {
+            credentials.manager.deinit();
+            if (credentials.owned_io) |*owned| owned.deinit();
+            self.allocator.destroy(credentials);
+        }
         self.fixed_chunk_runtime.deinit();
         self.model_manager.setHostCacheReclaimer(null);
         self.media_index_cache.deinit();
@@ -20865,6 +20872,28 @@ pub const Node = struct {
         return downloadRemoteContentWithBudgetForRequestWithContext(self, a, .{ .io = io, .control = control }, url, &budget);
     }
 
+    /// Credentials outlive individual document runs. A stable allocation keeps
+    /// the optional fallback IO alive until Node teardown, including when no
+    /// host IO is attached. Never retain a request's borrowed IO or callbacks.
+    const ProviderCredentials = struct {
+        owned_io: ?std.Io.Threaded = null,
+        manager: transcribing_api.CredentialManager,
+    };
+
+    fn providerCredentialManager(self: *Node) !*transcribing_api.CredentialManager {
+        while (!self.provider_credentials_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.provider_credentials_mutex.unlock();
+        const state = self.provider_credentials orelse init: {
+            const created = try self.allocator.create(ProviderCredentials);
+            created.* = .{ .manager = undefined };
+            const io = self.inferenceIo(self.allocator, null, &created.owned_io);
+            created.manager = transcribing_api.CredentialManager.init(self.allocator, io);
+            self.provider_credentials = created;
+            break :init created;
+        };
+        return &state.manager;
+    }
+
     const DocumentProviderSession = struct {
         allocator: std.mem.Allocator,
         owned_io: ?std.Io.Threaded = null,
@@ -21098,6 +21127,7 @@ pub const Node = struct {
             .timestamps = (options.timestamps orelse false) or (options.diarization orelse false),
             .diarization = options.diarization orelse false,
         }, .{
+            .credential_manager = if (cfg.provider == .vertex and cfg.bearer_token == null and cfg.api_key == null) try self.providerCredentialManager() else null,
             .resolved_audio = bytes,
             .timeout_ms = if (control.deadline_ns) |deadline| @max(1, (deadline -| platform.time.monotonicNs()) / std.time.ns_per_ms) else null,
             .cancellation = httpx.CancellationToken.fromCallback(&control, Cancel.cancelled),
@@ -48855,4 +48885,21 @@ test "hosted audio document equivalent URL aliases fail verifier preflight befor
     defer node.deinit();
     try node.attachIo(io);
     try std.testing.expectError(error.InvalidDocumentDefinition, node.readDocumentsJsonWithControl(a, "{\"model\":\"readers/test/plan\",\"audio\":\"AAAA\"}", .{ .io = io }));
+}
+
+test "hosted audio credential cache has stable runtime IO without an attached host" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    const first = try node.providerCredentialManager();
+    const second = try node.providerCredentialManager();
+    try std.testing.expect(first == second);
+    const state = node.provider_credentials.?;
+    try std.testing.expect(state.owned_io != null);
+    try std.testing.expect(first.io.userdata == state.owned_io.?.io().userdata);
+    // Attaching host IO later cannot invalidate an already created cache's
+    // network authority or leave it borrowing a completed caller's runtime.
+    try node.attachIo(std.testing.io);
+    try std.testing.expect(first == try node.providerCredentialManager());
+    try std.testing.expect(first.io.userdata == state.owned_io.?.io().userdata);
 }

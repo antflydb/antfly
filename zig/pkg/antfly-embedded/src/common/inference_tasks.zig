@@ -371,6 +371,7 @@ pub const Executor = struct {
         if (key) |value| cfg.bearer_token = try secrets.resolveReferenceOwned(a, self.secret_store, value);
         cfg.api_key = null;
         return transcribing.transcribeWithConfig(a, try self.providerHttp(), cfg, request, .{
+            .credential_manager = if (self.provider_runtime) |runtime| &runtime.google_credentials else null,
             .timeout_ms = try self.context.remainingTimeoutMs(),
             .cancellation = if (self.context.cancellation) |v| httpx.CancellationToken.fromCallback(v.ptr, v.is_cancelled_fn) else null,
         });
