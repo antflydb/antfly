@@ -15252,7 +15252,7 @@ fn primePrivacyRoots(runtime: *EnrichmentRuntime, pending: []const enrichment_wo
             if (try skipPersistedRequestFailure(runtime, &window, request)) continue;
             try roots.append(runtime.alloc, request);
             if (roots.items.len == 8) {
-                const failure: ?anyerror = if (processDeferredAssets(runtime, roots.items, &window, &scope)) |_| null else |err| err;
+                const failure: ?anyerror = if (processDeferredAssets(runtime, roots.items, &window, &scope, null)) |_| null else |err| err;
                 try scope.publish(runtime, &window, failure == null);
                 if (failure) |err| return scope.scannerFailure(runtime, err);
                 roots.clearRetainingCapacity();
@@ -15260,7 +15260,7 @@ fn primePrivacyRoots(runtime: *EnrichmentRuntime, pending: []const enrichment_wo
         }
     }
     if (roots.items.len == 0) return primed;
-    const failure: ?anyerror = if (processDeferredAssets(runtime, roots.items, &window, &scope)) |_| null else |err| err;
+    const failure: ?anyerror = if (processDeferredAssets(runtime, roots.items, &window, &scope, null)) |_| null else |err| err;
     try scope.publish(runtime, &window, failure == null);
     if (failure) |err| return scope.scannerFailure(runtime, err);
     return primed;
