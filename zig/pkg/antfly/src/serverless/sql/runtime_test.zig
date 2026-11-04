@@ -349,7 +349,23 @@ test "distributed SQL signed task RPC uses query listeners and recovery driver w
     _ = try client.turn(.{ .tenant = spec.tenant, .query = query }, .{});
     // A gateway-created query survives losing its first query coordinator.
     fixture.now = 92001;
-    var driver: @import("driver.zig").Driver = .{ .service = coordinator, .dispatcher = client.dispatcher() };
+    // A persistently unavailable query earlier in the discovery page must
+    // not hide later submissions or stall their coordinator recovery.
+    var unavailable = spec;
+    unavailable.expires_ms -= 1;
+    const broken_query = try coordinator.submit(unavailable);
+    const RejectOne = struct {
+        client: *transport.Client,
+        broken: state.Digest,
+        fn dispatch(raw: *anyopaque, tickets: []const plan.Ticket, context: Context) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (tickets) |ticket| if (std.mem.eql(u8, &ticket.query, &self.broken)) return error.SqlWorkerUnavailable;
+            const dispatcher_ = self.client.dispatcher();
+            try dispatcher_.dispatch(dispatcher_.ptr, tickets, context);
+        }
+    };
+    var reject: RejectOne = .{ .client = &client, .broken = broken_query };
+    var driver: @import("driver.zig").Driver = .{ .service = coordinator, .dispatcher = .{ .ptr = &reject, .dispatch = RejectOne.dispatch } };
     defer driver.stop();
     var complete = false;
     for (0..64) |_| {

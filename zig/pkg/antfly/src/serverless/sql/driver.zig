@@ -84,7 +84,11 @@ pub const Driver = struct {
             if (current.value.terminal()) continue;
             _ = service.turn(query, self.dispatcher) catch |err| switch (err) {
                 error.SqlExecutionFenced, error.PreconditionFailed, error.SqlExecutionNotFound => continue,
-                else => return err,
+                error.Canceled, error.Cancelled => return err,
+                else => {
+                    std.log.warn("distributed SQL recovery deferred query={s}: {s}", .{ query, @errorName(err) });
+                    continue;
+                },
             };
             turns += 1;
         }
