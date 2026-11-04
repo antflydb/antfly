@@ -1,0 +1,43 @@
+{
+  "scope": "matched warm native CPU HTTP qualification, local shared host",
+  "baseline": "7cf3812a345c2f483cc0042bdb790ead6b43ce1c",
+  "candidate_build_commit": "42d3eb1b7b60a2b8aacb8526580863a7b9ee8e9b",
+  "pairs_per_case": 100,
+  "warmup_rounds": 3,
+  "concurrency": [
+    1,
+    4
+  ],
+  "ordering": "alternate baseline/candidate and candidate/baseline",
+  "cases": [
+    "short_entities",
+    "reference_windows",
+    "composed_windows"
+  ],
+  "response_contract": "exact keys, entity ordering, labels, spans, cardinality, metadata and token usage; scores within 0.002",
+  "timing": "HTTP send through complete response body; synchronized bursts end at last response body, before oracle validation",
+  "correctness_gate": "every request succeeds and matches the pinned oracle; artifact hashes unchanged",
+  "performance_assessment": "report paired median ratio and bootstrap 95% interval; claim no material regression only if upper candidate/baseline bound <= 1.05",
+  "capacity_gate": "Exactly 16384 reported prompt/total tokens in one native HTTP window; measured dense/filler costs; all source spans valid. Run alone with default aggregate scratch before the paired four-client resource profile.",
+  "excluded": [
+    "long-context model accuracy",
+    "CUDA HTTP throughput",
+    "dedicated-host production performance",
+    "repository-wide aggregate CI"
+  ],
+  "aggregate_scratch_budget_mib": 4096,
+  "protocol_revision": 4,
+  "reason": "The optimized initial capacity probe exposed the native 512 MiB heap refusal. Runtime fix passed all six Debug regressions including 16381 real tokens under 512 MiB; repeat optimized qualification for the fixed binary and tighten the HTTP probe to the exact encoded limit. Add the largest common-supported word window as a separate 20-pair profile, because the native relative compaction branch activates above the short common cases.",
+  "full_word_comparison": {
+    "case_id": "full_word_reference",
+    "source_words": 4095,
+    "body_words": 4096,
+    "prompt_tokens": 4105,
+    "pairs": 20,
+    "warmup": 3,
+    "concurrency": [
+      1,
+      4
+    ]
+  }
+}

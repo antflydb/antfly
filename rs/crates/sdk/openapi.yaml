@@ -38380,6 +38380,17 @@ components:
       required:
         - provider
         - model
+    OpenAIReasoningEffort:
+      type: string
+      enum:
+        - none
+        - minimal
+        - low
+        - medium
+        - high
+        - xhigh
+        - max
+      description: OpenAI reasoning effort; model support varies. Omit to use the model default.
     OllamaGeneratorConfig:
       type: object
       description: >
@@ -38405,7 +38416,11 @@ components:
           maximum: 2.0
         max_tokens:
           type: integer
-          description: Maximum number of tokens to generate.
+          description: Maximum number of tokens to generate, including reasoning tokens for thinking models.
+        reasoning_effort:
+          $ref: '#/components/schemas/OpenAIReasoningEffort'
+          description: Optional reasoning effort for Ollama's OpenAI-compatible endpoint. Use none to
+            disable thinking on models that support it; supported values depend on the model.
         top_p:
           type: number
           format: float
@@ -38465,17 +38480,6 @@ components:
       required:
         - provider
         - model
-    OpenAIReasoningEffort:
-      type: string
-      enum:
-        - none
-        - minimal
-        - low
-        - medium
-        - high
-        - xhigh
-        - max
-      description: OpenAI reasoning effort; model support varies. Omit to use the model default.
     ChatGPTGeneratorConfig:
       type: object
       description: Personal ChatGPT plan for interactive generation. Credentials stay in the local runtime.
@@ -39509,6 +39513,14 @@ components:
           maximum: 1000000
           description: Number of tokens to overlap between consecutive chunks. Helps maintain context
             across chunk boundaries. Only used by fixed-size chunkers.
+        min_chars:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          default: 0
+          description: Minimum non-whitespace Unicode scalar values in a fixed text chunk. Shorter chunks
+            are omitted before storage and embedding; original source offsets are preserved. Zero disables
+            filtering (default). Does not filter model-aware media windows or image/audio chunks.
         separator:
           type: string
           description: Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size

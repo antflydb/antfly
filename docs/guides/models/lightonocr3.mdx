@@ -18,6 +18,13 @@ The pull installs the upstream configuration, tokenizer, chat template, image
 processor, and weights, plus a `model_manifest.json` declaring generation and
 reading. Refer to the model as `lightonai/LightOnOCR-3-0.8B`; the short alias `lightonocr3-0.8b` also resolves.
 
+Downloads made by older Antfly versions may lack `chat_template.jinja`. With an
+updated Antfly, rerun the same pull command to fetch the missing sidecar while
+reusing verified weights. Keep this file when sharing the model directory with
+other runtimes: a bare image placeholder can produce silently empty pages.
+Antfly's native reader uses its built-in equivalent of the trained image-only,
+non-thinking prompt for both model sizes.
+
 The larger model uses the same image-only prompt and `/read` API:
 
 ```bash

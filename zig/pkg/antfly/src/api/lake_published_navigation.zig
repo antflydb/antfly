@@ -138,7 +138,7 @@ const Factory = struct {
         const token: @import("antfly_cancellation").CancellationToken = if (held_context.cancellation) |value| .{ .ptr = value.ptr, .is_cancelled_fn = value.is_cancelled_fn } else .none;
         try context.ensureActive();
         try self.store.bindPublication(self.publication, token);
-        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = self.cache, .scope = self.store.identity, .context = held_context };
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = self.cache, .scope = self.store.cache_identity, .context = held_context };
         const pin = @import("lake_index_decoded_metadata.zig").acquire(nav.Root, cached, self.store.artifactStore(), ref, token, nav.load) catch |err| switch (err) {
             error.OutOfMemory, error.SqlMemoryLimitExceeded, error.FileNotFound, error.NotFound, error.ObjectNotFound, error.ArtifactIntegrityMismatch, error.InvalidNativeLakeFileState, error.CloudGenerationMapUnavailable => return null,
             else => return err,
@@ -229,7 +229,7 @@ fn attachStatistics(a: A, factory: *Factory, source: *Source, context: Context) 
     const ref = factory.publication.source_navigation orelse return;
     if (ref.metadata_version < 3) return;
     const binding = source.inventory;
-    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = factory.cache, .scope = factory.store.identity, .context = context };
+    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = factory.cache, .scope = factory.store.cache_identity, .context = context };
     const token: @import("antfly_cancellation").CancellationToken = if (context.cancellation) |value| .{ .ptr = value.ptr, .is_cancelled_fn = value.is_cancelled_fn } else .none;
     try factory.store.bindPublication(factory.publication, token);
     const pin = try @import("lake_index_decoded_metadata.zig").acquire(nav.Root, cached, factory.store.artifactStore(), ref, token, nav.load);

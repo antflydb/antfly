@@ -890,6 +890,7 @@ pub fn storageOwnerContextConfigureNativeQueries(context: ?*anyopaque, setup: ke
         owner.alloc.destroy(next);
         return storageOwnerStatusFromError(err);
     };
+    next.attachResources(&owner.resources.resource_manager);
     if (owner.native_queries) |previous| {
         previous.deinit();
         owner.alloc.destroy(previous);
@@ -2041,6 +2042,18 @@ pub fn metadataApplyStoreProjection(
                 .require_policy_topology_mutation_allowed => |input| {
                     handle.store.requirePolicyTopologyMutationAllowed(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, true);
+                },
+                .sql_completion_reference_preflight => |bytes| {
+                    handle.store.preflightSqlCompletionReference(group_id, bytes) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, true);
+                },
+                .sql_completion_reference => |reference| {
+                    const value = handle.store.sqlCompletionReferenceJson(a, group_id, reference) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .fk_publication_completion => |input| {
+                    const value = handle.store.fkPublicationCompletionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .fk_generation_publication_status => |input| {
                     const value = handle.store.fkGenerationPublicationStatusJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);

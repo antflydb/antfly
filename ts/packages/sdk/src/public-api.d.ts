@@ -16209,6 +16209,11 @@ export interface components {
             /** @description Top-k sampling parameter. */
             top_k?: number;
         };
+        /**
+         * @description OpenAI reasoning effort; model support varies. Omit to use the model default.
+         * @enum {string}
+         */
+        OpenAIReasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
         /** @description Configuration for the Ollama generative AI provider. */
         OllamaGeneratorConfig: {
             /** @enum {string} */
@@ -16228,8 +16233,10 @@ export interface components {
              * @description Controls randomness in generation (0.0-2.0).
              */
             temperature?: number;
-            /** @description Maximum number of tokens to generate. */
+            /** @description Maximum number of tokens to generate, including reasoning tokens for thinking models. */
             max_tokens?: number;
+            /** @description Optional reasoning effort for Ollama's OpenAI-compatible endpoint. Use none to disable thinking on models that support it; supported values depend on the model. */
+            reasoning_effort?: components["schemas"]["OpenAIReasoningEffort"];
             /**
              * Format: float
              * @description Nucleus sampling parameter.
@@ -16271,11 +16278,6 @@ export interface components {
             /** @description HTTP response timeout in seconds for Inference API calls. */
             timeout?: number;
         };
-        /**
-         * @description OpenAI reasoning effort; model support varies. Omit to use the model default.
-         * @enum {string}
-         */
-        OpenAIReasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
         /** @description Personal ChatGPT plan for interactive generation. Credentials stay in the local runtime. */
         ChatGPTGeneratorConfig: {
             /** @enum {string} */
@@ -16978,6 +16980,11 @@ export interface components {
             target_tokens?: number;
             /** @description Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers. */
             overlap_tokens?: number;
+            /**
+             * @description Minimum non-whitespace Unicode scalar values in a fixed text chunk. Shorter chunks are omitted before storage and embedding; original source offsets are preserved. Zero disables filtering (default). Does not filter model-aware media windows or image/audio chunks.
+             * @default 0
+             */
+            min_chars?: number;
             /** @description Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size chunkers. */
             separator?: string;
         };

@@ -380,6 +380,7 @@ pub const storage_db_enrichment_config_validation = @import("storage/db/enrichme
 pub const storage_db_enrichment_document_checkpoints = @import("storage/db/enrichment/document_checkpoints.zig");
 pub const storage_db_enrichment_document_extraction = @import("storage/db/enrichment/document_extraction.zig");
 pub const storage_db_enrichment_document_extraction_client = @import("storage/db/enrichment/document_extraction_client.zig");
+pub const storage_db_enrichment_document_extraction_completion = @import("storage/db/enrichment/document_extraction_completion.zig");
 pub const storage_db_enrichment_document_unit_fingerprint = @import("storage/db/enrichment/document_unit_fingerprint.zig");
 pub const storage_db_enrichment_document_unit_payload = @import("storage/db/enrichment/document_unit_payload.zig");
 pub const storage_db_enrichment_embedder = @import("storage/db/enrichment/embedder.zig");

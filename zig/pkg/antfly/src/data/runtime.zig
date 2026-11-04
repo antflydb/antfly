@@ -9937,6 +9937,7 @@ pub const DataServer = struct {
                 const repository = try self.alloc.create(Repository);
                 errdefer self.alloc.destroy(repository);
                 repository.* = try Repository.init(self.alloc, self.api_server_cfg.node_config, self.api_server_cfg.secret_store, self.api_server_cfg.deployment_mode, self.api_server_cfg.native_lake_artifact_base_dir);
+                repository.attachResources(&self.provisioned_storage.resource_manager);
                 self.native_query_repository = repository;
                 ptr.query_cut_repository = repository.capability();
             };
@@ -26406,6 +26407,7 @@ const RemoteMetadataSource = struct {
             .routing = self.catalogSource().routingSource() catch unreachable,
             .vtable = &.{
                 .system_catalog = remoteSystemCatalog,
+                .tracks_sql_submission = true,
                 .supports_query_definitions = true,
                 .supports_resolver_catalog_read = true,
                 .supports_resolver_authority = true,
@@ -28204,7 +28206,7 @@ const RemoteMetadataSource = struct {
                     if (now >= deadline) return error.DeadlineExceeded;
                     bounded.remaining_ms = @intCast(@min(bounded.remaining_ms, @max(1, (deadline - now) / std.time.ns_per_ms)));
                 }
-                const bytes = try client.forwardSystemCatalog(base_uri, ctx.input, bounded, ctx.request.setting_admin);
+                const bytes = try client.forwardSystemCatalogObserved(base_uri, ctx.input, bounded, ctx.request.setting_admin, ctx.request.sql_completion_submission);
                 defer client.alloc.free(bytes);
                 return ctx.alloc.dupe(u8, bytes) catch return error.MetadataMutationOutcomeUnknown;
             }

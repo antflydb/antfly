@@ -33,7 +33,7 @@ const Owner = struct {
     row_resolver: ?local.serverless_query_lake_serving.ServingSource.RowResolver = null,
     store: Store,
     owns_store: bool = true,
-    store_identity: [32]u8,
+    cache_scope: [32]u8,
     artifacts: @import("../serverless/artifacts/store.zig").ArtifactStore,
     lease: ?*@import("lake_index_reader_lease.zig").Handle = null,
     reader: ordered.Reader = undefined,
@@ -751,7 +751,7 @@ pub const Predicate = struct {
 /// Reusing this authorization avoids reopening a client/lease for every conjunct.
 pub const PredicateContext = struct {
     artifacts: @import("../serverless/artifacts/store.zig").ArtifactStore,
-    store_identity: [32]u8,
+    cache_scope: [32]u8,
     domain: [32]u8,
     declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact,
     read_context: local.serverless_query_lake_read_context.Context,
@@ -963,7 +963,7 @@ fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: c
             var selected: std.ArrayList(usize) = .empty;
             defer selected.deinit(a);
             for (root.cover, 0..) |name, i| if (covers(fields, name)) try selected.append(a, i);
-            try wave.read(a, .{ .cache = &server.lake_read_cache, .scope = pinned.store_identity, .context = pinned.read_context }, owner.artifacts, block_refs[0..count], selected.items, root.cover.len, owner.reader.pages.cancellation, &owner.reader.remaining_reads);
+            try wave.read(a, .{ .cache = &server.lake_read_cache, .scope = pinned.cache_scope, .context = pinned.read_context }, owner.artifacts, block_refs[0..count], selected.items, root.cover.len, owner.reader.pages.cancellation, &owner.reader.remaining_reads);
             for (wave.jobs[0..count], groups[0..count]) |job, group| {
                 const loaded = job.block.?;
                 const block = loaded.block;
@@ -1912,7 +1912,7 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
         if (pinned == null) store.deinit();
         return err;
     };
-    owner.* = .{ .a = a, .arena = .init(a), .window = .init(a), .cover_arena = .init(a), .probe_scratch = .init(a), .source = source, .store = store, .owns_store = pinned == null, .store_identity = if (pinned) |shared| shared.store_identity else store.identity, .artifacts = undefined, .table = table, .request = request, .context = context, .read_context = if (pinned) |shared| shared.read_context else read_context };
+    owner.* = .{ .a = a, .arena = .init(a), .window = .init(a), .cover_arena = .init(a), .probe_scratch = .init(a), .source = source, .store = store, .owns_store = pinned == null, .cache_scope = if (pinned) |shared| shared.cache_scope else store.cache_identity, .artifacts = undefined, .table = table, .request = request, .context = context, .read_context = if (pinned) |shared| shared.read_context else read_context };
     owner.artifacts = if (pinned) |shared| shared.artifacts else owner.store.artifactStore();
     var keep = false;
     defer if (!keep) Owner.close(owner);
@@ -2003,11 +2003,11 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
     } else return if (policy == .automatic) null else error.ExternalLakeRowIndexNotPublished;
     owner.row_resolver = try source.resolverForIndex(declaration.name);
     const cancel: operation.CancellationToken = .{ .ptr = owner, .is_cancelled_fn = Owner.canceled };
-    const resident_metadata = if (identities_only) try @import("lake_index_decoded_metadata.zig").resident(ordered.VerifiedRoot, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, declaration.artifact) else false;
-    owner.metadata = try @import("lake_index_decoded_metadata.zig").acquire(ordered.VerifiedRoot, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, owner.artifacts, declaration.artifact, cancel, ordered.VerifiedRoot.load);
+    const resident_metadata = if (identities_only) try @import("lake_index_decoded_metadata.zig").resident(ordered.VerifiedRoot, .{ .cache = &server.lake_read_cache, .scope = owner.cache_scope, .context = owner.read_context }, declaration.artifact) else false;
+    owner.metadata = try @import("lake_index_decoded_metadata.zig").acquire(ordered.VerifiedRoot, .{ .cache = &server.lake_read_cache, .scope = owner.cache_scope, .context = owner.read_context }, owner.artifacts, declaration.artifact, cancel, ordered.VerifiedRoot.load);
     const root = owner.metadata.?.value.value;
     if ((identities_only or dynamic != null) and !owner.acceptsCut(root.source, root.snapshot)) return error.ExternalLakeSnapshotMismatch;
-    const domain = if (pinned) |shared| shared.domain else @import("lake_index_publication.zig").uploadDomainWithNamespace(table.id, owner.store_identity, selected.?.publication().namespace);
+    const domain = if (pinned) |shared| shared.domain else @import("lake_index_publication.zig").uploadDomainWithNamespace(table.id, owner.store.identity, selected.?.publication().namespace);
     if (!std.mem.eql(u8, &root.domain, &domain)) return error.InvalidNativeLakeRowIndex;
     const expected = native_rows.fingerprint(tuple, predicate, try native_rows.coverColumns(ca, definition));
     if (if (dynamic == null) request.index_range else null) |range| {
@@ -2031,7 +2031,7 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
     if (upper) |end| {
         if (std.mem.order(u8, lower, end) != .lt) empty_range = true;
     }
-    try owner.reader.initVerified(a, &owner.artifacts, owner.metadata.?.value.*, expected, lower, if (dynamic != null) null else upper, cancel, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context });
+    try owner.reader.initVerified(a, &owner.artifacts, owner.metadata.?.value.*, expected, lower, if (dynamic != null) null else upper, cancel, .{ .cache = &server.lake_read_cache, .scope = owner.cache_scope, .context = owner.read_context });
     if (empty_range) owner.reader.exhausted = true;
     owner.reader_open = true;
     if (dynamic != null) {

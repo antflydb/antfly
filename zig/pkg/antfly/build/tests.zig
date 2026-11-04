@@ -344,6 +344,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         test_mod.*.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     }
     const media_status_step = b.step("antfly-media-status-test", "Verify output counters and rolling runtime status profiles");
+    const metadata_sql_sessions = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[4],
+        .filters = &.{ "metadata server can expose admin listener endpoints", "metadata SQL session routing" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-metadata-sql-sessions-test", "Verify persistent metadata API sessions and issuer routing")
+        .dependOn(&addFilteredTestRunArtifact(b, metadata_sql_sessions).step);
+    const metadata_sql_submission = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{ "SQL pgwire native metadata", "system catalog relation replacement preserves private grants", "table definition stamp distinguishes rejection", "metadata proposal receipt survives a post-acceptance dispatch failure" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-metadata-sql-submission-test", "Verify SQL metadata submission evidence and RPC outcomes")
+        .dependOn(&addFilteredTestRunArtifact(b, metadata_sql_submission).step);
     const media_status_owners = [_]*std.Build.Module{ metadata_unit_baseline_mods[8], metadata_unit_baseline_mods[2], api_http_runtime_test_mod };
     const media_status_filters = [_][]const []const u8{ &.{"runtime status"}, &.{"runtime status output counters"}, &.{ "runtime status media output counters", "index encoders expose local shard runtime status" } };
     for (media_status_owners, media_status_filters) |owner, filters| {
@@ -451,7 +465,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);
-    const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire" } });
+    const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire", "SQL rewrite response" } });
     b.step("antfly-sql-index-ddl-test", "Verify qualified SQL index ownership, authorization and guarded schema admission")
         .dependOn(&b.addRunArtifact(sql_index_ddl_tests).step);
     const sql_native_cells_tests = b.addTest(.{
@@ -2090,6 +2104,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx inference connection propagates failures after stream commit",
         "httpx retrieval SSE",
         "httpx retrieval read failures preserve retryable JSON and conflict status",
+        "httpx agent generation output failures",
+        "query builder incomplete generation",
         "retrieval agent sse",
         "retrieval agent streaming emits go-shaped tree",
         "httpx inference gateway",
@@ -2211,6 +2227,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("install-api-http-runtime-tests", "Install the API runtime unit suite for cross-platform qualification")
         .dependOn(&b.addInstallArtifact(api_http_runtime_tests, .{ .dest_sub_path = "api-http-runtime-tests" }).step);
 
+    const agent_generation_filters = &.{ "httpx agent generation output failures", "query builder incomplete generation" };
+    const agent_generation_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = agent_generation_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-agent-generation-test", "Verify public agent incomplete-output HTTP responses")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, agent_generation_tests, agent_generation_filters).step);
+
     const lake_api_default_filters = [_][]const u8{ "lake SQL", "external lake", "httpx SQL executes one relational page with exact integer parameters" };
     const lake_api_filters = selectTestFilters(b, &lake_api_default_filters);
     const lake_api_tests = b.addTest(.{
@@ -2246,7 +2271,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-artifact-http-test", "Run artifact maintenance request and authorization contracts").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, artifact_http_tests, artifact_http_filters).step);
-    const native_query_repository_filters = &.{ "external lake native", "external lake invalid native" };
+    const native_query_repository_filters = &.{ "external lake native", "external lake invalid native", "objectstore-backed configured adapters", "external lake single request", "external lake bounded WAL retained cuts", "external lake retained cursor cohorts" };
     const native_query_repository_tests = b.addTest(.{
         .name = "native-query-repository-tests",
         .root_module = api_http_runtime_test_mod,
@@ -5440,6 +5465,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "local generate message conversion preserves tool history and admission",
             "inference worker",
             "standalone inference host placement",
+            "standalone chunk minimum content",
             "native call policy is scoped",
             "memory admission diagnostics retain",
             "session manager load clones preserve",
@@ -6011,6 +6037,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     index_manager_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
 
     const db_test_mod = makeLmdbModule(b, "pkg/antfly/src/db_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    const document_quality_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "db minimum chunk content", "db document quality policy", "enrichment chunker omits short text" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const quality_step = b.step("antfly-document-quality-test", "Verify extraction filtering, provider parity and stale text/vector retirement");
+    quality_step.dependOn(&addFilteredTestRunArtifact(b, document_quality_tests).step);
+    const quality_host_tests = b.addTest(.{
+        .root_module = test_imports.runtime.inference_host,
+        .filters = &.{"standalone chunk minimum content"},
+    });
+    quality_step.dependOn(&b.addRunArtifact(quality_host_tests).step);
     const graph_admission_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = selectTestFilters(b, &.{

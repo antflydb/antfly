@@ -766,6 +766,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     runtime_abi_mod.addImport("httpx", httpx_mod);
     runtime_abi_mod.addImport("antfly_platform", platform_mod);
+    pgwire_test_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
     const inference_api_source = inference_runtime_build.addInferenceApiOverride(b, openapi_build, b.path("../scripts"), openapi_codegen);
     // Model kernels have a serving-latency contract independently of Debug
     // storage/API validation. CI can qualify that mixed product without
@@ -941,6 +942,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .optimize = optimize,
     });
     cache_budget_mod.addImport("antfly_platform", platform_mod);
+    // Pgwire cursor allocation checkpoints use the shared cache budget owner.
+    pgwire_test_mod.addImport("antfly_cache_budget", cache_budget_mod);
     const runtime_fs_mod = b.createModule(.{
         .root_source_file = b.path("lib/runtime/src/fs.zig"),
         .target = target,

@@ -90,6 +90,9 @@ def table_definition(args):
             "base_source": {
                 "kind": "external",
                 "format": "iceberg",
+                # Iceberg commits replace metadata pointers; data files receive
+                # fresh URIs and remain immutable for retained snapshots.
+                "object_mutability": "immutable",
                 "table_id": args.table_id,
                 "uri": args.warehouse,
                 "credentials": {"ref": args.source_connection},

@@ -196,6 +196,49 @@ pub const Store = struct {
         const after = try indexed.captureRead(namespace);
         return .{ .floor = after.snapshot.first_lsn - 1, .records_removed = @intCast(after.head.physical_first_lsn - before.head.physical_first_lsn), .complete = !more };
     }
+    /// A forward reader pins one authority and opens the WAL once. Consumers
+    /// stop at their own group limits without materializing the pending suffix.
+    pub const Reader = struct {
+        wal: ObjectWal,
+        cursor: IndexedWal.CapturedReader,
+        position: u64,
+        context: catalog.types.Context = .{},
+
+        pub fn deinit(self: *Reader) void {
+            self.cursor.deinit();
+            self.wal.deinit();
+        }
+        pub fn next(self: *Reader, a: A) !?Record {
+            return self.nextCaptured(a) catch |err| switch (err) {
+                error.WalSnapshotExpired => error.LakeOverlayCoverageUnavailable,
+                else => err,
+            };
+        }
+        /// Keep expiry distinct from missing coverage and caller cancellation.
+        /// A drain may yield already-owned rows, without renewing this root.
+        pub fn nextCaptured(self: *Reader, a: A) !?Record {
+            const row = (try self.cursor.next(a)) orelse return null;
+            errdefer {
+                a.free(row.payload);
+                if (row.operation_id) |id| a.free(id);
+            }
+            const record = try adapt(row);
+            if (record.lsn != self.position + 1) return error.LakeWalCoverageGap;
+            self.position = record.lsn;
+            return record;
+        }
+    };
+    pub fn reader(self: *const Store, a: A, cut: u64) !Reader {
+        var opened = try self.open(a, false);
+        errdefer opened.deinit();
+        const captured = try opened.indexed.?.captureRead(namespace);
+        const snapshot = captured.snapshot;
+        if (cut < snapshot.first_lsn - 1) return error.LakeOverlayCoverageUnavailable;
+        if (snapshot.latest_lsn < cut) return error.LakeWalCoverageGap;
+        if (snapshot.latest_lsn - cut > max_pending) return error.LakeOverlayCoverageUnavailable;
+        const cursor = try opened.indexed.?.capturedReader(a, namespace, captured, .{ .start_lsn = cut + 1, .end_lsn = snapshot.latest_lsn, .max_record_bytes = 32 * 1024 * 1024, .cancellation = catalog.types.contextCancellation(&self.context) });
+        return .{ .wal = opened, .cursor = cursor, .position = cut, .context = self.context };
+    }
     pub fn next(self: Store, a: A, cut: u64) !?Record {
         const head = try self.pin(a, cut) orelse return null;
         if (head.lsn == cut) return null;

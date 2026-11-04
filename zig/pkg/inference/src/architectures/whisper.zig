@@ -845,9 +845,16 @@ pub const DecodeCache = struct {
             const v_b = try fetcher.fetchOptional(std.fmt.bufPrint(&buf, "model.decoder.layers.{d}.encoder_attn.v_proj.bias", .{layer}) catch return error.NameTooLong);
             // Every later step reads these from the device; keep them there
             // rather than re-uploading megabytes per layer per token.
-            const k_cross = try residentProjection(cb, try (Linear{ .w = k, .b = k_b }).apply(cb, encoder_hidden, enc_seq, d_model, d_model));
+            var k_cross = try residentProjection(cb, try (Linear{ .w = k, .b = k_b }).apply(cb, encoder_hidden, enc_seq, d_model, d_model));
             errdefer cb.free(k_cross);
-            const v_cross = try residentProjection(cb, try (Linear{ .w = v, .b = v_b }).apply(cb, encoder_hidden, enc_seq, d_model, d_model));
+            var v_cross = try residentProjection(cb, try (Linear{ .w = v, .b = v_b }).apply(cb, encoder_hidden, enc_seq, d_model, d_model));
+            errdefer cb.free(v_cross);
+            if (try cb.whisperPrepareCrossKv(k_cross, v_cross)) |prepared| {
+                cb.free(k_cross);
+                cb.free(v_cross);
+                k_cross = prepared.first;
+                v_cross = prepared.second;
+            }
             layers[layer] = .{ .k_cross = k_cross, .v_cross = v_cross };
             built += 1;
         }
@@ -1415,10 +1422,21 @@ fn decoderBlockCached(
     profile.mark(cb, .cross_out);
 
     // --- FFN ---
-    const fc1_out = try w.fc1.apply(cb, after_cross.normed, dec_seq, d_model, ffn_dim);
-    defer cb.free(fc1_out);
-    profile.mark(cb, .fc1);
-    const activated = try cb.gelu(fc1_out);
+    var fc1_out: ?CT = null;
+    defer if (fc1_out) |tensor| cb.free(tensor);
+    const activated = activation: {
+        if (cb.kind() == .cuda) {
+            if (w.fc1.b) |bias| {
+                if (try cb.linearGelu(after_cross.normed, w.fc1.w, bias, dec_seq, d_model, ffn_dim)) |fused| {
+                    profile.mark(cb, .fc1);
+                    break :activation fused;
+                }
+            }
+        }
+        fc1_out = try w.fc1.apply(cb, after_cross.normed, dec_seq, d_model, ffn_dim);
+        profile.mark(cb, .fc1);
+        break :activation try cb.gelu(fc1_out.?);
+    };
     defer cb.free(activated);
     profile.mark(cb, .gelu);
     const fc2_out = try w.fc2.apply(cb, activated, dec_seq, ffn_dim, d_model);
