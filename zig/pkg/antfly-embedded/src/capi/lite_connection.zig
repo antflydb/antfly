@@ -858,7 +858,9 @@ pub const PreparedPublication = struct {
             self.owner.publication_stats.generated_refused +|= 1;
         }
         var lease = try self.owner.acquireMaintenancePathLeaseAssumeLocked();
+        const held_from = nowNs();
         errdefer lease.close();
+        errdefer MaintenanceHoldSites.record(&self.owner.publication_stats.maintenance_hold_sites.generated_store, held_from);
         const database = try self.current();
         if (fence) |expected| {
             var ownership = try ProducerLease.init(alloc, database.core.store, expected.lease_key);
@@ -869,7 +871,7 @@ pub const PreparedPublication = struct {
         }
         if (database.enrichment_runtime == null) try database.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
         const held = try alloc.create(HeldStore);
-        held.* = .{ .publication = self, .path_lease = lease, .database = database, .held_from = nowNs() };
+        held.* = .{ .publication = self, .path_lease = lease, .database = database, .held_from = held_from };
         return .{ .store = database.enrichment_runtime.?.store, .ptr = held, .release = HeldStore.release, .guard_key = HeldStore.guardKey };
     }
 
@@ -2147,6 +2149,7 @@ pub const Owner = struct {
         errdefer lease.close();
         // The hold starts here: admission checks and rebases run under it.
         const held_from = nowNs();
+        errdefer MaintenanceHoldSites.record(self.publication_stats.maintenance_hold_sites.writer(scope), held_from);
         var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
         defer probe.close();
         const file = &root.owned_lite_backend.?.native_docstore.?.file;
@@ -7428,26 +7431,38 @@ test "capi native logical generations maintenance snapshot replacement carries t
     Owner.leaveMaintenanceWriter(first);
     first.maintenance_owner = null;
     const first_file = &first.owned_lite_backend.?.native_docstore.?.file;
-    try std.testing.expect(first_file.free_pages_verified and first_file.ledger != null);
-    const full_loads = first_file.allocator_work.full_loads;
-    const transfers = first_file.allocator_work.cache_transfers;
+    // An idle runtime returns its mutable ledger to the path cache. Measure
+    // that shared owner, not a runtime-local cache that should now be empty.
+    const cache = &owner.gate.writer_allocator_cache;
+    try std.testing.expect(cache.borrower == null);
+    const warm_ledger = cache.holder.?.ledger.?;
+    try std.testing.expect(cache.holder.?.free_pages_verified);
+    const before = first_file.allocatorWorkSnapshot();
 
-    // A foreground write moves the tip, so the next capture replaces the
-    // snapshot. Its allocator must rebase the donated ledger, not reload it.
+    // A foreground write moves the tip and borrows the same allocator. The
+    // replacement's bounded storage turn must not reload or copy the ledger.
     try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
     const second = try refreshSnapshot(&fixture);
     try std.testing.expect(second != first);
     const file = &second.owned_lite_backend.?.native_docstore.?.file;
-    try std.testing.expect(file.free_pages_verified);
-    try std.testing.expect(file.allocator_work.cache_transfers > transfers);
-    try std.testing.expectEqual(full_loads, file.allocator_work.full_loads);
     second.maintenance_owner = owner;
     defer second.maintenance_owner = null;
     try Owner.enterMaintenanceWriter(second, .allocator_service);
+    var held = true;
+    defer if (held) Owner.leaveMaintenanceWriter(second);
     _ = try file.reclaimPagesForMaintenanceWithCancel(8, null);
+    const after = file.allocatorWorkSnapshot();
+    try std.testing.expectEqual(before.full_loads, after.full_loads);
+    try std.testing.expectEqual(before.cache_copies, after.cache_copies);
+    try std.testing.expect(after.cache_transfers > before.cache_transfers);
+    try std.testing.expect(cache.borrower == null);
+    try std.testing.expectEqual(warm_ledger, cache.holder.?.ledger.?);
+    try std.testing.expect(cache.holder.?.free_pages_verified);
+    // Integrity inspection deliberately uses independent allocator metadata;
+    // its proof/load cost is separate from the service measurements above.
     try std.testing.expect((try file.check()).valid);
     Owner.leaveMaintenanceWriter(second);
-    try std.testing.expectEqual(full_loads, file.allocator_work.full_loads);
+    held = false;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.read));
     try fixture.expectWritten(.batch, true);
 }

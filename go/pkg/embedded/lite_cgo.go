@@ -658,9 +658,8 @@ func (db *DB) BatchJSON(request []byte) ([]byte, error) {
 
 // OutcomeReceiptStatus resolves an outcome receipt from an OutcomeUnknown
 // batch or autocommit SQL write, on any handle for the same database. It
-// returns Stalled while the uncertain commit is not reconciled yet: retry on
-// a Lite database; for a directory database, close the issuing handle and
-// reopen first.
+// returns Stalled while the uncertain commit is not reconciled yet: close
+// the issuing handle and reopen first.
 func (db *DB) OutcomeReceiptStatus(receipt string) (OutcomeReceiptStatus, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()

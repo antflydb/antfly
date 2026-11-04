@@ -332,8 +332,8 @@ ends with ANTFLY_OUTCOME_UNKNOWN, the rejection (`SqlError`, or
 (`undefined` when none was issued). Resolve it on any handle for the same
 database with `db.outcomeReceiptStatus(receipt)`, which resolves to
 `"applied"` or `"not_applied"`, or rejects with `StalledError` while the
-uncertain commit is not reconciled yet (Lite: retry; directory database:
-close the issuing handle and reopen first). Call
+uncertain commit is not reconciled yet (close the issuing handle and
+reopen first). Call
 `db.forgetOutcomeReceipt(receipt)` once resolved; afterwards it can no
 longer be resolved.
 

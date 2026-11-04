@@ -866,7 +866,9 @@ test "capi SQL outcome receipt resolves a Lite autocommit write of unknown outco
         break :blk receipt;
     };
     defer std.testing.allocator.free(receipt);
-    // Querying enters (and so reconciles) the connection, then answers exactly.
+    // The uncertain owner stays fenced. Reopen before resolving durable truth.
+    try std.testing.expectEqual(h.capi.ErrorCode.stalled, (try receiptStatus(f.id, receipt)).code);
+    try f.reopen();
     const first = try receiptStatus(f.id, receipt);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, first.code);
     const expected: u8 = if (try f.rows() == 1) @import("db.zig").ANTFLY_OUTCOME_RECEIPT_APPLIED else @import("db.zig").ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED;
@@ -1024,6 +1026,8 @@ test "capi SQL outcome receipt for a Lite batch export of unknown outcome" {
     try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, code);
     const receipt = try lastReceiptAlloc();
     defer std.testing.allocator.free(receipt);
+    try std.testing.expectEqual(h.capi.ErrorCode.stalled, (try receiptStatus(f.id, receipt)).code);
+    try f.reopen();
     const resolved = try receiptStatus(f.id, receipt);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, resolved.code);
     var lookup: h.capi.Buffer = .{};

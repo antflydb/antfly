@@ -396,8 +396,7 @@ class Database:
         SQLStateError's `outcome_receipt`) on any handle for the same database.
 
         Raises StalledError while the uncertain commit is not reconciled yet:
-        retry on a Lite database; for a directory database, close the issuing
-        handle and reopen first.
+        close the issuing handle and reopen first.
         """
         handle = self._acquire()
         try:

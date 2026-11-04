@@ -2737,7 +2737,7 @@ pub const ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED: u8 = 2;
 
 /// Resolves a receipt from `antfly_last_error_outcome_receipt` on any handle
 /// for the same database. ANTFLY_STALLED while the uncertain commit is not yet
-/// reconciled: reopen the database (directory handles) or retry (Lite).
+/// reconciled: close the issuing handle and reopen the database.
 pub fn antfly_db_outcome_receipt_status(handle_ptr: ?*anyopaque, receipt: capi.Slice, out_status: ?*u8) callconv(.c) capi.ErrorCode {
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_outcome_receipt_status), .{ .name = "antfly_db_outcome_receipt_status" }), .{ handle_ptr, receipt, out_status });
@@ -2753,10 +2753,11 @@ pub fn antfly_db_outcome_receipt_status(handle_ptr: ?*anyopaque, receipt: capi.S
     defer guard.leave();
     if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
     const root = receiptRoot(guard);
-    // Entering refreshes a Lite runtime; one still uncertain is not settled.
+    // An existing uncertain Lite owner stays fenced until a fresh handle
+    // reconstructs durable state. Never answer from that owner's cached state.
     if (guard.lock_handle.lite_connection != null) if (root.owned_lite_backend) |backend| if (backend.native_docstore != null) {
         if (@import("lite_connection.zig").Owner.needsOutcomeReconciliation(root))
-            return capi.recordError(.stalled, @src().fn_name ++ ": the uncertain commit is not reconciled yet; retry");
+            return capi.recordError(.stalled, @src().fn_name ++ ": the uncertain commit is not reconciled yet; close and reopen");
     };
     const database = receiptDatabase(root, &parsed) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     const persisted = database.readOutcomeMarker(marker.writer) catch |err| return capi.mapErrorContext(err, @src().fn_name);

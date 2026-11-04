@@ -428,9 +428,9 @@ antfly_error_code antfly_db_batch_json(
  * it as "outcome_receipt". antfly_db_outcome_receipt_status later resolves it
  * on any handle for the same database: *out_status is
  * ANTFLY_OUTCOME_RECEIPT_APPLIED or ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED.
- * It returns ANTFLY_STALLED until the uncertain commit is reconciled: a Lite
- * connection reconciles on its next call; a directory database must first be
- * closed by the handle that issued the receipt and reopened. Forget a receipt
+ * It returns ANTFLY_STALLED until the uncertain commit is reconciled: close
+ * the handle that issued the receipt and reopen the database. Existing Lite
+ * owners stay fenced while their outcome is uncertain. Forget a receipt
  * once resolved; afterwards it can no longer be resolved.
  */
 #define ANTFLY_OUTCOME_RECEIPT_APPLIED 1

@@ -804,8 +804,7 @@ export class Database implements AsyncDisposable {
    * Resolves an outcome receipt (`SqlError.outcomeReceipt` or
    * `OutcomeUnknownError.outcomeReceipt`) on any handle for the same
    * database. Rejects with `StalledError` while the uncertain commit is not
-   * reconciled yet: retry on a Lite database; for a directory database,
-   * close the issuing handle and reopen first.
+   * reconciled yet: close the issuing handle and reopen first.
    */
   outcomeReceiptStatus(receipt: string): Promise<OutcomeReceiptStatus> {
     return this.#run(async (handle) => {

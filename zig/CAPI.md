@@ -739,8 +739,8 @@ the same database answers `ANTFLY_OUTCOME_RECEIPT_APPLIED` or
 `ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED`, or returns `ANTFLY_STALLED` while the
 uncertain commit is not reconciled:
 
-- Lite connections reconcile on their next call; the status query itself enters
-  the connection, so retrying it settles.
+- Lite connections keep an uncertain owner fenced. Close the issuing handle
+  and open a fresh handle before resolving its receipt.
 - Directory (LSM) databases settle only after the handle that issued the receipt
   is closed and the database reopened (a durable WAL record may still be
   unpublished). A clean close checkpoints and resets the WAL, so such a record
@@ -759,8 +759,8 @@ receipt's marker, after which it can no longer be resolved.
 
 While an unknown outcome is unresolved, new statements and calls are refused
 before running, with SQLSTATE 55000 (`ANTFLY_STALLED`): they were not applied,
-and are not themselves of unknown outcome. Lite connections reconcile by
-reopening on their next call; other handles must be reopened.
+and are not themselves of unknown outcome. Close and reopen the database to
+reconcile durable state; existing uncertain owners stay fenced.
 
 XX000 is reserved for internal defects and never reports a commit outcome. Commit responses reserve a fallback buffer
 before mutation, so response allocation cannot erase a committed outcome.

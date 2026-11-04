@@ -26,9 +26,8 @@
 //! absent means not applied.
 //!
 //! Reconciliation:
-//! - Lite connections mark an uncertain runtime and reconcile it by reopening
-//!   on their next call; a status query enters the handle the same way and
-//!   refuses while the runtime still needs reconciliation.
+//! - Lite connections keep an uncertain owner fenced. A fresh database handle
+//!   reconstructs durable state; a status query on the old owner refuses.
 //! - Directory (LSM) handles have no such flag: a WAL record may be durable
 //!   but unpublished until the handle is reopened. Their receipts stay pending
 //!   in a process-wide registry until the issuing handle closes.
