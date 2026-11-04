@@ -128,7 +128,7 @@ workers validate the capability, schema incarnation, and snapshot on reopen.
   partition. Empty partitions need only the footer. Columnar v2 blocks preserve SQL NULL independently of
   JSON null, exact NUMERIC, arrays, and encoded payloads.
 - Adaptive coalescing groups adjacent small partitions from accepted map
-  statistics. Recovery checkpoints at most sixteen map directories per turn;
+  statistics. Recovery checkpoints at most eight map directories per turn;
   immutable progress objects and the final boundary list are fenced by the
   query CAS. Workers never infer a layout from changing pod counts. Aggregation
   fan-in uses the resolved reducer count.
@@ -170,7 +170,10 @@ listener (port 4200 by default); maintenance does not need a query listener.
 Result assembly checkpoints at most 64 accepted outputs per coordinator turn.
 Immutable result pages link to the preceding page, keeping checkpoint and final
 root size constant while writing each descriptor once. Results with at most
-64 outputs retain the inline `pages` representation. Larger internal result
+64 outputs retain the inline `pages` representation when assembly finishes in
+one turn. Slow storage yields earlier, retaining time for publication and the
+query CAS; native reads use private arenas in concurrent waves of eight.
+Partially assembled and larger internal result
 handles expose a single `manifests` head; follow each authenticated result
 page's `previous` reference to stream its `pages`. Physical output order is
 unspecified; the ordinary SQL engine still owns `ORDER BY`. The native gateway
@@ -247,3 +250,10 @@ a bounded regex session, and reusable row scratch belong to that task. Both VM
 and regex work inherit the task's cancellation/deadline checkpoints. Map filters,
 bucket/broadcast probes, ordinary and spill joins, and skew pairs all use this
 same execution owner, avoiding per-row regex compilation and setup allocation.
+
+Adaptive tile indexing makes one shared map pass for every hot partition. All
+partition tails live in an authenticated packed buffer object capped at 4 MiB;
+the coordinator CAS references it alongside the immutable page lists. Each turn
+either reads eight map directories or flushes at most eight tile pages, keeping
+storage operation counts linear in maps plus published pages. Older in-flight
+per-partition checkpoints retain their recovery path during rolling upgrades.

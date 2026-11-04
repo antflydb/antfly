@@ -990,6 +990,7 @@ test "distributed SQL row ranges bound a large single Parquet row group" {
 test "distributed SQL paged layouts exceed legacy metadata sizes and remain recoverable" {
     try pagedLayout(96, 128, false, 4096, false);
     try pagedLayout(1000, 1, true, 4096, false);
+    try pagedLayout(96, 16, true, 16384, false);
     try pagedLayout(40, 1, true, 64, true);
 }
 fn pagedLayout(maps: u32, partitions: u16, hot: bool, max_tasks: u32, budget_failure: bool) !void {
@@ -1040,6 +1041,8 @@ fn pagedLayout(maps: u32, partitions: u16, hot: bool, max_tasks: u32, budget_fai
     var moved = false;
     var advanced = false;
     const query_key = try records.key(sa, query, null, 0);
+    const metrics = storage.operation_metrics;
+    const get_before = metrics.runtime.snapshot().calls[@backingInt(metrics.Operation.get)];
     for (0..512) |turn| {
         _ = try service.tick(query, claim, .{ .ptr = &fixture, .dispatch = Ignore.dispatch });
         var record = (try records.load(sa, query_key)).?;
@@ -1062,7 +1065,18 @@ fn pagedLayout(maps: u32, partitions: u16, hot: bool, max_tasks: u32, budget_fai
             advanced = true;
             break;
         }
-        if (turn == 2 and !moved) {
+        var tile_checkpoint = false;
+        if (hot and partitions > 1 and !moved) {
+            if (record.value.adaptive) |progress_ref| {
+                var client = service.exchange_store.client;
+                client.allocator = sa;
+                var raw = try client.getObject(service.exchange_store.bucket, progress_ref.key, .{});
+                defer raw.deinit(sa);
+                const progress = try std.json.parseFromSliceLeaky(struct { tile_buffers: ?state.Output = null }, sa, raw.body, .{ .ignore_unknown_fields = true });
+                tile_checkpoint = progress.tile_buffers != null;
+            }
+        }
+        if (!moved and (if (hot and partitions > 1) tile_checkpoint else turn == 2)) {
             fixture.now += 92001;
             service = fixture.service(a, memory.client(), "owner-b");
             claim = (try service.acquire(query)).?;
@@ -1071,6 +1085,12 @@ fn pagedLayout(maps: u32, partitions: u16, hot: bool, max_tasks: u32, budget_fai
     }
     try std.testing.expect(advanced);
     try std.testing.expect(moved);
+    if (hot and partitions > 1) {
+        const gets = metrics.runtime.snapshot().calls[@backingInt(metrics.Operation.get)] - get_before;
+        // Two shared passes plus bounded CAS/checkpoint overhead. A separate
+        // map scan for each hot partition exceeds this bound by several times.
+        try std.testing.expect(gets < @as(u64, maps + 1) * 24);
+    }
     var dispatch: Dispatch = .{ .workers = .{ service, service }, .drop_once = false };
     for (0..256) |_| {
         var record = (try records.load(sa, query_key)).?;
@@ -1704,4 +1724,99 @@ test "distributed SQL metadata quanta refill a wide dispatch window before compl
     var untouched = (try service.state_store.load(a, other_key)).?;
     defer untouched.deinit(a);
     try std.testing.expectEqual(state.Status.pending, untouched.value.status);
+}
+
+test "distributed SQL result assembly checkpoints slow storage within its turn and survives takeover" {
+    try slowResultAssembly(false);
+    try slowResultAssembly(true);
+}
+fn slowResultAssembly(parallel: bool) !void {
+    const a = std.testing.allocator;
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    var service = fixture.service(a, memory.client(), "owner");
+    const column: plan.Column = .{ .name = "id", .type = .integer };
+    const left: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{column}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 64 };
+    var right = left;
+    right.table_id = 2;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    right.splits = 1;
+    const spec = try plan.choose(left, right, service.tenant, 121000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .query_exchange_bytes = 16 * 1024 * 1024 * 1024 }, fixture.now);
+    try std.testing.expectEqual(@as(u32, 64), try spec.stageTasks(spec.finalStage() - 1));
+    const query = try service.submit(spec);
+    const claim = (try service.acquire(query)).?;
+    var records = service.state_store;
+    records.tenant = service.tenant;
+    const query_key = try records.key(a, query, null, 0);
+    defer a.free(query_key);
+    for (0..64) |id| {
+        const key = try records.key(a, query, spec.finalStage() - 1, @intCast(id));
+        defer a.free(key);
+        try records.create(a, key, query.id, query.expires_ms);
+        const task_claim = (try records.claim(a, key, "worker", 60000)).?;
+        const output_key = try std.fmt.allocPrint(a, "accepted-{d}", .{id});
+        defer a.free(output_key);
+        try records.complete(a, key, task_claim, .{ .key = output_key, .hash = @splat('c'), .bytes = 0, .rows = 1 });
+    }
+    try records.checkpointTasks(a, query_key, claim, spec.finalStage(), 0, &.{});
+    const Slow = struct {
+        var base_get: @FieldType(storage.Client.VTable, "get_object") = undefined;
+        fn get(raw: *anyopaque, allocator: A, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            if (std.mem.indexOf(u8, key, "/stage/") != null) try std.Io.sleep(std.testing.io, .fromMilliseconds(50), .awake);
+            if (options.cancellation) |token| try token.check();
+            return base_get(raw, allocator, bucket, key, options);
+        }
+    };
+    Slow.base_get = service.state_store.client.vtable.get_object;
+    var table = service.state_store.client.vtable.*;
+    table.get_object = Slow.get;
+    service.state_store.client.vtable = &table;
+    var turns: @import("scheduler.zig").Turns = .{};
+    service.coordination = turns.port();
+    var complete = false;
+    var moved = false;
+    for (0..16) |turn| {
+        service.context.io = if (parallel) std.testing.io else null;
+        service.context.deadline_ns = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s;
+        complete = try service.turn(query, undefined);
+        if (complete) break;
+        var current = (try records.load(a, query_key)).?;
+        defer current.deinit(a);
+        try std.testing.expect(current.value.result_progress != null);
+        if (turn == 0) {
+            fixture.now += 92001;
+            service = fixture.service(a, service.state_store.client, "replacement");
+            service.coordination = turns.port();
+            moved = true;
+        }
+    }
+    try std.testing.expect(complete);
+    if (!parallel) try std.testing.expect(moved);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    service.context = .{};
+    const result = (try service.pollResult(arena.allocator(), query)).?;
+    try std.testing.expectEqual(@as(u64, 64), result.rows);
+    var seen: [64]bool = @splat(false);
+    const Check = struct {
+        fn pages(values: []const state.Output, visited: *[64]bool) !void {
+            for (values) |page| {
+                const id = try std.fmt.parseInt(usize, page.key["accepted-".len..], 10);
+                try std.testing.expect(id < visited.len and !visited[id]);
+                visited[id] = true;
+            }
+        }
+    };
+    try Check.pages(result.pages, &seen);
+    for (result.manifests) |head| {
+        var next: ?state.Output = head;
+        while (next) |ref| {
+            const page = try service.readResultPage(arena.allocator(), ref);
+            try Check.pages(page.pages, &seen);
+            next = page.previous;
+        }
+    }
+    for (seen) |present| try std.testing.expect(present);
 }

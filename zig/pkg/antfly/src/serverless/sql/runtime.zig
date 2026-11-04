@@ -429,6 +429,9 @@ pub const Service = struct {
         map: u32 = 0,
         left_buffer: []const physical.Tile = &.{},
         right_buffer: []const physical.Tile = &.{},
+        // New shared-pass format; legacy per-partition checkpoints resume below.
+        shared_tiles: bool = false,
+        tile_buffers: ?state.Output = null,
     };
     const Resolution = union(enum) { pending: state.Output, done: struct { reference: state.Output, index: physical.Index } };
     fn putMetadata(self: Service, a: A, query: state.Query, label: []const u8, bytes: []const u8, limit: usize) !state.Output {
@@ -456,6 +459,68 @@ pub const Service = struct {
             return spec.withPhysical(index.boundaries, index.skew);
         }
         return spec.withPhysical(record.reduce_boundaries, record.skew);
+    }
+    fn metadataWorkContext(self: Service) Context {
+        var context = self.context;
+        const now = @import("antfly_platform").time.monotonicNs();
+        // Leave half of the remaining turn for immutable metadata publication
+        // and the query CAS. Child cancellation must not cancel that checkpoint.
+        const budget = if (context.deadline_ns) |deadline| @min(3 * std.time.ns_per_s, (deadline -| now) / 2) else 3 * std.time.ns_per_s;
+        context.deadline_ns = now +| budget;
+        return context;
+    }
+    const Metadata = struct { output: state.Output, partitions: []const exchange.Partition = &.{} };
+    const metadata_width = 8;
+    /// One native wave uses private arenas, never concurrent allocation into the
+    /// caller's turn arena. Hosted execution remains serial and operation-bounded.
+    fn metadataWindow(self: Service, a: A, query: state.Query, stage: u32, first: u32, count: usize, directories: bool) ![]Metadata {
+        if (count > metadata_width) return error.InvalidSqlExecutionState;
+        const Job = struct {
+            service: Service,
+            arena: std.heap.ArenaAllocator,
+            query: state.Query,
+            stage: u32,
+            id: u32,
+            directories: bool,
+            value: ?Metadata = null,
+            failure: ?anyerror = null,
+            fn run(job: *@This()) void {
+                job.value = job.read() catch |err| {
+                    job.failure = err;
+                    return;
+                };
+            }
+            fn read(job: *@This()) !Metadata {
+                const allocator = job.arena.allocator();
+                const ref = try job.service.loadAccepted(allocator, job.query, job.stage, job.id);
+                if (!job.directories) return .{ .output = ref };
+                var objects = job.service.exchange_store;
+                objects.context = job.service.context;
+                const footer = try objects.footer(allocator, ref);
+                return .{ .output = ref, .partitions = footer.partitions };
+            }
+        };
+        var jobs: [metadata_width]Job = undefined;
+        for (jobs[0..count], 0..) |*job, offset| job.* = .{ .service = self, .arena = .init(self.a), .query = query, .stage = stage, .id = first + @as(u32, @intCast(offset)), .directories = directories };
+        defer for (jobs[0..count]) |*job| job.arena.deinit();
+        if (!@import("builtin").single_threaded and self.context.io != null) {
+            const io = self.context.io.?;
+            var group: std.Io.Group = .init;
+            defer group.cancel(io);
+            for (jobs[0..count]) |*job| try group.concurrent(io, Job.run, .{job});
+            try group.await(io);
+        } else for (jobs[0..count]) |*job| job.run();
+        const result = try a.alloc(Metadata, count);
+        // The caller owns a turn arena; every borrowed job field is copied out
+        // before the private arenas are retired, including optional witnesses.
+        for (jobs[0..count], result) |job, *item| {
+            if (job.failure) |err| return err;
+            item.* = job.value.?;
+            item.output.key = try a.dupe(u8, item.output.key);
+            if (item.output.matches) |*witness| witness.key = try a.dupe(u8, witness.key);
+            item.partitions = try a.dupe(exchange.Partition, item.partitions);
+        }
+        return result;
     }
     fn mapDirectory(self: Service, a: A, query: state.Query, id: u32) !exchange.Footer {
         const ref = try self.loadAccepted(a, query, 0, id);
@@ -495,6 +560,111 @@ pub const Service = struct {
         pages.* = appended;
         buffer.* = &.{};
     }
+    const TileBuffers = struct { left: []const physical.Tile = &.{}, right: []const physical.Tile = &.{} };
+    // At most 127 retained tiles plus one eight-map wave per side/partition.
+    // Packed entries avoid the allocation amplification of JSON tile objects.
+    const max_tile_buffer_bytes = 4 * 1024 * 1024;
+    fn readTileBuffers(self: Service, a: A, progress: Adaptive, spec: plan.Plan) ![]TileBuffers {
+        const buffers = try a.alloc(TileBuffers, progress.parts.len);
+        @memset(buffers, .{});
+        const ref = progress.tile_buffers orelse return buffers;
+        const bytes = try self.getMetadata(a, ref, max_tile_buffer_bytes);
+        if (bytes.len < 2 or std.mem.readInt(u16, bytes[0..2], .little) != buffers.len) return error.InvalidSqlExecutionState;
+        var offset: usize = 2;
+        for (buffers) |*buffer| {
+            inline for (.{ false, true }) |build| {
+                if (bytes.len - offset < 2) return error.InvalidSqlExecutionState;
+                const size = std.mem.readInt(u16, bytes[offset..][0..2], .little);
+                offset += 2;
+                if (size >= physical.page_tiles + metadata_width or @as(usize, size) * 12 > bytes.len - offset) return error.InvalidSqlExecutionState;
+                const tiles = try a.alloc(physical.Tile, size);
+                var previous: ?u32 = null;
+                for (tiles) |*tile| {
+                    const id = std.mem.readInt(u32, bytes[offset..][0..4], .little);
+                    const rows = std.mem.readInt(u64, bytes[offset + 4 ..][0..8], .little);
+                    if (id >= progress.map or (id < spec.right.splits) != build or rows == 0 or (if (previous) |prior| id <= prior else false)) return error.InvalidSqlExecutionState;
+                    tile.* = .{ .map = id, .rows = rows };
+                    previous = id;
+                    offset += 12;
+                }
+                if (build) buffer.right = tiles else buffer.left = tiles;
+            }
+        }
+        if (offset != bytes.len) return error.InvalidSqlExecutionState;
+        return buffers;
+    }
+    fn writeTileBuffers(self: Service, a: A, query: state.Query, buffers: []const TileBuffers) !state.Output {
+        var size: usize = 2 + buffers.len * 4;
+        for (buffers) |buffer| size += (buffer.left.len + buffer.right.len) * 12;
+        if (size > max_tile_buffer_bytes) return error.SqlJoinBudgetExceeded;
+        const bytes = try a.alloc(u8, size);
+        std.mem.writeInt(u16, bytes[0..2], @intCast(buffers.len), .little);
+        var offset: usize = 2;
+        for (buffers) |buffer| {
+            for ([_][]const physical.Tile{ buffer.left, buffer.right }) |tiles| {
+                std.mem.writeInt(u16, bytes[offset..][0..2], @intCast(tiles.len), .little);
+                offset += 2;
+                for (tiles) |tile| {
+                    std.mem.writeInt(u32, bytes[offset..][0..4], tile.map.?, .little);
+                    std.mem.writeInt(u64, bytes[offset + 4 ..][0..8], tile.rows, .little);
+                    offset += 12;
+                }
+            }
+        }
+        return self.putMetadata(a, query, "tile-buffers", bytes, max_tile_buffer_bytes);
+    }
+    fn coalesceShared(self: Service, a: A, spec: plan.Plan, query: state.Query, progress: *Adaptive, count: u32) !void {
+        if (progress.map > count) return error.InvalidSqlExecutionState;
+        const buffers = try self.readTileBuffers(a, progress.*, spec);
+        var flushed: usize = 0;
+        var work = self;
+        work.context = self.metadataWorkContext();
+        // Flush at most eight immutable pages in a turn. A wave that fills many
+        // partitions cannot turn into hundreds of serial PUTs before checkpoint.
+        flush: for (buffers, progress.parts) |*buffer, *part| {
+            inline for (.{ false, true }) |build| {
+                const pending = if (build) &buffer.right else &buffer.left;
+                if (flushed < metadata_width and (pending.len >= physical.page_tiles or (progress.map == count and pending.len != 0))) {
+                    if (flushed != 0) work.context.ensureActive() catch break :flush;
+                    const end = @min(physical.page_tiles, pending.len);
+                    var page = pending.*[0..end];
+                    work.flushTiles(a, query, part, build, &page) catch |err| {
+                        if (flushed != 0 and (err == error.DeadlineExceeded or err == error.Canceled or err == error.Cancelled)) {
+                            try self.context.ensureActive();
+                            break :flush;
+                        }
+                        return err;
+                    };
+                    pending.* = pending.*[end..];
+                    flushed += 1;
+                }
+            }
+        }
+        if (flushed == 0 and progress.map < count) {
+            const end = @min(count, progress.map + metadata_width);
+            const metadata = try self.metadataWindow(a, query, 0, progress.map, end - progress.map, true);
+            for (metadata, progress.map..) |directory, id| {
+                if (directory.partitions.len != spec.partitions) return error.InvalidSqlExchange;
+                for (buffers, progress.parts) |*buffer, part| {
+                    const rows = directory.partitions[part.partition].rows;
+                    if (rows == 0) continue;
+                    const pending = if (id < spec.right.splits) &buffer.right else &buffer.left;
+                    const appended = try a.alloc(physical.Tile, pending.len + 1);
+                    @memcpy(appended[0..pending.len], pending.*);
+                    appended[pending.len] = .{ .map = @intCast(id), .rows = rows };
+                    pending.* = appended;
+                }
+            }
+            progress.map = end;
+        }
+        const empty = for (buffers) |buffer| {
+            if (buffer.left.len != 0 or buffer.right.len != 0) break false;
+        } else true;
+        if (progress.map == count and empty) {
+            progress.part = @intCast(progress.parts.len);
+            progress.tile_buffers = null;
+        } else progress.tile_buffers = try self.writeTileBuffers(a, query, buffers);
+    }
     fn coalesce(self: Service, a: A, spec: plan.Plan, query: state.Query, previous: ?state.Output) !Resolution {
         var progress: Adaptive = if (previous) |ref|
             try std.json.parseFromSliceLeaky(Adaptive, a, try self.getMetadata(a, ref, physical.max_index_bytes), .{ .allocate = .alloc_always })
@@ -514,11 +684,9 @@ pub const Service = struct {
         const count = try spec.stageTasks(0);
         if (progress.bytes.len != spec.partitions or progress.rows.len != spec.partitions or progress.right_bytes.len != spec.partitions or progress.left_counts.len != spec.partitions or progress.right_counts.len != spec.partitions or progress.cursor > count) return error.InvalidSqlExecutionState;
         if (progress.boundaries.len == 0) {
-            const end = @min(count, progress.cursor + 16);
-            for (progress.cursor..end) |id| {
-                var arena = std.heap.ArenaAllocator.init(a);
-                defer arena.deinit();
-                const directory = try self.mapDirectory(arena.allocator(), query, @intCast(id));
+            const end = @min(count, progress.cursor + metadata_width);
+            const metadata = try self.metadataWindow(a, query, 0, progress.cursor, end - progress.cursor, true);
+            for (metadata, progress.cursor..) |directory, id| {
                 if (directory.partitions.len != spec.partitions) return error.InvalidSqlExchange;
                 for (directory.partitions, 0..) |partition, index| {
                     progress.bytes[index] +|= partition.retained_bytes;
@@ -554,11 +722,14 @@ pub const Service = struct {
                     try parts.append(a, .{ .partition = @intCast(index), .left_count = if (left == 0) null else left, .right_count = if (right == 0) null else right, .left = if (left == 0) &.{.{}} else &.{}, .right = if (right == 0) &.{.{}} else &.{} });
                 }
                 progress.parts = parts.items;
+                progress.shared_tiles = true;
                 _ = spec.withPhysical(progress.boundaries, progress.parts) catch |err| switch (err) {
                     error.Overflow => return error.SqlJoinBudgetExceeded,
                     else => return err,
                 };
             }
+        } else if (progress.shared_tiles and progress.part < progress.parts.len) {
+            try self.coalesceShared(a, spec, query, &progress, count);
         } else if (progress.part < progress.parts.len) {
             const part = &progress.parts[progress.part];
             const end = @min(count, progress.map + 16);
@@ -600,16 +771,34 @@ pub const Service = struct {
         var progress: ResultProgress = if (previous) |ref| try std.json.parseFromSliceLeaky(ResultProgress, a, try self.getMetadata(a, ref, physical.max_index_bytes), .{ .allocate = .alloc_always }) else .{};
         const count = try tasks(spec, spec.finalStage() - 1);
         if (progress.cursor > count) return error.InvalidSqlExecutionState;
-        const end = @min(count, progress.cursor + 64);
-        const pages = try a.alloc(state.Output, end - progress.cursor);
+        const capacity = @min(count - progress.cursor, 64);
+        const storage_ = try a.alloc(state.Output, capacity);
+        var used: usize = 0;
         var rows: u64 = 0;
-        for (pages, progress.cursor..) |*page, task| {
-            page.* = try self.loadAccepted(a, query, spec.finalStage() - 1, @intCast(task));
-            page.matches = null;
-            rows = try std.math.add(u64, rows, page.rows);
+        var work = self;
+        work.context = self.metadataWorkContext();
+        while (used < capacity) {
+            if (used != 0) work.context.ensureActive() catch break;
+            const parallel = !@import("builtin").single_threaded and work.context.io != null;
+            const width = @min(capacity - used, if (parallel) @as(usize, metadata_width) else 1);
+            const metadata = work.metadataWindow(a, query, spec.finalStage() - 1, progress.cursor + @as(u32, @intCast(used)), width, false) catch |err| {
+                if (used != 0 and (err == error.DeadlineExceeded or err == error.Canceled or err == error.Cancelled)) {
+                    try self.context.ensureActive();
+                    break;
+                }
+                return err;
+            };
+            for (metadata) |item| {
+                storage_[used] = item.output;
+                storage_[used].matches = null;
+                rows = try std.math.add(u64, rows, item.output.rows);
+                used += 1;
+            }
         }
+        const pages = storage_[0..used];
+        const end = progress.cursor + @as(u32, @intCast(used));
         progress.rows = try std.math.add(u64, progress.rows, rows);
-        if (count <= 64) return self.completeResult(a, query, query_key, claim, .{ .query = query, .pages = pages, .rows = progress.rows });
+        if (progress.head == null and progress.cursor == 0 and end == count) return self.completeResult(a, query, query_key, claim, .{ .query = query, .pages = pages, .rows = progress.rows });
         const page_ref = try self.putMetadata(a, query, "result-page", try std.json.Stringify.valueAlloc(a, ResultPage{ .pages = pages, .rows = rows, .previous = progress.head }, .{}), 128 * 1024);
         progress.head = page_ref;
         progress.cursor = end;
