@@ -263,6 +263,26 @@
       "backup_checks_passed": 2,
       "runtime_anchors_passed": 11,
       "seconds": 430.023
+    },
+    {
+      "suite": "Integrated Debug producer and full SDK gate at d296a057ac6ec27568cffbbe4479c7dc075ffd8d",
+      "whole_build_returncode": 0,
+      "native_api_passed": 151,
+      "native_api_skipped": 0,
+      "native_api_failed": 0,
+      "native_api_leaked": 0,
+      "public_exports": 134,
+      "smoke_and_linkage": "passed",
+      "admission_unit_tests_passed": 19,
+      "admission_real_process_cases_passed": 7,
+      "sdk_passed": 209,
+      "sdk_failed": 0,
+      "sdk_seconds": 122.45,
+      "library_sha256": "896ae1c386cf7ca99e13d8586f3b76248fa6b825489cc8d9fa2e5ffb7c7c32d1",
+      "library_bytes": 285085936,
+      "build_report_sha256": "44dc413cc9b8fe19424a2735234a73f2415f05c808191e5fbffe39620fc7ddd9",
+      "native_tests_log_sha256": "8c7da042c8d2f86662671248c64a9f0d8b2f1f8d766b5d664f567903c5ccd668",
+      "sdk_log_sha256": "bb12b1f763f7dc925d69f54b26cbed946f34bdd06193b11586d54eedb86ceaf6"
     }
   ],
   "remaining": [
@@ -768,7 +788,7 @@
     "benchmark_report_tests_passed": 23,
     "main_admission_source": "270057158c",
     "main_merge_pushed": true,
-    "status": "Integrated Debug build, native API and segmented 209 SDK cases pass. Current-candidate importer and final optimized qualification remain pending."
+    "status": "Full native771, API151, ABI134, admission19unit/7process and SDK209 pass on d296. Causal allocator fix is verified in the unchanged importer (5883 full loads before, one after). Optimized end-to-end performance and active-write storage qualification remain pending."
   },
   "local_runtime_diagnostic": {
     "qualification": false,
@@ -1059,6 +1079,86 @@
       "seconds": 430.023
     },
     "counter_scope": "full_load_ns includes preparing the initial digest of a newly loaded State. The separate explicit digest_rebuilds counter does not count that initial work; its zero is not evidence that loading avoided hashing. Nested service counters are not additive wall time.",
-    "pending": "Fresh Debug API/ABI/smoke/SDK and unchanged-importer run on this fix; final optimized qualification remains pending."
+    "pending": "All native/API/ABI/smoke/admission/SDK gates pass and the real importer performs one initial allocator load. Debug under up to36 unrelated native builds still reaches replay quota after92primarybatches; final optimized capacity/contention/active-write qualification on reserved Wolfspider remains pending.",
+    "real_importer_after_fix": {
+      "full_loads": 1,
+      "full_load_ns": 214042,
+      "prior_sql_entries_revisited": 0,
+      "mechanism_verified": true,
+      "end_to_end_capacity_qualified": false
+    }
+  },
+  "current_d296_original_importer_diagnostic": {
+    "qualification": false,
+    "runtime_source": "d296a057ac6ec27568cffbbe4479c7dc075ffd8d",
+    "library_sha256": "896ae1c386cf7ca99e13d8586f3b76248fa6b825489cc8d9fa2e5ffb7c7c32d1",
+    "input_index": 7,
+    "success": false,
+    "public_errors": [
+      "LiteReplayBacklogExceeded"
+    ],
+    "seconds": 471.61788412497845,
+    "peak_native_builds": 36,
+    "metrics_enabled": true,
+    "scope": "Instrumented Debug diagnosis on a heavily shared host. No task-owned build ran concurrently; unrelated compilation overlapped. Not a throughput comparison, and no baseline/reference was rerun.",
+    "primary_batch_profiles": 92,
+    "replay_profiles": 163,
+    "allocator_work": {
+      "full_loads": 1,
+      "full_load_ns": 214042,
+      "digest_rebuilds": 0,
+      "digest_rebuild_ns": 0,
+      "journal_rebases": 0,
+      "journal_rebase_ns": 0,
+      "cache_transfers": 42169
+    },
+    "owner_counters": {
+      "source_turns": 259,
+      "capture_ns": 15053574000,
+      "replay_ns": 232858494000,
+      "artifacts_ns": 99108839000,
+      "storage_ns": 79447749000,
+      "runtime_refreshes": 751,
+      "maintenance_errors": 211,
+      "maintenance_timeouts": 0,
+      "merge_started": 56,
+      "merge_applied": 55,
+      "merge_discarded": 1,
+      "merge_prepare_ns": 22542785000,
+      "merge_staging_ns": 2370223000,
+      "merge_staged_bytes": 75867827,
+      "merge_publication_ns": 27279225000,
+      "sql_overlay_hits": 953,
+      "sql_overlay_scope_extensions": 127,
+      "sql_overlay_rebuilds": 184,
+      "sql_overlay_rebuild_entries": 0,
+      "sql_overlay_evictions": 0,
+      "sql_staged_statements": 632,
+      "replay_waits": 6,
+      "replay_refused_prepare_ns": 4716237459
+    },
+    "runtime_counters": {
+      "maintenance_opens": 308,
+      "namespace_opens": 355,
+      "source_reuses": 57
+    },
+    "service_counters": {
+      "refresh_ns": 8585629000,
+      "replay_publication_overhead_ns": 127726414834,
+      "index_admission_ns": 31948134000,
+      "metadata_admission_ns": 23003253000,
+      "publication_hold_ns": 30308874112
+    },
+    "cache_counters": {
+      "capture_attempts": 259,
+      "captured": 222,
+      "miss_no_cache": 49,
+      "miss_closed": 256,
+      "not_retained_settled": 140,
+      "not_retained_failed": 25,
+      "retained_storage_yield": 19,
+      "blocked_enrichment": 36,
+      "blocked_nontext_indexes": 1
+    }
   }
 }
