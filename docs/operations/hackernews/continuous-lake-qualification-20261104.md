@@ -360,6 +360,24 @@ passed all 22 focused Debug vacuum tests, including both control orderings, cold
 resume, deep/shared graphs, cancellation and lost responses. Native tests
 reported no leaks.
 
+An additional Debug regression independently reproduced an accepted-overlay
+correctness gap: retaining a published base and the current head while expiring
+an intermediate snapshot leaves valid base WAL coverage but breaks the native
+ancestry check with `LakeOverlayCoverageUnavailable`. That error is one of the
+internal causes mapped to a retryable query 503; the recorded GCS failures cannot
+be attributed to it because their precise codes were discarded.
+
+Vacuum now protects the ancestry from the current head through every live
+publication/reader base and partial-publication checkpoint before managed or
+provider-delegated maintenance. WAL collection also honors checkpoint coverage.
+Protection is computed once using indexed parent lookup, with deterministic,
+deduplicated IDs. Missing/cyclic ancestry retains known snapshots conservatively,
+including a missing main-chain parent that an older saved job might otherwise
+retire. This prevents further damage but does not certify an already-broken
+chain. Unrelated older history remains eligible when the required chain is
+intact. This can extend retention while publications/readers need that ancestry;
+accepted query validation and deletion proofs remain unchanged.
+
 Next work should:
 
 1. Attribute the remaining accepted-search failures with live public stages,

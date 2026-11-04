@@ -415,6 +415,73 @@ fn planSnapshot(a: A, files: catalog.row_commit.Files, snapshot: V, budget: *u64
     return plans.children(children.items);
 }
 const IdSet = std.StringHashMapUnmanaged(void);
+/// Accepted overlays certify every commit between their publication base and
+/// the current head. Keeping the base alone can leave that proof with a hole.
+/// Unknown/broken ancestry retains conservatively; it never manufactures a
+/// native-commit certificate or changes query validation.
+/// All allocations, including the result, belong to the operation arena.
+pub fn protectOverlayAncestry(a: A, root: V, bases: []const []const u8) ![]const []const u8 {
+    if (bases.len == 0) return bases;
+    const m = catalog.metadata;
+    const snapshots_value = try m.get(root, "snapshots");
+    if (snapshots_value != .array or snapshots_value.array.items.len > 100_000) return error.InvalidLakeMetadata;
+    const snapshots = snapshots_value.array.items;
+    const Entry = struct { text: []const u8, parent: ?i64 };
+    var nodes: std.AutoHashMapUnmanaged(i64, Entry) = .empty;
+    for (snapshots) |snapshot| {
+        const id = try m.int(try m.get(snapshot, "snapshot-id"));
+        const parent = snapshot.object.get("parent-snapshot-id") orelse .null;
+        const entry = try nodes.getOrPut(a, id);
+        if (entry.found_existing) return error.InvalidLakeMetadata;
+        entry.value_ptr.* = .{ .text = try std.fmt.allocPrint(a, "{d}", .{id}), .parent = if (parent == .null) null else try m.int(parent) };
+    }
+    var protected: IdSet = .empty;
+    var wanted: std.AutoHashMapUnmanaged(i64, void) = .empty;
+    var unknown = false;
+    for (bases) |base| {
+        try protected.put(a, base, {});
+        const id = std.fmt.parseInt(i64, base, 10) catch {
+            unknown = true;
+            continue;
+        };
+        try wanted.put(a, id, {});
+    }
+    var complete = false;
+    const head = root.object.get("current-snapshot-id") orelse .null;
+    if (!unknown and head != .null) {
+        var current = try m.int(head);
+        // A linear bound also terminates corrupt cycles without allocating an
+        // additional per-publication graph or rescanning the snapshot array.
+        for (0..snapshots.len + 1) |_| {
+            const node = nodes.get(current) orelse {
+                // A previously planned job must not retire a missing middle
+                // snapshot while a live base still depends on that edge.
+                try protected.put(a, try std.fmt.allocPrint(a, "{d}", .{current}), {});
+                break;
+            };
+            try protected.put(a, node.text, {});
+            _ = wanted.remove(current);
+            if (wanted.count() == 0) {
+                complete = true;
+                break;
+            }
+            current = node.parent orelse break;
+        }
+    }
+    if (!complete) {
+        var all = nodes.valueIterator();
+        while (all.next()) |node| try protected.put(a, node.text, {});
+    }
+    const result = try a.alloc([]const u8, protected.count());
+    var keys = protected.keyIterator();
+    for (result) |*id| id.* = (keys.next() orelse unreachable).*;
+    std.mem.sort([]const u8, result, {}, struct {
+        fn less(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.lessThan(u8, left, right);
+        }
+    }.less);
+    return result;
+}
 fn retainedIds(a: A, root: V, extra: []const []const u8, keep_latest: usize, before: i64) !IdSet {
     var retained: IdSet = .empty;
     for (extra) |id| try retained.put(a, id, {});
@@ -632,6 +699,42 @@ test "external lake vacuum retains refs newest snapshots recent commits and read
     try std.testing.expect(retained.contains("3"));
     try std.testing.expect(retained.contains("4"));
     try std.testing.expect(retained.contains("5"));
+}
+
+test "external lake vacuum ancestry protection unions live bases without retaining older history" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.json.parseFromSliceLeaky(V, a,
+        \\{"current-snapshot-id":4,"snapshots":[{"snapshot-id":1},{"snapshot-id":9},{"snapshot-id":2,"parent-snapshot-id":1},{"snapshot-id":3,"parent-snapshot-id":2},{"snapshot-id":4,"parent-snapshot-id":3}]}
+    , .{});
+    const protected = try protectOverlayAncestry(a, root, &.{ "3", "2", "3" });
+    try std.testing.expectEqual(@as(usize, 3), protected.len);
+    for (protected, [_][]const u8{ "2", "3", "4" }) |id, expected| try std.testing.expectEqualStrings(expected, id);
+    const current = try protectOverlayAncestry(a, root, &.{"4"});
+    try std.testing.expectEqual(@as(usize, 1), current.len);
+    try std.testing.expectEqualStrings("4", current[0]);
+    try std.testing.expectEqual(@as(usize, 0), (try protectOverlayAncestry(a, root, &.{})).len);
+}
+
+test "external lake vacuum ancestry protection fails closed for gaps cycles and unknown bases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        \\{"current-snapshot-id":3,"snapshots":[{"snapshot-id":1},{"snapshot-id":9},{"snapshot-id":3,"parent-snapshot-id":2}]}
+        ,
+        \\{"current-snapshot-id":3,"snapshots":[{"snapshot-id":1},{"snapshot-id":9},{"snapshot-id":2,"parent-snapshot-id":3},{"snapshot-id":3,"parent-snapshot-id":2}]}
+        ,
+    }) |bytes| {
+        const root = try std.json.parseFromSliceLeaky(V, a, bytes, .{});
+        const protected = try protectOverlayAncestry(a, root, &.{"1"});
+        // Include a missing middle ID as a guard against an already-planned
+        // retirement, and terminate cycles without granting new read authority.
+        for ([_][]const u8{ "1", "2", "3", "9" }) |id| try std.testing.expect(has(protected, id));
+        const unknown = try protectOverlayAncestry(a, root, &.{"empty:initial"});
+        try std.testing.expect(has(unknown, "1") and has(unknown, "3") and has(unknown, "9"));
+    }
 }
 
 const Collection = enum { retained, eligible, deleted };
