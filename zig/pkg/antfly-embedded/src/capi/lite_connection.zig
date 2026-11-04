@@ -9104,7 +9104,7 @@ test "capi native registered replay fragments oversized batches across maintenan
     }
     const live = try owner.refresh();
     try std.testing.expect(try live.db.core.loadAppliedSequence(a, "text") >= target);
-    const snapshot = live.db.core.index_manager.textIndex("text").?.persistent.acquireSnapshot();
+    const snapshot = live.db.core.index_manager.textIndex("text").?.acquireSnapshot();
     defer snapshot.release();
     try std.testing.expectEqual(@as(u32, 1024), snapshot.liveDocCount());
     try std.testing.expect((try live.owned_lite_backend.?.native_docstore.?.file.check()).valid);
