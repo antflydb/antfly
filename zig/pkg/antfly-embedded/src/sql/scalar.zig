@@ -472,6 +472,23 @@ pub const Program = struct {
         }
     }
 
+    /// Prepare execution caches for validated typed IR. Instructions and their
+    /// literal payloads are borrowed and must outlive this execution program.
+    /// No binder, settings, or statement-owned invocation pointers are copied.
+    pub fn fromTypedInstructions(alloc: Allocator, instructions: []const Instruction, root: u32, output: Type, limits: BindLimits) !Program {
+        if (root >= instructions.len or !std.meta.eql(instructions[root].type, output)) return error.InvalidSqlBackendResponse;
+        const arena = try alloc.create(std.heap.ArenaAllocator);
+        errdefer alloc.destroy(arena);
+        arena.* = .init(alloc);
+        errdefer arena.deinit();
+        var program: Program = .{ .arena = arena, .instructions = instructions, .root = root, .output_type = output, .parameter_types = &.{}, .parameter_descriptors = &.{}, .required_columns = &.{} };
+        errdefer program.releaseConstants();
+        try program.prepareConstantArrays(arena.allocator(), limits);
+        try program.prepareConcatNodes(arena.allocator());
+        program.decimal_plan = try @import("decimal_program.zig").compile(arena.allocator(), instructions, root);
+        return program;
+    }
+
     pub fn deinit(self: *Program) void {
         self.releaseConstants();
         const backing = self.arena.child_allocator;

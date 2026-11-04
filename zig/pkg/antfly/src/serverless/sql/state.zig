@@ -124,11 +124,110 @@ pub const Store = struct {
         const parsed = try std.json.parseFromSlice(Record, a, object.body, .{ .allocate = .alloc_always });
         errdefer parsed.deinit();
         const value = parsed.value;
+        try self.validateRecord(value);
+        return .{ .object = object, .value = value, .parsed = parsed };
+    }
+    pub const TaskStatus = struct { status: Status, until_ms: u64, failure: ?[]const u8 };
+    /// Native waves overlap at most sixteen GETs using private response arenas.
+    /// Hosted stores use their bounded eight-object batch ABI instead.
+    pub fn taskStatuses(self: Store, a: A, query: Query, stage: u32, ids: []const u32, io: ?std.Io) ![]TaskStatus {
+        return self.taskWindow(a, query, stage, ids, io, false);
+    }
+    pub fn admitTasks(self: Store, a: A, query: Query, stage: u32, ids: []const u32, io: ?std.Io) ![]TaskStatus {
+        return self.taskWindow(a, query, stage, ids, io, true);
+    }
+    fn taskWindow(self: Store, a: A, query: Query, stage: u32, ids: []const u32, io: ?std.Io, admission: bool) ![]TaskStatus {
+        if (ids.len > 256) return error.InvalidSqlExecutionState;
+        const result = try a.alloc(TaskStatus, ids.len);
+        var done: usize = 0;
+        errdefer {
+            for (result[0..done]) |status| if (status.failure) |failure| a.free(failure);
+            a.free(result);
+        }
+        const Job = struct {
+            arena: std.heap.ArenaAllocator,
+            store: Store,
+            path: []const u8,
+            query: Query,
+            create: bool,
+            value: ?TaskStatus = null,
+            failure: ?anyerror = null,
+            fn run(self_: *@This()) void {
+                const allocator = self_.arena.allocator();
+                if (self_.create) {
+                    const created = self_.store.ensure(allocator, self_.path, self_.query.id, self_.query.expires_ms) catch |err| {
+                        self_.failure = err;
+                        return;
+                    };
+                    if (created) {
+                        self_.value = .{ .status = .pending, .until_ms = 0, .failure = null };
+                        return;
+                    }
+                }
+                var value = (self_.store.load(allocator, self_.path) catch |err| {
+                    self_.failure = err;
+                    return;
+                }) orelse {
+                    self_.failure = error.InvalidSqlExecutionState;
+                    return;
+                };
+                defer value.deinit(allocator);
+                self_.value = .{ .status = value.value.status, .until_ms = value.value.until_ms, .failure = if (value.value.failure) |failure| allocator.dupe(u8, failure) catch |err| {
+                    self_.failure = err;
+                    return;
+                } else null };
+            }
+        };
+        const native_parallel = !@import("builtin").single_threaded and io != null and (admission or self.client.vtable.get_objects == null);
+        while (done < ids.len) {
+            const count = @min(ids.len - done, if (native_parallel) @as(usize, 16) else 8);
+            var jobs: [16]Job = undefined;
+            var initialized: usize = 0;
+            defer for (jobs[0..initialized]) |*job| {
+                job.arena.deinit();
+                a.free(job.path);
+            };
+            for (jobs[0..count], ids[done..][0..count]) |*job, id| {
+                job.* = .{ .arena = .init(self.client.allocator), .store = self, .path = try self.key(a, query, stage, id), .query = query, .create = admission };
+                initialized += 1;
+            }
+            if (native_parallel) {
+                var group: std.Io.Group = .init;
+                defer group.cancel(io.?);
+                for (jobs[0..count]) |*job| try group.concurrent(io.?, Job.run, .{job});
+                try group.await(io.?);
+            } else if (!admission and self.client.vtable.get_objects != null) {
+                var requests: [8]storage.GetObjectRequest = undefined;
+                for (requests[0..count], jobs[0..count]) |*request, job| request.* = .{ .key = job.path, .options = .{ .skip_metadata_probe = true, .max_response_bytes = 16384, .cancellation = catalog.types.contextCancellation(&self.context) } };
+                var client = self.client;
+                client.allocator = a;
+                const objects = try client.getObjects(self.bucket, requests[0..count]);
+                defer {
+                    for (objects) |*object| if (object.*) |*value| value.deinit(a);
+                    a.free(objects);
+                }
+                for (objects, jobs[0..count]) |object, *job| {
+                    const value = object orelse return error.InvalidSqlExecutionState;
+                    const parsed = try std.json.parseFromSlice(Record, job.arena.allocator(), value.body, .{});
+                    defer parsed.deinit();
+                    try self.validateRecord(parsed.value);
+                    job.value = .{ .status = parsed.value.status, .until_ms = parsed.value.until_ms, .failure = if (parsed.value.failure) |failure| try job.arena.allocator().dupe(u8, failure) else null };
+                }
+            } else for (jobs[0..count]) |*job| job.run();
+            for (jobs[0..count]) |job| {
+                if (job.failure) |err| return err;
+                const value = job.value.?;
+                result[done] = .{ .status = value.status, .until_ms = value.until_ms, .failure = if (value.failure) |failure| try a.dupe(u8, failure) else null };
+                done += 1;
+            }
+        }
+        return result;
+    }
+    fn validateRecord(self: Store, value: Record) !void {
         if (self.tenant) |scope| if (value.tenant) |admitted| {
             if (!std.meta.eql(scope, admitted)) return error.SqlExecutionUnauthorized;
         };
         if (value.version != 2 or value.owner.len > 256 or (value.status == .succeeded and value.output == null)) return error.InvalidSqlExecutionState;
-        return .{ .object = object, .value = value, .parsed = parsed };
     }
     fn write(self: Store, a: A, path: []const u8, before: ?Loaded, value: Record) !void {
         try self.context.ensureActive();

@@ -1572,3 +1572,136 @@ test "distributed SQL empty collection backs off independently of maintenance ti
     try std.testing.expectEqual(@as(usize, 0), try schedule.runAt(a, faulty, .{}, now + 1));
     try std.testing.expectEqual(@as(usize, 1), try schedule.runAt(a, faulty, .{}, schedule.next_ms));
 }
+
+test "distributed SQL coordinator metadata lanes isolate blocked reads and preserve cancellation" {
+    const a = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporary.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var filesystem = try storage.FilesystemClient.initWithIo(a, path, std.testing.io);
+    defer filesystem.deinit();
+    var base = filesystem.client();
+    try base.makeBucket("queries");
+    try base.makeBucket("exchange");
+    const Gate = struct {
+        var current: *@This() = undefined;
+        base_get: @FieldType(storage.Client.VTable, "get_object"),
+        key: []const u8 = "",
+        once: std.atomic.Value(bool) = .init(true),
+        entered: std.Io.Event = .unset,
+        finished: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        short: std.Io.Event = .unset,
+        fn get(raw: *anyopaque, allocator: A, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            const self = current;
+            var value = try self.base_get(raw, allocator, bucket, key, options);
+            errdefer value.deinit(allocator);
+            if (std.mem.eql(u8, self.key, key) and self.once.swap(false, .acq_rel)) {
+                self.entered.set(std.testing.io);
+                defer self.finished.set(std.testing.io);
+                while (!self.release.isSet()) {
+                    if (options.cancellation) |token| try token.check();
+                    self.release.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch |err| switch (err) {
+                        error.Timeout => continue,
+                        error.Canceled => return err,
+                    };
+                }
+            }
+            return value;
+        }
+        fn dispatch(raw: *anyopaque, tickets: []const plan.Ticket, _: Context) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (tickets) |ticket| if (ticket.query.expires_ms == 16000) self.short.set(std.testing.io);
+        }
+    };
+    var gate: Gate = .{ .base_get = base.vtable.get_object };
+    Gate.current = &gate;
+    var table = base.vtable.*;
+    table.get_object = Gate.get;
+    var client = base;
+    client.vtable = &table;
+    var fixture: Fixture = .{};
+    var service = fixture.service(a, client, "query-pod");
+    service.context.io = std.testing.io;
+    var turns: @import("scheduler.zig").Turns = .{};
+    service.coordination = turns.port();
+    var driver: @import("driver.zig").Driver = .{ .service = service, .dispatcher = .{ .ptr = &gate, .dispatch = Gate.dispatch }, .metadata_budget_ms = 10000 };
+    defer driver.stop();
+    service.notification = driver.notification();
+    const column: plan.Column = .{ .name = "id", .type = .integer };
+    const left: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{column}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 1 };
+    var right = left;
+    right.table_id = 2;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    var spec = try plan.choose(left, right, service.tenant, 121000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{}, fixture.now);
+    const slow = try service.submit(spec);
+    gate.key = try service.state_store.key(a, slow, null, 0);
+    defer a.free(gate.key);
+    try driver.start(std.testing.io);
+    // stop must join every metadata worker before its borrowed key is freed.
+    defer driver.stop();
+    try gate.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    spec.expires_ms = 16000;
+    const short = try service.submit(spec);
+    try gate.short.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try std.testing.expect(!gate.finished.isSet());
+    try service.requestCancel(short);
+    // A short query's cancellation also settles while the other GET is parked.
+    for (0..100) |_| {
+        const key = try service.state_store.key(a, short, null, 0);
+        defer a.free(key);
+        var record = (try service.state_store.load(a, key)).?;
+        defer record.deinit(a);
+        if (record.value.status == .cancelled) break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+    }
+    try std.testing.expectError(error.Canceled, service.pollResult(a, short));
+    try std.testing.expect(!gate.finished.isSet());
+    // Group cancellation interrupts the blocked provider and joins its worker.
+    driver.stop();
+    try std.testing.expect(gate.finished.isSet());
+}
+
+test "distributed SQL metadata quanta refill a wide dispatch window before completion" {
+    const a = std.testing.allocator;
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    var service = fixture.service(a, memory.client(), "owner");
+    var scheduler: @import("scheduler.zig").Scheduler = .{ .io = std.testing.io, .clock = service.clock, .delivery = undefined };
+    defer scheduler.stop();
+    var turns: @import("scheduler.zig").Turns = .{ .scheduler = &scheduler };
+    service.coordination = turns.port();
+    const column: plan.Column = .{ .name = "id", .type = .integer };
+    const left: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{column}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 1 };
+    var right = left;
+    right.table_id = 2;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    right.splits = 32;
+    var spec = try plan.choose(left, right, service.tenant, 121000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .concurrency = 32, .query_exchange_bytes = 8 * 1024 * 1024 * 1024 }, fixture.now);
+    const query = try service.submit(spec);
+    for (0..4) |_| try std.testing.expect(!try service.turn(query, scheduler.dispatcher()));
+    const key = try service.state_store.key(a, query, null, 0);
+    defer a.free(key);
+    var value = (try service.state_store.load(a, key)).?;
+    defer value.deinit(a);
+    try std.testing.expectEqual(@as(usize, 32), value.value.pending.len);
+    try std.testing.expectEqual(@as(u32, 32), value.value.cursor);
+    const get = @backingInt(storage.operation_metrics.Operation.get);
+    const before = storage.operation_metrics.runtime.snapshot().calls[get];
+    try std.testing.expect(!try service.turn(query, scheduler.dispatcher()));
+    try std.testing.expectEqual(@as(u64, 1), storage.operation_metrics.runtime.snapshot().calls[get] - before);
+    // RPC-facing turns authorize and notify, without claiming or executing work.
+    spec.expires_ms -= 1;
+    const other = try service.submit(spec);
+    service.async_control = true;
+    try std.testing.expect(!try service.turn(other, undefined));
+    const other_key = try service.state_store.key(a, other, null, 0);
+    defer a.free(other_key);
+    var untouched = (try service.state_store.load(a, other_key)).?;
+    defer untouched.deinit(a);
+    try std.testing.expectEqual(state.Status.pending, untouched.value.status);
+}

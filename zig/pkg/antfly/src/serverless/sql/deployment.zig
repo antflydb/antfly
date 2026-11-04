@@ -185,6 +185,7 @@ pub const Owned = struct {
         try @import("state.zig").validateDigest(tenant);
         var service = self.service;
         service.tenant = tenant;
+        service.async_control = true;
         service.context = context;
         return service;
     }

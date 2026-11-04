@@ -228,3 +228,22 @@ schedule: empty or failed passes back off to thirty seconds with boot jitter;
 nonempty pages continue promptly. SQL-only maintenance sleeps until that
 schedule, while mixed-role maintenance retains its other work deadlines.
 Collection errors retry on this schedule without stopping unrelated maintenance.
+
+Native recovery separates bounded discovery from metadata execution. Sixteen
+metadata lanes share a coalescing FIFO; two lanes are reserved for imminent lease
+renewal. A due renewal performs only the scope check and lease CAS, preserving
+its pending-task cursor. Ordinary turns have a ten-second I/O quantum, and task
+status/admission waves overlap at most sixteen/eight native operations with
+private response arenas. Admission checkpoints at most eight new tasks per
+quantum and explicitly retains the refill signal until the query window is full.
+Native control RPCs authorize and notify this scheduler rather than running a
+second set of metadata turns. Transient failures and delivery saturation back
+off without blocking other queries. `Driver.start()` enables these production
+lanes; synchronous `tick()` remains a deterministic embedding/test hook.
+
+Worker tasks prepare only the predicates used by their physical task kind.
+Typed instructions remain immutable and borrowed; scalar constant/decimal plans,
+a bounded regex session, and reusable row scratch belong to that task. Both VM
+and regex work inherit the task's cancellation/deadline checkpoints. Map filters,
+bucket/broadcast probes, ordinary and spill joins, and skew pairs all use this
+same execution owner, avoiding per-row regex compilation and setup allocation.

@@ -71,6 +71,7 @@ pub const Coordination = struct {
     leave: *const fn (*anyopaque, state.Query) void,
     delivery_pending: *const fn (*anyopaque, state.Query) bool,
     delivery_ready: *const fn (*anyopaque, state.Query) bool,
+    has_progress: *const fn (*anyopaque, state.Query) bool,
     retry: *const fn (*anyopaque, state.Query) void,
 };
 pub const Service = struct {
@@ -88,6 +89,8 @@ pub const Service = struct {
     task_memory_ceiling: u64 = 1024 * 1024 * 1024,
     notification: ?Notification = null,
     coordination: ?Coordination = null,
+    /// Native RPCs schedule work; only the bounded driver executes metadata turns.
+    async_control: bool = false,
     fn notify(self: Service, query: state.Query) void {
         if (self.notification) |notification| notification.notify(notification.ptr, self.tenant, query);
     }
@@ -98,7 +101,7 @@ pub const Service = struct {
         result.context = self.context;
         return result;
     }
-    fn authorize(self: Service, a: A, query: state.Query, record: state.Record) !void {
+    pub fn authorize(self: Service, a: A, query: state.Query, record: state.Record) !void {
         if (!std.meta.eql(record.plan, query.id) or record.expires_ms != query.expires_ms) return error.InvalidSqlExecutionState;
         if (record.tenant) |tenant| {
             if (!std.meta.eql(tenant, self.tenant)) return error.SqlExecutionUnauthorized;
@@ -267,11 +270,10 @@ pub const Service = struct {
         var pending: std.ArrayList(u32) = .empty;
         // Only unresolved tasks are revisited. A slow first task cannot pin a
         // sliding window or force repeated GETs of an ever-growing prefix.
-        for (current.value.pending) |id| {
-            if (id >= count) return error.InvalidSqlExecutionState;
-            const key = try self.store().key(a, query, current.value.stage, id);
-            var value = (try self.store().load(a, key)) orelse return error.InvalidSqlExecutionState;
-            defer value.deinit(a);
+        for (current.value.pending) |id| if (id >= count) return error.InvalidSqlExecutionState;
+        const statuses = try self.store().taskStatuses(a, query, current.value.stage, current.value.pending, self.context.io);
+        for (current.value.pending, statuses) |id, status| {
+            const value = .{ .value = status };
             if (value.value.status == .failed or value.value.status == .cancelled) {
                 try self.store().terminate(a, query_key, claim, .failed, value.value.failure orelse "TaskFailed");
                 return true;
@@ -280,22 +282,20 @@ pub const Service = struct {
             try pending.append(a, id);
             if (value.value.status != .running or value.value.until_ms +| 30_000 < self.clock.now()) try tickets.append(a, .{ .tenant = self.tenant, .query = query, .stage = current.value.stage, .task = id });
         }
-        while (cursor < count and pending.items.len < spec.limits.concurrency) : (cursor += 1) {
-            const key = try self.store().key(a, query, current.value.stage, cursor);
-            if (try self.store().ensure(a, key, query.id, spec.expires_ms)) {
-                try pending.append(a, cursor);
-                try tickets.append(a, .{ .tenant = self.tenant, .query = query, .stage = current.value.stage, .task = cursor });
-                continue;
-            }
-            var value = (try self.store().load(a, key)) orelse return error.InvalidSqlExecutionState;
-            defer value.deinit(a);
-            if (value.value.status == .failed or value.value.status == .cancelled) {
-                try self.store().terminate(a, query_key, claim, .failed, value.value.failure orelse "TaskFailed");
+        const free = spec.limits.concurrency -| pending.items.len;
+        const admission_end = @min(count, cursor +| @as(u32, @intCast(@min(free, if (self.coordination != null) @as(usize, 8) else 256))));
+        const ids = try a.alloc(u32, admission_end - cursor);
+        for (ids, cursor..) |*id, value| id.* = @intCast(value);
+        const admitted = try self.store().admitTasks(a, query, current.value.stage, ids, if (self.coordination != null) self.context.io else null);
+        for (ids, admitted) |id, status| {
+            cursor = id + 1;
+            if (status.status == .failed or status.status == .cancelled) {
+                try self.store().terminate(a, query_key, claim, .failed, status.failure orelse "TaskFailed");
                 return true;
             }
-            if (value.value.status == .succeeded) continue;
-            try pending.append(a, cursor);
-            if (value.value.status != .running or value.value.until_ms +| 30_000 < self.clock.now()) try tickets.append(a, .{ .tenant = self.tenant, .query = query, .stage = current.value.stage, .task = cursor });
+            if (status.status == .succeeded) continue;
+            try pending.append(a, id);
+            if (status.status != .running or status.until_ms +| 30_000 < self.clock.now()) try tickets.append(a, .{ .tenant = self.tenant, .query = query, .stage = current.value.stage, .task = id });
         }
         // Persist the dispatch intent first. Lost acknowledgements and process
         // loss replay only this bounded set, without relying on queue delivery.
@@ -328,6 +328,7 @@ pub const Service = struct {
             try self.store().checkpointResolved(a, query_key, claim, current.value.stage + 1, 0, &.{}, null, null, resolved);
         } else try self.store().checkpointTasks(a, query_key, claim, current.value.stage, cursor, pending.items);
         if (tickets.items.len != 0) try dispatcher.dispatch(dispatcher.ptr, tickets.items, self.context);
+        if (cursor < count and pending.items.len < spec.limits.concurrency) if (self.coordination) |coordination| coordination.retry(coordination.ptr, query);
         return false;
     }
     /// Invoke only after authenticating the internal caller. Tickets contain no
@@ -708,6 +709,34 @@ pub const Service = struct {
         return dependencies.items;
     }
     pub fn turn(self: Service, query: state.Query, dispatcher: Dispatcher) !bool {
+        if (self.async_control) {
+            const key = try self.store().key(self.a, query, null, 0);
+            defer self.a.free(key);
+            var current = (try self.store().load(self.a, key)) orelse return error.SqlExecutionNotFound;
+            defer current.deinit(self.a);
+            try self.authorize(self.a, query, current.value);
+            if (current.value.status == .succeeded) return true;
+            if (current.value.terminal()) return error.SqlExecutionFailed;
+            self.notify(query);
+            return false;
+        }
+        var scoped = self;
+        if (self.coordination != null) {
+            const deadline = @import("antfly_platform").time.monotonicNs() +| 10_000 * std.time.ns_per_ms;
+            scoped.context.deadline_ns = if (scoped.context.deadline_ns) |parent| @min(parent, deadline) else deadline;
+        }
+        return scoped.turnBounded(query, dispatcher) catch |err| {
+            if (self.coordination != null and (err == error.Canceled or err == error.Cancelled or err == error.DeadlineExceeded)) {
+                // A scheduling quantum is not the statement deadline. Persisted
+                // intent is replayable; allow the caller to keep polling.
+                self.context.ensureActive() catch return err;
+                self.notify(query);
+                return false;
+            }
+            return err;
+        };
+    }
+    fn turnBounded(self: Service, query: state.Query, dispatcher: Dispatcher) !bool {
         if (self.coordination) |coordination| if (!coordination.enter(coordination.ptr, query)) return false;
         defer if (self.coordination) |coordination| coordination.leave(coordination.ptr, query);
         errdefer if (self.coordination) |coordination| coordination.retry(coordination.ptr, query);

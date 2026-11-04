@@ -116,8 +116,31 @@ pub const Runner = struct {
     exchange_store: exchange.Store,
     context: Context,
     spill: ?*local.sql_spill.Manager = null,
+    predicates: ?*@import("expression.zig").Task = null,
     pub fn run(self: Runner, query: plan.Digest, specification: plan.Plan, task: plan.Task, dependencies: []const state.Output) !state.Output {
         try self.context.ensureActive();
+        const left_filter = switch (task.kind) {
+            .map_left, .bucket_join, .broadcast_probe => specification.left.filter,
+            else => null,
+        };
+        const right_filter = switch (task.kind) {
+            .scan_build, .map_right, .bucket_join => specification.right.filter,
+            else => null,
+        };
+        const condition = switch (task.kind) {
+            .bucket_join, .broadcast_probe, .reduce, .tile_pair => specification.join.condition,
+            else => null,
+        };
+        var predicates = try @import("expression.zig").Task.init(self.a, self.context, specification.limits.task_memory, left_filter, right_filter, condition);
+        defer predicates.deinit();
+        var prepared = self;
+        prepared.predicates = &predicates;
+        return prepared.runPrepared(query, specification, task, dependencies);
+    }
+    pub fn predicate(self: Runner, kind: @import("expression.zig").Task.Kind, cells: []const Datum) !bool {
+        return (self.predicates orelse return error.InvalidSqlExecutionState).matches(kind, cells);
+    }
+    fn runPrepared(self: Runner, query: plan.Digest, specification: plan.Plan, task: plan.Task, dependencies: []const state.Output) !state.Output {
         return switch (task.kind) {
             .merge_probe_matches, .merge_build_matches => @import("skew_runner.zig").merge(self, query, specification, task, dependencies),
             .consolidate => self.consolidate(query, specification, task, dependencies),
@@ -180,7 +203,7 @@ pub const Runner = struct {
             if (count > spec.limits.task_scan_rows) return error.SqlJoinBudgetExceeded;
             for (rows) |cells| {
                 if (cells.len != input.columns.len) return error.InvalidSqlBackendResponse;
-                if (input.filter) |filter| if (!try filter.matches(self.a, cells)) continue;
+                if (input.filter != null) if (!try self.predicate(if (task.kind == .map_left) .left else .right, cells)) continue;
                 var key: [32]Datum = undefined;
                 const hashed = try operators.HashJoin.keyHash(try keys(cells, ordinals, &key));
                 if (hashed == null and (if (task.kind == .map_left) !spec.join.preservesProbe() else !spec.join.preservesBuild())) continue;
@@ -226,7 +249,7 @@ pub const Runner = struct {
                     if (cells.len != spec.right.columns.len) return error.InvalidSqlBackendResponse;
                     input_rows += 1;
                     if (input_rows > spec.limits.task_scan_rows) return error.SqlJoinBudgetExceeded;
-                    if (spec.right.filter) |filter_| if (!try filter_.matches(self.a, cells)) continue;
+                    if (spec.right.filter != null) if (!try self.predicate(.right, cells)) continue;
                     var key: [32]Datum = undefined;
                     const values = try keys(cells, spec.join.right_keys, &key);
                     if (!spec.join.preservesBuild() and try operators.HashJoin.keyHash(values) == null) continue;
@@ -275,7 +298,7 @@ pub const Runner = struct {
                 for (rows) |cells| {
                     input_rows += 1;
                     if (input_rows > spec.limits.task_scan_rows) return error.SqlJoinBudgetExceeded;
-                    if (spec.left.filter) |filter_| if (!try filter_.matches(self.a, cells)) continue;
+                    if (spec.left.filter != null) if (!try self.predicate(.left, cells)) continue;
                     try self.probe(spec, hash, cells, &output, &row_arena);
                 }
             }
@@ -347,11 +370,11 @@ pub const Runner = struct {
             try self.context.ensureActive();
             _ = scratch.reset(.free_all);
             if (pair.left != null and pair.right != null) {
-                if (spec.join.condition) |condition| {
+                if (spec.join.condition != null) {
                     const cells = try scratch.allocator().alloc(Datum, pair.left.?.len + pair.right.?.len);
                     @memcpy(cells[0..pair.left.?.len], pair.left.?);
                     @memcpy(cells[pair.left.?.len..], pair.right.?);
-                    if (!try condition.matches(self.a, cells)) continue;
+                    if (!try self.predicate(.condition, cells)) continue;
                 }
                 if (pair.match) |match| try join_.accept(match);
             }
@@ -411,11 +434,11 @@ pub const Runner = struct {
             try self.context.ensureActive();
             _ = scratch.reset(.free_all);
             const right = try match.materializeValues(scratch.allocator());
-            if (spec.join.condition) |condition| {
+            if (spec.join.condition != null) {
                 const cells = try scratch.allocator().alloc(Datum, left.len + right.len);
                 @memcpy(cells[0..left.len], left);
                 @memcpy(cells[left.len..], right);
-                if (!try condition.matches(self.a, cells)) continue;
+                if (!try self.predicate(.condition, cells)) continue;
             }
             matched = true;
             try hash.markMatched(match.index);

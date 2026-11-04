@@ -26,11 +26,15 @@ pub const Turns = struct {
     scheduler: ?*Scheduler = null,
     active: [256]?state.Query = @splat(null),
     pub fn port(self: *Turns) runtime.Coordination {
-        return .{ .ptr = self, .enter = enter, .leave = leave, .delivery_pending = pending, .delivery_ready = ready, .retry = retry };
+        return .{ .ptr = self, .enter = enter, .leave = leave, .delivery_pending = pending, .delivery_ready = ready, .has_progress = progress, .retry = retry };
     }
     fn pending(raw: *anyopaque, query: state.Query) bool {
         const self: *Turns = @ptrCast(@alignCast(raw));
         return if (self.scheduler) |scheduler| scheduler.hasPending(query) else false;
+    }
+    fn progress(raw: *anyopaque, query: state.Query) bool {
+        const self: *Turns = @ptrCast(@alignCast(raw));
+        return if (self.scheduler) |scheduler| scheduler.hasProgress(query) else true;
     }
     fn ready(raw: *anyopaque, query: state.Query) bool {
         const self: *Turns = @ptrCast(@alignCast(raw));
@@ -91,6 +95,14 @@ pub const Scheduler = struct {
         };
         return false;
     }
+    fn hasProgress(self: *Scheduler, query: state.Query) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.slots) |slot| if (slot.query) |value| {
+            if (std.meta.eql(value, query)) return slot.dirty;
+        };
+        return true;
+    }
     fn consumeProgress(self: *Scheduler, query: state.Query) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -141,6 +153,7 @@ pub const Scheduler = struct {
         defer self.mutex.unlock(self.io);
         if (self.stopping.load(.acquire)) return error.Canceled;
         self.retireExpired();
+        var overflow = false;
         for (tickets) |ticket| {
             if (ticket.query.expires_ms <= self.clock.now()) continue;
             var slot_id: ?usize = null;
@@ -166,8 +179,14 @@ pub const Scheduler = struct {
             if (duplicate) continue;
             // Do not block a coordinator on task capacity. Its persisted
             // pending set replays tickets that do not fit this local queue.
-            const id = free_node orelse continue;
-            const slot_index = slot_id orelse free_slot orelse continue;
+            const id = free_node orelse {
+                overflow = true;
+                continue;
+            };
+            const slot_index = slot_id orelse free_slot orelse {
+                overflow = true;
+                continue;
+            };
             const slot = &self.slots[slot_index];
             if (slot.query == null) slot.* = .{ .query = ticket.query, .tenant = ticket.tenant };
             self.nodes[id] = .{ .ticket = ticket, .slot = @intCast(slot_index) };
@@ -175,6 +194,7 @@ pub const Scheduler = struct {
             slot.tail = @intCast(id);
             self.available.signal(self.io);
         }
+        if (overflow) return error.SqlWorkerUnavailable;
     }
     // Caller holds mutex. One ticket per query in round-robin order prevents
     // a large query's concurrency window from monopolizing queued delivery.
@@ -338,7 +358,7 @@ test "distributed SQL scheduler fairly rotates bounded queues and deduplicates i
     for (0..1100) |i| {
         var ticket = a;
         ticket.task = @intCast(i);
-        try port.dispatch(port.ptr, &.{ticket}, .{});
+        if (i < 1024) try port.dispatch(port.ptr, &.{ticket}, .{}) else try std.testing.expectError(error.SqlWorkerUnavailable, port.dispatch(port.ptr, &.{ticket}, .{}));
     }
     var count: usize = 0;
     while (scheduler.take()) |id| {

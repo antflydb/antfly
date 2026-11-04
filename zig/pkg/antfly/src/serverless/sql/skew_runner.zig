@@ -115,11 +115,11 @@ pub fn pair(self: anytype, query: plan.Digest, spec: plan.Plan, task: plan.Task,
                     try self.context.ensureActive();
                     _ = matches.reset(.free_all);
                     const right_cells = try match.materializeValues(matches.allocator());
-                    if (spec.join.condition) |condition| {
+                    if (spec.join.condition != null) {
                         const joined = try matches.allocator().alloc(Datum, cells.len + right_cells.len);
                         @memcpy(joined[0..cells.len], cells);
                         @memcpy(joined[cells.len..], right_cells);
-                        if (!try condition.matches(self.a, joined)) continue;
+                        if (!try self.predicate(.condition, joined)) continue;
                     }
                     matched = true;
                     if (match.index >= right_rows) return error.InvalidSqlExchange;
