@@ -931,6 +931,7 @@ pub const NativePort = struct {
         context.sql_completion = null;
         context.sql_completion_submission = null;
         try context.ensureActive();
+        if (input == .sql_lock_mutate) if (!try @import("sql_data_locks.zig").beforeMetadataMutation(self.server, a, context, input.sql_lock_mutate)) return error.MetadataMutationOutcomeUnknown;
         return self.server.source.systemCatalog(a, context, input);
     }
 };

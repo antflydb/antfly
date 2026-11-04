@@ -96,6 +96,7 @@ pub fn applyReplicatedTransactionMutationInternal(
                 _ = try db.beginExternalTransaction(.{
                     .txn_id = begin.txn_id,
                     .owner = owner,
+                    .sql_locks = begin.sql_locks,
                     .begin_timestamp = begin.begin_timestamp,
                     .created_at_ns = begin.created_at_ns,
                     .participants = durable_participants,

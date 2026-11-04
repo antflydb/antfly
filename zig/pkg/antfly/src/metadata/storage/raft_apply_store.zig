@@ -20957,7 +20957,7 @@ pub const RaftApplyStore = struct {
         // An admitted external cohort pins physical owners and definitions
         // until every native terminal handoff is durable. This is a point
         // counter read, not a scan of transaction journals or table rows.
-        if (try PreparedTransactions.tableCount(self.alloc, txn, group_id, table_id) != 0) return error.TableTransitionActive;
+        if (try tableHasSqlParticipants(self.alloc, txn, group_id, table_id)) return error.TableTransitionActive;
         var publication = try system_catalog_storage.loadPolicyPublication(self.alloc, txn, group_id, table_id);
         defer if (publication) |*value| value.deinit();
         const value = publication orelse return true;
@@ -26179,7 +26179,7 @@ pub const RaftApplyStore = struct {
         if (mutation.kind == .table) {
             if (mutation.action == .create) return;
             const table = (try reader.store.resolveSystemCatalogResultTxn(system_catalog.ResolvedTable, reader.view.alloc, reader.view.txn, reader.view.group_id, .{ .database = mutation.database, .namespace = mutation.namespace, .table = mutation.name })) orelse return;
-            if (mutation.action != .comment and try PreparedTransactions.tableCount(reader.view.alloc, reader.view.txn, reader.view.group_id, table.table_id) != 0) return error.TableTransitionActive;
+            if (mutation.action != .comment and try tableHasSqlParticipants(reader.view.alloc, reader.view.txn, reader.view.group_id, table.table_id)) return error.TableTransitionActive;
             if (try reader.store.fkTableLockKindTxn(reader.view.txn, reader.view.group_id, table.table_id)) |kind| if (kind == .sql_drop or kind == .table_retirement) return error.TableTransitionActive;
             return;
         }
@@ -34971,7 +34971,7 @@ pub const RaftApplyStore = struct {
     /// rejection must precede logical unbinding: Raft commits rejected commands
     /// as no-ops, while standalone aborts and exposes the precise policy error.
     fn removeTableTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64, expected_generation: u64) !void {
-        if (try PreparedTransactions.tableCount(self.alloc, txn, group_id, table_id) != 0) return error.TableTransitionActive;
+        if (try tableHasSqlParticipants(self.alloc, txn, group_id, table_id)) return error.TableTransitionActive;
         if (try self.fkGenerationTableLockedTxn(txn, group_id, table_id)) return error.TableTransitionActive;
         const fence = try self.loadTableTransitionFenceTxn(txn, group_id, table_id);
         if (fence.active()) return error.TableTransitionActive;
@@ -36764,7 +36764,7 @@ pub const RaftApplyStore = struct {
                 }
             },
             .drop => |drop| {
-                if (try PreparedTransactions.tableCount(self.alloc, txn, group_id, drop.table_id) != 0) return false;
+                if (try tableHasSqlParticipants(self.alloc, txn, group_id, drop.table_id)) return false;
                 if (!generation_drop and try self.fkGenerationTableLockedTxn(txn, group_id, drop.table_id)) return false;
                 const fence = try self.loadTableTransitionFenceTxn(txn, group_id, drop.table_id);
                 if (fence.active() or fence.generation != drop.expected_transition_generation) return false;
@@ -40035,7 +40035,7 @@ pub const RaftApplyStore = struct {
                 .indexes_json = try resolver_arena.allocator().dupe(u8, existing.indexes_json),
             };
             if (!metadata_table_manager.tableDefinitionsEqual(existing, record) and
-                try PreparedTransactions.tableCount(self.alloc, txn, group_id, record.table_id) != 0) return null;
+                try tableHasSqlParticipants(self.alloc, txn, group_id, record.table_id)) return null;
             if (!published_fk_generation) {
                 const previous_guards = try sql_type_layouts.guardsForDefinitionsAlloc(resolver_arena.allocator(), existing.schema_json, existing.read_schema_json);
                 var changed = previous_guards.len != type_guards.len;
@@ -40684,6 +40684,15 @@ pub const RaftApplyStore = struct {
     }
 
     const SqlLocks = @import("../../system_catalog/lock_authority.zig");
+    fn tableHasSqlParticipants(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: u64) !bool {
+        if (try PreparedTransactions.tableCount(a, txn, group, table) != 0) return true;
+        // Older empty catalogs have no incarnation and cannot contain a lock
+        // enrollment. Once installed, both counters share the same writer cut.
+        var buffer: [192]u8 = undefined;
+        if (try stagingGet(txn, try metadataIncarnationKeyForGroup(&buffer, group)) == null) return false;
+        return try SqlLocks.scopes.Data.tableCount(txn, .{ .home = .metadata, .group = group, .incarnation = try catalogIncarnationTxn(txn, group) }, table) != 0;
+    }
+
     fn validateSqlLockEnvelopeTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, request: SqlLocks.Request) !void {
         try request.validate();
         if (!std.mem.eql(u8, &try catalogIncarnationTxn(txn, group), &request.incarnation)) return error.CatalogGenerationChanged;
@@ -40746,8 +40755,61 @@ pub const RaftApplyStore = struct {
         else
             null;
         try context.ensureActive();
-        return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .group = group, .incarnation = incarnation, .standalone = standalone, .head = try outcomes.head(a), .scope = scope, .owner = owner, .next_work = work, .receipt = receipt, .wait_resource = wait_resource }, .{});
+        const participant = if (query.participant) |selector| participant: {
+            const parent = scope orelse break :participant null;
+            break :participant switch (selector) {
+                .generation => |generation| try SqlLocks.scopes.Data.readParticipant(a, &txn, ns, parent.registration.lease.backend, generation),
+                .route => |selection| try SqlLocks.scopes.Data.find(a, &txn, ns, parent.registration.lease.backend, selection.spec, selection.transaction),
+            };
+        } else null;
+        return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .group = group, .incarnation = incarnation, .standalone = standalone, .head = try outcomes.head(a), .scope = scope, .owner = owner, .next_work = work, .receipt = receipt, .wait_resource = wait_resource, .participant = participant }, .{});
     }
+    /// Every route/schema check shares the enrollment's native metadata
+    /// writer. A resolved table name or a frontend routing cache is no proof.
+    fn validateSqlDataEnrollmentTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, request: SqlLocks.Request) !void {
+        if (request.operation != .data_enroll) return error.InvalidCatalogMutation;
+        var phase: enum { metadata_group, revision, range, table, binding, database, schema } = .metadata_group;
+        errdefer std.log.warn("SQL data enrollment validation rejected phase={s} metadata_group={} table_id={}", .{ @tagName(phase), group, request.operation.data_enroll.spec.route.table_id });
+        const spec = request.operation.data_enroll.spec;
+        const route = spec.route;
+        if (route.metadata_group_id != group) return error.CatalogGenerationChanged;
+        phase = .revision;
+        var revision_buffer: [160]u8 = undefined;
+        const revision_bytes = try stagingGet(txn, if (request.standalone) standalone_revision_key else try catalogRevisionKeyForGroup(&revision_buffer, group));
+        const revision: u64 = if (revision_bytes) |raw| blk: {
+            if (raw.len != 8) return error.InvalidCatalogRecord;
+            break :blk std.mem.readInt(u64, raw[0..8], .little);
+        } else 0;
+        if (route.catalog_revision != revision) {
+            std.log.warn("SQL data enrollment revision changed provided={} current={}", .{ route.catalog_revision, revision });
+            return error.CatalogGenerationChanged;
+        }
+        phase = .range;
+        var range_buffer: [192]u8 = undefined;
+        const raw = try stagingGet(txn, try rangeKeyForGroup(&range_buffer, group, route.route.group_id)) orelse return error.CatalogGenerationChanged;
+        const range = try decodeRangeRecord(a, raw);
+        if (range.table_id != route.table_id or range.group_id != route.route.group_id or
+            metadata_table_manager.rangeDocIdentityShardId(range) != route.route.identity_namespace.shard_id or
+            metadata_table_manager.rangeDocIdentityRangeId(range) != route.route.identity_namespace.range_id or route.route.range_id != route.route.identity_namespace.range_id) return error.CatalogGenerationChanged;
+        if ((try self.loadTableTransitionFenceTxn(txn, group, route.table_id)).active()) return error.CatalogGenerationChanged;
+        phase = .table;
+        const table = try self.getTableByNameTxn(a, txn, group, spec.table_name) orelse return error.CatalogGenerationChanged;
+        if (table.table_id != route.table_id or table.read_schema_json.len != 0 or table.storage_migration != null) return error.CatalogGenerationChanged;
+        phase = .binding;
+        const binding = try system_catalog_storage.getBindingForStorage(a, txn, group, spec.table_name) orelse return error.CatalogGenerationChanged;
+        defer binding.deinit();
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = txn, .group_id = group, .meta = try system_catalog_storage.readMeta(a, txn, group) };
+        phase = .database;
+        const parent = try view.byId(.namespace, binding.value.parent_id) orelse return error.CatalogGenerationChanged;
+        if (parent.parent_id != request.database) return error.CatalogGenerationChanged;
+        phase = .schema;
+        if (spec.schema_version) |version| {
+            if (table.schema_json.len == 0) return error.CatalogGenerationChanged;
+            const declared = try std.json.parseFromSliceLeaky(struct { version: u32 = 0 }, a, table.schema_json, .{ .ignore_unknown_fields = true });
+            if (declared.version != version) return error.CatalogGenerationChanged;
+        } else if (table.schema_json.len != 0) return error.CatalogGenerationChanged;
+    }
+
     fn applySqlLockScopeTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, bytes: []const u8) !void {
         if (bytes.len > SqlLocks.max_bytes) return error.CatalogCommandTooLarge;
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
@@ -40772,7 +40834,16 @@ pub const RaftApplyStore = struct {
                 var journal = command_journal.Journal.init(self.alloc, txn);
                 defer journal.deinit();
                 try journal.attach();
-                const effect_result = SqlLocks.apply(a, txn, group, request) catch |err| {
+                const checked_enrollment = if (request.operation == .data_enroll) enrollment: {
+                    self.validateSqlDataEnrollmentTxn(a, txn, group, request) catch |err| {
+                        try journal.rollback();
+                        const rejection = SqlLocks.outcomes.Outcome.fromError(err) orelse return err;
+                        try outcomes.append(a, ordinal, request.admission, hash, rejection);
+                        return;
+                    };
+                    break :enrollment request.operation.data_enroll.spec;
+                } else null;
+                const effect_result = SqlLocks.applyWithEnrollment(a, txn, group, request, checked_enrollment) catch |err| {
                     try journal.rollback();
                     const mapped = SqlLocks.semanticError(err);
                     const rejection = SqlLocks.outcomes.Outcome.fromError(mapped) orelse return mapped;

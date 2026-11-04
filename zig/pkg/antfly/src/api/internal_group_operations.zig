@@ -201,7 +201,7 @@ fn validateHandoffReceiptLookup(input: LookupInput, request: operation.RequestCo
         input.key.len != 0 or input.consistency != .read_index or
         input.options.generation_handoff_install_read_index_certified or
         input.options.include_primary_digest or input.options.relational_integrity_catalog or input.options.relational_integrity_action or
-        input.options.relational_integrity_jobs_json.len != 0 or input.options.group_source_query_json.len != 0 or input.options.relational_index_status_json.len != 0 or
+        input.options.relational_integrity_jobs_json.len != 0 or input.options.sql_lock_query_json.len != 0 or input.options.group_source_query_json.len != 0 or input.options.relational_index_status_json.len != 0 or
         input.options.relational_activation_json.len != 0 or input.options.fields.len != 0)
         return error.InvalidArgument;
 }
@@ -275,6 +275,10 @@ pub const Operations = struct {
     txn_validator: ?TxnValidator = null,
     repair_cancellation_lookup: ?RepairCancellationLookup = null,
     routed_raft_batch_writer: ?RoutedRaftBatchWriter = null,
+    sql_lock_validator: ?struct {
+        ptr: *anyopaque,
+        check: *const fn (*anyopaque, std.mem.Allocator, operation.RequestContext, u64, []const u8, @import("antfly_local_sources").storage_pessimistic_lock_control.Command) anyerror!@import("antfly_local_sources").storage_pessimistic_lock_control.Command,
+    } = null,
 
     fn routedReads(
         self: Operations,
@@ -447,6 +451,12 @@ pub const Operations = struct {
     ) Error!batch_api.BatchResult {
         try request.ensureActive();
         if (self.reject_unrouted_batch) return error.Unsupported;
+        var admitted = input;
+        if (input.sql_lock) |command| {
+            @import("antfly_local_sources").storage_pessimistic_lock_control.validateBatch(input) catch return error.InvalidArgument;
+            const validator = self.sql_lock_validator orelse return error.Unavailable;
+            admitted.sql_lock = validator.check(validator.ptr, alloc, request, group_id, table_name, command) catch return error.Unavailable;
+        }
         const writes = self.writes orelse return error.NotFound;
         const validator = self.batch_validator orelse return error.Unavailable;
         validator.validate(request, table_name, input.writes) catch |err| switch (err) {
@@ -467,7 +477,7 @@ pub const Operations = struct {
                 return error.Internal;
             },
         };
-        _ = (writes.batchGroupLocal(alloc, group_id, table_name, input) catch |err| switch (err) {
+        _ = (writes.batchGroupLocal(alloc, group_id, table_name, admitted) catch |err| switch (err) {
             error.OnlineMergeArtifactCatalogUncoordinated => return error.OnlineMergeArtifactCatalogUncoordinated,
             error.OnlineSourcePinPending => return error.RaftBatchWriteOutcomeUnknown,
             error.RetainedEffectsFull => return retainedBatchPressure(input),
@@ -553,6 +563,10 @@ pub const Operations = struct {
             parsed_fence.?.value.admission_deadline_io = request.deadline_io;
             parsed_fence.?.value.admission_cancellation = request.cancellation;
             break :fence .{ .catalog = parsed_fence.?.value };
+        } else if (input.sql_lock != null) lock: {
+            @import("antfly_local_sources").storage_pessimistic_lock_control.validateBatch(input) catch return error.InvalidArgument;
+            if (input.sql_lock.?.admission.binding.namespace.group != group_id) return error.InvalidArgument;
+            break :lock .transaction;
         } else if (input.merge_source_transition != null) rollback: {
             // Authenticated private cleanup only. The replicated donor state
             // remains responsible for matching this transition and receiver;
@@ -705,6 +719,7 @@ pub const Operations = struct {
             writes.vtable.txn_begin_group_local_with_pre_decision_context != null;
         _ = (writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.begin_timestamp, input.topology_epoch, input.retain_terminal, input.participants, .{
             .external_decision_owner = input.external_decision_owner,
+            .sql_locks = input.sql_locks,
             .route_fence = input.route_fence,
             .restore_staging_scope = input.restore_staging_scope,
             .restore_staging_plan_id = input.restore_staging_plan_id,
@@ -1102,7 +1117,7 @@ pub const Operations = struct {
             if (probe.value.transition_id != null) {
                 if (input.key.len != 0 or input.consistency != .read_index or input.options.restore_staging_scope != null or
                     input.options.include_primary_digest or input.options.relational_integrity_catalog or input.options.relational_integrity_action or
-                    input.options.relational_integrity_jobs_json.len != 0 or input.options.group_source_query_json.len != 0 or input.options.relational_index_status_json.len != 0 or input.options.relational_activation_json.len != 0 or input.options.fields.len != 0) return error.InvalidArgument;
+                    input.options.relational_integrity_jobs_json.len != 0 or input.options.sql_lock_query_json.len != 0 or input.options.group_source_query_json.len != 0 or input.options.relational_index_status_json.len != 0 or input.options.relational_activation_json.len != 0 or input.options.fields.len != 0) return error.InvalidArgument;
                 var scoped = std.json.parseFromSlice(@import("../raft/shard_ops.zig").TopologyReadRequest, alloc, input.options.relational_topology_json, .{}) catch return error.InvalidArgument;
                 defer scoped.deinit();
                 const ops = self.shard_ops orelse return error.NotFound;

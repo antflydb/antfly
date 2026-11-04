@@ -2279,6 +2279,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL LIKE full ownership lifetime retires borrowed defaults and fresh identities through cold owners",
             "mounted SQL original prepared transactions retain multi-owner intents across complete cold restart",
             "mounted SQL original advisory locks",
+            "mounted SQL original table and row locks",
             "mounted SQL native sync controls",
             "pgwire native sync controls",
             "pgwire transaction preparation",
@@ -2448,7 +2449,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const sql_locking_tests = b.addTest(.{
         .root_module = sql_owner_lifecycle_test_mod,
-        .filters = &.{ "mounted SQL original advisory locks", "mounted SQL native sync controls", "mounted SQL original prepared transactions", "pgwire transaction preparation" },
+        .filters = &.{ "mounted SQL original advisory locks", "mounted SQL original table and row locks", "mounted SQL native sync controls", "mounted SQL original prepared transactions", "pgwire transaction preparation" },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) (if (optimize == .debug) 21 else 12) else 7) * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });

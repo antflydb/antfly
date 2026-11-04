@@ -113,6 +113,15 @@ pub const Aggregate = struct {
             if (value.class != self.class) return error.InvalidLockClass;
             break :blk value.mask();
         } else 0;
+        return self.blockedCounts(requested, own_mask);
+    }
+    /// Ordinary native operations have no SQL backend to subtract. A read-only
+    /// conflict probe must not invent a registered owner or acquire a grant.
+    pub fn blockedUnowned(self: Aggregate, requested: Mode) !bool {
+        return self.blockedCounts(requested, 0);
+    }
+    fn blockedCounts(self: Aggregate, requested: Mode, own_mask: u8) !bool {
+        if (self.class != requested.class()) return error.InvalidLockClass;
         for (self.owners, 0..) |count, index| {
             const bit = @as(u8, 1) << @as(u3, @intCast(index));
             if (index >= modeCount(self.class) and count != 0) return error.InvalidLockRecord;

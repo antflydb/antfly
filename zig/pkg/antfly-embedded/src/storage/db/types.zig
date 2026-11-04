@@ -290,6 +290,7 @@ pub const MergeReplicationCheckpoint = struct {
 /// replay is deterministic on followers and after restart.
 pub const TransactionMutation = union(enum) {
     begin: struct {
+        sql_locks: ?@import("../pessimistic_lock_transaction.zig").Ref = null,
         external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
         txn_id: TxnId,
         begin_timestamp: u64,
@@ -336,6 +337,8 @@ pub const TransactionMutation = union(enum) {
 };
 
 pub const BatchRequest = struct {
+    /// Private owner-leader checked lock control; never public batch JSON.
+    sql_lock: ?@import("../pessimistic_lock_control.zig").Command = null,
     /// Private ordered curator decision; never accepted from public batch JSON.
     resolver_review: ?@import("resolver_review.zig").Command = null,
     /// Trusted ingress attaches a signed write principal and the admission
@@ -1459,6 +1462,8 @@ pub const LookupOptions = struct {
     relational_index_status_json: []const u8 = "",
     /// Authenticated private grouped-source control read.
     group_source_query_json: []const u8 = "",
+    /// Authenticated native lock observation, never accepted by public lookup.
+    sql_lock_query_json: []const u8 = "",
     relational_topology_json: []const u8 = "",
     /// Local FK source-control capability. Never parsed from HTTP or encoded
     /// on the lookup wire; only the authenticated owner receiver sets it.
@@ -4452,6 +4457,7 @@ pub const IndexRepairWake = union(enum) {
 /// One borrowed, synchronous native resolution authority. Ordered replay
 /// supplies its own receipt; public commit bodies cannot construct this value.
 pub const ExternalTransactionBegin = struct {
+    sql_locks: ?@import("../pessimistic_lock_transaction.zig").Ref = null,
     txn_id: TxnId,
     owner: @import("../transactions.zig").ExternalDecisionOwner,
     begin_timestamp: u64,

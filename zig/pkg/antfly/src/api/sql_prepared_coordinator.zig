@@ -213,6 +213,7 @@ pub const Registry = struct {
         var nonce: [16]u8 = undefined;
         try self.server.embedding_provider_runtime.io.randomSecure(&nonce);
         const request: types.Request = .{ .admission = .{ .head = before.head, .nonce = nonce }, .incarnation = before.incarnation, .standalone = before.standalone, .actor = query.actor, .database = query.database, .backend = ref.backend, .operation = .{ .release_unadmitted = try seal.admissionRequest() } };
+        if (!try @import("sql_data_locks.zig").beforeMetadataMutation(self.server, a, context, request)) return false;
         const bytes = try self.server.source.systemCatalog(a, context, .{ .sql_lock_mutate = request });
         const result = (try std.json.parseFromSliceLeaky(?types.outcomes.Outcome, a, bytes, .{})) orelse return error.MetadataMutationOutcomeUnknown;
         _ = try result.result();
@@ -248,6 +249,7 @@ pub const Registry = struct {
         var nonce: [16]u8 = undefined;
         try self.server.embedding_provider_runtime.io.randomSecure(&nonce);
         const request: types.Request = .{ .admission = .{ .nonce = nonce, .head = before.head }, .incarnation = anchor.incarnation, .standalone = anchor.standalone, .actor = query.actor, .database = identity.database_id, .backend = ref.backend, .operation = .{ .release = expected } };
+        if (!try @import("sql_data_locks.zig").beforeMetadataMutation(self.server, a, context, request)) return false;
         const result = try std.json.parseFromSliceLeaky(types.outcomes.Outcome, a, try self.server.source.systemCatalog(a, context, .{ .sql_lock_mutate = request }), .{});
         _ = try result.result();
         self.server.sql_lock_work_pending.store(true, .release);
@@ -377,6 +379,7 @@ pub fn advanceLockWork(server: *http.ApiHttpServer, after: *?@import("../system_
         .{ .fence = .{ .expired = .{ .expected_expiry = scope.registration.lease.expires_at_ms, .observed_at_ms = now_ms } } }
     else if (scope.transaction) |transaction| .{ .release = transaction } else .close_step;
     const request: types.Request = .{ .admission = .{ .nonce = nonce, .head = cut.head }, .incarnation = cut.incarnation, .standalone = cut.standalone, .actor = actor, .database = scope.registration.lease.database, .backend = work.backend, .operation = operation };
+    if (!try @import("sql_data_locks.zig").beforeMetadataMutation(server, a, context, request)) return true;
     const outcome = try std.json.parseFromSliceLeaky(types.outcomes.Outcome, a, try server.source.systemCatalog(a, context, .{ .sql_lock_mutate = request }), .{});
     _ = outcome.result() catch |err| switch (err) {
         error.CatalogGenerationChanged, error.CatalogPublicationProofPending => return true,
@@ -556,6 +559,16 @@ pub fn commitScoped(server: *http.ApiHttpServer, user: ?http.AuthenticatedIdenti
     recoverSessionWithContext(server, id, bytes, false, false, false, context) catch {};
     var observed = (server.txn_sessions.getSqlState(server.alloc, id) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
     defer observed.deinit(server.alloc);
+    // A terminal decision is durable before native lock retirement. Keep the
+    // SQL command loan until its exact completion is acknowledged: otherwise a
+    // successful ROLLBACK/COMMIT can leave locks visible to the next command.
+    // Recovery resumes the same decision if the caller's deadline expires.
+    if (observed.terminal_abort or observed.terminal != null) {
+        drainSessionCompletion(server, id, context) catch return .{
+            .outcome = if (observed.terminal_abort) .unknown else .committed_pending,
+            .reconciliation_id = id,
+        };
+    }
     return .{ .outcome = if (observed.terminal_abort) .aborted else if (observed.terminal) |terminal| switch (terminal) {
         .committed => if (observed.terminal_repair_required) .committed_repair_required else .committed,
         .committed_recovery_pending, .committed_visibility_pending => .committed_pending,

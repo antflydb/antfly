@@ -473,6 +473,7 @@ pub const OwnedBatchRequest = struct {
     restore_staging: ?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").Control) = null,
     online_source: ?std.json.Parsed(@import("../storage/db/online_source_contract.zig").Command) = null,
     group_source: ?std.json.Parsed(@import("../storage/db/group_source_contract.zig").Command) = null,
+    sql_lock: ?std.json.Parsed(@import("../storage/pessimistic_lock_control.zig").Command) = null,
     resolver_review: ?std.json.Parsed(@import("../storage/db/resolver_review.zig").Command) = null,
     artifact_catalog: ?std.json.Parsed(@import("../storage/db/artifact_inventory.zig").Command) = null,
     artifact_publication: ?std.json.Parsed(@import("../storage/db/artifact_publication.zig").Command) = null,
@@ -510,6 +511,7 @@ pub const OwnedBatchRequest = struct {
         if (self.restore_staging) |*control| control.deinit();
         if (self.online_source) |*control| control.deinit();
         if (self.group_source) |*control| control.deinit();
+        if (self.sql_lock) |*control| control.deinit();
         if (self.resolver_review) |*control| control.deinit();
         if (self.artifact_catalog) |*control| control.deinit();
         if (self.artifact_publication) |*control| control.deinit();
@@ -913,6 +915,18 @@ fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_
         break :control @as(?std.json.Parsed(@import("../storage/db/group_source_contract.zig").Command), parsed_control);
     } else null;
     errdefer if (group_source) |*control| control.deinit();
+    var sql_lock = if (root.get("_sql_lock")) |value| control: {
+        if (!allow_internal) return error.InvalidBatchRequest;
+        const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
+        if (marker != .object or marker.object.count() != 1) return error.InvalidBatchRequest;
+        const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "sql_lock_v1")) return error.InvalidBatchRequest;
+        const parsed_control = try std.json.parseFromValue(@import("../storage/pessimistic_lock_control.zig").Command, alloc, value, .{ .allocate = .alloc_always });
+        errdefer parsed_control.deinit();
+        try parsed_control.value.validate();
+        break :control @as(?std.json.Parsed(@import("../storage/pessimistic_lock_control.zig").Command), parsed_control);
+    } else null;
+    errdefer if (sql_lock) |*control| control.deinit();
     var resolver_review = if (root.get("_resolver_review")) |value| control: {
         if (!allow_internal) return error.InvalidBatchRequest;
         const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
@@ -1347,6 +1361,10 @@ fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_
             if (group_source == null or object.count() != 1) return error.InvalidBatchRequest;
             break :merge null;
         }
+        if (std.mem.eql(u8, kind_value.string, "sql_lock_v1")) {
+            if (sql_lock == null or object.count() != 1) return error.InvalidBatchRequest;
+            break :merge null;
+        }
         if (std.mem.eql(u8, kind_value.string, "resolver_review_v1")) {
             if (resolver_review == null or object.count() != 1) return error.InvalidBatchRequest;
             break :merge null;
@@ -1492,6 +1510,13 @@ fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_
             }
             break :transaction .{ .begin = .{
                 .external_decision_owner = external_owner,
+                .sql_locks = if (object.get("sql_locks")) |lock_value| ref: {
+                    if (!external_begin) return error.InvalidBatchRequest;
+                    const parsed_ref = try std.json.parseFromValue(@import("../storage/pessimistic_lock_transaction.zig").Ref, alloc, lock_value, .{});
+                    defer parsed_ref.deinit();
+                    try parsed_ref.value.validate(txn_id, external_owner.?);
+                    break :ref parsed_ref.value;
+                } else null,
                 .txn_id = txn_id,
                 .begin_timestamp = try parseInternalU64(object.get("begin_timestamp") orelse return error.InvalidBatchRequest),
                 .created_at_ns = try parseInternalU64(object.get("created_at_ns") orelse return error.InvalidBatchRequest),
@@ -1637,6 +1662,7 @@ fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_
         .restore_staging = restore_staging,
         .online_source = online_source,
         .group_source = group_source,
+        .sql_lock = sql_lock,
         .resolver_review = resolver_review,
         .artifact_catalog = artifact_catalog,
         .artifact_publication = artifact_publication,
@@ -1675,6 +1701,7 @@ fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_
             .restore_staging = if (restore_staging) |control| control.value else null,
             .online_source = if (online_source) |control| control.value else null,
             .group_source = if (group_source) |control| control.value else null,
+            .sql_lock = if (sql_lock) |control| control.value else null,
             .resolver_review = if (resolver_review) |control| control.value else null,
             .artifact_catalog = if (artifact_catalog) |control| control.value else null,
             .artifact_publication = if (artifact_publication) |control| control.value else null,
@@ -1813,6 +1840,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_types.BatchRequest,
     try @import("../storage/db/relational_index_raft_contract.zig").validateBatchRequest(req);
     try @import("../storage/db/resolver_review.zig").validateRequest(req);
     try db_types.validateLeannRecordCommand(req);
+    if (req.sql_lock != null) try @import("../storage/pessimistic_lock_control.zig").validateBatch(req);
     try @import("../storage/db/group_source_contract.zig").validateRequest(req);
     try @import("../storage/db/artifact_publication.zig").validateRequest(alloc, req);
     try @import("../storage/db/artifact_publication_transport.zig").validateBatchRequest(req);
@@ -2065,6 +2093,12 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_types.BatchRequest,
         defer alloc.free(encoded);
         try writer.writeAll(encoded);
     }
+    if (req.sql_lock) |control| {
+        try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"sql_lock_v1\"},\"_sql_lock\":");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, control, .{});
+        defer alloc.free(encoded);
+        try writer.writeAll(encoded);
+    }
     if (req.resolver_review) |control| {
         try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"resolver_review_v1\"},\"_resolver_review\":");
         const encoded = try std.json.Stringify.valueAlloc(alloc, control, .{});
@@ -2296,6 +2330,10 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_types.BatchRequest,
                     try writer.print("{f}", .{std.json.fmt(participant, .{})});
                 }
                 try writer.writeByte(']');
+                if (begin.sql_locks) |ref| {
+                    try ref.validate(begin.txn_id, begin.external_decision_owner orelse return error.InvalidBatchRequest);
+                    try writer.print(",\"sql_locks\":{f}", .{std.json.fmt(ref, .{})});
+                }
                 if (begin.external_decision_owner) |owner| {
                     try owner.validate();
                     if (!begin.retain_terminal) return error.InvalidBatchRequest;

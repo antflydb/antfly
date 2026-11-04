@@ -23331,7 +23331,7 @@ pub const ProvisionedTableWriteSource = struct {
             try self.applyRestoreStagingBatch(alloc, table_name, group_id, .{
                 .restore_staging_scope = scope,
                 .restore_staging_plan_id = context.restore_staging_plan_id,
-                .transaction = .{ .begin = .{ .txn_id = txn_id, .begin_timestamp = begin_timestamp, .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null), .topology_epoch = topology_epoch, .retain_terminal = retain_terminal or context.external_decision_owner != null, .external_decision_owner = context.external_decision_owner, .participants = participants } },
+                .transaction = .{ .begin = .{ .txn_id = txn_id, .begin_timestamp = begin_timestamp, .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null), .topology_epoch = topology_epoch, .retain_terminal = retain_terminal or context.external_decision_owner != null, .external_decision_owner = context.external_decision_owner, .sql_locks = context.sql_locks, .participants = participants } },
             }, context);
             return {};
         }
@@ -23349,6 +23349,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .topology_epoch = topology_epoch,
                     .retain_terminal = retain_terminal or context.external_decision_owner != null,
                     .external_decision_owner = context.external_decision_owner,
+                    .sql_locks = context.sql_locks,
                     .participants = participants,
                 } },
             }, context);
@@ -23394,6 +23395,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .topology_epoch = topology_epoch,
                 .retain_terminal = retain_terminal or context.external_decision_owner != null,
                 .external_decision_owner = context.external_decision_owner,
+                .sql_locks = context.sql_locks,
                 .participants = participants,
             } } });
             lockAtomic(&self.local_db_mutex);
@@ -23411,6 +23413,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .topology_epoch = topology_epoch,
                 .retain_terminal = retain_terminal or context.external_decision_owner != null,
                 .external_decision_owner = context.external_decision_owner,
+                .sql_locks = context.sql_locks,
                 .participants = participants,
             } } });
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
@@ -26855,6 +26858,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .topology_epoch = topology_epoch,
                 .retain_terminal = retain_terminal or context.external_decision_owner != null,
                 .external_decision_owner = context.external_decision_owner,
+                .sql_locks = context.sql_locks,
                 .participants = participants,
             } },
         }, topology_epoch, context);

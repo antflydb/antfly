@@ -18581,3 +18581,55 @@ The inventory is **915 implemented / 138 rejected / 449 superseded / 84 unresolv
 (**61 DDL/catalog unresolved**). The seven table/row locking originals remain
 unresolved; native conflict matrices and parser coverage alone do not close them.
 See [public advisory case closure](sql-lock-ownership.md#public-advisory-case-closure).
+
+### Original table and row locking cohort qualified (2026-11-03)
+
+The seven remaining original locking statements now execute unchanged through
+native authenticated SQL owners: sql-0080, sql-0081, sql-0173 and sql-0433 through
+sql-0436. Together with the three previously qualified advisory originals, this
+closes all ten original locking inventory cases. The ledger is **922 implemented /
+138 rejected / 449 superseded / 77 unresolved**, including **59 unresolved
+DDL/catalog cases**. The invalid OF-target original sql-0437 remains rejected;
+its binder regression now proves rejection before catalog authorization or row
+access instead of treating every SELECT locking clause as unsupported syntax.
+
+The SQL LockRows node keeps opaque primary identity, physical version and digest
+through candidate ordering. It locks before predicate recheck, OFFSET/LIMIT and
+fallible projection; SKIP LOCKED refills from later candidates. Its owned typed
+candidate values avoid a second row fetch after an uncontended native grant.
+Candidate scans reuse the same authorized table and UPDATE USING policy context;
+a runtime scan assertion prevents rebinding them as an ordinary SELECT.
+Table modes and row modes use the existing native lock ledger. Metadata enrolls
+bounded per-transaction native participants in the same durable source command;
+actual receiving owners validate physical route/schema identity before grants.
+Ordinary native mutation admission checks the table/row conflict aggregate under
+the existing apply mutex, including key-changing versus non-key writes. Native
+control writes share the ordinary WAL, Raft receipts and standby outbox. Finish,
+cancellation and transaction retirement make bounded durable progress without
+replaying SQL or relying on a surviving request-side participant cache.
+
+The public campaign exposed two integration errors that isolated tests did not:
+schema epoch zero was incorrectly treated as absent, and terminal SQL decisions
+could return before native data-lock retirement. Epoch presence now follows the
+schema's presence rather than its numeric version. COMMIT/ROLLBACK retain the
+command loan while draining the exact durable completion acknowledgement; a
+caller deadline leaves the same decision in recovery rather than replaying SQL.
+
+Qualification: the complete native public Debug executable passed **22 tests,
+zero skips, failures or leaks**. The dedicated campaign executes all seven exact
+statements, independent connection conflicts, NOWAIT SQLSTATE 55P03, SKIP LOCKED
+refill, COMMIT/ROLLBACK release and complete metadata/session/data cold restart.
+The final compiler/runtime selection passed **212 tests** including policy
+context, invalid OF targets, spill admission and allocation-failure cleanup.
+The native LSM/WAL Debug gate separately passed **14 tests**; PostgreSQL 18 passed
+**134 matrix, MVCC, key-update, reentrance and savepoint assertions**. Evidence is
+registered under `sql-qualified-table-row-locks-native-debug` and
+`sql-qualified-lock-matrix-postgres`; inventory integrity still checks all 1,586
+unchanged originals.
+
+These original-statement closures do not qualify arbitrary joined/derived
+LockRows plans or the additional native data-lock integrations with named
+prepared transactions, DML self-exclusion, distributed savepoint delivery and
+ordinary read barriers. The durable participant/2PC boundaries are present, but
+those combinations require their own public tests before they can be described
+as fully activated PostgreSQL locking semantics.

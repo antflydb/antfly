@@ -40,6 +40,7 @@ pub const status_server_response_reserve_ms: u32 = 50;
 /// Process-local execution context established by the receiving node. This is
 /// never serialized directly across the wire.
 pub const PreDecisionContext = struct {
+    sql_locks: ?@import("../storage/pessimistic_lock_transaction.zig").Ref = null,
     external_decision_owner: ?@import("../storage/transactions.zig").ExternalDecisionOwner = null,
     route_fence: ?@import("../metadata/catalog_route_contract.zig").CatalogRouteFence = null,
     restore_staging_scope: ?[32]u8 = null,

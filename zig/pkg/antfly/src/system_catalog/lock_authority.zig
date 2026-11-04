@@ -40,6 +40,9 @@ pub const Request = struct {
         renew: struct { expected_expiry: u64, expires_at_ms: u64, observed_at_ms: u64 },
         fence: scopes.Fence,
         bind: struct { command: scopes.Command, transaction: [16]u8 },
+        data_enroll: struct { command: scopes.Command, transaction: [16]u8, spec: scopes.Data.Spec },
+        data_ack: struct { generation: u64, command: scopes.Command, native: local.storage_pessimistic_lock_control.Snapshot },
+        data_retire: struct { generation: u64, native: local.storage_pessimistic_lock_control.Snapshot },
         release: scopes.Transaction,
         /// Exact unadmitted purpose, retained locally before dispatch.
         /// Native journal absence/rejection, not that local claim, authorizes cleanup.
@@ -69,6 +72,16 @@ pub const Request = struct {
             },
             .begin, .finish => |command| try command.validate(),
             .bind => |value| try value.command.validate(),
+            .data_enroll => |value| {
+                try value.command.validate();
+                try value.spec.validate(.{ .home = .metadata, .group = value.spec.route.metadata_group_id, .incarnation = self.incarnation });
+                if (std.mem.allEqual(u8, &value.transaction, 0)) return error.InvalidCatalogMutation;
+            },
+            .data_ack => |value| {
+                if (value.generation == 0) return error.InvalidCatalogMutation;
+                try value.command.validate();
+            },
+            .data_retire => |value| if (value.generation == 0) return error.InvalidCatalogMutation,
             .release_unadmitted => |original| {
                 try original.validate();
                 if (original.operation != .admit or !std.mem.eql(u8, &original.incarnation, &self.incarnation) or original.standalone != self.standalone or original.database_id != self.database) return error.InvalidCatalogMutation;
@@ -118,6 +131,37 @@ pub const Context = struct {
     maintenance: bool = false,
     unadmitted: ?prepared.Mutation = null,
     prepared_operation: ?[16]u8 = null,
+    /// Populated only after the accepting metadata writer checks the current
+    /// catalog binding, schema, physical route and transition fences.
+    enrollment: ?scopes.Data.Spec = null,
+    data_proof: ?local.storage_pessimistic_lock_control.Snapshot = null,
+    fn nativeParticipant(self: Context, root: scopes.Record, part: scopes.Data.Participant) !struct { scope: scopes.Record, owner: scopes.ledger.Owner } {
+        try self.requireOwner(root);
+        const native = self.data_proof orelse return error.Forbidden;
+        const scope = native.scope orelse return error.LockOwnerBusy;
+        const owner = native.owner orelse return error.LockOwnerBusy;
+        const ns = part.admission.binding.namespace;
+        try scope.validate(ns);
+        try owner.validate(ns);
+        var registration = try part.admission.registration();
+        registration.lease.expires_at_ms = scope.registration.lease.expires_at_ms;
+        if (!std.meta.eql(registration, scope.registration) or !std.meta.eql(owner.lease, scope.registration.lease)) return error.LockOwnerChanged;
+        return .{ .scope = scope, .owner = owner };
+    }
+    pub fn requireDataCompletion(self: Context, _: anytype, _: scopes.ledger.Namespace, root: scopes.Record, part: scopes.Data.Participant) !void {
+        const native = try self.nativeParticipant(root, part);
+        if (native.scope.command != null or !std.meta.eql(native.scope.completed, @as(?scopes.Command, try part.admission.command())) or native.owner.waiting != null or native.owner.job != null) return error.LockOwnerBusy;
+    }
+    pub fn requireDataRetirement(self: Context, _: anytype, _: scopes.ledger.Namespace, root: scopes.Record, part: scopes.Data.Participant) !void {
+        const native = try self.nativeParticipant(root, part);
+        if (native.scope.state != .retired or native.scope.transaction != null or native.owner.state != .retired or native.owner.resources != 0 or native.owner.waiting != null or native.owner.job != null) return error.LockOwnerBusy;
+        if (self.data_proof.?.frozen) |frozen| if (!frozen.retired or !std.mem.eql(u8, &frozen.ref.admission.transaction, &part.admission.transaction)) return error.LockOwnerBusy;
+    }
+    pub fn requireDataEnrollment(self: Context, _: anytype, _: scopes.ledger.Namespace, value: scopes.Record, spec: scopes.Data.Spec) !void {
+        try self.requireOwner(value);
+        const checked = self.enrollment orelse return error.Forbidden;
+        if (!std.mem.eql(u8, try std.json.Stringify.valueAlloc(self.a, checked, .{}), try std.json.Stringify.valueAlloc(self.a, spec, .{}))) return error.Forbidden;
+    }
     fn requireOwner(self: Context, value: scopes.Record) !void {
         if (value.registration.standalone != self.standalone or value.registration.lease.database != self.database) return error.Forbidden;
         if (self.maintenance and self.actor.session_user.kind == .bootstrap and self.actor.current_role == null) return;
@@ -225,15 +269,27 @@ pub const Context = struct {
     }
 };
 pub fn apply(a: A, txn: anytype, group: u64, request: Request) !?outcomes.LockEffect {
+    return applyWithEnrollment(a, txn, group, request, null);
+}
+pub fn applyWithEnrollment(a: A, txn: anytype, group: u64, request: Request, checked: ?scopes.Data.Spec) !?outcomes.LockEffect {
     try request.validate();
     const ns: scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = request.incarnation };
-    const context: Context = .{ .a = a, .actor = request.actor, .database = request.database, .standalone = request.standalone, .maintenance = request.operation == .close_step or request.operation == .release or request.operation == .release_unadmitted or request.operation == .fence, .unadmitted = if (request.operation == .release_unadmitted) request.operation.release_unadmitted else null };
+    const context: Context = .{ .a = a, .actor = request.actor, .database = request.database, .standalone = request.standalone, .maintenance = request.operation == .close_step or request.operation == .release or request.operation == .release_unadmitted or request.operation == .fence or request.operation == .data_ack or request.operation == .data_retire, .unadmitted = if (request.operation == .release_unadmitted) request.operation.release_unadmitted else null, .enrollment = checked };
+    var checked_context = context;
+    checked_context.data_proof = switch (request.operation) {
+        .data_ack => |value| value.native,
+        .data_retire => |value| value.native,
+        else => null,
+    };
     var receipt: ?scopes.ledger.Receipt = null;
     switch (request.operation) {
         .register => |value| try scopes.register(a, txn, ns, value, context),
         .begin => |command| _ = try scopes.begin(a, txn, ns, request.backend, command, context),
         .finish => |command| try scopes.finish(a, txn, ns, request.backend, command, context),
         .bind => |value| try scopes.bindTransaction(a, txn, ns, request.backend, value.command, value.transaction, context),
+        .data_enroll => |value| _ = try scopes.Data.enroll(a, txn, ns, request.backend, value.command, value.transaction, value.spec, context),
+        .data_ack => |value| try scopes.Data.acknowledge(a, txn, ns, request.backend, value.generation, value.command, checked_context),
+        .data_retire => |value| try scopes.Data.retire(a, txn, ns, request.backend, value.generation, checked_context),
         .release => |value| _ = try scopes.releaseTransaction(a, txn, ns, request.backend, value, context),
         .release_unadmitted => |original| _ = try scopes.releaseTransaction(a, txn, ns, request.backend, .{ .id = original.operation.admit.identity.txn_id }, context),
         .renew => |value| try scopes.renew(a, txn, ns, request.backend, value.expected_expiry, value.expires_at_ms, context),
@@ -274,6 +330,10 @@ pub const Query = struct {
     effect: ?scopes.ledger.Effect = null,
     /// Bounded ingress anchor: one database lookup, no backend/work scan.
     discovery: ?[]const u8 = null,
+    participant: ?union(enum) {
+        generation: u64,
+        route: struct { spec: scopes.Data.Spec, transaction: [16]u8 },
+    } = null,
     pub fn validate(self: Query) !void {
         try self.actor.validate();
         const selectors = @as(u8, @intFromBool(self.backend != null)) + @as(u8, @intFromBool(self.work != null)) + @as(u8, @intFromBool(self.discovery != null));
@@ -281,6 +341,14 @@ pub const Query = struct {
         if (self.discovery) |name| {
             if (self.database != 0 or name.len == 0 or name.len > 256 or !std.unicode.utf8ValidateSlice(name) or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidCatalogMutation;
         }
+        if (self.participant != null and (self.backend == null or self.effect != null)) return error.InvalidCatalogMutation;
+        if (self.participant) |selector| switch (selector) {
+            .generation => |generation| if (generation == 0) return error.InvalidCatalogMutation,
+            .route => |route| {
+                if (std.mem.allEqual(u8, &route.transaction, 0)) return error.InvalidCatalogMutation;
+                try route.spec.validate(.{ .home = .metadata, .group = route.spec.route.metadata_group_id, .incarnation = self.incarnation });
+            },
+        };
         if (self.effect) |effect| {
             try effect.validate();
             if (self.backend == null or !effect.backend.eql(self.backend.?)) return error.InvalidCatalogMutation;
@@ -303,6 +371,7 @@ pub const Snapshot = struct {
     receipt: ?scopes.ledger.Receipt = null,
     wait_resource: ?scopes.ledger.ResourceStamp = null,
     database_id: ?u64 = null,
+    participant: ?scopes.Data.Participant = null,
 };
 
 pub const Observer = struct {

@@ -40,6 +40,7 @@ const table_participant_v3_prefix = @import("antfly_local_sources").api_local_tr
 pub const group_participant_marker = @import("antfly_local_sources").api_local_transaction_contract.group_participant_marker;
 
 pub const TxnBeginRequest = struct {
+    sql_locks: ?@import("antfly_local_sources").storage_pessimistic_lock_transaction.Ref = null,
     external_decision_owner: ?@import("antfly_local_sources").storage_transactions.ExternalDecisionOwner = null,
     route_fence: ?@import("../metadata/api.zig").CatalogRouteFence = null,
     txn_id: db_mod.types.TxnId,
@@ -2732,6 +2733,12 @@ pub fn encodeTxnBeginRequest(alloc: std.mem.Allocator, req: TxnBeginRequest) ![]
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
     }
+    if (req.sql_locks) |ref| {
+        try ref.validate(req.txn_id, req.external_decision_owner orelse return error.InvalidTxnRequest);
+        const bytes = try std.fmt.allocPrint(alloc, ",\"sql_locks\":{f}", .{std.json.fmt(ref, .{})});
+        defer alloc.free(bytes);
+        try out.appendSlice(alloc, bytes);
+    }
     if (req.external_decision_owner) |owner| {
         const encoded = try std.fmt.allocPrint(alloc, ",\"external_decision_owner\":{f}", .{std.json.fmt(owner, .{})});
         defer alloc.free(encoded);
@@ -3073,6 +3080,13 @@ pub fn parseTxnBeginRequest(alloc: std.mem.Allocator, body: []const u8) !TxnBegi
     if (external and (obj.get("retain_terminal") == null or obj.get("retain_terminal").? != .bool or !obj.get("retain_terminal").?.bool)) return error.InvalidTxnRequest;
     return .{
         .external_decision_owner = if (owner) |held| held.value else null,
+        .sql_locks = if (obj.get("sql_locks")) |value| ref: {
+            if (!external) return error.InvalidTxnRequest;
+            const parsed_ref = try std.json.parseFromValue(@import("antfly_local_sources").storage_pessimistic_lock_transaction.Ref, alloc, value, .{});
+            defer parsed_ref.deinit();
+            try parsed_ref.value.validate(txn_id, owner.?.value);
+            break :ref parsed_ref.value;
+        } else null,
         .route_fence = if (route) |held| held.value else null,
         .txn_id = txn_id,
         .begin_timestamp = begin_timestamp,

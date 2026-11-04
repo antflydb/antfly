@@ -1263,7 +1263,7 @@ const Job = struct {
             effective.uses_advisory = effective.uses_advisory or source.uses_advisory;
         };
         const compiled = &effective;
-        const write = self.kind == .execute and compiled.statement.requiresWriteAdmission();
+        const write = self.kind == .execute and compiled.requiresWriteAdmission();
         const server = self.adapter.server;
         var admission = try server.acquireSqlExecution(write);
         defer admission.release();

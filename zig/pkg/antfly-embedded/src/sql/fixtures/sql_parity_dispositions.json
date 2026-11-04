@@ -4673,6 +4673,30 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-qualified-table-row-locks-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-locking-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-lock-matrix-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/check_sql_lock_postgres.py"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -5947,13 +5971,37 @@
     },
     {
       "id": "sql-0080",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original statement executes through authenticated public SQL connections and actual native owner WALs. Independent connections qualify table/row conflicts, NOWAIT SQLSTATE 55P03, SKIP LOCKED refill, native lock-release acknowledgement before successful transaction completion, and cold metadata/session/data recovery. Native lock-journal tests cover conflict matrices, key-changing write strength, cancellation, replay and bounded retirement; PostgreSQL 18 independently checks the table/row matrices, MVCC and savepoint lifetime rules.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_table_lock_integration_test.zig",
+          "test": "mounted SQL original table and row locks execute all seven cases with contention skip locked transaction release and cold recovery",
+          "gate": "sql-qualified-table-row-locks-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_table_lock_integration_test.zig",
+          "test": "mounted SQL original table and row locks execute all seven cases with contention skip locked transaction release and cold recovery",
+          "gate": "sql-qualified-lock-matrix-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0081",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original statement executes through authenticated public SQL connections and actual native owner WALs. Independent connections qualify table/row conflicts, NOWAIT SQLSTATE 55P03, SKIP LOCKED refill, native lock-release acknowledgement before successful transaction completion, and cold metadata/session/data recovery. Native lock-journal tests cover conflict matrices, key-changing write strength, cancellation, replay and bounded retirement; PostgreSQL 18 independently checks the table/row matrices, MVCC and savepoint lifetime rules.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_table_lock_integration_test.zig",
+          "test": "mounted SQL original table and row locks execute all seven cases with contention skip locked transaction release and cold recovery",
+          "gate": "sql-qualified-table-row-locks-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_table_lock_integration_test.zig",
+          "test": "mounted SQL original table and row locks execute all seven cases with contention skip locked transaction release and cold recovery",
+          "gate": "sql-qualified-lock-matrix-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0082",
@@ -7550,8 +7598,20 @@
     },
     {
       "id": "sql-0173",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original statement executes through authenticated public SQL connections and actual native owner WALs. Independent connections qualify table/row conflicts, NOWAIT SQLSTATE 55P03, SKIP LOCKED refill, native lock-release acknowledgement before successful transaction completion, and cold metadata/session/data recovery. Native lock-journal tests cover conflict matrices, key-changing write strength, cancellation, replay and bounded retirement; PostgreSQL 18 independently checks the table/row matrices, MVCC and savepoint lifetime rules.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_table_lock_integration_test.zig",
+          "test": "mounted SQL original table and row locks execute all seven cases with contention skip locked transaction release and cold recovery",
+          "gate": "sql-qualified-table-row-locks-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_table_lock_integration_test.zig",
+          "test": "mounted SQL original table and row locks execute all seven cases with contention skip locked transaction release and cold recovery",
+          "gate": "sql-qualified-lock-matrix-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0174",
@@ -12803,28 +12863,76 @@
     },
     {
       "id": "sql-0433",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original statement executes through authenticated public SQL connections and actual native owner WALs. Independent connections qualify table/row conflicts, NOWAIT SQLSTATE 55P03, SKIP LOCKED refill, native lock-release acknowledgement before successful transaction completion, and cold metadata/session/data recovery. Native lock-journal tests cover conflict matrices, key-changing write strength, cancellation, replay and bounded retirement; PostgreSQL 18 independently checks the table/row matrices, MVCC and savepoint lifetime rules.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_table_lock_integration_test.zig",
+          "test": "mounted SQL original table and row locks execute all seven cases with contention skip locked transaction release and cold recovery",
+          "gate": "sql-qualified-table-row-locks-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_table_lock_integration_test.zig",
+          "test": "mounted SQL original table and row locks execute all seven cases with contention skip locked transaction release and cold recovery",
+          "gate": "sql-qualified-lock-matrix-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0434",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original statement executes through authenticated public SQL connections and actual native owner WALs. Independent connections qualify table/row conflicts, NOWAIT SQLSTATE 55P03, SKIP LOCKED refill, native lock-release acknowledgement before successful transaction completion, and cold metadata/session/data recovery. Native lock-journal tests cover conflict matrices, key-changing write strength, cancellation, replay and bounded retirement; PostgreSQL 18 independently checks the table/row matrices, MVCC and savepoint lifetime rules.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_table_lock_integration_test.zig",
+          "test": "mounted SQL original table and row locks execute all seven cases with contention skip locked transaction release and cold recovery",
+          "gate": "sql-qualified-table-row-locks-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_table_lock_integration_test.zig",
+          "test": "mounted SQL original table and row locks execute all seven cases with contention skip locked transaction release and cold recovery",
+          "gate": "sql-qualified-lock-matrix-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0435",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original statement executes through authenticated public SQL connections and actual native owner WALs. Independent connections qualify table/row conflicts, NOWAIT SQLSTATE 55P03, SKIP LOCKED refill, native lock-release acknowledgement before successful transaction completion, and cold metadata/session/data recovery. Native lock-journal tests cover conflict matrices, key-changing write strength, cancellation, replay and bounded retirement; PostgreSQL 18 independently checks the table/row matrices, MVCC and savepoint lifetime rules.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_table_lock_integration_test.zig",
+          "test": "mounted SQL original table and row locks execute all seven cases with contention skip locked transaction release and cold recovery",
+          "gate": "sql-qualified-table-row-locks-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_table_lock_integration_test.zig",
+          "test": "mounted SQL original table and row locks execute all seven cases with contention skip locked transaction release and cold recovery",
+          "gate": "sql-qualified-lock-matrix-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0436",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original statement executes through authenticated public SQL connections and actual native owner WALs. Independent connections qualify table/row conflicts, NOWAIT SQLSTATE 55P03, SKIP LOCKED refill, native lock-release acknowledgement before successful transaction completion, and cold metadata/session/data recovery. Native lock-journal tests cover conflict matrices, key-changing write strength, cancellation, replay and bounded retirement; PostgreSQL 18 independently checks the table/row matrices, MVCC and savepoint lifetime rules.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_table_lock_integration_test.zig",
+          "test": "mounted SQL original table and row locks execute all seven cases with contention skip locked transaction release and cold recovery",
+          "gate": "sql-qualified-table-row-locks-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_table_lock_integration_test.zig",
+          "test": "mounted SQL original table and row locks execute all seven cases with contention skip locked transaction release and cold recovery",
+          "gate": "sql-qualified-lock-matrix-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0437",
       "status": "rejected",
-      "reason": "The original rejected a read row lock on a non-target relation without a native request or authorization. The current compiler rejects the exact SQL before backend access instead of running its unlocked SELECT prefix.",
+      "reason": "The original rejects a row-lock OF name absent from the SELECT source. The compiler retains locking syntax and the binder rejects the unchanged original with UndefinedTable before catalog authorization, native row access or lock effects; the compiler-owner regression supplies no callable backend.",
       "evidence": [
         {
           "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",

@@ -6628,7 +6628,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}")) and
             !opts.include_primary_digest and !opts.relational_integrity_catalog and !opts.relational_integrity_action and
             !opts.generation_handoff_install_read_index_certified and
-            opts.relational_integrity_jobs_json.len == 0 and opts.group_source_query_json.len == 0 and opts.relational_index_status_json.len == 0 and
+            opts.relational_integrity_jobs_json.len == 0 and opts.sql_lock_query_json.len == 0 and opts.group_source_query_json.len == 0 and opts.relational_index_status_json.len == 0 and
             opts.relational_activation_json.len == 0 and opts.fields.len == 0 and
             opts.restore_staging_scope != null and opts.restore_staging_plan_id != null;
     }
@@ -15954,6 +15954,7 @@ fn lookupRemote(
             .relational_index_status_json = opts.relational_index_status_json,
             .relational_topology_json = opts.relational_topology_json,
             .group_source_query_json = opts.group_source_query_json,
+            .sql_lock_query_json = opts.sql_lock_query_json,
             .restore_staging_scope = opts.restore_staging_scope,
             .restore_staging_plan_id = opts.restore_staging_plan_id,
             .include_primary_digest = opts.include_primary_digest,

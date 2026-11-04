@@ -6674,7 +6674,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (!opts.fk_generation_source_control or !opts.fk_generation_source_read_index_certified or
             key.len != 0 or consistency != .stale or
             opts.relational_integrity_action or opts.relational_integrity_jobs_json.len != 0 or
-            opts.group_source_query_json.len != 0 or opts.relational_index_status_json.len != 0 or
+            (opts.sql_lock_query_json.len != 0 or opts.group_source_query_json.len != 0) or opts.relational_index_status_json.len != 0 or
             opts.row_policy_receipt != null or opts.restore_staging_scope != null or
             opts.include_primary_digest or opts.fields.len != 0) return false;
         // Install completion must inspect durable reference coverage while
@@ -6739,7 +6739,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const handoff_identity = std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}");
         const handoff_receipt = handoff_identity or std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}");
         if (handoff_identity and (fence != null or opts.include_primary_digest or opts.relational_integrity_catalog or opts.relational_integrity_action or
-            opts.relational_integrity_jobs_json.len != 0 or opts.group_source_query_json.len != 0 or opts.relational_index_status_json.len != 0 or
+            opts.relational_integrity_jobs_json.len != 0 or (opts.sql_lock_query_json.len != 0 or opts.group_source_query_json.len != 0) or opts.relational_index_status_json.len != 0 or
             opts.relational_activation_json.len != 0 or opts.fields.len != 0 or opts.generation_handoff_install_read_index_certified)) return error.RestoreStagingScopeChanged;
         if (handoff_receipt and (opts.restore_staging_plan_id == null or key.len != 0)) return error.RestoreStagingScopeChanged;
         var descriptor = try self.resolveRestoreDescriptor(alloc, group_id, table_name, scope, opts.restore_staging_plan_id, if (handoff_receipt) .resolve else .read, .{ .deadline_ns = opts.execution_deadline_ns, .deadline_io = opts.execution_io, .cancellation = opts.cancellation orelse .none });

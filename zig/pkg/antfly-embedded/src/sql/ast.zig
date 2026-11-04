@@ -126,9 +126,28 @@ pub const Window = struct {
     pub const Exclusion = enum { no_others, current, group, ties };
     pub const Frame = struct { mode: enum { rows, range, groups }, start: Bound, end: Bound = .current, exclusion: Exclusion = .no_others };
 };
+/// Syntax owns only names and modes. Execution joins stable native resource
+/// identities and transaction authority after binding and authorization.
+pub const LockWait = enum { block, nowait, skip_locked };
+pub const RowLockClause = struct {
+    mode: @import("../storage/pessimistic_lock_contract.zig").RowMode,
+    relations: []const []const u8 = &.{},
+    wait: LockWait = .block,
+};
+pub const RowLocking = struct { clauses: []const RowLockClause };
+pub const TableLock = struct {
+    pub const Target = struct { name: Name, only: bool = false };
+    targets: []const Target,
+    mode: @import("../storage/pessimistic_lock_contract.zig").TableMode = .access_exclusive,
+    wait: LockWait = .block,
+};
+
 pub const Select = struct {
     /// A relation graph has already classified user callables for this owner.
     catalog_calls_bound: bool = false,
+    /// Cold lock intent must survive lowering, including pagination. A missing
+    /// execution provider must reject it before opening an unlocked producer.
+    locking: ?*const RowLocking = null,
     /// null is a bag; an empty list is DISTINCT over output slots; otherwise
     /// the expressions identify PostgreSQL DISTINCT ON's first-row groups.
     distinct: ?[]const *const Scalar = null,
@@ -752,6 +771,7 @@ pub const Statement = union(enum) {
     copy_from: struct { table: Name, columns: []const []const u8, options: CopyOptions, predicate: ?*const Predicate = null },
     explain: Explain,
     select: Select,
+    lock_table: TableLock,
     insert: Insert,
     update: Update,
     delete: Delete,
@@ -775,7 +795,9 @@ pub const Statement = union(enum) {
     /// writer admission; writable WITH always reserves the mutation lane.
     pub fn requiresWriteAdmission(self: Statement) bool {
         return switch (self) {
-            .select, .explain, .copy_to, .copy_from => false,
+            .select => |query| query.locking != null,
+            .explain, .copy_to, .copy_from => false,
+            .lock_table => true,
             .effect_block, .call, .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints, .set_transaction, .prepared_transaction => true,
         };
     }

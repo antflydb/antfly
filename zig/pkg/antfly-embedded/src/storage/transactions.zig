@@ -495,6 +495,24 @@ fn readPredicateIdentity(predicate: VersionPredicate, out: *[33]u8) []const u8 {
     }
 }
 
+/// Compact native decision state for control journals that share this 2PC
+/// owner. Read it through the accepting write transaction, without materializing
+/// plans or sampling a different snapshot while transferring resource custody.
+pub const ExternalParticipant = struct {
+    owner: ?ExternalDecisionOwner,
+    status: TxnStatus,
+    prepared: bool,
+    commit_version: u64,
+};
+pub fn externalParticipant(txn: anytype, id: TxnId) !?ExternalParticipant {
+    const bytes = txn.get(&makeRecordKey(id)) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    const record = try decodeRecord(bytes);
+    return .{ .owner = record.external_decision_owner, .status = record.status, .prepared = record.prepared, .commit_version = record.commit_version };
+}
+
 pub const TxnError = error{
     VersionConflict,
     IntentConflict,
@@ -1907,6 +1925,11 @@ pub const TxnManager = struct {
     /// Reuse the caller's pinned snapshot or writer view. Schema publication
     /// must not validate its directory against a second, differently cut read.
     pub fn hasTopologySensitiveTransactionsInView(alloc: Allocator, read: anytype) !bool {
+        // Enrollment owns identity before the first row grant. Moving or
+        // restoring that owner must not strand even an empty, fenced scope.
+        if (try @import("pessimistic_lock_resource.zig").Binding.load(read)) |binding| {
+            if (try @import("pessimistic_lock_authority.zig").activeCount(read, binding.namespace) != 0) return true;
+        }
 
         // Resolution normally removes intents and HA outboxes atomically before
         // a transaction becomes quiescent. Check the global prefixes once rather
@@ -2828,6 +2851,16 @@ pub const TxnManager = struct {
             try self.applyMutationExtraBatch(extra_batch);
             return false;
         }
+        {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            var read = try self.store.beginRead();
+            defer read.abort();
+            if (!try @import("pessimistic_lock_transaction.zig").cleanupReady(arena.allocator(), &read, txn_id)) {
+                try self.applyMutationExtraBatch(extra_batch);
+                return false;
+            }
+        }
         const unresolved = try self.getUnresolvedParticipants(self.alloc, txn_id);
         defer freeParticipantList(self.alloc, unresolved);
         if (unresolved.len != 0) {
@@ -3013,6 +3046,8 @@ pub const TxnManager = struct {
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer deletes.deinit(self.alloc);
+        const lock_key = @import("pessimistic_lock_transaction.zig").key(txn_id);
+        try deletes.append(self.alloc, &lock_key);
         const admission_key = makeSidecarKey(intent_admission_prefix, txn_id);
         try deletes.append(self.alloc, &admission_key);
         try deletes.appendSlice(self.alloc, &.{ &record_key, &participant_key, &resolved_key, &hot_standby_batch_key, &hot_standby_replay_key, &intent_keys_key, &schema_lease_key });

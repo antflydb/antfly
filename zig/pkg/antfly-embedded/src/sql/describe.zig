@@ -143,6 +143,7 @@ pub fn scanOrder(a: std.mem.Allocator, binding: BoundStatement, statement: ast.S
     return result;
 }
 pub const BoundStatement = struct {
+    locking: ?*const @import("locking.zig").Plan = null,
     effect_graph: ?*const @import("statement_effects.zig").Bound = null,
     copy_filter: ?bound_scalars.Bound = null,
     parameter_invocation: ?*@import("parameter_binding.zig").Invocation = null,
@@ -427,6 +428,11 @@ pub fn copyRead(allocator: std.mem.Allocator, backend: catalog.Backend, compiled
 /// Internal plans retain full typed descriptors. Wire validation belongs only
 /// at the public statement boundary, never at a derived relation boundary.
 pub fn bindInternal(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, explicit_parameter_types: []const ?ast.ColumnType) anyerror!BoundStatement {
+    // Locking is an execution capability, not a decoration on a read. Keep
+    // every lowering path closed until the provider can retain native grants.
+    if (compiled.statement == .select and compiled.statement.select.locking != null) return @import("locking.zig").bind(allocator, backend, compiled, explicit_parameter_types);
+    if (compiled.uses_row_locks and compiled.statement != .explain) return error.UnsupportedSqlExecution;
+    if (compiled.statement == .lock_table) return @import("locking.zig").bindTables(allocator, backend, compiled.statement.lock_table);
     if (compiled.statement == .copy_to) {
         const read = try copyRead(allocator, backend, compiled);
         return bindInternal(allocator, read.binding_backend, &read.compiled, explicit_parameter_types);

@@ -263,6 +263,12 @@ pub const Compiled = struct {
     uses_current_setting: bool = false,
     uses_sequences: bool = false,
     uses_advisory: bool = false,
+    uses_row_locks: bool = false,
+
+    pub fn requiresWriteAdmission(self: Compiled) bool {
+        if (self.statement == .explain and !self.statement.explain.analyze) return false;
+        return self.uses_row_locks or self.statement.requiresWriteAdmission();
+    }
 
     pub fn deinit(self: *Compiled) void {
         self.arena.deinit();
@@ -359,6 +365,7 @@ pub fn compileDiagnostic(allocator: std.mem.Allocator, sql: []const u8, limits: 
             // PostgreSQL row locks belong to a SELECT producer, not to the
             // mutation itself. Likewise UPDATE/DELETE do not accept ORDER/LIMIT.
             // Never execute a valid mutation prefix while discarding its suffix.
+            .lock_table => error.InvalidSqlSyntax,
             .update, .delete => if (tokens.items[parser.pos].isKeyword(.@"for") or
                 tokens.items[parser.pos].isKeyword(.order) or tokens.items[parser.pos].isKeyword(.limit) or
                 tokens.items[parser.pos].isKeyword(.offset) or tokens.items[parser.pos].isKeyword(.fetch))
@@ -368,7 +375,7 @@ pub fn compileDiagnostic(allocator: std.mem.Allocator, sql: []const u8, limits: 
             else => error.UnsupportedSqlShape,
         }, "unexpected trailing SQL; only one supported statement is allowed");
     }
-    return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting, .uses_sequences = parser.uses_sequences, .uses_advisory = parser.uses_advisory };
+    return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting, .uses_sequences = parser.uses_sequences, .uses_advisory = parser.uses_advisory, .uses_row_locks = parser.uses_row_locks };
 }
 
 fn lexicalError(kind: lexer.LexErrorKind) Error {
@@ -564,6 +571,7 @@ const Parser = struct {
     uses_current_setting: bool = false,
     uses_sequences: bool = false,
     uses_advisory: bool = false,
+    uses_row_locks: bool = false,
     relation_depth: usize = 0,
     into_target: ?*?ast.RelationPopulation = null,
 
@@ -1400,7 +1408,7 @@ const Parser = struct {
             },
             else => return err,
         };
-        if (self.pos < self.tokens.len and self.tokens[self.pos].kind != .semicolon and !self.tokens[self.pos].isKeyword(.order) and !self.tokens[self.pos].isKeyword(.limit) and !self.tokens[self.pos].isKeyword(.offset) and !self.tokens[self.pos].isKeyword(.fetch) and !self.tokens[self.pos].isKeyword(.returning)) {
+        if (self.pos < self.tokens.len and self.tokens[self.pos].kind != .semicolon and !self.tokens[self.pos].isKeyword(.order) and !self.tokens[self.pos].isKeyword(.limit) and !self.tokens[self.pos].isKeyword(.offset) and !self.tokens[self.pos].isKeyword(.fetch) and !self.tokens[self.pos].isKeyword(.returning) and !self.tokens[self.pos].isKeyword(.@"for")) {
             self.pos = start;
             const expression = try self.scalar(0, 0);
             try self.checkScalarDepth(expression, 0);
@@ -1442,6 +1450,71 @@ const Parser = struct {
         return .{ .values_arms = try arms.toOwnedSlice(self.alloc), .generated_values = true };
     }
 
+    fn rowLockClause(self: *Parser) Error!ast.RowLockClause {
+        self.uses_row_locks = true;
+        const mode: @FieldType(ast.RowLockClause, "mode") = if (self.keyword(.update)) .update else if (self.ddlWord("NO")) mode: {
+            if (!self.ddlWord("KEY")) return self.fail(error.InvalidSqlSyntax, "FOR NO requires KEY UPDATE");
+            try self.expectKeyword(.update);
+            break :mode .no_key_update;
+        } else if (self.ddlWord("KEY")) mode: {
+            if (!self.ddlWord("SHARE")) return self.fail(error.InvalidSqlSyntax, "FOR KEY requires SHARE");
+            break :mode .key_share;
+        } else if (self.ddlWord("SHARE")) .share else return self.fail(error.InvalidSqlSyntax, "expected UPDATE, NO KEY UPDATE, SHARE or KEY SHARE");
+        var relations: std.ArrayList([]const u8) = .empty;
+        if (self.ddlWord("OF")) while (true) {
+            try self.node();
+            try relations.append(self.alloc, try self.identifier());
+            if (self.peek(.dot)) return self.fail(error.InvalidSqlSyntax, "locking OF requires unqualified relation aliases");
+            if (!self.take(.comma)) break;
+        };
+        const wait: ast.LockWait = if (self.ddlWord("NOWAIT")) .nowait else if (self.ddlWord("SKIP")) wait: {
+            if (!self.ddlWord("LOCKED")) return self.fail(error.InvalidSqlSyntax, "SKIP requires LOCKED");
+            break :wait .skip_locked;
+        } else .block;
+        if (self.pos < self.tokens.len and !self.tokens[self.pos].owned and
+            (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "NOWAIT") or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "SKIP") or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "LOCKED")))
+            return self.fail(error.InvalidSqlSyntax, "duplicate or conflicting row lock wait policy");
+        return .{ .mode = mode, .relations = try relations.toOwnedSlice(self.alloc), .wait = wait };
+    }
+
+    fn tableLock(self: *Parser) Error!ast.TableLock {
+        _ = self.keyword(.table);
+        var targets: std.ArrayList(ast.TableLock.Target) = .empty;
+        while (true) {
+            try self.node();
+            const only = self.keyword(.only);
+            const target_name = try self.tableReferenceName();
+            if (self.take(.star) and only) return self.fail(error.InvalidSqlSyntax, "ONLY and descendant expansion cannot be combined");
+            try targets.append(self.alloc, .{ .name = target_name, .only = only });
+            if (targets.items.len > 128) return self.fail(error.SqlLimitExceeded, "LOCK TABLE target limit exceeded");
+            if (!self.take(.comma)) break;
+        }
+        var mode: @FieldType(ast.TableLock, "mode") = .access_exclusive;
+        if (self.keyword(.in)) {
+            mode = if (self.ddlWord("ACCESS")) mode: {
+                if (self.ddlWord("SHARE")) break :mode .access_share;
+                if (!self.ddlWord("EXCLUSIVE")) return self.fail(error.InvalidSqlSyntax, "invalid ACCESS lock mode");
+                break :mode .access_exclusive;
+            } else if (self.keyword(.row)) mode: {
+                if (self.ddlWord("SHARE")) break :mode .row_share;
+                if (!self.ddlWord("EXCLUSIVE")) return self.fail(error.InvalidSqlSyntax, "invalid ROW lock mode");
+                break :mode .row_exclusive;
+            } else if (self.ddlWord("SHARE")) mode: {
+                if (self.keyword(.update)) {
+                    if (!self.ddlWord("EXCLUSIVE")) return self.fail(error.InvalidSqlSyntax, "SHARE UPDATE requires EXCLUSIVE");
+                    break :mode .share_update_exclusive;
+                }
+                if (self.keyword(.row)) {
+                    if (!self.ddlWord("EXCLUSIVE")) return self.fail(error.InvalidSqlSyntax, "SHARE ROW requires EXCLUSIVE");
+                    break :mode .share_row_exclusive;
+                }
+                break :mode .share;
+            } else if (self.ddlWord("EXCLUSIVE")) .exclusive else return self.fail(error.InvalidSqlSyntax, "invalid table lock mode");
+            if (!self.ddlWord("MODE")) return self.fail(error.InvalidSqlSyntax, "table lock mode requires MODE");
+        }
+        return .{ .targets = try targets.toOwnedSlice(self.alloc), .mode = mode, .wait = if (self.ddlWord("NOWAIT")) .nowait else .block };
+    }
+
     fn selectFinish(self: *Parser, first: ast.Select) Error!ast.Select {
         var result = try self.setTail(first, 1, 0);
         result.order_by = try self.selectOrder();
@@ -1449,6 +1522,7 @@ const Parser = struct {
         // PostgreSQL admits either pagination-clause order. Normalize FETCH
         // into the same bound as LIMIT, retaining explicit NULL/ALL as an
         // unbounded request rather than a configured-result truncation.
+        var lock_clauses: std.ArrayList(ast.RowLockClause) = .empty;
         var has_limit = false;
         var has_offset = false;
         while (true) {
@@ -1469,7 +1543,15 @@ const Parser = struct {
                 if (!self.keyword(.row)) try self.expectKeyword(.rows);
                 if (self.keyword(.with)) return self.fail(error.UnsupportedSqlShape, "FETCH WITH TIES requires peer-aware result admission");
                 try self.expectKeyword(.only);
+            } else if (self.keyword(.@"for")) {
+                try self.node();
+                try lock_clauses.append(self.alloc, try self.rowLockClause());
             } else break;
+        }
+        if (lock_clauses.items.len != 0) {
+            const locking = try self.alloc.create(ast.RowLocking);
+            locking.* = .{ .clauses = try lock_clauses.toOwnedSlice(self.alloc) };
+            result.locking = locking;
         }
         if (result.distinct == null and result.columns.len == 1 and result.group_by.len == 0 and result.having == null and result.order_by.len == 0) {
             if (result.columns[0].expression) |expression| if (expression.* == .call and expression.call.window == null and expression.call.within_group == null and expression.call.star and !expression.call.distinct and expression.call.filter == null and std.mem.eql(u8, expression.call.name, "count")) {
@@ -4267,6 +4349,7 @@ const Parser = struct {
     }
 
     fn statement(self: *Parser) Error!ast.Statement {
+        if (self.ddlWord("LOCK")) return .{ .lock_table = try self.tableLock() };
         if (self.ddlWord("GRANT")) return .{ .catalog_ddl = try self.authorizationDdl(false, null) };
         if (self.ddlWord("REVOKE")) return .{ .catalog_ddl = try self.authorizationDdl(true, null) };
         if (self.ddlWord("CALL")) {
@@ -5609,23 +5692,29 @@ test "compiler releases all owned allocations on every allocation failure" {
 
 test "compiler diagnostic identifies rejected trailing syntax without retained source" {
     var diagnostic: Diagnostic = .{};
-    try std.testing.expectError(error.UnsupportedSqlShape, compileDiagnostic(std.testing.allocator, "SELECT * FROM t FOR UPDATE", .{}, &diagnostic));
-    try std.testing.expectEqual(@as(usize, 16), diagnostic.start);
-    try std.testing.expectEqual(@as(usize, 19), diagnostic.end);
-    try std.testing.expectEqualStrings("unexpected trailing SQL; only one supported statement is allowed", diagnostic.message);
+    try std.testing.expectError(error.InvalidSqlSyntax, compileDiagnostic(std.testing.allocator, "SELECT * FROM t FOR UNSUPPORTED", .{}, &diagnostic));
+    try std.testing.expectEqual(@as(usize, 20), diagnostic.start);
+    try std.testing.expectEqual(@as(usize, 31), diagnostic.end);
+    try std.testing.expectEqualStrings("expected UPDATE, NO KEY UPDATE, SHARE or KEY SHARE", diagnostic.message);
 }
 
 test "SQL original row-lock clauses on non-locking SQL surfaces reject before backend access" {
-    // sql-0437, sql-0577, sql-0578, sql-0618: the original corpus marks
-    // these row-lock forms invalid. This compiler has no row-lock syntax, so
-    // reject the complete statement instead of executing its unlocked prefix.
+    // sql-0437: syntax can retain a SELECT locking clause, but an absent OF
+    // alias must fail in binding before catalog authorization or row access.
+    var invalid = try compile(std.testing.allocator, "SELECT u.id FROM usage_records AS u WHERE u.status = 'queued' FOR UPDATE OF archived_records", .{});
+    defer invalid.deinit();
+    var marker: u8 = 0;
+    const provider: @import("locking.zig").Provider = .{ .ptr = &marker, .table = undefined, .row = undefined };
+    const backend: @import("catalog.zig").Backend = .{ .ptr = &marker, .locking_provider = &provider, .vtable = &.{ .resolve = undefined, .checkpoint = undefined, .scan = undefined, .mutate = undefined } };
+    try std.testing.expectError(error.UndefinedTable, @import("locking.zig").bind(std.testing.allocator, backend, &invalid, &.{}));
+    // sql-0577, sql-0578, sql-0618: mutations cannot carry SELECT locking
+    // clauses. Binding validates SELECT OF aliases against the source scope.
     for ([_][]const u8{
-        "SELECT u.id FROM usage_records AS u WHERE u.status = 'queued' FOR UPDATE OF archived_records",
         "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' FOR SHARE RETURNING id",
         "UPDATE usage_records AS u SET status = 'processing' WHERE u.status = 'queued' FOR UPDATE OF archived_records RETURNING u.id",
         "UPDATE usage_records AS target SET status = source.status FROM source_records AS source WHERE target.id = source.id FOR UPDATE OF source RETURNING target.id",
     }) |sql| {
-        try std.testing.expectError(if (std.mem.startsWith(u8, sql, "SELECT")) error.UnsupportedSqlShape else error.InvalidSqlSyntax, compile(std.testing.allocator, sql, .{}));
+        try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, sql, .{}));
     }
 }
 
@@ -6767,4 +6856,67 @@ test "SQL statement effect CTE transports share mutation admission classificatio
         defer compiled.deinit();
         try std.testing.expectEqual(case.writing, compiled.statement.requiresWriteAdmission());
     }
+}
+
+test "SQL locking originals retain every table mode row target and wait policy" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    for ([_][]const u8{ "sql-0080", "sql-0081" }, 0..) |id, index| {
+        var parsed = try compile(a, (try corpus.get(id)).sql, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.statement == .lock_table);
+        const value = parsed.statement.lock_table;
+        try std.testing.expectEqual(index + 1, value.targets.len);
+        const expected_mode: @FieldType(ast.TableLock, "mode") = if (index == 0) .access_exclusive else .share_row_exclusive;
+        try std.testing.expectEqual(expected_mode, value.mode);
+        try std.testing.expectEqual(ast.LockWait.block, value.wait);
+        try std.testing.expect(parsed.statement.requiresWriteAdmission());
+    }
+    const modes = [_]@FieldType(ast.RowLockClause, "mode"){ .update, .no_key_update, .update, .share, .key_share };
+    for ([_][]const u8{ "sql-0173", "sql-0433", "sql-0434", "sql-0435", "sql-0436" }, modes, 0..) |id, mode, index| {
+        var parsed = try compile(a, (try corpus.get(id)).sql, .{});
+        defer parsed.deinit();
+        const query = parsed.statement.select;
+        try std.testing.expect(query.locking != null);
+        try std.testing.expectEqual(@as(usize, 1), query.locking.?.clauses.len);
+        const clause = query.locking.?.clauses[0];
+        try std.testing.expectEqual(mode, clause.mode);
+        try std.testing.expectEqual(if (index == 0) ast.LockWait.skip_locked else if (index == 2) ast.LockWait.nowait else .block, clause.wait);
+        if (index == 0) try std.testing.expectEqualStrings("u", clause.relations[0]);
+        try std.testing.expect(parsed.statement.requiresWriteAdmission());
+    }
+    inline for (.{ "ACCESS SHARE", "ROW SHARE", "ROW EXCLUSIVE", "SHARE UPDATE EXCLUSIVE", "SHARE", "SHARE ROW EXCLUSIVE", "EXCLUSIVE", "ACCESS EXCLUSIVE" }, 0..) |mode, ordinal| {
+        var parsed = try compile(a, "LOCK TABLE ONLY a, b IN " ++ mode ++ " MODE NOWAIT", .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(ordinal, @backingInt(parsed.statement.lock_table.mode));
+        try std.testing.expect(parsed.statement.lock_table.targets[0].only);
+        try std.testing.expectEqual(ast.LockWait.nowait, parsed.statement.lock_table.wait);
+    }
+    var combined = try compile(a, "SELECT a.id FROM a JOIN b ON a.id=b.id FOR UPDATE OF a SKIP LOCKED LIMIT 1 FOR SHARE OF b NOWAIT", .{});
+    defer combined.deinit();
+    try std.testing.expectEqual(@as(usize, 2), combined.statement.select.locking.?.clauses.len);
+    for ([_][]const u8{
+        "LOCK TABLE a IN ACCESS SHARE",            "LOCK TABLE a SKIP LOCKED",        "LOCK TABLE ONLY a*",
+        "SELECT id FROM a FOR NO UPDATE",          "SELECT id FROM a FOR KEY UPDATE", "SELECT id FROM a FOR SHARE NOWAIT SKIP LOCKED",
+        "SELECT id FROM a FOR UPDATE OF public.a",
+    }) |text| try std.testing.expectError(error.InvalidSqlSyntax, compile(a, text, .{}));
+}
+
+test "SQL locking admission retains nested row effects through CTE derived and EXPLAIN boundaries" {
+    for ([_][]const u8{
+        "SELECT id FROM usage_records FOR UPDATE",
+        "SELECT x.id FROM (SELECT id FROM usage_records FOR SHARE) AS x",
+        "WITH locked AS (SELECT id FROM usage_records FOR KEY SHARE) SELECT id FROM locked",
+        "EXPLAIN (ANALYZE) SELECT id FROM usage_records FOR NO KEY UPDATE",
+    }) |sql| {
+        var compiled = try compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expect(compiled.uses_row_locks);
+        try std.testing.expect(compiled.requiresWriteAdmission());
+    }
+    var inspected = try compile(std.testing.allocator, "EXPLAIN SELECT id FROM usage_records FOR UPDATE", .{});
+    defer inspected.deinit();
+    try std.testing.expect(inspected.uses_row_locks);
+    try std.testing.expect(!inspected.requiresWriteAdmission());
 }

@@ -108,7 +108,12 @@ fn unwrapGraphApplyEnvelope(payload: *BatchMutationPayload) !void {
 
 /// Page semantics cannot be silently ignored by older standbys. Their V1
 /// decoder rejects V2 before applying rows, independently of Raft negotiation.
+fn hasSqlLocks(request: db_types.BatchRequest) bool {
+    if (request.sql_lock != null) return true;
+    return if (request.transaction) |transaction| transaction == .begin and transaction.begin.sql_locks != null else false;
+}
 fn batchMutationVersion(request: db_types.BatchRequest) u32 {
+    if (hasSqlLocks(request)) return 24;
     if (request.resolver_review != null) return 22;
     if (request.graph_endpoint_cleanup) return 18;
     if (request.merge_proof_adoption != null) return 17;
@@ -663,7 +668,7 @@ test "storage.hot_standby ordered artifact inventory merge adoption requires a v
 }
 
 pub fn encodeRaftBatchMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.OrderedApplyReceipt) ![]u8 {
-    const payload: BatchMutationPayload = .{ .schema_version = if (request.resolver_review != null) 23 else if (request.graph_endpoint_cleanup) 19 else 15, .request = request, .ordinary_raft_entry = entry };
+    const payload: BatchMutationPayload = .{ .schema_version = if (hasSqlLocks(request)) 25 else if (request.resolver_review != null) 23 else if (request.graph_endpoint_cleanup) 19 else 15, .request = request, .ordinary_raft_entry = entry };
     try validateOrdinaryRaftPayload(payload);
     return encodeBatchPayloadAlloc(alloc, payload);
 }
@@ -792,13 +797,16 @@ test "storage.hot_standby ordered artifact inventory standby transport marker ca
 
 fn validateOrdinaryRaftPayload(payload: BatchMutationPayload) !void {
     const entry = payload.ordinary_raft_entry orelse return error.InvalidBatchRequest;
-    if ((payload.schema_version != 15 and payload.schema_version != 19 and payload.schema_version != 23) or entry.term == 0 or entry.index == 0 or
+    if ((payload.schema_version != 15 and payload.schema_version != 19 and payload.schema_version != 23 and payload.schema_version != 25) or entry.term == 0 or entry.index == 0 or
         payload.native_topology_position != null or payload.artifact_publication_raft_entry != null or payload.artifact_publication_transport_raft_entry != null or payload.merge_proof_adoption_raft_entry != null or payload.artifact_catalog_raft_entry != null or
         payload.initial_child_raft_entry != null or payload.graph_retirement_raft_entry != null or payload.restore_generation_admission_raft_entry != null or
         payload.online_source_applied_index != null or payload.restore_staging_bootstrap != null or payload.request.online_source != null)
         return error.InvalidBatchRequest;
     const base = batchMutationVersion(payload.request);
-    if (payload.schema_version == 23) {
+    if (payload.schema_version == 25) {
+        if (base != 24) return error.InvalidBatchRequest;
+        if (payload.request.sql_lock != null) try @import("../pessimistic_lock_control.zig").validateBatch(payload.request);
+    } else if (payload.schema_version == 23) {
         if (base != 22) return error.InvalidBatchRequest;
     } else if (payload.schema_version == 19) {
         if (base != 18 or !payload.request.graph_endpoint_cleanup_planned) return error.InvalidBatchRequest;
@@ -844,7 +852,7 @@ pub fn decodeBatchMutationRequest(
         return parsed;
     }
     try unwrapGraphApplyEnvelope(&parsed.value);
-    if (parsed.value.schema_version == 15 or parsed.value.schema_version == 19 or parsed.value.schema_version == 23) {
+    if (parsed.value.schema_version == 15 or parsed.value.schema_version == 19 or parsed.value.schema_version == 23 or parsed.value.schema_version == 25) {
         try validateOrdinaryRaftPayload(parsed.value);
         return parsed;
     }
@@ -964,7 +972,7 @@ pub fn decodeRestoreFinishForReplay(
     // A duplicate ordinary batch needs only this small projection. Preserve
     // the no-row-copy replay path even for the graph capability envelope.
     try unwrapSchemaVersion(&parsed.value.schema_version, &parsed.value.apply_schema_version);
-    if (parsed.value.schema_version == 19 or parsed.value.schema_version == 18 or parsed.value.schema_version == 22 or parsed.value.schema_version == 23) {
+    if (parsed.value.schema_version == 19 or parsed.value.schema_version == 18 or parsed.value.schema_version == 22 or parsed.value.schema_version == 23 or parsed.value.schema_version == 24 or parsed.value.schema_version == 25) {
         var control = try decodeBatchMutationRequest(alloc, record);
         defer control.deinit();
         return null;

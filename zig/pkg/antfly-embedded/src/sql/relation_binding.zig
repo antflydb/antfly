@@ -2710,6 +2710,13 @@ pub fn lowerBoundExpression(alloc: Allocator, columns: []const Column, expressio
     return builder.expression(columns, expression_, &.{});
 }
 
+/// Reuse SELECT's qualification and ambiguity rules before converting native
+/// comparisons into a full scalar predicate for locked-row rechecks.
+pub fn lowerBoundPredicate(alloc: Allocator, columns: []const Column, predicate: *const ast.Predicate) !*const ast.Predicate {
+    var builder: Builder = .{ .alloc = alloc, .backend = undefined, .parameters = &.{}, .bind_catalog_calls = false };
+    return builder.predicate(columns, predicate);
+}
+
 /// RETURNING has one authorized target, not a separate relational read. Reuse
 /// ordinary qualification validation while retaining native column names for
 /// evaluating the already-prepared mutation image.

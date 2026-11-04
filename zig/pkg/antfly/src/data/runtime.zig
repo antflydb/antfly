@@ -14537,7 +14537,7 @@ pub const DataServer = struct {
         // Source-bound pages carry certified per-row timestamps. Ordered
         // artifact admission is a catalog-only command with no row timestamp.
         // A wall-clock override would change either command's replay contract.
-        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.row_policy_publication != null or proposal_req.group_source != null or proposal_req.resolver_review != null or proposal_req.leann_record != null) return proposal_req;
+        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.row_policy_publication != null or proposal_req.group_source != null or proposal_req.sql_lock != null or proposal_req.resolver_review != null or proposal_req.leann_record != null) return proposal_req;
         // DB.batch treats zero as "read realtime now". Materialize that value
         // once before any forwarding or Raft encoding so every replica applies
         // identical document versions and TTL deadlines. Preserve zero as the
@@ -15438,6 +15438,16 @@ pub const DataServer = struct {
                             active_protocol_version >= data_raft_batch.timestamp_protocol_version,
                             proposal_time,
                         );
+                        var sql_lock_region = std.heap.ArenaAllocator.init(alloc);
+                        defer sql_lock_region.deinit();
+                        if (proposal_req.sql_lock) |command| {
+                            const api_server = if (self.http_server) |*server| server else return error.UnsupportedOperation;
+                            proposal_req.sql_lock = try @import("../api/sql_data_locks.zig").authorize(api_server, sql_lock_region.allocator(), .{
+                                .deadline_ns = platform_time.monotonicNs() +| (deadline_ns -| self.dataRaftMonotonicNs()),
+                                .cancellation = route.visibility_cancellation,
+                            }, group_id, table_name, command);
+                            try ensureDataRaftBatchRouteActive(route);
+                        }
                         const proposal_term = status.hard.current_term;
                         const encoded = if (comptime linked_storage)
                             try data_raft_batch.encodeWithStorageOwnerDescriptor(

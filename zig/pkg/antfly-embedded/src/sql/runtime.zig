@@ -677,6 +677,7 @@ pub const Context = struct {
         if (context.binding.merge_mutation) |merge| return @import("merge_mutation.zig").execute(context, merge.*);
         return switch (input) {
             .select => |statement| try context.selectOutput(statement),
+            .lock_table => try @import("locking.zig").executeTables(context, &(context.binding.locking orelse return error.InvalidSqlBackendResponse).tables),
             .call => try @import("procedure.zig").execute(context, context.binding.procedure orelse return error.InvalidSqlBackendResponse),
             .insert => |input_insert| blk: {
                 var statement = input_insert;
@@ -1137,6 +1138,10 @@ pub const Context = struct {
     }
 
     pub fn select(unscoped: Context, requested: ast.Select) anyerror!Output {
+        if (unscoped.binding.locking) |plan| return switch (plan.*) {
+            .rows => |*rows_plan| @import("locking.zig").execute(unscoped, rows_plan),
+            .tables => error.InvalidSqlBackendResponse,
+        };
         var self = unscoped;
         self.backend = @import("decision_eval.zig").scopedBackend(self.backend, self.binding);
         try @import("decision_eval.zig").validateStatement(self.arena, self.backend.decision_provider, self.binding, self.parameters);
@@ -3607,6 +3612,7 @@ const TestBackend = struct {
     pages: usize = 0,
     writes: usize = 0,
     row_count: usize = 2,
+    expected_scan_policy: ?@TypeOf(@as(catalog.Table, undefined).row_policy_purpose) = null,
     group_every: ?usize = null,
     group_modulo: ?usize = null,
     metadata_count: ?u64 = null,
@@ -3706,6 +3712,7 @@ const TestBackend = struct {
         const self: *TestBackend = @ptrCast(@alignCast(ptr));
         try std.testing.expectEqual(@as(u64, 19), table_def.id);
         try std.testing.expectEqual(@as(u32, 7), table_def.schema_version);
+        if (self.expected_scan_policy) |purpose| try std.testing.expectEqual(purpose, table_def.row_policy_purpose);
         self.pages += 1;
         self.primary_order = request.primary_order;
         self.row_goal = request.row_goal;
@@ -9188,4 +9195,95 @@ test "SQL statement effect CTE receipt dependencies include producers below zero
 
 comptime {
     if (@import("builtin").is_test) _ = @import("mutation_returning.zig");
+}
+
+test "SQL LockRows skips contenders refills LIMIT locks OFFSET and defers fallible projection" {
+    const Locking = @import("locking.zig");
+    const Fixture = struct {
+        backend: TestBackend = .{ .row_count = 3, .group_every = 1, .expected_scan_policy = .update_select },
+        provider: Locking.Provider = undefined,
+        tables: usize = 0,
+        locks: usize = 0,
+        skip_first: bool = true,
+        change_first: bool = false,
+        nowait: bool = false,
+        fn table(raw: *anyopaque, _: std.mem.Allocator, target: catalog.Table, mode: @import("../storage/pessimistic_lock_contract.zig").TableMode, _: ast.LockWait) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u64, 19), target.id);
+            try std.testing.expectEqual(.row_share, mode);
+            self.tables += 1;
+        }
+        fn row(raw: *anyopaque, a: std.mem.Allocator, target: catalog.Table, identity: Locking.Identity, _: catalog.Row, _: @import("../storage/pessimistic_lock_contract.zig").RowMode, wait: ast.LockWait, _: []const []const u8) !?catalog.Row {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u64, 99), identity.version);
+            self.locks += 1;
+            if (std.mem.eql(u8, identity.key, "0")) {
+                if (self.nowait) {
+                    try std.testing.expectEqual(.nowait, wait);
+                    return error.SqlLockNotAvailable;
+                }
+                if (self.skip_first) {
+                    try std.testing.expectEqual(.skip_locked, wait);
+                    return null;
+                }
+            }
+            const page = try TestBackend.scan(&self.backend, a, target, .{ .fields = &.{"id"}, .primary_key = identity.key, .limit = 1 });
+            if (page.rows.len != 1) return error.InvalidSqlBackendResponse;
+            var current = page.rows[0];
+            if (self.change_first and std.mem.eql(u8, identity.key, "0")) {
+                var object = current.value.object;
+                try object.put(a, "id", .{ .integer = 999 });
+                current.value = .{ .object = object };
+            }
+            return current;
+        }
+        fn iface(self: *@This()) catalog.Backend {
+            var backend = self.backend.coordinated();
+            self.provider = .{ .ptr = self, .table = table, .row = row };
+            backend.locking_provider = &self.provider;
+            return backend;
+        }
+    };
+    const a = std.testing.allocator;
+    {
+        var fixture: Fixture = .{};
+        var compiled = try compiler.compile(a, "SELECT 1/(u.id-1) AS value FROM things AS u ORDER BY u.id LIMIT 1 OFFSET 1 FOR UPDATE OF u SKIP LOCKED", .{});
+        defer compiled.deinit();
+        var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings("1", result.output.rows[0][0].string);
+        try std.testing.expectEqual(@as(usize, 3), fixture.locks);
+        try std.testing.expectEqual(@as(usize, 1), fixture.tables);
+        try std.testing.expectEqual(fixture.backend.statement_opens, fixture.backend.statement_closes);
+    }
+    {
+        var fixture: Fixture = .{ .skip_first = false, .change_first = true };
+        var compiled = try compiler.compile(a, "SELECT u.id FROM things AS u WHERE u.id < 2 ORDER BY u.id LIMIT 1 FOR NO KEY UPDATE OF u", .{});
+        defer compiled.deinit();
+        var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqualStrings("1", result.output.rows[0][0].string);
+        try std.testing.expectEqual(@as(usize, 2), fixture.locks);
+    }
+    {
+        var fixture: Fixture = .{ .nowait = true };
+        var compiled = try compiler.compile(a, "SELECT id FROM things LIMIT 1 FOR UPDATE NOWAIT", .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlLockNotAvailable, execute(a, fixture.iface(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 1), fixture.locks);
+        try std.testing.expectEqual(fixture.backend.statement_opens, fixture.backend.statement_closes);
+    }
+    for ([_][]const u8{
+        "SELECT id FROM things FOR SHARE",
+        "SELECT id FROM things FOR KEY SHARE",
+    }) |sql| {
+        var fixture: Fixture = .{ .skip_first = false };
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
+        try std.testing.expectEqual(@as(usize, 3), fixture.locks);
+    }
 }

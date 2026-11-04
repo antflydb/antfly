@@ -994,6 +994,7 @@ pub const Stream = struct {
 
     fn openInner(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: runtime.Limits, memory_owner: ?runtime.MemoryOwner) !?*Stream {
         if (compiled.statement != .select and compiled.statement != .copy_to) return null;
+        if (compiled.uses_row_locks or (compiled.statement == .select and compiled.statement.select.locking != null)) return null;
         if (parameters.len != compiled.parameter_count) return error.InvalidSqlParameters;
         if (limits.execution_batch_rows == 0 or limits.execution_batch_rows > 4096 or limits.page_rows == 0 or limits.page_rows > 4096 or limits.page_bytes == 0 or limits.scan_rows == 0 or limits.scan_pages == 0) return error.InvalidSqlLimit;
         try backend.vtable.checkpoint(backend.ptr);
@@ -1044,7 +1045,7 @@ pub const Stream = struct {
         // Advisory effects need the ordinary execution owner's lazy native
         // transaction and completion cut. Decline before any producer/effect;
         // the caller can select that owner without replaying SQL.
-        if (try @import("connection_effects.zig").required(self.budget.allocator(), binding)) {
+        if (binding.locking != null or try @import("connection_effects.zig").required(self.budget.allocator(), binding)) {
             if (binding.parameter_invocation) |invocation| invocation.deinitFrame();
             if (self.settings) |view| view.deinit();
             self.regex_execution.deinit();

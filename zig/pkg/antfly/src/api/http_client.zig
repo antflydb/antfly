@@ -731,6 +731,7 @@ pub const ApiHttpClient = struct {
         relational_index_status_json: []const u8 = "",
         relational_topology_json: []const u8 = "",
         group_source_query_json: []const u8 = "",
+        sql_lock_query_json: []const u8 = "",
         restore_staging_scope: ?[32]u8 = null,
         restore_staging_plan_id: ?[16]u8 = null,
         include_primary_digest: bool = false,
@@ -746,6 +747,7 @@ pub const ApiHttpClient = struct {
         const relational_index_status_json = options.relational_index_status_json;
         const relational_topology_json = options.relational_topology_json;
         const group_source_query_json = options.group_source_query_json;
+        const sql_lock_query_json = options.sql_lock_query_json;
         const restore_staging_scope = options.restore_staging_scope;
         const restore_staging_plan_id = options.restore_staging_plan_id;
         const include_primary_digest = options.include_primary_digest;
@@ -769,7 +771,7 @@ pub const ApiHttpClient = struct {
         // value even when they contain URI delimiters.
         const encoded_table_name = try percentEncodePathComponent(self.alloc, table_name);
         defer self.alloc.free(encoded_table_name);
-        const special = group_source_query_json.len != 0 or relational_integrity_catalog or relational_integrity_action or relational_integrity_jobs_json.len != 0 or relational_activation_json.len != 0 or relational_topology_json.len != 0 or relational_index_status_json.len != 0;
+        const special = sql_lock_query_json.len != 0 or group_source_query_json.len != 0 or relational_integrity_catalog or relational_integrity_action or relational_integrity_jobs_json.len != 0 or relational_activation_json.len != 0 or relational_topology_json.len != 0 or relational_index_status_json.len != 0;
         // Routing uses the actual logical key, including empty first-range
         // boundaries. Only the already-routed HTTP path needs a placeholder.
         const encoded_key = try percentEncodePathComponent(self.alloc, if (special and key.len == 0) "\x00relational_control" else key);
@@ -830,7 +832,11 @@ pub const ApiHttpClient = struct {
         defer if (group_source.len != 0) self.alloc.free(group_source);
         const group_path = if (group_source.len != 0) try std.fmt.allocPrint(self.alloc, "{s}&_group_source={s}", .{ index_path orelse observation_path orelse path, group_source }) else null;
         defer if (group_path) |value| self.alloc.free(value);
-        const uri = try self.joinRoute(base_uri, group_path orelse index_path orelse observation_path orelse path);
+        const sql_lock = if (sql_lock_query_json.len != 0) try percentEncodePathComponent(self.alloc, sql_lock_query_json) else "";
+        defer if (sql_lock.len != 0) self.alloc.free(sql_lock);
+        const sql_lock_path = if (sql_lock.len != 0) try std.fmt.allocPrint(self.alloc, "{s}&_sql_lock={s}", .{ group_path orelse index_path orelse observation_path orelse path, sql_lock }) else null;
+        defer if (sql_lock_path) |value| self.alloc.free(value);
+        const uri = try self.joinRoute(base_uri, sql_lock_path orelse group_path orelse index_path orelse observation_path orelse path);
         defer self.alloc.free(uri);
 
         var resp = try self.executeRequest(.{

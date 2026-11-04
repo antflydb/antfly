@@ -770,3 +770,799 @@ test "pessimistic locks native LSM scoped prepared handoff and cleanup abort eve
     try std.testing.expectEqual(@as(?ledger.Owner, null), try ledger.readOwner(a, &txn, ns, prepared_lease.backend));
     try std.testing.expectEqual(.retired, (try scopes.read(a, &txn, ns, source.backend)).?.state);
 }
+
+const data_participant = @import("pessimistic_lock_participant.zig");
+const native_transactions = @import("transactions.zig");
+const DataAuthority = struct {
+    approved: data_participant.Admission,
+    enabled: bool = true,
+    decision: ?scopes.DecisionRef = null,
+    pub fn requireDataAdmission(self: @This(), _: anytype, value: data_participant.Admission) !void {
+        if (!self.enabled or !std.meta.eql(self.approved, value)) return error.Forbidden;
+    }
+    pub fn requireDataCommand(self: @This(), txn: anytype, value: data_participant.Admission, _: @import("pessimistic_lock_authority.zig").Record) !void {
+        try self.requireDataAdmission(txn, value);
+    }
+    pub fn requireDataResource(self: @This(), txn: anytype, value: data_participant.Admission, physical_key: ?[]const u8) !void {
+        try self.requireDataAdmission(txn, value);
+        if (physical_key) |key_value| if (std.mem.order(u8, key_value, "a") == .lt or std.mem.order(u8, key_value, "z") != .lt) return error.IdentityNamespaceMismatch;
+    }
+    pub fn requireDataEffect(self: @This(), txn: anytype, value: data_participant.Admission, _: ledger.Effect) !void {
+        try self.requireDataAdmission(txn, value);
+    }
+    pub fn requireDataObservation(self: @This(), txn: anytype, value: data_participant.Admission, _: ledger.Effect) !void {
+        try self.requireDataAdmission(txn, value);
+    }
+    pub fn requireDataControl(self: @This(), txn: anytype, value: data_participant.Admission, _: ledger.Effect) !void {
+        try self.requireDataAdmission(txn, value);
+    }
+    pub fn requireDataFence(self: @This(), txn: anytype, value: data_participant.Admission) !void {
+        try self.requireDataAdmission(txn, value);
+    }
+    fn requireNativeDecision(self: @This(), txn: anytype, selected: scopes.DecisionRef, terminal: bool) !void {
+        if (!self.enabled or !std.meta.eql(self.decision, @as(?scopes.DecisionRef, selected))) return error.Forbidden;
+        const state = try native_transactions.externalParticipant(txn, self.approved.transaction) orelse return error.Forbidden;
+        const owner = state.owner orelse return error.Forbidden;
+        if (!std.mem.eql(u8, &owner.operation_id, &selected.operation) or !std.mem.eql(u8, &owner.admission_digest, &selected.admission) or
+            !std.mem.eql(u8, &owner.metadata_incarnation, &std.fmt.bytesToHex(self.approved.binding.namespace.incarnation, .lower))) return error.Forbidden;
+        if ((state.status != .pending) != terminal) return error.Forbidden;
+    }
+    pub fn requireDataPreparedAdmission(self: @This(), txn: anytype, value: data_participant.Admission, selected: scopes.DecisionRef, _: scopes.Record) !void {
+        try self.requireDataAdmission(txn, value);
+        try self.requireNativeDecision(txn, selected, false);
+    }
+    pub fn requirePreparedDataResolution(self: @This(), txn: anytype, selected_binding: data_participant.Binding, selected: scopes.DecisionRef, id: [16]u8, _: ledger.Lease) !void {
+        if (!selected_binding.eql(self.approved.binding) or !std.mem.eql(u8, &id, &self.approved.transaction)) return error.Forbidden;
+        try self.requireNativeDecision(txn, selected, true);
+    }
+    pub fn requireFence(self: @This(), txn: anytype, selected_ns: ledger.Namespace, _: scopes.Record, _: scopes.Fence) !void {
+        if (!std.meta.eql(selected_ns, self.approved.binding.namespace)) return error.Forbidden;
+        try self.requireNativeDecision(txn, self.decision orelse return error.Forbidden, false);
+    }
+    pub fn requirePreparedHandoff(_: @This(), _: anytype, _: ledger.Namespace, _: scopes.Record, _: ledger.Lease, _: ledger.Lease, _: [16]u8) !void {
+        // This authority closes only after independent prepared resolution.
+        // It cannot use retirement as permission to initiate another handoff.
+        return error.Forbidden;
+    }
+    pub fn requireRetirement(self: @This(), txn: anytype, selected_ns: ledger.Namespace, value: scopes.Record) !void {
+        if (!std.meta.eql(selected_ns, self.approved.binding.namespace)) return error.Forbidden;
+        const released = value.released_transaction orelse return error.Forbidden;
+        const selected = released.decision orelse return error.Forbidden;
+        if (!std.mem.eql(u8, &released.id, &self.approved.transaction)) return error.Forbidden;
+        try self.requireNativeDecision(txn, selected, true);
+        const prepared = try ledger.readOwner(a, txn, selected_ns, try scopes.preparedBackend(selected_ns, selected)) orelse return error.Forbidden;
+        if (prepared.state != .retired or prepared.resources != 0) return error.Forbidden;
+    }
+};
+
+test "pessimistic locks native LSM data participants preserve admission atomicity row grants and command fences across cold reopen" {
+    const binding = @import("pessimistic_lock_resource.zig");
+    const path = try pathFor("data-participant");
+    defer a.free(path);
+    defer cleanup(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    const admitted = dataFixture();
+    const receiving = admitted.binding.identity;
+    const registration = try admitted.registration();
+    const authorized: DataAuthority = .{ .approved = admitted };
+    const denied: DataAuthority = .{ .approved = admitted, .enabled = false };
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.Forbidden, data_participant.admit(a, &txn, receiving, admitted, denied));
+        try std.testing.expect((try binding.Binding.load(&txn)) == null);
+    }
+    var committed = false;
+    var aborted_boundaries: usize = 0;
+    for (0..32) |fail_after| {
+        var txn = try store.beginWriteTxn();
+        var fault: FaultTxn = .{ .txn = &txn, .remaining = fail_after };
+        const result = data_participant.admit(a, &fault, receiving, admitted, authorized) catch |err| {
+            txn.abort();
+            try std.testing.expectEqual(error.InjectedLockWriteFailure, err);
+            aborted_boundaries += 1;
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expect((try binding.Binding.load(&read)) == null);
+            try std.testing.expect((try scopes.read(a, &read, admitted.binding.namespace, registration.lease.backend)) == null);
+            continue;
+        };
+        try std.testing.expectEqual(scopes.Begin.admitted, result);
+        try txn.commit();
+        committed = true;
+        break;
+    }
+    try std.testing.expect(committed and aborted_boundaries >= 8);
+    const table: data_participant.Acquisition = .{ .admission = admitted, .effect = .{
+        .backend = registration.lease.backend,
+        .sequence = 1,
+        .nonce = @splat(10),
+        .action = .{ .try_acquire = .{ .resource = try admitted.binding.table(), .mode = .{ .table = .row_share }, .scope = .{ .transaction = .{ .id = admitted.transaction, .subtransaction = 4 } } } },
+    } };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(ledger.Outcome.granted, (try data_participant.acquire(a, &txn, receiving, table, authorized)).outcome);
+        try txn.commit();
+    }
+    var row = table;
+    row.physical_key = "r";
+    row.effect.sequence = 2;
+    row.effect.nonce = @splat(11);
+    row.effect.action.try_acquire.resource = try admitted.binding.row("r");
+    row.effect.action.try_acquire.mode = .{ .row = .key_share };
+    var receipt: ledger.Receipt = undefined;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        receipt = try data_participant.acquire(a, &txn, receiving, row, authorized);
+        try std.testing.expectEqual(ledger.Outcome.granted, receipt.outcome);
+        try data_participant.finish(a, &txn, admitted, authorized);
+        try txn.commit();
+    }
+    store.close();
+    store = try DocStore.open(a, path, .{});
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqualDeep(receipt, (try data_participant.observe(a, &read, receiving, row, authorized)).?);
+        try std.testing.expect(!try ledger.accessBlocked(a, &read, admitted.binding.namespace, try admitted.binding.row("r"), .{ .row = .no_key_update }, null));
+        try std.testing.expect(try ledger.accessBlocked(a, &read, admitted.binding.namespace, try admitted.binding.row("r"), .{ .row = .update }, null));
+        try std.testing.expectError(error.Forbidden, data_participant.observe(a, &read, receiving, row, denied));
+        var other_identity = receiving;
+        other_identity.range_id += 1;
+        try std.testing.expectError(error.IdentityNamespaceMismatch, data_participant.observe(a, &read, other_identity, row, authorized));
+        var altered = row;
+        altered.physical_key = "s";
+        try std.testing.expectError(error.InvalidLockResource, data_participant.observe(a, &read, receiving, altered, authorized));
+    }
+    // A retained grant receipt is historical evidence, never permission for a
+    // delayed new row effect to enter a completed participant command.
+    var late = row;
+    late.physical_key = "s";
+    late.effect.sequence = 3;
+    late.effect.nonce = @splat(12);
+    late.effect.action.try_acquire.resource = try admitted.binding.row("s");
+    late.effect.action.try_acquire.mode = .{ .row = .update };
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.LockEffectExpired, data_participant.acquire(a, &txn, receiving, late, authorized));
+    }
+    var next = admitted;
+    next.serial = 2;
+    next.parent_command.sequence = 57;
+    next.parent_command.nonce = @splat(13);
+    next.parent_command.executor = @splat(14);
+    const next_authority: DataAuthority = .{ .approved = next };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(scopes.Begin.admitted, try data_participant.admit(a, &txn, receiving, next, next_authority));
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.LockEffectChanged, data_participant.acquire(a, &txn, receiving, late, authorized));
+    }
+    late.admission = next;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(ledger.Outcome.granted, (try data_participant.acquire(a, &txn, receiving, late, next_authority)).outcome);
+        try data_participant.finish(a, &txn, next, next_authority);
+        try txn.commit();
+    }
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u32, 3), (try ledger.readOwner(a, &read, admitted.binding.namespace, registration.lease.backend)).?.resources);
+        try std.testing.expect(try ledger.accessBlocked(a, &read, admitted.binding.namespace, try admitted.binding.row("s"), .{ .row = .key_share }, null));
+    }
+    // The native 2PC BEGIN is durable before custody handoff. Fencing the
+    // frontend before it delivers SEAL must not orphan already admitted work.
+    const selected: scopes.DecisionRef = .{ .operation = @splat(20), .admission = @splat(21) };
+    const external: native_transactions.ExternalDecisionOwner = .{ .metadata_incarnation = std.fmt.bytesToHex(admitted.binding.namespace.incarnation, .lower), .operation_id = selected.operation, .admission_digest = selected.admission, .expires_at_unix_ns = 10000 };
+    {
+        var manager = try native_transactions.TxnManager.init(a, &store);
+        defer manager.deinit();
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(admitted.transaction, 100, 1, &.{"data:901"}, false, true, .{ .external_decision_owner = external });
+    }
+    var resolving = next;
+    resolving.purpose = .resolution;
+    resolving.serial = 3;
+    resolving.parent_command.sequence = 59;
+    resolving.parent_command.nonce = @splat(22);
+    resolving.parent_command.executor = @splat(23);
+    const resolution: DataAuthority = .{ .approved = resolving, .decision = selected };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try scopes.fence(a, &txn, admitted.binding.namespace, registration.lease.backend, .close, resolution);
+        try txn.commit();
+    }
+    store.close();
+    store = try DocStore.open(a, path, .{});
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        var changed = selected;
+        changed.admission[0] += 1;
+        try std.testing.expectError(error.Forbidden, data_participant.prepareStep(a, &txn, receiving, resolving, changed, resolution));
+        try std.testing.expect((try scopes.read(a, &txn, admitted.binding.namespace, registration.lease.backend)).?.transaction.?.decision == null);
+    }
+    var handoff_done = false;
+    for (0..8) |_| {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        handoff_done = try data_participant.prepareStep(a, &txn, receiving, resolving, selected, resolution);
+        try txn.commit();
+        if (handoff_done) break;
+    }
+    try std.testing.expect(handoff_done);
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.Forbidden, data_participant.resolvePreparedStep(a, &txn, receiving, admitted.binding, selected, admitted.transaction, resolution));
+    }
+    const prepared_backend = try scopes.preparedBackend(admitted.binding.namespace, selected);
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const held = (try ledger.readOwner(a, &read, admitted.binding.namespace, prepared_backend)).?;
+        try std.testing.expectEqual(@as(u32, 3), held.resources);
+        try std.testing.expectEqual(.prepared, held.state);
+        try std.testing.expect(try ledger.accessBlocked(a, &read, admitted.binding.namespace, try admitted.binding.row("s"), .{ .row = .key_share }, null));
+        try std.testing.expect(!try ledger.accessBlocked(a, &read, admitted.binding.namespace, try admitted.binding.row("s"), .{ .row = .update }, .{ .backend = prepared_backend, .transaction = admitted.transaction }));
+    }
+    {
+        var manager = try native_transactions.TxnManager.init(a, &store);
+        defer manager.deinit();
+        try manager.writeIntentsExtraBatch(admitted.transaction, &.{}, &.{}, .{ .external_decision_owner = external });
+        try manager.activateExternalDecision(admitted.transaction, external, .{});
+        _ = try manager.resolveIntentsWithExtraBatch(admitted.transaction, .committed, 200, .{ .external_decision_owner = external });
+    }
+    store.close();
+    store = try DocStore.open(a, path, .{});
+    var released = false;
+    for (0..8) |_| {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        released = try data_participant.resolvePreparedStep(a, &txn, receiving, admitted.binding, selected, admitted.transaction, resolution);
+        try txn.commit();
+        if (released) break;
+    }
+    try std.testing.expect(released);
+    var retired = false;
+    for (0..8) |_| {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        retired = try scopes.closeStep(a, &txn, admitted.binding.namespace, registration.lease.backend, resolution);
+        try txn.commit();
+        if (retired) break;
+    }
+    try std.testing.expect(retired);
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u32, 0), try scopes.databaseCount(&read, admitted.binding.namespace, admitted.source.lease.database));
+        try std.testing.expect(!try ledger.accessBlocked(a, &read, admitted.binding.namespace, try admitted.binding.row("r"), .{ .row = .update }, null));
+        try std.testing.expect(!try ledger.accessBlocked(a, &read, admitted.binding.namespace, try admitted.binding.row("s"), .{ .row = .update }, null));
+    }
+}
+
+fn dataFixture() data_participant.Admission {
+    return .{
+        .purpose = .execution,
+        .binding = .{ .namespace = .{ .home = .data, .group = 901, .incarnation = @splat(1) }, .identity = .{ .table_id = 7, .shard_id = 901, .range_id = 903 } },
+        .source = .{ .group = 2188, .lease = .{ .backend = .{ .incarnation = @splat(1), .id = @splat(3), .fence = 1 }, .database = 1, .node = 9, .principal = @splat(4), .expires_at_ms = 1000 }, .connection = @splat('a'), .nonce = @splat(5), .standalone = false },
+        .transaction = @splat(6),
+        .generation = 1,
+        .parent_command = .{ .sequence = 42, .nonce = @splat(7), .executor = @splat(8) },
+        .serial = 1,
+    };
+}
+
+fn dataGrant(admission: data_participant.Admission, serial: u64, key_value: []const u8, mode: locks.RowMode, subtransaction: u64) !data_participant.Acquisition {
+    var nonce: [16]u8 = @splat(15);
+    std.mem.writeInt(u64, nonce[8..16], serial, .little);
+    return .{ .admission = admission, .physical_key = key_value, .effect = .{ .backend = (try admission.registration()).lease.backend, .sequence = serial, .nonce = nonce, .action = .{ .try_acquire = .{ .resource = try admission.binding.row(key_value), .mode = .{ .row = mode }, .scope = .{ .transaction = .{ .id = admission.transaction, .subtransaction = subtransaction } } } } } };
+}
+fn dataControl(admission: data_participant.Admission, serial: u64, control_value: ledger.Control) !data_participant.SavepointControl {
+    var nonce: [16]u8 = @splat(16);
+    std.mem.writeInt(u64, nonce[8..16], serial, .little);
+    return .{ .admission = admission, .effect = .{ .backend = (try admission.registration()).lease.backend, .sequence = serial, .nonce = nonce, .action = .{ .control = control_value } } };
+}
+fn applyDataControl(store: *DocStore, request: data_participant.SavepointControl) !void {
+    for (0..8) |_| {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const receipt = try data_participant.controlStep(a, &txn, request.admission.binding.identity, request, DataAuthority{ .approved = request.admission });
+        try txn.commit();
+        if (receipt.outcome == .completed) return;
+        try std.testing.expectEqual(ledger.Outcome.pending, receipt.outcome);
+    }
+    return error.UnboundedLockCleanup;
+}
+
+test "pessimistic locks native LSM data savepoint rollback promotion queued cancellation and fence before first admission" {
+    const path = try pathFor("data-controls");
+    defer a.free(path);
+    defer cleanup(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    const admitted = dataFixture();
+    const authorized: DataAuthority = .{ .approved = admitted };
+    const receiving = admitted.binding.identity;
+    const backend = (try admitted.registration()).lease.backend;
+    const parent = try dataGrant(admitted, 1, "a", .key_share, 0);
+    const child = try dataGrant(admitted, 2, "b", .update, 2);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try data_participant.admit(a, &txn, receiving, admitted, authorized);
+        try std.testing.expectEqual(ledger.Outcome.granted, (try data_participant.acquire(a, &txn, receiving, parent, authorized)).outcome);
+        try std.testing.expectEqual(ledger.Outcome.granted, (try data_participant.acquire(a, &txn, receiving, child, authorized)).outcome);
+        try txn.commit();
+    }
+    const rollback = try dataControl(admitted, 3, .{ .rollback = .{ .transaction = admitted.transaction, .first_aborted = 2 } });
+    try applyDataControl(&store, rollback);
+    // Lost control responses observe exactly the retained completion.
+    try applyDataControl(&store, rollback);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(@as(u32, 1), (try ledger.readOwner(a, &txn, admitted.binding.namespace, backend)).?.resources);
+        try std.testing.expect(!try ledger.accessBlocked(a, &txn, admitted.binding.namespace, try admitted.binding.row("b"), .{ .row = .update }, null));
+        try data_participant.finish(a, &txn, admitted, authorized);
+        try txn.commit();
+    }
+    store.close();
+    store = try DocStore.open(a, path, .{});
+    var next = admitted;
+    next.serial += 1;
+    next.parent_command.sequence += 1;
+    next.parent_command.nonce = @splat(18);
+    const next_authority: DataAuthority = .{ .approved = next };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try data_participant.admit(a, &txn, receiving, next, next_authority);
+        const grant = try dataGrant(next, 4, "b", .share, 3);
+        try std.testing.expectEqual(ledger.Outcome.granted, (try data_participant.acquire(a, &txn, receiving, grant, next_authority)).outcome);
+        try txn.commit();
+    }
+    try applyDataControl(&store, try dataControl(next, 5, .{ .release_savepoint = .{ .transaction = next.transaction, .first_child = 3, .parent = 0 } }));
+    try applyDataControl(&store, try dataControl(next, 6, .{ .rollback = .{ .transaction = next.transaction, .first_aborted = 3 } }));
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u32, 2), (try ledger.readOwner(a, &read, next.binding.namespace, backend)).?.resources);
+        try std.testing.expect(try ledger.accessBlocked(a, &read, next.binding.namespace, try next.binding.row("b"), .{ .row = .no_key_update }, null));
+    }
+    var competing = admitted;
+    competing.source.lease.backend.id = @splat(19);
+    competing.transaction = @splat(20);
+    const competitor: DataAuthority = .{ .approved = competing };
+    var queued = try dataGrant(competing, 1, "a", .update, 0);
+    const queued_request = queued.effect.action.try_acquire;
+    queued.effect.action = .{ .acquire = queued_request };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try data_participant.admit(a, &txn, receiving, competing, competitor);
+        try std.testing.expectEqual(ledger.Outcome.pending, (try data_participant.acquire(a, &txn, receiving, queued, competitor)).outcome);
+        try txn.commit();
+    }
+    store.close();
+    store = try DocStore.open(a, path, .{});
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(ledger.Outcome.cancelled, (try data_participant.cancel(a, &txn, receiving, queued, competitor)).outcome);
+        try data_participant.finish(a, &txn, competing, competitor);
+        try txn.commit();
+    }
+    // An enrolled but never contacted participant must be fenced even when
+    // the first execution RPC is delayed beyond connection cleanup.
+    var absent = admitted;
+    absent.generation = 7;
+    const absence: DataAuthority = .{ .approved = absent };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try data_participant.fence(a, &txn, receiving, absent, absence);
+        try txn.commit();
+    }
+    store.close();
+    store = try DocStore.open(a, path, .{});
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        const fenced = (try scopes.read(a, &txn, absent.binding.namespace, (try absent.registration()).lease.backend)).?;
+        try std.testing.expectEqual(.fenced, fenced.state);
+        try std.testing.expectEqual(@as(u64, 1), fenced.next_command);
+        try std.testing.expectError(error.LockOwnerBusy, data_participant.admit(a, &txn, receiving, absent, absence));
+    }
+}
+
+const DirectoryAuthority = struct {
+    registration: scopes.Registration,
+    command: scopes.Command,
+    spec: scopes.Data.Spec,
+    data: *DocStore,
+    pub fn requireRegistration(self: @This(), _: anytype, _: ledger.Namespace, value: scopes.Registration) !void {
+        if (!std.meta.eql(value, self.registration)) return error.Forbidden;
+    }
+    pub fn requireCommand(self: @This(), txn: anytype, namespace: ledger.Namespace, value: scopes.Record, command: scopes.Command) !void {
+        try self.requireRegistration(txn, namespace, value.registration);
+        if (!std.meta.eql(command, self.command)) return error.Forbidden;
+    }
+    pub fn requireTransaction(self: @This(), txn: anytype, namespace: ledger.Namespace, value: scopes.Record, id: [16]u8) !void {
+        try self.requireCommand(txn, namespace, value, self.command);
+        if (!std.mem.eql(u8, &id, &dataFixture().transaction)) return error.Forbidden;
+    }
+    pub fn requireDataEnrollment(self: @This(), txn: anytype, namespace: ledger.Namespace, value: scopes.Record, spec: scopes.Data.Spec) !void {
+        try self.requireCommand(txn, namespace, value, self.command);
+        // The fixture's authoritative route is independent of the request.
+        if (!std.meta.eql(spec.route.route, self.spec.route.route) or spec.schema_version != self.spec.schema_version or !std.mem.eql(u8, spec.table_name, self.spec.table_name)) return error.Forbidden;
+    }
+    pub fn requireDataCompletion(self: @This(), _: anytype, _: ledger.Namespace, _: scopes.Record, participant: scopes.Data.Participant) !void {
+        var read = try self.data.beginReadTxn();
+        defer read.abort();
+        const registration = try participant.admission.registration();
+        const native = try scopes.read(a, &read, participant.admission.binding.namespace, registration.lease.backend) orelse return error.LockOwnerBusy;
+        if (!std.meta.eql(native.completed, @as(?scopes.Command, try participant.admission.command())) or native.command != null) return error.LockOwnerBusy;
+    }
+    pub fn requireDataRetirement(self: @This(), _: anytype, _: ledger.Namespace, _: scopes.Record, participant: scopes.Data.Participant) !void {
+        var read = try self.data.beginReadTxn();
+        defer read.abort();
+        const registration = try participant.admission.registration();
+        const native = try scopes.read(a, &read, participant.admission.binding.namespace, registration.lease.backend) orelse return error.LockOwnerBusy;
+        if (native.state != .retired or native.transaction != null) return error.LockOwnerBusy;
+    }
+};
+
+test "pessimistic locks native LSM metadata enrollment fences FINISH and catalog retirement until independent native completion" {
+    const metadata_path = try pathFor("locking-directory");
+    defer a.free(metadata_path);
+    defer cleanup(metadata_path);
+    const data_path = try pathFor("locking-directory-data");
+    defer a.free(data_path);
+    defer cleanup(data_path);
+    var metadata = try DocStore.open(a, metadata_path, .{});
+    defer metadata.close();
+    var data = try DocStore.open(a, data_path, .{});
+    defer data.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var selected = dataFixture();
+    selected.parent_command.sequence = 1;
+    const metadata_ns: ledger.Namespace = .{ .home = .metadata, .group = selected.source.group, .incarnation = selected.binding.namespace.incarnation };
+    const backend = selected.source.lease.backend;
+    const spec: scopes.Data.Spec = .{ .table_name = "physical", .schema_version = 0, .route = .{
+        .metadata_group_id = metadata_ns.group,
+        .metadata_incarnation = std.fmt.bytesToHex(metadata_ns.incarnation, .lower),
+        .catalog_revision = 10,
+        .table_id = selected.binding.identity.table_id,
+        .topology_epoch = 9,
+        .route = .{ .group_id = selected.binding.namespace.group, .range_id = selected.binding.identity.range_id, .identity_namespace = .{ .table_id = selected.binding.identity.table_id, .shard_id = selected.binding.identity.shard_id, .range_id = selected.binding.identity.range_id } },
+    } };
+    var authority: DirectoryAuthority = .{ .registration = selected.source, .command = selected.parent_command, .spec = spec, .data = &data };
+    var first: scopes.Data.Participant = undefined;
+    {
+        var txn = try metadata.beginWriteTxn();
+        errdefer txn.abort();
+        try scopes.register(scratch, &txn, metadata_ns, selected.source, authority);
+        _ = try scopes.begin(scratch, &txn, metadata_ns, backend, selected.parent_command, authority);
+        first = try scopes.Data.enroll(scratch, &txn, metadata_ns, backend, selected.parent_command, selected.transaction, spec, authority);
+        try std.testing.expectEqual(@as(u64, 1), first.admission.generation);
+        try std.testing.expectEqual(@as(u32, 1), try scopes.Data.tableCount(&txn, metadata_ns, spec.route.table_id));
+        try std.testing.expectError(error.LockOwnerBusy, scopes.finish(scratch, &txn, metadata_ns, backend, selected.parent_command, authority));
+        try std.testing.expectError(error.LockOwnerBusy, scopes.Data.acknowledge(scratch, &txn, metadata_ns, backend, 1, selected.parent_command, authority));
+        try std.testing.expectError(error.LockOwnerBusy, scopes.Data.retire(scratch, &txn, metadata_ns, backend, 1, authority));
+        try txn.commit();
+    }
+    metadata.close();
+    metadata = try DocStore.open(a, metadata_path, .{});
+    // Duplicate enrollment consumes neither another slot nor a generation.
+    {
+        var txn = try metadata.beginWriteTxn();
+        errdefer txn.abort();
+        const replay = try scopes.Data.enroll(scratch, &txn, metadata_ns, backend, selected.parent_command, selected.transaction, spec, authority);
+        try std.testing.expectEqualDeep(first, replay);
+        try std.testing.expectEqual(@as(usize, 1), (try scopes.read(scratch, &txn, metadata_ns, backend)).?.data.?.count());
+        var changed = spec;
+        changed.schema_version = 10;
+        try std.testing.expectError(error.Forbidden, scopes.Data.enroll(scratch, &txn, metadata_ns, backend, selected.parent_command, selected.transaction, changed, authority));
+        try txn.commit();
+    }
+    {
+        var txn = try data.beginWriteTxn();
+        errdefer txn.abort();
+        const control = @import("pessimistic_lock_control.zig");
+        var metadata_read = try metadata.beginReadTxn();
+        defer metadata_read.abort();
+        const checked: control.Checked = .{ .source = (try scopes.read(scratch, &metadata_read, metadata_ns, backend)).?, .participant = first, .admitted_at_ms = 1 };
+        const begin_command: control.Command = .{ .admission = first.admission, .checked = checked, .operation = .begin };
+        try control.apply(scratch, &txn, selected.binding.identity, selected.binding.namespace.group, .document, begin_command);
+        var finish_command = begin_command;
+        finish_command.operation = .finish;
+        try control.apply(scratch, &txn, selected.binding.identity, selected.binding.namespace.group, .document, finish_command);
+        const native_snapshot = try control.snapshot(scratch, &txn, selected.binding.identity, .{ .admission = first.admission });
+        try std.testing.expectEqualDeep(try first.admission.command(), native_snapshot.scope.?.completed.?);
+        try std.testing.expectEqual(@as(?scopes.Command, null), native_snapshot.scope.?.command);
+        try txn.commit();
+    }
+    {
+        var txn = try metadata.beginWriteTxn();
+        errdefer txn.abort();
+        try scopes.Data.acknowledge(scratch, &txn, metadata_ns, backend, 1, selected.parent_command, authority);
+        // Exact repeated ACKs do not underflow the shared open counter.
+        try scopes.Data.acknowledge(scratch, &txn, metadata_ns, backend, 1, selected.parent_command, authority);
+        const replay = try scopes.Data.enroll(scratch, &txn, metadata_ns, backend, selected.parent_command, selected.transaction, spec, authority);
+        try std.testing.expect(!replay.command_open);
+        try scopes.finish(scratch, &txn, metadata_ns, backend, selected.parent_command, authority);
+        try txn.commit();
+    }
+    selected.parent_command.sequence += 1;
+    selected.parent_command.nonce = @splat(24);
+    authority.command = selected.parent_command;
+    {
+        var txn = try metadata.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try scopes.begin(scratch, &txn, metadata_ns, backend, selected.parent_command, authority);
+        const second = try scopes.Data.enroll(scratch, &txn, metadata_ns, backend, selected.parent_command, selected.transaction, spec, authority);
+        try std.testing.expectEqual(first.admission.generation, second.admission.generation);
+        try std.testing.expectEqual(@as(u64, 2), second.admission.serial);
+        try std.testing.expectError(error.LockEffectChanged, scopes.Data.acknowledge(scratch, &txn, metadata_ns, backend, 1, first.admission.parent_command, authority));
+        try std.testing.expectError(error.LockOwnerBusy, scopes.Data.acknowledge(scratch, &txn, metadata_ns, backend, 1, selected.parent_command, authority));
+        try std.testing.expectEqual(@as(u8, 1), (try scopes.read(scratch, &txn, metadata_ns, backend)).?.data.?.open);
+        try std.testing.expectEqual(@as(u32, 1), try scopes.Data.tableCount(&txn, metadata_ns, spec.route.table_id));
+        try txn.commit();
+    }
+}
+
+const AccessCore = struct {
+    store: *DocStore,
+    identity_namespace: @import("db/doc_identity_namespace.zig").Namespace,
+    schema: ?@import("db/schema_registry.zig").SchemaView = null,
+    pub fn acquireSchemaView(self: *@This()) ?@import("db/schema_registry.zig").SchemaView {
+        return if (self.schema) |view| view.clone() else null;
+    }
+    pub fn acquireSchemaVersionView(self: *@This(), version: u32) !?@import("db/schema_registry.zig").SchemaView {
+        if (self.schema) |view| if (view.version() == version) return view.clone();
+        return null;
+    }
+};
+
+test "pessimistic locks native LSM mutation guard uses typed unique equality and independent native owner for self exclusion" {
+    const schema_api = @import("../schema/mod.zig");
+    const schema_registry = @import("db/schema_registry.zig");
+    const mapper = @import("db/document_mapper.zig");
+    const access = @import("db/pessimistic_access.zig");
+    const path = try pathFor("typed-access");
+    defer a.free(path);
+    defer cleanup(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    const validator = try schema_api.CompiledTableValidator.init(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"value":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    const runtime_schema = try schema_api.deriveRuntimeTableSchema(a, validator.schema);
+    const epoch = try schema_registry.Epoch.createOwnedValidated(a, runtime_schema, validator);
+    var schema: schema_registry.SchemaView = .{ .epoch = epoch };
+    defer schema.release();
+    const admitted = dataFixture();
+    const authorized: DataAuthority = .{ .approved = admitted };
+    var core: AccessCore = .{ .store = &store, .identity_namespace = admitted.binding.identity, .schema = schema };
+    var initial = try mapper.PreparedRelationalWrite.init(a, "r", "{\"id\":1,\"value\":10}", schema.validator(), schema.tableSchema().*, schema.physicalLayout());
+    defer initial.deinit(a);
+    try initial.finalizeMetadata(1);
+    var unchanged_key = try mapper.PreparedRelationalWrite.init(a, "r", "{\"id\":1,\"value\":11}", schema.validator(), schema.tableSchema().*, schema.physicalLayout());
+    defer unchanged_key.deinit(a);
+    var changed_key = try mapper.PreparedRelationalWrite.init(a, "r", "{\"id\":2,\"value\":10}", schema.validator(), schema.tableSchema().*, schema.physicalLayout());
+    defer changed_key.deinit(a);
+    const row_key = try @import("db/relational_store.zig").keyAlloc(a, "r");
+    defer a.free(row_key);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try data_participant.admit(a, &txn, core.identity_namespace, admitted, authorized);
+        const grant = try dataGrant(admitted, 1, "r", .key_share, 0);
+        try std.testing.expectEqual(ledger.Outcome.granted, (try data_participant.acquire(a, &txn, core.identity_namespace, grant, authorized)).outcome);
+        try txn.put(row_key, initial.packed_row);
+        try txn.commit();
+    }
+    {
+        var guard = try access.Guard.init(a, &core, null);
+        defer guard.deinit();
+        try guard.table(.row_exclusive);
+        try guard.write(&core, "r", unchanged_key.packed_row);
+        try std.testing.expectError(error.IntentConflict, guard.write(&core, "r", changed_key.packed_row));
+        try std.testing.expectError(error.IntentConflict, guard.write(&core, "r", null));
+        // A caller-supplied transaction ID without a real native owner cannot
+        // exclude any grant, even when it names the lock holder's transaction.
+        var unowned = try access.Guard.init(a, &core, admitted.transaction);
+        defer unowned.deinit();
+        try std.testing.expect(unowned.owner == null);
+        try std.testing.expectError(error.IntentConflict, unowned.row("r", .update));
+        try guard.write(&core, "\x00\x00internal", null);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const registration = try admitted.registration();
+        const table: data_participant.Acquisition = .{ .admission = admitted, .effect = .{ .backend = registration.lease.backend, .sequence = 2, .nonce = @splat(28), .action = .{ .try_acquire = .{ .resource = try admitted.binding.table(), .mode = .{ .table = .access_exclusive }, .scope = .{ .transaction = .{ .id = admitted.transaction, .subtransaction = 0 } } } } } };
+        try std.testing.expectEqual(ledger.Outcome.granted, (try data_participant.acquire(a, &txn, core.identity_namespace, table, authorized)).outcome);
+        try txn.commit();
+    }
+    store.close();
+    store = try DocStore.open(a, path, .{});
+    {
+        var guard = try access.Guard.init(a, &core, null);
+        defer guard.deinit();
+        try std.testing.expectError(error.IntentConflict, guard.table(.row_exclusive));
+        try std.testing.expectError(error.IntentConflict, guard.table(.access_share));
+        var changed = core;
+        changed.identity_namespace.table_id += 1;
+        try std.testing.expectError(error.IdentityNamespaceMismatch, access.Guard.init(a, &changed, null));
+    }
+}
+
+test "pessimistic locks native LSM compare and lock preserves false outcomes current row witnesses and bounded queued refresh across restart" {
+    const row_locks = @import("pessimistic_lock_row.zig");
+    const internal = @import("internal_keys.zig");
+    const path = try pathFor("compare-and-lock");
+    defer a.free(path);
+    defer cleanup(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    const admitted = dataFixture();
+    const receiving = admitted.binding.identity;
+    const authorized: DataAuthority = .{ .approved = admitted };
+    const primary = try internal.documentKeyAlloc(a, "r");
+    defer a.free(primary);
+    const timestamp = try internal.ttlKeyAlloc(a, "r");
+    defer a.free(timestamp);
+    var stamp: [8]u8 = undefined;
+    std.mem.writeInt(u64, &stamp, 11, .little);
+    var initial: row_locks.Witness = undefined;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try data_participant.admit(a, &txn, receiving, admitted, authorized);
+        try txn.put(primary, "{\"id\":1}");
+        try txn.put(timestamp, &stamp);
+        initial = (try row_locks.current(a, &txn, .document, "r")).?;
+        try txn.commit();
+    }
+    var grant = try dataGrant(admitted, 1, "r", .key_share, 4);
+    const initial_action = grant.effect.action.try_acquire;
+    grant.effect.action = .{ .acquire = initial_action };
+    const request: row_locks.Request = .{ .acquisition = grant, .witness = initial, .wait = .try_lock };
+    var known: row_locks.Result = undefined;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        known = try row_locks.acquire(a, &txn, receiving, .document, request, authorized);
+        try std.testing.expectEqual(.matched, known.status);
+        try std.testing.expectEqual(.granted, known.receipt.outcome);
+        try txn.commit();
+    }
+    store.close();
+    store = try DocStore.open(a, path, .{});
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqualDeep(known, (try row_locks.observe(a, &txn, receiving, request, authorized)).?);
+        var changed = request;
+        changed.witness.version += 1;
+        try std.testing.expectError(error.LockEffectChanged, row_locks.observe(a, &txn, receiving, changed, authorized));
+        std.mem.writeInt(u64, &stamp, 12, .little);
+        try txn.put(primary, "{\"id\":1,\"value\":2}");
+        try txn.put(timestamp, &stamp);
+        // An already granted occurrence retains its exact captured image,
+        // even after a compatible non-key update changes the primary bytes.
+        try std.testing.expectEqualDeep(known, try row_locks.acquire(a, &txn, receiving, .document, request, authorized));
+        try txn.commit();
+    }
+    var changed_request = request;
+    changed_request.acquisition.effect.sequence = 2;
+    changed_request.acquisition.effect.nonce = @splat(32);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const rejected = try row_locks.acquire(a, &txn, receiving, .document, changed_request, authorized);
+        try std.testing.expectEqual(.changed, rejected.status);
+        try std.testing.expectEqual(.cancelled, rejected.receipt.outcome);
+        const owner = (try ledger.readOwner(a, &txn, admitted.binding.namespace, grant.effect.backend)).?;
+        try std.testing.expectEqual(@as(u32, 1), owner.resources);
+        try std.testing.expectEqual(@as(u64, 3), owner.next_effect);
+        try txn.commit();
+    }
+    var competing = admitted;
+    competing.source.lease.backend.id = @splat(33);
+    competing.transaction = @splat(34);
+    const competitor: DataAuthority = .{ .approved = competing };
+    var next = try dataGrant(competing, 1, "r", .update, 4);
+    const next_action = next.effect.action.try_acquire;
+    next.effect.action = .{ .acquire = next_action };
+    var contended: row_locks.Request = .{ .acquisition = next, .witness = initial, .wait = .try_lock };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try data_participant.admit(a, &txn, receiving, competing, competitor);
+        contended.witness = (try row_locks.current(a, &txn, .document, "r")).?;
+        const rejected = try row_locks.acquire(a, &txn, receiving, .document, contended, competitor);
+        try std.testing.expectEqual(.contended, rejected.status);
+        const owner = (try ledger.readOwner(a, &txn, competing.binding.namespace, next.effect.backend)).?;
+        try std.testing.expectEqual(@as(u32, 0), owner.resources);
+        try std.testing.expect(owner.waiting == null);
+        try txn.commit();
+    }
+    try applyDataControl(&store, try dataControl(admitted, 3, .{ .rollback = .{ .transaction = admitted.transaction, .first_aborted = 4 } }));
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        // Unblocking does not turn a lost NOWAIT/SKIP outcome into a grant.
+        try std.testing.expectEqual(.contended, (try row_locks.acquire(a, &txn, receiving, .document, contended, competitor)).status);
+        var fresh = contended;
+        fresh.acquisition.effect.sequence = 2;
+        fresh.acquisition.effect.nonce = @splat(35);
+        try std.testing.expectEqual(.granted, (try row_locks.acquire(a, &txn, receiving, .document, fresh, competitor)).receipt.outcome);
+        try txn.commit();
+    }
+    var absent = request;
+    absent.acquisition.physical_key = "s";
+    absent.acquisition.effect.sequence = 4;
+    absent.acquisition.effect.nonce = @splat(36);
+    absent.acquisition.effect.action.acquire.resource = try admitted.binding.row("s");
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const missing = try row_locks.acquire(a, &txn, receiving, .document, absent, authorized);
+        try std.testing.expectEqual(.absent, missing.status);
+        try std.testing.expectEqual(@as(u32, 0), (try ledger.readOwner(a, &txn, admitted.binding.namespace, grant.effect.backend)).?.resources);
+        try txn.commit();
+    }
+    var queued = request;
+    queued.acquisition.effect.sequence = 5;
+    queued.acquisition.effect.nonce = @splat(37);
+    queued.witness = contended.witness;
+    queued.wait = .block;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(.pending, (try row_locks.acquire(a, &txn, receiving, .document, queued, authorized)).receipt.outcome);
+        try txn.commit();
+    }
+    store.close();
+    store = try DocStore.open(a, path, .{});
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        std.mem.writeInt(u64, &stamp, 13, .little);
+        try txn.put(primary, "{\"id\":1,\"value\":3}");
+        try txn.put(timestamp, &stamp);
+        try txn.commit();
+    }
+    try applyDataControl(&store, try dataControl(competing, 3, .{ .rollback = .{ .transaction = competing.transaction, .first_aborted = 4 } }));
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const rejected = try row_locks.acquire(a, &txn, receiving, .document, queued, authorized);
+        try std.testing.expectEqual(.changed, rejected.status);
+        try std.testing.expectEqual(.cancelled, rejected.receipt.outcome);
+        try std.testing.expectEqual(@as(u32, 0), (try ledger.readOwner(a, &txn, admitted.binding.namespace, grant.effect.backend)).?.resources);
+        var refreshed = queued;
+        refreshed.acquisition.effect.sequence = 6;
+        refreshed.acquisition.effect.nonce = @splat(38);
+        refreshed.witness = (try row_locks.current(a, &txn, .document, "r")).?;
+        try std.testing.expectEqual(.granted, (try row_locks.acquire(a, &txn, receiving, .document, refreshed, authorized)).receipt.outcome);
+        try txn.commit();
+    }
+}

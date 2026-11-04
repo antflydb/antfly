@@ -2586,6 +2586,11 @@ pub const AntflyApiHandler = struct {
             },
             .reject_unrouted_batch = self.api_server.cfg.routed_raft_batch_writer != null,
             .routed_raft_batch_writer = self.api_server.cfg.routed_raft_batch_writer,
+            .sql_lock_validator = .{ .ptr = self.api_server, .check = struct {
+                fn check(raw: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, group: u64, table: []const u8, command: @import("antfly_local_sources").storage_pessimistic_lock_control.Command) !@import("antfly_local_sources").storage_pessimistic_lock_control.Command {
+                    return @import("sql_data_locks.zig").authorize(@ptrCast(@alignCast(raw)), a, context, group, table, command);
+                }
+            }.check },
             .txn_validator = .{
                 .ptr = self.api_server,
                 .validate_fn = struct {
@@ -3080,7 +3085,7 @@ pub const AntflyApiHandler = struct {
             // Two spellings must not disagree about which control is routed.
             if (lookup_options.opts.relational_integrity_jobs_json.len != 0 or lookup_options.opts.relational_integrity_catalog or lookup_options.opts.relational_integrity_action or
                 lookup_options.opts.relational_activation_json.len != 0 or lookup_options.opts.relational_topology_json.len != 0 or
-                lookup_options.opts.relational_index_status_json.len != 0 or lookup_options.opts.group_source_query_json.len != 0)
+                lookup_options.opts.relational_index_status_json.len != 0 or (lookup_options.opts.sql_lock_query_json.len != 0 or lookup_options.opts.group_source_query_json.len != 0))
                 return textResponse(ctx, 400, "ambiguous lookup controls");
             const body = (try ctx.body()) orelse return textResponse(ctx, 400, "lookup control body required");
             if (body.len == 0 or body.len > @import("antfly_local_sources").storage_db_relational_integrity_contract.max_preparation_bytes)
@@ -3122,7 +3127,7 @@ pub const AntflyApiHandler = struct {
             defer identity.deinit(self.api_server.alloc);
             if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
         }
-        const control_lookup = lookup_options.opts.group_source_query_json.len != 0 or lookup_options.opts.relational_integrity_catalog or lookup_options.opts.relational_integrity_jobs_json.len != 0 or lookup_options.opts.relational_index_status_json.len != 0 or lookup_options.opts.relational_activation_json.len != 0 or lookup_options.opts.relational_topology_json.len != 0;
+        const control_lookup = (lookup_options.opts.sql_lock_query_json.len != 0 or lookup_options.opts.group_source_query_json.len != 0) or lookup_options.opts.relational_integrity_catalog or lookup_options.opts.relational_integrity_jobs_json.len != 0 or lookup_options.opts.relational_index_status_json.len != 0 or lookup_options.opts.relational_activation_json.len != 0 or lookup_options.opts.relational_topology_json.len != 0;
         const logical_key = if (control_lookup and std.mem.eql(u8, key, "\x00relational_control")) "" else key;
         const consistency = http_server_mod.parseLookupReadConsistency(ctx.request.uri.query orelse "") catch
             return textResponse(ctx, 400, "invalid read consistency");
@@ -6992,7 +6997,7 @@ pub const AntflyApiHandler = struct {
                 self.prepared_response = response;
                 return;
             }
-            self.is_write = compiled.statement.requiresWriteAdmission();
+            self.is_write = compiled.requiresWriteAdmission();
             var execution = self.adapter.server.acquireSqlExecution(self.is_write) catch |err| {
                 self.failure = err;
                 return;

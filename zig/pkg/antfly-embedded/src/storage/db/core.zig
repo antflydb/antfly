@@ -2657,7 +2657,17 @@ pub const DBCore = struct {
         predicates: []const transactions_mod.VersionPredicate,
         extra_batch: transactions_mod.MutationExtraBatch,
     ) !void {
-        var manager = try transactions_mod.TxnManager.init(extra_batch.preparation_allocator orelse self.alloc, self.store);
+        const lock_alloc = extra_batch.preparation_allocator orelse self.alloc;
+        const user_intents = for (intents) |intent| {
+            if (!std.mem.startsWith(u8, intent.key, "\x00\x00")) break true;
+        } else false;
+        if (user_intents) {
+            var locks = try @import("pessimistic_access.zig").Guard.init(lock_alloc, self, txn_id);
+            defer locks.deinit();
+            try locks.table(.row_exclusive);
+            for (intents) |intent| try locks.write(self, intent.key, intent.prepared_row orelse intent.value);
+        }
+        var manager = try transactions_mod.TxnManager.init(lock_alloc, self.store);
         defer manager.deinit();
         var bound = extra_batch;
         if (bound.max_intent_admission_bytes == 0)

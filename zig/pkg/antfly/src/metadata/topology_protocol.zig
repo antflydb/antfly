@@ -168,10 +168,10 @@ const std = @import("std");
 // unreleased SQL profile reserves floors above 78; historical notes above
 // describe its development sequence before this rebasing. Published transition
 // tag 81 remains SQL completion references; private SQL tags begin at 82.
-pub const current_version: u16 = 159;
+pub const current_version: u16 = 160;
 /// Ordinary catalog DDL binds a prepared command to a retained native outcome.
 pub const sql_catalog_journal_version: u16 = 158;
-pub const sql_prepared_lock_handoff_version: u16 = 155;
+pub const sql_prepared_lock_handoff_version: u16 = 160;
 /// The unreleased combined catalog profile also decodes trigger-return contracts.
 /// Keep new declarations above the older scalar-only routine capability floor.
 pub const sql_trigger_function_version: u16 = 151;
@@ -181,9 +181,9 @@ pub const sql_native_index_namespace_version: u16 = 151;
 pub const sql_connection_transactions_version: u16 = 152;
 /// Native lock scopes bind command authority and external-decision admission.
 // Exact effects and command hashes bind the configured metadata group.
-pub const sql_lock_authority_version: u16 = 159;
+pub const sql_lock_authority_version: u16 = 160;
 /// Guarded catalog/counter identities retain outcomes before checking command liveness.
-pub const sql_command_fence_version: u16 = 159;
+pub const sql_command_fence_version: u16 = 160;
 /// Public catalog-operation recovery binds an immutable logical target label.
 pub const table_retirement_public_version: u16 = 151;
 /// Exact whole-table publication after physical barriers with no survivors.

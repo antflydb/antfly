@@ -181,10 +181,18 @@ pub const Receipt = struct {
 };
 
 const Lane = enum { owner, resource, holder, member, receipt, waiter };
+fn namespacePrefix(buffer: []u8, ns: Namespace) ![]const u8 {
+    try ns.validate();
+    return std.fmt.bufPrint(buffer, "{s}{x:0>16}:{s}:", .{ if (ns.home == .metadata) "\x00\x00__metadata__:sql_locks:" else "\x00\x00__locks__:", ns.group, std.fmt.bytesToHex(ns.incarnation, .lower) });
+}
+fn resourceKey(buffer: []u8, ns: Namespace, resource: [32]u8) ![]const u8 {
+    var base: [128]u8 = undefined;
+    return std.fmt.bufPrint(buffer, "{s}resource:{s}:head", .{ try namespacePrefix(&base, ns), std.fmt.bytesToHex(resource, .lower) });
+}
 fn key(buffer: []u8, ns: Namespace, lane: Lane, backend: locks.Backend, resource: [32]u8, sequence: u64) ![]const u8 {
     try ns.validate();
     var base: [128]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(&base, "{s}{x:0>16}:{s}:", .{ if (ns.home == .metadata) "\x00\x00__metadata__:sql_locks:" else "\x00\x00__locks__:", ns.group, std.fmt.bytesToHex(ns.incarnation, .lower) });
+    const prefix = try namespacePrefix(&base, ns);
     return switch (lane) {
         .resource => std.fmt.bufPrint(buffer, "{s}resource:{s}:head", .{ prefix, std.fmt.bytesToHex(resource, .lower) }),
         .waiter => std.fmt.bufPrint(buffer, "{s}resource:{s}:wait:{s}:{x:0>16}", .{ prefix, std.fmt.bytesToHex(resource, .lower), std.fmt.bytesToHex(backend.id, .lower), backend.fence }),
@@ -260,6 +268,81 @@ pub fn readResourceStamp(backing: A, txn: anytype, ns: Namespace, resource: [32]
     if (!std.mem.eql(u8, &value.digest, &resource)) return error.InvalidLockRecord;
     return .{ .resource = resource, .generation = value.generation, .revision = value.revision };
 }
+/// A native participant's already authenticated transaction attachment. The
+/// accepting writer must independently verify its decision/command authority;
+/// this read-only check cannot grant access based on a caller's backend claim.
+pub const AccessOwner = struct { backend: locks.Backend, transaction: [16]u8 };
+
+/// Check ordinary native access in the same serialized apply section as its
+/// effect. The caller retains that section until commit; a preflight probe is
+/// insufficient. This neither registers an owner nor increments grant counts.
+/// Compatible writes must still respect queued upgrades to avoid starvation.
+pub fn accessBlocked(backing: A, txn: anytype, ns: Namespace, resource: [32]u8, mode: locks.Mode, attachment: ?AccessOwner) !bool {
+    try ns.validate();
+    if (mode.class() == .advisory or std.mem.allEqual(u8, &resource, 0)) return error.InvalidLockResource;
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var own: ?locks.Grant = null;
+    if (attachment) |attached| {
+        try attached.backend.validate();
+        if (!std.mem.eql(u8, &attached.backend.incarnation, &ns.incarnation) or std.mem.allEqual(u8, &attached.transaction, 0)) return error.InvalidLockScope;
+        const owner = try readOwner(a, txn, ns, attached.backend) orelse return error.LockOwnerNotRegistered;
+        if (owner.state != .active and owner.state != .prepared) return error.LockOwnerBusy;
+        if (owner.waiting != null or owner.job != null) return error.LockOwnerBusy;
+        if (!std.meta.eql(owner.transaction, @as(?[16]u8, attached.transaction))) return error.LockOwnerChanged;
+        var buffer: [256]u8 = undefined;
+        if (try optional(txn, try key(&buffer, ns, .holder, attached.backend, resource, 0))) |bytes| {
+            own = try locks.Grant.decode(bytes);
+            if (!own.?.backend.eql(attached.backend) or !std.mem.eql(u8, &own.?.resource, &resource) or own.?.class != mode.class()) return error.InvalidLockRecord;
+            if (!std.meta.eql(own.?.transaction, @as(?[16]u8, attached.transaction))) return error.LockOwnerChanged;
+        }
+    }
+    var buffer: [256]u8 = undefined;
+    // Resource keys are independent of a backend. An attached owner has already
+    // been validated; anonymous access never borrows a synthetic identity.
+    const raw = try optional(txn, try resourceKey(&buffer, ns, resource));
+    const bytes = raw orelse {
+        if (own != null) return error.InvalidLockRecord;
+        return false;
+    };
+    const head = try decode(Resource, a, bytes);
+    try head.validate();
+    if (!std.mem.eql(u8, &head.digest, &resource) or head.class != mode.class()) return error.InvalidLockRecord;
+    const aggregate: locks.Aggregate = .{ .class = head.class, .owners = head.counts };
+    const blocked = if (attachment) |attached|
+        try aggregate.blocked(mode, .{ .backend = attached.backend, .resource = resource }, own)
+    else
+        try aggregate.blockedUnowned(mode);
+    if (blocked) return true;
+    const own_mask = if (own) |grant| grant.mask() else 0;
+    if (own_mask & (@as(u8, 1) << mode.index()) != 0) return false;
+    var queued = false;
+    for (head.wait_counts, 0..) |count, index| if (count != 0 and mode.conflicts() & (@as(u8, 1) << @as(u3, @intCast(index))) != 0) {
+        queued = true;
+    };
+    if (!queued or own == null) return queued;
+    // An existing holder may upgrade before waiters blocked by its own grant.
+    // Earlier independent waiters keep priority, exactly as regular admission.
+    var current = head.first;
+    var previous: ?locks.Backend = null;
+    var visited: u32 = 0;
+    var earlier_blocked = false;
+    while (current) |backend| {
+        if (visited >= head.waiters) return error.InvalidLockRecord;
+        const waiter = try readWaiter(a, txn, ns, head, backend);
+        if (!std.meta.eql(previous, waiter.previous) or backend.eql(attachment.?.backend)) return error.InvalidLockRecord;
+        const waiting_mode = waiter.effect.action.acquire.mode;
+        if (own_mask & waiting_mode.conflicts() != 0) return earlier_blocked;
+        earlier_blocked = earlier_blocked or try mode.conflictsWith(waiting_mode);
+        visited += 1;
+        previous = backend;
+        current = waiter.next;
+    }
+    if (visited != head.waiters or !std.meta.eql(previous, head.last)) return error.InvalidLockRecord;
+    return earlier_blocked;
+}
+
 pub fn readOwner(backing: A, txn: anytype, ns: Namespace, backend: locks.Backend) !?Owner {
     try ns.validate();
     try backend.validate();
@@ -1645,4 +1728,64 @@ test "pessimistic lock deadlock proof rejects a checksummed grant copied from an
     try std.testing.expectEqual(@as(u64, 1), owner.next_effect);
     try std.testing.expect(owner.waiting == null);
     try std.testing.expect((try observe(a, &store, f.ns, request, cb)) == null);
+}
+
+fn accessTestMode(class: locks.Class, index: usize) locks.Mode {
+    return switch (class) {
+        .table => .{ .table = @fromBackingInt(@as(u3, @intCast(index))) },
+        .row => .{ .row = @fromBackingInt(@as(u2, @intCast(index))) },
+        .advisory => unreachable,
+    };
+}
+
+test "native lock access checks every PostgreSQL table and row conflict without creating an owner or changing grants" {
+    const a = std.testing.allocator;
+    const f = TestFixture;
+    const transaction: [16]u8 = @splat(9);
+    for ([_]locks.Class{ .table, .row }) |class| {
+        for (0..locks.modeCount(class)) |held| {
+            var store: TestStore = .{ .a = a };
+            defer store.deinit();
+            const context: TestContext = .{ .expected = f.a };
+            try register(a, &store, f.ns, f.a, context);
+            var effect = f.request(f.a, 1);
+            effect.action = .{ .try_acquire = .{ .resource = @splat(6), .mode = accessTestMode(class, held), .scope = .{ .transaction = .{ .id = transaction, .subtransaction = 0 } } } };
+            try std.testing.expectEqual(Outcome.granted, (try store.effect(f.ns, effect, context, null)).outcome);
+            const writes = store.writes;
+            for (0..locks.modeCount(class)) |requested| {
+                const mode = accessTestMode(class, requested);
+                try std.testing.expectEqual(try mode.conflictsWith(accessTestMode(class, held)), try accessBlocked(a, &store, f.ns, @splat(6), mode, null));
+                try std.testing.expect(!try accessBlocked(a, &store, f.ns, @splat(6), mode, .{ .backend = f.a.backend, .transaction = transaction }));
+                try std.testing.expect(!try accessBlocked(a, &store, f.ns, @splat(7), mode, null));
+            }
+            try std.testing.expectEqual(writes, store.writes);
+            try std.testing.expect((try readOwner(a, &store, f.ns, f.b.backend)) == null);
+            try std.testing.expectError(error.LockOwnerChanged, accessBlocked(a, &store, f.ns, @splat(6), accessTestMode(class, 0), .{ .backend = f.a.backend, .transaction = @splat(8) }));
+            var stale = f.a.backend;
+            stale.fence += 1;
+            try std.testing.expectError(error.LockOwnerNotRegistered, accessBlocked(a, &store, f.ns, @splat(6), accessTestMode(class, 0), .{ .backend = stale, .transaction = transaction }));
+        }
+    }
+}
+
+test "native lock access preserves queued update priority while permitting the blocking holder's upgrade" {
+    const a = std.testing.allocator;
+    const f = TestFixture;
+    var store: TestStore = .{ .a = a };
+    defer store.deinit();
+    const ca: TestContext = .{ .expected = f.a };
+    const cb: TestContext = .{ .expected = f.b };
+    try register(a, &store, f.ns, f.a, ca);
+    try register(a, &store, f.ns, f.b, cb);
+    var first = f.request(f.a, 1);
+    first.action = .{ .acquire = .{ .resource = @splat(6), .mode = .{ .row = .key_share }, .scope = .{ .transaction = .{ .id = @splat(9), .subtransaction = 0 } } } };
+    try std.testing.expectEqual(Outcome.granted, (try store.effect(f.ns, first, ca, null)).outcome);
+    try std.testing.expect(!try accessBlocked(a, &store, f.ns, @splat(6), .{ .row = .no_key_update }, null));
+    var queued = f.request(f.b, 1);
+    queued.action = .{ .acquire = .{ .resource = @splat(6), .mode = .{ .row = .update }, .scope = .{ .transaction = .{ .id = @splat(8), .subtransaction = 0 } } } };
+    try std.testing.expectEqual(Outcome.pending, (try store.effect(f.ns, queued, cb, null)).outcome);
+    try std.testing.expect(try accessBlocked(a, &store, f.ns, @splat(6), .{ .row = .no_key_update }, null));
+    try std.testing.expect(!try accessBlocked(a, &store, f.ns, @splat(6), .{ .row = .no_key_update }, .{ .backend = f.a.backend, .transaction = @splat(9) }));
+    _ = try store.cancellation(f.ns, queued, cb, null);
+    try std.testing.expect(!try accessBlocked(a, &store, f.ns, @splat(6), .{ .row = .no_key_update }, null));
 }

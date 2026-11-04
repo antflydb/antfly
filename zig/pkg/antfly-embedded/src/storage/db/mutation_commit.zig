@@ -1342,6 +1342,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (opts.transaction_resolution == null) {
                 try S.ownerField(self, "core").*.checkOrdinaryWriteConflicts(effective_ops.writes, effective_ops.deletes);
             }
+            var pessimistic = try @import("pessimistic_access.zig").Guard.init(preparation_alloc, S.ownerField(self, "core").*, if (opts.transaction_resolution) |resolution| resolution.txn_id else null);
+            defer pessimistic.deinit();
+            const user_changes = for (effective_req.writes) |write| {
+                if (!isMetadataKey(write.key)) break true;
+            } else for (effective_req.deletes) |key| {
+                if (!isMetadataKey(key)) break true;
+            } else false;
+            if (user_changes) try pessimistic.table(.row_exclusive);
+            for (effective_req.deletes) |key| try pessimistic.row(key, .update);
             try self.validateTransformReadSnapshot(transform_snapshot);
             // Catches a concurrent commit to one of this batch's own write keys
             // between the pre-lock precompute read and this lock acquisition --
@@ -1592,6 +1601,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 else
                     null;
                 defer if (prepared_relational) |*prepared| prepared.deinit(S.ownerField(self, "alloc").*);
+                try pessimistic.write(S.ownerField(self, "core").*, write.key, if (prepared_relational) |prepared| prepared.packed_row else write.value);
                 var fallback_consumer_plan = if (!use_preprepared_rows and prepared_relational != null) try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot() else null;
                 defer if (fallback_consumer_plan) |*plan| plan.release();
                 if (fallback_consumer_plan) |plan| try requireRelationalConsumerFields(&prepared_relational.?, apply_schema_view.?.tableSchema().*, plan.plan().*, false);

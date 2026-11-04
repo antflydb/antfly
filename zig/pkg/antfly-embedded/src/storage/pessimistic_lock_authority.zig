@@ -62,7 +62,7 @@ pub const CommandFence = struct {
         if (self.group == 0 or self.database == 0 or std.mem.allEqual(u8, &self.principal, 0)) return error.InvalidLockScope;
     }
     pub fn requireCommand(self: CommandFence, _: anytype, ns: ledger.Namespace, value: Record, command: Command) !void {
-        if (self.group != ns.group or self.group != value.registration.group or !self.backend.eql(value.registration.lease.backend) or !std.meta.eql(self.command, command) or
+        if (ns.home != .metadata or self.group != ns.group or self.group != value.registration.group or !self.backend.eql(value.registration.lease.backend) or !std.meta.eql(self.command, command) or
             self.database != value.registration.lease.database or self.standalone != value.registration.standalone or
             !std.mem.eql(u8, &self.principal, &value.registration.lease.principal)) return error.Forbidden;
     }
@@ -96,6 +96,7 @@ pub const DecisionRef = struct {
 pub const Transaction = struct { id: [16]u8, decision: ?DecisionRef = null };
 pub const Record = struct {
     registration: Registration,
+    data: ?Data.Header = null,
     next_command: u64 = 1,
     command: ?Command = null,
     completed: ?Command = null,
@@ -105,6 +106,10 @@ pub const Record = struct {
     state: enum { active, fenced, retired } = .active,
     pub fn validate(self: Record, ns: ledger.Namespace) !void {
         try self.registration.validate(ns);
+        if (self.data) |directory| {
+            try directory.validate();
+            if (ns.home != .metadata or (self.state == .retired and directory.count() != 0)) return error.InvalidLockRecord;
+        }
         if (self.next_command == 0) return error.InvalidLockRecord;
         if (self.command) |command| {
             try command.validate();
@@ -122,25 +127,254 @@ pub const Record = struct {
         if (self.state == .retired and self.transaction != null) return error.InvalidLockRecord;
     }
 };
+/// Durable participant directory owned by the existing metadata command.
+/// Enrollment precedes the first data RPC; FINISH and retirement cannot pass
+/// outstanding native acknowledgements. Every operation is bounded by the
+/// existing 64-member external transaction cohort, never by table row count.
+pub const Data = struct {
+    pub const capacity = 64;
+    pub const Header = struct {
+        next_generation: u64 = 1,
+        slots: [capacity]u64 = @splat(0),
+        open: u8 = 0,
+        pub fn count(self: Header) usize {
+            var total: usize = 0;
+            for (self.slots) |generation| if (generation != 0) {
+                total += 1;
+            };
+            return total;
+        }
+        pub fn validate(self: Header) !void {
+            if (self.next_generation == 0 or self.open > self.count()) return error.InvalidLockRecord;
+            for (self.slots, 0..) |generation, i| {
+                if (generation >= self.next_generation) return error.InvalidLockRecord;
+                if (generation != 0) for (self.slots[0..i]) |previous| if (generation == previous) return error.InvalidLockRecord;
+            }
+        }
+    };
+    pub const Spec = struct {
+        table_name: []const u8,
+        route: @import("../metadata/catalog_route_contract.zig").CatalogRouteFence,
+        schema_version: ?u32 = null,
+        pub fn validate(self: Spec, ns: ledger.Namespace) !void {
+            try self.route.validate();
+            const incarnation = self.route.metadata_incarnation orelse return error.InvalidLockResource;
+            if (ns.home != .metadata or self.route.metadata_group_id != ns.group or !std.mem.eql(u8, &incarnation, &std.fmt.bytesToHex(ns.incarnation, .lower)) or
+                self.table_name.len == 0 or self.table_name.len > 1024 or !std.unicode.utf8ValidateSlice(self.table_name) or std.mem.indexOfScalar(u8, self.table_name, 0) != null or self.route.topology_epoch == 0) return error.InvalidLockResource;
+        }
+        pub fn binding(self: Spec, ns: ledger.Namespace) !@import("pessimistic_lock_resource.zig").Binding {
+            try self.validate(ns);
+            const identity = self.route.route.identity_namespace;
+            return .{ .namespace = .{ .home = .data, .group = self.route.route.group_id, .incarnation = ns.incarnation }, .identity = .{ .table_id = identity.table_id, .shard_id = identity.shard_id, .range_id = identity.range_id } };
+        }
+    };
+    pub const Participant = struct {
+        spec: Spec,
+        admission: @import("pessimistic_lock_participant.zig").Admission,
+        command_open: bool = true,
+        pub fn validate(self: Participant, ns: ledger.Namespace, backend: locks.Backend) !void {
+            try self.spec.validate(ns);
+            try self.admission.validate();
+            if (!self.admission.source.lease.backend.eql(backend) or !self.admission.binding.eql(try self.spec.binding(ns)) or self.admission.purpose != .execution) return error.InvalidLockRecord;
+        }
+    };
+    fn participantKey(buffer: []u8, ns: ledger.Namespace, backend: locks.Backend, generation: u64) ![]const u8 {
+        var root_buffer: [192]u8 = undefined;
+        const root = try key(&root_buffer, ns, backend);
+        return std.fmt.bufPrint(buffer, "{s}:participant:{x:0>16}", .{ root, generation });
+    }
+    fn lookupKey(buffer: []u8, ns: ledger.Namespace, backend: locks.Backend, spec: Spec, transaction: [16]u8) ![]const u8 {
+        var root_buffer: [192]u8 = undefined;
+        const root = try key(&root_buffer, ns, backend);
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly/data-lock-enrollment/v1");
+        hash.update(&try (try spec.binding(ns)).encode());
+        hash.update(&transaction);
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        return std.fmt.bufPrint(buffer, "{s}:route:{s}", .{ root, std.fmt.bytesToHex(digest, .lower) });
+    }
+    fn tableCountKey(buffer: []u8, ns: ledger.Namespace, table: u64) ![]const u8 {
+        return std.fmt.bufPrint(buffer, "{s}{x:0>16}:{s}:table:{x:0>16}:participants", .{ homePrefix(ns, .scope), ns.group, std.fmt.bytesToHex(ns.incarnation, .lower), table });
+    }
+    /// Unreclaimed participant debt blocks topology/restore/schema retirement
+    /// in O(1), including enrollment whose first data BEGIN was never delivered.
+    pub fn tableCount(txn: anytype, ns: ledger.Namespace, table: u64) !u32 {
+        var buffer: [256]u8 = undefined;
+        const raw = (try optional(txn, try tableCountKey(&buffer, ns, table))) orelse return 0;
+        if (raw.len != 4) return error.InvalidLockRecord;
+        const total = std.mem.readInt(u32, raw[0..4], .little);
+        if (total == 0 or total > max_active * capacity) return error.InvalidLockRecord;
+        return total;
+    }
+    fn writeTableCount(txn: anytype, ns: ledger.Namespace, table: u64, total: u32) !void {
+        var buffer: [256]u8 = undefined;
+        const address = try tableCountKey(&buffer, ns, table);
+        if (total == 0) return txn.delete(address);
+        var raw: [4]u8 = undefined;
+        std.mem.writeInt(u32, &raw, total, .little);
+        try txn.put(address, &raw);
+    }
+    pub fn readParticipant(a: A, txn: anytype, ns: ledger.Namespace, backend: locks.Backend, generation: u64) !?Participant {
+        var buffer: [256]u8 = undefined;
+        const raw = (try optional(txn, try participantKey(&buffer, ns, backend, generation))) orelse return null;
+        if (raw.len > 8192 or raw.len <= 32) return error.InvalidLockRecord;
+        const body = raw[0 .. raw.len - 32];
+        var checksum: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(body, &checksum, .{});
+        if (!std.mem.eql(u8, raw[body.len..], &checksum)) return error.InvalidLockRecord;
+        const result = try std.json.parseFromSliceLeaky(Participant, a, body, .{ .allocate = .alloc_always });
+        try result.validate(ns, backend);
+        if (result.admission.generation != generation or !std.mem.eql(u8, body, try std.json.Stringify.valueAlloc(a, result, .{}))) return error.InvalidLockRecord;
+        return result;
+    }
+    pub fn find(a: A, txn: anytype, ns: ledger.Namespace, backend: locks.Backend, spec: Spec, transaction: [16]u8) !?Participant {
+        var buffer: [256]u8 = undefined;
+        const raw = (try optional(txn, try lookupKey(&buffer, ns, backend, spec, transaction))) orelse return null;
+        if (raw.len != 8) return error.InvalidLockRecord;
+        const generation = std.mem.readInt(u64, raw[0..8], .little);
+        const value = try load(a, txn, ns, backend);
+        const directory = value.data orelse return error.InvalidLockRecord;
+        if (std.mem.indexOfScalar(u64, &directory.slots, generation) == null) return error.InvalidLockRecord;
+        return try readParticipant(a, txn, ns, backend, generation) orelse error.InvalidLockRecord;
+    }
+    fn writeParticipant(a: A, txn: anytype, ns: ledger.Namespace, backend: locks.Backend, value: Participant) !void {
+        try value.validate(ns, backend);
+        const body = try std.json.Stringify.valueAlloc(a, value, .{});
+        if (body.len + 32 > 8192) return error.InvalidLockRecord;
+        const bytes = try a.alloc(u8, body.len + 32);
+        @memcpy(bytes[0..body.len], body);
+        std.crypto.hash.Blake3.hash(body, bytes[body.len..][0..32], .{});
+        var buffer: [256]u8 = undefined;
+        try txn.put(try participantKey(&buffer, ns, backend, value.admission.generation), bytes);
+    }
+    /// Returns a caller-allocator-owned descriptor. An exact completed replay
+    /// stays completed; it cannot reopen the same native command.
+    pub fn enroll(a: A, txn: anytype, ns: ledger.Namespace, backend: locks.Backend, command: Command, transaction: [16]u8, spec: Spec, authority: anytype) !Participant {
+        try spec.validate(ns);
+        var value = try guard(a, txn, ns, backend, command, authority);
+        try authority.requireTransaction(txn, ns, value, transaction);
+        try authority.requireDataEnrollment(txn, ns, value, spec);
+        if (std.mem.allEqual(u8, &transaction, 0)) return error.InvalidLockScope;
+        if (value.transaction) |current| {
+            if (!std.mem.eql(u8, &current.id, &transaction) or current.decision != null) return error.LockOwnerChanged;
+        } else {
+            if (value.released_transaction) |released| if (std.mem.eql(u8, &released.id, &transaction)) return error.LockEffectExpired;
+            value.transaction = .{ .id = transaction };
+        }
+        var directory = value.data orelse Header{};
+        var lookup_buffer: [256]u8 = undefined;
+        const lookup_address = try lookupKey(&lookup_buffer, ns, backend, spec, transaction);
+        if (try optional(txn, lookup_address)) |raw| {
+            if (raw.len != 8) return error.InvalidLockRecord;
+            const generation = std.mem.readInt(u64, raw[0..8], .little);
+            const slot = std.mem.indexOfScalar(u64, &directory.slots, generation) orelse return error.LockOwnerChanged;
+            _ = slot;
+            var prior = try readParticipant(a, txn, ns, backend, generation) orelse return error.InvalidLockRecord;
+            // An unrelated catalog write may advance the revision without
+            // changing this participant's physical or schema identity. The
+            // accepting metadata writer independently validates the new cut.
+            var previous_spec = prior.spec;
+            previous_spec.route.catalog_revision = spec.route.catalog_revision;
+            if (!std.mem.eql(u8, try std.json.Stringify.valueAlloc(a, previous_spec, .{}), try std.json.Stringify.valueAlloc(a, spec, .{}))) return error.LockOwnerChanged;
+            prior.spec = spec;
+            if (std.meta.eql(prior.admission.parent_command, command)) {
+                try writeParticipant(a, txn, ns, backend, prior);
+                return prior;
+            }
+            if (prior.command_open or prior.admission.parent_command.sequence >= command.sequence) return error.LockOwnerBusy;
+            prior.admission.parent_command = command;
+            prior.admission.serial = std.math.add(u64, prior.admission.serial, 1) catch return error.LockLimitExceeded;
+            prior.admission.source = value.registration;
+            prior.command_open = true;
+            directory.open += 1;
+            value.data = directory;
+            try writeParticipant(a, txn, ns, backend, prior);
+            try write(a, txn, ns, value);
+            return prior;
+        }
+        const slot = std.mem.indexOfScalar(u64, &directory.slots, 0) orelse return error.LockLimitExceeded;
+        if (directory.next_generation == std.math.maxInt(u64)) return error.LockLimitExceeded;
+        const result: Participant = .{ .spec = spec, .admission = .{ .purpose = .execution, .binding = try spec.binding(ns), .source = value.registration, .transaction = transaction, .generation = directory.next_generation, .parent_command = command, .serial = 1 } };
+        directory.slots[slot] = directory.next_generation;
+        directory.next_generation += 1;
+        directory.open += 1;
+        value.data = directory;
+        const total = try tableCount(txn, ns, spec.route.table_id);
+        if (total == max_active * capacity) return error.LockLimitExceeded;
+        var raw: [8]u8 = undefined;
+        std.mem.writeInt(u64, &raw, result.admission.generation, .little);
+        try writeParticipant(a, txn, ns, backend, result);
+        try txn.put(lookup_address, &raw);
+        try writeTableCount(txn, ns, spec.route.table_id, total + 1);
+        try write(a, txn, ns, value);
+        return result;
+    }
+    /// Acknowledgement is accepted only after independent native observation.
+    /// A late ACK may finish its exact frame, never a newer participant command.
+    pub fn acknowledge(a: A, txn: anytype, ns: ledger.Namespace, backend: locks.Backend, generation: u64, command: Command, authority: anytype) !void {
+        var value = try load(a, txn, ns, backend);
+        var directory = value.data orelse return error.InvalidLockScope;
+        if (std.mem.indexOfScalar(u64, &directory.slots, generation) == null) return error.LockOwnerChanged;
+        var participant = try readParticipant(a, txn, ns, backend, generation) orelse return error.InvalidLockRecord;
+        if (!std.meta.eql(participant.admission.parent_command, command)) return error.LockEffectChanged;
+        try authority.requireDataCompletion(txn, ns, value, participant);
+        if (!participant.command_open) return;
+        if (directory.open == 0) return error.InvalidLockRecord;
+        directory.open -= 1;
+        participant.command_open = false;
+        value.data = directory;
+        try writeParticipant(a, txn, ns, backend, participant);
+        try write(a, txn, ns, value);
+    }
+    /// Retained enrollment bodies fence delayed data RPCs after slot reuse.
+    /// Only independent native retirement releases catalog/topology debt.
+    pub fn retire(a: A, txn: anytype, ns: ledger.Namespace, backend: locks.Backend, generation: u64, authority: anytype) !void {
+        var value = try load(a, txn, ns, backend);
+        var directory = value.data orelse return error.InvalidLockScope;
+        const participant = try readParticipant(a, txn, ns, backend, generation) orelse return error.InvalidLockRecord;
+        try authority.requireDataRetirement(txn, ns, value, participant);
+        const slot = std.mem.indexOfScalar(u64, &directory.slots, generation) orelse return;
+        if (participant.command_open) {
+            if (directory.open == 0) return error.InvalidLockRecord;
+            directory.open -= 1;
+        }
+        directory.slots[slot] = 0;
+        value.data = directory;
+        const total = try tableCount(txn, ns, participant.spec.route.table_id);
+        if (total == 0) return error.InvalidLockRecord;
+        var lookup_buffer: [256]u8 = undefined;
+        try txn.delete(try lookupKey(&lookup_buffer, ns, backend, participant.spec, participant.admission.transaction));
+        try writeTableCount(txn, ns, participant.spec.route.table_id, total - 1);
+        try write(a, txn, ns, value);
+    }
+};
+
 pub const Begin = enum { admitted, active, completed };
 pub const Fence = union(enum) { close, expired: struct { expected_expiry: u64, observed_at_ms: u64 } };
 
+const Lane = enum { scope, work, connection };
+fn homePrefix(ns: ledger.Namespace, lane: Lane) []const u8 {
+    return switch (lane) {
+        .scope => if (ns.home == .metadata) "\x00\x00__metadata__:sql_lock_scope:" else "\x00\x00__lock_scope__:",
+        .work => if (ns.home == .metadata) "\x00\x00__metadata__:sql_lock_work:" else "\x00\x00__lock_work__:",
+        .connection => if (ns.home == .metadata) "\x00\x00__metadata__:sql_lock_connection:" else "\x00\x00__lock_connection__:",
+    };
+}
 fn key(buffer: []u8, ns: ledger.Namespace, backend: ?locks.Backend) ![]const u8 {
     try ns.validate();
-    if (ns.home != .metadata) return error.InvalidLockScope;
     if (backend) |owner| {
         try owner.validate();
         if (!std.mem.eql(u8, &owner.incarnation, &ns.incarnation)) return error.InvalidLockOwner;
-        return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:sql_lock_scope:{x:0>16}:{s}:{s}:{x:0>16}", .{ ns.group, std.fmt.bytesToHex(ns.incarnation, .lower), std.fmt.bytesToHex(owner.id, .lower), owner.fence });
+        return std.fmt.bufPrint(buffer, "{s}{x:0>16}:{s}:{s}:{x:0>16}", .{ homePrefix(ns, .scope), ns.group, std.fmt.bytesToHex(ns.incarnation, .lower), std.fmt.bytesToHex(owner.id, .lower), owner.fence });
     }
-    return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:sql_lock_scope:{x:0>16}:{s}:count", .{ ns.group, std.fmt.bytesToHex(ns.incarnation, .lower) });
+    return std.fmt.bufPrint(buffer, "{s}{x:0>16}:{s}:count", .{ homePrefix(ns, .scope), ns.group, std.fmt.bytesToHex(ns.incarnation, .lower) });
 }
 pub const Work = struct { at_ms: u64, backend: locks.Backend };
 pub const WorkItem = struct { work: Work, scope: Record };
 fn workKey(buffer: []u8, ns: ledger.Namespace, work: Work) ![]const u8 {
     try ns.validate();
-    if (ns.home != .metadata) return error.InvalidLockScope;
-    return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:sql_lock_work:{x:0>16}:{s}:{x:0>16}:{s}:{x:0>16}", .{ ns.group, std.fmt.bytesToHex(ns.incarnation, .lower), work.at_ms, std.fmt.bytesToHex(work.backend.id, .lower), work.backend.fence });
+    return std.fmt.bufPrint(buffer, "{s}{x:0>16}:{s}:{x:0>16}:{s}:{x:0>16}", .{ homePrefix(ns, .work), ns.group, std.fmt.bytesToHex(ns.incarnation, .lower), work.at_ms, std.fmt.bytesToHex(work.backend.id, .lower), work.backend.fence });
 }
 fn workFor(value: Record) Work {
     return .{ .at_ms = if (value.state == .active and !value.releasing) value.registration.lease.expires_at_ms else 0, .backend = value.registration.lease.backend };
@@ -223,6 +457,9 @@ fn write(a: A, txn: anytype, ns: ledger.Namespace, value: Record) !void {
     var buffer: [192]u8 = undefined;
     try txn.put(try key(&buffer, ns, value.registration.lease.backend), try encode(a, value));
 }
+pub fn activeCount(txn: anytype, ns: ledger.Namespace) !u32 {
+    return count(txn, ns);
+}
 fn count(txn: anytype, ns: ledger.Namespace) !u32 {
     var buffer: [192]u8 = undefined;
     const raw = (try optional(txn, try key(&buffer, ns, null))) orelse return 0;
@@ -242,7 +479,7 @@ fn databaseCountKey(buffer: []u8, ns: ledger.Namespace, database: u64) ![]const 
     if (database == 0) return error.InvalidLockScope;
     // Keep the counter in the existing scope snapshot projection. It counts
     // unreclaimed owners, including fenced owners whose cleanup is unfinished.
-    return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:sql_lock_scope:{x:0>16}:{s}:database:{x:0>16}", .{ ns.group, std.fmt.bytesToHex(ns.incarnation, .lower), database });
+    return std.fmt.bufPrint(buffer, "{s}{x:0>16}:{s}:database:{x:0>16}", .{ homePrefix(ns, .scope), ns.group, std.fmt.bytesToHex(ns.incarnation, .lower), database });
 }
 pub fn databaseCount(txn: anytype, ns: ledger.Namespace, database: u64) !u32 {
     var buffer: [192]u8 = undefined;
@@ -262,8 +499,7 @@ fn writeDatabaseCount(txn: anytype, ns: ledger.Namespace, database: u64, value: 
 }
 fn connectionKey(buffer: []u8, ns: ledger.Namespace, node: u64, connection_id: [32]u8) ![]const u8 {
     try ns.validate();
-    if (ns.home != .metadata) return error.InvalidLockScope;
-    return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:sql_lock_connection:{x:0>16}:{s}:{x:0>16}:{s}", .{ ns.group, std.fmt.bytesToHex(ns.incarnation, .lower), node, connection_id });
+    return std.fmt.bufPrint(buffer, "{s}{x:0>16}:{s}:{x:0>16}:{s}", .{ homePrefix(ns, .connection), ns.group, std.fmt.bytesToHex(ns.incarnation, .lower), node, connection_id });
 }
 /// Retained bindings prevent an old connection registration from adopting a
 /// new backend after its original owner was fenced or retired.
@@ -360,7 +596,7 @@ pub fn finish(backing: A, txn: anytype, ns: ledger.Namespace, backend: locks.Bac
     try authority.requireCommand(txn, ns, value, command);
     if (value.completed) |completed| if (std.meta.eql(completed, command)) return;
     try requireFrame(value, command);
-    if (value.releasing) return error.LockOwnerBusy;
+    if (value.releasing or (if (value.data) |directory| directory.open != 0 else false)) return error.LockOwnerBusy;
     if (value.transaction) |transaction| if (transaction.decision != null) return error.LockOwnerBusy;
     const owner = try ledger.readOwner(a, txn, ns, backend) orelse return error.InvalidLockRecord;
     if (owner.waiting != null or owner.job != null) return error.LockOwnerBusy;
@@ -427,6 +663,10 @@ pub fn releaseTransaction(backing: A, txn: anytype, ns: ledger.Namespace, backen
             }
             try write(a, txn, ns, value);
         }
+        // The checked terminal decision first publishes retirement intent.
+        // Data owners can then drain independently without a frontend, while
+        // the source transaction remains attached until every ACK is durable.
+        if (value.data) |directory| if (directory.count() != 0) return false;
         const owner = try ledger.readOwner(a, txn, ns, backend) orelse return error.InvalidLockRecord;
         const context: ResolutionContext(@TypeOf(authority)) = .{ .authority = authority, .value = value, .ns = ns, .transaction = expected };
         if (owner.waiting) |waiting| {
@@ -470,7 +710,8 @@ pub fn releaseTransaction(backing: A, txn: anytype, ns: ledger.Namespace, backen
 }
 /// Stable non-expiring metadata participant. Its identity is derived solely
 /// from the immutable external owner, so source retirement cannot orphan it.
-pub fn preparedLease(ns: ledger.Namespace, database: u64, node: u64, decision: DecisionRef) !ledger.Lease {
+pub fn preparedBackend(ns: ledger.Namespace, decision: DecisionRef) !locks.Backend {
+    try ns.validate();
     try decision.validate();
     var digest: [32]u8 = undefined;
     var h = std.crypto.hash.Blake3.init(.{});
@@ -478,9 +719,42 @@ pub fn preparedLease(ns: ledger.Namespace, database: u64, node: u64, decision: D
     h.update(&decision.operation);
     h.update(&decision.admission);
     h.final(&digest);
-    const value: ledger.Lease = .{ .backend = .{ .incarnation = ns.incarnation, .id = digest[0..16].*, .fence = 1 }, .database = database, .node = node, .principal = decision.admission, .expires_at_ms = std.math.maxInt(u64) };
+    const backend: locks.Backend = .{ .incarnation = ns.incarnation, .id = digest[0..16].*, .fence = 1 };
+    try backend.validate();
+    return backend;
+}
+pub fn preparedLease(ns: ledger.Namespace, database: u64, node: u64, decision: DecisionRef) !ledger.Lease {
+    const value: ledger.Lease = .{ .backend = try preparedBackend(ns, decision), .database = database, .node = node, .principal = decision.admission, .expires_at_ms = std.math.maxInt(u64) };
     try value.validate(ns);
     return value;
+}
+
+/// Attach an already admitted native decision to a data participant even if
+/// its frontend expired before delivering SEAL. This creates no execution
+/// permit and never reactivates a fenced scope. The independent authority must
+/// join the native external owner and its frozen participant reference.
+pub fn adoptPreparedAdmission(backing: A, txn: anytype, ns: ledger.Namespace, backend: locks.Backend, command: Command, expected: Transaction, authority: anytype) !void {
+    if (ns.home != .data or expected.decision == null or std.mem.allEqual(u8, &expected.id, 0)) return error.InvalidLockScope;
+    try command.validate();
+    try expected.decision.?.validate();
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var value = try load(a, txn, ns, backend);
+    // Observation of a completed transfer still needs the same native owner.
+    try authority.requirePreparedAdmission(txn, ns, value, command, expected);
+    if (std.meta.eql(value.released_transaction, @as(?Transaction, expected))) return;
+    if (value.state == .retired or value.releasing or value.next_command != command.sequence) return error.LockOwnerChanged;
+    const current = value.transaction orelse return error.InvalidLockScope;
+    if (!std.mem.eql(u8, &current.id, &expected.id)) return error.LockOwnerChanged;
+    if (current.decision) |decision| {
+        if (!std.meta.eql(decision, expected.decision.?)) return error.LockOwnerChanged;
+        return;
+    }
+    const owner = try ledger.readOwner(a, txn, ns, backend) orelse return error.InvalidLockRecord;
+    if (owner.state != .active or owner.waiting != null or owner.job != null) return error.LockOwnerBusy;
+    value.transaction = expected;
+    try write(a, txn, ns, value);
 }
 
 /// Transfer at most one indexed transaction resource. A sealed native decision
@@ -705,8 +979,17 @@ pub fn closeStep(backing: A, txn: anytype, ns: ledger.Namespace, backend: locks.
     var value = try load(a, txn, ns, backend);
     if (value.state == .active) return error.LockOwnerBusy;
     try authority.requireRetirement(txn, ns, value);
+    if (value.data) |directory| if (directory.count() != 0) return error.LockOwnerBusy;
     if (value.state == .retired) return true;
     if (value.transaction != null) return error.LockOwnerBusy;
+    // A data participant's source debt remains visible until its transferred
+    // grants are actually retired. Metadata session owners may retire before
+    // their independent prepared home; data topology owners may not.
+    if (ns.home == .data) if (value.released_transaction) |released| if (released.decision) |decision| {
+        if (try ledger.readOwner(a, txn, ns, try preparedBackend(ns, decision))) |prepared| {
+            if (prepared.state != .retired or prepared.resources != 0 or prepared.job != null or prepared.waiting != null) return error.LockOwnerBusy;
+        }
+    };
     const owner = try ledger.readOwner(a, txn, ns, backend) orelse return error.InvalidLockRecord;
     if (!std.meta.eql(owner.lease, value.registration.lease)) return error.InvalidLockRecord;
     const context: CloseContext(@TypeOf(authority)) = .{ .authority = authority, .value = value, .ns = ns };
@@ -792,4 +1075,32 @@ test "pessimistic locks command fences and registrations bind the receiving meta
     var parsed = try std.json.parseFromSlice(CommandFence, a, bytes, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(ns.group, parsed.value.group);
+}
+
+test "pessimistic native data participant scopes cannot alias metadata authority or its cleanup indexes" {
+    const metadata: ledger.Namespace = .{ .home = .metadata, .group = 2188, .incarnation = @splat(1) };
+    var data = metadata;
+    data.home = .data;
+    const backend: locks.Backend = .{ .incarnation = metadata.incarnation, .id = @splat(3), .fence = 1 };
+    var first: [192]u8 = undefined;
+    var second: [192]u8 = undefined;
+    try std.testing.expect(!std.mem.eql(u8, try key(&first, metadata, backend), try key(&second, data, backend)));
+    try std.testing.expect(!std.mem.eql(u8, try key(&first, metadata, null), try key(&second, data, null)));
+    try std.testing.expect(!std.mem.eql(u8, try databaseCountKey(&first, metadata, 1), try databaseCountKey(&second, data, 1)));
+    const work: Work = .{ .at_ms = 1000, .backend = backend };
+    try std.testing.expect(!std.mem.eql(u8, try workKey(&first, metadata, work), try workKey(&second, data, work)));
+    try std.testing.expect(!std.mem.eql(u8, try connectionKey(&first, metadata, 7, @splat('a')), try connectionKey(&second, data, 7, @splat('a'))));
+    const command: Command = .{ .sequence = 1, .nonce = @splat(5), .executor = @splat(6) };
+    const registration: Registration = .{ .group = data.group, .connection = @splat('a'), .nonce = @splat(2), .standalone = false, .lease = .{ .backend = backend, .database = 1, .node = 7, .principal = @splat(4), .expires_at_ms = 1000 } };
+    try registration.validate(data);
+    const fence_value: CommandFence = .{ .group = metadata.group, .backend = backend, .command = command, .database = 1, .principal = registration.lease.principal, .standalone = false };
+    const record: Record = .{ .registration = registration, .command = command };
+    try fence_value.requireCommand({}, metadata, record, command);
+    try std.testing.expectError(error.Forbidden, fence_value.requireCommand({}, data, record, command));
+    const decision: DecisionRef = .{ .operation = @splat(7), .admission = @splat(8) };
+    const prepared = try preparedLease(data, 1, 7, decision);
+    try std.testing.expect(prepared.backend.eql(try preparedBackend(data, decision)));
+    var other = decision;
+    other.admission[0] += 1;
+    try std.testing.expect(!prepared.backend.eql(try preparedBackend(data, other)));
 }

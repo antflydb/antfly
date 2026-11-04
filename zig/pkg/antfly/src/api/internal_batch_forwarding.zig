@@ -151,6 +151,8 @@ comptime {
 }
 
 pub fn externalTransactionProtocol(req: @import("antfly_local_sources").storage_db_types.BatchRequest) ?u16 {
+    if (req.sql_lock != null) return @import("../common/data_raft_protocol.zig").batch_sql_lock_protocol_version;
+    if (req.transaction) |transaction| if (transaction == .begin and transaction.begin.sql_locks != null) return @import("../common/data_raft_protocol.zig").batch_sql_lock_protocol_version;
     if (req.transaction) |transaction| switch (transaction) {
         .begin => |begin| if (begin.external_decision_owner != null) {
             return @import("../common/data_raft_protocol.zig").batch_external_transaction_protocol_version;

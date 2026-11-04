@@ -10688,7 +10688,77 @@ pub const DB = struct {
         }
     }
 
+    fn applySqlLockBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
+        const locks = @import("../pessimistic_lock_control.zig");
+        try locks.validateBatch(req);
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var replication = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication) |*lease| lease.release();
+        if (!opts.bypass_replication_write_gate) {
+            try self.enforceReplicationWriteGate();
+            try self.ensureDurableReplicationStartupBarrier();
+            try self.flushDurableReplicationOutboxes();
+            try self.preflightReplicationBatchSyncCommit();
+        }
+        const payload: ?[]u8 = if (!opts.bypass_replication_write_gate and self.local_execution.replication_async_batch_mirror != null)
+            if (opts.ordered_apply_receipt) |entry| try replication_effects_mod.encodeRaftBatchMutationRequestAlloc(self.alloc, req, entry) else try replication_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, req)
+        else
+            null;
+        defer if (payload) |bytes| self.alloc.free(bytes);
+        {
+            var admission = self.core.snapshot_admission.acquireMutation();
+            defer admission.release();
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+            if (opts.ordered_apply_receipt) |entry| if (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry) == .already_applied) return;
+            const command = req.sql_lock.?;
+            if (command.checked) |checked| {
+                if (checked.participant.spec.schema_version != self.core.index_manager.activeSchemaVersion()) return error.LockOwnerChanged;
+            }
+            const physical_key: ?[]const u8 = switch (command.operation) {
+                .row => |value| value.key,
+                .cancel => |value| value.key,
+                else => null,
+            };
+            if (physical_key) |key_value| if (!self.core.byteRange().contains(key_value)) return error.IdentityNamespaceMismatch;
+            var control_batch = try self.core.store.beginWriteBatch();
+            errdefer control_batch.abort();
+            var txn = control_batch.asTxn();
+            if (self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingInProgress;
+            try @import("relational_integrity_topology.zig").requireUnfenced(&txn);
+            try locks.apply(self.alloc, &txn, self.core.identity_namespace, command.admission.binding.namespace.group, self.core.table_catalog.storage_mode, command);
+            for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
+            if (opts.ordered_apply_receipt) |entry| {
+                var buffer: [ordered_apply_receipt_value_len]u8 = undefined;
+                const marker = orderedApplyReceiptWrite(entry, &buffer);
+                try txn.put(marker.key, marker.value);
+            }
+            if (opts.replication_applied_lsn_marker) |lsn| {
+                var buffer: [replication_applied_lsn_value_len]u8 = undefined;
+                const marker = replicationAppliedSequenceWrite(lsn, &buffer);
+                try txn.put(marker.key, marker.value);
+            }
+            try self.stageRestoreStagingReplicationOutbox(&txn, payload);
+            try control_batch.commit();
+        }
+        if (payload != null) try self.flushDurableReplicationOutboxes();
+    }
+
+    fn lookupSqlLock(self: *DB, a: Allocator, raw: []const u8) !?types.LookupResult {
+        if (raw.len > 32768) return error.InvalidLockRecord;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const locks = @import("../pessimistic_lock_control.zig");
+        const query = try std.json.parseFromSliceLeaky(locks.Query, arena.allocator(), raw, .{});
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        const state = try locks.snapshot(arena.allocator(), &read, self.core.identity_namespace, query);
+        return .{ .json = try std.json.Stringify.valueAlloc(a, state, .{}) };
+    }
+
     noinline fn batchInternalCommit(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
+        if (req.sql_lock != null) return self.applySqlLockBatch(req, opts);
         // Only a committed group adapter supplies the actual group and index.
         if (req.relational_index_owner_control != null) return error.InvalidBatchRequest;
         try types.validateGraphEndpointCleanupCommand(req);
@@ -21533,6 +21603,10 @@ pub const DB = struct {
             const receipt = try self.loadRowPolicyReceipt(request.generation, request.phase);
             return .{ .json = try std.json.Stringify.valueAlloc(alloc, receipt, .{}) };
         }
+        if (opts.sql_lock_query_json.len != 0) {
+            if (key.len != 0) return error.InvalidLockResource;
+            return self.lookupSqlLock(alloc, opts.sql_lock_query_json);
+        }
         try self.maybeFinalizePendingRowPolicyPublication();
         if (self.local_execution.initial_child_hidden.load(.acquire) and
             opts.relational_topology_json.len == 0 and opts.relational_index_status_json.len == 0 and
@@ -26851,9 +26925,24 @@ pub const DB = struct {
         }
         var receipt_buf: [ordered_apply_receipt_value_len]u8 = undefined;
         const marker = if (request.ordered_receipt) |identity| orderedApplyReceiptWrite(identity, &receipt_buf) else null;
+        var writes: std.ArrayList(docstore_mod.KVPair) = .empty;
+        defer writes.deinit(self.alloc);
+        if (marker) |write| try writes.append(self.alloc, write);
+        const lock_key = @import("../pessimistic_lock_transaction.zig").key(request.txn_id);
+        var lock_bytes: ?[]u8 = null;
+        defer if (lock_bytes) |bytes| self.alloc.free(bytes);
+        if (request.sql_locks) |ref| {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            try @import("../pessimistic_lock_transaction.zig").requireBegin(arena.allocator(), &read, self.core.identity_namespace, request.txn_id, request.owner, ref);
+            lock_bytes = try @import("../pessimistic_lock_transaction.zig").encode(self.alloc, .{ .ref = ref });
+            try writes.append(self.alloc, .{ .key = &lock_key, .value = lock_bytes.? });
+        }
         return self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(request.txn_id, request.begin_timestamp, request.created_at_ns, request.participants, request.coordinator, true, .{
             .external_decision_owner = request.owner,
-            .writes = if (marker) |write| &.{write} else &.{},
+            .writes = writes.items,
         });
     }
 

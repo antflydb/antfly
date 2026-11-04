@@ -452,6 +452,15 @@ pub const Adapter = struct {
     /// Borrowed only while an autocommit read is executing. Bound routines,
     /// operators and casts reach the same provider as direct SQL calls.
     implicit_advisory: ?*ImplicitAdvisory = null,
+    data_lock_owner: ?*@import("sql_table_lock_execution.zig").Owner = null,
+    lock_provider: @import("antfly_local_sources").sql_locking.Provider = .{
+        .ptr = undefined,
+        .authorize_table = @import("sql_table_lock_execution.zig").authorize,
+        .authorize_rows = @import("sql_table_lock_execution.zig").authorizeRows,
+        .require_explicit_transaction = @import("sql_table_lock_execution.zig").explicit,
+        .table = @import("sql_table_lock_execution.zig").table,
+        .row = @import("sql_table_lock_execution.zig").row,
+    },
     active_subtransaction: u64 = 0,
     active_write_version: ?u64 = null,
     accepted_lake_repeatable: bool = false,
@@ -518,6 +527,8 @@ pub const Adapter = struct {
     }
 
     pub fn releaseExecutionOwners(self: *Adapter) void {
+        if (self.data_lock_owner) |owner| owner.deinit();
+        self.data_lock_owner = null;
         if (self.sequence_owner) |owner| owner.deinit();
         self.sequence_owner = null;
         if (self.routine_owner) |owner| owner.deinit();
@@ -1052,7 +1063,48 @@ pub const Adapter = struct {
         // Each new backend starts an execution scope; binding, cursor selection
         // and fallback execution within that scope share the receipt budget.
         self.receipt_wait_budget = .{};
-        return .{ .prepare_definition_copy = .{ .ptr = self, .prepare = @import("sql_definition_copy.zig").prepare }, .named_type_resolver = if (self.server.source.vtable.supports_sql_types) .{ .ptr = self, .resolve = @import("sql_type_schema.zig").bindCast } else null, .resolve_declared_types = if (self.server.source.vtable.supports_sql_types) .{ .ptr = self, .resolve = @import("sql_type_schema.zig").bindDeclaredColumns } else null, .validate_persisted_expressions = .{ .ptr = self, .validate = @import("sql_persisted_expressions.zig").validate }, .copy_filter = self.copy_filter, .notice_sink = self.notice_sink, .procedure_resolver = if (self.server.source.vtable.supports_sql_routines) .{ .ptr = self, .resolve = @import("sql_routine_execution.zig").bindProcedure } else null, .routine_resolver = if (self.server.source.vtable.supports_sql_routines) .{ .ptr = self, .resolve = @import("sql_routine_execution.zig").bind, .resolve_operator = @import("sql_routine_execution.zig").bindOperator, .resolve_aggregate = @import("sql_routine_execution.zig").bindAggregate, .resolve_cast = @import("sql_routine_execution.zig").bindCast } else null, .sequence_resolver = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .resolve = @import("sql_sequence_execution.zig").bind } else null, .advisory_provider = if (self.context.sql_command_fence != null) .{ .ptr = self, .invoke = @import("sql_advisory_execution.zig").invoke } else null, .sequence_provider = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .invoke = @import("sql_sequence_execution.zig").invoke, .flush = @import("sql_sequence_execution.zig").flush } else null, .write_version = self.active_write_version, .supports_write_versions = supportsRangeGuards(self.server) and self.server.txn_sessions.durable != null, .execution_binding_validator = if (self.read_requirements.after_write != null or self.pending_transaction_cut != null) .{ .ptr = self, .validate = validatePreparedExecution } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .supports_text_predicates = true, .supports_expression_access_hints = self.staged == null or self.staged.?.tables.len == 0, .predicate_only_mutations = true, .statement_mutations = if (self.active_transaction != null and self.range_reads != null) .{ .ptr = self, .begin = beginCommand } else null, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.dynamic_snapshot == null and self.pending_transaction_cut == null and self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null or self.pending_transaction_cut != null, .vtable = if (self.server.source.vtable.supports_sql_views) &view_vtable else &table_vtable };
+        self.lock_provider.ptr = self;
+        return .{ .locking_provider = if (self.context.sql_command_fence != null) &self.lock_provider else null, .prepare_definition_copy = .{ .ptr = self, .prepare = @import("sql_definition_copy.zig").prepare }, .named_type_resolver = if (self.server.source.vtable.supports_sql_types) .{ .ptr = self, .resolve = @import("sql_type_schema.zig").bindCast } else null, .resolve_declared_types = if (self.server.source.vtable.supports_sql_types) .{ .ptr = self, .resolve = @import("sql_type_schema.zig").bindDeclaredColumns } else null, .validate_persisted_expressions = .{ .ptr = self, .validate = @import("sql_persisted_expressions.zig").validate }, .copy_filter = self.copy_filter, .notice_sink = self.notice_sink, .procedure_resolver = if (self.server.source.vtable.supports_sql_routines) .{ .ptr = self, .resolve = @import("sql_routine_execution.zig").bindProcedure } else null, .routine_resolver = if (self.server.source.vtable.supports_sql_routines) .{ .ptr = self, .resolve = @import("sql_routine_execution.zig").bind, .resolve_operator = @import("sql_routine_execution.zig").bindOperator, .resolve_aggregate = @import("sql_routine_execution.zig").bindAggregate, .resolve_cast = @import("sql_routine_execution.zig").bindCast } else null, .sequence_resolver = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .resolve = @import("sql_sequence_execution.zig").bind } else null, .advisory_provider = if (self.context.sql_command_fence != null) .{ .ptr = self, .invoke = @import("sql_advisory_execution.zig").invoke } else null, .sequence_provider = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .invoke = @import("sql_sequence_execution.zig").invoke, .flush = @import("sql_sequence_execution.zig").flush } else null, .write_version = self.active_write_version, .supports_write_versions = supportsRangeGuards(self.server) and self.server.txn_sessions.durable != null, .execution_binding_validator = if (self.read_requirements.after_write != null or self.pending_transaction_cut != null) .{ .ptr = self, .validate = validatePreparedExecution } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .supports_text_predicates = true, .supports_expression_access_hints = self.staged == null or self.staged.?.tables.len == 0, .predicate_only_mutations = true, .statement_mutations = if (self.active_transaction != null and self.range_reads != null) .{ .ptr = self, .begin = beginCommand } else null, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.dynamic_snapshot == null and self.pending_transaction_cut == null and self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null or self.pending_transaction_cut != null, .vtable = if (self.server.source.vtable.supports_sql_views) &view_vtable else &table_vtable };
+    }
+
+    pub fn lockingFrame(self: *Adapter) !@import("sql_advisory_execution.zig").Frame {
+        const fence = self.context.sql_command_fence orelse return error.SqlConnectionBusy;
+        return .{
+            .source = self.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable,
+            .connection = self.connection_id orelse return error.SqlConnectionNotFound,
+            .principal = http_server.transactionPrincipal(self.identity.*) orelse "",
+            .instance = try self.server.sql_connection_admission.executionInstance(self.server.embedding_provider_runtime.io),
+            .fence = fence.*,
+            .actor = try @import("sql_authorization_recovery.zig").actor(self.server, self.identity.*),
+        };
+    }
+    pub fn lockingTransaction(self: *Adapter) ![16]u8 {
+        const id = if (self.active_transaction) |active| active else if (self.implicit_advisory) |scope| try scope.transaction() else return error.SqlTransactionNotActive;
+        var state = (try self.server.txn_sessions.getSqlState(self.server.alloc, id)) orelse return error.SqlTransactionNotActive;
+        defer state.deinit(self.server.alloc);
+        if (state.metadata.mode == .read_only) return error.SqlReadOnlyTransaction;
+        return id;
+    }
+    pub fn lockingReadCommitted(self: *Adapter) !bool {
+        const id = self.effectTransaction() orelse return error.SqlTransactionNotActive;
+        var state = (try self.server.txn_sessions.getSqlState(self.server.alloc, id)) orelse return error.SqlTransactionNotActive;
+        defer state.deinit(self.server.alloc);
+        return state.metadata.isolation == .read_committed;
+    }
+    pub fn lockingCurrentRow(self: *Adapter, a: std.mem.Allocator, table: catalog.Table, key: []const u8, fields: []const []const u8) !?catalog.Row {
+        // READ COMMITTED's post-wait refresh opens a new native cut while
+        // retaining the original SQL/RLS authority and statement clock.
+        var fresh = self.*;
+        fresh.dynamic_snapshot = null;
+        fresh.pending_transaction_cut = null;
+        fresh.range_reads = null;
+        const cursor = (try openScan(&fresh, a, table, .{ .fields = fields, .primary_key = key, .include_primary_digest = true, .limit = 1 })) orelse return error.SqlStatementSnapshotRequired;
+        defer cursor.close(cursor.ptr);
+        var page = try cursor.next(cursor.ptr, a, 1);
+        defer page.deinit();
+        if (page.rows.len == 0) return null;
+        if (page.rows.len != 1 or !std.mem.eql(u8, page.rows[0].id, key)) return error.InvalidSqlBackendResponse;
+        return try page.rows[0].cloneOwned(a);
     }
 
     /// Effect providers follow lazy advisory attachment without changing the

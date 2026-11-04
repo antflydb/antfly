@@ -40,7 +40,10 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 29;
+pub const batch_protocol_version: u16 = 30;
+/// Native row/table grants and their frozen 2PC references must be decoded by
+/// every applying replica before the first private lock command is admitted.
+pub const batch_sql_lock_protocol_version: u16 = 30;
 /// Version 29 carries externally decided votes, admission deadlines and
 /// irreversible read activation. Old members must never ignore these fields.
 pub const batch_external_transaction_protocol_version: u16 = 29;
