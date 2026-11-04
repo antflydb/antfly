@@ -768,6 +768,37 @@ test "capi SQL outcome receipt from a table handle batch names that table" {
     try std.testing.expectEqual(api.ANTFLY_OUTCOME_RECEIPT_APPLIED, status.status);
 }
 
+test "capi SQL outcome receipt resolves the same through a table handle as through the root" {
+    const api = @import("db.zig");
+    const receipts = @import("outcome_receipts.zig");
+    var f = try OutcomeFixture.init("receipt-via-table-handle");
+    defer f.deinit();
+    const writer = &f.wrapper.outcome_writer;
+    // One applied write to the root database, one to table `t`.
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(f.id, .fromSlice("{\"inserts\":{\"root-key\":{\"v\":1}}}"), &out));
+    var root_buf: [receipts.max_text_len]u8 = undefined;
+    const root_receipt = receipts.format(&receipts.Receipt.init(.{ .writer = writer.id.?, .sequence = writer.sequence }, null), &root_buf);
+    try f.expectOk(insert_one);
+    var named_buf: [receipts.max_text_len]u8 = undefined;
+    const named_receipt = receipts.format(&receipts.Receipt.init(.{ .writer = writer.id.?, .sequence = writer.sequence }, "t"), &named_buf);
+
+    var table_id: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, @import("tables.zig").antfly_db_open_table(f.id, .fromSlice("t"), &table_id));
+    defer api.antfly_db_close(table_id);
+    for ([_]?*anyopaque{ f.id, table_id }) |via| {
+        for ([_][]const u8{ root_receipt, named_receipt }) |receipt| {
+            const status = try receiptStatus(via, receipt);
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, status.code);
+            try std.testing.expectEqual(api.ANTFLY_OUTCOME_RECEIPT_APPLIED, status.status);
+        }
+    }
+    // Forget routes the same way.
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_outcome_receipt_forget(table_id, .fromSlice(named_receipt)));
+    try std.testing.expectEqual(api.ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED, (try receiptStatus(f.id, named_receipt)).status);
+}
+
 test "capi SQL outcome receipt for a named table on a directory handle resolves after reopen through the root" {
     const api = @import("db.zig");
     const Backend = @import("../storage/lsm_backend.zig").Backend;

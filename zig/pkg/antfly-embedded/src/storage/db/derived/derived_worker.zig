@@ -506,9 +506,9 @@ fn applyBatchBounded(
     yield_deadline: ?u64,
 ) !BoundedApply {
     if (index_ref.kind != .full_text or max_items == 0) return .{ .applied = try apply_fn(apply_ctx, batch, index_ref) };
-    // Asset artifact keys are allowed: full-text replay uses them only after
-    // the record's documents are applied (to clear repair issues for
-    // published assets), so they travel with the record's final subchunk.
+    // Asset artifact keys are a fourth part, after the documents: full-text
+    // replay uses them only to clear repair issues for published assets, so
+    // they apply on their own, in bounded subchunks within the same budget.
     if (batch.graph_doc_clears.len != 0 or
         batch.dense_embeddings.len != 0 or
         batch.sparse_embeddings.len != 0 or
@@ -519,35 +519,32 @@ fn applyBatchBounded(
         return .{ .applied = try apply_fn(apply_ctx, batch, index_ref) };
     }
 
-    const total_items = batch.deleted_keys.len +| batch.overwritten_doc_keys.len +| batch.documents.len;
+    const total_items = batch.deleted_keys.len +| batch.overwritten_doc_keys.len +| batch.documents.len +| batch.changed_artifact_keys.len;
     if (total_items <= max_items and resume_offset == 0) return .{ .applied = try apply_fn(apply_ctx, batch, index_ref) };
 
-    const Part = enum { deleted, overwritten, documents };
+    const Part = enum { deleted, overwritten, documents, artifacts };
     const parts = [_]struct { part: Part, len: usize }{
         .{ .part = .deleted, .len = batch.deleted_keys.len },
         .{ .part = .overwritten, .len = batch.overwritten_doc_keys.len },
         .{ .part = .documents, .len = batch.documents.len },
+        .{ .part = .artifacts, .len = batch.changed_artifact_keys.len },
     };
-    var last_part: usize = 0;
-    for (parts, 0..) |part, i| {
-        if (part.len != 0) last_part = i;
-    }
     var applied_any = false;
     var subchunks: usize = 0;
     var base: usize = 0;
-    for (parts, 0..) |part, part_index| {
+    for (parts) |part| {
         defer base += part.len;
         var start = if (resume_offset > base) @min(resume_offset - base, part.len) else 0;
         while (start < part.len) {
             if (yield_deadline) |deadline| if (subchunks != 0 and monotonicTimeNs() >= deadline)
                 return .{ .applied = applied_any, .next_offset = base + start };
             const end = @min(start + max_items, part.len);
-            var chunk: derived_types.DerivedBatch = switch (part.part) {
+            const chunk: derived_types.DerivedBatch = switch (part.part) {
                 .deleted => .{ .sequence = batch.sequence, .deleted_keys = batch.deleted_keys[start..end] },
                 .overwritten => .{ .sequence = batch.sequence, .overwritten_doc_keys = batch.overwritten_doc_keys[start..end] },
                 .documents => .{ .sequence = batch.sequence, .documents = batch.documents[start..end] },
+                .artifacts => .{ .sequence = batch.sequence, .changed_artifact_keys = batch.changed_artifact_keys[start..end] },
             };
-            if (part_index == last_part and end == part.len) chunk.changed_artifact_keys = batch.changed_artifact_keys;
             applied_any = (try apply_fn(apply_ctx, chunk, index_ref)) or applied_any;
             subchunks += 1;
             start = end;
@@ -1972,24 +1969,31 @@ test "catchUpIndex bounds a full text record carrying asset artifact keys" {
     const alloc = std.testing.allocator;
     var capture = TestApplyCapture{ .alloc = alloc };
     defer capture.deinit();
-    const documents = [_]derived_types.DerivedDocument{ .{ .key = "doc:a" }, .{ .key = "doc:b" }, .{ .key = "doc:c" }, .{ .key = "doc:d" }, .{ .key = "doc:e" } };
-    const artifacts = [_][]const u8{ "asset:1", "asset:2" };
+    const documents = [_]derived_types.DerivedDocument{ .{ .key = "doc:a" }, .{ .key = "doc:b" }, .{ .key = "doc:c" } };
+    var artifacts: [9][]const u8 = undefined;
+    var names: [9][16]u8 = undefined;
+    for (&artifacts, &names, 0..) |*artifact, *name, i| artifact.* = std.fmt.bufPrint(name, "asset:{d}", .{i}) catch unreachable;
     const batch: derived_types.DerivedBatch = .{ .sequence = 4, .documents = &documents, .changed_artifact_keys = &artifacts };
     const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = "text", .kind = .full_text };
-    // Already past its deadline: stops after the first subchunk, without the
-    // artifact keys, which belong to the record's completion.
-    const first = try applyBatchBounded(&capture, testApplyCapture, batch, index_ref, 2, 0, 1);
-    try std.testing.expectEqual(@as(?usize, 2), first.next_offset);
-    try std.testing.expectEqual(@as(usize, 1), capture.call_count);
-    try std.testing.expectEqual(@as(usize, 0), capture.applied_changed_artifact_keys);
-    // Resumed without a deadline: the rest, with the keys on the final chunk.
-    const rest = try applyBatchBounded(&capture, testApplyCapture, batch, index_ref, 2, first.next_offset.?, null);
-    try std.testing.expectEqual(@as(?usize, null), rest.next_offset);
-    try std.testing.expect(rest.applied);
-    try std.testing.expectEqual(@as(usize, 3), capture.call_count);
-    try std.testing.expectEqual(@as(usize, 5), capture.applied_documents);
-    try std.testing.expectEqual(@as(usize, 2), capture.applied_changed_artifact_keys);
-    try std.testing.expectEqual(@as(usize, 2), capture.last_batch.?.changed_artifact_keys.len);
+    // Every call is past its deadline: each applies one subchunk of at most
+    // two items, documents first, then the asset keys, and reports where to
+    // resume. Asset cleanup is inside the same resumable budget.
+    var offset: usize = 0;
+    var calls: usize = 0;
+    var largest: usize = 0;
+    while (true) : (calls += 1) {
+        const before_docs = capture.applied_documents;
+        const before_artifacts = capture.applied_changed_artifact_keys;
+        const outcome = try applyBatchBounded(&capture, testApplyCapture, batch, index_ref, 2, offset, 1);
+        largest = @max(largest, (capture.applied_documents - before_docs) + (capture.applied_changed_artifact_keys - before_artifacts));
+        offset = outcome.next_offset orelse break;
+        try std.testing.expect(calls < 20);
+    }
+    try std.testing.expectEqual(@as(usize, 2), largest);
+    try std.testing.expectEqual(@as(usize, 3), capture.applied_documents);
+    try std.testing.expectEqual(@as(usize, 9), capture.applied_changed_artifact_keys);
+    // Documents never share a subchunk with asset keys.
+    try std.testing.expectEqual(@as(usize, 0), capture.last_batch.?.documents.len);
 }
 
 test "catchUpIndex ignores a resume point for a record it did not collect" {

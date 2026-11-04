@@ -2714,16 +2714,13 @@ pub fn antfly_db_outcome_receipt_status(handle_ptr: ?*anyopaque, receipt: capi.S
     const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     defer guard.leave();
     if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
+    const root = receiptRoot(guard);
     // Entering refreshes a Lite runtime; one still uncertain is not settled.
-    if (guard.lock_handle.lite_connection != null) if (guard.handle.owned_lite_backend) |backend| if (backend.native_docstore != null) {
-        if (@import("lite_connection.zig").Owner.needsOutcomeReconciliation(guard.handle))
+    if (guard.lock_handle.lite_connection != null) if (root.owned_lite_backend) |backend| if (backend.native_docstore != null) {
+        if (@import("lite_connection.zig").Owner.needsOutcomeReconciliation(root))
             return capi.recordError(.stalled, @src().fn_name ++ ": the uncertain commit is not reconciled yet; retry");
     };
-    // The marker lives in the database the write committed to.
-    const database = if (parsed.table()) |name|
-        (@import("tables.zig").get(guard.handle, name) catch |err| return capi.mapErrorContext(err, @src().fn_name))
-    else
-        guard.handle.database();
+    const database = receiptDatabase(root, &parsed) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     const persisted = database.readOutcomeMarker(marker.writer) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     const disposition = @import("../storage/db/apply_receipts.zig").outcomeDisposition(persisted, marker.sequence) catch
         return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": the receipt does not match this database");
@@ -2732,6 +2729,21 @@ pub fn antfly_db_outcome_receipt_status(handle_ptr: ?*anyopaque, receipt: capi.S
         .not_applied => ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED,
     };
     return .ok;
+}
+
+/// The database handle a receipt resolves against, whichever handle the
+/// caller used: a table handle's parent (on Lite, the refreshed root runtime),
+/// never the table handle itself, whose own catalog is not a root catalog.
+fn receiptRoot(guard: HandleGuard) *Handle {
+    if (guard.handle.parent_id != null) if (guard.handle.parent_handle) |parent| return parent;
+    return guard.handle;
+}
+
+/// The database that holds a receipt's marker: the root database, or the
+/// named table the write committed to.
+fn receiptDatabase(root: *Handle, receipt: *const @import("outcome_receipts.zig").Receipt) !*db_mod.DB {
+    if (receipt.table()) |name| return @import("tables.zig").get(root, name);
+    return &root.db;
 }
 
 /// Removes a resolved receipt's durable marker. Idempotent.
@@ -2747,10 +2759,7 @@ pub fn antfly_db_outcome_receipt_forget(handle_ptr: ?*anyopaque, receipt: capi.S
     const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     defer guard.leave();
     if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
-    const database = if (parsed.table()) |name|
-        (@import("tables.zig").get(guard.handle, name) catch |err| return capi.mapErrorContext(err, @src().fn_name))
-    else
-        guard.handle.database();
+    const database = receiptDatabase(receiptRoot(guard), &parsed) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     database.deleteOutcomeMarker(marker.writer) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     return .ok;
 }
