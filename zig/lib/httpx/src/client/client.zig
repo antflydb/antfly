@@ -661,34 +661,55 @@ fn isSafeUnsentRetryError(err: anyerror) bool {
     };
 }
 
+// Keep the typed transport path and durable error-name consumers in sync.
+const retryable_transport_errors = .{
+    // SERVFAIL / EAI_AGAIN. NXDOMAIN and malformed resolver config stay terminal.
+    error.NameServerFailure,
+    error.ConnectionReset,
+    error.ConnectionResetByPeer,
+    error.ConnectionAborted,
+    error.ConnectionTimedOut,
+    error.ConnectionTimeout,
+    error.BrokenPipe,
+    error.ConnectionClosed,
+    error.ConnectionRefused,
+    error.Closed,
+    error.NotConnected,
+    error.EndOfStream,
+    error.UnexpectedEof,
+    error.ReadFailed,
+    error.WriteFailed,
+    error.RecvFailed,
+    error.SendFailed,
+};
+
 /// Classifies transient transport failures, independently of replay safety.
 /// Callers must still gate retries by operation semantics and a total deadline.
 pub fn isRetryableTransportError(err: anyerror) bool {
-    return switch (err) {
-        // std.Io reports SERVFAIL / EAI_AGAIN with this name, not the
-        // application-level DnsResolutionFailed alias. NXDOMAIN and malformed
-        // resolver configuration remain terminal. The method/retry-policy and
-        // whole-request deadline gates still apply before replaying anything.
-        error.NameServerFailure,
-        error.ConnectionReset,
-        error.ConnectionResetByPeer,
-        error.ConnectionAborted,
-        error.ConnectionTimedOut,
-        error.ConnectionTimeout,
-        error.BrokenPipe,
-        error.ConnectionClosed,
-        error.ConnectionRefused,
-        error.Closed,
-        error.NotConnected,
-        error.EndOfStream,
-        error.UnexpectedEof,
-        error.ReadFailed,
-        error.WriteFailed,
-        error.RecvFailed,
-        error.SendFailed,
-        => true,
-        else => false,
-    };
+    inline for (retryable_transport_errors) |candidate| if (err == candidate) return true;
+    return false;
+}
+
+/// The same classification for persisted diagnostics, without inventing runtime
+/// error-set ordinals or changing the operation's replay policy.
+pub fn isRetryableTransportErrorName(name: []const u8) bool {
+    inline for (retryable_transport_errors) |candidate| {
+        if (std.mem.eql(u8, name, @errorName(candidate))) return true;
+    }
+    return false;
+}
+
+test "transport classification survives durable error names without authorizing TLS replay" {
+    inline for (retryable_transport_errors) |err| {
+        try std.testing.expect(isRetryableTransportError(err));
+        try std.testing.expect(isRetryableTransportErrorName(@errorName(err)));
+    }
+    inline for (.{ error.AccessDenied, error.Unauthorized, error.TlsBadRecordMac, error.TlsAlert, error.TlsTransportReadFailed, error.UnknownProviderError }) |err| {
+        try std.testing.expect(!isRetryableTransportError(err));
+        try std.testing.expect(!isRetryableTransportErrorName(@errorName(err)));
+    }
+    try std.testing.expect(!isRetryableTransportErrorName(""));
+    try std.testing.expect(!isRetryableTransportErrorName("error.ConnectionRefused"));
 }
 
 /// Request interceptor function type.

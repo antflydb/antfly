@@ -26,6 +26,7 @@ pub const ChatWireFlavor = chat_wire.ChatWireFlavor;
 pub const ChatRequestOptions = chat_wire.ChatRequestOptions;
 pub const chatRequestJsonAlloc = chat_wire.chatRequestJsonAlloc;
 pub const chatRequestJsonWithOptionsAlloc = chat_wire.chatRequestJsonWithOptionsAlloc;
+pub const chatToolsFromValue = chat_wire.chatToolsFromValue;
 
 pub const Role = enum {
     system,
@@ -600,7 +601,8 @@ pub const GeneratorConfig = struct {
         if (self.image_input_token_bound) |bound| if (bound == 0 or bound > std.math.maxInt(i64)) return error.InvalidGeneratorConfig;
         if (self.max_tokens <= 0) return error.InvalidGeneratorConfig;
         if (self.max_completion_tokens) |limit| if (limit <= 0) return error.InvalidGeneratorConfig;
-        if (self.provider != .openai and self.provider != .chatgpt and (self.max_completion_tokens != null or self.reasoning_effort != null)) return error.InvalidGeneratorConfig;
+        if (self.provider != .openai and self.provider != .chatgpt and self.max_completion_tokens != null) return error.InvalidGeneratorConfig;
+        if (self.provider != .openai and self.provider != .chatgpt and self.provider != .ollama and self.reasoning_effort != null) return error.InvalidGeneratorConfig;
         if (self.temperature) |value| if (value < 0 or value > 2) return error.InvalidGeneratorConfig;
         if (self.top_p) |value| if (value < 0 or value > 1) return error.InvalidGeneratorConfig;
         if (self.top_k) |value| if (value <= 0) return error.InvalidGeneratorConfig;
@@ -1501,6 +1503,23 @@ test "generator config preserves OpenAI completion options through clone and rou
     defer reparsed.deinit(alloc);
     try std.testing.expectEqual(cfg.max_completion_tokens, reparsed.max_completion_tokens);
     try std.testing.expectEqual(cfg.reasoning_effort, reparsed.reasoning_effort);
+}
+
+test "generator config preserves Ollama reasoning through clone and round trip" {
+    const a = std.testing.allocator;
+    var cfg = try parseConfigFromSlice(a,
+        \\{"provider":"ollama","model":"thinking-model","reasoning_effort":"none","max_tokens":4096}
+    );
+    defer cfg.deinit(a);
+    var cloned = try cfg.clone(a);
+    defer cloned.deinit(a);
+    const encoded = try stringifyConfigAlloc(a, cloned);
+    defer a.free(encoded);
+    var reparsed = try parseConfigFromSlice(a, encoded);
+    defer reparsed.deinit(a);
+    try std.testing.expectEqual(OpenAIReasoningEffort.none, reparsed.reasoning_effort.?);
+    try std.testing.expectEqual(@as(i64, 4096), reparsed.outputTokenBudget());
+    try std.testing.expectEqual(@as(?i64, null), reparsed.max_completion_tokens);
 }
 
 test "generator config rejects ambiguous and invalid OpenAI completion options" {

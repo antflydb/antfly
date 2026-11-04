@@ -88,6 +88,8 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
     defer working.deinit();
     const build_alloc = working.allocator();
     var artifact_reads = @import("lake_index_artifact_recovery.zig").Reads.init(store.artifactStore());
+    artifact_reads.enableWriteCache(build_alloc, 8 * 1024 * 1024);
+    defer artifact_reads.close();
     var handle = artifact_reads.store();
     const published_bytes = publication.buildWithReuse(build_alloc, &handle, pending, source, store.identity, build_context, cancellation, clock, .{ .ptr = &lease, .snapshot = Renewal.snapshot, .save_checkpoint = Renewal.saveCheckpoint, .discard_checkpoint = Renewal.discardCheckpoint }, options.embedding_options, .{ .store = store, .table_id = table.table_id, .recipe = catalog.desiredFingerprint(table), .context = build_context }, .{ .allow_reuse = !repair, .identity_spill_bytes = options.identity_spill_bytes }) catch |reported_error| {
         heartbeat.cancel(io);
@@ -826,7 +828,7 @@ test "external lake global frontier coordinator rebuilds missing cloud map direc
     defer provider.deinit();
     var client = provider.client();
     try client.makeBucket("bucket");
-    var store: Store = .{ .opened = undefined, .implementation = try @import("../serverless/artifacts/object_store.zig").ObjectStore.initWithClient(a, client, "bucket", "native"), .identity = @splat(3), .locator = .{ .protocol = .s3, .connection = "test", .bucket = "bucket", .prefix = "native", .root = "test" } };
+    var store: Store = .{ .opened = undefined, .implementation = try @import("../serverless/artifacts/object_store.zig").ObjectStore.initWithClient(a, client, "bucket", "native"), .identity = @splat(3), .cache_identity = @splat(4), .locator = .{ .protocol = .s3, .connection = "test", .bucket = "bucket", .prefix = "native", .root = "test" } };
     defer store.implementation.deinit();
     const scope = try @import("../serverless/artifacts/store.zig").UploadScope.forPublication(@splat(4), 1, std.testing.io);
     var writer: maps.Writer = .{ .a = a, .io = std.testing.io, .scope = scope, .reader = .{ .client = client, .bucket = "bucket", .prefix = "native" }, .complete = true };

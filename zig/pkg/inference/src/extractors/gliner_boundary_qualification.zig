@@ -164,6 +164,16 @@ pub fn requiredFeaturesResolved(request: *const wire.Request, common: pipeline.O
     return result;
 }
 
+/// Encoded prompt capacity is separate from the artifact's body-word limit.
+/// DeBERTa's position table buckets relative distances; it is not a context cap.
+/// ModernBERT's supported RoPE extent is an actual sequence limit.
+pub fn sequenceLimit(config: *const model.Config, configured: usize) usize {
+    return if (config.encoder.family == .modern_bert)
+        @min(configured, config.encoder.max_position_embeddings)
+    else
+        configured;
+}
+
 /// Shared by qualification preflight and actual single-item execution. These
 /// are existing service/model clamps, not policy-derived or inferred capacities.
 pub fn singleProcessor(config: *const model.Config, item: *const wire.Item, supplied: processor.Options, max_queries: usize, control: ?Control) processor.Options {
@@ -223,6 +233,37 @@ pub fn lengths(request_items: usize, document_bytes: usize, document_words: usiz
     };
 }
 
+/// Runtime admission checks the consumed artifact, backend and complete feature
+/// union. Measured LengthContracts belong to Gate below, not to model capacity.
+/// Exact processor/encoder/device plans and cumulative work budgets enforce the
+/// request's actual geometry before any learned operation.
+pub const Admission = struct {
+    request_items: usize,
+    long_document_supported: bool,
+    control: ?Control,
+
+    pub fn init(consumed: artifact.Identity, backend: policy.Backend, request: *const wire.Request, control: ?Control) !Admission {
+        return initResolved(consumed, backend, request, .{}, control);
+    }
+
+    pub fn initResolved(consumed: artifact.Identity, backend: policy.Backend, request: *const wire.Request, common: pipeline.Options, control: ?Control) !Admission {
+        const coverage = try Gate.initResolved(consumed, backend, request, common, control);
+        return .{ .request_items = request.items.len, .long_document_supported = coverage.long_document_qualified, .control = control };
+    }
+
+    pub fn observe(self: *Admission, document_bytes: usize, document_words: usize, window_count: usize, prepared: *const processor.PreparedBatch) !void {
+        try check(self.control);
+        _ = try lengths(self.request_items, document_bytes, document_words, window_count, prepared);
+        if (window_count != 1 and !self.long_document_supported) return error.UnsupportedGlinerBoundaryRuntime;
+    }
+
+    pub fn observeSingle(self: *Admission, allocator: Allocator, text: []const u8, prepared: *const processor.PreparedBatch, options: processor.Options) !void {
+        try self.observe(text.len, try sourceWords(allocator, text, options), 1, prepared);
+    }
+};
+
+/// Evidence checker: requires one measured profile to cover every observation.
+/// This remains useful for qualification receipts, independently of serving.
 pub const Gate = struct {
     candidates: policy.Candidates,
     single_window_candidates: ?policy.Candidates = null,

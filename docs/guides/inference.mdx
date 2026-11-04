@@ -207,6 +207,12 @@ The chunkers `fixed_bert` and `fixed_bpe` are built in and need no download. Chu
 - **Memory.** Model loads and requests reserve memory from one process envelope shared with storage and caches. Set it with `--process-memory-budget-mb` or `ANTFLY_PROCESS_MEMORY_BUDGET_MB`; otherwise the cgroup or host limit applies. A request that can never fit returns `MODEL_RESOURCE_LIMIT`; temporary contention returns `MODEL_RESOURCE_BUSY`.
 - **Query priority.** Background enrichment yields to query-time work in the same database process. Embedding backfill pauses (up to 5 s) while a query-time embed is running, and background generation pauses while an interactive generate or chat request is in flight. Backfill that receives `503` retries with backoff.
 
+Admission checks every request limit before considering contention. A request that exceeds its own scratch, KV, backend, host, or combined limit fails permanently even when another model currently occupies memory. Feasible requests may reclaim idle models and caches before returning a retryable capacity refusal.
+
+Both permanent and temporary memory-admission failures record the error identity, requested bytes, current reservations, and configured limits in the inference process logs. For `MODEL_RESOURCE_LIMIT`, inspect the `inference run admission denied` and `inference run admission request` records before changing budgets. A loaded model's RSS does not include all request scratch or preprocessing memory. The process envelope and live host/cgroup capacity apply in addition to the individual inference budgets.
+
+Native EmbeddingGemma text execution lets physical temporary allocations consume its prepaid workspace, reserving only additional bytes. The 512 MiB temporary-allocation ceiling is a guard, not an upfront reservation. Retained output buffers keep their admission when an execution phase finishes. Cumulative scratch owned by one request is checked against the policy separately from other requests' occupancy.
+
 The [inference runtime reference](../reference/inference-runtime.md) covers weighted work admission, request ceilings, and the model-instance API.
 
 ### Loading models in Antfarm
@@ -234,6 +240,10 @@ curl http://127.0.0.1:8080/db/v1/tables/TABLE/indexes/INDEX
 ```
 
 The `enrichment_runtime` object carries sequence progress, retry and failure counters, the active batch, and worker lifecycle state. `worker_started` says whether the background worker is running. `stalled` is the narrower condition: work is pending, no retry or terminal failure already explains the backlog, and either no worker is running or the active batch has passed its deadline without progress. `stall_reason` says which (`worker_missing`, `model_loading`, `embedding_overdue`, or `publishing_overdue`).
+
+During capacity contention, `retrying: true`, `last_error_code: "EmbedAdmissionRefused"` (or `ResourceTemporarilyUnavailable`), and `next_retry_at_ms` explain the wait. Admission refusals do not consume the provider-failure attempt budget. A separate ceiling allows 16 admission attempts for the same request, approximately five minutes of capped backoff excluding execution time. That counter survives restart. Persistent refusals then become terminal repair debt, preserving the underlying error; they do not retry indefinitely. Once capacity or configuration is corrected, run a bounded repair pass for the affected documents.
+
+Index creation preserves permanent inference-budget failures as HTTP 400 `MODEL_RESOURCE_LIMIT` with `retryable: false`; a temporarily unavailable validation probe remains HTTP 503 with a retry hint. Query hierarchy validation reports a JSON pointer and a reason when grouped matches omit `fields` or child navigation uses an invalid `order_by`.
 
 For keys that have reached the durable repair queues, ask the bounded operator endpoint:
 

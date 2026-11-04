@@ -22,13 +22,17 @@ pub const Metadata = struct { key: []const u8, value: []const u8 };
 const Buffer = struct {
     a: A,
     bytes: std.ArrayList(u8) = .empty,
+    counted: ?usize = null,
+    fn byte(b: *Buffer, value: u8) !void {
+        if (b.counted) |*count| count.* += 1 else try b.bytes.append(b.a, value);
+    }
     fn raw(b: *Buffer, value: []const u8) !void {
-        try b.bytes.appendSlice(b.a, value);
+        if (b.counted) |*count| count.* += value.len else try b.bytes.appendSlice(b.a, value);
     }
     fn long(b: *Buffer, value: i64) !void {
         var n: u64 = @as(u64, @bitCast(value << 1)) ^ @as(u64, @bitCast(value >> 63));
-        while (n >= 128) : (n >>= 7) try b.bytes.append(b.a, @as(u8, @truncate(n)) | 128);
-        try b.bytes.append(b.a, @intCast(n));
+        while (n >= 128) : (n >>= 7) try b.byte(@as(u8, @truncate(n)) | 128);
+        try b.byte(@intCast(n));
     }
     fn string(b: *Buffer, value: []const u8) !void {
         try b.long(@intCast(value.len));
@@ -75,8 +79,21 @@ fn encode(b: *Buffer, schema: V, value: V) anyerror!void {
         try b.string(value.string);
     } else if (std.mem.eql(u8, schema.string, "boolean")) {
         if (value != .bool) return error.InvalidLakeManifest;
-        try b.bytes.append(b.a, @intFromBool(value.bool));
+        try b.byte(@intFromBool(value.bool));
     } else return error.InvalidLakeManifest;
+}
+/// Exact sizes use the same encoder as the writer, without allocating payloads.
+pub fn recordSize(schema: V, row: V) !usize {
+    var counter: Buffer = .{ .a = undefined, .counted = 0 };
+    try encode(&counter, schema, row);
+    return counter.counted.?;
+}
+pub fn ocfSize(header_bytes: usize, records: usize, block_bytes: usize) !usize {
+    if (records == 0) return header_bytes;
+    var counter: Buffer = .{ .a = undefined, .counted = 0 };
+    try counter.long(@intCast(records));
+    try counter.long(@intCast(block_bytes));
+    return header_bytes + counter.counted.? + block_bytes + 16;
 }
 pub fn ocf(a: A, schema_json: []const u8, rows: []const V, metadata: []const Metadata) ![]u8 {
     var parsed = try std.json.parseFromSlice(V, a, schema_json, .{});

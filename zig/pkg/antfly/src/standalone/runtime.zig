@@ -6055,6 +6055,9 @@ pub fn runFromIterator(
         data_server.provisioned_storage.setDenseNativeAuthorityPermitted(true);
     }
     defer data_server.deinitWithDeadline(supervisor.deadline());
+    if (comptime !control_only_storage_sources) if (native_query_repository) |*repository| {
+        repository.attachResources(&data_server.provisioned_storage.resource_manager);
+    };
     const managed_memory = data_server.provisioned_storage.resource_manager.snapshot().memory;
     std.log.info(
         "process memory policy operator_source={s} effective_source={s} configured_limit_bytes={d} effective_limit_bytes={d} managed_hard_limit_bytes={d}",

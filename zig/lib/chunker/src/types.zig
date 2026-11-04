@@ -128,9 +128,29 @@ pub const Chunk = struct {
     }
 };
 
+/// Count scalars rather than bytes or English words. Whitespace cannot make a
+/// page label eligible. Opt-in so short captions and identifiers remain usable.
+pub fn hasMinimumTextContent(text: []const u8, minimum: usize) bool {
+    if (minimum == 0) return true;
+    const view = std.unicode.Utf8View.init(text) catch return false;
+    var it = view.iterator();
+    var count: usize = 0;
+    while (it.nextCodepoint()) |cp| {
+        switch (cp) {
+            0x09...0x0d, 0x20, 0x85, 0xa0, 0x1680, 0x2000...0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000 => continue,
+            else => {},
+        }
+        count += 1;
+        if (count >= minimum) return true;
+    }
+    return false;
+}
+
 pub const FixedTextConfig = struct {
     target_tokens: usize = 500,
     overlap_tokens: usize = 50,
+    /// Minimum non-whitespace Unicode scalars; zero preserves all chunks.
+    min_chars: usize = 0,
     /// 0 = unlimited: chunk the entire unit. An explicit value is still
     /// bounded by `max_chunk_results` in `validate()`.
     max_chunks: usize = 0,
@@ -138,6 +158,7 @@ pub const FixedTextConfig = struct {
 
     pub fn validate(self: @This()) !void {
         const target = if (self.target_tokens > 0) self.target_tokens else 500;
+        if (self.min_chars > max_chunk_target_tokens) return error.InvalidChunkMinChars;
         if (target > max_chunk_target_tokens) return error.InvalidChunkTargetTokens;
         if (self.overlap_tokens > max_chunk_target_tokens or self.overlap_tokens >= target)
             return error.InvalidChunkOverlapTokens;
@@ -169,15 +190,19 @@ pub const FixedChunkConfig = struct {
     text: FixedTextConfig = .{},
     audio: AudioChunkOptions = .{},
 
+    pub fn textConfig(self: @This()) FixedTextConfig {
+        var config = self.text;
+        config.max_chunks = self.max_chunks;
+        return config;
+    }
+
     pub fn validate(self: @This()) !void {
         if (self.max_chunks > max_chunk_results) return error.InvalidMaxChunks;
         if (self.threshold) |value| {
             if (!std.math.isFinite(value) or value < 0 or value > 1)
                 return error.InvalidChunkThreshold;
         }
-        var text = self.text;
-        text.max_chunks = self.max_chunks;
-        try text.validate();
+        try self.textConfig().validate();
         try self.audio.validate();
     }
 };

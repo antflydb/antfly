@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const inference_validation_errors = @import("inference_validation_errors.zig");
 const index_metadata = @import("antfly_local_sources").api_index_metadata;
 const join_planning = @import("join_planning.zig");
 const system_catalog = @import("antfly_local_sources").system_catalog_domain;
@@ -6575,6 +6576,7 @@ pub const ApiHttpServer = struct {
         } else {
             var repository = try @import("native_query_repository.zig").Repository.init(a, config, self.cfg.secret_store, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
             defer repository.deinit();
+            repository.attachResources(self.shared_resource_manager orelse &self.local_resource_manager);
             const control: @import("antfly_local_sources").storage_db_native_query_cut.Control = .{ .parent = cancel, .deadline_ns = request.deadline_ns.? };
             if (self.native_query_gc_collection == null) {
                 const runtime = self.cfg.backend_runtime orelse return;
@@ -17404,6 +17406,8 @@ pub const ApiHttpServer = struct {
             error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
             error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
             error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.ModelNotFound => return error.ModelNotFound,
             else => {
@@ -17423,6 +17427,8 @@ pub const ApiHttpServer = struct {
         }) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
             error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.ModelNotFound => return error.ModelNotFound,
             else => {
@@ -17478,6 +17484,8 @@ pub const ApiHttpServer = struct {
         ) catch |err| switch (err) {
             error.ModelNotFound => return error.ModelNotFound,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
             error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
             error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
@@ -17502,6 +17510,8 @@ pub const ApiHttpServer = struct {
         ) catch |err| switch (err) {
             error.ModelNotFound => return error.ModelNotFound,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
             error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.InvalidCreateTableRequest => return error.InvalidIndexRequest,
             error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
@@ -18110,6 +18120,11 @@ pub const ApiHttpServer = struct {
                 .inference_api_key = self.cfg.inference_api_key,
             },
         ) catch |err| switch (err) {
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
+            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
+            error.ModelNotFound => return error.ModelNotFound,
             error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
             error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
             error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
@@ -18130,7 +18145,12 @@ pub const ApiHttpServer = struct {
                 .inference_api_key = self.cfg.inference_api_key,
             },
         ) catch |err| switch (err) {
-            error.ModelNotFound, error.EmbeddingProbeUnavailable, error.InvalidCreateTableRequest, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
+            error.InvalidCreateTableRequest, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
+            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
+            error.ModelNotFound => return error.ModelNotFound,
             error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
             error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
             error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
@@ -18153,6 +18173,11 @@ pub const ApiHttpServer = struct {
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
+            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
+            error.ModelNotFound => return error.ModelNotFound,
             error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
             error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
             error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
@@ -22326,7 +22351,7 @@ pub const ApiHttpServer = struct {
             },
         ) catch |err| return switch (err) {
             error.ModelNotFound => try contextualJsonErrorResponse(self.alloc, 404, "model not found"),
-            error.EmbeddingProbeUnavailable => try contextualIndexProbeUnavailableResponse(self.alloc),
+            error.ResourceLimitExceeded, error.MemoryBudgetExceeded, error.EmbeddingProbeUnavailable => try contextualInferenceValidationFailureResponse(self.alloc, err),
             error.InferenceEndpointAccessDenied => try contextualJsonResponse(self.alloc, 400, .{ .@"error" = "invalid_index_request", .message = public_table_http.inference_endpoint_access_denied_message, .retryable = false }),
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration"),
             error.MissingEmbeddingArtifactEnrichment => try contextual_operations.textAlloc(self.alloc, 400, "embedding index source has no matching embedding enrichment"),
@@ -22352,7 +22377,7 @@ pub const ApiHttpServer = struct {
             },
         ) catch |err| return switch (err) {
             error.ModelNotFound => try contextualJsonErrorResponse(self.alloc, 404, "model not found"),
-            error.EmbeddingProbeUnavailable => try contextualIndexProbeUnavailableResponse(self.alloc),
+            error.ResourceLimitExceeded, error.MemoryBudgetExceeded, error.EmbeddingProbeUnavailable => try contextualInferenceValidationFailureResponse(self.alloc, err),
             error.InferenceEndpointAccessDenied => try contextualJsonResponse(self.alloc, 400, .{ .@"error" = "invalid_index_request", .message = public_table_http.inference_endpoint_access_denied_message, .retryable = false }),
             error.InvalidCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration"),
             error.MissingEmbeddingArtifactEnrichment => try contextual_operations.textAlloc(self.alloc, 400, "embedding index source has no matching embedding enrichment"),
@@ -23060,6 +23085,8 @@ pub const ApiHttpServer = struct {
             error.InvalidCatalogName => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid table target"),
             error.InvalidComposedGraphIdentity, error.InvalidQueryRequest => if (db_mod.peekLastSortRejectionDiagnostic() != null)
                 try contextualUnsupportedExactSortResponse(self.alloc)
+            else if (try query_request_diagnostics.validationErrorBodyForRequest(self.alloc, table_name, body)) |error_body|
+                contextual_operations.jsonWithStatus(400, error_body, false)
             else
                 try contextual_operations.textAlloc(self.alloc, 400, "invalid query request"),
             // Seeded personalization contract failures (seeds without fresh
@@ -27555,18 +27582,23 @@ fn contextualArtifactSourcesUpgradePendingResponse(alloc: std.mem.Allocator) !co
     return response;
 }
 
-fn contextualIndexProbeUnavailableResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
-    var response = try contextualJsonResponse(alloc, 503, .{
-        .@"error" = "index_probe_unavailable",
-        .message = "index validation probe unavailable",
-        .retryable = true,
-    });
+fn contextualInferenceValidationFailureResponse(alloc: std.mem.Allocator, err: anyerror) !contextual_operations.OwnedResponse {
+    const failure = inference_validation_errors.classify(err) orelse return error.InvalidArgument;
+    var response = contextual_operations.jsonWithStatus(failure.status, try failure.bodyAlloc(alloc), false);
     errdefer response.deinit(alloc);
-    var retry_after = try ownedContextualHeader(alloc, "Retry-After", "1");
-    errdefer retry_after.deinit(alloc);
-    response.headers = try alloc.alloc(contextual_operations.Header, 1);
-    response.headers[0] = retry_after;
+    if (failure.retry_after_seconds) |seconds| {
+        const value = try std.fmt.allocPrint(alloc, "{d}", .{seconds});
+        defer alloc.free(value);
+        var header = try ownedContextualHeader(alloc, "Retry-After", value);
+        errdefer header.deinit(alloc);
+        response.headers = try alloc.alloc(contextual_operations.Header, 1);
+        response.headers[0] = header;
+    }
     return response;
+}
+
+fn contextualIndexProbeUnavailableResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    return contextualInferenceValidationFailureResponse(alloc, error.EmbeddingProbeUnavailable);
 }
 
 fn contextualPublicFilterQueryErrorResponseForBody(
@@ -27646,7 +27678,18 @@ fn contextualUnsupportedQueryResponse(alloc: std.mem.Allocator) !contextual_oper
     };
 }
 
+/// Public agents share one upstream-output failure contract. This is a
+/// completed provider attempt, so automatic retry guidance would be misleading.
+pub fn generationOutputErrorResponse(alloc: std.mem.Allocator, err: anyerror) !?contextual_operations.OwnedResponse {
+    if (err != error.InferenceOutputIncomplete) return null;
+    return contextual_operations.jsonWithStatus(502, try std.json.Stringify.valueAlloc(alloc, .{
+        .@"error" = "InferenceOutputIncomplete",
+        .message = "generator output was truncated; increase the output token budget or reduce reasoning effort",
+    }, .{}), false);
+}
+
 fn queryBuilderFailureResponse(alloc: std.mem.Allocator, err: anyerror) !contextual_operations.OwnedResponse {
+    if (try generationOutputErrorResponse(alloc, err)) |response| return response;
     return switch (err) {
         error.InvalidQueryBuilderRequest => try contextual_operations.jsonErrorAlloc(alloc, 400, "invalid query builder request"),
         error.InvalidQueryBuilderGeneration, error.InvalidAgentToolCall => try contextual_operations.jsonErrorAlloc(alloc, 422, "generator did not submit a valid query tool call"),
@@ -58421,6 +58464,19 @@ test "api http server executes direct foreign table aggregations through registr
     try std.testing.expectEqualStrings("unsupported_query_request", unsupported.value.@"error");
 }
 
+test "query builder incomplete generation preserves upstream failure and budget guidance" {
+    const a = std.testing.allocator;
+    var response = try queryBuilderFailureResponse(a, error.InferenceOutputIncomplete);
+    defer response.deinit(a);
+    try std.testing.expectEqual(@as(u16, 502), response.status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("InferenceOutputIncomplete", parsed.value.object.get("error").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.object.get("message").?.string, "token budget") != null);
+    for (response.headers) |header| try std.testing.expect(!std.ascii.eqlIgnoreCase(header.name, "Retry-After"));
+    try std.testing.expect(try generationOutputErrorResponse(a, error.InvalidQueryBuilderRequest) == null);
+}
+
 test "query builder dependency 503 responses preserve public retry contract" {
     const alloc = std.testing.allocator;
     const cases = .{
@@ -61934,5 +61990,139 @@ test "SQL pgwire native shared resource routing checks persisted ownership" {
         var forwarded = false;
         try std.testing.expectEqual(@as(?contextual_operations.OwnedResponse, null), try peer.forwardSQLResourceOperation(&id, kind, .{ .method = .DELETE, .uri = "/db/v1/sql/resource", .body = "" }, &forwarded));
         try std.testing.expect(!forwarded and !fixture.called);
+    }
+}
+
+test "admission routing standalone query preserves hierarchy pointers over HTTP" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    const FakeReads = struct {
+        query_error: anyerror,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .document_artifact_manifest = artifactManifest,
+                    .document_artifact_manifests = artifactManifests,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            return self.query_error;
+        }
+
+        fn artifactManifest(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.query_error;
+        }
+
+        fn artifactManifests(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifestList {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.query_error;
+        }
+    };
+
+    var reads = FakeReads{ .query_error = error.TestUnexpectedResult };
+    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), reads.source(), null);
+    defer server.deinit();
+    var response = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/db/v1/tables/docs/query",
+        .content_type = "application/json",
+        .body = "{\"fields\":[],\"hierarchy\":{\"group_by\":{\"level\":\"source\",\"matches\":{}}}}",
+    });
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), response.status);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("/hierarchy/group_by/matches/fields", parsed.value.object.get("pointer").?.string);
+    try std.testing.expectEqualStrings("invalid_query_request", parsed.value.object.get("error").?.string);
+    try std.testing.expect(!parsed.value.object.get("retryable").?.bool);
+}
+
+test "admission routing table creation preserves permanent validation refusals over HTTP" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        failure: anyerror = error.ResourceLimitExceeded,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+        fn dense(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+        fn sparse(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]managed_embedder.SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+    };
+    var fake = Fake{};
+    var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status } }, null, null);
+    defer server.deinit();
+    server.antfly_provider = .{ .ptr = &fake, .owns_invocation_admission = true, .embed_dense_texts = Fake.dense, .embed_sparse_texts = Fake.sparse };
+    for ([_]anyerror{ error.ResourceLimitExceeded, error.MemoryBudgetExceeded }) |failure| {
+        fake.failure = failure;
+        for ([_][]const u8{
+            "{\"indexes\":{\"semantic\":{\"type\":\"embeddings\",\"field\":\"body\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"local-model\"}}}}",
+            "{\"indexes\":{\"semantic\":{\"type\":\"embeddings\",\"field\":\"body\",\"sparse\":true,\"embedder\":{\"provider\":\"antfly\",\"model\":\"local-model\"}}}}",
+        }) |body| {
+            var response = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = "/tables/docs", .content_type = "application/json", .body = body });
+            defer response.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 400), response.status);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("MODEL_RESOURCE_LIMIT", parsed.value.object.get("error").?.string);
+            try std.testing.expect(!parsed.value.object.get("retryable").?.bool);
+        }
     }
 }

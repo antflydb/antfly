@@ -2707,6 +2707,20 @@ fn buildGeneratedSemanticOrHybridQueryBuilderPlan(
     };
 }
 
+test "query builder incomplete generation remains terminal across every specialist" {
+    const Fake = struct {
+        fn generate(_: *anyopaque, _: std.mem.Allocator, _: []const generating.ChainLink, _: []const generating.ChatMessage) !generating.GenerateResult {
+            return error.InferenceOutputIncomplete;
+        }
+    };
+    const a = std.testing.allocator;
+    const request = metadata_openapi.QueryBuilderRequest{ .intent = "find evidence" };
+    const runner = GenerationRunner{ .ptr = undefined, .vtable = &.{ .execute_chain = Fake.generate } };
+    try std.testing.expectError(error.InferenceOutputIncomplete, buildGeneratedSemanticQueryBuilderAttemptFromMessages(a, request, "semantic", &.{}, &.{}, null, runner, &.{}, &.{}));
+    try std.testing.expectError(error.InferenceOutputIncomplete, buildGeneratedFullTextQueryBuilderAttemptFromMessages(a, request, &.{}, null, runner, &.{}, &.{}));
+    try std.testing.expectError(error.InferenceOutputIncomplete, buildGeneratedGraphQueryBuilderAttemptFromMessages(a, request, &.{}, &.{}, .{}, null, runner, &.{}, &.{}));
+}
+
 fn queryBuilderGeneratedSemanticIndexNames(
     alloc: std.mem.Allocator,
     embedding_index_metadata: []const QueryBuilderEmbeddingIndex,
@@ -2739,7 +2753,8 @@ fn buildGeneratedSemanticQueryBuilderAttemptFromMessages(
     chain: []const generating.ChainLink,
     messages: []const generating.ChatMessage,
 ) !GeneratedSemanticQueryBuilderAttempt {
-    var result = generation_runner.executeChain(alloc, chain, messages) catch return error.UnsupportedQueryBuilderGeneration;
+    var result = generation_runner.executeChain(alloc, chain, messages) catch |err|
+        return if (err == error.InferenceOutputIncomplete) err else error.UnsupportedQueryBuilderGeneration;
     defer result.deinit();
 
     const json_text = extractJsonObjectSlice(result.content) orelse return error.InvalidQueryBuilderGeneration;
@@ -2881,7 +2896,8 @@ fn buildGeneratedFullTextQueryBuilderAttemptFromMessages(
     chain: []const generating.ChainLink,
     messages: []const generating.ChatMessage,
 ) !GeneratedFullTextQueryBuilderAttempt {
-    var result = generation_runner.executeChain(alloc, chain, messages) catch return error.UnsupportedQueryBuilderGeneration;
+    var result = generation_runner.executeChain(alloc, chain, messages) catch |err|
+        return if (err == error.InferenceOutputIncomplete) err else error.UnsupportedQueryBuilderGeneration;
     defer result.deinit();
 
     const json_text = extractJsonObjectSlice(result.content) orelse return error.InvalidQueryBuilderGeneration;
@@ -2984,7 +3000,8 @@ fn buildGeneratedGraphQueryBuilderAttemptFromMessages(
     chain: []const generating.ChainLink,
     messages: []const generating.ChatMessage,
 ) !GeneratedGraphQueryBuilderAttempt {
-    var result = generation_runner.executeChain(alloc, chain, messages) catch return error.UnsupportedQueryBuilderGeneration;
+    var result = generation_runner.executeChain(alloc, chain, messages) catch |err|
+        return if (err == error.InferenceOutputIncomplete) err else error.UnsupportedQueryBuilderGeneration;
     defer result.deinit();
 
     const json_text = extractJsonObjectSlice(result.content) orelse return error.InvalidQueryBuilderGeneration;
