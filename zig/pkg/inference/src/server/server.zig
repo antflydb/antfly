@@ -18,6 +18,7 @@
 
 pub const chunk_response = @import("chunk_response.zig");
 const std = @import("std");
+const embedding_revision = httpx.embedding_revision;
 const builtin = @import("builtin");
 const build_info = @import("build_info");
 const build_options = @import("build_options");
@@ -1937,10 +1938,31 @@ fn runEmbeddingRuntimeRecoveryLoop(adapter: anytype) !void {
 // Check the acquired generation on every recovery attempt, before broker or
 // pipeline dispatch. Observing the alias before/after execution cannot fence ABA.
 fn requireLoadedEmbeddingRevision(expected: ?[32]u8, actual: ?[32]u8) !void {
-    if (expected) |revision| {
-        const loaded = actual orelse return error.InferenceCapabilitiesStale;
-        if (!std.mem.eql(u8, &revision, &loaded)) return error.InferenceCapabilitiesStale;
+    try embedding_revision.require(expected, actual);
+}
+
+fn acknowledgeEmbeddingRevision(ctx: *httpx.Context, revision: ?[32]u8) !void {
+    if (revision) |value| {
+        const hex = std.fmt.bytesToHex(value, .lower);
+        try ctx.setHeader(embedding_revision.response_header, &hex);
+        // Make the proof readable by cross-origin JSON and numeric callers,
+        // preserving any exposure policy installed by middleware.
+        const existing = ctx.response.headers.get("Access-Control-Expose-Headers") orelse "";
+        var values = std.mem.splitScalar(u8, existing, ',');
+        while (values.next()) |name| if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, name, " \t"), embedding_revision.response_header)) return;
+        if (existing.len == 0) {
+            try ctx.setHeader("Access-Control-Expose-Headers", embedding_revision.response_header);
+        } else {
+            const exposed = try std.fmt.allocPrint(ctx.allocator, "{s}, {s}", .{ existing, embedding_revision.response_header });
+            defer ctx.allocator.free(exposed);
+            try ctx.setHeader("Access-Control-Expose-Headers", exposed);
+        }
     }
+}
+
+fn embeddingRevisionFailureResponse(ctx: *httpx.Context) !httpx.Response {
+    try ctx.setHeader("X-Antfly-Capability-Stale", "true");
+    return ctx.status(409).json(.{ .@"error" = "MODEL_REVISION_MISMATCH", .message = "the acquired embedding model does not match model_revision; refresh capabilities and replan" });
 }
 
 fn runLoadedEmbeddingRuntimeWithRecovery(
@@ -13380,9 +13402,11 @@ pub const Node = struct {
                 node: *Node,
                 prompt_tokens: usize = 0,
                 executor_contract: ResolvedInferenceExecutorContract,
+                model_revision: ?[32]u8,
 
                 fn run(attempt_ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                     const attempt: *@This() = @ptrCast(@alignCast(attempt_ctx));
+                    try requireLoadedEmbeddingRevision(attempt.model_revision, model.resolution_revision);
                     if (!model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
                     var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
                         .allocator = attempt.allocator,
@@ -13412,6 +13436,7 @@ pub const Node = struct {
                 .allocator = ctx.allocator,
                 .io = self.session_manager.io,
                 .texts = sparse_texts,
+                .model_revision = request.model_revision,
                 .node = self,
                 .executor_contract = executor_contract,
                 .execution_control = execution_control,
@@ -13420,6 +13445,7 @@ pub const Node = struct {
                 .execution_control = execution_control,
             }, &attempt, Attempt.run) catch |err|
                 {
+                    if (err == error.InferenceCapabilitiesStale) return embeddingRevisionFailureResponse(ctx);
                     if (isInferenceExecutorContractError(err)) return inferenceExecutorContractFailureResponse(ctx, err);
                     return inferenceFailureResponse(ctx, err);
                 };
@@ -13428,6 +13454,7 @@ pub const Node = struct {
                 for (sparse_vecs) |*sv| @constCast(sv).deinit(ctx.allocator);
                 ctx.allocator.free(sparse_vecs);
             }
+            try acknowledgeEmbeddingRevision(ctx, request.model_revision);
 
             var arena = std.heap.ArenaAllocator.init(ctx.allocator);
             defer arena.deinit();
@@ -13533,6 +13560,7 @@ pub const Node = struct {
 
             fn run(attempt_ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(attempt_ctx));
+                try requireLoadedEmbeddingRevision(attempt.request.model_revision, model.resolution_revision);
                 attempt.model_identity = model.embedding_identity;
                 try model.verifyEmbeddingIdentityWithControl(attempt.execution_control);
                 if (attempt.request.model_identity) |expected| {
@@ -13654,6 +13682,7 @@ pub const Node = struct {
             .trace = attempt.trace,
             .execution_control = execution_control,
         }, &attempt, Attempt.run) catch |err| {
+            if (err == error.InferenceCapabilitiesStale) return embeddingRevisionFailureResponse(ctx);
             if (err == error.EmbeddingIdentityMismatch) return ctx.status(409).json(.{ .@"error" = "MODEL_IDENTITY_MISMATCH", .message = "embedding assets or recipe differ from the pinned index identity" });
             if (isInferenceExecutorContractError(err)) return inferenceExecutorContractFailureResponse(ctx, err);
             if (isEmbedRequestOptionError(err)) {
@@ -13680,6 +13709,7 @@ pub const Node = struct {
                     for (embeddings) |e| ctx.allocator.free(e);
                     ctx.allocator.free(embeddings);
                 }
+                try acknowledgeEmbeddingRevision(ctx, request.model_revision);
                 if (httpx.numeric_response.requested(ctx.header("Accept"))) {
                     const frame = buildDenseNumericFrame(ctx.allocator, embeddings, requested_dimensions, attempt.normalize_response) catch |err| switch (err) {
                         error.InvalidEmbeddingDimensions => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "dimensions exceeds the model embedding size" }),
@@ -13709,6 +13739,7 @@ pub const Node = struct {
             .per_item => |partial_value| {
                 var partial = partial_value;
                 defer partial.deinit(ctx.allocator);
+                try acknowledgeEmbeddingRevision(ctx, request.model_revision);
                 var response = buildEmbedDensePartialResponse(arena.allocator(), request.model, &partial, requested_dimensions, attempt.normalize_response, attempt.prompt_tokens) catch |err| switch (err) {
                     error.InvalidEmbeddingDimensions => {
                         return ctx.status(400).json(.{
@@ -24399,6 +24430,7 @@ pub const Node = struct {
         var handle = try self.model_manager.acquireFromDirWithControl(path, control);
         defer handle.release();
         const loaded = handle.get();
+        try requireLoadedEmbeddingRevision(request.model_revision, loaded.resolution_revision);
         var frame_cache = grouped.FrameCache{ .allocator = grouped.workspaceBackingAllocator(loaded.session.backend()), .session = loaded.session };
         defer frame_cache.deinit();
         if (request.model_identity) |expected| {
@@ -24456,6 +24488,7 @@ pub const Node = struct {
             }
         }
         try loaded.verifyEmbeddingIdentityWithControl(control);
+        try acknowledgeEmbeddingRevision(ctx, request.model_revision);
         if (request.error_policy == .per_item) {
             const partial = DenseEmbedPartialResult{ .embeddings = vectors, .errors = errors.items };
             var response = try buildEmbedDensePartialResponse(a, request.model, &partial, if (request.dimensions) |dim| @intCast(dim) else null, true, input_tokens);
@@ -24835,6 +24868,7 @@ pub const Node = struct {
                 const catalog_allocator = catalog.arena.allocator();
                 try info.object.put(catalog_allocator, "model_revision", .{ .string = &hex });
                 if (std.mem.eql(u8, task, "generate")) return ctx.json(catalog.value);
+                try info.object.put(catalog_allocator, "model_revision_pinning", .{ .bool = true });
                 // Registry-wide listing deliberately skips full geometry parsing.
                 // Scoped discovery already resolved metadata without loading weights.
                 if (dense_output) |shape| {
@@ -36914,6 +36948,7 @@ fn validateQwen3EmbeddingDimensions(manifest: *const manifest_mod.ModelManifest,
 }
 
 const ParsedEmbedRequest = struct {
+    model_revision: ?[32]u8 = null,
     model_identity: ?[]const u8 = null,
     model: []const u8,
     input: std.json.Value,
@@ -37324,6 +37359,11 @@ fn parseEmbedRequest(body: std.json.Value) !ParsedEmbedRequest {
         break :blk v.string;
     } else null;
 
+    const revision: ?[32]u8 = if (obj.get("model_revision")) |value| blk: {
+        if (value != .string) return error.InvalidEmbeddingRevision;
+        break :blk try embedding_revision.parse(value.string);
+    } else null;
+
     const model_value = obj.get("model") orelse return error.ModelRequired;
     if (model_value != .string or model_value.string.len == 0) return error.ModelRequired;
 
@@ -37364,6 +37404,7 @@ fn parseEmbedRequest(body: std.json.Value) !ParsedEmbedRequest {
     } else null;
 
     return .{
+        .model_revision = revision,
         .model_identity = identity,
         .model = model_value.string,
         .input = input_value,
@@ -37378,6 +37419,7 @@ fn parseEmbedRequest(body: std.json.Value) !ParsedEmbedRequest {
 fn embedRequestParseErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.RequestBodyMustBeObject => "request body must be a JSON object",
+        error.InvalidEmbeddingRevision => "model_revision must be a 64-character lowercase hexadecimal revision from model capabilities",
         error.ModelRequired => "model is required",
         error.InputRequired => "input is required",
         error.EncodingFormatMustBeString => "encoding_format must be a string",
@@ -38549,6 +38591,7 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
 /// Grouped execution uses the same admission failure identities as flat
 /// execution, before interpreting failures as invalid grouped input.
 fn groupedEmbeddingFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (err == error.InferenceCapabilitiesStale) return embeddingRevisionFailureResponse(ctx);
     if (err == error.QueueFull) return transientCapacityFailureResponse(ctx, "SERVICE_UNAVAILABLE", "server at capacity for expanded request workload, try again later", "inference_admission");
     if (err == error.ImageTooLarge or err == error.ImageBatchTooLarge) return readImageErrorResponse(ctx, err);
     if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
@@ -47847,6 +47890,7 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     try std.testing.expectEqual(@as(i64, 768), shape.object.get("native_dimensions").?.integer);
     try std.testing.expectEqual(@as(i64, 1), shape.object.get("minimum_dimensions").?.integer);
     try std.testing.expectEqual(@as(usize, 64), model.object.get("model_revision").?.string.len);
+    try std.testing.expect(model.object.get("model_revision_pinning").?.bool);
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
 }
 
@@ -49244,4 +49288,50 @@ test "grouped embedding request charges framed attachments before inline media" 
         try std.testing.expectError(error.RemoteContentTooLarge, node.createGroupedEmbeddingTracked(&ctx, "missing-model", &manifest, contract, .{ .model = "missing", .input = parsed.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = policy }, &attachments, .{ .media = media, .reserved_units = &units }, .{}));
     }
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+}
+
+test "standalone embedding HTTP revision parser and acknowledgements" {
+    const a = std.testing.allocator;
+    const expected: [32]u8 = @splat(0x11);
+    const hex = std.fmt.bytesToHex(expected, .lower);
+    const body = try std.fmt.allocPrint(a, "{{\"model\":\"alias\",\"input\":\"text\",\"model_revision\":\"{s}\"}}", .{hex});
+    defer a.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    const pin = (try parseEmbedRequest(parsed.value)).model_revision;
+    try std.testing.expectEqual(expected, pin.?);
+    try requireLoadedEmbeddingRevision(pin, expected);
+    try std.testing.expectError(error.InferenceCapabilitiesStale, requireLoadedEmbeddingRevision(pin, @as([32]u8, @splat(0x22))));
+    try std.testing.expectError(error.InferenceCapabilitiesStale, requireLoadedEmbeddingRevision(pin, null));
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+    defer request.deinit();
+    {
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        try ctx.setHeader("Access-Control-Expose-Headers", "X-Request-ID");
+        try acknowledgeEmbeddingRevision(&ctx, pin);
+        // A numeric response carries the same proof without a JSON vector copy.
+        const frame = try httpx.numeric_response.allocFrame(a, .dense, 1, 2);
+        var response = try publishNumericFrame(&ctx, frame);
+        defer response.deinit();
+        try std.testing.expectEqualStrings(&hex, response.headers.get(embedding_revision.response_header).?);
+        try std.testing.expectEqualStrings("X-Request-ID, X-Antfly-Model-Revision", response.headers.get("Access-Control-Expose-Headers").?);
+        try std.testing.expectEqualStrings(httpx.numeric_response.content_type, response.contentType().?);
+    }
+    {
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try groupedEmbeddingFailureResponse(&ctx, error.InferenceCapabilitiesStale);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 409), response.status.code);
+        try std.testing.expectEqualStrings("true", response.headers.get("X-Antfly-Capability-Stale").?);
+        try std.testing.expect(response.headers.get(embedding_revision.response_header) == null);
+    }
+    for ([_][]const u8{ "\"bad\"", "7", "null" }) |value| {
+        const invalid_body = try std.fmt.allocPrint(a, "{{\"model\":\"alias\",\"input\":\"text\",\"model_revision\":{s}}}", .{value});
+        defer a.free(invalid_body);
+        var invalid = try std.json.parseFromSlice(std.json.Value, a, invalid_body, .{});
+        defer invalid.deinit();
+        try std.testing.expectError(error.InvalidEmbeddingRevision, parseEmbedRequest(invalid.value));
+    }
 }

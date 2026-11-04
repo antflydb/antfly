@@ -2533,6 +2533,7 @@ fn applyAntflyEmbeddingRequestControls(
         @max(@as(u64, 1), (remaining_ns +| std.time.ns_per_ms - 1) / std.time.ns_per_ms),
     );
     provider.model_identity = if (entry.model_identity.len > 0) entry.model_identity else null;
+    provider.model_revision = if (entry.planned_embedding_lease) |lease| if (lease.capabilities) |caps| caps.model_revision else null else provider.model_revision;
     provider.requested_dense_dimensions = if (entry.dimensions > 0) entry.dimensions else null;
     if (provider.model_identity != null) provider.numeric_dense_dimensions = null;
     provider.setRequestCancellation(entry.cancellation);
@@ -6215,10 +6216,17 @@ fn bindRemoteEmbeddingLease(
 // after the lease is ready. Every planner/executor/query lookup shares this path.
 fn discoverRemoteEmbeddingLease(entry: *const ManagedEmbeddingEntry, http: *httpx.Client, headers: []const [2][]const u8) !remote_capabilities.CapabilityLease {
     const cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
-    return cache.getOrDiscoverLeaseWithContext(http, entry.base_url, entry.model, .embed, headers, .{
+    var lease = try cache.getOrDiscoverLeaseWithContext(http, entry.base_url, entry.model, .embed, headers, .{
         .deadline_ns = entry.deadline_ns,
         .cancellation = entry.cancellation orelse .none,
     });
+    // Older catalogs expose an observed identity without promising that their
+    // executor can pin it. Keep those routes usable, but never stamp their
+    // unqualified outputs as results of that immutable generation.
+    if (lease.capabilities) |*caps| if (!caps.model_revision_pinning) {
+        caps.model_revision = null;
+    };
+    return lease;
 }
 
 fn acquireRemoteEmbeddingLease(
@@ -6235,6 +6243,7 @@ fn acquireRemoteEmbeddingLease(
         // Keep the coordinator's route and descriptor through every retry.
         // Discovering another lease here could stamp its vectors with the old
         // generation captured before execution.
+        provider.model_revision = if (planned.capabilities) |caps| caps.model_revision else null;
         var execution = planned;
         if (execution.planning_only) execution.capabilities = null;
         provider.setFramedAttachments(if (execution.capabilities) |caps| caps.framed_attachments else false);
@@ -6243,6 +6252,7 @@ fn acquireRemoteEmbeddingLease(
         return execution;
     }
     const lease = try discoverRemoteEmbeddingLease(entry, http, headers);
+    provider.model_revision = if (lease.capabilities) |caps| caps.model_revision else null;
     // Providers are reused across invocations, but transport support belongs
     // to this concrete lease. Reset first so a legacy or downgraded route can
     // never inherit framed mode from an earlier endpoint.
@@ -12434,4 +12444,116 @@ test "managed embedder legacy parts reject revision bound groups and independent
         try std.testing.expectError(error.InvalidEmbeddingIdentity, dense.withPartLease(lease).embedDensePartItems(a, "visual", &.{.{ .text = "input" }}, 2));
     }
     try std.testing.expectEqual(@as(usize, 0), local.calls);
+}
+
+test "managed embedder HTTP revision pins fence text grouped framed and numeric results" {
+    const a = std.testing.allocator;
+    const App = struct {
+        mode: std.atomic.Value(u8) = .init(0), // missing, stale, matching
+        numeric: std.atomic.Value(bool) = .init(false),
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const mode = self.mode.load(.acquire);
+            if (req.method == .GET) {
+                try std.testing.expect(mode == 3 or mode == 4);
+                var catalog = try std.json.parseFromSlice(std.json.Value, alloc, "{\"embedders\":{\"mutable-model\":{\"inputs\":[\"text\",\"image\"],\"model_revision\":\"1111111111111111111111111111111111111111111111111111111111111111\"}}}", .{});
+                defer catalog.deinit();
+                if (mode == 4) {
+                    const info = catalog.value.object.getPtr("embedders").?.object.getPtr("mutable-model").?;
+                    try info.object.put(catalog.arena.allocator(), "model_revision_pinning", .{ .bool = true });
+                }
+                return .{ .status = 200, .content_type = try alloc.dupe(u8, "application/json"), .body = try std.json.Stringify.valueAlloc(alloc, catalog.value, .{}) };
+            }
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            var envelope: ?httpx.attachment_envelope.Envelope = null;
+            defer if (envelope) |*value| value.deinit();
+            const metadata = if (req.header("Content-Type")) |ct| blk: {
+                if (std.ascii.eqlIgnoreCase(ct, httpx.attachment_envelope.content_type)) {
+                    envelope = try httpx.attachment_envelope.parseAlloc(alloc, req.body, .{});
+                    try std.testing.expectEqual(@as(usize, 1), envelope.?.attachments.len);
+                    break :blk envelope.?.metadata;
+                }
+                break :blk req.body;
+            } else req.body;
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, metadata, .{});
+            defer parsed.deinit();
+            const expected = std.fmt.bytesToHex(@as([32]u8, @splat(0x11)), .lower);
+            if (mode == 3) {
+                try std.testing.expect(!parsed.value.object.contains("model_revision"));
+            } else try std.testing.expectEqualStrings(&expected, parsed.value.object.get("model_revision").?.string);
+            var response = http_common.HttpResponse{ .status = 200 };
+            errdefer response.deinit(alloc);
+            if (mode == 1 or mode == 2 or mode == 4) {
+                const name = try alloc.dupe(u8, httpx.embedding_revision.response_header);
+                errdefer alloc.free(name);
+                const actual = std.fmt.bytesToHex(@as([32]u8, @splat(if (mode == 1) @as(u8, 0x22) else 0x11)), .lower);
+                const value = try alloc.dupe(u8, &actual);
+                errdefer alloc.free(value);
+                response.headers = try alloc.alloc(http_common.Header, 1);
+                response.headers[0] = .{ .name = name, .value = value };
+            }
+            if (self.numeric.load(.acquire)) {
+                response.content_type = try alloc.dupe(u8, httpx.numeric_response.content_type);
+                response.body = try httpx.numeric_response.allocFrame(alloc, .dense, 1, 2);
+                try httpx.numeric_response.setValue(response.body, 0, 0.25);
+                try httpx.numeric_response.setValue(response.body, 1, 0.75);
+            } else {
+                response.content_type = try alloc.dupe(u8, "application/json");
+                response.body = try alloc.dupe(u8, "{\"data\":[{\"index\":0,\"embedding\":[0.25,0.75]}]}");
+            }
+            return response;
+        }
+    };
+    var app = App{};
+    var listener = std_http_listener.StdHttpListener.init(a, .{}, .{ .ptr = &app, .vtable = &.{ .execute = App.execute } });
+    defer listener.deinit();
+    try listener.start();
+    const url = try listener.baseUri(a);
+    defer a.free(url);
+    var entries = [_]ManagedEmbeddingEntry{.{ .alloc = a, .index_name = @constCast("visual"), .provider = .antfly, .model = @constCast("mutable-model"), .base_url = url, .dimensions = 2, .declared_inputs = .{ .text = true, .image = true }, .io = std.testing.io }};
+    var cache = remote_capabilities.Cache.init(a, std.testing.io);
+    defer cache.deinit();
+    entries[0].shared_remote_capability_cache = &cache;
+    var managed = ManagedEmbedder{ .alloc = a, .entries = &entries };
+    const parts = [_]template_mod.ContentPart{
+        .{ .text = "caption" },
+        .{ .binary = .{ .mime_type = "image/png", .data = &.{ 0x89, 'P', 'N', 'G', 13, 10, 26, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3 } } },
+    };
+    for (0..3) |transport| for ([_]bool{ false, true }) |numeric| {
+        app.numeric.store(numeric, .release);
+        const lease = inference_work.CapabilityLease{ .capabilities = .{ .task = .embed, .input_modalities = .{ .text = true, .image = true }, .accepted_mime_types = .{ .text_plain = true, .image_png = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(0x11), .model_revision_pinning = true, .framed_attachments = transport == 2, .numeric_responses_v1 = numeric, .batch = .{ .max_media_parts_per_item = 1 } } };
+        const planned = managed.denseInterface().withPartLease(lease);
+        for (0..3) |mode| {
+            app.mode.store(@intCast(mode), .release);
+            const result = if (transport == 0) blk: {
+                const rows = planned.embedDenseBatch(a, "visual", &.{"caption"}, 2) catch |err| break :blk @as(anyerror![]f32, err);
+                defer a.free(rows);
+                break :blk @as(anyerror![]f32, @constCast(rows[0]));
+            } else planned.embedDenseParts(a, "visual", &parts, 2);
+            if (result) |vector| {
+                defer a.free(vector);
+                try std.testing.expectEqual(@as(usize, 2), mode);
+                try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.75 }, vector);
+            } else |err| {
+                if (mode == 2) return err;
+                try std.testing.expectEqual(error.InferenceCapabilitiesStale, err);
+            }
+        }
+    };
+    app.mode.store(3, .release);
+    app.numeric.store(false, .release);
+    const legacy = try managed.denseInterface().captureTextGeneration(a, "visual");
+    try std.testing.expect(legacy.revision == null);
+    const legacy_rows = try managed.denseInterface().withTextGeneration(legacy).embedDenseBatch(a, "visual", &.{"legacy"}, 2);
+    defer db_embedder.freeDenseEmbeddingBatch(a, legacy_rows);
+    try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.75 }, legacy_rows[0]);
+    // Once an upgraded endpoint advertises execution pinning, discovery must
+    // retain its revision and propagate it automatically through real calls.
+    try invalidateRemoteEmbeddingLease(&entries[0], &.{});
+    app.mode.store(4, .release);
+    const upgraded = try managed.denseInterface().captureTextGeneration(a, "visual");
+    try std.testing.expectEqual(@as([32]u8, @splat(0x11)), upgraded.revision.?);
+    const upgraded_rows = try managed.denseInterface().withTextGeneration(upgraded).embedDenseBatch(a, "visual", &.{"upgraded"}, 2);
+    defer db_embedder.freeDenseEmbeddingBatch(a, upgraded_rows);
+    try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.75 }, upgraded_rows[0]);
 }

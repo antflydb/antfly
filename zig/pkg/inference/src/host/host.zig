@@ -3280,6 +3280,7 @@ fn localModelCapabilitiesInScope(
             result.model_revision = try node.model_manager.modelIdentityForManifest(model_path, manifest);
         }
     }
+    if (task == .embed) result.model_revision_pinning = true;
     try result.validate();
     return result;
 }

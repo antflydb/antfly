@@ -215,3 +215,15 @@ require the protocol-26 membership barrier. Historical `activate` controls retai
 their original replay behavior; readiness detects an insufficient legacy binding
 and causes the worker to submit an upgrade. Duplicate current activations retain
 the existing epoch and do not invalidate in-flight work.
+
+Remote embedding catalogs advertise `model_revision_pinning` when their executor
+supports an immutable generation fence. Managed calls carry that generation in
+`model_revision`; flat, sparse, and grouped HTTP execution check every acquired
+model before dispatch, including recovery attempts. Successful JSON and numeric
+responses acknowledge the generation in `X-Antfly-Model-Revision`. Clients verify
+the acknowledgement before decoding vectors, preserving numeric and framed
+transports. Missing or changed acknowledgements invalidate capability discovery
+and yield a stale-plan error for bounded replanning. Catalogs without advertised
+pinning remain usable as unversioned routes; an observed catalog revision alone
+never qualifies their output as belonging to an immutable generation. Explicit
+pins fail closed when an endpoint cannot acknowledge them.
