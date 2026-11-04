@@ -24,7 +24,7 @@ function run(command,args,cwd=example,extra={}){
  if(result.error)throw result.error;if(result.status!==0)throw Error(command+' failed: '+result.status);
 }
 await mkdir(new URL('../dist/',import.meta.url),{recursive:true});
-run(env.ANTFLY_ZIG??'zig',['build','distributed-sql-test','-j2'],zigRoot,{ANTFLY_SQL_HOSTED_FIXTURE:fileURLToPath(new URL('../dist/sql-fixture.json',import.meta.url)),ANTFLY_SQL_HOSTED_BUCKET_FIXTURE:fileURLToPath(new URL('../dist/sql-bucket-fixture.json',import.meta.url)),ANTFLY_SQL_HOSTED_SKEW_FIXTURE:fileURLToPath(new URL('../dist/sql-skew-fixture.json',import.meta.url))});
+run(env.ANTFLY_ZIG??'zig',['build','distributed-sql-test','-j2'],zigRoot,{ANTFLY_SQL_HOSTED_FIXTURE:fileURLToPath(new URL('../dist/sql-fixture.json',import.meta.url)),ANTFLY_SQL_HOSTED_BUCKET_FIXTURE:fileURLToPath(new URL('../dist/sql-bucket-fixture.json',import.meta.url)),ANTFLY_SQL_HOSTED_SKEW_FIXTURE:fileURLToPath(new URL('../dist/sql-skew-fixture.json',import.meta.url)),ANTFLY_SQL_HOSTED_RANGE_FIXTURE:fileURLToPath(new URL('../dist/sql-range-fixture.json',import.meta.url))});
 run(process.execPath,['build.mjs']);
 run(process.execPath,['--test','test/sql-control.test.mjs','test/sql-hosted.test.mjs']);
 if(process.argv.includes('--workerd')){

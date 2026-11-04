@@ -279,7 +279,7 @@ const ServerlessHealthSource = struct {
     fn readiness(self: *ServerlessHealthSource) antfly.common.health_server.ReadinessChecker {
         return .{
             .ptr = self,
-            .vtable = &.{ .check = checkReady },
+            .vtable = &.{ .check = checkReady, .sql_check = checkSqlReady },
         };
     }
 
@@ -293,6 +293,11 @@ const ServerlessHealthSource = struct {
     fn checkReady(ptr: *anyopaque) bool {
         const self: *ServerlessHealthSource = @ptrCast(@alignCast(ptr));
         return self.supervisor.currentState() == .ready and self.srv.runtimeStatus().validated;
+    }
+
+    fn checkSqlReady(ptr: *anyopaque) bool {
+        const self: *ServerlessHealthSource = @ptrCast(@alignCast(ptr));
+        return self.srv.sql_owned != null and checkReady(ptr);
     }
 
     fn writeMetrics(ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void {

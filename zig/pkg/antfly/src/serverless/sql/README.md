@@ -120,13 +120,21 @@ workers validate the capability, schema incarnation, and snapshot on reopen.
   live early queries cannot hide later submissions. Accepted outputs, including
   empty results, are reused after coordinator takeover.
 
-## Hosted execution and remaining strategy work
+## Hosted execution
 
 The [Cloudflare SQL profile](../../../../../../examples/cloudflare-serverless/SQL.md)
 wires this service to WASM, R2, Durable Object alarms and Queues. Its tests share
 native-generated retained Parquet/WAL fixtures and run under real local workerd
 bindings. No provider deployment or throughput qualification is claimed.
 
-Bucket-compatible planning/native bucketed writes and distributed recursive
-repartitioning/skew tiling remain strategy work. Native reducers use the existing
-disk grace/skew kernel; hosted tasks currently enforce their in-memory budgets.
+Bucket-compatible plans reuse proven native bucket layouts. Adaptive coalescing
+and skew tiling run on native and hosted workers. Layouts use authenticated
+immutable tile pages; coordinator CAS records retain only bounded references.
+Pinned source scans divide canonical row ranges within files and row groups,
+with page pruning and retained-size-aware task planning. Native reducers also
+reuse the disk grace/skew kernel; hosted tasks enforce their in-memory budgets.
+
+Query control requests select a stable worker by query identity, with bounded
+failover. Statement deadlines and cancellation cover result exchange reads.
+Both SQL roles expose capability readiness at `/readyz/sql` on the health
+listener (port 4200 by default); maintenance does not need a query listener.

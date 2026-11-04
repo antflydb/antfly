@@ -89,11 +89,16 @@ which additional hash bits cannot separate. Pair tasks publish compact match
 bitmaps separately from result rows. Independent finalizers OR all accepted
 witnesses before emitting unmatched outer rows or semi/anti existence results;
 residual `ON` predicates contribute evidence only after they accept a pair.
-The query CAS commits this layout together with the stage transition. A new
+Authenticated immutable pages hold tile descriptors; the query CAS commits only
+a bounded layout reference together with the stage transition. A new
 coordinator reconstructs the same tasks, and result pass-through references avoid
 copying joined rows into another exchange. Sparse partitions still use ordinary
 reducers and adjacent coalescing. Resolved tasks, retry/output reservations and
 request estimates are checked again before tile dispatch.
+
+Source task splitting uses canonical row ranges within Parquet row groups and
+estimates retained column values instead of compressed bytes alone. A large
+single row group can therefore execute across multiple bounded tasks.
 
 Each tile remains subject to task memory, scan, output and runtime limits. Large
 Cartesian results and excessive tile grids fail explicit query budgets. This
@@ -110,7 +115,8 @@ ANTFLY_ZIG=/path/to/pinned/zig npm run test:sql-workerd
 The runner exports a fresh native fixture containing real typed Parquet, a
 retained snapshot and accepted WAL delete/upsert images, then builds and
 instruments WASM. Tests execute that fixture in a fresh WASM instance, lose a
-completion response and verify accepted-output recovery. A separate kernel stress
+completion response and verify accepted-output recovery. The row-range fixture
+executes a 16,384-row single-group source with narrow per-task output budgets. A separate kernel stress
 fixture seeds 16,384 accepted build rows into a hot partition, then executes
 portable tile joins, compact match proofs and global NULL/unmatched finalization.
 Control tests cover

@@ -170,8 +170,8 @@ pub const Plan = struct {
     pub fn finalizerCount(self: Plan) !u32 {
         var count = try physical.pairCount(self.skew, self.reduceCount());
         for (self.skew) |part| {
-            if (self.join.preservesProbe() or self.join.kind == .semi) count = try std.math.add(u32, count, @intCast(part.left.len));
-            if (self.join.preservesBuild()) count = try std.math.add(u32, count, @intCast(part.right.len));
+            if (self.join.preservesProbe() or self.join.kind == .semi) count = try std.math.add(u32, count, part.leftCount());
+            if (self.join.preservesBuild()) count = try std.math.add(u32, count, part.rightCount());
         }
         return count;
     }
@@ -179,7 +179,7 @@ pub const Plan = struct {
         var result = try self.withReducers(boundaries);
         if (parts.len > self.partitions or (parts.len != 0 and (self.strategy != .shuffle or boundaries.len < 2))) return error.InvalidSqlExecutionState;
         for (parts, 0..) |part, index| {
-            if (part.partition >= self.partitions or part.left.len == 0 or part.right.len == 0 or (index != 0 and parts[index - 1].partition >= part.partition)) return error.InvalidSqlExecutionState;
+            if (part.partition >= self.partitions or part.leftCount() == 0 or part.rightCount() == 0 or (index != 0 and parts[index - 1].partition >= part.partition)) return error.InvalidSqlExecutionState;
             const isolated = for (boundaries[0 .. boundaries.len - 1], boundaries[1..]) |begin, end| {
                 if (begin == part.partition and end == begin + 1) break true;
             } else false;
@@ -241,6 +241,8 @@ pub const Task = struct {
     split: u32 = 0,
     partition: u16 = 0,
     partition_end: u16 = 1,
+    left_tile: physical.Tile = .{},
+    right_tile: physical.Tile = .{},
     physical_part: u16 = 0,
     tile_left: u32 = 0,
     tile_right: u32 = 0,

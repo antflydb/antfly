@@ -84,6 +84,7 @@ pub const Service = struct {
         return std.fmt.allocPrint(a, "{s}/sql-execution-v2/{d:0>20}/{s}/plan.json", .{ self.state_store.prefix, query.expires_ms, query.id });
     }
     fn immutable(self: Service, a: A, key: []const u8, bytes: []const u8, limit: usize) !void {
+        if (bytes.len > limit) return error.SqlJoinBudgetExceeded;
         try self.context.ensureActive();
         var client = self.state_store.client;
         client.allocator = a;
@@ -152,12 +153,12 @@ pub const Service = struct {
             var next = task - pairs;
             for (spec.skew, 0..) |part, index| {
                 if (spec.join.preservesProbe() or spec.join.kind == .semi) {
-                    if (next < part.left.len) return .{ .stage = stage, .task = task, .kind = .finalize_probe, .physical_part = @intCast(index), .tile_left = next };
-                    next -= @intCast(part.left.len);
+                    if (next < part.leftCount()) return .{ .stage = stage, .task = task, .kind = .finalize_probe, .physical_part = @intCast(index), .tile_left = next };
+                    next -= @intCast(part.leftCount());
                 }
                 if (spec.join.preservesBuild()) {
-                    if (next < part.right.len) return .{ .stage = stage, .task = task, .kind = .finalize_build, .physical_part = @intCast(index), .tile_right = next };
-                    next -= @intCast(part.right.len);
+                    if (next < part.rightCount()) return .{ .stage = stage, .task = task, .kind = .finalize_build, .physical_part = @intCast(index), .tile_right = next };
+                    next -= @intCast(part.rightCount());
                 }
             }
             return error.InvalidSqlExecutionState;
@@ -191,7 +192,11 @@ pub const Service = struct {
         // submit() retained both inputs through the immutable query expiry.
         // Workers revalidate their scanned capability on open. Reducer/control
         // turns consume accepted exchange, without reopening source catalogs.
-        spec = try spec.withPhysical(current.value.reduce_boundaries, current.value.skew);
+        spec = self.resolvePhysical(a, spec, current.value) catch |err| {
+            if (err != error.SqlJoinBudgetExceeded) return err;
+            try self.store().terminate(a, query_key, claim, .failed, "SqlJoinBudgetExceeded");
+            return true;
+        };
         if (current.value.stage == spec.finalStage()) {
             const count = try tasks(spec, spec.finalStage() - 1);
             const pages = try a.alloc(state.Output, count);
@@ -206,7 +211,10 @@ pub const Service = struct {
                 rows = try std.math.add(u64, rows, page.rows);
             }
             const bytes = try std.json.Stringify.valueAlloc(a, Result{ .query = query, .pages = pages, .rows = rows }, .{});
-            if (bytes.len > 4 * 1024 * 1024) return error.SqlJoinBudgetExceeded;
+            if (bytes.len > 4 * 1024 * 1024) {
+                try self.store().terminate(a, query_key, claim, .failed, "SqlJoinBudgetExceeded");
+                return true;
+            }
             const key = try std.fmt.allocPrint(a, "{s}/sql-exchange/{d:0>20}/{s}/{s}.result.json", .{ self.exchange_store.prefix, spec.expires_ms, query.id, digest(bytes) });
             var result_service = self;
             result_service.state_store.client = self.exchange_store.client;
@@ -254,8 +262,7 @@ pub const Service = struct {
         // Persist the dispatch intent first. Lost acknowledgements and process
         // loss replay only this bounded set, without relying on queue delivery.
         if (pending.items.len == 0 and cursor == count) {
-            var boundaries: ?[]const u16 = null;
-            var skew: ?[]const physical.Part = null;
+            var resolved: ?state.Output = null;
             if (current.value.stage == 0 and spec.strategy == .shuffle) {
                 // First persist the completed scan cursor, then checkpoint at
                 // most sixteen authenticated map directories per turn.
@@ -271,9 +278,8 @@ pub const Service = struct {
                         return false;
                     },
                     .done => |value| {
-                        boundaries = value.boundaries;
-                        skew = value.skew;
-                        _ = spec.withPhysical(value.boundaries, value.skew) catch |err| {
+                        resolved = value.reference;
+                        _ = spec.withPhysical(value.index.boundaries, value.index.skew) catch |err| {
                             if (err != error.SqlJoinBudgetExceeded) return err;
                             try self.store().terminate(a, query_key, claim, .failed, "SqlJoinBudgetExceeded");
                             return true;
@@ -281,7 +287,7 @@ pub const Service = struct {
                     },
                 }
             }
-            try self.store().checkpointPhysical(a, query_key, claim, current.value.stage + 1, 0, &.{}, boundaries, skew);
+            try self.store().checkpointResolved(a, query_key, claim, current.value.stage + 1, 0, &.{}, null, null, resolved);
         } else try self.store().checkpointTasks(a, query_key, claim, current.value.stage, cursor, pending.items);
         if (tickets.items.len != 0) try dispatcher.dispatch(dispatcher.ptr, tickets.items, self.context);
         return false;
@@ -318,8 +324,8 @@ pub const Service = struct {
             }
             return err;
         };
-        spec = try spec.withPhysical(query.value.reduce_boundaries, query.value.skew);
-        const task = try taskFor(spec, ticket.stage, ticket.task);
+        spec = try scoped_service.resolvePhysical(a, spec, query.value);
+        const task = try scoped_service.hydrateTask(a, spec, try taskFor(spec, ticket.stage, ticket.task));
         if (task_memory.live > spec.limits.task_memory) {
             try self.store().terminate(self.a, key, claim, .failed, "SqlJoinBudgetExceeded");
             return;
@@ -329,7 +335,7 @@ pub const Service = struct {
             try self.store().terminate(self.a, key, claim, .failed, "TaskRetryBudgetExceeded");
             return;
         }
-        const inputs = scoped_service.loadDependencies(a, spec, ticket.query, ticket.stage, ticket.task) catch |err| {
+        const inputs = scoped_service.loadDependencies(a, spec, ticket.query, task) catch |err| {
             if (err == error.OutOfMemory and task_memory.exhausted) {
                 try self.store().terminate(self.a, key, claim, .failed, "SqlJoinBudgetExceeded");
                 return;
@@ -368,98 +374,182 @@ pub const Service = struct {
         // Uses a fresh wall-clock reading, never the claim's stale timestamp.
         try scoped_service.store().complete(self.a, key, claim, output);
     }
-    /// Resolve adjacent partitions once from accepted map statistics. The
-    /// boundary list is committed with the stage transition under the same CAS.
-    /// Worker count and subsequent coordinator placement cannot change it.
-    const Adaptive = struct { cursor: u32 = 0, bytes: []u64, rows: []u64, right_bytes: []u64, left_tiles: [][]const physical.Tile, right_tiles: [][]const physical.Tile };
-    const Resolution = union(enum) { pending: state.Output, done: struct { boundaries: []const u16, skew: []const physical.Part } };
+    // Mutable CAS records hold only hashes/references. Statistics are fixed by
+    // virtual partition count; tile pages are immutable and capped at 128 rows.
+    const Adaptive = struct {
+        cursor: u32 = 0,
+        bytes: []u64,
+        rows: []u64,
+        right_bytes: []u64,
+        left_counts: []u32,
+        right_counts: []u32,
+        boundaries: []const u16 = &.{},
+        parts: []physical.Part = &.{},
+        part: u16 = 0,
+        map: u32 = 0,
+        left_buffer: []const physical.Tile = &.{},
+        right_buffer: []const physical.Tile = &.{},
+    };
+    const Resolution = union(enum) { pending: state.Output, done: struct { reference: state.Output, index: physical.Index } };
+    fn putMetadata(self: Service, a: A, query: state.Query, label: []const u8, bytes: []const u8, limit: usize) !state.Output {
+        if (bytes.len > limit) return error.SqlJoinBudgetExceeded;
+        const hash = digest(bytes);
+        const key = try std.fmt.allocPrint(a, "{s}/sql-exchange/{d:0>20}/{s}/{s}.{s}.json", .{ self.exchange_store.prefix, query.expires_ms, query.id, hash, label });
+        var writer = self;
+        writer.state_store.client = self.exchange_store.client;
+        writer.state_store.bucket = self.exchange_store.bucket;
+        try writer.immutable(a, key, bytes, limit);
+        return .{ .key = key, .hash = hash, .bytes = bytes.len };
+    }
+    fn getMetadata(self: Service, a: A, ref: state.Output, limit: usize) ![]const u8 {
+        if (ref.bytes > limit) return error.SqlJoinBudgetExceeded;
+        var client = self.exchange_store.client;
+        client.allocator = a;
+        var object = try client.getObject(self.exchange_store.bucket, ref.key, .{ .skip_metadata_probe = true, .max_response_bytes = limit, .cancellation = local.serverless_external_source_mod.lake_catalog.types.contextCancellation(&self.context) });
+        defer object.deinit(a);
+        if (object.body.len != ref.bytes or !std.mem.eql(u8, &digest(object.body), &ref.hash)) return error.InvalidSqlExchange;
+        return a.dupe(u8, object.body);
+    }
+    pub fn resolvePhysical(self: Service, a: A, spec: plan.Plan, record: state.Record) !plan.Plan {
+        if (record.physical) |ref| {
+            const index = try std.json.parseFromSliceLeaky(physical.Index, a, try self.getMetadata(a, ref, physical.max_index_bytes), .{ .allocate = .alloc_always });
+            return spec.withPhysical(index.boundaries, index.skew);
+        }
+        return spec.withPhysical(record.reduce_boundaries, record.skew);
+    }
+    fn mapDirectory(self: Service, a: A, query: state.Query, id: u32) !exchange.Footer {
+        const ref = try self.loadAccepted(a, query, 0, id);
+        var objects = self.exchange_store;
+        objects.context = self.context;
+        return objects.footer(a, ref);
+    }
+    fn loadTile(self: Service, a: A, part: physical.Part, build: bool, ordinal: u32) !physical.Tile {
+        const inline_tiles = if (build) part.right else part.left;
+        if (inline_tiles.len != 0) {
+            if (ordinal >= inline_tiles.len) return error.InvalidSqlExecutionState;
+            return inline_tiles[ordinal];
+        }
+        const pages = if (build) part.right_pages else part.left_pages;
+        const page_id = ordinal / physical.page_tiles;
+        if (page_id >= pages.len) return error.InvalidSqlExecutionState;
+        const page = pages[page_id];
+        if (page.first > ordinal or ordinal - page.first >= page.count or page.count > physical.page_tiles) return error.InvalidSqlExecutionState;
+        const tiles = try std.json.parseFromSliceLeaky([]const physical.Tile, a, try self.getMetadata(a, page.output, 8192), .{ .allocate = .alloc_always });
+        if (tiles.len != page.count) return error.InvalidSqlExecutionState;
+        return tiles[ordinal - page.first];
+    }
+    fn hydrateTask(self: Service, a: A, spec: plan.Plan, original: plan.Task) !plan.Task {
+        var task = original;
+        if (task.kind == .tile_pair or task.kind == .finalize_probe) task.left_tile = try self.loadTile(a, spec.skew[task.physical_part], false, task.tile_left);
+        if (task.kind == .tile_pair or task.kind == .finalize_build) task.right_tile = try self.loadTile(a, spec.skew[task.physical_part], true, task.tile_right);
+        return task;
+    }
+    fn flushTiles(self: Service, a: A, query: state.Query, part: *physical.Part, build: bool, buffer: *[]const physical.Tile) !void {
+        if (buffer.len == 0) return;
+        const pages = if (build) &part.right_pages else &part.left_pages;
+        const first: u32 = if (pages.len == 0) 0 else pages.*[pages.len - 1].first + pages.*[pages.len - 1].count;
+        const ref = try self.putMetadata(a, query, "tiles", try std.json.Stringify.valueAlloc(a, buffer.*, .{}), 8192);
+        const appended = try a.alloc(physical.TilePage, pages.len + 1);
+        @memcpy(appended[0..pages.len], pages.*);
+        appended[pages.len] = .{ .first = first, .count = @intCast(buffer.len), .output = ref };
+        pages.* = appended;
+        buffer.* = &.{};
+    }
     fn coalesce(self: Service, a: A, spec: plan.Plan, query: state.Query, previous: ?state.Output) !Resolution {
-        var progress: Adaptive = if (previous) |output| blk: {
-            var client = self.exchange_store.client;
-            client.allocator = a;
-            var object = try client.getObject(self.exchange_store.bucket, output.key, .{ .skip_metadata_probe = true, .max_response_bytes = 128 * 1024, .cancellation = local.serverless_external_source_mod.lake_catalog.types.contextCancellation(&self.context) });
-            defer object.deinit(a);
-            if (!std.mem.eql(u8, &digest(object.body), &output.hash)) return error.InvalidSqlExchange;
-            break :blk try std.json.parseFromSliceLeaky(Adaptive, a, object.body, .{ .allocate = .alloc_always });
-        } else blk: {
+        var progress: Adaptive = if (previous) |ref|
+            try std.json.parseFromSliceLeaky(Adaptive, a, try self.getMetadata(a, ref, physical.max_index_bytes), .{ .allocate = .alloc_always })
+        else blk: {
             const bytes = try a.alloc(u64, spec.partitions);
-            const rows = try a.alloc(u64, spec.partitions);
             @memset(bytes, 0);
+            const rows = try a.alloc(u64, spec.partitions);
             @memset(rows, 0);
             const right_bytes = try a.alloc(u64, spec.partitions);
             @memset(right_bytes, 0);
-            const left_tiles = try a.alloc([]const physical.Tile, spec.partitions);
-            @memset(left_tiles, &.{});
-            const right_tiles = try a.alloc([]const physical.Tile, spec.partitions);
-            @memset(right_tiles, &.{});
-            break :blk .{ .bytes = bytes, .rows = rows, .right_bytes = right_bytes, .left_tiles = left_tiles, .right_tiles = right_tiles };
+            const left_counts = try a.alloc(u32, spec.partitions);
+            @memset(left_counts, 0);
+            const right_counts = try a.alloc(u32, spec.partitions);
+            @memset(right_counts, 0);
+            break :blk .{ .bytes = bytes, .rows = rows, .right_bytes = right_bytes, .left_counts = left_counts, .right_counts = right_counts };
         };
-        const bytes = progress.bytes;
-        const rows = progress.rows;
         const count = try spec.stageTasks(0);
-        if (bytes.len != spec.partitions or rows.len != spec.partitions or progress.cursor > count) return error.InvalidSqlExecutionState;
-        const end = @min(count, progress.cursor + 16);
-        for (progress.cursor..end) |id| {
-            var scratch = std.heap.ArenaAllocator.init(self.a);
-            defer scratch.deinit();
-            const sa = scratch.allocator();
-            const key = try self.store().key(sa, query, 0, @intCast(id));
-            var value = (try self.store().load(sa, key)) orelse return error.InvalidSqlExecutionState;
-            defer value.deinit(sa);
-            if (value.value.status != .succeeded) return error.InvalidSqlExecutionState;
-            var objects = self.exchange_store;
-            objects.context = self.context;
-            const directory = try objects.footer(sa, value.value.output.?);
-            if (directory.partitions.len != spec.partitions) return error.InvalidSqlExchange;
-            for (directory.partitions, bytes, rows, 0..) |partition, *size, *row_count, index| {
-                size.* +|= partition.retained_bytes;
-                row_count.* +|= partition.rows;
-                if (id < spec.right.splits) progress.right_bytes[index] +|= partition.retained_bytes;
-                if (partition.rows != 0) {
-                    const tiles = if (id < spec.right.splits) &progress.right_tiles[index] else &progress.left_tiles[index];
-                    const appended = try a.alloc(physical.Tile, tiles.len + 1);
-                    @memcpy(appended[0..tiles.len], tiles.*);
-                    appended[tiles.len] = .{ .map = @intCast(id), .rows = partition.rows };
-                    tiles.* = appended;
+        if (progress.bytes.len != spec.partitions or progress.rows.len != spec.partitions or progress.right_bytes.len != spec.partitions or progress.left_counts.len != spec.partitions or progress.right_counts.len != spec.partitions or progress.cursor > count) return error.InvalidSqlExecutionState;
+        if (progress.boundaries.len == 0) {
+            const end = @min(count, progress.cursor + 16);
+            for (progress.cursor..end) |id| {
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const directory = try self.mapDirectory(arena.allocator(), query, @intCast(id));
+                if (directory.partitions.len != spec.partitions) return error.InvalidSqlExchange;
+                for (directory.partitions, 0..) |partition, index| {
+                    progress.bytes[index] +|= partition.retained_bytes;
+                    progress.rows[index] +|= partition.rows;
+                    if (id < spec.right.splits) progress.right_bytes[index] +|= partition.retained_bytes;
+                    if (partition.rows != 0) {
+                        if (id < spec.right.splits) progress.right_counts[index] += 1 else progress.left_counts[index] += 1;
+                    }
                 }
             }
-        }
-        progress.cursor = end;
-        if (end != count) {
-            const encoded = try std.json.Stringify.valueAlloc(a, progress, .{});
-            const hash = digest(encoded);
-            const key = try std.fmt.allocPrint(a, "{s}/sql-exchange/{d:0>20}/{s}/{s}.adaptive.json", .{ self.exchange_store.prefix, spec.expires_ms, query.id, hash });
-            var writer = self;
-            writer.state_store.client = self.exchange_store.client;
-            writer.state_store.bucket = self.exchange_store.bucket;
-            try writer.immutable(a, key, encoded, 128 * 1024);
-            return .{ .pending = .{ .key = key, .hash = hash, .bytes = encoded.len } };
-        }
-        var boundaries: std.ArrayList(u16) = .empty;
-        try boundaries.append(a, 0);
-        var total_bytes: u64 = 0;
-        var total_rows: u64 = 0;
-        for (bytes, rows, 0..) |size, row_count, index| {
-            // Reserve ample headroom for hash metadata, output and decoding.
-            if (index > boundaries.items[boundaries.items.len - 1] and (total_bytes +| size > spec.limits.task_memory / 8 or total_rows +| row_count > spec.limits.task_scan_rows / 2)) {
-                try boundaries.append(a, @intCast(index));
-                total_bytes = 0;
-                total_rows = 0;
+            progress.cursor = end;
+            if (end == count) {
+                var boundaries: std.ArrayList(u16) = .empty;
+                try boundaries.append(a, 0);
+                var total_bytes: u64 = 0;
+                var total_rows: u64 = 0;
+                for (progress.bytes, progress.rows, 0..) |size, row_count, index| {
+                    if (index > boundaries.items[boundaries.items.len - 1] and (total_bytes +| size > spec.limits.task_memory / 8 or total_rows +| row_count > spec.limits.task_scan_rows / 2)) {
+                        try boundaries.append(a, @intCast(index));
+                        total_bytes = 0;
+                        total_rows = 0;
+                    }
+                    total_bytes +|= size;
+                    total_rows +|= row_count;
+                }
+                try boundaries.append(a, spec.partitions);
+                progress.boundaries = boundaries.items;
+                var parts: std.ArrayList(physical.Part) = .empty;
+                for (0..spec.partitions) |index| {
+                    if (progress.right_bytes[index] <= spec.limits.task_memory / 8 and progress.rows[index] <= spec.limits.task_scan_rows / 2) continue;
+                    const left = progress.left_counts[index];
+                    const right = progress.right_counts[index];
+                    try parts.append(a, .{ .partition = @intCast(index), .left_count = if (left == 0) null else left, .right_count = if (right == 0) null else right, .left = if (left == 0) &.{.{}} else &.{}, .right = if (right == 0) &.{.{}} else &.{} });
+                }
+                progress.parts = parts.items;
+                _ = spec.withPhysical(progress.boundaries, progress.parts) catch |err| switch (err) {
+                    error.Overflow => return error.SqlJoinBudgetExceeded,
+                    else => return err,
+                };
             }
-            total_bytes +|= size;
-            total_rows +|= row_count;
+        } else if (progress.part < progress.parts.len) {
+            const part = &progress.parts[progress.part];
+            const end = @min(count, progress.map + 16);
+            for (progress.map..end) |id| {
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const directory = try self.mapDirectory(arena.allocator(), query, @intCast(id));
+                const rows = directory.partitions[part.partition].rows;
+                if (rows == 0) continue;
+                const build = id < spec.right.splits;
+                const buffer = if (build) &progress.right_buffer else &progress.left_buffer;
+                const appended = try a.alloc(physical.Tile, buffer.len + 1);
+                @memcpy(appended[0..buffer.len], buffer.*);
+                appended[buffer.len] = .{ .map = @intCast(id), .rows = rows };
+                buffer.* = appended;
+                if (buffer.len == physical.page_tiles) try self.flushTiles(a, query, part, build, buffer);
+            }
+            progress.map = end;
+            if (end == count) {
+                try self.flushTiles(a, query, part, false, &progress.left_buffer);
+                try self.flushTiles(a, query, part, true, &progress.right_buffer);
+                progress.part += 1;
+                progress.map = 0;
+            }
         }
-        try boundaries.append(a, spec.partitions);
-        var skew: std.ArrayList(physical.Part) = .empty;
-        for (0..spec.partitions) |index| {
-            if (progress.right_bytes[index] <= spec.limits.task_memory / 8 and rows[index] <= spec.limits.task_scan_rows / 2) continue;
-            // Coalescing leaves an oversized partition isolated. Tile original
-            // accepted map partitions; no rehash can split one hot equal key.
-            const left = progress.left_tiles[index];
-            const right = progress.right_tiles[index];
-            try skew.append(a, .{ .partition = @intCast(index), .left = if (left.len == 0) &.{.{}} else left, .right = if (right.len == 0) &.{.{}} else right });
+        if (progress.boundaries.len != 0 and progress.part == progress.parts.len) {
+            const index: physical.Index = .{ .boundaries = progress.boundaries, .skew = progress.parts };
+            const ref = try self.putMetadata(a, query, "physical", try std.json.Stringify.valueAlloc(a, index, .{}), physical.max_index_bytes);
+            return .{ .done = .{ .reference = ref, .index = index } };
         }
-        return .{ .done = .{ .boundaries = boundaries.items, .skew = skew.items } };
+        return .{ .pending = try self.putMetadata(a, query, "adaptive", try std.json.Stringify.valueAlloc(a, progress, .{}), physical.max_index_bytes) };
     }
     fn loadAccepted(self: Service, a: A, query: state.Query, stage: u32, id: u32) !state.Output {
         const key = try self.store().key(a, query, stage, id);
@@ -471,8 +561,9 @@ pub const Service = struct {
         if (result.matches) |*witness| witness.key = try a.dupe(u8, witness.key);
         return result;
     }
-    fn loadDependencies(self: Service, a: A, spec: plan.Plan, query: state.Query, stage: u32, task: u32) ![]const state.Output {
-        const descriptor = try taskFor(spec, stage, task);
+    fn loadDependencies(self: Service, a: A, spec: plan.Plan, query: state.Query, descriptor: plan.Task) ![]const state.Output {
+        const stage = descriptor.stage;
+        const task = descriptor.task;
         if (descriptor.kind == .passthrough) {
             const refs = try a.alloc(state.Output, 1);
             refs[0] = try self.loadAccepted(a, query, 1, descriptor.dependent);
@@ -482,13 +573,13 @@ pub const Service = struct {
             var refs: std.ArrayList(state.Output) = .empty;
             const part = spec.skew[descriptor.physical_part];
             if (descriptor.kind == .tile_pair) {
-                if (part.left[descriptor.tile_left].map) |id| try refs.append(a, try self.loadAccepted(a, query, 0, id));
-                if (part.right[descriptor.tile_right].map) |id| try refs.append(a, try self.loadAccepted(a, query, 0, id));
+                if (descriptor.left_tile.map) |id| try refs.append(a, try self.loadAccepted(a, query, 0, id));
+                if (descriptor.right_tile.map) |id| try refs.append(a, try self.loadAccepted(a, query, 0, id));
             } else {
                 const build = descriptor.kind == .finalize_build;
-                const tile = if (build) part.right[descriptor.tile_right] else part.left[descriptor.tile_left];
+                const tile = if (build) descriptor.right_tile else descriptor.left_tile;
                 if (tile.map) |id| try refs.append(a, try self.loadAccepted(a, query, 0, id));
-                const count = if (build) part.left.len else part.right.len;
+                const count = if (build) part.leftCount() else part.rightCount();
                 for (0..count) |index| {
                     const pair_id = try physical.pairId(spec.skew, spec.reduce_boundaries, spec.reduceCount(), .{ .part = descriptor.physical_part, .left = if (build) @intCast(index) else descriptor.tile_left, .right = if (build) descriptor.tile_right else @intCast(index) });
                     try refs.append(a, try self.loadAccepted(a, query, 1, pair_id));

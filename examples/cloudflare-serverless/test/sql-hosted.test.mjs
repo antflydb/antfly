@@ -23,9 +23,9 @@ import {createR2Transport} from '../../../zig/lib/objectstore/wasm/r2.mjs';
 // Generate with ANTFLY_SQL_HOSTED_FIXTURE=../examples/cloudflare-serverless/dist/sql-fixture.json
 // zig build distributed-sql-test, then instrument the WASM through npm run build.
 const module = await WebAssembly.compile(await readFile(new URL('../dist/antfly-serverless.wasm', import.meta.url)));
-for (const mode of ['shuffle','bucket','skew']) {
+for (const mode of ['shuffle','bucket','skew','range']) {
 const bucketed=mode==='bucket';
-const fixture = JSON.parse(await readFile(new URL(mode==='skew'?'../dist/sql-skew-fixture.json':bucketed?'../dist/sql-bucket-fixture.json':'../dist/sql-fixture.json', import.meta.url)));
+const fixture = JSON.parse(await readFile(new URL(mode==='range'?'../dist/sql-range-fixture.json':mode==='skew'?'../dist/sql-skew-fixture.json':bucketed?'../dist/sql-bucket-fixture.json':'../dist/sql-fixture.json', import.meta.url)));
 test(mode==='skew'?'WASM skew kernel finalizes accepted native map tiles with global NULL ownership':`WASM ${mode} joins native retained Parquet cuts with WAL overlays and recovers accepted tasks`, async () => {
   const buckets = Object.fromEntries(['source','execution'].map(name => [name,new Bucket()]));
   for (const object of fixture.objects) await buckets[object.bucket].put(object.key, new Uint8Array(Buffer.from(object.body_base64,'base64')));
@@ -63,7 +63,7 @@ test(mode==='skew'?'WASM skew kernel finalizes accepted native map tiles with gl
   }
   assert.ok(complete);assert.ok(accepted);assert.ok(lost);
   const result=await host.request({...request,op:'sql_result'});
-  assert.equal(result.rows,fixture.expected_rows??2);assert.equal(result.pages.length,fixture.expected_pages??(bucketed?4:1));
+  assert.equal(result.rows,fixture.expected_rows??2);if(mode!=='range') assert.equal(result.pages.length,fixture.expected_pages??(bucketed?4:1));
   assert.ok(result.pages[0].index_bytes>0);
   const other=await instantiateHost(module,transport);
   assert.deepEqual(await other.request({...request,op:'sql_result'}),result);

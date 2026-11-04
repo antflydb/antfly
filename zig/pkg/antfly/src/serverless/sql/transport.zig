@@ -106,9 +106,10 @@ pub const Client = struct {
         // Bound discovery failover; a dead first coordinator must not pin the
         // gateway to that process while another query pod can make progress.
         if (self.workers.len == 0) return error.SqlWorkerUnavailable;
+        const first = try firstControlWorker(self.a, self.workers.len, path, body);
         for (0..@min(@max(self.workers.len, 2), 8)) |attempt| {
             try context.ensureActive();
-            return self.queryCallAt(attempt % self.workers.len, path, body, context) catch |err| switch (err) {
+            return self.queryCallAt((first + attempt) % self.workers.len, path, body, context) catch |err| switch (err) {
                 error.SqlExecutionUnauthorized, error.SqlExecutionFailed, error.SqlJoinBudgetExceeded, error.SqlQueryExpired, error.DeadlineExceeded, error.Canceled => return err,
                 else => {
                     last_error = err;
@@ -117,6 +118,16 @@ pub const Client = struct {
             };
         }
         return last_error;
+    }
+    fn firstControlWorker(a: A, count: usize, path: []const u8, body: []const u8) !usize {
+        const identity = if (std.mem.eql(u8, path, submit_path))
+            local.serverless_external_source_mod.lake_catalog.types.digestHex(body)
+        else blk: {
+            const parsed = try std.json.parseFromSlice(QueryRequest, a, body, .{});
+            defer parsed.deinit();
+            break :blk parsed.value.query.id;
+        };
+        return std.hash.Wyhash.hash(0, &identity) % count;
     }
     fn queryCallAt(self: *Client, index: usize, path: []const u8, body: []const u8, context: Context) !http.HttpResponse {
         const uri = try std.fmt.allocPrint(self.a, "{s}{s}", .{ std.mem.trimEnd(u8, self.workers[index], "/"), path });
@@ -291,3 +302,22 @@ pub const Server = struct {
         return .{ .status = status, .owner_allocator = a, .body = try a.dupe(u8, body) };
     }
 };
+
+test "distributed SQL control routing is stable and spreads healthy queries" {
+    var seen: [8]bool = @splat(false);
+    for (0..128) |id| {
+        const a = std.testing.allocator;
+        const label = try std.fmt.allocPrint(a, "query-{d}", .{id});
+        defer a.free(label);
+        const digest_ = local.serverless_external_source_mod.lake_catalog.types.digestHex(label);
+        const request: QueryRequest = .{ .tenant = @splat('a'), .query = .{ .id = digest_, .expires_ms = 1000000 } };
+        const body = try std.json.Stringify.valueAlloc(a, request, .{});
+        defer a.free(body);
+        const chosen = try Client.firstControlWorker(a, seen.len, result_path, body);
+        try std.testing.expectEqual(chosen, try Client.firstControlWorker(a, seen.len, turn_path, body));
+        try std.testing.expectEqual(chosen, try Client.firstControlWorker(a, seen.len, cancel_path, body));
+        try std.testing.expectEqual(@as(usize, std.hash.Wyhash.hash(0, &digest_) % seen.len), chosen);
+        seen[chosen] = true;
+    }
+    for (seen) |used| try std.testing.expect(used);
+}

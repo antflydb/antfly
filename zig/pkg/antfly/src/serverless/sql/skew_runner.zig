@@ -57,8 +57,8 @@ fn contains(bits: []const u8, ordinal: usize) bool {
 /// placeholder tiles. SQL NULL keys remain owned by exactly one original tile.
 pub fn pair(self: anytype, query: plan.Digest, spec: plan.Plan, task: plan.Task, dependencies: []const state.Output) !state.Output {
     const part = spec.skew[task.physical_part];
-    const left = part.left[task.tile_left];
-    const right = part.right[task.tile_right];
+    const left = task.left_tile;
+    const right = task.right_tile;
     if (dependencies.len != @as(usize, @intFromBool(left.map != null)) + @intFromBool(right.map != null)) return error.InvalidSqlExecutionState;
     if (left.rows +| right.rows > spec.limits.task_scan_rows) return error.SqlJoinBudgetExceeded;
     const hash = try operators.HashJoin.create(self.a, .{ .bytes = @intCast(spec.limits.task_memory / 2), .rows = @intCast(spec.limits.task_scan_rows) });
@@ -147,8 +147,8 @@ pub fn pair(self: anytype, query: plan.Digest, spec: plan.Plan, task: plan.Task,
 pub fn finalize(self: anytype, query: plan.Digest, spec: plan.Plan, task: plan.Task, dependencies: []const state.Output) !state.Output {
     const part = spec.skew[task.physical_part];
     const build = task.kind == .finalize_build;
-    const tile = if (build) part.right[task.tile_right] else part.left[task.tile_left];
-    const count = if (build) part.left.len else part.right.len;
+    const tile = if (build) task.right_tile else task.left_tile;
+    const count = if (build) part.leftCount() else part.rightCount();
     if (dependencies.len != count + @intFromBool(tile.map != null)) return error.InvalidSqlExecutionState;
     const bits = try self.a.alloc(u8, @intCast((tile.rows + 7) / 8));
     defer self.a.free(bits);

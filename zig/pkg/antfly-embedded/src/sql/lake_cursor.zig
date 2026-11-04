@@ -130,19 +130,8 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
 /// on another process after a task retry without sharing mutable iterators.
 pub fn openPinnedPartition(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *serving.ServingSource, index: usize, count: usize) !catalog.Cursor {
     if (count == 0 or count > 65536 or index >= count) return error.InvalidSqlBackendResponse;
-    const cursor = try openPinned(alloc, table, request, context, source);
-    errdefer cursor.close(cursor.ptr);
-    if (count == 1) return cursor;
-    const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
-    if (owner.stream.iterator) |iterator| {
-        const split = iterator.split orelse return error.UnsupportedSqlExecution;
-        const part = try split(iterator.ptr, alloc, index, count, owner.stream.context);
-        iterator.close(iterator.ptr);
-        owner.stream.iterator = part;
-    } else {
-        owner.stream.partition_index = index;
-        owner.stream.partition_count = count;
-    }
+    const cursor = try openPinnedMaterializedMode(alloc, table, request, context, source, .{ .index = index, .count = count });
+
     return cursor;
 }
 
@@ -157,6 +146,13 @@ pub fn openPinnedBucket(alloc: Allocator, table: catalog.Table, request: catalog
 }
 
 fn openPinnedMaterialized(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *serving.ServingSource) !catalog.Cursor {
+    return openPinnedMaterializedMode(alloc, table, request, context, source, null);
+}
+fn openPinnedMaterializedMode(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *serving.ServingSource, partition: ?struct { index: usize, count: usize }) !catalog.Cursor {
+    if (partition != null) {
+        const deadline = try context.platformDeadline();
+        try source.ensureInventory(.{ .io = if (source.context_store) |store| store.context.io else null, .deadline_ns = deadline.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(deadline.cancellation.ptr, deadline.cancellation.is_cancelled_fn) });
+    }
     if (request.include_primary_digest or request.include_document or request.index_equality != null) return error.UnsupportedSqlExecution;
     try context.ensureActive();
     const binding = table.external_base_source orelse return error.InvalidSqlBackend;
@@ -218,8 +214,10 @@ fn openPinnedMaterialized(alloc: Allocator, table: catalog.Table, request: catal
         try pruning.append(owned, .{ .column = column.path, .op = std.meta.stringToEnum(Predicate.Op, @tagName(condition.op)).?, .value = value });
     }
     const normalized = try context.platformDeadline();
-    var stream = try @import("../serverless/query/lake_stream.zig").Stream.init(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{});
+    const Stream = @import("../serverless/query/lake_stream.zig").Stream;
+    var stream = if (partition != null) try Stream.initMaterialized(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{}) else try Stream.init(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{});
     errdefer stream.deinit();
+    if (partition) |part| try stream.partitionRows(part.index, part.count);
     stream.identity_only = identity_only;
     if (request.physical_selection) |selection| {
         if (request.row_refs != null) return error.InvalidLakeCandidateReference;

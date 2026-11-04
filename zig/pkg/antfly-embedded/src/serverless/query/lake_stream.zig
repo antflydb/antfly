@@ -77,6 +77,7 @@ pub const ScanWork = struct {
         return if (index < self.units.len) self.units[index] else null;
     }
 };
+const RowRange = struct { file: usize, begin: u64, end: u64 };
 pub const Stream = struct {
     alloc: Allocator,
     source: *serving.ServingSource,
@@ -110,6 +111,7 @@ pub const Stream = struct {
     hydration_plan: ?@import("lake_decoded_cache.zig").Lease = null,
     planning_footer: ?@import("lake_decoded_cache.zig").Lease = null,
     bucket_group: ?BucketGroup = null,
+    row_ranges: []const RowRange = &.{},
     partition_index: usize = 0,
     partition_count: usize = 1,
     discovered: ?parquet.DiscoveredObjectRangeRowGroupPlan = null,
@@ -243,7 +245,7 @@ pub const Stream = struct {
         };
     }
     fn startBloomLookahead(self: *Stream) void {
-        if (self.partition_count != 1) return; // Partition workers already overlap required probes.
+        if (self.partition_count != 1 or self.row_ranges.len != 0) return; // Partition workers already overlap required probes.
         const reader = self.source.scanner.shared_reader orelse return;
         const io = reader.context.io orelse return;
         const plan = self.discovered orelse return;
@@ -324,7 +326,7 @@ pub const Stream = struct {
             @min(self.limits.max_decoded_bytes, 2 * 1024 * 1024) *| 2;
     }
     fn startLookahead(self: *Stream) void {
-        if (self.identity_only or self.partition_count != 1) return;
+        if (self.identity_only or self.partition_count != 1 or self.row_ranges.len != 0) return;
         const reader = self.source.scanner.shared_reader orelse return;
         const io = reader.context.io orelse return;
         const plan = self.discovered orelse return;
@@ -387,6 +389,10 @@ pub const Stream = struct {
 
     fn pageMayMatch(raw: *anyopaque, chunk: external.ColumnChunk, page: @import("lake_parquet_metadata.zig").IndexedPage) bool {
         const self: *Stream = @ptrCast(@alignCast(raw));
+        if (self.rowRange(self.active_file)) |range| {
+            const first = self.position_starts[self.page_cursor.?.group.ordinal] + page.first;
+            if (page.rows != 0 and (first >= range.end or first + page.rows <= range.begin)) return false;
+        }
         if (self.selection) |selection| {
             const group = self.page_cursor.?.group.ordinal;
             if (page.rows != 0 and !selection.rangeMayMatch(self.active_file, group, page.first, page.rows)) return false;
@@ -486,12 +492,50 @@ pub const Stream = struct {
         const context = source.protectContext(parent);
         try context.ensureActive();
         if (source.canEnumerate()) return initEnumerated(alloc, source, columns, predicates, context, limits);
+        return initMaterialized(alloc, source, columns, predicates, context, limits);
+    }
+    pub fn initMaterialized(alloc: Allocator, source: *serving.ServingSource, columns: []const []const u8, predicates: []const Predicate, context: Context, limits: Limits) !Stream {
         try source.ensureInventory(context);
         try source.ensureCanonicalPlan(context);
         const cached_order = source.canonicalOrder();
         if (cached_order == null) try source.inventory.validate();
         const files = cached_order orelse try serving.ServingSource.canonicalFileOrder(alloc, source.inventory);
         return .{ .alloc = alloc, .source = source, .columns = columns, .predicates = predicates, .context = context, .limits = limits, .files = files, .owns_files = cached_order == null, .schema_contract = if (source.iceberg_schema) |schema| schema.columns else &.{} };
+    }
+    pub fn partitionRows(self: *Stream, index: usize, count: usize) !void {
+        if (count == 0 or index >= count or self.iterator != null or self.file_index != 0) return error.InvalidLakeCandidateReference;
+        var total: u64 = 0;
+        for (self.files) |file| total = try std.math.add(u64, total, self.source.inventory.files[file].row_count);
+        const begin: u64 = @intCast(@as(u128, total) * index / count);
+        const end: u64 = @intCast(@as(u128, total) * (index + 1) / count);
+        var ranges: std.ArrayList(RowRange) = .empty;
+        errdefer ranges.deinit(self.alloc);
+        var files: std.ArrayList(usize) = .empty;
+        errdefer files.deinit(self.alloc);
+        var at: u64 = 0;
+        for (self.files) |file| {
+            const file_end = at + self.source.inventory.files[file].row_count;
+            if (begin < file_end and end > at and begin < end) {
+                try files.append(self.alloc, file);
+                try ranges.append(self.alloc, .{ .file = file, .begin = begin -| at, .end = @min(end, file_end) - at });
+            }
+            at = file_end;
+        }
+        const retained = try files.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(retained);
+        self.row_ranges = try ranges.toOwnedSlice(self.alloc);
+        if (self.owns_files) self.alloc.free(self.files);
+        self.files = retained;
+        self.owns_files = true;
+    }
+    fn rowRange(self: Stream, file: usize) ?RowRange {
+        if (self.file_index > 0 and self.file_index <= self.row_ranges.len) {
+            const range = self.row_ranges[self.file_index - 1];
+            if (range.file == file) return range;
+        }
+        // File IDs index the pinned inventory; ranges follow canonical order.
+        for (self.row_ranges) |range| if (range.file == file) return range;
+        return null;
     }
     fn initEnumerated(a: Allocator, parent: *serving.ServingSource, columns: []const []const u8, predicates: []const Predicate, context: Context, limits: Limits) !Stream {
         const navigation = parent.file_navigation.?;
@@ -896,6 +940,7 @@ pub const Stream = struct {
         if (self.source.scanner.shared_reader) |reader| reader.drain(true);
         self.releaseWork();
         if (self.owns_files) self.alloc.free(self.files);
+        self.alloc.free(self.row_ranges);
         self.mapped_columns.deinit(self.alloc);
         if (self.iterator_parent) |parent| {
             self.source.closeParallelView(parent);
@@ -1002,7 +1047,16 @@ pub const Stream = struct {
                         self.stats.bloom_groups_pruned += 1;
                         continue;
                     }
-                    try self.admitRows(group.row_count);
+                    var row_begin: u64 = 0;
+                    var row_end: u64 = group.row_count;
+                    if (self.rowRange(self.active_file)) |range| {
+                        if (self.position_starts.len == 0) self.position_starts = try self.rowGroupStarts(plan.inventory.files[0]);
+                        const first = self.position_starts[group.ordinal];
+                        if (first >= range.end or first + group.row_count <= range.begin) continue;
+                        row_begin = range.begin -| first;
+                        row_end = @min(group.row_count, range.end - first);
+                    }
+                    try self.admitRows(row_end - row_begin);
                     self.page_cursor = try @import("lake_parquet_cursor.zig").Cursor.init(self.alloc, self.source.scanner.reader(), plan.inventory, input.file_id, input.row_group_ordinal, if (self.identity_only) &.{} else if (self.schema_contract.len != 0) self.file_columns else self.columns, .{
                         .max_rows = self.limits.max_row_group_rows,
                         .max_struct_allocation_bytes = self.limits.max_decoded_bytes,
@@ -1010,8 +1064,10 @@ pub const Stream = struct {
                         .max_decoded_bytes = self.limits.max_decoded_bytes,
                     });
                     self.stats.groups_decoded += 1;
-                    self.stats.rows_examined += group.row_count;
+                    self.stats.rows_examined += row_end - row_begin;
                     try self.context.ensureActive();
+                    self.page_cursor.?.position = row_begin;
+                    self.page_cursor.?.row_end = row_end;
                     self.page_cursor.?.shared_reader = self.source.scanner.shared_reader;
                     if (self.resume_at) |position| if (group.ordinal == position.group) {
                         self.page_cursor.?.position = position.row;
@@ -1096,7 +1152,7 @@ pub const Stream = struct {
         }
     }
     fn prefetchNext(self: *Stream) !void {
-        if (self.partition_count != 1) return;
+        if (self.partition_count != 1 or self.row_ranges.len != 0) return;
         const reader = self.source.scanner.shared_reader orelse return;
         if (reader.context.io == null) return;
         try self.context.ensureActive();
@@ -1416,6 +1472,9 @@ pub const Stream = struct {
     fn positionStarts(self: *Stream, file: external.FileEntry) ![]const u64 {
         const prepared = self.source.prepared_deletes orelse return &.{};
         if (prepared.positions.count() == 0) return &.{};
+        return self.rowGroupStarts(file);
+    }
+    fn rowGroupStarts(self: *Stream, file: external.FileEntry) ![]const u64 {
         const starts = try self.alloc.alloc(u64, file.row_groups.len);
         errdefer self.alloc.free(starts);
         var total: u64 = 0;

@@ -78,6 +78,7 @@ pub const Record = struct {
     pending: []const u32 = &.{},
     reduce_boundaries: []const u16 = &.{},
     skew: []const @import("physical.zig").Part = &.{},
+    physical: ?Output = null,
     adaptive: ?Output = null,
     cancel_requested: bool = false,
     output: ?Output = null,
@@ -189,6 +190,9 @@ pub const Store = struct {
         return self.checkpointPhysical(a, path, claim_, stage, cursor, pending, boundaries, null);
     }
     pub fn checkpointPhysical(self: Store, a: A, path: []const u8, claim_: Claim, stage: u32, cursor: u32, pending: []const u32, boundaries: ?[]const u16, skew: ?[]const @import("physical.zig").Part) !void {
+        return self.checkpointResolved(a, path, claim_, stage, cursor, pending, boundaries, skew, null);
+    }
+    pub fn checkpointResolved(self: Store, a: A, path: []const u8, claim_: Claim, stage: u32, cursor: u32, pending: []const u32, boundaries: ?[]const u16, skew: ?[]const @import("physical.zig").Part, physical_ref: ?Output) !void {
         if (pending.len > 256) return error.InvalidSqlExecutionState;
         for (pending, 0..) |id, index| {
             if (id >= cursor or (index != 0 and id <= pending[index - 1])) return error.InvalidSqlExecutionState;
@@ -200,6 +204,11 @@ pub const Store = struct {
         next.stage = stage;
         next.cursor = cursor;
         next.pending = pending;
+        if (physical_ref) |ref| {
+            if (old.value.stage != 0 or stage != 1 or old.value.physical != null) return error.InvalidSqlExecutionState;
+            next.physical = ref;
+            next.adaptive = null;
+        }
         if (boundaries) |value| {
             if (old.value.stage != 0 or stage != 1 or old.value.reduce_boundaries.len != 0 or value.len < 2 or value.len > 1025) return error.InvalidSqlExecutionState;
             next.reduce_boundaries = value;
