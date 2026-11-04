@@ -163,6 +163,20 @@ its inputs retires the cache reference while the merge retains its old owner
 until cancellation or completion is joined. Namespace switching never closes a
 table still borrowed by a merge.
 
+SQL constraint overlays retain their dependency scope alongside staged effects.
+Adding an independent target first revalidates the prior scope against the
+current admitted generation, then adopts the expanded witness without rebuilding
+previous rows. Current-statement entries do not enter that prior scope. Relevant
+peer changes, schema changes, new foreign-key edges and namespace replacement
+still rebuild; legacy physical-cut witnesses do not use this shortcut. Owned
+target names share the session memory budget and are freed on invalidation.
+COMMIT continues to validate every staged predicate and constraint.
+
+Runtime-cache counters distinguish unsupported state, changed identities and
+controls, namespace limits, and settling from successful reuse. They are needed
+to distinguish safe invalidation from repeated startup work in the importer;
+a small replay fixture alone does not qualify importer throughput.
+
 Both producer and consumer controllers size preparation windows from elapsed
 time minus measured admission/publication overhead. That fixed cost still
 counts toward call deadlines and yield decisions. Contention therefore does
@@ -176,8 +190,8 @@ restarting a whole-database upgrade on every maintenance turn under active write
 
 ## Qualification
 
-Component coverage includes the ordering model, slot reuse, bounded capacity,
-partial initialization, partial enrollment writes, delayed descriptor close,
+Component coverage includes ticket ordering, abandoned and dead predecessors,
+damaged counters, interrupted grants, failed enrollment, long coordination names,
 cancellation, and deadline expiry. Real process fixtures
 exercise immediate holder reentry, death while queued and while holding a turn,
 middle-waiter timeout, read cohorts, and interoperability with a legacy flock

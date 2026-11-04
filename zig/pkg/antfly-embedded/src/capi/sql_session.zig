@@ -53,7 +53,7 @@ const Savepoint = struct { name: []const u8, length: usize };
 const MutationFold = @import("../sql/mutation_fold.zig").Accumulator(Entry);
 const Integrity = d.api_relational_integrity_commit;
 const OverlayWitness = struct { inode: u64, primary: [16]u8, metadata: [16]u8, dependencies: ?[32]u8 = null };
-const ConstraintOverlay = struct { witness: OverlayWitness, entry_count: usize, value: Integrity.StatementOverlay };
+const ConstraintOverlay = struct { witness: OverlayWitness, target: []const u8, entry_count: usize, value: Integrity.StatementOverlay };
 pub const Session = struct {
     handle: *h.Handle,
     budget: d.sql_memory_budget,
@@ -88,7 +88,10 @@ pub const Session = struct {
         self.dependency_entries_count = 0;
     }
     fn invalidateConstraintOverlay(self: *Session) void {
-        if (self.constraint_overlay) |*overlay| overlay.value.deinit();
+        if (self.constraint_overlay) |*overlay| {
+            overlay.value.deinit();
+            self.budget.allocator().free(overlay.target);
+        }
         self.constraint_overlay = null;
     }
     pub fn deinit(self: *Session) void {
@@ -106,19 +109,21 @@ pub const Session = struct {
             try self.folded.?.append(self.entries.items[self.folded_count]);
         return &self.folded.?;
     }
-    fn overlayWitness(self: *Session, metadata: anytype, target: []const u8) !?OverlayWitness {
+    fn overlayWitness(self: *Session, metadata: anytype, entry_count: usize, target: []const u8) !?OverlayWitness {
         const backend = self.handle.owned_lite_backend orelse return null;
         const store = backend.native_docstore orelse return null;
         if (!store.file.header.indexed_reclamation or store.file.transaction_header != null or store.file.checkpoint_publication_uncertain) return null;
         const logical = store.file.activeCheckpoint().logical;
         if (std.mem.allEqual(u8, &logical.primary, 0) or std.mem.allEqual(u8, &logical.metadata, 0)) return null;
-        if (self.dependency_entries_count > self.entries.items.len) {
+        if (self.dependency_entries_count > entry_count) {
             self.dependency_tables.clearRetainingCapacity();
             self.dependency_entries_count = 0;
         }
         // Only newly staged entries discover dependencies. The witness must
         // never rescan all previous rows merely to discover their table names.
-        while (self.dependency_entries_count < self.entries.items.len) : (self.dependency_entries_count += 1)
+        // Current-statement entries are already staged at this point; only
+        // completed effects belong to the old scope. The target is explicit.
+        while (self.dependency_entries_count < entry_count) : (self.dependency_entries_count += 1)
             try self.dependency_tables.put(self.budget.allocator(), self.entries.items[self.dependency_entries_count].table.physical_name, {});
         if (try @import("sql_dependency_witness.zig").capture(self.handle.alloc, &self.handle.owned_lite_backend.?, metadata, &self.dependency_tables, target)) |dependencies|
             return .{ .inode = (try store.file.file.stat(store.file.runtime())).inode, .primary = @splat(0), .metadata = @splat(0), .dependencies = dependencies };
@@ -128,21 +133,40 @@ pub const Session = struct {
     /// constraint, DDL and incarnation changes rebuild previous effects;
     /// unrelated publication does not. Legacy files use the complete file cut.
     pub fn preparedConstraintOverlay(self: *Session, source: d.api_table_read_source.TableReadSource, metadata: anytype, admission: Integrity.RepairAdmission, entry_count: usize, target: []const u8) !?*const Integrity.StatementOverlay {
-        const witness = (try self.overlayWitness(metadata, target)) orelse {
+        const witness = (try self.overlayWitness(metadata, entry_count, target)) orelse {
             self.invalidateConstraintOverlay();
             return null;
         };
         if (self.constraint_overlay) |*cached| {
-            if (cached.entry_count == entry_count and std.meta.eql(cached.witness, witness)) {
-                self.countOverlay("sql_constraint_overlay_hits", 1);
-                return &cached.value;
+            if (cached.entry_count == entry_count) {
+                if (std.meta.eql(cached.witness, witness)) {
+                    self.countOverlay("sql_constraint_overlay_hits", 1);
+                    return &cached.value;
+                }
+                // Adding a disjoint target widens the witness, but does not
+                // invalidate already prepared effects. Validate the old scope
+                // first: peer changes, new FK edges, namespace replacement and
+                // legacy file cuts must still rebuild. Newly discovered effect
+                // tables conservatively widen this check as well.
+                if (cached.witness.dependencies != null and witness.dependencies != null) {
+                    const previous = try self.overlayWitness(metadata, entry_count, cached.target);
+                    if (previous != null and std.meta.eql(cached.witness, previous.?)) {
+                        const owned_target = self.retainOverlayTarget(target) orelse return null;
+                        self.budget.allocator().free(cached.target);
+                        cached.target = owned_target;
+                        cached.witness = witness;
+                        self.countOverlay("sql_constraint_overlay_scope_extensions", 1);
+                        return &cached.value;
+                    }
+                }
             }
         }
         self.invalidateConstraintOverlay();
+        const owned_target = self.retainOverlayTarget(target) orelse return null;
         if (comptime h.builtin.is_test) self.test_overlay_rebuilds += 1;
         self.countOverlay("sql_constraint_overlay_rebuilds", 1);
         self.countOverlay("sql_constraint_overlay_rebuild_entries", @intCast(entry_count));
-        self.constraint_overlay = .{ .witness = witness, .entry_count = entry_count, .value = .init(self.budget.allocator()) };
+        self.constraint_overlay = .{ .witness = witness, .target = owned_target, .entry_count = entry_count, .value = .init(self.budget.allocator()) };
         errdefer self.invalidateConstraintOverlay();
         if (entry_count != 0) {
             var scratch = std.heap.ArenaAllocator.init(self.handle.alloc);
@@ -164,6 +188,18 @@ pub const Session = struct {
             };
         }
         return &self.constraint_overlay.?.value;
+    }
+
+    fn retainOverlayTarget(self: *Session, target: []const u8) ?[]const u8 {
+        const exhausted = self.budget.exhausted;
+        const admission_exhausted = self.budget.admission_exhausted;
+        return self.budget.allocator().dupe(u8, target) catch {
+            self.invalidateConstraintOverlay();
+            self.countOverlay("sql_constraint_overlay_evictions", 1);
+            self.budget.exhausted = exhausted;
+            self.budget.admission_exhausted = admission_exhausted;
+            return null;
+        };
     }
 
     pub fn reset(self: *Session) void {

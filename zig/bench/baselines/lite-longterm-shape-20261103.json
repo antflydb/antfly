@@ -5,7 +5,7 @@
   "components": [
     {
       "component": "SQL dependency validity",
-      "implementation": "Revision-9 transactional semantic revisions for schema-bearing namespaces; schema-directory, namespace-incarnation and FK-connected table witnesses. Table discovery extends only over newly staged entries and clears on rollback/reset. Missing revisions retain conservative file-wide validity. COMMIT still revalidates all predicates and constraints."
+      "implementation": "Revision-9 transactional semantic revisions for schema-bearing namespaces; schema-directory, namespace-incarnation and FK-connected table witnesses. Table discovery extends only over newly staged entries and clears on rollback/reset. Missing revisions retain conservative file-wide validity. COMMIT still revalidates all predicates and constraints. Scope expansion revalidates the prior completed-entry scope before adopting a wider dependency witness, avoiding rebuilding all prior rows solely for an independent new target; target ownership is budgeted and COMMIT remains authoritative."
     },
     {
       "component": "Writer allocator ownership",
@@ -165,6 +165,30 @@
       "sources": 1061,
       "tool_tests_passed": 21,
       "failed": 0
+    },
+    {
+      "suite": "Main admission integration at 1179bcce49, before SQL scope-extension changes",
+      "passed": 47,
+      "skipped": 0,
+      "failed": 1,
+      "leaked": 0,
+      "failure": "New relational replay diagnostic bypassed required SQL constraint coordination. Corrected diagnostic uses public SQL inserts. Prior uncertainty/proof-budget/outcome regressions all passed."
+    },
+    {
+      "suite": "Cooperative legacy conversion and shrink admission at 1179bcce49",
+      "passed": 6,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "runtime_anchors_passed": 11
+    },
+    {
+      "suite": "SQL scope extension and runtime diagnostics, before conflict-fixture correction",
+      "passed": 51,
+      "skipped": 0,
+      "failed": 1,
+      "leaked": 0,
+      "failure": "Conflict fixture expected rejection while building an unrelated speculative statement; the staged predicates are validated at COMMIT. Corrected fixture asserts COMMIT serialization failure, preservation of the peer row and no staged publication. No production change for this correction."
     }
   ],
   "remaining": [
@@ -667,6 +691,99 @@
     "main_commit": "270057158c",
     "work": "Use landed writer queue and boundary classification once; preserve cancellation-safe timed local admission, add bounded lease handoff, retain precommit replay-capacity retries and preallocated JSON responses. Automatic format conversion now observes replay/quiet admission and primary-publication preemption. Remove superseded byte-range queue shim.",
     "component_builds_passed": false,
-    "benchmark_report_tests_passed": 23
+    "benchmark_report_tests_passed": 23,
+    "main_admission_source": "270057158c",
+    "main_merge_pushed": true
+  },
+  "local_runtime_diagnostic": {
+    "qualification": false,
+    "scope": "One current candidate; no reference rebuild or run. Public SQL inserts through coordinated constraint path, eight batches of 256 rows per namespace. Operation counts precede explicit replay drain; acknowledged rows and physical integrity checked after drain. Scheduling and merge completion affect counts; this is not an importer timing comparison.",
+    "observations": [
+      {
+        "namespaces": 1,
+        "maintenance_runtime_opens": 2,
+        "source_runtime_reuses": 1,
+        "cache_diagnostics": {
+          "capture_attempts": 3,
+          "captured": 3,
+          "capture_namespace_limit": 0,
+          "capture_control": 0,
+          "miss_no_cache": 0,
+          "miss_closed": 1,
+          "miss_inode": 0,
+          "miss_binding": 0,
+          "miss_borrow": 0,
+          "miss_namespace": 0,
+          "miss_indexes": 0,
+          "miss_metadata": 0,
+          "miss_config": 0,
+          "miss_control": 0,
+          "not_retained_settled": 1,
+          "not_retained_failed": 0,
+          "blocked_manual": 0,
+          "blocked_enrichment": 0,
+          "blocked_queries": 0,
+          "blocked_policy": 0,
+          "blocked_transition": 0,
+          "blocked_index_loads": 0,
+          "blocked_admission": 0,
+          "blocked_resolver": 0,
+          "blocked_split": 0,
+          "blocked_groups": 0,
+          "blocked_nontext_indexes": 0,
+          "blocked_replacement": 0,
+          "blocked_repairs": 0,
+          "blocked_coalescer": 0
+        }
+      },
+      {
+        "namespaces": 2,
+        "maintenance_runtime_opens": 3,
+        "source_runtime_reuses": 4,
+        "cache_diagnostics": {
+          "capture_attempts": 7,
+          "captured": 7,
+          "capture_namespace_limit": 0,
+          "capture_control": 0,
+          "miss_no_cache": 0,
+          "miss_closed": 2,
+          "miss_inode": 0,
+          "miss_binding": 0,
+          "miss_borrow": 0,
+          "miss_namespace": 0,
+          "miss_indexes": 0,
+          "miss_metadata": 0,
+          "miss_config": 0,
+          "miss_control": 0,
+          "not_retained_settled": 1,
+          "not_retained_failed": 0,
+          "blocked_manual": 0,
+          "blocked_enrichment": 0,
+          "blocked_queries": 0,
+          "blocked_policy": 0,
+          "blocked_transition": 0,
+          "blocked_index_loads": 0,
+          "blocked_admission": 0,
+          "blocked_resolver": 0,
+          "blocked_split": 0,
+          "blocked_groups": 0,
+          "blocked_nontext_indexes": 0,
+          "blocked_replacement": 0,
+          "blocked_repairs": 0,
+          "blocked_coalescer": 0
+        }
+      }
+    ],
+    "passed": true
+  },
+  "sql_scope_expansion_diagnosis": {
+    "qualification": false,
+    "candidate_source": "a6f3d4afed",
+    "previous_candidate_counts": {
+      "staged_a_rows": 16,
+      "first_b_rebuilds": 1,
+      "first_b_prior_entries_revisited": 16
+    },
+    "fix": "Validate previous completed-entry scope and adopt wider witness when unchanged. Regression observed no prior entries revisited with unrelated peer publication; relevant peer or schema publication rebuilt 16 entries. Corrected COMMIT-conflict fixture rerun pending."
   }
 }

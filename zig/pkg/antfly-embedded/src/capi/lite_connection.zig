@@ -1279,6 +1279,7 @@ pub const Owner = struct {
         text_merge_publication_ns: u64 = 0,
         maintenance_storage_ns: u64 = 0,
         sql_constraint_overlay_hits: u64 = 0,
+        sql_constraint_overlay_scope_extensions: u64 = 0,
         sql_constraint_overlay_rebuilds: u64 = 0,
         sql_constraint_overlay_rebuild_entries: u64 = 0,
         sql_constraint_overlay_evictions: u64 = 0,
@@ -3660,7 +3661,7 @@ pub const Owner = struct {
         const p = &self.publication_stats;
         // Numeric/enum diagnostics only: no path, SQL, model or document data.
         // Preparation overlaps actor service; durations are not additive.
-        std.log.info("antfly_bench_native_owner source_turns={d} capture_ns={d} replay_ns={d} artifacts_ns={d} storage_ns={d} runtime_refreshes={d} maintenance_errors={d} maintenance_timeouts={d} merge_started={d} merge_applied={d} merge_discarded={d} merge_prepare_ns={d} merge_staging_ns={d} merge_staged_bytes={d} merge_publication_ns={d} sql_overlay_hits={d} sql_overlay_rebuilds={d} sql_overlay_rebuild_entries={d} sql_overlay_evictions={d} sql_staged_statements={d} replay_waits={d} replay_refused_prepare_ns={d} last_failure={s}", .{ p.maintenance_source_turns, p.maintenance_capture_ns, p.maintenance_replay_ns, p.maintenance_artifacts_ns, p.maintenance_storage_ns, p.serving_runtime_refreshes, p.maintenance_errors, p.maintenance_queue_timeouts, p.text_merge_jobs_started, p.text_merge_jobs_applied, p.text_merge_jobs_discarded, p.text_merge_prepare_ns, p.text_merge_staging_ns, p.text_merge_staged_bytes, p.text_merge_publication_ns, p.sql_constraint_overlay_hits, p.sql_constraint_overlay_rebuilds, p.sql_constraint_overlay_rebuild_entries, p.sql_constraint_overlay_evictions, p.sql_constraint_staged_statements, p.replay_backpressure_waits, p.replay_refused_preparation_ns, p.last_maintenance_failure orelse "none" });
+        std.log.info("antfly_bench_native_owner source_turns={d} capture_ns={d} replay_ns={d} artifacts_ns={d} storage_ns={d} runtime_refreshes={d} maintenance_errors={d} maintenance_timeouts={d} merge_started={d} merge_applied={d} merge_discarded={d} merge_prepare_ns={d} merge_staging_ns={d} merge_staged_bytes={d} merge_publication_ns={d} sql_overlay_hits={d} sql_overlay_scope_extensions={d} sql_overlay_rebuilds={d} sql_overlay_rebuild_entries={d} sql_overlay_evictions={d} sql_staged_statements={d} replay_waits={d} replay_refused_prepare_ns={d} last_failure={s}", .{ p.maintenance_source_turns, p.maintenance_capture_ns, p.maintenance_replay_ns, p.maintenance_artifacts_ns, p.maintenance_storage_ns, p.serving_runtime_refreshes, p.maintenance_errors, p.maintenance_queue_timeouts, p.text_merge_jobs_started, p.text_merge_jobs_applied, p.text_merge_jobs_discarded, p.text_merge_prepare_ns, p.text_merge_staging_ns, p.text_merge_staged_bytes, p.text_merge_publication_ns, p.sql_constraint_overlay_hits, p.sql_constraint_overlay_scope_extensions, p.sql_constraint_overlay_rebuilds, p.sql_constraint_overlay_rebuild_entries, p.sql_constraint_overlay_evictions, p.sql_constraint_staged_statements, p.replay_backpressure_waits, p.replay_refused_preparation_ns, p.last_maintenance_failure orelse "none" });
         inline for (@typeInfo(TextRuntimeCacheDiagnostics).@"struct".field_names) |field_name| {
             const count = @field(p.text_runtime_cache, field_name);
             if (count != 0) std.log.info("antfly_bench_native_runtime_cache_{s} count={d}", .{ field_name, count });
@@ -5776,6 +5777,67 @@ test "capi native SQL constraint overlay fences dependencies while ignoring unre
     try std.testing.expect((try owner.current.?.owned_lite_backend.?.native_docstore.?.checkWithCancel(null)).valid);
 }
 
+test "capi native SQL constraint overlay extends independent scopes after validating prior effects" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Probe = ConstraintOverlayProbe;
+    const Change = enum { unrelated, relevant, ddl, conflict };
+    for ([_]Change{ .unrelated, .relevant, .ddl, .conflict }) |change| {
+        var fixture = try AdmissionFollowupFixture.init("sql-overlay-scope-extension", 5000, .batch);
+        defer fixture.deinit();
+        for ([_][]const u8{ "items", "other", "unrelated" }) |name| {
+            const create = try std.fmt.allocPrint(std.testing.allocator, "CREATE TABLE {s} (id BIGINT PRIMARY KEY, v BIGINT)", .{name});
+            defer std.testing.allocator.free(create);
+            _ = try Probe.run(fixture.id, null, create, null);
+            const seed = try std.fmt.allocPrint(std.testing.allocator, "INSERT INTO {s} (id,v) VALUES (0,0)", .{name});
+            defer std.testing.allocator.free(seed);
+            _ = try Probe.run(fixture.id, null, seed, null);
+        }
+        var id: u64 = 0;
+        const sessions = @import("sql_session.zig");
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, sessions.antfly_db_sql_session_open(fixture.id, &id));
+        defer _ = sessions.antfly_db_sql_session_close(fixture.id, id);
+        _ = try Probe.run(fixture.id, id, "BEGIN", null);
+        const session = fixture.connection.sql_sessions.get(id).?;
+        for (1..17) |n| {
+            var buffer: [128]u8 = undefined;
+            _ = try Probe.run(fixture.id, id, try std.fmt.bufPrint(&buffer, "INSERT INTO items (id,v) VALUES ({d},{d})", .{ n, n }), null);
+        }
+        try std.testing.expectEqual(@as(usize, 1), session.test_overlay_rebuilds);
+        const stats = &fixture.connection.owner.publication_stats;
+        const entries_before = stats.sql_constraint_overlay_rebuild_entries;
+        const extensions_before = stats.sql_constraint_overlay_scope_extensions;
+        _ = try Probe.run(fixture.id, null, switch (change) {
+            .unrelated => "INSERT INTO unrelated (id,v) VALUES (99,0)",
+            .relevant => "INSERT INTO items (id,v) VALUES (99,0)",
+            .ddl => "CREATE TABLE new_dependency (id BIGINT PRIMARY KEY)",
+            .conflict => "INSERT INTO items (id,v) VALUES (1,99)",
+        }, null);
+        if (change == .conflict) {
+            // Rebuilding speculative prior effects does not make them commit
+            // authority. The original unique-absence predicate must survive
+            // scope expansion and reject this conflicting peer at COMMIT.
+            _ = try Probe.run(fixture.id, id, "INSERT INTO other (id,v) VALUES (1,1)", null);
+            try std.testing.expectEqual(@as(usize, 2), session.test_overlay_rebuilds);
+            try std.testing.expectEqual(entries_before + 16, stats.sql_constraint_overlay_rebuild_entries);
+            _ = try Probe.run(fixture.id, id, "COMMIT", "40001");
+            _ = try Probe.run(fixture.id, id, "ROLLBACK", null);
+            try std.testing.expectEqual(@as(?i64, 1), try Probe.run(fixture.id, null, "SELECT COUNT(*) FROM other", null));
+        } else {
+            _ = try Probe.run(fixture.id, id, "INSERT INTO other (id,v) VALUES (1,1)", null);
+            const can_extend = change == .unrelated;
+            try std.testing.expectEqual(@as(usize, if (can_extend) 1 else 2), session.test_overlay_rebuilds);
+            try std.testing.expectEqual(entries_before + @as(u64, if (can_extend) 0 else 16), stats.sql_constraint_overlay_rebuild_entries);
+            try std.testing.expectEqual(extensions_before + @as(u64, if (can_extend) 1 else 0), stats.sql_constraint_overlay_scope_extensions);
+            _ = try Probe.run(fixture.id, id, "INSERT INTO items (id,v) VALUES (17,17)", null);
+            try std.testing.expectEqual(@as(usize, if (can_extend) 1 else 2), session.test_overlay_rebuilds);
+            _ = try Probe.run(fixture.id, id, "COMMIT", null);
+            try std.testing.expectEqual(@as(?i64, 2), try Probe.run(fixture.id, null, "SELECT COUNT(*) FROM other", null));
+        }
+        try std.testing.expectEqual(@as(usize, 0), session.budget.live);
+        try std.testing.expect((try fixture.connection.owner.current.?.owned_lite_backend.?.native_docstore.?.checkWithCancel(null)).valid);
+    }
+}
+
 test "capi native SQL constraint overlay fences inbound and outbound foreign key dependencies" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("sql-overlay-dependencies", 5000, .batch);
@@ -5793,6 +5855,9 @@ test "capi native SQL constraint overlay fences inbound and outbound foreign key
     const session = fixture.connection.sql_sessions.get(id).?;
     const before = session.test_overlay_rebuilds;
     _ = try Probe.run(fixture.id, null, "INSERT INTO parents (id) VALUES (2)", null);
+    // Switching to an FK-connected target cannot hide a relevant peer change.
+    _ = try Probe.run(fixture.id, id, "INSERT INTO parents (id) VALUES (3)", null);
+    try std.testing.expectEqual(before + 1, session.test_overlay_rebuilds);
     _ = try Probe.run(fixture.id, id, "INSERT INTO children (id,parent_id) VALUES (2,2)", null);
     try std.testing.expectEqual(before + 1, session.test_overlay_rebuilds);
     _ = try Probe.run(fixture.id, id, "COMMIT", null);
@@ -8133,28 +8198,16 @@ test "capi native maintenance relational replay diagnoses bounded runtime reuse"
         const reuses_before = owner.publication_stats.maintenance_source_runtime_reuses;
         for (0..8 * namespace_count) |batch| {
             {
-                var lease = try fixture.connection.acquire();
-                defer {
-                    lease.close();
-                    fixture.connection.gate.mutex.unlock(io);
-                }
-                const root = try owner.refresh();
-                var name_buf: [32]u8 = undefined;
-                const name = try std.fmt.bufPrint(&name_buf, "replay_{d}", .{batch % namespace_count});
-                const table = try @import("tables.zig").get(root, name);
                 var arena: std.heap.ArenaAllocator = .init(a);
                 defer arena.deinit();
                 const scratch = arena.allocator();
-                const writes = try scratch.alloc(h.db_mod.types.BatchWrite, 256);
-                for (writes, 0..) |*write, row| {
-                    const id = batch * 256 + row;
-                    write.* = .{
-                        .key = try std.fmt.allocPrint(scratch, "row-{d}", .{id}),
-                        .value = try std.fmt.allocPrint(scratch, "{{\"id\":{d},\"body\":\"benchmark canary café 東京\",\"item\":{{\"value\":{d}}}}}", .{ id, id }),
-                    };
+                const rows = try scratch.alloc([]const u8, 256);
+                for (rows, 0..) |*row, ordinal| {
+                    const id = batch * 256 + ordinal;
+                    row.* = try std.fmt.allocPrint(scratch, "('row-{d}',{d},'benchmark canary café 東京')", .{ id, id });
                 }
-                try table.batch(.{ .writes = writes, .sync_level = .write });
-                owner.notifyMutation();
+                const statement = try std.fmt.allocPrint(scratch, "INSERT INTO replay_{d} (_id,id,body) VALUES {s}", .{ batch % namespace_count, try std.mem.join(scratch, ",", rows) });
+                _ = try ConstraintOverlayProbe.run(fixture.id, null, statement, null);
             }
             _ = owner.maintenanceTurnForTest() catch |err| switch (err) {
                 error.EnrichmentWaitCanceled, error.EnrichmentSourceChanged, error.FileBusy, error.WouldBlock => true,
@@ -8164,6 +8217,8 @@ test "capi native maintenance relational replay diagnoses bounded runtime reuse"
         const diagnostics = owner.publication_stats.text_runtime_cache;
         std.debug.print("LITE_RELATIONAL_RUNTIME namespaces={d} opens={d} reuses={d} diagnostics={f}\n", .{ namespace_count, owner.publication_stats.maintenance_runtime_opens - opens_before, owner.publication_stats.maintenance_source_runtime_reuses - reuses_before, std.json.fmt(diagnostics, .{}) });
         try std.testing.expect(diagnostics.capture_attempts > 0);
+        try std.testing.expect(owner.publication_stats.maintenance_source_runtime_reuses > reuses_before);
+        try std.testing.expectEqual(@as(u64, 0), diagnostics.capture_namespace_limit);
         // Verify the diagnostic uses the real replay path. Drain only after
         // the measured operation counts, then check every acknowledged row.
         var drained = false;
