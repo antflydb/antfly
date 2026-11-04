@@ -87,17 +87,9 @@ fn load(a: A, raw: []const u8) !?std.json.Parsed(catalog.Resource) {
     return catalog.current(a, parsed.value);
 }
 
-fn external(producer: contract.Producer) bool {
-    if (producer.config != .object) return false;
-    const config = producer.config.object;
-    if (config.get("generator")) |generator| {
-        if (generator == .object) return external(.{ .config = generator });
-    }
-    const provider = config.get("provider") orelse return false;
-    if (provider != .string) return false;
-    if (!std.mem.eql(u8, provider.string, "antfly") and !std.mem.eql(u8, provider.string, "apple") and !std.mem.eql(u8, provider.string, "mock")) return true;
-    const url = config.get("url") orelse config.get("api_url") orelse .null;
-    return url == .string and url.string.len != 0;
+fn external(server: anytype, producer: contract.Producer) bool {
+    const routes = local.asset_producer_runtime.ProducerRouting.init(.{ .default_endpoint = server.configuredInferenceAPIURL() }, server.antfly_provider);
+    return routes.externalPrivacy(producer);
 }
 
 const RawJson = struct {
@@ -108,7 +100,6 @@ const RawJson = struct {
 };
 
 fn statusResponse(server: anytype, a: A, table: []const u8, resource: ?catalog.Resource, code: u16, request: operation.RequestContext) !Response {
-    _ = server;
     _ = table;
     _ = request;
     const value = resource orelse return json(a, code, .{ .configured = false });
@@ -117,7 +108,7 @@ fn statusResponse(server: anytype, a: A, table: []const u8, resource: ?catalog.R
     const producer = try projection.resolve(arena.allocator(), value.policy, false);
     const tag = try catalog.etag(a, value);
     errdefer a.free(tag);
-    var result = try json(a, code, .{ .configured = true, .policy = value.policy, .policy_version = value.policy_version[0..], .resource_version = value.resource_version, .generation = value.generation, .scan_id = value.scan_id[0..], .etag = tag, .resolved_producer = producer, .external_processing = external(producer), .coverage = RawJson{ .bytes = try catalog.coverage.response(arena.allocator(), value.coverage) } });
+    var result = try json(a, code, .{ .configured = true, .policy = value.policy, .policy_version = value.policy_version[0..], .resource_version = value.resource_version, .generation = value.generation, .scan_id = value.scan_id[0..], .etag = tag, .resolved_producer = producer, .external_processing = external(server, producer), .coverage = RawJson{ .bytes = try catalog.coverage.response(arena.allocator(), value.coverage) } });
     result.etag = tag;
     return result;
 }
@@ -577,7 +568,7 @@ fn preview(server: anytype, a: A, table: []const u8, body: []const u8, request: 
         try row.object.put(scratch, "fields", fields);
         try output.array.append(row);
     }
-    const result = .{ .policy_version = (try input.value.policy.identity(scratch))[0..], .sampled = documents.len, .complete_table_scan = false, .external_processing = external(producer), .documents = output };
+    const result = .{ .policy_version = (try input.value.policy.identity(scratch))[0..], .sampled = documents.len, .complete_table_scan = false, .external_processing = external(server, producer), .documents = output };
     var size = PreviewSize{ .remaining = @import("antfly_public_limits").privacy_preview_response_bytes };
     try size.add(result);
     return json(a, 200, result);
@@ -1263,11 +1254,18 @@ test {
 test "privacy status returns persisted coverage without opening data shards" {
     const a = std.testing.allocator;
     const resource = try catalog.next(a, null, .{ .mode = .monitor, .fields = &.{"body"} }, null);
-    var response = try statusResponse(struct {}{}, a, "docs", resource, 200, .{});
+    const Server = struct {
+        antfly_provider: @TypeOf(@as(@import("http_server.zig").ApiHttpServer, undefined).antfly_provider) = null,
+        pub fn configuredInferenceAPIURL(_: @This()) ?[]const u8 {
+            return "https://remote.example/ai/v1";
+        }
+    };
+    var response = try statusResponse(Server{}, a, "docs", resource, 200, .{});
     defer response.deinit(a);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, response.response.body, .{});
     defer parsed.deinit();
     try std.testing.expect(!parsed.value.object.get("coverage").?.object.get("available").?.bool);
+    try std.testing.expect(parsed.value.object.get("external_processing").?.bool);
 }
 
 test "privacy acknowledgement ignores worker progress and accepts a newer committed policy" {

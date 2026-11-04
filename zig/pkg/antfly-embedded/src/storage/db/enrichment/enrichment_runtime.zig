@@ -2996,6 +2996,25 @@ const ScopedReplay = struct {
         _ = std.base64.standard.Encoder.encode(encoded, key);
         return encoded;
     }
+    /// Dependency priming precedes ordinary document replay. Consult the same
+    /// source/incarnation/definition-bound tickets before invoking a root.
+    /// Healthy roots do one indexed lookup and no additional primary read.
+    fn rootDelayed(self: *@This(), runtime: *EnrichmentRuntime, group: enrichment_worker.PendingDocumentGroup, templates: []const enrichment_types.GeneratedEnrichmentRequest, root: enrichment_types.GeneratedEnrichmentRequest) !bool {
+        const logical = logicalRequestFingerprint(root);
+        const io = concurrencyIo(runtime);
+        self.mutex.lockUncancelable(io);
+        const present = self.state.hasLogical(runtime.alloc, logical) catch |err| {
+            self.mutex.unlock(io);
+            return err;
+        };
+        self.mutex.unlock(io);
+        if (!present) return false;
+        const planned = try prepareDocumentRequests(runtime, group, templates);
+        defer runtime.alloc.free(planned);
+        const delayed = try self.prepareDocument(runtime, group, planned);
+        defer runtime.alloc.free(delayed);
+        return std.mem.indexOfScalar(u64, delayed, logical) != null;
+    }
     fn prepareDocument(self: *@This(), runtime: *EnrichmentRuntime, group: enrichment_worker.PendingDocumentGroup, planned: []const enrichment_types.GeneratedEnrichmentRequest) ![]u64 {
         const key = try documentKey(runtime.alloc, group.doc_key);
         defer runtime.alloc.free(key);
@@ -14591,6 +14610,17 @@ fn scheduleScannerRetry(runtime: *EnrichmentRuntime, request: enrichment_types.G
     return try scope.shouldYield(runtime, err);
 }
 
+fn prepareDocumentRequests(runtime: *EnrichmentRuntime, pending: enrichment_worker.PendingDocumentGroup, templates: []const enrichment_types.GeneratedEnrichmentRequest) ![]enrichment_types.GeneratedEnrichmentRequest {
+    const planned = try runtime.alloc.dupe(enrichment_types.GeneratedEnrichmentRequest, templates);
+    errdefer runtime.alloc.free(planned);
+    for (planned) |*request| {
+        request.sequence = pending.sequence;
+        if (request.kind != .dense_embedding and request.kind != .sparse_embedding) continue;
+        request.reprocess_generation = try embeddingReprocessGeneration(runtime, request.doc_key, requestEmbeddingName(request.*), request.producer_json);
+    }
+    return planned;
+}
+
 fn processPendingDocumentGroup(
     runtime: *EnrichmentRuntime,
     pending: enrichment_worker.PendingDocumentGroup,
@@ -14607,13 +14637,8 @@ fn processPendingDocumentGroup(
     try guard.check();
     try servicePendingArtifactUnitJobs(runtime, pending.doc_key, guard);
     const templates = try getOrCreatePlannedRequests(runtime, pending.doc_key, request_plan_cache);
-    const planned = try runtime.alloc.dupe(enrichment_types.GeneratedEnrichmentRequest, templates);
+    const planned = try prepareDocumentRequests(runtime, pending, templates);
     defer runtime.alloc.free(planned);
-    for (planned) |*request| {
-        request.sequence = pending.sequence;
-        if (request.kind != .dense_embedding and request.kind != .sparse_embedding) continue;
-        request.reprocess_generation = try embeddingReprocessGeneration(runtime, request.doc_key, requestEmbeddingName(request.*), request.producer_json);
-    }
     const delayed_requests = if (runtime.retry_scheduler) |scheduler|
         try scheduler.prepareDocument(runtime, pending, planned)
     else
@@ -15230,12 +15255,26 @@ fn dispatchDeferredGeneratedWork(
 /// Prepare policy roots across the bounded replay page before traversing
 /// their consumers. A per-document dependency must not force serial detector
 /// calls or let a missing upstream settle a downstream vector as skipped.
+fn flushPrimedPrivacyRoots(runtime: *EnrichmentRuntime, roots: []const enrichment_types.GeneratedEnrichmentRequest, window: *GeneratedReplayWindow) !void {
+    var scope = FailureScope{};
+    const failure: ?anyerror = if (processDeferredAssets(runtime, roots, window, &scope, null)) |_| null else |err| err;
+    try scope.publish(runtime, window, failure == null);
+    if (failure) |err| {
+        // A durably parked provider failure must not hold successful roots or
+        // their consumers behind its retry clock. Ordinary replay reloads the
+        // tickets after priming and skips precisely the delayed dependency.
+        if (runtime.retry_scheduler != null and scope.first_scheduled_fingerprint != 0 and
+            !scope.publication_failed and !isEnrichmentControlError(err) and
+            enrichmentErrorDisposition(err) == .retryable_request) return;
+        return scope.scannerFailure(runtime, err);
+    }
+}
+
 fn primePrivacyRoots(runtime: *EnrichmentRuntime, pending: []const enrichment_worker.PendingDocumentGroup, plans: *std.ArrayListUnmanaged(RequestPlanCacheEntry), guard: ForegroundCatchUpGuard) !bool {
     var roots: std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest) = .empty;
     defer roots.deinit(runtime.alloc);
     var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
     defer window.deinit();
-    var scope = FailureScope{};
     var primed = false;
     for (pending) |group| {
         try guard.check();
@@ -15249,20 +15288,17 @@ fn primePrivacyRoots(runtime: *EnrichmentRuntime, pending: []const enrichment_wo
             primed = true;
             var request = root_template;
             request.sequence = group.sequence;
+            if (runtime.retry_scheduler) |scheduler| if (try scheduler.rootDelayed(runtime, group, requests, request)) continue;
             if (try skipPersistedRequestFailure(runtime, &window, request)) continue;
             try roots.append(runtime.alloc, request);
             if (roots.items.len == 8) {
-                const failure: ?anyerror = if (processDeferredAssets(runtime, roots.items, &window, &scope, null)) |_| null else |err| err;
-                try scope.publish(runtime, &window, failure == null);
-                if (failure) |err| return scope.scannerFailure(runtime, err);
+                try flushPrimedPrivacyRoots(runtime, roots.items, &window);
                 roots.clearRetainingCapacity();
             }
         }
     }
     if (roots.items.len == 0) return primed;
-    const failure: ?anyerror = if (processDeferredAssets(runtime, roots.items, &window, &scope, null)) |_| null else |err| err;
-    try scope.publish(runtime, &window, failure == null);
-    if (failure) |err| return scope.scannerFailure(runtime, err);
+    try flushPrimedPrivacyRoots(runtime, roots.items, &window);
     return primed;
 }
 

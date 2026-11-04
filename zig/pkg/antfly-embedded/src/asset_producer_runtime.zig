@@ -30,6 +30,49 @@ const extracting = @import("antfly_extracting");
 const extraction_api = @import("antfly_extraction_openapi");
 const asset_producer = @import("storage/db/enrichment/asset_producer.zig");
 pub const Request = asset_producer.Request;
+/// Pure route selection shared by execution and privacy disclosure. It neither
+/// fetches capabilities nor resolves credentials when inspecting a policy.
+pub const ProducerRouting = struct {
+    execution: execution_context.ExecutionEnvironment = .{},
+    generator_linked: bool = false,
+    extractor_linked: bool = false,
+
+    pub fn init(execution: execution_context.ExecutionEnvironment, provider: ?managed_embedder.AntflyProvider) ProducerRouting {
+        const linked = provider orelse return .{ .execution = execution };
+        return .{
+            .execution = execution,
+            .generator_linked = linked.generate_messages != null or linked.generate_text != null or
+                linked.generate_messages_with_attachments != null or linked.generate_messages_with_context != null or
+                linked.generate_text_with_context != null or linked.generate_messages_with_attachments_with_context != null,
+            .extractor_linked = linked.extract != null or linked.extract_with_context != null,
+        };
+    }
+    pub fn generatorEndpoint(self: @This(), explicit: ?[]const u8) ?[]const u8 {
+        return self.execution.resolveAntflyEndpoint(explicit, self.generator_linked);
+    }
+    pub fn extractorEndpoint(self: @This(), explicit: ?[]const u8) ?[]const u8 {
+        return self.execution.resolveAntflyEndpoint(explicit, self.extractor_linked);
+    }
+    pub fn externalPrivacy(self: @This(), producer: @import("privacy/contract.zig").Producer) bool {
+        return self.externalConfig(producer.config, producer.type == .generator);
+    }
+    fn string(config: std.json.Value, key: []const u8) ?[]const u8 {
+        const value = config.object.get(key) orelse return null;
+        return if (value == .string) value.string else null;
+    }
+    fn externalConfig(self: @This(), config: std.json.Value, generator: bool) bool {
+        if (config != .object) return false;
+        // Generated extractors execute their generator route, independently of
+        // whether a native extractor callback is installed in this process.
+        if (config.object.get("generator")) |nested| if (nested == .object) return self.externalConfig(nested, true);
+        const provider = string(config, "provider") orelse return false;
+        if (std.mem.eql(u8, provider, "apple") or std.mem.eql(u8, provider, "mock")) return false;
+        if (!std.mem.eql(u8, provider, "antfly")) return true;
+        const explicit = string(config, "url") orelse string(config, "api_url");
+        return (if (generator) self.generatorEndpoint(explicit) else self.extractorEndpoint(explicit)) != null;
+    }
+};
+
 const inference_work = @import("antfly_inference_work");
 const remote_capabilities = @import("antfly_inference_remote_capabilities");
 const execution_context = @import("antfly_inference_execution_context");
@@ -583,17 +626,11 @@ pub const Runtime = struct {
     }
 
     fn linkedGeneratorAvailable(self: *const Runtime) bool {
-        const provider = self.antfly_provider orelse return false;
-        return provider.generate_messages != null or provider.generate_text != null or
-            provider.generate_messages_with_attachments != null or
-            provider.generate_messages_with_context != null or
-            provider.generate_text_with_context != null or
-            provider.generate_messages_with_attachments_with_context != null;
+        return ProducerRouting.init(self.execution, self.antfly_provider).generator_linked;
     }
 
     fn linkedExtractorAvailable(self: *const Runtime) bool {
-        const provider = self.antfly_provider orelse return false;
-        return provider.extract != null or provider.extract_with_context != null;
+        return ProducerRouting.init(self.execution, self.antfly_provider).extractor_linked;
     }
 
     fn linkedTranscriberAvailable(self: *const Runtime) bool {
@@ -619,7 +656,7 @@ pub const Runtime = struct {
 
     fn routeGeneratorConfig(self: *const Runtime, alloc: Allocator, cfg: *generating_runtime.GeneratorConfig) !void {
         if (cfg.provider != .antfly or cfg.url.len > 0 or self.linkedGeneratorAvailable()) return;
-        const endpoint = self.execution.resolveAntflyEndpoint(null, false) orelse return;
+        const endpoint = ProducerRouting.init(self.execution, self.antfly_provider).generatorEndpoint(null) orelse return;
         cfg.url = try alloc.dupe(u8, endpoint);
     }
 
@@ -636,7 +673,7 @@ pub const Runtime = struct {
             return;
         }
         if (cfg.provider != .antfly or cfg.resolvedUrl() != null or self.linkedExtractorAvailable()) return;
-        const endpoint = self.execution.resolveAntflyEndpoint(null, false) orelse return;
+        const endpoint = ProducerRouting.init(self.execution, self.antfly_provider).extractorEndpoint(null) orelse return;
         cfg.url = try alloc.dupe(u8, endpoint);
     }
 
@@ -744,7 +781,11 @@ pub const Runtime = struct {
         var largest: [8]asset_producer.Request = undefined;
         var count: usize = 0;
         const capacity: usize = if (requests.len < 2) 1 else inspector.policy.execution.batch_items;
+        var source_bytes: usize = 0;
+        var largest_source: usize = 0;
         for (requests) |request| {
+            source_bytes = try std.math.add(usize, source_bytes, request.source_text.len);
+            largest_source = @max(largest_source, request.source_text.len);
             var document_backing = inference_work.ReclaimingInvocationAllocator.init(alloc);
             var document_arena = std.heap.ArenaAllocator.init(document_backing.allocator());
             defer document_arena.deinit();
@@ -768,13 +809,27 @@ pub const Runtime = struct {
         // Host composition retains only normalized receipts and the bounded
         // logical outputs. At most one physical detector batch is resident.
         var host_runtime = self.*;
-        host_runtime.result_limits.copy_bytes_per_item = self.result_limits.forProducer(requests[0].producer_type);
+        const privacy = @import("privacy/document.zig");
+        const evidence_bytes = self.result_limits.forProducer(requests[0].producer_type);
+        host_runtime.result_limits.copy_bytes_per_item = try privacy.projectionLimit(0, evidence_bytes);
         const host = try a.dupe(asset_producer.Request, requests);
         for (host) |*request| {
             request.producer_type = .copy;
             request.config_json = "";
         }
         var plan = try invocationMemoryForRequests(&host_runtime, a, host);
+        // Logical results are document projections, not detector envelopes.
+        // Charge the actual source sum, rather than largest-source * cohort
+        // size, so one large row does not inflate every sibling's reservation.
+        const projection_growth = try std.math.mul(usize, source_bytes, 3);
+        plan.max_result_bytes = try std.math.add(usize, plan.max_result_bytes, projection_growth);
+        plan.max_result_bytes_per_item = try privacy.projectionLimit(largest_source, evidence_bytes);
+        // Normalized receipts coexist with final results until the cohort
+        // returns; their source-sized text and evidence need their own charge.
+        const retained = try std.math.add(usize, source_bytes, try std.math.mul(usize, evidence_bytes, requests.len));
+        const growth = try std.math.add(usize, projection_growth, retained);
+        plan.fixed_bytes = try std.math.add(usize, plan.fixed_bytes, growth);
+        plan.allocator_limit_bytes = try std.math.add(usize, plan.allocator_limit_bytes, growth);
         const cells = try std.math.mul(usize, requests.len, inspector.policy.fields.len);
         const control = try std.math.add(usize, try std.math.mul(usize, requests[0].config_json.len, invocation_nonmedia_allocator_multiplier), try std.math.mul(usize, cells, 512));
         plan.fixed_bytes = try std.math.add(usize, plan.fixed_bytes, control);
@@ -1887,7 +1942,12 @@ pub const Runtime = struct {
                     return runtime.producer().produce(a, .{ .producer_type = if (detector.type == .extractor) .extractor else .generator, .config_json = config, .source_text = text, .content_type = "application/json" });
                 }
             };
-            return privacy.produce(alloc, request.config_json, request.source_text, .{ .ptr = self, .produce = Adapter.produce, .check = Adapter.check });
+            return privacy.produce(alloc, request.config_json, request.source_text, .{
+                .ptr = self,
+                .produce = Adapter.produce,
+                .check = Adapter.check,
+                .max_normalized_bytes = try privacy.normalizedLimit(request.source_text.len, self.result_limits.forProducer(request.producer_type)),
+            });
         }
         return switch (request.producer_type) {
             .copy => try alloc.dupe(u8, request.source_text),
@@ -2012,7 +2072,7 @@ pub const Runtime = struct {
                             continue;
                         };
                         retained_bytes[document_index] +|= normalized.len;
-                        if (retained_bytes[document_index] > self.result_limits.forProducer(requests[document_index].producer_type)) {
+                        if (retained_bytes[document_index] > try privacy.normalizedLimit(requests[document_index].source_text.len, self.result_limits.forProducer(requests[document_index].producer_type))) {
                             invalid[document_index] = error.InferenceResultTooLarge;
                             continue;
                         }
@@ -9208,5 +9268,54 @@ test "privacy maximum field cohort planning releases document DOMs within the re
     try plan.validate();
     try std.testing.expectEqual(inference_work.InvocationAllocatorOwner.caller, plan.allocator_owner);
     try std.testing.expect(plan.fixed_bytes < 512 * 1024 * 1024);
-    try std.testing.expectEqual(@as(usize, 50 * 1024 * 1024), plan.max_result_bytes);
+    try std.testing.expectEqual(try std.math.mul(usize, 50, try privacy.projectionLimit(source.len, 1 << 20)), plan.max_result_bytes);
+    const payload = try scratch.alloc(u8, 2 << 20);
+    @memset(payload, 'x');
+    try document.object.put(scratch, "unselected", .{ .string = payload });
+    const large_source = try std.json.Stringify.valueAlloc(scratch, document, .{});
+    requests[0].source_text = large_source;
+    const mixed = try runtime.producer().invocationMemoryForRequests(a, &requests);
+    try mixed.validate();
+    const difference = large_source.len - source.len;
+    try std.testing.expectEqual(plan.max_result_bytes + 3 * difference, mixed.max_result_bytes);
+    try std.testing.expectEqual(try privacy.projectionLimit(large_source.len, 1 << 20), mixed.max_result_bytes_per_item);
+    try std.testing.expectEqual(plan.fixed_bytes + (invocation_nonmedia_allocator_multiplier + 4) * difference, mixed.fixed_bytes);
+}
+
+test "privacy disclosure follows explicit default linked and generated execution routes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const privacy = @import("privacy/contract.zig");
+    const configs = [_][]const u8{
+        "{\"provider\":\"antfly\",\"model\":\"extractor\"}",
+        "{\"provider\":\"antfly\",\"model\":\"extractor\",\"url\":\"https://explicit.example/ai/v1\"}",
+        "{\"provider\":\"antfly\",\"model\":\"extractor\",\"api_url\":\"https://explicit.example/ai/v1\"}",
+        "{\"generator\":{\"provider\":\"antfly\",\"model\":\"generator\"}}",
+        "{\"method\":\"generated\",\"generator\":{\"provider\":\"antfly\",\"model\":\"generator\"}}",
+        "{\"generator\":{\"provider\":\"openai\",\"model\":\"hosted\"}}",
+        "{\"generator\":{\"provider\":\"apple\",\"model\":\"local\"}}",
+        "{\"provider\":\"mock\"}",
+    };
+    const expected_default = [_]bool{ true, true, true, true, true, true, false, false };
+    const expected_linked = [_]bool{ false, true, true, false, false, true, false, false };
+    for (configs, expected_default, expected_linked, 0..) |raw, remote, linked, i| {
+        const config = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+        const producer = privacy.Producer{ .type = if (i == 3 or i == 5 or i == 6) .generator else .extractor, .config = config };
+        const routes = ProducerRouting{ .execution = .{ .default_endpoint = "https://default.example/ai/v1" } };
+        try std.testing.expectEqual(remote, routes.externalPrivacy(producer));
+        var with_callbacks = routes;
+        with_callbacks.generator_linked = true;
+        with_callbacks.extractor_linked = true;
+        try std.testing.expectEqual(linked, with_callbacks.externalPrivacy(producer));
+        // Missing extractor callbacks must not borrow generator availability.
+        with_callbacks.extractor_linked = false;
+        if (i == 0) try std.testing.expect(with_callbacks.externalPrivacy(producer));
+        // Generated extraction follows generator callbacks, not native extract.
+        with_callbacks.generator_linked = false;
+        with_callbacks.extractor_linked = true;
+        if (i == 4) try std.testing.expect(with_callbacks.externalPrivacy(producer));
+    }
+    const native = privacy.Producer{ .config = try std.json.parseFromSliceLeaky(std.json.Value, a, configs[0], .{}) };
+    try std.testing.expect(!(ProducerRouting{ .execution = .{ .default_endpoint = " \t" } }).externalPrivacy(native));
 }

@@ -55,6 +55,8 @@ pub const Invoke = struct {
     check: *const fn (*anyopaque) anyerror!void,
     /// Advance an invocation-owned field cohort only after evidence validates.
     accepted: ?*const fn (*anyopaque) void = null,
+    /// Source-sized normalized text plus separately bounded detector evidence.
+    max_normalized_bytes: usize = std.math.maxInt(usize),
 };
 
 /// Borrowing JSON values is deliberate: callers allocate these resolved
@@ -206,6 +208,26 @@ pub const Inspector = struct {
     }
 };
 
+/// Normalized field JSON retains selected source text as well as evidence.
+/// Source bytes never consume the independent detector/evidence allowance.
+pub fn normalizedLimit(source_bytes: usize, evidence_bytes: usize) !usize {
+    return std.math.add(usize, source_bytes, evidence_bytes);
+}
+
+/// Composition retains unselected source once and selected normalized text
+/// both in the projection and its receipts. The allowance also bounds redaction
+/// expansion and normalized findings; 512 bytes cover the document envelope.
+pub fn projectionLimit(source_bytes: usize, evidence_bytes: usize) !usize {
+    return std.math.add(usize, source_bytes, try std.math.add(usize, try std.math.mul(usize, 2, try normalizedLimit(source_bytes, evidence_bytes)), 512));
+}
+
+test "privacy projection budgets separate source bytes from detector evidence and reject overflow" {
+    try std.testing.expectEqual(@as(usize, 3 << 20), try normalizedLimit(2 << 20, 1 << 20));
+    try std.testing.expectEqual(@as(usize, (8 << 20) + 512), try projectionLimit(2 << 20, 1 << 20));
+    try std.testing.expectError(error.Overflow, normalizedLimit(std.math.maxInt(usize), 1));
+    try std.testing.expectError(error.Overflow, projectionLimit(std.math.maxInt(usize) / 2, 1));
+}
+
 pub fn produce(a: A, config_json: []const u8, source: []const u8, invoke: Invoke) ![]u8 {
     var backing = @import("antfly_inference_work").ReclaimingInvocationAllocator.init(a);
     var arena = std.heap.ArenaAllocator.init(backing.allocator());
@@ -215,6 +237,7 @@ pub fn produce(a: A, config_json: []const u8, source: []const u8, invoke: Invoke
     const document = try std.json.parseFromSliceLeaky(std.json.Value, scratch, source, .{ .parse_numbers = false });
     if (document != .object or document.object.contains("_privacy")) return error.InvalidPrivacyDocument;
     const fields = try scratch.alloc([]const u8, inspector.policy.fields.len);
+    var normalized_bytes: usize = 0;
     for (inspector.policy.fields, fields) |field, *result| {
         const value = document.object.get(field) orelse .null;
         const text = switch (value) {
@@ -223,6 +246,8 @@ pub fn produce(a: A, config_json: []const u8, source: []const u8, invoke: Invoke
             else => return error.InvalidPrivacyFieldType,
         };
         result.* = try inspector.inspect(scratch, field, text, invoke);
+        normalized_bytes = std.math.add(usize, normalized_bytes, result.*.len) catch return error.InferenceResultTooLarge;
+        if (normalized_bytes > invoke.max_normalized_bytes) return error.InferenceResultTooLarge;
         if (invoke.accepted) |accepted| accepted(invoke.ptr);
     }
     try invoke.check(invoke.ptr);

@@ -147424,3 +147424,72 @@ test "db scoped retry workset never parks committed earlier chunk requests" {
     try std.testing.expectEqual(@as(usize, 1), gated.successful_requests.load(.acquire));
     try std.testing.expect(!queue.hasDocument("ZG9jOmE="));
 }
+
+test "privacy primed roots preserve durable retry deadlines and healthy consumers" {
+    const a = std.testing.allocator;
+    const Mock = struct {
+        bad_calls: usize = 0,
+        healthy_calls: usize = 0,
+        recover: bool = false,
+        fn produce(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            return error.UnexpectedSingleInvocation;
+        }
+        fn controlled(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request, _: asset_producer_mod.InvocationContext) ![]u8 {
+            return produce(ptr, alloc, request);
+        }
+        fn reported(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer_mod.Request, _: asset_producer_mod.InvocationContext) !asset_producer_mod.ProducedBatch {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const items = try alloc.alloc(asset_producer_mod.ProducedItem, requests.len);
+            for (requests, items) |request, *item| {
+                const bad = std.mem.eql(u8, request.source_text, "bad");
+                if (request.producer_type == .generator) {
+                    if (bad) self.bad_calls += 1 else self.healthy_calls += 1;
+                }
+                item.* = .{
+                    .identity = .{ .item_id = request.item_id, .source_fingerprint = request.source_fingerprint, .page_number = request.page_number },
+                    .result = if (bad and !self.recover) .{ .item_error = .{ .cause = error.EmbedRateLimited, .retryable = true, .retry_after_ms = 3_600_000 } } else .{ .value = try std.json.Stringify.valueAlloc(alloc, .{ .value = request.source_text }, .{}) },
+                };
+            }
+            return .{ .items = items, .execution = inference_work.ExecutionReport.compatibility(requests.len) };
+        }
+        fn interface(self: *@This()) asset_producer_mod.Producer {
+            return .{ .ptr = self, .vtable = &.{ .produce = produce, .produce_with_context = controlled, .produce_batch_reported_with_context = reported, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } };
+        }
+    };
+    var mock = Mock{};
+    var clock: @import("antfly_platform").clock.ManualClock = .{};
+    clock.setRealtimeNs(1_000 * std.time.ns_per_ms);
+    var tmp = try TestDirectory.init("privacy-priming-retry-review");
+    defer tmp.cleanup();
+    const options = OpenOptions{ .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "privacy-review", .asset_producer = mock.interface(), .clock = clock.clock(), .inline_retry_max_attempts = 1, .worker_retry_max_attempts = 4 } };
+    var db = try DB.open(a, tmp.path(), options);
+    var opened = true;
+    defer if (opened) db.close();
+    try db.addEnrichment(.{ .name = "_privacy_document", .kind = .asset, .field = "body", .content_type = "application/json", .producer_json = "{\"type\":\"generator\",\"config\":{\"generator\":{\"provider\":\"antfly\",\"model\":\"test-generator\"},\"_antfly_privacy\":{\"mode\":\"monitor\",\"fields\":[\"body\"]}}}" });
+    try db.addEnrichment(.{ .name = "consumer", .kind = .asset, .source_artifact_name = "_privacy_document", .content_type = "application/json", .producer_json = "{\"type\":\"copy\"}" });
+    try db.batch(.{ .writes = &.{.{ .key = "bad", .value = "{\"body\":\"bad\"}" }}, .sync_level = .write });
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(db.core.nextEnrichmentSequence()));
+    try std.testing.expectEqual(@as(usize, 1), mock.bad_calls);
+    const deadline = db.enrichment_runtime.?.next_retry_at_ms;
+    try std.testing.expect(deadline >= 3_601_000 and deadline <= 3_601_250);
+    db.close();
+    opened = false;
+    clock.advanceMs(30_000);
+    db = try DB.open(a, tmp.path(), options);
+    opened = true;
+    try db.batch(.{ .writes = &.{.{ .key = "good", .value = "{\"body\":\"healthy\"}" }}, .sync_level = .write });
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(db.core.nextEnrichmentSequence()));
+    try std.testing.expectEqual(@as(usize, 1), mock.bad_calls);
+    const key = try internal_keys.artifactNamedPrefixAlloc(a, "good", "asset", "consumer");
+    defer a.free(key);
+    const value = try db.core.store.get(a, key);
+    defer a.free(value);
+    try std.testing.expect(std.mem.indexOf(u8, value, "healthy") != null);
+    try std.testing.expectEqual(@as(usize, 1), mock.healthy_calls);
+    try std.testing.expectEqual(deadline, db.enrichment_runtime.?.next_retry_at_ms);
+    mock.recover = true;
+    clock.advanceMs(3_600_000);
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    try std.testing.expectEqual(@as(usize, 2), mock.bad_calls);
+    try std.testing.expectEqual(@as(usize, 1), mock.healthy_calls);
+}

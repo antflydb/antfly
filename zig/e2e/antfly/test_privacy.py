@@ -1459,6 +1459,76 @@ def test_privacy_multifield_batches_release_detector_scratch(stateful_api):
             if docs > 1:
                 assert max(calls) == min(8, count * docs)
             calls.clear()
+
+        # Managed output contains the source document, independently of the
+        # detector's small findings envelope. Exercise both the serial and
+        # batched paths with selected and unrelated source-sized values.
+        large = "x" * (2 * 1024 * 1024)
+        api.batch_write(
+            table,
+            inserts={
+                "large-unselected": {fields[0]: "hello", "payload": large},
+                "large-selected": {fields[0]: large},
+            },
+            sync_level="full_index",
+        )
+        policy["fields"] = fields[:1]
+        for keys in (
+            ["large-unselected"],
+            ["large-selected"],
+            ["doc0", "large-unselected", "large-selected"],
+        ):
+            response = api.s.post(
+                api.url + f"/tables/{table}/privacy/preview",
+                json={"policy": policy, "sample": {"keys": keys}},
+                timeout=180,
+            )
+            assert response.status_code == 200, (keys, response.text[:1000])
+            result = response.json()
+            assert result["sampled"] == len(keys)
+            for row in result["documents"]:
+                field = row["fields"][0]
+                expected = large if row["document"] == "large-selected" else "hello"
+                assert field["original"] == expected
+                assert field["text"] == expected
+                assert field["findings"] == []
+            assert sum(calls) == len(keys)
+            if len(keys) > 1:
+                assert max(calls) == len(keys)
+            calls.clear()
+
+        # A protective save must converge on the same documents and serve
+        # them normally, rather than accepting a policy that cannot backfill.
+        policy["mode"] = "redact_for_search_and_ai"
+        installed = api.put(f"/tables/{table}/privacy", policy)
+        progress = None
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            progress = api.get(f"/tables/{table}/privacy/scans/{installed['scan_id']}")
+            assert progress["phase"] not in ("failed", "superseded"), (
+                progress,
+                api.debug_logs()[-12000:],
+            )
+            if progress["phase"] == "succeeded":
+                break
+            time.sleep(0.2)
+        assert progress["phase"] == "succeeded", (progress, api.debug_logs()[-12000:])
+        for key in ("large-selected", "large-unselected"):
+            document = api.get(f"/tables/{table}/documents/{key}")
+            assert document[fields[0]] == (
+                large if key == "large-selected" else "hello"
+            )
+        # Raising the host projection allowance must not raise provider limits.
+        padding = "x" * (1024 * 1024 + 1)
+        response = api.s.post(
+            api.url + f"/tables/{table}/privacy/preview",
+            json={"policy": policy, "sample": {"keys": ["doc0"]}},
+            timeout=180,
+        )
+        assert response.status_code == 422, response.text[:1000]
+        assert response.json()["code"] == "InferenceResultTooLarge", response.text[
+            :1000
+        ]
     finally:
         server.shutdown()
         thread.join(timeout=5)
