@@ -173,6 +173,7 @@ export class AntflyDialect implements Dialect {
             let schema: {
               default_type?: string;
               column_defaults?: { column: string }[];
+              generated_columns?: { column: string }[];
               document_schemas?: Record<
                 string,
                 {
@@ -196,14 +197,23 @@ export class AntflyDialect implements Dialect {
               isForeign: false,
               columns: described.columns.map((column) => ({
                 name: column.name,
-                dataType: column.type,
+                // The embedded decoder returns every integer width as bigint.
+                // Exact NUMERIC uses decimal text; other structured values
+                // retain conservative metadata for schema generation.
+                dataType:
+                  column.element_type === "numeric" && column.type !== "array"
+                    ? "numeric"
+                    : column.type,
                 isNullable:
                   column.name !== "_id" &&
-                  !document?.required?.includes(column.name) &&
-                  document?.properties?.[column.name]?.nullable !== false,
+                  (document?.properties?.[column.name]?.nullable === true ||
+                    (!document?.required?.includes(column.name) &&
+                      document?.properties?.[column.name]?.nullable !== false)),
                 isAutoIncrementing: false,
                 hasDefaultValue:
                   schema.column_defaults?.some((entry) => entry.column === column.name) ?? false,
+                isGeneratedAlways:
+                  schema.generated_columns?.some((entry) => entry.column === column.name) ?? false,
               })),
             };
           })

@@ -683,6 +683,9 @@ importers:
         specifier: ^4.3.2
         version: 4.3.2
     devDependencies:
+      '@antfly/sdk':
+        specifier: workspace:*
+        version: link:../sdk
       '@types/node':
         specifier: ^25.9.3
         version: 25.9.3
@@ -847,6 +850,9 @@ importers:
       '@vitest/ui':
         specifier: ^4.1.9
         version: 4.1.9(vitest@4.1.9)
+      kysely:
+        specifier: ^0.29.6
+        version: 0.29.6
       openapi-typescript:
         specifier: ^7.13.0
         version: 7.13.0(typescript@5.9.3)
@@ -856,6 +862,9 @@ importers:
       tsx:
         specifier: ^4.22.4
         version: 4.22.4
+      typescript:
+        specifier: ~5.9.3
+        version: 5.9.3
       vitest:
         specifier: ^4.1.9
         version: 4.1.9(@opentelemetry/api@1.9.1)(@types/node@25.9.3)(@vitest/coverage-v8@4.1.9)(@vitest/ui@4.1.9)(jsdom@29.1.1(@noble/hashes@2.4.0))(msw@2.14.6(@types/node@25.9.3)(typescript@5.9.3))(vite@8.0.16(@types/node@25.9.3)(esbuild@0.28.1)(jiti@2.7.0)(tsx@4.22.4)(yaml@2.9.1))

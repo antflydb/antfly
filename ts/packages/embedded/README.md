@@ -440,6 +440,11 @@ const people = await sql.selectFrom("people").selectAll().execute();
 await sql.destroy(); // The caller still owns database.
 ```
 
+For typed search relations, migration-table setup, and generated Kysely schema
+interfaces, see the [Kysely guide](../../../docs/guides/kysely.mdx) and
+[`examples/kysely.mjs`](examples/kysely.mjs). The optional shared helpers live in
+`@antfly/sdk/kysely`.
+
 `createTable`, `listTables`, `openTable`, and `dropTable` expose the shared
 document catalog. Table handles reuse existing schema, index, enrichment,
 search, and document methods. Close them before dropping their tables;

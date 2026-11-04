@@ -1,0 +1,261 @@
+---
+title: Type-safe SQL with Kysely
+description: Query embedded and server Antfly, compose search with SQL, and generate schema types.
+order: 10
+---
+
+Kysely builds typed SQL; Antfly executes it. Use the embedded dialect for a local
+database, or the PostgreSQL driver for a server. Optional helpers live in
+`@antfly/sdk/kysely`; importing the main SDK does not load Kysely. These APIs
+target Kysely 0.29.6 and later compatible 0.29 releases, and Node 24+.
+
+## Embedded connection
+
+```sh
+npm install @antfly/embedded @antfly/sdk kysely@^0.29.6
+```
+
+```ts
+import { create } from "@antfly/embedded";
+import { AntflyDialect } from "@antfly/embedded/kysely";
+import { Kysely } from "kysely";
+
+interface Tables {
+  articles: { id: string; title: string; body: string; published: boolean };
+}
+
+const database = await create("app.aflite");
+const db = new Kysely<Tables>({
+  dialect: new AntflyDialect({ database }),
+});
+
+try {
+  await db.schema.createTable("articles").ifNotExists()
+    .addColumn("id", "text", (col) => col.primaryKey())
+    .addColumn("title", "text", (col) => col.notNull())
+    .addColumn("body", "text", (col) => col.notNull())
+    .addColumn("published", "boolean", (col) => col.notNull())
+    .execute();
+
+  await db.insertInto("articles").values({
+    id: "article-1", title: "Getting started", body: "Search and SQL with Antfly",
+    published: true,
+  }).onConflict((conflict) => conflict.column("id").doNothing()).execute();
+
+  const articles = await db.selectFrom("articles")
+    .select(["id", "title"]).where("published", "=", true).execute();
+  console.log(articles);
+} finally {
+  await db.destroy(); // closes SQL sessions
+  await database.close(); // caller owns the native database
+}
+```
+
+See the runnable `ts/packages/embedded/examples/kysely.mjs` example for search
+setup, querying, and type generation in one process.
+
+## Server connection
+
+Enable the optional pgwire listener on a server with authentication configured:
+
+```json
+{"enable_auth":true,"pgwire":{"enabled":true,"bind_host":"127.0.0.1","bind_port":5432}}
+```
+
+Install the PostgreSQL driver and, for streaming, its cursor implementation:
+
+```sh
+npm install @antfly/sdk kysely@^0.29.6 pg@8.16.3 pg-cursor@2.15.3
+npm install -D @types/pg @types/pg-cursor
+```
+
+Set `ANTFLY_PGWIRE_URL` to your authenticated PostgreSQL URL, for example
+`postgres://USER:PASSWORD@127.0.0.1:5432/default`, and `ANTFLY_HTTP_URL` to the
+matching HTTP server origin. Obtain credentials through your deployment's secret
+configuration. Remote pgwire requires an externally protected transport; see
+the [pgwire contract](https://github.com/antflydb/antfly/blob/main/zig/pkg/antfly/src/pgwire/README.md).
+
+```ts
+import { AntflyClient } from "@antfly/sdk";
+import { AntflyPostgresDialect, createAntflyIntrospector } from "@antfly/sdk/kysely";
+import { Kysely } from "kysely";
+import { Pool } from "pg";
+import Cursor from "pg-cursor";
+
+const credentials = new URL(process.env.ANTFLY_PGWIRE_URL!);
+const client = new AntflyClient({
+  baseUrl: process.env.ANTFLY_HTTP_URL!,
+  auth: {
+    username: decodeURIComponent(credentials.username),
+    password: decodeURIComponent(credentials.password),
+  },
+});
+
+const db = new Kysely<Tables>({
+  dialect: new AntflyPostgresDialect({
+    pool: new Pool({ connectionString: process.env.ANTFLY_PGWIRE_URL }),
+    cursor: Cursor,
+    introspector: createAntflyIntrospector(client),
+  }),
+});
+
+try {
+  // Reuse the schema builders and ordinary queries from the embedded example.
+  console.log(await db.selectFrom("articles").selectAll().execute());
+} finally {
+  await db.destroy(); // ends the supplied pool
+}
+```
+
+`Tables` is the interface from the embedded example. Both transports compile
+PostgreSQL-style SQL. The server dialect reuses Kysely's standard pg driver and
+compiler. Its overrides disable transactional DDL, replace PostgreSQL catalog
+introspection, and require explicit migration locking. Standard `PostgresDialect`
+also works for ordinary SQL queries, but its PostgreSQL introspection and advisory
+locks are not supported by Antfly.
+
+The HTTP introspector currently describes the default database's `public`
+namespace. Its HTTP client and pg pool must use the same principal, deployment,
+and scope. Other database/namespace configurations require a matching custom
+`DatabaseIntrospector`; do not pair them with default-scope metadata.
+
+## Search as a SQL relation
+
+The embedded backend exposes `antfly_search` as a relation. A search helper
+produces that SQL relation, so SQL joins and filters execute inside Antfly.
+Server SQL currently rejects this relation with SQLSTATE `0A000`; the helper
+does not fall back to fetching and joining documents in JavaScript.
+
+On an embedded database with an indexed `articles` table:
+
+```ts
+import { antflySearch } from "@antfly/sdk/kysely";
+
+const hits = await db
+  .selectFrom(antflySearch<Tables["articles"]>("articles", {
+    full_text_search: { query: "body:search" },
+  }, { candidateLimit: 100 }).as("hits"))
+  .select(["hits._id", "hits.title", "hits.score"])
+  .where("hits.published", "=", true)
+  .orderBy("hits.score", "desc")
+  .orderBy("hits._id")
+  .limit(10)
+  .execute();
+```
+
+The relation adds `_id`, `score`, and `_highlights` to document columns. The row
+generic asserts your schema; it does not validate runtime data. Aliases work in
+`innerJoin` and other ordinary Kysely composition. Pass a query string such as
+`"body:search"`, or an SDK `TableQueryRequest`. Values are bound parameters;
+the compiler-required table literal is escaped separately.
+
+`candidateLimit: 100` admits up to 100 candidates **before** the outer SQL filter.
+An outer `LIMIT 10` can return fewer than ten surviving hits. Put eligible filters
+in the search request's `filter_query` when they should constrain search candidates.
+There is no promise of exhaustive top-K or automatic SQL filter pushdown.
+Add `_id` after score ordering for deterministic ties within a captured result.
+The engine currently bounds search candidates to 10,000.
+
+The helper accepts existing full-text, vector, and hybrid request types; index
+availability and provider support still apply. Search materializes a bounded
+candidate relation; using `.stream()` does not make candidate discovery unbounded.
+Native statement capture governs consistency. Embedded search over a table with
+uncommitted writes in the same transaction is rejected rather than merging staged
+writes into index results. Query authorization remains a backend responsibility;
+the helper adds no authorization or snapshot guarantees.
+
+## Generate database interfaces
+
+Both dialects expose Kysely introspection. Generate a source file during schema
+development, review it, and commit it alongside application queries:
+
+```ts
+import { writeFile } from "node:fs/promises";
+import { generateKyselyTypes } from "@antfly/sdk/kysely";
+
+const tables = await db.introspection.getTables();
+await writeFile("database.ts", generateKyselyTypes(tables, {
+  integerMode: "bigint", // embedded; use "string" for pg's default BIGINT parser
+}));
+```
+
+The generator emits quoted table/column names, nullability, `Generated<T>` for
+defaults, and `GeneratedAlways<T>` for output-only generated columns. Unknown
+types, JSON, and timestamps remain `unknown` for application-specific refinement.
+Only imports that the generated source uses are included. Run this against a
+stable schema; metadata reads are not an atomic catalog export.
+
+Integer mode describes driver behavior; it does not convert results. Embedded
+SQL returns integer columns as `bigint`; pg returns BIGINT as strings and smaller
+integer widths as numbers. Exact NUMERIC is decimal text. Do not coerce BIGINT to
+`number` unless you enforce JavaScript's safe integer range. If you customize pg
+parsers, match the generated types to your scalar and array parsers explicitly.
+
+## Transactions and migrations
+
+Use `db.transaction().setIsolationLevel("read committed").execute(...)` for portable
+transactions. Embedded supports READ COMMITTED; server stronger isolation depends
+on capable providers. Savepoints are supported. Schema DDL runs outside explicit
+transactions, so a failed migration can leave previously committed DDL in place.
+Inspect results and repair the migration; do not blindly retry uncertain writes.
+
+Import `Migrator` from `kysely/migration` with Kysely 0.29. The embedded dialect
+queues migrators that share the same native `Database` object. That queue is not
+a distributed lock or a guarantee across independent handles.
+
+First call `prepareKyselyMigrationTables(db)`. Kysely's automatic bookkeeping
+DDL uses `varchar(255)`, which Antfly does not accept. This helper creates only
+the bookkeeping tables with native `TEXT` columns, under the dialect's migration
+lock. It does not rewrite application DDL. If you customize migration table names,
+pass the same `migrationTable` and `migrationLockTable` options to the helper
+and to `Migrator`. The setup helper supports the default namespace.
+
+```ts
+import { prepareKyselyMigrationTables } from "@antfly/sdk/kysely";
+import { Migrator } from "kysely/migration";
+
+await prepareKyselyMigrationTables(db);
+const migrator = new Migrator({
+  db,
+  provider: { async getMigrations() { return {
+    "001_create_notes": { async up(migrationDb) {
+      await migrationDb.schema.createTable("notes")
+        .addColumn("id", "text", (col) => col.primaryKey())
+        .addColumn("body", "text").execute();
+    } },
+  }; } },
+});
+const result = await migrator.migrateToLatest();
+if (result.error) throw result.error;
+```
+
+For server migrations, supply `migrationLock` with asynchronous `acquire(db,
+options)` and `release(db, options)` methods. Its implementation must exclude
+**all** runners for the database, including other processes. A deployment lock
+or exclusive migration job can provide that contract. The adapter throws when a
+lock is missing; it never assumes PostgreSQL advisory locks exist. Kysely can
+bootstrap its metadata tables before asking the adapter for the migration lock.
+Do not supply no-op callbacks unless deployment orchestration already guarantees
+exclusive execution throughout the run. Lock release failures must be surfaced.
+
+Unsupported schema operations and query shapes retain Antfly's SQL errors.
+Do not infer PostgreSQL extension or catalog compatibility from the wire protocol.
+
+## Tested capabilities
+
+| Capability | Embedded | Server through pgwire |
+| --- | --- | --- |
+| Typed CRUD, parameters, joins | Native Kysely driver | Kysely pg driver |
+| SQL NULL and exact integers | Integers as bigint | BIGINT strings with default pg parsers |
+| Commit, rollback, savepoints | READ COMMITTED | Native provider isolation contracts |
+| Result streaming beyond a page | Native cursors | Supply pg-cursor |
+| Schema introspection and type generation | Native catalog | HTTP metadata provider, default/public scope |
+| Kysely migrations | Queue shared by Database object | Requires explicit deployment lock |
+| Transactional schema DDL | Unsupported | Unsupported |
+| Search relation with SQL composition | Supported | Explicitly unsupported |
+
+Native Kysely tests run with the embedded SDK suite. The pgwire driver conformance
+suite runs real Kysely CRUD, transaction, streaming, introspection, and migration
+queries against the candidate server. Compile-time tests verify inferred search
+selections and invalid field/request rejection. Neither transport needs a new
+HTTP SQL execution driver.

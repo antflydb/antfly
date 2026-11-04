@@ -478,3 +478,12 @@ Reuse a submission key after an ambiguous response; use a new key for new work.
 Inspect both execution state and publication outcome. Provider credentials and
 media delivery stay in the selected runtime. `StandaloneSourcesClient` exposes
 standalone-only credential installation and legacy whole-profile operations.
+
+## Kysely
+
+The optional `@antfly/sdk/kysely` subpath provides `antflySearch`,
+`AntflyPostgresDialect`, `createAntflyIntrospector`, `generateKyselyTypes`, and
+`prepareKyselyMigrationTables`.
+Install Kysely 0.29.6+ separately. See the
+[embedded and server guide](../../../docs/guides/kysely.mdx) for connections,
+typed search composition, migrations, integer mappings, and backend capabilities.
