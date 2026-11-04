@@ -490,21 +490,32 @@ func (c *CollaborationConnector) collaborationInput(r Request, ref collaboration
 	h.Write(b)
 	return Input{Item: Item{ID: id, Path: key, Filename: m.Title, URL: m.URL, Revision: hex.EncodeToString(h.Sum(nil)), Size: int64(len(text)), SourceKind: c.ProviderName, ReadMode: sourceReadBytes, Metadata: meta}, Bytes: text}
 }
+
+// Parent identity depends on canonical text and provider metadata, never on
+// acquiring sibling representations. Share this construction with reads and
+// media checks so each route validates the same revision.
+func (c *CollaborationConnector) parentInput(r Request, ref collaborationRef, m collaborationMaterial) (Input, error) {
+	if len(m.Files) > 1000 {
+		return Input{}, fmt.Errorf("%w: too many attachments in one parent", ErrInventoryIncomplete)
+	}
+	if len(m.Text) > maxImportSourceObjectBytes || !utf8.Valid(m.Text) {
+		return Input{}, fmt.Errorf("resource text exceeds byte limit")
+	}
+	return c.collaborationInput(r, ref, m, m.Text, collaborationMetadata(ref, m)), nil
+}
+
 func (c *CollaborationConnector) materialItems(ctx context.Context, r Request, config CollaborationConfig, ref collaborationRef, m collaborationMaterial) ([]Input, error) {
 	if config.preview && len(m.Files) > PreviewItemLimit-1 {
 		m.Files = m.Files[:PreviewItemLimit-1]
 	}
-	if len(m.Files) > 1000 {
-		return nil, fmt.Errorf("%w: too many attachments in one parent", ErrInventoryIncomplete)
+	parent, err := c.parentInput(r, ref, m)
+	if err != nil {
+		return nil, err
 	}
-	if len(m.Text) > maxImportSourceObjectBytes || !utf8.Valid(m.Text) {
-		return nil, fmt.Errorf("resource text exceeds byte limit")
-	}
-	metadata := collaborationMetadata(ref, m)
+	metadata := parent.Metadata
 	makeInput := func(ref collaborationRef, text []byte, meta map[string]any) Input {
 		return c.collaborationInput(r, ref, m, text, meta)
 	}
-	parent := makeInput(ref, m.Text, metadata)
 	items := []Input{parent}
 	totalBytes := len(m.Text)
 	if config.Attachments {
@@ -660,8 +671,22 @@ func (c *CollaborationConnector) Read(ctx context.Context, r Request, item Item)
 	if err := c.validateRef(ctx, config, ref); err != nil {
 		return nil, err
 	}
-	if c.NativeAttachments && ref.Attachment != "" {
-		return c.nativeMediaBytes(ctx, r, item)
+	if c.NativeAttachments {
+		if ref.Attachment != "" {
+			return c.nativeMediaBytes(ctx, r, item)
+		}
+		material, err := c.load(ctx, config, ref)
+		if err != nil {
+			return nil, err
+		}
+		parent, err := c.parentInput(r, ref, material)
+		if err != nil {
+			return nil, err
+		}
+		if parent.ID != item.ID || parent.Revision != item.Revision {
+			return nil, &RevisionChangedError{Expected: item.Revision, Actual: parent.Revision}
+		}
+		return parent.Bytes, nil
 	}
 	attachment := ref.Attachment
 	ref.Attachment = ""
