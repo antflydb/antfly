@@ -6741,7 +6741,8 @@ pub const Node = struct {
         input: std.json.Value,
     ) ![][]f32 {
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        const media_admission = requestMediaAdmission(self, denseEmbedRequestMediaShape(input));
+        const media_shape = denseEmbedRequestMediaShape(input);
+        const media_admission = requestMediaAdmission(self, media_shape);
         try self.acquireAdmissionUnits(media_admission.units);
         var reserved_units = media_admission.units;
         defer self.releaseAdmissionUnits(reserved_units);
@@ -6758,7 +6759,13 @@ pub const Node = struct {
         try ensureDirectEmbeddingDeadline(deadline_ns);
 
         if (hasGroupedEmbeddingInput(input)) {
-            return self.embedGroupsFromPath(allocator, io, model_path, &admission_manifest, executor_contract, input, .{}, .{ .deadline_ns = deadline_ns }, media_admission.byte_cap);
+            const audio_admission = audioDecodeAdmission(self, media_admission.resident_byte_cap);
+            if (media_shape.has_audio) {
+                const required_units = @max(reserved_units, audio_admission.units);
+                try self.growAdmissionUnits(reserved_units, required_units);
+                reserved_units = required_units;
+            }
+            return self.embedGroupsFromPath(allocator, io, model_path, &admission_manifest, executor_contract, input, .{ .max_audio_decode_working_bytes = audio_admission.max_decode_working_bytes }, .{ .deadline_ns = deadline_ns }, media_admission.byte_cap);
         }
 
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
@@ -7064,7 +7071,7 @@ pub const Node = struct {
                 group.* = .{ .content = parts[index..][0..1] };
             }
             const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
-            const batch = (try self.tryEmbedGemma4MediaGroups(allocator, model, groups, try groupedEmbeddingOptions(&model.manifest, contract, .{ .task_type = @tagName(task_type) }), control, contract)) orelse return null;
+            const batch = (try self.tryEmbedGemma4MediaGroups(allocator, model, groups, try groupedEmbeddingOptions(&model.manifest, contract, .{ .task_type = @tagName(task_type), .max_audio_decode_working_bytes = audio_working_bytes }), control, contract)) orelse return null;
             defer batch.deinit();
             const vectors = try allocator.alloc([]f32, parsed.total_count);
             @memset(vectors, &.{});
@@ -13325,10 +13332,8 @@ pub const Node = struct {
             });
         };
 
-        const media_admission = requestMediaAdmission(
-            self,
-            denseEmbedRequestMediaShapeWithAttachments(request.input, borrowed_attachments),
-        );
+        const media_shape = denseEmbedRequestMediaShapeWithAttachments(request.input, borrowed_attachments);
+        const media_admission = requestMediaAdmission(self, media_shape);
         const admission_units = @max(self.estimateHttpRequestAdmissionUnits(ctx), media_admission.units);
         const trace_admission_started = if (tracing) embedding_trace.now() else 0;
         if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
@@ -13368,7 +13373,13 @@ pub const Node = struct {
         if (hasGroupedEmbeddingInput(request.input)) {
             if (admission_manifest.embedding_style != .embedding_gemma2) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "ordered content groups require an EmbeddingGemma 2 model" });
             if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
-            return self.createGroupedEmbedding(ctx, model_path, admission_manifest, executor_contract, request, borrowed_attachments, media_admission.byte_cap, execution_control) catch |err| {
+            const audio_admission = audioDecodeAdmission(self, media_admission.resident_byte_cap);
+            if (media_shape.has_audio) {
+                const required_units = @max(reserved_units, audio_admission.units);
+                if (try self.growSlotUnits(ctx, reserved_units, required_units)) |resp| return resp;
+                reserved_units = required_units;
+            }
+            return self.createGroupedEmbedding(ctx, model_path, admission_manifest, executor_contract, request, borrowed_attachments, media_admission.byte_cap, audio_admission.max_decode_working_bytes, execution_control) catch |err| {
                 return groupedEmbeddingFailureResponse(ctx, err);
             };
         }
@@ -24192,18 +24203,18 @@ pub const Node = struct {
         return vectors;
     }
 
-    fn createGroupedEmbedding(self: *Node, ctx: *httpx.Context, path: []const u8, manifest: *const manifest_mod.ModelManifest, contract: ResolvedInferenceExecutorContract, request: ParsedEmbedRequest, attachments: []const httpx.attachment_envelope.Attachment, byte_cap: usize, control: InferenceExecutionControl) !httpx.Response {
+    fn createGroupedEmbedding(self: *Node, ctx: *httpx.Context, path: []const u8, manifest: *const manifest_mod.ModelManifest, contract: ResolvedInferenceExecutorContract, request: ParsedEmbedRequest, attachments: []const httpx.attachment_envelope.Attachment, byte_cap: usize, audio_working_bytes: usize, control: InferenceExecutionControl) !httpx.Response {
         // The inner call releases frame-cache fences, model handles and arena
         // storage before this scope publishes the completed cleanup outcome.
         var outcome = self.metrics.embedding_groups.begin();
         defer outcome.finish();
-        return self.createGroupedEmbeddingTracked(ctx, path, manifest, contract, request, attachments, byte_cap, control) catch |err| {
+        return self.createGroupedEmbeddingTracked(ctx, path, manifest, contract, request, attachments, byte_cap, audio_working_bytes, control) catch |err| {
             outcome.failure = err;
             return err;
         };
     }
 
-    fn createGroupedEmbeddingTracked(self: *Node, ctx: *httpx.Context, path: []const u8, manifest: *const manifest_mod.ModelManifest, contract: ResolvedInferenceExecutorContract, request: ParsedEmbedRequest, attachments: []const httpx.attachment_envelope.Attachment, byte_cap: usize, control: InferenceExecutionControl) !httpx.Response {
+    fn createGroupedEmbeddingTracked(self: *Node, ctx: *httpx.Context, path: []const u8, manifest: *const manifest_mod.ModelManifest, contract: ResolvedInferenceExecutorContract, request: ParsedEmbedRequest, attachments: []const httpx.attachment_envelope.Attachment, byte_cap: usize, audio_working_bytes: usize, control: InferenceExecutionControl) !httpx.Response {
         const grouped = @import("../pipelines/embedding_gemma2.zig");
         if (request.instruction != null) return error.InstructionNotSupportedForModel;
         if (request.dimensions) |dim| if (dim <= 0 or !@import("../architectures/embedding_gemma2.zig").validDimension(@intCast(dim))) return error.InvalidEmbeddingDimensions;
@@ -24226,7 +24237,7 @@ pub const Node = struct {
                 try errors.append(a, embedItemFailure(index, err, "input"));
                 continue;
             };
-            const options = grouped.Options{ .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT), .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768 };
+            const options = grouped.Options{ .max_audio_decode_working_bytes = audio_working_bytes, .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT), .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768 };
             preflight: {
                 grouped.validateGroup(groups[index].?, options) catch |err| {
                     if (request.error_policy == .fail_fast) return err;
@@ -24259,6 +24270,7 @@ pub const Node = struct {
         try loaded.verifyEmbeddingIdentityWithControl(control);
         const active_contract = try resolvedInferenceExecutorContract(self, "embed", &loaded.manifest);
         const active_options = try groupedEmbeddingOptions(&loaded.manifest, active_contract, .{
+            .max_audio_decode_working_bytes = audio_working_bytes,
             .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT),
             .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768,
         });

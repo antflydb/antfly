@@ -867,7 +867,7 @@ fn inspectGroup(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAll
             sequence_bound = try std.math.add(usize, sequence_bound, audio_tokens);
             // Encoded codecs retain their full bounded decoder allowance even
             // when a trustworthy header supplies a shorter sequence bound.
-            if (part == .audio) preparation_bound = @max(preparation_bound, @import("audio.zig").default_decode_working_bytes);
+            if (part == .audio) preparation_bound = @max(preparation_bound, options.max_audio_decode_working_bytes);
             vision_bound = @max(vision_bound, audioRunRequest(session.backend(), 0, 0, 1).workspace_bytes);
         },
     };
@@ -1765,6 +1765,7 @@ const MixedWave = struct {
     refs: []const PartRef,
     control: Control,
     image: bool,
+    max_audio_decode_working_bytes: usize = @import("audio.zig").default_decode_working_bytes,
     budget: @import("../runtime/bounded_allocator.zig").BoundedAllocator = .{ .backing = std.heap.smp_allocator, .limit = 64 * 1024 * 1024 },
     allocation_exceeded_budget: bool = false,
     permit: ?RunPermit = null,
@@ -1823,7 +1824,7 @@ const MixedWave = struct {
                     continue;
                 };
             } else {
-                self.audio[self.count] = (if (part == .pcm) projector.prepareEmbeddingGemma2AudioPcmWithPacking(a, part.pcm, self.session.backend() != .native) else projector.prepareEmbeddingGemma2AudioForBackend(a, part.audio.bytes, part.audio.decode_options, self.session.backend())) catch |err| {
+                self.audio[self.count] = (if (part == .pcm) projector.prepareEmbeddingGemma2AudioPcmWithPacking(a, part.pcm, self.session.backend() != .native) else projector.prepareEmbeddingGemma2AudioForBackendBounded(a, part.audio.bytes, part.audio.decode_options, self.session.backend(), self.max_audio_decode_working_bytes)) catch |err| {
                     if (@import("audio_preparation.zig").abort(err)) return err;
                     self.errors[index] = err;
                     continue;
@@ -1910,7 +1911,7 @@ fn projectCohortParts(a: std.mem.Allocator, session: Session, cb: *const Compute
         try scheduler.run(&result, true);
         return result;
     }
-    waves[0] = .{ .session = session, .groups = groups, .refs = refs[0..mixedWaveEnd(refs[0..count], 0)], .control = control, .image = refs[0].image };
+    waves[0] = .{ .session = session, .groups = groups, .refs = refs[0..mixedWaveEnd(refs[0..count], 0)], .control = control, .image = refs[0].image, .max_audio_decode_working_bytes = options.max_audio_decode_working_bytes };
     live[0] = true;
     if (options.prepare_ahead) {
         _ = waves[0].start();
@@ -1930,7 +1931,7 @@ fn projectCohortParts(a: std.mem.Allocator, session: Session, cb: *const Compute
         const next = 1 - current;
         const end = offset + wave.refs.len;
         if (end < count) {
-            waves[next] = .{ .session = session, .groups = groups, .refs = refs[end..mixedWaveEnd(refs[0..count], end)], .control = control, .image = refs[end].image };
+            waves[next] = .{ .session = session, .groups = groups, .refs = refs[end..mixedWaveEnd(refs[0..count], end)], .control = control, .image = refs[end].image, .max_audio_decode_working_bytes = options.max_audio_decode_working_bytes };
             live[next] = true;
             const spawned = if (options.prepare_ahead) waves[next].start() else blk: {
                 waves[next].run();
@@ -2007,7 +2008,7 @@ fn prepareCudaProjectedGroup(a: std.mem.Allocator, cb: *const ComputeBackend, to
     }
     const prefix = if (group.title) |title| try std.fmt.allocPrint(a, "title: {s} | text: ", .{title}) else try a.dupe(u8, try encoder.taskPrefix(options.task_type));
     defer a.free(prefix);
-    const prepared = try content.prepareResidentProjected(cb, a, tokenizer, prefix, parts, options.max_tokens, control, rows);
+    const prepared = try content.prepareResidentProjected(cb, a, tokenizer, prefix, parts, options.max_tokens, options.max_audio_decode_working_bytes, control, rows);
     // Transfer all owned fields; no tower output is downloaded for composition.
     return .{ .ids = prepared.input_ids, .mask = prepared.attention_mask, .embeddings = prepared.input_embeddings, .tensor = prepared.resident_embeddings, .backend = cb };
 }
@@ -2521,7 +2522,7 @@ fn prepareGroupCombined(a: std.mem.Allocator, cb: *const ComputeBackend, tokeniz
                     var prepared = if (part == .pcm)
                         try projector.prepareEmbeddingGemma2AudioPcmWithPacking(a, part.pcm, device)
                     else
-                        try projector.prepareEmbeddingGemma2AudioWithPacking(a, bytes, part.audio.decode_options, device);
+                        try projector.prepareEmbeddingGemma2AudioWithPackingBounded(a, bytes, part.audio.decode_options, device, options.max_audio_decode_working_bytes);
                     defer prepared.deinit();
                     const p = try projector.encodePreparedEmbeddingGemma2AudioResident(cb, a, &prepared);
                     if (device) break :blk SoftTokens{ .id = 258881, .embeddings = &.{}, .tokens = p.tokens, .tensor = p.embeddings };
@@ -2957,7 +2958,7 @@ pub fn embedAudios(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     var current: usize = 0;
     var offset: usize = 0;
     const first = @min(@as(usize, 4), clips.len);
-    slots[0] = prep.Wave.init(session, clips[0..first], if (errors) |e| e[0..first] else null, control, .gemma4, 64 * 1024 * 1024);
+    slots[0] = prep.Wave.initWithLimits(session, clips[0..first], if (errors) |e| e[0..first] else null, control, .gemma4, .{ .preparation_bytes = 64 * 1024 * 1024, .decode_working_bytes = options.max_audio_decode_working_bytes });
     live[0] = true;
     slots[0].run();
     var observation = BatchExecution.Observation{};
@@ -2971,7 +2972,7 @@ pub fn embedAudios(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
         const next_offset = offset + slot.consumed;
         const next_count = @min(@as(usize, 4), clips.len - next_offset);
         if (next_count > 0) {
-            slots[next] = prep.Wave.init(session, clips[next_offset..][0..next_count], if (errors) |e| e[next_offset..][0..next_count] else null, control, .gemma4, 64 * 1024 * 1024);
+            slots[next] = prep.Wave.initWithLimits(session, clips[next_offset..][0..next_count], if (errors) |e| e[next_offset..][0..next_count] else null, control, .gemma4, .{ .preparation_bytes = 64 * 1024 * 1024, .decode_working_bytes = options.max_audio_decode_working_bytes });
             live[next] = true;
             if (options.prepare_ahead) {
                 const spawned = slots[next].start();
@@ -2993,7 +2994,7 @@ pub fn embedAudios(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
             slots[next].join();
             if (slots[next].failure) |err| if (prep.pressure(err)) {
                 slots[next].deinit();
-                slots[next] = prep.Wave.init(session, clips[next_offset..][0..next_count], if (errors) |e| e[next_offset..][0..next_count] else null, control, .gemma4, 64 * 1024 * 1024);
+                slots[next] = prep.Wave.initWithLimits(session, clips[next_offset..][0..next_count], if (errors) |e| e[next_offset..][0..next_count] else null, control, .gemma4, .{ .preparation_bytes = 64 * 1024 * 1024, .decode_working_bytes = options.max_audio_decode_working_bytes });
                 if (options.timings) |t| t.preparation_backpressure_retries += 1;
                 slots[next].run();
             };
@@ -4980,6 +4981,18 @@ test "embeddinggemma2 mixed preparation drains cancellation partial errors and d
     try std.testing.expectEqual(error.Cancelled, audio_wave.failure.?);
     try std.testing.expectEqual(@as(usize, 0), audio_wave.count);
     audio_wave.deinit();
+    // Encoded audio enforces the decoder's request budget before allocating
+    // features. A refusal releases the preparation allocator and run lease.
+    const samples: [3200]f32 = @splat(0);
+    const wav = try @import("audio.zig").wav.encodeInterleaved(std.testing.allocator, &samples, 1, .{ .audio_format = 3, .sample_rate = 16000, .bits_per_sample = 32 });
+    defer std.testing.allocator.free(wav);
+    const limited_groups = [_]Group{.{ .content = &.{.{ .audio = .{ .bytes = wav } }} }};
+    var limited = MixedWave{ .session = session, .groups = &limited_groups, .refs = &.{.{ .group = 0, .part = 0, .image = false }}, .control = .{}, .image = false, .max_audio_decode_working_bytes = 1 };
+    limited.budget.backing = std.testing.allocator;
+    limited.run();
+    try std.testing.expectEqual(error.AudioTooLarge, limited.errors[0].?);
+    try std.testing.expectEqual(@as(usize, 0), limited.count);
+    limited.deinit();
 }
 
 test "embeddinggemma2 CUDA video inspected admission fits constrained scratch and retains encoder phase" {

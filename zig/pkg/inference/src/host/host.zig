@@ -4301,5 +4301,11 @@ test "linked embedding audio MIME hints match public and native grouped vectors"
         };
         try std.testing.expectApproxEqAbs(expected, actual, 0.001);
     }
+    // Decoder policy is request-local on the real grouped backend too.
+    var handle = try node.model_manager.acquireFromDirWithControl(model, .{ .io = std.testing.io });
+    defer handle.release();
+    const loaded = handle.get();
+    const grouped = inference.embedding_gemma2_pipeline;
+    try std.testing.expectError(error.AudioTooLarge, grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{ .{ .text = "Describe this tone" }, .{ .audio = .{ .bytes = padded, .decode_options = .{ .mime_hint = "audio/mpeg" } } } } }, .{ .max_audio_decode_working_bytes = 1 }, loaded.embeddingExecutionLock(), node.bindExecutionControl(std.testing.io, .{})));
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
 }

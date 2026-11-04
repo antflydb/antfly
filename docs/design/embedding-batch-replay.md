@@ -189,3 +189,15 @@ Source image decode planning and background preparation waves share the same che
 Grouped encoded audio uses the shared `audio.EncodedClip` descriptor, retaining borrowed bytes and each clip's decode options through HTTP/native parsing, broker shape planning, CPU preparation, and resident/serial execution. Mixed groups never substitute one request-wide codec hint for their individual clips. Serial audio forwarding also preserves the descriptor instead of allocating a byte-only array. Revision-bound local parts requests reject legacy callbacks that cannot receive the captured revision, matching the text boundary's identity contract.
 
 The opt-in `linked embedding audio MIME hints match public and native grouped vectors` qualification takes `ANTFLY_AUDIO_PARITY_MP3` and `ANTFLY_EMBEDDINGGEMMA2_MODEL`. Use the repository's `zig/lib/audio/testdata/tone.mp3` fixture. It adds a leading zero byte so sniffing alone cannot identify the codec, then compares public and native joint text/audio vectors with an explicit `audio/mpeg` declaration under the default model budgets.
+
+Output guards are captured independently of model revision discovery. Protocol 17
+publications with unknown execution identity still compare the observed artifact
+bytes and revision, so a late unversioned worker cannot overwrite a newer result
+or pass an ABA check. Legacy catalog epochs retain their original wire contract.
+
+Encoded audio carries a request-local decoder working-set limit through mixed
+preparation, inline execution, audio waves, projected CUDA composition, and serial
+fallback. The limit is distinct from the preparation allocator ceiling. Broker
+cohorts include this limit for encoded audio; image and PCM-only cohorts do not
+split on an unused decoder policy. Public and direct JSON grouped requests reserve
+the same resident-media-plus-decoder admission as flat audio requests.

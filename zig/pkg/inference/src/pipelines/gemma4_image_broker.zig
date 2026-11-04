@@ -144,6 +144,8 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
     defer allocator.free(shapes);
     const identities = try allocator.alloc(micro.Identity, groups.len);
     defer allocator.free(identities);
+    var effective_options = options;
+    effective_options.max_audio_decode_working_bytes = audioDecodeLimitKey(groups, options);
     var raster_mode: ?bool = null;
     var largest_input: usize = 0;
     var largest_scratch: usize = 0;
@@ -169,7 +171,7 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
                 if (!raw) largest_decoded = @max(largest_decoded, try std.math.mul(usize, try std.math.mul(usize, info.width, info.height), 3));
             } else largest_scratch = @max(largest_scratch, try projector.embeddingGemma2ImageScratch(info.width, info.height, 2 * 1024 * 1024 * 1024));
         }
-        payloads[index] = .{ .session = session, .tokenizer = tokenizer, .gate = gate, .options = options, .part = part, .group = if (general) group else null, .control = control, .input_tokens = shapes[index].tokens };
+        payloads[index] = .{ .session = session, .tokenizer = tokenizer, .gate = gate, .options = effective_options, .part = part, .group = if (general) group else null, .control = control, .input_tokens = shapes[index].tokens };
         identities[index] = if (raw) .{ .item_id = part.raster.item_id, .source_fingerprint = part.raster.source_fingerprint, .page_number = part.raster.page_number } else .{};
     }
     // Plan against immutable policy limits without reserving GPU scratch.
@@ -185,7 +187,7 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
         }
     };
     const shared = std.heap.smp_allocator;
-    const items = try broker.submitBatchControlled(Ticket, grouped.Result, io, shared, .{ .model = model, .generation = generation, .task = .embed, .schema = options.task_type, .option_key = imageOptionsKey(options), .transform = if (general) "gemma4-prepared-groups" else if (audio_mode) "gemma4-audio" else if (raster_mode.?) "gemma4-rgba" else "gemma4-encoded", .resource_class = if (session.backend() == .metal or session.backend() == .cuda) .gpu else .cpu }, .{ .mode = .native, .preferred_items = capacity, .max_items = capacity, .max_bytes = if (!general and raster_mode.?) 512 * 1024 * 1024 else max_bytes, .max_pixels = max_pixels, .max_tokens = if (general) 4 * 8192 else if (audio_mode) 4096 else 2048, .max_wait_us = max_wait_us }, shapes, identities, try deadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, broker, execute);
+    const items = try broker.submitBatchControlled(Ticket, grouped.Result, io, shared, .{ .model = model, .generation = generation, .task = .embed, .schema = options.task_type, .option_key = imageOptionsKey(options), .resource_limit_bytes = effective_options.max_audio_decode_working_bytes, .transform = if (general) "gemma4-prepared-groups" else if (audio_mode) "gemma4-audio" else if (raster_mode.?) "gemma4-rgba" else "gemma4-encoded", .resource_class = if (session.backend() == .metal or session.backend() == .cuda) .gpu else .cpu }, .{ .mode = .native, .preferred_items = capacity, .max_items = capacity, .max_bytes = if (!general and raster_mode.?) 512 * 1024 * 1024 else max_bytes, .max_pixels = max_pixels, .max_tokens = if (general) 4 * 8192 else if (audio_mode) 4096 else 2048, .max_wait_us = max_wait_us }, shapes, identities, try deadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, broker, execute);
     defer {
         for (items) |item| switch (item.result) {
             .value => |value| shared.free(value.vector),
@@ -402,6 +404,23 @@ test "gemma4 audio broker bounds unknown lengths and rejects mixed modalities" {
     try std.testing.expectEqual(@as(usize, 1024), value.tokens);
     try std.testing.expectEqual(@as(usize, 7), value.bytes);
     try std.testing.expect(try shape(.{ .content = &.{ .{ .text = "query" }, .{ .audio = .{ .bytes = "encoded" } } } }) == null);
+}
+
+// Decoder limits affect execution only for encoded audio. Image and PCM-only
+// tickets can continue sharing cohorts regardless of this unused policy.
+fn audioDecodeLimitKey(groups: []const grouped.Group, options: grouped.Options) usize {
+    for (groups) |group| for (group.content) |part| {
+        if (part == .audio) return options.max_audio_decode_working_bytes;
+    };
+    return (grouped.Options{}).max_audio_decode_working_bytes;
+}
+
+test "embeddinggemma2 broker decoder limits distinguish encoded audio cohorts" {
+    const encoded = [_]grouped.Group{.{ .content = &.{.{ .audio = .{ .bytes = "encoded" } }} }};
+    const text = [_]grouped.Group{.{ .content = &.{.{ .text = "caption" }} }};
+    try std.testing.expect(audioDecodeLimitKey(&encoded, .{ .max_audio_decode_working_bytes = 1 }) != audioDecodeLimitKey(&encoded, .{ .max_audio_decode_working_bytes = 2 }));
+    try std.testing.expect(audioDecodeLimitKey(&encoded, .{ .max_audio_decode_working_bytes = 0 }) != audioDecodeLimitKey(&text, .{}));
+    try std.testing.expectEqual(audioDecodeLimitKey(&text, .{ .max_audio_decode_working_bytes = 1 }), audioDecodeLimitKey(&text, .{ .max_audio_decode_working_bytes = 2 }));
 }
 
 fn imageOptionsKey(options: grouped.Options) u64 {

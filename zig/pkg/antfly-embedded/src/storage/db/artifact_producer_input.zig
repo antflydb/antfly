@@ -97,11 +97,16 @@ pub const Token = struct {
         self.* = undefined;
     }
 
-    /// Bind the resolved execution and the exact output observed before work.
-    /// A late result from an old revision cannot overwrite a newer publication.
+    /// Bind the optional execution identity and the output observed before work.
+    /// Late results cannot replace newer publications, even without a revision.
     pub fn bindExecution(self: *@This(), txn: anytype, revision: ?publication.Digest) !void {
-        const resolved = revision orelse return;
-        if (self.effect_protocol < 17) return error.OnlineMergeArtifactTailsUnsupported;
+        // Legacy catalogs cannot encode an output precondition. Resolved
+        // executions require the newer protocol; legacy unbound work retains
+        // its original behavior until the catalog epoch upgrades.
+        if (self.effect_protocol < 17) {
+            if (revision != null) return error.OnlineMergeArtifactTailsUnsupported;
+            return;
+        }
         const key = try keys.embeddingArtifactKeyForDocumentAlloc(self.alloc, self.source.document_key, self.artifact_name);
         errdefer self.alloc.free(key);
         const raw = txn.get(key) catch |err| switch (err) {
@@ -113,8 +118,10 @@ pub const Token = struct {
             std.crypto.hash.sha2.Sha256.hash(value, &result, .{});
             break :blk result;
         } else null;
-        self.output_guard = .{ .key = key, .content_digest = digest, .input_position = try publication.artifactRevision(txn, self.namespace, key), .source_index = 0 };
-        self.execution_identity = resolved;
+        const guard: publication.ArtifactSource = .{ .key = key, .content_digest = digest, .input_position = try publication.artifactRevision(txn, self.namespace, key), .source_index = 0 };
+        if (self.output_guard) |old| self.alloc.free(@constCast(old.key));
+        self.output_guard = guard;
+        self.execution_identity = revision;
     }
 
     /// Values are immutable authored output; the caller retains them until
@@ -341,13 +348,13 @@ test "ordered artifact inventory resolved execution refreshes vectors and fences
     var pin = try db.core.index_manager.acquireWritePlanSnapshot();
     defer pin.release();
     const Factory = struct {
-        fn make(alloc: std.mem.Allocator, owner: *DB, command: inventory.Command, generation: u64, revision: u8) !Token {
+        fn make(alloc: std.mem.Allocator, owner: *DB, command: inventory.Command, generation: u64, revision: ?u8) !Token {
             var read = try owner.core.store.beginReadTxn();
             defer read.abort();
             const source = try publication.capturePrimarySource(alloc, &read, command.namespace, "doc");
             var token: Token = .{ .effect_protocol = command.binding.effect_protocol, .alloc = alloc, .root = owner.root_incarnation, .namespace = command.namespace, .authority_epoch = command.binding.epoch, .catalog_digest = command.binding.digest, .producer_name = try alloc.dupe(u8, "semantic"), .producer_generation = generation, .artifact_name = try alloc.dupe(u8, "model"), .source = source };
             errdefer token.deinit();
-            try token.bindExecution(&read, @splat(revision));
+            try token.bindExecution(&read, if (revision) |value| @splat(value) else null);
             return token;
         }
         fn accepted(owner: *DB, token: *Token) !bool {
@@ -357,6 +364,8 @@ test "ordered artifact inventory resolved execution refreshes vectors and fences
         }
     };
     const generation = pin.plan().coverageGeneration("semantic").?;
+    var unbound = try Factory.make(a, &db, catalog, generation, null);
+    defer unbound.deinit();
     var first = try Factory.make(a, &db, catalog, generation, 1);
     defer first.deinit();
     const key = try keys.embeddingArtifactKeyForDocumentAlloc(a, "doc", "model");
@@ -391,8 +400,25 @@ test "ordered artifact inventory resolved execution refreshes vectors and fences
     const canonical = try db.core.store.get(a, key);
     defer a.free(canonical);
     try std.testing.expectEqualSlices(u8, two, canonical);
+    // Missing execution identity still fences the output snapshot.
+    try db.applyOrderedCommittedMutation(.{ .artifact_publication = unbound.command((&first_effect)[0..1]) }, .{ .term = 1, .index = 6 }, false);
+    const after_unbound = try db.core.store.get(a, key);
+    defer a.free(after_unbound);
+    try std.testing.expectEqualSlices(u8, two, after_unbound);
+    // Current unversioned work remains publishable. Returning to the same
+    // bytes cannot make the older guard valid again (artifact revision ABA).
+    var current_unbound = try Factory.make(a, &db, catalog, generation, null);
+    defer current_unbound.deinit();
+    try db.applyOrderedCommittedMutation(.{ .artifact_publication = current_unbound.command((&first_effect)[0..1]) }, .{ .term = 1, .index = 7 }, false);
+    const unversioned = try db.core.store.get(a, key);
+    defer a.free(unversioned);
+    try std.testing.expectEqualSlices(u8, one, unversioned);
+    try db.applyOrderedCommittedMutation(.{ .artifact_publication = second_command }, .{ .term = 1, .index = 8 }, false);
+    const after_aba = try db.core.store.get(a, key);
+    defer a.free(after_aba);
+    try std.testing.expectEqualSlices(u8, one, after_aba);
     // Explicit ingress stays canonical even when model resolution changes.
-    try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"same\",\"_embeddings\":{\"model\":[1,0]}}" }}, .sync_level = .write }, .{ .term = 1, .index = 6 }, false);
+    try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"same\",\"_embeddings\":{\"model\":[1,0]}}" }}, .sync_level = .write }, .{ .term = 1, .index = 9 }, false);
     var authored = try Factory.make(a, &db, catalog, generation, 3);
     defer authored.deinit();
     {
