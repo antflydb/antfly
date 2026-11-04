@@ -226,6 +226,38 @@ pub fn removeIndexFromTableIndexesJson(
     return try @import("antfly_local_sources").storage_db_resolver_curation.retainRetiredMetadata(alloc, current_indexes_json, out.items);
 }
 
+/// Resolve the same admitted, credential-free producer that inline collection
+/// inherits from an owning index. A table-wide declaration must retain that
+/// provenance instead of becoming a producer-less copy of an executable artifact.
+fn inheritedInlineEmbeddingProducerAlloc(alloc: std.mem.Allocator, root: std.json.ObjectMap, name: []const u8, replacement: std.json.Value) !?[]u8 {
+    const kind = replacement.object.get("kind") orelse return null;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "embedding")) return null;
+    if (replacement.object.get("producer") != null) return null;
+    if (replacement.object.get("producer_json")) |producer| {
+        if (producer != .string or producer.string.len != 0) return null;
+    }
+    var inherited: ?[]u8 = null;
+    errdefer if (inherited) |value| alloc.free(value);
+    var entries = root.iterator();
+    while (entries.next()) |entry| {
+        const index = entry.value_ptr.*;
+        if (index != .object or index.object.get("embedder") == null) continue;
+        const index_type = index.object.get("type") orelse continue;
+        if (index_type != .string or !std.mem.eql(u8, index_type.string, "embeddings")) continue;
+        const definitions = index.object.get("enrichments") orelse continue;
+        if (definitions != .array) continue;
+        for (definitions.array.items) |definition| {
+            if (!enrichmentValueNameEquals(definition, name)) continue;
+            const candidate = try managed_embedder.embeddingCatalogSemanticProducerJsonAllocWithOptions(alloc, index, .{});
+            defer alloc.free(candidate);
+            if (inherited) |prior| {
+                if (!try enrichment_config_validation.producerJsonValuesEqual(alloc, prior, candidate)) return error.ConflictingEnrichmentConfig;
+            } else inherited = try alloc.dupe(u8, candidate);
+        }
+    }
+    return inherited;
+}
+
 pub fn addEnrichmentToTableIndexesJson(
     alloc: std.mem.Allocator,
     current_indexes_json: []const u8,
@@ -243,6 +275,10 @@ pub fn addEnrichmentToTableIndexesJson(
         else => return error.InvalidTableIndexMetadata,
     };
     if (config.value != .object) return error.InvalidExtensionEnrichment;
+    const inherited_producer = try inheritedInlineEmbeddingProducerAlloc(alloc, root, enrichment_name, config.value);
+    defer if (inherited_producer) |value| alloc.free(value);
+    if (inherited_producer) |value| try config.value.object.put(config.arena.allocator(), "producer_json", .{ .string = value });
+    _ = @import("enrichment_catalog_update.zig").replaceInline(root, enrichment_name, config.value);
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -292,12 +328,12 @@ pub fn removeEnrichmentFromTableIndexesJson(
         .object => |object| object,
         else => return error.InvalidTableIndexMetadata,
     };
-    const current_enrichments = root.get("enrichments") orelse return null;
-    if (current_enrichments != .array) return error.InvalidTableIndexMetadata;
+    const current_enrichments = root.get("enrichments");
+    if (current_enrichments != null and current_enrichments.? != .array) return error.InvalidTableIndexMetadata;
 
-    var removed = false;
+    var removed = @import("enrichment_catalog_update.zig").removeInline(root, enrichment_name) != 0;
     var remaining: usize = 0;
-    for (current_enrichments.array.items) |item| {
+    for (if (current_enrichments) |value| value.array.items else &.{}) |item| {
         if (enrichmentValueNameEquals(item, enrichment_name)) {
             removed = true;
         } else {
@@ -707,6 +743,17 @@ pub fn encodeIndexList(
     return try out.toOwnedSlice(alloc);
 }
 
+fn isRetryableLakeBuildFailure(reason: []const u8) bool {
+    // This controls coordinator readiness, not HTTP replay. The coordinator
+    // reacquires its fence and resumes verified checkpoints after backoff.
+    // In particular, an ambiguous TLS write must not be blindly replayed.
+    if (@import("httpx").isRetryableTransportErrorName(reason)) return true;
+    inline for (.{ "Canceled", "Cancelled", "DeadlineExceeded", "Timeout", "TlsTransportReadFailed", "RateLimited", "RemoteUnavailable", "StorageReadTemporarilyUnavailable" }) |name| {
+        if (std.mem.eql(u8, reason, name)) return true;
+    }
+    return false;
+}
+
 /// Remote readiness is catalog owned. Empty native shard indexes cannot prove
 /// external coverage. Queryability is supplied only by a serving proof.
 pub fn encodeLakeIndexResource(alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord, index_name: []const u8, config: std.json.Value, queryable: bool) ![]u8 {
@@ -739,13 +786,16 @@ pub fn encodeLakeIndexResource(alloc: std.mem.Allocator, table: metadata_table_m
         break :published null;
     } else null;
     const serving_ready = queryable and published != null;
+    // Reconciliation retries interruptions and transient transport failures
+    // after durable backoff. Queryability still requires the independent proof.
+    const terminal_failure = if (failure) |value| !isRetryableLakeBuildFailure(value.reason) else false;
     const readiness: indexes_openapi.IndexReadinessStatus = .{
-        .state = if (serving_ready) .ready else if (failure != null) .failed else .pending,
+        .state = if (serving_ready) .ready else if (terminal_failure) .failed else .pending,
         .queryable = serving_ready,
         .complete = serving_ready,
         .target_revision = if (state.value.generation > 0) state.value.generation else null,
         .published_revision = published,
-        .pending_reasons = if (serving_ready) &.{} else if (failure != null) &.{.load_failure} else &.{.publication},
+        .pending_reasons = if (serving_ready) &.{} else if (terminal_failure) &.{.load_failure} else &.{.publication},
     };
     const status = try std.json.Stringify.valueAlloc(alloc, .{
         .index_type = indexTypeName(inferIndexType(index_name, config) orelse return error.InvalidTableIndexMetadata),
@@ -8169,6 +8219,65 @@ fn consumerTests() type {
             try std.testing.expect(std.mem.indexOf(u8, removed, "\"default\"") != null);
         }
 
+        test "artifact replacement repairs obsolete inline extraction without dropping its index" {
+            const alloc = std.testing.allocator;
+            const original =
+                \\{"document_text":{"type":"full_text","sources":[{"artifact":"chunks"}],"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{\"ocr_fallback\":true}}"},{"name":"chunks","kind":"chunk","field":"text","source_artifact_name":"units","chunk_size":512}]}}
+            ;
+            const repaired = try addEnrichmentToTableIndexesJson(alloc, original, "units",
+                \\{"name":"units","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"}
+            );
+            defer alloc.free(repaired);
+            try validateArtifactEnrichmentsForTableIndexesJson(alloc, repaired);
+            try std.testing.expect(std.mem.indexOf(u8, repaired, "ocr_fallback") == null);
+            try std.testing.expect(std.mem.indexOf(u8, repaired, "chunks") != null);
+            try std.testing.expect(std.mem.indexOf(u8, repaired, "document_text") != null);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, repaired, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("enrichments").?.array.items.len);
+            const dropped = (try removeIndexFromTableIndexesJson(alloc, repaired, "document_text")).?;
+            defer alloc.free(dropped);
+            try validateArtifactEnrichmentsForTableIndexesJson(alloc, dropped);
+            try std.testing.expect(std.mem.indexOf(u8, dropped, "units") != null);
+            const deleted = (try removeEnrichmentFromTableIndexesJson(alloc, dropped, "units")).?;
+            defer alloc.free(deleted);
+            try validateArtifactEnrichmentsForTableIndexesJson(alloc, deleted);
+            try std.testing.expect(std.mem.indexOf(u8, deleted, "units") == null);
+            // Inline copies must not silently resurrect a deleted producer.
+            const dependent = (try removeEnrichmentFromTableIndexesJson(alloc, repaired, "units")).?;
+            defer alloc.free(dependent);
+            try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(alloc, dependent));
+        }
+
+        test "artifact replacement preserves inherited inline embedding producers" {
+            const alloc = std.testing.allocator;
+            const original =
+                \\{"vectors":{"type":"embeddings","dimension":1536,"embedder":{"provider":"openai","model":"text-embedding-3-small","api_url":"https://embedding.example/v1","api_key":"${secret:embedding_key}"},"sources":[{"artifact":"vectors"}],"enrichments":[{"name":"vectors","kind":"embedding","field":"body","expected_dims":1536}]}}
+            ;
+            try validateArtifactEnrichmentsForTableIndexesJson(alloc, original);
+            for ([_][]const u8{
+                \\{"name":"vectors","kind":"embedding","field":"updated_body","expected_dims":1536}
+                ,
+                \\{"name":"vectors","kind":"embedding","field":"updated_body","expected_dims":1536,"producer_json":""}
+            }) |replacement| {
+                const updated = try addEnrichmentToTableIndexesJson(alloc, original, "vectors", replacement);
+                defer alloc.free(updated);
+                try validateArtifactEnrichmentsForTableIndexesJson(alloc, updated);
+                var parsed = try std.json.parseFromSlice(std.json.Value, alloc, updated, .{});
+                defer parsed.deinit();
+                const producer = parsed.value.object.get("enrichments").?.array.items[0].object.get("producer_json").?;
+                try std.testing.expect(producer == .string and producer.string.len > 0);
+                try std.testing.expect(std.mem.indexOf(u8, producer.string, "embedding_key") == null);
+                const configs = try collectArtifactEnrichmentsFromTableIndexesJson(alloc, updated);
+                defer db_mod.types.freeEnrichmentConfigs(alloc, configs);
+                try validateArtifactEnrichmentConfigDefinitions(alloc, configs);
+                for (configs) |cfg| {
+                    try std.testing.expectEqualStrings("updated_body", cfg.field);
+                    try std.testing.expectEqualStrings(producer.string, cfg.producer_json);
+                }
+            }
+        }
+
         test "index metadata validates artifact enrichment graph" {
             try std.testing.expectError(
                 error.InvalidEnrichmentConfig,
@@ -11153,4 +11262,30 @@ test "resolver curation HTTP hides destination namespace metadata from index res
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.value.object.count());
     try std.testing.expect(parsed.value.object.contains("default"));
+}
+
+test "external lake native interrupted publication is pending while integrity and admission failures remain terminal" {
+    const a = std.testing.allocator;
+    const lake = @import("antfly_local_sources").metadata_lake_index_catalog;
+    var config = try std.json.parseFromSlice(std.json.Value, a, "{\"type\":\"full_text\"}", .{});
+    defer config.deinit();
+    var table: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "events", .indexes_json = "{\"body_text\":{\"type\":\"full_text\"}}" };
+    const desired = lake.desiredFingerprint(table);
+    const pending_errors = [_][]const u8{ "Canceled", "Cancelled", "DeadlineExceeded", "Timeout", "TlsTransportReadFailed", "NameServerFailure", "ConnectionReset", "ConnectionResetByPeer", "ConnectionAborted", "ConnectionTimedOut", "ConnectionTimeout", "BrokenPipe", "ConnectionClosed", "ConnectionRefused", "Closed", "NotConnected", "EndOfStream", "UnexpectedEof", "ReadFailed", "WriteFailed", "RecvFailed", "SendFailed", "RateLimited", "RemoteUnavailable", "StorageReadTemporarilyUnavailable" };
+    const terminal_errors = [_][]const u8{ "ArtifactIntegrityMismatch", "SqlProgramLimitExceeded", "TlsBadRecordMac", "TlsAlert", "AccessDenied", "Unauthorized", "PreconditionFailed" };
+    for (pending_errors ++ terminal_errors, 0..) |reason, i| {
+        const catalog_json = try lake.encode(a, .{ .generation = 1, .failure = .{ .generation = 1, .desired = desired, .reason = reason, .retry_at_ms = 1000 } });
+        defer a.free(catalog_json);
+        table.lake_index_catalog_json = catalog_json;
+        const bytes = try encodeLakeIndexResource(a, table, "body_text", config.value, false);
+        defer a.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+        defer parsed.deinit();
+        const status = parsed.value.object.get("status").?;
+        const readiness = status.object.get("readiness").?;
+        try std.testing.expectEqualStrings(if (i < pending_errors.len) "pending" else "failed", readiness.object.get("state").?.string);
+        try std.testing.expect(!readiness.object.get("queryable").?.bool);
+        try std.testing.expectEqualStrings(if (i < pending_errors.len) "publication" else "load_failure", readiness.object.get("pending_reasons").?.array.items[0].string);
+        try std.testing.expectEqualStrings(reason, status.object.get("error").?.string);
+    }
 }

@@ -29,7 +29,7 @@ pub fn collect(a: A, store: *Store, table: u64, kind: []const u8, context: Conte
     defer a.free(prefix);
     const checkpoint = try std.fmt.allocPrint(a, "{s}{s}expiring-gc/{d}/{s}.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", table, kind });
     defer a.free(checkpoint);
-    var previous = client.getObject(store.opened.bucket, checkpoint, .{ .max_response_bytes = 16384, .cancellation = token }) catch |err| switch (err) {
+    var previous = client.getObject(store.opened.bucket, checkpoint, .{ .skip_metadata_probe = true, .max_response_bytes = 16384, .cancellation = token }) catch |err| switch (err) {
         error.NotFound, error.ObjectNotFound, error.FileNotFound => null,
         else => return err,
     };
@@ -41,7 +41,7 @@ pub fn collect(a: A, store: *Store, table: u64, kind: []const u8, context: Conte
     const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
     for (page.entries) |object| {
         try context.ensureActive();
-        var value = client.getObject(store.opened.bucket, object.key, .{ .max_response_bytes = 2 * 1024 * 1024, .cancellation = token }) catch |err| switch (err) {
+        var value = client.getObject(store.opened.bucket, object.key, .{ .skip_metadata_probe = true, .max_response_bytes = 2 * 1024 * 1024, .cancellation = token }) catch |err| switch (err) {
             error.NotFound, error.ObjectNotFound, error.FileNotFound => continue,
             else => return err,
         };
@@ -53,14 +53,14 @@ pub fn collect(a: A, store: *Store, table: u64, kind: []const u8, context: Conte
         if (expires != .integer or expires.integer <= 0) return error.InvalidExpiringLakeObject;
         if (@as(u64, @intCast(expires.integer)) +| 30_000 >= now) continue;
         if (document.value.object.get("lease_until_ms")) |lease| if (lease == .integer and lease.integer > 0 and @as(u64, @intCast(lease.integer)) > now) continue;
-        client.deleteObject(store.opened.bucket, object.key, .{ .if_match_etag = value.metadata.etag orelse return error.MissingObjectEtag, .cancellation = token }) catch |err| switch (err) {
+        client.compareAndDelete(store.opened.bucket, object.key, value.metadata.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = token }) catch |err| switch (err) {
             error.PreconditionFailed, error.NotFound, error.ObjectNotFound, error.FileNotFound => {},
             else => return err,
         };
     }
     const bytes = try std.json.Stringify.valueAlloc(a, Progress{ .cursor = page.next_continuation_token }, .{});
     defer a.free(bytes);
-    var saved = client.putObject(store.opened.bucket, checkpoint, bytes, .{ .if_none_match = previous == null, .if_match_etag = if (previous) |value| value.metadata.etag orelse return error.MissingObjectEtag else null, .cancellation = token }) catch |err| switch (err) {
+    var saved = client.compareAndPut(store.opened.bucket, checkpoint, bytes, if (previous) |value| value.metadata.writeRevision() orelse return error.MissingObjectRevision else null, .{ .cancellation = token }) catch |err| switch (err) {
         error.PreconditionFailed, error.ObjectAlreadyExists => return,
         else => return err,
     };

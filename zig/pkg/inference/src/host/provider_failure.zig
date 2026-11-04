@@ -90,3 +90,10 @@ test "model publication races remain transient through repeated provider hops" {
         try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, bridge.errorFromStatus(second));
     }
 }
+
+test "OCR truncation retains its actionable terminal identity through provider hops" {
+    const first = status(@backingInt(bridge.ProviderOperation.read_raster_images_reported), "", false, error.ReadOutputTruncated);
+    const forwarded = status(0, "", false, bridge.errorFromStatus(first));
+    try std.testing.expectEqual(error.ReadOutputTruncated, bridge.errorFromStatus(forwarded));
+    try std.testing.expectEqual(first, forwarded);
+}

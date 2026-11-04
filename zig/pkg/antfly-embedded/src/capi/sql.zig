@@ -518,7 +518,8 @@ pub fn Adapter(comptime native: type) type {
         fn commitCoordinated(self: *Self, request: contract.TableCommitRequest) !catalog.MutationOutcome {
             const io = self.db.backend_runtime.io() orelse return error.UnsupportedSqlExecution;
             const now: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).nanoseconds));
-            const txn_id = try self.db.beginTransaction(now);
+            const outcomes = dependencies.sql_errors;
+            const txn_id = self.db.beginTransaction(now) catch |err| return outcomes.notApplied(err);
             self.outcome_transaction_id = txn_id;
             self.db.writeTransaction(txn_id, .{
                 .schema_version = request.schema_version,
@@ -530,9 +531,12 @@ pub fn Adapter(comptime native: type) type {
                 .predicates = request.predicates,
                 .integrity_commands = request.integrity_commands,
             }) catch |err| {
-                self.db.abortTransaction(txn_id, now +| 1) catch return error.SqlMutationOutcomeUnknown;
+                // Commit was never requested, so the mutation is not applied
+                // even if the abort fails; recovery aborts leftover intents.
+                self.db.abortTransaction(txn_id, now +| 1) catch {};
                 self.outcome_transaction_id = null;
-                return if (err == error.VersionConflict) error.SqlWriteConflict else err;
+                if (err == error.VersionConflict) return error.SqlWriteConflict;
+                return outcomes.notApplied(err);
             };
             // Only durable status can classify a failure after commit starts.
             // Never abort/replay a possibly published mutation.
@@ -1136,13 +1140,14 @@ pub fn Adapter(comptime native: type) type {
                 } else try deletes.append(temporary, mutation.key);
             }
             const request: types.BatchRequest = .{ .writes = writes.items, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null };
+            const outcomes = dependencies.sql_errors;
             var prepared: ?integrity.Prepared = null;
             defer if (prepared) |*value| value.deinit();
             var view = self.db.core.acquireSchemaView() orelse return error.IntegrityCatalogUnavailable;
             defer view.release();
             if (view.version() != table.schema_version) return error.PreparedGenerationChanged;
             if (view.hasCoordinatedConstraints()) {
-                const metadata = try self.localCatalog(temporary, table.schema_version);
+                const metadata = self.localCatalog(temporary, table.schema_version) catch |err| return outcomes.notApplied(err);
                 var generation: ?[32]u8 = null;
                 var commands: std.ArrayList(@typeInfo(@FieldType(types.BatchRequest, "integrity_commands")).pointer.child) = .empty;
                 for (mutations) |mutation| if (mutation.conflict_guard) |proof| {
@@ -1154,16 +1159,23 @@ pub fn Adapter(comptime native: type) type {
                 const input_writes = try temporary.alloc(types.TransactionWrite, writes.items.len);
                 for (writes.items, input_writes) |write, *out| out.* = .{ .key = write.key, .value = write.value, .json_null_fields = write.json_null_fields };
                 const input: contract.TableCommitRequest = .{ .table_name = self.table_name, .writes = input_writes, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = table.schema_version, .relational_integrity_generation_set = generation, .integrity_commands = commands.items };
-                prepared = try integrity.prepareWithRepairAdmission(scratch_alloc, self.localSource(), metadata.table, metadata.range, &.{input}, self.repairAdmission(), .{});
+                // Preparation only reads: any failure here is not applied.
+                prepared = integrity.prepareWithRepairAdmission(scratch_alloc, self.localSource(), metadata.table, metadata.range, &.{input}, self.repairAdmission(), .{}) catch |err| return outcomes.notApplied(err);
                 if (self.handle) |handle| return @import("sql_commit.zig").commit(handle, prepared.?.tables, &self.outcome_transaction_id);
                 if (prepared.?.tables.len != 1 or !std.mem.eql(u8, prepared.?.tables[0].table_name, self.table_name)) return error.UnsupportedSqlExecution;
                 return self.commitCoordinated(prepared.?.tables[0]);
             }
-            self.db.batch(request) catch |err| switch (err) {
-                error.VersionConflict => return error.SqlWriteConflict,
-                error.CommitVisibilityNotSatisfied, error.EnrichmentWaitCanceled, error.EnrichmentWaitTimeout, error.EnrichmentRetryInProgress, error.CommitPropagationIncomplete => return .committed_pending,
-                error.EnrichmentWorkerFailed => return .committed_repair_required,
-                else => return err,
+            // Classify by the batch's own state, not by error name: whether the
+            // primary write became durable, and whether its publication was
+            // left uncertain (reported as an unknown outcome).
+            var primary_committed = false;
+            self.db.batchTracked(request, &primary_committed) catch |err| {
+                // A confirmed primary write wins: later uncertainty in derived
+                // or control publication leaves it committed, not unknown.
+                if (primary_committed) return if (err == error.EnrichmentWorkerFailed) .committed_repair_required else .committed_pending;
+                if (outcomes.isUnknownOutcome(err)) return error.SqlMutationOutcomeUnknown;
+                if (err == error.VersionConflict) return error.SqlWriteConflict;
+                return outcomes.notApplied(err);
             };
             return .committed;
         }

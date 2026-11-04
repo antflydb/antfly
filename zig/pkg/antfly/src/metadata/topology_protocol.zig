@@ -99,8 +99,21 @@ const std = @import("std");
 /// Version 66 indexes routing sources for dependency-validated canonical proofs.
 /// Version 67 qualifies legacy resolver content before native cache admission.
 /// Version 68 tracks bounded edits during resumable resolver qualification.
-/// Version 69 adds graph definitions and transaction sessions.
-pub const current_version: u16 = 69;
+/// Version 69 retains consumer-owned SQL completion references.
+/// Version 70 qualifies routed SQL completion ownership across every peer.
+/// Version 71 retains managed completion producer retirement checkpoints.
+/// Version 72 requires pre-execution transaction proof handoff on all issuers.
+/// Version 73 prepares metadata-owned SQL completion consumers before admission.
+/// Version 74 retires unpublished completion subscriptions after issuer restart.
+/// Version 75 binds HTTP SQL handles to issuers and observes DDL submission.
+/// Version 76 requires attempt-aware commit proofs and joined connection refusals.
+/// Version 77 isolates issuer outboxes in shared transaction stores.
+/// Version 78 requires backend-wide coordination of shared session mutations.
+/// Version 79 adds graph definitions and transaction sessions.
+pub const current_version: u16 = 79;
+pub const sql_completion_admission_version: u16 = 78;
+pub const sql_completion_owner_version: u16 = 71;
+pub const sql_completion_reference_version: u16 = 69;
 pub const job_state_version: u16 = 59;
 pub const resolver_records_version: u16 = 58;
 pub const native_service_tables_version: u16 = 38;
@@ -114,10 +127,10 @@ pub fn usesResolverNamespaces(indexes_json: []const u8) bool {
     return std.mem.indexOf(u8, indexes_json, "_resolver_namespaces") != null or std.mem.indexOf(u8, indexes_json, "namespace_owned") != null or std.mem.indexOf(u8, indexes_json, "resolvers") != null or std.mem.indexOf(u8, indexes_json, "_resolver_curation") != null or std.mem.indexOf(u8, indexes_json, "_curation_proposals") != null;
 }
 
-/// Version 69 adds graph definitions and transaction sessions alongside main's
+/// Version 79 adds graph definitions and transaction sessions alongside main's
 /// resolver namespace and document job formats, preserving command tags 0..80.
-pub const transaction_sessions_version: u16 = 69;
-pub const graph_definition_version: u16 = 69;
+pub const transaction_sessions_version: u16 = 79;
+pub const graph_definition_version: u16 = 79;
 pub const relation_mutation_version: u16 = 33;
 pub const relation_publication_version: u16 = 32;
 pub const relation_reconciliation_version: u16 = 31;

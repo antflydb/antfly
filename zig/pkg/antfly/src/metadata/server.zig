@@ -363,21 +363,24 @@ pub const MetadataServer = struct {
             owned_public_write_source = public_write_source;
 
             var api_server_cfg = cfg.api_server_cfg;
-            api_server_cfg.restore_owner_progress_generation = &svc.restore_owner_progress_generation;
-            api_server_cfg.configureRemoteCatalogPublicationAuthority();
-            // Restore-owner and durable-session RPCs share the same owned
-            // data-bearing routes and transport as ordinary hosted reads and
-            // writes. An API caller need not inject a test-only executor to
-            // make remote restore work. Explicit host overrides stay intact.
+            api_server_cfg.session_maintenance_local_only = true;
+            api_server_cfg.session_store_path_only = true;
+            // Graph request IDs need one durable authority across issuers. The
+            // completion store namespaces producer outboxes by issuer; shared
+            // session mutations are serialized by the metadata transaction store.
             if (api_server_cfg.session_store == null and api_server_cfg.session_store_path == null and replica_root_dir.len != 0) {
                 owned_sessions = try MetadataSessions.create(alloc, svc);
                 api_server_cfg.session_store = &owned_sessions.?.durable;
                 api_server_cfg.session_store_scope = .cluster_shared;
                 if (api_server_cfg.session_owner_lease_ttl_ns == null) api_server_cfg.session_owner_lease_ttl_ns = 15 * std.time.ns_per_s;
             }
-            if (api_server_cfg.session_router == null) {
-                api_server_cfg.session_router = metadataSessionRouter(svc);
-            }
+            api_server_cfg.restore_owner_progress_generation = &svc.restore_owner_progress_generation;
+            api_server_cfg.configureRemoteCatalogPublicationAuthority();
+            // Restore-owner and durable-session RPCs share the same owned
+            // data-bearing routes and transport as ordinary hosted reads and
+            // writes. An API caller need not inject a test-only executor to
+            // make remote restore work. Explicit host overrides stay intact.
+            if (api_server_cfg.session_router == null) api_server_cfg.session_router = metadataSessionRouter(svc);
             if (api_server_cfg.session_executor == null) api_server_cfg.session_executor = svc.raft.host.http_host.request_executor;
             api_server_cfg.restore_validation = .{ .status = public_api_http_server.StatusSource.fromMetadataHttpService(svc), .factory = @import("../api/restore_catalog.zig").ValidationPort.SourceFactory.hosted(public_read_source, public_write_source) };
             api_server_cfg.shard_ops = if (owned_hosted_shard_ops) |ops| ops.adapter() else null;
@@ -394,7 +397,7 @@ pub const MetadataServer = struct {
             };
 
             const public_http_server = try alloc.create(public_api_kernel.ApiHttpServer);
-            public_http_server.* = public_api_kernel.ApiHttpServer.initWithProcessRequestAllocatorFallible(
+            public_http_server.* = public_api_kernel.ApiHttpServer.initWithConfig(
                 alloc,
                 api_server_cfg,
                 public_api_http_server.StatusSource.fromMetadataHttpService(svc),
@@ -578,6 +581,9 @@ pub const MetadataServer = struct {
         var last_unexpected_error: ?anyerror = null;
         while (!self.restore_supervisor_stop.load(.acquire)) {
             const observed_progress = self.svc.restore_owner_progress_generation.load(.acquire);
+            if (self.owned_public_http_server) |api| api.scheduleSessionMaintenance() catch |err| {
+                if (!metadata_authority.isRetryableError(err)) std.log.warn("metadata local session maintenance deferred err={s}", .{@errorName(err)});
+            };
             if (self.owned_admin_mux) |mux| {
                 if (mux.ensureRestoreLeadershipIfLocalLeader()) |local_leader| {
                     if (local_leader) {
@@ -1092,6 +1098,34 @@ fn metadataDataBearingStoreGroupRouter(svc: *service.MetadataHttpService) api_ta
     };
 }
 
+// SQL sessions belong to the public metadata API cohort. Data routing keeps
+// its no-local-replica identity, while session/proof routing names the actual
+// metadata issuer and uses its orchestration endpoint across public API pods.
+fn metadataSessionRouter(svc: *service.MetadataHttpService) api_table_router.HostedGroupRouter {
+    return .{ .ptr = svc, .vtable = &.{
+        .local_node_id = metadataSessionLocalNodeId,
+        .local_status = metadataStoreRouterLocalStatus,
+        .group_leader_node_id = metadataDataBearingStoreRouterGroupLeaderNodeId,
+        .group_node_ids = metadataDataBearingStoreRouterGroupNodeIds,
+        .node_status = metadataDataBearingStoreRouterNodeStatus,
+        .node_base_uri = metadataSessionNodeBaseUri,
+        .node_base_uri_for_group = metadataStoreRouterNodeBaseUriForGroup,
+        .resolve_group_routes = metadataDataBearingStoreRouterGroupRoutes,
+    } };
+}
+fn metadataSessionLocalNodeId(ptr: *anyopaque) u64 {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return svc.raft.host.http_host.host.cfg.local_node_id;
+}
+fn metadataSessionNodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    for (svc.reallocation_protocol_peers) |peer| {
+        if (peer.node_id != node_id) continue;
+        if (peer.orchestration_url) |uri| if (uri.len != 0) return try alloc.dupe(u8, uri);
+        return null;
+    }
+    return metadataStoreRouterNodeBaseUri(ptr, alloc, node_id);
+}
 fn metadataStoreRouterLocalNodeId(ptr: *anyopaque) u64 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     if (!svc.local_data_owner) return 0;
@@ -1821,6 +1855,17 @@ test "metadata server can expose admin listener endpoints" {
     // The actual production constructor, not an injected restore fixture,
     // supplies the transport used by executeRestoreOwner's remote branch.
     const public_cfg = server.owned_public_http_server.?.cfg;
+    try std.testing.expect(public_cfg.session_store != null);
+    try std.testing.expectEqual(@as(u64, 1), public_cfg.session_router.?.localNodeId());
+    try std.testing.expect(public_cfg.session_store_path == null);
+    try std.testing.expect(public_cfg.session_maintenance_local_only);
+    try std.testing.expect(public_cfg.session_store_scope == .cluster_shared);
+    const api = server.owned_public_http_server.?;
+    const durable_session = try api.txn_sessions.begin(std.heap.page_allocator, .{}, public_cfg.session_router.?.localNodeId());
+    var persisted = (try api.txn_sessions.durable.?.load(durable_session.txn_id)).?;
+    persisted.deinit(std.heap.page_allocator);
+    // Retire the fixture record after proving the default store is durable.
+    try std.testing.expect(api.txn_sessions.removeBeforeExecution(std.heap.page_allocator, durable_session.txn_id));
     try std.testing.expect(public_cfg.session_executor != null);
     try std.testing.expect(public_cfg.session_executor.?.ptr == server.svc.raft.host.http_host.request_executor.ptr);
     try std.testing.expect(public_cfg.session_router != null);
@@ -2194,4 +2239,21 @@ fn metadataJobStateCas(ptr: *anyopaque, key: []const u8, expected: ?[]const u8, 
     const current = (try store.getJobState(svc.alloc, svc.metadata_group_id, key)) orelse return false;
     defer svc.alloc.free(current);
     return std.mem.eql(u8, current, value);
+}
+
+test "metadata SQL session routing uses issuer IDs and orchestration endpoints" {
+    var host: raft_host.Host = undefined;
+    host.cfg.local_node_id = 2;
+    var http_host: raft_host.HttpHost = undefined;
+    http_host.host = &host;
+    var svc: service.MetadataHttpService = undefined;
+    svc.raft.host.http_host = &http_host;
+    svc.local_data_owner = false;
+    svc.reallocation_protocol_peers = &.{ .{ .node_id = 1, .orchestration_url = "http://metadata-0:12377" }, .{ .node_id = 2, .orchestration_url = "http://metadata-1:12377" } };
+    const session_router = metadataSessionRouter(&svc);
+    try std.testing.expectEqual(@as(u64, 2), session_router.localNodeId());
+    try std.testing.expectEqual(@as(u64, 0), metadataDataBearingStoreGroupRouter(&svc).localNodeId());
+    const uri = (try session_router.nodeBaseUri(std.testing.allocator, 1)).?;
+    defer std.testing.allocator.free(uri);
+    try std.testing.expectEqualStrings("http://metadata-0:12377", uri);
 }

@@ -64,6 +64,17 @@ const manifest_object_store = @import("../manifest/object_store.zig");
 const FullTextIndexSpec = full_text_indexes.FullTextIndexSpec;
 const FullTextSourceMode = full_text_indexes.FullTextSourceMode;
 
+pub const ProjectionBuildContext = struct {
+    maintenance_pending: ?*bool = null,
+    enabled: bool = false,
+    partial: bool = false,
+    namespace: []const u8 = "",
+    attempt: [16]u8 = @splat(0),
+};
+fn existingProjectionContext(artifacts: *artifacts_mod.ArtifactStore, current: ?manifest_mod.Manifest) ProjectionBuildContext {
+    return .{ .enabled = if (current) |source| hasPagedProjections(source) else false, .namespace = if (current) |source| source.namespace else "", .attempt = if (artifacts.upload_scope) |scope| scope.attempt else @splat(0) };
+}
+
 pub const BuildResult = struct {
     namespace: []u8,
     published: bool,
@@ -71,6 +82,10 @@ pub const BuildResult = struct {
     wal_start_lsn: u64,
     wal_end_lsn: u64,
     artifact_count: usize,
+    /// Actual admitted WAL records, independent of retained manifest ranges.
+    consumed_records: usize = 0,
+    maintenance_pending: bool = false,
+    maintenance_performed: bool = false,
 
     pub fn deinit(self: *BuildResult, alloc: Allocator) void {
         alloc.free(self.namespace);
@@ -132,7 +147,15 @@ pub const Builder = struct {
     manifests: *manifest_mod.ManifestStore,
     progress: *catalog_mod.ProgressStore,
     wal: *wal_mod.WalStore,
+    deferred_wal_maintenance: bool = false,
     io: ?std.Io = null,
+    /// Hosted invocations publish a bounded prefix. A subsequent invocation
+    /// resumes from the durably published manifest's WAL watermark.
+    max_wal_records: ?usize = null,
+    /// Opt-in paged text projection; existing paged publications retain it.
+    paged_text: bool = false,
+    paged_projections: bool = false,
+    max_wal_bytes: usize = 8 * 1024 * 1024,
     graph_metric_max_parallelism: usize = lake_graph_metric.default_compute_parallelism,
     publication_lifecycle_hook: ?PublicationLifecycleHook = null,
 
@@ -161,6 +184,69 @@ pub const Builder = struct {
             .progress = progress,
             .wal = wal,
         };
+    }
+
+    fn maintainVectorRuns(self: *Builder, namespace: []const u8, current_head: u64, current: manifest_mod.Manifest, guard: ?work_lease.PublicationGuard, cancellation: ?maintenance_cancellation.Token) !?BuildResult {
+        var bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
+        var read_bytes: u64 = 4 * 1024 * 1024;
+        var write_bytes: u64 = 4 * 1024 * 1024;
+        var pages = graph_page_store.PageStore{
+            .domain = graph_page_store.PageStore.namespaceDomain(namespace),
+            .attempt = self.artifacts.upload_scope.?.attempt,
+            .artifacts = self.artifacts,
+            .cancellation = bridge.token(),
+            .remaining_read_bytes = &read_bytes,
+            .remaining_write_bytes = &write_bytes,
+        };
+        for (current.artifacts, 0..) |ref, index| {
+            if (ref.kind != .vector_segment or ref.metadata_version != @import("../paged_projection.zig").metadata_version) continue;
+            const step = (try @import("../vector_segment/runs.zig").maintain(self.alloc, &pages, ref)) orelse continue;
+            var manifest = manifest_mod.cloneManifest(self.alloc, current) catch |err| {
+                freeArtifactRef(self.alloc, step.ref);
+                return err;
+            };
+            defer manifest.deinit(self.alloc);
+            freeArtifactRef(self.alloc, manifest.artifacts[index]);
+            manifest.artifacts[index] = step.ref;
+            manifest.version = std.math.add(u64, current_head, 1) catch return error.ManifestVersionExhausted;
+            // No WAL record is consumed by maintenance. Publication and fresh
+            // visibility remain attached to the same acknowledged prefix.
+            try stampPublicationFence(&manifest, guard);
+            const version = try putManifestForPublication(self.manifests, &manifest, current_head);
+            if (!try self.compareAndSwapPublishedHead(namespace, current_head, version, guard, cancellation)) return error.HeadChanged;
+            const later_vector = for (current.artifacts[index + 1 ..]) |later| {
+                if (later.kind == .vector_segment and later.metadata_version == @import("../paged_projection.zig").metadata_version) break true;
+            } else false;
+            return .{
+                .namespace = try self.alloc.dupe(u8, namespace),
+                .published = true,
+                .version = version,
+                .wal_start_lsn = manifest.wal_start_lsn,
+                .wal_end_lsn = manifest.wal_end_lsn,
+                .artifact_count = manifest.artifacts.len,
+                .maintenance_pending = step.has_more or later_vector,
+                .maintenance_performed = true,
+            };
+        }
+        return null;
+    }
+
+    fn readWalForBuild(self: *Builder, namespace: []const u8, start: u64) ![]wal_mod.Record {
+        const count = self.max_wal_records orelse return self.wal.readFromAlloc(namespace, start);
+        if (count == 0) return error.InvalidWalBatch;
+        const latest = try self.wal.latestLsn(namespace);
+        if (start > latest) return self.alloc.alloc(wal_mod.Record, 0);
+        var end = @min(latest, start +| (@as(u64, @intCast(count)) - 1));
+        while (true) {
+            return self.wal.readRangeAlloc(namespace, .{ .start_lsn = start, .end_lsn = end, .max_records = count, .max_bytes = self.max_wal_bytes }) catch |err| switch (err) {
+                error.WalReadBudgetExceeded => {
+                    if (end == start) return err;
+                    end = start + (end - start) / 2;
+                    continue;
+                },
+                else => return err,
+            };
+        }
     }
 
     pub fn setIo(self: *Builder, io: ?std.Io) void {
@@ -351,7 +437,7 @@ pub const Builder = struct {
         plan: publication_plan.TablePublicationPlan,
         cancellation: CancellationToken,
     ) !BuildResult {
-        var fallback: ?std.Io.Threaded = if (self.io == null) threadedIo() else null;
+        var fallback: ?FallbackIo = if (self.io == null) threadedIo() else null;
         defer if (fallback) |*value| value.deinit();
         return self.publishNamespaceWithMetricAndPlanGuardedUntil(namespace, vector_metric, plan, null, .{
             .io = self.io orelse fallback.?.io(),
@@ -367,7 +453,7 @@ pub const Builder = struct {
         publication_guard: ?work_lease.PublicationGuard,
         cancellation: ?maintenance_cancellation.Token,
     ) !BuildResult {
-        var fallback: ?std.Io.Threaded = if (self.io == null and cancellation == null) threadedIo() else null;
+        var fallback: ?FallbackIo = if (self.io == null and cancellation == null) threadedIo() else null;
         defer if (fallback) |*value| value.deinit();
         const io = if (cancellation) |token| token.io else self.io orelse fallback.?.io();
         if (publication_guard == null) {
@@ -387,7 +473,16 @@ pub const Builder = struct {
         };
         var publisher = self.*;
         publisher.artifacts = &scoped_artifacts;
-        return publisher.publishNamespaceWithMetricAndPlanPinnedUntil(namespace, vector_metric, plan, publication_guard, protection.token(io)) catch |err| return graphPublicationError(err, false);
+        while (true) {
+            var result = publisher.publishNamespaceWithMetricAndPlanPinnedUntil(namespace, vector_metric, plan, publication_guard, protection.token(io)) catch |err| return graphPublicationError(err, false);
+            // Hosted callers return at every durable maintenance boundary.
+            // Preserve the ordinary native builder's whole-prefix contract.
+            if (self.max_wal_records == null and result.maintenance_performed) {
+                result.deinit(self.alloc);
+                continue;
+            }
+            return result;
+        }
     }
 
     fn publishNamespaceWithMetricAndPlanPinnedUntil(
@@ -399,6 +494,11 @@ pub const Builder = struct {
         cancellation: ?maintenance_cancellation.Token,
     ) !BuildResult {
         try maintenance_cancellation.check(cancellation);
+        if (self.deferred_wal_maintenance) {
+            var bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
+            _ = try self.wal.materializePendingCooperatively(namespace, bridge.token());
+            try maintenance_cancellation.check(cancellation);
+        }
         const targets = plan.targets;
         var head = try self.loadCurrentHeadManifestAlloc(namespace);
         defer head.deinit(self.alloc);
@@ -415,7 +515,10 @@ pub const Builder = struct {
         const next_version: u64 = current_head + 1;
         const start_lsn: u64 = if (current_manifest) |current| current.wal_end_lsn + 1 else 1;
 
-        const records = try self.wal.readFromAlloc(namespace, start_lsn);
+        if (source_kind == .managed and head.manifest_version == current_head and !plan.forceRepublishFromHead()) {
+            if (current_manifest) |current| if (try self.maintainVectorRuns(namespace, current_head, current, publication_guard, cancellation)) |result| return result;
+        }
+        const records = try self.readWalForBuild(namespace, start_lsn);
         defer wal_mod.freeRecords(self.alloc, records);
         try maintenance_cancellation.check(cancellation);
 
@@ -436,6 +539,7 @@ pub const Builder = struct {
                     publication_guard,
                     cancellation,
                     last_record,
+                    records.len,
                 );
             }
             if (last_record) |record| return try self.publishHeadConsumingIgnoredWal(
@@ -443,6 +547,7 @@ pub const Builder = struct {
                 current_head,
                 current_manifest.?,
                 record,
+                records.len,
                 publication_guard,
                 cancellation,
             );
@@ -503,6 +608,7 @@ pub const Builder = struct {
                 current_head,
                 current,
                 last_record,
+                records.len,
                 publication_guard,
                 cancellation,
             );
@@ -548,7 +654,24 @@ pub const Builder = struct {
         defer query_mod.freeMaterializedDocuments(self.alloc, materialized.documents);
         try maintenance_cancellation.check(cancellation);
 
+        const use_paged_projections = self.paged_projections or (if (current_manifest) |prior| hasPagedProjections(prior) else false);
+        const use_paged_text = self.paged_text or use_paged_projections or (if (current_manifest) |prior| hasPagedText(prior) else false);
         const document_ref = blk: {
+            if (use_paged_text and materialized.partial and current_manifest != null and
+                allArtifactsPagedOrAbsent(current_manifest.?, .vector_segment) and allArtifactsPagedOrAbsent(current_manifest.?, .sparse_segment) and findArtifactIndex(current_manifest.?, .graph_segment) == null)
+            {
+                const payload = try document_segment_mod.encodeAlloc(self.alloc, &.{});
+                defer self.alloc.free(payload);
+                if (findArtifactIndex(current_manifest.?, .document_segment)) |position| {
+                    const cached = current_manifest.?.artifacts[position];
+                    var digest: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+                    if (cached.byte_len == payload.len and std.mem.eql(u8, cached.checksum, &std.fmt.bytesToHex(digest, .lower))) break :blk try cloneArtifactRefAlloc(self.alloc, cached);
+                }
+                var artifact = try self.artifacts.put(payload);
+                defer artifact.deinit(self.alloc);
+                break :blk try artifactRefFromMetadataAlloc(self.alloc, .document_segment, artifact);
+            }
             if (materialized.partial) {
                 const idx = findArtifactIndex(current_manifest.?, .document_segment) orelse return error.DocumentSegmentNotFound;
                 break :blk try cloneArtifactRefAlloc(self.alloc, current_manifest.?.artifacts[idx]);
@@ -565,7 +688,7 @@ pub const Builder = struct {
         try maintenance_cancellation.check(cancellation);
         const text_index_specs = try resolvePublishedTextIndexSpecsAlloc(self.alloc, plan.table_definition, plan.full_text_index_actions);
         defer full_text_indexes.freeFullTextIndexSpecs(self.alloc, text_index_specs);
-        const text_refs = try buildTextArtifactRefsForMaterializedDocsAllocUntil(
+        const text_refs = try buildTextArtifactRefsForTouchedDocsAllocUntil(
             self.alloc,
             self.artifacts,
             current_manifest,
@@ -574,10 +697,14 @@ pub const Builder = struct {
             materialized.mutations,
             text_index_specs,
             cancellation,
+            materialized.partial,
+            use_paged_text,
+            try graphPublicationAttempt(publication_guard, namespace, cancellation.?.io),
+            namespace,
         );
         defer freeArtifactRefs(self.alloc, text_refs);
         try maintenance_cancellation.check(cancellation);
-        const sparse_refs = try buildSparseArtifactRefsForMaterializedDocsAllocUntil(
+        const sparse_refs = try buildSparseArtifactRefsWithContextAllocUntil(
             self.alloc,
             self.artifacts,
             current_manifest,
@@ -586,10 +713,12 @@ pub const Builder = struct {
             materialized.mutations,
             targets.published_search_sources,
             cancellation,
+            .{ .enabled = use_paged_projections, .partial = materialized.partial, .namespace = namespace, .attempt = self.artifacts.upload_scope.?.attempt },
         );
         defer freeArtifactRefs(self.alloc, sparse_refs);
         try maintenance_cancellation.check(cancellation);
-        const vector_refs = try buildVectorArtifactRefsForMaterializedDocsAllocUntil(
+        var vector_maintenance_pending = false;
+        const vector_refs = try buildVectorArtifactRefsWithContextAllocUntil(
             self.alloc,
             self.artifacts,
             current_manifest,
@@ -601,6 +730,7 @@ pub const Builder = struct {
             &.{},
             targets.published_search_sources,
             cancellation,
+            .{ .enabled = use_paged_projections, .partial = materialized.partial, .namespace = namespace, .attempt = self.artifacts.upload_scope.?.attempt, .maintenance_pending = &vector_maintenance_pending },
         );
         defer freeArtifactRefs(self.alloc, vector_refs);
         try maintenance_cancellation.check(cancellation);
@@ -723,6 +853,8 @@ pub const Builder = struct {
             .wal_start_lsn = if (inline_document_rebase) wal_end_lsn else start_lsn,
             .wal_end_lsn = wal_end_lsn,
             .artifact_count = manifest.artifacts.len,
+            .consumed_records = records.len,
+            .maintenance_pending = vector_maintenance_pending,
         };
     }
 
@@ -732,6 +864,7 @@ pub const Builder = struct {
         current_head: u64,
         current: manifest_mod.Manifest,
         last_record: wal_mod.Record,
+        consumed_records: usize,
         publication_guard: ?work_lease.PublicationGuard,
         cancellation: ?maintenance_cancellation.Token,
     ) !BuildResult {
@@ -767,6 +900,7 @@ pub const Builder = struct {
             .wal_start_lsn = manifest.wal_start_lsn,
             .wal_end_lsn = manifest.wal_end_lsn,
             .artifact_count = manifest.artifacts.len,
+            .consumed_records = consumed_records,
         };
     }
 
@@ -781,6 +915,7 @@ pub const Builder = struct {
         publication_guard: ?work_lease.PublicationGuard,
         cancellation: ?maintenance_cancellation.Token,
         consumed_record: ?wal_mod.Record,
+        consumed_records: usize,
     ) !BuildResult {
         try maintenance_cancellation.check(cancellation);
         var manifest = reconcile: {
@@ -824,6 +959,7 @@ pub const Builder = struct {
             .wal_start_lsn = manifest.wal_start_lsn,
             .wal_end_lsn = manifest.wal_end_lsn,
             .artifact_count = manifest.artifacts.len,
+            .consumed_records = consumed_records,
         };
     }
 
@@ -1157,7 +1293,7 @@ pub const Builder = struct {
         defer head.deinit(self.alloc);
         const current = head.manifest orelse return null;
 
-        var fallback: ?std.Io.Threaded = if (self.io == null and parent_cancellation == null) threadedIo() else null;
+        var fallback: ?FallbackIo = if (self.io == null and parent_cancellation == null) threadedIo() else null;
         defer if (fallback) |*value| value.deinit();
         const io = if (parent_cancellation) |token| token.io else self.io orelse fallback.?.io();
         var protection = try GraphSourceProtection.initAt(self.progress, namespace, current.version, parent_cancellation);
@@ -1165,7 +1301,7 @@ pub const Builder = struct {
         var cancellation_bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
 
         const start_lsn = current.wal_end_lsn + 1;
-        const records = try self.wal.readFromAlloc(namespace, start_lsn);
+        const records = try self.readWalForBuild(namespace, start_lsn);
         defer wal_mod.freeRecords(self.alloc, records);
         if (records.len == 0) return null;
         if (records.len > limits.max_rows) return error.LakeSidecarBuildBudgetExceeded;
@@ -1414,7 +1550,7 @@ pub fn compareAndSwapHeadGuarded(
 
 pub fn stampPublicationFence(manifest: *manifest_mod.Manifest, guard: ?work_lease.PublicationGuard) !void {
     const authority = guard orelse return error.GraphPublicationGuardRequired;
-    const fence = (try authority.preparePublication(manifest.namespace)) orelse return error.GraphPublicationGuardRequired;
+    const fence = (try authority.uploadFence(manifest.namespace)) orelse return error.GraphPublicationGuardRequired;
     manifest.publication_fencing_token = fence.fencing_token;
 }
 
@@ -1490,7 +1626,7 @@ pub fn publishDocumentFactsForManifest(
     }
 }
 
-fn applicableWalRecordsForHeadAlloc(
+pub fn applicableWalRecordsForHeadAlloc(
     alloc: Allocator,
     records: []const wal_mod.Record,
     current_head: u64,
@@ -1763,7 +1899,7 @@ fn buildCompactedManifestAlloc(
     );
 }
 
-fn buildRebasedManifestFromRefsAlloc(
+pub fn buildRebasedManifestFromRefsAlloc(
     alloc: Allocator,
     namespace: []const u8,
     version: u64,
@@ -2496,7 +2632,7 @@ fn materializeWalDocumentsForPublicationAlloc(
                 defer if (owned) freeMaterializerMutations(self.alloc, mutations);
                 var touched = try document_facts_builder.materializeTouchedAlloc(self.alloc, &pages, root, mutations);
                 defer if (owned) touched.deinit();
-                if (!try flatSearchProjectionChangedAlloc(self.alloc, manifest, touched.before, touched.after, mutations, plan, cancellation)) {
+                if (!try requiresFullDocumentViewAlloc(self.alloc, manifest, touched.before, touched.after, mutations, plan, cancellation, self.paged_projections)) {
                     const counts = try document_facts_builder.predictCountsAlloc(self.alloc, root, touched, plan.policy, plan.table_definition.indexes_json);
                     const count = try std.math.add(u64, std.math.sub(u64, root.document_count, touched.before.len) catch return error.InvalidDocumentFactsRoot, touched.after.len);
                     const document_count = std.math.cast(usize, count) orelse return error.LakeSidecarBuildBudgetExceeded;
@@ -2510,10 +2646,10 @@ fn materializeWalDocumentsForPublicationAlloc(
     return .{ .base_documents = full.base_documents, .documents = full.documents, .mutations = full.mutations, .document_count = full.documents.len };
 }
 
-/// Flat text/vector/sparse formats still need the complete view only when
-/// their own projection changes. Graph-only updates remain point lookups and
-/// copy-on-write page mutations even when unrelated search indexes coexist.
-fn flatSearchProjectionChangedAlloc(
+/// Text can replace touched postings in its existing format. Vector/sparse
+/// changes still require the complete view; unchanged projections and graph
+/// mutations reuse point lookups and copy-on-write facts pages.
+fn requiresFullDocumentViewAlloc(
     alloc: Allocator,
     current: manifest_mod.Manifest,
     before: []const query_mod.QueryMaterializedDocument,
@@ -2521,25 +2657,39 @@ fn flatSearchProjectionChangedAlloc(
     mutations: []const query_mod.QueryMaterializerMutation,
     plan: publication_plan.TablePublicationPlan,
     cancellation: ?maintenance_cancellation.Token,
+    paged: bool,
 ) !bool {
+    if (!std.mem.eql(u8, current.stats.indexes_json, plan.table_definition.indexes_json)) return true;
+    const supports_paged = paged or hasPagedProjections(current);
+    if (supports_paged) {
+        const before_sources = try @import("../paged_projection.zig").fingerprint(alloc, current.stats.published_search_sources);
+        const after_sources = try @import("../paged_projection.zig").fingerprint(alloc, plan.targets.published_search_sources);
+        if (!std.mem.eql(u8, &before_sources, &after_sources)) return true;
+    }
     const specs = try resolvePublishedTextIndexSpecsAlloc(alloc, plan.table_definition, plan.full_text_index_actions);
     defer full_text_indexes.freeFullTextIndexSpecs(alloc, specs);
     for (specs) |spec| {
         try maintenance_cancellation.check(cancellation);
-        if (!artifactAvailableForName(current, .text_segment, spec.name) or
-            try textProjectionChangedForMutationsAlloc(alloc, before, after, mutations, spec)) return true;
+        const index = findNamedArtifactIndex(current, .text_segment, spec.name) orelse return true;
+        if (!std.mem.eql(u8, current.artifacts[index].name, spec.name)) return true;
     }
     const vectors = try search_sources.listVectorSourcesAlloc(alloc, plan.targets.published_search_sources);
     defer search_sources.freeVectorSourceDescriptors(alloc, vectors);
     for (vectors) |source| {
         try maintenance_cancellation.check(cancellation);
-        if (try vectorProjectionChangedForMutationsAlloc(alloc, before, after, mutations, source)) return true;
+        if (try vectorProjectionChangedForMutationsAlloc(alloc, before, after, mutations, source)) {
+            const index = findNamedArtifactIndex(current, .vector_segment, source.index_name);
+            if (!supports_paged or (index != null and current.artifacts[index.?].metadata_version != 2)) return true;
+        }
     }
     const sparse = try search_sources.listSparseSourcesAlloc(alloc, plan.targets.published_search_sources);
     defer search_sources.freeSparseSourceDescriptors(alloc, sparse);
     for (sparse) |source| {
         try maintenance_cancellation.check(cancellation);
-        if (try sparseProjectionChangedForMutationsAlloc(alloc, before, after, mutations, source)) return true;
+        if (try sparseProjectionChangedForMutationsAlloc(alloc, before, after, mutations, source)) {
+            const index = findNamedArtifactIndex(current, .sparse_segment, source.index_name);
+            if (!supports_paged or (index != null and current.artifacts[index.?].metadata_version != 2)) return true;
+        }
     }
     return false;
 }
@@ -2701,6 +2851,20 @@ pub fn buildSparseArtifactRefsForMaterializedDocsAllocUntil(
     published_search_sources: search_sources.PublishedSearchSources,
     cancellation: ?maintenance_cancellation.Token,
 ) ![]manifest_mod.ArtifactRef {
+    return buildSparseArtifactRefsWithContextAllocUntil(alloc, artifacts, current, before_docs, docs, mutations, published_search_sources, cancellation, existingProjectionContext(artifacts, current));
+}
+
+pub fn buildSparseArtifactRefsWithContextAllocUntil(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    current: ?manifest_mod.Manifest,
+    before_docs: []const query_mod.QueryMaterializedDocument,
+    docs: []const query_mod.QueryMaterializedDocument,
+    mutations: []const query_mod.QueryMaterializerMutation,
+    published_search_sources: search_sources.PublishedSearchSources,
+    cancellation: ?maintenance_cancellation.Token,
+    context: ProjectionBuildContext,
+) ![]manifest_mod.ArtifactRef {
     const sparse_sources = try search_sources.listSparseSourcesAlloc(alloc, published_search_sources);
     defer search_sources.freeSparseSourceDescriptors(alloc, sparse_sources);
 
@@ -2708,10 +2872,26 @@ pub fn buildSparseArtifactRefsForMaterializedDocsAllocUntil(
     errdefer freeArtifactRefs(alloc, refs.items);
     for (sparse_sources) |source| {
         try maintenance_cancellation.check(cancellation);
-        if (current) |manifest| {
+        if (current) |manifest| if (!context.enabled or context.partial) {
             if (!try sparseProjectionChangedForMutationsAlloc(alloc, before_docs, docs, mutations, source)) {
                 if (try appendReusedNamedArtifactRefAlloc(alloc, &refs, manifest, .sparse_segment, source.index_name)) continue;
             }
+        };
+        if (context.enabled) {
+            var bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
+            var reads: u64 = 32 * 1024 * 1024;
+            var writes: u64 = 32 * 1024 * 1024;
+            var pages = graph_page_store.PageStore{ .domain = graph_page_store.PageStore.namespaceDomain(context.namespace), .attempt = context.attempt, .artifacts = artifacts, .cancellation = bridge.token(), .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+            const prior_index = if (current != null and context.partial) findNamedArtifactIndex(current.?, .sparse_segment, source.index_name) else null;
+            const prior = if (prior_index) |index| current.?.artifacts[index] else null;
+            if (prior != null and prior.?.metadata_version != 2) return error.ProjectionReindexRequired;
+            const ids = try alloc.alloc([]const u8, mutations.len);
+            defer alloc.free(ids);
+            for (mutations, ids) |mutation, *id| id.* = mutation.doc_id;
+            var delta = try allocSparseSegmentAlloc(alloc, docs, source, cancellation);
+            defer if (delta) |*value| value.deinit(alloc);
+            try refs.append(alloc, try @import("../sparse_segment/paged.zig").publishAlloc(alloc, &pages, prior, delta, ids, source.index_name, try @import("../paged_projection.zig").fingerprint(alloc, source)));
+            continue;
         }
         const built = try buildSparseSegmentAllocForSource(alloc, docs, source, cancellation);
         defer if (built.payload) |payload| alloc.free(payload);
@@ -2765,6 +2945,15 @@ pub fn materializeManifestFactsAlloc(alloc: Allocator, artifacts: *artifacts_mod
     var pages = graph_page_store.PageStore{ .domain = graph_page_store.PageStore.namespaceDomain(manifest.namespace), .artifacts = artifacts, .cancellation = bridge.token(), .remaining_read_bytes = &read_budget, .remaining_write_bytes = &write_budget };
     const root = try document_facts.loadRoot(alloc, &pages, ref);
     if (root.wal_end_lsn != manifest.wal_end_lsn) return error.DocumentFactsSourceChanged;
+    if (findArtifactIndex(manifest, .document_segment)) |index| {
+        const snapshot = manifest.artifacts[index];
+        try @import("../artifacts/store.zig").chargeReadBudget(&read_budget, snapshot.byte_len);
+        const payload = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(alloc, snapshot.artifact_id, snapshot.byte_len, snapshot.checksum, bridge.token());
+        defer alloc.free(payload);
+        const entries = try document_segment_mod.decodeAlloc(alloc, payload);
+        defer document_segment_mod.freeEntries(alloc, entries);
+        return document_facts_builder.materializeWithSnapshotAlloc(alloc, &pages, root, entries);
+    }
     return document_facts_builder.materializeAllAlloc(alloc, &pages, root);
 }
 
@@ -2823,7 +3012,7 @@ fn allocQueryMutationsFromSegmentEntries(alloc: Allocator, entries: []const segm
     return mutations;
 }
 
-fn decodeWalMutationsAlloc(alloc: Allocator, records: []const wal_mod.Record) ![]query_mod.QueryMaterializerMutation {
+pub fn decodeWalMutationsAlloc(alloc: Allocator, records: []const wal_mod.Record) ![]query_mod.QueryMaterializerMutation {
     const mutations = try alloc.alloc(query_mod.QueryMaterializerMutation, records.len);
     errdefer alloc.free(mutations);
 
@@ -3082,12 +3271,11 @@ fn vectorProjectionChangedAlloc(
     after_doc: ?query_mod.QueryMaterializedDocument,
     source: search_sources.VectorSourceDescriptor,
 ) !bool {
-    if ((before_doc == null) != (after_doc == null)) return true;
     if (before_doc == null and after_doc == null) return false;
 
-    var before_projection = try document_projection.parseAlloc(alloc, before_doc.?.body);
+    var before_projection = try document_projection.parseAlloc(alloc, if (before_doc) |doc| doc.body else "{}");
     defer before_projection.deinit(alloc);
-    var after_projection = try document_projection.parseAlloc(alloc, after_doc.?.body);
+    var after_projection = try document_projection.parseAlloc(alloc, if (after_doc) |doc| doc.body else "{}");
     defer after_projection.deinit(alloc);
 
     const before = search_sources.selectVectorSource(&before_projection, source);
@@ -3136,12 +3324,11 @@ fn sparseProjectionChangedAlloc(
     after_doc: ?query_mod.QueryMaterializedDocument,
     source: search_sources.SparseSourceDescriptor,
 ) !bool {
-    if ((before_doc == null) != (after_doc == null)) return true;
     if (before_doc == null and after_doc == null) return false;
 
-    var before_projection = try document_projection.parseAlloc(alloc, before_doc.?.body);
+    var before_projection = try document_projection.parseAlloc(alloc, if (before_doc) |doc| doc.body else "{}");
     defer before_projection.deinit(alloc);
-    var after_projection = try document_projection.parseAlloc(alloc, after_doc.?.body);
+    var after_projection = try document_projection.parseAlloc(alloc, if (after_doc) |doc| doc.body else "{}");
     defer after_projection.deinit(alloc);
 
     const before = search_sources.selectSparseSource(&before_projection, source);
@@ -3297,6 +3484,20 @@ pub fn findNamedArtifactIndex(manifest: manifest_mod.Manifest, kind: manifest_mo
     return unnamed_match;
 }
 
+pub fn hasPagedProjections(source: manifest_mod.Manifest) bool {
+    for (source.artifacts) |ref| if ((ref.kind == .vector_segment or ref.kind == .sparse_segment) and ref.metadata_version == @import("../paged_projection.zig").metadata_version) return true;
+    return false;
+}
+pub fn allArtifactsPagedOrAbsent(source: manifest_mod.Manifest, kind: manifest_mod.ArtifactKind) bool {
+    for (source.artifacts) |ref| if (ref.kind == kind and ref.metadata_version != 2) return false;
+    return true;
+}
+
+pub fn hasPagedText(source: manifest_mod.Manifest) bool {
+    for (source.artifacts) |ref| if (ref.kind == .text_segment and ref.metadata_version == @import("../text_segment/paged.zig").metadata_version) return true;
+    return false;
+}
+
 pub fn countArtifactsByKind(manifest: manifest_mod.Manifest, kind: manifest_mod.ArtifactKind) usize {
     var count: usize = 0;
     for (manifest.artifacts) |artifact| {
@@ -3327,6 +3528,16 @@ pub fn readVectorArtifactInfoAlloc(
     artifacts: *artifacts_mod.ArtifactStore,
     artifact: manifest_mod.ArtifactRef,
 ) !VectorArtifactInfo {
+    if (artifact.metadata_version == 2) {
+        const scope = (try @import("../artifacts/store.zig").uploadScopeFromArtifactId(artifact.artifact_id)) orelse return error.InvalidArtifactUploadScope;
+        var reads: u64 = 4 * 1024 * 1024;
+        var writes: u64 = 0;
+        var pages = graph_page_store.PageStore{ .domain = scope.domain, .artifacts = artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+        const root = try @import("../paged_projection.zig").load(alloc, &pages, artifact);
+        defer root.deinit();
+        return .{ .metric = root.value.metric, .cluster_count = if (root.value.centroids) |ref| @intCast(ref.records) else 0, .base_probe_count = root.value.base_probe_count, .shortlist_multiplier = root.value.shortlist_multiplier };
+    }
+
     const header_bytes = try artifacts.getRangeAlloc(artifact.artifact_id, 0, vector_segment_mod.header_len);
     defer alloc.free(header_bytes);
     const header = try vector_segment_mod.decodeHeader(header_bytes);
@@ -3492,7 +3703,7 @@ pub fn cloneArtifactRefAlloc(alloc: Allocator, artifact: manifest_mod.ArtifactRe
     };
 }
 
-fn artifactRefFromMetadataAlloc(
+pub fn artifactRefFromMetadataAlloc(
     alloc: Allocator,
     kind: manifest_mod.ArtifactKind,
     artifact: artifacts_mod.ArtifactMetadata,
@@ -3697,6 +3908,23 @@ pub fn buildTextArtifactRefsForMaterializedDocsAllocUntil(
     text_index_specs: []const FullTextIndexSpec,
     cancellation: ?maintenance_cancellation.Token,
 ) ![]manifest_mod.ArtifactRef {
+    return buildTextArtifactRefsForTouchedDocsAllocUntil(alloc, artifacts, current, before_docs, docs, mutations, text_index_specs, cancellation, false, if (current) |source| hasPagedText(source) else false, if (artifacts.upload_scope) |scope| scope.attempt else @splat(0), if (current) |source| source.namespace else "");
+}
+
+pub fn buildTextArtifactRefsForTouchedDocsAllocUntil(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    current: ?manifest_mod.Manifest,
+    before_docs: []const query_mod.QueryMaterializedDocument,
+    docs: []const query_mod.QueryMaterializedDocument,
+    mutations: []const query_mod.QueryMaterializerMutation,
+    text_index_specs: []const FullTextIndexSpec,
+    cancellation: ?maintenance_cancellation.Token,
+    touched_only: bool,
+    use_paged: bool,
+    attempt: [16]u8,
+    namespace: []const u8,
+) ![]manifest_mod.ArtifactRef {
     const refs = try alloc.alloc(manifest_mod.ArtifactRef, text_index_specs.len);
     errdefer alloc.free(refs);
     var initialized: usize = 0;
@@ -3707,7 +3935,8 @@ pub fn buildTextArtifactRefsForMaterializedDocsAllocUntil(
     for (text_index_specs, 0..) |spec, idx| {
         try maintenance_cancellation.check(cancellation);
         if (current) |manifest| {
-            if (!try textProjectionChangedForMutationsAlloc(alloc, before_docs, docs, mutations, spec)) {
+            const prior_index = findNamedArtifactIndex(manifest, .text_segment, spec.name);
+            if ((!use_paged or (prior_index != null and manifest.artifacts[prior_index.?].metadata_version == @import("../text_segment/paged.zig").metadata_version)) and !try textProjectionChangedForMutationsAlloc(alloc, before_docs, docs, mutations, spec)) {
                 if (try cloneNamedArtifactRefAlloc(alloc, manifest, .text_segment, spec.name)) |artifact| {
                     refs[idx] = artifact;
                     initialized += 1;
@@ -3715,7 +3944,49 @@ pub fn buildTextArtifactRefsForMaterializedDocsAllocUntil(
                 }
             }
         }
-        const payload = try buildTextSegmentAlloc(alloc, docs, spec, cancellation);
+        if (use_paged) {
+            var bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
+            var reads: u64 = 32 * 1024 * 1024;
+            var writes: u64 = 32 * 1024 * 1024;
+            var pages = graph_page_store.PageStore{ .domain = graph_page_store.PageStore.namespaceDomain(namespace), .attempt = attempt, .artifacts = artifacts, .cancellation = bridge.token(), .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+            var delta = try allocTextSegmentAlloc(alloc, docs, spec, cancellation);
+            defer delta.deinit(alloc);
+            const ids = try alloc.alloc([]const u8, mutations.len);
+            defer alloc.free(ids);
+            for (mutations, ids) |mutation, *id| id.* = mutation.doc_id;
+            const prior_index = if (current) |source| findNamedArtifactIndex(source, .text_segment, spec.name) else null;
+            const prior = if (prior_index) |position| current.?.artifacts[position] else null;
+            if (prior != null and prior.?.metadata_version != @import("../text_segment/paged.zig").metadata_version and touched_only) {
+                const bytes = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(alloc, prior.?.artifact_id, prior.?.byte_len, prior.?.checksum, bridge.token());
+                defer alloc.free(bytes);
+                var base = try text_segment_mod.decodeAlloc(alloc, bytes);
+                defer base.deinit(alloc);
+                const combined = try @import("../text_segment/incremental.zig").encodeReplacementAlloc(alloc, base, delta, ids, bridge.token());
+                defer alloc.free(combined);
+                var full = try text_segment_mod.decodeAlloc(alloc, combined);
+                defer full.deinit(alloc);
+                refs[idx] = try @import("../text_segment/paged.zig").publishAlloc(alloc, &pages, null, full, &.{});
+            } else {
+                refs[idx] = try @import("../text_segment/paged.zig").publishAlloc(alloc, &pages, if (prior != null and prior.?.metadata_version == @import("../text_segment/paged.zig").metadata_version) prior else null, delta, ids);
+            }
+            initialized += 1;
+            continue;
+        }
+        const payload = if (touched_only) incremental: {
+            const prior = current orelse return error.DocumentFactsSourceChanged;
+            const index = findNamedArtifactIndex(prior, .text_segment, spec.name) orelse return error.TextSegmentNotFound;
+            var bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
+            const bytes = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(alloc, prior.artifacts[index].artifact_id, prior.artifacts[index].byte_len, prior.artifacts[index].checksum, bridge.token());
+            defer alloc.free(bytes);
+            var base = try text_segment_mod.decodeAlloc(alloc, bytes);
+            defer base.deinit(alloc);
+            var delta = try allocTextSegmentAlloc(alloc, docs, spec, cancellation);
+            defer delta.deinit(alloc);
+            const ids = try alloc.alloc([]const u8, mutations.len);
+            defer alloc.free(ids);
+            for (mutations, ids) |mutation, *id| id.* = mutation.doc_id;
+            break :incremental try @import("../text_segment/incremental.zig").encodeReplacementAlloc(alloc, base, delta, ids, bridge.token());
+        } else try buildTextSegmentAlloc(alloc, docs, spec, cancellation);
         defer alloc.free(payload);
         var artifact = try artifacts.put(payload);
         defer artifact.deinit(alloc);
@@ -3909,7 +4180,26 @@ fn freeQueryMutations(alloc: Allocator, mutations: []query_mod.QueryMaterializer
     freeMaterializerMutations(alloc, mutations);
 }
 
-fn allocTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterializedDocument, spec: FullTextIndexSpec, cancellation: ?maintenance_cancellation.Token) !text_segment_mod.Segment {
+pub fn textSourceNameAlloc(alloc: Allocator, spec: FullTextIndexSpec) ![]u8 {
+    return switch (spec.source_mode) {
+        .document => try alloc.dupe(u8, "text"),
+        .artifact_only => try alloc.dupe(u8, spec.source_artifact_name orelse "text"),
+        .document_plus_artifact => if (spec.source_artifact_name) |name|
+            try std.fmt.allocPrint(alloc, "text+{s}", .{name})
+        else
+            try alloc.dupe(u8, "text"),
+    };
+}
+
+pub fn normalizedTextForDocumentAlloc(alloc: Allocator, doc: query_mod.QueryMaterializedDocument, spec: FullTextIndexSpec) ![]u8 {
+    var projection = try document_projection.parseAlloc(alloc, doc.body);
+    defer projection.deinit(alloc);
+    const source_text = try selectTextSourceAlloc(alloc, doc.body, &projection, spec);
+    defer alloc.free(source_text);
+    return @import("../query/indexed_reader.zig").normalizeAlloc(alloc, source_text);
+}
+
+pub fn allocTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterializedDocument, spec: FullTextIndexSpec, cancellation: ?maintenance_cancellation.Token) !text_segment_mod.Segment {
     const doc_entries = try alloc.alloc(text_segment_mod.DocumentEntry, docs.len);
     errdefer alloc.free(doc_entries);
 
@@ -3926,11 +4216,7 @@ fn allocTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterial
 
     for (docs, 0..) |doc, doc_index| {
         if (doc_index % 64 == 0) try maintenance_cancellation.check(cancellation);
-        var projection = try document_projection.parseAlloc(alloc, doc.body);
-        defer projection.deinit(alloc);
-        const source_text = try selectTextSourceAlloc(alloc, doc.body, &projection, spec);
-        defer alloc.free(source_text);
-        const normalized_text = try @import("../query/indexed_reader.zig").normalizeAlloc(alloc, source_text);
+        const normalized_text = try normalizedTextForDocumentAlloc(alloc, doc, spec);
         errdefer alloc.free(normalized_text);
 
         var token_count: u32 = 0;
@@ -3983,14 +4269,7 @@ fn allocTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterial
 
     return .{
         .index_name = try alloc.dupe(u8, spec.name),
-        .source_name = switch (spec.source_mode) {
-            .document => try alloc.dupe(u8, "text"),
-            .artifact_only => try alloc.dupe(u8, spec.source_artifact_name orelse "text"),
-            .document_plus_artifact => if (spec.source_artifact_name) |name|
-                try std.fmt.allocPrint(alloc, "text+{s}", .{name})
-            else
-                try alloc.dupe(u8, "text"),
-        },
+        .source_name = try textSourceNameAlloc(alloc, spec),
         .config_json = try alloc.dupe(u8, spec.config_json),
         .docs = doc_entries,
         .terms = term_entries,
@@ -4055,19 +4334,14 @@ fn combineTextSourcesAlloc(alloc: Allocator, primary: []const u8, secondary: []c
     return out;
 }
 
-fn buildVectorSegmentAlloc(
-    alloc: Allocator,
-    fallback_metric: shared_vector.DistanceMetric,
-    docs: []const query_mod.QueryMaterializedDocument,
-    policy: ?vector_index.BuildPolicy,
-    vector_source: ?search_sources.VectorSourceDescriptor,
-    cancellation: ?maintenance_cancellation.Token,
-) !struct {
-    payload: ?[]u8,
-    vector_count: usize,
-} {
-    if (vector_source == null) return .{ .payload = null, .vector_count = 0 };
-    const metric = vector_source.?.distance_metric orelse fallback_metric;
+fn cloneVectorEntryAlloc(alloc: Allocator, id: []const u8, vector: []const f32) !vector_segment_mod.Entry {
+    const doc_id = try alloc.dupe(u8, id);
+    errdefer alloc.free(doc_id);
+    return .{ .doc_id = doc_id, .vector = try alloc.dupe(f32, vector) };
+}
+
+pub fn allocVectorEntriesForSourceAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterializedDocument, vector_source: ?search_sources.VectorSourceDescriptor, cancellation: ?maintenance_cancellation.Token) !struct { entries: []vector_segment_mod.Entry, dims: u32 } {
+    if (vector_source == null) return .{ .entries = try alloc.alloc(vector_segment_mod.Entry, 0), .dims = 0 };
     var dims: ?usize = null;
     var count: usize = 0;
     for (docs, 0..) |doc, doc_index| {
@@ -4089,7 +4363,7 @@ fn buildVectorSegmentAlloc(
         }
     }
 
-    if (count == 0) return .{ .payload = null, .vector_count = 0 };
+    if (count == 0) return .{ .entries = try alloc.alloc(vector_segment_mod.Entry, 0), .dims = 0 };
 
     const entries = try alloc.alloc(vector_segment_mod.Entry, count);
     errdefer alloc.free(entries);
@@ -4105,37 +4379,35 @@ fn buildVectorSegmentAlloc(
         switch (search_sources.selectVectorSource(&projection, vector_source.?)) {
             .none => continue,
             .chunk_embeddings => |chunk_embeddings| {
-                for (chunk_embeddings) |chunk_embedding| {
-                    entries[initialized] = .{
-                        .doc_id = try alloc.dupe(u8, doc.doc_id),
-                        .vector = try alloc.dupe(f32, chunk_embedding.embedding),
-                    };
+                for (chunk_embeddings, 0..) |chunk_embedding, ordinal| {
+                    entries[initialized] = try cloneVectorEntryAlloc(alloc, doc.doc_id, chunk_embedding.embedding);
+                    entries[initialized].source_lsn = doc.last_lsn;
+                    entries[initialized].source_ordinal = @intCast(ordinal);
                     initialized += 1;
                 }
             },
             .top_level => |embedding| {
-                entries[initialized] = .{
-                    .doc_id = try alloc.dupe(u8, doc.doc_id),
-                    .vector = try alloc.dupe(f32, embedding),
-                };
+                entries[initialized] = try cloneVectorEntryAlloc(alloc, doc.doc_id, embedding);
+                entries[initialized].source_lsn = doc.last_lsn;
                 initialized += 1;
             },
         }
     }
 
-    var segment = try vector_index.buildClusteredSegmentWithPolicyAllocUntil(
-        alloc,
-        metric,
-        @intCast(dims.?),
-        entries,
-        policy orelse .{},
-        cancellation,
-    );
-    defer vector_segment_mod.freeSegment(alloc, &segment);
-    return .{
-        .payload = try vector_segment_mod.encodeAlloc(alloc, segment),
-        .vector_count = count,
-    };
+    return .{ .entries = entries, .dims = @intCast(dims.?) };
+}
+
+fn buildVectorSegmentAlloc(alloc: Allocator, fallback_metric: shared_vector.DistanceMetric, docs: []const query_mod.QueryMaterializedDocument, policy: ?vector_index.BuildPolicy, vector_source: ?search_sources.VectorSourceDescriptor, cancellation: ?maintenance_cancellation.Token) !struct { payload: ?[]u8, vector_count: usize } {
+    const projected = try allocVectorEntriesForSourceAlloc(alloc, docs, vector_source, cancellation);
+    const count = projected.entries.len;
+    if (count == 0) {
+        alloc.free(projected.entries);
+        return .{ .payload = null, .vector_count = 0 };
+    }
+    const metric = vector_source.?.distance_metric orelse fallback_metric;
+    var built = try vector_index.buildClusteredSegmentWithPolicyAllocUntil(alloc, metric, projected.dims, projected.entries, policy orelse .{}, cancellation);
+    defer built.deinit(alloc);
+    return .{ .payload = try vector_segment_mod.encodeAlloc(alloc, built), .vector_count = count };
 }
 
 pub fn buildVectorArtifactRefsForMaterializedDocsAlloc(
@@ -4178,6 +4450,26 @@ pub fn buildVectorArtifactRefsForMaterializedDocsAllocUntil(
     published_search_sources: search_sources.PublishedSearchSources,
     cancellation: ?maintenance_cancellation.Token,
 ) ![]manifest_mod.ArtifactRef {
+    return buildVectorArtifactRefsWithContextAllocUntil(alloc, artifacts, current, metric, before_docs, docs, mutations, policy, named_policies, published_search_sources, cancellation, existingProjectionContext(artifacts, current));
+}
+
+pub fn buildVectorArtifactRefsWithContextAllocUntil(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    current: ?manifest_mod.Manifest,
+    metric: shared_vector.DistanceMetric,
+    before_docs: []const query_mod.QueryMaterializedDocument,
+    docs: []const query_mod.QueryMaterializedDocument,
+    mutations: []const query_mod.QueryMaterializerMutation,
+    policy: ?vector_index.BuildPolicy,
+    named_policies: []const NamedVectorBuildPolicy,
+    published_search_sources: search_sources.PublishedSearchSources,
+    cancellation: ?maintenance_cancellation.Token,
+    context: ProjectionBuildContext,
+) ![]manifest_mod.ArtifactRef {
+    // Paged shards own their bounded local clustering policy. Reject explicit
+    // flat-generation tuning rather than silently dropping caller intent.
+    if (context.enabled and (policy != null or named_policies.len != 0)) return error.PagedVectorBuildPolicyUnsupported;
     const vector_sources = try search_sources.listVectorSourcesAlloc(alloc, published_search_sources);
     defer search_sources.freeVectorSourceDescriptors(alloc, vector_sources);
 
@@ -4185,10 +4477,31 @@ pub fn buildVectorArtifactRefsForMaterializedDocsAllocUntil(
     errdefer freeArtifactRefs(alloc, refs.items);
     for (vector_sources) |source| {
         try maintenance_cancellation.check(cancellation);
-        if (current) |manifest| {
+        if (current) |manifest| if (!context.enabled or context.partial) {
             if (!try vectorProjectionChangedForMutationsAlloc(alloc, before_docs, docs, mutations, source)) {
                 if (try appendReusedNamedArtifactRefAlloc(alloc, &refs, manifest, .vector_segment, source.index_name)) continue;
             }
+        };
+        if (context.enabled) {
+            var bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
+            var reads: u64 = 32 * 1024 * 1024;
+            var writes: u64 = 32 * 1024 * 1024;
+            var pages = graph_page_store.PageStore{ .domain = graph_page_store.PageStore.namespaceDomain(context.namespace), .attempt = context.attempt, .artifacts = artifacts, .cancellation = bridge.token(), .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+            const prior_index = if (current != null and context.partial) findNamedArtifactIndex(current.?, .vector_segment, source.index_name) else null;
+            const prior = if (prior_index) |index| current.?.artifacts[index] else null;
+            if (prior != null and prior.?.metadata_version != 2) return error.ProjectionReindexRequired;
+            const ids = try alloc.alloc([]const u8, mutations.len);
+            defer alloc.free(ids);
+            for (mutations, ids) |mutation, *id| id.* = mutation.doc_id;
+            const delta = try allocVectorEntriesForSourceAlloc(alloc, docs, source, cancellation);
+            defer {
+                for (delta.entries) |*entry| entry.deinit(alloc);
+                alloc.free(delta.entries);
+            }
+            const effective_metric = source.distance_metric orelse metric;
+            const fingerprint = try @import("../paged_projection.zig").fingerprint(alloc, .{ .source = source, .metric = effective_metric });
+            try refs.append(alloc, try @import("../vector_segment/paged.zig").publishWithMaintenanceAlloc(alloc, &pages, prior, delta.entries, ids, source.index_name, fingerprint, effective_metric, cancellation, context.maintenance_pending));
+            continue;
         }
         const built = try buildVectorSegmentAlloc(
             alloc,
@@ -4340,7 +4653,7 @@ fn buildVectorArtifactRefsForRepublishAlloc(
 /// subsequent writer's identical content.
 pub fn graphPublicationAttempt(guard: ?work_lease.PublicationGuard, namespace: []const u8, io: std.Io) ![16]u8 {
     const authority = guard orelse return error.GraphPublicationGuardRequired;
-    const fence = (try authority.preparePublication(namespace)) orelse return error.GraphPublicationGuardRequired;
+    const fence = (try authority.uploadFence(namespace)) orelse return error.GraphPublicationGuardRequired;
     return (try @import("../artifacts/store.zig").UploadScope.forPublication(graph_page_store.PageStore.namespaceDomain(namespace), fence.fencing_token, io)).attempt;
 }
 
@@ -4369,7 +4682,12 @@ pub const GraphSourceProtection = struct {
     }
 
     pub fn token(self: *GraphSourceProtection, io: std.Io) maintenance_cancellation.Token {
-        return .{ .io = io, .cooperative = .{ .ptr = self, .check_fn = check } };
+        return .{ .io = io, .cooperative = .{ .ptr = self, .check_fn = check, .is_cancelled_fn = isRequested } };
+    }
+
+    fn isRequested(ptr: *const anyopaque) bool {
+        const self: *const GraphSourceProtection = @ptrCast(@alignCast(ptr));
+        return if (self.parent) |parent| parent.isRequested() else false;
     }
 
     fn check(ptr: *const anyopaque) !void {
@@ -5339,7 +5657,7 @@ fn lessGraphAdjacency(_: void, lhs: graph_segment_mod.Adjacency, rhs: graph_segm
     return std.mem.order(u8, lhs.node_id, rhs.node_id) == .lt;
 }
 
-fn allocSparseSegmentAlloc(
+pub fn allocSparseSegmentAlloc(
     alloc: Allocator,
     docs: []const query_mod.QueryMaterializedDocument,
     sparse_source: search_sources.SparseSourceDescriptor,
@@ -7960,7 +8278,14 @@ test "serverless external selector transitions preserve resolved sidecars withou
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
-fn threadedIo() std.Io.Threaded {
+const FallbackIo = if (@import("builtin").os.tag == .freestanding) struct {
+    fn io(_: *@This()) std.Io {
+        return .failing;
+    }
+    fn deinit(_: *@This()) void {}
+} else std.Io.Threaded;
+fn threadedIo() FallbackIo {
+    if (comptime @import("builtin").os.tag == .freestanding) return .{};
     return std.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 

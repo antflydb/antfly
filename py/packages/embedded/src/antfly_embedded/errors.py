@@ -72,8 +72,9 @@ VERSION_CONFLICT = 3
 INTENT_CONFLICT = 4
 TXN_NOT_FOUND = 5
 BUSY = 6
-# The operation crossed its publication point, but crash durability could
-# not be confirmed. Inspect the destination; do not retry automatically.
+# The operation may have taken effect: it was published but crash durability
+# could not be confirmed, or a failure left it unknown whether it applied.
+# Inspect the affected data; do not retry automatically.
 OUTCOME_UNKNOWN = 7
 # The operation requires a capability unavailable on this platform or
 # filesystem. Retrying unchanged will not succeed.
@@ -116,8 +117,8 @@ _DESCRIPTIONS: dict[int, str] = {
     TXN_NOT_FOUND: "the requested transaction was not found",
     BUSY: "the requested resource is temporarily busy or changed during streaming; stabilize it and retry",
     OUTCOME_UNKNOWN: (
-        "the operation was published, but crash durability could not be confirmed; "
-        "inspect the destination and do not retry automatically"
+        "the operation may have taken effect, but whether it applied or became durable "
+        "could not be confirmed; inspect the affected data and do not retry automatically"
     ),
     UNSUPPORTED: "the operation requires a capability that is not supported by this platform or filesystem",
     STALLED: "derived work stalled or failed; inspect pending-work diagnostics and repair or reopen the database",

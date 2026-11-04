@@ -8498,6 +8498,7 @@ pub const KernelModule = struct {
         gh: buffer_mod.DeviceBuffer,
         rows: usize,
         dim: usize,
+        add_residual: bool,
     ) driver_mod.Error!void {
         const count = try checkedTensorElements(rows, dim);
         const gate_dim = try checkedTensorElements(dim, 3);
@@ -8513,6 +8514,7 @@ pub const KernelModule = struct {
         var gh_ptr = gh.ptr;
         var rows_u32 = try toU32(rows);
         var dim_u32 = try toU32(dim);
+        var add_residual_u32: u32 = @intFromBool(add_residual);
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&label_ptr),
@@ -8520,6 +8522,7 @@ pub const KernelModule = struct {
             @ptrCast(&gh_ptr),
             @ptrCast(&rows_u32),
             @ptrCast(&dim_u32),
+            @ptrCast(&add_residual_u32),
         };
         try launch1d(self.gliner_gru_combine_f32, ctx, count, &params);
     }

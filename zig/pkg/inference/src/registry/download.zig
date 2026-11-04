@@ -247,6 +247,7 @@ const always_files = [_][]const u8{
     "preprocessor_config.json",
     "tokenizer.json",
     "tokenizer_config.json",
+    "chat_template.jinja", // Processor-level templates may not be embedded in tokenizer config.
     "special_tokens_map.json",
     "tokenizer.model", // SentencePiece fallback
     "sentencepiece.bpe.model",
@@ -5436,7 +5437,7 @@ fn exerciseHubSnapshot(mode: []const u8, variant: []const u8, expected_format: ?
         try std.testing.expect(receipt.find("onnx/weights.bin") != null);
         try std.testing.expect(receipt.find("onnx/Constant_7_attr__value") != null);
         try std.testing.expect(receipt.find("onnx/tokenizer.json") != null);
-    } else if (std.mem.eql(u8, expected_format.?, "safetensors")) {
+    } else if (std.mem.eql(u8, expected_format.?, "safetensors") and !std.mem.eql(u8, mode, "lighton-template")) {
         try std.testing.expect(receipt.find("custom.safetensors") != null);
         try std.testing.expect(receipt.find("model-00001-of-00001.safetensors") == null);
         try std.testing.expect(receipt.find("onnx/model.onnx") == null);
@@ -5447,6 +5448,16 @@ fn exerciseHubSnapshot(mode: []const u8, variant: []const u8, expected_format: ?
         try std.testing.expect(receipt.find("gliner_head.gguf") != null);
         try std.testing.expect(receipt.find("unrelated.Q4_K.gguf") == null);
     }
+    if (std.mem.eql(u8, mode, "lighton-template")) {
+        // A separate upstream template must survive the full download and
+        // receipt path even when tokenizer_config.json has no embedded one.
+        try std.testing.expect(receipt.find("chat_template.jinja") != null);
+        var dir = try std.Io.Dir.cwd().openDir(io, dest, .{});
+        defer dir.close(io);
+        const template = try dir.readFileAlloc(io, "chat_template.jinja", allocator, .limited(4096));
+        defer allocator.free(template);
+        try std.testing.expectEqualStrings("{% for message in messages %}{{ message.content }}{% endfor %}", template);
+    }
     const log = try tmp.dir.readFileAlloc(io, "requests.log", allocator, .limited(64 * 1024));
     defer allocator.free(log);
     try std.testing.expect(std.mem.indexOf(u8, log, "/resolve/main/") == null);
@@ -5455,6 +5466,10 @@ fn exerciseHubSnapshot(mode: []const u8, variant: []const u8, expected_format: ?
 
 test "Hub snapshot uses one resolved commit when main moves and auto selects only GGUF" {
     try exerciseHubSnapshot("all", "auto", "gguf", null);
+}
+
+test "Hub snapshot preserves the standalone LightOn chat template" {
+    try exerciseHubSnapshot("lighton-template", "safetensors", "safetensors", null);
 }
 
 test "Hub snapshot resolves slash branches and downloads every ONNX dependency" {

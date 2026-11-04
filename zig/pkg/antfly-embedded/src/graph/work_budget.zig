@@ -102,6 +102,9 @@ pub const WorkBudget = struct {
     remaining_anchors: usize,
     retained_state_bytes: usize = 0,
     last_exhaustion: ?Exhaustion = null,
+    /// Optional request-local storage can surrender memory before required
+    /// graph state is denied. The callback must only free existing ownership.
+    state_reclaimer: ?struct { ctx: *anyopaque, reclaim: *const fn (*anyopaque, usize) void } = null,
 
     pub fn init(max_nodes: usize, max_edges: usize) WorkBudget {
         return initWithLimits(.{
@@ -183,12 +186,29 @@ pub const WorkBudget = struct {
         if (count > effective_maximum) return self.exhaust(.intermediate_states, effective_maximum);
     }
 
+    /// Yield optional state toward a preferred read/transport allowance.
+    /// A required response may still use the smaller remaining headroom.
+    pub fn prepareStateHeadroom(self: *WorkBudget, bytes: usize) usize {
+        if (bytes > self.max_retained_state_bytes -| self.retained_state_bytes) {
+            if (self.state_reclaimer) |optional| optional.reclaim(optional.ctx, bytes);
+        }
+        return self.max_retained_state_bytes -| self.retained_state_bytes;
+    }
+
+    /// Make room for required work without reserving bytes or raising limits.
+    pub fn ensureStateHeadroom(self: *WorkBudget, bytes: usize) !usize {
+        if (bytes > self.max_retained_state_bytes)
+            return self.exhaust(.retained_state_bytes, self.max_retained_state_bytes);
+        const available = self.prepareStateHeadroom(bytes);
+        if (self.retained_state_bytes > self.max_retained_state_bytes or bytes > available)
+            return self.exhaust(.retained_state_bytes, self.max_retained_state_bytes);
+        return available;
+    }
+
     pub fn retainStateBytes(self: *WorkBudget, bytes: usize) !void {
-        const retained = std.math.add(usize, self.retained_state_bytes, bytes) catch
+        _ = try self.ensureStateHeadroom(bytes);
+        self.retained_state_bytes = std.math.add(usize, self.retained_state_bytes, bytes) catch
             return self.exhaust(.retained_state_bytes, self.max_retained_state_bytes);
-        if (retained > self.max_retained_state_bytes)
-            return self.exhaust(.retained_state_bytes, self.max_retained_state_bytes);
-        self.retained_state_bytes = retained;
     }
 
     pub fn releaseStateBytes(self: *WorkBudget, bytes: usize) void {
@@ -444,4 +464,41 @@ test "hash map retained bytes track capacity rather than entry count" {
         @as(usize, 160),
         try hashMapRetainedBytes([]const u8, void, 8),
     );
+}
+
+test "required headroom reclaims optional state without reserving or raising limits" {
+    var budget = WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 100 });
+    const Optional = struct {
+        budget: *WorkBudget,
+        calls: usize = 0,
+        bytes: usize = 30,
+        fn reclaim(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.budget.releaseStateBytes(self.bytes);
+            self.bytes = 0;
+        }
+    };
+    var optional = Optional{ .budget = &budget };
+    try budget.retainStateBytes(90);
+    budget.state_reclaimer = .{ .ctx = &optional, .reclaim = Optional.reclaim };
+    try std.testing.expectEqual(@as(usize, 10), try budget.ensureStateHeadroom(10));
+    try std.testing.expectEqual(@as(usize, 0), optional.calls);
+    try std.testing.expectEqual(@as(usize, 40), try budget.ensureStateHeadroom(11));
+    try std.testing.expectEqual(@as(usize, 60), budget.retained_state_bytes);
+    try std.testing.expectEqual(@as(usize, 1), optional.calls);
+    try budget.retainStateBytes(40);
+    try std.testing.expectEqual(@as(usize, 100), budget.retained_state_bytes);
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, budget.ensureStateHeadroom(1));
+    try std.testing.expectEqual(@as(usize, 2), optional.calls);
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, budget.ensureStateHeadroom(101));
+    try std.testing.expectEqual(@as(usize, 2), optional.calls);
+    try std.testing.expectEqual(@as(usize, 100), budget.retained_state_bytes);
+    // A preferred read allowance may exceed what mandatory state leaves.
+    // Preparing it remains non-failing and does not consume headroom.
+    budget.releaseStateBytes(40);
+    budget.state_reclaimer = null;
+    try std.testing.expectEqual(@as(usize, 40), budget.prepareStateHeadroom(101));
+    try std.testing.expectEqual(@as(usize, 60), budget.retained_state_bytes);
+    budget.releaseStateBytes(60);
 }

@@ -467,6 +467,7 @@ pub const CapabilityProfile = enum {
     gliner25_boundary,
     gliner25_modern_bert,
     florence2,
+    whisper,
     gemma4,
     gemma4_training,
     qwen3_embedding,
@@ -480,9 +481,9 @@ pub const CapabilityProfile = enum {
 /// CudaCompute initialization; this rejects architectures whose numeric path
 /// cannot run on the selected GPU at all.
 pub fn profileSupportsDevice(profile: CapabilityProfile, compute_major: i32, compute_minor: i32) bool {
-    _ = compute_minor;
     return switch (profile) {
         .embedding_gemma2, .lightonocr3 => compute_major >= 8,
+        .whisper => compute_major > 7 or (compute_major == 7 and compute_minor >= 5),
         else => true,
     };
 }
@@ -510,7 +511,7 @@ fn jitModelProfile(profile: CapabilityProfile) kernels_mod.JitModelProfile {
         .deberta_reranker => .deberta_reranker,
         .gliner2, .gliner2_training, .gliner25_boundary => .gliner2,
         .gliner25_modern_bert => .laya,
-        .florence2 => .florence2,
+        .florence2, .whisper => .florence2,
         .gemma4, .gemma4_training, .embedding_gemma2 => .gemma4,
         .qwen3_embedding => .qwen3_embedding,
         .qwen3_vl_generation, .lightonocr3 => .qwen3_vl_generation,
@@ -1292,6 +1293,8 @@ pub const RuntimeStats = struct {
     from_float32_calls: usize = 0,
     from_float32_bytes: usize = 0,
     to_float32_calls: usize = 0,
+    gliner_label_gru_calls: usize = 0,
+    gliner_label_gru_no_residual_calls: usize = 0,
     to_float32_bytes: usize = 0,
     training_input_uploads: usize = 0,
     training_input_upload_bytes: usize = 0,
@@ -2344,6 +2347,7 @@ pub const CudaCompute = struct {
         const attention = &self.embedding_gemma2_cudnn.?;
         const key = cudnn_sdpa_mod.Key{ .batch = batch, .q_heads = hidden / 64, .kv_heads = hidden / 64, .sequence = rows / batch, .dim = 64, .scale = 0.125, .ocr_vision = true, .dtype = .bf16 };
         const workspace_bytes = (try attention.workspaceBytesFor(key)) orelse return error.CudnnFailure;
+        if (workspace_bytes > try @import("vision_memory_contract.zig").vendorWorkspaceLimit(rows, hidden)) return null;
         // Retain the existing vendor-workspace admission and retirement
         // policy; encoder temporaries create no additional retained pool.
         if (self.run_budget) |budget| {
@@ -4059,6 +4063,9 @@ pub const CudaCompute = struct {
 
     /// Laya parity requires FP32 execution even for reduced-storage source tensors.
     strict_f32_weights: bool = false,
+    /// Artifact-qualified specialty span models retain FP32 attention even
+    /// when global diagnostic environment switches request reduced precision.
+    qualified_span_fp32: bool = false,
     laya_optimizations: bool = false,
     gliner_encoder_attention: bool = false,
     gliner_mixed_attention: bool = false,
@@ -4073,6 +4080,10 @@ pub const CudaCompute = struct {
     ctx: context_mod.CudaContext,
     scalar_clamp_kernel: @import("scalar_clamp.zig").Kernel = .{},
     florence_fused: @import("florence_fused.zig").Module = .{},
+    whisper_cuda: @import("whisper_cuda.zig").Module = .{},
+    whisper_f16_weights_enabled: bool = true,
+    whisper_stats: [2]ops.WhisperLogitsStatsRaw = undefined,
+    whisper_stats_valid: [2]bool = .{ false, false },
     florence_fused_depthwise_enabled: bool = false,
     ocr_retained_cache_bytes: usize = 0,
     ocr_retained_cache_lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null,
@@ -4386,11 +4397,13 @@ pub const CudaCompute = struct {
         return &self.ctx;
     }
 
-    pub const EmbeddingGemma2TrainingAllocationStats = struct {
+    pub const AllocationStats = struct {
         limit: usize,
         live: usize,
         peak: usize,
     };
+
+    pub const EmbeddingGemma2TrainingAllocationStats = AllocationStats;
 
     /// Applies to every physical DeviceBuffer owned by this CUDA context,
     /// including loaded base weights, BF16 mirrors, adapter state, tape, and
@@ -4401,9 +4414,16 @@ pub const CudaCompute = struct {
         try self.ctx.device_allocations.setLimit(bytes);
     }
 
-    pub fn embeddingGemma2TrainingAllocationStats(self: *CudaCompute) EmbeddingGemma2TrainingAllocationStats {
+    /// Physical owned CUDA buffers, including resident weights and cached
+    /// temporaries. Driver/library-private allocations require separate headroom.
+    /// Peak is the lifetime high-water mark of this compute context.
+    pub fn allocationStats(self: *CudaCompute) AllocationStats {
         const value = self.ctx.device_allocations.snapshot();
         return .{ .limit = value.limit, .live = value.live, .peak = value.peak };
+    }
+
+    pub fn embeddingGemma2TrainingAllocationStats(self: *CudaCompute) EmbeddingGemma2TrainingAllocationStats {
+        return self.allocationStats();
     }
 
     pub fn embeddingGemma2TrainingCublasLt(self: *CudaCompute) !*cublaslt_mod.CublasLt {
@@ -5222,6 +5242,7 @@ pub const CudaCompute = struct {
             .lighton_ragged_recurrent_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_RAGGED_RECURRENT", lighton_auto),
             .lighton_fused_gdn_decode_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_GDN_DECODE", lighton_auto),
             .florence_f16_weights_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_F16_WEIGHTS"),
+            .whisper_f16_weights_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_WHISPER_F16_WEIGHTS", true),
             .florence_channel_tc_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_CHANNEL_TC"),
             .florence_fused_bias_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_FUSED_BIAS"),
             .florence_fused_depthwise_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_FUSED_DEPTHWISE"),
@@ -5344,6 +5365,7 @@ pub const CudaCompute = struct {
         self.lighton_vision_down.deinit(&self.ctx);
 
         self.florence_fused.deinit(&self.ctx);
+        self.whisper_cuda.deinit(&self.ctx);
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_cached_gate_single_calls={d} cuda_cached_gate_batch_calls={d}\n", .{ self.lighton_recurrent.cached_single_calls, self.lighton_recurrent.cached_batch_calls });
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
@@ -5664,6 +5686,7 @@ pub const CudaCompute = struct {
             .gliner25_boundary => self.kernels.hasGliner25InferencePrimitives(),
             .gliner25_modern_bert => self.kernels.hasLayaPrimitives() and self.kernels.gliner_encoder_attention_f32 != null,
             .florence2 => self.kernels.hasFlorence2Primitives(),
+            .whisper => profileSupportsDevice(.whisper, self.ctx.info.compute_major, self.ctx.info.compute_minor) and self.kernels.hasFlorence2Primitives() and self.kernels.gliner_encoder_attention_tc_f16 != null,
             .gemma4 => self.kernels.hasQuantMatmulMvpPrimitives() and
                 self.kernels.hasBf16WeightPrimitives() and
                 (self.kernels.hasGemma4DecoderPrimitives() or cudaAllowHostAttentionFallback()),
@@ -5682,6 +5705,7 @@ pub const CudaCompute = struct {
     pub fn requireProfile(self: *CudaCompute, profile: CapabilityProfile) !void {
         if (!self.supportsProfile(profile)) return error.CudaKernelUnavailable;
         if (profile == .lightonocr3) try self.lighton_recurrent.init(&self.ctx);
+        if (profile == .whisper) try self.whisper_cuda.init(&self.ctx);
     }
 
     pub fn snapshotStats(self: *const CudaCompute) RuntimeStats {
@@ -6540,6 +6564,27 @@ pub const CudaCompute = struct {
         }
         if (loaded.tensor.dtype == .bf16 and loaded.tensor.shape.len >= 2) {
             return self.insertBf16WeightFromTensor(owned_key, &loaded.tensor);
+        }
+        // Whisper checkpoints commonly store FP32 matrices. Keep the dense
+        // projections and embedding table in FP16, with FP32 accumulation and
+        // logits; norms, biases and convolution filters retain FP32 storage.
+        if (self.capability_profile == .whisper and loaded.tensor.shape.len == 2 and
+            std.mem.endsWith(u8, owned_key, ".weight") and canUseF16TensorCoreWeights(self) and
+            self.whisper_f16_weights_enabled)
+        {
+            if (loaded.tensor.dtype == .f16) return self.insertF16WeightFromTensor(owned_key, &loaded.tensor);
+            if (loaded.tensor.dtype != .f32) return error.UnsupportedTensorType;
+            const values = loaded.tensor.asFloat32();
+            const half = try self.allocator.alloc(f16, values.len);
+            defer self.allocator.free(half);
+            for (values, half) |value, *out| {
+                out.* = @floatCast(value);
+                if (!std.math.isFinite(out.*)) return error.InvalidModelWeights;
+            }
+            var tensor = loaded.tensor;
+            tensor.dtype = .f16;
+            tensor.data = std.mem.sliceAsBytes(half);
+            return self.insertF16WeightFromTensor(owned_key, &tensor);
         }
         // Keep matrix-shaped FP16 GGUF tensors in their native representation
         // only when the complete tensor-core route is available. Rank-one
@@ -8102,10 +8147,16 @@ fn warmupCublasLtBf16(cublaslt: *cublaslt_mod.CublasLt, ctx: *context_mod.CudaCo
     defer weight.free(ctx);
     var dst = buffer_mod.DeviceBuffer.alloc(ctx, rows * dim * @sizeOf(f32)) catch return;
     defer dst.free(ctx);
-    // Inputs stay uninitialized: the result is discarded, only the library
-    // load and heuristic init matter.
+    // Even discarded warmup outputs must consume initialized inputs. This
+    // path also runs before a specialty session installs its FP32 policy.
+    // Drain async copies and matmul before stack storage or buffers retire,
+    // including a partial-copy or heuristic failure.
+    defer ctx.synchronize() catch {};
+    const zeros: [dim * dim]u16 = @splat(0);
+    const zero_bytes = std.mem.asBytes(&zeros);
+    input.copyFromHost(ctx, zero_bytes[0..input.len]) catch return;
+    weight.copyFromHost(ctx, zero_bytes) catch return;
     cublaslt.matmulBf16WeightF32Out(ctx, dst, input, weight, .{}, rows, dim, dim) catch return;
-    ctx.driver.check(ctx.driver.fns.cuStreamSynchronize(ctx.stream)) catch {};
 }
 
 fn cudaShouldDequantizeWeightOnUpload(name: []const u8, storage: weight_source_mod.QuantizedStorage) bool {
@@ -11862,7 +11913,14 @@ fn tryCublasLtF32Linear(
     // Its wide projections benefit from cuBLASLt below the general 128-row gate.
     if ((!self.strict_f32_weights and rows < 128) or in_dim < 64 or out_dim < 64) return false;
     const blas = &(self.cublaslt orelse return false);
-    blas.matmulF32WeightF32Out(&self.ctx, dst, input, weight, rows, in_dim, out_dim) catch return false;
+    // Zero-workspace plans exclude the faster strict FP32 SGEMM schedules on
+    // GB10. Reuse one bounded buffer, included in specialty request admission.
+    // Allocation failure keeps the existing zero-workspace correctness path.
+    const workspace = if (self.qualified_span_fp32)
+        self.cublaslt_workspace_scratch.acquire(&self.ctx, @import("../../models/gliner_specialty_qualification.zig").cuda_matmul_workspace_bytes) catch buffer_mod.DeviceBuffer{}
+    else
+        buffer_mod.DeviceBuffer{};
+    blas.matmulF32WeightF32OutWithWorkspace(&self.ctx, dst, input, weight, workspace, rows, in_dim, out_dim) catch return false;
     return true;
 }
 
@@ -17898,12 +17956,18 @@ fn cudaDisableFusedQkv() bool {
     return platform.env.getenvBoolDefault("ANTFLY_CUDA_DISABLE_FUSED_QKV", false);
 }
 
-// Select the fused route from compiled tensor-core capability. The call
-// site retains shape, masking, library and admission requirements.
+// Retain the compiled-capability policy for general encoders. Original FP32
+// specialty checkpoints also use the fused F32 kernel on qualified GB10/SM121,
+// including portable PTX builds without tensor-core artifacts.
+fn debertaFusedF32Default(qualified_span_fp32: bool, major: i32, minor: i32) bool {
+    return cudaTensorCoreArtifactSupported(major, minor) or
+        (qualified_span_fp32 and major == 12 and minor == 1);
+}
+
 fn cudaDebertaFusedAttentionEnabled(self: *const CudaCompute) bool {
     return platform.env.getenvBoolDefault(
         "ANTFLY_CUDA_DEBERTA_FUSED_ATTENTION",
-        cudaTensorCoreArtifactSupported(self.ctx.info.compute_major, self.ctx.info.compute_minor),
+        debertaFusedF32Default(self.qualified_span_fp32, self.ctx.info.compute_major, self.ctx.info.compute_minor),
     );
 }
 
@@ -17927,6 +17991,29 @@ fn parseCudaDebertaAttentionMode(value: []const u8) ?CudaDebertaAttentionMode {
 const CudaDebertaInvalidModeWarning = struct {
     var emitted = std.atomic.Value(bool).init(false);
 };
+
+fn debertaAttentionExecutionMode(qualified_span_fp32: bool, requested: CudaDebertaAttentionMode) CudaDebertaAttentionMode {
+    return if (qualified_span_fp32) .fused_f32 else requested;
+}
+
+test "specialty FP32 attention policy cannot be overridden by reduced precision diagnostics" {
+    inline for (std.meta.tags(CudaDebertaAttentionMode)) |mode| {
+        try std.testing.expectEqual(CudaDebertaAttentionMode.fused_f32, debertaAttentionExecutionMode(true, mode));
+        try std.testing.expectEqual(mode, debertaAttentionExecutionMode(false, mode));
+    }
+    // The generated-auto path additionally requires .auto; the qualified
+    // effective mode is never .auto even if its environment flag is enabled.
+    try std.testing.expect(debertaAttentionExecutionMode(true, .auto) != .auto);
+    try std.testing.expect(debertaFusedF32Default(true, 12, 1));
+    // General encoders keep main's compiled-artifact policy on every target;
+    // specialty's GB10 exception must not depend on a BF16 tensor-core image.
+    for ([_][2]i32{ .{ 8, 0 }, .{ 8, 6 }, .{ 8, 9 }, .{ 12, 1 } }) |cc| {
+        const supported = cudaTensorCoreArtifactSupported(cc[0], cc[1]);
+        try std.testing.expectEqual(supported, debertaFusedF32Default(false, cc[0], cc[1]));
+        try std.testing.expectEqual(supported or (cc[0] == 12 and cc[1] == 1), debertaFusedF32Default(true, cc[0], cc[1]));
+    }
+    try std.testing.expect(!debertaFusedF32Default(true, 7, 0));
+}
 
 fn cudaDebertaAttentionMode() CudaDebertaAttentionMode {
     if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_DEBERTA_ATTENTION_MODE")) |value| {
@@ -18076,6 +18163,10 @@ fn uploadTempI64(self: *CudaCompute, data: []const i64) !buffer_mod.DeviceBuffer
 
 fn uploadCachedAttentionMaskI64(self: *CudaCompute, data: []const i64) !buffer_mod.DeviceBuffer {
     const bytes = try checkedMul(data.len, @sizeOf(i64));
+    // Growth can free the old device allocation before a new allocation fails.
+    // Invalidate before acquiring so retries cannot reuse its stale host tag.
+    if (self.attention_mask_scratch.buffer.len < bytes)
+        self.attention_mask_cache_host.clearRetainingCapacity();
     const device = try self.attention_mask_scratch.acquire(&self.ctx, bytes);
     // Compare against the retained host copy byte-for-byte: a 64-bit hash
     // alone would silently reuse a stale device mask on collision, and the
@@ -18445,8 +18536,11 @@ fn glinerLabelGruCombined(ctx: *anyopaque, request: *const ops.GlinerLabelGruCom
         gh_tensor.buffer,
         request.num_labels,
         request.hidden_size,
+        request.add_residual,
     );
     self.stats.launch_other += 1;
+    self.stats.gliner_label_gru_calls += 1;
+    if (!request.add_residual) self.stats.gliner_label_gru_no_residual_calls += 1;
     return try createTensor(self, device, shape, label_count);
 }
 
@@ -18902,6 +18996,17 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
         self.dispatch_stats.note(self.allocator, .linear, .q4_0, .q4_simt, .bias, .none, rows, in_dim, out_dim, 0);
         return result;
     }
+    if (self.capability_profile == .whisper and rows == 1 and isF16Weight(weight_tensor)) {
+        const shape = try allocShape2(self.allocator, rows, out_dim);
+        errdefer self.allocator.free(shape);
+        var device = try allocDeviceBuffer(self, try checkedMul(out_dim, @sizeOf(f32)));
+        errdefer releaseDeviceBuffer(self, &device);
+        try self.whisper_cuda.init(&self.ctx);
+        try self.whisper_cuda.gemvF16(&self.ctx, device.ptr, input_tensor.buffer.ptr, weight_tensor.buffer.ptr, bias_tensor.buffer.ptr, @intCast(in_dim), @intCast(out_dim), false);
+        self.stats.launch_linear += 1;
+        self.dispatch_stats.note(self.allocator, .linear, .f16, .dense_cuda, .bias, .none, rows, in_dim, out_dim, 0);
+        return createTensor(self, device, shape, out_dim);
+    }
     if (isF16Weight(weight_tensor)) {
         if (self.capability_profile == .florence2 and self.florence_fused_bias_enabled and
             self.florence_f16_weights_enabled and rows >= 2 and !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active)
@@ -19128,6 +19233,11 @@ fn linearRelu(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_
             try self.kernels.launchLinearQ4KBiasReluTile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
             self.dispatch_stats.note(self.allocator, .linear_relu, .q4_k, .q4_simt, .bias_relu, tcUnavailableReason(), rows, in_dim, out_dim, 0);
         }
+    } else if (self.qualified_span_fp32 and self.kernels.add_bias_relu_rows_f32 != null and
+        try tryCublasLtF32Linear(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim))
+    {
+        try self.kernels.launchAddBiasReluRowsF32(&self.ctx, device, bias_tensor.buffer, rows, out_dim);
+        self.dispatch_stats.note(self.allocator, .linear_relu, .f32, .dense_lt, .bias_relu, .none, rows, in_dim, out_dim, 0);
     } else {
         try self.kernels.launchLinearBiasReluTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
         self.dispatch_stats.note(self.allocator, .linear_relu, .f32, .f32_cuda, .bias_relu, .none, rows, in_dim, out_dim, 0);
@@ -19140,6 +19250,21 @@ fn linearGelu(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
     const weight_tensor = tensorFromCt(weight);
+    if (self.capability_profile == .whisper and rows == 1 and isF16Weight(weight_tensor)) {
+        const bias_tensor = tensorFromCt(bias);
+        try ensureF32(input_tensor);
+        try ensureF32(bias_tensor);
+        try ensureCount(input_tensor, in_dim);
+        try ensureCount(weight_tensor, try checkedMul(in_dim, out_dim));
+        try ensureCount(bias_tensor, out_dim);
+        const out = (try allocUninitF32ShapeOp(ctx, &.{ 1, @intCast(out_dim) })).?;
+        errdefer freeTensor(ctx, out);
+        try self.whisper_cuda.init(&self.ctx);
+        try self.whisper_cuda.gemvF16(&self.ctx, tensorFromCt(out).buffer.ptr, input_tensor.buffer.ptr, weight_tensor.buffer.ptr, bias_tensor.buffer.ptr, @intCast(in_dim), @intCast(out_dim), true);
+        self.stats.launch_linear += 1;
+        self.dispatch_stats.note(self.allocator, .linear_gelu, .f16, .dense_cuda, .bias_gelu, .none, rows, in_dim, out_dim, 0);
+        return out;
+    }
     if (boundaryMixedWeight(self, weight_tensor) != null) return null;
     const bias_tensor = tensorFromCt(bias);
     const q8_variant = if (isKnownQuant(weight_tensor, .Q8_0)) mxbaiQ8Variant(rows, in_dim, out_dim) else null;
@@ -19186,6 +19311,10 @@ fn linearAdd(ctx: *anyopaque, input: CT, weight: CT, bias: CT, residual: CT, row
     const input_tensor = tensorFromCt(input);
     const weight_tensor = tensorFromCt(weight);
     if (boundaryMixedWeight(self, weight_tensor) != null) return null;
+    // The encoder composes plain linear + residual layer norm when declined.
+    // Its strict FP32 cuBLASLt projection is much faster than the small fused
+    // SIMT projection for these wide FFN output matrices, without extra storage.
+    if (self.qualified_span_fp32 and weight_tensor.quant_type == null) return null;
     const bias_tensor = tensorFromCt(bias);
     const residual_tensor = tensorFromCt(residual);
     try ensureF32(input_tensor);
@@ -19548,6 +19677,10 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
             self.stats.bf16_scalar_linear_calls += 1;
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .bf16, .dense_cuda, .none, .none, rows, in_dim, out_dim, 0);
         }
+    } else if (self.capability_profile == .whisper and rows == 1 and isF16Weight(weight_tensor)) {
+        try self.whisper_cuda.init(&self.ctx);
+        try self.whisper_cuda.gemvF16(&self.ctx, device.ptr, input_tensor.buffer.ptr, weight_tensor.buffer.ptr, 0, @intCast(in_dim), @intCast(out_dim), false);
+        self.dispatch_stats.note(self.allocator, .linear_no_bias, .f16, .dense_cuda, .none, .none, rows, in_dim, out_dim, 0);
     } else if (isF16Weight(weight_tensor)) {
         if (try tryCublasLtF16Linear(self, device, input_tensor, weight_tensor.buffer, rows, in_dim, out_dim)) {
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .f16, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
@@ -22447,6 +22580,39 @@ fn layerNorm(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f
     return createTensor(self, device, shape, input_tensor.elem_count);
 }
 
+fn whisperAllocLikeF32(self: *CudaCompute, input: *const CudaTensor) !CT {
+    const shape = try dupeShape(self.allocator, input.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, try checkedMul(input.elem_count, @sizeOf(f32)));
+    errdefer releaseDeviceBuffer(self, &device);
+    return createTensor(self, device, shape, input.elem_count);
+}
+
+fn whisperAddLayerNormSum(ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?ops.AddLayerNormSumResult {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.capability_profile != .whisper) return null;
+    const at = tensorFromCt(a);
+    const bt = tensorFromCt(b);
+    const gt = tensorFromCt(gamma);
+    const wt = tensorFromCt(beta);
+    try ensureF32(at);
+    try ensureF32(bt);
+    try ensureF32(gt);
+    try ensureF32(wt);
+    if (dim == 0 or at.elem_count == 0 or at.elem_count % dim != 0 or at.elem_count != bt.elem_count or !sameShape(at.shape, bt.shape)) return error.InvalidShape;
+    if (!std.math.isFinite(eps) or eps <= 0) return error.InvalidShape;
+    try ensureCount(gt, dim);
+    try ensureCount(wt, dim);
+    const sum = try whisperAllocLikeF32(self, at);
+    errdefer freeTensor(ctx, sum);
+    const normed = try whisperAllocLikeF32(self, at);
+    errdefer freeTensor(ctx, normed);
+    try self.whisper_cuda.init(&self.ctx);
+    try self.whisper_cuda.addNormSum(&self.ctx, .{ tensorFromCt(normed).buffer.ptr, tensorFromCt(sum).buffer.ptr, at.buffer.ptr, bt.buffer.ptr, gt.buffer.ptr, wt.buffer.ptr }, @intCast(at.elem_count / dim), @intCast(dim), eps);
+    self.stats.launch_norm += 1;
+    return .{ .sum = sum, .normed = normed };
+}
+
 fn addLayerNorm(ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const a_tensor = tensorFromCt(a);
@@ -24036,9 +24202,10 @@ fn tryReducedVisionCudnnInput(
         };
     }
     const cudnn = &self.embedding_gemma2_cudnn.?;
-    const use_f16 = self.capability_profile == .florence2;
-    const key = cudnn_sdpa_mod.Key{ .batch = batch, .q_heads = num_heads, .kv_heads = num_heads, .sequence = seq_len, .dim = head_dim, .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))), .ocr_vision = self.capability_profile == .lightonocr3, .florence_vision = use_f16, .dtype = if (use_f16) .f16 else .bf16 };
+    const use_f16 = self.capability_profile == .florence2 or self.capability_profile == .whisper;
+    const key = cudnn_sdpa_mod.Key{ .batch = batch, .q_heads = num_heads, .kv_heads = num_heads, .sequence = seq_len, .dim = head_dim, .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))), .ocr_vision = self.capability_profile == .lightonocr3, .florence_vision = self.capability_profile == .florence2, .whisper_encoder = self.capability_profile == .whisper, .dtype = if (use_f16) .f16 else .bf16 };
     const workspace_bytes = (try cudnn.workspaceBytesFor(key)) orelse return null;
+    if (self.capability_profile == .lightonocr3 and workspace_bytes > try @import("vision_memory_contract.zig").vendorWorkspaceLimit(try checkedMul(batch, seq_len), try checkedMul(num_heads, head_dim))) return null;
     const count = try checkedMul(batch, try checkedMul(seq_len, try checkedMul(num_heads, head_dim)));
     const activation_bytes = try checkedMul(count, @sizeOf(u16));
     var cursor: usize = 0;
@@ -24685,6 +24852,26 @@ fn sdpaQwen3VlVision(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize
     try ensureCount(q_tensor, count);
     try ensureCount(k_tensor, count);
     try ensureCount(v_tensor, count);
+
+    // Whisper uses FP16 attention operands, matching its resident matrices.
+    // Prefer fused vendor SDPA; the existing tiled FP16 kernel is the bounded
+    // fallback when cuDNN is absent. Never route speech through BF16 vision.
+    if (self.capability_profile == .whisper and head_dim == 64 and seq_len <= 1500) {
+        if (platform.env.getenvBoolDefault("ANTFLY_CUDA_WHISPER_CUDNN", true)) {
+            if (try tryReducedVisionCudnn(self, q_tensor, k_tensor, v_tensor, batch, seq_len, num_heads, head_dim)) |result| return result;
+        }
+        const shape = try dupeShape(self.allocator, q_tensor.shape);
+        errdefer self.allocator.free(shape);
+        var device = try allocDeviceBuffer(self, try checkedMul(count, @sizeOf(f32)));
+        errdefer releaseDeviceBuffer(self, &device);
+        const mask = try self.allocator.alloc(i64, try checkedMul(batch, seq_len));
+        defer self.allocator.free(mask);
+        @memset(mask, 1);
+        const mask_device = try uploadCachedAttentionMaskI64(self, mask);
+        try self.kernels.launchGlinerEncoderAttentionTcF16(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, batch, seq_len, num_heads, head_dim, seq_len);
+        self.stats.launch_attention += 1;
+        return createTensor(self, device, shape, count);
+    }
 
     // Qwen3.5 OCR vision uses the same noncausal BSHD/64-head-dimension
     // contract as the existing cuDNN BF16 vision route. Keep it opt-in until
@@ -26241,8 +26428,11 @@ fn crossAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, enc_mask: []con
     const k_tensor = tensorFromCt(k_ct);
     const v_tensor = tensorFromCt(v_ct);
     try ensureF32(q_tensor);
-    try ensureF32(k_tensor);
-    try ensureF32(v_tensor);
+    const half_kv = self.capability_profile == .whisper and k_tensor.dtype == .f16 and v_tensor.dtype == .f16;
+    if (!half_kv) {
+        try ensureF32(k_tensor);
+        try ensureF32(v_tensor);
+    }
     const hidden = try checkedMul(num_heads, head_dim);
     const q_count = try checkedMul(try checkedMul(batch, dec_seq), hidden);
     const kv_count = try checkedMul(try checkedMul(batch, enc_seq), hidden);
@@ -26257,7 +26447,17 @@ fn crossAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, enc_mask: []con
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, q_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    if (self.capability_profile == .florence2 and self.florence_fused_cross_enabled and
+    if (self.capability_profile == .whisper and head_dim == 64 and batch > 0 and batch <= 8 and
+        dec_seq > 0 and dec_seq <= 448 and enc_seq > 0 and enc_seq <= 1500)
+    {
+        try self.whisper_cuda.init(&self.ctx);
+        const splits = (enc_seq + 127) / 128;
+        var partial = try allocDeviceBuffer(self, try checkedMul(try checkedMul(q_count / 64, splits), 66 * @sizeOf(f32)));
+        defer releaseDeviceBuffer(self, &partial);
+        try self.whisper_cuda.crossAttention(&self.ctx, device.ptr, partial.ptr, q_tensor.buffer.ptr, k_tensor.buffer.ptr, v_tensor.buffer.ptr, mask_device.ptr, @intCast(batch), @intCast(dec_seq), @intCast(enc_seq), @intCast(num_heads), half_kv);
+    } else if (half_kv) {
+        return error.UnsupportedOperation;
+    } else if (self.capability_profile == .florence2 and self.florence_fused_cross_enabled and
         self.ctx.info.compute_major >= 8 and !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active and
         batch > 0 and batch <= 64 and dec_seq == 1 and enc_seq > 0 and enc_seq <= 1024 and
         num_heads == 12 and head_dim == 64 and mask_device.ptr == 0)
@@ -26297,12 +26497,12 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
     try ensureCount(k_r_tensor, rel_count);
     if (mask.len < try checkedMul(batch, seq_len)) return error.InvalidShape;
 
-    const mask_device = try uploadTempI64(self, mask);
+    const mask_device = try uploadCachedAttentionMaskI64(self, mask);
     const shape = try dupeShape(self.allocator, q_tensor.shape);
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    const attention_mode = cudaDebertaAttentionMode();
+    const attention_mode = debertaAttentionExecutionMode(self.qualified_span_fp32, cudaDebertaAttentionMode());
     if ((attention_mode == .generated_tc or (attention_mode == .auto and cudaDebertaGeneratedTcAutoEnabled())) and seq_len <= 256 and head_dim == 64) {
         const requested_variant = cudaDebertaGeneratedTcVariant();
         const launched_m32 = if (requested_variant != .m16)
@@ -26687,6 +26887,8 @@ fn trainingRuntimeStatsOp(ctx: *anyopaque) ops.TrainingRuntimeStats {
         .download_last_bytes = @intCast(stats.download_last_bytes),
         .download_previous_bytes = @intCast(stats.download_previous_bytes),
         .to_float32_calls = @intCast(stats.to_float32_calls),
+        .gliner_label_gru_calls = @intCast(stats.gliner_label_gru_calls),
+        .gliner_label_gru_no_residual_calls = @intCast(stats.gliner_label_gru_no_residual_calls),
         .download_alloc_calls = @intCast(stats.download_alloc_calls),
         .stream_synchronizations = @intCast(stats.stream_syncs),
         .upload_synchronizations = @intCast(stats.upload_syncs),
@@ -27091,8 +27293,103 @@ fn tokenGridConv2d(
     errdefer self.allocator.free(out_shape);
     return createTensor(self, out_device, out_shape, out_count);
 }
-fn conv1d(_: *anyopaque, _: CT, _: CT, _: CT, _: usize, _: usize, _: usize, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
-    return unsupportedCt();
+fn whisperPrepareCrossKvOp(ctx: *anyopaque, k: CT, v: CT) anyerror!?ops.LinearNoBiasPairResult {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.capability_profile != .whisper or !self.whisper_f16_weights_enabled) return null;
+    const kt = tensorFromCt(k);
+    const vt = tensorFromCt(v);
+    try ensureF32(kt);
+    try ensureF32(vt);
+    if (!sameShape(kt.shape, vt.shape) or kt.elem_count != vt.elem_count) return error.InvalidShape;
+    var outputs: [2]CT = undefined;
+    var built: usize = 0;
+    errdefer for (outputs[0..built]) |out| freeTensor(ctx, out);
+    for ([_]*const CudaTensor{ kt, vt }, 0..) |source, i| {
+        const shape = try dupeShape(self.allocator, source.shape);
+        errdefer self.allocator.free(shape);
+        var device = try allocDeviceBuffer(self, try checkedMul(source.elem_count, @sizeOf(f16)));
+        errdefer releaseDeviceBuffer(self, &device);
+        try self.kernels.launchF32ToF16(&self.ctx, device, source.buffer, source.elem_count);
+        const out = try createTensor(self, device, shape, source.elem_count);
+        tensorFromCt(out).dtype = .f16;
+        outputs[i] = out;
+        built += 1;
+    }
+    return .{ .first = outputs[0], .second = outputs[1] };
+}
+
+fn whisperLogitsStatsEncodeOp(ctx: *anyopaque, logits: CT, params: *const ops.WhisperLogitsParams, suppress: []const i32) anyerror!bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (params.mode != 0 or params.stats_slot >= 2) return false;
+    const slot = params.stats_slot;
+    self.whisper_stats_valid[slot] = false;
+    const tensor = tensorFromCt(logits);
+    try ensureF32(tensor);
+    try ensureCount(tensor, params.out_dim);
+    if (params.out_dim == 0 or suppress.len != params.suppress_count) return error.InvalidShape;
+    var result = try allocDeviceBuffer(self, @sizeOf(ops.WhisperLogitsStatsRaw));
+    defer releaseDeviceBuffer(self, &result);
+    const blocks = (@as(usize, params.out_dim) + 2047) / 2048;
+    var partial = try allocDeviceBuffer(self, try checkedMul(blocks, @sizeOf(ops.WhisperLogitsStatsRaw)));
+    defer releaseDeviceBuffer(self, &partial);
+    var suppressed = try allocDeviceBuffer(self, try checkedMul(suppress.len, @sizeOf(i32)));
+    defer releaseDeviceBuffer(self, &suppressed);
+    // All allocations and copies belong to the admitted request. The compact
+    // readback is synchronous on CUDA; no frame or host pointer outlives it.
+    errdefer self.ctx.synchronize() catch {};
+    try suppressed.copyFromHost(&self.ctx, std.mem.sliceAsBytes(suppress));
+    try self.whisper_cuda.init(&self.ctx);
+    try self.whisper_cuda.logitsStats(&self.ctx, result.ptr, partial.ptr, tensor.buffer.ptr, suppressed.ptr, params.*);
+    try result.copyToHost(&self.ctx, std.mem.asBytes(&self.whisper_stats[slot]));
+    try self.ctx.synchronize();
+    self.whisper_stats_valid[slot] = true;
+    return true;
+}
+
+fn whisperLogitsStatsReadOp(ctx: *anyopaque, slot: usize, out: *ops.WhisperLogitsStatsRaw) bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (slot >= 2 or !self.whisper_stats_valid[slot]) return false;
+    out.* = self.whisper_stats[slot];
+    self.whisper_stats_valid[slot] = false;
+    return true;
+}
+
+fn conv1dIm2colOp(ctx: *anyopaque, input: CT, batch: usize, channels: usize, time: usize, kernel: usize, stride: usize, padding: usize, time_major: bool) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const tensor = tensorFromCt(input);
+    try ensureF32(tensor);
+    if (batch == 0 or channels == 0 or time == 0 or kernel == 0 or stride == 0) return error.InvalidShape;
+    const padded = try std.math.add(usize, time, try checkedMul(2, padding));
+    if (padded < kernel) return error.InvalidShape;
+    const out_time = (padded - kernel) / stride + 1;
+    const rows = try checkedMul(batch, out_time);
+    const cols = try checkedMul(channels, kernel);
+    const count = try checkedMul(rows, cols);
+    if (count > std.math.maxInt(u32) - 255 or stride > std.math.maxInt(u32) or time > std.math.maxInt(i32) or padded > std.math.maxInt(i32)) return error.InvalidShape;
+    try ensureCount(tensor, try checkedMul(try checkedMul(batch, channels), time));
+    const shape = try allocShape2(self.allocator, rows, cols);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, try checkedMul(count, @sizeOf(f32)));
+    errdefer device.free(&self.ctx);
+    try self.whisper_cuda.init(&self.ctx);
+    try self.whisper_cuda.unfold(&self.ctx, device.ptr, tensor.buffer.ptr, @intCast(channels), @intCast(time), @intCast(kernel), @intCast(stride), @intCast(padding), @intCast(out_time), time_major, @intCast(count));
+    return createTensor(self, device, shape, count);
+}
+
+fn conv1d(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_channels: usize, out_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize) anyerror!CT {
+    if (stride == 0 or kernel_size == 0 or time_steps == 0) return error.InvalidShape;
+    const padded = try std.math.add(usize, time_steps, try checkedMul(2, padding));
+    if (padded < kernel_size) return error.InvalidShape;
+    // NCHW with height one has exactly the Conv1d channel-major layout.
+    // Relabel the result; no host copy or change to convolution semantics.
+    const result = try conv2d(ctx, input, weight, bias, batch, in_channels, out_channels, 1, time_steps, 1, kernel_size, 1, stride, 0, padding, 1);
+    errdefer freeTensor(ctx, result);
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const tensor = tensorFromCt(result);
+    const shape = try self.allocator.dupe(i64, &.{ @as(i64, @intCast(batch)), @as(i64, @intCast(out_channels)), tensor.shape[3] });
+    self.allocator.free(tensor.shape);
+    tensor.shape = shape;
+    return result;
 }
 fn tryFlorenceCudnnConv(self: *CudaCompute, output: buffer_mod.DeviceBuffer, input: *const CudaTensor, weight: *const CudaTensor, bias: *const CudaTensor, key: @import("cudnn_conv.zig").Key) !bool {
     if (!key.eligible() or self.florence_cudnn_conv_unavailable) return false;
@@ -27911,7 +28208,7 @@ fn decoderRuntimePrepareLinearSlot(
     in_dim: usize,
     out_dim: usize,
 ) !void {
-    try ensureF32Bf16OrQuantized(weight);
+    try ensureF32F16Bf16OrQuantized(weight);
     try ensureLogicalWeightCount(weight, try checkedMul(out_dim, in_dim));
     if (bias) |bias_tensor| {
         try ensureF32(bias_tensor);
@@ -28041,6 +28338,35 @@ fn decoderRuntimeApplyLinearPairOp(ctx: *anyopaque, request: *const ops.DecoderR
     var profile_scope = beginDecodeProfile(self, .ffn_gate_up, rows);
     defer if (profile_scope) |*scope| scope.end();
     return try linearNoBiasPair(ctx, request.input, &slot_a.weight, &slot_b.weight, rows, request.in_dim, request.out_dim);
+}
+
+fn whisperLinearQkvInto(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearQkvRequest, k_out: CT, v_out: CT) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.capability_profile != .whisper or request.in_dim == 0 or request.q_out_dim != request.in_dim or request.kv_out_dim != request.in_dim) return null;
+    if (try decoderRuntimeInputRows(request.input, request.in_dim) != 1) return null;
+    const q = self.decoder_runtime_linear_slots.getPtr(request.q_slot) orelse return null;
+    const k = self.decoder_runtime_linear_slots.getPtr(request.k_slot) orelse return null;
+    const v = self.decoder_runtime_linear_slots.getPtr(request.v_slot) orelse return null;
+    for ([_]@TypeOf(q){ q, k, v }) |slot| {
+        if (slot.in_dim != request.in_dim or slot.out_dim != request.in_dim or !isF16Weight(&slot.weight)) return null;
+    }
+    const input = tensorFromCt(request.input);
+    const kt = tensorFromCt(k_out);
+    const vt = tensorFromCt(v_out);
+    try ensureF32(input);
+    try ensureF32(kt);
+    try ensureF32(vt);
+    try ensureCount(kt, request.in_dim);
+    try ensureCount(vt, request.in_dim);
+    if (kt.buffer.ptr == vt.buffer.ptr or input.buffer.ptr == kt.buffer.ptr or input.buffer.ptr == vt.buffer.ptr) return error.InvalidShape;
+    const out = (try allocUninitF32ShapeOp(ctx, &.{ 1, @intCast(request.in_dim) })).?;
+    errdefer freeTensor(ctx, out);
+    try self.whisper_cuda.init(&self.ctx);
+    try self.whisper_cuda.qkvF16(&self.ctx, .{ tensorFromCt(out).buffer.ptr, kt.buffer.ptr, vt.buffer.ptr, input.buffer.ptr, q.weight.buffer.ptr, k.weight.buffer.ptr, v.weight.buffer.ptr, if (q.bias) |bias| bias.buffer.ptr else 0, if (k.bias) |bias| bias.buffer.ptr else 0, if (v.bias) |bias| bias.buffer.ptr else 0 }, @intCast(request.in_dim));
+    self.stats.decoder_runtime_linear_apply_hits += 3;
+    self.stats.decoder_runtime_linear_qkv_apply_hits += 1;
+    self.stats.launch_linear += 1;
+    return out;
 }
 
 fn decoderRuntimeApplyLinearQkvOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearQkvRequest) anyerror!?ops.LinearNoBiasTripleResult {
@@ -30040,6 +30366,7 @@ const vtable = ops.ComputeBackend.VTable{
     .decoderRuntimeApplyLinearArgmax = &decoderRuntimeApplyLinearArgmaxOp,
     .decoderRuntimeApplyLinearPair = &decoderRuntimeApplyLinearPairOp,
     .decoderRuntimeApplyLinearQkv = &decoderRuntimeApplyLinearQkvOp,
+    .decoderRuntimeApplyLinearQkvInto = &whisperLinearQkvInto,
     .decoderRuntimeApplyScaledAddScale = &decoderRuntimeApplyScaledAddScaleOp,
     .runGatedFfnResidual = &runGatedFfnResidualOp,
     .runGatedDecoderBlock = &runGatedDecoderBlockOp,
@@ -30057,6 +30384,7 @@ const vtable = ops.ComputeBackend.VTable{
     .layerNorm = &layerNorm,
     .layerNormBackward = &layerNormBackwardOp,
     .addLayerNorm = &addLayerNorm,
+    .addLayerNormSum = &whisperAddLayerNormSum,
     .rmsNorm = &rmsNorm,
     .rmsNormAddMultiplyScalarTensor = &rmsNormAddMultiplyScalarTensor,
     .rmsNormAddTensor = &rmsNormAddTensor,
@@ -30114,6 +30442,10 @@ const vtable = ops.ComputeBackend.VTable{
     .tokenGridConv2d = &tokenGridConv2d,
     .multiply = &multiply,
     .conv1d = &conv1d,
+    .conv1dIm2col = &conv1dIm2colOp,
+    .whisperPrepareCrossKv = &whisperPrepareCrossKvOp,
+    .whisperLogitsStatsEncode = &whisperLogitsStatsEncodeOp,
+    .whisperLogitsStatsRead = &whisperLogitsStatsReadOp,
     .conv2d = &conv2d,
     .rope = &rope,
     .mrope = &mrope,
@@ -36069,6 +36401,124 @@ test "LightOnOCR3 CUDA burst readback retains admission source and unique pendin
     fourth.deinit();
 }
 
+test "cuda GLiNER GRU residual modes preserve cancellation-sensitive state on device" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const labels = [_]f32{ 16777216, -16777216, 2, -3, 0, 5 };
+    var gates: [18]f32 = @splat(0);
+    for (0..2) |row| for (0..3) |col| {
+        gates[row * 9 + 3 + col] = -100;
+        gates[row * 9 + 6 + col] = 0.25541282;
+    };
+    const label_ct = try cb.fromFloat32Shape(&labels, &.{ 2, 3 });
+    defer cb.free(label_ct);
+    const gi = try cb.fromFloat32Shape(&gates, &.{ 2, 9 });
+    defer cb.free(gi);
+    const zero_gates: [18]f32 = @splat(0);
+    const gh = try cb.fromFloat32Shape(&zero_gates, &.{ 2, 9 });
+    defer cb.free(gh);
+    const out = try cb.fromFloat32Shape(&labels, &.{ 2, 3 });
+    defer cb.free(out);
+    for ([_]bool{ false, true }) |add_residual| {
+        const before = cb.trainingRuntimeStats();
+        try compute.kernels.launchGlinerGruCombineF32(&compute.ctx, tensorFromCt(out).buffer, tensorFromCt(label_ct).buffer, tensorFromCt(gi).buffer, tensorFromCt(gh).buffer, 2, 3, add_residual);
+        try std.testing.expectEqual(before.d2h_bytes, cb.trainingRuntimeStats().d2h_bytes);
+        try std.testing.expectEqual(before.h2d_bytes, cb.trainingRuntimeStats().h2d_bytes);
+        const got = try cb.toFloat32(out, std.testing.allocator);
+        defer std.testing.allocator.free(got);
+        for (got, labels) |value, label| try std.testing.expectApproxEqAbs(@as(f32, 0.25) + (if (add_residual) label else 0), value, 0.000001);
+    }
+}
+
+test "cuda specialty FP32 fused attention preserves ragged full geometry and repeat stability" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    const batch: usize = 8;
+    const heads: usize = 12;
+    const head_dim: usize = 64;
+    const hidden = heads * head_dim;
+    // The existing raw FP32 DeBERTa attention gate is 1e-4. Do not relax
+    // it to the downstream classifier's less strict accumulated-error gate.
+    const tolerance: f32 = 1e-4;
+    for ([_]usize{ 268, 512 }) |sequence| {
+        const count = batch * sequence * hidden;
+        const relative_count = (2 * sequence - 1) * hidden;
+        var inputs: [5]buffer_mod.DeviceBuffer = @splat(.{});
+        defer {
+            compute.ctx.synchronize() catch {};
+            for (&inputs) |*value| value.free(&compute.ctx);
+        }
+        for (&inputs, 0..) |*value, index| value.* = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, (if (index < 3) count else relative_count) * @sizeOf(f32));
+        var reference = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, count * @sizeOf(f32));
+        defer reference.free(&compute.ctx);
+        var fused = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, count * @sizeOf(f32));
+        defer fused.free(&compute.ctx);
+        var mask_device = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, batch * sequence * @sizeOf(i64));
+        defer mask_device.free(&compute.ctx);
+        const values = try a.alloc(f32, @max(count, relative_count));
+        defer a.free(values);
+        const expected = try a.alloc(f32, count);
+        defer a.free(expected);
+        const actual = try a.alloc(f32, count);
+        defer a.free(actual);
+        const first = try a.alloc(f32, count);
+        defer a.free(first);
+        const mask = try a.alloc(i64, batch * sequence);
+        defer a.free(mask);
+        // LCG inputs reproduce the standalone failure receipt exactly;
+        // sin/cos inputs independently cover structured attention scores.
+        for (0..2) |pattern| {
+            for (&inputs, 0..) |*input, index| {
+                const length = if (index < 3) count else relative_count;
+                var state: u32 = @intCast(101 + index * 31);
+                for (values[0..length], 0..) |*value, i| {
+                    value.* = if (pattern == 0) lcg: {
+                        state = state *% 1664525 +% 1013904223;
+                        break :lcg @floatCast((@as(f64, @floatFromInt(state >> 8)) / 16777216 * 2 - 1) * 4);
+                    } else trig: {
+                        const coordinate = @as(f32, @floatFromInt(i)) * 0.03125 + @as(f32, @floatFromInt(index)) * 0.171875;
+                        break :trig 2 * (@sin(coordinate) + @cos(coordinate * 0.4375));
+                    };
+                }
+                try input.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(values[0..length]));
+            }
+            const ragged_lengths = [_]usize{ sequence, sequence - 1, sequence / 2, 1, 0, sequence / 3, sequence - 7, sequence / 4 };
+            for (0..3) |mask_kind| {
+                for (0..batch) |item| for (0..sequence) |position| {
+                    mask[item * sequence + position] = @intFromBool(switch (mask_kind) {
+                        0 => true,
+                        1 => position < ragged_lengths[item],
+                        else => false,
+                    });
+                };
+                try mask_device.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(mask));
+                try compute.kernels.launchDebertaAttentionF32(&compute.ctx, reference, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], mask_device, batch, sequence, heads, head_dim);
+                try reference.copyToHost(&compute.ctx, std.mem.sliceAsBytes(expected));
+                try compute.ctx.synchronize();
+                for (0..5) |repeat| {
+                    try std.testing.expect(try compute.kernels.launchDebertaAttentionFusedF32(&compute.ctx, fused, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], mask_device, batch, sequence, heads, head_dim));
+                    try fused.copyToHost(&compute.ctx, std.mem.sliceAsBytes(actual));
+                    try compute.ctx.synchronize();
+                    for (expected, actual, 0..) |want, got, i| {
+                        try std.testing.expect(std.math.isFinite(want) and std.math.isFinite(got));
+                        try std.testing.expectApproxEqAbs(want, got, tolerance);
+                        const item = i / (sequence * hidden);
+                        if (mask_kind == 2 or (mask_kind == 1 and ragged_lengths[item] == 0)) {
+                            try std.testing.expectEqual(@as(f32, 0), want);
+                            try std.testing.expectEqual(@as(f32, 0), got);
+                        }
+                    }
+                    if (repeat == 0) @memcpy(first, actual) else try std.testing.expectEqualSlices(f32, first, actual);
+                }
+            }
+        }
+    }
+}
+
 test "LightOnOCR3 CUDA BF16 vision projection retains bias dtype, readonly inputs and alias guards across F32 plans" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     var compute = try CudaCompute.init(std.testing.allocator);
@@ -36534,4 +36984,249 @@ test "LightOn BF16 vision capability includes the portable artifact driver contr
     compute.ctx.info.compute_major = 8;
     compute.cublaslt = null;
     try std.testing.expect(!CudaCompute.lightOnBf16VisionEnabled(&cb));
+}
+
+test "Whisper CUDA im2col preserves channel order padding and stride" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const channel = [_]f32{ 1, 2, 3, 4, 10, 20, 30, 40, 5, 6, 7, 8, 50, 60, 70, 80 };
+    const time_major = [_]f32{ 1, 10, 2, 20, 3, 30, 4, 40, 5, 50, 6, 60, 7, 70, 8, 80 };
+    const expected = [_]f32{ 0, 1, 2, 0, 10, 20, 2, 3, 4, 20, 30, 40, 0, 5, 6, 0, 50, 60, 6, 7, 8, 60, 70, 80 };
+    for ([_]bool{ false, true }) |major| {
+        const input = try cb.fromFloat32(if (major) &time_major else &channel);
+        defer cb.free(input);
+        const output = (try cb.conv1dIm2col(input, 2, 2, 4, 3, 2, 1, major)).?;
+        defer cb.free(output);
+        const actual = try cb.toFloat32(output, a);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(f32, &expected, actual);
+    }
+}
+
+test "Whisper CUDA logits statistics preserve suppression ties and timestamp mass" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const timestamps = @import("../../pipelines/whisper_timestamps.zig");
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    for ([_]usize{ 8, 51865 }) |count| {
+        const logits = try a.alloc(f32, count);
+        defer a.free(logits);
+        @memset(logits, -8);
+        @memcpy(logits[0..8], &[_]f32{ 0, 2, 2, 10, -1, 1.5, 1.5, 1.5 });
+        if (count > 8) {
+            logits[4000] = 12;
+            logits[50000] = 12;
+        }
+        const input = try cb.fromFloat32(logits);
+        defer cb.free(input);
+        const suppress = [_]i32{ -1, 3, 1000 };
+        for ([_]u32{ 0, 1 }) |text_allowed| {
+            const params = ops.WhisperLogitsParams{ .out_dim = @intCast(logits.len), .suppress_count = suppress.len, .ts_begin = 5, .text_allowed = text_allowed, .ts_min = 5, .ts_max = 8, .eot = 4, .probe_id = 3 };
+            const expected = timestamps.hostLogitsStats(logits, params, &suppress);
+            try std.testing.expect(try cb.whisperLogitsStatsEncode(input, &params, &suppress));
+            var actual: ops.WhisperLogitsStatsRaw = undefined;
+            try std.testing.expect(cb.whisperLogitsStatsRead(0, &actual));
+            for (0..16) |i| {
+                if (i == 1 or i == 3 or i == 5 or i == 7) {
+                    try std.testing.expectEqual(@as(u32, @bitCast(expected[i])), @as(u32, @bitCast(actual[i])));
+                } else if (std.math.isFinite(expected[i])) {
+                    try std.testing.expectApproxEqAbs(expected[i], actual[i], 0.00001 * @max(1, @abs(expected[i])));
+                } else try std.testing.expectEqual(expected[i], actual[i]);
+            }
+            try std.testing.expect(!cb.whisperLogitsStatsRead(0, &actual));
+        }
+    }
+}
+
+test "Whisper CUDA FP32 checkpoint upload retains FP16 matrices and FP32 bias" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.capability_profile = .whisper;
+    compute.whisper_f16_weights_enabled = true;
+    const values = [_]f32{ 1, 2, 3, 4 };
+    const matrix = tensor_mod.Tensor{ .name = "matrix", .data = @constCast(std.mem.sliceAsBytes(&values)), .dtype = .f32, .shape = &.{ 2, 2 }, .allocator = a, .owns_data = false, .owns_shape = false };
+    try compute.insertWeightFromLoaded(try a.dupe(u8, "model.decoder.layers.0.fc1.weight"), &.{ .tensor = matrix });
+    try std.testing.expectEqual(@as(@TypeOf(compute.resident_weights.get("model.decoder.layers.0.fc1.weight").?.dtype), .f16), compute.resident_weights.get("model.decoder.layers.0.fc1.weight").?.dtype);
+    const vector = tensor_mod.Tensor{ .name = "bias", .data = @constCast(std.mem.sliceAsBytes(&values)), .dtype = .f32, .shape = &.{4}, .allocator = a, .owns_data = false, .owns_shape = false };
+    try compute.insertWeightFromLoaded(try a.dupe(u8, "model.decoder.layers.0.fc1.bias"), &.{ .tensor = vector });
+    try std.testing.expectEqual(@as(@TypeOf(compute.resident_weights.get("model.decoder.layers.0.fc1.bias").?.dtype), .f32), compute.resident_weights.get("model.decoder.layers.0.fc1.bias").?.dtype);
+}
+
+test "Whisper CUDA profile requires a device compatible with the portable kernel module" {
+    try std.testing.expect(!profileSupportsDevice(.whisper, 7, 0));
+    try std.testing.expect(profileSupportsDevice(.whisper, 7, 5));
+    try std.testing.expect(profileSupportsDevice(.whisper, 8, 0)); // A100
+    try std.testing.expect(profileSupportsDevice(.whisper, 8, 9)); // L4
+    try std.testing.expect(profileSupportsDevice(.whisper, 12, 1));
+}
+
+test "Whisper CUDA split key attention matches generic attention across masks and tails" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const batch = 2;
+    const heads = 2;
+    const dim = 64;
+    for ([_]usize{ 1, 3 }) |queries| {
+        for ([_]usize{ 1, 129, 1500 }) |keys| {
+            const q = try a.alloc(f32, batch * queries * heads * dim);
+            defer a.free(q);
+            const k = try a.alloc(f32, batch * keys * heads * dim);
+            defer a.free(k);
+            const v = try a.alloc(f32, k.len);
+            defer a.free(v);
+            const mask = try a.alloc(i64, batch * keys);
+            defer a.free(mask);
+            for (q, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.13) * 2;
+            for (k, v, 0..) |*x, *y, i| {
+                x.* = @cos(@as(f32, @floatFromInt(i)) * 0.07);
+                y.* = @sin(@as(f32, @floatFromInt(i)) * 0.17);
+            }
+            const qt = try cb.fromFloat32(q);
+            defer cb.free(qt);
+            const kt = try cb.fromFloat32(k);
+            defer cb.free(kt);
+            const vt = try cb.fromFloat32(v);
+            defer cb.free(vt);
+            for ([_]bool{ false, true }) |masked| {
+                for (mask, 0..) |*x, i| x.* = if (masked and i % 5 == 3) 0 else 1;
+                compute.capability_profile = null;
+                const reference = try cb.crossAttention(qt, kt, vt, mask, batch, queries, keys, heads, dim);
+                defer cb.free(reference);
+                compute.capability_profile = .whisper;
+                const actual = try cb.crossAttention(qt, kt, vt, mask, batch, queries, keys, heads, dim);
+                defer cb.free(actual);
+                const expected_values = try cb.toFloat32(reference, a);
+                defer a.free(expected_values);
+                const actual_values = try cb.toFloat32(actual, a);
+                defer a.free(actual_values);
+                for (expected_values, actual_values) |expected, value| try std.testing.expectApproxEqAbs(expected, value, 2e-5);
+                const prepared = (try cb.whisperPrepareCrossKv(kt, vt)).?;
+                defer cb.free(prepared.first);
+                defer cb.free(prepared.second);
+                for (k) |*value| value.* = @floatCast(@as(f16, @floatCast(value.*)));
+                for (v) |*value| value.* = @floatCast(@as(f16, @floatCast(value.*)));
+                const rounded_k = try cb.fromFloat32(k);
+                defer cb.free(rounded_k);
+                const rounded_v = try cb.fromFloat32(v);
+                defer cb.free(rounded_v);
+                compute.capability_profile = null;
+                const half_reference = try cb.crossAttention(qt, rounded_k, rounded_v, mask, batch, queries, keys, heads, dim);
+                defer cb.free(half_reference);
+                compute.capability_profile = .whisper;
+                const half_actual = try cb.crossAttention(qt, prepared.first, prepared.second, mask, batch, queries, keys, heads, dim);
+                defer cb.free(half_actual);
+                const half_expected = try cb.toFloat32(half_reference, a);
+                defer a.free(half_expected);
+                const half_values = try cb.toFloat32(half_actual, a);
+                defer a.free(half_values);
+                for (half_expected, half_values) |expected, value| try std.testing.expectApproxEqAbs(expected, value, 2e-5);
+            }
+        }
+    }
+}
+
+test "Whisper CUDA fused GEMV retains FP16 rounding bias and odd output tails" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    for ([_]usize{ 64, 67 }) |inputs| {
+        var compute = try CudaCompute.init(a);
+        defer compute.deinit();
+        compute.capability_profile = .whisper;
+        const cb = compute.computeBackend();
+        const outputs = 13;
+        const x = try a.alloc(f32, inputs);
+        defer a.free(x);
+        const w = try a.alloc(f32, inputs * outputs);
+        defer a.free(w);
+        var bias: [outputs]f32 = undefined;
+        for (x, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.31);
+        for (w, 0..) |*value, i| value.* = @cos(@as(f32, @floatFromInt(i)) * 0.13);
+        for (&bias, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i)) * 0.1;
+        const weight = tensor_mod.Tensor{ .name = "model.decoder.layers.0.fc1.weight", .data = std.mem.sliceAsBytes(w), .dtype = .f32, .shape = &.{ outputs, @intCast(inputs) }, .allocator = a, .owns_data = false, .owns_shape = false };
+        try compute.insertWeightFromLoaded(try a.dupe(u8, weight.name), &.{ .tensor = weight });
+        const wt = try cb.getWeight(weight.name);
+        const xt = try cb.fromFloat32(x);
+        defer cb.free(xt);
+        const bt = try cb.fromFloat32(&bias);
+        defer cb.free(bt);
+        for ([_]bool{ false, true }) |with_bias| {
+            const result = if (with_bias) try cb.linear(xt, wt, bt, 1, inputs, outputs) else try cb.linearNoBias(xt, wt, 1, inputs, outputs);
+            defer cb.free(result);
+            const actual = try cb.toFloat32(result, a);
+            defer a.free(actual);
+            if (with_bias) {
+                const reference_gelu = try cb.gelu(result);
+                defer cb.free(reference_gelu);
+                const fused_gelu = (try cb.linearGelu(xt, wt, bt, 1, inputs, outputs)).?;
+                defer cb.free(fused_gelu);
+                const expected_gelu = try cb.toFloat32(reference_gelu, a);
+                defer a.free(expected_gelu);
+                const actual_gelu = try cb.toFloat32(fused_gelu, a);
+                defer a.free(actual_gelu);
+                for (expected_gelu, actual_gelu) |expected, value| try std.testing.expectApproxEqAbs(expected, value, 1e-5);
+            }
+            for (actual, 0..) |value, row| {
+                var expected: f32 = 0;
+                for (x, 0..) |item, col| expected += @as(f32, @floatCast(@as(f16, @floatCast(item)))) * @as(f32, @floatCast(@as(f16, @floatCast(w[row * inputs + col]))));
+                if (with_bias) expected += bias[row];
+                try std.testing.expectApproxEqAbs(expected, value, 1e-5);
+            }
+        }
+    }
+}
+
+test "Whisper CUDA residual normalization returns the sum and matching normalization" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.capability_profile = .whisper;
+    const cb = compute.computeBackend();
+    var x: [3 * 67]f32 = undefined;
+    var y: [x.len]f32 = undefined;
+    var gamma: [67]f32 = undefined;
+    var beta: [67]f32 = undefined;
+    for (&x, &y, 0..) |*lhs, *rhs, i| {
+        lhs.* = @sin(@as(f32, @floatFromInt(i)) * 0.17);
+        rhs.* = @cos(@as(f32, @floatFromInt(i)) * 0.31);
+    }
+    for (&gamma, &beta, 0..) |*g, *b, i| {
+        g.* = 0.5 + @as(f32, @floatFromInt(i)) * 0.01;
+        b.* = @as(f32, @floatFromInt(i)) * -0.001;
+    }
+    const xt = try cb.fromFloat32(&x);
+    defer cb.free(xt);
+    const yt = try cb.fromFloat32(&y);
+    defer cb.free(yt);
+    const gt = try cb.fromFloat32(&gamma);
+    defer cb.free(gt);
+    const bt = try cb.fromFloat32(&beta);
+    defer cb.free(bt);
+    const sum = try cb.add(xt, yt);
+    defer cb.free(sum);
+    const normalized = try cb.layerNorm(sum, gt, bt, 67, 1e-5);
+    defer cb.free(normalized);
+    const fused = (try cb.addLayerNormSum(xt, yt, gt, bt, 67, 1e-5)).?;
+    defer cb.free(fused.sum);
+    defer cb.free(fused.normed);
+    const expected_sum = try cb.toFloat32(sum, a);
+    defer a.free(expected_sum);
+    const actual_sum = try cb.toFloat32(fused.sum, a);
+    defer a.free(actual_sum);
+    try std.testing.expectEqualSlices(f32, expected_sum, actual_sum);
+    const expected_norm = try cb.toFloat32(normalized, a);
+    defer a.free(expected_norm);
+    const actual_norm = try cb.toFloat32(fused.normed, a);
+    defer a.free(actual_norm);
+    for (expected_norm, actual_norm) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
 }

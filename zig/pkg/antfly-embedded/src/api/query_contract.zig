@@ -14,6 +14,42 @@
 // limitations under the License.
 
 const std = @import("std");
+
+/// Literal-only validation details, owned by the public request. Bindings are
+/// stackable so nested calls and reused executor threads cannot leak failures.
+pub const ValidationDiagnostic = struct {
+    pointer: []const u8,
+    message: []const u8,
+};
+pub const ValidationDiagnosticStorage = struct {
+    diagnostic: ?ValidationDiagnostic = null,
+};
+threadlocal var validation_diagnostic_storage: ?*ValidationDiagnosticStorage = null;
+pub const ValidationDiagnosticBinding = struct {
+    previous: ?*ValidationDiagnosticStorage,
+    pub fn deinit(self: @This()) void {
+        validation_diagnostic_storage = self.previous;
+    }
+};
+pub fn bindValidationDiagnostic(storage: *ValidationDiagnosticStorage) ValidationDiagnosticBinding {
+    const previous = validation_diagnostic_storage;
+    validation_diagnostic_storage = storage;
+    return .{ .previous = previous };
+}
+pub fn resetValidationDiagnostic() void {
+    if (validation_diagnostic_storage) |storage| storage.diagnostic = null;
+}
+pub fn takeValidationDiagnostic() ?ValidationDiagnostic {
+    const storage = validation_diagnostic_storage orelse return null;
+    const diagnostic = storage.diagnostic;
+    storage.diagnostic = null;
+    return diagnostic;
+}
+fn invalidQueryField(comptime pointer: []const u8, comptime message: []const u8) error{InvalidQueryRequest} {
+    if (validation_diagnostic_storage) |storage| storage.diagnostic = .{ .pointer = pointer, .message = message };
+    return error.InvalidQueryRequest;
+}
+
 const relationship_filter = @import("../graph/relationship_filter.zig");
 const builtin = @import("builtin");
 const ant_json = @import("antfly-json");
@@ -10503,9 +10539,9 @@ fn parseLegacyPatternNodeFilter(
     errdefer freePatternNodeFilter(alloc, out);
     if (value.filter_prefix) |prefix| out.filter_prefix = try alloc.dupe(u8, prefix);
     if (value.filter_query) |filter_query| {
-        const parsed = try parseSupportedFullTextQuery(alloc, .{ .object = filter_query.map }, 10);
-        defer freeTextQuery(alloc, parsed);
-        out.filter_query_json = try encodePatternFilterQuery(alloc, parsed);
+        // Apply ordinary retrieval's bounded filter normalization, including
+        // structured scalar and array predicates, before graph admission.
+        out.filter_query_json = try normalizePublicStoredFilterQueryAlloc(alloc, @as(std.json.Value, .{ .object = filter_query.map }));
     }
     return out;
 }
@@ -12751,7 +12787,7 @@ fn applyPublicHierarchyControls(
                             return error.InvalidQueryRequest;
                         }
                     }
-                    if (!fields_set) return error.InvalidQueryRequest;
+                    if (!fields_set) return invalidQueryField("/hierarchy/group_by/matches/fields", "fields is required when hierarchy.group_by.matches is configured; use an explicit field array (which may be empty)");
                 } else {
                     return error.InvalidQueryRequest;
                 }
@@ -12842,7 +12878,7 @@ fn applyPublicHierarchyControls(
                 !std.mem.eql(u8, req.order_by[1].field, "_id") or
                 req.order_by[1].desc)
             {
-                return error.InvalidQueryRequest;
+                return invalidQueryField("/order_by", "hierarchy.children requires order_by with _hierarchy.position ascending followed by _id ascending");
             }
             if (req.search_after.len > 0 and
                 (req.search_after.len != 2 or req.search_after[0] != .string or req.search_after[1] != .string))
@@ -17935,6 +17971,93 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("active", filter.object.get("term").?.string);
         }
 
+        test "api query contract graph permission filters stop denied roots and intermediates" {
+            const a = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/db", .{tmp.sub_path});
+            defer a.free(path);
+            var db = try db_mod.DB.open(a, path, .{ .start_optional_runtimes = false, .start_index_workers = false });
+            defer db.close();
+            try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+            try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
+            try db.batch(.{ .writes = &.{
+                .{ .key = "a", .value = "{\"allowed_plans\":[\"standard\",\"enterprise\"],\"allowed_regions\":[\"eu\"],\"_edges\":{\"g\":{\"links\":[{\"target\":\"denied\"},{\"target\":\"b\"}]}}}" },
+                .{ .key = "b", .value = "{\"allowed_plans\":[\"standard\"],\"allowed_regions\":[\"eu\"],\"_edges\":{\"g\":{\"links\":[{\"target\":\"c\"}]}}}" },
+                .{ .key = "c", .value = "{\"allowed_plans\":[\"standard\"],\"allowed_regions\":[\"eu\"]}" },
+                .{ .key = "denied", .value = "{\"allowed_plans\":[\"enterprise\"],\"allowed_regions\":[\"us\"],\"_edges\":{\"g\":{\"links\":[{\"target\":\"hidden_descendant\"}]}}}" },
+                .{ .key = "hidden_descendant", .value = "{\"allowed_plans\":[\"standard\"],\"allowed_regions\":[\"eu\"]}" },
+            }, .sync_level = .full_index });
+            for ([_][]const u8{
+                "{\"query\":\"+allowed_plans:standard +allowed_regions:eu\"}",
+                "{\"conjuncts\":[{\"term\":\"standard\",\"field\":\"allowed_plans\"},{\"term\":\"eu\",\"field\":\"allowed_regions\"}]}",
+            }) |filter| {
+                for ([_][]const u8{ "traverse", "neighbors", "shortest_path", "k_shortest_paths", "pattern" }) |kind| {
+                    const extra = if (std.mem.eql(u8, kind, "pattern"))
+                        ",\"pattern\":[{\"alias\":\"source\"},{\"alias\":\"target\",\"edge\":{\"types\":[\"links\"],\"direction\":\"out\"}}],\"return_aliases\":[\"source\",\"target\"]"
+                    else if (std.mem.eql(u8, kind, "shortest_path") or std.mem.eql(u8, kind, "k_shortest_paths"))
+                        ",\"target_nodes\":{\"keys\":[\"c\"]}"
+                    else
+                        "";
+                    const body = try std.mem.concat(a, u8, &.{ "{\"graph_searches\":{\"walk\":{\"type\":\"", kind, "\",\"index_name\":\"g\",\"start_nodes\":{\"keys\":[\"a\"]},\"params\":{\"max_depth\":4,\"include_paths\":true,\"node_filter\":{\"filter_query\":", filter, "}},\"include_documents\":true", extra, "}}}" });
+                    defer a.free(body);
+                    var owned = try parseQueryRequest(a, null, "docs", body);
+                    defer owned.deinit(a);
+                    var result = try db.search(a, owned.req);
+                    defer result.deinit();
+                    const graph = result.graph_results[0];
+                    try std.testing.expect(graph.total_hits > 0);
+                    var encoded = try encodeQueryResponses(a, "docs", owned.req, .{}, result);
+                    defer encoded.deinit(a);
+                    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "denied") == null);
+                    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "hidden_descendant") == null);
+                    if (std.mem.eql(u8, kind, "traverse") or std.mem.eql(u8, kind, "neighbors")) {
+                        const multi_body = try std.mem.replaceOwned(u8, a, body, "[\"a\"]", "[\"a\",\"b\",\"denied\"]");
+                        defer a.free(multi_body);
+                        var multi_req = try parseQueryRequest(a, null, "docs", multi_body);
+                        defer multi_req.deinit(a);
+                        var multi = try db.search(a, multi_req.req);
+                        defer multi.deinit();
+                        try std.testing.expectEqual(@as(usize, if (std.mem.eql(u8, kind, "traverse")) 3 else 2), multi.graph_results[0].nodes.len);
+                        try std.testing.expectEqual(@as(usize, 2), multi.graph_results[0].hits.len);
+                        for (multi.graph_results[0].nodes) |node| for (node.path.?) |key| {
+                            try std.testing.expect(!std.mem.eql(u8, key, "denied"));
+                            try std.testing.expect(!std.mem.eql(u8, key, "hidden_descendant"));
+                        };
+                    }
+                    // A denied root must not expose its allowed descendant.
+                    const denied_body = try std.mem.replaceOwned(u8, a, body, "[\"a\"]", "[\"denied\"]");
+                    defer a.free(denied_body);
+                    var denied = try parseQueryRequest(a, null, "docs", denied_body);
+                    defer denied.deinit(a);
+                    var denied_result = try db.search(a, denied.req);
+                    defer denied_result.deinit();
+                    try std.testing.expectEqual(@as(u32, 0), denied_result.graph_results[0].total_hits);
+                }
+            }
+        }
+
+        test "api query contract legacy graph node filters use retrieval validation" {
+            const a = std.testing.allocator;
+            const filters = [_][]const u8{
+                "{\"query\":\"+allowed_plans:standard +allowed_regions:eu\"}",
+                "{\"conjuncts\":[{\"term\":\"standard\",\"field\":\"allowed_plans\"},{\"term\":\"eu\",\"field\":\"allowed_regions\"}]}",
+                "{\"term\":{\"path\":\"allowed\",\"value\":true}}",
+            };
+            for (filters) |filter| {
+                const body = try std.fmt.allocPrint(a, "{{\"graph_searches\":{{\"walk\":{{\"type\":\"traverse\",\"index_name\":\"g\",\"start_nodes\":{{\"keys\":[\"a\"]}},\"params\":{{\"node_filter\":{{\"filter_query\":{s}}}}}}}}}}}", .{filter});
+                defer a.free(body);
+                var owned = try parseQueryRequest(a, null, "docs", body);
+                defer owned.deinit(a);
+                const expected = try normalizePublicStoredFilterQueryAlloc(a, .{ .bytes = filter });
+                defer a.free(expected);
+                try std.testing.expectEqualStrings(expected, owned.req.graph_queries[0].query.params.node_filter.filter_query_json.?);
+            }
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "docs",
+                \\{"graph_searches":{"walk":{"type":"traverse","index_name":"g","start_nodes":{"keys":["a"]},"params":{"node_filter":{"filter_query":{"term":42,"field":"allowed_plans"}}}}}}
+            ));
+        }
+
         test "api query contract preserves opaque legacy graph operation names" {
             const alloc = std.testing.allocator;
             const body =
@@ -20585,4 +20708,25 @@ test "api query contract source only column delivery keeps payload outside metad
     try std.testing.expect(counter.bytes > body.len);
     try std.testing.expectEqual(@as(?usize, counter.bytes), response.delivered_bytes);
     try std.testing.expect(hits[0].column_source == null);
+}
+
+test "hierarchy validation diagnostics name required fields and stay request scoped" {
+    const a = std.testing.allocator;
+    var outer: ValidationDiagnosticStorage = .{};
+    const outer_binding = bindValidationDiagnostic(&outer);
+    defer outer_binding.deinit();
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "docs",
+        \\{"fields":[],"hierarchy":{"group_by":{"level":"source","matches":{}}}}
+    ));
+    var inner: ValidationDiagnosticStorage = .{};
+    const inner_binding = bindValidationDiagnostic(&inner);
+    try std.testing.expect(takeValidationDiagnostic() == null);
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "docs",
+        \\{"fields":[],"hierarchy":{"children":{"parent":{"level":"source","id":"doc"},"level":"unit"}}}
+    ));
+    try std.testing.expectEqualStrings("/order_by", takeValidationDiagnostic().?.pointer);
+    try std.testing.expect(takeValidationDiagnostic() == null);
+    inner_binding.deinit();
+    try std.testing.expectEqualStrings("/hierarchy/group_by/matches/fields", takeValidationDiagnostic().?.pointer);
+    try std.testing.expect(takeValidationDiagnostic() == null);
 }

@@ -160,6 +160,30 @@ curl -X POST http://127.0.0.1:8080/db/v1/tables/docs/query \
 
 The result is `entity/backup_service` over a `depends_on` edge, plus the `storage` and `backups` sections over `mentions` edges.
 
+## Multiple Seeds and Permissions
+
+With `include_paths: true`, traversal keeps a separate visited set for each
+start node. For seeds `a` and `b` on `a -> b -> c`, one request can return both
+`a -> b -> c` and `b -> c`. The first entry in each `path` identifies its root.
+With `deduplicate_nodes: true`, each endpoint appears once per root; without
+paths, endpoints are deduplicated across roots.
+
+`max_depth` counts hops from each root. The canonical `limit` (legacy
+`params.max_results`) caps result entries across the whole operation, so two
+root-specific paths to the same endpoint consume two slots. A small limit can
+truncate path coverage. Cycles terminate through per-root deduplication, depth
+limits, and shared request work budgets. Use a sufficiently large limit when
+comparing one multi-start request with separate requests for each seed.
+
+Node filters apply before returning or expanding starts, targets, and
+intermediate nodes for traversal, neighbors, path queries, and patterns. A
+denied node cannot serve as a bridge to an otherwise allowed descendant.
+Canonical traversal uses `traverse.filter`; the compatibility API accepts
+`params.node_filter.filter_query`. Structured term predicates match values in
+string arrays. Query-string predicates use the same full-text index and analyzer
+as ordinary retrieval, so the permission fields must be indexed for that form.
+Authenticated row permissions continue to intersect with the node filter.
+
 ## Tradeoffs
 
 The extraction schema decides what the graph can answer. GLiNER only finds the entity labels and relation types you list, so name the things your readers ask about ("component", "protocol") rather than generic labels, and keep relation types few and specific. `min_confidence` trades recall for precision: below about 0.5, weak mentions mint entities that connect unrelated sections. The resolver keys entities by name alone, so "the storage engine" in two documents becomes one node, but two different things with the same name also merge. The embedder and the extractor share Antfly Inference's memory, so extraction can wait while chunks are embedded; the graph lags the vector index during a large ingest.

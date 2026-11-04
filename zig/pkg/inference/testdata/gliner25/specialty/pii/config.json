@@ -1,0 +1,10 @@
+{
+  "_attn_implementation_autoset": true,
+  "counting_layer": "count_lstm",
+  "max_len": null,
+  "max_width": 8,
+  "model_name": "microsoft/mdeberta-v3-base",
+  "model_type": "extractor",
+  "token_pooling": "first",
+  "transformers_version": "5.8.0"
+}

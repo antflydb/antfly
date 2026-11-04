@@ -1128,6 +1128,13 @@ pub fn logMelSpectrogramWithConfig(
 
     for (0..actual_frames) |frame| {
         const start = frame * hop;
+        // A short clip is zero padded to the complete encoder context. Avoid
+        // transforming windows wholly inside that padding; their spectrum is
+        // exactly zero. Keep reflected boundary windows on the normal path.
+        if (start >= padding + samples.len and start + n_fft <= padding + padded_len) {
+            for (0..n_mels) |m| output[m * max_frames + frame] = 1e-10;
+            continue;
+        }
         try fft_plan.powerSpectrumWindowed(padded[start .. start + n_fft], window, magnitudes);
 
         for (0..n_mels) |m| {
@@ -1462,11 +1469,23 @@ pub const FftPlan = struct {
     n_freq: usize,
     m: usize,
     use_bluestein: bool,
+    mixed400_twiddles: []Complex = &.{},
     chirp: []Complex,
     kernel_fft: []Complex,
     work: []Complex,
 
     pub fn init(allocator: std.mem.Allocator, n: usize) !FftPlan {
+        // Whisper factors as 16 * 5 * 5, avoiding two 1024-point FFTs.
+        if (n == 400) {
+            const twiddles = try allocator.alloc(Complex, n);
+            errdefer allocator.free(twiddles);
+            const work = try allocator.alloc(Complex, n);
+            for (twiddles, 0..) |*value, k| {
+                const angle = -2 * std.math.pi * @as(f64, @floatFromInt(k)) / 400;
+                value.* = .{ .re = @cos(angle), .im = @sin(angle) };
+            }
+            return .{ .n = n, .n_freq = 201, .m = n, .use_bluestein = false, .mixed400_twiddles = twiddles, .chirp = &.{}, .kernel_fft = &.{}, .work = work };
+        }
         if (std.math.isPowerOfTwo(n)) {
             const work = try allocator.alloc(Complex, n);
             errdefer allocator.free(work);
@@ -1515,6 +1534,7 @@ pub const FftPlan = struct {
     }
 
     pub fn deinit(self: *FftPlan, allocator: std.mem.Allocator) void {
+        allocator.free(self.mixed400_twiddles);
         allocator.free(self.chirp);
         allocator.free(self.kernel_fft);
         allocator.free(self.work);
@@ -1530,6 +1550,10 @@ pub const FftPlan = struct {
         std.debug.assert(window.len == self.n);
         std.debug.assert(out.len >= self.n_freq);
 
+        if (self.mixed400_twiddles.len != 0) {
+            try self.powerSpectrum400(frame, window, out);
+            return;
+        }
         @memset(self.work, .{ .re = 0, .im = 0 });
         if (!self.use_bluestein) {
             for (0..self.n) |i| {
@@ -1562,7 +1586,57 @@ pub const FftPlan = struct {
             out[k] = @floatCast(spectrum.re * spectrum.re + spectrum.im * spectrum.im);
         }
     }
+    fn powerSpectrum400(self: *FftPlan, frame: []const f32, window: []const f32, out: []f32) !void {
+        const tw = self.mixed400_twiddles;
+        for (0..25) |r| {
+            var values: [16]Complex = undefined;
+            for (&values, 0..) |*value, j| value.* = .{ .re = @floatCast(frame[j * 25 + r] * window[j * 25 + r]), .im = 0 };
+            try fftComplex(&values, false);
+            for (values, 0..) |value, p| self.work[p * 25 + r] = complexMul(value, tw[r * p]);
+        }
+        for (0..16) |p| {
+            var intermediate: [25]Complex = undefined;
+            for (0..5) |r| {
+                var values: [5]Complex = undefined;
+                for (&values, 0..) |*value, j| value.* = self.work[p * 25 + j * 5 + r];
+                fftFive(&values);
+                for (values, 0..) |value, q| intermediate[q * 5 + r] = complexMul(value, tw[16 * q * r]);
+            }
+            for (0..5) |q| {
+                var values: [5]Complex = intermediate[q * 5 ..][0..5].*;
+                fftFive(&values);
+                for (values, 0..) |value, j| {
+                    const k = p + 16 * (q + 5 * j);
+                    if (k < self.n_freq) out[k] = @floatCast(value.re * value.re + value.im * value.im);
+                }
+            }
+        }
+    }
 };
+
+fn complexScale(value: Complex, scale: f64) Complex {
+    return .{ .re = value.re * scale, .im = value.im * scale };
+}
+
+fn fftFive(values: *[5]Complex) void {
+    const a = complexAdd(values[1], values[4]);
+    const b = complexAdd(values[2], values[3]);
+    const c = complexSub(values[1], values[4]);
+    const d = complexSub(values[2], values[3]);
+    const c1 = 0.3090169943749474241;
+    const c2 = -0.8090169943749474241;
+    const s1 = 0.9510565162951535721;
+    const s2 = 0.5877852522924731292;
+    const t0 = complexAdd(values[0], complexAdd(complexScale(a, c1), complexScale(b, c2)));
+    const t1 = complexAdd(values[0], complexAdd(complexScale(a, c2), complexScale(b, c1)));
+    const odd_first = complexAdd(complexScale(c, s1), complexScale(d, s2));
+    const odd_second = complexSub(complexScale(c, s2), complexScale(d, s1));
+    values[0] = complexAdd(values[0], complexAdd(a, b));
+    values[1] = complexAdd(t0, .{ .re = odd_first.im, .im = -odd_first.re });
+    values[4] = complexSub(t0, .{ .re = odd_first.im, .im = -odd_first.re });
+    values[2] = complexAdd(t1, .{ .re = odd_second.im, .im = -odd_second.re });
+    values[3] = complexSub(t1, .{ .re = odd_second.im, .im = -odd_second.re });
+}
 
 fn fftComplex(values: []Complex, inverse: bool) !void {
     if (values.len == 0) return;
@@ -3573,4 +3647,18 @@ test "Whisper silence has the reference floor and complete 30 second shape" {
     defer alloc.free(output);
     try std.testing.expectEqual(@as(usize, 80 * 3000), output.len);
     for (output) |value| try std.testing.expectApproxEqAbs(@as(f32, -1.5), value, 1e-6);
+}
+
+test "Whisper implicit silence padding matches explicit PCM padding" {
+    const alloc = std.testing.allocator;
+    var samples: [16000]f32 = @splat(0);
+    for (samples[0..1234], 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.137) * 0.2;
+    for ([_]u32{ 80, 128 }) |bins| {
+        const config = AudioConfig{ .sample_rate = 16000, .n_fft = 400, .hop_length = 160, .n_mels = bins, .chunk_length_s = 1, .normalization = .whisper, .mel_scale = .slaney, .center = true };
+        const implicit = try logMelSpectrogramWithConfig(alloc, samples[0..1234], config);
+        defer alloc.free(implicit);
+        const explicit = try logMelSpectrogramWithConfig(alloc, &samples, config);
+        defer alloc.free(explicit);
+        try std.testing.expectEqualSlices(f32, explicit, implicit);
+    }
 }

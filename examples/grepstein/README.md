@@ -424,3 +424,27 @@ index readiness, queue drain, and OCR spend before loading the full v1 set. Incr
 CPU/memory/disk through existing instance configuration and scale inference
 separately. Indexing large datasets and automatic large-corpus capacity selection
 are deferred; their raw originals can be preserved independently.
+
+### Investigating incomplete OCR
+
+A manifest's `merge_status: converged` reports artifact publication, not OCR
+success. Inspect `ocr_failed_count` on document artifact summaries and run
+`qualify` before declaring extraction complete. A nonempty text index can still
+contain embedded PDF text while OCR pages have failed. Failed OCR pages must not
+qualify for Antfly's unchanged-source fast path. Transient failures use the
+existing per-request retry budget and backoff; exhausted or terminal failures
+remain repair debt. Fix the reported cause before reprocessing those artifacts.
+
+Use the existing named-table artifact and repair APIs through the Cloud session
+or an instance-scoped key. Reprocessing an artifact preserves the source document;
+there is no need to delete its table or index. Keep native repair/reprocess job
+IDs and advance their bounded passes until complete; job creation alone is not
+proof that a repair finished. If an API response is uncertain, inspect the job or
+artifact generation before submitting the mutation again.
+
+Cloud global discovery and named-table requests must resolve the same live user
+permissions. A `401` on global discovery with working named-table requests is a
+proxy routing/authentication problem. A Cloudflare `403` with error `1010` is a
+separate transport rejection. Diagnostic clients should identify themselves with
+a descriptive application `User-Agent`, such as `antfly-cloud/grepstein-diagnostics`.
+Do not treat either response as evidence that OCR failed or that the GPU is busy.

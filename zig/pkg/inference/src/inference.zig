@@ -182,6 +182,7 @@ test {
     _ = linalg;
     _ = graph;
     _ = architectures;
+    _ = architectures.deberta;
     _ = architectures.embedding_gemma2;
     _ = @import("architectures/embedding_gemma2_reference.zig");
     _ = @import("pipelines/embedding_gemma2_content.zig");
@@ -201,6 +202,7 @@ test {
     _ = @import("extractors/gliner_window_parity_test.zig");
     _ = @import("models/gliner_boundary_qualification.zig");
     _ = @import("models/gliner_decide_qualification.zig");
+    _ = @import("models/gliner_specialty_qualification.zig");
     _ = @import("extractors/gliner_graph_qualification_fixtures.zig");
     _ = @import("architectures/gliner/boundary_request_device_test.zig");
     _ = @import("extractors/gliner_boundary_long_tasks_test.zig");

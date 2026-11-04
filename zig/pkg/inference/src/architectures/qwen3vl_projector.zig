@@ -207,11 +207,17 @@ fn admissionF32Bytes(rows: usize, columns: usize) !usize {
 
 /// Probe untrusted image headers and derive the exact geometry used by the
 /// projector before scheduler or process-wide memory admission occurs.
+pub const AdmissionBackend = enum { generic, cuda };
+
 pub fn estimateAdmission(
     images: []const []const u8,
     config: gpt_config.Config,
     limits: Limits,
 ) !AdmissionEstimate {
+    return estimateAdmissionForBackend(images, config, limits, .generic);
+}
+
+pub fn estimateAdmissionForBackend(images: []const []const u8, config: gpt_config.Config, limits: Limits, backend: AdmissionBackend) !AdmissionEstimate {
     try limits.validate();
     if (images.len == 0 or images.len > limits.max_images) return error.ImageLimitExceeded;
     var dimensions: [64]image.EncodedImageInfo = undefined;
@@ -219,7 +225,7 @@ pub fn estimateAdmission(
         if (bytes.len == 0 or bytes.len > limits.max_encoded_image_bytes) return error.VisionAdmissionExceeded;
         dimensions[index] = try image.inspectEncodedForInference(bytes, null);
     }
-    return estimateAdmissionForImageDimensions(dimensions[0..images.len], config, limits);
+    return estimateAdmissionForImageDimensionsWithBackend(dimensions[0..images.len], config, limits, backend);
 }
 
 /// A closed Metal graph with these two qualified vision geometries can use
@@ -238,6 +244,10 @@ fn estimateAdmissionForImageDimensions(
     config: gpt_config.Config,
     limits: Limits,
 ) !AdmissionEstimate {
+    return estimateAdmissionForImageDimensionsWithBackend(dimensions, config, limits, .generic);
+}
+
+fn estimateAdmissionForImageDimensionsWithBackend(dimensions: []const image.EncodedImageInfo, config: gpt_config.Config, limits: Limits, backend: AdmissionBackend) !AdmissionEstimate {
     try limits.validate();
     if (config.qwen35_metal_resident_vision and !supportsResidentVisionBudget(config)) return error.UnsupportedResidentVisionBudget;
     if (dimensions.len == 0 or dimensions.len > limits.max_images) return error.ImageLimitExceeded;
@@ -293,16 +303,12 @@ fn estimateAdmissionForImageDimensions(
     host_scratch = try admissionAdd(host_scratch, projected_outputs);
     host_scratch = try admissionAdd(host_scratch, deepstack_outputs);
 
-    // Backend peak: QKV/RoPE/output tensors plus the larger of an explicit
-    // attention score matrix and the two FFN intermediates. This deliberately
-    // remains conservative when a backend selects fused SDPA.
+    // Backend peak: QKV/RoPE/output tensors and the larger working phase.
+    // Generic estimation allows a materialized attention score matrix. CUDA
+    // uses the closed streaming/vendor contract shared with its dispatcher.
     const hidden_rows = try admissionF32Bytes(max_patch_tokens, vision_hidden);
     const qkv_rows = try admissionMul(hidden_rows, 3);
     const rope_and_outputs = try admissionMul(hidden_rows, 4);
-    const attention_scores = try admissionF32Bytes(
-        try admissionMul(try admissionMul(max_patch_tokens, max_patch_tokens), head_count),
-        1,
-    );
     const ffn_intermediates = try admissionMul(try admissionF32Bytes(max_patch_tokens, intermediate), 2);
     const merged_hidden = try admissionMul(vision_hidden, try admissionMul(config.vision_spatial_merge_size, config.vision_spatial_merge_size));
     const merge_intermediates = try admissionAdd(
@@ -317,10 +323,12 @@ fn estimateAdmissionForImageDimensions(
     // <=H. Existing 7H + this 20H + merge (>=3H) covers >=30H before the
     // separately charged two SDPA packing banks. Frame grouping still scales
     // the complete bound, including weights/output ownership as before.
-    const attention_working = if (config.qwen35_metal_resident_vision)
+    const attention_working = if (backend == .cuda and vision_hidden / head_count == 64 and vision_hidden % head_count == 0 and intermediate <= vision_hidden * 4)
+        try @import("../ops/cuda/vision_memory_contract.zig").workingBytes(max_patch_tokens, vision_hidden)
+    else if (config.qwen35_metal_resident_vision)
         try admissionMul(hidden_rows, 20)
     else
-        attention_scores;
+        try admissionF32Bytes(try admissionMul(try admissionMul(max_patch_tokens, max_patch_tokens), head_count), 1);
     backend_scratch = try admissionAdd(backend_scratch, @max(attention_working, ffn_intermediates));
     backend_scratch = try admissionAdd(backend_scratch, merge_intermediates);
     // Packed vision SDPA keeps two half Q/K/V workspaces for overlapping
@@ -1830,7 +1838,15 @@ fn encoderBlock(
     image_batch: usize,
 ) !CT {
     if (try tryLightOnBf16VisionBlock(cb, weights, cfg, input_ct, positions, token_count, layer, image_batch)) |compact| return compact;
-    var resident_scope = try ResidentVisionScope.begin(cb, cfg, input_ct);
+    // A rejected vendor plan must remain on the bounded portable path even
+    // when an earlier compact block returned BF16. Widen once for both norm
+    // and residual consumers rather than letting them see mixed dtypes.
+    const expanded_input: ?CT = if (comptime build_options.enable_cuda)
+        try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnVisionBf16ToF32(cb, input_ct)
+    else
+        null;
+    defer if (expanded_input) |expanded| cb.free(expanded);
+    var resident_scope = try ResidentVisionScope.begin(cb, cfg, expanded_input orelse input_ct);
     defer resident_scope.deinit();
     const input = resident_scope.input;
     const owns_encoder_scope = if (cfg.is_qwen35)
@@ -3382,4 +3398,16 @@ test "LightOnOCR3 device feature prompt assembly preserves host bytes source ten
     const untouched = try cb.toFloat32(features, a);
     defer a.free(untouched);
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&visual), std.mem.sliceAsBytes(untouched));
+}
+
+test "CUDA Qwen vision admission preserves tokens and host bytes without quadratic score scratch" {
+    const cfg = gpt_config.Config{ .family = .qwen3_5, .hidden_size = 2560, .vision_hidden_size = 1024, .vision_intermediate_size = 4096, .vision_num_attention_heads = 16, .vision_patch_size = 16, .vision_spatial_merge_size = 2 };
+    const dims = [_]image.EncodedImageInfo{.{ .width = 2048, .height = 2048 }};
+    const limits = Limits{ .max_merged_tokens = 4096, .hard_max_merged_tokens = 4096 };
+    const generic = try estimateAdmissionForImageDimensionsWithBackend(&dims, cfg, limits, .generic);
+    const cuda = try estimateAdmissionForImageDimensionsWithBackend(&dims, cfg, limits, .cuda);
+    try std.testing.expectEqual(generic.visual_tokens, cuda.visual_tokens);
+    try std.testing.expectEqual(generic.host_scratch_bytes, cuda.host_scratch_bytes);
+    try std.testing.expect(cuda.backend_scratch_bytes < generic.backend_scratch_bytes);
+    try std.testing.expect(cuda.backend_scratch_bytes < 4 * @as(usize, 1024 * 1024 * 1024));
 }

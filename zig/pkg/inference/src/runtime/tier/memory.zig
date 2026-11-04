@@ -650,18 +650,59 @@ pub const AdmissionAmounts = struct {
         return std.math.add(usize, self.host_scratch_bytes, self.backend_scratch_bytes);
     }
 
-    pub fn fitsLimits(self: @This(), limits: Limits) !bool {
+    pub const LimitExceeded = struct {
+        limit: enum { host, backend, combined, scratch, kv },
+        requested_bytes: usize,
+        limit_bytes: usize,
+    };
+
+    /// Return the first constraint that prevents this request fitting alone.
+    /// Keep validation and operator diagnostics on the same checked arithmetic.
+    pub fn firstLimitExceeded(self: @This(), limits: Limits) !?LimitExceeded {
         const host = try self.hostTotalBytesChecked();
         const device = try self.backendTotalBytesChecked();
         const combined = try std.math.add(usize, host, device);
         const scratch = try self.scratchTotalBytesChecked();
         const kv = try self.kvTotalBytesChecked();
-        inline for (.{ .{ host, limits.host_limit_bytes }, .{ device, limits.backend_limit_bytes }, .{ combined, limits.combined_limit_bytes }, .{ scratch, limits.scratch_limit_bytes }, .{ kv, limits.kv_limit_bytes } }) |pair| {
-            if (pair[1] != 0 and pair[0] > pair[1]) return false;
+        inline for (.{
+            .{ .host, host, limits.host_limit_bytes },
+            .{ .backend, device, limits.backend_limit_bytes },
+            .{ .combined, combined, limits.combined_limit_bytes },
+            .{ .scratch, scratch, limits.scratch_limit_bytes },
+            .{ .kv, kv, limits.kv_limit_bytes },
+        }) |entry| {
+            if (entry[2] != 0 and entry[1] > entry[2]) return .{
+                .limit = entry[0],
+                .requested_bytes = entry[1],
+                .limit_bytes = entry[2],
+            };
         }
-        return true;
+        return null;
+    }
+
+    pub fn fitsLimits(self: @This(), limits: Limits) !bool {
+        return (try self.firstLimitExceeded(limits)) == null;
     }
 };
+
+test "admission amounts identify the blocking budget even when scratch fits" {
+    const amounts = AdmissionAmounts{ .host_scratch_bytes = 40, .backend_scratch_bytes = 50, .backend_kv_bytes = 10 };
+    const cases = [_]struct { limits: Limits, expected: AdmissionAmounts.LimitExceeded }{
+        .{ .limits = .{ .host_limit_bytes = 39 }, .expected = .{ .limit = .host, .requested_bytes = 40, .limit_bytes = 39 } },
+        .{ .limits = .{ .backend_limit_bytes = 59 }, .expected = .{ .limit = .backend, .requested_bytes = 60, .limit_bytes = 59 } },
+        .{ .limits = .{ .combined_limit_bytes = 99, .scratch_limit_bytes = 100 }, .expected = .{ .limit = .combined, .requested_bytes = 100, .limit_bytes = 99 } },
+        .{ .limits = .{ .scratch_limit_bytes = 89 }, .expected = .{ .limit = .scratch, .requested_bytes = 90, .limit_bytes = 89 } },
+        .{ .limits = .{ .kv_limit_bytes = 9 }, .expected = .{ .limit = .kv, .requested_bytes = 10, .limit_bytes = 9 } },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, (try amounts.firstLimitExceeded(case.limits)).?);
+        try std.testing.expect(!try amounts.fitsLimits(case.limits));
+    }
+    try std.testing.expect(try amounts.fitsLimits(.{}));
+    try std.testing.expect(try amounts.fitsLimits(.{ .host_limit_bytes = 40, .backend_limit_bytes = 60, .combined_limit_bytes = 100, .scratch_limit_bytes = 90, .kv_limit_bytes = 10 }));
+    const overflow = AdmissionAmounts{ .host_scratch_bytes = std.math.maxInt(usize), .backend_scratch_bytes = 1 };
+    try std.testing.expectError(error.Overflow, overflow.firstLimitExceeded(.{}));
+}
 
 /// Optional process-owner bridge for coordinating inference admission with a
 /// broader resource manager. The inference runtime remains independent of the
@@ -1031,6 +1072,15 @@ pub const AdmissionController = struct {
         const request_combined = std.math.add(usize, request_host, request_backend) catch
             return error.ResourceLimitExceeded;
 
+        // Check every intrinsic limit before considering contention. An
+        // occupied host pool must not hide an impossible scratch/KV/backend
+        // request and cause needless eviction and retries.
+        for (0..backend_class_count) |index| {
+            if (!active_backends[index]) continue;
+            if ((amounts_by_backend[index].firstLimitExceeded(limits_by_backend[index]) catch
+                return error.ResourceLimitExceeded) != null) return error.ResourceLimitExceeded;
+        }
+
         // Publish a provisional reservation while holding only the in-memory
         // accounting lock. The potentially blocking OS/cgroup probe runs after
         // unlock; concurrent requests see the provisional bytes and therefore
@@ -1038,6 +1088,11 @@ pub const AdmissionController = struct {
         {
             spinLockAdmission(&self.mutex);
             defer self.mutex.unlock();
+
+            // Shared limits can tighten concurrently; inspect them only under
+            // the accounting lock, before testing aggregate occupancy.
+            try checkAdmissionLimit(request_host, request_host, self.shared_limits.host_limit_bytes);
+            try checkAdmissionLimit(request_combined, request_combined, self.shared_limits.unified_limit_bytes);
 
             const next = addAdmissionAmounts(self.admitted, amounts) orelse
                 return error.ResourceLimitExceeded;
@@ -1196,6 +1251,12 @@ pub const AdmissionController = struct {
             .external_lease = external_lease,
             .live_reserved_bytes = live_reserved_bytes,
         };
+    }
+
+    pub fn sharedLimitsSnapshot(self: *AdmissionController) SharedAdmissionLimits {
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        return self.shared_limits;
     }
 
     pub fn snapshot(self: *AdmissionController) AdmissionAmounts {
@@ -4680,4 +4741,36 @@ test "LightOnOCR3 physical CUDA clamping preserves host scratch and KV within co
     var explicit = requested;
     explicit.scratch_limit_bytes = mib(32);
     try std.testing.expectEqual(mib(32), clampDiscreteDeviceLimits(explicit, gib(24), gib(2)).scratch_limit_bytes);
+}
+
+test "permanent admission limits win over unrelated host contention" {
+    var controller = AdmissionController{ .shared_limits = .{ .host_limit_bytes = 100 } };
+    var held = try controller.tryAcquire(.cpu, .{}, .{ .host_weight_bytes = 80 }, false);
+    defer held.release();
+    const cases = [_]AdmissionRequest{
+        .{ .backend_class = .cpu, .limits = .{ .scratch_limit_bytes = 20 }, .amounts = .{ .host_scratch_bytes = 30 } },
+        .{ .backend_class = .cpu, .limits = .{ .kv_limit_bytes = 20 }, .amounts = .{ .host_kv_bytes = 30 } },
+        .{ .backend_class = .gpu, .limits = .{ .backend_limit_bytes = 20 }, .amounts = .{ .host_scratch_bytes = 30, .backend_scratch_bytes = 30 } },
+        .{ .backend_class = .gpu, .limits = .{ .combined_limit_bytes = 40 }, .amounts = .{ .host_scratch_bytes = 30, .backend_scratch_bytes = 30 } },
+    };
+    for (cases) |request| {
+        var pressure: ?AdmissionPressure = null;
+        try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquireRequestsWithPressure(&.{request}, false, &pressure));
+        try std.testing.expect(pressure == null);
+        try std.testing.expectEqual(@as(usize, 80), controller.snapshot().hostTotalBytes());
+    }
+    // The first component would contend, but another component cannot fit
+    // even alone. Atomic multi-domain requests must report that permanent
+    // cause without reserving either component.
+    try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquireRequests(&.{
+        .{ .backend_class = .cpu, .limits = .{}, .amounts = .{ .host_scratch_bytes = 30 } },
+        .{ .backend_class = .gpu, .limits = .{ .backend_limit_bytes = 20 }, .amounts = .{ .backend_scratch_bytes = 30 } },
+    }, false));
+    try std.testing.expectEqual(@as(usize, 80), controller.snapshot().hostTotalBytes());
+    // A feasible request still reports temporary contention and recovers.
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 30 }, false));
+    held.release();
+    var recovered = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 30 }, false);
+    recovered.release();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
 }

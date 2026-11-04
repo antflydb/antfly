@@ -3005,6 +3005,9 @@ test "external lake bounded WAL inventory deltas seek changed records within a b
     source.verified_files = null;
     source.prepared_deletes = null;
     source.scanner.iceberg_delete_plan = null;
+    // catalog() reads these; leaving them undefined is illegal behavior.
+    source.selected_catalog_view = false;
+    source.plan_lease = null;
     var provider: RowProvider = .{ .source = &source, .previous_inventory = prior, .context = .{ .io = std.testing.io } };
     try std.testing.expect(eligibleInventory(&provider, baseline) != null);
     var delta = try state.Plan.fromInventory(a, ca, &provider, prior);

@@ -20,11 +20,13 @@
 //!
 //! The production table holds exactly the artifacts that passed a reviewed
 //! release qualification: exact weight/sidecar digests, backend, feature
-//! set, and safe LengthContract bounds measured on the real artifact (see
+//! set, and LengthContract coverage measured on the real artifact (see
 //! zig/pkg/inference/models/gliner2/GLINER25.md for the record). This module
 //! does not consume JSON evidence, expose a runtime override, or
-//! authenticate release evidence. Adding a row is a reviewed release
-//! decision, not an inference from successful loading or from the
+//! authenticate release evidence. Serving checks identity/backend/features
+//! here, then actual model/resource limits in the executors; measured geometry
+//! remains an evidence contract rather than an execution-capacity limit.
+//! Adding a row is a reviewed release decision, not an inference from successful loading or from the
 //! architecture-wide runtime_available flag.
 const std = @import("std");
 const bundle = @import("gliner_boundary_bundle.zig");
@@ -1321,6 +1323,8 @@ test "boundary qualification Transformers wrapper has exactly the original fp32 
         try std.testing.expectEqual(@as(usize, 1), exact_peers);
         try require(peer_identity, entry.backend, entry.features, entry.lengths);
     }
+    // Six original wrapper rows, two CUDA base rows, and the bounded CUDA and
+    // Metal batch profiles all authenticate the same original FP32 identity.
     try std.testing.expect(original_count > 0);
     try std.testing.expectEqual(original_count, wrapper_count);
     for (0..4) |index| {
