@@ -238,12 +238,9 @@ pub const Store = struct {
             if (!std.mem.startsWith(u8, entry.key, prefix) or entry.key.len < prefix.len + 21) return error.InvalidSqlExchange;
             const expiry = std.fmt.parseInt(u64, entry.key[prefix.len..][0..20], 10) catch return error.InvalidSqlExchange;
             if (expiry +| 30_000 >= now_ms) break;
-            var metadata = client.statObjectWithOptions(self.bucket, entry.key, .{ .cancellation = catalog.types.contextCancellation(&self.context) }) catch |err| switch (err) {
-                error.NotFound, error.ObjectNotFound, error.FileNotFound => continue,
-                else => return err,
-            };
-            defer metadata.deinit(a);
-            try client.compareAndDelete(self.bucket, entry.key, metadata.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = catalog.types.contextCancellation(&self.context) });
+            // Expired content-addressed exchange names can never be a live
+            // generation again. A late upload is found by the next expiry walk.
+            try client.deleteObject(self.bucket, entry.key, .{ .cancellation = catalog.types.contextCancellation(&self.context) });
             deleted += 1;
         }
         return deleted;

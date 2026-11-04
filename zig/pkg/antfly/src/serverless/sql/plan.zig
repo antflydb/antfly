@@ -63,6 +63,10 @@ pub const Limits = struct {
     max_partitions: u16 = 256,
     concurrency: u16 = 8,
     max_attempts: u16 = 3,
+    pub fn validate(self: Limits) !void {
+        if (self.task_memory < 1024 * 1024 or self.task_memory > 1024 * 1024 * 1024 or self.task_scan_rows == 0 or self.task_output_bytes < 4096 or self.task_output_bytes > @import("exchange.zig").max_object_bytes or self.max_tasks == 0 or self.max_tasks > 65536 or self.max_partitions == 0 or self.max_partitions > 1024 or self.concurrency == 0 or self.concurrency > 256 or self.max_attempts == 0 or self.max_attempts > 16) return error.InvalidSqlDistributedPlan;
+        if (self.task_scan_rows > std.math.maxInt(u32) or self.query_scan_bytes == 0 or self.query_exchange_bytes == 0 or self.query_requests == 0) return error.InvalidSqlDistributedPlan;
+    }
 };
 pub const Aggregation = struct {
     groups: []const u16 = &.{},
@@ -71,7 +75,7 @@ pub const Aggregation = struct {
 };
 pub const Strategy = enum { broadcast, shuffle };
 pub const Plan = struct {
-    version: u16 = 1,
+    version: u16 = 2,
     tenant: Digest,
     expires_ms: u64,
     left: Input,
@@ -96,9 +100,9 @@ pub const Plan = struct {
         return result;
     }
     pub fn validate(self: Plan, now_ms: u64) !void {
-        if (self.version != 1 or self.expires_ms <= now_ms) return error.SqlQueryExpired;
+        if (self.version != 2 or self.expires_ms <= now_ms) return error.SqlQueryExpired;
         const limits = self.limits;
-        if (limits.task_memory < 1024 * 1024 or limits.task_memory > 1024 * 1024 * 1024 or limits.task_scan_rows == 0 or limits.task_output_bytes < 4096 or limits.task_output_bytes > @import("exchange.zig").max_object_bytes or limits.max_tasks == 0 or limits.max_tasks > 65536 or limits.max_partitions == 0 or limits.max_partitions > 1024 or limits.concurrency == 0 or limits.concurrency > 256 or limits.max_attempts == 0 or limits.max_attempts > 16) return error.InvalidSqlDistributedPlan;
+        try limits.validate();
         if (self.partitions == 0 or self.partitions > limits.max_partitions or !std.math.isPowerOfTwo(self.partitions)) return error.InvalidSqlDistributedPlan;
         if (self.left.columns.len == 0 or self.right.columns.len == 0 or self.left.columns.len + self.right.columns.len > 2048 or self.left.splits == 0 or self.right.splits == 0 or self.left.splits > 65536 or self.right.splits > 65536 or self.left.cut.len == 0 or self.right.cut.len == 0 or self.left.cut.len > 8192 or self.right.cut.len > 8192 or self.left.snapshot.len > 256 or self.right.snapshot.len > 256) return error.InvalidSqlDistributedPlan;
         if (self.join.left_keys.len == 0 or self.join.left_keys.len > 32 or self.join.left_keys.len != self.join.right_keys.len) return error.InvalidSqlDistributedPlan;
@@ -185,11 +189,12 @@ pub const Task = struct {
 };
 /// No row payload travels through the dispatcher. The worker loads the durable
 /// plan and accepted dependency records using these deterministic identities.
-pub const Ticket = struct { tenant: Digest, query: Digest, stage: u32, task: u32 };
+pub const Ticket = struct { tenant: Digest, query: @import("state.zig").Query, stage: u32, task: u32 };
 pub fn choose(left: Input, right: Input, tenant: Digest, expires_ms: u64, join: Join, limits: Limits, now_ms: u64) !Plan {
     const broadcast = !join.preservesBuild() and right.estimated_bytes <= @min(64 * 1024 * 1024, limits.task_memory / 4);
     var partitions: u16 = 1;
     if (!broadcast) while (@as(u64, partitions) *| (limits.task_memory / 2) < right.estimated_bytes and partitions < limits.max_partitions) {
+        if (partitions > limits.max_partitions / 2) break;
         partitions = std.math.mul(u16, partitions, 2) catch return error.SqlJoinBudgetExceeded;
     };
     const result: Plan = .{ .tenant = tenant, .expires_ms = expires_ms, .left = left, .right = right, .join = join, .strategy = if (broadcast) .broadcast else .shuffle, .partitions = partitions, .limits = limits };
@@ -209,6 +214,12 @@ test "distributed SQL plan preserves join semantics and admits retry and exchang
     try std.testing.expectError(error.SqlDistributedJoinUnsupported, selected.validate(1));
     selected.strategy = .shuffle;
     try selected.validate(1);
+    var larger = input;
+    larger.estimated_bytes = 256 * 1024 * 1024;
+    var capped = selected.limits;
+    capped.max_partitions = 3;
+    const bounded = try choose(input, larger, @splat('b'), 10000, selected.join, capped, 1);
+    try std.testing.expectEqual(@as(u16, 2), bounded.partitions);
     selected.limits.query_exchange_bytes = 1;
     try std.testing.expectError(error.SqlJoinBudgetExceeded, selected.validate(1));
 }

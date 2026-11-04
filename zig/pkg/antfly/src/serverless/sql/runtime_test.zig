@@ -222,7 +222,7 @@ test "distributed SQL runtime executes broadcast and shuffle SQL join semantics 
                     }
                 }
                 try std.testing.expectEqual(if (aggregate) @as(u64, 1) else case.count, actual);
-                try std.testing.expect(fixture.retained > 2);
+                try std.testing.expectEqual(@as(usize, 1), fixture.retained);
                 if (case.kind == .left or case.kind == .anti) try std.testing.expectEqual(@as(usize, 0), fixture.filters);
                 var api = replacement;
                 api.role = .api_only;
@@ -354,11 +354,14 @@ test "distributed SQL signed task RPC uses query listeners and recovery driver w
     const authentication: @import("../../api/internal_service_auth.zig").Config = .{ .secret = secret, .issuer = "sql-workers" };
     var admission = local.common_request_admission.RequestAdmission.init(2);
     const Dummy = struct {
-        pub fn handle(_: *@This(), _: @import("../api/http_types.zig").HttpRequest) !@import("../api/http_types.zig").HttpResponse {
-            return error.UnexpectedPublicRequest;
+        alloc: A,
+        ready: std.atomic.Value(bool) = .init(false),
+        pub fn handle(self: *@This(), request_: @import("../api/http_types.zig").HttpRequest) !@import("../api/http_types.zig").HttpResponse {
+            if (!std.mem.eql(u8, request_.path, "/readyz")) return error.UnexpectedPublicRequest;
+            return .{ .status = if (self.ready.load(.acquire)) 200 else 503, .content_type = try self.alloc.dupe(u8, "application/json"), .body = try self.alloc.dupe(u8, "{}") };
         }
     };
-    var dummy: Dummy = .{};
+    var dummy: Dummy = .{ .alloc = a };
     const Server = @import("../../serverless_http_server.zig").ServerlessHttpServer;
     var server_a = Server.init(a, .{ .distributed_sql = .{ .factory = .{ .ptr = &scope_a, .open = Scope.open, .dispatcher = .{ .ptr = &scope_a, .dispatch = Scope.noDispatch } }, .authentication = authentication, .admission = &admission } }, &dummy);
     var server_b = Server.init(a, .{ .distributed_sql = .{ .factory = .{ .ptr = &scope_b, .open = Scope.open, .dispatcher = .{ .ptr = &scope_b, .dispatch = Scope.noDispatch } }, .authentication = authentication, .admission = &admission } }, &dummy);
@@ -372,6 +375,18 @@ test "distributed SQL signed task RPC uses query listeners and recovery driver w
     var unsigned = try server_a.handle(.{ .method = .POST, .uri = transport.task_path, .body = "{}" });
     defer unsigned.deinit(a);
     try std.testing.expectEqual(@as(u16, 401), unsigned.status);
+    const probe_uri = try std.fmt.allocPrint(sa, "{s}/readyz/sql", .{listener_a.base_uri});
+    var unready = try executor.executor().execute(a, .{ .method = .GET, .uri = probe_uri });
+    defer unready.deinit(a);
+    try std.testing.expectEqual(@as(u16, 503), unready.status);
+    dummy.ready.store(true, .release);
+    var ready = try executor.executor().execute(a, .{ .method = .GET, .uri = probe_uri });
+    defer ready.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), ready.status);
+    var unsupported = Server.init(a, .{}, &dummy);
+    var absent = try unsupported.handle(.{ .method = .GET, .uri = "/readyz/sql" });
+    defer absent.deinit(a);
+    try std.testing.expectEqual(@as(u16, 503), absent.status);
     const column: plan.Column = .{ .name = "id", .type = .integer };
     const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{column}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 2 };
     var right = input;
@@ -395,10 +410,10 @@ test "distributed SQL signed task RPC uses query listeners and recovery driver w
     const broken_query = try coordinator.submit(unavailable);
     const RejectOne = struct {
         client: *transport.Client,
-        broken: state.Digest,
+        broken: state.Query,
         fn dispatch(raw: *anyopaque, tickets: []const plan.Ticket, context: Context) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            for (tickets) |ticket| if (std.mem.eql(u8, &ticket.query, &self.broken)) return error.SqlWorkerUnavailable;
+            for (tickets) |ticket| if (std.meta.eql(ticket.query, self.broken)) return error.SqlWorkerUnavailable;
             const dispatcher_ = self.client.dispatcher();
             try dispatcher_.dispatch(dispatcher_.ptr, tickets, context);
         }
@@ -418,6 +433,36 @@ test "distributed SQL signed task RPC uses query listeners and recovery driver w
     try std.testing.expect(complete and fixture.opens >= 4);
     try std.testing.expectEqual(@as(u64, 4), (try client.result(sa, .{ .tenant = spec.tenant, .query = query }, .{})).?.rows);
     try std.testing.expectEqual(@as(usize, 0), admission.stats().in_flight);
+    const Http = local.common_http_http_common;
+    const LostSubmit = struct {
+        base: Http.RequestExecutor,
+        dropped: bool = false,
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, allocator: A, request_: Http.HttpRequest) !Http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var response_ = try self.base.execute(allocator, request_);
+            if (std.mem.endsWith(u8, request_.uri, transport.submit_path)) {
+                self.calls += 1;
+                if (!self.dropped) {
+                    self.dropped = true;
+                    response_.deinit(allocator);
+                    return error.ConnectionResetByPeer;
+                }
+            }
+            return response_;
+        }
+    };
+    var lost: LostSubmit = .{ .base = executor.executor() };
+    var single = client;
+    single.workers = &.{listener_a.base_uri};
+    single.executor = .{ .ptr = &lost, .vtable = &.{ .execute = LostSubmit.execute } };
+    var abandoned = spec;
+    abandoned.expires_ms -= 2;
+    const abandoned_query = try single.submit(abandoned, .{});
+    try std.testing.expectEqual(@as(usize, 2), lost.calls);
+    try single.cancel(.{ .tenant = spec.tenant, .query = abandoned_query }, .{});
+    for (0..4) |_| _ = try driver.tick();
+    try std.testing.expectError(error.Canceled, single.result(sa, .{ .tenant = spec.tenant, .query = abandoned_query }, .{}));
     fixture.now = spec.expires_ms + 30001;
     var store = coordinator.state_store;
     store.now_ms = fixture.now;
@@ -617,4 +662,128 @@ test "distributed SQL task budget failure is terminal and reported to the query"
     const claim = (try coordinator.acquire(query)).?;
     for (0..4) |_| if (try coordinator.tick(query, claim, .{ .ptr = &dispatch, .dispatch = Dispatch.run })) break;
     try std.testing.expectError(error.SqlJoinBudgetExceeded, coordinator.pollResult(sa, query));
+}
+
+test "distributed SQL hosted bound-client execution reopens native cuts and typed Parquet" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    const hosted = @import("hosted.zig");
+    const lake = local.serverless_external_source_mod.lake_catalog;
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var managed: lake.managed.Managed = .{ .client = memory.client(), .bucket = "source", .prefix = "table", .source_uri = "s3://source/table" };
+    const initial = try managed.create(sa, "create", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+    const images = try std.json.parseFromSliceLeaky(std.json.Value, sa, "[{\"id\":1},{\"id\":2}]", .{});
+    const batch: lake.row_commit.Batch = .{ .batch_id = "base", .source = "s", .epoch = "1", .checkpoint = "1", .key_fields = &.{"id"}, .changes = &.{ .{ .op = .upsert, .row = images.array.items[0] }, .{ .op = .upsert, .row = images.array.items[1] } } };
+    const prepared = try lake.row_commit.prepare(sa, initial, .{ .client = memory.client(), .bucket = "source", .prefix = "table", .uri = "s3://source/table" }, batch, 1, 2);
+    const committed = try managed.commit(sa, .{ .id = "base", .expected_metadata_location = initial.metadata_location, .body = prepared.body, .timestamp_ms = 2 });
+    const schema = "{\"base_source\":{\"kind\":\"external\",\"table_id\":\"events\",\"format\":\"iceberg\",\"uri\":\"s3://source/table\",\"schema_fingerprint\":\"auto\",\"write_policy\":\"iceberg_writer\",\"catalog\":{\"type\":\"managed\"}}}";
+    const binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(sa, schema)).?;
+    var table: local.sql_catalog.Table = .{ .id = 7, .physical_name = "events", .schema_version = 1, .external_base_source = binding, .columns = &.{.{ .name = "id", .path = "id", .type = .integer }} };
+    const detected = try local.serverless_query_lake_schema.icebergSchema(sa, committed.metadata_json, null);
+    table.external_base_source.?.binding.schema_fingerprint = detected.fingerprint;
+    const config: hosted.Config = .{ .state = .{ .bucket = "execution", .prefix = "state" }, .exchange = .{ .bucket = "execution", .prefix = "exchange" }, .artifacts = .{ .protocol = .s3, .connection = "source", .bucket = "source", .prefix = "artifacts", .root = "account.r2.cloudflarestorage.com" }, .source_buckets = &.{"source"} };
+    var object_artifacts = try @import("../artifacts/object_store.zig").ObjectStore.initWithClientOptions(a, memory.client(), "source", "artifacts", .{ .skip_bucket_probe = true });
+    var artifacts = object_artifacts.artifactStore();
+    defer artifacts.deinit();
+    const expires = @as(u64, @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms)) + 3600000;
+    const root = try lake.metadata.parse(sa, committed.metadata_json);
+    const snapshot = try std.fmt.allocPrint(sa, "{d}", .{try lake.metadata.int(try lake.metadata.get(root, "current-snapshot-id"))});
+    const recent = try std.json.parseFromSliceLeaky(std.json.Value, sa, "[{\"id\":2},{\"id\":3}]", .{});
+    const descriptor: @import("../../api/lake_sql_retained_cut.zig").Descriptor = .{ .table_id = 7, .schema_version = 1, .object_generation = 0, .expires_ms = expires, .metadata_location = committed.metadata_location, .metadata_json = committed.metadata_json, .table_uuid = try lake.metadata.str(try lake.metadata.get(root, "table-uuid")), .snapshot_id = snapshot, .pending = .{ .lsn = 2, .key_fields = &.{"id"}, .changes = &.{ .{ .op = .delete, .row = recent.array.items[0] }, .{ .op = .upsert, .row = recent.array.items[1] } } }, .authorization = .{ .scope = @splat('a'), .table = @import("../../api/lake_sql_retained_cut.zig").ReadTable.from(table) } };
+    const identity = try @import("../../api/native_retained_cut.zig").storeIdentity(sa, config.artifacts);
+    const cut = try @import("../../api/lake_sql_retained_cut.zig").save(sa, &artifacts, identity, std.testing.io, descriptor, .none);
+    const input: plan.Input = .{ .table_id = 7, .schema = try @import("lake_source.zig").Host.fingerprint(sa, table), .snapshot = snapshot, .wal_cut = 2, .cut = cut, .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 100, .estimated_rows = 2, .splits = 2 };
+    const spec: plan.Plan = .{ .tenant = @splat('a'), .expires_ms = expires, .left = input, .right = input, .join = .{ .left_keys = &.{0}, .right_keys = &.{0} }, .strategy = .shuffle, .partitions = 4, .limits = .{ .task_memory = config.task_memory } };
+    const raw_plan = try spec.encode(sa);
+    if (std.testing.environ.getPosix("ANTFLY_SQL_HOSTED_FIXTURE")) |path| {
+        const Item = struct { bucket: []const u8, key: []const u8, body_base64: []const u8 };
+        var items: std.ArrayList(Item) = .empty;
+        var buckets = memory.buckets.iterator();
+        while (buckets.next()) |bucket| {
+            var objects = bucket.value_ptr.iterator();
+            while (objects.next()) |object| {
+                const bytes = object.value_ptr.body;
+                const encoded = try sa.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+                _ = std.base64.standard.Encoder.encode(encoded, bytes);
+                try items.append(sa, .{ .bucket = bucket.key_ptr.*, .key = object.key_ptr.*, .body_base64 = encoded });
+            }
+        }
+        const encoded = try std.json.Stringify.valueAlloc(sa, .{ .config = config, .raw_plan = raw_plan, .tenant = spec.tenant, .objects = items.items }, .{});
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = encoded });
+    }
+    var request: hosted.Request = .{ .op = .sql_submit, .config = config, .tenant = spec.tenant, .owner = "hosted-coordinator", .raw_plan = raw_plan };
+    const submit = try hosted.execute(sa, memory.client(), std.testing.io, .{ .io = std.testing.io }, try std.json.Stringify.valueAlloc(sa, request, .{}));
+    request.query = (try std.json.parseFromSliceLeaky(struct { query: state.Query }, sa, submit, .{})).query;
+    request.raw_plan = null;
+    var complete = false;
+    for (0..64) |_| {
+        request.op = .sql_turn;
+        const turn = try hosted.execute(sa, memory.client(), std.testing.io, .{ .io = std.testing.io }, try std.json.Stringify.valueAlloc(sa, request, .{}));
+        const value = try std.json.parseFromSliceLeaky(struct { complete: bool, tickets: []const plan.Ticket }, sa, turn, .{});
+        if (value.complete) {
+            complete = true;
+            break;
+        }
+        for (value.tickets) |ticket| {
+            var worker = request;
+            worker.op = .sql_execute;
+            worker.owner = "hosted-worker";
+            worker.ticket = ticket;
+            _ = try hosted.execute(sa, memory.client(), std.testing.io, .{ .io = std.testing.io }, try std.json.Stringify.valueAlloc(sa, worker, .{}));
+        }
+    }
+    try std.testing.expect(complete);
+    request.op = .sql_result;
+    const result = try hosted.execute(sa, memory.client(), std.testing.io, .{ .io = std.testing.io }, try std.json.Stringify.valueAlloc(sa, request, .{}));
+    const value = try std.json.parseFromSliceLeaky(runtime.Result, sa, result, .{});
+    try std.testing.expectEqual(@as(u64, 2), value.rows);
+    try std.testing.expectEqual(@as(usize, 1), value.pages.len);
+}
+
+test "distributed SQL cancellation is durable before dispatch and scope checked" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    const service = fixture.service(a, memory.client(), "coordinator");
+    const column: plan.Column = .{ .name = "id", .type = .integer };
+    const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{column}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 1 };
+    var right = input;
+    right.table_id = 2;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    const spec: plan.Plan = .{ .tenant = @splat('a'), .expires_ms = 1000000, .left = input, .right = right, .join = .{ .left_keys = &.{0}, .right_keys = &.{0} }, .strategy = .broadcast, .partitions = 1, .limits = .{} };
+    const query = try service.submit(spec);
+    var stranger = service;
+    stranger.tenant = @splat('b');
+    try std.testing.expectError(error.SqlExecutionUnauthorized, stranger.requestCancel(query));
+    try service.requestCancel(query);
+    const before = fixture.retained;
+    const claim = (try service.acquire(query)).?;
+    var dispatch: Dispatch = .{ .workers = .{ service, service } };
+    try std.testing.expect(try service.tick(query, claim, .{ .ptr = &dispatch, .dispatch = Dispatch.run }));
+    try std.testing.expectEqual(before, fixture.retained);
+    try std.testing.expectError(error.Canceled, service.pollResult(sa, query));
+    try std.testing.expect((try service.state_store.load(sa, try service.state_store.key(sa, query, 0, 0))) == null);
+}
+
+test "distributed SQL maintenance deployment opens without source table credentials" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("sql-maintenance-only");
+    defer directory.cleanup();
+    const uri = try std.fmt.allocPrint(sa, "file://{s}", .{directory.path()});
+    const owned = try @import("deployment.zig").Owned.init(a, std.testing.io, .{ .state_uri = uri, .exchange_uri = uri, .workers = &.{"http://query-pool:12390"}, .authentication = .{ .secret = "0123456789abcdef0123456789abcdef", .issuer = "maintenance" } }, .maintenance_only, null, null, .serverless, null);
+    defer owned.deinit();
+    try std.testing.expect(owned.artifacts == null);
+    try std.testing.expect(owned.host == null);
+    try std.testing.expectError(error.SqlQueryRoleRequired, owned.service.acquire(.{ .id = @splat('a'), .expires_ms = 1000000 }));
 }

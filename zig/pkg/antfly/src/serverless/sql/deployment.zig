@@ -32,10 +32,20 @@ pub const Config = struct {
     authentication: @import("../../api/internal_service_auth.zig").Config,
     task_memory: u64 = 128 * 1024 * 1024,
     concurrency: u16 = 8,
+    query_concurrency: u16 = 64,
+    query_limits: @import("plan.zig").Limits = .{},
     spill_dir: ?[]const u8 = null,
     spill_bytes: u64 = 8 * 1024 * 1024 * 1024,
+    pub fn limits(self: Config) @import("plan.zig").Limits {
+        var result = self.query_limits;
+        result.task_memory = self.task_memory;
+        result.concurrency = self.query_concurrency;
+        result.task_output_bytes = @min(result.task_output_bytes, self.task_memory / 4);
+        return result;
+    }
     pub fn validate(self: Config) !void {
-        if (self.task_memory < 1024 * 1024 or self.task_memory > 1024 * 1024 * 1024 or self.concurrency == 0 or self.concurrency > 256 or self.workers.len == 0 or self.workers.len > 256) return error.InvalidSqlDeployment;
+        if (self.task_memory < 1024 * 1024 or self.task_memory > 1024 * 1024 * 1024 or self.concurrency == 0 or self.concurrency > 256 or self.query_concurrency == 0 or self.query_concurrency > 256 or self.workers.len == 0 or self.workers.len > 256) return error.InvalidSqlDeployment;
+        try self.limits().validate();
         try @import("../../api/internal_service_auth.zig").validateRuntimeConfig(self.authentication.secret, null, self.authentication.issuer);
         for ([_][]const u8{ self.state_uri, self.exchange_uri }) |uri| {
             if (!(std.mem.startsWith(u8, uri, "s3://") or std.mem.startsWith(u8, uri, "gs://") or std.mem.startsWith(u8, uri, "file://"))) return error.InvalidSqlDeployment;
@@ -67,6 +77,8 @@ pub const Config = struct {
             .authentication = .{ .secret = secret orelse return error.InvalidSqlDeployment, .issuer = issuer orelse return error.InvalidSqlDeployment },
             .task_memory = if (env.get("ANTFLY_SQL_TASK_MEMORY_BYTES")) |value| try std.fmt.parseInt(u64, value, 10) else 128 * 1024 * 1024,
             .spill_dir = env.get("ANTFLY_SQL_SPILL_DIR"),
+            .query_limits = if (env.get("ANTFLY_SQL_QUERY_LIMITS")) |json| try std.json.parseFromSliceLeaky(@import("plan.zig").Limits, a, json, .{}) else .{},
+            .query_concurrency = if (env.get("ANTFLY_SQL_QUERY_CONCURRENCY")) |value| try std.fmt.parseInt(u16, value, 10) else 64,
             .concurrency = if (env.get("ANTFLY_SQL_CONCURRENCY")) |value| try std.fmt.parseInt(u16, value, 10) else 8,
         };
         try result.validate();
@@ -98,9 +110,9 @@ pub const Owned = struct {
     arena: std.heap.ArenaAllocator,
     state: Opened,
     exchange: Opened,
-    artifacts: ArtifactStore,
+    artifacts: ?ArtifactStore,
     artifact_port: @import("../artifacts/store.zig").ArtifactStore,
-    host: @import("lake_source.zig").Host,
+    host: ?@import("lake_source.zig").Host,
     executor: @import("../../common/http/std_http_executor.zig").StdHttpExecutor,
     client: transport.Client,
     service: runtime.Service,
@@ -124,9 +136,11 @@ pub const Owned = struct {
         errdefer self.state.deinit();
         self.exchange = try openExecution(a, node, secrets, cfg.exchange_uri, cfg.exchange_connection orelse cfg.state_connection, "sql-exchange");
         errdefer self.exchange.deinit();
-        self.artifacts = try ArtifactStore.openNative(a, node, secrets, false, deployment, local_base);
-        errdefer self.artifacts.deinit();
-        self.artifact_port = self.artifacts.artifactStore();
+        // Maintenance owns only execution expiry collection. Opening source
+        // artifacts would unnecessarily require table/source credentials.
+        self.artifacts = if (role == .maintenance_only) null else try ArtifactStore.openNative(a, node, secrets, false, deployment, local_base);
+        errdefer if (self.artifacts) |*store| store.deinit();
+        self.artifact_port = if (self.artifacts) |*store| store.artifactStore() else undefined;
         self.cache = local.serverless_query_lake_serving_cache.Cache.initWithMemoryLimit(a, 64 * 1024 * 1024);
         errdefer self.cache.deinit();
         self.spill = .{ .alloc = a, .io = io, .root = self.config.spill_dir orelse "", .max_bytes = cfg.spill_bytes, .context = self, .checkpoint = struct {
@@ -136,7 +150,7 @@ pub const Owned = struct {
             if (!std.fs.path.isAbsolute(path)) return error.InvalidSqlDeployment;
             try std.Io.Dir.cwd().createDirPath(io, path);
         }
-        self.host = .{ .cache = &self.cache, .artifacts = &self.artifact_port, .store_identity = try @import("../../api/native_retained_cut.zig").storeIdentity(scratch, self.artifacts.locator), .options = .{ .node_config = node, .secret_store = secrets }, .io = io };
+        self.host = if (self.artifacts) |*store| .{ .cache = &self.cache, .artifacts = &self.artifact_port, .store_identity = try @import("../../api/native_retained_cut.zig").storeIdentity(scratch, store.locator), .options = .{ .node_config = node, .secret_store = secrets }, .io = io } else null;
         self.executor.initInPlace(a, .{});
         errdefer self.executor.deinit();
         self.client = .{ .a = a, .executor = self.executor.executor(), .authentication = self.config.authentication, .workers = self.config.workers, .io = io, .discovery = if (self.config.discovery_name) |name| .{ .name = name, .io = io, .port = 12390 } else null };
@@ -144,11 +158,17 @@ pub const Owned = struct {
         try io.randomSecure(&nonce);
         const owner = try scratch.dupe(u8, &std.fmt.bytesToHex(nonce, .lower));
         const seed = local.serverless_external_source_mod.lake_catalog.types.digestHex(try std.fmt.allocPrint(scratch, "{s}\x00{s}\x00{s}", .{ cfg.state_uri, cfg.exchange_uri, cfg.authentication.issuer }));
-        self.service = .{ .a = a, .state_store = .{ .client = self.state.client, .bucket = self.state.bucket, .prefix = if (self.state.prefix.len == 0) "sql" else self.state.prefix, .now_ms = 0 }, .exchange_store = .{ .client = self.exchange.client, .bucket = self.exchange.bucket, .prefix = if (self.exchange.prefix.len == 0) "sql" else self.exchange.prefix }, .tenant = seed, .owner = owner, .role = role, .source = self.host.source(), .retention = self.host.retention(), .context = .{ .io = io }, .task_memory_ceiling = cfg.task_memory, .spill = if (cfg.spill_dir != null) &self.spill else null };
-        self.bridge = .{ .service = self.service, .dispatcher = self.client.dispatcher(), .gateway = &self.client, .principal_scopes = true, .limits = .{ .task_memory = cfg.task_memory, .concurrency = cfg.concurrency } };
+        self.service = .{ .a = a, .state_store = .{ .client = self.state.client, .bucket = self.state.bucket, .prefix = if (self.state.prefix.len == 0) "sql" else self.state.prefix, .now_ms = 0 }, .exchange_store = .{ .client = self.exchange.client, .bucket = self.exchange.bucket, .prefix = if (self.exchange.prefix.len == 0) "sql" else self.exchange.prefix }, .tenant = seed, .owner = owner, .role = role, .source = if (self.host) |*host| host.source() else .{ .ptr = self, .open = noSource }, .retention = if (self.host) |*host| host.retention() else .{ .ptr = self, .ensure = noRetention }, .context = .{ .io = io }, .task_memory_ceiling = cfg.task_memory, .spill = if (cfg.spill_dir != null) &self.spill else null };
+        self.bridge = .{ .service = self.service, .dispatcher = self.client.dispatcher(), .gateway = &self.client, .principal_scopes = true, .limits = cfg.limits() };
         self.driver = .{ .service = self.service, .dispatcher = self.client.dispatcher(), .principal_scopes = true };
         self.admission = .init(cfg.concurrency);
         return self;
+    }
+    fn noSource(_: *anyopaque, _: A, _: @import("plan.zig").Digest, _: @import("plan.zig").Input, _: u32, _: ?*const local.sql_dynamic_filter.Filter, _: local.serverless_query_lake_read_context.Context) !@import("runner.zig").Stream {
+        return error.SqlQueryRoleRequired;
+    }
+    fn noRetention(_: *anyopaque, _: A, _: @import("plan.zig").Plan, _: local.serverless_query_lake_read_context.Context) !void {
+        return error.SqlQueryRoleRequired;
     }
     fn open(raw: *anyopaque, _: A, tenant: @import("plan.zig").Digest, context: local.serverless_query_lake_read_context.Context) !runtime.Service {
         const self: *Owned = @ptrCast(@alignCast(raw));
@@ -170,6 +190,7 @@ pub const Owned = struct {
     }
     pub fn attachServer(self: *Owned, server: *@import("../server.zig").ServerlessServer) void {
         server.sql_owned = self;
+        server.owned_http_server.cfg.sql_configured = true;
         switch (self.service.role) {
             .query_only, .combined => {
                 server.owned_http_server.cfg.distributed_sql = .{ .factory = self.factory(), .authentication = self.config.authentication, .admission = &self.admission };
@@ -188,10 +209,23 @@ pub const Owned = struct {
         self.spill.deinit();
         self.cache.deinit();
         self.artifact_port = undefined;
-        self.artifacts.deinit();
+        if (self.artifacts) |*store| store.deinit();
         self.exchange.deinit();
         self.state.deinit();
         self.arena.deinit();
         self.a.destroy(self);
     }
 };
+
+test "distributed SQL deployment separates cluster fan-out from pod admission and bounds output" {
+    const config: Config = .{ .state_uri = "file:///state", .exchange_uri = "file:///exchange", .workers = &.{"https://query.example"}, .authentication = .{ .secret = "0123456789abcdef0123456789abcdef", .issuer = "sql" }, .task_memory = 8 * 1024 * 1024, .concurrency = 2, .query_concurrency = 64, .query_limits = .{ .query_exchange_bytes = 8 * 1024 * 1024 * 1024 } };
+    try config.validate();
+    const policy = config.limits();
+    try std.testing.expectEqual(@as(u16, 64), policy.concurrency);
+    try std.testing.expectEqual(@as(u16, 2), config.concurrency);
+    try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024), policy.task_output_bytes);
+    try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024 * 1024), policy.query_exchange_bytes);
+    var invalid = config;
+    invalid.query_limits.task_scan_rows = std.math.maxInt(u64);
+    try std.testing.expectError(error.InvalidSqlDistributedPlan, invalid.validate());
+}

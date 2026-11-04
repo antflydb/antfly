@@ -929,6 +929,11 @@ pub const Stream = struct {
             if (rows > self.limits.max_examined_rows -| self.stats.rows_examined) return error.LakeRowsScanBudgetExceeded;
             return;
         };
+        if (comptime @import("builtin").single_threaded) {
+            if (rows > self.limits.max_examined_rows -| counter.raw) return error.LakeRowsScanBudgetExceeded;
+            counter.raw += rows;
+            return;
+        }
         var used = counter.load(.monotonic);
         while (true) {
             if (rows > self.limits.max_examined_rows -| used) return error.LakeRowsScanBudgetExceeded;

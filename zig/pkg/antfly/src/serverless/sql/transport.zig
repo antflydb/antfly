@@ -26,8 +26,9 @@ const Context = local.serverless_query_lake_read_context.Context;
 pub const task_path = "/internal/v1/sql/tasks/execute";
 pub const submit_path = "/internal/v1/sql/queries/submit";
 pub const turn_path = "/internal/v1/sql/queries/turn";
+pub const cancel_path = "/internal/v1/sql/queries/cancel";
 pub const result_path = "/internal/v1/sql/queries/result";
-pub const QueryRequest = struct { tenant: plan.Digest, query: plan.Digest };
+pub const QueryRequest = struct { tenant: plan.Digest, query: @import("state.zig").Query };
 /// Resolve a bounded snapshot per call; concurrent requests never mutate the
 /// shared client's routing slice. Headless Services expose ready query pods.
 pub const Discovery = struct {
@@ -104,10 +105,11 @@ pub const Client = struct {
         // All control operations are replayable against shared durable state.
         // Bound discovery failover; a dead first coordinator must not pin the
         // gateway to that process while another query pod can make progress.
-        for (0..@min(self.workers.len, 8)) |index| {
+        if (self.workers.len == 0) return error.SqlWorkerUnavailable;
+        for (0..@min(@max(self.workers.len, 2), 8)) |attempt| {
             try context.ensureActive();
-            return self.queryCallAt(index, path, body, context) catch |err| switch (err) {
-                error.SqlExecutionUnauthorized, error.SqlJoinBudgetExceeded, error.SqlQueryExpired, error.DeadlineExceeded, error.Canceled => return err,
+            return self.queryCallAt(attempt % self.workers.len, path, body, context) catch |err| switch (err) {
+                error.SqlExecutionUnauthorized, error.SqlExecutionFailed, error.SqlJoinBudgetExceeded, error.SqlQueryExpired, error.DeadlineExceeded, error.Canceled => return err,
                 else => {
                     last_error = err;
                     continue;
@@ -136,20 +138,23 @@ pub const Client = struct {
         errdefer response_.deinit(self.a);
         try context.ensureActive();
         if (response_.status == 401 or response_.status == 403) return error.SqlExecutionUnauthorized;
+        if (response_.status == 408) return error.Canceled;
+        if (response_.status == 504) return error.DeadlineExceeded;
+        if (response_.status == 409) return error.SqlExecutionFailed;
         if (response_.status == 422) return error.SqlJoinBudgetExceeded;
         if (response_.status == 410) return error.SqlQueryExpired;
         if (response_.status != 200) return error.SqlWorkerUnavailable;
         return response_;
     }
-    pub fn submit(self: *Client, specification: plan.Plan, context: Context) !plan.Digest {
+    pub fn submit(self: *Client, specification: plan.Plan, context: Context) !@import("state.zig").Query {
         const bytes = try specification.encode(self.a);
         defer self.a.free(bytes);
         var response_ = try self.queryCall(submit_path, bytes, context);
         defer response_.deinit(self.a);
-        var parsed = try std.json.parseFromSlice(struct { query: plan.Digest }, self.a, response_.body, .{});
+        var parsed = try std.json.parseFromSlice(struct { query: @import("state.zig").Query }, self.a, response_.body, .{});
         defer parsed.deinit();
         const expected = try specification.digest(self.a);
-        if (!std.mem.eql(u8, &expected, &parsed.value.query)) return error.InvalidSqlDistributedPlan;
+        if (!std.mem.eql(u8, &expected, &parsed.value.query.id) or parsed.value.query.expires_ms != specification.expires_ms) return error.InvalidSqlDistributedPlan;
         return parsed.value.query;
     }
     pub fn turn(self: *Client, query: QueryRequest, context: Context) !bool {
@@ -160,6 +165,12 @@ pub const Client = struct {
         var parsed = try std.json.parseFromSlice(struct { complete: bool }, self.a, response_.body, .{});
         defer parsed.deinit();
         return parsed.value.complete;
+    }
+    pub fn cancel(self: *Client, query: QueryRequest, context: Context) !void {
+        const bytes = try std.json.Stringify.valueAlloc(self.a, query, .{});
+        defer self.a.free(bytes);
+        var response_ = try self.queryCall(cancel_path, bytes, context);
+        response_.deinit(self.a);
     }
     pub fn result(self: *Client, a: A, query: QueryRequest, context: Context) !?runtime.Result {
         const bytes = try std.json.Stringify.valueAlloc(self.a, query, .{});
@@ -176,7 +187,7 @@ pub const Client = struct {
     pub fn execute(self: *Client, ticket: plan.Ticket, context: Context) !void {
         try context.ensureActive();
         if (self.workers.len == 0) return error.SqlWorkerUnavailable;
-        const first = (std.hash.Wyhash.hash(ticket.stage, &ticket.query) +% ticket.task) % self.workers.len;
+        const first = (std.hash.Wyhash.hash(ticket.stage, &ticket.query.id) +% ticket.task) % self.workers.len;
         var last_error: anyerror = error.SqlWorkerUnavailable;
         for (0..@min(self.workers.len, 8)) |offset| {
             self.executeAt((first + offset) % self.workers.len, ticket, context) catch |err| {
@@ -222,7 +233,7 @@ pub const Server = struct {
     authentication: auth.Config,
     admission: *@import("antfly_local_sources").common_request_admission.RequestAdmission,
     pub fn handles(path: []const u8) bool {
-        return std.mem.eql(u8, path, task_path) or std.mem.eql(u8, path, submit_path) or std.mem.eql(u8, path, turn_path) or std.mem.eql(u8, path, result_path);
+        return std.mem.eql(u8, path, task_path) or std.mem.eql(u8, path, submit_path) or std.mem.eql(u8, path, turn_path) or std.mem.eql(u8, path, result_path) or std.mem.eql(u8, path, cancel_path);
     }
     pub fn handle(self: Server, a: A, path: []const u8, credential: ?[]const u8, body: []const u8, context: Context) !http.HttpResponse {
         const now: i64 = @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s));
@@ -239,6 +250,7 @@ pub const Server = struct {
             error.SqlExecutionUnauthorized => 403,
             error.SqlQueryRoleRequired, error.SqlExecutionFenced, error.PreconditionFailed, error.SqlWorkerUnavailable => 503,
             error.SqlQueryExpired => 410,
+            error.SqlExecutionFailed => 409,
             error.SqlExecutionNotFound => 404,
             error.DeadlineExceeded => 504,
             error.Canceled => 408,
@@ -262,6 +274,10 @@ pub const Server = struct {
         }
         const input = std.json.parseFromSliceLeaky(QueryRequest, scratch, body, .{}) catch return response(a, 400, "{}");
         const service = try self.factory.open(self.factory.ptr, scratch, input.tenant, context);
+        if (std.mem.eql(u8, path, cancel_path)) {
+            try service.requestCancel(input.query);
+            return response(a, 200, "{}");
+        }
         if (std.mem.eql(u8, path, turn_path)) return json(a, .{ .complete = try service.turn(input.query, self.factory.dispatcher) });
         if (std.mem.eql(u8, path, result_path)) return json(a, try service.pollResult(scratch, input.query));
         return response(a, 404, "{}");

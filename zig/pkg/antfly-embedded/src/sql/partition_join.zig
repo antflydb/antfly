@@ -427,7 +427,7 @@ pub const Join = struct {
         if (hash) |value| {
             const bit = value % (self.filter.len * 64);
             const mask = @as(u64, 1) << @as(u6, @intCast(bit % 64));
-            if (build) self.filter[bit / 64] |= mask else if (!self.outer_left and self.filter[bit / 64] & mask == 0) {
+            if (build) self.filter[@intCast(bit / 64)] |= mask else if (!self.outer_left and self.filter[@intCast(bit / 64)] & mask == 0) {
                 self.filtered_rows += 1;
                 return null;
             }

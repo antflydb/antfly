@@ -37,8 +37,9 @@ pub const Clock = struct {
 };
 pub const Retention = struct {
     ptr: *anyopaque,
-    /// Resolve and validate every authorized input capability; renew its base
-    /// snapshot pins. Accepted WAL images belong to the retained capability.
+    /// Resolve and validate every authorized input capability and retain its
+    /// base through spec.expires_ms. Accepted WAL images belong to the durable
+    /// capability. Retention survives coordinator loss without periodic renewal.
     ensure: *const fn (*anyopaque, A, plan.Plan, Context) anyerror!void,
 };
 pub const Dispatcher = struct {
@@ -47,7 +48,7 @@ pub const Dispatcher = struct {
     /// deterministic tickets recovers dispatch without an external queue.
     dispatch: *const fn (*anyopaque, []const plan.Ticket, Context) anyerror!void,
 };
-pub const Result = struct { version: u16 = 1, query: state.Digest, pages: []const state.Output, rows: u64 };
+pub const Result = struct { version: u16 = 2, query: state.Query, pages: []const state.Output, rows: u64 };
 pub const Factory = struct {
     ptr: *anyopaque,
     /// Returns a borrowed process-owned service for this authenticated scope.
@@ -77,9 +78,9 @@ pub const Service = struct {
     fn requireQueryRole(self: Service) !void {
         if (self.role != .query_only and self.role != .combined) return error.SqlQueryRoleRequired;
     }
-    fn planKey(self: Service, a: A, query: state.Digest) ![]const u8 {
-        try state.validateDigest(query);
-        return std.fmt.allocPrint(a, "{s}/sql-execution/{s}/plan.json", .{ self.state_store.prefix, query });
+    fn planKey(self: Service, a: A, query: state.Query) ![]const u8 {
+        try query.validate();
+        return std.fmt.allocPrint(a, "{s}/sql-execution-v2/{d:0>20}/{s}/plan.json", .{ self.state_store.prefix, query.expires_ms, query.id });
     }
     fn immutable(self: Service, a: A, key: []const u8, bytes: []const u8, limit: usize) !void {
         try self.context.ensureActive();
@@ -93,7 +94,7 @@ pub const Service = struct {
         };
         stored.deinit(a);
     }
-    pub fn submit(self: Service, specification: plan.Plan) !state.Digest {
+    pub fn submit(self: Service, specification: plan.Plan) !state.Query {
         try self.requireQueryRole();
         try specification.validate(self.clock.now());
         if (specification.reduce_boundaries.len != 0) return error.InvalidSqlDistributedPlan;
@@ -103,35 +104,36 @@ pub const Service = struct {
         const bytes = try specification.encode(self.a);
         defer self.a.free(bytes);
         if (bytes.len > 1024 * 1024) return error.SqlJoinBudgetExceeded;
-        const query = digest(bytes);
+        const query: state.Query = .{ .id = digest(bytes), .expires_ms = specification.expires_ms };
         const key = try self.planKey(self.a, query);
         defer self.a.free(key);
         // Expiry index precedes every durable write so failed submissions are
         // discoverable without listing every active query or exchange object.
-        const expiry_key = try std.fmt.allocPrint(self.a, "{s}/sql-query-expiry/{d:0>20}/{s}.json", .{ self.state_store.prefix, specification.expires_ms, query });
+        const expiry_key = try std.fmt.allocPrint(self.a, "{s}/sql-query-expiry/{d:0>20}/{s}.json", .{ self.state_store.prefix, specification.expires_ms, query.id });
         defer self.a.free(expiry_key);
         try self.immutable(self.a, expiry_key, "{}", 1024);
         try self.immutable(self.a, key, bytes, 1024 * 1024);
         const query_key = try self.store().key(self.a, query, null, 0);
         defer self.a.free(query_key);
-        try self.store().create(self.a, query_key, query, specification.expires_ms);
+        try self.store().create(self.a, query_key, query.id, specification.expires_ms);
         return query;
     }
-    pub fn loadPlan(self: Service, a: A, query: state.Digest) !plan.Plan {
+    pub fn loadPlan(self: Service, a: A, query: state.Query) !plan.Plan {
         const key = try self.planKey(a, query);
         defer a.free(key);
         var client = self.state_store.client;
         client.allocator = a;
         var object = try client.getObject(self.state_store.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = 1024 * 1024, .cancellation = local.serverless_external_source_mod.lake_catalog.types.contextCancellation(&self.context) });
         defer object.deinit(a);
-        if (!std.mem.eql(u8, &digest(object.body), &query)) return error.InvalidSqlDistributedPlan;
+        if (!std.mem.eql(u8, &digest(object.body), &query.id)) return error.InvalidSqlDistributedPlan;
         const specification = try std.json.parseFromSliceLeaky(plan.Plan, a, object.body, .{ .allocate = .alloc_always });
+        if (specification.expires_ms != query.expires_ms) return error.InvalidSqlDistributedPlan;
         if (!std.mem.eql(u8, &self.tenant, &specification.tenant)) return error.SqlExecutionUnauthorized;
         try specification.validate(self.clock.now());
         if (specification.limits.task_memory > self.task_memory_ceiling) return error.SqlJoinBudgetExceeded;
         return specification;
     }
-    pub fn acquire(self: Service, query: state.Digest) !?state.Claim {
+    pub fn acquire(self: Service, query: state.Query) !?state.Claim {
         try self.requireQueryRole();
         const key = try self.store().key(self.a, query, null, 0);
         defer self.a.free(key);
@@ -148,7 +150,7 @@ pub const Service = struct {
     }
     /// One bounded coordinator turn. A caller schedules subsequent turns while
     /// pending, renews ownership, and may move ownership to any query pod.
-    pub fn tick(self: Service, query: state.Digest, claim: state.Claim, dispatcher: Dispatcher) !bool {
+    pub fn tick(self: Service, query: state.Query, claim: state.Claim, dispatcher: Dispatcher) !bool {
         try self.requireQueryRole();
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
@@ -156,9 +158,15 @@ pub const Service = struct {
         var spec = try self.loadPlan(a, query);
         const query_key = try self.store().key(a, query, null, 0);
         try self.store().renew(a, query_key, claim, 60_000);
-        try self.retention.ensure(self.retention.ptr, a, spec, self.context);
         var current = (try self.store().load(a, query_key)) orelse return error.SqlExecutionNotFound;
         defer current.deinit(a);
+        if (current.value.cancel_requested) {
+            try self.store().terminate(a, query_key, claim, .cancelled, "Cancelled");
+            return true;
+        }
+        // submit() retained both inputs through the immutable query expiry.
+        // Workers revalidate their scanned capability on open. Reducer/control
+        // turns consume accepted exchange, without reopening source catalogs.
         spec = try spec.withReducers(current.value.reduce_boundaries);
         if (current.value.stage == spec.finalStage()) {
             const count = try tasks(spec, spec.finalStage() - 1);
@@ -175,7 +183,7 @@ pub const Service = struct {
             }
             const bytes = try std.json.Stringify.valueAlloc(a, Result{ .query = query, .pages = pages, .rows = rows }, .{});
             if (bytes.len > 4 * 1024 * 1024) return error.SqlJoinBudgetExceeded;
-            const key = try std.fmt.allocPrint(a, "{s}/sql-exchange/{d:0>20}/{s}/{s}.result.json", .{ self.exchange_store.prefix, spec.expires_ms, query, digest(bytes) });
+            const key = try std.fmt.allocPrint(a, "{s}/sql-exchange/{d:0>20}/{s}/{s}.result.json", .{ self.exchange_store.prefix, spec.expires_ms, query.id, digest(bytes) });
             var result_service = self;
             result_service.state_store.client = self.exchange_store.client;
             result_service.state_store.bucket = self.exchange_store.bucket;
@@ -204,7 +212,7 @@ pub const Service = struct {
         }
         while (cursor < count and pending.items.len < spec.limits.concurrency) : (cursor += 1) {
             const key = try self.store().key(a, query, current.value.stage, cursor);
-            if (try self.store().ensure(a, key, query, spec.expires_ms)) {
+            if (try self.store().ensure(a, key, query.id, spec.expires_ms)) {
                 try pending.append(a, cursor);
                 try tickets.append(a, .{ .tenant = self.tenant, .query = query, .stage = current.value.stage, .task = cursor });
                 continue;
@@ -256,7 +264,7 @@ pub const Service = struct {
         var query = (try self.store().load(a, query_key)) orelse return error.SqlExecutionNotFound;
         defer query.deinit(a);
         if (query.value.terminal()) return;
-        if (query.value.stage != ticket.stage or !std.mem.eql(u8, &query.value.plan, &ticket.query)) return error.SqlExecutionFenced;
+        if (query.value.stage != ticket.stage or !std.mem.eql(u8, &query.value.plan, &ticket.query.id)) return error.SqlExecutionFenced;
         const key = try self.store().key(a, ticket.query, ticket.stage, ticket.task);
         const claim_started = self.clock.now();
         const claim = (try self.store().claim(a, key, self.owner, 60_000)) orelse return;
@@ -306,11 +314,11 @@ pub const Service = struct {
             }.check;
         }
         const executor: runner.Runner = .{ .a = task_allocator, .source = self.source, .exchange_store = objects, .context = context, .spill = if (task_spill) |*manager| manager else null };
-        const output = executor.run(ticket.query, spec, task, inputs) catch |raw_error| {
+        const output = executor.run(ticket.query.id, spec, task, inputs) catch |raw_error| {
             const err = if (raw_error == error.OutOfMemory and task_memory.exhausted) error.SqlJoinBudgetExceeded else raw_error;
             switch (err) {
                 error.SqlJoinBudgetExceeded, error.SqlProgramLimitExceeded, error.InvalidSqlBackendResponse, error.InvalidSqlExchange, error.SqlExecutionUnauthorized => {
-                    std.log.warn("distributed SQL task failed query={s} stage={d} task={d} err={s}", .{ ticket.query, ticket.stage, ticket.task, @errorName(err) });
+                    std.log.warn("distributed SQL task failed query={s} stage={d} task={d} err={s}", .{ ticket.query.id, ticket.stage, ticket.task, @errorName(err) });
                     try self.store().terminate(self.a, key, claim, .failed, @errorName(err));
                     return;
                 },
@@ -327,7 +335,7 @@ pub const Service = struct {
     /// Worker count and subsequent coordinator placement cannot change it.
     const Adaptive = struct { cursor: u32 = 0, bytes: []u64, rows: []u64 };
     const Resolution = union(enum) { pending: state.Output, done: []const u16 };
-    fn coalesce(self: Service, a: A, spec: plan.Plan, query: state.Digest, previous: ?state.Output) !Resolution {
+    fn coalesce(self: Service, a: A, spec: plan.Plan, query: state.Query, previous: ?state.Output) !Resolution {
         var progress: Adaptive = if (previous) |output| blk: {
             var client = self.exchange_store.client;
             client.allocator = a;
@@ -368,7 +376,7 @@ pub const Service = struct {
         if (end != count) {
             const encoded = try std.json.Stringify.valueAlloc(a, progress, .{});
             const hash = digest(encoded);
-            const key = try std.fmt.allocPrint(a, "{s}/sql-exchange/{d:0>20}/{s}/{s}.adaptive.json", .{ self.exchange_store.prefix, spec.expires_ms, query, hash });
+            const key = try std.fmt.allocPrint(a, "{s}/sql-exchange/{d:0>20}/{s}/{s}.adaptive.json", .{ self.exchange_store.prefix, spec.expires_ms, query.id, hash });
             var writer = self;
             writer.state_store.client = self.exchange_store.client;
             writer.state_store.bucket = self.exchange_store.bucket;
@@ -392,7 +400,7 @@ pub const Service = struct {
         try boundaries.append(a, spec.partitions);
         return .{ .done = boundaries.items };
     }
-    fn loadDependencies(self: Service, a: A, spec: plan.Plan, query: state.Digest, stage: u32, task: u32) ![]const state.Output {
+    fn loadDependencies(self: Service, a: A, spec: plan.Plan, query: state.Query, stage: u32, task: u32) ![]const state.Output {
         var dependencies: std.ArrayList(state.Output) = .empty;
         if (stage >= 1) {
             const previous = stage - 1;
@@ -411,7 +419,7 @@ pub const Service = struct {
         }
         return dependencies.items;
     }
-    pub fn turn(self: Service, query: state.Digest, dispatcher: Dispatcher) !bool {
+    pub fn turn(self: Service, query: state.Query, dispatcher: Dispatcher) !bool {
         const key = try self.store().key(self.a, query, null, 0);
         defer self.a.free(key);
         var current = (try self.store().load(self.a, key)) orelse return error.SqlExecutionNotFound;
@@ -421,12 +429,20 @@ pub const Service = struct {
         const claim: state.Claim = if (current.value.status == .running and std.mem.eql(u8, current.value.owner, self.owner) and current.value.until_ms > self.clock.now()) .{ .owner = self.owner, .epoch = current.value.epoch } else (try self.acquire(query)) orelse return false;
         return self.tick(query, claim, dispatcher);
     }
-    pub fn cancel(self: Service, query: state.Digest, claim: state.Claim) !void {
+    pub fn requestCancel(self: Service, query: state.Query) !void {
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        const a = arena.allocator();
+        _ = try self.loadPlan(a, query); // Bind the request to its admitted scope.
+        const key = try self.store().key(a, query, null, 0);
+        try self.store().requestCancel(a, key);
+    }
+    pub fn cancel(self: Service, query: state.Query, claim: state.Claim) !void {
         const key = try self.store().key(self.a, query, null, 0);
         defer self.a.free(key);
         try self.store().terminate(self.a, key, claim, .cancelled, "Cancelled");
     }
-    pub fn pollResult(self: Service, a: A, query: state.Digest) !?Result {
+    pub fn pollResult(self: Service, a: A, query: state.Query) !?Result {
         const key = try self.store().key(a, query, null, 0);
         defer a.free(key);
         var current = (try self.store().load(a, key)) orelse return error.SqlExecutionNotFound;
@@ -447,7 +463,7 @@ pub const Service = struct {
         defer object.deinit(a);
         if (!std.mem.eql(u8, &digest(object.body), &output.hash)) return error.InvalidSqlExchange;
         const value = try std.json.parseFromSliceLeaky(Result, a, object.body, .{ .allocate = .alloc_always });
-        if (value.version != 1 or !std.mem.eql(u8, &value.query, &query) or value.rows != output.rows) return error.InvalidSqlExchange;
+        if (value.version != 2 or !std.meta.eql(value.query, query) or value.rows != output.rows) return error.InvalidSqlExchange;
         return value;
     }
 };

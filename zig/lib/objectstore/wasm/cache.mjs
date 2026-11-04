@@ -16,15 +16,15 @@
 import { ObjectStoreError } from "./r2.mjs";
 // Cache only immutable object names, never catalog/progress/WAL HEAD records.
 // Values contain copied bytes and plain metadata, not request-owned I/O handles.
-export const isImmutableObjectKey = (key,{includeCommitLog=false}={}) => /\/manifests\/.+\/manifests\/[0-9]+\.bin$/.test(key) || (includeCommitLog && /\/coord-v1\/[a-f0-9]{64}\/epochs\/[a-f0-9]{32}\/(?:[0-9]{20}\.json|START|SEALED)$/.test(key)) || /\/wal-v1\/[a-f0-9]{64}\/pages\/(?:[a-f0-9]{32}\/)?[a-f0-9]{64}$/.test(key) ||
+export const isImmutableObjectKey = (key,{includeCommitLog=false,includeSQL=false}={}) => (includeSQL && (/\/sql-exchange\/[0-9]{20}\/[a-f0-9]{64}\/[a-f0-9]{64}\.(?:bin|result\.json|adaptive\.json)$/.test(key) || /\/sql-execution-v2\/[0-9]{20}\/[a-f0-9]{64}\/plan\.json$/.test(key))) || /\/manifests\/.+\/manifests\/[0-9]+\.bin$/.test(key) || (includeCommitLog && /\/coord-v1\/[a-f0-9]{64}\/epochs\/[a-f0-9]{32}\/(?:[0-9]{20}\.json|START|SEALED)$/.test(key)) || /\/wal-v1\/[a-f0-9]{64}\/pages\/(?:[a-f0-9]{32}\/)?[a-f0-9]{64}$/.test(key) ||
     /\/artifacts\/(?:sha256\/[a-f0-9]{2}\/[a-f0-9]{62}|graph\/[a-f0-9]{64}\/[a-f0-9]{32}\/[a-f0-9]{64})$/.test(key);
-export function createImmutableReadCache({ maxBytes = 8 * 1024 * 1024, maxEntries = 128, includeCommitLog = false, writeThrough = false } = {}) {
+export function createImmutableReadCache({ maxBytes = 8 * 1024 * 1024, maxEntries = 128, includeCommitLog = false, includeSQL = false, writeThrough = false } = {}) {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || !Number.isSafeInteger(maxEntries) || maxEntries < 0) throw new TypeError("invalid cache budget");
   const entries=new Map(),probation=new Map(),protectedEntries=new Map();let retained=0,protectedBytes=0;
   // Commit log names are immutable within the native checkpoint floor.
   // Only the coordinator opts in; it reads that mutable floor uncached before
   // accepting cached cursors or acknowledging a write to a retired epoch.
-  const eligible = key => isImmutableObjectKey(key,{includeCommitLog});
+  const eligible = key => isImmutableObjectKey(key,{includeCommitLog,includeSQL});
   function evict(key){const item=entries.get(key);if(!item)return;retained-=item.charge;if(item.protected)protectedBytes-=item.charge;entries.delete(key);probation.delete(key);protectedEntries.delete(key);}
   const cacheKey=(scope,request)=>JSON.stringify([scope, request.bucket, request.key, request.range ?? null, request.if_match_etag ?? null]);
   function remember(key,bytes,json,preserveProtected=false){

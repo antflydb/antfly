@@ -21,6 +21,7 @@ const serverless_http_types = @import("serverless/api/http_types.zig");
 
 const secrets = @import("antfly_local_sources").common_secrets;
 pub const ServerlessHttpServerConfig = struct {
+    sql_configured: bool = false,
     distributed_sql: ?@import("serverless/sql/transport.zig").Server = null,
     secret_store: ?*secrets.FileStore = null,
     // Explicit credential required even on otherwise unauthenticated serverless
@@ -107,6 +108,11 @@ pub const ServerlessHttpServer = struct {
                 }
             }.canceled } else null });
         }
+        const sql_probe = std.mem.eql(u8, req.uri, "/readyz/sql");
+        if (sql_probe) {
+            if (req.method != .GET) return self.secretResponse(405, "{}");
+            if (!self.cfg.sql_configured and self.cfg.distributed_sql == null) return self.secretResponse(503, "{}");
+        }
         if (isSecretPath(req.uri)) return self.handleSecrets(req);
         const method: serverless_http_routes.HttpMethod = switch (req.method) {
             .GET => .get,
@@ -118,7 +124,7 @@ pub const ServerlessHttpServer = struct {
         const path = if (std.mem.indexOfScalar(u8, req.uri, '?')) |query_index| req.uri[0..query_index] else req.uri;
         var resp = try self.handler.handle(.{
             .method = method,
-            .path = path,
+            .path = if (sql_probe) "/readyz" else path,
             .body = req.body,
             .cancellation = if (req.cancellation) |value| value.token() else .none,
         });
@@ -205,6 +211,11 @@ pub const ServerlessHttpServer = struct {
     /// the transport edge; the serverless handler receives its canonical
     /// transport-neutral request exactly once.
     pub fn handleHttpx(self: *ServerlessHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const sql_probe = std.mem.eql(u8, ctx.request.uri.path, "/readyz/sql");
+        if (sql_probe) {
+            if (ctx.request.method != .GET) return ctx.status(405).text("method not allowed");
+            if (!self.cfg.sql_configured and self.cfg.distributed_sql == null) return ctx.status(503).text("SQL runtime unavailable");
+        }
         if (@import("serverless/sql/transport.zig").Server.handles(ctx.request.uri.path)) {
             if (ctx.request.method != .POST) return ctx.status(405).text("method not allowed");
             const sql = self.cfg.distributed_sql orelse return ctx.status(503).text("SQL query runtime unavailable");
@@ -245,7 +256,7 @@ pub const ServerlessHttpServer = struct {
         const body = (try ctx.body()) orelse "";
         var response = try self.handler.handle(.{
             .method = method,
-            .path = ctx.request.uri.path,
+            .path = if (sql_probe) "/readyz" else ctx.request.uri.path,
             .body = body,
             .cancellation = .{
                 .ptr = ctx,

@@ -21,10 +21,14 @@ ANTFLY_SQL_SERVICE_SECRET=<dedicated-secret-of-at-least-32-bytes>
 ANTFLY_SQL_SERVICE_ISSUER=sql:cluster-incarnation
 ANTFLY_SQL_TASK_MEMORY_BYTES=134217728
 ANTFLY_SQL_CONCURRENCY=4
+ANTFLY_SQL_QUERY_CONCURRENCY=64
+ANTFLY_SQL_QUERY_LIMITS='{"query_exchange_bytes":8589934592}'
 ANTFLY_SQL_SPILL_DIR=/var/lib/antfly/sql-spill
 ```
 
-`QUERY_DNS` and spill are optional. DNS discovery snapshots ready pod addresses
+`QUERY_DNS`, query-limit overrides and spill are optional. Per-pod task admission
+and total per-query fan-out are separate budgets. SQL-specific startup/readiness
+probes fail closed on images without the execution service. DNS discovery snapshots ready pod addresses
 for each dispatch; failed or busy workers fail over without changing task
 identity. Initial worker URLs also support fixed native deployments. Ports in
 DNS mode use the query listener's standard port 12390. State and exchange use
@@ -61,14 +65,20 @@ operators above the distributed relation and exports its existing statement cut.
 Plans are versioned, pointer-free JSON; scalar fragments contain validated
 instruction DAGs with bound parameter values. Process caches, settings captures,
 external AI calls, and relation-node pointers are not serialized. A scope plus
-plan content identifies a query. Deterministic stage/task IDs make dispatch
+plan content identifies a query. Version-2 query references carry that full digest
+and expiry; state objects use an expiry-first namespace, independently of the
+discovery marker, so late writes remain discoverable after cleanup. Deterministic stage/task IDs make dispatch
 recoverable without relying on queue acknowledgements.
 
 A task's owner, epoch, deadline, and accepted output share one conditional
 record. Completion CAS therefore rejects an attempt superseded by another
 worker. Lost completion responses resolve by exact accepted output identity.
 Coordinator checkpoints and terminal transitions similarly require the current
-claim. Expiry and the 30-second grace fence cleanup from in-flight attempts.
+claim. Scope-checked cancellation sets a durable flag without stealing that lease;
+the owner stops dispatch, and an accepted cancellation wins a later result CAS.
+Expiry and the 30-second grace fence cleanup from live attempts. Expired physical
+names cannot be reused by a live query, so bounded cleanup works on R2 without
+conditional DELETE.
 
 The native lake adapter copies the accepted WAL suffix into the retained-cut
 capability and pins base snapshots through capability expiry. Every split
@@ -110,10 +120,13 @@ workers validate the capability, schema incarnation, and snapshot on reopen.
   live early queries cannot hide later submissions. Accepted outputs, including
   empty results, are reused after coordinator takeover.
 
-## Remaining strategy work
+## Hosted execution and remaining strategy work
 
-The service supplies native broadcast/shuffle execution and their common
-recovery contracts. Bucket-compatible planning/native bucketed writes, adaptive
-distributed skew replication, Cloudflare Queue/Durable Object
-bindings and R2 recursive repartitioning remain subsequent strategy work.
-There is no claim of trillion-row or cloud-provider performance qualification.
+The [Cloudflare SQL profile](../../../../../../examples/cloudflare-serverless/SQL.md)
+wires this service to WASM, R2, Durable Object alarms and Queues. Its tests share
+native-generated retained Parquet/WAL fixtures and run under real local workerd
+bindings. No provider deployment or throughput qualification is claimed.
+
+Bucket-compatible planning/native bucketed writes and distributed recursive
+repartitioning/skew tiling remain strategy work. Native reducers use the existing
+disk grace/skew kernel; hosted tasks currently enforce their in-memory budgets.

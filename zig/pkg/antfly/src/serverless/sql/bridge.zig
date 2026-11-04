@@ -90,6 +90,17 @@ pub const Bridge = struct {
             else => return err,
         };
         const query = if (self.gateway) |gateway| try gateway.submit(specification, service.context) else try service.submit(specification);
+        errdefer {
+            // Cleanup has its own short I/O deadline: the statement's canceled
+            // token must not suppress the durable cancellation request itself.
+            const cleanup: local.serverless_query_lake_read_context.Context = .{ .io = service.context.io, .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_s };
+            if (self.gateway) |gateway| gateway.cancel(.{ .tenant = service.tenant, .query = query }, cleanup) catch {} else {
+                var abandoned = service;
+                abandoned.context = cleanup;
+                abandoned.requestCancel(query) catch {};
+            }
+        }
+        var poll_delay_ms: u64 = 1;
         while (true) {
             try service.context.ensureActive();
             var poll_arena = std.heap.ArenaAllocator.init(a);
@@ -105,7 +116,8 @@ pub const Bridge = struct {
             if (self.gateway) |gateway| {
                 _ = try gateway.turn(.{ .tenant = service.tenant, .query = query }, service.context);
             } else _ = try service.turn(query, self.dispatcher);
-            if (service.context.io) |io| try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+            if (service.context.io) |io| try std.Io.sleep(io, .fromMilliseconds(@intCast(poll_delay_ms)), .awake);
+            poll_delay_ms = @min(poll_delay_ms * 2, 100);
         }
     }
     fn input(self: Bridge, a: A, table: catalog.Table, names: []const []const u8, cut: catalog.ReadCapability, filter: ?expression.Program) !plan.Input {

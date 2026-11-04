@@ -34,7 +34,14 @@ const Datum = local.sql_scalar.Datum;
 pub const Host = struct {
     artifacts: *@import("../artifacts/store.zig").ArtifactStore,
     store_identity: [32]u8,
-    options: configured.BindingObjectStoreOpenOptions,
+    options: if (@import("builtin").os.tag == .freestanding) void else configured.BindingObjectStoreOpenOptions = if (@import("builtin").os.tag == .freestanding) {} else .{},
+    /// Hosted implementations reopen the same retained grants using a bound
+    /// object-store client, without loading native credential SDKs.
+    backend: ?struct {
+        ptr: *anyopaque,
+        pin: *const fn (*anyopaque, A, catalog.Table, retained.Descriptor, Context) anyerror!void,
+        open: *const fn (*anyopaque, A, catalog.Table, retained.Descriptor, Context) anyerror!serving.ServingSource,
+    } = null,
     cache: ?*local.serverless_query_lake_serving_cache.Cache = null,
     io: std.Io,
     authorization: ?struct {
@@ -77,6 +84,8 @@ pub const Host = struct {
         return .{ .table = table, .cut = cut };
     }
     fn pin(self: *Host, a: A, table: catalog.Table, cut: retained.Descriptor, context: Context) !void {
+        if (self.backend) |backend| return backend.pin(backend.ptr, a, table, cut, context);
+        if (comptime @import("builtin").os.tag == .freestanding) return error.SqlDistributedJoinUnsupported;
         var options = self.options;
         options.catalog_table_id = table.id;
         options.catalog_generation = cut.object_generation;
@@ -139,6 +148,14 @@ pub const Host = struct {
         };
         return .{ .table_id = table.id, .schema = try fingerprint(a, table), .snapshot = try a.dupe(u8, cut.snapshot_id), .wal_cut = pending.lsn, .cut = token, .columns = columns, .estimated_bytes = estimates.bytes, .estimated_rows = estimates.rows, .splits = splits };
     }
+    fn openNative(self: *Host, a: A, table: catalog.Table, cut: retained.Descriptor, context: Context) !serving.ServingSource {
+        var options = self.options;
+        options.catalog_table_id = table.id;
+        options.catalog_generation = cut.object_generation;
+        options.retained_catalog_metadata = .{ .metadata_location = @constCast(cut.metadata_location), .metadata_json = @constCast(cut.metadata_json) };
+        const schema: local.storage_schema.TableSchema = .{ .storage_mode = .relational, .external_base_source = table.external_base_source };
+        return serving.ServingSource.openLazyCached(a, schema, options.lakeOptions(), context, self.cache);
+    }
     fn open(raw: *anyopaque, a: A, tenant: plan.Digest, input: plan.Input, split: u32, filter: ?*const local.sql_dynamic_filter.Filter, context: Context) !runner.Stream {
         const self: *Host = @ptrCast(@alignCast(raw));
         const owner = try a.create(Owner);
@@ -150,12 +167,12 @@ pub const Host = struct {
         const table = admitted_.table;
         const cut = admitted_.cut;
         try self.pin(scratch, table, cut, context);
-        var options = self.options;
-        options.catalog_table_id = table.id;
-        options.catalog_generation = cut.object_generation;
-        options.retained_catalog_metadata = .{ .metadata_location = @constCast(cut.metadata_location), .metadata_json = @constCast(cut.metadata_json) };
-        const schema: local.storage_schema.TableSchema = .{ .storage_mode = .relational, .external_base_source = table.external_base_source };
-        owner.source = try serving.ServingSource.openLazyCached(a, schema, options.lakeOptions(), context, self.cache);
+        owner.source = if (self.backend) |backend|
+            try backend.open(backend.ptr, a, table, cut, context)
+        else if (comptime @import("builtin").os.tag == .freestanding)
+            return error.SqlDistributedJoinUnsupported
+        else
+            try self.openNative(a, table, cut, context);
         errdefer owner.source.deinit();
         if (!std.mem.eql(u8, owner.source.inventory.snapshot_id, input.snapshot)) return error.CatalogGenerationChanged;
         const names = try scratch.alloc([]const u8, input.columns.len);

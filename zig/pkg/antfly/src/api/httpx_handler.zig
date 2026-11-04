@@ -21855,7 +21855,7 @@ test "distributed SQL API worker RPC requires signed service authority even duri
     var handler: AntflyApiHandler = .{ .api_server = &api };
     const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "sql-workers" }, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
     defer a.free(token);
-    const ticket = try std.json.Stringify.valueAlloc(a, @import("../serverless/sql/plan.zig").Ticket{ .tenant = @splat('a'), .query = @splat('b'), .stage = 0, .task = 0 }, .{});
+    const ticket = try std.json.Stringify.valueAlloc(a, @import("../serverless/sql/plan.zig").Ticket{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 1000000 }, .stage = 0, .task = 0 }, .{});
     defer a.free(ticket);
     for ([_]?[]const u8{ null, "invalid", token }, 0..) |credential, index| {
         var request = try httpx.Request.init(a, .POST, "http://localhost/internal/v1/sql/tasks/execute");

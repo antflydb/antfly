@@ -76,7 +76,7 @@ pub const Driver = struct {
             if (!std.mem.startsWith(u8, entry.key, prefix) or entry.key.len != prefix.len + 90) return error.InvalidSqlExecutionState;
             const expiry = try std.fmt.parseInt(u64, entry.key[prefix.len..][0..20], 10);
             if (expiry <= self.service.clock.now()) continue;
-            const query = entry.key[prefix.len + 21 ..][0..64].*;
+            const query: @import("state.zig").Query = .{ .id = entry.key[prefix.len + 21 ..][0..64].*, .expires_ms = expiry };
             const key = try self.service.state_store.key(a, query, null, 0);
             var records = self.service.state_store;
             records.context = service.context;
@@ -85,7 +85,7 @@ pub const Driver = struct {
             if (current.value.terminal()) continue;
             var scoped = service;
             if (self.principal_scopes) {
-                const plan_key = try std.fmt.allocPrint(a, "{s}/sql-execution/{s}/plan.json", .{ service.state_store.prefix, query });
+                const plan_key = try std.fmt.allocPrint(a, "{s}/sql-execution-v2/{d:0>20}/{s}/plan.json", .{ service.state_store.prefix, query.expires_ms, query.id });
                 var object = client.getObject(service.state_store.bucket, plan_key, .{ .skip_metadata_probe = true, .max_response_bytes = 1024 * 1024, .cancellation = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.contextCancellation(&service.context) }) catch continue;
                 defer object.deinit(a);
                 const identity = std.json.parseFromSliceLeaky(struct { tenant: @import("state.zig").Digest }, a, object.body, .{ .ignore_unknown_fields = true }) catch continue;
@@ -95,7 +95,7 @@ pub const Driver = struct {
                 error.SqlExecutionFenced, error.PreconditionFailed, error.SqlExecutionNotFound => continue,
                 error.Canceled, error.Cancelled => return err,
                 else => {
-                    std.log.warn("distributed SQL recovery deferred query={s}: {s}", .{ query, @errorName(err) });
+                    std.log.warn("distributed SQL recovery deferred query={s}: {s}", .{ query.id, @errorName(err) });
                     continue;
                 },
             };

@@ -211,6 +211,12 @@ pub fn requestAdditional(raw: []const u8) ![]u8 {
 }
 fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     @import("antfly_platform").time.installHostClocks(.{ .monotonic_ns = monotonicNs, .realtime_ns = realtimeNs, .authority_ns = authorityNs });
+    const envelope = try std.json.parseFromSlice(struct { op: []const u8 = "" }, a, raw, .{ .ignore_unknown_fields = true });
+    defer envelope.deinit();
+    if (std.mem.startsWith(u8, envelope.value.op, "sql_")) {
+        var sql_host = objects.wasm_host.Host{ .alloc = a, .transfer_allocator = wasm_allocator };
+        return @import("serverless/sql/hosted.zig").execute(a, sql_host.client(), host_io, .{ .io = host_io, .cancellation = transport_cancellation }, raw);
+    }
     const MutationGroup = struct { mutations: []const @import("serverless/api/types.zig").DocumentMutation, operation_id: []const u8, timestamp_ns: []const u8 = "0" };
     const Request = struct {
         op: enum { search, mutate, publish, compact, lookup, list, count, status, enrich, gc_prepare, gc_wal, gc_trace, reindex, coordinate, publication_acquire, publication_validate, publication_release },

@@ -23,10 +23,20 @@ pub const Digest = [64]u8;
 pub fn validateDigest(value: Digest) !void {
     for (value) |byte| if (!std.ascii.isHex(byte)) return error.InvalidSqlExecutionState;
 }
+/// Expiry is part of the physical query namespace, so a delayed write remains
+/// discoverable after cleanup has removed the submission/discovery marker.
+pub const Query = struct {
+    id: Digest,
+    expires_ms: u64,
+    pub fn validate(self: Query) !void {
+        try validateDigest(self.id);
+        if (self.expires_ms == 0) return error.InvalidSqlExecutionState;
+    }
+};
 pub const Output = struct { key: []const u8, hash: Digest, bytes: u64, rows: u64 = 0, partitions: u16 = 0, index_bytes: u32 = 0, index_hash: ?Digest = null };
 pub const Status = enum { pending, running, succeeded, failed, cancelled };
 pub const Record = struct {
-    version: u8 = 1,
+    version: u8 = 2,
     plan: Digest,
     expires_ms: u64,
     status: Status = .pending,
@@ -38,6 +48,7 @@ pub const Record = struct {
     pending: []const u32 = &.{},
     reduce_boundaries: []const u16 = &.{},
     adaptive: ?Output = null,
+    cancel_requested: bool = false,
     output: ?Output = null,
     failure: ?[]const u8 = null,
     pub fn terminal(self: Record) bool {
@@ -60,10 +71,10 @@ pub const Store = struct {
     prefix: []const u8,
     context: catalog.types.Context = .{},
     now_ms: u64,
-    pub fn key(self: Store, a: A, query: Digest, stage: ?u32, task: u32) ![]const u8 {
-        try validateDigest(query);
-        if (stage) |s| return std.fmt.allocPrint(a, "{s}/sql-execution/{s}/stage/{d}/task/{d}.json", .{ self.prefix, query, s, task });
-        return std.fmt.allocPrint(a, "{s}/sql-execution/{s}/query.json", .{ self.prefix, query });
+    pub fn key(self: Store, a: A, query: Query, stage: ?u32, task: u32) ![]const u8 {
+        try query.validate();
+        if (stage) |s| return std.fmt.allocPrint(a, "{s}/sql-execution-v2/{d:0>20}/{s}/stage/{d}/task/{d}.json", .{ self.prefix, query.expires_ms, query.id, s, task });
+        return std.fmt.allocPrint(a, "{s}/sql-execution-v2/{d:0>20}/{s}/query.json", .{ self.prefix, query.expires_ms, query.id });
     }
     pub fn load(self: Store, a: A, path: []const u8) !?Loaded {
         try self.context.ensureActive();
@@ -77,7 +88,7 @@ pub const Store = struct {
         const parsed = try std.json.parseFromSlice(Record, a, object.body, .{ .allocate = .alloc_always });
         errdefer parsed.deinit();
         const value = parsed.value;
-        if (value.version != 1 or value.owner.len > 256 or (value.status == .succeeded and value.output == null)) return error.InvalidSqlExecutionState;
+        if (value.version != 2 or value.owner.len > 256 or (value.status == .succeeded and value.output == null)) return error.InvalidSqlExecutionState;
         return .{ .object = object, .value = value, .parsed = parsed };
     }
     fn write(self: Store, a: A, path: []const u8, before: ?Loaded, value: Record) !void {
@@ -170,6 +181,23 @@ pub const Store = struct {
         next.adaptive = output;
         try self.write(a, path, old, next);
     }
+    /// A read-authorized submitter can request cancellation without stealing
+    /// the coordinator lease. The current fenced owner performs termination.
+    pub fn requestCancel(self: Store, a: A, path: []const u8) !void {
+        for (0..8) |_| {
+            var old = (try self.load(a, path)) orelse return error.SqlExecutionNotFound;
+            defer old.deinit(a);
+            if (old.value.terminal() or old.value.cancel_requested) return;
+            var next = old.value;
+            next.cancel_requested = true;
+            self.write(a, path, old, next) catch |err| switch (err) {
+                error.PreconditionFailed => continue,
+                else => return err,
+            };
+            return;
+        }
+        return error.PreconditionFailed;
+    }
     pub fn complete(self: Store, a: A, path: []const u8, claim_: Claim, output: Output) !void {
         var old = (try self.load(a, path)) orelse return error.SqlExecutionNotFound;
         defer old.deinit(a);
@@ -181,8 +209,13 @@ pub const Store = struct {
         if (old.value.expires_ms <= self.now_ms) return error.SqlQueryExpired;
         if (old.value.status != .running or old.value.epoch != claim_.epoch or !std.mem.eql(u8, old.value.owner, claim_.owner) or old.value.until_ms <= self.now_ms) return error.SqlExecutionFenced;
         var next = old.value;
-        next.status = .succeeded;
-        next.output = output;
+        if (old.value.cancel_requested) {
+            next.status = .cancelled;
+            next.failure = "Cancelled";
+        } else {
+            next.status = .succeeded;
+            next.output = output;
+        }
         try self.write(a, path, old, next);
     }
     pub fn terminate(self: Store, a: A, path: []const u8, claim_: Claim, status: Status, failure: []const u8) !void {
@@ -206,7 +239,7 @@ test "distributed SQL state fences delayed owners and resolves accepted completi
     var faults = storage.ScriptedFaultClient.init(a, memory.client());
     defer faults.deinit();
     var store: Store = .{ .client = faults.client(), .bucket = "queries", .prefix = "tenant", .now_ms = 1000 };
-    const key_ = try store.key(scratch, @splat('a'), 0, 0);
+    const key_ = try store.key(scratch, .{ .id = @splat('a'), .expires_ms = 1000000 }, 0, 0);
     try store.create(scratch, key_, @splat('b'), 1000000);
     const first = (try store.claim(scratch, key_, "pod-a", 1000)).?;
     try std.testing.expect(try store.claim(scratch, key_, "pod-b", 1000) == null);
@@ -229,12 +262,33 @@ test "distributed SQL state keeps cancellation terminal and rejects query path i
     var memory = storage.MemoryClient.init(a);
     defer memory.deinit();
     const store: Store = .{ .client = memory.client(), .bucket = "queries", .prefix = "tenant", .now_ms = 1000 };
-    try std.testing.expectError(error.InvalidSqlExecutionState, store.key(sa, @splat('/'), 0, 0));
-    const key_ = try store.key(sa, @splat('a'), null, 0);
+    try std.testing.expectError(error.InvalidSqlExecutionState, store.key(sa, .{ .id = @splat('/'), .expires_ms = 1000000 }, 0, 0));
+    const key_ = try store.key(sa, .{ .id = @splat('a'), .expires_ms = 1000000 }, null, 0);
     try store.create(sa, key_, @splat('b'), 100000);
     const owner = (try store.claim(sa, key_, "coordinator", 1000)).?;
     try store.terminate(sa, key_, owner, .cancelled, "Cancelled");
     try std.testing.expectError(error.SqlExecutionFenced, store.checkpoint(sa, key_, owner, 1, 0));
     try std.testing.expectError(error.SqlExecutionFenced, store.complete(sa, key_, owner, .{ .key = "ignored", .hash = @splat('c'), .bytes = 1 }));
     try std.testing.expect(try store.claim(sa, key_, "replacement", 1000) == null);
+}
+
+test "distributed SQL cancellation wins a later result CAS without stealing ownership" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    const store: Store = .{ .client = memory.client(), .bucket = "execution", .prefix = "queries", .now_ms = 1 };
+    const query: Query = .{ .id = @splat('a'), .expires_ms = 1000000 };
+    const key_ = try store.key(sa, query, null, 0);
+    try store.create(sa, key_, query.id, query.expires_ms);
+    const claim_ = (try store.claim(sa, key_, "coordinator", 60000)).?;
+    try store.requestCancel(sa, key_);
+    try store.complete(sa, key_, claim_, .{ .key = "result", .hash = @splat('b'), .bytes = 0 });
+    var value = (try store.load(sa, key_)).?;
+    defer value.deinit(sa);
+    try std.testing.expectEqual(Status.cancelled, value.value.status);
+    try std.testing.expectEqualStrings("coordinator", value.value.owner);
+    try std.testing.expect(value.value.output == null);
 }
