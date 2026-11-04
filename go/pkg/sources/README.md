@@ -704,3 +704,8 @@ single-writer filesystem; Colony uses protected hosted credentials and PostgreSQ
 This does not require native Drive/email/chat connectors or durable byte staging.
 Proxy and provider availability remain dependencies for later processing/retries;
 stale historical representations fail rather than silently returning newer bytes.
+
+`MediaContentScope()` on the built-in media connectors identifies their provider
+endpoint independently of credentials and source policy. Hosting runtimes can
+cache verified byte digests under that namespace, immutable object version and
+length; a digest receipt never replaces live access checks or grants delivery.

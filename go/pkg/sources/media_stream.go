@@ -60,6 +60,16 @@ type StableMediaConnector interface {
 	StableMediaRanges() bool
 }
 
+// MediaContentScope identifies the provider byte namespace independently of
+// credentials and publication policy. Custom media transports must provide an
+// equally stable namespace before a host can reuse verified byte digests.
+func (c *S3Connector) MediaContentScope() string {
+	return ProviderS3 + "|" + c.Client.EndpointURL().String()
+}
+func (c *GoogleConnector) MediaContentScope() string {
+	return c.ProviderName + "|" + c.base()
+}
+
 func (*S3Connector) StableMediaRanges() bool       { return true }
 func (c *GoogleConnector) StableMediaRanges() bool { return c.ProviderName == ProviderGCS }
 

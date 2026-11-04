@@ -21,6 +21,8 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/stretchr/testify/require"
 	"io"
 	"net/http"
@@ -140,4 +142,19 @@ func TestWorkspaceMediaReadsOriginalBytesWithRevisionFences(t *testing.T) {
 	require.ErrorAs(t, err, &changed)
 	require.Equal(t, "7", changed.Expected)
 	require.Equal(t, "8", changed.Actual)
+}
+
+func TestMediaContentScopePinsProviderEndpoint(t *testing.T) {
+	makeS3 := func(endpoint, key string) *S3Connector {
+		client, err := minio.New(endpoint, &minio.Options{Creds: credentials.NewStaticV4(key, "secret", ""), Secure: true})
+		require.NoError(t, err)
+		return &S3Connector{Client: client}
+	}
+	first := makeS3("first.example", "first-key").MediaContentScope()
+	require.Equal(t, first, makeS3("first.example", "rotated-key").MediaContentScope())
+	require.NotEqual(t, first, makeS3("second.example", "first-key").MediaContentScope())
+	gcs := &GoogleConnector{ProviderName: ProviderGCS, APIBase: "https://first.example"}
+	before := gcs.MediaContentScope()
+	gcs.APIBase = "https://second.example"
+	require.NotEqual(t, before, gcs.MediaContentScope())
 }
