@@ -287,7 +287,22 @@ producer definitions or primary inputs start a new episode. Deleted primaries
 retire their tickets even though enrichment replay omits deletion groups.
 
 The workset holds at most 128 document tickets, 1024 producer budgets per ticket,
-and 16 MiB of serialized metadata. It retains no document payloads or credentials.
+and 16 MiB of serialized metadata. A compile-time bound covers the Cartesian
+product of maximum document keys, producer budgets, source identities, and the
+partial cursor. Versioned binary ticket records and a small manifest replace
+the legacy whole-queue JSON blob; legacy clocks migrate without being reset.
+Each atomic save writes only dirty tickets, deletes retired slots, and updates
+the manifest. It retains no document payloads or credentials.
+
+Source validation uses document incarnation, mutation revision, and the existing
+primary-content authority digest in one read snapshot. Unchanged queued sources
+do not require reading, materializing, or hashing their primary bodies. Derived
+writes may advance the revision while preserving primary content. Older rows
+without qualified content metadata use a primary-read fallback. A nonzero
+mutation revision caches that fallback until the next mutation; unversioned
+rows remain on the conservative read path. Relational logical inputs are
+materialized when needed to capture a failed request. Deletion and reinsertion start a new source episode
+even when the bytes are identical.
 A discovery cursor includes a document key when a single atomic journal record
 exceeds available slots. Capacity backpressure bounds admission; newly notified
 primary revisions still receive one bounded maintenance pass when the workset
@@ -297,7 +312,8 @@ guards. Full
 `Retry-After` clocks survive restart; scheduler wakeups are bounded independently
 and never shorten those clocks. No provider lease is held during the delay.
 
-Workset writes use the live ownership/catalog publication fence and precede
+Workset writes validate the live ownership/catalog publication fence inside
+the same write transaction as the ticket records and manifest, and precede
 watermark advancement. Completion tokens retire only the producer revision
 actually attempted, preserving other clocks and failures scheduled during the
 pass. The contiguous applied watermark stays behind the earliest deferred

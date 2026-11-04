@@ -146807,3 +146807,25 @@ test "db scoped retry workset processes healthy batches across restart before a 
     try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
     try std.testing.expectEqual(before_capacity + 128, mock.bad_calls);
 }
+
+test "db scoped retry workset never parks committed earlier chunk requests" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("review-completed-debt");
+    defer tmp.cleanup();
+    var gated = GateDenseEmbedder{};
+    var db = try DB.open(a, tmp.path(), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .owner_id = "review", .dense_embedder = gated.interface(), .inline_retry_max_attempts = 1 },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "chunks", .kind = .dense_vector, .config_json =
+        \\{"field":"embedding","dims":3,"publication_policy":"progressive","execution":{"embedding":{"batch_items":1}},"generator":{"kind":"dense_embedding","source_field":"body","chunk_name":"chunks_v1","chunk_size":8,"chunk_overlap":0,"embedding_name":"chunk_dense"}}
+    });
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"abcdefgh\"}" }}, .sync_level = .write });
+    try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"ijklmnop\"}" }}, .sync_level = .write });
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(db.core.nextEnrichmentSequence()));
+    var queue = try enrichment_state.loadScopedRetries(a, db.enrichment_runtime.?.store);
+    defer queue.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), gated.successful_requests.load(.acquire));
+    try std.testing.expect(!queue.hasDocument("ZG9jOmE="));
+}
