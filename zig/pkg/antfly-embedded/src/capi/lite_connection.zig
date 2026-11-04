@@ -1484,11 +1484,14 @@ pub const Owner = struct {
             // and publication. Unchanged physical index inputs and catalog
             // identity keep detached computations valid; transactions opened
             // after this admission read the current primary checkpoint.
-            // The probe was opened under this same exclusive lease, so it is
-            // still the latest checkpoint; no second open is needed.
-            const latest = &probe;
+            // Validation can itself commit under this lease (runtime refresh,
+            // SQL recovery, immutable-reader leases), so the probe above may
+            // be stale. Compare and rebase against the header it produced.
+            var latest = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
+            defer latest.close();
+            if ((try latest.file.stat(latest.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
             if (file.activeCheckpoint().index_catalog_root_page != latest.activeCheckpoint().index_catalog_root_page) {
-                if (!try publication.indexInputsUnchanged(file, latest)) {
+                if (!try publication.indexInputsUnchanged(file, &latest)) {
                     publication.index_inputs_changed = true;
                     if (scope == .index) {
                         self.publication_stats.index_input_refusals +|= 1;
@@ -1523,11 +1526,13 @@ pub const Owner = struct {
         if (root.maintenance_writer_references != 0) return;
         var lease = root.maintenance_writer_lease.?;
         root.maintenance_writer_lease = null;
-        defer MaintenanceHoldSites.record(self.publication_stats.maintenance_hold_sites.writer(@fromBackingInt(@intCast(root.maintenance_writer_scope))), root.maintenance_writer_held_from);
         // Admission alone is not a mutation. Reclamation probes also take
         // this lease; waking replay here makes each idle turn schedule itself.
         // Generated and replay publications notify at their commit boundary.
         lease.close();
+        // Status readers serialize publication_stats under the gate; record
+        // before releasing it.
+        MaintenanceHoldSites.record(self.publication_stats.maintenance_hold_sites.writer(@fromBackingInt(@intCast(root.maintenance_writer_scope))), root.maintenance_writer_held_from);
         self.gate.mutex.unlock(h.handleLockIo());
     }
 

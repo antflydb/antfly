@@ -1286,7 +1286,8 @@ pub fn trackedBatch(database: *db_mod.DB, req: db_mod.types.BatchRequest, primar
     const named = if (table_name) |name| (if (std.mem.eql(u8, name, "default")) null else name) else null;
     const marker = writer.next(named);
     database.batchTrackedWithMarker(req, primary_committed, marker) catch |err| {
-        if (!primary_committed.* and antfly.capi_dependencies.sql_errors.isUnknownOutcome(err)) writer.retire(marker, named);
+        if (!primary_committed.* and antfly.capi_dependencies.sql_errors.isUnknownOutcome(err))
+            writer.retire(marker, if (named) |name| .{ .name = name, .id = database.core.identity_namespace.table_id } else null);
         return err;
     };
 }
@@ -2720,7 +2721,7 @@ pub fn antfly_db_outcome_receipt_status(handle_ptr: ?*anyopaque, receipt: capi.S
         if (@import("lite_connection.zig").Owner.needsOutcomeReconciliation(root))
             return capi.recordError(.stalled, @src().fn_name ++ ": the uncertain commit is not reconciled yet; retry");
     };
-    const database = receiptDatabase(root, &parsed) catch |err| return capi.mapErrorContext(err, @src().fn_name);
+    const database = receiptDatabase(root, &parsed) catch |err| return capi.mapErrorContext(err, if (err == error.UndefinedTable) @src().fn_name ++ ": the receipt's table was dropped or replaced; its outcome cannot be determined here" else @src().fn_name);
     const persisted = database.readOutcomeMarker(marker.writer) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     const disposition = @import("../storage/db/apply_receipts.zig").outcomeDisposition(persisted, marker.sequence) catch
         return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": the receipt does not match this database");
@@ -2740,10 +2741,14 @@ fn receiptRoot(guard: HandleGuard) *Handle {
 }
 
 /// The database that holds a receipt's marker: the root database, or the
-/// named table the write committed to.
+/// named table the write committed to. A table that has since been dropped,
+/// or dropped and recreated under the same name, cannot answer for the
+/// receipt: report it missing rather than "not applied".
 fn receiptDatabase(root: *Handle, receipt: *const @import("outcome_receipts.zig").Receipt) !*db_mod.DB {
-    if (receipt.table()) |name| return @import("tables.zig").get(root, name);
-    return &root.db;
+    const ref = receipt.table() orelse return &root.db;
+    const database = try @import("tables.zig").get(root, ref.name);
+    if (database.core.identity_namespace.table_id != ref.id) return error.UndefinedTable;
+    return database;
 }
 
 /// Removes a resolved receipt's durable marker. Idempotent.
@@ -2759,7 +2764,7 @@ pub fn antfly_db_outcome_receipt_forget(handle_ptr: ?*anyopaque, receipt: capi.S
     const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     defer guard.leave();
     if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
-    const database = receiptDatabase(receiptRoot(guard), &parsed) catch |err| return capi.mapErrorContext(err, @src().fn_name);
+    const database = receiptDatabase(receiptRoot(guard), &parsed) catch |err| return capi.mapErrorContext(err, if (err == error.UndefinedTable) @src().fn_name ++ ": the receipt's table was dropped or replaced; its outcome cannot be determined here" else @src().fn_name);
     database.deleteOutcomeMarker(marker.writer) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     return .ok;
 }
