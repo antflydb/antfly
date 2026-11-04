@@ -55623,6 +55623,7 @@ fn replayPendingDerivedBatches(
         fn save(ctx: *anyopaque, index_name: []const u8, cursor: derived_worker.PartialCursor) !void {
             const progress: *PersistReplayProgressContext = @ptrCast(@alignCast(ctx));
             const db = progress.db;
+            if (cursor.offset == 0) return apply_state.clearPartialReplayCursor(db.alloc, db.core.store, index_name);
             // As for applied progress: the index output is durable first.
             try db.core.index_manager.checkpointLsmWalForManagedIndex(.{ .name = index_name, .kind = .full_text });
             try apply_state.savePartialReplayCursor(db.alloc, db.core.store, index_name, .{

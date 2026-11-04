@@ -58,6 +58,28 @@ pub fn savePartialReplayCursor(alloc: Allocator, store: anytype, index_name: []c
     try txn.commit();
 }
 
+/// Removes an index's resume point. Every reset of its applied progress
+/// (drop, recreate, rebuild, recovery replacement) must also clear it: a
+/// recreated index replaying the same record must not skip items that only
+/// the old index applied.
+pub fn clearPartialReplayCursor(alloc: Allocator, store: anytype, index_name: []const u8) !void {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    try clearPartialReplayCursorTxn(&txn, index_name);
+    try txn.commit();
+}
+
+fn clearPartialReplayCursorTxn(txn: anytype, index_name: []const u8) !void {
+    var key_buf: [256]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "{s}{s}", .{ partial_cursor_prefix, index_name });
+    txn.delete(key) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
+}
+
 pub fn loadPartialReplayCursor(alloc: Allocator, store: anytype, index_name: []const u8) !?PartialReplayCursor {
     var key_buf: [256]u8 = undefined;
     const key = try std.fmt.bufPrint(&key_buf, "{s}{s}", .{ partial_cursor_prefix, index_name });
@@ -270,6 +292,7 @@ fn saveProjectionMetadataUpdates(alloc: Allocator, store: anytype, updates: []co
             mergeSequenceMetadata(&checkpoint, update, previous_sequence, mode == .set);
         }
         if (mode == .replace or invalidatesCompletion(previous, checkpoint)) try @import("../artifact_projection_epoch.zig").revoke(&txn);
+        if (mode == .replace) try clearPartialReplayCursorTxn(&txn, update.index_name);
         if (mode == .replace) {
             try putScalarAppliedSequenceTxn(&txn, update.index_name, checkpoint.applied_sequence);
         } else {
@@ -668,6 +691,8 @@ pub fn clearAppliedSequenceWithCheckpointWithStorage(
     if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try clearAppliedSequence(store, index_name);
     if (checkpoint_path) |path| {
         try clearAppliedSequenceCheckpointWithStorage(storage, alloc, io, path, store, index_name);
+        // The sidecar holds applied progress; the resume point is in the store.
+        try clearPartialReplayCursor(alloc, store, index_name);
         return;
     }
     try clearAppliedSequence(store, index_name);
@@ -683,6 +708,7 @@ pub fn clearAppliedSequenceTxn(txn: anytype, index_name: []const u8) !void {
         else => return err,
     };
     try clearProjectionMetadataTxn(mutable_txn, index_name);
+    try clearPartialReplayCursorTxn(mutable_txn, index_name);
 }
 
 fn clearProjectionMetadataTxn(txn: anytype, index_name: []const u8) !void {
@@ -1542,6 +1568,14 @@ test "partial replay cursor round-trips per index and is independent of applied 
     // Applied progress is a separate record.
     try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequence(std.testing.allocator, runtime, "text"));
     try std.testing.expectEqual(@as(u64, 3), (try loadPartialReplayCursor(std.testing.allocator, runtime, "other")).?.sequence);
+    // Resetting an index's applied progress (drop, recreate, rebuild) clears
+    // its resume point, and only its own.
+    try saveAppliedSequence(runtime, "text", 8);
+    try clearAppliedSequence(runtime, "text");
+    try std.testing.expectEqual(@as(?PartialReplayCursor, null), try loadPartialReplayCursor(std.testing.allocator, runtime, "text"));
+    try std.testing.expect(try loadPartialReplayCursor(std.testing.allocator, runtime, "other") != null);
+    try clearPartialReplayCursor(std.testing.allocator, runtime, "other");
+    try std.testing.expectEqual(@as(?PartialReplayCursor, null), try loadPartialReplayCursor(std.testing.allocator, runtime, "other"));
 }
 
 test "derived apply state lsm point load does not clone mutable snapshot" {

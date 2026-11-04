@@ -34,7 +34,8 @@ pub const PersistProgressFn = *const fn (ctx: *anyopaque, index_name: []const u8
 /// already applied and published.
 pub const PartialCursor = struct { sequence: u64, offset: u64 };
 pub const LoadPartialFn = *const fn (ctx: *anyopaque, index_name: []const u8) anyerror!?PartialCursor;
-/// Called after the window that applied the prefix has been published.
+/// Called after the window that applied the prefix has been published. An
+/// `offset` of 0 clears the resume point (its record completed).
 pub const SavePartialFn = *const fn (ctx: *anyopaque, index_name: []const u8, cursor: PartialCursor) anyerror!void;
 pub const ProgressFn = *const fn (ctx: *anyopaque, index_name: []const u8, progress: CatchUpProgress) anyerror!void;
 pub const BeginWindowFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) anyerror!void;
@@ -463,6 +464,10 @@ pub fn catchUpIndexFromMatchingCursor(
                 };
             }
         }
+        // A resumed record completed: drop its resume point. Best effort, as
+        // applied progress now passes it and progress resets clear it too.
+        if (resume_offset != 0) options.save_partial_fn.?(options.partial_ctx.?, index_ref.name, .{ .sequence = chunk_stats.last_sequence, .offset = 0 }) catch |err|
+            logCatchUpError(index_ref, "clear_partial", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
         completed_windows += 1;
         call_bytes +|= collected_bytes;
         // Oversized single records retain the existing one-record progress
@@ -1888,7 +1893,7 @@ const TestPartialStore = struct {
     }
     fn save(ctx: *anyopaque, _: []const u8, cursor: PartialCursor) !void {
         const self: *TestPartialStore = @ptrCast(@alignCast(ctx));
-        self.cursor = cursor;
+        self.cursor = if (cursor.offset == 0) null else cursor;
         self.saves += 1;
     }
     fn persist(ctx: *anyopaque, _: []const u8, sequence: u64) !void {
@@ -1949,9 +1954,11 @@ test "catchUpIndex yields inside an oversized full text record and resumes at it
         if (stats.partial_yields == 0) try std.testing.expectEqual(@as(usize, 1), stats.applied_entries);
         try std.testing.expect(calls < 10);
     }
-    // Every item applied exactly once across the turns, then progress saved.
+    // Every item applied exactly once across the turns, then progress saved
+    // and the resume point dropped.
     try std.testing.expectEqual(@as(usize, 5), applied_total);
     try std.testing.expectEqual(@as(?u64, 1), store.persisted);
+    try std.testing.expectEqual(@as(?PartialCursor, null), store.cursor);
 }
 
 test "catchUpIndex ignores a resume point for a record it did not collect" {
