@@ -69,7 +69,9 @@
 //!    everything below it in ascending order, including leftovers of an
 //!    earlier grant that died mid-cleanup. Interrupted cleanup therefore
 //!    leaves one contiguous run ending at the dead grant's own file, and the
-//!    next grant removes it, so ticket history stays bounded.
+//!    next grant removes it, so ticket history stays bounded. An idle check
+//!    under the tail lock may also remove a dead or abandoned run at the
+//!    tail once it reaches a finished ticket below it: nothing is above it.
 //! 5. Death. Process death releases all of its ticket and tail locks: a dead
 //!    waiter reads as `W` (skipped), a dead holder as `G` (finished). Death
 //!    while holding the tail lock leaves at most rule 2's unadvanced file.
@@ -242,23 +244,37 @@ pub const Queue = struct {
     /// True when nobody is queued or holding a queue grant. Caller holds the
     /// tail, so the answer stays valid until the tail is released.
     pub fn isIdle(self: *Queue, io: std.Io, tail: *const TailGuard) !bool {
-        if (tail.next == 0) return true;
         var name_buf: [ticket_name_len]u8 = undefined;
-        const last = self.dir.openFile(io, ticketName(&name_buf, tail.next - 1), .{ .mode = .read_write }) catch |err| switch (err) {
-            error.FileNotFound => return true,
-            else => return err,
-        };
-        defer last.close(io);
-        // A live last waiter or holder keeps its lock.
-        if (!try last.tryLock(io, .exclusive)) return false;
-        defer last.unlock(io);
-        // A dead or abandoned last waiter may still have live waiters ahead of
-        // it. Only a finished (or dead-while-granted) last ticket proves FIFO
-        // has drained.
-        return switch (try readState(last, io)) {
-            .done, .granted => true,
-            else => false,
-        };
+        // Walk down from the last ticket, as a successor would, but without
+        // waiting. A locked ticket is a live waiter or holder: not idle. An
+        // unlocked `W`/`A` is dead or abandoned and may still have live
+        // tickets below it, so keep going. A finished ticket (`D`, or `G`
+        // left by a dead holder) or a missing file proves everything below
+        // it finished (rule 4), as does running out of tickets.
+        var lowest_dead: ?u64 = null;
+        var k = tail.next;
+        while (k > 0) {
+            k -= 1;
+            const file = self.dir.openFile(io, ticketName(&name_buf, k), .{ .mode = .read_write }) catch |err| switch (err) {
+                error.FileNotFound => break,
+                else => return err,
+            };
+            defer file.close(io);
+            if (!try file.tryLock(io, .exclusive)) return false;
+            defer file.unlock(io);
+            switch (try readState(file, io)) {
+                .done, .granted => break,
+                else => lowest_dead = k,
+            }
+        }
+        // Idle. The dead run above the boundary can never be waited on: no
+        // ticket is above it and the tail is held. Remove it so the next
+        // check does not walk it again (ascending, as in rule 4).
+        if (lowest_dead) |low| {
+            var i = low;
+            while (i < tail.next) : (i += 1) self.dir.deleteFile(io, ticketName(&name_buf, i)) catch {};
+        }
+        return true;
     }
 
     /// Issues the next ticket while the caller holds the tail. The returned
@@ -805,6 +821,46 @@ test "writer queue persists a recovered counter so idle admissions do not rescan
         try testing.expect(try q.isIdle(io, &tail));
     }
     try testing.expectEqual(@as(u64, 1), q.recover_scans);
+}
+
+test "writer queue is idle again once an abandoned last waiter's predecessors finish" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .concurrent_limit = .limited(8) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sidecar = try testSidecar(&tmp, io, &path_buf);
+    var q = try Queue.open(testing.allocator, io, sidecar);
+    defer q.close(io);
+
+    var head = try enqueueOne(&q, io);
+    try q.awaitTurn(io, &head, farDeadline(io));
+    // The last waiter times out, and a second one dies while waiting.
+    var impatient = try enqueueOne(&q, io);
+    try testing.expectError(error.FileBusy, q.awaitTurn(io, &impatient, std.Io.Clock.awake.now(io).nanoseconds + 10 * std.time.ns_per_ms));
+    const dead = try enqueueOne(&q, io);
+    dead.file.close(io);
+    {
+        // Still busy: the holder is live below the dead run.
+        var tail = try q.lockTail(io, farDeadline(io));
+        defer tail.release(io);
+        try testing.expect(!try q.isIdle(io, &tail));
+    }
+    q.finish(io, &head);
+    for (0..20) |_| {
+        var tail = try q.lockTail(io, farDeadline(io));
+        defer tail.release(io);
+        try testing.expect(try q.isIdle(io, &tail));
+    }
+    // Also through a fresh handle, as another process would see it.
+    var other = try Queue.open(testing.allocator, io, sidecar);
+    defer other.close(io);
+    var tail = try other.lockTail(io, farDeadline(io));
+    defer tail.release(io);
+    try testing.expect(try other.isIdle(io, &tail));
+    // Only the finished boundary remains; the dead run was removed.
+    try testing.expectEqual(@as(usize, 1), try countTickets(&other, io));
 }
 
 test "writer queue rule 4: leftovers of interrupted grants are removed by the next grant" {

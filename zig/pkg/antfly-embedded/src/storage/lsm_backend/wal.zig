@@ -70,6 +70,11 @@ pub const ReplayEntry = backend_types.ReplayEntry;
 
 pub const AppendOptions = struct {
     segment_bytes: u64 = default_wal_segment_bytes,
+    /// Set when a failed append may have left bytes that could not be cut
+    /// back; the caller must repair (`repairSegmentTail`) before appending.
+    unrepaired_tail: ?*?TornTail = null,
+    /// Set when a failed append is proven to have written nothing.
+    proven_unwritten: ?*bool = null,
 };
 
 pub const AppendResult = struct {
@@ -279,11 +284,23 @@ pub fn appendStateWithOptionsResult(
     const segment_became_nonempty = current_size == 0;
     appendRecordOnce(storage, allocator, wal_dir, segment_path, record, sync, segment_became_nonempty) catch |err| {
         if (comptime @import("builtin").is_test) if (err == error.TestCrashAfterPartialAppend) return err;
-        // A failed or partial append may have left torn bytes. Cut the
-        // segment back before anything else is appended after them.
+        // The original error is always returned: callers act on its cause
+        // (for example cancellation). Only the tail is handled here.
+        const size: ?u64 = storage.fileSize(segment_path) catch |size_err| switch (size_err) {
+            error.FileNotFound => 0,
+            else => null,
+        };
+        // Proven: the append was refused before writing anything.
+        if (size == current_size) {
+            if (options.proven_unwritten) |out| out.* = true;
+            return err;
+        }
+        // Bytes may have landed. Cut the segment back before anything else
+        // is appended after them; if that fails, the caller repairs before
+        // its next append (and recovery repairs after a crash).
         repairFileTail(storage, allocator, segment_path, current_size) catch |repair_err| {
-            std.log.err("lsm wal append failed and tail repair failed path={s} append_err={s} repair_err={s}", .{ segment_path, @errorName(err), @errorName(repair_err) });
-            return error.WalTailRepairFailed;
+            std.log.warn("lsm wal append failed; tail repair deferred path={s} append_err={s} repair_err={s}", .{ segment_path, @errorName(err), @errorName(repair_err) });
+            if (options.unrepaired_tail) |out| out.* = .{ .segment = segment, .valid_bytes = current_size };
         };
         return err;
     };
@@ -300,14 +317,17 @@ pub fn appendStateWithOptionsResult(
 
 /// Test hook: append only the first `bytes` of the next record, then fail.
 /// With `crash`, the failure skips tail repair, as if the process died.
-pub const TestAppendFault = struct { bytes: usize, crash: bool = false };
+pub const TestAppendFault = struct { bytes: usize, crash: bool = false, err: anyerror = error.InputOutput, fail_repairs: usize = 0 };
 pub var test_append_fault: if (@import("builtin").is_test) ?TestAppendFault else void = if (@import("builtin").is_test) null else {};
+/// Test hook: fail this many upcoming tail repairs.
+pub var test_fail_repairs: if (@import("builtin").is_test) usize else void = if (@import("builtin").is_test) 0 else {};
 
 fn appendRecordOnce(storage: storage_io.Storage, allocator: Allocator, wal_dir: []const u8, segment_path: []const u8, record: []const u8, sync: bool, segment_became_nonempty: bool) !void {
     if (comptime @import("builtin").is_test) if (test_append_fault) |fault| {
         test_append_fault = null;
-        try storage.appendFileAbsolute(allocator, segment_path, record[0..@min(fault.bytes, record.len)], true);
-        return if (fault.crash) error.TestCrashAfterPartialAppend else error.InputOutput;
+        test_fail_repairs = fault.fail_repairs;
+        if (fault.bytes != 0) try storage.appendFileAbsolute(allocator, segment_path, record[0..@min(fault.bytes, record.len)], true);
+        return if (fault.crash) error.TestCrashAfterPartialAppend else fault.err;
     };
     storage.appendFileAbsolute(allocator, segment_path, record, sync) catch |err| switch (err) {
         error.FileNotFound => {
@@ -1222,6 +1242,10 @@ pub fn repairSegmentTail(storage: storage_io.Storage, allocator: Allocator, root
 }
 
 fn repairFileTail(storage: storage_io.Storage, allocator: Allocator, path: []const u8, valid_bytes: u64) !void {
+    if (comptime @import("builtin").is_test) if (test_fail_repairs > 0) {
+        test_fail_repairs -= 1;
+        return error.InputOutput;
+    };
     const size = storage.fileSize(path) catch |err| switch (err) {
         error.FileNotFound => if (valid_bytes == 0) return else return err,
         else => return err,

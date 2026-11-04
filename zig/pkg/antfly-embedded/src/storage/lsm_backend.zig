@@ -1762,9 +1762,10 @@ pub const Backend = struct {
     /// WAL appends and direct ingests started, counted before any write so a
     /// commit can tell whether a failure may follow a durable or visible one.
     write_publication_attempts: u64 = 0,
-    /// A failed WAL append left bytes that could not be cut back. Writes are
-    /// refused until a reopen repairs the tail during recovery.
-    wal_tail_repair_required: bool = false,
+    /// A failed WAL append may have left bytes that could not be cut back.
+    /// The next append repairs this tail first (under the WAL lock), and
+    /// fails without writing if it still cannot; recovery repairs it too.
+    wal_unrepaired_tail: ?wal_mod.TornTail = null,
     remembered_compaction: ?compaction_mod.RememberedCompaction = null,
     open_stats: OpenStats = .{},
     write_stats: WriteStats = .{},
@@ -5917,7 +5918,6 @@ pub const Backend = struct {
 
     fn appendWalWithPreparation(self: *Backend, state: anytype, prepared: ?*ActiveMemTable) !void {
         if (self.manifest_recovery_required) return error.RecoveryRequired;
-        if (self.wal_tail_repair_required) return error.RecoveryRequired;
         const wal_enabled = self.options.wal_enabled and self.root_dir != null and !self.options.backend.read_only and state.entryCount() != 0;
 
         const encoded_bytes: u64 = @intCast(wal_mod.encodedStateRecordLen(state));
@@ -5951,23 +5951,28 @@ pub const Backend = struct {
         };
         var wal_lock = try self.acquireWalOperationLock(.exclusive);
         defer wal_lock.release();
+        if (self.wal_unrepaired_tail) |torn| {
+            // Nothing may be appended after bytes an earlier failure left.
+            try wal_mod.repairSegmentTail(self.storage.?, self.allocator, self.root_dir.?, torn.segment, torn.valid_bytes);
+            self.wal_unrepaired_tail = null;
+            self.wal_retention.invalidateAll();
+        }
         try takeTestCommitFault(.before_wal_append);
         self.write_publication_attempts +%= 1;
-        const append_result = self.wal_retention.append(
+        var proven_unwritten = false;
+        errdefer if (proven_unwritten) {
+            // Nothing reached the segment: this commit has not applied.
+            self.write_publication_attempts -%= 1;
+        };
+        const append_result = try self.wal_retention.append(
             self.storage.?,
             self.allocator,
             self.root_dir.?,
             state,
             self.options.wal_sync_on_commit,
-            .{ .segment_bytes = self.options.wal_segment_bytes },
+            .{ .segment_bytes = self.options.wal_segment_bytes, .unrepaired_tail = &self.wal_unrepaired_tail, .proven_unwritten = &proven_unwritten },
             self.writeStatsNowNs(),
-        ) catch |err| {
-            // The append failed and its torn bytes could not be cut back.
-            // Refuse further writes until reopen repairs the tail.
-            if (err == error.WalTailRepairFailed) self.wal_tail_repair_required = true;
-            self.wal_retention.invalidateAll();
-            return err;
-        };
+        );
         self.noteMutableWalSegment(append_result.segment);
         self.syncTrackedWalRetentionUsageCurrentLocked();
         // Stands in for a sync failure after the record reached the segment.
@@ -11423,10 +11428,13 @@ fn implementationTests() type {
         }
 
         test "issue1431 lsm torn wal tail never hides later acknowledged writes" {
-            // `crash`: the process dies right after a partial append, so the
-            // torn bytes reach recovery. Otherwise the failed append repairs
-            // its own tail in place.
-            for ([_]bool{ true, false }) |crash| {
+            // `.crash`: the process dies right after a partial append, so the
+            // torn bytes reach recovery. `.in_place`: the failed append
+            // repairs its own tail. `.deferred`: that repair fails, and the
+            // next append repairs first.
+            const Mode = enum { crash, in_place, deferred };
+            for ([_]Mode{ .crash, .in_place, .deferred }) |mode| {
+                const crash = mode == .crash;
                 var storage = storage_io.MemoryStorage.init(std.testing.allocator);
                 defer storage.deinit();
                 const root_dir = "/lsm-torn-wal-tail";
@@ -11442,7 +11450,7 @@ fn implementationTests() type {
                     var txn = try backend.beginWrite();
                     defer txn.abort();
                     try txn.put(.{ .name = "docs" }, "doc:torn", "never acknowledged");
-                    wal_mod.test_append_fault = .{ .bytes = 8, .crash = crash };
+                    wal_mod.test_append_fault = .{ .bytes = 8, .crash = crash, .fail_repairs = if (mode == .deferred) 1 else 0 };
                     defer wal_mod.test_append_fault = null;
                     const expected: anyerror = if (crash) error.TestCrashAfterPartialAppend else error.InputOutput;
                     try std.testing.expectError(expected, txn.commit());
@@ -11470,6 +11478,40 @@ fn implementationTests() type {
                 try std.testing.expectEqualStrings("beta", try read.get(.{ .name = "docs" }, "doc:b"));
                 try std.testing.expectError(error.NotFound, read.get(.{ .name = "docs" }, "doc:torn"));
             }
+        }
+
+        test "issue1431 lsm append refused before writing keeps its cause and the wal usable" {
+            var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+            defer storage.deinit();
+            const options = Options{ .flush_threshold = 1 << 20, .storage = storage.storage() };
+            var backend = try Backend.open(std.testing.allocator, "/lsm-refused-append", options);
+            defer backend.close();
+            {
+                var txn = try backend.beginWrite();
+                defer txn.abort();
+                try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+                try txn.commit();
+            }
+            {
+                var txn = try backend.beginWrite();
+                defer txn.abort();
+                try txn.put(.{ .name = "docs" }, "doc:refused", "x");
+                // Refused before any byte is written, and the repair path is
+                // also refused: neither may fence the healthy WAL.
+                wal_mod.test_append_fault = .{ .bytes = 0, .err = error.EnrichmentWaitCanceled, .fail_repairs = 1 };
+                defer wal_mod.test_append_fault = null;
+                defer wal_mod.test_fail_repairs = 0;
+                var progress: backend_types.CommitProgress = .{};
+                backend_types.commit_progress = &progress;
+                defer backend_types.commit_progress = null;
+                try std.testing.expectError(error.EnrichmentWaitCanceled, txn.commit());
+                try std.testing.expect(!progress.maybe_applied);
+            }
+            try std.testing.expect(backend.wal_unrepaired_tail == null);
+            var txn = try backend.beginWrite();
+            defer txn.abort();
+            try txn.put(.{ .name = "docs" }, "doc:b", "beta");
+            try txn.commit();
         }
 
         test "lsm backend maintenance stats report retained wal debt across reopen and reset" {
