@@ -372,3 +372,76 @@ func TestNativeMemberBatchIntegration(t *testing.T) {
 	require.Len(t, second.Responses[0].Hits.Hits, 1)
 	require.NotEqual(t, first.Responses[0].Hits.Hits[0].ID, second.Responses[0].Hits.Hits[0].ID)
 }
+
+func TestNativeMemberSourceAuthorityIntegration(t *testing.T) {
+	endpoint, binary := os.Getenv("ANTFLY_SOURCE_TEST_ENDPOINT"), os.Getenv("ANTFLY_GREP_TEST_BINARY")
+	if endpoint == "" || binary == "" {
+		t.Skip("set native source endpoint and grep binary")
+	}
+	p := &Publisher{Endpoint: endpoint}
+	table := fmt.Sprintf("native_authority_%d", time.Now().UnixNano())
+	_, err := p.call(t.Context(), "POST", tablePath(table), map[string]any{"num_shards": 1, "indexes": map[string]any{"copies": map[string]any{"type": "full_text", "sources": []any{map[string]any{"artifact": "copied", "field": "text"}}, "enrichments": []any{map[string]any{"name": "copied", "kind": "asset", "field": "payload", "content_type": "application/json", "producer_json": `{"type":"copy"}`}}}}})
+	require.NoError(t, err)
+	defer p.call(context.Background(), "DELETE", tablePath(table), nil)
+	records := map[string]any{}
+	for _, id := range []string{"allowed", "secret"} {
+		content := map[string]any{"text": "ordinary text"}
+		if id == "allowed" {
+			content = map[string]any{"resource": map[string]any{"type": "source", "uri": "gs://fixture/file.pdf"}}
+		}
+		records[id] = map[string]any{"source": map[string]any{"uri": "gs://fixture/" + id, "path": id + ".pdf", "revision": "1", "indexed_at": time.Now().Unix()}, "permissions": map[string]any{"public": id == "allowed", "readers": []string{}}, "metadata": map[string]any{}, "marker": id, "content": content, "payload": `{"text":"needle","parent_doc_key":"secret","_parent_doc_key":"secret"}`}
+	}
+	require.NoError(t, p.Batch(t.Context(), table, records, nil))
+	require.Eventually(t, func() bool {
+		raw, err := p.call(t.Context(), "GET", tablePath(table)+"/indexes/copies", nil)
+		return err == nil && strings.Contains(string(raw), `"complete":true`)
+	}, 30*time.Second, 50*time.Millisecond)
+	raw, err := p.call(t.Context(), "POST", tablePath(table)+"/query", map[string]any{"full_text_index": "copies", "full_text_search": map[string]any{"match_all": map[string]any{}}, "filter_query": map[string]any{"bool": true, "field": "permissions.public"}, "execution": map[string]any{"value_verification": map[string]any{"allow_scan": true}}, "hierarchy": map[string]any{"ancestors": map[string]any{"source": map[string]any{"fields": []string{"marker", "permissions"}}}}, "fields": []string{"text"}, "limit": 10})
+	require.NoError(t, err)
+	var result struct {
+		Responses []struct {
+			Status int `json:"status"`
+			Hits   struct {
+				Hits []struct {
+					Hierarchy struct {
+						Ancestors struct {
+							Source struct {
+								Document struct {
+									Marker string `json:"marker"`
+								} `json:"document"`
+							} `json:"source"`
+						} `json:"ancestors"`
+					} `json:"hierarchy"`
+				} `json:"hits"`
+			} `json:"hits"`
+		} `json:"responses"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &result))
+	require.Len(t, result.Responses, 1)
+	require.Equal(t, 200, result.Responses[0].Status, string(raw))
+	require.Len(t, result.Responses[0].Hits.Hits, 1, string(raw))
+	require.Equal(t, "allowed", result.Responses[0].Hits.Hits[0].Hierarchy.Ancestors.Source.Document.Marker, string(raw))
+	streams := []TextStream{{Name: "source", Field: "content.text", Default: true}, {Name: "extracted", Artifact: "copied", Index: "copies", Field: "text", Default: true}}
+	for _, mixed := range []bool{true, false} {
+		if !mixed {
+			streams = streams[:1]
+		}
+		file := filepath.Join(t.TempDir(), "grep.json")
+		require.NoError(t, writeJSON(file, map[string]any{"version": 1, "endpoint": endpoint, "principals": []string{"user:self"}, "tables": []any{map[string]any{"name": table, "fields": CanonicalDocumentFields(), "source_filter": map[string]any{"doc_id": map[string]any{"ids": []string{"allowed"}}}, "streams": streams}}}, 1<<20))
+		for _, flags := range [][]string{nil, {"--json"}} {
+			args := append([]string{"--table-config", file}, flags...)
+			output, err := exec.CommandContext(t.Context(), binary, append(args, "needle")...).CombinedOutput()
+			if mixed {
+				require.NoError(t, err, string(output))
+				require.Contains(t, string(output), "needle")
+			} else {
+				require.Error(t, err, string(output))
+				require.Contains(t, string(output), "NativeArtifactStreamRequired")
+			}
+		}
+		output, err := exec.CommandContext(t.Context(), binary, "--table-config", file, "--glob", "!**", "needle").CombinedOutput()
+		var exit *exec.ExitError
+		require.ErrorAs(t, err, &exit, string(output))
+		require.Equal(t, 1, exit.ExitCode(), string(output))
+	}
+}
