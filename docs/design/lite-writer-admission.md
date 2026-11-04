@@ -158,7 +158,7 @@ SQL decisions, and exact schema/index/provider configuration fingerprints.
 Before using the new primary cut, replay invalidates source certificates without
 reusing their generations, resets replay-head and retention observations, and
 reloads shard and identity visibility state. The cache retains at most root plus
-one named namespace, including after catching the current source target and
+eight named namespaces, including after catching the current source target and
 through compatible artifact/control turns. Every admitted background turn checks
 its witnesses before idle readiness can skip the namespace. Changed inputs retire
 the cache and promptly schedule released artifact leases for storage cleanup;
@@ -201,10 +201,39 @@ controls, namespace limits, and settling from successful reuse. They are needed
 to distinguish safe invalidation from repeated startup work in the importer;
 a small replay fixture alone does not qualify importer throughput.
 
-Both producer and consumer controllers size preparation windows from elapsed
-time minus measured admission/publication overhead. That fixed cost still
-counts toward call deadlines and yield decisions. Contention therefore does
-not by itself shrink preparation windows and multiply admission and sync work.
+Unavoidable actor replacement retains individual immutable segment readers in
+one file-wide handoff. Independent limits cover 256 MiB of admitted resident
+reader memory, 1,024 segment visits, and source ranges no larger than one captured
+file generation. Resident cost includes navigation, identity routing, deletion
+bitmaps and provider cache/state overhead. Only durable artifact-lease sources
+qualify; query and epoch/inode-fenced sources cannot enter this cache. Unused
+handoffs expire after five seconds through maintenance audit or close.
+
+Foreground refresh has a shorter bridge: an export keeps its predecessor alive
+until it opens the requested named namespace. This retirement reference grants
+no old query or allocator capability. Admission releases it after selecting the
+successor, on errors, before detached provider work, or at root export exit.
+Exact inode/value checks still govern immutable pooling. This avoids destroying
+named sources after reconstructing only the default namespace, then publishing
+new leases to reopen those same inputs in the export.
+
+Text upserts use a persisted external-ID lookup in segment version 6. Sorted
+hash/local-document rows support bounded seeks, followed by exact stored-ID
+comparison on every hash hit. Deletion still visits every live duplicate and
+preserves atomic bitmap rollback. Merges rebuild output coordinates with bounded
+spill sorting. Older v4/v5 segments build a resource-admitted compatibility lookup
+once per physical reader; this lifetime cache is not a persistent migration.
+Compaction rewrites those inputs to the current format.
+
+Text consumers size preparation windows from explicitly measured collection,
+projection and segment preparation, including when benchmark logging is off.
+Other preparation controllers subtract measured admission/publication overhead
+from elapsed time. Fixed cursor, publication and checkpoint costs still count
+toward call deadlines and yield decisions; they do not by themselves shrink text
+preparation windows and multiply admission and sync work. Registered manual
+workers and workerless replay both publish durable document-fragment progress
+before continuing. Complete-record progress and retirement never advance on a
+partial output or failed continuation write.
 
 Automatic full-generation format conversion follows the same replay/quiet
 admission and primary-publication preemption as automatic shrinking. A legacy
