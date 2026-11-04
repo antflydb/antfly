@@ -522,22 +522,26 @@ pub const ImmutableDecodeCache = struct {
     metadata_reservation: ?resources.Reservation,
     host_budget: ?resources.BudgetedAllocator,
     budget: LocalBudget,
+    reclaimer: u64 = 0,
     mutex: std.atomic.Mutex = .unlocked,
     entries: [16]?*Entry = @splat(null),
     tick: u64 = 0,
     pub const metadata_overhead = @sizeOf(Self) + 16 * @sizeOf(Entry);
 
     pub fn create(a: std.mem.Allocator, manager: ?*resources.ResourceManager, limit: usize) !*Self {
-        var metadata: ?resources.Reservation = if (manager) |rm| try rm.reserveWithoutReclaim(.full_text_segment_residency, metadata_overhead) else null;
+        var metadata: ?resources.Reservation = if (manager) |rm| try rm.reserveWithoutReclaim(.lite_native_page_cache, metadata_overhead) else null;
         errdefer if (metadata) |*held| held.release();
         const self = try a.create(Self);
+        errdefer a.destroy(self);
         self.* = .{
             .allocator = a,
             .metadata_reservation = metadata,
-            .host_budget = if (manager) |rm| resources.BudgetedAllocator.init(rm, .full_text_segment_residency, a, 1) else null,
+            .host_budget = if (manager) |rm| resources.BudgetedAllocator.init(rm, .lite_native_page_cache, a, 1) else null,
             .budget = .{ .backing = undefined, .limit = limit },
         };
         self.budget.backing = if (self.host_budget) |*host| host.threadSafeAllocator() else a;
+        errdefer if (self.host_budget) |*host| host.deinit();
+        if (manager) |rm| self.reclaimer = try rm.registerReclaimer(.lite_native_page_cache, self, reclaim);
         return self;
     }
 
@@ -555,12 +559,31 @@ pub const ImmutableDecodeCache = struct {
 
     pub fn deinit(self: *Self) void {
         // The source's lifetime admission excludes new loads and leases here.
+        if (self.host_budget) |*host| host.reservation.manager.unregisterReclaimer(self.reclaimer);
         for (&self.entries) |*slot| self.destroyEntry(slot);
         std.debug.assert(self.budget.live == 0);
         if (self.host_budget) |*host| host.deinit();
         if (self.metadata_reservation) |*held| held.release();
         const a = self.allocator;
         a.destroy(self);
+    }
+
+    fn reclaim(raw: *anyopaque, target_bytes: u64) u64 {
+        const self: *Self = @ptrCast(@alignCast(raw));
+        if (!self.mutex.tryLock()) return 0;
+        defer self.mutex.unlock();
+        const host = if (self.host_budget) |*budget| budget else return 0;
+        const before = host.liveBytesThreadSafe();
+        var released: u64 = 0;
+        for (&self.entries) |*slot| if (slot.*) |entry| {
+            if (entry.references != 0) continue;
+            self.destroyEntry(slot);
+            released = before -| host.liveBytesThreadSafe();
+            if (released >= target_bytes) break;
+        };
+        // Arena frees can leave amortized reservation credit. Return it too;
+        // concurrent loaders can only make the live-byte delta conservative.
+        return @max(released, host.releaseUnusedCreditThreadSafe());
     }
 
     pub fn retainedBytes(self: *Self) usize {
@@ -775,6 +798,30 @@ test "segment.immutable decode cache discards interrupted loads and cleans alloc
     const held = (try cache.acquire(probe.request(0))) orelse return error.TestUnexpectedResult;
     held.release();
     try std.testing.checkAllAllocationFailures(std.testing.allocator, DecodeCacheProbe.allocationProbe, .{});
+}
+
+test "segment.immutable decode cache returns host admission without evicting leased metadata" {
+    const a = std.testing.allocator;
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 4 * 1024 * 1024 } });
+    defer manager.deinit(a);
+    {
+        const cache = try ImmutableDecodeCache.create(a, &manager, 1024 * 1024);
+        defer cache.deinit();
+        var probe: DecodeCacheProbe = .{ .bytes = 32 * 1024 };
+        const pinned = (try cache.acquire(probe.request(0))) orelse return error.TestUnexpectedResult;
+        defer pinned.release();
+        const cached = (try cache.acquire(probe.request(1))) orelse return error.TestUnexpectedResult;
+        cached.release();
+        const before = manager.snapshot().memory.used_bytes;
+        try std.testing.expect(manager.reclaimForAllocation(.lite_native_page_cache, 4 * 1024 * 1024) != 0);
+        try std.testing.expect(manager.snapshot().memory.used_bytes < before);
+        try std.testing.expect(cache.lookup(probe.request(1).key()) == null);
+        const value: *const DecodeCacheProbe.Value = @ptrCast(@alignCast(pinned.entry.value.?));
+        try std.testing.expectEqual(@as(usize, 32 * 1024), value.bytes.len);
+        try std.testing.expectEqual(@as(u8, 'r'), value.bytes[0]);
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
 }
 
 /// Shared immutable range cache. Backend I/O owns a separate bounded fill

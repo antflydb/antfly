@@ -8779,6 +8779,12 @@ test "capi native decoded artifact lease retains physical inputs and accounting 
             value.* = 0x12345678;
             return value;
         }
+        fn oversized(_: *anyopaque, a: std.mem.Allocator) !*const anyopaque {
+            const value = try a.create(u64);
+            _ = try a.alloc(u8, 2 * 1024 * 1024);
+            value.* = 0;
+            return value;
+        }
     };
     {
         var fixture = try AdmissionFollowupFixture.init("native-decoded-source-owner", 5000, .batch);
@@ -8795,6 +8801,16 @@ test "capi native decoded artifact lease retains physical inputs and accounting 
         defer inventory.release();
         backing = inventory.segments[0].reader.immutableSource();
         try backing.readInto(0, &original);
+        {
+            // An unrelated handoff use must not keep a failed optional
+            // cache's metadata admission charged against the normal fallback.
+            try std.testing.expect(backing.acquireUse());
+            defer backing.releaseUse();
+            const manager = backing.resourceManager().?;
+            const before = manager.snapshot().memory.used_bytes;
+            try std.testing.expect((try backing.acquireDecoded(.{ .offset = 0, .length = 8, .interpretation = @splat(92), .context = &calls, .decode = Loader.oversized })) == null);
+            try std.testing.expectEqual(before, manager.snapshot().memory.used_bytes);
+        }
         const request: source_module.DecodeRequest = .{ .offset = 0, .length = 8, .interpretation = @splat(91), .context = &calls, .decode = Loader.decode };
         held = (try backing.acquireDecoded(request)) orelse return error.TestUnexpectedResult;
         const reused = (try backing.acquireDecoded(request)) orelse return error.TestUnexpectedResult;

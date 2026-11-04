@@ -223,14 +223,17 @@ comparison on every hash hit. Deletion still visits every live duplicate and
 preserves atomic bitmap rollback. Merges rebuild output coordinates with bounded
 spill sorting. Older v4/v5 segments first seek a source-owned compatibility
 lookup. Each native immutable value admits at most 16 decoded metadata entries
-and 1 MiB of their arena capacity, charged to full-text residency. Values own all
-their bytes and no request or reader context. Reconstruction can therefore reuse
+and 1 MiB of their arena capacity, charged to the native page-cache budget.
+Values own all their bytes and no request or reader context. Reconstruction can therefore reuse
 ID routing without sharing another runtime's deletion visibility. Decode leases
 retain both a source reference and an active use, including its accounting owner
 after the DB closes. Loading occurs outside the cache lock, and nested or
 concurrent misses use the caller's normal fallback rather than waiting on another
-decode. If optional admission declines, the existing resource-admitted per-reader
-lookup remains available. This lifetime cache is not a persistent migration;
+decode. Host pressure may evict only unleased metadata. If optional admission
+declines, an exclusive decode caller returns its entire cache admission,
+including metadata, before the existing per-reader fallback reserves memory.
+An unrelated source use does not prevent this cleanup. This lifetime cache is
+not a persistent migration;
 compaction rewrites old segments to the current format.
 
 Text consumers size preparation windows from explicitly measured collection,

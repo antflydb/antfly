@@ -626,6 +626,7 @@ const State = struct {
     decoded_cache: ?*DecodedCache = null,
     lifetime_mutex: std.atomic.Mutex = .unlocked,
     active_uses: usize = 0,
+    decoded_users: usize = 0, // lifetime_mutex; distinct from general source uses
     idle_expiry: bool = false,
     retired: bool = false,
     resources_closed: std.atomic.Value(bool) = .init(false),
@@ -716,7 +717,11 @@ const State = struct {
     fn pinDecoded(self: *State) bool {
         @import("antfly_platform").sync.lockYielding(&source_pool_mutex);
         defer source_pool_mutex.unlock();
-        if (!acquireUse(self)) return false;
+        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
+        defer self.lifetime_mutex.unlock();
+        if (self.resources_closed.load(.monotonic)) return false;
+        self.active_uses += 1;
+        self.decoded_users += 1;
         // A decoded lease may outlive its caller's Source. Its use prevents
         // idle expiry, and its reference keeps this provider/accounting owner.
         self.source_references += 1;
@@ -724,8 +729,23 @@ const State = struct {
     }
 
     fn releaseDecodedPin(self: *State) void {
+        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
+        std.debug.assert(self.decoded_users != 0);
+        self.decoded_users -= 1;
+        self.lifetime_mutex.unlock();
         releaseUse(self);
         close(self);
+    }
+
+    fn discardDeclinedDecode(self: *State) void {
+        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
+        defer self.lifetime_mutex.unlock();
+        // This caller still owns its pin. All other decoders and returned
+        // leases count separately, even when a handoff also uses this source.
+        // Give the fallback its original host headroom, including metadata.
+        if (self.decoded_users != 1) return;
+        if (self.decoded_cache) |cache| cache.deinit();
+        self.decoded_cache = null;
     }
 
     fn releaseDecoded(raw: *anyopaque, item: *anyopaque) void {
@@ -756,7 +776,10 @@ const State = struct {
         if (self.decoded_cache == null) self.decoded_cache = DecodedCache.create(self.registry.allocator, self.resource_manager, decoded_cache_bytes) catch null;
         const cache = self.decoded_cache;
         self.lifetime_mutex.unlock();
-        const lease = (try (cache orelse return null).acquire(request)) orelse return null;
+        const lease = (try (cache orelse return null).acquire(request)) orelse {
+            self.discardDeclinedDecode();
+            return null;
+        };
         transferred = true;
         return .{ .value = lease.entry.value.?, .owner = self, .item = lease.entry, .release_fn = releaseDecoded, .retained_bytes = lease.entry.arena.queryCapacity() };
     }
