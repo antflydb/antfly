@@ -377,6 +377,10 @@ pub fn catchUpIndexFromMatchingCursor(
         }
 
         const collected_bytes = builder.tracked_bytes;
+        // No-op records stay in the window, so their progress is saved with
+        // the record they precede; they must not stop it from yielding.
+        const single_record = builder.work_records == 1;
+        const work_sequence = builder.work_sequence;
         const batch = try builder.finishBorrowed(chunk_stats.last_sequence);
         var window_open = false;
         errdefer if (window_open) {
@@ -392,13 +396,12 @@ pub fn catchUpIndexFromMatchingCursor(
             window_open = true;
         }
 
-        const single_record = builder.accepted_records == 1;
         const resume_offset: usize = if (resume_cursor) |cursor|
-            (if (single_record and cursor.sequence == chunk_stats.last_sequence) @intCast(cursor.offset) else 0)
+            (if (single_record and cursor.sequence == work_sequence) @intCast(cursor.offset) else 0)
         else
             0;
         resume_cursor = null;
-        // Only a single-record window can stop inside its record: its items
+        // Only a window with one record of work can stop inside it: its items
         // are exactly that record's, in a deterministic order.
         const yield_deadline: ?u64 = if (partial_enabled and single_record) blk: {
             var limit: ?u64 = options.deadline_ns;
@@ -425,7 +428,7 @@ pub fn catchUpIndexFromMatchingCursor(
                 };
                 window_open = false;
             }
-            options.save_partial_fn.?(options.partial_ctx.?, index_ref.name, .{ .sequence = chunk_stats.last_sequence, .offset = next_offset }) catch |err| {
+            options.save_partial_fn.?(options.partial_ctx.?, index_ref.name, .{ .sequence = work_sequence, .offset = next_offset }) catch |err| {
                 logCatchUpError(index_ref, "persist_partial", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
                 return err;
             };
@@ -466,7 +469,7 @@ pub fn catchUpIndexFromMatchingCursor(
         }
         // A resumed record completed: drop its resume point. Best effort, as
         // applied progress now passes it and progress resets clear it too.
-        if (resume_offset != 0) options.save_partial_fn.?(options.partial_ctx.?, index_ref.name, .{ .sequence = chunk_stats.last_sequence, .offset = 0 }) catch |err|
+        if (resume_offset != 0) options.save_partial_fn.?(options.partial_ctx.?, index_ref.name, .{ .sequence = work_sequence, .offset = 0 }) catch |err|
             logCatchUpError(index_ref, "clear_partial", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
         completed_windows += 1;
         call_bytes +|= collected_bytes;
@@ -587,6 +590,11 @@ const ReplayChunkBuilder = struct {
     tracked_bytes: u64 = 0,
     tracked_dense_vector_bytes: u64 = 0,
     item_count: usize = 0,
+    /// Records in this window with work for the index, and the last one's
+    /// sequence. Bounded replay can yield inside a window holding exactly one
+    /// such record: no-op records add no items, so every batch item is its.
+    work_records: usize = 0,
+    work_sequence: u64 = 0,
     max_items: usize = 0,
     estimated_dense_vector_bytes: u64 = 0,
     max_work_chunk_bytes: u64 = 0,
@@ -626,6 +634,12 @@ const ReplayChunkBuilder = struct {
         if (self.resource_manager) |manager|
             manager.adjustUsage(.derived_replay_window, &self.tracked_bytes, 0) catch {};
         self.* = undefined;
+    }
+
+    fn noteWork(self: *@This(), sequence: u64, record: change_journal_mod.Record) void {
+        if (recordItemCountForIndex(record, self.index_ref.kind) == 0) return;
+        self.work_records += 1;
+        self.work_sequence = sequence;
     }
 
     fn resetEmptyWindow(self: *@This()) void {
@@ -842,11 +856,7 @@ const ReplayChunkBuilder = struct {
     }
 
     fn wouldOverflowWithRecord(self: *@This(), record: change_journal_mod.Record) bool {
-        // Only a window with no records yet admits a record over its limits.
-        // Records with no work for this index leave the window without bytes
-        // or items, but still count: an oversized record behind them must
-        // start its own window, where bounded replay can yield inside it.
-        if (self.accepted_records == 0) return false;
+        if (self.tracked_bytes == 0 and self.item_count == 0) return false;
         if (self.max_chunk_bytes > 0 or self.max_work_chunk_bytes != 0) {
             const incoming_bytes = recordEstimatedBytesForIndex(record, self.index_ref.kind, self.estimatedDenseVectorBytes());
             if (self.max_chunk_bytes > 0 and self.tracked_bytes +| incoming_bytes > self.max_chunk_bytes) return true;
@@ -1046,6 +1056,7 @@ fn replayChunkConsumeRecord(ctx: *anyopaque, sequence: u64, payload: []const u8)
         try builder.appendRecord(record);
         if (!builder.has_accepted_work) builder.has_accepted_work = builder.hasOutput();
         builder.accepted_records += 1;
+        builder.noteWork(sequence, record);
         return;
     }
 
@@ -1055,6 +1066,7 @@ fn replayChunkConsumeRecord(ctx: *anyopaque, sequence: u64, payload: []const u8)
     try builder.appendRecord(record.record);
     if (!builder.has_accepted_work) builder.has_accepted_work = builder.hasOutput();
     builder.accepted_records += 1;
+    builder.noteWork(sequence, record.record);
 }
 
 fn recordEstimatedBytesForIndex(record: change_journal_mod.Record, kind: db_types.IndexKind, estimated_dense_vector_bytes: u64) u64 {
@@ -1969,7 +1981,7 @@ test "catchUpIndex yields inside an oversized full text record and resumes at it
     try std.testing.expectEqual(@as(?PartialCursor, null), store.cursor);
 }
 
-test "catchUpIndex isolates an oversized full text record behind a no-op record" {
+test "catchUpIndex yields inside an oversized full text record behind a no-op record" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
