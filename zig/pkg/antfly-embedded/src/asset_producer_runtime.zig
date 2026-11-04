@@ -7541,7 +7541,8 @@ test "generator item failures preserve remote retry guidance" {
         \\{"index":1,"error":{"code":"CONTENT_TOO_LARGE","retryable":false}}
         \\],"execution":{"requested_items":2,"native_batches":0,"native_items":0,"serial_items":2,"rejected_items":0,"fallback_items":0}}
     ;
-    var batch = try parseAntflyGenerateBatchResponseAlloc(std.testing.allocator, payload, &requests);
+    const parsed = try parseAntflyGenerateBatchResponseAlloc(std.testing.allocator, payload, &requests);
+    var batch = asset_producer.ProducedBatch{ .items = parsed.items, .execution = parsed.execution };
     defer batch.deinit(std.testing.allocator);
 
     const transient = batch.items[0].result.item_error;

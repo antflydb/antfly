@@ -14188,6 +14188,13 @@ paths:
       responses:
         '200':
           description: Embeddings generated successfully
+          headers:
+            X-Antfly-Model-Revision:
+              description: The acquired model revision, acknowledging model_revision after successful
+                execution. Present for pinned JSON and numeric responses.
+              schema:
+                type: string
+                pattern: ^[0-9a-f]{64}$
           content:
             application/json:
               schema:
@@ -14222,6 +14229,20 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '409':
+          description: The model identity or immutable revision pin does not match the acquired model.
+          headers:
+            X-Antfly-Capability-Stale:
+              description: Present with value true for a stale model revision. Refresh capabilities and
+                replan before retrying.
+              schema:
+                type: string
+                enum:
+                  - 'true'
           content:
             application/json:
               schema:
@@ -15997,6 +16018,13 @@ paths:
       responses:
         '200':
           description: Embedding response
+          headers:
+            X-Antfly-Model-Revision:
+              description: The acquired model revision, acknowledging model_revision after successful
+                execution. Present for pinned JSON and numeric responses.
+              schema:
+                type: string
+                pattern: ^[0-9a-f]{64}$
           content:
             application/json:
               schema:
@@ -16031,6 +16059,20 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '409':
+          description: The model identity or immutable revision pin does not match the acquired model.
+          headers:
+            X-Antfly-Capability-Stale:
+              description: Present with value true for a stale model revision. Refresh capabilities and
+                replan before retrying.
+              schema:
+                type: string
+                enum:
+                  - 'true'
           content:
             application/json:
               schema:
@@ -52402,6 +52444,13 @@ components:
         - model
         - input
       properties:
+        model_revision:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: Optional immutable execution revision from model capabilities. Every acquired model,
+            including recovery attempts, must match before inference. A mismatch returns 409 with X-Antfly-Capability-Stale
+            true. Successful execution acknowledges the pin in X-Antfly-Model-Revision for JSON and numeric
+            responses; callers requiring a pin must reject missing or different acknowledgements.
         model_identity:
           type: string
           pattern: ^[0-9a-f]{64}$
@@ -53881,6 +53930,12 @@ components:
               format: int64
               minimum: 1
               maximum: 4294967295
+        model_revision_pinning:
+          type: boolean
+          default: false
+          description: The embedding endpoint enforces model_revision and acknowledges successful execution
+            in X-Antfly-Model-Revision for both JSON and numeric responses. An observed model_revision
+            alone does not establish this support.
         model_revision:
           type: string
           minLength: 64

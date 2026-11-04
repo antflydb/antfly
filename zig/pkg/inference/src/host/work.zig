@@ -528,6 +528,9 @@ pub const CapabilityRevision = struct {
 
 pub const CapabilityLease = struct {
     capabilities: ?InferenceCapabilities,
+    /// Conservative planner defaults are not an advertised provider contract.
+    /// Executors must not reject legacy invocations using these estimates.
+    planning_only: bool = false,
     routing_token: ?RoutingToken = null,
     descriptor_revision: ?CapabilityRevision = null,
     /// Digest of URL, model, task and authorization/source headers at planning.
@@ -1017,6 +1020,9 @@ pub const DenseEmbeddingOutput = struct {
 pub const InferenceCapabilities = struct {
     /// Stable model/tokenizer identity, available before loading weights.
     model_revision: ?[32]u8 = null,
+    /// The HTTP embed executor enforces model_revision and acknowledges it
+    /// for JSON and numeric results. Catalog identity alone is not this promise.
+    model_revision_pinning: bool = false,
     dense_output: ?DenseEmbeddingOutput = null,
     task: Task,
     input_modalities: Modalities,

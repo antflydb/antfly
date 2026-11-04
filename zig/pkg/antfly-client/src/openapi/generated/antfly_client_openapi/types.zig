@@ -30397,6 +30397,8 @@ pub const InferenceDocumentJobRequest = struct {
 
 /// OpenAI-compatible embedding request with inference multimodal content-part extension. EmbeddingGemma 2 text encoding uses official task prefixes, a shared 8192-token limit, mean pooling including prompt tokens, and normalized vectors.
 pub const InferenceEmbedRequest = struct {
+    /// Optional immutable execution revision from model capabilities. Every acquired model, including recovery attempts, must match before inference. A mismatch returns 409 with X-Antfly-Capability-Stale true. Successful execution acknowledges the pin in X-Antfly-Model-Revision for JSON and numeric responses; callers requiring a pin must reject missing or different acknowledgements.
+    model_revision: ?[]const u8 = null,
     /// Optional exact asset identity pin. A mismatch returns 409 before inference.
     model_identity: ?[]const u8 = null,
     /// Model name to use for embedding generation
@@ -30418,6 +30420,7 @@ pub const InferenceEmbedRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "model_revision", "model_revision", true },
         .{ "model_identity", "model_identity", true },
         .{ "model", "model", false },
         .{ "input", "input", false },
@@ -30439,6 +30442,10 @@ pub const InferenceEmbedRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.model_revision) |value| {
+            try jw.objectField("model_revision");
+            try jw.write(value);
+        }
         if (self.model_identity) |value| {
             try jw.objectField("model_identity");
             try jw.write(value);
@@ -32036,6 +32043,8 @@ pub const InferenceModelInfo = struct {
     inference_capabilities: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Proven native dense output width and inclusive supported truncation range, read from resolved metadata without loading weights. Omitted when unknown or for non-embedding tasks.
     dense_output: ?std.json.Value = null,
+    /// The embedding endpoint enforces model_revision and acknowledges successful execution in X-Antfly-Model-Revision for both JSON and numeric responses. An observed model_revision alone does not establish this support.
+    model_revision_pinning: ?bool = null,
     /// Immutable resolved embedding or generator generation, returned for scoped model/task discovery without loading weights.
     model_revision: ?[]const u8 = null,
     /// Pull-time qualified request profiles for this exact artifact, including backend, supported features and min/max geometry. Runtime admission revalidates artifact identity and resource limits. Omitted for artifacts without a qualification receipt.
@@ -32057,6 +32066,7 @@ pub const InferenceModelInfo = struct {
         .{ "chunking_limits", "chunking_limits", true },
         .{ "inference_capabilities", "inference_capabilities", true },
         .{ "dense_output", "dense_output", true },
+        .{ "model_revision_pinning", "model_revision_pinning", true },
         .{ "model_revision", "model_revision", true },
         .{ "qualified_limits", "qualified_limits", true },
         .{ "compatibility", "compatibility", true },
@@ -32090,6 +32100,10 @@ pub const InferenceModelInfo = struct {
         }
         if (self.dense_output) |value| {
             try jw.objectField("dense_output");
+            try jw.write(value);
+        }
+        if (self.model_revision_pinning) |value| {
+            try jw.objectField("model_revision_pinning");
             try jw.write(value);
         }
         if (self.model_revision) |value| {

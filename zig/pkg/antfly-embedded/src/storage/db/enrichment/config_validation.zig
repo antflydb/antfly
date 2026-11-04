@@ -366,3 +366,32 @@ pub fn priorSharesGroup(configs: anytype, name: []const u8, prior: []const u8) b
     const prior_root = @import("enrichment_types.zig").groupRoot(configs, prior) orelse return false;
     return std.mem.eql(u8, current_root, prior_root);
 }
+
+/// Shared admission for a media-output projection's edge into a model pass.
+/// API normalization and local installation must accept the same recipes.
+pub fn validateMediaOutputSource(alloc: Allocator, producer_json: []const u8, chunker_json: []const u8, upstream_source: []const u8) !void {
+    if (upstream_source.len != 0 or chunker_json.len == 0) return error.InvalidEnrichmentConfig;
+    var chunker = try @import("../../../chunking/types.zig").parseConfigFromSlice(alloc, chunker_json);
+    defer chunker.deinit(alloc);
+    if (!chunker.isModelAware() or chunker.outputs_json.len == 0) return error.InvalidEnrichmentConfig;
+    var outputs = try std.json.parseFromSlice(@import("inference_chunker").outputs.Config, alloc, chunker.outputs_json, .{});
+    defer outputs.deinit();
+    var producer = try asset_producer.parseProducerConfig(alloc, producer_json);
+    defer producer.deinit(alloc);
+    if (producer.type != .media_output) return error.InvalidEnrichmentConfig;
+    var consumer = try @import("media_output.zig").parse(alloc, producer.config_json);
+    defer consumer.deinit();
+    for (outputs.value.targets) |target| {
+        if (std.mem.eql(u8, target.name, consumer.value.output_name)) return;
+    }
+    return error.InvalidEnrichmentConfig;
+}
+
+/// A media-output asset is the root of an ordinary asset-bytes chain. Its
+/// separate edge into the model pass is validated by validateMediaOutputSource;
+/// consumers must not reinterpret that chunk name as another asset name.
+pub fn assetSourceChainEndsHere(alloc: Allocator, producer_json: []const u8) !bool {
+    var producer = try asset_producer.parseProducerConfig(alloc, producer_json);
+    defer producer.deinit(alloc);
+    return producer.type == .media_output;
+}

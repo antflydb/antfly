@@ -16,6 +16,9 @@ All notable changes to Antfly will be documented in this file.
 
 ### [Unreleased]
 
+- **evalaf removed** — remove the unused `go/pkg/evalaf` evaluation module and
+  its Antfly plugin. Nothing in this repository depends on them.
+
 - **Trusted-principal authorization** — reject requests carrying a trusted
   principal when no verifier is configured, including MCP and inference routes
   with local authentication disabled. MCP sessions cannot preserve a previous
@@ -66,7 +69,7 @@ All notable changes to Antfly will be documented in this file.
   phase, are scoped to the authenticated user, and survive restarts in local
   standalone mode. Available from the CLI (`antfly agents research`, `--job`),
   the Go and TypeScript SDKs, `@antfly/components` (`useResearchStream`,
-  `ResearchReport`), evalaf, and as the A2A `research` skill.
+  `ResearchReport`), and as the A2A `research` skill.
 - **Retrieval agent `fetch` tool** — agents can read full web pages. Fetch is
   opt-in and admits only URLs returned by `web_search` in the same run or on
   `fetch_config.allowed_hosts`; private addresses are always blocked. Tool

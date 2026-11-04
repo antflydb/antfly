@@ -216,10 +216,10 @@ pub fn prepare(alloc: std.mem.Allocator, command: publication.Command, catalogs:
             try changed.append(owned, expected);
         } else try deleted.append(owned, expected);
     }
-    // Finish arena allocation before transferring its state into Prepared.
-    // A final allocation can grow the arena and replace its backing list.
-    const scope_key = try owned.dupe(u8, command.producer_scope_key);
-    return .{ .arena = arena, .chunk_vector_fence = .{ .scope = scope_key, .requires_member = changed.items.len != 0 }, .batch = .{
+    // Finish allocations before copying the arena owner. Growing the arena
+    // after that copy would leave its new allocation chain unowned.
+    const owned_scope = try owned.dupe(u8, command.producer_scope_key);
+    return .{ .arena = arena, .chunk_vector_fence = .{ .scope = owned_scope, .requires_member = changed.items.len != 0 }, .batch = .{
         .dense_embeddings = dense.items,
         .sparse_embeddings = sparse.items,
         .changed_artifact_keys = changed.items,
