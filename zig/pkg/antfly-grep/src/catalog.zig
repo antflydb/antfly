@@ -19,6 +19,8 @@ const std = @import("std");
 const A = std.mem.Allocator;
 const indexed = @import("indexed.zig");
 pub const Source = struct {
+    publication: []const u8 = "text",
+    document_version: u32 = 1,
     published_revision: ?[]const u8 = null,
     id: []const u8,
     alias: ?[]const u8 = null,
@@ -36,6 +38,7 @@ pub const Catalog = struct {
     principals: []const []const u8 = &.{},
 };
 pub fn table(source: Source) !indexed.Table {
+    if (source.document_version != 1 or std.mem.eql(u8, source.publication, "media")) return error.UnsupportedSourceKind;
     if (source.filter != .object or !std.mem.eql(u8, source.document_field, "grep")) return error.InvalidSourceCatalog;
     if (source.id.len == 0 or source.id.len > 512 or std.mem.indexOfAny(u8, source.id, "\x00\r\n") != null or source.table.len == 0 or std.mem.indexOfAny(u8, source.table, "\x00\r\n") != null or std.mem.eql(u8, source.table, ".") or std.mem.eql(u8, source.table, "..")) return error.InvalidSourceCatalog;
     if (source.access_id) |id| {
@@ -56,7 +59,11 @@ pub fn load(a: A, io: std.Io, path: []const u8) ![]const u8 {
     if (catalog.version != 2 or catalog.sources.len == 0 or catalog.sources.len > 1000 or catalog.principals.len > 262144) return error.InvalidSourceCatalog;
     try @import("providers.zig").validateCustom(catalog.endpoint);
     var tables: std.ArrayList(indexed.Table) = .empty;
-    for (catalog.sources) |source| try tables.append(state, try table(source));
+    for (catalog.sources) |source| {
+        if (source.document_version == 2 and std.mem.eql(u8, source.publication, "media")) continue;
+        try tables.append(state, try table(source));
+    }
+    if (tables.items.len == 0) return error.NoConnectedSources;
     return std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 1), .endpoint = catalog.endpoint, .tables = tables.items, .principals = catalog.principals }, .{});
 }
 
@@ -145,10 +152,15 @@ fn discoverSelected(a: A, io: std.Io, endpoint: []const u8, catalog_table: []con
         if (result.hits.hits.len > 64) return error.InvalidSourceCatalog;
         for (result.hits.hits) |hit| {
             if (source_id) |id| if (!std.mem.eql(u8, id, hit._id)) return error.InvalidSourceCatalog;
-            if (hit._source.version != 1 or hit._source.document_version != 1 or !std.mem.eql(u8, hit._source.doc_type, "source_catalog") or !std.mem.eql(u8, hit._id, hit._source.source.id)) return error.InvalidSourceCatalog;
+            if (hit._source.version != 1 or (hit._source.document_version != 1 and hit._source.document_version != 2) or !std.mem.eql(u8, hit._source.doc_type, "source_catalog") or !std.mem.eql(u8, hit._id, hit._source.source.id)) return error.InvalidSourceCatalog;
             if (previous) |id| if (std.mem.order(u8, id, hit._id) != .lt) return error.InvalidSourceCatalog;
             if (std.mem.eql(u8, hit._source.source.status, "searchable") and (hit._source.source.valid_until == null or hit._source.published_revision.len == 0)) return error.InvalidSourceCatalog;
             previous = hit._id;
+            if (hit._source.document_version == 2) {
+                if (hit._source.source.document_version != 2 or !std.mem.eql(u8, hit._source.source.publication, "media")) return error.InvalidSourceCatalog;
+                if (source_id != null) return error.UnsupportedSourceKind;
+                continue;
+            }
             _ = try table(hit._source.source);
             var binding = hit._source.source;
             binding.published_revision = hit._source.published_revision;
@@ -193,4 +205,20 @@ pub fn validatePublication(a: A, io: std.Io, options: *const @import("options.zi
         return;
     }
     return error.SourcePublicationChanged;
+}
+
+test "media bindings cannot be interpreted as text tables" {
+    const media: Source = .{
+        .id = "media-source",
+        .table = "files",
+        .document_field = "grep",
+        .filter = .null,
+        .status = "searchable",
+        .publication = "media",
+        .document_version = 2,
+    };
+    try std.testing.expectError(error.UnsupportedSourceKind, table(media));
+    var invalid = media;
+    invalid.document_version = 1;
+    try std.testing.expectError(error.UnsupportedSourceKind, table(invalid));
 }
