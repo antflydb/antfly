@@ -378,6 +378,68 @@ chain. Unrelated older history remains eligible when the required chain is
 intact. This can extend retention while publications/readers need that ancestry;
 accepted query validation and deletion proofs remain unchanged.
 
+## Fresh optimized run after hints and ancestry protection
+
+The frozen `14772abf19` ReleaseFast binary has SHA-256
+`55059f0b7b4f59dd852b9cf69e4ec3cd6de3272f033af7f9479e10eeccbd73ca`.
+Its local smoke passed, but its fresh full local profile remained **unqualified**:
+one accepted search timed out after 60.00 seconds before response headers.
+The run otherwise completed in 977.93 seconds with all row, publication, restart
+and maintenance checks passing. Published searches had median / p95 / maximum
+27.56 / 274.71 / 4,817.03 ms; successful accepted searches had
+48.73 / 82.39 / 1,369.18 ms. The timeout is excluded from that successful-request
+distribution. Publication lag was median 11.15 / p95 28.98 seconds, with 11.47
+seconds of final catch-up. Maintenance reported one deletion during writes and
+73 overall; 16 expired snapshot manifest lists were independently absent.
+
+Live metrics captured the timed-out request inside public dispatch, with a
+55.74-second admission age at client failure. The stack traversed result
+hydration into the Parquet column coordinator's completion-event wait. Other
+reads and writes continued. This locates the stalled path; it does not establish
+the precise ordering that stranded it. A small reset-ordering control did not
+reproduce a lost notification, so weak-memory reordering remains a hypothesis.
+
+The follow-up replaces the resettable completion event with a generation
+counter shared by the SQL scheduler's notified cohorts. Coordinators observe
+the generation before inspecting readiness, then futex-wait only while that
+generation is unchanged. Completion publishes readiness before advancing it.
+The Parquet coordinator also bounds its park and checks the request context
+before scanning and after waiting, then cancels/joins outstanding work on exit.
+Tests cover coalesced notifications before parking, wraparound, expiry without
+a notification, immediate worker cohorts and cancellation with parked siblings.
+This is not yet evidence that the optimized timeout has been eliminated.
+
+The concurrent GCS run reproduced five accepted 503s. New counters attribute
+them to overlay coverage, rather than the other reader/cache/lease causes.
+It also exceeded the 300-second restart-maintenance allowance, ending incomplete
+at 2,140.87 seconds. Published searches had median / p95 / maximum
+1,295.70 / 1,610.73 / 4,298.03 ms; successful accepted searches had
+1,857.97 / 2,553.36 / 4,874.19 ms. Publication lag was median 203.33 / p95 353.54
+seconds, with 199.80 seconds of final catch-up. Maintenance reported two
+deletions during writes and three overall; the independent post-maintenance
+deletion checks were not reached. All 102 expected row images were verified
+before and after restart, but post-maintenance validation was not reached.
+These are contended, cross-region developer
+measurements, not production SLOs.
+
+Investigation independently reproduced another coverage bug in Debug: 72 valid
+WAL records, with catalog commit keeping pace at every append, could not replay
+from an older searchable publication. The adapter applied the 64-record
+catalog-admission backlog limit to publication replay as well. These are
+different cuts: search publication can lag an otherwise healthy catalog.
+
+Replay now retains the existing 32 MiB encoded/payload/descriptor budget and
+derives its record guard from that budget. The uncommitted ingestion backlog
+remains 64. Missing retained WAL coverage still fails closed. The regression
+failed with `LakeOverlayCoverageUnavailable` before the change and passes after
+it; the existing admission/backpressure controls also pass. A cached replay
+test verifies normalization of the longer committed suffix to its final row
+image. Fresh optimized qualification of these subsequent fixes remains required.
+The shared SQL scheduling tests, all 59 object-WAL owner tests and the broader
+697-test Debug lake corpus (one skipped) passed without leaks. The SQL test
+owner also needed its missing native runtime ABI import for shared memory
+admission's named callbacks.
+
 Next work should:
 
 1. Attribute the remaining accepted-search failures with live public stages,
