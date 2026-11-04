@@ -664,10 +664,7 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             count.* += 1;
             const id = try document.string(hit, "_id");
             const source = document.field(hit, "_source") orelse return error.InvalidIndexResponse;
-            if (table.selected_stream) |stream| if (stream.artifact == null and document.at(source, stream.field) == null and document.at(source, "content.resource") != null) {
-                if (search.options.artifacts.items.len == 0 and table.streams.len == 1) return error.NativeArtifactStreamRequired;
-                continue;
-            };
+            const binary_inline = if (table.selected_stream) |stream| stream.artifact == null and document.at(source, stream.field) == null and document.at(source, "content.resource") != null else false;
             if (table.selected_stream) |stream| if (stream.artifact) |expected| {
                 const actual = document.at(hit, "hierarchy.artifact.name") orelse return error.MissingArtifactIdentity;
                 if (actual != .string) return error.MissingArtifactIdentity;
@@ -678,7 +675,7 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                 if (table.selected_stream) |stream| if (stream.artifact != null) {
                     parent = document.at(hit, "hierarchy.ancestors.source.document") orelse return error.MissingArtifactSource;
                 };
-                const content = if (metadataListing(search.options)) "" else if (table.selected_stream) |stream| try record_view.text(source, stream.field) else "";
+                const content = if (metadataListing(search.options) or binary_inline) "" else if (table.selected_stream) |stream| try record_view.text(source, stream.field) else "";
                 break :mapped try record_view.view(a, parent, fields, content);
             } else document.at(source, table.document_field) orelse return error.MissingGrepDocument;
             var doc = if (metadataListing(search.options))
@@ -710,6 +707,10 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             }
             if (!try discovery.indexedAllowed(doc.path)) {
                 search.skipped();
+                continue;
+            }
+            if (binary_inline) {
+                if (requiresNativeStreamCheck(search.options, table)) return error.NativeArtifactStreamRequired;
                 continue;
             }
             if (search.options.sourced()) {
@@ -1379,6 +1380,9 @@ fn contentQuery(a: A, search: anytype, table: Table) !?std.json.Value {
     if (literals.len == 0) return null;
     const field = if (table.selected_stream) |stream| stream.field else try std.fmt.allocPrint(a, "{s}.content", .{table.document_field});
     var alternatives: std.ArrayList(std.json.Value) = .empty;
+    // Do not let necessary text literals hide unbound binary originals. Their
+    // metadata must reach the same ACL/path checks and completeness guard.
+    if (requiresNativeStreamCheck(search.options, table)) try alternatives.append(a, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"equals\":\"source\",\"field\":\"content.resource.type\"}", .{}));
     for (literals) |literal| {
         const encoded = try std.json.Stringify.valueAlloc(a, .{ .contains = literal, .field = field, .case_sensitive = true }, .{});
         try alternatives.append(a, try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}));
@@ -1396,9 +1400,12 @@ fn candidateFilter(a: A, search: anytype, table: Table, user_filter: ?std.json.V
     if (!canPrune(o)) return user_filter;
     const literals = (try search.matcher.requiredLiterals(a)) orelse return user_filter;
     var grams: std.ArrayList(std.json.Value) = .empty;
-    const certificate_bytes = try std.json.Stringify.valueAlloc(a, .{ .term = "raw-byte-trigrams-v1", .field = index.version_field }, .{});
+    const certificate_bytes = try std.json.Stringify.valueAlloc(a, .{ .equals = "raw-byte-trigrams-v1", .field = index.version_field }, .{});
     const certificate = (try std.json.parseFromSlice(std.json.Value, a, certificate_bytes, .{ .allocate = .alloc_always })).value;
     var alternatives: std.ArrayList(std.json.Value) = .empty;
+    // A text certificate never certifies the availability of binary extraction.
+    // Preserve its completeness check while retaining trigram pruning for text.
+    if (requiresNativeStreamCheck(search.options, table)) try alternatives.append(a, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"equals\":\"source\",\"field\":\"content.resource.type\"}", .{}));
     for (literals) |literal| {
         grams.clearRetainingCapacity();
         const n = @min(@as(usize, 8), literal.len - 2);
@@ -1415,7 +1422,7 @@ fn candidateFilter(a: A, search: anytype, table: Table, user_filter: ?std.json.V
             if (duplicate) continue;
             seen[seen_count] = gram;
             seen_count += 1;
-            const encoded = try std.json.Stringify.valueAlloc(a, .{ .term = gram[0..], .field = index.field }, .{});
+            const encoded = try std.json.Stringify.valueAlloc(a, .{ .equals = gram[0..], .field = index.field }, .{});
             const term = try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .allocate = .alloc_always });
             try grams.append(a, term.value);
         }
@@ -1428,12 +1435,17 @@ fn candidateFilter(a: A, search: anytype, table: Table, user_filter: ?std.json.V
     // This permits incremental backfills without dropping legacy revisions.
     const candidates_bytes = try std.json.Stringify.valueAlloc(a, .{ .disjuncts = .{
         .{ .conjuncts = .{ certificate, union_value } },
-        .{ .must_not = .{ .disjuncts = .{certificate} } },
+        .{ .bool = .{ .must_not = .{certificate} } },
     } }, .{});
     const candidates = (try std.json.parseFromSlice(std.json.Value, a, candidates_bytes, .{ .allocate = .alloc_always })).value;
     if (user_filter == null) return candidates;
     const encoded = try std.json.Stringify.valueAlloc(a, .{ .conjuncts = .{ user_filter.?, candidates } }, .{});
     return (try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .allocate = .alloc_always })).value;
+}
+
+fn requiresNativeStreamCheck(o: *const @import("options.zig").Options, table: Table) bool {
+    const stream = table.selected_stream orelse return false;
+    return table.fields != null and stream.artifact == null and table.streams.len == 1 and o.artifacts.items.len == 0;
 }
 
 fn metadataListing(o: *const @import("options.zig").Options) bool {
@@ -1449,7 +1461,10 @@ fn tableProjectionFields(a: A, o: *const @import("options.zig").Options, table: 
     };
     var result: std.ArrayList([]const u8) = .empty;
     try result.appendSlice(a, try record_view.parentFields(a, fields));
-    if (!metadataListing(o)) if (table.selected_stream) |stream| try result.append(a, stream.field);
+    if (!metadataListing(o)) if (table.selected_stream) |stream| {
+        try result.append(a, stream.field);
+        try result.append(a, "content.resource.type");
+    };
     return result.toOwnedSlice(a);
 }
 

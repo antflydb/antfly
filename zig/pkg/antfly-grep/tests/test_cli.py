@@ -314,13 +314,31 @@ class DecisionHandler(BaseHTTPRequestHandler):
             if "ids" in query:
                 return doc["_id"] in query["ids"]
             if "bool" in query:
-                return candidate_matches(query["bool"].get("filter"), doc)
+                b = query["bool"]
+                required = b.get("must", []) + (
+                    [b["filter"]]
+                    if isinstance(b.get("filter"), dict)
+                    else b.get("filter", [])
+                )
+                return (
+                    all(candidate_matches(q, doc) for q in required)
+                    and not any(
+                        candidate_matches(q, doc) for q in b.get("must_not", [])
+                    )
+                    and sum(candidate_matches(q, doc) for q in b.get("should", []))
+                    >= b.get(
+                        "minimum_should_match",
+                        int(bool(b.get("should")) and not required),
+                    )
+                )
             if "disjuncts" in query:
                 return any(candidate_matches(q, doc) for q in query["disjuncts"])
             if "must_not" in query:
                 return not candidate_matches(query["must_not"], doc)
             if query.get("field") == "grep_trigrams_version":
-                return doc["_source"].get("grep_trigrams_version") == query["term"]
+                return doc["_source"].get("grep_trigrams_version") == query.get(
+                    "term", query.get("equals")
+                )
             if "conjuncts" in query:
                 return all(candidate_matches(q, doc) for q in query["conjuncts"])
             if "contains" in query:
@@ -334,7 +352,10 @@ class DecisionHandler(BaseHTTPRequestHandler):
                 term = query.get("match", query.get("regexp", "").removesuffix(".*"))
                 return term in normalized
             if query.get("field") == "grep_trigrams":
-                return query["term"] in doc["_source"]["grep_trigrams"]
+                return (
+                    query.get("term", query.get("equals"))
+                    in doc["_source"]["grep_trigrams"]
+                )
             return True
 
         docs = [doc for doc in docs if candidate_matches(body.get("filter_query"), doc)]

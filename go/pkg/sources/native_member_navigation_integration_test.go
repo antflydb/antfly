@@ -389,7 +389,7 @@ func TestNativeMemberSourceAuthorityIntegration(t *testing.T) {
 		if id == "allowed" {
 			content = map[string]any{"resource": map[string]any{"type": "source", "uri": "gs://fixture/file.pdf"}}
 		}
-		records[id] = map[string]any{"source": map[string]any{"uri": "gs://fixture/" + id, "path": id + ".pdf", "revision": "1", "indexed_at": time.Now().Unix()}, "permissions": map[string]any{"public": id == "allowed", "readers": []string{}}, "metadata": map[string]any{}, "marker": id, "content": content, "payload": `{"text":"needle","parent_doc_key":"secret","_parent_doc_key":"secret"}`}
+		records[id] = map[string]any{"source": map[string]any{"uri": "gs://fixture/" + id, "path": id + ".pdf", "revision": "1", "indexed_at": time.Now().Unix()}, "permissions": map[string]any{"public": id == "allowed", "readers": []string{}}, "metadata": map[string]any{}, "marker": id, "certificate": "raw-byte-trigrams-v1", "trigrams": []string{}, "content": content, "payload": `{"text":"needle","parent_doc_key":"secret","_parent_doc_key":"secret"}`}
 	}
 	require.NoError(t, p.Batch(t.Context(), table, records, nil))
 	require.Eventually(t, func() bool {
@@ -427,7 +427,7 @@ func TestNativeMemberSourceAuthorityIntegration(t *testing.T) {
 			streams = streams[:1]
 		}
 		file := filepath.Join(t.TempDir(), "grep.json")
-		require.NoError(t, writeJSON(file, map[string]any{"version": 1, "endpoint": endpoint, "principals": []string{"user:self"}, "tables": []any{map[string]any{"name": table, "fields": CanonicalDocumentFields(), "source_filter": map[string]any{"doc_id": map[string]any{"ids": []string{"allowed"}}}, "streams": streams}}}, 1<<20))
+		require.NoError(t, writeJSON(file, map[string]any{"version": 1, "endpoint": endpoint, "principals": []string{"user:self"}, "tables": []any{map[string]any{"name": table, "candidate_index": map[string]any{"version": 1, "field": "trigrams", "version_field": "certificate"}, "fields": CanonicalDocumentFields(), "source_filter": map[string]any{"doc_id": map[string]any{"ids": []string{"allowed"}}}, "streams": streams}}}, 1<<20))
 		for _, flags := range [][]string{nil, {"--json"}} {
 			args := append([]string{"--table-config", file}, flags...)
 			output, err := exec.CommandContext(t.Context(), binary, append(args, "needle")...).CombinedOutput()

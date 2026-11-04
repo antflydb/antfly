@@ -31,6 +31,7 @@ BINARY = str(Path(sys.argv.pop(1)).resolve())
 class NativeStreams(unittest.TestCase):
     def setUp(self):
         self.complete = True
+        self.binary = False
         self.revision = 1
         self.wrong_field = False
         self.requests = []
@@ -93,6 +94,8 @@ class NativeStreams(unittest.TestCase):
                     "permissions": {"public": False, "readers": owner.readers},
                     "metadata": {},
                 }
+                if owner.binary:
+                    parent["content"] = {"resource": {"type": "source"}}
                 children = body.get("hierarchy", {}).get("children")
                 if children is None:
                     records = (
@@ -106,6 +109,29 @@ class NativeStreams(unittest.TestCase):
                             }
                         ]
                     )
+                    query = json.dumps(body.get("query"))
+                    if (
+                        owner.binary
+                        and "content.text" in query
+                        and "content.resource.type" not in query
+                    ):
+                        records = []
+                    if "fields" in body:
+                        projected = {}
+                        for path in body["fields"]:
+                            value = parent
+                            parts = path.split(".")
+                            for part in parts:
+                                if not isinstance(value, dict) or part not in value:
+                                    break
+                                value = value[part]
+                            else:
+                                target = projected
+                                for part in parts[:-1]:
+                                    target = target.setdefault(part, {})
+                                target[parts[-1]] = value
+                        for row in records:
+                            row["_source"] = projected
                     self.reply(
                         {
                             "responses": [
@@ -254,6 +280,32 @@ class NativeStreams(unittest.TestCase):
                 if body.get("hierarchy")
             )
         )
+
+    def test_binary_inline_eligibility_survives_projection_and_pruning(self):
+        self.binary = True
+        config = json.loads(self.config.read_text())
+        config["tables"][0]["streams"].insert(
+            0, {"name": "source", "field": "content.text", "default": True}
+        )
+        self.config.write_text(json.dumps(config))
+        result = self.run_grep("Tuesday")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"complete":true', result.stdout)
+        self.assertNotIn('"type":"error"', result.stdout)
+        config["tables"][0]["streams"] = config["tables"][0]["streams"][:1]
+        self.config.write_text(json.dumps(config))
+        result = subprocess.run(
+            [BINARY, "--table-config", str(self.config), "Tuesday"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("NativeArtifactStreamRequired", result.stderr)
+        queries = [
+            body.get("query") for method, body in self.requests if method == "POST"
+        ]
+        self.assertIn("content.resource.type", json.dumps(queries))
 
     def test_generated_selection_and_authorization_narrowing(self):
         result = self.run_grep("Tuesday", "--artifact", "summary")

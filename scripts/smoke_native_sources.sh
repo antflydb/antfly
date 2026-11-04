@@ -64,5 +64,5 @@ export ANTFLY_GREP_TEST_BINARY="$grep_binary"
 export ANTFLY_SOURCE_TEST_VIDEO="$repo/zig/lib/media/testdata/video-audio.mp4"
 cd "$repo/go/pkg/sources"
 GOWORK=off GOEXPERIMENT=simd go test . \
-  -run "${ANTFLY_SOURCE_SMOKE_TESTS:-^Test(LocalAntflySourcePipeline|SourceMediaArtifactIntegration|SourceNativeMultimodalIntegration|NativeMemberNavigationIntegration|NativeMemberSnapshotCompletionIntegration|NativeMemberBatchIntegration)$}" \
+  -run "${ANTFLY_SOURCE_SMOKE_TESTS:-^Test(LocalAntflySourcePipeline|SourceMediaArtifactIntegration|SourceNativeMultimodalIntegration|NativeMemberSourceAuthorityIntegration|NativeMemberNavigationIntegration|NativeMemberSnapshotCompletionIntegration|NativeMemberBatchIntegration)$}" \
   -count=1 -v -timeout 10m

@@ -1152,29 +1152,21 @@ fn loadDirectChunkPayloads(
 fn parseChunkAncestorInfoAlloc(alloc: Allocator, chunk_key: []const u8, payload: []const u8) !ChunkAncestorInfo {
     var decoded = (try artifact_ids.decodeArtifactRefAlloc(alloc, chunk_key)) orelse return error.InvalidChunkArtifact;
     defer decoded.deinit(alloc);
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch |err| {
-        if (err == error.OutOfMemory) return err;
-        if (decoded.kind == .asset and decoded.unit_id == null) return .{ .parent_doc_key = try alloc.dupe(u8, decoded.document_id) };
-        return error.InvalidChunkArtifact;
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) {
-        if (decoded.kind == .asset and decoded.unit_id == null) return .{ .parent_doc_key = try alloc.dupe(u8, decoded.document_id) };
-        return error.InvalidChunkArtifact;
-    }
-    const object = parsed.value.object;
-    const parent_doc_key = if (try jsonObjectStringDupe(alloc, object, "_parent_doc_key")) |key|
-        key
-    else if (try jsonObjectStringDupe(alloc, object, "parent_doc_key")) |key|
-        key
-    else
-        try alloc.dupe(u8, decoded.document_id);
+    // Native keys own source identity. Generic asset payloads are application
+    // data and may legitimately contain fields named parent_doc_key.
+    const parent_doc_key = try alloc.dupe(u8, decoded.document_id);
     errdefer alloc.free(parent_doc_key);
-
+    if (decoded.kind == .asset) return .{
+        .parent_doc_key = parent_doc_key,
+        .unit_key = if (decoded.unit_id) |unit| try internal_keys.documentUnitArtifactKeyAlloc(alloc, parent_doc_key, decoded.name, unit) else null,
+    };
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidChunkArtifact;
+    const object = parsed.value.object;
     const source_artifact_name = try jsonObjectStringDupe(alloc, object, "_source_artifact_name");
     defer if (source_artifact_name) |name| alloc.free(name);
-    const parent_unit_id = try jsonObjectStringDupe(alloc, object, "_parent_unit_id");
-    defer if (parent_unit_id) |unit_id| alloc.free(unit_id);
+    const parent_unit_id = decoded.unit_id;
 
     const unit_key = if (source_artifact_name != null and parent_unit_id != null)
         try internal_keys.documentUnitArtifactKeyAlloc(alloc, parent_doc_key, source_artifact_name.?, parent_unit_id.?)
@@ -3698,4 +3690,21 @@ test "native member value verification retains scan policy and work budgets" {
         }
         try std.testing.expect(!req.value_search_execution.allow_scan);
     }
+}
+
+test "native member ancestry ignores payload source and unit identities" {
+    const a = std.testing.allocator;
+    const payload = "{\"_parent_doc_key\":\"secret\",\"parent_doc_key\":\"secret\",\"_parent_unit_id\":\"wrong-unit\",\"_source_artifact_name\":\"wrong-producer\"}";
+    const asset = try internal_keys.documentUnitArtifactKeyAlloc(a, "allowed", "speech", "segment-1");
+    defer a.free(asset);
+    var info = try parseChunkAncestorInfoAlloc(a, asset, payload);
+    defer info.deinit(a);
+    try std.testing.expectEqualStrings("allowed", info.parent_doc_key);
+    try std.testing.expectEqualStrings(asset, info.unit_key.?);
+    const root = try internal_keys.artifactNamedPrefixAlloc(a, "allowed", "asset", "summary");
+    defer a.free(root);
+    var scalar = try parseChunkAncestorInfoAlloc(a, root, payload);
+    defer scalar.deinit(a);
+    try std.testing.expectEqualStrings("allowed", scalar.parent_doc_key);
+    try std.testing.expect(scalar.unit_key == null);
 }
