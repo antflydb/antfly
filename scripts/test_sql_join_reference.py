@@ -38,7 +38,7 @@ class JoinReferenceTest(unittest.TestCase):
 
     def test_peer_witness_preserves_distinct_from_and_cte_bodies(self):
         cases = self.cases()
-        for case_id in ("sql-1341", "sql-1326", "sql-1320"):
+        for case_id in ("sql-1341", "sql-1326", "sql-1320", "sql-1216"):
             case = cases[case_id]
             witness = reference.join_order_observer(case)
             body = case["sql"].rsplit(" ORDER BY ", 1)[0]

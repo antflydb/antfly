@@ -4697,6 +4697,18 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-original-joins-mounted-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-join-read-test",
+        "-Doptimize=Debug",
+        "-j1",
+        "-Dtest-filter=mounted SQL original joins"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
     }
   },
   "entries": [
@@ -19863,22 +19875,22 @@
     {
       "id": "sql-0853",
       "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "reason": "The source defines a private view_mappings object inside docs.indexes_json, not an admitted public SQL view. A missing support_view rejection does not prove the intended typed-path, required-index, source-generation or schema-fingerprint guard. Keep this original unresolved until source-faithful mapping admission and those native execution proofs are implemented."
     },
     {
       "id": "sql-0854",
       "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "reason": "The source defines a private view_mappings object inside docs.indexes_json, not an admitted public SQL view. A missing support_view rejection does not prove the intended typed-path, required-index, source-generation or schema-fingerprint guard. Keep this original unresolved until source-faithful mapping admission and those native execution proofs are implemented."
     },
     {
       "id": "sql-0855",
       "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "reason": "The source defines a private view_mappings object inside docs.indexes_json, not an admitted public SQL view. A missing support_view rejection does not prove the intended typed-path, required-index, source-generation or schema-fingerprint guard. Keep this original unresolved until source-faithful mapping admission and those native execution proofs are implemented."
     },
     {
       "id": "sql-0856",
       "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "reason": "The source defines a private view_mappings object inside docs.indexes_json, not an admitted public SQL view. A missing support_view rejection does not prove the intended typed-path, required-index, source-generation or schema-fingerprint guard. Keep this original unresolved until source-faithful mapping admission and those native execution proofs are implemented."
     },
     {
       "id": "sql-0857",
@@ -19922,7 +19934,7 @@
     {
       "id": "sql-0859",
       "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "reason": "The source defines a private view_mappings object inside docs.indexes_json, not an admitted public SQL view. A missing support_view rejection does not prove the intended typed-path, required-index, source-generation or schema-fingerprint guard. Keep this original unresolved until source-faithful mapping admission and those native execution proofs are implemented."
     },
     {
       "id": "sql-0860",
@@ -26472,8 +26484,20 @@
     },
     {
       "id": "sql-1216",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged catalog-backed LEFT JOIN executes through authenticated public SQL over independently routed native tables before and after complete owner restart. PostgreSQL 18 verifies the exact row count, NULLs, bag multiplicities and ORDER BY/OFFSET peer frontier. Both native input policies remain mandatory, including after conservative null-rejecting outer-join reduction.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_join_read_integration_test.zig",
+          "test": "mounted SQL original joins preserve catalog cuts policies null padding and peer pagination across restart",
+          "gate": "sql-original-joins-mounted-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_join_campaign_test.zig",
+          "test": "httpx SQL PostgreSQL original joins preserve match scopes nulls and bags",
+          "gate": "sql-original-joins-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1217",

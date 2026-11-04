@@ -1136,7 +1136,7 @@ def join_order_observer(case, retain_offset=True):
     and exposes its existing key. OFFSET is retained after separately proving
     that its cut does not split a peer group.
     """
-    if case.get("family") != "join":
+    if case.get("family") != "join" and case.get("id") != "sql-1216":
         raise ValueError("join witness requires an original join")
     match = re.fullmatch(
         r"(.+) ORDER BY (order_id|1|3) (ASC|DESC|USING >)( NULLS FIRST)? LIMIT ([0-9]+)(?: OFFSET ([0-9]+))?",

@@ -1,14 +1,14 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: ongoing SQL catalog lifecycle qualification, merged with `origin/main`
-at `24486f5f30` (2026-11-03). This is an implementation and qualification
+at `2c0905501d` (2026-11-03). This is an implementation and qualification
 backlog, not a completion claim. PostgreSQL is the SQL standard and independent
 oracle.
 
-## Current original-case qualification (2026-11-02)
+## Current original-case qualification (2026-11-03)
 
-The ledger records **912 implemented / 138 rejected / 449 superseded /
-87 unresolved**, including **64 unresolved DDL/catalog cases**. The immutable
+The ledger records **923 implemented / 138 rejected / 449 superseded /
+76 unresolved**, including **59 unresolved DDL/catalog cases**. The immutable
 inventory still contains the same 1,586 originals. The ledger is authoritative;
 counts in earlier checkpoints below describe their recorded historical state.
 
@@ -18659,3 +18659,30 @@ are qualification, not additional invented original-case closures.
 
 Arbitrary joined/derived LockRows shapes and cross-group deadlock detection are
 separate capabilities; this original-cohort qualification does not claim them.
+
+
+### Catalog-backed joins and null-rejecting outer joins
+
+The unchanged `sql-1216` closes through authenticated mounted SQL and the
+PostgreSQL 18 oracle alongside the 22 existing original joins. Both native
+metadata/data owners restart independently before the complete 23-case campaign
+runs again. Assertions preserve output types, SQL NULLs, bag multiplicity and
+ordered peer frontiers; OFFSET is independently checked not to split a peer
+group. Original parameter values are forwarded unchanged. Mandatory native
+row filters on both input tables remain effective before and after restart.
+The shared CI owner includes this campaign, with an audited nonempty selection.
+
+A conservative bound-program proof removes outer-join padding only when WHERE
+cannot accept it under three-valued logic. LEFT/RIGHT may become INNER; FULL may
+become LEFT, RIGHT or INNER. A single bounded postorder pass handles comparisons
+and AND/OR without evaluating SQL. The predicate stays in place, source policy
+boundaries and column identities remain unchanged, and cached nodes are copied.
+COALESCE, IS NULL, unknown/effectful operations, mapped output order and correlated
+shapes conservatively retain their original join. This exposes existing inner
+join costing and exact probes without a second execution mechanism. Debug
+regression passes all 253 runtime/binding/operator tests without skips or leaks.
+
+The five private `view_mappings` originals remain unresolved. The source stores
+those declarations inside index metadata rather than the public SQL-view
+catalog. Rejecting an absent view would not certify its intended type/index/
+generation/fingerprint checks, so this campaign claims no closures for them.

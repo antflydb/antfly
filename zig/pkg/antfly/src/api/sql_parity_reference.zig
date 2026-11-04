@@ -43,7 +43,7 @@ pub fn runUuidExpressions(alloc: std.mem.Allocator, handler: anytype) !void {
     try std.testing.expectEqualStrings("1 mon 2 days 03:00:00", result.rows[0][3].string);
 }
 
-const OrderedGroup = struct { rows: []const []const Json, sql_nulls: []const []const bool };
+pub const OrderedGroup = struct { rows: []const []const Json, sql_nulls: []const []const bool };
 
 test "SQL PostgreSQL reference distinguishes JSON null and validates ordered peer prefixes" {
     const alloc = std.testing.allocator;
@@ -72,7 +72,7 @@ const Reference = struct {
     entries: []const struct { id: []const u8, columns: []const []const u8, rows: []const []const Json, sql_nulls: ?[]const []const bool = null, column_oids: ?[]const u32 = null, ordered_groups: ?[]const OrderedGroup = null },
 };
 
-fn orderedPrefixMatches(alloc: std.mem.Allocator, result: wire.SQLResponse, groups: []const OrderedGroup) !bool {
+pub fn orderedPrefixMatches(alloc: std.mem.Allocator, result: wire.SQLResponse, groups: []const OrderedGroup) !bool {
     var offset: usize = 0;
     for (groups) |group| {
         try std.testing.expectEqual(group.rows.len, group.sql_nulls.len);

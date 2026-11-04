@@ -1327,6 +1327,452 @@
   },
   "entries": [
     {
+      "id": "sql-1216",
+      "columns": [
+        "order_id",
+        "customer_name",
+        "amount"
+      ],
+      "rows": [
+        [
+          "u21",
+          "Ada",
+          63
+        ],
+        [
+          "u20",
+          "ad_user",
+          60
+        ],
+        [
+          "u19",
+          "Ada",
+          57
+        ],
+        [
+          "u18",
+          "ad_user",
+          54
+        ],
+        [
+          "u17",
+          "Ada",
+          51
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25,
+        20
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "u21",
+              "Ada",
+              63
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u20",
+              "ad_user",
+              60
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u19",
+              "Ada",
+              57
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u18",
+              "ad_user",
+              54
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u17",
+              "Ada",
+              51
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u16",
+              "ad_user",
+              48
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u15",
+              "Ada",
+              45
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u14",
+              "ad_user",
+              42
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u13",
+              "Ada",
+              39
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u12",
+              "ad_user",
+              36
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u11",
+              "Ada",
+              33
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u10",
+              "ad_user",
+              30
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u9",
+              "Ada",
+              27
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u8",
+              "ad_user",
+              24
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u7",
+              "Ada",
+              21
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u6",
+              "ad_user",
+              18
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u5",
+              "Ada",
+              15
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u1",
+              "Ada",
+              12
+            ],
+            [
+              "u4",
+              "ad_user",
+              12
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ],
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u3",
+              "Ada",
+              9
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u2",
+              "ad_user",
+              6
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "00-dup",
+              "Dupe B",
+              -2
+            ],
+            [
+              "00-dup",
+              "Dupe B",
+              -2
+            ],
+            [
+              "00-dup",
+              "Dupe A",
+              -2
+            ],
+            [
+              "00-dup",
+              "Dupe A",
+              -2
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ],
+            [
+              false,
+              false,
+              false
+            ],
+            [
+              false,
+              false,
+              false
+            ],
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
       "id": "sql-1320",
       "columns": [
         "order_id",

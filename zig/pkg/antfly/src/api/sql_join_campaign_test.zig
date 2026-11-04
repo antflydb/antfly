@@ -23,10 +23,29 @@ const Handler = @import("httpx_handler.zig").AntflyApiHandler;
 
 test "httpx SQL PostgreSQL original joins preserve match scopes nulls and bags" {
     const ids = [_][]const u8{
-        "sql-1320", "sql-1321", "sql-1322", "sql-1323", "sql-1324", "sql-1325",
-        "sql-1326", "sql-1327", "sql-1328", "sql-1329", "sql-1330", "sql-1331",
-        "sql-1332", "sql-1334", "sql-1335", "sql-1336", "sql-1338", "sql-1339",
-        "sql-1341", "sql-1342", "sql-1343", "sql-1344",
+        "sql-1216",
+        "sql-1320",
+        "sql-1321",
+        "sql-1322",
+        "sql-1323",
+        "sql-1324",
+        "sql-1325",
+        "sql-1326",
+        "sql-1327",
+        "sql-1328",
+        "sql-1329",
+        "sql-1330",
+        "sql-1331",
+        "sql-1332",
+        "sql-1334",
+        "sql-1335",
+        "sql-1336",
+        "sql-1338",
+        "sql-1339",
+        "sql-1341",
+        "sql-1342",
+        "sql-1343",
+        "sql-1344",
     };
     const a = std.testing.allocator;
     const reference = local.sql_parity_fixtures.join_read_reference;

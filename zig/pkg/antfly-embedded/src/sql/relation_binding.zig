@@ -1638,6 +1638,7 @@ const Builder = struct {
         var adapter: ResolveAdapter = .{ .backend = self.backend, .table = table };
         const compiled: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = lowered }, .parameter_count = @intCast(self.parameters.len) };
         const bound = try describe.bindInternal(self.alloc, adapter.iface(), &compiled, self.parameters);
+        child = try JoinPlanning.reduceOuter(self.alloc, child, bound.scalars.predicate);
         for (bound.parameter_types, self.parameters) |hint, *parameter| if (hint != null) {
             parameter.* = hint;
         };
@@ -2818,6 +2819,65 @@ pub const JoinPlanning = struct {
         };
         return true;
     }
+    /// Keep WHERE above the join; eliminate only NULL padding that cannot
+    /// make that predicate TRUE. No predicate crosses a policy/view boundary.
+    pub fn reduceOuter(a: Allocator, source: *const Node, predicate: ?scalar.Program) !*const Node {
+        if (source.operation != .join or source.security_barrier or source.row_filter != null) return source;
+        const join = source.operation.join;
+        if (join.kind != .left and join.kind != .right and join.kind != .full) return source;
+        if (join.correlation or join.membership != null or join.output_order != null or
+            source.columns.len != join.left.columns.len + join.right.columns.len) return source;
+        const program = predicate orelse return source;
+        if (!purePredicate(program)) return source;
+        // One postorder pass, with a bit for each side's complete NULL padding.
+        const Proof = struct { nulls: u2 = 0, rejects: u2 = 0 };
+        const proofs = try a.alloc(Proof, program.instructions.len);
+        defer a.free(proofs);
+        for (program.instructions, proofs, 0..) |instruction, *proof, index| {
+            proof.* = .{};
+            switch (instruction.operation) {
+                .column => |ordinal_| {
+                    if (ordinal_ >= source.columns.len) return source;
+                    proof.nulls = if (ordinal_ < join.left.columns.len) 1 else 2;
+                    proof.rejects = proof.nulls;
+                },
+                .literal => |value| {
+                    if (value == .null) proof.nulls = 3;
+                    if (value == .null or (value == .bool and !value.bool)) proof.rejects = 3;
+                },
+                .binary => |part| {
+                    if (part.left >= index or part.right >= index) return source;
+                    const left = proofs[part.left];
+                    const right = proofs[part.right];
+                    switch (part.op) {
+                        .@"and", .@"or" => {
+                            proof.nulls = left.nulls & right.nulls;
+                            proof.rejects = if (part.op == .@"and") left.rejects | right.rejects else left.rejects & right.rejects;
+                        },
+                        .eq, .neq, .lt, .lte, .gt, .gte => {
+                            proof.nulls = left.nulls | right.nulls;
+                            proof.rejects = proof.nulls;
+                        },
+                        else => return source,
+                    }
+                },
+                else => return source,
+            }
+        }
+        if (program.root >= proofs.len) return source;
+        const rejects = proofs[program.root].rejects;
+        const kind: ast.JoinKind = switch (join.kind) {
+            .left => if (rejects & 2 != 0) .inner else .left,
+            .right => if (rejects & 1 != 0) .inner else .right,
+            .full => if (rejects == 3) .inner else if (rejects & 1 != 0) .left else if (rejects & 2 != 0) .right else .full,
+            else => unreachable,
+        };
+        if (kind == join.kind) return source;
+        const result = try a.create(Node);
+        result.* = source.*;
+        result.operation.join.kind = kind;
+        return result;
+    }
     fn collect(self: *JoinPlanning, node: *const Node) bool {
         if (node.operation == .join) {
             const join = node.operation.join;
@@ -3240,4 +3300,66 @@ test "SQL user aggregate catalog routing includes ordinary ORDER BY FILTER and i
     var builtin = try @import("compiler.zig").compile(a, "SELECT sum(id ORDER BY id) FROM aggregate_rows", .{});
     defer builtin.deinit();
     try std.testing.expect(!acceptsWithCatalog(builtin.statement.select, resolver));
+}
+
+test "SQL outer join reduction proves null rejection without moving policies or changing bags" {
+    const Case = struct { text: []const u8, left: ast.JoinKind, right: ast.JoinKind, full: ast.JoinKind };
+    const cases = [_]Case{
+        .{ .text = "b = 1", .left = .inner, .right = .right, .full = .right },
+        .{ .text = "a <> 1", .left = .left, .right = .inner, .full = .left },
+        .{ .text = "a > 0 AND b < 2", .left = .inner, .right = .inner, .full = .inner },
+        .{ .text = "a > 0 OR b < 2", .left = .left, .right = .right, .full = .full },
+        .{ .text = "b = 1 OR b = 2", .left = .inner, .right = .right, .full = .right },
+        .{ .text = "b = 1 OR true", .left = .left, .right = .right, .full = .full },
+        .{ .text = "b = 1 AND false", .left = .inner, .right = .inner, .full = .inner },
+        .{ .text = "b IS NULL", .left = .left, .right = .right, .full = .full },
+        .{ .text = "coalesce(b, 1) = 1", .left = .left, .right = .right, .full = .full },
+        .{ .text = "b IS NOT DISTINCT FROM NULL", .left = .left, .right = .right, .full = .full },
+        .{ .text = "(b = 1) = false", .left = .inner, .right = .right, .full = .right },
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const columns = [_]Column{
+        .{ .name = "a", .internal = "a", .qualifier = "l", .type = .integer, .nullable = true },
+        .{ .name = "b", .internal = "b", .qualifier = "r", .type = .integer, .nullable = true },
+    };
+    const left: Node = .{ .columns = columns[0..1], .operation = .{ .scan = .{ .index = 0, .source_columns = &.{"a"} } } };
+    const right: Node = .{ .columns = columns[1..2], .operation = .{ .scan = .{ .index = 1, .source_columns = &.{"b"} } } };
+    const scalar_columns = [_]scalar.Column{ .{ .name = "a", .type = .integer }, .{ .name = "b", .type = .integer } };
+    const values = [_]scalar.Datum{ .{}, .{ .value = .{ .integer = -1 }, .sql_null = false }, .{ .value = .{ .integer = 0 }, .sql_null = false }, .{ .value = .{ .integer = 1 }, .sql_null = false }, .{ .value = .{ .integer = 2 }, .sql_null = false } };
+    for (cases) |case| {
+        var compiled = try compiler.compileScalar(a, case.text, .{});
+        defer compiled.deinit();
+        var predicate = try scalar.bind(a, compiled.expression, &scalar_columns, &.{}, .{});
+        defer predicate.deinit();
+        for ([_]ast.JoinKind{ .left, .right, .full }, [_]ast.JoinKind{ case.left, case.right, case.full }) |kind, expected| {
+            var original: Node = .{ .columns = &columns, .operation = .{ .join = .{ .kind = kind, .left = &left, .right = &right, .condition = null, .left_keys = &.{}, .right_keys = &.{} } } };
+            const reduced = try JoinPlanning.reduceOuter(a, &original, predicate);
+            try std.testing.expectEqual(expected, reduced.operation.join.kind);
+            try std.testing.expectEqual(kind, original.operation.join.kind);
+            try std.testing.expectEqual(original.columns.ptr, reduced.columns.ptr);
+            // Independently execute the real scalar program on every padded
+            // row in this finite domain. No removed padding may pass WHERE.
+            for (values) |value| {
+                for (0..2) |side| {
+                    const padded_left = side == 0;
+                    const originally_emits = if (padded_left) kind == .right or kind == .full else kind == .left or kind == .full;
+                    const still_emits = if (padded_left) expected == .right or expected == .full else expected == .left or expected == .full;
+                    if (!originally_emits or still_emits) continue;
+                    const cells = if (padded_left) [_]scalar.Datum{ .{}, value } else [_]scalar.Datum{ value, .{} };
+                    const output = try predicate.evaluate(a, &cells, &.{}, .{});
+                    try std.testing.expect(output.sql_null or !output.value.bool);
+                }
+            }
+            original.security_barrier = true;
+            try std.testing.expectEqual(&original, try JoinPlanning.reduceOuter(a, &original, predicate));
+            original.security_barrier = false;
+            original.operation.join.output_order = &.{ 1, 0 };
+            try std.testing.expectEqual(&original, try JoinPlanning.reduceOuter(a, &original, predicate));
+            original.operation.join.output_order = null;
+            original.operation.join.correlation = true;
+            try std.testing.expectEqual(&original, try JoinPlanning.reduceOuter(a, &original, predicate));
+        }
+    }
 }
