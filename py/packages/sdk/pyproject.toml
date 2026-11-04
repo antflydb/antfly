@@ -30,10 +30,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/antflydb/antfly-py"
-Documentation = "https://antfly-sdk-python.readthedocs.io"
-Repository = "https://github.com/antflydb/antfly-py"
-Issues = "https://github.com/antflydb/antfly-py/issues"
+Homepage = "https://github.com/antflydb/antfly"
+Documentation = "https://docs.antfly.io"
+Repository = "https://github.com/antflydb/antfly"
+Issues = "https://github.com/antflydb/antfly/issues"
 
 [dependency-groups]
 dev = [
