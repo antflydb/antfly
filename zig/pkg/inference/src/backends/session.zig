@@ -3135,22 +3135,21 @@ pub const PreparedSource = struct {
         errdefer self.deinit();
         self.cleanup = if (placement != .host or source.preparesInvocation()) try Owner.beginResident(source) else try Owner.beginAdmitted(source);
         try scheduling.selectReadyCohort(source.execution_gate orelse fallback_gate, control orelse .{}, &self.waiter);
+        // Both managed and ordinary raw sources bind current B only after
+        // the true selected encoder output/workspace has been admitted. A
+        // pooled/export envelope cannot stand in for the encoder's host output.
+        var planned = request;
+        try source.resolveRunGeometry(shapes, &planned);
+        planned.sequence = @max(planned.sequence, request.sequence);
+        planned.workspace_bytes = @max(planned.workspace_bytes, request.workspace_bytes);
+        if (request.output_bytes) |bytes| planned.output_bytes = @max(planned.output_bytes orelse 0, bytes);
+        planned.output_kv_bytes = @max(planned.output_kv_bytes, request.output_kv_bytes);
         if (workspace) |owner| {
             const actual = owner.session orelse return error.InvalidSourceWorkspace;
             if (actual.ptr != source.ptr or actual.vtable != source.vtable or source.preparesInvocation()) return error.InvalidSourceWorkspace;
-            // Resolve the selected numerical geometry BEFORE the allocator
-            // lends this lease and BEFORE any model/provider lane is acquired.
-            // Output shapes/metadata are real protected bytes, not just the
-            // payload estimate. Keep every explicit adapter envelope/floor.
-            var planned = request;
-            try source.resolveRunGeometry(shapes, &planned);
-            planned.sequence = @max(planned.sequence, request.sequence);
-            planned.workspace_bytes = @max(planned.workspace_bytes, request.workspace_bytes);
-            if (request.output_bytes) |bytes| planned.output_bytes = @max(planned.output_bytes orelse 0, bytes);
-            planned.output_kv_bytes = @max(planned.output_kv_bytes, request.output_kv_bytes);
             self.shape_scope = try owner.admitRun(planned);
         } else {
-            self.shape_scope = .{ .permit = try source.admitShapeRequestBeforeExecution(shapes, request, allocator, control) };
+            self.shape_scope = .{ .permit = try source.admitShapeRequestBeforeExecution(shapes, planned, allocator, control) };
         }
     }
 
@@ -7564,4 +7563,137 @@ test "mandatory producer delta classifies exact own run sum as permanent and pre
     added.release();
     original.release();
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+const NativeRawSourceGeometry135 = struct {
+    gate: *std.atomic.Mutex,
+    calls: usize = 0,
+    violation: bool = false,
+    widened: bool = false,
+    fn from(raw: *anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw));
+    }
+    fn info(_: *anyopaque) []const TensorInfo {
+        return &.{.{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, -1 } }};
+    }
+    fn outputs(_: *anyopaque) []const TensorInfo {
+        return &.{.{ .name = "hidden", .dtype = .f32, .shape = &.{ -1, -1, 8 } }};
+    }
+    fn backend(_: *anyopaque) BackendType {
+        return .native;
+    }
+    fn close(_: *anyopaque) void {}
+    fn geometry(raw: *anyopaque, inputs: ShapeInputs, batch: usize) !?RunGeometry {
+        const self = from(raw);
+        const sequence: usize = @intCast(inputs.get(0).shape[1]);
+        return .{ .sequence = sequence, .output_bytes = batch * sequence * 8 * 4 + 24 + @as(usize, if (self.widened) 4096 else 0), .workspace_bytes = batch * sequence * sequence * 32 };
+    }
+    fn run(raw: *anyopaque, inputs: []const Tensor, a: std.mem.Allocator) ![]Tensor {
+        return controlled(raw, inputs, a, .{});
+    }
+    fn controlled(raw: *anyopaque, _: []const Tensor, a: std.mem.Allocator, _: InferenceExecutionControl) ![]Tensor {
+        const self = from(raw);
+        if (self.gate.tryLock()) {
+            self.gate.unlock();
+            self.violation = true;
+        }
+        self.calls += 1;
+        const result = try a.alloc(Tensor, 1);
+        errdefer a.free(result);
+        result[0] = try Tensor.initFloat32(a, "hidden", &.{ 2, 3, 8 }, &@as([48]f32, @splat(0.25)));
+        return result;
+    }
+    fn reserve(raw: *anyopaque, _: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+        const self = from(raw);
+        if (self.gate.tryLock()) self.gate.unlock() else self.violation = true;
+        return 1;
+    }
+    fn retain(raw: *anyopaque, _: usize, _: memory.AdmissionAmounts) memory.AdmissionResourceError!void {
+        const self = from(raw);
+        if (self.gate.tryLock()) self.gate.unlock() else self.violation = true;
+    }
+    fn release(raw: *anyopaque, _: usize) void {
+        const self = from(raw);
+        if (self.gate.tryLock()) self.gate.unlock() else self.violation = true;
+    }
+    const table: Session.VTable = .{ .run = run, .runWithControl = controlled, .inputInfo = info, .outputInfo = outputs, .backend = backend, .close = close, .runGeometry = geometry };
+};
+
+test "Native raw Source resolves unequal encoder output and workspace before current B and exact admission cap" {
+    const a = std.testing.allocator;
+    const Probe = NativeRawSourceGeometry135;
+    var gate: std.atomic.Mutex = .unlocked;
+    var scheduler: @import("../runtime/embedding_scheduler.zig").Scheduler = .{};
+    var probe: Probe = .{ .gate = &gate };
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    defer domain.controller.configureResourceBudget(null) catch @panic("geometry135 live quota");
+    var model: Session.ModelLifetime = .{ .owner = &probe, .destroy_fn = Probe.close, .admission_domain = domain.pin() };
+    defer model.release();
+    var session = Session{ .ptr = &probe, .vtable = &Probe.table, .model_lifetime = &model, .execution_gate = &gate, .cohort_scheduler = &scheduler, .run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var input = try Tensor.initInt64(a, "input_ids", &.{ 2, 3 }, &.{ 1, 2, 3, 4, 5, 6 });
+    defer input.deinit();
+    const shapes = [_]TensorInfo{.{ .name = input.name, .dtype = input.dtype, .shape = input.shape }};
+    for ([_]?usize{ null, 16, 4096 }) |declared_output| {
+        const declared = RunRequest{ .batch = 2, .sequence = 3, .input_bytes = input.data.len, .output_bytes = declared_output, .host_preprocess_bytes = 37, .workspace_bytes = 64 };
+        var actual = try session.planRun(&.{input}, null);
+        actual.output_bytes = @max(actual.output_bytes.?, declared_output orelse 0);
+        actual.host_preprocess_bytes = declared.host_preprocess_bytes;
+        actual.workspace_bytes = @max(actual.workspace_bytes, declared.workspace_bytes);
+        const required = try session.run_admission.?.estimateRequest(actual, session.outputInfo());
+        session.run_admission.?.limits = .{ .host_limit_bytes = required.host_scratch_bytes - 1 };
+        var denied: PreparedSource = .{};
+        try std.testing.expectError(error.ResourceLimitExceeded, denied.initShapesBeforeExecutionInto(session, session, &gate, .{ .host_shapes = &shapes }, declared, null, .host, a, .{ .native_call_policy = .in_process }));
+        denied.deinit();
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
+        try std.testing.expect(scheduler.head == null);
+        session.run_admission.?.limits.host_limit_bytes = required.host_scratch_bytes;
+        {
+            var source: PreparedSource = .{};
+            defer source.deinit();
+            try source.initShapesBeforeExecutionInto(session, session, &gate, .{ .host_shapes = &shapes }, declared, null, .host, a, .{ .native_call_policy = .in_process });
+            try std.testing.expectEqualDeep(actual, source.shape_scope.?.permit.request.?);
+            try std.testing.expectEqualDeep(required, domain.controller.snapshot());
+            try source.bindInputsBeforeExecution(.{ .host = &.{input} }, .host);
+            try std.testing.expect(source.epoch() != null);
+            try source.enter();
+            const permit = try source.beginExecutionDispatch();
+            // A later genuine geometry change still refuses BEFORE math,
+            // rather than using this fix as permission for late admission.
+            probe.widened = true;
+            try std.testing.expectError(error.PreparedAdmissionRequiresReadyTurn, permit.resolveGeometry(&.{input}));
+            probe.widened = false;
+            const result = try permit.runWithControl(&.{input}, a, .{ .native_call_policy = .in_process });
+            defer {
+                for (result) |*tensor| tensor.deinit();
+                a.free(result);
+            }
+            try std.testing.expectEqualSlices(f32, &@as([48]f32, @splat(0.25)), result[0].asFloat32());
+            source.leaveExecution();
+        }
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
+        try std.testing.expect(!probe.violation);
+    }
+    try std.testing.expectEqual(@as(usize, 3), probe.calls);
+    const Cancellation = struct {
+        canceled: bool = false,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.canceled) return error.Cancelled;
+        }
+    };
+    var cancellation: Cancellation = .{};
+    {
+        var source: PreparedSource = .{};
+        defer source.deinit();
+        const control: InferenceExecutionControl = .{ .ptr = &cancellation, .check_fn = Cancellation.check, .native_call_policy = .in_process };
+        try source.initShapesBeforeExecutionInto(session, session, &gate, .{ .host_shapes = &shapes }, .{ .batch = 2, .sequence = 3, .input_bytes = input.data.len }, null, .host, a, control);
+        try source.bindInputsBeforeExecution(.{ .host = &.{input} }, .host);
+        cancellation.canceled = true;
+        try std.testing.expectError(error.Cancelled, source.enter());
+    }
+    try std.testing.expectEqual(@as(usize, 3), probe.calls);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
+    try std.testing.expect(scheduler.head == null and !probe.violation);
 }

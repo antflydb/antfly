@@ -1429,29 +1429,28 @@ pub const EmbeddingPipeline = struct {
     }
 
     fn prepareTextSource(self: *EmbeddingPipeline, source: *session_mod.PreparedSource, session: session_mod.Session, shapes: session_mod.ShapeInputs, request: session_mod.RunRequest) !void {
-        // Native prepaid funding stays in the source owner throughout its
-        // synchronous head consumer, then adopts any surviving host arrays.
-        if (session.backend() == .native and !session.preparesInvocation()) if (self.gemma_workspace) |workspace| {
-            // Resolve the full encoder output before lending its workspace.
-            // Generic/non-pooled paths must not later yield this borrowed
-            // permit merely to discover the fixed Gemma output geometry.
-            const cfg = session_factory.getEmbeddingGemma2Config(session) orelse return error.InvalidAdmissionLeaseReduction;
-            const rows = std.math.mul(usize, request.batch, request.sequence) catch return error.ResourceLimitExceeded;
+        const workspace = if (session.backend() == .native and !session.preparesInvocation()) self.gemma_workspace else null;
+        const cfg = session_factory.getEmbeddingGemma2Config(session);
+        if (workspace != null and cfg == null) return error.InvalidAdmissionLeaseReduction;
+        if (cfg) |gemma| {
             var planned = request;
-            planned.output_bytes = @max(request.output_bytes orelse 0, std.math.mul(usize, rows, cfg.embedding_dim * @sizeOf(f32)) catch return error.ResourceLimitExceeded);
-            planned.workspace_bytes = @max(request.workspace_bytes, try @import("embedding_gemma2.zig").textEncoderWorkspace(rows));
-            // This adapter already selected the actual token-row execution
-            // geometry. Compact preparedTexts uses flattened active rows,
-            // while full-prefix/headed execution retains the padded geometry.
-            // Query numerical geometry with that selected plane; protected host
-            // input/preprocess bytes and the real materialized IDs stay intact.
+            if (workspace != null) {
+                // Preserve the Native prepaid encoder floor independently of
+                // the final pooled/export backing and original input bytes.
+                const rows = std.math.mul(usize, request.batch, request.sequence) catch return error.ResourceLimitExceeded;
+                planned.output_bytes = @max(request.output_bytes orelse 0, std.math.mul(usize, rows, gemma.embedding_dim * @sizeOf(f32)) catch return error.ResourceLimitExceeded);
+                planned.workspace_bytes = @max(request.workspace_bytes, try @import("embedding_gemma2.zig").textEncoderWorkspace(rows));
+            }
+            // One actual selected numerical plane for prepaid and ordinary
+            // sources. Compact active rows differ from padded host inputs;
+            // their original input/preprocessing byte floors remain intact.
             const token_shape = [_]i64{ @intCast(planned.batch), @intCast(planned.sequence) };
             const numerical_inputs = [_]backends.TensorInfo{
                 .{ .name = "input_ids", .dtype = .i64, .shape = &token_shape },
                 .{ .name = "attention_mask", .dtype = .i64, .shape = &token_shape },
             };
             return source.initShapesBeforeExecutionInto(session, self.session, self.execution_lock, .{ .shapes = &numerical_inputs }, planned, workspace, self.textSourcePlacement(session), self.allocator, self.execution_control);
-        };
+        }
         return source.initShapesBeforeExecutionInto(session, self.session, self.execution_lock, shapes, request, null, self.textSourcePlacement(session), self.allocator, self.execution_control);
     }
 
