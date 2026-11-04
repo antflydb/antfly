@@ -26,6 +26,8 @@ const mem_backend = @import("../../mem_backend.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const platform_time = @import("antfly_platform").time;
 
+pub const replay_fragment = @import("replay_fragment.zig");
+
 const metadata_prefix = "\x00\x00__metadata__:derived_apply:";
 const projection_metadata_prefix = "\x00\x00__metadata__:derived_projection:";
 const projection_metadata_magic = "AFPRJMD1";
@@ -183,6 +185,70 @@ fn loadScalarAppliedSequenceTxn(txn: anytype, index_name: []const u8) !?u64 {
     return std.mem.readInt(u64, raw[0..8], .little);
 }
 
+fn fragmentKey(buffer: []u8, name: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "{s}{s}", .{ replay_fragment.prefix, name });
+}
+
+pub fn loadReplayFragment(alloc: Allocator, store: anytype, index_name: []const u8, identity: replay_fragment.Identity) !?replay_fragment.Position {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginProbe();
+    defer txn.abort();
+    var buffer: [256]u8 = undefined;
+    const raw = txn.get(try fragmentKey(&buffer, index_name)) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    const checkpoint = try replay_fragment.decode(raw);
+    if (!std.meta.eql(checkpoint.identity, identity)) return null;
+    if (checkpoint.position.sequence <= (try loadScalarAppliedSequenceTxn(&txn, index_name) orelse 0)) return null;
+    return checkpoint.position;
+}
+
+/// The caller first checkpoints index output, then enters its checked metadata
+/// publication lane. A crash before this transaction replays the last fragment;
+/// a crash after it resumes without advancing the scalar record watermark.
+pub fn saveReplayFragment(alloc: Allocator, store: anytype, index_name: []const u8, identity: replay_fragment.Identity, position: replay_fragment.Position) !void {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    const applied = (try loadScalarAppliedSequenceTxn(&txn, index_name)) orelse 0;
+    if (applied >= position.sequence) {
+        txn.abort();
+        return;
+    }
+    var buffer: [256]u8 = undefined;
+    const key = try fragmentKey(&buffer, index_name);
+    const previous_raw: ?[]const u8 = txn.get(key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (previous_raw) |raw| {
+        const previous = try replay_fragment.decode(raw);
+        if (std.meta.eql(previous.identity, identity) and previous.position.sequence > applied) {
+            if (previous.position.sequence != position.sequence or previous.position.total_items != position.total_items or
+                !std.mem.eql(u8, &previous.position.fingerprint, &position.fingerprint)) return error.InvalidDerivedApplyState;
+            if (previous.position.next_item > position.next_item) {
+                txn.abort();
+                return;
+            }
+            if (previous.position.applied and !position.applied) return error.InvalidDerivedApplyState;
+        }
+    }
+    const encoded = replay_fragment.encode(.{ .identity = identity, .position = position });
+    try txn.put(key, &encoded);
+    try txn.commit();
+}
+
+fn clearReplayFragmentTxn(txn: anytype, index_name: []const u8) !void {
+    var buffer: [256]u8 = undefined;
+    txn.delete(try fragmentKey(&buffer, index_name)) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
+}
+
 fn loadProjectionMetadata(alloc: Allocator, store: anytype, index_name: []const u8) !ProjectionCheckpoint {
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
@@ -215,6 +281,7 @@ fn saveProjectionMetadataUpdates(alloc: Allocator, store: anytype, updates: []co
             .applied_sequence = if (mode == .replace) 0 else (try loadScalarAppliedSequenceTxn(&txn, update.index_name)) orelse 0,
         };
         if (mode == .replace) {
+            try clearReplayFragmentTxn(&txn, update.index_name);
             checkpoint = update.checkpoint();
         } else {
             const previous_sequence = checkpoint.applied_sequence;
@@ -635,6 +702,7 @@ pub fn clearAppliedSequenceTxn(txn: anytype, index_name: []const u8) !void {
         else => return err,
     };
     try clearProjectionMetadataTxn(mutable_txn, index_name);
+    try clearReplayFragmentTxn(mutable_txn, index_name);
 }
 
 fn clearProjectionMetadataTxn(txn: anytype, index_name: []const u8) !void {
@@ -1452,6 +1520,37 @@ test "projection metadata rejects corrupt recovery identities (#1207)" {
     try std.testing.expectError(error.InvalidDerivedApplyState, decodeProjectionMetadata(encoded[0..8]));
     encoded[17] ^= 1;
     try std.testing.expectError(error.InvalidDerivedApplyState, decodeProjectionMetadata(&encoded));
+}
+
+test "derived replay fragment checkpoints fence identities preserve monotonic progress and clear on reset" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "fragments" });
+    defer runtime.deinit();
+    const identity: replay_fragment.Identity = .{ .generation = 7, .config_hash = 8, .incarnation = 9 };
+    var position: replay_fragment.Position = .{ .sequence = 42, .next_item = 2, .total_items = 6, .fingerprint = @splat(1), .applied = true };
+    try saveReplayFragment(a, runtime, "index", identity, position);
+    try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequence(a, runtime, "index"));
+    try std.testing.expectEqualDeep(position, (try loadReplayFragment(a, runtime, "index", identity)).?);
+    for ([_]replay_fragment.Identity{
+        .{ .generation = 77, .config_hash = 8, .incarnation = 9 },
+        .{ .generation = 7, .config_hash = 88, .incarnation = 9 },
+        .{ .generation = 7, .config_hash = 8, .incarnation = 99 },
+    }) |changed| try std.testing.expect((try loadReplayFragment(a, runtime, "index", changed)) == null);
+    position.next_item = 4;
+    try saveReplayFragment(a, runtime, "index", identity, position);
+    var stale = position;
+    stale.next_item = 2;
+    try saveReplayFragment(a, runtime, "index", identity, stale);
+    try std.testing.expectEqualDeep(position, (try loadReplayFragment(a, runtime, "index", identity)).?);
+    stale = position;
+    stale.fingerprint[0] ^= 1;
+    try std.testing.expectError(error.InvalidDerivedApplyState, saveReplayFragment(a, runtime, "index", identity, stale));
+    try saveAppliedSequence(runtime, "index", 42);
+    try std.testing.expect((try loadReplayFragment(a, runtime, "index", identity)) == null);
+    try clearAppliedSequence(runtime, "index");
+    try std.testing.expect((try loadReplayFragment(a, runtime, "index", identity)) == null);
 }
 
 test "derived apply state works with memory backend store" {

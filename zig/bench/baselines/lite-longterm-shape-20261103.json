@@ -1,0 +1,78 @@
+{
+  "kind": "implementation_checkpoint",
+  "qualification": false,
+  "base_commit": "c9ed82860591fa6d061b7fd4f8907b97709dd80a",
+  "components": [
+    {
+      "component": "SQL dependency validity",
+      "implementation": "Revision-9 transactional semantic revisions for schema-bearing namespaces; schema-directory, namespace-incarnation and FK-connected table witnesses. Table discovery extends only over newly staged entries and clears on rollback/reset. Missing revisions retain conservative file-wide validity. COMMIT still revalidates all predicates and constraints."
+    },
+    {
+      "component": "Writer allocator ownership",
+      "implementation": "A path-owned cache exclusively loans checked ledger/digest state to native transactions, page allocation and admitted inspection. Clean state returns after publication; dirty or uncertain state never becomes authority. Existing inode/header/certificate/rebase checks remain. Detached proof capture and publication serialize mutable wrapper bookkeeping under the Store mutex."
+    },
+    {
+      "component": "Resumable full-text replay",
+      "implementation": "Durable index-generation/configuration/namespace-bound continuations split oversized journal records by primary document family. Row, delete, overwrite and asset effects remain together. Index durability precedes continuation publication. Scalar applied progress and completion seals advance only after the record completes. No-op scan progress is retained without certifying corpus completeness."
+    }
+  ],
+  "validation": [
+    {
+      "suite": "Initial SQL dependency C API contracts before allocator/replay integration",
+      "passed": 4,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    {
+      "suite": "Full native Debug run before snapshot-test correction",
+      "passed": 760,
+      "skipped": 5,
+      "failed": 1,
+      "leaked": 0,
+      "failure": "New test checked a pinned header against later physical file growth and reported tail_bytes. Corrected to use the length captured with the header; focused rerun passes."
+    },
+    {
+      "suite": "Replay ownership/allocation Debug contracts after fault-log declarations",
+      "passed": 146,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    {
+      "suite": "Focused native allocator-loan and semantic-revision Debug regressions",
+      "passed": 5,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    {
+      "suite": "Semantic key-family classification",
+      "passed": 1,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    {
+      "suite": "Runtime anchor checks accompanying focused run",
+      "passed": 11,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    }
+  ],
+  "remaining": [
+    "Build integrated C API library and owner tests; run ABI/linkage and affected SDK contracts.",
+    "Recheck SQL overlay operation counts with the current candidate only.",
+    "Run the unchanged original importer locally for diagnosis, with correctly bound native snapshots or a fresh database; no baseline/reference reruns.",
+    "Measure remaining runtime-open and text-analysis costs before claiming E2E service capacity is fixed.",
+    "Candidate-only optimized final qualification on wolfspider, including importer contention and ten-minute active-write storage/visibility qualification.",
+    "Applicable CI/model gates; full factory qualification remains with Beads."
+  ],
+  "limits": [
+    "This is an implementation checkpoint, not an E2E performance or merge-readiness claim.",
+    "Replay family limits are scheduling bounds; one large family retains existing memory limits and a soft time bound.",
+    "Legacy index configurations lacking a coverage generation retain whole-record replay.",
+    "No baseline/reference binary was rebuilt or rerun; wolfspider was not used for local development."
+  ]
+}

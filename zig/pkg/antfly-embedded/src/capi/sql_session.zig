@@ -52,7 +52,7 @@ const Entry = struct {
 const Savepoint = struct { name: []const u8, length: usize };
 const MutationFold = @import("../sql/mutation_fold.zig").Accumulator(Entry);
 const Integrity = d.api_relational_integrity_commit;
-const OverlayWitness = struct { inode: u64, primary: [16]u8, metadata: [16]u8 };
+const OverlayWitness = struct { inode: u64, primary: [16]u8, metadata: [16]u8, dependencies: ?[32]u8 = null };
 const ConstraintOverlay = struct { witness: OverlayWitness, entry_count: usize, value: Integrity.StatementOverlay };
 pub const Session = struct {
     handle: *h.Handle,
@@ -67,6 +67,8 @@ pub const Session = struct {
     folded: ?MutationFold = null,
     folded_count: usize = 0,
     constraint_overlay: ?ConstraintOverlay = null,
+    dependency_tables: std.StringHashMapUnmanaged(void) = .empty,
+    dependency_entries_count: usize = 0,
     test_overlay_rebuilds: if (h.builtin.is_test) usize else void = if (h.builtin.is_test) 0 else {},
     test_overlay_extensions: if (h.builtin.is_test) usize else void = if (h.builtin.is_test) 0 else {},
 
@@ -81,6 +83,10 @@ pub const Session = struct {
         self.folded = null;
         self.folded_count = 0;
     }
+    fn invalidateDependencyTables(self: *Session) void {
+        self.dependency_tables.clearRetainingCapacity();
+        self.dependency_entries_count = 0;
+    }
     fn invalidateConstraintOverlay(self: *Session) void {
         if (self.constraint_overlay) |*overlay| overlay.value.deinit();
         self.constraint_overlay = null;
@@ -88,6 +94,9 @@ pub const Session = struct {
     pub fn deinit(self: *Session) void {
         self.invalidateConstraintOverlay();
         self.invalidateFold();
+        self.dependency_tables.deinit(self.budget.allocator());
+        self.dependency_tables = .empty;
+        self.dependency_entries_count = 0;
         self.arena.deinit();
     }
     fn foldedEntries(self: *Session) !*MutationFold {
@@ -97,19 +106,29 @@ pub const Session = struct {
             try self.folded.?.append(self.entries.items[self.folded_count]);
         return &self.folded.?;
     }
-    fn overlayWitness(self: *Session) !?OverlayWitness {
+    fn overlayWitness(self: *Session, metadata: anytype, target: []const u8) !?OverlayWitness {
         const backend = self.handle.owned_lite_backend orelse return null;
         const store = backend.native_docstore orelse return null;
         if (!store.file.header.indexed_reclamation or store.file.transaction_header != null or store.file.checkpoint_publication_uncertain) return null;
         const logical = store.file.activeCheckpoint().logical;
         if (std.mem.allEqual(u8, &logical.primary, 0) or std.mem.allEqual(u8, &logical.metadata, 0)) return null;
+        if (self.dependency_entries_count > self.entries.items.len) {
+            self.dependency_tables.clearRetainingCapacity();
+            self.dependency_entries_count = 0;
+        }
+        // Only newly staged entries discover dependencies. The witness must
+        // never rescan all previous rows merely to discover their table names.
+        while (self.dependency_entries_count < self.entries.items.len) : (self.dependency_entries_count += 1)
+            try self.dependency_tables.put(self.budget.allocator(), self.entries.items[self.dependency_entries_count].table.physical_name, {});
+        if (try @import("sql_dependency_witness.zig").capture(self.handle.alloc, &self.handle.owned_lite_backend.?, metadata, &self.dependency_tables, target)) |dependencies|
+            return .{ .inode = (try store.file.file.stat(store.file.runtime())).inode, .primary = @splat(0), .metadata = @splat(0), .dependencies = dependencies };
         return .{ .inode = (try store.file.file.stat(store.file.runtime())).inode, .primary = logical.primary, .metadata = logical.metadata };
     }
-    /// The API/path gate protects this complete primary/catalog witness. A
-    /// refreshed runtime, peer write, DDL or replacement must rebuild previous
-    /// effects; a matching cut may extend them using only this statement.
-    pub fn preparedConstraintOverlay(self: *Session, source: d.api_table_read_source.TableReadSource, metadata: anytype, admission: Integrity.RepairAdmission, entry_count: usize) !?*const Integrity.StatementOverlay {
-        const witness = (try self.overlayWitness()) orelse {
+    /// The API/path gate protects the dependency witness. Relevant peer row,
+    /// constraint, DDL and incarnation changes rebuild previous effects;
+    /// unrelated publication does not. Legacy files use the complete file cut.
+    pub fn preparedConstraintOverlay(self: *Session, source: d.api_table_read_source.TableReadSource, metadata: anytype, admission: Integrity.RepairAdmission, entry_count: usize, target: []const u8) !?*const Integrity.StatementOverlay {
+        const witness = (try self.overlayWitness(metadata, target)) orelse {
             self.invalidateConstraintOverlay();
             return null;
         };
@@ -173,6 +192,7 @@ pub const Session = struct {
         const before = self.entries.items.len;
         errdefer {
             self.entries.items.len = before;
+            self.invalidateDependencyTables();
             self.invalidateConstraintOverlay();
             self.invalidateFold();
         }
@@ -210,7 +230,7 @@ pub const Session = struct {
         var adapter = sql.Adapter(h.antfly){ .handle = self.handle, .db = try @import("tables.zig").get(self.handle, target.physical_name), .table_name = target.physical_name };
         if (!try adapter.localRequiresCoordination()) return;
         const metadata = try adapter.localCatalog(a, target.schema_version);
-        const overlay = try self.preparedConstraintOverlay(adapter.localSource(), metadata, adapter.repairAdmission(), statement_start);
+        const overlay = try self.preparedConstraintOverlay(adapter.localSource(), metadata, adapter.repairAdmission(), statement_start, target.physical_name);
         const statement = try requestsForEntries(a, self.entries.items[statement_start..]);
         var prepared = if (overlay) |previous|
             try Integrity.prepareSessionStatementWithOverlay(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, previous, statement, adapter.repairAdmission(), .{})
@@ -430,6 +450,7 @@ pub const Session = struct {
                 }
                 if (self.savepoints.items.len == 0 or !std.mem.eql(u8, name, self.savepoints.items[i].name)) return error.InvalidSavepointName;
                 if (statement == .rollback_to_savepoint) {
+                    self.invalidateDependencyTables();
                     self.invalidateConstraintOverlay();
                     self.invalidateFold();
                     self.entries.items.len = self.savepoints.items[i].length;

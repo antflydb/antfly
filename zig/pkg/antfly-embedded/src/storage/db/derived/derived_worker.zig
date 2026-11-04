@@ -28,6 +28,10 @@ const mem_backend_mod = @import("../../mem_backend.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const platform_time = @import("antfly_platform").time;
 
+pub const replay_fragment = @import("replay_fragment.zig");
+pub const LoadFragmentFn = *const fn (*anyopaque, []const u8) anyerror!?replay_fragment.Position;
+pub const SaveFragmentFn = *const fn (*anyopaque, []const u8, replay_fragment.Position) anyerror!void;
+
 pub const ApplyFn = batcher.ApplyFn;
 pub const PersistProgressFn = *const fn (ctx: *anyopaque, index_name: []const u8, sequence: u64) anyerror!void;
 pub const ProgressFn = *const fn (ctx: *anyopaque, index_name: []const u8, progress: CatchUpProgress) anyerror!void;
@@ -44,6 +48,7 @@ pub const CatchUpStats = struct {
     replay_hint_filter_skips: usize = 0,
     last_sequence: u64 = 0,
     last_applied_sequence: u64 = 0,
+    partial_sequence: u64 = 0,
     window_collect_ns: u64 = 0,
     apply_ns: u64 = 0,
 
@@ -53,7 +58,7 @@ pub const CatchUpStats = struct {
     }
 
     pub fn shouldTryTargetAdvance(self: @This(), from_sequence: u64, target_sequence: u64) bool {
-        return self.applied_entries == 0 and target_sequence > from_sequence;
+        return self.partial_sequence == 0 and self.applied_entries == 0 and target_sequence > from_sequence;
     }
 };
 
@@ -122,6 +127,12 @@ pub const CatchUpOptions = struct {
     max_records_per_window: usize = catch_up_max_records_per_window_default,
     max_chunk_bytes: u64 = catch_up_max_chunk_bytes_default,
     max_items_per_window: usize = 0,
+    /// Durable sub-record progress for full-text replay. Each family retains
+    /// its row, tombstones and asset effects in one apply invocation.
+    max_fragment_families: usize = 0,
+    fragment_ctx: ?*anyopaque = null,
+    load_fragment_fn: ?LoadFragmentFn = null,
+    save_fragment_fn: ?SaveFragmentFn = null,
     /// Bound expanded work across complete journal records, without splitting
     /// an apply callback's input-ownership boundary. One oversized record is
     /// still admitted so the cursor can always advance.
@@ -223,7 +234,8 @@ fn catchUpIndexFromReplaySource(
 ) !CatchUpStats {
     const hint = targetHintForManagedIndex(index_ref);
     var stats = CatchUpStats{};
-    const next_sequence = from_sequence;
+    var next_sequence = from_sequence;
+    var completed_fragment: ?replay_fragment.Position = null;
     var catch_up_open = false;
     errdefer if (catch_up_open) {
         if (options.finish_catch_up_fn) |finish_catch_up| {
@@ -237,7 +249,18 @@ fn catchUpIndexFromReplaySource(
         };
         catch_up_open = true;
     }
-    var replay_cursor = replay_source.openMatchingCursor(alloc, from_sequence, hint) catch |err| {
+    if (options.max_fragment_families != 0 and options.load_fragment_fn != null and options.save_fragment_fn != null) {
+        if (try options.load_fragment_fn.?(options.fragment_ctx.?, index_ref.name)) |saved| if (saved.sequence > from_sequence) {
+            if (saved.next_item == saved.total_items) {
+                next_sequence = saved.sequence;
+                if (saved.applied) {
+                    if (options.persist_progress_fn) |persist| try persist(options.persist_ctx.?, index_ref.name, saved.sequence);
+                    completed_fragment = saved;
+                }
+            } else next_sequence = saved.sequence - 1;
+        };
+    }
+    var replay_cursor = replay_source.openMatchingCursor(alloc, next_sequence, hint) catch |err| {
         logCatchUpError(index_ref, "replay_source_open", next_sequence, stats.scanned_entries, stats.applied_entries, err);
         return err;
     };
@@ -246,6 +269,11 @@ fn catchUpIndexFromReplaySource(
         logCatchUpError(index_ref, "replay_source_iterate", next_sequence, stats.scanned_entries, stats.applied_entries, err);
         return err;
     };
+    if (completed_fragment) |saved| {
+        stats.applied_entries += 1;
+        stats.last_applied_sequence = @max(stats.last_applied_sequence, saved.sequence);
+        stats.last_sequence = @max(stats.last_sequence, saved.sequence);
+    }
     if (catch_up_open) {
         if (options.finish_catch_up_fn) |finish_catch_up| {
             finish_catch_up(options.catch_up_ctx.?, index_ref, true) catch |err| {
@@ -266,6 +294,8 @@ pub fn catchUpIndexFromMatchingCursor(
     options: CatchUpOptions,
 ) !CatchUpStats {
     var stats = CatchUpStats{};
+    const fragments = options.max_fragment_families != 0 and options.load_fragment_fn != null and options.save_fragment_fn != null;
+    if (fragments) std.debug.assert(index_ref.kind == .full_text and options.max_windows_per_call == 1);
     var completed_windows: usize = 0;
     const call_started_ns = monotonicTimeNs();
     var call_bytes: u64 = 0;
@@ -315,7 +345,7 @@ pub fn catchUpIndexFromMatchingCursor(
         const collect_started_ns = monotonicTimeNs();
         const had_retained_scratch = decode_scratch.retainedCapacityBytes() != 0;
         var retried_fresh = false;
-        var collection_limit = options.max_records_per_window;
+        var collection_limit = if (fragments) @as(usize, 1) else options.max_records_per_window;
         var retry_stats = replay_source_mod.MatchingRecordStats{};
         const chunk_stats = collect: while (true) {
             const collected = replay_cursor.forEachNext(collection_limit, &builder, replayChunkConsumeRecord) catch |err| {
@@ -367,8 +397,32 @@ pub fn catchUpIndexFromMatchingCursor(
         }
 
         const collected_bytes = builder.tracked_bytes;
-        stats.collected_items += builder.item_count;
         const batch = try builder.finishBorrowed(chunk_stats.last_sequence);
+        var fragment_plan: ?replay_fragment.Plan = null;
+        defer if (fragment_plan) |*plan| plan.deinit(scratch_alloc);
+        var fragment_piece: ?replay_fragment.Piece = null;
+        defer if (fragment_piece) |*piece| piece.deinit(scratch_alloc);
+        var fragment_position: ?replay_fragment.Position = null;
+        var previously_applied = false;
+        var fragment_complete = true;
+        var apply_batch = batch;
+        if (fragments) {
+            var saved = try options.load_fragment_fn.?(options.fragment_ctx.?, index_ref.name);
+            if (saved) |previous| if (previous.sequence < batch.sequence and previous.next_item == previous.total_items) {
+                saved = null;
+            };
+            const total = batch.documents.len + batch.deleted_keys.len + batch.overwritten_doc_keys.len + batch.changed_artifact_keys.len;
+            if (saved != null or total > options.max_fragment_families) {
+                fragment_plan = try replay_fragment.Plan.init(scratch_alloc, batch, index_ref.name);
+                const continuation = try fragment_plan.?.startPosition(saved);
+                previously_applied = continuation.applied;
+                fragment_piece = try fragment_plan.?.piece(scratch_alloc, continuation.start, options.max_fragment_families);
+                apply_batch = fragment_piece.?.batch;
+                fragment_complete = fragment_piece.?.next_item == total;
+                fragment_position = .{ .sequence = batch.sequence, .next_item = fragment_piece.?.next_item, .total_items = total, .fingerprint = fragment_plan.?.fingerprint, .applied = previously_applied };
+                stats.collected_items += fragment_piece.?.next_item - continuation.start;
+            } else stats.collected_items += builder.item_count;
+        } else stats.collected_items += builder.item_count;
         if (options.release_read_snapshot_after_collect) {
             std.debug.assert(options.max_windows_per_call == 1);
             replay_cursor.releaseReadSnapshot();
@@ -388,11 +442,13 @@ pub fn catchUpIndexFromMatchingCursor(
         }
 
         const apply_started_ns = monotonicTimeNs();
-        const applied = applyBatchBounded(apply_ctx, apply_fn, batch, index_ref, options.max_items_per_window) catch |err| {
+        const new_effects = applyBatchBounded(apply_ctx, apply_fn, apply_batch, index_ref, if (fragments) 0 else options.max_items_per_window) catch |err| {
             stats.apply_ns += monotonicTimeNs() - apply_started_ns;
             logCatchUpError(index_ref, "journal_apply", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
             return err;
         };
+        const applied = (new_effects or previously_applied) and fragment_complete;
+        if (fragment_position) |*position| position.applied = new_effects or previously_applied;
         if (applied) {
             stats.apply_ns += monotonicTimeNs() - apply_started_ns;
             stats.applied_entries += 1;
@@ -415,6 +471,20 @@ pub fn catchUpIndexFromMatchingCursor(
                 return err;
             };
             window_open = false;
+        }
+        if (fragments and !new_effects and fragment_position == null) {
+            // Preserve bounded scan progress across records irrelevant to this
+            // index, without asserting corpus-wide coverage. Otherwise one
+            // no-op before an unfinished record could monopolize every turn.
+            fragment_plan = try replay_fragment.Plan.init(scratch_alloc, batch, index_ref.name);
+            fragment_position = .{ .sequence = batch.sequence, .next_item = fragment_plan.?.items.len, .total_items = fragment_plan.?.items.len, .fingerprint = fragment_plan.?.fingerprint };
+        }
+        if (fragment_position) |position| {
+            try options.save_fragment_fn.?(options.fragment_ctx.?, index_ref.name, position);
+            if (!fragment_complete) {
+                stats.partial_sequence = chunk_stats.last_sequence;
+                return stats;
+            }
         }
         if (options.persist_progress_fn) |persist| {
             if (applied) {
@@ -1783,6 +1853,137 @@ test "catchUpIndex chunks dense replay by item budget" {
     try std.testing.expectEqual(@as(usize, 2), stats.applied_entries);
     try std.testing.expectEqual(@as(usize, 2), capture.call_count);
     try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, capture.sequences.items);
+}
+
+test "catchUpIndex durable full text fragments resume after lost progress without early coverage" {
+    @import("antfly_test_error_logs").expectErrorLogs(1);
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/durable-fragments", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var journal = try change_journal_mod.Journal.open(path, testInMemoryJournalOpenOptions());
+    defer journal.close();
+    try appendChangeJournalRecord(&journal, a, .{ .sequence = 1, .changed_doc_keys = &.{ "a", "b", "c", "d", "e" }, .overwritten_doc_keys = &.{ "a", "b", "c", "d", "e" }, .target_hints = &.{.full_text} });
+    const State = struct {
+        encoded: ?[replay_fragment.encoded_size]u8 = null,
+        counts: [5]usize = @splat(0),
+        scalar: u64 = 0,
+        fail_save: bool = true,
+        window_closed: bool = false,
+
+        fn apply(ptr: *anyopaque, batch: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.window_closed = false;
+            try std.testing.expect(batch.documents.len <= 2);
+            try std.testing.expectEqual(batch.documents.len, batch.overwritten_doc_keys.len);
+            for (batch.documents) |doc| self.counts[doc.key[0] - 'a'] += 1;
+            return batch.documents.len != 0;
+        }
+        fn finish(ptr: *anyopaque, _: index_manager_mod.ManagedIndexRef, success: bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(success);
+            self.window_closed = true;
+        }
+        fn load(ptr: *anyopaque, _: []const u8) !?replay_fragment.Position {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // No cursor or borrowed batch is retained between catch-up calls.
+            return if (self.encoded) |encoded| (try replay_fragment.decode(&encoded)).position else null;
+        }
+        fn save(ptr: *anyopaque, _: []const u8, position: replay_fragment.Position) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.window_closed);
+            try std.testing.expectEqual(@as(u64, 0), self.scalar);
+            if (self.fail_save) {
+                self.fail_save = false;
+                return error.TestFragmentPersistFailure;
+            }
+            self.encoded = replay_fragment.encode(.{ .position = position, .identity = .{ .generation = 1, .config_hash = 2, .incarnation = 3 } });
+        }
+        fn scalarProgress(ptr: *anyopaque, _: []const u8, sequence: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const position = (try replay_fragment.decode(&self.encoded.?)).position;
+            try std.testing.expectEqual(position.total_items, position.next_item);
+            self.scalar = sequence;
+        }
+    };
+    var state: State = .{};
+    const options: CatchUpOptions = .{ .max_windows_per_call = 1, .max_fragment_families = 2, .fragment_ctx = &state, .load_fragment_fn = State.load, .save_fragment_fn = State.save, .window_ctx = &state, .finish_window_fn = State.finish, .persist_ctx = &state, .persist_progress_fn = State.scalarProgress };
+    const index: index_manager_mod.ManagedIndexRef = .{ .name = "text", .kind = .full_text };
+    try std.testing.expectError(error.TestFragmentPersistFailure, catchUpIndexWithOptions(a, replay_source_mod.Source.fromJournal(&journal), index, 0, &state, State.apply, options));
+    try std.testing.expect(state.encoded == null);
+    for (0..3) |turn| {
+        const stats = try catchUpIndexWithOptions(a, replay_source_mod.Source.fromJournal(&journal), index, 0, &state, State.apply, options);
+        if (turn < 2) {
+            try std.testing.expectEqual(@as(u64, 1), stats.partial_sequence);
+            try std.testing.expectEqual(@as(?u64, null), stats.appliedSequenceAdvance(0));
+            try std.testing.expect(!stats.shouldTryTargetAdvance(0, 1));
+            try std.testing.expectEqual(@as(u64, 0), state.scalar);
+        } else {
+            try std.testing.expectEqual(@as(?u64, 1), stats.appliedSequenceAdvance(0));
+            try std.testing.expectEqual(@as(u64, 1), state.scalar);
+        }
+    }
+    try std.testing.expectEqualSlices(usize, &.{ 2, 2, 1, 1, 1 }, &state.counts);
+}
+
+test "catchUpIndex durable fragments cross irrelevant records and recover final watermark failure" {
+    @import("antfly_test_error_logs").expectErrorLogs(2);
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/fragment-noops", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var journal = try change_journal_mod.Journal.open(path, testInMemoryJournalOpenOptions());
+    defer journal.close();
+    try appendChangeJournalRecord(&journal, a, .{ .sequence = 1, .changed_doc_keys = &.{"z"}, .target_hints = &.{.full_text} });
+    try appendChangeJournalRecord(&journal, a, .{ .sequence = 2, .changed_doc_keys = &.{ "a", "b", "c", "d", "e" }, .target_hints = &.{.full_text} });
+    try appendChangeJournalRecord(&journal, a, .{ .sequence = 3, .target_hints = &.{.full_text} });
+    const State = struct {
+        saved: ?replay_fragment.Position = null,
+        documents: usize = 0,
+        scalar: u64 = 0,
+        fail_scalar: bool = true,
+        fn apply(ptr: *anyopaque, batch: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (batch.documents.len == 0 or std.mem.eql(u8, batch.documents[0].key, "z")) return false;
+            self.documents += batch.documents.len;
+            return true;
+        }
+        fn load(ptr: *anyopaque, _: []const u8) !?replay_fragment.Position {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return if (self.saved) |saved| if (saved.sequence > self.scalar) saved else null else null;
+        }
+        fn save(ptr: *anyopaque, _: []const u8, position: replay_fragment.Position) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.saved = position;
+        }
+        fn persist(ptr: *anyopaque, _: []const u8, sequence: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail_scalar) {
+                self.fail_scalar = false;
+                return error.TestScalarPersistFailure;
+            }
+            self.scalar = sequence;
+        }
+    };
+    var state: State = .{};
+    const options: CatchUpOptions = .{ .max_windows_per_call = 1, .max_fragment_families = 2, .fragment_ctx = &state, .load_fragment_fn = State.load, .save_fragment_fn = State.save, .persist_ctx = &state, .persist_progress_fn = State.persist };
+    const index: index_manager_mod.ManagedIndexRef = .{ .name = "text", .kind = .full_text };
+    for (0..3) |_| {
+        const stats = try catchUpIndexWithOptions(a, replay_source_mod.Source.fromJournal(&journal), index, state.scalar, &state, State.apply, options);
+        try std.testing.expectEqual(@as(?u64, null), stats.appliedSequenceAdvance(0));
+    }
+    try std.testing.expectError(error.TestScalarPersistFailure, catchUpIndexWithOptions(a, replay_source_mod.Source.fromJournal(&journal), index, state.scalar, &state, State.apply, options));
+    try std.testing.expectEqual(@as(usize, 5), state.documents);
+    try std.testing.expectEqual(@as(u64, 0), state.scalar);
+    const recovered = try catchUpIndexWithOptions(a, replay_source_mod.Source.fromJournal(&journal), index, state.scalar, &state, State.apply, options);
+    try std.testing.expectEqual(@as(u64, 2), state.scalar);
+    try std.testing.expectEqual(@as(?u64, 2), recovered.appliedSequenceAdvance(0));
+    try std.testing.expectEqual(@as(usize, 5), state.documents);
+    const tail = try catchUpIndexWithOptions(a, replay_source_mod.Source.fromJournal(&journal), index, state.scalar, &state, State.apply, options);
+    try std.testing.expectEqual(@as(usize, 0), tail.scanned_entries);
+    try std.testing.expect(tail.shouldTryTargetAdvance(state.scalar, 3));
 }
 
 test "catchUpIndex subchunks one oversized full text record before advancing its sequence" {

@@ -55697,6 +55697,29 @@ fn replayPendingDerivedBatches(
             try progress.db.core.saveAppliedSequence(index_name, sequence);
             try progress.publish(index_name);
         }
+
+        fn identity(progress: *PersistReplayProgressContext, name: []const u8) !apply_state.replay_fragment.Identity {
+            const cfg = progress.db.core.index_manager.get(name) orelse return error.IndexNotFound;
+            if (cfg.kind != .full_text or cfg.coverage_generation == 0) return error.InvalidDerivedApplyState;
+            return .{ .generation = cfg.coverage_generation, .config_hash = types.indexConfigHash(cfg.*), .incarnation = progress.db.root_incarnation };
+        }
+
+        fn loadFragment(ctx: *anyopaque, name: []const u8) !?apply_state.replay_fragment.Position {
+            const progress: *PersistReplayProgressContext = @ptrCast(@alignCast(ctx));
+            return apply_state.loadReplayFragment(progress.db.alloc, progress.db.core.store, name, try identity(progress, name));
+        }
+
+        fn saveFragment(ctx: *anyopaque, name: []const u8, position: apply_state.replay_fragment.Position) !void {
+            const progress: *PersistReplayProgressContext = @ptrCast(@alignCast(ctx));
+            // No partial record may mint a full-text completion seal. Persist
+            // only after this fragment's index output crossed its real durable
+            // boundary; the ordinary sequence callback seals the final record.
+            try progress.db.core.index_manager.syncAppliedReplayBoundaryForManagedIndex(.{ .name = name, .kind = .full_text });
+            const port = progress.db.async_context.replay_metadata_publication;
+            if (port) |publication| try publication.enter(publication.ptr);
+            defer if (port) |publication| publication.leave(publication.ptr);
+            try apply_state.saveReplayFragment(progress.db.alloc, progress.db.core.store, name, try identity(progress, name), position);
+        }
     };
 
     const DenseReplayProgressContext = struct {
@@ -55878,6 +55901,9 @@ fn replayPendingDerivedBatches(
             .algebraic => 4,
         };
         const adaptive_budget = replay_state.replay_budget.budget(replay_lane);
+        const fragment_replay = options.bounded_replay and index_ref.kind == .full_text and
+            self.core.store.runtime_store.capabilities().bounded_replay_admission and
+            (self.core.index_manager.get(index_ref.name) orelse return error.IndexNotFound).coverage_generation != 0;
         const replay_started = monotonicTimeNs();
         var replay_completed = false;
         defer if (options.bounded_replay and !replay_completed)
@@ -55907,6 +55933,10 @@ fn replayPendingDerivedBatches(
                     if (options.bounded_replay) adaptive_budget.bytes else std.math.maxInt(u64),
                 ),
                 .max_collected_items_per_window = if (options.bounded_replay) adaptive_budget.records else 0,
+                .max_fragment_families = if (fragment_replay) adaptive_budget.records else 0,
+                .fragment_ctx = &persist_progress_ctx,
+                .load_fragment_fn = if (fragment_replay) PersistReplayProgress.loadFragment else null,
+                .save_fragment_fn = if (fragment_replay) PersistReplayProgress.saveFragment else null,
                 .max_windows_per_call = if (options.bounded_replay) 1 else options.max_windows_per_index,
                 .target_sequence = if (options.bounded_replay) target_sequence else 0,
                 .max_call_ns = if (options.bounded_replay) @import("derived/replay_budget.zig").Controller.quantum_ns else 0,

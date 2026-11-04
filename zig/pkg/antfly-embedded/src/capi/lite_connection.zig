@@ -724,6 +724,7 @@ const PathGate = struct {
     references: usize = 1,
     owners: std.ArrayList(*Owner) = .empty,
     lease_stats: native.PathLeaseStats = .{},
+    writer_allocator_cache: native.WriterAllocatorCache = .{},
 };
 var registry_mutex: std.Io.Mutex = .init;
 var gates: std.StringHashMapUnmanaged(*PathGate) = .empty;
@@ -832,6 +833,7 @@ fn releaseGate(gate: *PathGate) void {
     _ = gates.remove(gate.path);
     std.debug.assert(gate.owners.items.len == 0);
     gate.owners.deinit(alloc);
+    gate.writer_allocator_cache.deinit();
     alloc.free(gate.path);
     alloc.destroy(gate);
     if (gates.count() == 0) {
@@ -1655,6 +1657,7 @@ pub const Owner = struct {
             // vacuum assessment/copy publication still rejects a moved tip.
             try root.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(probe.header);
             if (self.current) |current| try file.inheritAllocatorVerification(&current.owned_lite_backend.?.native_docstore.?.file);
+            try root.owned_lite_backend.?.native_docstore.?.prepareWriterAllocatorAssumeAdmitted();
             if (!file.free_pages_verified) _ = try file.inheritAllocatorCertificate();
             self.publication_stats.rebased +|= 1;
         } else if (!std.meta.eql(probe.header, file.header)) {
@@ -1688,6 +1691,7 @@ pub const Owner = struct {
         // Metadata-only validation need not open a serving runtime to donate
         // an allocator. Rebase this writer's checked ledger against the exact
         // admitted tip using the native certificate protocol.
+        if (scope != .reclamation) try root.owned_lite_backend.?.native_docstore.?.prepareWriterAllocatorAssumeAdmitted();
         if (scope != .reclamation and !file.free_pages_verified)
             _ = try file.inheritAllocatorCertificate();
         if ((scope == .primary or scope == .index) and !file.free_pages_verified) {
@@ -1787,6 +1791,7 @@ pub const Owner = struct {
             if (&owner.owned_lite_backend.?.native_docstore.?.file == file and
                 (owner.query_borrows != 0 or owner.maintenance_references != 0 or owner.allocator_verification_references != 0 or owner.sql_cursors.count() != 0)) return;
         };
+        try self.gate.writer_allocator_cache.prepare(file);
         for (donors) |maybe_donor| if (maybe_donor) |donor| {
             if (donor.query_borrows != 0 or donor.maintenance_references != 0 or donor.allocator_verification_references != 0 or donor.sql_cursors.count() != 0) continue;
             if (try file.takeVerifiedAllocator(&donor.owned_lite_backend.?.native_docstore.?.file)) return;
@@ -1900,6 +1905,7 @@ pub const Owner = struct {
         snapshot.sql_ddl_recovery_generation = foreground.sql_ddl_recovery_generation;
         const store = snapshot.owned_lite_backend.?.native_docstore.?;
         store.file.reader_coordinator = self.reader_coordinator;
+        store.file.writer_allocator_cache = &self.gate.writer_allocator_cache;
         try store.file.inheritAllocatorVerification(file);
         if (self.maintenance_snapshot) |old| {
             try store.file.inheritAllocatorVerification(&old.owned_lite_backend.?.native_docstore.?.file);
@@ -2380,12 +2386,18 @@ pub const Owner = struct {
         defer authority_arena.deinit();
         if (self.options.open_mode == .writer and try @import("resolver_authority.zig").hasProjectionDebt(foreground, database, authority_arena.allocator())) namespace_pending = true;
         const group_state = try self.groupSourceStateNamed(database, if (selected) |table| table.name else "default");
-        if (foreground_file.ledger) |ledger| {
-            group_state.replay_budget.updatePressure(ledger.data_pending, ledger.free_pages, foreground_file.allocator_work.reuse_blocked_append_pages);
-            group_state.producer_replay_budget.updatePressure(ledger.data_pending, ledger.free_pages, foreground_file.allocator_work.reuse_blocked_append_pages);
+        const allocator_stats = stats: {
+            const foreground_store = foreground.owned_lite_backend.?.native_docstore.?;
+            foreground_store.mutex.lock();
+            defer foreground_store.mutex.unlock();
+            break :stats try foreground_file.allocatorStats();
+        };
+        if (allocator_stats) |ledger| {
+            group_state.replay_budget.updatePressure(ledger.pending_data_objects, ledger.reusable_pages, foreground_file.allocatorWorkSnapshot().reuse_blocked_append_pages);
+            group_state.producer_replay_budget.updatePressure(ledger.pending_data_objects, ledger.reusable_pages, foreground_file.allocatorWorkSnapshot().reuse_blocked_append_pages);
             // Bound each service publication independently, increasing useful
             // work when foreground retirement is outpacing the baseline turn.
-            const work_pages: usize = @intCast(@min(512, 128 + ledger.data_pending / 8));
+            const work_pages: usize = @intCast(@min(512, 128 + ledger.pending_data_objects / 8));
             self.publication_stats.retirement_work_pages = work_pages;
             self.configureRetirementBudget(foreground.owned_lite_backend.?.native_docstore.?);
         }
@@ -3192,6 +3204,8 @@ fn compatible(a: api.LiteResolvedOpenOptions, b: api.LiteResolvedOpenOptions) bo
     right.busy_timeout_ms = 0;
     left.reader_coordinator = null;
     right.reader_coordinator = null;
+    left.writer_allocator_cache = null;
+    right.writer_allocator_cache = null;
     if (left.ttl_cleanup) |*ttl| {
         const other = right.ttl_cleanup orelse return false;
         if (!std.mem.eql(u8, ttl.owner_id, other.owner_id)) return false;
@@ -3565,6 +3579,8 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
             owner.reader_coordinator = coordinator;
         } else owner.reader_coordinator = try native.ReaderCoordinator.create(alloc, io);
         owner.options.reader_coordinator = owner.reader_coordinator;
+        owner.options.writer_allocator_cache = &gate.writer_allocator_cache;
+        if (initial) |root| root.owned_lite_backend.?.native_docstore.?.file.writer_allocator_cache = &gate.writer_allocator_cache;
         if (initial) |root| root.owned_lite_backend.?.native_docstore.?.file.reader_coordinator = owner.reader_coordinator;
     }
     errdefer if (existing == null) owner.reader_coordinator.release();
@@ -5010,6 +5026,8 @@ const AdmissionFollowupFixture = struct {
         }
         if (operation == .read) try boundCapacity(owner.current.?);
         owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+        // Model a genuinely cold owner, including its path-owned cache.
+        owner.gate.writer_allocator_cache.deinit();
         return .{ .tmp = tmp, .path = path, .id = id, .connection = connection };
     }
 
@@ -5083,7 +5101,7 @@ const ConstraintOverlayProbe = struct {
     }
 };
 
-test "capi native SQL constraint overlay extends once per statement and invalidates rollback primary and DDL cuts" {
+test "capi native SQL constraint overlay fences dependencies while ignoring unrelated primary writes" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("sql-constraint-overlay", 5000, .batch);
     defer fixture.deinit();
@@ -5111,6 +5129,9 @@ test "capi native SQL constraint overlay extends once per statement and invalida
     try std.testing.expectEqual(@as(?i64, 60), try Probe.run(fixture.id, session_id, "SELECT SUM(v) FROM items", null));
     try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
     _ = try Probe.run(fixture.id, session_id, "INSERT INTO items (id,v) VALUES (4,40)", null);
+    try std.testing.expectEqual(@as(usize, 2), session.test_overlay_rebuilds);
+    _ = try Probe.run(fixture.id, null, "INSERT INTO items (id,v) VALUES (99,0)", null);
+    _ = try Probe.run(fixture.id, session_id, "UPDATE items SET v=20 WHERE id=2", null);
     try std.testing.expectEqual(@as(usize, 3), session.test_overlay_rebuilds);
     _ = try Probe.run(fixture.id, null, "CREATE TABLE unrelated (n BIGINT)", null);
     _ = try Probe.run(fixture.id, session_id, "INSERT INTO items (id,v) VALUES (5,50)", null);
@@ -5128,6 +5149,29 @@ test "capi native SQL constraint overlay extends once per statement and invalida
     _ = try Probe.run(fixture.id, session_id, "ROLLBACK", null);
     try std.testing.expectEqual(@as(?i64, 88), try Probe.run(fixture.id, null, "SELECT v FROM items WHERE id=1", null));
     try std.testing.expect((try owner.current.?.owned_lite_backend.?.native_docstore.?.checkWithCancel(null)).valid);
+}
+
+test "capi native SQL constraint overlay fences inbound and outbound foreign key dependencies" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("sql-overlay-dependencies", 5000, .batch);
+    defer fixture.deinit();
+    const Probe = ConstraintOverlayProbe;
+    _ = try Probe.run(fixture.id, null, "CREATE TABLE parents (id BIGINT PRIMARY KEY)", null);
+    _ = try Probe.run(fixture.id, null, "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT REFERENCES parents(id))", null);
+    _ = try Probe.run(fixture.id, null, "INSERT INTO parents (id) VALUES (1)", null);
+    var id: u64 = 0;
+    const sessions = @import("sql_session.zig");
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, sessions.antfly_db_sql_session_open(fixture.id, &id));
+    defer _ = sessions.antfly_db_sql_session_close(fixture.id, id);
+    _ = try Probe.run(fixture.id, id, "BEGIN", null);
+    _ = try Probe.run(fixture.id, id, "INSERT INTO children (id,parent_id) VALUES (1,1)", null);
+    const session = fixture.connection.sql_sessions.get(id).?;
+    const before = session.test_overlay_rebuilds;
+    _ = try Probe.run(fixture.id, null, "INSERT INTO parents (id) VALUES (2)", null);
+    _ = try Probe.run(fixture.id, id, "INSERT INTO children (id,parent_id) VALUES (2,2)", null);
+    try std.testing.expectEqual(before + 1, session.test_overlay_rebuilds);
+    _ = try Probe.run(fixture.id, id, "COMMIT", null);
+    try std.testing.expectEqual(@as(?i64, 2), try Probe.run(fixture.id, null, "SELECT COUNT(*) FROM children", null));
 }
 
 test "capi native SQL constraint overlay evicts optional allocation failures without losing staged writes" {
@@ -6861,9 +6905,9 @@ test "capi native replay admission preserves oversized record input ownership" {
     var fixture = try AdmissionFollowupFixture.init("replay-oversized-inputs", 5000, .batch);
     defer fixture.deinit();
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"search\",\"type\":\"full_text\"}")));
-    // A single record exceeds the initial 64-item collection budget. It must
-    // remain one apply input boundary: releasing its source after a first
-    // split callback would strand the remaining documents on every retry.
+    // A record exceeds the initial 64-family budget. Each fragment keeps
+    // its own source/callback borrows alive, then durably checkpoints progress
+    // before another turn can release and reconstruct the source snapshot.
     var request: std.ArrayListUnmanaged(u8) = .empty;
     defer request.deinit(a);
     try request.appendSlice(a, "{\"inserts\":{");
@@ -6960,8 +7004,8 @@ test "capi native replay maintenance replacement transfers authenticated allocat
     try first_file.beginTransaction();
     try first_file.putCatalogRecord("cache-transfer-first", "one");
     try first_file.commitTransaction();
-    const cached = first_file.ledger.?;
-    const loads = first_file.allocator_work.full_loads;
+    const cached = owner.gate.writer_allocator_cache.holder.?.ledger.?;
+    const loads = first_file.allocatorWorkSnapshot().full_loads;
     try std.testing.expect(cached.digest_cache != null);
     _ = try owner.refresh();
     const foreground_file = &owner.current.?.owned_lite_backend.?.native_docstore.?.file;
@@ -6971,11 +7015,11 @@ test "capi native replay maintenance replacement transfers authenticated allocat
     try foreground_file.commitTransaction();
     const replacement = try owner.refreshMaintenanceSnapshot(owner.current.?, .storage);
     const adopted = &replacement.owned_lite_backend.?.native_docstore.?.file;
-    try std.testing.expectEqual(cached, adopted.ledger.?);
+    try std.testing.expectEqual(cached, owner.gate.writer_allocator_cache.holder.?.ledger.?);
     try std.testing.expect(adopted.free_pages_verified);
-    try std.testing.expectEqual(loads, adopted.allocator_work.full_loads);
+    try std.testing.expectEqual(loads, adopted.allocatorWorkSnapshot().full_loads);
     try adopted.putCatalogRecord("cache-transfer-after", "three");
-    try std.testing.expectEqual(loads, adopted.allocator_work.full_loads);
+    try std.testing.expectEqual(loads, adopted.allocatorWorkSnapshot().full_loads);
     try std.testing.expect((try adopted.check()).valid);
 }
 
@@ -7705,18 +7749,18 @@ test "capi native allocator proof verified replacement preserves the checked dig
     try file.putCatalogRecord("runtime-affecting-metadata", "checked publication");
     try std.testing.expect(file.free_pages_verified);
     try std.testing.expect(try file.certifyAllocator());
-    const ledger = file.ledger.?;
-    const rebuilds = file.allocator_work.digest_rebuilds;
-    const loads = file.allocator_work.full_loads;
+    const ledger = owner.gate.writer_allocator_cache.holder.?.ledger.?;
+    const rebuilds = file.allocatorWorkSnapshot().digest_rebuilds;
+    const loads = file.allocatorWorkSnapshot().full_loads;
     const digest_work = ledger.digestWork();
     const current = try owner.refresh();
     const adopted = &current.owned_lite_backend.?.native_docstore.?.file;
     try std.testing.expect(current != previous);
     try std.testing.expect(adopted.free_pages_verified);
-    try std.testing.expect(adopted.ledger != null);
-    try std.testing.expectEqual(ledger, adopted.ledger.?);
-    try std.testing.expectEqual(loads, adopted.allocator_work.full_loads);
-    try std.testing.expectEqual(rebuilds, adopted.allocator_work.digest_rebuilds);
+    try std.testing.expect(owner.gate.writer_allocator_cache.holder.?.ledger != null);
+    try std.testing.expectEqual(ledger, owner.gate.writer_allocator_cache.holder.?.ledger.?);
+    try std.testing.expectEqual(loads, adopted.allocatorWorkSnapshot().full_loads);
+    try std.testing.expectEqual(rebuilds, adopted.allocatorWorkSnapshot().digest_rebuilds);
     try std.testing.expectEqual(digest_work, ledger.digestWork());
     try std.testing.expect((try adopted.check()).valid);
 }
@@ -7743,7 +7787,7 @@ test "capi native allocator proof storage-only foreign tip avoids runtime refres
     }
     const refreshes = owner.publication_stats.serving_runtime_refreshes;
     const runtime_opens = owner.test_runtime_snapshot_opens;
-    const cache_transfers_before = foreground.owned_lite_backend.?.native_docstore.?.file.allocator_work.cache_transfers;
+    const cache_transfers_before = foreground.owned_lite_backend.?.native_docstore.?.file.allocatorWorkSnapshot().cache_transfers;
     try std.testing.expect(try owner.storageMaintenanceTurn());
     try std.testing.expectEqual(foreground, owner.current.?);
     try std.testing.expectEqualDeep(entry_header, foreground.owned_lite_backend.?.native_docstore.?.file.header);
@@ -7755,9 +7799,9 @@ test "capi native allocator proof storage-only foreign tip avoids runtime refres
     try std.testing.expect(owner.maintenance_snapshot.?.sql_ddl_recovery_needed);
     const physical_file = &owner.maintenance_snapshot.?.owned_lite_backend.?.native_docstore.?.file;
     try std.testing.expect(physical_file.free_pages_verified);
-    try std.testing.expect(physical_file.ledger != null);
+    try std.testing.expect(owner.gate.writer_allocator_cache.holder.?.ledger != null);
     // Physical telemetry is absorbed into the serving owner after service.
-    try std.testing.expect(foreground.owned_lite_backend.?.native_docstore.?.file.allocator_work.cache_transfers > cache_transfers_before);
+    try std.testing.expect(foreground.owned_lite_backend.?.native_docstore.?.file.allocatorWorkSnapshot().cache_transfers > cache_transfers_before);
     try std.testing.expectEqual(@as(usize, 0), foreground.query_borrows);
     // Logical admission must still refresh and expose the real data; physical
     // housekeeping never certifies an obsolete schema/index runtime as current.

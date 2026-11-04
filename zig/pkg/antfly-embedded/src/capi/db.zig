@@ -2648,6 +2648,7 @@ pub const LiteResolvedOpenOptions = struct {
     externally_locked: bool = false,
     artifact_reader_fence: bool = false,
     reader_coordinator: ?*lite_backend.native.ReaderCoordinator = null,
+    writer_allocator_cache: ?*lite_backend.native.WriterAllocatorCache = null,
     /// Borrowed only during open, under the connection's publication fence.
     allocator_verification_owner: ?*lite_backend.native.NativeFile = null,
     /// Exclusive temporary verifier; consumes its cache before DB.open.
@@ -2914,6 +2915,8 @@ pub fn openLiteHandleAllocWithSharedInference(
     // Its reader coordinator must be installed before that first transaction.
     backend.native_docstore.?.artifact_reader_fence = resolved.artifact_reader_fence;
     backend.native_docstore.?.file.reader_coordinator = resolved.reader_coordinator;
+    backend.native_docstore.?.file.writer_allocator_cache = resolved.writer_allocator_cache;
+    if (resolved.writer_allocator_cache) |cache| try cache.prepare(&backend.native_docstore.?.file);
 
     if (create and resolved.profile == .native and backend.native_docstore.?.file.header.indexed_revision >= 8 and backend.native_docstore.?.file.header.indexed_reclamation) {
         // A new file starts with known zero debt. Legacy files bootstrap once

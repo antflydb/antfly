@@ -1160,16 +1160,25 @@ The naming recommendation is:
 
 ## Native throughput and online compaction
 
-Native owners create revision-8 files (`AFLITE\x08P`) with packed records and
+Native owners create revision-9 files (`AFLITE\x09P`) with packed records and
 durable page ownership. Existing revision-3 signatures (`AFLITE\x03N` for
 unpacked records and `AFLITE\x03P` for packed records) remain readable. Writable
-owners migrate revisions 3 and 7 through an atomic compact-generation replacement;
+owners migrate revisions 3, 7 and 8 through an atomic compact-generation replacement;
 read-only opens preserve the existing encoding. The Zig `page_reuse = false`
 option preserves revision-3 creation/open behavior. Raw native primitives also
 retain their revision-3 default for compatibility. Revision 2 remains unsupported,
-and older binaries reject the revision-8 signature before checkpoint selection.
+and older binaries reject the revision-9 signature before checkpoint selection.
 Unreleased revision-4/5/6 prototypes are rejected rather than mixing reader,
-logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-8 image.
+logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-9 image.
+
+Revision 9 maintains a semantic revision for each schema-bearing native document namespace in
+the same transaction as its row, identity or relational-constraint changes.
+Replay cursors, immutable artifacts and columnar housekeeping do not invalidate
+that revision. SQL statement overlays combine these revisions for their
+foreign-key-connected dependency set with schema-directory and namespace
+incarnation witnesses. They remain speculative: COMMIT revalidates native
+constraints and predicates. Revision 7/8 readers retain conservative file-wide
+overlay invalidation until writable maintenance upgrades the generation.
 
 Revision 7 records separate opaque identities for primary data, runtime metadata,
 and index inputs in each recovery slot. Allocator-only checkpoints and scoped
@@ -1179,6 +1188,27 @@ validate journal ancestry and the current seal; a repeated physical root ID does
 not establish a cache hit. Compaction assigns fresh identities to every logical
 root family before sealing its replacement generation; allocator-only publication
 normalization preserves those identities.
+
+A connection path owns one checked allocator cache independently of serving
+and detached DB wrappers. A serialized native transaction or page-allocation
+operation loans that mutable state and returns it only at a clean boundary.
+Readers keep independent protected snapshots. The cache has no reader epoch or
+artifact lease, cannot pin reuse, checks inode/checkpoint identity on handoff,
+and authenticates foreign journal rebases before reuse. Its work counters remain
+with the path across serving/maintenance replacements.
+
+Bounded full-text replay can persist a continuation inside one journal record.
+A fragment keeps a primary document's row, deletion, overwrite and asset effects
+together. Index output crosses its durability barrier before the continuation is
+written. The continuation binds the namespace incarnation, index coverage
+generation/configuration and deterministic input fingerprint. Only a completed
+record advances the public applied sequence or full-text completion seal; replay
+truncation continues to use that sequence. Lost progress writes safely replay the
+last fragment. Irrelevant-record scan progress is retained without certifying
+corpus completeness. The scheduling limit counts document families; one large
+family still uses existing projection memory limits and is a soft time bound.
+Legacy index configurations without a coverage generation keep whole-record
+replay until their generation is replaced.
 
 Schema and SQL recovery-state writes atomically mark their namespace in a durable
 recovery agenda. Admission checks pending namespaces instead of opening every

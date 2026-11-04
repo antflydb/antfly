@@ -572,6 +572,8 @@ comptime {
 }
 
 test {
+    _ = @import("antfly_local_sources").storage_lite_semantic_revision;
+    _ = @import("antfly_local_sources").storage_db_derived_replay_fragment;
     _ = @import("antfly_local_sources").storage_db_enrichment_media_output;
 }
 

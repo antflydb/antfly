@@ -2001,6 +2001,15 @@ pub const Store = struct {
         return NativeBackendStore.init(self);
     }
 
+    /// The caller holds path publication admission and has rebound this
+    /// wrapper to the admitted tip. Move no mutable allocator across an
+    /// unlocked Store boundary, even when detached readers retain this DB.
+    pub fn prepareWriterAllocatorAssumeAdmitted(self: *Store) !void {
+        lockStore(self);
+        defer self.mutex.unlock();
+        if (self.file.writer_allocator_cache) |cache| try cache.prepare(&self.file);
+    }
+
     /// Starts only after the owner has reached its permanent address. A Store
     /// returned by value from open/create must never start a self-referencing task.
     pub fn startMaintenance(self: *Store) void {
@@ -2101,20 +2110,32 @@ pub const Store = struct {
     /// The detached connection owner calls this before provider/index work,
     /// while no foreground gate or writer path lease is held.
     pub fn prepareAllocatorVerification(self: *Store, cancel: ?*const maintenance.CancelToken) !void {
-        if (self.file.free_pages_verified) return;
-        if (@import("builtin").is_test) if (self.test_maintenance_hook) |hook| try hook.notify(hook.ptr, .verification);
-        const reader = try self.file.allocatorVerificationSnapshot(cancel);
+        // Capture the mutable wrapper's proof lineage under its Store mutex.
+        // The graph walk owns an independent inode-fenced reader; it never
+        // races a writer loaning the root wrapper's allocator state.
+        lockStore(self);
+        const reader = capture: {
+            defer self.mutex.unlock();
+            if (self.file.free_pages_verified) return;
+            break :capture try self.file.captureAllocatorVerificationSnapshot(cancel);
+        };
         defer {
             reader.close();
             self.file.allocator.destroy(reader);
         }
+        if (@import("builtin").is_test) if (self.test_maintenance_hook) |hook| try hook.notify(hook.ptr, .verification);
+        try reader.completeAllocatorVerification();
         // Publish the completed proof under the same short owner fence as
         // lease metadata. Foreground readers may inherit this flag, so the
         // detached scan must never mutate it concurrently outside that fence.
         if (self.writer_admission) |admission| try admission.enter(admission.ptr, .artifact_lease);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
+        lockStore(self);
+        defer self.mutex.unlock();
         try self.file.inheritAllocatorVerification(reader);
         if (!self.file.free_pages_verified) return error.EnrichmentWaitCanceled;
+        _ = try self.file.takeVerifiedAllocator(reader);
+        if (self.file.writer_allocator_cache) |cache| try cache.prepare(&self.file);
     }
 
     /// Automatic shrinking is optional and preemptible. Required allocator,
@@ -2500,7 +2521,7 @@ pub const Store = struct {
             status.oldest_data_retirement_epoch = stats.oldest_data_epoch;
             status.oldest_metadata_retirement_epoch = stats.oldest_metadata_epoch;
         }
-        status.allocator_work = self.file.allocator_work;
+        status.allocator_work = self.file.allocatorWorkSnapshot();
         if (self.file.reader_coordinator) |coordinator| {
             const readers = coordinator.readerStats((try self.file.file.stat(self.file.runtime())).inode);
             status.coordinated_reader_count = readers.count;

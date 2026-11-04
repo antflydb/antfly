@@ -509,7 +509,7 @@ pub fn Adapter(comptime native: type) type {
             const writes = try dependencies.sql_mutation_images.writes(types.BatchWrite, alloc, mutations);
             const target_predicates = try dependencies.sql_conflict_predicate.toNative(alloc, target.conditions);
             const keys = try dependencies.sql_conflict_predicate.expressionsToNative(alloc, target.expressions);
-            const overlay = if (session) |value| try value.preparedConstraintOverlay(self.localSource(), metadata, self.repairAdmission(), value.entries.items.len) else null;
+            const overlay = if (session) |value| try value.preparedConstraintOverlay(self.localSource(), metadata, self.repairAdmission(), value.entries.items.len, table.physical_name) else null;
             const previous = if (overlay == null) (if (session) |value| try value.commitRequests(alloc) else &.{}) else &.{};
             const owners = try integrity.resolveConflictTargetOwnersWithOverlay(alloc, scratch_alloc, self.localSource(), metadata.table, metadata.range, self.table_name, table.schema_version, .{ .columns = target.columns, .expressions = keys, .predicate = target_predicates, .constraint_name = target.constraint_name }, writes, previous, overlay, .{});
             const output = try alloc.alloc(catalog.ConflictOwner, owners.len);

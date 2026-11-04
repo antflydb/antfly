@@ -14,6 +14,7 @@
 // limitations under the License.
 
 test {
+    _ = @import("antfly_local_sources").storage_lite_semantic_revision;
     _ = @import("antfly_local_sources").storage_lite_backup_preflight;
     _ = @import("standalone/backup_inspection.zig");
     _ = @import("antfly_local_sources").storage_lite_backend;
