@@ -17,8 +17,10 @@
 //! Durable submissions are rediscovered after pod loss; notifications are hints.
 const std = @import("std");
 const runtime = @import("runtime.zig");
+const state = @import("state.zig");
 const A = std.mem.Allocator;
 pub const Driver = struct {
+    const Hint = struct { tenant: state.Digest, query: state.Query };
     service: runtime.Service,
     dispatcher: runtime.Dispatcher,
     interval_ms: u32 = 100,
@@ -31,6 +33,44 @@ pub const Driver = struct {
     started: bool = false,
     stopping: std.atomic.Value(bool) = .init(false),
     io: ?std.Io = null,
+    wake: std.Io.Event = .unset,
+    hint_mutex: std.atomic.Mutex = .unlocked,
+    hints: [256]Hint = undefined,
+    hint_head: usize = 0,
+    hint_count: usize = 0,
+    pub fn notification(self: *Driver) runtime.Notification {
+        return .{ .ptr = self, .notify = struct {
+            fn notify(raw: *anyopaque, tenant: state.Digest, query: state.Query) void {
+                const driver: *Driver = @ptrCast(@alignCast(raw));
+                driver.enqueue(.{ .tenant = tenant, .query = query }, true);
+            }
+        }.notify };
+    }
+    fn enqueue(self: *Driver, hint: Hint, signal: bool) void {
+        if (self.stopping.load(.acquire)) return;
+        while (!self.hint_mutex.tryLock()) std.atomic.spinLoopHint();
+        const duplicate = for (0..self.hint_count) |i| {
+            const queued = self.hints[(self.hint_head + i) % self.hints.len];
+            if (std.meta.eql(queued.query, hint.query) and std.meta.eql(queued.tenant, hint.tenant)) break true;
+        } else false;
+        if (!duplicate and self.hint_count < self.hints.len) {
+            self.hints[(self.hint_head + self.hint_count) % self.hints.len] = hint;
+            self.hint_count += 1;
+        }
+        self.hint_mutex.unlock();
+        // A full queue still wakes discovery. Overflow loses only the hint,
+        // never the durable query or cancellation record.
+        if (signal) if (self.io orelse self.service.context.io) |io| self.wake.set(io);
+    }
+    fn drain(self: *Driver, out: []Hint) usize {
+        while (!self.hint_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.hint_mutex.unlock();
+        const count = @min(out.len, self.hint_count);
+        for (out[0..count], 0..) |*hint, i| hint.* = self.hints[(self.hint_head + i) % self.hints.len];
+        self.hint_head = (self.hint_head + count) % self.hints.len;
+        self.hint_count -= count;
+        return count;
+    }
     pub fn start(self: *Driver, io: std.Io) !void {
         if (self.started) return;
         if (self.service.role != .query_only and self.service.role != .combined) return error.SqlQueryRoleRequired;
@@ -47,12 +87,18 @@ pub const Driver = struct {
         self.after = null;
     }
     fn run(self: *Driver) void {
-        while (true) {
+        while (!self.stopping.load(.acquire)) {
+            // Reset before draining: a notification during a turn remains set
+            // and prevents sleeping. A notification before reset is in the queue.
+            self.wake.reset();
             _ = self.tick() catch |err| switch (err) {
                 error.Canceled, error.Cancelled => return,
                 else => std.log.warn("distributed SQL recovery turn deferred: {s}", .{@errorName(err)}),
             };
-            std.Io.sleep(self.io.?, .fromMilliseconds(self.sleepDelay()), .awake) catch return;
+            self.wake.waitTimeout(self.io.?, .{ .duration = .{ .raw = .fromMilliseconds(self.sleepDelay()), .clock = .awake } }) catch |err| switch (err) {
+                error.Timeout => continue,
+                error.Canceled => return,
+            };
         }
     }
     pub fn sleepDelay(self: *const Driver) u32 {
@@ -65,6 +111,8 @@ pub const Driver = struct {
     pub fn tick(self: *Driver) !usize {
         if (self.service.role != .query_only and self.service.role != .combined) return error.SqlQueryRoleRequired;
         var service = self.service;
+        // Internal progress must not recursively notify its own driver.
+        service.notification = null;
         service.context.cancellation = .{ .ptr = self, .is_cancelled_fn = struct {
             fn canceled(raw: *const anyopaque) bool {
                 const driver: *const Driver = @ptrCast(@alignCast(raw));
@@ -74,17 +122,55 @@ pub const Driver = struct {
         var arena = std.heap.ArenaAllocator.init(self.service.a);
         defer arena.deinit();
         const a = arena.allocator();
+        var hinted: [16]Hint = undefined;
+        const hinted_count = self.drain(&hinted);
+        var turns: usize = 0;
+        // Reset backoff before any I/O: a transient read failure must not put
+        // newly admitted work back into the previous thirty-second sleep.
+        if (hinted_count != 0) {
+            self.idle_delay_ms = self.interval_ms;
+            self.delay_ms = self.interval_ms;
+            self.sweep_work = true;
+        }
+        var consumed: usize = 0;
+        errdefer for (hinted[consumed..hinted_count]) |hint| self.enqueue(hint, false);
+        for (hinted[0..hinted_count]) |hint| {
+            consumed += 1;
+            errdefer self.enqueue(hint, false);
+            if (hint.query.expires_ms <= service.clock.now()) continue;
+            var records = service.state_store;
+            records.context = service.context;
+            const key = try records.key(a, hint.query, null, 0);
+            var current = (try records.load(a, key)) orelse continue;
+            defer current.deinit(a);
+            if (current.value.status == .running and !std.mem.eql(u8, current.value.owner, service.owner) and current.value.until_ms +| 30_000 >= service.clock.now()) continue;
+            var scoped = service;
+            scoped.tenant = hint.tenant;
+            const complete = scoped.turn(hint.query, self.dispatcher) catch |err| switch (err) {
+                error.SqlQueryExpired, error.SqlExecutionFailed, error.SqlExecutionNotFound, error.SqlExecutionUnauthorized => continue,
+                error.Canceled, error.Cancelled => return err,
+                else => {
+                    self.enqueue(hint, false);
+                    continue;
+                },
+            };
+            if (!complete) self.enqueue(hint, false);
+            turns += 1;
+        }
         var client = self.service.state_store.client;
         client.allocator = a;
         const prefix = try std.fmt.allocPrint(a, "{s}/sql-query-expiry/", .{self.service.state_store.prefix});
         var listed = try client.listObjects(self.service.state_store.bucket, .{ .prefix = prefix, .start_after = self.after, .max_keys = 16, .cancellation = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.contextCancellation(&service.context) });
         defer listed.deinit(a);
-        var turns: usize = 0;
         for (listed.entries) |entry| {
             if (!std.mem.startsWith(u8, entry.key, prefix) or entry.key.len != prefix.len + 90) return error.InvalidSqlExecutionState;
             const expiry = try std.fmt.parseInt(u64, entry.key[prefix.len..][0..20], 10);
             if (expiry <= self.service.clock.now()) continue;
             const query: @import("state.zig").Query = .{ .id = entry.key[prefix.len + 21 ..][0..64].*, .expires_ms = expiry };
+            const just_processed = for (hinted[0..hinted_count]) |hint| {
+                if (std.meta.eql(hint.query, query)) break true;
+            } else false;
+            if (just_processed) continue;
             const key = try self.service.state_store.key(a, query, null, 0);
             var records = self.service.state_store;
             records.context = service.context;

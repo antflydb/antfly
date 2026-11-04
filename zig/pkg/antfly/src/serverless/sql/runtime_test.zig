@@ -1277,3 +1277,110 @@ test "distributed SQL recovery retires terminal hints and backs off idle sweeps"
     expired.now_ms = query.expires_ms + 30001;
     try std.testing.expectEqual(@as(usize, 1), try @import("collector.zig").collect(sa, expired, 64));
 }
+
+test "distributed SQL notifications interrupt idle waits and retain durable cancellation" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    var service = fixture.service(a, memory.client(), "query-pod");
+    var dispatch: Dispatch = .{ .workers = .{ fixture.service(a, memory.client(), "worker-a"), fixture.service(a, memory.client(), "worker-b") }, .drop_once = false };
+    var driver: @import("driver.zig").Driver = .{ .service = service, .dispatcher = .{ .ptr = &dispatch, .dispatch = Dispatch.run }, .io = std.testing.io };
+    defer driver.stop();
+    service.notification = driver.notification();
+    for (0..16) |_| _ = try driver.tick();
+    try std.testing.expect(driver.sleepDelay() >= 30000);
+    const column: plan.Column = .{ .name = "id", .type = .integer };
+    const left: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{column}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 2 };
+    var right = left;
+    right.table_id = 2;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    var spec = try plan.choose(left, right, service.tenant, fixture.now + 15000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{}, fixture.now);
+    const Wait = struct {
+        wake: *std.Io.Event,
+        entered: std.Io.Event = .unset,
+        done: std.Io.Event = .unset,
+        fn run(self: *@This(), io: std.Io) void {
+            self.entered.set(io);
+            self.wake.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } }) catch return;
+            self.done.set(io);
+        }
+    };
+    var waiter: Wait = .{ .wake = &driver.wake };
+    var group: std.Io.Group = .init;
+    defer group.cancel(std.testing.io);
+    try group.concurrent(std.testing.io, Wait.run, .{ &waiter, std.testing.io });
+    try waiter.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
+    const query = try service.submit(spec);
+    try waiter.done.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
+    try group.await(std.testing.io);
+    // Repeated hints coalesce, and clearing a pre-wait signal cannot lose work.
+    _ = try service.submit(spec);
+    try std.testing.expectEqual(@as(usize, 1), driver.hint_count);
+    driver.wake.reset();
+    driver.after = try a.dupe(u8, "tenant/sql-query-expiry/99999999999999999999/z.json");
+    // Failure after draining must preserve the hint and the fast retry delay.
+    var failed = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    driver.service.a = failed.allocator();
+    try std.testing.expectError(error.OutOfMemory, driver.tick());
+    driver.service.a = a;
+    try std.testing.expectEqual(@as(usize, 1), driver.hint_count);
+    try std.testing.expectEqual(driver.interval_ms, driver.sleepDelay());
+    var complete = false;
+    for (0..64) |_| {
+        _ = try driver.tick();
+        if (try service.pollResult(sa, query)) |result| {
+            try std.testing.expectEqual(@as(u64, 2), result.rows);
+            complete = true;
+            break;
+        }
+        fixture.now += driver.sleepDelay();
+    }
+    try std.testing.expect(complete and fixture.now < spec.expires_ms);
+    // A cancellation notification arriving during a turn must remain signaled.
+    spec.expires_ms -= 1;
+    const cancelled = try service.submit(spec);
+    const CancelDuringTurn = struct {
+        dispatch: *Dispatch,
+        service: runtime.Service,
+        query: state.Query,
+        once: bool = false,
+        fn run(raw: *anyopaque, tickets: []const plan.Ticket, context: Context) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try Dispatch.run(self.dispatch, tickets, context);
+            if (!self.once) {
+                self.once = true;
+                try self.service.requestCancel(self.query);
+            }
+        }
+    };
+    var cancel: CancelDuringTurn = .{ .dispatch = &dispatch, .service = service, .query = cancelled };
+    driver.dispatcher = .{ .ptr = &cancel, .dispatch = CancelDuringTurn.run };
+    driver.wake.reset();
+    _ = try driver.tick();
+    try std.testing.expect(driver.wake.isSet());
+    _ = try driver.tick();
+    try std.testing.expectError(error.Canceled, service.pollResult(sa, cancelled));
+    // Bounded notification overflow still falls back to durable discovery.
+    driver.dispatcher = .{ .ptr = &dispatch, .dispatch = Dispatch.run };
+    const notification = driver.notification();
+    for (0..300) |i| notification.notify(notification.ptr, service.tenant, .{ .id = local.serverless_external_source_mod.lake_catalog.types.digestHex(try std.fmt.allocPrint(sa, "missing-{d}", .{i})), .expires_ms = spec.expires_ms });
+    try std.testing.expectEqual(@as(usize, 256), driver.hint_count);
+    spec.expires_ms -= 1;
+    const overflowed = try service.submit(spec);
+    try std.testing.expectEqual(@as(usize, 256), driver.hint_count);
+    var recovered = false;
+    for (0..64) |_| {
+        _ = try driver.tick();
+        if (try service.pollResult(sa, overflowed)) |_| {
+            recovered = true;
+            break;
+        }
+        fixture.now += driver.sleepDelay();
+    }
+    try std.testing.expect(recovered);
+}

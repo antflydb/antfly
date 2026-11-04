@@ -47,8 +47,15 @@ they do not need table publication authority. Query pools run recovery and
 signed task/control RPCs. Terminal CAS operations retire discovery hints; expiry
 GC uses the actual state/exchange roots independently. Recovery skips live foreign
 leases, drains discovery pages promptly, and backs off empty sweeps to about
-30 seconds with boot-specific jitter. Active owners retain fast recovery. Maintenance pools collect expired execution records
-and exchange objects. API gateways never execute worker tasks.
+30 seconds with boot-specific jitter. Active owners retain fast recovery.
+Submissions, cancellations, and foreground ownership acquisition signal an interruptible
+local event after durable admission. An allocation-free, coalescing FIFO retains
+up to 256 query hints, with at most 16 processed per turn. Hinted queries bypass
+the discovery cursor and remain queued until complete. Internal progress never
+self-signals; notification overflow and process loss fall back to durable
+round-robin discovery. Embeddings wire `Driver.notification()` into their
+`Service.notification` when they use the native recovery driver. Maintenance
+pools collect expired execution records and exchange objects. API gateways never execute worker tasks.
 
 The companion Colony operator adds `AntflyCluster.spec.serverlessSQL` and
 owns long-lived query and maintenance Deployments, ready-pod DNS discovery,

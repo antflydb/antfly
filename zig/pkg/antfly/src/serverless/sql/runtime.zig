@@ -57,6 +57,12 @@ pub const Factory = struct {
     open: *const fn (*anyopaque, A, plan.Digest, Context) anyerror!Service,
     dispatcher: Dispatcher,
 };
+/// Best-effort local scheduling hint. Durable records remain authoritative;
+/// notifications must not allocate or make an accepted write fail.
+pub const Notification = struct {
+    ptr: *anyopaque,
+    notify: *const fn (*anyopaque, state.Digest, state.Query) void,
+};
 pub const Service = struct {
     a: A,
     state_store: state.Store,
@@ -70,6 +76,10 @@ pub const Service = struct {
     source: runner.Source,
     spill: ?*local.sql_spill.Manager = null,
     task_memory_ceiling: u64 = 1024 * 1024 * 1024,
+    notification: ?Notification = null,
+    fn notify(self: Service, query: state.Query) void {
+        if (self.notification) |notification| notification.notify(notification.ptr, self.tenant, query);
+    }
     fn store(self: Service) state.Store {
         var result = self.state_store;
         result.now_ms = self.clock.now();
@@ -118,6 +128,7 @@ pub const Service = struct {
         const query_key = try self.store().key(self.a, query, null, 0);
         defer self.a.free(query_key);
         try self.store().create(self.a, query_key, query.id, specification.expires_ms);
+        self.notify(query);
         return query;
     }
     pub fn loadPlan(self: Service, a: A, query: state.Query) !plan.Plan {
@@ -676,6 +687,7 @@ pub const Service = struct {
         if (current.value.status == .succeeded) return true;
         if (current.value.status == .failed or current.value.status == .cancelled) return error.SqlExecutionFailed;
         const claim: state.Claim = if (current.value.status == .running and std.mem.eql(u8, current.value.owner, self.owner) and current.value.until_ms > self.clock.now()) .{ .owner = self.owner, .epoch = current.value.epoch } else (try self.acquire(query)) orelse return false;
+        self.notify(query);
         return self.tick(query, claim, dispatcher);
     }
     pub fn requestCancel(self: Service, query: state.Query) !void {
@@ -685,6 +697,7 @@ pub const Service = struct {
         _ = try self.loadPlan(a, query); // Bind the request to its admitted scope.
         const key = try self.store().key(a, query, null, 0);
         try self.store().requestCancel(a, key);
+        self.notify(query);
     }
     pub fn cancel(self: Service, query: state.Query, claim: state.Claim) !void {
         const key = try self.store().key(self.a, query, null, 0);

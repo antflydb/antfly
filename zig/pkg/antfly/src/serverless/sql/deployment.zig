@@ -161,6 +161,10 @@ pub const Owned = struct {
         self.service = .{ .a = a, .state_store = .{ .client = self.state.client, .bucket = self.state.bucket, .prefix = if (self.state.prefix.len == 0) "sql" else self.state.prefix, .now_ms = 0 }, .exchange_store = .{ .client = self.exchange.client, .bucket = self.exchange.bucket, .prefix = if (self.exchange.prefix.len == 0) "sql" else self.exchange.prefix }, .tenant = seed, .owner = owner, .role = role, .source = if (self.host) |*host| host.source() else .{ .ptr = self, .open = noSource }, .retention = if (self.host) |*host| host.retention() else .{ .ptr = self, .ensure = noRetention }, .context = .{ .io = io }, .task_memory_ceiling = cfg.task_memory, .spill = if (cfg.spill_dir != null) &self.spill else null };
         self.bridge = .{ .service = self.service, .dispatcher = self.client.dispatcher(), .gateway = &self.client, .principal_scopes = true, .limits = cfg.limits() };
         self.driver = .{ .service = self.service, .dispatcher = self.client.dispatcher(), .principal_scopes = true };
+        if (role == .query_only or role == .combined) {
+            self.service.notification = self.driver.notification();
+            self.bridge.service.notification = self.service.notification;
+        }
         self.admission = .init(cfg.concurrency);
         return self;
     }
