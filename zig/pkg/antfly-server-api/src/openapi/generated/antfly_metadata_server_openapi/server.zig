@@ -1530,6 +1530,16 @@ pub const ListTablePrivacyFindingsParams = struct {
     limit: ?[]const u8 = null,
 };
 
+/// List current privacy findings with body filters
+pub const QueryTablePrivacyFindingsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for queryTablePrivacyFindings.
+pub fn parseQueryTablePrivacyFindingsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_privacy_openapi.PrivacyFindingsRequest) {
+    return std.json.parseFromSlice(antfly_privacy_openapi.PrivacyFindingsRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Inspect a bounded sample without saving the policy
 pub const PreviewTablePrivacyPathParams = struct {
     table_name: []const u8,
@@ -2150,6 +2160,7 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/privacy", .operation_id = "getTablePrivacy", .request_body = .none, .streaming_response = false },
     .{ .method = "PUT", .path = "/tables/{tableName}/privacy", .operation_id = "putTablePrivacy", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/privacy/findings", .operation_id = "listTablePrivacyFindings", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/privacy/findings", .operation_id = "queryTablePrivacyFindings", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/privacy/preview", .operation_id = "previewTablePrivacy", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/privacy/scans", .operation_id = "startTablePrivacyScan", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/privacy/scans/{scanId}", .operation_id = "getTablePrivacyScan", .request_body = .none, .streaming_response = false },
@@ -2374,6 +2385,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "getTablePrivacy")) @compileError("ServerRouter: Impl missing required method 'getTablePrivacy'");
         if (!@hasDecl(Impl, "putTablePrivacy")) @compileError("ServerRouter: Impl missing required method 'putTablePrivacy'");
         if (!@hasDecl(Impl, "listTablePrivacyFindings")) @compileError("ServerRouter: Impl missing required method 'listTablePrivacyFindings'");
+        if (!@hasDecl(Impl, "queryTablePrivacyFindings")) @compileError("ServerRouter: Impl missing required method 'queryTablePrivacyFindings'");
         if (!@hasDecl(Impl, "previewTablePrivacy")) @compileError("ServerRouter: Impl missing required method 'previewTablePrivacy'");
         if (!@hasDecl(Impl, "startTablePrivacyScan")) @compileError("ServerRouter: Impl missing required method 'startTablePrivacyScan'");
         if (!@hasDecl(Impl, "getTablePrivacyScan")) @compileError("ServerRouter: Impl missing required method 'getTablePrivacyScan'");
@@ -2596,6 +2608,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.get("/tables/:tableName/privacy", httpx.Handler.bind(self.impl, getTablePrivacy));
             try server.put("/tables/:tableName/privacy", httpx.Handler.bind(self.impl, putTablePrivacy));
             try server.get("/tables/:tableName/privacy/findings", httpx.Handler.bind(self.impl, listTablePrivacyFindings));
+            try server.post("/tables/:tableName/privacy/findings", httpx.Handler.bind(self.impl, queryTablePrivacyFindings));
             try server.post("/tables/:tableName/privacy/preview", httpx.Handler.bind(self.impl, previewTablePrivacy));
             try server.post("/tables/:tableName/privacy/scans", httpx.Handler.bind(self.impl, startTablePrivacyScan));
             try server.get("/tables/:tableName/privacy/scans/:scanId", httpx.Handler.bind(self.impl, getTablePrivacyScan));
@@ -4004,6 +4017,13 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.listTablePrivacyFindings(ctx, table_name, query_params);
         }
 
+        /// List current privacy findings with body filters
+        /// POST /tables/{tableName}/privacy/findings
+        fn queryTablePrivacyFindings(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.queryTablePrivacyFindings(ctx, table_name);
+        }
+
         /// Inspect a bounded sample without saving the policy
         /// POST /tables/{tableName}/privacy/preview
         fn previewTablePrivacy(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -4559,6 +4579,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn getTablePrivacy(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn putTablePrivacy(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn listTablePrivacyFindings(self: *Impl, ctx: *httpx.Context, table_name: []const u8, params: ListTablePrivacyFindingsParams) !httpx.Response
+//   fn queryTablePrivacyFindings(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn previewTablePrivacy(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn startTablePrivacyScan(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getTablePrivacyScan(self: *Impl, ctx: *httpx.Context, table_name: []const u8, scan_id: []const u8) !httpx.Response

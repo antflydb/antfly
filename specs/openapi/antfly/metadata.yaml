@@ -1272,6 +1272,8 @@ components:
       $ref: "privacy.yaml#/components/schemas/PrivacyScanRequest"
     PrivacyScan:
       $ref: "privacy.yaml#/components/schemas/PrivacyScan"
+    PrivacyFindingsRequest:
+      $ref: "privacy.yaml#/components/schemas/PrivacyFindingsRequest"
     PrivacyFindingsPage:
       $ref: "privacy.yaml#/components/schemas/PrivacyFindingsPage"
     LakeCatalogCreateRequest:
@@ -12841,6 +12843,73 @@ paths:
         - name: limit
           in: query
           schema: {type: integer}
+      responses:
+        "200":
+          description: List current privacy findings
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyFindingsPage"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+    post:
+      tags: [table_privacy]
+      operationId: queryTablePrivacyFindings
+      summary: List current privacy findings with body filters
+      description: Equivalent to GET findings, with filters and continuation in JSON so large document identifiers do not exceed URL limits.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "privacy.yaml#/components/schemas/PrivacyFindingsRequest"}
       responses:
         "200":
           description: List current privacy findings

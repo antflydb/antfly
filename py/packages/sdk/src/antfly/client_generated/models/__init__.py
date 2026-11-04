@@ -1995,6 +1995,7 @@ from .prior_artifact_context import PriorArtifactContext
 from .privacy_category import PrivacyCategory
 from .privacy_finding import PrivacyFinding
 from .privacy_findings_page import PrivacyFindingsPage
+from .privacy_findings_request import PrivacyFindingsRequest
 from .privacy_policy import PrivacyPolicy
 from .privacy_policy_category_groups_item import PrivacyPolicyCategoryGroupsItem
 from .privacy_policy_execution import PrivacyPolicyExecution
@@ -2139,6 +2140,10 @@ from .query_result_base_source_ranking import QueryResultBaseSourceRanking
 from .query_score_details import QueryScoreDetails
 from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
+from .query_table_privacy_findings_response_403 import QueryTablePrivacyFindingsResponse403
+from .query_table_privacy_findings_response_412 import QueryTablePrivacyFindingsResponse412
+from .query_table_privacy_findings_response_422 import QueryTablePrivacyFindingsResponse422
+from .query_table_privacy_findings_response_428 import QueryTablePrivacyFindingsResponse428
 from .query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
 from .query_temporarily_unavailable_error_code import QueryTemporarilyUnavailableErrorCode
 from .rate_limit_config import RateLimitConfig
@@ -4360,6 +4365,7 @@ __all__ = (
     "PrivacyCategory",
     "PrivacyFinding",
     "PrivacyFindingsPage",
+    "PrivacyFindingsRequest",
     "PrivacyPolicy",
     "PrivacyPolicyCategoryGroupsItem",
     "PrivacyPolicyExecution",
@@ -4502,6 +4508,10 @@ __all__ = (
     "QueryScoreDetails",
     "QueryStrategy",
     "QueryStringQuery",
+    "QueryTablePrivacyFindingsResponse403",
+    "QueryTablePrivacyFindingsResponse412",
+    "QueryTablePrivacyFindingsResponse422",
+    "QueryTablePrivacyFindingsResponse428",
     "QueryTemporarilyUnavailableError",
     "QueryTemporarilyUnavailableErrorCode",
     "RateLimitConfig",

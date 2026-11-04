@@ -177,6 +177,7 @@ pub const PermissionType = types.PermissionType;
 pub const PrivacyCategory = types.PrivacyCategory;
 pub const PrivacyFinding = types.PrivacyFinding;
 pub const PrivacyFindingsPage = types.PrivacyFindingsPage;
+pub const PrivacyFindingsRequest = types.PrivacyFindingsRequest;
 pub const PrivacyPolicy = types.PrivacyPolicy;
 pub const PrivacyPreview = types.PrivacyPreview;
 pub const PrivacyPreviewRequest = types.PrivacyPreviewRequest;

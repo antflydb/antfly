@@ -493,6 +493,74 @@ fn replaceTableDefinitionStampedWithReceipt(
     return replaceTableDefinitionGuardedWithReceipt(service, expected, replacement, null);
 }
 
+/// Shared by HTTP ingress and the in-process API adapter. Semantic snapshots
+/// may retain older runtime progress; only the physical point read is a CAS
+/// preimage. Foreign/test services may borrow their uncached supplied snapshot.
+pub fn validateCurrentTableDefinitionOnService(svc: anytype, snapshot: anytype, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+    if (replacement.table_id != expected.table_id) return error.TableGenerationChanged;
+    if (comptime @hasDecl(@TypeOf(svc.*), "tableRecord")) {
+        const current = (try svc.tableRecord(std.heap.page_allocator, replacement.name)) orelse return error.TableNotFound;
+        defer metadata_table_manager.freeTable(std.heap.page_allocator, current);
+        if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return error.TableGenerationChanged;
+    } else {
+        for (snapshot.tables) |current| {
+            if (!std.mem.eql(u8, current.name, replacement.name)) continue;
+            if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return error.TableGenerationChanged;
+            return;
+        }
+        return error.TableNotFound;
+    }
+}
+
+/// The allowlist plus a current physical preimage suffices for runtime-only
+/// updates. No ownership/catalog enumeration or semantic revalidation is needed
+/// because every authored field is unchanged. Missing point-read capability
+/// retains the ordinary admission path for foreign services.
+pub fn admitPrivacyProgressOnService(svc: anytype, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !bool {
+    if (comptime @hasDecl(@TypeOf(svc.*), "tableRecord")) {
+        if (!try metadata_table_manager.privacyProgressOnly(std.heap.page_allocator, expected, replacement)) return false;
+        try validateCurrentTableDefinitionOnService(svc, .{ .tables = &[_]metadata_table_manager.TableRecord{} }, expected, replacement);
+        return true;
+    } else return false;
+}
+
+test "privacy definition preflight uses current progress while semantic snapshots remain cached" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    var resource = try privacy.next(a, null, .{ .mode = .monitor, .fields = &.{"body"} }, null);
+    const cached = metadata_table_manager.TableRecord{ .table_id = 1, .name = "private", .indexes_json = try privacy.install(a, "{}", resource) };
+    resource.coverage.retry_after_millis = 200;
+    var current = cached;
+    current.indexes_json = try privacy.replaceResource(a, cached.indexes_json, resource);
+    resource.coverage.retry_after_millis = 300;
+    var desired = current;
+    desired.indexes_json = try privacy.replaceResource(a, current.indexes_json, resource);
+    const Fake = struct {
+        current: metadata_table_manager.TableRecord,
+        reads: usize = 0,
+        pub fn tableRecord(self: *@This(), alloc: std.mem.Allocator, name: []const u8) !?metadata_table_manager.TableRecord {
+            self.reads += 1;
+            if (!std.mem.eql(u8, name, self.current.name)) return null;
+            return try metadata_table_manager.cloneTable(alloc, self.current);
+        }
+    };
+    var fake = Fake{ .current = current };
+    const snapshot = .{ .tables = &[_]metadata_table_manager.TableRecord{cached} };
+    try validateCurrentTableDefinitionOnService(&fake, snapshot, current, desired);
+    try std.testing.expectEqual(@as(usize, 1), fake.reads);
+    // Fake deliberately has no adminSnapshot method: runtime admission must
+    // require only its bounded physical point-read capability.
+    try std.testing.expect(try admitPrivacyProgressOnService(&fake, current, desired));
+    try std.testing.expectEqual(@as(usize, 2), fake.reads);
+    var semantic = desired;
+    semantic.description = "changed definition";
+    try std.testing.expect(!try admitPrivacyProgressOnService(&fake, current, semantic));
+    try std.testing.expectEqual(@as(usize, 2), fake.reads);
+    try std.testing.expectError(error.TableGenerationChanged, validateCurrentTableDefinitionOnService(&fake, snapshot, cached, desired));
+}
+
 /// Cheap admission uses the same bounded point contract as SQL name binding.
 /// It is not authority to commit: native apply repeats the exact owner/binding
 /// check in the replacing transaction. Never retain a group-wide revision CAS.
@@ -612,8 +680,9 @@ fn replaceTableDefinitionGuardedWithContextReceipt(
         return error.MetadataMutationOutcomeUnknown;
     };
     defer metadata_table_manager.freeTable(service.alloc, current);
-    if (try store.resolverNamespaceReplacementRejected(service.alloc, service.metadata_group_id, receipt.term, receipt.index, expected, replacement)) return error.TableGenerationChanged;
-    if (try store.resolverNamespaceReplacementMatches(service.alloc, service.metadata_group_id, current, replacement)) return .{
+    if (try store.tableDefinitionReplacementRejected(service.alloc, service.metadata_group_id, receipt.term, receipt.index, expected, replacement)) return error.TableGenerationChanged;
+    if (try store.resolverNamespaceReplacementMatches(service.alloc, service.metadata_group_id, current, replacement) or
+        try metadata_table_manager.privacyPolicyInstallationMatches(service.alloc, expected, replacement, current)) return .{
         .metadata_group_id = service.metadata_group_id,
         .metadata_incarnation = metadata_incarnation,
         .term = receipt.term,
@@ -701,7 +770,7 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
         current: metadata_table_manager.TableRecord,
         reads: usize = 0,
         rejected_index: ?u64 = null,
-        pub fn resolverNamespaceReplacementRejected(self: *@This(), _: std.mem.Allocator, _: u64, term: u64, index: u64, _: metadata_table_manager.TableRecord, _: metadata_table_manager.TableRecord) !bool {
+        pub fn tableDefinitionReplacementRejected(self: *@This(), _: std.mem.Allocator, _: u64, term: u64, index: u64, _: metadata_table_manager.TableRecord, _: metadata_table_manager.TableRecord) !bool {
             return term == 7 and self.rejected_index == index;
         }
         pub fn resolverNamespaceReplacementMatches(_: *@This(), _: std.mem.Allocator, _: u64, current: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !bool {

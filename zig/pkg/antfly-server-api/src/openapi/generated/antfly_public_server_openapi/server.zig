@@ -1773,6 +1773,16 @@ pub const ListTablePrivacyFindingsParams = struct {
     limit: ?[]const u8 = null,
 };
 
+/// List current privacy findings with body filters
+pub const QueryTablePrivacyFindingsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for queryTablePrivacyFindings.
+pub fn parseQueryTablePrivacyFindingsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_privacy_openapi.PrivacyFindingsRequest) {
+    return std.json.parseFromSlice(antfly_privacy_openapi.PrivacyFindingsRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Inspect a bounded sample without saving the policy
 pub const PreviewTablePrivacyPathParams = struct {
     table_name: []const u8,
@@ -2417,6 +2427,7 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/privacy", .operation_id = "getTablePrivacy", .request_body = .none, .streaming_response = false },
     .{ .method = "PUT", .path = "/tables/{tableName}/privacy", .operation_id = "putTablePrivacy", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/privacy/findings", .operation_id = "listTablePrivacyFindings", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/privacy/findings", .operation_id = "queryTablePrivacyFindings", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/privacy/preview", .operation_id = "previewTablePrivacy", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/privacy/scans", .operation_id = "startTablePrivacyScan", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/privacy/scans/{scanId}", .operation_id = "getTablePrivacyScan", .request_body = .none, .streaming_response = false },
@@ -2656,6 +2667,7 @@ pub const routes = [_]Route{
 //   fn getTablePrivacy(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn putTablePrivacy(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn listTablePrivacyFindings(self: *Impl, ctx: *httpx.Context, table_name: []const u8, params: ListTablePrivacyFindingsParams) !httpx.Response
+//   fn queryTablePrivacyFindings(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn previewTablePrivacy(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn startTablePrivacyScan(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getTablePrivacyScan(self: *Impl, ctx: *httpx.Context, table_name: []const u8, scan_id: []const u8) !httpx.Response

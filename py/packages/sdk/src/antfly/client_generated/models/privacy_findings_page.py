@@ -21,7 +21,8 @@ class PrivacyFindingsPage:
     Attributes:
         policy_version (str):
         findings (list[PrivacyFinding]):
-        next_cursor (None | str | Unset):
+        next_cursor (None | str | Unset): Opaque continuation bound to the table, policy version, and filters. Pass it
+            unchanged; its size depends on the document identifier.
         examined_documents (int | Unset):
         pending_documents (int | Unset):
     """

@@ -21548,6 +21548,8 @@ pub const RaftApplyStore = struct {
         };
         var retained: ?metadata.TableRecord = null;
         defer if (retained) |existing| metadata_table_manager.freeTable(self.alloc, existing);
+        var privacy_indexes: ?[]u8 = null;
+        defer if (privacy_indexes) |raw| self.alloc.free(raw);
         var admission = record;
         if (encoded_existing) |encoded| {
             const existing = try decodeTableRecord(self.alloc, encoded);
@@ -21561,6 +21563,8 @@ pub const RaftApplyStore = struct {
             // retains internal state so schema reconciliation can continue
             // without taking ownership of the publication lifecycle.
             if (record.lake_index_catalog_json.len == 0) admission.lake_index_catalog_json = existing.lake_index_catalog_json else if (!std.mem.eql(u8, existing.lake_index_catalog_json, record.lake_index_catalog_json)) return;
+            privacy_indexes = (try @import("antfly_local_sources").privacy_catalog.reconcileIndexes(self.alloc, existing.indexes_json, admission.indexes_json)) orelse return;
+            admission.indexes_json = privacy_indexes.?;
             if (metadata_table_manager.tableDefinitionsEqual(existing, admission)) return;
             if (!try self.policyDefinitionMutationAllowedTxn(txn, group_id, existing, admission)) return;
             if ((existing.relational_retirement_json.len != 0 or admission.relational_retirement_json.len != 0) and
@@ -23160,17 +23164,37 @@ pub const RaftApplyStore = struct {
         };
         const current = try decodeTableRecord(self.alloc, encoded);
         defer metadata_table_manager.freeTable(self.alloc, current);
-        if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return;
+        if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) {
+            // A point-read preflight can race progress before this command
+            // applies. Persist the exact rejection in this transaction so the
+            // receipt reader may retry rather than report an ambiguous outcome.
+            // Runtime-only contenders must not overwrite a pending authored
+            // command's rejection receipt.
+            if (!try metadata_table_manager.privacyProgressOnly(self.alloc, expected, replacement))
+                try self.recordTableDefinitionRejectionTxn(txn, group_id, expected, replacement);
+            return;
+        }
+        if (try metadata_table_manager.privacyProgressOnly(self.alloc, current, replacement)) {
+            if ((try self.loadTableTransitionFenceTxn(txn, group_id, current.table_id)).active()) return;
+            // Runtime state and its derived schedule commit atomically. Keep
+            // semantic projections intact: no table/schema/name notification,
+            // resolver re-publication, or catalog revision bump is required.
+            const value = try encodeTableRecord(self.alloc, replacement);
+            defer self.alloc.free(value);
+            try putPrivacyWork(self.alloc, txn, group_id, replacement);
+            try txn.put(key, value);
+            const fingerprint = policyTableSchemaRecordDigest(replacement);
+            var fingerprint_key_buf: [192]u8 = undefined;
+            try txn.put(try tableSchemaFingerprintKeyForGroup(&fingerprint_key_buf, group_id, replacement.table_id), &fingerprint);
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+            return;
+        }
         {
             var arena = std.heap.ArenaAllocator.init(self.alloc);
             defer arena.deinit();
             const a = arena.allocator();
             if (!try resolverNamespaceAdoptionAllowedTxn(txn, group_id, a, current, replacement) or !try self.resolverProjectionValidTxn(a, txn, group_id, replacement)) {
-                try txn.put(try resolverRejectionKey(a, group_id, expected.table_id), try std.json.Stringify.valueAlloc(a, ResolverRejection{
-                    .digest = try resolverReplacementDigest(a, expected, replacement),
-                    .term = self.active_resolver_apply_position.term,
-                    .index = self.active_resolver_apply_position.index,
-                }, .{}));
+                try self.recordTableDefinitionRejectionTxn(txn, group_id, expected, replacement);
                 return;
             }
             try txn.delete(try resolverRejectionKey(a, group_id, expected.table_id));
@@ -25136,7 +25160,21 @@ pub const RaftApplyStore = struct {
         }
         return projected;
     }
-    const ResolverRejection = struct { digest: [32]u8, term: u64, index: u64 };
+    // One bounded rejection per table, shared with existing resolver failures.
+    // Keep the durable key and encoding compatible. Later progress commits do
+    // not erase the marker; a later authored replacement may supersede it, in
+    // which case its receipt reader conservatively retains outcome-unknown.
+    fn recordTableDefinitionRejectionTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, expected: metadata.TableRecord, replacement: metadata.TableRecord) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        try txn.put(try resolverRejectionKey(a, group_id, expected.table_id), try std.json.Stringify.valueAlloc(a, TableDefinitionRejection{
+            .digest = try resolverReplacementDigest(a, expected, replacement),
+            .term = self.active_resolver_apply_position.term,
+            .index = self.active_resolver_apply_position.index,
+        }, .{}));
+    }
+    const TableDefinitionRejection = struct { digest: [32]u8, term: u64, index: u64 };
     fn resolverRejectionKey(a: std.mem.Allocator, group_id: u64, table_id: u64) ![]const u8 {
         return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:rejected:{x:0>16}", .{ group_id, table_id });
     }
@@ -25145,14 +25183,14 @@ pub const RaftApplyStore = struct {
         std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ expected, replacement }, .{}), &digest, .{});
         return digest;
     }
-    pub fn resolverNamespaceReplacementRejected(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, term: u64, index: u64, expected: metadata.TableRecord, replacement: metadata.TableRecord) !bool {
+    pub fn tableDefinitionReplacementRejected(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, term: u64, index: u64, expected: metadata.TableRecord, replacement: metadata.TableRecord) !bool {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
         const value = (try stagingGet(&txn, try resolverRejectionKey(a, group_id, expected.table_id))) orelse return false;
-        const receipt = try std.json.parseFromSliceLeaky(ResolverRejection, a, value, .{});
+        const receipt = try std.json.parseFromSliceLeaky(TableDefinitionRejection, a, value, .{});
         return receipt.term == term and receipt.index == index and std.mem.eql(u8, &receipt.digest, &(try resolverReplacementDigest(a, expected, replacement)));
     }
     pub fn resolverNamespaceReplacementMatches(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, current: metadata.TableRecord, replacement: metadata.TableRecord) !bool {
@@ -41605,16 +41643,16 @@ test "resolver curation namespace propagation rejects alias cycles without poiso
     try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 52, .name = "new-consumer", .indexes_json = indexes } });
     try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, .{ .table_name = "entities", .expected_revision = revision, .standalone = true }));
     try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = before, .replacement = replacement } });
-    try std.testing.expect(try store.resolverNamespaceReplacementRejected(std.testing.allocator, group, 0, 0, before, replacement));
+    try std.testing.expect(try store.tableDefinitionReplacementRejected(std.testing.allocator, group, 0, 0, before, replacement));
     try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(before, (try store.getTable(a, group, 1)).?));
     const rejected_command = try encodeTransitionCommand(a, .{ .compare_and_replace_table = .{ .expected = before, .replacement = replacement } });
     for ([_]u64{ 1, 2 }) |index| {
         var outcome = try MetadataReplayTest.apply(&store, group, &.{.{ .term = 7, .index = index, .entry_type = .normal, .data = rejected_command }});
         outcome.deinit();
-        try std.testing.expect(try store.resolverNamespaceReplacementRejected(std.testing.allocator, group, 7, index, before, replacement));
-        try std.testing.expect(!try store.resolverNamespaceReplacementRejected(std.testing.allocator, group, 7, index + 1, before, replacement));
+        try std.testing.expect(try store.tableDefinitionReplacementRejected(std.testing.allocator, group, 7, index, before, replacement));
+        try std.testing.expect(!try store.tableDefinitionReplacementRejected(std.testing.allocator, group, 7, index + 1, before, replacement));
     }
-    try std.testing.expect(!try store.resolverNamespaceReplacementRejected(std.testing.allocator, group, 7, 1, before, replacement));
+    try std.testing.expect(!try store.tableDefinitionReplacementRejected(std.testing.allocator, group, 7, 1, before, replacement));
     // Replay a proposal that bypassed public preflight with the relation
     // journal enabled, then prove the next committed entry still applies.
     {
@@ -41681,7 +41719,7 @@ test "resolver curation namespace propagation rejects source edits racing adopti
     const command = try encodeTransitionCommand(a, .{ .compare_and_replace_table = .{ .expected = source, .replacement = replacement } });
     var outcome = try MetadataReplayTest.apply(&store, group, &.{.{ .term = 9, .index = 1, .entry_type = .normal, .data = command }});
     outcome.deinit();
-    try std.testing.expect(try store.resolverNamespaceReplacementRejected(a, group, 9, 1, source, replacement));
+    try std.testing.expect(try store.tableDefinitionReplacementRejected(a, group, 9, 1, source, replacement));
     try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(source, (try store.getTable(a, group, 2)).?));
     // An ordinary source definition edit is allowed to inherit the namespace.
     var ordinary = source;
@@ -41754,7 +41792,7 @@ test "resolver curation namespace propagation rejects source edits racing propos
     const command = try encodeTransitionCommand(a, .{ .compare_and_replace_table = .{ .expected = source, .replacement = replacement } });
     var outcome = try MetadataReplayTest.apply(&store, group, &.{.{ .term = 9, .index = 1, .entry_type = .normal, .data = command }});
     outcome.deinit();
-    try std.testing.expect(try store.resolverNamespaceReplacementRejected(a, group, 9, 1, source, replacement));
+    try std.testing.expect(try store.tableDefinitionReplacementRejected(a, group, 9, 1, source, replacement));
     try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(source, (try store.getTable(a, group, 2)).?));
     // The same source-only CAS remains rejected when replicated again, while
     // unrelated schema changes still commit without adopting resolver policy.
@@ -43713,10 +43751,47 @@ test "privacy work index follows atomic table updates deletion and derived index
     try std.testing.expect(try store.nextPrivacyTable(a, group, 19) == null);
     try std.testing.expectEqual(@as(u64, 50), (try store.nextPrivacyTable(a, group, 20)).?.table_id);
     const before = (try store.tableByName(a, group, "private")).?;
+    const revision = try store.writeValidationRevision(group);
+    try std.testing.expect(!try metadata_table_manager.privacyProgressOnly(a, before, before));
     resource.coverage.retry_after_millis = 200;
     var replacement = before;
     replacement.indexes_json = try privacy.replaceResource(a, before.indexes_json, resource);
     try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = before, .replacement = replacement } });
+    try std.testing.expectEqual(revision, try store.writeValidationRevision(group));
+    // A second CAS based on the same cut cannot overwrite committed progress.
+    var stale = replacement;
+    resource.coverage.retry_after_millis = 300;
+    stale.indexes_json = try privacy.replaceResource(a, before.indexes_json, resource);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = before, .replacement = stale } });
+    const committed = (try store.tableByName(a, group, "private")).?;
+    try std.testing.expectEqualStrings(replacement.indexes_json, committed.indexes_json);
+    try std.testing.expect(!try store.tableDefinitionReplacementRejected(a, group, 0, 0, before, stale));
+    // An authored save based on an older runtime cut must also produce a known
+    // rejection. Later successful progress must retain that exact receipt.
+    var policy_save = before;
+    const saved_resource = try privacy.next(a, resource, resource.policy, try privacy.etag(a, resource));
+    policy_save.indexes_json = try privacy.install(a, before.indexes_json, saved_resource);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = before, .replacement = policy_save } });
+    try std.testing.expect(try store.tableDefinitionReplacementRejected(a, group, 0, 0, before, policy_save));
+    var later_resource = resource;
+    later_resource.coverage.retry_after_millis = 200;
+    later_resource.coverage.updated_at_millis += 1;
+    var later = committed;
+    later.indexes_json = try privacy.replaceResource(a, committed.indexes_json, later_resource);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = committed, .replacement = later } });
+    try std.testing.expect(try store.tableDefinitionReplacementRejected(a, group, 0, 0, before, policy_save));
+    // Restore this test's expected runtime cut through another valid CAS.
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = later, .replacement = committed } });
+    try store.applyStandaloneCommand(group, .{ .upsert_table = before });
+    const after_reconcile = (try store.tableByName(a, group, "private")).?;
+    try std.testing.expectEqualStrings(replacement.indexes_json, after_reconcile.indexes_json);
+    try std.testing.expectEqual(revision, try store.writeValidationRevision(group));
+    var schema_reconcile = before;
+    schema_reconcile.description = "reconciled";
+    try store.applyStandaloneCommand(group, .{ .upsert_table = schema_reconcile });
+    const after_schema = (try store.tableByName(a, group, "private")).?;
+    try std.testing.expectEqualStrings("reconciled", after_schema.description);
+    try std.testing.expectEqualStrings(replacement.indexes_json, after_schema.indexes_json);
     try std.testing.expect(try store.nextPrivacyTable(a, group, 100) == null);
     try store.rebuildDerivedCatalogIndexes(group);
     try std.testing.expectEqual(@as(u64, 50), (try store.nextPrivacyTable(a, group, 200)).?.table_id);

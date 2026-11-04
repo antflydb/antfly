@@ -126,6 +126,10 @@ pub const WorkIndex = struct {
             a.destroy(old);
         }
     }
+    pub fn dueTime(self: *const WorkIndex, id: u64) ?i64 {
+        const node = self.nodes.get(id) orelse return null;
+        return @intCast(node.key >> 64);
+    }
     pub fn first(self: *WorkIndex, now: i64) ?u64 {
         const node = self.tree.getMin() orelse return null;
         if (node.key >> 64 > @as(u64, @intCast(@max(0, now)))) return null;
@@ -178,6 +182,61 @@ pub fn replaceResource(a: A, indexes_json: []const u8, resource: Resource) ![]u8
     const value = (try std.json.parseFromSlice(std.json.Value, scratch, raw, .{})).value;
     try root.object.put(scratch, key, value);
     return std.json.Stringify.valueAlloc(a, root, .{});
+}
+
+/// A progress CAS may change only these runtime fields. Compare the remaining
+/// JSON, including unknown fields, so future policy/index fields fail closed.
+/// Keeping this allowlist here gives every metadata topology the same boundary.
+pub fn progressOnly(a: A, before: []const u8, after: []const u8) !bool {
+    if (before.len == 0 or after.len == 0) return false;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const lhs = try std.json.parseFromSliceLeaky(std.json.Value, scratch, before, .{});
+    const rhs = try std.json.parseFromSliceLeaky(std.json.Value, scratch, after, .{});
+    if (lhs != .object or rhs != .object) return false;
+    const old = lhs.object.get(key) orelse return false;
+    const next_value = rhs.object.get(key) orelse return false;
+    if (old != .object or next_value != .object) return false;
+    // Require a valid, unchanged policy binding before granting this path.
+    var prior = (try current(scratch, lhs)) orelse return false;
+    defer prior.deinit();
+    var next_resource = (try current(scratch, rhs)) orelse return false;
+    defer next_resource.deinit();
+    for ([_]*std.json.Value{ lhs.object.getPtr(key).?, rhs.object.getPtr(key).? }) |value| {
+        inline for (.{ "coverage", "scans", "scan_id", "scan_sequence" }) |name| {
+            _ = value.object.swapRemove(name);
+        }
+    }
+    return std.mem.eql(u8, try std.json.Stringify.valueAlloc(scratch, lhs, .{}), try std.json.Stringify.valueAlloc(scratch, rhs, .{}));
+}
+
+/// Reconciliation is not an owner of privacy configuration or progress. Retain
+/// the durable resource when a cached definition carries its older runtime cut;
+/// reject stale policy bindings, including an attempted resource removal.
+pub fn reconcileIndexes(a: A, durable: []const u8, desired: []const u8) !?[]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const old = try std.json.parseFromSliceLeaky(std.json.Value, scratch, if (durable.len == 0) "{}" else durable, .{});
+    if (old != .object or !old.object.contains(key)) return try a.dupe(u8, desired);
+    var next_value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, if (desired.len == 0) "{}" else desired, .{});
+    if (next_value != .object or !next_value.object.contains(key)) return null;
+    const saved = try std.json.Stringify.valueAlloc(scratch, old.object.get(key).?, .{});
+    for ([_]*std.json.Value{ old.object.getPtr(key).?, next_value.object.getPtr(key).? }) |value| {
+        if (value.* != .object) return null;
+        inline for (.{ "coverage", "scans", "scan_id", "scan_sequence" }) |name| _ = value.object.swapRemove(name);
+    }
+    if (!std.mem.eql(u8, try std.json.Stringify.valueAlloc(scratch, old.object.get(key).?, .{}), try std.json.Stringify.valueAlloc(scratch, next_value.object.get(key).?, .{}))) return null;
+    try next_value.object.put(scratch, key, try std.json.parseFromSliceLeaky(std.json.Value, scratch, saved, .{}));
+    return try std.json.Stringify.valueAlloc(a, next_value, .{});
+}
+
+pub fn resourceVersion(a: A, raw: []const u8) !?u64 {
+    const Root = struct { _privacy: ?struct { resource_version: u64 } = null };
+    var parsed = try std.json.parseFromSlice(Root, a, if (raw.len == 0) "{}" else raw, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    return if (parsed.value._privacy) |resource| resource.resource_version else null;
 }
 
 pub fn current(a: A, indexes: std.json.Value) !?std.json.Parsed(Resource) {
@@ -728,4 +787,42 @@ test "privacy due index preserves ownership through allocation failures" {
             try std.testing.expectEqual(@as(?u64, 2), index.first(50));
         }
     }.run, .{});
+}
+
+test "privacy progress classification retains all semantic fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var resource = try next(a, null, .{ .mode = .monitor, .fields = &.{"body"} }, null);
+    const before = try install(a, "{}", resource);
+    resource.coverage.retry_after_millis = 200;
+    _ = try startScan(a, &resource, "a", "z", 50);
+    const progress = try replaceResource(a, before, resource);
+    try std.testing.expect(try progressOnly(a, before, progress));
+    resource.resource_version += 1;
+    try std.testing.expect(!try progressOnly(a, before, try replaceResource(a, before, resource)));
+    resource.resource_version -= 1;
+    resource.unprotected_indexes_json = "{\"changed\":{}}";
+    try std.testing.expect(!try progressOnly(a, before, try replaceResource(a, before, resource)));
+    try std.testing.expect(!try progressOnly(a, "{}", progress));
+}
+
+test "privacy reconciliation preserves runtime state and rejects stale policy bindings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var resource = try next(a, null, .{ .mode = .monitor, .fields = &.{"body"} }, null);
+    const before = try install(a, "{}", resource);
+    resource.coverage.retry_after_millis = 200;
+    const durable = try replaceResource(a, before, resource);
+    const retained = (try reconcileIndexes(a, durable, before)).?;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, retained, .{});
+    defer parsed.deinit();
+    var value = (try current(a, parsed.value)).?;
+    defer value.deinit();
+    try std.testing.expectEqual(@as(i64, 200), value.value.coverage.retry_after_millis);
+    try std.testing.expect(try reconcileIndexes(a, durable, "{}") == null);
+    resource.resource_version += 1;
+    const changed = try replaceResource(a, before, resource);
+    try std.testing.expect(try reconcileIndexes(a, changed, before) == null);
 }

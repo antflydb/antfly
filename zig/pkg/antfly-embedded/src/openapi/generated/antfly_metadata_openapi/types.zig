@@ -7332,6 +7332,8 @@ pub const PrivacyFinding = antfly_privacy_openapi.PrivacyFinding;
 
 pub const PrivacyFindingsPage = antfly_privacy_openapi.PrivacyFindingsPage;
 
+pub const PrivacyFindingsRequest = antfly_privacy_openapi.PrivacyFindingsRequest;
+
 pub const PrivacyPolicy = antfly_privacy_openapi.PrivacyPolicy;
 
 pub const PrivacyPreview = antfly_privacy_openapi.PrivacyPreview;

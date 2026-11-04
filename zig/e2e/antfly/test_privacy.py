@@ -291,7 +291,13 @@ def test_privacy_preview_policy_cas_backfill_and_findings(
             headers={"If-Match": etag},
             timeout=30,
         )
-        assert saved.status_code == 202, saved.text
+        assert saved.status_code == 202, json.dumps(
+            {
+                "response": saved.text,
+                "privacy": stateful_api.get(path),
+                "logs": stateful_api.debug_logs(),
+            }
+        )
         assert saved.json()["policy_version"] == configured["policy_version"]
         assert saved.json()["generation"] == configured["generation"]
         assert saved.json()["scan_id"] == configured["scan_id"]
@@ -634,6 +640,8 @@ def test_privacy_preview_policy_cas_backfill_and_findings(
                     "status": stateful_api.get(path),
                     "scan": stateful_api.get(f"{path}/scans/{replacement_scan}"),
                     "vectors": stateful_api.get_index(table, "body_vectors"),
+                    "text": stateful_api.get_index(table, "body_search"),
+                    "indexes": stateful_api.list_indexes(table),
                     "logs": stateful_api.debug_logs(),
                 }
             )
@@ -1010,3 +1018,75 @@ def test_privacy_coverage_resumes_background_pages_and_tracks_membership(
         }
     )
     assert second["completed_at_millis"] > first["completed_at_millis"]
+
+
+@pytest.mark.parametrize("key_repeats", [1000, 12000])
+def test_privacy_findings_continue_with_large_escaped_document_ids(
+    stateful_api, key_repeats
+):
+    table = f"privacy_cursor_{uuid4().hex[:8]}"
+    stateful_api.create_table(table)
+    stateful_api.batch_write(
+        table,
+        inserts={('k\\"' * key_repeats) + f"{i:03}": {"ordinal": i} for i in range(51)},
+    )
+    path = f"/tables/{table}/privacy"
+    stateful_api.put(path, {"mode": "monitor", "fields": ["body"]})
+    first = stateful_api.get(path + "/findings")
+    cursor = first["next_cursor"]
+    assert len(cursor) > 4096
+    response = stateful_api.s.post(
+        stateful_api.url + path + "/findings", json={"cursor": cursor}, timeout=30
+    )
+    if key_repeats == 1000:
+        get_page = stateful_api.s.get(
+            stateful_api.url + path + "/findings", params={"cursor": cursor}, timeout=30
+        )
+        assert get_page.status_code == 200, get_page.text
+        assert get_page.json()["examined_documents"] == 1
+        assert get_page.json()["next_cursor"] is None
+    assert response.status_code == 200, response.text
+    assert response.json()["examined_documents"] == 1
+    assert response.json()["next_cursor"] is None
+    # Cursors cannot be reused with a different document filter.
+    mismatch = stateful_api.s.post(
+        stateful_api.url + path + "/findings",
+        json={"cursor": cursor, "field": "body"},
+        timeout=30,
+    )
+    assert mismatch.status_code == 422, mismatch.text
+
+
+@pytest.mark.parametrize("mode", ["monitor", "redact_for_search_and_ai"])
+def test_privacy_rejects_relational_storage_before_mutation(stateful_api, mode):
+    table = f"privacy_relational_{uuid4().hex[:8]}"
+    schema = {
+        "storage_mode": "relational",
+        "default_type": "row",
+        "document_schemas": {
+            "row": {
+                "schema": {
+                    "type": "object",
+                    "properties": {"id": {"type": "integer"}},
+                    "required": ["id"],
+                    "additionalProperties": False,
+                }
+            }
+        },
+    }
+    stateful_api.post(f"/tables/{table}", {"schema": schema})
+    path = f"/tables/{table}/privacy"
+    policy = {"mode": mode, "fields": ["body"]}
+    for method, suffix, payload in [
+        ("put", "", policy),
+        ("post", "/preview", {"policy": policy, "sample": {"limit": 1}}),
+        ("post", "/scans", {}),
+    ]:
+        response = stateful_api.s.request(
+            method, stateful_api.url + path + suffix, json=payload, timeout=30
+        )
+        assert response.status_code == 422, response.text
+        assert response.json()["code"] == "PrivacyRelationalStorageUnsupported", (
+            response.text
+        )
+    assert stateful_api.get(path)["configured"] is False

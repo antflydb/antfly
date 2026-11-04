@@ -242,17 +242,17 @@ fn executeAttempt(server: anytype, a: A, table: []const u8, action: Action, args
     var stored = try load(a, before.indexes_json);
     defer if (stored) |*value| value.deinit();
     if (action == .get) return statusResponse(server, a, table, if (stored) |value| value.value else null, 200, request);
+    if (action == .preview or action == .put or action == .start_scan) {
+        var schema = try local.schema_mod.parseValidatedTableSchema(a, before.schema_json);
+        defer schema.deinit(a);
+        if (schema.storage_mode != .document or schema.external_base_source != null) return error.PrivacyRelationalStorageUnsupported;
+    }
     if (action == .preview) return preview(server, a, table, args.body, request);
     if (action == .put) {
         var policy = try std.json.parseFromSlice(contract.Policy, a, args.body, .{});
         defer policy.deinit();
         if (policy.value.mode == .redact_before_storage) return error.PrivacySynchronousIngestionRequired;
         try server.ensurePrivacyAdmission(request);
-        if (policy.value.mode == .redact_for_search_and_ai) {
-            var schema = try local.schema_mod.parseValidatedTableSchema(a, before.schema_json);
-            defer schema.deinit(a);
-            if (schema.storage_mode != .document or schema.external_base_source != null) return error.PrivacyRelationalStorageUnsupported;
-        }
         var resource = try catalog.next(a, if (stored) |value| value.value else null, policy.value, args.if_match);
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
@@ -301,6 +301,18 @@ fn executeAttempt(server: anytype, a: A, table: []const u8, action: Action, args
             return err;
         };
         return json(a, 202, scan);
+    }
+    if (args.body.len != 0) {
+        var input = try std.json.parseFromSlice(FindingsRequest, a, args.body, .{});
+        defer input.deinit();
+        return findings(server, a, table, current, .{
+            .cursor = input.value.cursor,
+            .document = input.value.document,
+            .field = input.value.field,
+            .category = input.value.category,
+            .policy_version = input.value.policy_version,
+            .limit = input.value.limit,
+        }, request);
     }
     return findings(server, a, table, current, args, request);
 }
@@ -418,20 +430,94 @@ fn preview(server: anytype, a: A, table: []const u8, body: []const u8, request: 
     return json(a, 200, .{ .policy_version = (try input.value.policy.identity(scratch))[0..], .sampled = documents.len, .complete_table_scan = false, .external_processing = external(producer), .documents = output });
 }
 
+const FindingsRequest = struct {
+    cursor: ?[]const u8 = null,
+    document: ?[]const u8 = null,
+    field: ?[]const u8 = null,
+    category: ?[]const u8 = null,
+    policy_version: ?[]const u8 = null,
+    limit: u32 = 100,
+};
 const Cursor = struct { policy_version: [64]u8, document: []const u8 = "", offset: usize = 0, inclusive: bool = false, filter: [64]u8 };
+// A binary payload avoids JSON escaping amplification for arbitrary document
+// identifiers. Bound both issuance and decoding with the public document budget.
+const cursor_prefix = "p1.";
+const cursor_header_bytes = @import("antfly_public_limits").privacy_cursor_header_bytes;
+const cursor_max_key_bytes = @import("http_server.zig").public_api_max_request_body_bytes;
+const cursor_max_payload_bytes = @import("antfly_public_limits").max_privacy_cursor_payload_bytes;
 fn cursorEncode(a: A, cursor: Cursor) ![]u8 {
-    const raw = try std.json.Stringify.valueAlloc(a, cursor, .{});
+    if (cursor.document.len > cursor_max_key_bytes) return error.InvalidPrivacyCursor;
+    const raw = try a.alloc(u8, cursor_header_bytes + cursor.document.len);
     defer a.free(raw);
-    const out = try a.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(raw.len));
-    _ = std.base64.url_safe_no_pad.Encoder.encode(out, raw);
+    @memcpy(raw[0..64], &cursor.policy_version);
+    @memcpy(raw[64..128], &cursor.filter);
+    std.mem.writeInt(u64, raw[128..136], @intCast(cursor.offset), .little);
+    raw[136] = @intFromBool(cursor.inclusive);
+    @memcpy(raw[cursor_header_bytes..], cursor.document);
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const out = try a.alloc(u8, cursor_prefix.len + encoder.calcSize(raw.len));
+    @memcpy(out[0..cursor_prefix.len], cursor_prefix);
+    _ = encoder.encode(out[cursor_prefix.len..], raw);
     return out;
 }
 fn cursorDecode(a: A, raw: []const u8) !Cursor {
-    if (raw.len > 4096) return error.InvalidPrivacyCursor;
+    const modern = std.mem.startsWith(u8, raw, cursor_prefix);
+    const encoded = if (modern) raw[cursor_prefix.len..] else raw;
+    // Legacy JSON tokens remain readable across upgrades. Their key may expand
+    // sixfold in JSON before base64 encoding; modern tokens have no expansion.
+    const maximum = if (modern) cursor_max_payload_bytes else 6 * cursor_max_key_bytes + 2048;
     const decoder = std.base64.url_safe_no_pad.Decoder;
-    const decoded = try a.alloc(u8, try decoder.calcSizeForSlice(raw));
-    try decoder.decode(decoded, raw);
-    return (try std.json.parseFromSlice(Cursor, a, decoded, .{})).value;
+    if (encoded.len > std.base64.url_safe_no_pad.Encoder.calcSize(maximum)) return error.InvalidPrivacyCursor;
+    const size = decoder.calcSizeForSlice(encoded) catch return error.InvalidPrivacyCursor;
+    if (size > maximum) return error.InvalidPrivacyCursor;
+    const decoded = try a.alloc(u8, size);
+    defer a.free(decoded);
+    decoder.decode(decoded, encoded) catch return error.InvalidPrivacyCursor;
+    if (!modern) {
+        var parsed = std.json.parseFromSlice(Cursor, a, decoded, .{}) catch return error.InvalidPrivacyCursor;
+        defer parsed.deinit();
+        if (parsed.value.document.len > cursor_max_key_bytes) return error.InvalidPrivacyCursor;
+        var result = parsed.value;
+        result.document = try a.dupe(u8, parsed.value.document);
+        return result;
+    }
+    if (decoded.len < cursor_header_bytes or decoded[136] > 1) return error.InvalidPrivacyCursor;
+    return .{
+        .policy_version = decoded[0..64].*,
+        .filter = decoded[64..128].*,
+        .offset = std.math.cast(usize, std.mem.readInt(u64, decoded[128..136], .little)) orelse return error.InvalidPrivacyCursor,
+        .inclusive = decoded[136] == 1,
+        .document = try a.dupe(u8, decoded[cursor_header_bytes..]),
+    };
+}
+
+test "privacy cursors round trip large escaped keys and reject malformed payloads" {
+    const a = std.testing.allocator;
+    const key_bytes = try a.alloc(u8, 32000);
+    defer a.free(key_bytes);
+    for (key_bytes, 0..) |*byte, i| byte.* = switch (i % 4) {
+        0 => '"',
+        1 => '\\',
+        2 => 0,
+        else => 'x',
+    };
+    const cursor = Cursor{ .policy_version = contract.fingerprint("policy"), .filter = contract.fingerprint("filter"), .document = key_bytes, .offset = 231, .inclusive = true };
+    const encoded = try cursorEncode(a, cursor);
+    defer a.free(encoded);
+    try std.testing.expect(encoded.len > 4096);
+    const decoded = try cursorDecode(a, encoded);
+    defer a.free(decoded.document);
+    try std.testing.expectEqualStrings(key_bytes, decoded.document);
+    try std.testing.expectEqualDeep(cursor, decoded);
+    for ([_][]const u8{ "p1.", "p1.!", "???" }) |bad| try std.testing.expectError(error.InvalidPrivacyCursor, cursorDecode(a, bad));
+    const legacy_json = try std.json.Stringify.valueAlloc(a, cursor, .{});
+    defer a.free(legacy_json);
+    const legacy = try a.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(legacy_json.len));
+    defer a.free(legacy);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(legacy, legacy_json);
+    const legacy_decoded = try cursorDecode(a, legacy);
+    defer a.free(legacy_decoded.document);
+    try std.testing.expectEqualDeep(cursor, legacy_decoded);
 }
 
 fn findings(server: anytype, a: A, table: []const u8, resource: catalog.Resource, args: Arguments, request: operation.RequestContext) !Response {

@@ -2231,7 +2231,7 @@ pub fn metadataApplyStoreProjection(
             const Input = struct { current: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, term: u64 = 0, index: u64 = 0 };
             var parsed = std.json.parseFromSlice(Input, alloc, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
             defer parsed.deinit();
-            const value = (if (request.arg0 == 1) handle.store.resolverNamespaceReplacementRejected(alloc, request.group_id, parsed.value.term, parsed.value.index, parsed.value.current, parsed.value.replacement) else handle.store.resolverNamespaceReplacementMatches(alloc, request.group_id, parsed.value.current, parsed.value.replacement)) catch |err| break :blk storageOwnerStatusFromError(err);
+            const value = (if (request.arg0 == 1) handle.store.tableDefinitionReplacementRejected(alloc, request.group_id, parsed.value.term, parsed.value.index, parsed.value.current, parsed.value.replacement) else handle.store.resolverNamespaceReplacementMatches(alloc, request.group_id, parsed.value.current, parsed.value.replacement)) catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
         .catalog_cursor => blk: {

@@ -26,6 +26,7 @@ const graph_distinct_budget_diagnostic = @import("antfly_local_sources").graph_d
 const graph_work_budget_diagnostic = @import("antfly_local_sources").graph_work_budget_diagnostic;
 const graph_path_weight_diagnostic = @import("antfly_local_sources").graph_path_weight_diagnostic;
 const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
+const inference_validation_errors = @import("inference_validation_errors.zig");
 const query_request_diagnostics = @import("query_request_diagnostics.zig");
 const common_secrets = @import("antfly_local_sources").common_secrets;
 const common_config = @import("antfly_local_sources").common_config;
@@ -326,6 +327,8 @@ pub const TableApi = struct {
         UnsupportedArtifactIndexSources,
         ArtifactIndexSourcesTemporarilyUnavailable,
         ProbeUnavailable,
+        ResourceLimitExceeded,
+        MemoryBudgetExceeded,
         InferenceEndpointAccessDenied,
         ModelNotFound,
         Backpressured,
@@ -371,6 +374,11 @@ pub const TableApi = struct {
         InvalidEmbeddingArtifactProducer,
         EmbeddingArtifactDimensionRequired,
         ConflictingEmbeddingArtifactDimensions,
+        ProbeUnavailable,
+        ResourceLimitExceeded,
+        MemoryBudgetExceeded,
+        InferenceEndpointAccessDenied,
+        ModelNotFound,
         InternalFailure,
     };
 
@@ -1912,6 +1920,11 @@ pub fn handleTableQueryRequest(
                     return .{ .status = 422, .body = try unsupportedExactSortBody(alloc), .json = true };
                 }
                 std.log.err("public table query invalid table={s} err={}", .{ table_name, err });
+                if (try query_request_diagnostics.validationErrorBodyForRequest(alloc, table_name, body)) |error_body| return .{
+                    .status = 400,
+                    .body = error_body,
+                    .json = true,
+                };
                 return .{ .status = 400, .body = try alloc.dupe(u8, "invalid query request") };
             },
             error.InvalidFilterQueryRequest => return publicFilterQueryErrorResponse(
@@ -2467,6 +2480,16 @@ pub fn handleTableGetIndex(
 
 pub const inference_endpoint_access_denied_message = "embedder.api_url denied inference access; check endpoint credentials and permissions. For local Antfly inference omit embedder.api_url. An HTTP /ai/v1 endpoint requires public_inference.enabled and inference permissions.";
 
+pub fn embeddingValidationFailureResponse(alloc: std.mem.Allocator, err: anyerror) !OwnedResponse {
+    const failure = inference_validation_errors.classify(err) orelse return error.InvalidArgument;
+    return .{
+        .status = failure.status,
+        .body = try failure.bodyAlloc(alloc),
+        .json = true,
+        .retry_after_seconds = failure.retry_after_seconds,
+    };
+}
+
 pub fn handleTableCreateIndex(
     alloc: std.mem.Allocator,
     table_name: []const u8,
@@ -2496,12 +2519,8 @@ pub fn handleTableCreateIndex(
             .json = true,
             .retry_after_seconds = 1,
         },
-        error.ProbeUnavailable => return .{
-            .status = 503,
-            .body = try alloc.dupe(u8, "{\"error\":\"index_probe_unavailable\",\"message\":\"index validation probe unavailable\",\"retryable\":true}"),
-            .json = true,
-            .retry_after_seconds = 1,
-        },
+        error.ResourceLimitExceeded, error.MemoryBudgetExceeded => return embeddingValidationFailureResponse(alloc, err),
+        error.ProbeUnavailable => return embeddingValidationFailureResponse(alloc, err),
         error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"model_not_found\",\"message\":\"model not found\",\"retryable\":false}"), .json = true },
         error.Backpressured => return .{
             .status = 429,
@@ -2588,6 +2607,10 @@ pub fn handlePutArtifactEnrichment(
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "table mutation conflict; retry request") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
+        error.ResourceLimitExceeded, error.MemoryBudgetExceeded => return embeddingValidationFailureResponse(alloc, err),
+        error.ProbeUnavailable => return embeddingValidationFailureResponse(alloc, err),
+        error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "model not found") },
+        error.InferenceEndpointAccessDenied => return .{ .status = 400, .body = try alloc.dupe(u8, inference_endpoint_access_denied_message) },
         error.InvalidEnrichmentRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported artifact enrichment configuration") },
         error.MissingEmbeddingArtifactEnrichment => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding index source has no matching embedding enrichment") },
         error.MissingEmbeddingArtifactProducer => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding enrichment has no producer configuration") },
@@ -6765,4 +6788,99 @@ test "public table create index explains embedding endpoint access rejection" {
     try std.testing.expectEqual(@as(u16, 400), response.status);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "embedder.api_url") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "public_inference.enabled") != null);
+}
+
+test "public table create index preserves permanent inference budget identity" {
+    const Denied = struct {
+        fn create(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: @FieldType(TableApi, "request")) TableApi.ExecuteCreateIndexError![]u8 {
+            return error.ResourceLimitExceeded;
+        }
+    };
+    const api: TableApi = .{ .ptr = undefined, .request = .{}, .vtable = &.{
+        .execute_table_batch = unsupportedBatch,
+        .execute_table_query_request = unsupportedQueryRequest,
+        .execute_table_query_view = unsupportedQueryView,
+        .execute_table_backup = unsupportedBackup,
+        .execute_table_restore = unsupportedRestore,
+        .execute_table_list_indexes = unsupportedListIndexes,
+        .execute_table_get_index = unsupportedGetIndex,
+        .execute_table_create_index = Denied.create,
+        .execute_table_delete_index = unsupportedDeleteIndex,
+    } };
+    var response = try handleTableCreateIndex(std.testing.allocator, "docs", "semantic", "{}", api);
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), response.status);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_LIMIT", parsed.value.object.get("error").?.string);
+    try std.testing.expect(!parsed.value.object.get("retryable").?.bool);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.object.get("message").?.string, "scratch") != null);
+}
+
+test "public table query returns hierarchy validation pointers without leaking between requests" {
+    @import("antfly_test_error_logs").expectErrorLogs(2);
+    const Backend = struct {
+        fn query(_: *anyopaque, a: std.mem.Allocator, table: []const u8, body: []const u8, _: ?[]const u8, _: operation.RequestContext) TableApi.ExecuteQueryError![]u8 {
+            var parsed = query_contract.parseQueryRequest(a, null, table, body) catch return error.InvalidQueryRequest;
+            defer parsed.deinit(a);
+            return a.dupe(u8, "{}") catch return error.InternalFailure;
+        }
+    };
+    const api: TableApi = .{ .ptr = undefined, .request = .{}, .vtable = &.{
+        .execute_table_batch = unsupportedBatch,
+        .execute_table_query_request = Backend.query,
+        .execute_table_query_view = unsupportedQueryView,
+        .execute_table_backup = unsupportedBackup,
+        .execute_table_restore = unsupportedRestore,
+        .execute_table_list_indexes = unsupportedListIndexes,
+        .execute_table_get_index = unsupportedGetIndex,
+        .execute_table_create_index = unsupportedCreateIndex,
+        .execute_table_delete_index = unsupportedDeleteIndex,
+    } };
+    var response = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"fields":[],"hierarchy":{"group_by":{"level":"source","matches":{}}}}
+    , null, api);
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), response.status);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("/hierarchy/group_by/matches/fields", parsed.value.object.get("pointer").?.string);
+    try std.testing.expect(!parsed.value.object.get("retryable").?.bool);
+    var next = try handleTableQueryRequest(std.testing.allocator, "docs", "{\"bad\":true}", null, api);
+    defer next.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, next.body, "/hierarchy/") == null);
+}
+
+test "public artifact enrichment preserves permanent inference budget and retryable probes" {
+    const Backend = struct {
+        failure: TableApi.ExecutePutArtifactEnrichmentError,
+        fn put(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: operation.RequestContext) TableApi.ExecutePutArtifactEnrichmentError!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+    };
+    var backend = Backend{ .failure = error.ResourceLimitExceeded };
+    const api: TableApi = .{ .ptr = &backend, .request = .{}, .vtable = &.{
+        .execute_table_batch = unsupportedBatch,
+        .execute_table_query_request = unsupportedQueryRequest,
+        .execute_table_query_view = unsupportedQueryView,
+        .execute_table_backup = unsupportedBackup,
+        .execute_table_restore = unsupportedRestore,
+        .execute_table_list_indexes = unsupportedListIndexes,
+        .execute_table_get_index = unsupportedGetIndex,
+        .execute_table_create_index = unsupportedCreateIndex,
+        .execute_table_delete_index = unsupportedDeleteIndex,
+        .execute_put_artifact_enrichment = Backend.put,
+    } };
+    for ([_]TableApi.ExecutePutArtifactEnrichmentError{ error.ResourceLimitExceeded, error.MemoryBudgetExceeded, error.ProbeUnavailable }) |failure| {
+        backend.failure = failure;
+        var response = try handlePutArtifactEnrichment(std.testing.allocator, "docs", "vectors", "{}", api);
+        defer response.deinit(std.testing.allocator);
+        const retryable = failure == error.ProbeUnavailable;
+        try std.testing.expectEqual(@as(u16, if (retryable) 503 else 400), response.status);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(retryable, parsed.value.object.get("retryable").?.bool);
+        try std.testing.expectEqualStrings(if (retryable) "index_probe_unavailable" else "MODEL_RESOURCE_LIMIT", parsed.value.object.get("error").?.string);
+    }
 }

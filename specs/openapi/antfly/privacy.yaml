@@ -38,7 +38,7 @@ components:
         mode:
           type: string
           enum: [monitor, redact_for_search_and_ai, redact_before_storage]
-          description: Unsupported modes fail with a typed 422 response; pre-storage protection is never substituted with asynchronous inspection.
+          description: Policies, previews, and rescans require document storage without an external base source. Unsupported storage or modes fail with a typed 422 response; pre-storage protection is never substituted with asynchronous inspection.
         fields:
           type: array
           minItems: 1
@@ -177,12 +177,23 @@ components:
         verification_failed: {type: integer, format: uint64}
         verification_blocked: {type: integer, format: uint64}
         failures: {type: array, nullable: true, maxItems: 100, items: {type: object, additionalProperties: true}}
+    PrivacyFindingsRequest:
+      type: object
+      additionalProperties: false
+      description: Findings filters and opaque continuation in the request body, avoiding URL limits for large document identifiers.
+      properties:
+        cursor: {type: string}
+        document: {type: string}
+        field: {type: string}
+        category: {type: string}
+        policy_version: {type: string}
+        limit: {type: integer, minimum: 1, maximum: 1000, default: 100}
     PrivacyFindingsPage:
       type: object
       required: [findings, policy_version]
       properties:
         policy_version: {type: string}
         findings: {type: array, items: {$ref: '#/components/schemas/PrivacyFinding'}}
-        next_cursor: {type: string, nullable: true}
+        next_cursor: {type: string, nullable: true, description: "Opaque continuation bound to the table, policy version, and filters. Pass it unchanged; its size depends on the document identifier."}
         examined_documents: {type: integer, minimum: 0}
         pending_documents: {type: integer, minimum: 0}

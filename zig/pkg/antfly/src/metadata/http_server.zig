@@ -1018,10 +1018,11 @@ pub const AdminSource = struct {
         expected: metadata_table_manager.TableRecord,
         replacement: metadata_table_manager.TableRecord,
     ) !metadata_api.CatalogMutationStamp {
+        if (try service.admitPrivacyProgressOnService(svc, expected, replacement))
+            return svc.replaceTableDefinitionStamped(expected, replacement);
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
-        const current = findTableByName(&snapshot, replacement.name) orelse return error.TableNotFound;
-        if (!metadata_table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id) return error.TableGenerationChanged;
+        try service.validateCurrentTableDefinitionOnService(svc, &snapshot, expected, replacement);
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(std.heap.page_allocator, replacement.indexes_json);
         try managed_embedder.validateEmbeddingProducerOwnershipJson(std.heap.page_allocator, replacement.indexes_json);
         if (try extension_table_ownership.definitionMutationTouchesOwnedState(

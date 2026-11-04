@@ -757,7 +757,7 @@ pub const RaftApplyStore = struct {
     pub fn pendingResolverNamespaceSources(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.TableRecord {
         return self.projectionWithAllocator([]metadata.TableRecord, alloc, .{ .kind = .resolver_namespace_work, .group_id = group_id, .arg0 = 1 });
     }
-    pub fn resolverNamespaceReplacementRejected(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, term: u64, index: u64, expected: metadata.TableRecord, replacement: metadata.TableRecord) !bool {
+    pub fn tableDefinitionReplacementRejected(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, term: u64, index: u64, expected: metadata.TableRecord, replacement: metadata.TableRecord) !bool {
         const bytes = try std.json.Stringify.valueAlloc(alloc, .{ .current = expected, .replacement = replacement, .term = term, .index = index }, .{});
         defer alloc.free(bytes);
         return self.projectionWithAllocator(bool, alloc, .{ .kind = .resolver_namespace_replacement_matches, .group_id = group_id, .arg0 = 1, .key = .fromSlice(bytes) });

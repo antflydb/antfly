@@ -36,24 +36,29 @@ describe("table privacy", () => {
     expect(calls[0].signal.aborted).toBe(true);
   });
 
-  it("encodes opaque findings cursors without changing their filter binding", async () => {
+  it("carries large opaque findings cursors and filters in the body", async () => {
     const fetch = vi.fn(async (_input: string, _init?: RequestInit) =>
       Response.json({ findings: [], policy_version: "v" })
     );
     vi.stubGlobal("fetch", fetch);
     const client = new AntflyClient({ baseUrl: "https://antfly.test" });
     await client.privacy.findings("private", {
-      cursor: "a+/=?&",
+      cursor: "a+/=?&".repeat(10000),
       document: "A&B/É",
       category: "email",
       policy_version: "v",
       limit: 5,
     });
-    const url = new URL(fetch.mock.calls[0][0]);
-    expect(url.searchParams.get("cursor")).toBe("a+/=?&");
-    expect(url.searchParams.get("document")).toBe("A&B/É");
-    expect(url.searchParams.get("policy_version")).toBe("v");
-    expect(url.searchParams.get("limit")).toBe("5");
+    const [url, init] = fetch.mock.calls[0];
+    expect(new URL(url).search).toBe("");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(init?.body as string)).toEqual({
+      cursor: "a+/=?&".repeat(10000),
+      document: "A&B/É",
+      category: "email",
+      policy_version: "v",
+      limit: 5,
+    });
   });
 
   it("surfaces precondition errors instead of silently overwriting a policy", async () => {

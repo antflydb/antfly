@@ -24,8 +24,9 @@ T = TypeVar("T", bound="PrivacyPolicy")
 class PrivacyPolicy:
     """
     Attributes:
-        mode (PrivacyPolicyMode): Unsupported modes fail with a typed 422 response; pre-storage protection is never
-            substituted with asynchronous inspection.
+        mode (PrivacyPolicyMode): Policies, previews, and rescans require document storage without an external base
+            source. Unsupported storage or modes fail with a typed 422 response; pre-storage protection is never substituted
+            with asynchronous inspection.
         fields (list[str]): Literal source document field names, matching artifact source field semantics.
         category_groups (list[PrivacyPolicyCategoryGroupsItem] | Unset):
         categories (list[PrivacyCategory] | Unset): Add categories or override group categories. The union of explicit

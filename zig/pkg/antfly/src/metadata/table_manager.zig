@@ -45,6 +45,27 @@ pub const TableRecord = @import("antfly_local_sources").metadata_local_catalog.T
 pub const PrivacyWork = struct { table: TableRecord, term: u64 };
 pub const TableDefinition = TableRecord;
 
+/// Runtime progress has no effect on routing, planning, or owner definitions.
+/// The ordinary full-definition CAS still supplies concurrency protection.
+pub fn privacyProgressOnly(a: std.mem.Allocator, before: TableRecord, after: TableRecord) !bool {
+    // Unchanged CAS commands also drive resolver namespace maintenance.
+    if (tableDefinitionsEqual(before, after)) return false;
+    var immutable = after;
+    immutable.indexes_json = before.indexes_json;
+    if (!tableDefinitionsEqual(before, immutable)) return false;
+    return @import("antfly_local_sources").privacy_catalog.progressOnly(a, before.indexes_json, after.indexes_json);
+}
+
+/// Policy installation acknowledges an immutable resource version. Worker
+/// progress after the commit must not make that logical result ambiguous.
+pub fn privacyPolicyInstallationMatches(a: std.mem.Allocator, before: TableRecord, requested: TableRecord, visible: TableRecord) !bool {
+    if (!try privacyProgressOnly(a, requested, visible)) return false;
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    const prior = (try privacy.resourceVersion(a, before.indexes_json)) orelse 0;
+    const installed = (try privacy.resourceVersion(a, requested.indexes_json)) orelse return false;
+    return installed > prior;
+}
+
 pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
     return @import("antfly_local_sources").common_vector_migration.admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
         lhs.storage.engine == rhs.storage.engine and
@@ -3571,4 +3592,23 @@ test "source vector migration catalog fences configurations topology and stale p
     complete.storage_migration = null;
     try manager.publishVectorMigrationTable(published, complete);
     try std.testing.expectError(error.UnsupportedVectorMigrationDirection, manager.publishVectorMigrationTable(complete, before));
+}
+
+test "privacy policy installation acknowledgement survives progress but never acknowledges a different version" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    const before = TableRecord{ .table_id = 1, .name = "private" };
+    var resource = try privacy.next(a, null, .{ .mode = .monitor, .fields = &.{"body"} }, null);
+    var requested = before;
+    requested.indexes_json = try privacy.install(a, "{}", resource);
+    resource.coverage.retry_after_millis = 100;
+    var visible = requested;
+    visible.indexes_json = try privacy.replaceResource(a, requested.indexes_json, resource);
+    try std.testing.expect(try privacyPolicyInstallationMatches(a, before, requested, visible));
+    try std.testing.expect(!try privacyPolicyInstallationMatches(a, requested, requested, visible));
+    resource.resource_version += 1;
+    visible.indexes_json = try privacy.replaceResource(a, requested.indexes_json, resource);
+    try std.testing.expect(!try privacyPolicyInstallationMatches(a, before, requested, visible));
 }

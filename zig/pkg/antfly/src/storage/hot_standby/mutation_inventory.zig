@@ -122,7 +122,7 @@ pub const entries = [_]Entry{
     .{ .surface = .artifact_repair, .disposition = .reject, .path_pattern = "/tables/{table}/repair/{run|control-jobs|jobs/...}", .methods = post_delete, .reason = "repair job checkpoints and direct repair effects do not share one replicated acknowledgement" },
     .{ .surface = .artifact_reprocess, .disposition = .reject, .path_pattern = "/tables/{table}/.../reprocess[-jobs]", .methods = post_delete, .reason = "reprocess job checkpoints and derived effects do not share one replicated acknowledgement" },
     .{ .surface = .backup, .disposition = .reject, .path_pattern = "/backup | /tables/{table}/backup", .methods = post, .reason = "requires the shared durable cohort driver with primary-epoch authority, replicated write fences, immutable seals, and fenced repository publication" },
-    .{ .surface = .read_like_post, .disposition = .read_only, .path_pattern = "/query | /tables/{table}/{query|documents|repair/issues} | /eval | /agents/{query-builder|retrieval|research} | /ard/v1/{search|explore}", .methods = post, .reason = "these POST requests only compute or inspect state" },
+    .{ .surface = .read_like_post, .disposition = .read_only, .path_pattern = "/query | /tables/{table}/{query|documents|repair/issues|privacy/findings} | /eval | /agents/{query-builder|retrieval|research} | /ard/v1/{search|explore}", .methods = post, .reason = "these POST requests only compute or inspect state" },
     .{ .surface = .hot_standby_control, .disposition = .local_operational, .path_pattern = "/admin/v1/standby/... | /admin/v1/ha/... | /internal/v1/standby/replication/... | /internal/v1/ha/replication/...", .methods = post_put_delete, .reason = "authenticated HA control and replication endpoints implement the topology protocol itself" },
     .{ .surface = .storage_maintenance, .disposition = .local_operational, .path_pattern = "/admin/v1/maintenance/...", .methods = post_delete, .reason = "maintenance rewrites physical local representation without changing logical promoted state" },
     .{ .surface = .protocol_action, .disposition = .reject, .path_pattern = "/mcp/v1/... | /a2a | /agents/v1/extensions/...", .methods = post_delete, .reason = "protocol tool calls are payload-dispatched and cannot prove every invoked mutation enters RemoteApply" },
@@ -165,6 +165,7 @@ pub fn classify(method: http_common.Method, path: []const u8) ?Classification {
         (std.mem.eql(u8, path, routes.Routes.global_query) or
             routes.Routes.matchTableQuery(path) != null or
             routes.Routes.matchTableScan(path) != null or
+            routes.isPrivacyFindingsPath(path) or
             routes.Routes.matchTableArtifactRepair(path) != null or
             std.mem.eql(u8, path, routes.Routes.eval) or
             std.mem.eql(u8, path, routes.Routes.agents_query_builder) or
@@ -333,6 +334,7 @@ test "hot-standby mutation classifier leaves reads and RemoteApply data writes a
     try std.testing.expect(classify(.GET, "/auth/v1/users/alice") == null);
     try std.testing.expectEqual(Disposition.read_only, classify(.POST, "/query").?.disposition);
     try std.testing.expectEqual(Disposition.read_only, classify(.POST, "/tables/docs/query").?.disposition);
+    try std.testing.expectEqual(Disposition.read_only, classify(.POST, "/tables/docs/privacy/findings").?.disposition);
     try std.testing.expectEqual(Disposition.reject, classify(.POST, "/tables/docs/backup").?.disposition);
     try std.testing.expectEqual(Disposition.remote_apply, classify(.POST, "/tables/docs/batch").?.disposition);
     try std.testing.expectEqual(Disposition.remote_apply, classify(.POST, "/tables/docs/merge").?.disposition);

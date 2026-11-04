@@ -20,7 +20,23 @@ pub const sql_max_request_body_bytes: usize = 4 << 20;
 /// Transport admission shared by native and linked-kernel registrars. Resolve
 /// before buffering so a SQL request cannot consume the much larger batch cap.
 pub fn publicPostBodyLimit(path: []const u8) ?usize {
+    if (isPrivacyFindingsPath(path)) return @import("antfly_public_limits").max_privacy_findings_body_bytes;
     return if (std.mem.eql(u8, path, "/db/v1/sql") or std.mem.startsWith(u8, path, "/db/v1/sql/prepared")) sql_max_request_body_bytes else null;
+}
+
+pub fn isPrivacyFindingsPath(path: []const u8) bool {
+    const relative = if (std.mem.startsWith(u8, path, "/db/v1/")) path[6..] else path;
+    const prefix = "/tables/";
+    const suffix = "/privacy/findings";
+    if (!std.mem.startsWith(u8, relative, prefix) or !std.mem.endsWith(u8, relative, suffix) or relative.len <= prefix.len + suffix.len) return false;
+    return std.mem.indexOfScalar(u8, relative[prefix.len .. relative.len - suffix.len], '/') == null;
+}
+
+test "privacy findings body admission covers cursor and filters without enlarging other routes" {
+    const limit = @import("antfly_public_limits").max_privacy_findings_body_bytes;
+    try std.testing.expectEqual(@as(?usize, limit), publicPostBodyLimit("/db/v1/tables/:tableName/privacy/findings"));
+    try std.testing.expect(publicPostBodyLimit("/db/v1/tables/docs/privacy/preview") == null);
+    try std.testing.expect(!isPrivacyFindingsPath("/tables/docs/privacy/findings/extra"));
 }
 
 pub const Routes = struct {

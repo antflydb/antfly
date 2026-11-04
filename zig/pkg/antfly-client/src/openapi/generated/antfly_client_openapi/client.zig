@@ -4487,6 +4487,19 @@ pub const Client = struct {
         return ApiResponse(types.PrivacyFindingsPage).fromResponse(self.allocator, &resp);
     }
 
+    /// List current privacy findings with body filters
+    /// POST /db/v1/tables/{tableName}/privacy/findings
+    pub fn queryTablePrivacyFindings(self: *@This(), table_name: []const u8, body: types.PrivacyFindingsRequest) !ApiResponse(types.PrivacyFindingsPage) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/privacy/findings", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.PrivacyFindingsPage).fromResponse(self.allocator, &resp);
+    }
+
     /// Inspect a bounded sample without saving the policy
     /// POST /db/v1/tables/{tableName}/privacy/preview
     pub fn previewTablePrivacy(self: *@This(), table_name: []const u8, body: types.PrivacyPreviewRequest) !ApiResponse(types.PrivacyPreview) {

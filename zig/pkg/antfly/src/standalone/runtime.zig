@@ -823,6 +823,8 @@ const LocalStandaloneMetadata = struct {
         previous_ranges: std.AutoHashMapUnmanaged(u64, ?antfly.metadata.RangeRecord) = .empty,
         previous_extensions: ?antfly.extensions.ExtensionCatalog = null,
         compare_and_replace_table: ?u64 = null,
+        privacy_progress_only: bool = false,
+        previous_privacy_due: ?i64 = null,
         catalog_change: ?system_catalog.MutableState.Change = null,
         setting_command: ?@import("antfly_local_sources").system_catalog_settings.Command = null,
         previous_settings: ?system_catalog.MutableState.OwnedSettings = null,
@@ -920,7 +922,18 @@ const LocalStandaloneMetadata = struct {
             }
             var tables = self.previous_tables.iterator();
             while (tables.next()) |entry| {
-                if (!self.committed) {
+                if (!self.committed and self.privacy_progress_only) {
+                    // Both cuts retain the policy and its due node. Restore
+                    // that node in place: rollback must not allocate after OOM.
+                    const old = entry.value_ptr.*.?;
+                    const current = metadata.manager.tables.getPtr(entry.key_ptr.*).?;
+                    _ = metadata.manager.table_names.remove(current.name);
+                    antfly.metadata.table_manager.freeTable(metadata.alloc, current.*);
+                    current.* = old;
+                    if (metadata.manager.index_table_names) metadata.manager.table_names.putAssumeCapacity(old.name, old.table_id);
+                    std.debug.assert(metadata.manager.privacy_work.dueTime(old.table_id) != null);
+                    metadata.manager.privacy_work.update(metadata.alloc, old.table_id, self.previous_privacy_due) catch unreachable;
+                } else if (!self.committed) {
                     _ = metadata.manager.removeTable(entry.key_ptr.*);
                     if (entry.value_ptr.*) |row| {
                         metadata.manager.tables.putAssumeCapacity(entry.key_ptr.*, row);
@@ -3100,6 +3113,16 @@ const LocalStandaloneMetadata = struct {
                     .data_shapes = shapes,
                 }, .{});
             },
+            .table_record_read => |name| {
+                try context.ensureActive();
+                if (self.lifecycle_store) |store| {
+                    const table = try store.tableByName(alloc, group_ids.main_metadata_group_id, name);
+                    defer if (table) |value| antfly.metadata.table_manager.freeTable(alloc, value);
+                    return std.json.Stringify.valueAlloc(alloc, table, .{});
+                }
+                const table = self.manager.findTableByName(name);
+                return std.json.Stringify.valueAlloc(alloc, if (table) |value| @as(?antfly.metadata.TableRecord, value.*) else null, .{});
+            },
             .query_definition => |name| {
                 if (self.lifecycle_store) |store| {
                     var definition = try store.queryTableDefinition(alloc, group_ids.main_metadata_group_id, name);
@@ -3506,13 +3529,18 @@ const LocalStandaloneMetadata = struct {
         // replicates while reporting itself as configured.
         if (self.haRejectsReplicationSources() and !std.mem.eql(u8, replacement.replication_sources_json, "[]"))
             return error.HACatalogReplicationSourcesUnsupported;
-        try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(self.alloc, replacement.indexes_json);
-        try antfly.inference.managed_embedder.validateEmbeddingProducerOwnershipJson(self.alloc, replacement.indexes_json);
+        const progress_only = try antfly.metadata.table_manager.privacyProgressOnly(self.alloc, current.*, replacement);
+        if (!progress_only) {
+            try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(self.alloc, replacement.indexes_json);
+            try antfly.inference.managed_embedder.validateEmbeddingProducerOwnershipJson(self.alloc, replacement.indexes_json);
+        }
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
+        mutation.privacy_progress_only = progress_only;
+        mutation.previous_privacy_due = self.manager.privacy_work.dueTime(replacement.table_id);
         try mutation.upsertTable(self, replacement);
         mutation.compare_and_replace_table = replacement.table_id;
-        self.epoch +|= 1;
+        if (!progress_only) self.epoch +|= 1;
         try mutation.commit(self);
     }
 
@@ -5020,7 +5048,7 @@ const LocalStandaloneMetadata = struct {
                 // revision while the outbox gates future proposals and retries.
                 mutation.committed = true;
                 self.durable_revision += 1;
-                self.epoch = self.durable_revision;
+                if (!mutation.privacy_progress_only) self.epoch = self.durable_revision;
                 return error.MetadataMutationOutcomeUnknown;
             }
             if (err == error.MetadataMutationOutcomeUnknown) {
@@ -5038,7 +5066,7 @@ const LocalStandaloneMetadata = struct {
         };
         mutation.committed = true;
         self.durable_revision += 1;
-        self.epoch = self.durable_revision;
+        if (!mutation.privacy_progress_only) self.epoch = self.durable_revision;
         var projected_tables = mutation.previous_tables.keyIterator();
         while (projected_tables.next()) |id| {
             if (!self.manager.tables.contains(id.*)) continue;
@@ -16279,4 +16307,63 @@ test "standalone cdc review rejects replication sources with scoped HA ownership
     defer a.free(sources);
     std.debug.print("review scoped HA cdc_supported={} publication_supported={}\n", .{ try metadata.statusSource().replicationSourcesSupported(), metadata.standaloneRelationPublicationSupported() });
     try std.testing.expectError(error.HACatalogReplicationSourcesUnsupported, LocalStandaloneMetadata.createTable(&metadata, a, "tickets", .{ .replication_sources_json = sources }));
+}
+
+test "privacy standalone progress retains routing and join planning generations" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const path = try std.fmt.allocPrint(a, "{s}/catalog.json", .{root});
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    try LocalStandaloneMetadata.createTable(&metadata, alloc, "private", .{});
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    var resource = try privacy.next(a, null, .{ .mode = .monitor, .fields = &.{"body"} }, null);
+    var before = try antfly.metadata.table_manager.cloneTable(a, metadata.findTableByNameLocked("private").?.*);
+    var installed = before;
+    installed.indexes_json = try privacy.install(a, "{}", resource);
+    try LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, installed);
+    before = try antfly.metadata.table_manager.cloneTable(a, metadata.findTableByNameLocked("private").?.*);
+    const old = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, null, false);
+    defer old.release();
+    const old_plan = (try LocalStandaloneMetadata.acquireJoinPlanning(&metadata, .{})).?;
+    defer old_plan.release();
+    const epoch = metadata.epoch;
+    const durable = metadata.durable_revision;
+    resource.coverage.retry_after_millis = 200;
+    var replacement = before;
+    replacement.indexes_json = try privacy.replaceResource(a, before.indexes_json, resource);
+    try LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, replacement);
+    try std.testing.expectEqual(epoch, metadata.epoch);
+    try std.testing.expect(metadata.durable_revision > durable);
+    const current = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, null, false);
+    defer current.release();
+    const plan = (try LocalStandaloneMetadata.acquireJoinPlanning(&metadata, .{})).?;
+    defer plan.release();
+    try std.testing.expect(old == current);
+    try std.testing.expect(old_plan == plan);
+    try std.testing.expect(metadata.manager.privacy_work.first(199) == null);
+    try std.testing.expectEqual(replacement.table_id, metadata.manager.privacy_work.first(200).?);
+    try std.testing.expectError(error.TableGenerationChanged, LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, replacement));
+    {
+        var mutation = try metadata.beginCatalogMutationLocked();
+        mutation.privacy_progress_only = true;
+        mutation.previous_privacy_due = metadata.manager.privacy_work.dueTime(replacement.table_id);
+        resource.coverage.retry_after_millis = 400;
+        var tentative = replacement;
+        tentative.indexes_json = try privacy.replaceResource(a, replacement.indexes_json, resource);
+        try mutation.upsertTable(&metadata, tentative);
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        metadata.alloc = failing.allocator();
+        mutation.deinit(&metadata);
+        metadata.alloc = alloc;
+    }
+    try std.testing.expectEqual(@as(?i64, 200), metadata.manager.privacy_work.dueTime(replacement.table_id));
+    try std.testing.expectEqualStrings(replacement.indexes_json, metadata.findTableByNameLocked("private").?.indexes_json);
 }

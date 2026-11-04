@@ -105,6 +105,7 @@ pub const PrivacyFinding = struct {
 pub const PrivacyFindingsPage = struct {
     policy_version: []const u8,
     findings: []const PrivacyFinding,
+    /// Opaque continuation bound to the table, policy version, and filters. Pass it unchanged; its size depends on the document identifier.
     next_cursor: OpenApiOptionalNullable([]const u8) = .absent,
     examined_documents: ?i64 = null,
     pending_documents: ?i64 = null,
@@ -155,8 +156,65 @@ pub const PrivacyFindingsPage = struct {
     }
 };
 
+/// Findings filters and opaque continuation in the request body, avoiding URL limits for large document identifiers.
+pub const PrivacyFindingsRequest = struct {
+    cursor: ?[]const u8 = null,
+    document: ?[]const u8 = null,
+    field: ?[]const u8 = null,
+    category: ?[]const u8 = null,
+    policy_version: ?[]const u8 = null,
+    limit: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "cursor", "cursor", true },
+        .{ "document", "document", true },
+        .{ "field", "field", true },
+        .{ "category", "category", true },
+        .{ "policy_version", "policy_version", true },
+        .{ "limit", "limit", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.cursor) |value| {
+            try jw.objectField("cursor");
+            try jw.write(value);
+        }
+        if (self.document) |value| {
+            try jw.objectField("document");
+            try jw.write(value);
+        }
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.category) |value| {
+            try jw.objectField("category");
+            try jw.write(value);
+        }
+        if (self.policy_version) |value| {
+            try jw.objectField("policy_version");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const PrivacyPolicy = struct {
-    /// Unsupported modes fail with a typed 422 response; pre-storage protection is never substituted with asynchronous inspection.
+    /// Policies, previews, and rescans require document storage without an external base source. Unsupported storage or modes fail with a typed 422 response; pre-storage protection is never substituted with asynchronous inspection.
     mode: []const u8,
     /// Literal source document field names, matching artifact source field semantics.
     fields: []const []const u8,

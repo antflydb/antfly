@@ -158,6 +158,12 @@ status only, without original values. Parse scratch is released per row and
 failure details are bounded. An incomplete or unavailable census yields null
 counts. Findings pagination binds policy and filters and handles resumes within
 a document; missing/deleted documents contribute no current findings.
+Findings offer equivalent GET query and POST JSON-body forms. TypeScript SDK/UI clients use
+POST so a continuation can carry any admitted document identifier without the
+HTTP request-line limit. Versioned binary cursors avoid JSON-escape growth;
+issuance and decoding share a bound derived from the document-write budget.
+The findings POST body allowance covers that cursor plus document/field filters,
+while other endpoint limits remain unchanged. Legacy JSON cursors remain readable.
 
 
 Background work selection uses one ordered due entry per privacy-enabled table.
@@ -167,6 +173,28 @@ indexes, atomically with table CAS writes. Snapshot restore and index migration
 rebuild those hints from durable scan/coverage state. Selection reads one due
 entry and its table, then checks local leadership and rechecks the term before
 persisting progress. No page enumerates the entire administrative catalog.
+Progress-only table CAS updates use an explicit runtime-field allowlist
+(`coverage`, `scans`, `scan_id`, `scan_sequence`). Every other table, index,
+and policy field must remain identical. The authoritative row, schema digest,
+and due index commit atomically without a semantic catalog notification or
+revision change. Unconditional reconciliation upserts retain the durable
+privacy resource and reject stale policy bindings, so a cached semantic catalog
+cannot rewind job progress. Remote data APIs fetch current physical table records
+through a linearizable private catalog point read; progress never depends on a
+cached administrative/routing snapshot. Definition-CAS ingress also checks this
+current row through a shared validator. Runtime-only admission uses that point
+read and the allowlist, bypassing catalog-wide ownership validation and extra
+reconciliation rounds. Authored changes retain ordinary admission. Policy installation is acknowledged by its immutable
+resource version even if worker progress has already advanced. Standalone advances its durability revision while retaining
+routing and join-planning generations, including allocation-free rollback of
+the existing due node. Policy changes retain ordinary catalog publication.
+If a worker advances the row between policy admission and Raft apply, the
+rejected authored CAS records its command digest and exact term/index in the
+existing bounded per-table rejection slot. Successful or rejected runtime
+progress cannot overwrite that receipt. The policy endpoint can then retry a
+known rejection; a superseded or missing receipt remains an unknown outcome.
+This preserves the full-record CAS boundary without creating an unbounded
+per-command history or adding a wire command.
 Bounded-range verification pages shrink after an unavailable two-second read
 and persist the learned size, cursor and accumulated evidence together. Full-table
 jobs share the durable coverage census, accepting only a completed pass started
@@ -176,6 +204,14 @@ Readiness probes have a two-second execution budget. Routing, transport and
 readiness failures persist bounded backoff without marking inspection failed;
 the table advances its due entry so other tables can run. Publication still
 rechecks metadata authority and term before that progress can commit.
+An idle producer watermark and completed discovery cursor cannot discharge
+missing consumer publication receipts. The coverage audit re-arms the same
+durable source-discovery job using a control-revision CAS; its existing bounded
+pages restore proof without replacing the physical generation. Pending replay,
+paused jobs, known terminal producer debt, concurrent handoffs, and active
+candidate construction retain their existing owner boundaries. Aggregate
+failure receipts also suppress rediscovery when legacy per-source receipts are
+absent, preventing terminal failures from becoming repeated inference work.
 
 Policy PUT acknowledges a logical resource version, independently of mutable
 job JSON. A bounded CAS retry recomposes against current progress while
@@ -202,6 +238,28 @@ allocation accounting and failure injection beneath request arenas.
 
 ## Validation
 
+### Current review fixes (2026-11-03)
+
+- Merged main at `e6144685f8` and regenerated the public API and all SDKs.
+- Focused privacy build: 121/121 steps and 25/25 API/metadata tests passed;
+  the native storage/privacy group passed 65 tests without leaks. Regressions
+  cover cache retention, current-row admission, stale authored-CAS rejection
+  receipts, durable progress reconciliation, bounded publication recovery,
+  snapshot scheduling rebuilds, and modern/legacy cursor round trips.
+- Final standalone HTTP suite: 13 passed, 1 optional model-weight test skipped
+  in 279 seconds. Final Raft HTTP suite: 13 passed, 1 optional model-weight test
+  skipped in 406 seconds. Both run the same final binary and include one/two
+  shards, monitor/protective policy saves and replacements, restart, resumed
+  coverage, 3 KiB/36 KiB escaped document identifiers, and rejection of
+  unsupported storage before preview, installation or rescan.
+- Generated Go SDK tests, TypeScript privacy SDK tests (3), dashboard UTF-8
+  preview tests (3), full generation, formatting and license checks passed.
+  This review did not repeat native model-weight, Metal or CUDA qualification.
+- Final binary SHA-256:
+  `10e133029c1269edee2e9c951a8350a00344e2ddfee833566b09a3045bec3852`.
+
+### Prior validation
+
 - ReleaseFast deduplication microbenchmark (three repetitions): 65,536 distinct
   valid findings improved from a median 965 ms to 10.3 ms; 16,384 improved from
   58.4 ms to 2.75 ms. This measures normalization, not model inference.
@@ -226,7 +284,10 @@ allocation accounting and failure injection beneath request arenas.
 - An initial standalone one-shard policy-replacement check timed out waiting
   for serving readiness. It passed in an isolated run, in the preceding-monitor
   sequence, and in the complete rerun with unchanged code and binary. The cause
-  remains unconfirmed; the test retains scan, vector-index and server diagnostics.
+  was subsequently traced to missing default text-index publication receipts after
+  completed initial discovery. The bounded recovery fix described above and its
+  deterministic regression now cover that state; the HTTP test retains scan,
+  vector-index and server diagnostics.
 - Large Raft membership tests enforce a 90-second no-progress watchdog and a
   ten-minute hard convergence cap, accounting for bounded publication backpressure.
 

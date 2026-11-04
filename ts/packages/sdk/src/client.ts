@@ -815,25 +815,14 @@ export class AntflyClient {
         signal?: AbortSignal;
       }
     ) => {
-      const query = new URLSearchParams();
-      for (const name of [
-        "cursor",
-        "document",
-        "field",
-        "category",
-        "policy_version",
-        "limit",
-      ] as const) {
-        const value = options?.[name];
-        if (value !== undefined) query.set(name, String(value));
-      }
+      const { signal, ...body } = options ?? {};
       return this.privacyRequest<components["schemas"]["PrivacyFindingsPage"]>(
         table,
-        `/findings?${query}`,
-        "GET",
+        "/findings",
+        "POST",
+        body,
         undefined,
-        undefined,
-        options?.signal
+        signal
       );
     },
   };

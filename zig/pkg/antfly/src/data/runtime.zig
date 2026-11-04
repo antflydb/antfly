@@ -26407,6 +26407,7 @@ const RemoteMetadataSource = struct {
             .routing = self.catalogSource().routingSource() catch unreachable,
             .vtable = &.{
                 .system_catalog = remoteSystemCatalog,
+                .table_record = remoteTableRecord,
                 .tracks_sql_submission = true,
                 .supports_query_definitions = true,
                 .supports_resolver_catalog_read = true,
@@ -28165,6 +28166,14 @@ const RemoteMetadataSource = struct {
 
     fn isSystemCatalogMutation(input: @import("../system_catalog/server_call.zig").Call) bool {
         return input.isMutation();
+    }
+
+    fn remoteTableRecord(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8) !?antfly.metadata.TableRecord {
+        const bytes = try remoteSystemCatalog(ptr, a, .{}, .{ .table_record_read = name });
+        defer a.free(bytes);
+        var parsed = try std.json.parseFromSlice(?antfly.metadata.TableRecord, a, bytes, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        return if (parsed.value) |table| try antfly.metadata.table_manager.cloneTable(a, table) else null;
     }
 
     fn remoteGetLakeIndexLifecycle(ptr: *anyopaque, a: std.mem.Allocator, table_id: u64, request: antfly.public_api.operation.RequestContext) ![]u8 {
@@ -32654,6 +32663,10 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                         defer response_alloc.free(tables);
                         for (input.targets, tables) |target, *table| table.* = resolve(snapshot, target);
                         break :blk try std.json.Stringify.valueAlloc(response_alloc, catalog.ResolvedMany{ .revision = snapshot.status.metadata_epoch, .tables = tables }, .{});
+                    },
+                    .table_record_read => |name| blk: {
+                        const table = antfly.public_api.tables.findTableByName(snapshot, name);
+                        break :blk try std.json.Stringify.valueAlloc(response_alloc, if (table) |value| @as(?antfly.metadata.TableRecord, value.*) else null, .{});
                     },
                     .query_definition => |name| blk: {
                         const table = antfly.public_api.tables.findTableByName(snapshot, name) orelse return .{ .status = 404 };
@@ -45869,6 +45882,42 @@ fn consumerTests() type {
                 error.InvalidMetadataIncarnation,
                 source.acceptMetadataIdentity(9, antfly.metadata.incarnation.zero),
             );
+        }
+
+        test "privacy remote table reads observe progress without invalidating semantic caches" {
+            const a = std.testing.allocator;
+            const Fake = struct {
+                calls: usize = 0,
+                fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
+                    var call = try std.json.parseFromSlice(@import("../system_catalog/server_call.zig").Call, alloc, request.body, .{});
+                    defer call.deinit();
+                    try std.testing.expect(call.value == .table_record_read);
+                    try std.testing.expectEqualStrings("private", call.value.table_record_read);
+                    self.calls += 1;
+                    const description = try std.fmt.allocPrint(alloc, "progress-{d}", .{self.calls});
+                    defer alloc.free(description);
+                    const body = try std.json.Stringify.valueAlloc(alloc, antfly.metadata.TableRecord{ .table_id = 1, .name = "private", .description = description }, .{});
+                    const headers = try alloc.alloc(antfly.common.http.Header, 2);
+                    headers[0] = .{ .name = try alloc.dupe(u8, "x-antfly-catalog-metadata-group"), .value = try alloc.dupe(u8, "9") };
+                    headers[1] = .{ .name = try alloc.dupe(u8, "x-antfly-catalog-metadata-incarnation"), .value = try alloc.dupe(u8, "11111111111111111111111111111111") };
+                    return .{ .status = 200, .body = body, .headers = headers };
+                }
+            };
+            var fake = Fake{};
+            var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{"http://metadata.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+            defer source.deinit();
+            try source.acceptMetadataIdentity(9, "11111111111111111111111111111111".*);
+            const generation = source.snapshot_invalidation_generation;
+            const first = (try source.statusSource().tableRecord(a, "private")).?;
+            defer antfly.metadata.table_manager.freeTable(a, first);
+            const second = (try source.statusSource().tableRecord(a, "private")).?;
+            defer antfly.metadata.table_manager.freeTable(a, second);
+            try std.testing.expectEqualStrings("progress-1", first.description);
+            try std.testing.expectEqualStrings("progress-2", second.description);
+            try std.testing.expectEqual(generation, source.snapshot_invalidation_generation);
+            try std.testing.expectEqual(@as(usize, 2), fake.calls);
         }
 
         test "remote metadata status source advertises exact table drop cleanup" {

@@ -4,7 +4,9 @@ Privacy inspects selected string fields for configured entity categories. A
 policy can report findings (`monitor`) or redact the documents consumed by
 search and AI (`redact_for_search_and_ai`). Originals remain stored. The
 `redact_before_storage` mode returns a typed unsupported response until a
-synchronous ingestion implementation is available.
+synchronous ingestion implementation is available. Policies, previews, and rescans
+require document storage without an external base source; unsupported storage
+returns `PrivacyRelationalStorageUnsupported` before inspection or mutation.
 
 Start in a table's **Privacy** tab: choose fields and categories, preview a
 bounded sample, inspect highlighted spans, and adjust sensitivity or individual
@@ -51,7 +53,11 @@ GET /tables/customers/privacy/findings?field=body&category=email&limit=100
 Findings include document, field, category, half-open UTF-8 byte coordinates,
 policy version, source fingerprint, producer revision, and confidence when the
 producer supplies it. They omit matched values. Pagination cursors bind the
-policy and filters; restart pagination after changing either. Explicit
+policy and filters; restart pagination after changing either. Treat cursors as
+opaque strings and pass them unchanged, including for large or escaped document
+identifiers. Use `POST /tables/customers/privacy/findings` with the same fields
+in a JSON body for large cursors or filters that exceed URL limits. The TypeScript SDK
+and Privacy tab use this body form. Explicit
 `policy_version` requests for a superseded policy return `410`.
 
 Start a bounded retry or rescan with `POST /tables/customers/privacy/scans`,

@@ -94,7 +94,11 @@ export interface paths {
         /** List current privacy findings */
         get: operations["listTablePrivacyFindings"];
         put?: never;
-        post?: never;
+        /**
+         * List current privacy findings with body filters
+         * @description Equivalent to GET findings, with filters and continuation in JSON so large document identifiers do not exceed URL limits.
+         */
+        post: operations["queryTablePrivacyFindings"];
         delete?: never;
         options?: never;
         head?: never;
@@ -7032,7 +7036,7 @@ export interface components {
         };
         PrivacyPolicy: {
             /**
-             * @description Unsupported modes fail with a typed 422 response; pre-storage protection is never substituted with asynchronous inspection.
+             * @description Policies, previews, and rescans require document storage without an external base source. Unsupported storage or modes fail with a typed 422 response; pre-storage protection is never substituted with asynchronous inspection.
              * @enum {string}
              */
             mode: "monitor" | "redact_for_search_and_ai" | "redact_before_storage";
@@ -7197,9 +7201,20 @@ export interface components {
                 [key: string]: unknown;
             }[] | null;
         };
+        /** @description Findings filters and opaque continuation in the request body, avoiding URL limits for large document identifiers. */
+        PrivacyFindingsRequest: {
+            cursor?: string;
+            document?: string;
+            field?: string;
+            category?: string;
+            policy_version?: string;
+            /** @default 100 */
+            limit?: number;
+        };
         PrivacyFindingsPage: {
             policy_version: string;
             findings: components["schemas"]["PrivacyFinding"][];
+            /** @description Opaque continuation bound to the table, policy version, and filters. Pass it unchanged; its size depends on the document identifier. */
             next_cursor?: string | null;
             examined_documents?: number;
             pending_documents?: number;
@@ -7670,6 +7685,8 @@ export interface components {
             error: string;
             /** @description Human-readable error description when supplied by the endpoint. */
             message?: string;
+            /** @description Optional RFC 6901 JSON Pointer identifying the invalid request field. */
+            pointer?: string;
             /** @description Whether retrying the operation may succeed without changing the request. */
             retryable?: boolean;
             /**
@@ -31906,6 +31923,85 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description List current privacy findings */
+            200: {
+                headers: {
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrivacyFindingsPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Table privacy administration permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Policy ETag no longer matches */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Unsupported policy or invalid privacy producer contract */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Policy replacement requires If-Match */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    queryTablePrivacyFindings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrivacyFindingsRequest"];
+            };
+        };
         responses: {
             /** @description List current privacy findings */
             200: {

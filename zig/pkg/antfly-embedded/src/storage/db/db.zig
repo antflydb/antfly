@@ -40853,6 +40853,11 @@ pub const DB = struct {
                 defer read.abort();
                 if (try @import("artifact_publication.zig").authority(&read) != null) continue;
                 const generation = self.core.index_manager.coverageGenerationForIndex(index_ref.name) orelse continue;
+                // Failure publication owns its repair/retry lifecycle. Older
+                // failure paths may have only an aggregate receipt; absent
+                // per-source tuples must never turn that debt into new work.
+                const aggregate = try DerivedCoverageCounters.load(alloc, &read, index_ref.name, generation);
+                if ((aggregate.terminal_failed orelse 0) != 0) continue;
                 var complete = primary_doc_count != null;
                 for (source_names) |source_name| {
                     const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, index_ref.name, source_name, recovery_plan.plan());
@@ -40923,6 +40928,11 @@ pub const DB = struct {
         defer state.deinit(alloc);
         for (configs) |cfg| {
             if (!self.currentInitialBuildIntentMatches(&state, cfg)) return false;
+            const intent = state.entries.items[state.findIndex(cfg.name).?].intent;
+            // A finished discovery cursor cannot own missing publication
+            // forever at an idle producer watermark. Re-arm that same bounded
+            // source owner; candidate construction still owns its own work.
+            if (intent.phase == .detected and intent.source_replay_state != .pending) return false;
         }
         return true;
     }
@@ -40970,7 +40980,7 @@ pub const DB = struct {
         }
         var ensured: usize = 0;
         for (configs) |cfg| {
-            _ = try self.createGenerationRepairIntentAtTarget(
+            const id = try self.createGenerationRepairIntentAtTarget(
                 alloc,
                 cfg,
                 .replay_artifact_unavailable,
@@ -40985,6 +40995,27 @@ pub const DB = struct {
                 // repair, while retaining its non-repair lifecycle class.
                 .initial_build,
             );
+            var entry = try self.loadIndexRepairEntryById(alloc, id);
+            defer entry.deinit(alloc);
+            const intent = entry.intent;
+            const pending = self.pendingWorkStats().enrichment;
+            if (intent.work_class == .initial_build and intent.phase == .detected and
+                intent.automation != .paused and intent.source_replay_state != .pending and
+                intent.root_generation == self.core.root_generation and intent.group_id == self.localRepairGroupId() and
+                intent.config_hash == types.indexConfigHash(cfg) and pending.applied_sequence >= pending.target_sequence)
+            {
+                // Compare the exact control revision so a concurrent candidate
+                // handoff, pause, or replay page cannot be rewound by this audit.
+                self.updateIndexRepairIntentWithBindingEffect(alloc, id, .{
+                    .source_replay_state = .pending,
+                    .source_replay_resume_key = null,
+                    .replace_source_replay_resume_key = true,
+                    .next_retry_at_ms = 0,
+                }, .retain, intent.revision) catch |err| switch (err) {
+                    error.RepairTransitionConflict => continue,
+                    else => return err,
+                };
+            }
             ensured += 1;
         }
         return ensured;
@@ -146285,4 +146316,89 @@ test "db document quality policy reprocess retires text and vectors across reope
         defer a.free(original);
         try std.testing.expectEqualStrings("{\"url\":\"data:text/plain,scrap\"}", original);
     }
+}
+
+test "privacy local completed source replay rearms missing consumer receipts without a replacement generation" {
+    const a = std.testing.allocator;
+    var dir = try TestDirectory.init("db");
+    defer dir.cleanup();
+    var db = try DB.open(a, std.mem.span(dir.path().ptr), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .enable_without_producers = true },
+    });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "copied", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    const left = types.IndexConfig{ .name = "left", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"copied\"}]}" };
+    const right = types.IndexConfig{ .name = "right", .kind = .full_text, .config_json = left.config_json };
+    try db.addIndex(left);
+    try db.addIndex(right);
+    try db.batch(.{ .writes = &.{ .{ .key = "doc", .value = "{\"body\":\"silver\"}" }, .{ .key = "other", .value = "{\"body\":\"gold\"}" } }, .sync_level = .full_index });
+    const id = try db.createGenerationRepairIntentAtTarget(a, left, .replay_artifact_unavailable, 0, 0, null, null, .complete, .initial_build);
+    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+    const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(a, left.name, "copied", plan.plan());
+    plan.release();
+    defer a.free(scope);
+    const generation = db.core.index_manager.coverageGenerationForIndex(left.name).?;
+    const marker = try internal_keys.derivedCoverageOutcomeKeyAlloc(a, scope, generation, "doc");
+    defer a.free(marker);
+    const receipt = try @import("artifact_producer_readiness.zig").localReceiptRevisionKeyAlloc(a, marker);
+    defer a.free(receipt);
+    const counter = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(a, scope, generation, "produced");
+    defer a.free(counter);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(marker);
+        try txn.delete(receipt);
+        var bytes: [8]u8 = undefined;
+        try txn.put(counter, internal_keys.encodeDerivedCoverageOutcomeCount(&bytes, 1));
+        try txn.commit();
+    }
+    const aggregate_marker = try internal_keys.derivedCoverageOutcomeKeyAlloc(a, left.name, generation, "doc");
+    defer a.free(aggregate_marker);
+    const aggregate_produced = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(a, left.name, generation, "produced");
+    defer a.free(aggregate_produced);
+    const aggregate_failed = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(a, left.name, generation, "terminal_failed");
+    defer a.free(aggregate_failed);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        var bytes: [8]u8 = undefined;
+        try txn.put(aggregate_marker, "terminal_failed");
+        try txn.put(aggregate_produced, internal_keys.encodeDerivedCoverageOutcomeCount(&bytes, 1));
+        try txn.put(aggregate_failed, internal_keys.encodeDerivedCoverageOutcomeCount(&bytes, 1));
+        try txn.commit();
+    }
+    try std.testing.expect(!try db.generatedCoverageReplayNeeded(a));
+    try std.testing.expectEqual(@as(usize, 0), try db.ensureGeneratedCoverageRecoveryIntents(a));
+    {
+        var entry = try db.loadIndexRepairEntryById(a, id);
+        defer entry.deinit(a);
+        try std.testing.expectEqual(index_repair_state.SourceReplayState.complete, entry.intent.source_replay_state);
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        var bytes: [8]u8 = undefined;
+        try txn.put(aggregate_marker, "produced");
+        try txn.put(aggregate_produced, internal_keys.encodeDerivedCoverageOutcomeCount(&bytes, 2));
+        try txn.put(aggregate_failed, internal_keys.encodeDerivedCoverageOutcomeCount(&bytes, 0));
+        try txn.commit();
+    }
+    try std.testing.expect(!try db.generatedCoverageRecoveryOwnedByInitialBuild(a));
+    try std.testing.expectEqual(@as(usize, 1), try db.ensureGeneratedCoverageRecoveryIntents(a));
+    {
+        var entry = try db.loadIndexRepairEntryById(a, id);
+        defer entry.deinit(a);
+        try std.testing.expectEqual(index_repair_state.SourceReplayState.pending, entry.intent.source_replay_state);
+        try std.testing.expect(entry.intent.candidate_relative_path == null);
+    }
+    try drainManagedAdmissionSourceReplayForTest(&db, a, id);
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    var final_plan = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer final_plan.release();
+    try std.testing.expect(try db.privacyLocalIndexSourcesComplete(a, &read, left.name, left.kind, final_plan.plan()));
+    try std.testing.expect(try db.privacyLocalIndexSourcesComplete(a, &read, right.name, right.kind, final_plan.plan()));
+    try std.testing.expectEqual(generation, db.core.index_manager.coverageGenerationForIndex(left.name).?);
 }
