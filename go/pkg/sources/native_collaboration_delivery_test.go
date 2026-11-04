@@ -118,6 +118,7 @@ func TestNativeCollaborationDeliveryUsesSelectedAttachment(t *testing.T) {
 	t.Run("head_guard", func(t *testing.T) {
 		downloads = 0
 		fullReads = 0
+		require.NoError(t, c.CheckAccess(t.Context(), request, media[0].Item))
 		require.NoError(t, checkMediaAccess(t.Context(), c, c, request, media[0].Item))
 		recorder := httptest.NewRecorder()
 		ServeMedia(recorder, httptest.NewRequest("HEAD", "https://proxy.test/item", nil), c, request, media[0].Item, fmt.Sprintf("%x", sha256.Sum256(media[0].Bytes)))

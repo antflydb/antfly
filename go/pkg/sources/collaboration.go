@@ -674,6 +674,9 @@ func (c *CollaborationConnector) Read(ctx context.Context, r Request, item Item)
 	return nil, fmt.Errorf("resource or attachment no longer accessible")
 }
 func (c *CollaborationConnector) CheckAccess(ctx context.Context, r Request, item Item) error {
+	if c.NativeAttachments && UsesNativeResource(Source{}, item) {
+		return c.CheckMedia(ctx, r, item)
+	}
 	if c.ContentStore != nil && item.ContentRef != "" {
 		if err := c.Validate(ctx, r); err != nil {
 			return err

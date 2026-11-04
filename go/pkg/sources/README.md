@@ -740,7 +740,10 @@ hash before exposing bytes, then serves request-local ranges without a durable
 copy or staging bucket. Changed export bytes require resynchronization even when
 the provider revision is unchanged. Collaboration delivery checks the current
 parent object, attachment membership and pinned parent revision using metadata;
-HEAD and matching conditional responses acquire no attachment bodies. A GET
+HEAD, permission audits and matching conditional responses acquire no attachment
+bodies. Gmail checks the message history revision through its metadata API and
+fetches remote attachments by their pinned attachment ID. Inline MIME parts use
+a bounded full-message acquisition only when their bytes are requested. A GET
 fetches only the selected attachment and checks its pinned byte digest. Deleted
 or edited parents fail closed, and an unavailable sibling cannot block delivery.
 Exports and collaboration attachments retain
