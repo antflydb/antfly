@@ -396,9 +396,7 @@ fn consumeWriteFault(state: anytype) !bool {
     var txn = try state.lsm.beginWrite();
     defer txn.abort();
     try txn.put(.{}, "fault:write", "must-not-commit");
-    // A WAL write fault follows the append attempt, so the commit reports an
-    // unknown outcome rather than a plain, retryable failure.
-    txn.commit() catch |err| return err == error.InjectedWriteFault or err == error.OutcomeUnknown;
+    txn.commit() catch |err| return err == error.InjectedWriteFault;
     return false;
 }
 
@@ -412,8 +410,7 @@ fn consumeDeviceFullFault(state: anytype) !bool {
     var txn = try state.lsm.beginWrite();
     defer txn.abort();
     try txn.put(.{}, "fault:full", "must-not-commit");
-    // Device-full during the WAL append also follows the append attempt.
-    txn.commit() catch |err| return err == error.InjectedDeviceFull or err == error.OutcomeUnknown;
+    txn.commit() catch |err| return err == error.InjectedDeviceFull;
     return false;
 }
 

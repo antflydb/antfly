@@ -454,6 +454,12 @@ pub fn prepareMutableForWrite(backend: anytype) !void {
     if (@hasDecl(@TypeOf(backend.*), "prepareMutableForWrite")) try backend.prepareMutableForWrite();
 }
 
+/// Lets the backend fence or repair after a commit failed past its WAL
+/// append; see `Backend.noteFailedAppliedCommit`.
+fn noteFailedAppliedCommit(backend: anytype) void {
+    if (@hasDecl(@TypeOf(backend.*), "noteFailedAppliedCommit")) backend.noteFailedAppliedCommit();
+}
+
 /// WAL appends and direct ingests a backend has started; see `commit`.
 fn writePublicationAttempts(backend: anytype) u64 {
     return if (@hasField(@TypeOf(backend.*), "write_publication_attempts")) backend.write_publication_attempts else 0;
@@ -4773,18 +4779,21 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             self.* = undefined;
         }
 
-        /// After the write may have been applied (a WAL append or direct
-        /// ingest was attempted, or the memtable was published), every
-        /// failure is `error.OutcomeUnknown`. Later steps (flush, rotation,
-        /// manifest persist) can fail with ordinary errors while the write is
-        /// already durable or visible, and callers treat ordinary errors as
-        /// "not applied, safe to retry".
+        /// A failure after the write may have been applied (a WAL append or
+        /// direct ingest was attempted, or the memtable was published) keeps
+        /// its original error, so internal callers still see causes such as
+        /// cancellation, and is recorded in `backend_types.commit_progress`.
+        /// Later steps (flush, rotation, manifest persist) can fail while the
+        /// write is already durable or visible; public callers classify such
+        /// failures as unknown rather than "not applied".
         pub fn commit(self: *@This()) !void {
             var maybe_applied = false;
             self.commitTracked(&maybe_applied) catch |err| {
-                if (!maybe_applied) return err;
-                if (err != error.OutcomeUnknown) std.log.warn("lsm commit failed after the write may have applied: {s}", .{@errorName(err)});
-                return error.OutcomeUnknown;
+                if (maybe_applied) {
+                    if (backend_types.commit_progress) |progress| progress.maybe_applied = true;
+                    noteFailedAppliedCommit(self.backend);
+                }
+                return err;
             };
         }
 
@@ -9298,18 +9307,21 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             self.* = undefined;
         }
 
-        /// After the write may have been applied (a WAL append or direct
-        /// ingest was attempted, or the memtable was published), every
-        /// failure is `error.OutcomeUnknown`. Later steps (flush, rotation,
-        /// manifest persist) can fail with ordinary errors while the write is
-        /// already durable or visible, and callers treat ordinary errors as
-        /// "not applied, safe to retry".
+        /// A failure after the write may have been applied (a WAL append or
+        /// direct ingest was attempted, or the memtable was published) keeps
+        /// its original error, so internal callers still see causes such as
+        /// cancellation, and is recorded in `backend_types.commit_progress`.
+        /// Later steps (flush, rotation, manifest persist) can fail while the
+        /// write is already durable or visible; public callers classify such
+        /// failures as unknown rather than "not applied".
         pub fn commit(self: *@This()) !void {
             var maybe_applied = false;
             self.commitTracked(&maybe_applied) catch |err| {
-                if (!maybe_applied) return err;
-                if (err != error.OutcomeUnknown) std.log.warn("lsm commit failed after the write may have applied: {s}", .{@errorName(err)});
-                return error.OutcomeUnknown;
+                if (maybe_applied) {
+                    if (backend_types.commit_progress) |progress| progress.maybe_applied = true;
+                    noteFailedAppliedCommit(self.backend);
+                }
+                return err;
             };
         }
 
@@ -9854,9 +9866,13 @@ test "lsm namespace write txn keeps merged mutable state when flush fails after 
     var txn = try NamespaceWriteTxn(TestBackend).open(&backend);
     errdefer txn.abort();
     try txn.put(.{ .name = "docs" }, "doc:a", "A");
-    // The write is merged and visible before the flush fails, so the
-    // outcome cannot be reported as not applied.
-    try std.testing.expectError(error.OutcomeUnknown, txn.commit());
+    // The write is merged and visible before the flush fails: the cause is
+    // kept, and the commit records that it may have applied.
+    var progress: backend_types.CommitProgress = .{};
+    backend_types.commit_progress = &progress;
+    defer backend_types.commit_progress = null;
+    try std.testing.expectError(error.InjectedFlushFailure, txn.commit());
+    try std.testing.expect(progress.maybe_applied);
 
     try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
     try std.testing.expectEqualStrings("docs", backend.mutable.entryAt(0).namespace_name.?);

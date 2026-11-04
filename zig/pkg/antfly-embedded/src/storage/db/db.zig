@@ -7482,6 +7482,31 @@ pub const DB = struct {
     /// ANTFLY_BENCH_METRICS phase profile.
     pub fn batchTracked(self: *DB, req: types.BatchRequest, primary_committed: *bool) anyerror!void {
         primary_committed.* = false;
+        // Storage commits keep their original error; this records whether a
+        // failed commit may still have applied (for example, LSM WAL appended
+        // and then a sync or flush failed). For an exported call that is an
+        // unknown outcome, never "not applied".
+        var progress: backend_types.CommitProgress = .{};
+        const previous = backend_types.commit_progress;
+        backend_types.commit_progress = &progress;
+        defer backend_types.commit_progress = previous;
+        self.batchTrackedProfiled(req, primary_committed) catch |err| {
+            if (progress.maybe_applied and !primary_committed.* and !isOutcomeUnknownError(err)) {
+                std.log.warn("batch failed after its write may have applied: {s}", .{@errorName(err)});
+                return error.OutcomeUnknown;
+            }
+            return err;
+        };
+    }
+
+    fn isOutcomeUnknownError(err: anyerror) bool {
+        return switch (err) {
+            error.OutcomeUnknown, error.WriteOutcomeUnknown, error.DurabilityOutcomeUnknown, error.CommitDecisionUnknown => true,
+            else => false,
+        };
+    }
+
+    fn batchTrackedProfiled(self: *DB, req: types.BatchRequest, primary_committed: *bool) anyerror!void {
         if (benchMetricsEnabled()) {
             var profile = BatchProfile{};
             try self.batchInternal(req, &profile, .{ .primary_committed = primary_committed });

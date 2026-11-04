@@ -25,6 +25,7 @@ invented decomposition. Proof counters separately measure detached graph walks.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -279,7 +280,21 @@ def native_worker(config, index, ready, start, results, finish=None):
             config["database"],
             no_sync=config["no_sync"],
             busy_timeout=config["timeout_ms"] / 1000,
-        ) as db:
+        ) as db, contextlib.ExitStack() as thread_handles:
+            threads = max(1, config.get("threads_per_worker", 1))
+            # Each writer thread gets its own handle on the same database, so
+            # threads contend at the process-wide path gate (where the lease
+            # is handed off), not on one connection's mutex.
+            handles = [db] if threads == 1 else [
+                thread_handles.enter_context(
+                    af.open(
+                        config["database"],
+                        no_sync=config["no_sync"],
+                        busy_timeout=config["timeout_ms"] / 1000,
+                    )
+                )
+                for _ in range(threads)
+            ]
             initial_stats = measurement_stats(db)
             proof_observed_from = time.monotonic()
             ready.put({"index": index, "status": "ok"})
@@ -292,7 +307,6 @@ def native_worker(config, index, ready, start, results, finish=None):
             success, busy = [], []
             window_seconds = config.get("progress_window_seconds", 60)
             success_windows = [0] * max(1, math.ceil(config["seconds"] / window_seconds))
-            threads = max(1, config.get("threads_per_worker", 1))
             lock = threading.Lock()
             last_write = None
             latest_churn_writes = {}
@@ -300,10 +314,13 @@ def native_worker(config, index, ready, start, results, finish=None):
             # direct measure of starvation, independent of total throughput.
             thread_gaps = [0.0] * threads
             thread_last_progress = [0.0] * threads
+            thread_successes = [0] * threads
+            thread_windows = [[0] * len(success_windows) for _ in range(threads)]
             thread_errors = []
 
             def write_loop(thread_index):
                 nonlocal last_write
+                handle = handles[thread_index]
                 last_progress = 0.0
                 max_gap = 0.0
                 sequence = 0
@@ -314,7 +331,7 @@ def native_worker(config, index, ready, start, results, finish=None):
                         payload = {"inserts": {key: {"text": "v" * 1024, "sequence": sequence}}}
                         began_call = time.perf_counter_ns()
                         try:
-                            db.batch_json(payload)
+                            handle.batch_json(payload)
                             latency = time.perf_counter_ns() - began_call
                             elapsed = time.monotonic() - began
                             write = {"key": key, "sequence": sequence}
@@ -322,6 +339,8 @@ def native_worker(config, index, ready, start, results, finish=None):
                                 success.append(latency)
                                 window = min(len(success_windows) - 1, int(elapsed / window_seconds))
                                 success_windows[window] += 1
+                                thread_windows[thread_index][window] += 1
+                                thread_successes[thread_index] += 1
                                 last_write = write
                                 if config["workload"] == "churn":
                                     latest_churn_writes[key] = write
@@ -405,6 +424,8 @@ def native_worker(config, index, ready, start, results, finish=None):
                 "success_windows": success_windows,
                 "max_progress_gap_seconds": max_progress_gap,
                 "thread_max_progress_gap_seconds": thread_gaps,
+                "thread_successful_calls": thread_successes,
+                "thread_success_windows": thread_windows,
                 "progress_window_seconds": window_seconds,
                 "lease": lease_delta(initial_stats, final_stats),
                 "busy_latency_ns": busy,
@@ -509,6 +530,22 @@ def status_reader_problem(result: dict | None, exitcode: int | None) -> str | No
     return None
 
 
+def handoff_problem(row: dict, threads_per_worker: int) -> str | None:
+    """A multi-threaded run exists to exercise in-process lease handoff.
+
+    It qualifies only if handoffs were observed. A library without lease
+    timing (an older control) cannot report them and is not judged here.
+    """
+    if threads_per_worker <= 1:
+        return None
+    lease = row.get("lease")
+    if lease is None:
+        return None
+    if lease["foreground_lease"]["handoffs"] == 0:
+        return "no_handoffs"
+    return None
+
+
 def acknowledged_writes(workers: list[dict]) -> list[dict]:
     """Use actual acknowledgments; Busy can leave holes in a churn sequence."""
     return [
@@ -608,8 +645,20 @@ def aggregate(workers: list[dict]) -> dict:
     )
     if proof_elapsed <= 0:
         raise RuntimeError("invalid proof-observation interval")
-    starved = sum(not row["success_latency_ns"] for row in workers)
-    stalled = sum(0 in row.get("success_windows", []) for row in workers)
+    # Judge progress per writer thread when workers report it: a process can
+    # make progress while one of its threads starves.
+    starved = sum(
+        sum(count == 0 for count in row["thread_successful_calls"])
+        if row.get("thread_successful_calls") is not None
+        else int(not row["success_latency_ns"])
+        for row in workers
+    )
+    stalled = sum(
+        sum(0 in windows for windows in row["thread_success_windows"])
+        if row.get("thread_success_windows") is not None
+        else int(0 in row.get("success_windows", []))
+        for row in workers
+    )
     status = "ok"
     if not successful:
         status = "no_progress"
@@ -634,6 +683,12 @@ def aggregate(workers: list[dict]) -> dict:
         "lease": lease_summary(workers),
         "per_worker_success_windows": [
             row.get("success_windows", []) for row in workers
+        ],
+        "per_thread_successful_calls": [
+            row.get("thread_successful_calls") for row in workers
+        ],
+        "per_thread_max_progress_gap_seconds": [
+            row.get("thread_max_progress_gap_seconds") for row in workers
         ],
         "per_worker_background_publication_deltas": [
             row.get("background_publication_deltas", {}) for row in workers
@@ -871,6 +926,10 @@ def native_cases(args):
                     )
                 else:
                     row.update(aggregate(workers))
+                    if row["status"] == "ok":
+                        problem = handoff_problem(row, args.threads_per_worker)
+                        if problem:
+                            row.update(status=problem)
                     if reader is not None:
                         problem = status_reader_problem(
                             row["status_reader"], row["status_reader_exitcode"]

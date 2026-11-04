@@ -6051,9 +6051,7 @@ fn expectPersistentTextCompactionView(
 
 fn expectModeledPersistentReplaceError(result: anyerror!void) !void {
     result catch |err| switch (err) {
-        // A sync fault after the WAL append surfaces as an unknown outcome:
-        // the record may have reached the device. The crash below decides.
-        error.InjectedWriteFault, error.InjectedSyncFault, error.OutcomeUnknown => return,
+        error.InjectedWriteFault, error.InjectedSyncFault => return,
         else => return err,
     };
     return error.TestExpectedError;

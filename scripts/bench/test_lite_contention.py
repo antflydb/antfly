@@ -194,7 +194,13 @@ class ContentionReportTests(unittest.TestCase):
                 time.sleep(0.001)
 
         database = Database()
-        api = SimpleNamespace(open=lambda *a, **k: database, BusyError=RuntimeError)
+        opened = []
+
+        def open_handle(*_a, **_k):
+            opened.append(1)
+            return database
+
+        api = SimpleNamespace(open=open_handle, BusyError=RuntimeError)
         zero = dict.fromkeys(bench.PROOF_FIELDS, 0)
         zero.update(
             mutation_admission_count=0,
@@ -223,10 +229,49 @@ class ContentionReportTests(unittest.TestCase):
         result = results.get_nowait()
         self.assertEqual(result["status"], "ok")
         self.assertEqual(len(result["thread_max_progress_gap_seconds"]), 3)
+        # One handle for diagnostics plus one per writer thread.
+        self.assertEqual(len(opened), 4)
+        self.assertEqual(sum(result["thread_successful_calls"]), len(result["success_latency_ns"]))
         prefixes = {key.rsplit("-", 1)[0] for key in database.keys}
         self.assertEqual(prefixes, {"worker-2-t0", "worker-2-t1", "worker-2-t2"})
         written = {write["key"] for write in result["latest_churn_writes"]}
         self.assertEqual(written, database.keys)
+
+    def test_thread_starvation_fails_the_run_even_when_the_process_progresses(self):
+        def worker(thread_calls, thread_windows):
+            return {
+                "started": 0,
+                "ended": 120,
+                "proof_observed_from": 0,
+                "proof_observed_until": 120,
+                "success_latency_ns": [10] * sum(thread_calls),
+                "success_windows": [sum(w) for w in zip(*thread_windows)],
+                "thread_successful_calls": thread_calls,
+                "thread_success_windows": thread_windows,
+                "thread_max_progress_gap_seconds": [1, 120],
+                "admission": admission(),
+                "busy_latency_ns": [],
+                "proofs": dict.fromkeys(bench.PROOF_FIELDS, 0),
+                "cpu_seconds": 0,
+                "voluntary_context_switches": 0,
+                "involuntary_context_switches": 0,
+            }
+
+        starved = bench.aggregate([worker([50, 0], [[25, 25], [0, 0]])])
+        self.assertEqual(starved["status"], "starved_workers")
+        stalled = bench.aggregate([worker([50, 1], [[25, 25], [1, 0]])])
+        self.assertEqual(stalled["status"], "stalled_workers")
+        healthy = bench.aggregate([worker([50, 50], [[25, 25], [25, 25]])])
+        self.assertEqual(healthy["status"], "ok")
+
+    def test_threaded_runs_require_observed_handoffs(self):
+        lease = {"foreground_lease": {"handoffs": 0}}
+        self.assertEqual(bench.handoff_problem({"lease": lease}, 4), "no_handoffs")
+        self.assertIsNone(bench.handoff_problem({"lease": lease}, 1))
+        self.assertIsNone(
+            bench.handoff_problem({"lease": {"foreground_lease": {"handoffs": 3}}}, 4)
+        )
+        self.assertIsNone(bench.handoff_problem({"lease": None}, 4))
 
     def test_worker_close_failure_emits_one_error_and_no_success(self):
         class Database:

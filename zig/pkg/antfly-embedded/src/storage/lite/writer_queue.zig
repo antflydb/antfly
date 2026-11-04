@@ -129,6 +129,8 @@ fn ticketName(buf: *[ticket_name_len]u8, index: u64) []const u8 {
 
 pub const Queue = struct {
     dir: std.Io.Dir,
+    /// Directory scans this handle made to rebuild the counter.
+    recover_scans: u64 = 0,
 
     /// Opens (creating if needed) the queue directory next to the sidecar.
     pub fn open(allocator: std.mem.Allocator, io: std.Io, sidecar_path: []const u8) !Queue {
@@ -192,9 +194,15 @@ pub const Queue = struct {
         }
     }
 
-    /// Rule 2. Only called with the tail lock held.
+    /// Rule 2. Only called with the tail lock held. A recovered counter is
+    /// written back, so later admissions read it instead of rescanning.
     fn readOrRecoverCounter(self: *Queue, file: std.Io.File, io: std.Io) !u64 {
-        return try readCounter(file, io) orelse self.recoverCounter(io);
+        if (try readCounter(file, io)) |next| return next;
+        const next = try self.recoverCounter(io);
+        self.recover_scans +%= 1;
+        // Best effort: a failed write only means the next admission scans.
+        writeCounter(file, io, next) catch {};
+        return next;
     }
 
     /// One more than the highest ticket file, or 0 with no tickets.
@@ -779,6 +787,24 @@ test "writer queue rule 1: a failed counter write cannot let a later ticket pass
         try testing.expectError(error.FileBusy, q.awaitTurn(io, &later, std.Io.Clock.awake.now(io).nanoseconds + 30 * std.time.ns_per_ms));
         q.finish(io, &live);
     }
+}
+
+test "writer queue persists a recovered counter so idle admissions do not rescan" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .concurrent_limit = .limited(8) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sidecar = try testSidecar(&tmp, io, &path_buf);
+    var q = try Queue.open(testing.allocator, io, sidecar);
+    defer q.close(io);
+    for (0..20) |_| {
+        var tail = try q.lockTail(io, farDeadline(io));
+        defer tail.release(io);
+        try testing.expect(try q.isIdle(io, &tail));
+    }
+    try testing.expectEqual(@as(u64, 1), q.recover_scans);
 }
 
 test "writer queue rule 4: leftovers of interrupted grants are removed by the next grant" {
