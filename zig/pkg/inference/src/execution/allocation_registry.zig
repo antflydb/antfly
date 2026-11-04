@@ -18,6 +18,7 @@ pub const OwnerReport = struct {
     counter_scope: enum { owner_interval } = .owner_interval,
     /// Current/lifetime gauges and this observer's actual counter interval.
     usage: observer.Snapshot = .{},
+    requested_owner_interval_peak_bytes: ?u64 = null,
 };
 
 pub const Summary = struct {
@@ -40,6 +41,10 @@ pub const Summary = struct {
     /// Single proven root's live requested payloads; excludes mappings and
     /// unobserved owners. Never sum independent/possibly overlapping roots.
     requested_live_bytes: ?u64 = null,
+    /// One proven root, registration through subscription removal inside finish,
+    /// including other callers
+    /// using that owner. Never a sum of independent or differently timed peaks.
+    requested_owner_interval_peak_bytes: ?u64 = null,
     /// Largest single owner's lifetime peak; not an invocation high water and
     /// never a sum of independently timed owner peaks.
     maximum_individual_lifetime_peak_bytes: ?u64 = null,
@@ -77,11 +82,15 @@ pub const Registry = struct {
     const Entry = struct {
         owner: *observer.State,
         before: observer.Snapshot,
+        interval: ?*observer.State.Interval = null,
         model: bool = false,
         compute: bool = false,
     };
     previous: ?*Registry = null,
     inline_entries: [8]Entry = undefined,
+    // Entries may be copied during aggregation, so subscriptions point to this
+    // parallel final-address array rather than into a movable Entry value.
+    inline_intervals: [8]observer.State.Interval = undefined,
     inline_count: usize = 0,
     overflow: std.ArrayList(Entry) = .empty,
     metadata: std.mem.Allocator,
@@ -114,14 +123,35 @@ pub const Registry = struct {
         };
         var entry = Entry{ .owner = owner, .before = owner.snapshot() };
         mark(&entry, role);
-        if (self.inline_count < self.inline_entries.len) {
-            self.inline_entries[self.inline_count] = entry;
+        var inserted: *Entry = undefined;
+        const inline_index: ?usize = if (self.inline_count < self.inline_entries.len) self.inline_count else null;
+        if (inline_index) |index| {
+            self.inline_entries[index] = entry;
+            inserted = &self.inline_entries[index];
             self.inline_count += 1;
-        } else self.overflow.append(self.metadata, entry) catch {
-            self.summary.metadata_failures += 1;
-            return;
-        };
+        } else {
+            self.overflow.append(self.metadata, entry) catch {
+                self.summary.metadata_failures += 1;
+                return;
+            };
+            inserted = &self.overflow.items[self.overflow.items.len - 1];
+        }
         _ = owner.retain();
+        // Registry.begin already requires final-address storage. Common slots
+        // borrow stable nodes without heap metadata or an optional OOM path.
+        if (inline_index) |index| {
+            const interval = &self.inline_intervals[index];
+            owner.beginIntervalInto(interval);
+            inserted.interval = interval;
+        } else {
+            // Overflow Entry storage may move on append. Keep each linked
+            // interval independently allocated, with explicit partial coverage.
+            inserted.interval = owner.beginInterval() catch {
+                self.summary.metadata_failures += 1;
+                return;
+            };
+        }
+        inserted.before = inserted.interval.?.before;
     }
     fn contains(self: *const Registry, owner: *observer.State) bool {
         for (self.inline_entries[0..self.inline_count]) |entry| if (entry.owner == owner) return true;
@@ -141,8 +171,9 @@ pub const Registry = struct {
             covered = true;
             break;
         };
-        const after = entry.owner.snapshot();
-        const interval = after.since(entry.before);
+        const finished = if (entry.interval) |value| value.finish() else null;
+        const after = if (finished) |value| value.usage else entry.owner.snapshot();
+        const interval = if (finished != null) after else after.since(entry.before);
         self.summary.maximum_individual_lifetime_peak_bytes = @max(self.summary.maximum_individual_lifetime_peak_bytes orelse 0, after.requested_lifetime_peak_bytes);
         if (self.summary.reports_count < self.summary.reports.len) {
             self.summary.reports[self.summary.reports_count] = .{
@@ -153,6 +184,7 @@ pub const Registry = struct {
                 .covered_by_registered_ancestor = covered,
                 .coverage = entry.owner.coverage,
                 .usage = interval,
+                .requested_owner_interval_peak_bytes = if (finished) |value| value.peak else null,
             };
             self.summary.reports_count += 1;
         } else self.summary.reports_truncated = true;
@@ -161,6 +193,7 @@ pub const Registry = struct {
         const single_root = self.summary.observed_roots == 1;
         self.summary.aggregate_owner_identity = if (single_root) @intFromPtr(entry.owner) else null;
         self.summary.requested_live_bytes = if (single_root) after.requested_live_bytes else null;
+        self.summary.requested_owner_interval_peak_bytes = if (single_root and finished != null) finished.?.peak else null;
         inline for (.{ "allocations", "frees", "resizes", "remaps", "unobserved_frees", "unobserved_resizes", "unobserved_remaps" }) |name| {
             @field(self.summary, name) = if (single_root) @field(interval, name) else null;
         }
@@ -204,6 +237,7 @@ test "observed owner intervals deduplicate identities and nested allocator paylo
     try std.testing.expectEqual(@as(u64, 1), measured.allocations.?);
     try std.testing.expectEqual(@as(u64, 1), measured.frees.?);
     try std.testing.expectEqual(@as(u64, 31), measured.maximum_individual_lifetime_peak_bytes.?);
+    try std.testing.expectEqual(@as(u64, 31), measured.requested_owner_interval_peak_bytes.?);
 }
 
 test "nested observed registries retain retired metadata and unwind independently" {
@@ -264,10 +298,57 @@ test "multiple opaque observer roots keep exact owner intervals without inventin
     try std.testing.expectEqual(@as(usize, 2), measured.observed_roots);
     try std.testing.expect(measured.aggregate_owner_identity == null);
     try std.testing.expect(measured.requested_live_bytes == null and measured.allocations == null);
+    try std.testing.expect(measured.requested_owner_interval_peak_bytes == null);
     try std.testing.expectEqual(@as(u8, 2), measured.reports_count);
     try std.testing.expectEqual(@as(u64, 11), measured.reports[0].usage.requested_live_bytes);
     try std.testing.expectEqual(@as(u64, 17), measured.reports[1].usage.requested_live_bytes);
     try std.testing.expectEqual(@as(u64, 17), measured.maximum_individual_lifetime_peak_bytes.?);
+}
+
+test "registry inline interval allocates no metadata and preserves counters with exact peak" {
+    const a = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(a, .{});
+    const owner = try observer.State.createWithMetadata(a, failing.allocator(), .from_owner_creation);
+    defer owner.release();
+    const allocator = owner.allocator();
+    // Reserve payload bookkeeping, then reject any new owner-metadata request.
+    const first = try allocator.alloc(u8, 11);
+    allocator.free(first);
+    failing.fail_index = failing.alloc_index;
+    var registry: Registry = undefined;
+    registry.begin(a);
+    bind(.model, owner);
+    const bytes = try allocator.alloc(u8, 7);
+    allocator.free(bytes);
+    const measured = registry.finish();
+    try std.testing.expectEqual(@as(usize, 0), measured.metadata_failures);
+    try std.testing.expectEqual(@as(u64, 1), measured.allocations.?);
+    try std.testing.expectEqual(@as(u64, 1), measured.frees.?);
+    try std.testing.expectEqual(@as(u64, 7), measured.requested_owner_interval_peak_bytes.?);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(u64, 11), measured.maximum_individual_lifetime_peak_bytes.?);
+}
+
+test "owned report copies actual owner interval peak after registry and allocator retirement" {
+    const a = std.testing.allocator;
+    const owner = try observer.State.createWithMetadata(a, a, .from_owner_creation);
+    const allocator = owner.allocator();
+    const historical = try allocator.alloc(u8, 3072);
+    allocator.free(historical);
+    var registry: Registry = undefined;
+    registry.begin(a);
+    bind(.model, owner);
+    const bytes = try allocator.alloc(u8, 61);
+    allocator.free(bytes);
+    owner.release();
+    const summary = registry.finish();
+    const snapshot = @import("diagnostics.zig").Snapshot{ .runtime = .{ .allocation_owners = summary } };
+    const report = @import("invocation_report.zig").Report.init(snapshot);
+    try std.testing.expectEqual(@as(u64, 61), report.observed_host_owner_interval_peak_bytes.?);
+    try std.testing.expectEqual(@as(u64, 3072), report.maximum_individual_host_owner_lifetime_peak_bytes.?);
+    try std.testing.expectEqual(@as(u64, 0), report.observed_host_requested_live_bytes.?);
+    try std.testing.expect(!report.allocator_coverage_incomplete);
+    try std.testing.expect(report.whole_backend_residency_and_invocation_peak == .unavailable);
 }
 
 test "bounded owner reports own all data after sampled states and overflow metadata retire" {
@@ -287,4 +368,104 @@ test "bounded owner reports own all data after sampled states and overflow metad
     try std.testing.expectEqual(@as(usize, 0), copied.metadata_failures);
     try std.testing.expect(copied.reports[0].owner_identity != 0);
     try std.testing.expectEqual(@as(u64, 0), copied.reports[0].usage.requested_live_bytes);
+}
+
+test "nested owner interval subscriptions survive registry overflow reallocations and caller retirement" {
+    const a = std.testing.allocator;
+    var outer: Registry = undefined;
+    outer.begin(a);
+    var inner: Registry = undefined;
+    inner.begin(a);
+    for (0..33) |index| {
+        const owner = try observer.State.createWithMetadata(a, a, .from_owner_creation);
+        bind(.compute, owner);
+        const payload = try owner.allocator().alloc(u8, index + 1);
+        owner.allocator().free(payload);
+        owner.release();
+    }
+    const child = inner.finish();
+    const parent = outer.finish();
+    try std.testing.expectEqual(@as(usize, 33), child.owners);
+    try std.testing.expectEqual(@as(usize, 33), parent.owners);
+    try std.testing.expectEqual(@as(u64, 33), child.maximum_individual_lifetime_peak_bytes.?);
+    try std.testing.expectEqual(child.maximum_individual_lifetime_peak_bytes, parent.maximum_individual_lifetime_peak_bytes);
+    try std.testing.expect(child.reports_truncated and parent.reports_truncated);
+    try std.testing.expect(child.requested_owner_interval_peak_bytes == null and parent.requested_owner_interval_peak_bytes == null);
+    try std.testing.expectEqual(@as(usize, 0), child.metadata_failures);
+    try std.testing.expectEqual(@as(usize, 0), parent.metadata_failures);
+}
+
+test "registry common eight subscriptions use stable inline nodes with no metadata allocation" {
+    const a = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 8 });
+    var owners: [8]*observer.State = undefined;
+    var count: usize = 0;
+    defer for (owners[0..count]) |owner| owner.release();
+    for (&owners) |*owner| {
+        owner.* = try observer.State.createWithMetadata(a, failing.allocator(), .from_owner_creation);
+        count += 1;
+    }
+    var registry: Registry = undefined;
+    registry.begin(failing.allocator());
+    defer if (registry.attached) {
+        _ = registry.finish();
+    };
+    for (owners, 0..) |owner, index| {
+        bind(.compute, owner);
+        try std.testing.expect(registry.inline_entries[index].interval == &registry.inline_intervals[index]);
+        try std.testing.expect(!registry.inline_intervals[index].heap_owned);
+    }
+    const observed = registry.finish();
+    try std.testing.expectEqual(@as(usize, 8), observed.owners);
+    try std.testing.expectEqual(@as(usize, 0), observed.metadata_failures);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 8), failing.alloc_index);
+    for (observed.reports[0..observed.reports_count]) |report| try std.testing.expectEqual(@as(u64, 0), report.requested_owner_interval_peak_bytes.?);
+    for (owners) |owner| {
+        try std.testing.expect(owner.intervals == null);
+        try std.testing.expectEqual(@as(usize, 1), owner.references.load(.acquire));
+    }
+}
+
+test "registry overflow interval OOM preserves missing peak coverage and releases durable entry ownership" {
+    const a = std.testing.allocator;
+    var owners: [8]*observer.State = undefined;
+    var count: usize = 0;
+    defer for (owners[0..count]) |owner| owner.release();
+    for (&owners) |*owner| {
+        owner.* = try observer.State.createWithMetadata(a, a, .from_owner_creation);
+        count += 1;
+    }
+    var failing = std.testing.FailingAllocator.init(a, .{});
+    const overflow_owner = try observer.State.createWithMetadata(a, failing.allocator(), .from_owner_creation);
+    defer overflow_owner.release();
+    const allocator = overflow_owner.allocator();
+    const warm = try allocator.alloc(u8, 11);
+    allocator.free(warm);
+    failing.fail_index = failing.alloc_index;
+    var registry: Registry = undefined;
+    registry.begin(a);
+    defer if (registry.attached) {
+        _ = registry.finish();
+    };
+    for (owners) |owner| bind(.compute, owner);
+    bind(.model, overflow_owner);
+    try std.testing.expectEqual(@as(usize, 1), registry.overflow.items.len);
+    try std.testing.expect(registry.overflow.items[0].interval == null);
+    try std.testing.expect(overflow_owner.intervals == null);
+    try std.testing.expectEqual(@as(usize, 2), overflow_owner.references.load(.acquire));
+    const payload = try allocator.alloc(u8, 7);
+    allocator.free(payload);
+    const measured = registry.finish();
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 9), measured.owners);
+    try std.testing.expectEqual(@as(usize, 1), measured.metadata_failures);
+    try std.testing.expect(measured.reports_truncated);
+    try std.testing.expect(measured.requested_owner_interval_peak_bytes == null);
+    try std.testing.expectEqual(@as(usize, 1), overflow_owner.references.load(.acquire));
+    const usage = overflow_owner.snapshot();
+    try std.testing.expectEqual(@as(u64, 2), usage.allocations);
+    try std.testing.expectEqual(@as(u64, 2), usage.frees);
+    try std.testing.expectEqual(@as(u64, 0), usage.requested_live_bytes);
+    try std.testing.expectEqual(@as(u64, 11), usage.requested_lifetime_peak_bytes);
 }

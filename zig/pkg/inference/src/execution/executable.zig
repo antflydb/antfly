@@ -101,6 +101,11 @@ pub fn prepareWithOptions(allocator: std.mem.Allocator, program: *const ModelPro
         if (options.physical_replay) if (prepared.runtime.physical_pool) |pool| try pool.prepareReplay(&program.graph, &prepared.runtime.buffer_plan.?, program.bindings, options.region_costs orelse .{});
     }
     prepared.mutable_parameters = program.mutable_parameters;
+    if (comptime !@import("build_options").enable_wasm) {
+        if (prepared.runtime.physical_pool) |pool| for (program.bindings) |binding| {
+            if (binding.kind == .state_input or binding.kind == .state_output) pool.cuda_frame_dispatch = false;
+        };
+    }
     return prepared;
 }
 
@@ -2586,7 +2591,55 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
     pool.coverage_graph = graph;
     pool.coverage_reachable = analysis.reachable;
     pool.native_frame_dispatch = false;
+    pool.cuda_frame_dispatch = false;
     pool.coverage_backend = .{ .ptr = executable.runtime.default_backend.ptr, .vtable = executable.runtime.default_backend.vtable };
+    // CUDA's ordinary per-node branch calls interpreter.executeNode and its
+    // Frame first. No compiled executor/fusion may bypass the selected route.
+    if (@import("cuda_owned_coverage.zig").services(executable.runtime.default_backend.*) != null) {
+        const plan = executable.runtime.plan orelse return;
+        const mesh = executable.runtime.mesh orelse return;
+        if (plan.device_assignment.len != plan.base.partitions.len or plan.base.node_assignment.len != graph.nodeCount() or analysis.reachable.len != graph.nodeCount()) return;
+        // The runtime always catalogs an independently owned Native fallback
+        // when available. Its mere presence does not execute or transfer data.
+        // However runtimeInputDevice(null source_backend) resolves to literal
+        // DeviceId0, and explicit inputs resolve through the first exact owner
+        // match. Require one unambiguous target at0 and EVERY active part at0.
+        // Unused catalog entries keep their existing fallback behavior.
+        var target_entries: usize = 0;
+        for (mesh.devices, 0..) |entry, entry_index| {
+            for (mesh.devices[0..entry_index]) |previous| if (previous.id == entry.id) return;
+            if (entry.backend.ptr == executable.runtime.default_backend.ptr and entry.backend.vtable == executable.runtime.default_backend.vtable) {
+                if (entry.id != 0 or entry.kind != .cuda) return;
+                target_entries += 1;
+            }
+        }
+        if (target_entries != 1) return;
+        for (plan.base.partitions, 0..) |part, index| {
+            var active = false;
+            for (part.node_ids) |id| {
+                if (id >= analysis.reachable.len) return;
+                if (!analysis.reachable[id]) continue;
+                if (plan.base.node_assignment[id] != index or graph.node(id).op == .fused_from_float32) return;
+                active = true;
+            }
+            if (!active) continue;
+            if (part.backend != .cuda or part.executor != null or plan.device_assignment[index] != 0) return;
+            const device = mesh.device(plan.device_assignment[index]) orelse return;
+            if (device.kind != .cuda or device.backend.ptr != executable.runtime.default_backend.ptr or device.backend.vtable != executable.runtime.default_backend.vtable) return;
+        }
+        for (analysis.reachable, 0..) |active, id| {
+            if (!active) continue;
+            const assigned = plan.base.node_assignment[id];
+            if (assigned >= plan.base.partitions.len) return;
+            var count: usize = 0;
+            for (plan.base.partitions[assigned].node_ids) |node| if (node == id) {
+                count += 1;
+            };
+            if (count != 1) return;
+        }
+        pool.cuda_frame_dispatch = true;
+        return;
+    }
     if (executable.runtime.default_backend.vtable != &@import("../ops/native_compute.zig").vtable_impl) return;
     const plan = executable.runtime.plan orelse return;
     if (analysis.reachable.len != graph.nodeCount()) return;
@@ -3466,4 +3519,88 @@ fn affineResidentSourceConsumerParity(a: std.mem.Allocator) !void {
 
 test "Native affine resident source with earlier opaque materialization preserves both branch outputs" {
     try affineResidentSourceConsumerParity(std.testing.allocator);
+}
+
+test "CUDA owned dispatch permits unused Native catalog and declines active fallback aliases and state" {
+    const build = @import("build_options");
+    if (comptime build.enable_wasm or !build.enable_cuda or !build.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const shared = @import("../backends/compute_context.zig").SharedBackendContext.init(a, .cuda, null) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer shared.release();
+    const backend = shared.computeBackend();
+    const ml = @import("ml");
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{16}));
+    const output = try builder.absOp(input);
+    try graph.markOutput(output);
+    var program = try ModelProgram.init(a, &graph, &.{ .{ .name = "x", .node_id = input, .kind = .input }, .{ .name = "out", .node_id = output, .kind = .output } });
+    defer program.deinit();
+    var executable = try prepare(a, &program, &backend, .partitioned);
+    defer executable.deinit();
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const original_mesh = executable.runtime.mesh orelse return error.MissingDeviceMesh;
+    const fallback = original_mesh.device(1) orelse return error.MissingNativeFallback;
+    try std.testing.expectEqual(.native, fallback.kind);
+    try std.testing.expectEqual(@as(usize, 2), original_mesh.deviceCount());
+    try std.testing.expect(pool.cuda_frame_dispatch);
+    const device_plan = &executable.runtime.plan.?;
+    // Production assignments are immutable. Fault cases use an owned mutable
+    // test copy, restored before the actual plan destroys its original owner.
+    const original_assignments = device_plan.device_assignment;
+    const mutable_assignments = try a.dupe(@TypeOf(original_assignments[0]), original_assignments);
+    defer a.free(mutable_assignments);
+    device_plan.device_assignment = mutable_assignments;
+    defer device_plan.device_assignment = original_assignments;
+    const active_part = device_plan.base.node_assignment[program.id_map[output]];
+    {
+        const old_kind = device_plan.base.partitions[active_part].backend;
+        const old_device = mutable_assignments[active_part];
+        defer {
+            device_plan.base.partitions[active_part].backend = old_kind;
+            mutable_assignments[active_part] = old_device;
+        }
+        // Actual initialized fallback provider/catalog, made active in the
+        // concrete execution plan: it must never inherit CUDA physical credit.
+        device_plan.base.partitions[active_part].backend = .native;
+        mutable_assignments[active_part] = 1;
+        configureOwnedCoverage(&executable, executable.graph, executable.analysis);
+        try std.testing.expect(!pool.cuda_frame_dispatch);
+    }
+    configureOwnedCoverage(&executable, executable.graph, executable.analysis);
+    try std.testing.expect(pool.cuda_frame_dispatch);
+    {
+        const mesh_mod = @import("../graph/device_mesh.zig");
+        var aliased = try mesh_mod.DeviceMesh.init(a, &.{ original_mesh.devices[0], original_mesh.devices[1], .{ .id = 77, .kind = .cuda, .backend = &backend } });
+        defer aliased.deinit();
+        executable.runtime.mesh = aliased;
+        defer executable.runtime.mesh = original_mesh;
+        configureOwnedCoverage(&executable, executable.graph, executable.analysis);
+        try std.testing.expect(!pool.cuda_frame_dispatch);
+    }
+    {
+        const mesh_mod = @import("../graph/device_mesh.zig");
+        var nonzero = try mesh_mod.DeviceMesh.init(a, &.{ .{ .id = 77, .kind = .cuda, .backend = &backend }, original_mesh.devices[1] });
+        defer nonzero.deinit();
+        executable.runtime.mesh = nonzero;
+        defer executable.runtime.mesh = original_mesh;
+        const old_device = mutable_assignments[active_part];
+        defer mutable_assignments[active_part] = old_device;
+        mutable_assignments[active_part] = 77;
+        // Null source_backend runtime inputs resolve to DeviceId0 in the real
+        // executor; a lone target at77 cannot prove absence of transfers.
+        configureOwnedCoverage(&executable, executable.graph, executable.analysis);
+        try std.testing.expect(!pool.cuda_frame_dispatch);
+    }
+    configureOwnedCoverage(&executable, executable.graph, executable.analysis);
+    try std.testing.expect(pool.cuda_frame_dispatch);
+    var state_program = try ModelProgram.init(a, &graph, &.{ .{ .name = "x", .node_id = input, .kind = .state_input }, .{ .name = "out", .node_id = output, .kind = .output } });
+    defer state_program.deinit();
+    var state_executable = try prepare(a, &state_program, &backend, .partitioned);
+    defer state_executable.deinit();
+    try std.testing.expect(!state_executable.runtime.physical_pool.?.cuda_frame_dispatch);
 }

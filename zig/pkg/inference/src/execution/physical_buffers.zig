@@ -154,6 +154,7 @@ pub const Pool = struct {
     coverage_graph: ?*const Graph = null,
     coverage_reachable: ?[]const bool = null,
     native_frame_dispatch: bool = false,
+    cuda_frame_dispatch: bool = false,
     coverage_backend: ?ops.ComputeBackend = null,
     payload_coverage: @import("owned_coverage.zig").Coverage = .{ .compatibility = .no_selected_routes },
     route_owner: ?*prepared_routes.PreparedRoutes = null,
@@ -703,7 +704,20 @@ pub const Pool = struct {
     }
 
     pub fn matchesRoutes(self: *const Pool, inputs: []const route.InputBinding) bool {
+        return self.matchesRoutesChecked(inputs) catch false;
+    }
+    pub inline fn matchesRoutesChecked(self: *const Pool, inputs: []const route.InputBinding) anyerror!bool {
+        if (self.cuda_frame_dispatch) return self.matchesCudaRoutes(inputs);
         const selected = if (self.selection) |*value| value else return false;
+        return selected.matches(self, inputs) and self.matchesRegions(inputs);
+    }
+    noinline fn matchesCudaRoutes(self: *const Pool, inputs: []const route.InputBinding) anyerror!bool {
+        const selected = if (self.selection) |*value| value else return false;
+        const backend = self.coverage_backend orelse return false;
+        var metadata: @import("backend_operation.zig").Scope = .{};
+        try @import("backend_operation.zig").enterInto(&backend, self.coverage_graph, null, .metadata, &metadata);
+        defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        if (metadata.token() == null) return error.PreparedMetadataAuthorityUnavailable;
         return selected.matches(self, inputs) and self.matchesRegions(inputs);
     }
     pub fn validateRoutes(self: *const Pool, inputs: []const route.InputBinding) !void {
@@ -730,7 +744,11 @@ pub const Pool = struct {
             .complete => |value| value,
             else => return null,
         };
-        if (coverage.epoch != selected.epoch or !self.native_frame_dispatch) return null;
+        if (coverage.epoch != selected.epoch) return null;
+        switch (coverage.accounting_class) {
+            .host => if (!self.native_frame_dispatch) return null,
+            .device => if (!self.cuda_frame_dispatch) return null,
+        }
         return coverage;
     }
 
@@ -914,7 +932,7 @@ pub const Pool = struct {
         const ledger = try accounting.Ledger.create(self.allocator);
         errdefer ledger.release();
         const child = try self.allocator.create(Pool);
-        child.* = .{ .metadata_aliases = metadata_aliases, .replay_config = self.replay_config, .coverage_graph = self.coverage_graph, .coverage_reachable = self.coverage_reachable, .native_frame_dispatch = self.native_frame_dispatch, .coverage_backend = self.coverage_backend, .reshape_sources = reshapes, .allocator = self.allocator, .accounting = ledger, .plan = plan, .owns_plan = true, .kernels = selected, .transfers = transfers, .backends = backends, .workspace_allocations = workspaces, .host_workspace_allocation = self.host_workspace_allocation, .max_frames = self.max_frames, .replay_inputs = replay_inputs, .replay_input_indices = replay_indices, .replay_outputs = replay_outputs, .replay_kernel_count = self.replay_kernel_count, .replay_backend = self.replay_backend, .replay_decision = self.replay_decision, .host_alignment = self.host_alignment, .root_pool = self };
+        child.* = .{ .metadata_aliases = metadata_aliases, .replay_config = self.replay_config, .coverage_graph = self.coverage_graph, .coverage_reachable = self.coverage_reachable, .native_frame_dispatch = self.native_frame_dispatch, .cuda_frame_dispatch = self.cuda_frame_dispatch, .coverage_backend = self.coverage_backend, .reshape_sources = reshapes, .allocator = self.allocator, .accounting = ledger, .plan = plan, .owns_plan = true, .kernels = selected, .transfers = transfers, .backends = backends, .workspace_allocations = workspaces, .host_workspace_allocation = self.host_workspace_allocation, .max_frames = self.max_frames, .replay_inputs = replay_inputs, .replay_input_indices = replay_indices, .replay_outputs = replay_outputs, .replay_kernel_count = self.replay_kernel_count, .replay_backend = self.replay_backend, .replay_decision = self.replay_decision, .host_alignment = self.host_alignment, .root_pool = self };
         if (self.literal_store) |store| {
             store.retain();
             child.literal_store = store;
@@ -924,8 +942,17 @@ pub const Pool = struct {
     }
 
     fn prepareVariant(root: *Pool, inputs: []const route.InputBinding, policy: @import("region_route.zig").SelectionPolicy, profile: @import("region_route.zig").ExecutionProfile) !?*prepared_routes.PreparedRoutes {
+        var metadata: @import("backend_operation.zig").Scope = .{};
+        if (root.cuda_frame_dispatch) {
+            const backend = root.coverage_backend orelse return error.MissingPreparedKernelRoute;
+            try @import("backend_operation.zig").enterInto(&backend, root.coverage_graph, null, .metadata, &metadata);
+        }
+        defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         const child = try root.cloneVariant();
         errdefer child.deinit();
+        // This later defer runs before child errdefer; callbacks never execute
+        // under the snapshot gate, including candidate-allocation failures.
+        defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         child.region_policy = policy;
         child.region_execution_profile = profile;
         try @import("reachable_projection.zig").deactivate(child);
@@ -938,7 +965,7 @@ pub const Pool = struct {
         if (child.replay_backend == null) if (child.replay_config) |config| {
             var qualified = false;
             for (child.host_input_plans) |input| qualified = qualified or input.index_bounds != null;
-            if (qualified) {
+            if (qualified or child.cuda_frame_dispatch) {
                 // Root templates are immutable. This private variant owns its
                 // copied plan and publishes fresh templates only on success.
                 if (child.replay_inputs.len != 0 or child.replay_outputs.len != 0 or child.replay_input_indices.len != 0) return error.InvalidReplayTemplate;
@@ -946,7 +973,10 @@ pub const Pool = struct {
             }
         };
         try @import("reachable_projection.zig").refine(child);
-        child.payload_coverage = @import("owned_coverage.zig").assess(child);
+        child.payload_coverage = if (child.cuda_frame_dispatch)
+            @import("cuda_owned_coverage.zig").assess(child, child.coverage_backend.?, metadata.token())
+        else
+            @import("owned_coverage.zig").assess(child);
         const immutable = child.immutable_bindings orelse return error.MissingImmutableKernelBindings;
         // Epoch is identity, not a hash of equivalent metadata. Every cache hit
         // still calls full backend matches and validates its concrete policy.
@@ -1977,6 +2007,16 @@ pub const Frame = struct {
 
     /// Bind mutable values by device copy before recording or replaying.
     /// Immutable handles are retained separately and must keep their identity.
+    fn preparedImmutableReplayInput(self: *Frame, backend: ops.ComputeBackend, binding: ReplayInput, input: interpreter.RuntimeInput) bool {
+        if (binding.allocation != null) return false;
+        const witness = self.pool.completeOwnedPayload() orelse return false;
+        if (witness.accounting_class != .device) return false;
+        const immutable = self.pool.immutable_bindings orelse return false;
+        const original = immutable.originalTensor(binding.node) orelse return false;
+        if (original.value != input.value or original.implementation.context != backend.ptr or original.implementation.table != @as(*const anyopaque, @ptrCast(backend.vtable))) return false;
+        const service = @import("cuda_owned_coverage.zig").services(backend) orelse return false;
+        return service.input(backend.ptr, .{ .tensor = .{ .value = input.value, .implementation = .{ .context = backend.ptr, .table = backend.vtable } } }, binding.shape) catch false;
+    }
     pub fn bindReplayInputs(self: *Frame, options: *const interpreter.ExecuteOptions) !?[]const interpreter.RuntimeInput {
         if (!self.hostProofsCurrent()) return self.declineReplay(.incomplete_bindings);
 
@@ -2002,7 +2042,7 @@ pub const Frame = struct {
             // Per-node literal overrides retain their ordinary semantics;
             // they must never mutate a shared immutable captured address.
             if (binding.constant != null) return self.declineReplay(.literal_override);
-            if (!cb.vtable.kernels.?.physicalReplayTensorSupported.?(cb.ptr, input.value)) {
+            if (!cb.vtable.kernels.?.physicalReplayTensorSupported.?(cb.ptr, input.value) and !self.preparedImmutableReplayInput(cb.*, binding, input)) {
                 if (binding.allocation == null) self.replay_disabled = .unsupported_representation;
                 return self.declineReplay(.unsupported_representation);
             }

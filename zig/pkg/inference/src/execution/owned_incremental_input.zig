@@ -46,6 +46,35 @@ pub const Cleanup = union(enum) {
     }
 };
 
+/// The task owns both siblings and declares no enclosing model/provider lane.
+/// Only a foreign Metal receiver benefits from releasing its original Engine;
+/// same-model decode deliberately keeps its existing alias/borrowed-provider path.
+fn promoteForeignMetalSource(encoder: *stages.EncoderOutputs, destination: Session, cleanup: *Cleanup) !void {
+    if (cleanup.* != .task) return;
+    const resident = switch (encoder.*) {
+        .host => return,
+        .resident => |*value| value,
+    };
+    const receiver = resident.incremental_receiver orelse return;
+    if (receiver.destination_ptr != destination.ptr or receiver.destination_vtable != destination.vtable) return error.InvalidIncrementalReceiver;
+    if (receiver.backend != .metal or receiver.same_model_owner) return;
+    const values = &resident.values;
+    if (values.resource_hold != null or values.backend.execution_control == null) return;
+    const operation = values.backend.operationToken() orelse return;
+    // Existing provider publication owns its exact B. A raw Engine may bind
+    // only this task's explicit, pre-encoder epoch, never a newly invented B.
+    var epoch = try operation.retainCleanupEpoch();
+    defer if (epoch) |*value| value.release();
+    if (epoch == null) {
+        epoch = try cleanup.borrowedEpoch();
+        if (epoch == null) return;
+        if (!try values.backend.bindCleanupEpoch(&epoch.?)) return;
+    }
+    // Completion and original Engine/provider retirement occur here, before
+    // retainIncrementalSource selects a CT/backend and before receiver admission.
+    _ = try values.detachDenseF32PhysicalPayload(.{ .boundary = &epoch.?, .operation = operation });
+}
+
 pub const OwnedIncrementalInput = struct {
     encoder: stages.EncoderOutputs,
     source: ?decoder.RetainedEncoderSource,
@@ -55,6 +84,7 @@ pub const OwnedIncrementalInput = struct {
     /// Consumes encoder and cleanup only on success. The original holder stays
     /// valid on failed resource promotion, preserving construction error unwind.
     pub fn take(allocator: std.mem.Allocator, encoder: *stages.EncoderOutputs, destination: Session, cleanup: *Cleanup) !OwnedIncrementalInput {
+        try promoteForeignMetalSource(encoder, destination, cleanup);
         var source = try decoder.retainIncrementalSource(allocator, encoder, destination);
         if (source) |*value| switch (cleanup.*) {
             .task => |task| {

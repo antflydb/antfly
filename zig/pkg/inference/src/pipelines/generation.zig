@@ -2531,6 +2531,8 @@ pub const NativeGenerationPipeline = struct {
     draft_gpt_config: ?gpt_mod.Config = null,
     draft_decode_state: ?*NativeDecodeState = null,
     prompt_cache: ?*runtime.kv.prompt_cache.PromptPrefixCache = null,
+    /// Borrowed exact request-local Native metadata; invalidated when generation returns.
+    native_prefix_binding: ?decoder_storage.NativePrefixBinding = null,
     /// Optional graph cache for graph-mode execution. When non-null,
     /// the decode loop traces the forward pass once, caches the graph,
     /// and replays it through the interpreter on subsequent steps.
@@ -2806,6 +2808,7 @@ pub const NativeGenerationPipeline = struct {
         on_token_fn: ?TokenCallback,
         on_token_ctx: ?*anyopaque,
     ) !GenerationResult {
+        defer if (self.native_prefix_binding) |*binding| binding.deinit();
         try validateKvCachePolicy(config);
         const native_checkpoint = self.checkpoint_prepare != null or self.checkpoint_resume != null;
         if (native_checkpoint and (self.checkpoint_prepare != null and self.checkpoint_resume != null or
@@ -2816,16 +2819,7 @@ pub const NativeGenerationPipeline = struct {
             messagesHaveImages(messages) or messagesHaveAudio(messages) or config.kv_cache_mode != .exact_hybrid or
             config.cache_compaction_ratio != null or config.prompt_cache_enabled or config.speculation_requested))
             return error.UnsupportedAttentionMatchRoute;
-        // select_v1 currently has a complete explicit-position storage and
-        // attention implementation only on Metal. CUDA exposes contiguous or
-        // page-table KV descriptors without selected positions, repack, or
-        // selection scoring hooks; reject before request allocation.
-        if (config.kv_cache_mode == .select_v1 and self.cb.kind() != .metal)
-            return error.UnsupportedKvCachePolicy;
-        // The scheduler's batched attention route does not yet carry
-        // per-request selected position tables or query-capture ownership.
-        if (config.kv_cache_mode == .select_v1 and self.scheduler != null)
-            return error.UnsupportedKvCachePolicy;
+        try decoder_storage.validateSelectedRoute(config.kv_cache_mode == .select_v1, self.cb.kind(), self.scheduler != null);
         // The qualification-only sampled/grammar ring route is intentionally
         // direct eager: scheduler microbatches and compiled whole-model paths
         // can still request contiguous full-history KV.
@@ -3384,11 +3378,7 @@ pub const NativeGenerationPipeline = struct {
         const max_tokens = requested_max_tokens;
         const spec_slack: usize = if (use_speculative and config.speculative_k > 0) 1 else 0;
         const max_seq = prompt_token_count + max_tokens + spec_slack;
-        if (config.kv_cache_mode == .select_v1 and
-            try runtime.kv.selection.mandatoryRowCount(runtime.kv.selection.defaults, @intCast(max_seq), config.kv_protected_spans) > runtime.kv.selection.defaults.target_rows)
-        {
-            return error.ProtectedRowsExceedTarget;
-        }
+        try decoder_storage.validateSelectedTokenBudget(config.kv_cache_mode == .select_v1, max_seq, config.kv_protected_spans);
         var token_ids = try allocator.alloc(i64, max_seq);
         defer allocator.free(token_ids);
         if (prepared_qwen3vl_prompt) |prepared| {
@@ -3406,29 +3396,10 @@ pub const NativeGenerationPipeline = struct {
         );
 
         const runtime_prepare_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
-        if (config.kv_cache_mode == .select_v1) {
-            decode_state.selection_protected_spans = config.kv_protected_spans;
-        }
-        defer if (config.kv_cache_mode == .select_v1) {
-            decode_state.selection_capture_enabled = false;
-            decode_state.selection_protected_spans = &.{};
-            decode_state.clearSelectionQueries();
-        };
-        if (config.kv_cache_mode == .select_v1) {
-            const selected_peak = try selectedV1PeakBytes(self.gpt_config, self.kv_dtype orelse return error.UnsupportedKvCachePolicy);
-            if (selected_peak > config.kv_selection_peak_limit_bytes) return error.MemoryBudgetExceeded;
-            try decode_state.prepareSelectedGlobalDonors(self.gpt_config);
-        }
+        var selected_request = try decoder_storage.SelectedRequest.begin(config.kv_cache_mode == .select_v1, &self.cb, self.scheduler != null, decode_state, &self.gpt_config, self.kv_dtype, config.kv_selection_peak_limit_bytes, select_v1_gpu_oracle, config.kv_protected_spans);
+        defer selected_request.deinit();
         const whole_model_kv_policy = generationKvCapacityPolicyForRoute(
-            if (self.compiled_partition_backend == .metal and
-                self.compiled_attachment_target == .whole_model and
-                self.graph_cache != null and
-                decode_state.isPaged() and
-                self.cb.kind() == .metal and
-                self.kv_dtype != null)
-                .metal_whole_model
-            else
-                .standard,
+            (decoder_storage.ActiveRoute{ .backend = self.cb.kind(), .compiled_backend = self.compiled_partition_backend, .whole_model = self.compiled_attachment_target == .whole_model, .has_graph = self.graph_cache != null, .dtype = self.kv_dtype }).storageRoute(decode_state),
             self.gpt_config,
             config,
             self.kv_dtype orelse .f16,
@@ -3456,49 +3427,17 @@ pub const NativeGenerationPipeline = struct {
             );
         }
 
-        var cached_prompt_tokens: usize = 0;
-        var prefill_ids = token_ids[0..seq_len];
-        if (self.prompt_cache) |cache| {
-            const cache_eligible =
-                config.prompt_cache_enabled and
-                config.prompt_cache_key != null and
-                prepared_multimodal_prompt == null and
-                prepared_qwen3vl_prompt == null and
-                !use_speculative and
-                config.cache_compaction_ratio == null and
-                self.compiled_partition_backend == null and
-                !NativeDecodeState.requiresDeepSeekV4CompressedCache(self.gpt_config) and
-                !self.gpt_config.isQwen35() and
-                decode_state.isPaged() and
-                decode_state.kv_manager == cache.managerPtr();
-            if (cache_eligible) {
-                const page_size = cache.pageSize() orelse 0;
-                if (page_size > 0 and seq_len > page_size) {
-                    const maybe_hit = cache.attachLongestPrefix(
-                        config.prompt_cache_key.?,
-                        token_ids[0..seq_len],
-                        seq_len - page_size,
-                    ) catch |err| blk: {
-                        std.log.warn("prompt cache lookup failed; continuing without reuse: {s}", .{@errorName(err)});
-                        break :blk null;
-                    };
-                    if (maybe_hit) |hit| {
-                        const seeded = blk: {
-                            decode_state.seedAttachedPrefix(hit.sequence_id, hit.token_count) catch |err| {
-                                cache.releaseAttachedPrefix(hit);
-                                std.log.warn("prompt cache seed failed; continuing without reuse: {s}", .{@errorName(err)});
-                                break :blk false;
-                            };
-                            break :blk true;
-                        };
-                        if (seeded) {
-                            cached_prompt_tokens = hit.token_count;
-                            prefill_ids = token_ids[cached_prompt_tokens..seq_len];
-                        }
-                    }
-                }
-            }
-        }
+        const prefix_binding: ?*decoder_storage.NativePrefixBinding = if (self.native_prefix_binding) |*binding| binding else null;
+        const prefix_request = decoder_storage.PrefixRequest{
+            .enabled = config.prompt_cache_enabled,
+            .namespace = config.prompt_cache_key,
+            .has_media = prepared_multimodal_prompt != null or prepared_qwen3vl_prompt != null,
+            .speculation = use_speculative,
+            .compaction = config.cache_compaction_ratio != null,
+            .compiled = self.compiled_partition_backend != null,
+        };
+        var cached_prompt_tokens = try decoder_storage.attachPromptPrefix(&self.cb, prefix_binding, decode_state, &self.gpt_config, self.prompt_cache, prefix_request, token_ids[0..seq_len], self.execution_control);
+        const prefill_ids = token_ids[cached_prompt_tokens..seq_len];
 
         // Prefill
         try setWorkloadProfileRegime(&self.cb, .prefill);
@@ -3642,19 +3581,7 @@ pub const NativeGenerationPipeline = struct {
                 try self.verifyRestoredAttentionMatch(token_ids[0..seq_len], prefill_last_logits orelse return error.MissingCompactionResumeLogits, decode_state);
         }
 
-        if (self.prompt_cache) |cache| {
-            if (config.prompt_cache_enabled and prepared_multimodal_prompt == null and prepared_qwen3vl_prompt == null and decode_state.kv_manager == cache.managerPtr()) {
-                if (config.prompt_cache_key) |cache_key| {
-                    if (decode_state.sequence_id) |sequence_id| {
-                        cache.storeFromSequence(cache_key, token_ids[0..seq_len], sequence_id) catch |err| {
-                            // Prompt caching is an optional acceleration. A
-                            // failed insertion must not discard valid logits.
-                            std.log.warn("prompt cache store failed; continuing without insertion: {s}", .{@errorName(err)});
-                        };
-                    }
-                }
-            }
-        }
+        decoder_storage.storePromptPrefix(&self.cb, prefix_binding, decode_state, self.prompt_cache, prefix_request, token_ids[0..seq_len]);
 
         if (self.scheduler) |scheduler| {
             if (self.scheduler_lease) |lease| {
@@ -4327,39 +4254,10 @@ pub const NativeGenerationPipeline = struct {
             );
         }
 
-        // Radix mode also learns reusable conversation continuations. The
-        // final sampled token has a logical KV slot but is not materialized
-        // until the next autoregressive forward pass, so retain only the
-        // prefix ending immediately before it. storeGeneratedPrefixFromSequence
-        // page-aligns that valid prefix and is a no-op for non-radix modes.
-        if (tokens_generated > 0) {
-            if (self.prompt_cache) |cache| {
-                const cache_eligible =
-                    config.prompt_cache_enabled and
-                    config.prompt_cache_key != null and
-                    prepared_multimodal_prompt == null and prepared_qwen3vl_prompt == null and
-                    !use_speculative and
-                    config.cache_compaction_ratio == null and
-                    self.compiled_partition_backend == null and
-                    !NativeDecodeState.requiresDeepSeekV4CompressedCache(self.gpt_config) and
-                    !self.gpt_config.isQwen35() and
-                    decode_state.isPaged() and
-                    decode_state.kv_manager == cache.managerPtr();
-                if (cache_eligible) {
-                    if (decode_state.sequence_id) |sequence_id| {
-                        cache.storeGeneratedPrefixFromSequence(
-                            config.prompt_cache_key.?,
-                            token_ids[0 .. seq_len - 1],
-                            sequence_id,
-                        ) catch |err| {
-                            // A cache admission failure must not discard an
-                            // otherwise complete generation response.
-                            std.log.warn("radix continuation cache store failed: {s}", .{@errorName(err)});
-                        };
-                    }
-                }
-            }
-        }
+        // The final sampled token has no materialized KV yet. Task controls
+        // that semantic boundary; runtime owns cache/storage eligibility.
+        if (tokens_generated > 0)
+            decoder_storage.storeGeneratedPromptPrefix(&self.cb, prefix_binding, decode_state, &self.gpt_config, self.prompt_cache, prefix_request, token_ids[0 .. seq_len - 1]);
 
         // Decode only the generated tokens. By default channel-aware models
         // project public text and token IDs from the same slice. The explicit
@@ -13663,63 +13561,73 @@ const PreparedEmbeddingsTestModel = struct {
 };
 
 test "graph forward executes the decoder once on cache miss and hit" {
-    const a = std.testing.allocator;
-    const native = PreparedEmbeddingsTestModel.native_compute;
-    const Probe = struct {
-        var calls: usize = 0;
-        fn assigned(ctx: *anyopaque, request: ops.kernel_descriptor.Invocation) anyerror!bool {
-            const executed = try native.vtable_impl.kernels.?.runAssignedKernel.?(ctx, request);
-            if (executed and request.output != null and request.descriptor.operation == .linear) calls += 1;
-            return executed;
+    inline for (.{ true, false }) |wrapped| {
+        const a = std.testing.allocator;
+        const native = PreparedEmbeddingsTestModel.native_compute;
+        const Probe = struct {
+            var calls: usize = 0;
+            fn assigned(ctx: *anyopaque, request: ops.kernel_descriptor.Invocation) anyerror!bool {
+                const executed = try native.vtable_impl.kernels.?.runAssignedKernel.?(ctx, request);
+                if (executed and request.output != null and request.descriptor.operation == .linear) calls += 1;
+                return executed;
+            }
+            fn linear(ctx: *anyopaque, input: ops.CT, weight: ops.CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!ops.CT {
+                calls += 1;
+                return native.vtable_impl.linearNoBias(ctx, input, weight, rows, in_dim, out_dim);
+            }
+        };
+        var model: PreparedEmbeddingsTestModel = undefined;
+        model.init(a);
+        defer model.deinit(a);
+        try model.putWeight(a, "model.norm.weight", &.{4}, &.{ 1, 1, 1, 1 });
+        try model.putWeight(a, "model.embed_tokens.weight", &.{ 2, 4 }, &.{ 0, 0, 0, 0, 1, 2, 3, 4 });
+        var pipeline = model.pipeline(a, .{
+            .family = .llama,
+            .hidden_size = 4,
+            .vocab_size = 2,
+            .num_hidden_layers = 0,
+            .num_attention_heads = 1,
+            .position_encoding = .rope,
+            .norm_type = .rms_norm,
+        });
+        var vtable = native.vtable_impl;
+        vtable.linearNoBias = &Probe.linear;
+        var functions = vtable.kernels.?.*;
+        functions.runAssignedKernel = &Probe.assigned;
+        vtable.kernels = &functions;
+        pipeline.cb.vtable = if (wrapped) &vtable else &native.vtable_impl;
+        try std.testing.expectEqual(!wrapped, pipeline.cb.vtable.kernels.?.accepts(pipeline.cb.vtable));
+        var cache = graph_mod.cache.GraphCache.init(a);
+        defer cache.deinitWithBackend(&pipeline.cb);
+        const context = gpt_arch.DecodeContext{ .attention_mode = .full_recompute, .total_sequence_len = 2, .query_sequence_len = 2, .kv_sequence_len = 2 };
+        const expected = try gpt_arch.forward(&pipeline.cb, a, pipeline.gpt_config, &.{ 0, 1 }, 1, 2, &context);
+        defer a.free(expected);
+        Probe.calls = 0;
+        var prepared: ?*@import("../execution/executable.zig").Executable = null;
+        for (0..2) |iteration| {
+            const actual = try pipeline.graphForward(&cache, &.{ 0, 1 }, 1, 2, &context);
+            defer a.free(actual);
+            if (wrapped) try std.testing.expectEqual(iteration + 1, Probe.calls);
+            const current = cache.specializations.entries.items[0].single_device_executable.?;
+            if (prepared) |previous| {
+                try std.testing.expectEqual(previous, current);
+                const stats = current.diagnostics.snapshot().?.execution orelse return error.ExpectedProgramExecutionStats;
+                try std.testing.expectEqual(@as(u64, 0), stats.physical_storage_allocations);
+                if (wrapped) {
+                    // The spy proves single execution but deliberately lacks the
+                    // canonical table authority required by prepared native routes.
+                    try std.testing.expectEqual(@as(u64, 0), stats.physical_storage_reuses);
+                } else {
+                    try std.testing.expect(stats.assigned_kernel_dispatches > 0);
+                    try std.testing.expect(stats.physical_storage_reuses > 0);
+                }
+            } else {
+                prepared = current;
+                current.diagnostics.configure(true);
+            }
+            try std.testing.expectEqual(@as(usize, 2), actual.len);
+            for (actual, expected[expected.len - 2 ..]) |got, want| try std.testing.expectApproxEqAbs(want, got, 1e-5);
         }
-        fn linear(ctx: *anyopaque, input: ops.CT, weight: ops.CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!ops.CT {
-            calls += 1;
-            return native.vtable_impl.linearNoBias(ctx, input, weight, rows, in_dim, out_dim);
-        }
-    };
-    var model: PreparedEmbeddingsTestModel = undefined;
-    model.init(a);
-    defer model.deinit(a);
-    try model.putWeight(a, "model.norm.weight", &.{4}, &.{ 1, 1, 1, 1 });
-    try model.putWeight(a, "model.embed_tokens.weight", &.{ 2, 4 }, &.{ 0, 0, 0, 0, 1, 2, 3, 4 });
-    var pipeline = model.pipeline(a, .{
-        .family = .llama,
-        .hidden_size = 4,
-        .vocab_size = 2,
-        .num_hidden_layers = 0,
-        .num_attention_heads = 1,
-        .position_encoding = .rope,
-        .norm_type = .rms_norm,
-    });
-    var vtable = native.vtable_impl;
-    vtable.linearNoBias = &Probe.linear;
-    var functions = vtable.kernels.?.*;
-    functions.runAssignedKernel = &Probe.assigned;
-    vtable.kernels = &functions;
-    pipeline.cb.vtable = &vtable;
-    var cache = graph_mod.cache.GraphCache.init(a);
-    defer cache.deinitWithBackend(&pipeline.cb);
-    const context = gpt_arch.DecodeContext{ .attention_mode = .full_recompute, .total_sequence_len = 2, .query_sequence_len = 2, .kv_sequence_len = 2 };
-    const expected = try gpt_arch.forward(&pipeline.cb, a, pipeline.gpt_config, &.{ 0, 1 }, 1, 2, &context);
-    defer a.free(expected);
-    Probe.calls = 0;
-    var prepared: ?*@import("../execution/executable.zig").Executable = null;
-    for (0..2) |iteration| {
-        const actual = try pipeline.graphForward(&cache, &.{ 0, 1 }, 1, 2, &context);
-        defer a.free(actual);
-        try std.testing.expectEqual(iteration + 1, Probe.calls);
-        const current = cache.specializations.entries.items[0].single_device_executable.?;
-        if (prepared) |previous| {
-            try std.testing.expectEqual(previous, current);
-            const stats = current.diagnostics.snapshot().?.execution;
-            try std.testing.expectEqual(@as(u64, 0), stats.physical_storage_allocations);
-            try std.testing.expect(stats.physical_storage_reuses > 0);
-        } else {
-            prepared = current;
-            current.diagnostics.configure(true);
-        }
-        try std.testing.expectEqual(@as(usize, 2), actual.len);
-        for (actual, expected[expected.len - 2 ..]) |got, want| try std.testing.expectApproxEqAbs(want, got, 1e-5);
     }
 }
 
@@ -15489,4 +15397,97 @@ test "actual Native speculative forwardAll observes independent target and draft
     try std.testing.expectEqualSlices(f32, draft_expected, after_disable);
     try std.testing.expect(draft_diagnostics.snapshot() == null);
     try std.testing.expect(!@import("../execution/allocation_registry.zig").enabled());
+}
+
+test "Native full generation prefix reuse matches uncached cold warm and evicted requests with owned one layer weights" {
+    const a = std.testing.allocator;
+    const decoder_fixture = @import("../execution/testing/decoder.zig");
+    const tokenizer_json =
+        \\{"model":{"type":"WordPiece","unk_token":"[UNK]","continuing_subword_prefix":"##","vocab":{"[UNK]":0,"hello":1}},"pre_tokenizer":{"type":"Whitespace"},"decoder":{"type":"WordPiece","prefix":"##","cleanup":false},"added_tokens":[{"id":0,"content":"[UNK]","special":true}]}
+    ;
+    var tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(a, tokenizer_json);
+    defer tokenizer.deinitSelf();
+    var budget = runtime.tier.memory.RunBudget.init(.{ .host_limit_bytes = 16 * 1024 * 1024, .combined_limit_bytes = 16 * 1024 * 1024, .scratch_limit_bytes = 8 * 1024 * 1024 });
+    var model: PreparedEmbeddingsTestModel = undefined;
+    model.init(a);
+    var model_owned = true;
+    defer if (model_owned) model.deinit(a);
+    model.compute.run_budget = &budget;
+    try decoder_fixture.populate(&model.store);
+    var model_config = decoder_fixture.config();
+    model_config.eos_token_id = -1;
+    const storage_config = kvPoolConfig(.native, .f32, model_config, false);
+    var cache = runtime.kv.prompt_cache.PromptPrefixCache.init(a);
+    var cache_owned = true;
+    defer if (cache_owned) cache.deinit();
+    const cache_config = runtime.kv.prompt_cache.Config{ .enabled = true, .mode = .block_hash, .min_tokens = 16, .max_bytes = 1 << 20 };
+    cache.configure(cache_config);
+    const cached_pool = (try cache.ensurePool(storage_config)).?;
+    var expected: ?GenerationResult = null;
+    defer if (expected) |*result| result.deinit();
+    const prompt = "hello world hello world hello world hello world hello world hello world hello world hello world hello world hello world hello world hello world hello world hello world hello world hello world hello";
+    for (0..4) |arm| {
+        if (arm == 3) {
+            var eviction = cache_config;
+            eviction.max_bytes = 0;
+            cache.configure(eviction);
+            try std.testing.expectEqual(@as(usize, 0), cache.stats().live_entries);
+            cache.configure(cache_config);
+        }
+        var manager = runtime.kv.manager.KvManager.init(a);
+        defer manager.deinit();
+        const active_manager = if (arm == 0) &manager else cache.managerPtr();
+        const pool_id = if (arm == 0) try manager.addPool(requestKvManagerPoolConfig(storage_config)) else cached_pool;
+        // Exactly the Native server construction: ensurePool owns payloads,
+        // each request owns a separate, initially empty metadata object.
+        var metadata = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, storage_config);
+        defer metadata.deinit();
+        var state = NativeDecodeState.initPaged(a, active_manager, pool_id, null);
+        defer state.deinit();
+        state.kv_storage = &metadata;
+        var pipeline = model.pipeline(a, model_config);
+        pipeline.kv_dtype = .f32;
+        pipeline.tokenizer = tokenizer.tokenizer();
+        pipeline.prompt_override = prompt;
+        pipeline.return_raw_token_ids = true;
+        pipeline.decode_state = &state;
+        pipeline.prompt_cache = if (arm == 0) null else &cache;
+        pipeline.native_prefix_binding = decoder_storage.NativePrefixBinding.init(&pipeline.cb, pipeline.prompt_cache, &state, &metadata);
+        if (arm != 0) try std.testing.expect(pipeline.native_prefix_binding != null);
+        var result = try pipeline.generate(&.{.{ .role = "user", .content = "hello" }}, .{ .max_tokens = 3, .temperature = 0, .prompt_cache_enabled = arm != 0, .prompt_cache_key = "request-private-namespace" });
+        var result_owned = true;
+        defer if (result_owned) result.deinit();
+        try std.testing.expectEqual(@as(usize, 33), result.prompt_tokens);
+        try std.testing.expectEqual(@as(usize, 3), result.token_ids.?.len);
+        try std.testing.expectEqualStrings("length", result.finish_reason);
+        if (arm == 2) {
+            try std.testing.expect(result.cached_prompt_tokens > 0);
+            try std.testing.expectEqual(@as(usize, 16), result.cached_prompt_tokens);
+            try std.testing.expect(state.kv_storage == null);
+            try std.testing.expectEqual(@as(usize, 0), metadata.storage.liveBlocks());
+        } else try std.testing.expectEqual(@as(usize, 0), result.cached_prompt_tokens);
+        if (pipeline.native_prefix_binding) |binding| try std.testing.expect(binding.phase == .closed);
+        try std.testing.expectEqual(@as(usize, 0), budget.scratchTotalBytes());
+        try std.testing.expectEqual(@as(u64, 0), budget.denials);
+        if (expected) |reference| {
+            try std.testing.expectEqualSlices(i32, reference.token_ids.?, result.token_ids.?);
+            try std.testing.expectEqualStrings(reference.text, result.text);
+            try std.testing.expectEqualStrings(reference.finish_reason, result.finish_reason);
+            try std.testing.expectEqual(reference.tokens_used, result.tokens_used);
+        } else {
+            expected = result;
+            result_owned = false;
+        }
+    }
+    // No completed request retains sequence ownership. Only cache entries own
+    // prefix blocks until cache teardown; completed output text/IDs are copied.
+    for (cache.manager.sequences.items) |sequence| try std.testing.expect(!sequence.active);
+    cache.deinit();
+    cache_owned = false;
+    model.deinit(a);
+    model_owned = false;
+    try std.testing.expectEqual(@as(usize, 0), budget.hostTotalBytes());
+    try std.testing.expectEqual(@as(usize, 0), budget.backendTotalBytes());
+    try std.testing.expectEqual(@as(usize, 3), expected.?.token_ids.?.len);
+    try std.testing.expectEqualStrings("length", expected.?.finish_reason);
 }

@@ -30,10 +30,13 @@ pub const Report = struct {
     resolved_project_cuda_launches: ?@import("runtime_observation.zig").Kernels = null,
     resolved_project_metal_dispatches: ?@import("runtime_observation.zig").MetalDispatches = null,
     terminal_native_bodies: ?@import("runtime_observation.zig").NativeBodies = null,
+    selected_native_dispatches: ?@import("runtime_observation.zig").NativeDispatches = null,
     backend_counters: runtime.Counters = .{},
     completed_device_kernels: enum { unavailable_opaque_vendor } = .unavailable_opaque_vendor,
     backend_buffer_memory: runtime.Memory = .{},
     observed_host_requested_live_bytes: ?u64 = null,
+    observed_host_owner_interval_peak_bytes: ?u64 = null,
+    host_peak_scope: enum { registered_single_root_owner_interval_including_concurrent_activity } = .registered_single_root_owner_interval_including_concurrent_activity,
     observed_allocator_roots: ?usize = null,
     observed_allocator_root_identity: ?usize = null,
     host_allocation_counter_scope: enum { registered_single_root_invocation_interval } = .registered_single_root_invocation_interval,
@@ -65,6 +68,7 @@ pub const Report = struct {
         var report = Report{ .operation = @tagName(value.operation), .publication_scope = @tagName(value.scope), .backend_counter_scope = @tagName(value.context_runtime_scope), .outcome = @tagName(value.outcome), .backend = if (value.context_backend) |backend| @tagName(backend) else null, .backend_counters = value.runtime.counters, .cuda = value.runtime.cuda, .resolved_project_cuda_launches = value.runtime.resolved_project_cuda_launches, .backend_buffer_memory = value.runtime.memory, .worker_process = value.runtime.process };
         report.resolved_project_metal_dispatches = value.runtime.resolved_project_metal_dispatches;
         report.terminal_native_bodies = value.runtime.terminal_native_bodies;
+        report.selected_native_dispatches = value.runtime.selected_native_dispatches;
         if (value.pending_interval != null) report.synchronous_interval = .pending_phase_only;
         if (value.error_name) |failure| report.failure = @import("runtime_observation.zig").FailureText.init(failure.view());
         if (value.program_error) |failure| {
@@ -86,6 +90,7 @@ pub const Report = struct {
         }
         if (value.runtime.allocation_owners) |owners| {
             report.observed_host_requested_live_bytes = owners.requested_live_bytes;
+            report.observed_host_owner_interval_peak_bytes = owners.requested_owner_interval_peak_bytes;
             report.observed_allocator_roots = owners.observed_roots;
             report.observed_allocator_root_identity = owners.aggregate_owner_identity;
             report.host_allocations = owners.allocations;

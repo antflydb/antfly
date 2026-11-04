@@ -683,7 +683,10 @@ fn prepareInvocationIntoWithCleanup(session: *const Session, shapes: session_mod
     prepared.backend_cookie = events;
     if (comptime !build_options.enable_wasm) {
         if (target.executable.runtime.physical_pool) |root_pool| {
-            try preparePhysicalInvocationWithCleanup(prepared, session, target, root_pool, shapes, allocator, cleanup);
+            if (!InvocationInputFacts.needsResidentStorage(shapes) and @import("../execution/cuda_owned_coverage.zig").services(target.cb) != null)
+                try prepareCudaPhysicalInvocation(prepared, session, target, root_pool, shapes, allocator, cleanup, if (control) |*value| value else null)
+            else
+                try preparePhysicalInvocationWithCleanup(prepared, session, target, root_pool, shapes, allocator, cleanup);
         }
     }
     return;
@@ -4926,7 +4929,10 @@ fn selectPhysicalInvocation(prepared: *prepared_mod.PreparedInvocation, session:
     return selectPhysicalInvocationWithCleanup(prepared, session, target, root_pool, inputs, allocator, .{});
 }
 
-fn selectPhysicalInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, inputs: []const kernel_routes.InputBinding, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
+inline fn selectPhysicalInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, inputs: []const kernel_routes.InputBinding, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
+    return selectPhysicalInvocationControlled(prepared, session, target, root_pool, inputs, allocator, cleanup);
+}
+fn selectPhysicalInvocationControlled(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, inputs: []const kernel_routes.InputBinding, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
     var known = true;
     for (inputs) |fact| if (fact.value == .unknown) {
         known = false;
@@ -4935,7 +4941,9 @@ fn selectPhysicalInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocatio
     const profile = if (prepared.region_execution_profile) |claim| claim.profile else .unknown;
     var selection_policy: @import("../execution/region_route.zig").SelectionPolicy = .select_regions;
     while (true) {
-        prepared.routes = if (known) try root_pool.prepareRoutesWithProfileAndCleanup(inputs, selection_policy, profile, cleanup) else null;
+        if (known) {
+            prepared.routes = try root_pool.prepareRoutesWithProfileAndCleanup(inputs, selection_policy, profile, cleanup);
+        } else prepared.routes = null;
         const pool = if (prepared.routes) |routes| routes.pool else root_pool;
         if (session.run_admission) |admission| prepared.frame_claim = try pool.claimWarm(.{ .controller = admission.controller, .backend_class = admission.backend_class });
         const acquisition = try pool.claimRegions(allocator, if (prepared.frame_claim) |*claim| claim else null, inputs);
@@ -4971,6 +4979,23 @@ fn selectPhysicalInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocatio
         }
         break;
     }
+}
+
+// Generic preparation can run lazily while an outer caller owns a model lane.
+// It must never wait for another provider owner. Only Session's explicit
+// BeforeExecution admission contract may retry the failure-atomic preparation.
+noinline fn prepareCudaPhysicalInvocation(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, shapes: session_mod.ShapeInputs, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context, control: ?*const InferenceExecutionControl) !void {
+    var facts: InvocationInputFacts = undefined;
+    {
+        if (control) |active| try active.check();
+        var metadata = try @import("../execution/backend_operation.zig").enter(target.cb, target.executable.graph, null, .metadata);
+        defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        if (metadata.token() == null) return error.PreparedMetadataAuthorityUnavailable;
+        // Inline entries live in this caller, never the scope helper's frame.
+        try facts.init(target, shapes, allocator, null);
+    }
+    defer facts.deinit();
+    return selectPhysicalInvocationControlled(prepared, session, target, root_pool, facts.inputs, allocator, cleanup);
 }
 
 fn preparePhysicalInvocation(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, shapes: session_mod.ShapeInputs, allocator: std.mem.Allocator) !void {
@@ -5027,6 +5052,19 @@ fn frozenOwnedHostFacts(target: *const ImportedOnnxSession, inputs: []const Tens
 }
 
 fn validatePreparedRouteFacts(target: *ImportedOnnxSession, routes: *const PreparedRoutes, inputs: prepared_mod.Inputs, allocator: std.mem.Allocator, claims: ?*const @import("../execution/region_claims.zig").Set) !void {
+    if (inputs == .host and @import("../execution/cuda_owned_coverage.zig").services(target.cb) != null)
+        return validateCudaPreparedFacts(target, routes, inputs, allocator, claims);
+    return validatePreparedRouteFactsImpl(target, routes, inputs, allocator, claims);
+}
+// Dispatch already owns its model lane: preserve nonblocking provider-busy
+// semantics here. Waiting belongs exclusively to the pre-admission helpers.
+noinline fn validateCudaPreparedFacts(target: *ImportedOnnxSession, routes: *const PreparedRoutes, inputs: prepared_mod.Inputs, allocator: std.mem.Allocator, claims: ?*const @import("../execution/region_claims.zig").Set) !void {
+    var metadata = try @import("../execution/backend_operation.zig").enter(target.cb, target.executable.graph, null, .metadata);
+    defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+    if (metadata.token() == null) return error.PreparedMetadataAuthorityUnavailable;
+    return validatePreparedRouteFactsImpl(target, routes, inputs, allocator, claims);
+}
+fn validatePreparedRouteFactsImpl(target: *ImportedOnnxSession, routes: *const PreparedRoutes, inputs: prepared_mod.Inputs, allocator: std.mem.Allocator, claims: ?*const @import("../execution/region_claims.zig").Set) !void {
     if (inputs == .host) if (frozenOwnedHostFacts(target, inputs.host, routes)) |facts| {
         // Mutable provider policies and live regional claims still validate.
         // Runtime rechecks declared upload requirements before frame allocation.
@@ -5534,4 +5572,241 @@ test "Native typed slice owns exact integer output and preserves 112 byte cold w
     held.deinit();
     held_live = false;
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+}
+
+test "complete Imported CUDA assigned chain preserves host IO opaque floors exact device caps held outputs and capture" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const memory = @import("../runtime/tier/memory.zig");
+    const rows = 128;
+    const width = 64;
+    const payload = rows * width * @sizeOf(f32);
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    const controller = &domain.controller;
+
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ rows, width }));
+    const weight = try builder.parameter("w", Shape.init(.f32, &.{ width, width }));
+    var out = try builder.linearNoBias(try builder.absOp(try builder.linearNoBias(x, weight, rows, width, width)), weight, rows, width, width);
+    for (0..8) |_| out = try builder.add(out, x);
+    try graph.markOutput(out);
+    var identity: [width * width]f32 = @splat(0);
+    for (0..width) |index| identity[index * width + index] = 1;
+    const bytes = try onnx_graph.exportGraph(a, &graph, .{ .parameter_initializers = &.{.{ .name = "w", .shape = Shape.init(.f32, &.{ width, width }), .data = .{ .f32 = &identity } }} });
+    defer a.free(bytes);
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "complete-cuda.onnx", .data = bytes });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", dir.sub_path[0..], "complete-cuda.onnx" });
+    defer a.free(path);
+    var session = createSessionWithOptions(a, path, .cuda, .{ .graph_runtime_strategy = .partitioned }) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    var session_open = true;
+    defer if (session_open) session.close();
+    // Actual managed backing owners retain only the matching pure domain for
+    // quota; their separate SharedBackendContext pin protects SDK destruction.
+    try std.testing.expect(session.model_lifetime.?.admission_domain == null);
+    session.model_lifetime.?.admission_domain = domain.pin();
+    const impl: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+    const compute = impl.shared_backend_ctx.ctx.cuda;
+    if (compute.ctx.info.compute_major < 8 or compute.cublaslt == null) return error.SkipZigTest;
+    try std.testing.expect(session.configureExecutionDiagnostics(true));
+    var values: [rows * width]f32 = undefined;
+    for (&values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 9)) - 4)) / 8;
+    var input = try Tensor.initFloat32(a, "x", &.{ rows, width }, &values);
+    defer input.deinit();
+    // The old generic estimate is deliberately much larger than this program.
+    session.run_admission = .{ .controller = controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 1024 * 1024 * 1024, .static_workspace_kind = .estimate, .check_live_memory = false };
+    var proof = (try prepared_mod.prepare(session, .{ .tensors = &.{input} }, a, null)).?;
+    var proof_open = true;
+    defer if (proof_open) proof.deinit();
+    if (!proof.hasCompleteOwnedPayload()) {
+        const declined_pool = proof.routes.?.pool;
+        std.debug.print("CUDA_WITNESS_DECLINE case=imported reason={s} root_cuda={} child_cuda={} native={} regions={d} transfers={d} host_inputs={d} replay={}\n", .{ if (declined_pool.payload_coverage == .compatibility) @tagName(declined_pool.payload_coverage.compatibility) else "complete", impl.executable.runtime.physical_pool.?.cuda_frame_dispatch, declined_pool.cuda_frame_dispatch, declined_pool.native_frame_dispatch, declined_pool.regions.len, declined_pool.plan.transfers.len, declined_pool.host_input_plans.len, declined_pool.replay_backend != null });
+        if (impl.executable.runtime.plan) |dispatch_plan| for (dispatch_plan.base.partitions, 0..) |part, part_index| {
+            std.debug.print("CUDA_WITNESS_PART index={d} backend={s} executor={} device={d} nodes={any}\n", .{ part_index, @tagName(part.backend), part.executor != null, dispatch_plan.device_assignment[part_index], part.node_ids });
+        };
+        return error.MissingImportedCompleteCudaPayload;
+    }
+    try std.testing.expectEqual(.device, proof.requirement.owned_payload.?.accounting_class);
+    const physical = proof.requirement.physical;
+    const warm_root = proof.routes.?.pool.root_pool.?;
+    try std.testing.expect(physical.backend_scratch_bytes >= 2 * payload);
+    // Requested page-locked upload payload is separate host admission; its
+    // unknown SDK-private OS backing is never relabelled as known physical.
+    try std.testing.expectEqual(@as(usize, payload), physical.host_scratch_bytes);
+    try std.testing.expect(!proof.routes.?.pool.hostIngressBackingKnown());
+    const request = try session.planRun(&.{input}, null);
+    const plan = try session.run_admission.?.planRequest(request, session.outputInfo());
+    try std.testing.expectEqual(@as(usize, 3 * payload), plan.protected.host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), plan.opaque_compatibility.backend_scratch_bytes);
+    const cap = try plan.protected.merge(physical);
+    proof.deinit();
+    proof_open = false;
+    {
+        const Worker = struct {
+            session: Session,
+            input: *const Tensor,
+            allocator: std.mem.Allocator,
+            checks: std.atomic.Value(usize) = .init(0),
+            cancel: std.atomic.Value(bool) = .init(false),
+            done: std.atomic.Value(bool) = .init(false),
+            failure: ?anyerror = null,
+            complete: bool = false,
+            fn check(raw: ?*anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                _ = self.checks.fetchAdd(1, .acq_rel);
+                if (self.cancel.load(.acquire)) return error.Cancelled;
+            }
+            fn run(self: *@This()) void {
+                self.prepare() catch |err| {
+                    self.failure = err;
+                };
+                self.done.store(true, .release);
+            }
+            fn prepare(self: *@This()) !void {
+                const inputs = [_]Tensor{self.input.*};
+                const control = InferenceExecutionControl{ .ptr = self, .check_fn = check, .native_call_policy = .in_process, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s };
+                // This worker owns no numerical/provider/model lane. The named
+                // admission entry is the explicit authority to wait, bounded by
+                // the request deadline, rather than by merely having control.
+                var permit = try self.session.admitInputsBeforeExecution(&inputs, self.allocator, control);
+                defer permit.deinit();
+                self.complete = if (permit.prepared) |*prepared| prepared.hasCompleteOwnedPayload() else false;
+            }
+        };
+        var numerical = try @import("../execution/backend_operation.zig").enter(impl.cb, impl.executable.graph, null, .managed);
+        defer numerical.deinitChecked() catch unreachable;
+        const builds_before = warm_root.variant_cache.?.stats.builds;
+        const semantic_before = impl.execution_count.load(.acquire);
+        const misses_before = warm_root.variant_cache.?.stats.misses;
+        const before_busy = compute.ctx.device_allocations.snapshot();
+        // Generic/lazy preparation is nonblocking even if it has control. It
+        // may already be called under an external model lane, so waiting here
+        // could deadlock the owner responsible for completing the busy work.
+        {
+            const actual_model_gate = &session.model_lifetime.?.execution_gate;
+            @import("antfly_platform").sync.lockYielding(actual_model_gate);
+            defer actual_model_gate.unlock();
+            try std.testing.expectError(error.QueueFull, prepared_mod.prepare(session, .{ .tensors = &.{input} }, a, null));
+            try std.testing.expectError(error.QueueFull, prepared_mod.prepare(session, .{ .tensors = &.{input} }, a, .{ .native_call_policy = .in_process, .deadline_ns = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s }));
+        }
+        try std.testing.expectError(error.QueueFull, session.admitInputsBeforeExecution(&.{input}, a, null));
+        try std.testing.expectError(error.QueueFull, session.admitInputsBeforeExecution(&.{input}, a, .{ .native_call_policy = .in_process }));
+        try std.testing.expectError(error.Timeout, session.admitInputsBeforeExecution(&.{input}, a, .{ .native_call_policy = .in_process, .deadline_ns = 0 }));
+        try std.testing.expectEqualDeep(before_busy, compute.ctx.device_allocations.snapshot());
+        try std.testing.expectEqual(builds_before, warm_root.variant_cache.?.stats.builds);
+        try std.testing.expectEqual(misses_before, warm_root.variant_cache.?.stats.misses);
+        var worker = Worker{ .session = session, .input = &input, .allocator = a };
+        const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+        var joined = false;
+        defer if (!joined) {
+            worker.cancel.store(true, .release);
+            numerical.finish() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            thread.join();
+        };
+        const deadline = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (worker.checks.load(.acquire) < 8 and !worker.done.load(.acquire)) {
+            if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
+            std.Thread.yield() catch {};
+        }
+        try std.testing.expect(!worker.done.load(.acquire));
+        try std.testing.expectEqualDeep(before_busy, compute.ctx.device_allocations.snapshot());
+        try std.testing.expectEqual(semantic_before, impl.execution_count.load(.acquire));
+        try std.testing.expectEqual(builds_before, warm_root.variant_cache.?.stats.builds);
+        try std.testing.expectEqual(misses_before, warm_root.variant_cache.?.stats.misses);
+        try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+        try numerical.finish();
+        while (!worker.done.load(.acquire)) {
+            if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
+            std.Thread.yield() catch {};
+        }
+        thread.join();
+        joined = true;
+        if (worker.failure) |err| return err;
+        try std.testing.expect(worker.complete);
+        try std.testing.expectEqual(builds_before, warm_root.variant_cache.?.stats.builds);
+        try std.testing.expectEqualDeep(before_busy, compute.ctx.device_allocations.snapshot());
+        try std.testing.expectEqual(semantic_before, impl.execution_count.load(.acquire));
+    }
+
+    session.run_admission.?.limits = .{ .host_limit_bytes = cap.hostTotalBytes(), .backend_limit_bytes = cap.backendTotalBytes(), .combined_limit_bytes = try std.math.add(usize, cap.hostTotalBytes(), cap.backendTotalBytes()) };
+    const before = compute.ctx.device_allocations.snapshot();
+    var below = session;
+    below.run_admission.?.limits.backend_limit_bytes -= 1;
+    if (below.admitInputs(&.{input}, a, null)) |unexpected| {
+        var owned = unexpected;
+        owned.deinit();
+        return error.ExpectedOneByteBelowDenial;
+    } else |err| try std.testing.expectEqual(error.ResourceLimitExceeded, err);
+    try std.testing.expectEqualDeep(before, compute.ctx.device_allocations.snapshot());
+    var mandatory = session;
+    mandatory.run_admission.?.static_workspace_kind = .mandatory;
+    try std.testing.expectError(error.ResourceLimitExceeded, mandatory.admitInputs(&.{input}, a, null));
+    var opaque_session = session;
+    opaque_session.run_admission.?.opaque_workspace_bytes = 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, opaque_session.admitInputs(&.{input}, a, null));
+    var explicit = request;
+    explicit.workspace_bytes = 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admitShapeRequest(.{ .tensors = &.{input} }, explicit, a, null));
+    explicit.workspace_planned = true;
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admitShapeRequest(.{ .tensors = &.{input} }, explicit, a, null));
+    var profiled = session;
+    profiled.run_admission.?.model_profile.hidden_size = 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, profiled.admitInputs(&.{input}, a, null));
+    var preprocess = request;
+    preprocess.host_preprocess_bytes = 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admitShapeRequest(.{ .tensors = &.{input} }, preprocess, a, null));
+    const unknown_info = [_]@import("tensor.zig").TensorInfo{.{ .name = "x", .dtype = .f32, .shape = &.{ rows, width } }};
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admitShapes(&unknown_info, rows, a, null));
+    {
+        var earlier_host = try controller.tryAcquire(.gpu, .{}, .{ .host_scratch_bytes = 1 }, false);
+        defer earlier_host.release();
+        var credited = request;
+        credited.pre_admitted_host_bytes = 1;
+        var permit = try session.admitShapeRequest(.{ .tensors = &.{input} }, credited, a, null);
+        defer permit.deinit();
+        try std.testing.expectEqual(cap.host_scratch_bytes, controller.snapshot().host_scratch_bytes);
+        try std.testing.expectEqual(cap.backend_scratch_bytes, controller.snapshot().backend_scratch_bytes);
+    }
+    var captures: u64 = 0;
+    var replays: u64 = 0;
+    for (0..5) |iteration| {
+        for (input.asFloat32Mut(), 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 9)) - 4 + @as(i32, @intCast(iteration)))) / 8;
+        var result = (try session.runResident(&.{input}, a)) orelse return error.MissingResidentResult;
+        var result_open = true;
+        defer if (result_open) result.deinit();
+        const stats = session.executionDiagnostics().?.execution.?;
+        captures += stats.physical_graph_captures;
+        replays += stats.physical_graph_replays;
+        if (iteration == 0) try std.testing.expect(stats.assigned_kernel_dispatches >= 3);
+        const actual = try result.backend.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        for (actual, input.asFloat32()) |value, original| try std.testing.expectApproxEqAbs(@abs(original) + 8 * original, value, 0.002);
+        if (iteration == 4) {
+            // Public retained result pins its real frame; the exact cap cannot
+            // admit a second frame while that backing remains externally held.
+            if (session.admitInputs(&.{input}, a, null)) |unexpected| {
+                var owned = unexpected;
+                owned.deinit();
+                return error.ExpectedHeldFramePressure;
+            } else |err| try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, err);
+            session.close();
+            session_open = false;
+            const after_close = try result.backend.toFloat32(result.outputs[0], a);
+            defer a.free(after_close);
+            try std.testing.expectEqualSlices(f32, actual, after_close);
+        }
+        result.deinit();
+        result_open = false;
+    }
+    try std.testing.expectEqual(@as(u64, 1), captures);
+    try std.testing.expect(replays >= 2);
+    _ = @import("../execution/resource_retirement.zig").poll();
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
 }

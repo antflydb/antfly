@@ -173,7 +173,8 @@ fn writeSamples(a: std.mem.Allocator, label: []const u8, values: []const u64) !v
 
 pub fn run(init: std.process.Init, source_model: anytype, a: std.mem.Allocator, options: anytype) !void {
     if (options.source_trace_constructor and (options.backend != .cuda or options.source_proof == .off or !options.diagnostics)) return error.ConstructorTraceRequiresCudaProof;
-    if (options.source_proof == .off and options.diagnostics) return error.TimingRequiresDiagnosticsOff;
+    if (options.source_proof == .off and options.diagnostics and !options.source_metadata_proof) return error.TimingRequiresDiagnosticsOff;
+    if (options.source_metadata_proof and (options.backend != .metal or options.source_policy != .qualified or !options.diagnostics or options.source_proof != .off or options.source_trace_constructor)) return error.InvalidMetadataProof;
     if (options.source_proof != .off and !options.diagnostics) return error.ProofRequiresDiagnostics;
     if (options.source_proof == .detached and options.source_policy != .qualified) return error.InvalidProofPolicy;
     const Cuda = inference.native_compute.cuda;
@@ -262,11 +263,35 @@ pub fn run(init: std.process.Init, source_model: anytype, a: std.mem.Allocator, 
         source_bytes = try std.math.mul(usize, try std.math.mul(usize, @intCast(source_shape[1]), @intCast(source_shape[2])), @sizeOf(f32));
         const mask = try request_allocator.alloc(i64, @intCast(source_shape[1]));
         @memset(mask, 1);
+        const metadata_source_backend = if (options.source_metadata_proof) encoded.resident.values.backend else null;
+        const metadata_source_usage = if (options.source_metadata_proof) source_domain.controller().snapshot() else null;
+        if (options.source_metadata_proof and metadata_source_backend.?.operationToken() == null) return error.MetadataProofRequiresOwnedSourceOperation;
+        var metadata_audit = inference.execution.transfer_audit.Audit{ .forbid_device_host_access = true };
+        var metadata_audit_open = false;
+        defer if (metadata_audit_open) inference.execution.transfer_audit.end();
+        if (options.source_metadata_proof) {
+            try inference.execution.transfer_audit.begin(&metadata_audit);
+            metadata_audit_open = true;
+        }
         var owned = try Root.OwnedIncrementalInput.take(request_allocator, &encoded, destination, &cleanup);
+        if (metadata_audit_open) {
+            inference.execution.transfer_audit.end();
+            metadata_audit_open = false;
+        }
         encoded_open = false;
         var owned_open = true;
         defer if (owned_open) owned.deinit();
         if (owned.source == null) return error.RetainedIncrementalSourceRequired;
+        if (options.source_metadata_proof) {
+            if (owned.source.?.backend == metadata_source_backend.? or owned.source.?.backend.operationToken() != null) return error.MetadataPromotionRequired;
+            if (metadata_audit.device_copy_calls != 0 or metadata_audit.upload_calls != 0 or metadata_audit.download_calls != 0 or metadata_audit.host_accesses != 0) return error.MetadataPromotionTransferredPayload;
+            if (!std.meta.eql(transient(metadata_source_usage.?), transient(source_domain.controller().snapshot()))) return error.MetadataPromotionChangedSourceQuota;
+            // Actual source provider reacquisition is a diagnostic-only proof
+            // that the original Engine released exclusion before target admit.
+            // This extra construction is outside promotion's transfer audit.
+            var source_reentry = try architecture.getComputeBackendWithControl(encoder, a, control);
+            source_reentry.deinit();
+        }
         // Inspection also runs in timing mode: unsupported layouts fail closed.
         const source_address: u64 = if (backend == .cuda) address: {
             if (comptime @hasDecl(Cuda, "CudaCompute")) break :address (try inspectRoot(Cuda, owned.source.?, source_bytes)).buffer.ptr;
@@ -338,6 +363,7 @@ pub fn run(init: std.process.Init, source_model: anytype, a: std.mem.Allocator, 
                 audit_open = false;
             }
             const native = if (decoder.native) |*value| value else return error.NativeDecoderRequired;
+            if (options.source_metadata_proof and !std.meta.eql(transient(source_usage), transient(source_domain.controller().snapshot()))) return error.MetadataPromotionChangedSourceQuota;
             if (options.source_proof != .off) {
                 if (comptime @hasDecl(Cuda, "foreignTensorCopyTarget")) {
                     if (Cuda.foreignTensorCopyTarget(&native.cb.backend) == null) return error.CanonicalCudaDestinationRequired;
@@ -386,6 +412,7 @@ pub fn run(init: std.process.Init, source_model: anytype, a: std.mem.Allocator, 
             attempt_arena_open = false;
             const returned = inference.platform.time.monotonicNs();
             try waitRetired(target_domain.controller(), target_initial, control);
+            if (options.source_metadata_proof and !std.meta.eql(transient(source_usage), transient(source_domain.controller().snapshot()))) return error.MetadataPromotionChangedSourceQuota;
             const retired = inference.platform.time.monotonicNs();
             if (iteration >= options.warmup) {
                 const sample = (iteration - options.warmup) * options.source_attempts + attempt;
@@ -414,6 +441,10 @@ pub fn run(init: std.process.Init, source_model: anytype, a: std.mem.Allocator, 
     for (reference.?) |value| checksum += value;
     if (options.output) |path| try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = std.mem.sliceAsBytes(reference.?) });
     std.debug.print("unified_source_receiver backend={s} fixture={s} policy={s} shape={any} bytes={d} attempts={d} iterations={d} width={d} encoder_layers={d} decoder_layers={d} encoder_heads={d} decoder_heads={d} mel_bins={d} input_frames={d} output_elements={d} checksum={d:.9} parity=exact encoder_timing=complete_task_lifecycle request_arenas=destroyed terminal_quota=baseline\n", .{ @tagName(backend), @tagName(options.source_fixture_label), @tagName(options.source_policy), source_shape, source_bytes, options.source_attempts, options.iterations, config.d_model, encoder_config.encoder_layers, config.decoder_layers, encoder_config.encoder_attention_heads, config.decoder_attention_heads, encoder_config.num_mel_bins, options.seq_len, reference.?.len, checksum });
+    if (options.source_metadata_proof) {
+        std.debug.print("source_metadata_proof backend=metal policy=qualified promotion=actual_foreign_source Engine_retirement=before_receiver_admission promotion_device_copies=0 promotion_uploads=0 promotion_downloads=0 promotion_host_accesses=0 source_quota=unchanged source_and_target_terminal_quota=baseline scope=promotion_only receiver_transport=separate\n", .{});
+        return; // Diagnostic completion proof, never timing distributions.
+    }
     if (options.source_proof != .off) return; // Proof runs never publish timing samples.
     try writeSamples(a, "constructor", constructor_samples);
     try writeSamples(a, "first_consumer_and_return", return_samples);

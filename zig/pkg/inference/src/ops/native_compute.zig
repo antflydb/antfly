@@ -477,6 +477,12 @@ fn noteNativeQuantDispatch(kind: NativeQuantDispatchKind) void {
     }
 }
 
+/// Observe existing outer note sites without adding work to MR microkernels.
+inline fn noteNativeQuantOuterDispatch(kind: NativeQuantDispatchKind, phase: @import("../execution/runtime_observation.zig").NativeDispatchPhase) void {
+    @import("../execution/runtime_observation.zig").nativeDispatchFamily(kind, phase);
+    noteNativeQuantDispatch(kind);
+}
+
 fn nativeQuantPhaseStart() u64 {
     if (!nativeQuantDispatchStatsEnabled()) return 0;
     var timespec: std.posix.timespec = undefined;
@@ -643,7 +649,7 @@ fn layaDequantScratchSgemm(
     const scratch = try self.allocator.alloc(f32, out_dim * in_dim);
     defer self.allocator.free(scratch);
     try quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, scratch);
-    noteNativeQuantDispatch(.dequant_sgemm);
+    noteNativeQuantOuterDispatch(.dequant_sgemm, .before_dispatch);
     noteNativeQuantPhase(.dequant_fetch, dequant_start);
     const sgemm_start = nativeQuantPhaseStart();
     try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, input, scratch, beta, output);
@@ -6692,12 +6698,12 @@ fn tryLinearQuantizedDequantSgemmGroupedFromStores(
         dense[i] = (try denseDequantForSgemmFromStore(self, data[i], storages[i], names[i], in_dim, out_dim)) orelse return false;
         acquired += 1;
     }
-    noteNativeQuantDispatch(switch (count) {
+    noteNativeQuantOuterDispatch(switch (count) {
         1 => .dequant_sgemm,
         2 => .dequant_sgemm_pair,
         3 => .dequant_sgemm_triple,
         else => @compileError("unsupported grouped SGEMM arity"),
-    });
+    }, .before_dispatch);
     noteNativeQuantPhase(.dequant_fetch, dequant_start);
     if (with_bias) for (0..rows) |row| {
         inline for (0..count) |i| {
@@ -9232,6 +9238,7 @@ fn linearNoBiasQuantizedWithPolicy(
             {
                 const panel16_blocks = if (q6KPanel16SingleEnabledForShape(rows, out_dim, row_blocks)) storage.preparedBytes(.panel16) else null;
                 try linearNoBiasQ6KPreparedQ8KActivation(storage.allocator, io, input, storage.preparedBytes(.row_major_blocks).?, storage.preparedBytes(.panel4), storage.preparedBytes(.panel8), panel16_blocks, output, rows, in_dim, out_dim);
+                @import("../execution/runtime_observation.zig").nativeDispatchFamily(@as(enum { q6_k_q8k_activation }, .q6_k_q8k_activation), .successful_return);
                 return true;
             }
         }
@@ -9249,7 +9256,7 @@ fn linearNoBiasQuantizedWithPolicy(
                     .known => |known| known,
                     else => unreachable,
                 });
-                noteNativeQuantDispatch(.q4_q5_k_q8k_activation);
+                noteNativeQuantOuterDispatch(.q4_q5_k_q8k_activation, .successful_return);
                 return true;
             }
         }
@@ -9267,7 +9274,7 @@ fn linearNoBiasQuantizedWithPolicy(
                 } else {
                     if (storage.preparedBytes(.panel4)) |panel_blocks| {
                         try linearNoBiasQ4Q5KPreparedPanel(input, prepared_headers, panel_blocks, output, rows, in_dim, out_dim);
-                        noteNativeQuantDispatch(.q4_q5_k_prepared_panel);
+                        noteNativeQuantOuterDispatch(.q4_q5_k_prepared_panel, .successful_return);
                         return true;
                     }
                     try linearNoBiasQ4KPrepared(io, input, prepared_headers, output, rows, in_dim, out_dim);
@@ -9357,7 +9364,7 @@ fn linearNoBiasQuantizedWithPolicy(
             if ((policy == .automatic and shouldUseQ8_0ActivationQuant(rows, out_dim, row_blocks))) {
                 if (storage.preparedBytes(.row_major_blocks)) |prepared_blocks| {
                     try linearNoBiasLegacyPreparedActivation(storage.allocator, io, input, prepared_blocks, storage.preparedBytes(.panel4), known != .Q4_0, output, rows, in_dim, out_dim);
-                    noteNativeQuantDispatch(.legacy_activation);
+                    noteNativeQuantOuterDispatch(.legacy_activation, .successful_return);
                     return true;
                 }
             }
@@ -9386,7 +9393,7 @@ fn linearNoBiasQuantizedWithPolicy(
         if (storage.shape.len != 2) return false;
         if (storage.shape[0] != out_dim or storage.shape[1] != in_dim) return false;
         try linearNoBiasQ8_0WithPolicy(policy, storage.allocator, io, input, storage.raw_bytes, storage.preparedBytes(.row_major_blocks), storage.preparedBytes(.panel4), storage.preparedBytes(.panel8), output, rows, in_dim, out_dim);
-        noteNativeQuantDispatch(.q8_0_direct);
+        noteNativeQuantOuterDispatch(.q8_0_direct, .successful_return);
         return true;
     }
 
@@ -9402,7 +9409,7 @@ fn linearNoBiasQuantizedWithPolicy(
             const panel8_blocks = if (q8KPanel8DirectEnabled()) storage.preparedBytes(.panel8) else null;
             const panel16_blocks = if (q8KPanel16SingleEnabledForShape(rows, out_dim, row_blocks)) storage.preparedBytes(.panel16) else null;
             try linearNoBiasQ8KQ8KActivation(storage.allocator, io, input, storage.raw_bytes, storage.preparedBytes(.panel4), panel8_blocks, panel16_blocks, output, rows, in_dim, out_dim);
-            noteNativeQuantDispatch(.q8_k_q8k_activation);
+            noteNativeQuantOuterDispatch(.q8_k_q8k_activation, .successful_return);
             return true;
         }
     }
@@ -9605,7 +9612,7 @@ pub fn linearNoBiasQuantizedPair(
                     noteNativeQuantPhase(.q4q5_q8k_pair_compute, compute_start);
                 }
                 // quant-kernel-codegen:end CPU activation linearNoBiasQuantizedPair pipeline 1
-                noteNativeQuantDispatch(.q4_q5_k_q8k_activation_pair);
+                noteNativeQuantOuterDispatch(.q4_q5_k_q8k_activation_pair, .successful_return);
                 return true;
             }
             try linearNoBiasQ4KPrepared(io, input, storage_a.preparedBytes(.row_major_blocks).?, output_a, rows, in_dim, out_dim);
@@ -9746,14 +9753,14 @@ pub fn linearNoBiasQuantizedPair(
                             out_dim,
                             known == .Q5_0 or known == .Q5_1,
                         );
-                        noteNativeQuantDispatch(.legacy_activation_pair);
+                        noteNativeQuantOuterDispatch(.legacy_activation_pair, .successful_return);
                         return true;
                     }
                 }
             }
             if (known == .Q4_0 or known == .Q4_1) {
                 if (!(try projections.applyIndependent(io, input, rows, in_dim, out_dim))) return false;
-                noteNativeQuantDispatch(.legacy_activation_pair);
+                noteNativeQuantOuterDispatch(.legacy_activation_pair, .successful_return);
                 return true;
             }
             if (genericQuantPairDotFn(storage_a.tensor_type)) |dot_fn| {
@@ -9771,7 +9778,7 @@ pub fn linearNoBiasQuantizedPair(
             // Avoid the runtime dot-function pair fallback for Q8_0; use the
             // specialized MR/NR tiled path with one shared worker dispatch.
             try projections.applyQ8_0(allocator, io, input, rows, in_dim, out_dim);
-            noteNativeQuantDispatch(.q8_0_pair);
+            noteNativeQuantOuterDispatch(.q8_0_pair, .successful_return);
             return true;
         } else if (known == .Q8_1) {
             const values_per_block: usize = 32;
@@ -9914,7 +9921,7 @@ fn linearQ4Q5KPreparedQ8KActivationWithBias(
         .known => |known| known,
         else => unreachable,
     });
-    noteNativeQuantDispatch(.q4_q5_k_q8k_activation);
+    noteNativeQuantOuterDispatch(.q4_q5_k_q8k_activation, .successful_return);
     return true;
 }
 
@@ -10028,7 +10035,7 @@ pub fn linearQuantizedTriple(
                     }
                 }
                 // quant-kernel-codegen:end CPU activation linearQuantizedTriple pipeline 1
-                noteNativeQuantDispatch(.q4_q5_k_q8k_activation_triple);
+                noteNativeQuantOuterDispatch(.q4_q5_k_q8k_activation_triple, .successful_return);
                 return true;
             }
             try linearQ4KPreparedTriple(
@@ -10100,7 +10107,7 @@ pub fn linearQuantizedTriple(
             if (bias_a) |bias| addLinearBiasRows(output_a, bias, rows, out_dim);
             if (bias_b) |bias| addLinearBiasRows(output_b, bias, rows, out_dim);
             if (bias_c) |bias| addLinearBiasRows(output_c, bias, rows, out_dim);
-            noteNativeQuantDispatch(.legacy_activation_triple);
+            noteNativeQuantOuterDispatch(.legacy_activation_triple, .successful_return);
             return true;
         }
     }
@@ -10225,7 +10232,7 @@ pub fn linearQuantizedTriple(
                         out_dim,
                         known != .Q4_0,
                     );
-                    noteNativeQuantDispatch(.legacy_activation_triple);
+                    noteNativeQuantOuterDispatch(.legacy_activation_triple, .successful_return);
                     return true;
                 }
             }
@@ -10242,7 +10249,7 @@ pub fn linearQuantizedTriple(
                 return true;
             }
             try projections.applyQ8_0(storage_a.allocator, io, input, rows, in_dim, out_dim);
-            noteNativeQuantDispatch(.q8_0_triple);
+            noteNativeQuantOuterDispatch(.q8_0_triple, .successful_return);
             return true;
         } else if (known == .Q8_1) {
             const values_per_block: usize = 32;
@@ -40288,7 +40295,18 @@ test "q6_q8_k small-row activation quant route is wired" {
             .Q8_K => try linearNoBiasQ8KQ8KActivation(allocator, null, input, storage.raw_bytes, storage.preparedBytes(.panel4), storage.preparedBytes(.panel8), storage.preparedBytes(.panel16), expected, rows, in_dim, out_dim),
             else => unreachable,
         }
+        var observation = @import("../execution/runtime_observation.zig").KernelScope{};
+        observation.begin();
+        defer if (observation.attached) {
+            _ = observation.finish();
+        };
         try std.testing.expect(try linearNoBiasQuantized(null, &storage, input, routed, rows, in_dim, out_dim));
+        _ = observation.finish();
+        const actual_dispatch = observation.native_dispatches;
+        try std.testing.expectEqual(@as(u64, 1), actual_dispatch.total_events);
+        try std.testing.expectEqual(@as(u64, 1), actual_dispatch.successful_return_events);
+        try std.testing.expectEqualStrings(if (known == .Q6_K) "q6_k_q8k_activation" else "q8_k_q8k_activation", actual_dispatch.records[0].family);
+        try std.testing.expect(actual_dispatch.records[0].phase == .successful_return);
         for (routed, expected) |actual, expected_value| try std.testing.expectApproxEqAbs(expected_value, actual, 1e-6);
     }
 }
@@ -54300,3 +54318,58 @@ const NativeOperationProvider = struct {
         // returning; independent prefetch workers keep their existing owner.
     }
 };
+
+const NativeDispatchObservationFixture = struct {
+    fn run(storage: *const QuantizedStorage, input: []const f32, output: []f32) !void {
+        try std.testing.expect(try linearNoBiasQuantizedWithPolicy(.strict_f32, null, storage, input, output, 1, 32, 2));
+        try std.testing.expectEqualSlices(f32, &.{ 32, 64 }, output);
+    }
+    fn nested(inner: @import("../execution/invocation_observation.zig").Binding, storage: *const QuantizedStorage, input: []const f32, output: []f32) !void {
+        try run(storage, input, output);
+        try @import("../execution/invocation_observation.zig").call(inner, run, .{ storage, input, output });
+        try run(storage, input, output);
+    }
+};
+
+test "Native quantized outer dispatch families publish actual Q8 output with nested uniform reports and preserve disabled allocation path" {
+    const a = std.testing.allocator;
+    const invocation = @import("../execution/invocation_observation.zig");
+    const diagnostics = @import("../execution/diagnostics.zig");
+    var raw: [68]u8 = @splat(0);
+    std.mem.writeInt(u16, raw[0..2], @bitCast(@as(f16, 1)), .little);
+    std.mem.writeInt(u16, raw[34..36], @bitCast(@as(f16, 1)), .little);
+    @memset(raw[2..34], 1);
+    @memset(raw[36..68], 2);
+    const shape = [_]i64{ 2, 32 };
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    // All numerical storage is borrowed stack metadata; the actual strict-F32
+    // Q8 path requires no allocation, packing or alternate numerical body.
+    const storage = QuantizedStorage{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = &raw, .raw_owned = false, .shape = &shape, .allocator = failing.allocator() };
+    const input: [32]f32 = @splat(1);
+    var output: [2]f32 = undefined;
+    var outer = diagnostics.Diagnostics{};
+    var inner = diagnostics.Diagnostics{};
+    outer.configure(true);
+    inner.configure(true);
+    const before_legacy = nativeQuantDispatchStats();
+    try invocation.call(invocation.Binding{ .diagnostics = &outer }, NativeDispatchObservationFixture.nested, .{ invocation.Binding{ .diagnostics = &inner }, &storage, @as([]const f32, &input), @as([]f32, &output) });
+    const parent_report = outer.snapshot().?.report.?;
+    const child_report = inner.snapshot().?.report.?;
+    const parent = parent_report.selected_native_dispatches.?;
+    const child = child_report.selected_native_dispatches.?;
+    try std.testing.expectEqual(@as(u64, 3), parent.total_events);
+    try std.testing.expectEqual(@as(u64, 1), child.total_events);
+    try std.testing.expectEqual(@as(u64, 0), parent.before_dispatch_events);
+    try std.testing.expectEqual(@as(u64, 3), parent.successful_return_events);
+    try std.testing.expectEqual(@as(u8, 1), parent.count);
+    try std.testing.expectEqualStrings("q8_0_direct", parent.records[0].family);
+    try std.testing.expect(parent.records[0].phase == .successful_return);
+    try std.testing.expectEqual(@as(u64, 0), parent_report.terminal_native_bodies.?.total_calls);
+    try std.testing.expectEqual(before_legacy.q8_0_direct + 3, nativeQuantDispatchStats().q8_0_direct);
+    outer.configure(false);
+    try invocation.call(invocation.Binding{ .diagnostics = &outer }, NativeDispatchObservationFixture.run, .{ &storage, @as([]const f32, &input), @as([]f32, &output) });
+    try std.testing.expect(outer.snapshot() == null);
+    try std.testing.expectEqual(@as(u64, 3), parent.total_events);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
+    try std.testing.expect(!failing.has_induced_failure);
+}

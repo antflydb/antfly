@@ -260,6 +260,7 @@ const Invocation = struct {
         snapshot.runtime.transfers = self.transfers.measurements();
         snapshot.runtime.resolved_project_metal_dispatches = if (comptime build_options.enable_metal) self.kernels.metal else null;
         snapshot.runtime.terminal_native_bodies = self.kernels.native_bodies;
+        snapshot.runtime.selected_native_dispatches = self.kernels.native_dispatches;
         snapshot.runtime.resolved_project_cuda_launches = self.kernels.finish();
         snapshot.runtime.submission = self.scope.snapshot();
         snapshot.runtime.allocation_owners = self.owners.finish();

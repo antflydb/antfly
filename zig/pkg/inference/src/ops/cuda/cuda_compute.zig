@@ -11450,6 +11450,13 @@ fn weightBf16MirrorForRows(self: *const CudaCompute, weight: *const CudaTensor, 
     return weight.bf16_mirror;
 }
 
+// Pure policy shared by legacy and prepared F32 vendor routes. Generic F32
+// retains its historical zero-workspace policy; qualification grants the
+// configured generic bound, without allocating/growing any backend arena here.
+fn cublasLtF32WorkspaceBytes(self: *const CudaCompute) usize {
+    return if (self.qualified_span_fp32) self.runtime_policy.workspace_bytes else 0;
+}
+
 fn cublasLtWorkspace(self: *CudaCompute) buffer_mod.DeviceBuffer {
     const bytes = self.runtime_policy.workspace_bytes;
     if (bytes == 0) return .{};
@@ -12338,7 +12345,7 @@ fn tryCublasLtF32Linear(
     if ((!self.strict_f32_weights and rows < 128) or in_dim < 64 or out_dim < 64) return false;
     const blas = &(self.cublaslt orelse return false);
     // Reuse the admitted generic workspace policy for qualified F32 plans.
-    const workspace = if (self.qualified_span_fp32) cublasLtWorkspace(self) else buffer_mod.DeviceBuffer{};
+    const workspace = if (cublasLtF32WorkspaceBytes(self) != 0) cublasLtWorkspace(self) else buffer_mod.DeviceBuffer{};
     blas.matmulF32WeightF32OutWithWorkspace(&self.ctx, dst, input, weight, workspace, rows, in_dim, out_dim) catch |err| {
         // A prepared physical capture must preserve its warmed vendor route.
         // Cache eviction/misses decline recording before submission, rather
@@ -30133,6 +30140,7 @@ fn debugTimingSnapshotOp(ctx: *anyopaque) ops.BackendDebugTimingSnapshot {
 }
 
 const kernel_backend_impl: ops.KernelBackend = .{
+    .ownedPayloadServices = &owned_payload_services,
     .physicalReplayReshapeViews = true,
     .physicalExecutionScope = &physicalExecutionScopeOp,
     .allocatePhysicalStorage = &allocatePhysicalStorageOp,
@@ -39176,6 +39184,12 @@ const PreparedCudaProjection = struct {
         if (p.family == .f32) {
             if (cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null and (self.strict_f32_weights or g.rows >= 128) and g.width >= 64 and g.columns >= 64) p.family = .vendor_f32 else if (g.bias) p.family = if (g.rows >= 2 and g.width >= 256 and g.columns >= 4) .f32_bias_tiled else .f32_bias else if (cudaF32LinearTiledEnabled() and g.rows <= 16 and g.width >= 512 and (g.columns >= 512 or (self.a4b_runtime != null and isA4bRouterDecodeShape(g.rows, g.width, g.columns))) and self.kernels.linear_f32_tiled != null) p.family = .f32_tiled;
         }
+        if (p.family == .vendor_f32) {
+            p.vendor_bytes = cublasLtF32WorkspaceBytes(self);
+            // Physical workspace leases are F32-granular. Keep any padding
+            // outside the exact span offered to the vendor plan selector.
+            p.workspace_bytes = (try std.math.add(usize, p.vendor_bytes, 3)) & ~@as(usize, 3);
+        }
         if (p.family == .vendor_bf16 or p.family == .vendor_f16) {
             if (p.family == .vendor_bf16) {
                 p.physical_rows = g.rows;
@@ -39417,7 +39431,12 @@ fn prepareKernelRouteOp(ctx: *anyopaque, request: @import("../../execution/kerne
     owner.* = .{ .allocator = request.allocator, .compute = self, .descriptor = request.descriptor.*, .slot = request.output, .profile = profile };
     const key_fields = [8]u64{ @intCast(profile.geometry.rows), @intCast(profile.geometry.width), @intCast(profile.geometry.columns), @intCast(profile.weight.ptr), @backingInt(profile.family), @intCast(profile.primary_bytes), @intCast(profile.workspace_bytes), @intFromBool(profile.fused_bias) | (@as(u64, @intFromBool(profile.activation_mirror)) << 1) | (if (profile.quantized) |quantized| @as(u64, @backingInt(quantized.kind)) << 8 else @as(u64, 0)) };
     const key = std.hash.Wyhash.hash(0, std.mem.asBytes(&key_fields));
-    return route.Owned{ .context = owner, .implementation = .{ .context = implementation.context, .table = implementation.table, .policy_epoch = key }, .key = key, .requirements = .{ .primary_bytes = profile.primary_bytes, .profile = @backingInt(profile.family), .workspace = .{ .byte_size = profile.workspace_bytes, .alignment = 256 }, .probe_output = if (PreparedCudaProjection.isVendor(profile)) .assigned_unpublished else .none, .capture = .supported }, .vtable = &PreparedCudaProjection.vtable };
+    // Every selected Projection writes F32 into the explicitly assigned dense
+    // primary span; outputBuffer verifies dtype/geometry/authority/disjointness,
+    // and all auxiliary output planes are empty. Padded physical rows remain
+    // in the declared primary span. The source/profile is still invocation-
+    // validated by matches/run; no model Tensor plane inherits this authority.
+    return route.Owned{ .context = owner, .output_plane_metadata = .assigned_dense, .implementation = .{ .context = implementation.context, .table = implementation.table, .policy_epoch = key }, .key = key, .requirements = .{ .primary_bytes = profile.primary_bytes, .profile = @backingInt(profile.family), .workspace = .{ .byte_size = profile.workspace_bytes, .alignment = 256 }, .probe_output = if (PreparedCudaProjection.isVendor(profile)) .assigned_unpublished else .none, .capture = .supported }, .vtable = &PreparedCudaProjection.vtable };
 }
 fn directCudaRouteSupported(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
     // Index metadata gathering and non-projection dots retain their existing
@@ -39456,6 +39475,7 @@ fn initPreparedCudaMetadataFixture(self: *CudaCompute) void {
     self.florence_fused_bias_enabled = false;
     self.florence_f16_weights_enabled = false;
     self.strict_f32_weights = true;
+    self.qualified_span_fp32 = false;
     self.a4b_runtime = null;
     self.cublaslt_bf16_tuning_profile = .off;
     self.cublaslt = @as(cublaslt_mod.CublasLt, undefined);
@@ -43979,4 +43999,616 @@ test "CUDA row selection stats policy is cached at actual construction and ignor
     var actual: ops.WhisperLogitsStatsRaw = undefined;
     try std.testing.expect(device_backend.whisperLogitsStatsRead(0, &actual));
     try std.testing.expectEqual(@as(u32, 3), @as(u32, @bitCast(actual[1])));
+}
+
+// Exact-table backend witness. Generic callers must pass accepts before input
+// or route callbacks: a copied math table cannot inherit CudaTensor casts.
+const owned_payload_services = @import("../kernel_backend.zig").OwnedPayloadServices{
+    .accepts = acceptsPhysicalImplementation,
+    .available = ownedPayloadAvailable,
+    .input = ownedPayloadInput,
+    .route = ownedPayloadRoute,
+};
+fn ownedPayloadAvailable(ctx: *anyopaque) bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    // Init-once owner link, not a mutable capture/mirror/route snapshot.
+    return self.shared_operation_owner != null;
+}
+fn ownedPayloadInput(ctx: *anyopaque, binding: @import("../../execution/kernel_route.zig").Binding, logical: @import("ml").graph.Shape) !bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const known = switch (binding) {
+        .tensor => |value| value,
+        else => return false,
+    };
+    if (known.implementation.context != ctx or !acceptsPhysicalImplementation(known.implementation.table)) return false;
+    if (logical.dtype != .f32 or self.ctx.ctx == null) return false;
+    const tensor = tensorFromCt(known.value);
+    var root = tensor;
+    while (true) {
+        if (root.resident_owner) |origin| if (origin != self) return false;
+        root = root.resident_parent orelse break;
+    }
+    if (root.physical_lease) |lease| if (lease.backend.ptr != ctx or !acceptsPhysicalImplementation(lease.backend.vtable)) return false;
+    if (root.storage_retirement) |cell| {
+        // A strong tensor root pins its live physical payload and independent
+        // endpoint. The endpoint context/device are init-once until that last
+        // physical owner dies; source-context handoff does not rewrite them.
+        const endpoint = if (cell.provider) |*value| value else return false;
+        if (endpoint.ctx != self.ctx.ctx or endpoint.device != self.ctx.device) return false;
+    }
+    if (!PreparedCudaProjection.pinnedWeight(tensor) or tensor.shape.len != logical.rank() or !std.mem.eql(i64, tensor.shape, logical.dims[0..logical.rank()])) return false;
+    // This binding is an immutable model tensor retained by PreparedInvocation.
+    // Reject non-owned mirrors/packing, interior extent errors and unknown spans.
+    const Check = struct {
+        context: driver_mod.CUcontext,
+        valid: bool = true,
+        primary: usize = 0,
+        fn visit(raw: *anyopaque, report: @import("../../execution/storage_ownership.zig").Report) !void {
+            const check: *@This() = @ptrCast(@alignCast(raw));
+            switch (report) {
+                .backing => |span| {
+                    const requested = span.requested_bytes orelse {
+                        check.valid = false;
+                        return;
+                    };
+                    const backing = span.backing_bytes orelse {
+                        check.valid = false;
+                        return;
+                    };
+                    if (span.identity.base == 0 or requested == 0 or requested > backing or span.ownership != .allocation or (span.identity.kind == .cuda and span.identity.context != check.context)) check.valid = false;
+                },
+                .plane => |plane| if (plane.role == .primary) {
+                    check.primary += 1;
+                    if (plane.backing == null or plane.descriptor.current_backend != .cuda or plane.logical_bytes == 0 or plane.readable_bytes < plane.logical_bytes) check.valid = false;
+                },
+            }
+        }
+    };
+    var check = Check{ .context = self.ctx.ctx };
+    const coverage = try storageOwnershipOp(ctx, known.value, .{ .context = &check, .visit = Check.visit });
+    return coverage == .complete and check.valid and check.primary == 1;
+}
+fn ownedPayloadRoute(ctx: *anyopaque, owned: *const @import("../../execution/kernel_route.zig").Owned) bool {
+    if (owned.implementation.context != ctx or !acceptsPhysicalImplementation(owned.implementation.table)) return false;
+    const alignment = buffer_mod.DeviceBuffer.allocation_alignment;
+    const required = owned.requirements;
+    if (required.primary_alignment == 0 or !std.math.isPowerOfTwo(required.primary_alignment) or required.primary_alignment > alignment or required.workspace.alignment == 0 or !std.math.isPowerOfTwo(required.workspace.alignment) or required.workspace.alignment > alignment or required.probe_workspace.alignment == 0 or !std.math.isPowerOfTwo(required.probe_workspace.alignment) or required.probe_workspace.alignment > alignment) return false;
+    if (owned.vtable == &PreparedCudaProjection.vtable) {
+        const projection: *const PreparedCudaProjection = @ptrCast(@alignCast(owned.context));
+        return projection.compute == @as(*CudaCompute, @ptrCast(@alignCast(ctx))) and owned.requirements.primary_bytes == projection.profile.primary_bytes and owned.requirements.workspace.byte_size == projection.profile.workspace_bytes;
+    }
+    if (owned.vtable == &PreparedHostGather.vtable) {
+        const gather: *const PreparedHostGather = @ptrCast(@alignCast(owned.context));
+        const count = gather.descriptor.output_shape.numElements() orelse return false;
+        const expected = std.math.mul(usize, @intCast(count), @sizeOf(f32)) catch return false;
+        return gather.compute == @as(*CudaCompute, @ptrCast(@alignCast(ctx))) and gather.implementation.context == ctx and gather.implementation.table == owned.implementation.table and required.primary_bytes == expected and required.workspace.byte_size == 0 and required.workspace.host_byte_size == 0 and required.probe_workspace.byte_size == 0 and required.probe_workspace.host_byte_size == 0 and required.auxiliaries.count == 0;
+    }
+    if (owned.validation_scope != .prepared_program) return false;
+    return @import("../../execution/assigned_kernel_route.zig").belongsTo(owned, .{ .ptr = ctx, .vtable = @ptrCast(@alignCast(owned.implementation.table)) });
+}
+
+// Test-only cold funding shared by all four real ModelProgram weight formats.
+// The actual SharedBackendContext remains alive independently of the pure Domain.
+const CompleteCudaProgramBudget = struct {
+    const storage = @import("../../execution/storage_admission.zig");
+    const prepared_storage = @import("../../execution/prepared_storage_admission.zig");
+    const memory = @import("../../runtime/tier/memory.zig");
+    const sink = @import("../../execution/retirement_sink.zig");
+    const Domain = @import("../../runtime/tier/admission_domain.zig").Domain;
+    domain: *Domain,
+    retirement: sink.Ref,
+    guard: sink.Guard,
+    epoch: sink.Epoch,
+    source: ?memory.AdmissionLease = null,
+    prepared: ?*prepared_storage.Prepared = null,
+    credit: memory.AdmissionAmounts = .{},
+    limits: memory.Limits = .{},
+    physical: memory.AdmissionAmounts = .{},
+    open: bool = true,
+
+    fn init(pool: *@import("../../execution/physical_buffers.zig").Pool, payload: usize, compute: *CudaCompute) !@This() {
+        const domain = try Domain.create();
+        errdefer domain.release();
+        var retirement = try sink.Ref.create();
+        errdefer retirement.release();
+        var guard = try retirement.enter();
+        errdefer guard.finish();
+        var epoch = try guard.retainEpoch();
+        errdefer epoch.release();
+        var self = @This(){ .domain = domain, .retirement = retirement, .guard = guard, .epoch = epoch };
+        errdefer {
+            if (self.prepared) |value| value.finishInvocationWithBoundary(&self.epoch);
+            if (self.source) |*value| value.release();
+        }
+        var requirements = prepared_storage.Builder{ .allocator = std.testing.allocator };
+        defer requirements.deinit();
+        const identity = storage.Identity{ .controller = &domain.controller, .backend_class = .gpu };
+        const before = compute.ctx.device_allocations.snapshot();
+        // Match real Imported preparation: freeze provider-bounded physical
+        // requirements before collecting unowned spans. Metadata ownership
+        // ends before any quota/lifetime supplier or Prepared bank creation.
+        const frozen_requirement = blk: {
+            const backend = pool.coverage_backend orelse return error.MissingPreparedKernelRoute;
+            var metadata = try @import("../../execution/backend_operation.zig").enter(backend, pool.coverage_graph, null, .metadata);
+            defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            if (metadata.token() == null) return error.PreparedMetadataAuthorityUnavailable;
+            break :blk try pool.storageRequirement();
+        };
+        try pool.collectAdmissionRequirements(&requirements, null, identity);
+        for (requirements.items()) |required| {
+            if (required.backend == .native or required.class == .host_workspace)
+                self.physical.host_scratch_bytes = try std.math.add(usize, self.physical.host_scratch_bytes, required.bytes)
+            else
+                self.physical.backend_scratch_bytes = try std.math.add(usize, self.physical.backend_scratch_bytes, required.bytes);
+        }
+        try std.testing.expectEqualDeep(frozen_requirement, self.physical);
+        try std.testing.expect(self.physical.backend_scratch_bytes > 0);
+        // Exercise the public class-specific formula for EACH actual reduced/
+        // packed physical plan, rather than repeating its arithmetic in a test.
+        const session = @import("../../backends/session.zig");
+        const request = session.RunRequest{ .input_bytes = payload, .backend_input_bytes = payload, .output_bytes = payload };
+        var policy = session.RunAdmission{ .controller = &domain.controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 1024 * 1024 * 1024, .static_workspace_kind = .estimate, .opaque_workspace_bytes = 257, .check_live_memory = false };
+        const plan = try policy.planRequest(request, &.{});
+        try std.testing.expectEqual(payload * 3, plan.protected.host_scratch_bytes);
+        try std.testing.expectEqual(@as(usize, 257), plan.opaque_compatibility.backend_scratch_bytes);
+        policy.static_workspace_kind = .mandatory;
+        const mandatory = try policy.planRequest(request, &.{});
+        try std.testing.expectEqual(@as(usize, 1024 * 1024 * 1024 + 257), mandatory.opaque_compatibility.backend_scratch_bytes);
+        try std.testing.expectEqualDeep(plan.protected, mandatory.protected);
+        policy.static_workspace_kind = .estimate;
+        var explicit = request;
+        explicit.workspace_bytes = 1024;
+        const declared = try policy.planRequest(explicit, &.{});
+        try std.testing.expectEqual(@as(usize, 1281), declared.opaque_compatibility.backend_scratch_bytes);
+        try std.testing.expectEqualDeep(plan.protected, declared.protected);
+        policy.model_profile = .{ .hidden_size = 1 };
+        const profiled = try policy.planRequest(request, &.{});
+        try std.testing.expect(profiled.opaque_compatibility.backend_scratch_bytes > plan.opaque_compatibility.backend_scratch_bytes);
+        try std.testing.expect(profiled.protected.host_scratch_bytes >= plan.protected.host_scratch_bytes);
+        policy.model_profile = .{};
+        var preprocessing = request;
+        preprocessing.host_preprocess_bytes = 17;
+        try std.testing.expectEqual(plan.protected.host_scratch_bytes + 17, (try policy.planRequest(preprocessing, &.{})).protected.host_scratch_bytes);
+        const required = try (try plan.protected.merge(plan.opaque_compatibility)).merge(self.physical);
+        self.limits = .{ .host_limit_bytes = required.hostTotalBytes(), .backend_limit_bytes = required.backendTotalBytes(), .combined_limit_bytes = try std.math.add(usize, required.hostTotalBytes(), required.backendTotalBytes()) };
+        var below = self.limits;
+        below.backend_limit_bytes -= 1;
+        if (domain.controller.tryAcquire(.gpu, below, required, false)) |unexpected| {
+            var owned = unexpected;
+            owned.release();
+            return error.ExpectedPerFormatDeviceCapDenial;
+        } else |err| try std.testing.expectEqual(error.ResourceLimitExceeded, err);
+        try std.testing.expectEqualDeep(before, compute.ctx.device_allocations.snapshot());
+        try std.testing.expectEqual(memory.AdmissionAmounts{}, domain.controller.snapshot());
+        self.source = try domain.controller.tryAcquire(.gpu, self.limits, required, false);
+        self.credit = self.physical; // IO and the opaque floor are NEVER credit.
+        const source_capability = storage.Capability{ .identity = identity, .context = &self, .services = &source_services };
+        self.prepared = (try prepared_storage.Prepared.prepare(source_capability, requirements.items())) orelse return error.MissingPerFormatPreparedBanks;
+        try self.prepared.?.bindConstructionEpoch(&self.epoch);
+        try std.testing.expectEqual(memory.AdmissionAmounts{}, self.credit);
+        try std.testing.expectEqualDeep(before, compute.ctx.device_allocations.snapshot());
+        return self;
+    }
+    const source_services = storage.Capability.VTable{ .reserve = reserve };
+    fn reserve(raw: *anyopaque, allocator: std.mem.Allocator, backend: @import("../../graph/backend_contracts.zig").BackendKind, class: @import("../../execution/storage_accounting.zig").Class, bytes: usize) !storage.Reservation {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return storage.fromRunLease(allocator, &self.source.?, .{ .controller = &self.domain.controller, .backend_class = .gpu, .limits = self.limits, .check_live_memory = false, .lifetime = storage.Lifetime.forAdmissionDomain(.{ .owner = self.domain }), .credit = &self.credit }, backend, class, bytes);
+    }
+    fn capability(self: *@This()) storage.Capability {
+        return prepared_storage.Prepared.forDispatch(self.prepared, .{ .controller = &self.domain.controller, .backend_class = .gpu });
+    }
+    fn cleanup(self: *const @This()) @import("../../execution/cleanup_context.zig").Context {
+        return .{ .boundary = &self.epoch };
+    }
+    fn deinit(self: *@This()) void {
+        if (!self.open) return;
+        self.open = false;
+        if (self.prepared) |value| value.finishInvocationWithBoundary(&self.epoch);
+        self.prepared = null;
+        if (self.source) |*value| value.release();
+        self.source = null;
+        // All actual executable/frame/provider owners have already retired.
+        self.guard.finish();
+        _ = @import("../../execution/resource_retirement.zig").poll();
+        self.epoch.release();
+        self.retirement.release();
+        self.domain.release();
+    }
+    fn finishChecked(self: *@This()) !void {
+        const domain = self.domain.retain();
+        defer domain.release();
+        self.deinit();
+        try std.testing.expectEqual(memory.AdmissionAmounts{}, domain.controller.snapshot());
+    }
+};
+
+// A model Tensor directly consumed by Direct remains input-dependent, even
+// though the same model can feed an explicitly materializing Projection.
+fn qualifyCudaDirectModelTensorTaint(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, weight: CT, width: usize, expected: []const f32) !void {
+    const ml = @import("ml");
+    const program_mod = @import("../../execution/program.zig");
+    const executable_mod = @import("../../execution/executable.zig");
+    const route = @import("../../execution/kernel_route.zig");
+    var graph = ml.graph.Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const model = try builder.parameter("w", ml.graph.Shape.init(.f32, &.{ @intCast(width), @intCast(width) }));
+    const output = try builder.absOp(model);
+    try graph.markOutput(output);
+    var program = try program_mod.ModelProgram.init(allocator, &graph, &.{ .{ .name = "w", .node_id = model, .kind = .weight }, .{ .name = "out", .node_id = output, .kind = .output } });
+    defer program.deinit();
+    const bindings = [_]route.InputBinding{.{ .node_id = program.id_map[model], .value = .{ .tensor = .{ .value = weight, .implementation = .{ .context = backend.ptr, .table = backend.vtable } } } }};
+    var executable = try executable_mod.prepareWithOptions(allocator, &program, backend, .partitioned, .{ .immutable_input_bindings = &bindings });
+    defer executable.deinit();
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const routes = (try pool.prepareRoutes(&.{})) orelse return error.MissingPreparedKernelRoute;
+    defer routes.release();
+    const selection = &routes.pool.selection.?;
+    const selected = selection.routes[program.id_map[output]] orelse return error.MissingDirectModelRoute;
+    try std.testing.expectEqual(route.ValidationScope.invocation, selected.validation_scope);
+    try std.testing.expectEqual(route.OutputPlaneMetadata.input_dependent, selected.output_plane_metadata);
+    try std.testing.expect(!selection.planes_witnessed[program.id_map[model]]);
+    try std.testing.expect(!selection.planes_witnessed[program.id_map[output]]);
+    try std.testing.expect(routes.pool.completeOwnedPayload() == null);
+    try std.testing.expectEqual(@import("../../execution/owned_coverage.zig").Reason.operation, routes.pool.payload_coverage.compatibility);
+    const inputs = [_]@import("../../graph/interpreter.zig").RuntimeInput{.{ .node_id = program.id_map[model], .value = weight, .source_backend = backend }};
+    var result = try executable.run(allocator, .{ .runtime_inputs = &inputs, .prepared_routes = routes });
+    defer result.deinit(&executable.runtime);
+    const values = try backend.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(values);
+    try std.testing.expectEqualSlices(f32, expected, values);
+}
+
+fn qualifyCompleteCudaProgram(comptime format: enum { f32, f16, bf16, q4_0 }, comptime qualified_f32: bool) !void {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const shared = @import("../../backends/compute_context.zig").SharedBackendContext.init(a, .cuda, null) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer shared.release();
+    // Declared before graph/executable owners, so every error path destroys
+    // actual SDK/frame owners BEFORE sealing this exact current cleanup epoch.
+    var budget: ?CompleteCudaProgramBudget = null;
+    defer if (budget) |*value| value.deinit();
+    const compute = shared.ctx.cuda;
+    if (compute.ctx.info.compute_major < 8 or compute.cublaslt == null) return error.SkipZigTest;
+    compute.strict_f32_weights = true;
+    compute.qualified_span_fp32 = qualified_f32;
+    compute.runtime_policy.workspace_bytes = if (qualified_f32) 32 * 1024 * 1024 else 8192;
+    compute.tuned_route_gates.linear_q8_1_dp4a = true;
+    compute.tuned_route_gates.q8_1_prefill_rows = true;
+    compute.tuned_route_gates.q4_0_tc_hmma_prefill = false;
+    const cb = shared.computeBackend();
+    const width = if (format == .q4_0) 256 else 64;
+    const rows = 128;
+    const ml = @import("ml");
+    const Shape = ml.graph.Shape;
+    const executable_mod = @import("../../execution/executable.zig");
+    const Program = @import("../../execution/program.zig").ModelProgram;
+    const Tensor = @import("../../backends/tensor.zig").Tensor;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ rows, width }));
+    const w = try builder.parameter("w", Shape.init(.f32, &.{ width, width }));
+    const first = try builder.linearNoBias(x, w, rows, width, width);
+    var out = try builder.linearNoBias(try builder.absOp(first), w, rows, width, width);
+    for (0..8) |_| out = try builder.add(out, x);
+    try graph.markOutput(out);
+    var program = try Program.init(a, &graph, &.{ .{ .name = "x", .node_id = x, .kind = .input }, .{ .name = "w", .node_id = w, .kind = .weight }, .{ .name = "out", .node_id = out, .kind = .output } });
+    defer program.deinit();
+    var identity: [width * width]f32 = @splat(0);
+    // Q4_0 has an asymmetric signed range: -1 is exact while +1 rounds
+    // down for this block. Use an exactly representable signed identity,
+    // and preserve that sign in the independent scalar oracle below.
+    const projection_sign: f32 = if (format == .q4_0) -1 else 1;
+    for (0..width) |index| identity[index * width + index] = projection_sign;
+    var reduced: [width * width]u16 = undefined;
+    for (identity, &reduced) |value, *bits| bits.* = if (format == .f16) @bitCast(@as(f16, @floatCast(value))) else @truncate(@as(u32, @bitCast(value)) >> 16);
+    const encoded_weight: ?[]u8 = if (format == .q4_0) try quant_codec.quantizeQ4_0FromF32(a, &identity) else null;
+    defer if (encoded_weight) |value| a.free(value);
+    const data = if (encoded_weight) |value| value else if (format == .f32) std.mem.sliceAsBytes(&identity) else std.mem.sliceAsBytes(&reduced);
+    var weight_buffer = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, data.len);
+    var buffer_live = true;
+    defer if (buffer_live) weight_buffer.free(&compute.ctx);
+    try weight_buffer.copyFromHost(&compute.ctx, data);
+    const shape = try a.dupe(i64, &.{ width, width });
+    const weight = createTensorWithDType(compute, weight_buffer, shape, width * width, switch (format) {
+        .f32 => .f32,
+        .f16 => .f16,
+        .bf16 => .bf16,
+        .q4_0 => .u8,
+    }) catch |err| {
+        a.free(shape);
+        return err;
+    };
+    buffer_live = false;
+    defer cb.free(weight);
+    if (format == .q4_0) tensorFromCt(weight).quant_type = .{ .known = .Q4_0 };
+    // CPU codec independently proves the chosen packed signed identity; the numerical
+    // oracle below never calls a CUDA/legacy linear implementation.
+    var decoded: [width * width]f32 = undefined;
+    if (encoded_weight) |value| try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, value, &decoded) else @memcpy(&decoded, &identity);
+    try std.testing.expectEqualSlices(f32, &identity, &decoded);
+    const implementation = @import("../../execution/kernel_route.zig").Implementation{ .context = compute, .table = cb.vtable };
+    const facts = [_]@import("../../execution/kernel_route.zig").InputBinding{.{ .node_id = program.id_map[w], .value = .{ .tensor = .{ .value = weight, .implementation = implementation } } }};
+    var executable = try executable_mod.prepareWithOptions(a, &program, &cb, .partitioned, .{ .immutable_input_bindings = &facts });
+    var executable_live = true;
+    defer if (executable_live) executable.deinitWithCleanup(if (budget) |*value| value.cleanup() else .{});
+    const input_node = program.id_map[x];
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const routes = (try pool.prepareRoutes(&.{.{ .node_id = input_node, .value = .{ .imported_host = .{ .logical = program.graph.node(input_node).output_shape, .target = .cuda, .owned_ingress = true } } }})) orelse return error.MissingPreparedKernelRoute;
+    var routes_live = true;
+    defer if (routes_live) routes.releaseWithCleanup(if (budget) |*value| value.cleanup() else .{});
+    const witness = routes.pool.completeOwnedPayload() orelse {
+        const declined_pool = routes.pool;
+        std.debug.print("CUDA_WITNESS_DECLINE case=model_program format={s} reason={s} root_cuda={} child_cuda={} native={} regions={d} transfers={d} host_inputs={d} replay={}\n", .{ @tagName(format), if (declined_pool.payload_coverage == .compatibility) @tagName(declined_pool.payload_coverage.compatibility) else "complete", executable.runtime.physical_pool.?.cuda_frame_dispatch, declined_pool.cuda_frame_dispatch, declined_pool.native_frame_dispatch, declined_pool.regions.len, declined_pool.plan.transfers.len, declined_pool.host_input_plans.len, declined_pool.replay_backend != null });
+        if (executable.runtime.plan) |dispatch_plan| for (dispatch_plan.base.partitions, 0..) |part, part_index| {
+            std.debug.print("CUDA_WITNESS_PART index={d} backend={s} executor={} device={d} nodes={any}\n", .{ part_index, @tagName(part.backend), part.executor != null, dispatch_plan.device_assignment[part_index], part.node_ids });
+        };
+        return error.MissingCompleteCudaPayload;
+    };
+    try std.testing.expectEqual(.device, witness.accounting_class);
+    try std.testing.expect(witness.operations >= 3);
+    const plane_selection = &routes.pool.selection.?;
+    try std.testing.expect(!plane_selection.planes_witnessed[program.id_map[w]]);
+    const first_projection = plane_selection.routes[program.id_map[first]] orelse return error.MissingProjectionRoute;
+    try std.testing.expectEqual(@import("../../execution/kernel_route.zig").ValidationScope.invocation, first_projection.validation_scope);
+    try std.testing.expectEqual(@import("../../execution/kernel_route.zig").OutputPlaneMetadata.assigned_dense, first_projection.output_plane_metadata);
+    try std.testing.expect(plane_selection.planes_witnessed[program.id_map[first]]);
+    var source_checked = false;
+    for (plane_selection.invocation_nodes) |node| source_checked = source_checked or node == program.id_map[first];
+    try std.testing.expect(source_checked);
+    for (routes.pool.kernels, 0..) |maybe_kernel, node| if (maybe_kernel) |kernel| {
+        if (kernel.descriptor.operation == .unary and kernel.descriptor.operation.unary == .abs) {
+            const activation = plane_selection.routes[node] orelse return error.MissingActivationRoute;
+            try std.testing.expectEqual(@import("../../execution/kernel_route.zig").ValidationScope.prepared_program, activation.validation_scope);
+        }
+    };
+    try std.testing.expect(routes.pool.replay_backend != null);
+    {
+        var numeric = try @import("../../execution/backend_operation.zig").enter(cb, &program.graph, null, .managed);
+        defer numeric.deinitChecked() catch unreachable;
+        const before_busy = compute.ctx.device_allocations.snapshot();
+        const builds_before = pool.variant_cache.?.stats.builds;
+        try std.testing.expectError(error.QueueFull, pool.prepareRoutes(&.{.{ .node_id = input_node, .value = .{ .imported_host = .{ .logical = program.graph.node(input_node).output_shape, .target = .cuda, .owned_ingress = true } } }}));
+        try std.testing.expectEqualDeep(before_busy, compute.ctx.device_allocations.snapshot());
+        try std.testing.expectEqual(builds_before, pool.variant_cache.?.stats.builds);
+        try numeric.finish();
+    }
+
+    if (format == .f16 or format == .bf16 or qualified_f32) {
+        var has_nonzero = false;
+        for (routes.pool.kernels) |maybe| if (maybe) |kernel| if (kernel.descriptor.operation == .linear) {
+            has_nonzero = has_nonzero or kernel.workspace_bytes >= compute.runtime_policy.workspace_bytes;
+        };
+        try std.testing.expect(has_nonzero);
+    }
+    budget = try CompleteCudaProgramBudget.init(routes.pool, rows * width * @sizeOf(f32), compute);
+    const initial_banks = compute.ctx.device_allocations.snapshot();
+    var values: [rows * width]f32 = undefined;
+    for (&values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 9)) - 4)) / 8;
+    var input = try Tensor.initFloat32(a, "x", &.{ rows, width }, &values);
+    var input_live = true;
+    defer if (input_live) input.deinit();
+    const host = [_]@import("../../execution/host_ingress.zig").Input{.{ .node_id = input_node, .value = &input }};
+    const weights = [_]@import("../../graph/interpreter.zig").RuntimeInput{.{ .node_id = program.id_map[w], .value = weight, .source_backend = &cb }};
+    const ordinal_before = compute.temp_trace_seq;
+    const learned_before = compute.temp_arena_planner.observations;
+    var held: ?@import("../../graph/runtime.zig").Result = null;
+    defer if (held) |*value| value.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
+    var captures: u64 = 0;
+    var replays: u64 = 0;
+    for (0..5) |iteration| {
+        for (input.asFloat32Mut(), 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 9)) - 4 + @as(i32, @intCast(iteration)))) / 8;
+        var audit = @import("../../execution/transfer_audit.zig").Audit{ .forbid_device_host_access = true };
+        try @import("../../execution/transfer_audit.zig").begin(&audit);
+        var result = executable.run(a, .{ .runtime_inputs = &weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability(), .collect_partition_stats = true, .activation_readbacks = .forbidden }) catch |err| {
+            @import("../../execution/transfer_audit.zig").end();
+            return err;
+        };
+        @import("../../execution/transfer_audit.zig").end();
+        var result_live = true;
+        defer if (result_live) result.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
+        try std.testing.expectEqual(@as(u64, 1), audit.upload_calls);
+        try std.testing.expectEqual(@as(u64, 0), audit.download_calls);
+        captures += result.stats.physical_graph_captures;
+        replays += result.stats.physical_graph_replays;
+        if (iteration == 0) try std.testing.expect(result.stats.assigned_kernel_dispatches >= 3);
+        const actual = try cb.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        // The original Q4 route quantizes activations to Q8_1 twice. With
+        // unit-range samples, their combined rounding bound is 1/127;
+        // ordinary/reduced identity kernels retain the tighter tolerance.
+        const tolerance: f32 = if (format == .q4_0) 1.0 / 127.0 + 0.002 else 0.002;
+        for (actual, input.asFloat32()) |value, original| try std.testing.expectApproxEqAbs(projection_sign * @abs(original) + 8 * original, value, tolerance);
+        if (iteration == 4) {
+            held = result;
+            result_live = false;
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 1), captures);
+    try std.testing.expect(replays >= 2);
+    try std.testing.expectEqual(ordinal_before, compute.temp_trace_seq);
+    try std.testing.expectEqual(learned_before, compute.temp_arena_planner.observations);
+    try std.testing.expectEqual(@as(usize, 0), compute.cublaslt_workspace_scratch.buffer.len);
+    const bounded = compute.ctx.device_allocations.snapshot();
+    try std.testing.expect(bounded.physical_peak <= @max(initial_banks.physical_peak, initial_banks.physical_live + budget.?.physical.backend_scratch_bytes));
+    // The existing frame is pinned by a real public output. A second frame may
+    // not consume already-moved tokens or silently invoke a producer/SDK alloc.
+    if (executable.run(a, .{ .runtime_inputs = &weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() })) |unexpected| {
+        var owned = unexpected;
+        owned.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
+        return error.ExpectedPerFormatHeldOutputBankRefusal;
+    } else |err| try std.testing.expect(err == error.UnpreparedPhysicalStorageReservation or err == error.PhysicalFrameUnavailable or err == error.QueueFull);
+    try std.testing.expectEqualDeep(bounded, compute.ctx.device_allocations.snapshot());
+    try std.testing.expect(budget.?.domain.controller.snapshot().backend_scratch_bytes >= budget.?.physical.backend_scratch_bytes);
+    held.?.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
+    held = null;
+    var recovery = try executable.run(a, .{ .runtime_inputs = &weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() });
+    var recovery_live = true;
+    defer if (recovery_live) recovery.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
+    {
+        const recovery_values = try cb.toFloat32(recovery.outputs[0], a);
+        defer a.free(recovery_values);
+        const recovery_tolerance: f32 = if (format == .q4_0) 1.0 / 127.0 + 0.002 else 0.002;
+        for (recovery_values, input.asFloat32()) |value, original| try std.testing.expectApproxEqAbs(projection_sign * @abs(original) + 8 * original, value, recovery_tolerance);
+        // One exact CUDA device is already proved by the witness. Keep its actual
+        // process-owned backend value for output cleanup after Runtime teardown.
+        recovery.owner_backend = cb;
+        held = recovery;
+        recovery_live = false;
+        try std.testing.expectEqualDeep(bounded, compute.ctx.device_allocations.snapshot());
+        const before = compute.ctx.device_allocations.snapshot().allocations;
+        const ReplayProbe = struct {
+            var original: @FieldType(driver_mod.CudaDriver.Table, "cuGraphLaunch") = undefined;
+            var calls: std.atomic.Value(usize) = .init(0);
+            fn launch(graph_exec: driver_mod.CUgraphExec, stream: driver_mod.CUstream) callconv(.c) driver_mod.CUresult {
+                _ = calls.fetchAdd(1, .acq_rel);
+                return original(graph_exec, stream);
+            }
+        };
+        ReplayProbe.original = compute.ctx.driver.fns.cuGraphLaunch;
+        ReplayProbe.calls.store(0, .release);
+        compute.ctx.driver.fns.cuGraphLaunch = ReplayProbe.launch;
+        defer compute.ctx.driver.fns.cuGraphLaunch = ReplayProbe.original;
+
+        compute.resident_training_cache = true;
+        defer compute.resident_training_cache = false;
+        if (executable.run(a, .{ .runtime_inputs = &weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() })) |unexpected| {
+            var cleanup = unexpected;
+            cleanup.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
+            return error.ExpectedPreparedPolicyRefusal;
+        } else |err| try std.testing.expect(err == error.PreparedKernelBindingChanged or err == error.InvalidHostIngressBinding);
+        try std.testing.expectEqual(before, compute.ctx.device_allocations.snapshot().allocations);
+        try std.testing.expectEqual(@as(usize, 0), ReplayProbe.calls.load(.acquire));
+        compute.resident_training_cache = false;
+        routes.releaseWithCleanup(budget.?.cleanup());
+        routes_live = false;
+        executable.deinitWithCleanup(budget.?.cleanup());
+        executable_live = false;
+        // Runtime/cache/frame closure cannot refund the physically held output.
+        try std.testing.expect(budget.?.domain.controller.snapshot().backend_scratch_bytes > 257);
+        const after_close = try cb.toFloat32(held.?.outputs[0], a);
+        defer a.free(after_close);
+        try std.testing.expectEqualSlices(f32, recovery_values, after_close);
+    }
+    held.?.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
+    held = null;
+    input.deinit();
+    input_live = false;
+    try budget.?.finishChecked();
+    if (format == .f32) try qualifyCudaDirectModelTensorTaint(a, &cb, weight, width, &identity);
+    {
+        var alias_graph = ml.graph.Graph.init(a);
+        defer alias_graph.deinit();
+        var alias_builder = ml.graph.Builder.init(&alias_graph);
+        const alias_input = try alias_builder.parameter("alias_input", Shape.init(.f32, &.{4}));
+        const alias_out = try alias_builder.reshape(try alias_builder.absOp(alias_input), Shape.init(.f32, &.{ 2, 2 }));
+        try alias_graph.markOutput(alias_out);
+        var alias_program = try Program.init(a, &alias_graph, &.{ .{ .name = "alias_input", .node_id = alias_input, .kind = .input }, .{ .name = "alias_out", .node_id = alias_out, .kind = .output } });
+        defer alias_program.deinit();
+        var alias_executable = try executable_mod.prepare(a, &alias_program, &cb, .partitioned);
+        defer alias_executable.deinit();
+        const alias_node = alias_program.id_map[alias_input];
+        const alias_pool = alias_executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+        const alias_routes = (try alias_pool.prepareRoutes(&.{.{ .node_id = alias_node, .value = .{ .imported_host = .{ .logical = alias_program.graph.node(alias_node).output_shape, .target = .cuda, .owned_ingress = true } } }})) orelse return error.MissingPreparedKernelRoute;
+        defer alias_routes.release();
+        try std.testing.expect(alias_routes.pool.completeOwnedPayload() == null);
+        try std.testing.expectEqual(@import("../../execution/owned_coverage.zig").Reason.alias, alias_routes.pool.payload_coverage.compatibility);
+        var alias_host = try Tensor.initFloat32(a, "alias_input", &.{4}, &.{ -1, 2, -3, 4 });
+        defer alias_host.deinit();
+        const alias_ingress = [_]@import("../../execution/host_ingress.zig").Input{.{ .node_id = alias_node, .value = &alias_host }};
+        var alias_result = try alias_executable.run(a, .{ .host_inputs = &alias_ingress, .prepared_routes = alias_routes });
+        defer alias_result.deinit(&alias_executable.runtime);
+        const alias_actual = try cb.toFloat32(alias_result.outputs[0], a);
+        defer a.free(alias_actual);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, alias_actual);
+        const unknown = (try alias_pool.prepareRoutes(&.{.{ .node_id = alias_node, .value = .unknown }})) orelse return error.MissingPreparedKernelRoute;
+        defer unknown.release();
+        try std.testing.expect(unknown.pool.completeOwnedPayload() == null);
+    }
+}
+test "complete CUDA ModelProgram assigned routes capture F32 reduced and packed input-aware storage with an independent oracle" {
+    inline for (.{ .f32, .f16, .bf16, .q4_0 }) |format| try qualifyCompleteCudaProgram(format, false);
+    // Also exercise the qualified legacy F32 workspace allowance through
+    // real assigned storage, exact admission boundaries and graph capture.
+    try qualifyCompleteCudaProgram(.f32, true);
+}
+
+test "complete CUDA payload service vetoes copied custom tables before any context or tensor cast" {
+    var copied = vtable;
+    copied.kernels = &kernel_backend_impl;
+    const backend = ops.ComputeBackend{ .ptr = @ptrFromInt(8), .vtable = &copied };
+    try std.testing.expect(@import("../../execution/cuda_owned_coverage.zig").services(backend) == null);
+    const unused_pool: @import("../../execution/physical_buffers.zig").Pool = undefined;
+    const result = @import("../../execution/cuda_owned_coverage.zig").assess(&unused_pool, backend, null);
+    try std.testing.expectEqual(@import("../../execution/owned_coverage.zig").Coverage{ .compatibility = .execution_path }, result);
+}
+
+test "CUDA prepared F32 vendor metadata preserves qualified workspace policy and generic zero workspace without a device" {
+    if (!cudaCublasLtEnabled()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const route = @import("../../execution/kernel_route.zig");
+    const Shape = @import("ml").graph.Shape;
+    inline for (.{ @as(usize, 3), @as(usize, 128) }) |rows| inline for (.{ false, true }) |with_bias| {
+        var compute: CudaCompute = undefined;
+        initPreparedCudaMetadataFixture(&compute);
+        compute.cublaslt_workspace_scratch = .{};
+        var weight_dims = [_]i64{ 96, 64 };
+        var bias_dims = [_]i64{96};
+        var weight = CudaTensor{ .buffer = .{ .ptr = 4096, .len = 96 * 64 * 4, .allocation_bytes = 96 * 64 * 4 }, .dtype = .f32, .shape = &weight_dims, .elem_count = 96 * 64 };
+        var bias = CudaTensor{ .buffer = .{ .ptr = 65536, .len = 96 * 4, .allocation_bytes = 96 * 4 }, .dtype = .f32, .shape = &bias_dims, .elem_count = 96 };
+        const input_shape = Shape.init(.f32, &.{ @as(i64, @intCast(rows)), 64 });
+        const output_shape = Shape.init(.f32, &.{ @as(i64, @intCast(rows)), 96 });
+        const descriptor = ops.kernel_descriptor.Descriptor{ .operation = .{ .linear = .{ .rows = rows, .in_dim = 64, .out_dim = 96, .bias = with_bias } }, .input_count = if (with_bias) 3 else 2, .input_shapes = .{ input_shape, Shape.init(.f32, &.{ 96, 64 }), Shape.init(.f32, &.{96}) }, .output_shape = output_shape };
+        const bindings = [_]route.Binding{
+            .{ .imported_host = .{ .logical = input_shape, .target = .cuda } },
+            .{ .tensor = .{ .value = @ptrCast(&weight), .implementation = .{ .context = &compute, .table = &vtable } } },
+            .{ .tensor = .{ .value = @ptrCast(&bias), .implementation = .{ .context = &compute, .table = &vtable } } },
+        };
+        const slot = route.OutputSlot{ .allocation = 0, .node = 3, .epoch = 0, .logical = output_shape, .writable_bytes = 0 };
+        const inputs = bindings[0..descriptor.input_count];
+        const request = route.Prepare{ .allocator = a, .implementation = .{ .context = &compute, .table = &vtable }, .descriptor = &descriptor, .inputs = inputs, .output = slot };
+        for ([_]usize{ 0, 4096, 4097, 8192, 32 * 1024 * 1024 }) |budget| {
+            compute.runtime_policy.workspace_bytes = budget;
+            compute.qualified_span_fp32 = false;
+            var generic = (try prepareKernelRouteOp(&compute, request)) orelse return error.MissingGenericF32VendorRoute;
+            defer generic.deinit();
+            const generic_owner: *const PreparedCudaProjection = @ptrCast(@alignCast(generic.context));
+            try std.testing.expect(generic_owner.profile.family == .vendor_f32);
+            try std.testing.expectEqual(@as(usize, 0), generic.requirements.workspace.byte_size);
+            try std.testing.expectEqual(@as(usize, 0), generic_owner.profile.vendor_bytes);
+            compute.qualified_span_fp32 = true;
+            var qualified = (try prepareKernelRouteOp(&compute, request)) orelse return error.MissingQualifiedF32VendorRoute;
+            defer qualified.deinit();
+            const owner: *const PreparedCudaProjection = @ptrCast(@alignCast(qualified.context));
+            try std.testing.expect(owner.profile.family == .vendor_f32);
+            try std.testing.expectEqual(rows * 96 * 4, qualified.requirements.primary_bytes);
+            try std.testing.expectEqual((budget + 3) & ~@as(usize, 3), qualified.requirements.workspace.byte_size);
+            try std.testing.expectEqual(budget, owner.profile.vendor_bytes);
+            try std.testing.expectEqual(@as(usize, 0), owner.profile.conversion_bytes);
+            try std.testing.expectEqual(@as(usize, 0), owner.profile.vendor_offset);
+            try std.testing.expectEqual(rows, owner.profile.physical_rows);
+            try std.testing.expect(!owner.profile.activation_mirror and !owner.profile.fused_bias and !owner.profile.tuning.enabled);
+            try std.testing.expectEqual(@as(u32, 256), qualified.requirements.workspace.alignment);
+            try std.testing.expectEqual(@as(usize, 0), compute.cublaslt_workspace_scratch.buffer.len);
+            try qualified.validate(.{ .inputs = inputs, .output = slot });
+            if (budget != 0) {
+                try std.testing.expect(generic.key != qualified.key);
+                try std.testing.expectError(error.PreparedKernelBindingChanged, generic.validate(.{ .inputs = inputs, .output = slot }));
+                compute.qualified_span_fp32 = false;
+                try std.testing.expectError(error.PreparedKernelBindingChanged, qualified.validate(.{ .inputs = inputs, .output = slot }));
+                try generic.validate(.{ .inputs = inputs, .output = slot });
+                compute.qualified_span_fp32 = true;
+            } else try std.testing.expectEqual(generic.key, qualified.key);
+            //4097→4098 keeps the same rounded lease size; vendor-byte
+            // equivalence must still reject the changed exact policy.
+            compute.runtime_policy.workspace_bytes = if (budget == 4097) 4098 else if (budget == 4096) 8192 else 4096;
+            try std.testing.expectError(error.PreparedKernelBindingChanged, qualified.validate(.{ .inputs = inputs, .output = slot }));
+            compute.qualified_span_fp32 = false;
+            try generic.validate(.{ .inputs = inputs, .output = slot });
+        }
+    };
 }

@@ -236,6 +236,7 @@ pub const KernelScope = struct {
     values: Kernels = .{},
     metal: MetalDispatches = .{},
     native_bodies: NativeBodies = .{},
+    native_dispatches: NativeDispatches = .{},
     attached: bool = false,
     /// Must be called only after the owner reaches final address-stable storage.
     pub fn begin(self: *KernelScope) void {
@@ -387,4 +388,94 @@ test "Metal dispatch bridge links without SDK work and restores nested and forei
     root.begin();
     _ = root.finish();
     try std.testing.expect(termite_metal_observation_exchange_dispatch_sink(null) == null);
+}
+
+/// Existing outer dispatch note sites have explicit phase units. A note before
+/// a fallible call is not a completed body, and a successful outer return does
+/// not enumerate subordinate vendor kernels or independently submitting workers.
+pub const NativeDispatchPhase = enum { before_dispatch, successful_return };
+pub const NativeDispatch = struct {
+    /// Compiler-owned enum tag text, never a borrow from caller data.
+    family: []const u8 = "",
+    phase: NativeDispatchPhase = .before_dispatch,
+    events: u64 = 0,
+};
+pub const NativeDispatches = struct {
+    scope: enum { submitting_thread_outer_quantized_dispatch_notes } = .submitting_thread_outer_quantized_dispatch_notes,
+    unit: enum { phased_note_events_not_terminal_body_or_worker_counts } = .phased_note_events_not_terminal_body_or_worker_counts,
+    coverage: enum { excludes_unnoted_branches_and_inner_microkernel_counters } = .excludes_unnoted_branches_and_inner_microkernel_counters,
+    label_source: enum { native_outer_dispatch_note_tags } = .native_outer_dispatch_note_tags,
+    resolved_terminal_schedule_identity: enum { unavailable } = .unavailable,
+    independent_worker_dispatches: enum { unobserved } = .unobserved,
+    vendor_internals: enum { opaque_vendor } = .opaque_vendor,
+    records: [8]NativeDispatch = @splat(.{}),
+    count: u8 = 0,
+    total_events: u64 = 0,
+    before_dispatch_events: u64 = 0,
+    successful_return_events: u64 = 0,
+    truncated: bool = false,
+    unrecorded_events: u64 = 0,
+};
+
+pub inline fn nativeDispatchFamily(kind: anytype, phase: NativeDispatchPhase) void {
+    if (active_kernels == null) return;
+    nativeDispatchFamilyEnabled(@tagName(kind), phase);
+}
+noinline fn nativeDispatchFamilyEnabled(family: []const u8, phase: NativeDispatchPhase) void {
+    var active = active_kernels;
+    while (active) |scope| : (active = scope.previous) {
+        const values = &scope.native_dispatches;
+        values.total_events +|= 1;
+        switch (phase) {
+            .before_dispatch => values.before_dispatch_events +|= 1,
+            .successful_return => values.successful_return_events +|= 1,
+        }
+        var found: ?*NativeDispatch = null;
+        for (values.records[0..values.count]) |*record| if (record.phase == phase and @import("std").mem.eql(u8, record.family, family)) {
+            found = record;
+            break;
+        };
+        if (found == null) {
+            if (values.count == values.records.len) {
+                values.truncated = true;
+                values.unrecorded_events +|= 1;
+                continue;
+            }
+            found = &values.records[values.count];
+            values.count += 1;
+            found.?.* = .{ .family = family, .phase = phase };
+        }
+        found.?.events +|= 1;
+    }
+}
+
+test "Native outer dispatch note scopes preserve phases nesting truncation and detached path" {
+    const std = @import("std");
+    const Family = enum { same_family, family_a, family_b, family_c, family_d, family_e, family_f, family_g };
+    var outer = KernelScope{};
+    outer.begin();
+    defer if (outer.attached) {
+        _ = outer.finish();
+    };
+    nativeDispatchFamily(Family.same_family, .before_dispatch);
+    var inner = KernelScope{};
+    inner.begin();
+    defer if (inner.attached) {
+        _ = inner.finish();
+    };
+    nativeDispatchFamily(Family.same_family, .successful_return);
+    _ = inner.finish();
+    try std.testing.expectEqual(@as(u64, 1), inner.native_dispatches.total_events);
+    try std.testing.expectEqual(@as(u64, 2), outer.native_dispatches.total_events);
+    try std.testing.expectEqual(@as(u8, 2), outer.native_dispatches.count);
+    inline for (.{ Family.family_a, Family.family_b, Family.family_c, Family.family_d, Family.family_e, Family.family_f, Family.family_g }) |kind| nativeDispatchFamily(kind, .before_dispatch);
+    _ = outer.finish();
+    try std.testing.expectEqual(@as(u64, 9), outer.native_dispatches.total_events);
+    try std.testing.expectEqual(@as(u64, 8), outer.native_dispatches.before_dispatch_events);
+    try std.testing.expectEqual(@as(u64, 1), outer.native_dispatches.successful_return_events);
+    try std.testing.expect(outer.native_dispatches.truncated);
+    try std.testing.expectEqual(@as(u64, 1), outer.native_dispatches.unrecorded_events);
+    nativeDispatchFamily(Family.same_family, .successful_return);
+    try std.testing.expect(active_kernels == null);
+    try std.testing.expectEqual(@as(u64, 9), outer.native_dispatches.total_events);
 }

@@ -12,7 +12,7 @@ const ops = @import("../ops/ops.zig");
 const native = @import("../ops/native_compute.zig");
 const ml = @import("ml");
 pub const Reason = enum { no_selected_routes, execution_path, backend_region, transfer, input_representation, literal, alias, output_publication, operation, workspace };
-pub const Complete = struct { epoch: u64, operations: usize = 0, aliases: usize = 0, literals: usize = 0 };
+pub const Complete = struct { accounting_class: enum { host, device } = .host, epoch: u64, operations: usize = 0, aliases: usize = 0, literals: usize = 0 };
 pub const Coverage = union(enum) { compatibility: Reason, complete: Complete };
 
 fn canonical(backend: ops.ComputeBackend) bool {
@@ -140,6 +140,7 @@ fn nativeInputPlan(pool: *const physical.Pool, plan: anytype, target: ops.Comput
 pub fn assess(pool: *const physical.Pool) Coverage {
     const selected = if (pool.selection) |*value| value else return .{ .compatibility = .no_selected_routes };
     const target_backend = pool.coverage_backend orelse return .{ .compatibility = .execution_path };
+    if (@import("cuda_owned_coverage.zig").services(target_backend) != null) return @import("cuda_owned_coverage.zig").assess(pool, target_backend, null);
     if (!canonical(target_backend)) return .{ .compatibility = .execution_path };
     const graph = pool.coverage_graph orelse return .{ .compatibility = .execution_path };
     const reachable = pool.coverage_reachable orelse return .{ .compatibility = .execution_path };
@@ -179,7 +180,10 @@ pub fn assess(pool: *const physical.Pool) Coverage {
                 if (borrowed) return .{ .compatibility = .alias };
                 if (node.num_inputs != 1 or id >= selected.plane_counts.len or selected.plane_counts[id] != 1) return .{ .compatibility = .alias };
                 var exact_alias = false;
-                for (pool.metadata_aliases, 0..) |alias, alias_index| if (alias.node == id and alias.source == node.inputs[0] and selected.alias_enabled[alias_index]) { exact_alias = true; break; };
+                for (pool.metadata_aliases, 0..) |alias, alias_index| if (alias.node == id and alias.source == node.inputs[0] and selected.alias_enabled[alias_index]) {
+                    exact_alias = true;
+                    break;
+                };
                 if (!exact_alias) return .{ .compatibility = .alias };
                 const source = slot.source_slot orelse return .{ .compatibility = .alias };
                 if (source >= pool.plan.slots.len or pool.plan.slots[source].node_id != node.inputs[0]) return .{ .compatibility = .alias };

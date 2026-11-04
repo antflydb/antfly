@@ -1084,6 +1084,25 @@ pub const MetalTensor = struct {
         return self.device != null;
     }
 
+    /// An allocating Ref on the exact model-pinned shared runtime can outlive
+    /// its request Engine without any byte copy. External/frame aliases and
+    /// physical Lease roots need a separate backend-lifetime proof and decline.
+    fn hasStatelessProcessMetadata(allocator: std.mem.Allocator) bool {
+        // These exact implementations ignore ptr and own process-global state.
+        // Never inspect ptr: the standard stateless allocators leave it undefined.
+        // Compare PageAllocator directly; std.heap.page_allocator can be overridden
+        // by a root allocator which has an independent owner lifetime.
+        if (comptime @import("builtin").link_libc) if (allocator.vtable == std.heap.c_allocator.vtable) return true;
+        return allocator.vtable == &std.heap.PageAllocator.vtable or allocator.vtable == &std.heap.SmpAllocator.vtable;
+    }
+    pub fn canDetachDenseF32Allocation(self: *const MetalTensor, runtime: *anyopaque) bool {
+        const device = self.device orelse return false;
+        const ref = device.ref;
+        return hasStatelessProcessMetadata(ref.allocator) and self.dtype == .f32 and ref.runtime == runtime and !ref.released and
+            ref.ref_count.load(.acquire) != 0 and ref.release_on_drop and ref.recycle_on_drop and
+            ref.physical_lease == null and ref.write_owner == null;
+    }
+
     pub fn isOwnedDeviceBuffer(self: *const MetalTensor) bool {
         const d = self.device orelse return false;
         if (d.ref.released or d.ref.ref_count.load(.acquire) == 0) return false;
@@ -1558,4 +1577,28 @@ test "Metal source write versions become permanently unknown at exhaustion throu
     }
     try std.testing.expectEqual(std.math.maxInt(u64), owner.write_generation.load(.acquire));
     try std.testing.expectEqual(@as(?u64, null), owner.generation());
+}
+
+test "dense detached Ref metadata accepts exact stateless process allocators and declines owner allocators" {
+    const runtime: *anyopaque = @ptrFromInt(16);
+    var ref = DeviceBufferRef{ .handle = @ptrFromInt(32), .runtime = runtime, .byte_len = 16, .ref_count = .init(1), .released = false, .release_on_drop = true };
+    const tensor = MetalTensor.deviceView(&ref, 0, 16, &.{4}, .f32);
+    try std.testing.expect(tensor.canDetachDenseF32Allocation(runtime));
+    ref.allocator = .{ .ptr = undefined, .vtable = &std.heap.PageAllocator.vtable };
+    try std.testing.expect(tensor.canDetachDenseF32Allocation(runtime));
+    ref.allocator = std.heap.smp_allocator;
+    try std.testing.expect(tensor.canDetachDenseF32Allocation(runtime));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    ref.allocator = arena.allocator();
+    try std.testing.expect(!tensor.canDetachDenseF32Allocation(runtime));
+    ref.allocator = std.testing.allocator;
+    try std.testing.expect(!tensor.canDetachDenseF32Allocation(runtime));
+    ref.allocator = std.heap.c_allocator;
+    try std.testing.expect(!tensor.canDetachDenseF32Allocation(@ptrFromInt(64)));
+    ref.recycle_on_drop = false;
+    try std.testing.expect(!tensor.canDetachDenseF32Allocation(runtime));
+    ref.recycle_on_drop = true;
+    ref.release_on_drop = false;
+    try std.testing.expect(!tensor.canDetachDenseF32Allocation(runtime));
 }

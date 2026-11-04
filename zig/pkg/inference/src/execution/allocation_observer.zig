@@ -40,6 +40,58 @@ pub const State = struct {
     mutex: std.atomic.Mutex = .unlocked,
     records: std.AutoHashMapUnmanaged(usize, usize) = .empty,
     usage: Snapshot = .{},
+    intervals: ?*Interval = null,
+
+    /// Stable metadata: independently allocated, or borrowed at its final
+    /// address until finish. Includes all activity on this owner, including
+    /// concurrent callers, from registration
+    /// until finish; it is neither an isolated request nor whole-process peak.
+    pub const Interval = struct {
+        owner: *State,
+        next: ?*Interval,
+        before: Snapshot,
+        peak: u64,
+        heap_owned: bool,
+
+        pub const Result = struct { usage: Snapshot, peak: u64 };
+
+        pub fn finish(self: *Interval) Result {
+            const owner = self.owner;
+            platform.sync.lockYielding(&owner.mutex);
+            var link = &owner.intervals;
+            while (link.* != self) link = &link.*.?.next;
+            link.* = self.next;
+            const result = Result{ .usage = owner.usage.since(self.before), .peak = self.peak };
+            // Metadata may be a non-thread-safe independent allocator. Use
+            // the same lock as record bookkeeping for allocation and release.
+            if (self.heap_owned) owner.metadata.destroy(self);
+            owner.mutex.unlock();
+            owner.release();
+            return result;
+        }
+    };
+
+    pub fn beginInterval(self: *State) !*Interval {
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const interval = try self.metadata.create(Interval);
+        self.beginIntervalLocked(interval, true);
+        return interval;
+    }
+
+    /// Caller supplies an unlinked node at its final address, valid until its
+    /// single finish call. Registration retains State and never allocates.
+    pub fn beginIntervalInto(self: *State, interval: *Interval) void {
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        self.beginIntervalLocked(interval, false);
+    }
+
+    fn beginIntervalLocked(self: *State, interval: *Interval, heap_owned: bool) void {
+        _ = self.retain();
+        interval.* = .{ .owner = self, .next = self.intervals, .before = self.usage, .peak = self.usage.requested_live_bytes, .heap_owned = heap_owned };
+        self.intervals = interval;
+    }
 
     pub fn create(backing: std.mem.Allocator, coverage: Coverage) !*State {
         return createWithMetadata(backing, platform.allocator.processAllocator(platform.allocator.concurrentFallback()), coverage);
@@ -74,6 +126,7 @@ pub const State = struct {
     pub fn release(self: *State) void {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
         std.debug.assert(self.records.count() == 0);
+        std.debug.assert(self.intervals == null);
         const metadata = self.metadata;
         const parent_owner = self.parent_owner;
         self.records.deinit(metadata);
@@ -95,6 +148,9 @@ pub const State = struct {
         self.usage.requested_live_bytes -= before;
         self.usage.requested_live_bytes += after;
         self.usage.requested_lifetime_peak_bytes = @max(self.usage.requested_lifetime_peak_bytes, self.usage.requested_live_bytes);
+        var interval = self.intervals;
+        while (interval) |value| : (interval = value.next)
+            value.peak = @max(value.peak, self.usage.requested_live_bytes);
     }
 
     fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
@@ -178,6 +234,71 @@ test "observed compute allocations retain their owner and forward earlier spans"
     // Drop the compute owner before the allocation it published is retired.
     state.release();
     observed.free(current);
+}
+
+test "owner intervals measure transient peaks independently of lifetime and nested intervals" {
+    const a = std.testing.allocator;
+    const owner = try State.createWithMetadata(a, a, .from_owner_creation);
+    defer owner.release();
+    const allocator = owner.allocator();
+    const historical = try allocator.alloc(u8, 1024);
+    allocator.free(historical);
+    const outer = try owner.beginInterval();
+    const first = try allocator.alloc(u8, 23);
+    const inner = try owner.beginInterval();
+    const second = try allocator.alloc(u8, 41);
+    allocator.free(second);
+    const nested = inner.finish();
+    try std.testing.expectEqual(@as(u64, 64), nested.peak);
+    try std.testing.expectEqual(@as(u64, 23), nested.usage.requested_live_bytes);
+    try std.testing.expectEqual(@as(u64, 1), nested.usage.allocations);
+    const last = try allocator.alloc(u8, 101);
+    allocator.free(first);
+    allocator.free(last);
+    const measured = outer.finish();
+    try std.testing.expectEqual(@as(u64, 124), measured.peak);
+    try std.testing.expectEqual(@as(u64, 0), measured.usage.requested_live_bytes);
+    try std.testing.expectEqual(@as(u64, 1024), measured.usage.requested_lifetime_peak_bytes);
+    try std.testing.expectEqual(@as(u64, 3), measured.usage.allocations);
+    try std.testing.expectEqual(@as(u64, 64), nested.peak);
+}
+
+test "owner interval tracks resize remap and survives retired caller ownership" {
+    var buffer: [8192]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    const owner = try State.createWithMetadata(fixed.allocator(), std.testing.allocator, .from_owner_creation);
+    const allocator = owner.allocator();
+    var bytes = try allocator.alloc(u8, 32);
+    const interval = try owner.beginInterval();
+    try std.testing.expect(allocator.resize(bytes, 96));
+    bytes = bytes.ptr[0..96];
+    bytes = allocator.remap(bytes, 160) orelse return error.ExpectedRemap;
+    owner.release();
+    allocator.free(bytes);
+    const result = interval.finish();
+    try std.testing.expectEqual(@as(u64, 160), result.peak);
+    try std.testing.expectEqual(@as(u64, 0), result.usage.requested_live_bytes);
+    try std.testing.expectEqual(@as(u64, 1), result.usage.resizes);
+    try std.testing.expectEqual(@as(u64, 1), result.usage.remaps);
+}
+
+test "owner interval explicitly includes another thread using the registered allocator" {
+    const a = std.testing.allocator;
+    const owner = try State.createWithMetadata(a, a, .from_owner_creation);
+    defer owner.release();
+    const interval = try owner.beginInterval();
+    const Work = struct {
+        fn run(allocator: std.mem.Allocator) void {
+            const bytes = allocator.alloc(u8, 73) catch @panic("allocation failed");
+            allocator.free(bytes);
+        }
+    };
+    const worker = try std.Thread.spawn(.{}, Work.run, .{owner.allocator()});
+    worker.join();
+    const result = interval.finish();
+    try std.testing.expectEqual(@as(u64, 73), result.peak);
+    try std.testing.expectEqual(@as(u64, 1), result.usage.allocations);
+    try std.testing.expectEqual(@as(u64, 0), result.usage.requested_live_bytes);
 }
 
 test "observed compute allocation bookkeeping is failure atomic" {
@@ -273,4 +394,36 @@ test "nested observed owners retain parent identity without counting metadata as
     child.allocator().free(bytes);
     try std.testing.expectEqual(@as(u64, 0), child.parent().?.snapshot().requested_live_bytes);
     try std.testing.expectEqual(@as(u64, 29), child.snapshot().requested_lifetime_peak_bytes);
+}
+
+test "borrowed owner interval retains metadata after caller retirement and observes transient peak" {
+    const a = std.testing.allocator;
+    const owner = try State.createWithMetadata(a, a, .from_owner_creation);
+    var owner_live = true;
+    defer if (owner_live) owner.release();
+    const allocator = owner.allocator();
+    const first = try allocator.alloc(u8, 23);
+    var first_live = true;
+    defer if (first_live) allocator.free(first);
+    var interval: State.Interval = undefined;
+    owner.beginIntervalInto(&interval);
+    var attached = true;
+    defer if (attached) {
+        _ = interval.finish();
+    };
+    try std.testing.expect(!interval.heap_owned);
+    const second = try allocator.alloc(u8, 41);
+    allocator.free(second);
+    owner.release();
+    owner_live = false;
+    allocator.free(first);
+    first_live = false;
+    // The subscription is the last State owner; finish must unlink first and
+    // may destroy State without attempting to destroy this borrowed stack node.
+    const observed = interval.finish();
+    attached = false;
+    try std.testing.expectEqual(@as(u64, 64), observed.peak);
+    try std.testing.expectEqual(@as(u64, 0), observed.usage.requested_live_bytes);
+    try std.testing.expectEqual(@as(u64, 1), observed.usage.allocations);
+    try std.testing.expectEqual(@as(u64, 2), observed.usage.frees);
 }

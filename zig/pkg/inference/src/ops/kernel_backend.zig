@@ -19,6 +19,14 @@
 const CT = @import("../graph/backend_contracts.zig").CT;
 const kernel_descriptor = @import("kernel_descriptor.zig");
 const physical_storage = @import("physical_storage.zig");
+/// Optional complete project-payload proof, with a full-table veto before any
+/// concrete context/tensor callback. Does not bound driver-private memory.
+pub const OwnedPayloadServices = struct {
+    accepts: *const fn (*const anyopaque) bool,
+    available: *const fn (*anyopaque) bool,
+    input: *const fn (*anyopaque, @import("../execution/kernel_route.zig").Binding, @import("ml").graph.Shape) anyerror!bool,
+    route: *const fn (*anyopaque, *const @import("../execution/kernel_route.zig").Owned) bool,
+};
 pub const VTable = struct {
     /// Canonical full compute-table identity. Copying ordinary math callbacks
     /// does not silently inherit an equivalent native physical program.
@@ -28,6 +36,7 @@ pub const VTable = struct {
         return self.implementation_table == null;
     }
     implementation_table: ?*const anyopaque = null,
+    ownedPayloadServices: ?*const OwnedPayloadServices = null,
     /// Known canonical ownership facades may change only lifetime callbacks.
     /// This allowlist never accepts arbitrary copies of a math table.
     acceptsImplementation: ?*const fn (*const anyopaque) bool = null,

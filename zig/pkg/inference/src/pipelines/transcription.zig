@@ -301,13 +301,16 @@ pub const TranscriptionPipeline = struct {
         var mel_tensor = try backends.Tensor.initFloat32(allocator, "input_features", &mel_shape, mel);
         defer mel_tensor.deinit();
         const RootInput = @import("../execution/owned_incremental_input.zig");
-        const receiver = if (self.incremental_cleanup_contract == .no_enclosing_lanes and self.encoder.backend() == .cuda and self.decoder.backend() == .cuda and (self.encoder.ptr != self.decoder.ptr or self.encoder.vtable != self.decoder.vtable))
+        const receiver = if (self.incremental_cleanup_contract == .no_enclosing_lanes and
+            (self.encoder.backend() == .cuda or (self.encoder.backend() == .metal and self.execution_control != null)) and
+            self.decoder.backend() == self.encoder.backend() and (self.encoder.ptr != self.decoder.ptr or self.encoder.vtable != self.decoder.vtable))
             @import("../execution/architecture_session.zig").IncrementalDecoderAdapter.qualify(self.encoder, self.decoder)
         else
             null;
         const supervised_async = if (self.execution_control) |active| active.native_call_policy == .require_supervision and active.deadline_ns != null else false;
         const async_root = if (receiver) |value| supervised_async and value.backend == .cuda and !value.same_model_owner else false;
-        var input_cleanup: RootInput.Cleanup = if (self.incremental_cleanup_contract == .no_enclosing_lanes and async_root)
+        const foreign_metal_root = if (receiver) |value| value.backend == .metal and !value.same_model_owner else false;
+        var input_cleanup: RootInput.Cleanup = if (self.incremental_cleanup_contract == .no_enclosing_lanes and (async_root or foreign_metal_root))
             try RootInput.Cleanup.beginTaskWithoutEnclosingLanes(self.execution_control)
         else
             .unqualified;

@@ -60,6 +60,7 @@ pub const speculative_activation = @import("speculative_activation.zig");
 test {
     _ = @import("../backends/compute_factory.zig");
     _ = @import("decoder_forward.zig");
+    _ = @import("decoder_storage.zig");
     _ = @import("executable.zig");
     _ = @import("diagnostics.zig");
     _ = @import("runtime_observation.zig");
@@ -100,6 +101,12 @@ test {
 }
 
 pub const backend_operation = @import("backend_operation.zig");
+test {
+    _ = @import("allocation_observer.zig");
+    _ = @import("allocation_registry.zig");
+    _ = @import("invocation_report.zig");
+}
+
 test {
     _ = backend_operation;
 }

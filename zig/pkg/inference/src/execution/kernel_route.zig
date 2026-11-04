@@ -130,6 +130,13 @@ pub const ValidationScope = enum {
     prepared_program,
 };
 
+/// Layout of a materialized assigned output, independent of input values and
+/// live numerical profile. This never certifies a model Tensor's own planes or
+/// permits skipping the producer's invocation validation. Default propagation
+/// retains input-dependent taint. Explicit providers guarantee dense primary
+/// plus EVERY declared auxiliary, with no hidden output mirrors/aliases.
+pub const OutputPlaneMetadata = enum { input_dependent, assigned_dense };
+
 pub const Owned = struct {
     context: *anyopaque,
     implementation: Implementation,
@@ -138,6 +145,7 @@ pub const Owned = struct {
     key: u64,
     requirements: Requirements,
     validation_scope: ValidationScope = .invocation,
+    output_plane_metadata: OutputPlaneMetadata = .input_dependent,
     vtable: *const VTable,
 
     pub const VTable = struct {

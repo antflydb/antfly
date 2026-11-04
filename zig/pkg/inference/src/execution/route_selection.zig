@@ -288,8 +288,12 @@ pub const Selection = struct {
                 count += 1;
             }
             self.plane_counts[node] = count;
-            self.planes_witnessed[node] = output_witnessed;
+            // Publish representation authority only after this exact producer
+            // validates its live inputs/profile and assigned output geometry.
+            // A materializing kernel can guarantee its output layout while its
+            // source weight remains mutable and invocation-validated.
             try owned.validate(.{ .inputs = incoming[0..kernel.descriptor.input_count], .output = self.output(pool, node, required.primary_bytes) });
+            self.planes_witnessed[node] = output_witnessed or owned.output_plane_metadata == .assigned_dense;
         }
     }
 

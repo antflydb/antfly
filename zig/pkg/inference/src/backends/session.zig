@@ -69,6 +69,7 @@ pub const ResidentOutputs = struct {
     pub const BackendOwnerCleanupServices = struct {
         accepts: *const fn (*const ResidentOutputs) bool,
         deinit: *const fn (*anyopaque, std.mem.Allocator, @import("../execution/cleanup_context.zig").Context) void,
+        detach_dense_f32: ?*const fn (*ResidentOutputs, @import("../execution/cleanup_context.zig").Context) anyerror!bool = null,
     };
 
     const SharedResources = struct {
@@ -215,13 +216,26 @@ pub const ResidentOutputs = struct {
         SharedResources.release(owner);
     }
 
+    /// Owning stage boundary only. The exact concrete descriptor verifies its
+    /// model/runtime pin and performs checked completion before moving quota,
+    /// payload declarations and SDK ownership. Decline leaves self unchanged.
+    pub fn detachDenseF32PhysicalPayload(self: *ResidentOutputs, current: @import("../execution/cleanup_context.zig").Context) !bool {
+        if (current.boundary == null or current.outside_execution) return error.MissingCurrentCleanupEpoch;
+        if (try current.boundary.?.isSealed()) return error.RetirementEpochSealed;
+        if (self.resource_hold != null or self.backend_owner == null or self.model_retention == null) return false;
+        const services = self.backend_owner_cleanup_services orelse return false;
+        if (!services.accepts(self)) return false;
+        const detach = services.detach_dense_f32 orelse return false;
+        return detach(self, current);
+    }
+
     pub fn deinit(self: *ResidentOutputs) void {
         self.deinitWithCleanup(.{ .outside_execution = true });
     }
     pub fn deinitWithBoundary(self: *ResidentOutputs, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
         self.deinitWithCleanup(.{ .boundary = boundary });
     }
-    fn deinitWithCleanup(self: *ResidentOutputs, current: @import("../execution/cleanup_context.zig").Context) void {
+    pub fn deinitWithCleanup(self: *ResidentOutputs, current: @import("../execution/cleanup_context.zig").Context) void {
         const boundary = current.boundary;
         // A missing current B is not the explicit raw outside API contract.
         // Validate before clearing a published pin, decrementing any owner or
@@ -507,7 +521,10 @@ pub const RunAdmission = struct {
         return .{
             .protected = protected,
             .compatibility = compatibility,
-            .opaque_compatibility = if (self.backend_class == .cpu) .{ .host_scratch_bytes = opaque_workspace } else compatibility,
+            .opaque_compatibility = switch (self.backend_class) {
+                .cpu => .{ .host_scratch_bytes = opaque_workspace },
+                .gpu => .{ .backend_scratch_bytes = if (self.backend_workspace_reserved) 0 else opaque_workspace - @min(opaque_workspace, request.retained_backend_workspace_bytes) },
+            },
             .required = required,
             .retained_host_credit = request.pre_admitted_host_bytes,
             .retained_backend_credit = if (self.backend_class == .gpu) retained_backend_credit else 0,
@@ -1646,7 +1663,10 @@ pub const Session = struct {
         var boundary = if (control) |active| try active.enterUninterruptible(self.interruption()) else null;
         defer if (boundary) |*scope| scope.deinit();
         permit.* = .{ .session = self.*, .lease = null };
-        try invocation.prepareIntoWithCleanup(self, shapes, allocator, control, &permit.prepared, cleanup);
+        if (ready_guard != null)
+            try self.prepareBeforeExecution(shapes, allocator, control, &permit.prepared, cleanup)
+        else
+            try invocation.prepareIntoWithCleanup(self, shapes, allocator, control, &permit.prepared, cleanup);
         // The explicit caller has no outer numerical/provider/model gate.
         // Retired old-bank quota must return before the next supplier request.
         if (ready_guard) |guard| guard.finish();
@@ -1663,7 +1683,12 @@ pub const Session = struct {
             var required = plan.required;
             if (permit.prepared) |*prepared| {
                 prepared.requirement.protected = plan.protected;
-                const replace_guess = admission.backend_class == .cpu and request.workspace_bytes == 0 and !request.workspace_planned and prepared.hasCompleteOwnedPayload();
+                const witness = prepared.requirement.owned_payload;
+                const matching_class = if (witness) |owned| switch (admission.backend_class) {
+                    .cpu => owned.accounting_class == .host,
+                    .gpu => owned.accounting_class == .device,
+                } else false;
+                const replace_guess = matching_class and request.workspace_bytes == 0 and !request.workspace_planned and prepared.hasCompleteOwnedPayload();
                 const compatibility = if (replace_guess) plan.opaque_compatibility else plan.compatibility;
                 prepared.requirement.compatibility = compatibility;
                 const base = try plan.protected.merge(compatibility);
@@ -1702,6 +1727,27 @@ pub const Session = struct {
         if (lease != null) if (self.model_lifetime) |lifetime| if (lifetime.resource_pin) |pin| {
             permit.resource_pin = pin.retain();
         };
+    }
+
+    /// Called only by the existing BeforeExecution contract: the FIFO ready
+    /// owner holds no enclosing numerical/provider/model lane. A finite request
+    /// deadline is required for retries; generic/lazy preparation never waits.
+    noinline fn prepareBeforeExecution(self: *const Session, shapes: ShapeInputs, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, prepared: *?invocation.PreparedInvocation, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
+        while (true) {
+            if (control) |active| try active.check();
+            invocation.prepareIntoWithCleanup(self, shapes, allocator, control, prepared, cleanup) catch |err| {
+                if (err != error.QueueFull) return err;
+                // prepareInto clears its optional discriminator after provider
+                // partial ownership has retired. Never repeat a partial plan.
+                if (prepared.* != null) return error.InvalidPreparedInvocationRetirement;
+                const active = control orelse return err;
+                if (active.deadline_ns == null) return err;
+                try active.check();
+                std.Thread.yield() catch {};
+                continue;
+            };
+            return;
+        }
     }
 
     noinline fn retireRejectedBeforeExecution(prepared: *invocation.PreparedInvocation) void {

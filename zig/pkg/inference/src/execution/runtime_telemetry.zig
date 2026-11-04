@@ -180,6 +180,7 @@ pub const Cuda = struct {
 pub const Snapshot = struct {
     resolved_project_metal_dispatches: ?@import("runtime_observation.zig").MetalDispatches = null,
     terminal_native_bodies: ?@import("runtime_observation.zig").NativeBodies = null,
+    selected_native_dispatches: ?@import("runtime_observation.zig").NativeDispatches = null,
     resolved_project_cuda_launches: ?@import("runtime_observation.zig").Kernels = null,
     transfers: ?@import("transfer_audit.zig").Measurements = null,
     counters: Counters = .{},
@@ -197,6 +198,7 @@ pub const Snapshot = struct {
         return .{
             .resolved_project_metal_dispatches = self.resolved_project_metal_dispatches,
             .terminal_native_bodies = self.terminal_native_bodies,
+            .selected_native_dispatches = self.selected_native_dispatches,
             .resolved_project_cuda_launches = self.resolved_project_cuda_launches,
             .transfers = self.transfers,
             .counters = self.counters.since(before.counters),

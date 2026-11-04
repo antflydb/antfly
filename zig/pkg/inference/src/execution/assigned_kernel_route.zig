@@ -202,3 +202,11 @@ test "Native exact dense facts reject unaligned or oversized source F32 planes b
     plane.descriptor.shape.dtype = .bf16;
     try std.testing.expect(!planeDense(backend, plane, shape));
 }
+
+/// Cold attestation of the private Direct owner, after the concrete provider's
+/// full compute-table acceptance. Other private vtable users grant no context.
+pub fn belongsTo(selected: *const route.Owned, backend: ops.ComputeBackend) bool {
+    if (!isDirect(selected) or selected.implementation.context != backend.ptr or selected.implementation.table != @as(*const anyopaque, @ptrCast(backend.vtable))) return false;
+    const owner: *const Direct = @ptrCast(@alignCast(selected.context));
+    return owner.backend.ptr == backend.ptr and owner.backend.vtable == backend.vtable;
+}

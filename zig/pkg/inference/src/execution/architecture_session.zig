@@ -3020,7 +3020,42 @@ fn archRunIncrementalEncoderResident(self: *ArchSession, inputs: []const Tensor,
 fn acceptsResidentComputeCleanup(outputs: *const ResidentOutputs) bool {
     return outputs.deinit_backend_owner == deinitResidentComputeBackend;
 }
-const resident_compute_cleanup_services = ResidentOutputs.BackendOwnerCleanupServices{ .accepts = acceptsResidentComputeCleanup, .deinit = deinitResidentComputeBackendWithCleanup };
+const resident_compute_cleanup_services = ResidentOutputs.BackendOwnerCleanupServices{ .accepts = acceptsResidentComputeCleanup, .deinit = deinitResidentComputeBackendWithCleanup, .detach_dense_f32 = detachResidentDenseF32Payload };
+fn detachResidentDenseF32Payload(outputs: *ResidentOutputs, current: @import("cleanup_context.zig").Context) !bool {
+    const model = outputs.model_retention orelse return false;
+    if (outputs.backend_owner_cleanup_services != &resident_compute_cleanup_services or
+        outputs.deinit_backend_owner != deinitResidentComputeBackend or
+        outputs.backend_owner != @as(*const anyopaque, @ptrCast(outputs.backend))) return false;
+    // Static exact model services must veto wrappers before an owner cast.
+    if (model.destroy_fn != archClose or model.quiesce_fn != archQuiesce) return false;
+    const owner: *ArchSession = @ptrCast(@alignCast(model.owner));
+    if (owner.backend_type != .metal) return false;
+    if (comptime !build_options.enable_metal) return false;
+    if (&owner.model_lifetime != model) return false;
+    // Current B and its exact live numerical operation are both required.
+    // Keep supervision through producer completion AND original Engine teardown.
+    _ = try current.operationFor(outputs.backend);
+    const control = outputs.backend.execution_control orelse return error.ExecutionControlRequired;
+    var sdk_guard = try control.enterUninterruptible(.uninterruptible);
+    defer sdk_guard.deinit();
+    const payload = (try outputs.backend.detachDenseF32PhysicalPayload(outputs.outputs, @ptrCast(gpuBackendData(owner)), current)) orelse return false;
+    var replacement = outputs.*;
+    replacement.outputs = payload.outputs;
+    replacement.backend = payload.backend;
+    replacement.allocator = payload.allocator;
+    replacement.backend_owner = payload.backend;
+    replacement.deinit_backend_owner = deinitResidentComputeBackend;
+    replacement.backend_owner_cleanup_services = &resident_compute_cleanup_services;
+    replacement.model_retention = model.retain();
+    // Exact move of the existing request quota and cold shell; old SDK/header
+    // destruction cannot refund the still-live physical payload.
+    outputs.resource_lease = null;
+    outputs.retirement_shell = null;
+    outputs.deinitWithCleanup(current);
+    outputs.* = replacement;
+    return true;
+}
+
 fn deinitResidentComputeBackendWithCleanup(owner: *anyopaque, allocator: std.mem.Allocator, current: @import("../execution/cleanup_context.zig").Context) void {
     const cb: *ops.ComputeBackend = @ptrCast(@alignCast(owner));
     cb.deinitWithCleanup(current);
@@ -9533,4 +9568,228 @@ test "GLiNER specialty sealed identity accepts native Metal and CUDA sessions" {
         arch.gliner_decision_identity_sealed = false;
         try std.testing.expectError(error.MissingGlinerDecisionIdentity, getGlinerSpecialtyIdentity(session));
     }
+}
+
+const DetachedDenseBackingProbe = struct {
+    identity: ?@import("storage_ownership.zig").Identity = null,
+    count: usize = 0,
+    fn visit(raw: *anyopaque, report: @import("storage_ownership.zig").Report) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (report == .backing and report.backing.domain == .backend) {
+            self.count += 1;
+            self.identity = report.backing.identity;
+        }
+    }
+    fn read(backend: *const ops.ComputeBackend, value: ops.CT) !@import("storage_ownership.zig").Identity {
+        const kernels = backend.vtable.kernels orelse return error.MissingStorageOwnership;
+        const query = kernels.storageOwnership orelse return error.MissingStorageOwnership;
+        var probe = @This(){};
+        try std.testing.expect(try query(backend.ptr, value, .{ .context = &probe, .visit = visit }) == .complete);
+        try std.testing.expectEqual(@as(usize, 1), probe.count);
+        return probe.identity orelse error.MissingStorageIdentity;
+    }
+};
+
+test "dense stage promotion preserves actual Metal buffer through original Engine and arena close with two provider quota reentry" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const Sink = @import("retirement_sink.zig");
+    const operation = @import("backend_operation.zig");
+    const transfer = @import("transfer_audit.zig");
+    const retirement = @import("resource_retirement.zig");
+    var source = try incrementalMetalFixtureSession(a);
+    var source_open = true;
+    defer if (source_open) source.close();
+    var destination = try incrementalMetalFixtureSession(a);
+    defer destination.close();
+    try source.installOwnedExecutionGate(a);
+    try destination.installOwnedExecutionGate(a);
+    const source_model = source.model_lifetime.?;
+    const source_pin = source_model.retain();
+    defer source_pin.release();
+    const Probe = struct {
+        sessions: [2]Session,
+        calls: usize = 0,
+        failure: ?anyerror = null,
+        fn reserve(_: *anyopaque, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!usize {
+            return 1;
+        }
+        fn retain(_: *anyopaque, _: usize, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!void {}
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.reenter() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn reenter(self: *@This()) !void {
+            for (self.sessions) |session| {
+                const model = session.model_lifetime.?;
+                if (!model.execution_gate.tryLock()) return error.ModelGateStillOwned;
+                model.execution_gate.unlock();
+                var compute = try getComputeBackendWithControl(session, std.testing.allocator, .{ .native_call_policy = .in_process });
+                defer compute.deinit();
+                const input = try compute.backend.fromFloat32(&.{ 2, 5 });
+                defer compute.backend.free(input);
+                const result = try compute.backend.add(input, input);
+                defer compute.backend.free(result);
+                const values = try compute.backend.toFloat32(result, std.testing.allocator);
+                defer std.testing.allocator.free(values);
+                try std.testing.expectEqualSlices(f32, &.{ 4, 10 }, values);
+            }
+        }
+    };
+    const domain = try Domain.create();
+    defer domain.release();
+    try std.testing.expect(source_model.admission_domain == null);
+    source_model.admission_domain = domain.pin();
+    var probe = Probe{ .sessions = .{ source, destination } };
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    var lease: ?runtime.tier.memory.AdmissionLease = try domain.controller.tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = 16 }, false);
+    defer if (lease) |*value| value.release();
+    var arena = std.heap.ArenaAllocator.init(a);
+    var arena_open = true;
+    defer if (arena_open) arena.deinit();
+    const old_header = try arena.allocator().create(ops.ComputeBackend);
+    const impl: *ArchSession = @ptrCast(@alignCast(source.ptr));
+    old_header.* = try makeComputeBackend(impl, arena.allocator(), null);
+    old_header.execution_control = .{ .native_call_policy = .in_process };
+    var backend_owned = true;
+    defer if (backend_owned) old_header.deinit();
+    const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(old_header.ptr));
+    const value = try compute.importResidentF32(&.{ 1, 2, 3, 4 }, &.{4});
+    var value_owned = true;
+    defer if (value_owned) old_header.free(value);
+    const vector = try arena.allocator().alloc(ops.CT, 1);
+    vector[0] = value;
+    var outputs = ResidentOutputs{ .outputs = vector, .backend = old_header, .allocator = arena.allocator(), .backend_owner = old_header, .deinit_backend_owner = deinitResidentComputeBackend, .backend_owner_cleanup_services = &resident_compute_cleanup_services, .model_retention = source_model.retain(), .resource_lease = lease };
+    backend_owned = false;
+    value_owned = false;
+    lease = null;
+    var outputs_open = true;
+    defer if (outputs_open) outputs.deinit();
+    try outputs.prepareRetirement();
+    const original_shell = outputs.retirement_shell.?.owner;
+    const original_identity = try DetachedDenseBackingProbe.read(outputs.backend, outputs.outputs[0]);
+    var owner = try Sink.Ref.create();
+    defer owner.release();
+    var guard = try owner.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    @import("antfly_platform").sync.lockYielding(source.execution_gate.?);
+    var source_locked = true;
+    defer if (source_locked) source.execution_gate.?.unlock();
+    var audit = transfer.Audit{ .forbid_device_host_access = true };
+    try transfer.begin(&audit);
+    var auditing = true;
+    defer if (auditing) transfer.end();
+    try std.testing.expect(try old_header.bindCleanupEpoch(&epoch));
+    const source_operation = old_header.operationToken() orelse return error.BackendOperationUnavailable;
+    try std.testing.expectError(error.BackendCleanupAuthorityRequired, outputs.detachDenseF32PhysicalPayload(.{ .boundary = &epoch }));
+    old_header.execution_control = null;
+    try std.testing.expectError(error.ExecutionControlRequired, outputs.detachDenseF32PhysicalPayload(.{ .boundary = &epoch, .operation = source_operation }));
+    old_header.execution_control = .{ .native_call_policy = .in_process };
+    try std.testing.expect(try outputs.detachDenseF32PhysicalPayload(.{ .boundary = &epoch, .operation = source_operation }));
+    transfer.end();
+    auditing = false;
+    try std.testing.expect(outputs.backend != old_header);
+    try std.testing.expect(outputs.retirement_shell.?.owner == original_shell and outputs.resource_lease != null);
+    const moved_identity = try DetachedDenseBackingProbe.read(outputs.backend, outputs.outputs[0]);
+    try std.testing.expectEqual(original_identity.base, moved_identity.base);
+    try std.testing.expect(original_identity.context == moved_identity.context and moved_identity.kind == .metal);
+    try std.testing.expectEqual(@as(u64, 0), audit.device_copy_calls);
+    try std.testing.expectEqual(@as(u64, 0), audit.download_calls);
+    try std.testing.expectEqual(@as(u64, 0), audit.upload_calls);
+    try std.testing.expectEqual(@as(u64, 0), audit.host_accesses);
+    source.execution_gate.?.unlock();
+    source_locked = false;
+    guard.finish();
+    source.close();
+    source_open = false;
+    arena.deinit();
+    arena_open = false;
+    try probe.reenter(); // Original Engine/provider exclusion has actually ended.
+    {
+        var scope = try operation.enter(outputs.backend.*, null, null, .managed);
+        defer scope.deinitChecked() catch @panic("dense promoted read cleanup failed");
+        const values = try outputs.backend.toFloat32(outputs.outputs[0], a);
+        defer a.free(values);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, values);
+        try scope.finish();
+    }
+    var final_guard = try owner.enter();
+    defer final_guard.finish();
+    var final_epoch = try final_guard.retainEpoch();
+    defer final_epoch.release();
+    @import("antfly_platform").sync.lockYielding(source.execution_gate.?);
+    source_locked = true;
+    outputs.deinitWithBoundary(&final_epoch);
+    outputs_open = false;
+    try std.testing.expectEqual(@as(usize, 16), domain.controller.snapshot().backendTotalBytes());
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    source.execution_gate.?.unlock();
+    source_locked = false;
+    final_guard.finish();
+    _ = retirement.pollRawController(&domain.controller);
+    try std.testing.expectEqual(@as(usize, 0), domain.controller.snapshot().backendTotalBytes());
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    if (probe.failure) |err| return err;
+}
+
+test "foreign Metal public Whisper encoder final norm promotes before receiver admission without transport" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const encoder = try incrementalMetalFixtureSession(a);
+    defer encoder.close();
+    const destination = try incrementalMetalFixtureSession(a);
+    defer destination.close();
+    const control = InferenceExecutionControl{ .native_call_policy = .in_process };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const request_allocator = arena.allocator();
+    var features = [_]Tensor{try IncrementalFixture.features(a)};
+    defer features[0].deinit();
+    const Root = @import("owned_incremental_input.zig");
+    const stages = @import("encoder_decoder_runtime.zig");
+    var cleanup = try Root.Cleanup.beginTaskWithoutEnclosingLanes(control);
+    defer cleanup.finish();
+    var permit = try encoder.admitInputs(&features, request_allocator, control);
+    defer permit.deinit();
+    try stages.prepareEncoderPermit(encoder, destination, null, control, true, &permit);
+    var encoded = try stages.encodeForIncrementalWithPermit(request_allocator, encoder, destination, &features, null, control, &permit);
+    var encoded_open = true;
+    defer if (encoded_open) encoded.deinit(request_allocator);
+    permit.deinit();
+    const before_backend = encoded.resident.values.backend;
+    const before_identity = try DetachedDenseBackingProbe.read(before_backend, encoded.resident.values.outputs[0]);
+    var audit = @import("transfer_audit.zig").Audit{ .forbid_device_host_access = true };
+    try @import("transfer_audit.zig").begin(&audit);
+    var auditing = true;
+    defer if (auditing) @import("transfer_audit.zig").end();
+    var owned = try Root.OwnedIncrementalInput.take(request_allocator, &encoded, destination, &cleanup);
+    encoded_open = false;
+    defer owned.deinit();
+    @import("transfer_audit.zig").end();
+    auditing = false;
+    try std.testing.expect(owned.encoder.resident.values.backend != before_backend);
+    const after_identity = try DetachedDenseBackingProbe.read(owned.source.?.backend, owned.source.?.value);
+    try std.testing.expectEqual(before_identity.base, after_identity.base);
+    try std.testing.expect(before_identity.context == after_identity.context and after_identity.kind == .metal);
+    try std.testing.expectEqual(@as(u64, 0), audit.device_copy_calls);
+    try std.testing.expectEqual(@as(u64, 0), audit.upload_calls);
+    try std.testing.expectEqual(@as(u64, 0), audit.download_calls);
+    try std.testing.expectEqual(@as(u64, 0), audit.host_accesses);
+    const owner: *ArchSession = @ptrCast(@alignCast(encoder.ptr));
+    const store = gpuBackendData(owner);
+    // The ACTUAL source shared-provider lease is no longer held by outputs.
+    try std.testing.expect(store.shared_metal_native_provider_lock.tryLock());
+    store.shared_metal_native_provider_lock.unlock(std.testing.io);
+    var decoder = try @import("decoder_stage.zig").Decoder.initWithSource(request_allocator, destination, &owned.encoder, 2, &.{ 1, 1 }, @import("testing/incremental_encoder_decoder.zig").config.vocab_size, control, .{}, &owned.source.?);
+    defer decoder.deinit();
+    var first = try decoder.step(&.{ 0, 1 }, null, null);
+    defer first.deinit();
+    try std.testing.expect(first.logits.len != 0);
 }

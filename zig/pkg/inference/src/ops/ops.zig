@@ -1765,10 +1765,17 @@ pub const EmbeddingStageControl = struct {
 
 /// Cold cleanup hooks must veto inherited/copied target tables before any
 /// context cast. Unqualified wrappers retain their original freeTensor policy.
+pub const DetachedDenseF32Payload = struct {
+    outputs: []CT,
+    backend: *ComputeBackend,
+    allocator: std.mem.Allocator,
+};
+
 pub const ColdCleanupServices = struct {
     accepts: *const fn (*const ComputeBackend.VTable) bool,
     free: *const fn (*anyopaque, CT, @import("../execution/cleanup_context.zig").Context) void,
     deinit_backend: ?*const fn (*const ComputeBackend, @import("../execution/cleanup_context.zig").Context) void = null,
+    detach_dense_f32: ?*const fn (*const ComputeBackend, []const CT, *const anyopaque, @import("../execution/cleanup_context.zig").Context) anyerror!?DetachedDenseF32Payload = null,
 };
 
 pub const ComputeBackend = struct {
@@ -3582,6 +3589,14 @@ pub const ComputeBackend = struct {
             }
         }
         self.free(tensor);
+    }
+
+    pub fn detachDenseF32PhysicalPayload(self: *const ComputeBackend, outputs: []const CT, expected_model_data: *const anyopaque, current: @import("../execution/cleanup_context.zig").Context) !?DetachedDenseF32Payload {
+        const services = self.vtable.cold_cleanup_services orelse return null;
+        if (!services.accepts(self.vtable)) return null;
+        const detach = services.detach_dense_f32 orelse return null;
+        _ = try current.operationFor(self);
+        return detach(self, outputs, expected_model_data, current);
     }
 
     pub fn getWeight(self: *const ComputeBackend, name: []const u8) !CT {

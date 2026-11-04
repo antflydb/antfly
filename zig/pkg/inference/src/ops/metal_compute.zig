@@ -8469,7 +8469,69 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return tensor;
     }
 
-    const cold_cleanup_services = ops.ColdCleanupServices{ .accepts = retirementAccepts, .free = freeWithCleanupOp, .deinit_backend = deinitBackendWithCleanupOp };
+    const cold_cleanup_services = ops.ColdCleanupServices{ .accepts = retirementAccepts, .free = freeWithCleanupOp, .deinit_backend = deinitBackendWithCleanupOp, .detach_dense_f32 = detachDenseF32PhysicalPayloadOp };
+    fn detachDenseF32PhysicalPayloadOp(backend: *const ops.ComputeBackend, outputs: []const CT, expected_model_data: *const anyopaque, current: @import("../execution/cleanup_context.zig").Context) !?ops.DetachedDenseF32Payload {
+        const metadata = @import("antfly_platform").allocator.processAllocator(@import("antfly_platform").allocator.concurrentFallback());
+        return detachDenseF32PhysicalPayloadWithAllocator(backend, outputs, expected_model_data, metadata, current, operationQuiesce);
+    }
+    fn detachDenseF32PhysicalPayloadWithAllocator(backend: *const ops.ComputeBackend, outputs: []const CT, expected_model_data: *const anyopaque, stable: std.mem.Allocator, current: @import("../execution/cleanup_context.zig").Context, comptime complete: fn (*MetalNativeProvider, bool) anyerror!void) !?ops.DetachedDenseF32Payload {
+        if (current.boundary == null or current.outside_execution) return error.MissingCurrentCleanupEpoch;
+        if (try current.boundary.?.isSealed()) return error.RetirementEpochSealed;
+        _ = try current.operationFor(backend);
+        try backend.checkExecutionControl();
+        const self: *MetalCompute = @ptrCast(@alignCast(backend.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_model_data or self.owned_native_provider or
+            self.data.shared_metal_native_provider != self.provider_impl or self.engine_borrowed_operation != null or
+            (self.engine_operation == null and self.shared_provider_lease_io == null) or self.audio_capture != null)
+            return null;
+        const actual_operation = currentEngineOperation(self) orelse return error.BackendOperationInactive;
+        const supplied_operation = current.operation orelse return error.BackendCleanupAuthorityRequired;
+        if (actual_operation.context != supplied_operation.context or actual_operation.nonce != supplied_operation.nonce or
+            actual_operation.vtable != supplied_operation.vtable or actual_operation.mode != supplied_operation.mode)
+            return error.BackendOperationChanged;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        // Prove every layout before allocating or modifying source ownership.
+        for (outputs) |value| {
+            const buf = toBuf(value);
+            if (buf.mutable_state or buf.persistent_model or buf.weight_handle_name != null or buf.lazy_entry != null or
+                buf.lazy_multiply != null or buf.integer_storage or bufHasAnyQuantizedStorage(buf) or
+                buf.native_dense_dtype != null or buf.view_strides != null or buf.logical_view_strides != null or
+                buf.view_index_map != null or buf.view_base_offset != 0 or buf.shared_data_refcount != null)
+                return null;
+            const tensor = if (buf.metal_tensor) |*device| device else return null;
+            if (!tensor.canDetachDenseF32Allocation(@ptrCast(runtime))) return null;
+        }
+        const target = try stable.create(MetalCompute);
+        errdefer stable.destroy(target);
+        // No provider lease, numerical operation, model arena or Io pointer is
+        // transferred. The concrete model pin owns this EXACT shared runtime.
+        target.* = .{ .allocator = stable, .data = self.data, .provider_impl = self.provider_impl, .provider = if (false) null else {}, .owned_native_provider = false, .io = null };
+        const header = try stable.create(ops.ComputeBackend);
+        errdefer stable.destroy(header);
+        header.* = target.ownedComputeBackend();
+        const values = try stable.alloc(CT, outputs.len);
+        errdefer stable.free(values);
+        var initialized: usize = 0;
+        errdefer for (values[0..initialized]) |value| header.free(value);
+        for (outputs, values) |value, *result| {
+            const source = toBuf(value);
+            var view = try source.metal_tensor.?.retainedCopy();
+            result.* = target.ctFromOwnedMetalTensor(view) catch |err| {
+                view.deinit();
+                return err;
+            };
+            initialized += 1;
+            try target.cloneLogicalViewMetadata(toBuf(result.*), source);
+        }
+        // Do not cancel successful output work. Check actual producer command
+        // completion while the original owned Engine still excludes peers.
+        try complete(self.provider_impl, false);
+        // Cancellation after a completed producer must still leave the source
+        // transaction unchanged and unwind all replacement-only metadata.
+        try backend.checkExecutionControl();
+        return .{ .outputs = values, .backend = header, .allocator = stable };
+    }
+
     fn deinitBackendWithCleanupOp(backend: *const ops.ComputeBackend, current: @import("../execution/cleanup_context.zig").Context) void {
         const self: *MetalCompute = @ptrCast(@alignCast(backend.ptr));
         const allocator = self.allocator;
@@ -53566,4 +53628,156 @@ test "metal GLiNER GRU residual modes preserve cancellation-sensitive state on d
         defer a.free(got);
         for (got, labels) |value, label| try std.testing.expectApproxEqAbs(@as(f32, 0.25) + (if (add_residual) label else 0), value, 0.000001);
     }
+}
+
+fn detachedDensePayloadOomCase(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, values: []const CT, expected_data: *const anyopaque, current: @import("../execution/cleanup_context.zig").Context) !void {
+    const source = MetalCompute.toBuf(values[0]);
+    const original_ref = source.metal_tensor.?.device.?.ref;
+    const original_handle = source.metal_tensor.?.deviceHandle();
+    const original_refs = original_ref.ref_count.load(.acquire);
+    var audit = metal_tensor_mod.TransferAudit{ .forbid_device_host_access = true };
+    try metal_tensor_mod.beginTransferAudit(&audit);
+    defer metal_tensor_mod.endTransferAudit();
+    const payload = (MetalCompute.detachDenseF32PhysicalPayloadWithAllocator(backend, values, expected_data, allocator, current, MetalCompute.operationQuiesce) catch |err| {
+        try std.testing.expect(MetalCompute.toBuf(values[0]) == source);
+        try std.testing.expectEqual(original_refs, original_ref.ref_count.load(.acquire));
+        return err;
+    }) orelse return error.ExpectedDetachedDensePayload;
+    defer {
+        for (payload.outputs) |value| payload.backend.free(value);
+        payload.allocator.free(payload.outputs);
+        payload.backend.deinit();
+        payload.allocator.destroy(payload.backend);
+    }
+    const result = MetalCompute.toBuf(payload.outputs[0]);
+    try std.testing.expect(result.metal_tensor.?.device.?.ref == original_ref);
+    try std.testing.expect(result.metal_tensor.?.deviceHandle() == original_handle);
+    try std.testing.expectEqual(original_refs + 1, original_ref.ref_count.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), audit.device_copy_calls);
+    try std.testing.expectEqual(@as(u64, 0), audit.download_calls);
+    try std.testing.expectEqual(@as(u64, 0), audit.upload_calls);
+    try std.testing.expectEqual(@as(u64, 0), audit.host_accesses);
+}
+
+test "Metal dense detach retains exact backing Ref without copies and unwinds every metadata OOM" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer {
+        deinitSharedNativeProvider(&store);
+        store.lazy_weights.deinit(a);
+    }
+    var source = try MetalCompute.init(a, &store, null);
+    defer source.deinit();
+    try source.beginEngineOperation();
+    var backend = source.computeBackend();
+    backend.execution_control = .{ .native_call_policy = .in_process };
+    var terminal = try @import("../execution/retirement_sink.zig").Ref.create();
+    defer terminal.release();
+    var turn = try terminal.enter();
+    defer turn.finish();
+    var epoch = try turn.retainEpoch();
+    defer epoch.release();
+    try std.testing.expect(try backend.bindCleanupEpoch(&epoch));
+    const current = @import("../execution/cleanup_context.zig").Context{ .boundary = &epoch, .operation = backend.operationToken() orelse return error.BackendOperationUnavailable };
+    var sdk_guard = try backend.execution_control.?.enterUninterruptible(.uninterruptible);
+    defer sdk_guard.deinit();
+    const value = try auditDeviceTensor(&source, &backend, &.{ 1, 2, 3, 4 }, &.{4});
+    defer backend.free(value);
+    const values = [_]CT{value};
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, detachedDensePayloadOomCase, .{ &backend, &values, @as(*const anyopaque, @ptrCast(&store)), current });
+    try detachedDensePayloadOomCase(a, &backend, &values, @ptrCast(&store), current);
+}
+
+test "Metal dense promotion refuses cancellation and foreign B and preserves source on checked completion error" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer {
+        deinitSharedNativeProvider(&store);
+        store.lazy_weights.deinit(a);
+    }
+    var source = try MetalCompute.init(a, &store, null);
+    defer source.deinit();
+    try source.beginEngineOperation();
+    var backend = source.computeBackend();
+    const Probe = struct {
+        cancelled: bool = false,
+        checks: usize = 0,
+        cancel_after: ?usize = null,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.cancel_after) |at| if (self.checks >= at) return error.Cancelled;
+        }
+        fn isCancelled(raw: ?*anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return self.cancelled;
+        }
+        fn completionError(provider: *MetalCompute.MetalNativeProvider, cancel: bool) !void {
+            // Exercise the actual accepted producer and checked SDK completion.
+            // Inject only its reported failure after safe completion; this is
+            // not a destructive GPU command-fault qualification.
+            try MetalCompute.operationQuiesce(provider, cancel);
+            return error.InjectedProducerCompletionFailure;
+        }
+    };
+    var probe = Probe{};
+    backend.execution_control = .{ .native_call_policy = .in_process, .cancellation = .{ .ptr = &probe, .is_cancelled_fn = Probe.isCancelled } };
+    const Sink = @import("../execution/retirement_sink.zig");
+    var terminal = try Sink.Ref.create();
+    defer terminal.release();
+    var turn = try terminal.enter();
+    defer turn.finish();
+    var epoch = try turn.retainEpoch();
+    defer epoch.release();
+    try std.testing.expect(try backend.bindCleanupEpoch(&epoch));
+    const token = backend.operationToken() orelse return error.BackendOperationUnavailable;
+    const Cleanup = @import("../execution/cleanup_context.zig").Context;
+    const current = Cleanup{ .boundary = &epoch, .operation = token };
+    const value = try auditDeviceTensor(&source, &backend, &.{ 1, 2, 3, 4 }, &.{4});
+    defer backend.free(value);
+    const values = [_]CT{value};
+    const original = MetalCompute.toBuf(value).metal_tensor.?.device.?.ref;
+    const refs = original.ref_count.load(.acquire);
+    const copied_table = backend.vtable.*;
+    var copied_backend = backend;
+    copied_backend.vtable = &copied_table;
+    try std.testing.expect((try copied_backend.detachDenseF32PhysicalPayload(&values, @ptrCast(&store), current)) == null);
+    try std.testing.expect((try MetalCompute.detachDenseF32PhysicalPayloadWithAllocator(&backend, &values, @ptrFromInt(16), a, current, MetalCompute.operationQuiesce)) == null);
+    try std.testing.expectError(error.MissingCurrentCleanupEpoch, MetalCompute.detachDenseF32PhysicalPayloadWithAllocator(&backend, &values, @ptrCast(&store), a, .{ .operation = token }, MetalCompute.operationQuiesce));
+    var foreign = try Sink.Ref.create();
+    defer foreign.release();
+    var foreign_turn = try foreign.enter();
+    defer foreign_turn.finish();
+    var foreign_epoch = try foreign_turn.retainEpoch();
+    defer foreign_epoch.release();
+    try std.testing.expectError(error.BackendOperationCleanupChanged, MetalCompute.detachDenseF32PhysicalPayloadWithAllocator(&backend, &values, @ptrCast(&store), a, .{ .boundary = &foreign_epoch, .operation = token }, MetalCompute.operationQuiesce));
+    probe.cancelled = true;
+    try std.testing.expectError(error.Cancelled, MetalCompute.detachDenseF32PhysicalPayloadWithAllocator(&backend, &values, @ptrCast(&store), a, current, MetalCompute.operationQuiesce));
+    probe.cancelled = false;
+    {
+        var sdk_guard = try backend.execution_control.?.enterUninterruptible(.uninterruptible);
+        defer sdk_guard.deinit();
+        try std.testing.expectError(error.InjectedProducerCompletionFailure, MetalCompute.detachDenseF32PhysicalPayloadWithAllocator(&backend, &values, @ptrCast(&store), a, current, Probe.completionError));
+    }
+    backend.execution_control.?.ptr = &probe;
+    backend.execution_control.?.check_fn = Probe.check;
+    {
+        var sdk_guard = try backend.execution_control.?.enterUninterruptible(.uninterruptible);
+        defer sdk_guard.deinit();
+        probe.checks = 0;
+        probe.cancel_after = 2;
+        try std.testing.expectError(error.Cancelled, MetalCompute.detachDenseF32PhysicalPayloadWithAllocator(&backend, &values, @ptrCast(&store), a, current, MetalCompute.operationQuiesce));
+        try std.testing.expectEqual(@as(usize, 2), probe.checks);
+        probe.cancel_after = null;
+    }
+    try std.testing.expect(MetalCompute.toBuf(values[0]).metal_tensor.?.device.?.ref == original);
+    try std.testing.expectEqual(refs, original.ref_count.load(.acquire));
+    try token.validate(.{ .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .program = null, .mode = .managed });
+    const actual = try backend.toFloat32(value, a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, actual);
 }

@@ -134,6 +134,9 @@ pub const PreparedRoutes = struct {
         self.immutable.releaseWithCleanup(cleanup);
         self.allocator.destroy(self);
     }
+    pub inline fn matchesChecked(self: *const PreparedRoutes, inputs: []const route.InputBinding) anyerror!bool {
+        return self.pool.matchesRoutesChecked(inputs);
+    }
     pub fn matches(self: *const PreparedRoutes, inputs: []const route.InputBinding) bool {
         return self.pool.matchesRoutes(inputs);
     }
@@ -192,12 +195,15 @@ pub fn InternedVariants(comptime Owner: type) type {
         closed: bool = false,
         stats: CacheStats = .{},
 
-        fn lookupLocked(self: *Self, facts: []const route.InputBinding, filter: anytype) ?*Owner {
-            for (self.entries.items, 0..) |owner, index| if (filter.accept(owner) and owner.matches(facts)) {
+        fn lookupLocked(self: *Self, facts: []const route.InputBinding, filter: anytype) anyerror!?*Owner {
+            for (self.entries.items, 0..) |owner, index| {
+                if (!filter.accept(owner)) continue;
+                const matches = if (comptime @hasDecl(Owner, "matchesChecked")) try owner.matchesChecked(facts) else owner.matches(facts);
+                if (!matches) continue;
                 _ = self.entries.orderedRemove(index);
                 self.entries.appendAssumeCapacity(owner);
                 return owner.retain();
-            };
+            }
             return null;
         }
         pub fn prepare(self: *Self, context: anytype, facts: []const route.InputBinding, comptime create: anytype) !?*Owner {
@@ -217,7 +223,11 @@ pub fn InternedVariants(comptime Owner: type) type {
                 self.mutex.unlock();
                 return error.PreparedRouteCacheClosed;
             }
-            if (self.lookupLocked(facts, filter)) |owner| {
+            const hit = self.lookupLocked(facts, filter) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
+            if (hit) |owner| {
                 self.stats.hits +|= 1;
                 self.mutex.unlock();
                 return owner;
@@ -235,7 +245,7 @@ pub fn InternedVariants(comptime Owner: type) type {
                 if (self.limit == 0) break :blk candidate;
                 // Another preparation may have interned the same full metadata
                 // while this thread was doing cold work. Keep the single owner.
-                if (self.lookupLocked(facts, filter)) |existing| break :blk existing;
+                if (try self.lookupLocked(facts, filter)) |existing| break :blk existing;
                 if (self.entries.items.len < self.limit) try self.entries.ensureUnusedCapacity(self.allocator, 1);
                 if (self.entries.items.len == self.limit) {
                     if (comptime Owner == PreparedRoutes) {
