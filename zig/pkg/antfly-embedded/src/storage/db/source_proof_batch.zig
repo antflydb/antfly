@@ -136,6 +136,8 @@ pub const DonorIdentity = struct {
     producer_generation: u64,
     producer_artifact_name: []const u8,
     producer_scope_key: []const u8,
+    version: u8 = 3,
+    execution_identity: ?publication.Digest = null,
     selected_bitmap: []const u8,
 };
 
@@ -422,6 +424,8 @@ pub fn prepareReceiverCandidate(
             .producer_generation = proof.producer_generation,
             .producer_artifact_name = producer_artifact_name,
             .producer_scope_key = producer_scope_key,
+            .version = proof.version,
+            .execution_identity = proof.execution_identity,
             .selected_bitmap = selected_bitmap,
         },
         .sources = sources,
@@ -510,6 +514,7 @@ pub fn buildAdoptedProofAlloc(alloc: std.mem.Allocator, candidate: *const Receiv
         effect.* = selected.effect;
     }
     var proof: provenance.Proof = .{
+        .version = candidate.donor.version,
         .namespace = candidate.receiver.namespace,
         .authority_epoch = candidate.receiver.binding.epoch,
         .catalog_digest = candidate.receiver.binding.digest,
@@ -518,6 +523,7 @@ pub fn buildAdoptedProofAlloc(alloc: std.mem.Allocator, candidate: *const Receiv
         .producer_generation = generation,
         .producer_artifact_name = candidate.donor.producer_artifact_name,
         .producer_scope_key = candidate.donor.producer_scope_key,
+        .execution_identity = candidate.donor.execution_identity,
         .publication_digest = @splat(0),
         .input_digest = undefined,
         .sources = candidate.sources,

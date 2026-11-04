@@ -20,6 +20,7 @@ Shares the pinned fixtures, normalization and SSE timing of qualify_transcriptio
 Video inputs use explicitly hashed decoded PCM controls because the reference
 requires an external ffmpeg executable for those containers.
 """
+
 import argparse
 import base64
 import hashlib
@@ -46,26 +47,71 @@ def main():
     parser.add_argument("--generation-repeats", type=int, default=5)
     parser.add_argument("--generation-warmups", type=int, default=1)
     args = parser.parse_args()
-    if args.limit < 0 or args.generation_tokens < 2 or args.generation_repeats < 1 or args.generation_warmups < 0:
+    if (
+        args.limit < 0
+        or args.generation_tokens < 2
+        or args.generation_repeats < 1
+        or args.generation_warmups < 0
+    ):
         parser.error("invalid corpus limit or generation budget")
     args.output.mkdir(parents=True, exist_ok=False)
     decoder = args.model_dir.resolve() / "gemma-4-E4B_q4_0-it.gguf"
     projector = args.model_dir.resolve() / "gemma-4-E4B-it-mmproj.gguf"
-    cases, corpus = q.fixtures(SimpleNamespace(corpus_source=args.corpus_source, limit=args.limit, offset=0))
+    cases, corpus = q.fixtures(
+        SimpleNamespace(corpus_source=args.corpus_source, limit=args.limit, offset=0)
+    )
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     base = f"http://127.0.0.1:{port}"
-    command = [str(args.binary.resolve()), "-m", str(decoder), "--mmproj", str(projector),
-               "--host", "127.0.0.1", "--port", str(port), "-ngl", "99", "-np", "1",
-               "-c", "8192", "-b", "2048", "-ub", "2048", "-ctk", "f32", "-ctv", "f32",
-               "-t", "8", "--reasoning-format", "none", "-lv", "4"]
-    report = {"runtime": "llama.cpp", "model": q.DEFAULT_MODEL,
-              "revision": subprocess.check_output(["git", "-C", str(args.llama_root), "rev-parse", "HEAD"], text=True).strip(),
-              "binary_sha256": q.file_sha(args.binary), "harness_sha256": q.file_sha(Path(__file__)),
-              "decoder_sha256": q.file_sha(decoder), "projector_sha256": q.file_sha(projector),
-              "command": command, "gpu_before": q.gpu_snapshot(), "corpus": corpus,
-              "cache_prompt": False, "generation": [], "transcription": []}
+    command = [
+        str(args.binary.resolve()),
+        "-m",
+        str(decoder),
+        "--mmproj",
+        str(projector),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "-ngl",
+        "99",
+        "-np",
+        "1",
+        "-c",
+        "8192",
+        "-b",
+        "2048",
+        "-ub",
+        "2048",
+        "-ctk",
+        "f32",
+        "-ctv",
+        "f32",
+        "-t",
+        "8",
+        "--reasoning-format",
+        "none",
+        "-lv",
+        "4",
+    ]
+    report = {
+        "runtime": "llama.cpp",
+        "model": q.DEFAULT_MODEL,
+        "revision": subprocess.check_output(
+            ["git", "-C", str(args.llama_root), "rev-parse", "HEAD"], text=True
+        ).strip(),
+        "binary_sha256": q.file_sha(args.binary),
+        "harness_sha256": q.file_sha(Path(__file__)),
+        "decoder_sha256": q.file_sha(decoder),
+        "projector_sha256": q.file_sha(projector),
+        "command": command,
+        "gpu_before": q.gpu_snapshot(),
+        "corpus": corpus,
+        "cache_prompt": False,
+        "generation": [],
+        "transcription": [],
+    }
     process = None
     with (args.output / "server.log").open("wb") as log:
         try:
@@ -83,39 +129,88 @@ def main():
                     time.sleep(0.25)
             print("reference ready", base, flush=True)
             for i in range(args.generation_warmups + args.generation_repeats):
-                result = q.sse_generate(base, q.DEFAULT_MODEL, args.generation_tokens,
-                                        route="/v1/chat/completions", extra_body={"cache_prompt": False})
+                result = q.sse_generate(
+                    base,
+                    q.DEFAULT_MODEL,
+                    args.generation_tokens,
+                    route="/v1/chat/completions",
+                    extra_body={"cache_prompt": False},
+                )
                 result["warmup"] = i < args.generation_warmups
                 result["gpu"] = q.gpu_snapshot()
                 report["generation"].append(result)
                 q.save(args.output / "report.json", report)
-                print(f"generation {i}: {result['decode_tokens_per_second']:.2f} decode tok/s", flush=True)
+                print(
+                    f"generation {i}: {result['decode_tokens_per_second']:.2f} decode tok/s",
+                    flush=True,
+                )
             for case in cases:
                 data = case["data"]
                 video = case["mime"].startswith("video/")
                 transport = q.wav_bytes(q.decoded_pcm(data)) if video else data
-                body = {"model": q.DEFAULT_MODEL, "messages": [{"role": "user", "content": [
-                    {"type": "input_audio", "input_audio": {"data": base64.b64encode(transport).decode(), "format": "wav" if video else case["mime"]}},
-                    {"type": "text", "text": "Transcribe the speech in this audio. Return only the transcript, without commentary."}]}],
-                    "temperature": 0, "max_tokens": 256, "chat_template_kwargs": {"enable_thinking": False}, "cache_prompt": False}
+                body = {
+                    "model": q.DEFAULT_MODEL,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_audio",
+                                    "input_audio": {
+                                        "data": base64.b64encode(transport).decode(),
+                                        "format": "wav" if video else case["mime"],
+                                    },
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "Transcribe the speech in this audio. Return only the transcript, without commentary.",
+                                },
+                            ],
+                        }
+                    ],
+                    "temperature": 0,
+                    "max_tokens": 256,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                    "cache_prompt": False,
+                }
                 response, elapsed, _headers = q.post(base, "/v1/chat/completions", body)
                 transcript = response["choices"][0]["message"]["content"]
                 result = {k: v for k, v in case.items() if k != "data"}
-                result.update(transcript=transcript, score=q.score(case["reference"], transcript),
-                              elapsed_seconds=elapsed, response=response,
-                              input_sha256=hashlib.sha256(data).hexdigest(),
-                              reference_transport_sha256=hashlib.sha256(transport).hexdigest(),
-                              transport="pcm-wav" if video else "original")
+                result.update(
+                    transcript=transcript,
+                    score=q.score(case["reference"], transcript),
+                    elapsed_seconds=elapsed,
+                    response=response,
+                    input_sha256=hashlib.sha256(data).hexdigest(),
+                    reference_transport_sha256=hashlib.sha256(transport).hexdigest(),
+                    transport="pcm-wav" if video else "original",
+                )
                 report["transcription"].append(result)
                 q.save(args.output / "report.json", report)
-                print(f"read {case['id']}: WER={result['score']['wer']} {transcript!r}", flush=True)
-            corpus_results = [r for r in report["transcription"] if r["group"] == "corpus"]
+                print(
+                    f"read {case['id']}: WER={result['score']['wer']} {transcript!r}",
+                    flush=True,
+                )
+            corpus_results = [
+                r for r in report["transcription"] if r["group"] == "corpus"
+            ]
             errors = sum(r["score"]["errors"] for r in corpus_results)
             words = sum(r["score"]["reference_words"] for r in corpus_results)
-            report["corpus_summary"] = {"clips": len(corpus_results), "reference_words": words, "errors": errors, "wer": errors / words}
+            report["corpus_summary"] = {
+                "clips": len(corpus_results),
+                "reference_words": words,
+                "errors": errors,
+                "wer": errors / words,
+            }
             measured = [r for r in report["generation"] if not r["warmup"]]
-            report["generation_summary"] = {k: statistics.median(r[k] for r in measured) for k in [
-                "decode_tokens_per_second", "end_to_end_tokens_per_second", "ttft_seconds"]}
+            report["generation_summary"] = {
+                k: statistics.median(r[k] for r in measured)
+                for k in [
+                    "decode_tokens_per_second",
+                    "end_to_end_tokens_per_second",
+                    "ttft_seconds",
+                ]
+            }
         except Exception as error:
             report["error"] = f"{type(error).__name__}: {error}"
             raise

@@ -806,7 +806,10 @@ export class InferenceClient {
   }
 
   /** Read source audio with backend-specific recognition options. */
-  async readAudio(audio: string, options: Omit<components["schemas"]["InferenceReadRequest"], "audio">): Promise<components["schemas"]["InferenceReadResponse"]> {
+  async readAudio(
+    audio: string,
+    options: Omit<components["schemas"]["InferenceReadRequest"], "audio">
+  ): Promise<components["schemas"]["InferenceReadResponse"]> {
     return this.read({ ...options, audio });
   }
 

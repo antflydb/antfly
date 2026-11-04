@@ -312,6 +312,14 @@ pub const DecodeOptions = struct {
     file_name_hint: ?[]const u8 = null,
 };
 
+/// Borrowed encoded audio and its preprocessing contract. Keep these together
+/// through admission, queueing and decoding; sniffing alone may select a
+/// different codec than the caller's explicit format or MIME declaration.
+pub const EncodedClip = struct {
+    bytes: []const u8,
+    decode_options: DecodeOptions = .{},
+};
+
 /// Resolve the encoded format using the same hint precedence as decoding.
 /// Header-only admission must use this before interpreting format-specific data.
 pub fn detectFormatWithOptions(audio_bytes: []const u8, options: DecodeOptions) ?EncodedFormat {

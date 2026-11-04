@@ -982,14 +982,19 @@ def maybe_pull_missing_model(path: str, payload: dict | None, response) -> bool:
     body = payload if isinstance(payload, dict) else {}
     options = body.get("audio_options") or {}
     diarization = bool(
-        (path == "/ai/v1/read" and isinstance(options, dict) and options.get("diarization"))
+        (
+            path == "/ai/v1/read"
+            and isinstance(options, dict)
+            and options.get("diarization")
+        )
         or (path == "/ai/v1/dictate" and body.get("diarization"))
     )
     missing_speaker = False
     if diarization and response.status_code == 422:
         try:
-            missing_speaker = (
-                response.json().get("error") in ("SPEAKER_MODEL_UNAVAILABLE", "SpeakerModelUnavailable")
+            missing_speaker = response.json().get("error") in (
+                "SPEAKER_MODEL_UNAVAILABLE",
+                "SpeakerModelUnavailable",
             )
         except ValueError:
             pass
