@@ -1271,19 +1271,22 @@ pub fn batchInternal(
         .predicates = predicates,
         .timestamp_ns = timestamp_ns,
         .sync_level = level,
-    }, primary_committed);
+    }, primary_committed, null);
 }
 
 /// A tracked exported batch. When this thread runs an exported write (see
 /// `outcome_receipts.begin`), the handle's writer marker is committed with
 /// the primary write; an unknown outcome publishes its receipt and retires
 /// the writer.
-pub fn trackedBatch(database: *db_mod.DB, req: db_mod.types.BatchRequest, primary_committed: *bool) anyerror!void {
+/// `table_name` names the SQL table whose database `database` is (null for
+/// the handle's root database), so its receipt finds the marker.
+pub fn trackedBatch(database: *db_mod.DB, req: db_mod.types.BatchRequest, primary_committed: *bool, table_name: ?[]const u8) anyerror!void {
     const receipts = @import("outcome_receipts.zig");
     const writer = receipts.activeWriter() orelse return database.batchTracked(req, primary_committed);
-    const marker = writer.next();
+    const named = if (table_name) |name| (if (std.mem.eql(u8, name, "default")) null else name) else null;
+    const marker = writer.next(named);
     database.batchTrackedWithMarker(req, primary_committed, marker) catch |err| {
-        if (!primary_committed.* and antfly.capi_dependencies.sql_errors.isUnknownOutcome(err)) writer.retire(marker);
+        if (!primary_committed.* and antfly.capi_dependencies.sql_errors.isUnknownOutcome(err)) writer.retire(marker, named);
         return err;
     };
 }
@@ -2609,15 +2612,22 @@ pub fn antfly_db_close(handle_ptr: ?*anyopaque) callconv(.c) void {
 /// effort; a leftover marker is a few bytes and harmless.
 fn removeOutcomeMarkerBeforeClose(handle_ptr: ?*anyopaque) void {
     const entry = HandleEntry.capture(handle_ptr) orelse return;
-    const wrote = entry.handle.parent_id == null and entry.lock_handle.outcome_writer.marker_written;
+    const wrote = entry.handle.parent_id == null and entry.lock_handle.outcome_writer.hasCloseCleanup();
     entry.release();
     if (!wrote) return;
     const guard = enterHandle(handle_ptr, .write) orelse return;
     defer guard.leave();
     if (guard.entry_error != null) return;
-    const writer = guard.lock_handle.outcome_writer.takeCloseCleanup() orelse return;
-    guard.handle.database().deleteOutcomeMarker(writer) catch |err|
+    var cleanup = guard.lock_handle.outcome_writer.takeCloseCleanup() orelse return;
+    defer cleanup.deinit();
+    if (cleanup.root) guard.handle.database().deleteOutcomeMarker(cleanup.writer) catch |err|
         std.log.debug("outcome receipt marker left at close: {s}", .{@errorName(err)});
+    // Named SQL tables keep their markers in their own databases.
+    for (cleanup.tables) |name| {
+        const database = @import("tables.zig").get(guard.handle, name) catch continue;
+        database.deleteOutcomeMarker(cleanup.writer) catch |err|
+            std.log.debug("outcome receipt marker left at close: {s}", .{@errorName(err)});
+    }
 }
 
 /// Threading contract of this library, like sqlite3_threadsafe(). Always
@@ -2697,7 +2707,8 @@ pub fn antfly_db_outcome_receipt_status(handle_ptr: ?*anyopaque, receipt: capi.S
     const out = out_status orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = 0;
     const receipts = @import("outcome_receipts.zig");
-    const marker = receipts.parse(receipt.bytes()) catch return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": malformed outcome receipt");
+    const parsed = receipts.parse(receipt.bytes()) catch return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": malformed outcome receipt");
+    const marker = parsed.marker;
     if (receipts.isPending(marker.writer))
         return capi.recordError(.stalled, @src().fn_name ++ ": the uncertain commit is not reconciled until the issuing handle is closed and the database reopened");
     const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
@@ -2708,7 +2719,12 @@ pub fn antfly_db_outcome_receipt_status(handle_ptr: ?*anyopaque, receipt: capi.S
         if (@import("lite_connection.zig").Owner.needsOutcomeReconciliation(guard.handle))
             return capi.recordError(.stalled, @src().fn_name ++ ": the uncertain commit is not reconciled yet; retry");
     };
-    const persisted = guard.handle.database().readOutcomeMarker(marker.writer) catch |err| return capi.mapErrorContext(err, @src().fn_name);
+    // The marker lives in the database the write committed to.
+    const database = if (parsed.table()) |name|
+        (@import("tables.zig").get(guard.handle, name) catch |err| return capi.mapErrorContext(err, @src().fn_name))
+    else
+        guard.handle.database();
+    const persisted = database.readOutcomeMarker(marker.writer) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     const disposition = @import("../storage/db/apply_receipts.zig").outcomeDisposition(persisted, marker.sequence) catch
         return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": the receipt does not match this database");
     out.* = switch (disposition) {
@@ -2724,13 +2740,18 @@ pub fn antfly_db_outcome_receipt_forget(handle_ptr: ?*anyopaque, receipt: capi.S
         return @call(.auto, @extern(*const @TypeOf(antfly_db_outcome_receipt_forget), .{ .name = "antfly_db_outcome_receipt_forget" }), .{ handle_ptr, receipt });
     capi.clearLastError();
     const receipts = @import("outcome_receipts.zig");
-    const marker = receipts.parse(receipt.bytes()) catch return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": malformed outcome receipt");
+    const parsed = receipts.parse(receipt.bytes()) catch return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": malformed outcome receipt");
+    const marker = parsed.marker;
     if (receipts.isPending(marker.writer))
         return capi.recordError(.stalled, @src().fn_name ++ ": the uncertain commit is not reconciled yet");
     const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     defer guard.leave();
     if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
-    guard.handle.database().deleteOutcomeMarker(marker.writer) catch |err| return capi.mapErrorContext(err, @src().fn_name);
+    const database = if (parsed.table()) |name|
+        (@import("tables.zig").get(guard.handle, name) catch |err| return capi.mapErrorContext(err, @src().fn_name))
+    else
+        guard.handle.database();
+    database.deleteOutcomeMarker(marker.writer) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     return .ok;
 }
 
@@ -4907,7 +4928,7 @@ pub fn antfly_db_batch_json(
     const receipt_scope = beginOutcomeReceipts(guard.lock_handle);
     defer receipt_scope.end();
     var primary_committed = false;
-    trackedBatch(handle.database(), owned.req, &primary_committed) catch |err| return batchFailureCode(err, primary_committed);
+    trackedBatch(handle.database(), owned.req, &primary_committed, null) catch |err| return batchFailureCode(err, primary_committed);
     // Committed: a response failure must not read as a failed batch.
     const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch
         return capi.recordError(.stalled, "batch committed; its response could not be encoded; do not retry the batch");

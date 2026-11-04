@@ -683,8 +683,10 @@ test "capi SQL outcome receipt resolves a Lite autocommit write of unknown outco
         defer reply.deinit();
         try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, reply.code);
         const receipt = try lastReceiptAlloc();
-        // The SQL error body carries the same receipt.
+        // The SQL error body carries the same receipt, naming table `t`
+        // (hex 74), whose database holds the marker.
         try std.testing.expectEqualStrings(receipt, reply.parsed.?.value.object.get("outcome_receipt").?.string);
+        try std.testing.expect(std.mem.endsWith(u8, receipt, ":74"));
         break :blk receipt;
     };
     defer std.testing.allocator.free(receipt);
@@ -698,6 +700,51 @@ test "capi SQL outcome receipt resolves a Lite autocommit write of unknown outco
     try std.testing.expectEqual(expected, (try receiptStatus(f.id, receipt)).status);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_outcome_receipt_forget(f.id, .fromSlice(receipt)));
     try std.testing.expectEqual(h.capi.ErrorCode.invalid_argument, (try receiptStatus(f.id, "or1:not-a-receipt")).code);
+}
+
+test "capi SQL outcome receipt resolves against the named table that holds its marker" {
+    const receipts = @import("outcome_receipts.zig");
+    var f = try OutcomeFixture.init("receipt-named-table");
+    defer f.deinit();
+    // An applied write to table `t` commits its marker in t's database.
+    try f.expectOk(insert_one);
+    const writer = &f.wrapper.outcome_writer;
+    const marker: receipts.Marker = .{ .writer = writer.id.?, .sequence = writer.sequence };
+    var buf: [receipts.max_text_len]u8 = undefined;
+    const named = receipts.Receipt.init(marker, "t");
+    const applied = try receiptStatus(f.id, receipts.format(&named, &buf));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, applied.code);
+    try std.testing.expectEqual(@import("db.zig").ANTFLY_OUTCOME_RECEIPT_APPLIED, applied.status);
+    // The root database never saw it: reading there would wrongly answer
+    // "not applied", which is the mistake a receipt without its table makes.
+    var root_buf: [receipts.max_text_len]u8 = undefined;
+    const root = receipts.Receipt.init(marker, null);
+    try std.testing.expectEqual(@import("db.zig").ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED, (try receiptStatus(f.id, receipts.format(&root, &root_buf))).status);
+    // An unknown table is an error, not "not applied".
+    var missing_buf: [receipts.max_text_len]u8 = undefined;
+    const missing = receipts.Receipt.init(marker, "no_such_table");
+    try std.testing.expect((try receiptStatus(f.id, receipts.format(&missing, &missing_buf))).code != .ok);
+}
+
+test "capi SQL outcome receipt markers in named tables are removed at a clean close" {
+    const api = @import("db.zig");
+    var f = try OutcomeFixture.init("receipt-named-close");
+    defer f.deinit();
+    try f.expectOk(insert_one);
+    const writer = f.wrapper.outcome_writer.id.?;
+    {
+        const guard = api.enterHandle(f.id, .read).?;
+        defer guard.leave();
+        const table = try @import("tables.zig").get(guard.handle, "t");
+        try std.testing.expect(try table.readOutcomeMarker(writer) != null);
+    }
+    api.antfly_db_close(f.id);
+    const reopened = try api.openLiteHandleAlloc(f.path, .{ .no_sync = true, .profile = .hosted, .busy_timeout_ms = 5000 }, false);
+    f.id = try api.publishHandle(reopened);
+    const guard = api.enterHandle(f.id, .read).?;
+    defer guard.leave();
+    const table = try @import("tables.zig").get(guard.handle, "t");
+    try std.testing.expectEqual(@as(?u64, null), try table.readOutcomeMarker(writer));
 }
 
 test "capi SQL outcome receipt for a Lite batch export of unknown outcome" {

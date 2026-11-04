@@ -1147,7 +1147,9 @@ pub fn Adapter(comptime native: type) type {
             // primary write became durable, and whether its publication was
             // left uncertain (reported as an unknown outcome).
             var primary_committed = false;
-            @import("db.zig").trackedBatch(self.db, request, &primary_committed) catch |err| {
+            // Named tables commit to their own database, which holds the marker.
+            const receipt_table: ?[]const u8 = if (self.handle != null) self.table_name else null;
+            @import("db.zig").trackedBatch(self.db, request, &primary_committed, receipt_table) catch |err| {
                 // A confirmed primary write wins: later uncertainty in derived
                 // or control publication leaves it committed, not unknown.
                 if (primary_committed) return if (err == error.EnrichmentWorkerFailed) .committed_repair_required else .committed_pending;

@@ -750,8 +750,10 @@ How it works: each database handle owns a writer (a random id and a call
 sequence). Every tracked write commits the internal marker
 `writer -> sequence` atomically with its primary write. After an unknown
 outcome the handle retires that writer, so its marker never moves again;
-equal means applied, lower or absent means not applied. The cost is one small
-internal key overwrite per exported write. A clean close removes the handle's
+equal means applied, lower or absent means not applied. A SQL write to a named
+table commits the marker in that table's own database, and its receipt names
+the table, so status and forget read the database the write committed to. The
+cost is one small internal key overwrite per exported write. A clean close removes the handle's
 current marker; `antfly_db_outcome_receipt_forget` removes a resolved
 receipt's marker, after which it can no longer be resolved.
 
