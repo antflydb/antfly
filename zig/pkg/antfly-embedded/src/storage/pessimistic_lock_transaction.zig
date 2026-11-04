@@ -85,6 +85,44 @@ pub fn requireBegin(a: A, txn: anytype, receiving: @import("db/doc_identity_name
     if (!std.mem.eql(u8, &transaction.id, &id)) return error.InvalidLockScope;
     if (transaction.decision) |decision| if (!std.meta.eql(decision, ref.decision)) return error.ExternalTransactionDecisionChanged;
 }
+/// Phase-two ABORT can win before BEGIN reaches this group. The existing
+/// native abort tombstone is then the authority for retiring source custody;
+/// it never authorizes a new vote or any row mutation.
+pub fn adoptAbortedIfMissing(a: A, txn: anytype, receiving: @import("db/doc_identity_namespace.zig").Namespace, ref: Ref) !void {
+    if (try read(a, txn, ref.admission.transaction)) |existing| {
+        if (!std.meta.eql(existing.ref, ref)) return error.ExternalTransactionDecisionChanged;
+        return;
+    }
+    return adoptAborted(a, txn, receiving, ref);
+}
+pub fn adoptAborted(a: A, txn: anytype, receiving: @import("db/doc_identity_namespace.zig").Namespace, ref: Ref) !void {
+    const id = ref.admission.transaction;
+    if (try read(a, txn, id)) |previous| {
+        if (!std.meta.eql(previous.ref, ref)) return error.ExternalTransactionDecisionChanged;
+        return;
+    }
+    try ref.admission.binding.requireIdentity(receiving);
+    const native = try transactions.externalParticipant(txn, id) orelse return error.ExternalTransactionDecisionChanged;
+    const owner = native.owner orelse return error.ExternalTransactionDecisionChanged;
+    try ref.validate(id, owner);
+    if (native.status != .aborted) return error.ExternalTransactionDecisionChanged;
+    const scope = try scopes.read(a, txn, ref.admission.binding.namespace, (try ref.admission.registration()).lease.backend) orelse return error.LockOwnerChanged;
+    var expected = try ref.admission.registration();
+    expected.lease.expires_at_ms = scope.registration.lease.expires_at_ms;
+    if (!std.meta.eql(expected, scope.registration) or scope.state == .retired) return error.LockOwnerChanged;
+    if (scope.transaction) |value| {
+        if (!std.mem.eql(u8, &value.id, &id) or (value.decision != null and !std.meta.eql(value.decision.?, ref.decision))) return error.InvalidLockScope;
+    } else if (scope.released_transaction) |value| {
+        if (!std.mem.eql(u8, &value.id, &id)) return error.InvalidLockScope;
+    } else {
+        const held = try scopes.ledger.readOwner(a, txn, ref.admission.binding.namespace, expected.lease.backend) orelse return error.InvalidLockRecord;
+        if (held.resources != 0 or held.transaction != null) return error.InvalidLockScope;
+    }
+    const encoded = try encode(a, .{ .ref = ref });
+    defer a.free(encoded);
+    try txn.put(&key(id), encoded);
+}
+
 /// The caller supplies the actual native writer used for lock retirement.
 /// Completion follows the real native terminal decision and source retirement.
 pub fn complete(a: A, txn: anytype, id: transactions.TxnId, owner: transactions.ExternalDecisionOwner) !void {
@@ -95,8 +133,12 @@ pub fn complete(a: A, txn: anytype, id: transactions.TxnId, owner: transactions.
     const admission = record.ref.admission;
     const source = try scopes.read(a, txn, admission.binding.namespace, (try admission.registration()).lease.backend) orelse return error.InvalidLockRecord;
     if (source.state != .retired or source.transaction != null) return error.LockOwnerBusy;
-    const released = source.released_transaction orelse return error.InvalidLockRecord;
-    if (!std.mem.eql(u8, &released.id, &id) or !std.meta.eql(released.decision, @as(?scopes.DecisionRef, record.ref.decision))) return error.InvalidLockRecord;
+    if (source.released_transaction) |released| {
+        if (!std.mem.eql(u8, &released.id, &id) or (!std.meta.eql(released.decision, @as(?scopes.DecisionRef, record.ref.decision)) and !(native.status == .aborted and released.decision == null))) return error.InvalidLockRecord;
+    } else if (native.status != .aborted) return error.InvalidLockRecord;
+    if (try scopes.ledger.readOwner(a, txn, admission.binding.namespace, try scopes.preparedBackend(admission.binding.namespace, record.ref.decision))) |prepared| {
+        if (prepared.state != .retired or prepared.resources != 0 or prepared.job != null or prepared.waiting != null) return error.LockOwnerBusy;
+    }
     if (record.retired) return;
     record.retired = true;
     const encoded = try encode(a, record);

@@ -18627,9 +18627,30 @@ registered under `sql-qualified-table-row-locks-native-debug` and
 `sql-qualified-lock-matrix-postgres`; inventory integrity still checks all 1,586
 unchanged originals.
 
-These original-statement closures do not qualify arbitrary joined/derived
-LockRows plans or the additional native data-lock integrations with named
-prepared transactions, DML self-exclusion, distributed savepoint delivery and
-ordinary read barriers. The durable participant/2PC boundaries are present, but
-those combinations require their own public tests before they can be described
-as fully activated PostgreSQL locking semantics.
+The native lifecycle integrations now execute through authenticated public
+connections too: SELECT FOR UPDATE followed by UPDATE/COMMIT, savepoint rollback
+and lock promotion, ordinary SELECT/READ ONLY ACCESS SHARE barriers, and prepared
+custody across source connection close and complete process restart. Lock-only
+tables join the same immutable native transaction manifest as written tables.
+Row resolution, native lock retirement and metadata completion have separate
+durable acknowledgements; retention cannot delete the native custody proof early.
+
+Statement failure publishes the failed SQL shell and exact root/subtransaction
+rollback intent together. Recovery advances control only, preserving session
+advisory grants and savepoint parents. A bounded command/effect binding survives
+lost control replies without guessing a new effect sequence. Waiters poll
+resource generations/revisions or native write-intent ownership read-only, and
+re-propose only after relevant state changes. Request-local table admissions
+reuse their pinned ranges across repeated operators.
+
+Native range activation distinguishes pure lock ownership from outstanding row
+work. Terminal externally coordinated participants do not retain fake native
+fan-out debt: metadata owns that cohort and its catalog pins. Legacy native
+coordinators retain their existing resolution barriers. Native tests cover both
+cases, abort-before-BEGIN, write-intent exclusion, cold recovery and atomic
+rollback of interrupted publication. The original inventory remains 922
+implemented / 138 rejected / 449 superseded / 77 unresolved; integration tests
+are qualification, not additional invented original-case closures.
+
+Arbitrary joined/derived LockRows shapes and cross-group deadlock detection are
+separate capabilities; this original-cohort qualification does not claim them.

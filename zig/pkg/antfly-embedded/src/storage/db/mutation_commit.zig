@@ -1429,7 +1429,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var probe = try S.ownerField(self, "core").*.store.beginReadTxn();
                 defer probe.abort();
                 if (!try ranges.isActive(&probe)) {
-                    if (try S.ownerField(self, "core").*.hasTopologySensitiveTransactions()) return error.IntentConflict;
+                    var manager = try S.ownerField(self, "core").*.initTxnManager();
+                    defer manager.deinit();
+                    if (try manager.hasRangeActivationTransactions()) return error.IntentConflict;
                     try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = ranges.activation_key, .value = ranges.activation_value });
                 }
             }

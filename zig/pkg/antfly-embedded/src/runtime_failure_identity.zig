@@ -41,6 +41,20 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .invalid_lock_class, .err = error.InvalidLockClass },
+    .{ .status = .invalid_lock_effect, .err = error.InvalidLockEffect },
+    .{ .status = .invalid_lock_owner, .err = error.InvalidLockOwner },
+    .{ .status = .invalid_lock_record, .err = error.InvalidLockRecord },
+    .{ .status = .invalid_lock_resource, .err = error.InvalidLockResource },
+    .{ .status = .invalid_lock_scope, .err = error.InvalidLockScope },
+    .{ .status = .lock_effect_changed, .err = error.LockEffectChanged },
+    .{ .status = .lock_effect_expired, .err = error.LockEffectExpired },
+    .{ .status = .lock_effect_out_of_order, .err = error.LockEffectOutOfOrder },
+    .{ .status = .lock_limit_exceeded, .err = error.LockLimitExceeded },
+    .{ .status = .lock_owner_busy, .err = error.LockOwnerBusy },
+    .{ .status = .lock_owner_changed, .err = error.LockOwnerChanged },
+    .{ .status = .lock_owner_not_registered, .err = error.LockOwnerNotRegistered },
+    .{ .status = .lock_plan_limit_exceeded, .err = error.LockPlanLimitExceeded },
     .{ .status = .sql_index_already_exists, .err = error.SqlIndexAlreadyExists },
     .{ .status = .sql_constraint_already_exists, .err = error.SqlConstraintAlreadyExists },
     .{ .status = .sql_index_not_found, .err = error.SqlIndexNotFound },
@@ -1372,5 +1386,13 @@ test "reader failures and scoped GCS failures retain exact storage boundary iden
         try std.testing.expect(failure.status != .internal);
         try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
         try std.testing.expectError(expected, statusToError(failure.status));
+    }
+}
+
+test "native locking control failures preserve exact stable identities" {
+    inline for (.{ error.InvalidLockClass, error.InvalidLockEffect, error.InvalidLockOwner, error.InvalidLockRecord, error.InvalidLockResource, error.InvalidLockScope, error.LockEffectChanged, error.LockEffectExpired, error.LockEffectOutOfOrder, error.LockLimitExceeded, error.LockOwnerBusy, error.LockOwnerChanged, error.LockOwnerNotRegistered, error.LockPlanLimitExceeded }) |err| {
+        const transported = statusFromError(err);
+        try std.testing.expect(transported != .internal);
+        try std.testing.expectError(err, statusToError(transported));
     }
 }

@@ -38,14 +38,38 @@ pub const Participant = struct {
     table_name: []const u8,
     route: local.metadata_catalog_route_contract.CatalogRouteFence,
     schema_version: ?u32 = null,
+    sql_locks: ?local.storage_pessimistic_lock_participant.Admission = null,
+
+    pub fn jsonStringify(self: Participant, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Participant).@"struct".field_names) |field| {
+            if (!(comptime std.mem.eql(u8, field, "sql_locks")) or self.sql_locks != null) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+
+    pub fn lockReference(self: Participant, identity: Identity, a: A) !?local.storage_pessimistic_lock_transaction.Ref {
+        const admission = self.sql_locks orelse return null;
+        const owner = try identity.owner(a);
+        const result: local.storage_pessimistic_lock_transaction.Ref = .{ .admission = admission, .decision = .{ .operation = owner.operation_id, .admission = owner.admission_digest } };
+        try result.validate(identity.txn_id, owner);
+        return result;
+    }
 
     pub fn validate(self: Participant, incarnation: [32]u8) !void {
         try self.route.validate();
         if (self.table_name.len == 0 or self.table_name.len > 1024 or !std.unicode.utf8ValidateSlice(self.table_name) or std.mem.indexOfScalar(u8, self.table_name, 0) != null or
             self.route.table_id == 0 or self.route.route.group_id == 0 or self.route.topology_epoch == 0 or self.route.metadata_group_id == 0 or
             self.route.route.identity_namespace.table_id != self.route.table_id or
-            self.route.metadata_incarnation == null or !std.mem.eql(u8, &self.route.metadata_incarnation.?, &incarnation) or
-            (self.schema_version != null and self.schema_version.? == 0)) return error.InvalidCatalogMutation;
+            self.route.metadata_incarnation == null or !std.mem.eql(u8, &self.route.metadata_incarnation.?, &incarnation)) return error.InvalidCatalogMutation;
+        if (self.sql_locks) |admission| {
+            try admission.validate();
+            const expected = try (local.storage_pessimistic_lock_authority.Data.Spec{ .table_name = self.table_name, .route = self.route, .schema_version = self.schema_version }).binding(.{ .home = .metadata, .group = self.route.metadata_group_id, .incarnation = admission.binding.namespace.incarnation });
+            if (admission.purpose != .resolution or !admission.binding.eql(expected)) return error.InvalidCatalogMutation;
+        }
     }
 };
 
@@ -197,6 +221,7 @@ pub const Record = struct {
     was_prepared: bool = false,
     participants: []const Participant,
     votes: u64 = 0,
+    native_lock_releases: u64 = 0,
     activations: u64 = 0,
     resolutions: u64 = 0,
     visibility: u64 = 0,
@@ -214,15 +239,30 @@ pub const Record = struct {
     pub fn visibilityMask(self: Record) u64 {
         return if (self.identity.kind == .session_commit and self.decision != null and self.decision.?.status == .committed and self.decision.?.sync_level != .write) self.mask() else 0;
     }
+    pub fn nativeLockMask(self: Record) u64 {
+        var result: u64 = 0;
+        for (self.participants, 0..) |part, index| if (part.sql_locks != null) {
+            result |= @as(u64, 1) << @intCast(index);
+        };
+        return result;
+    }
     pub fn commitProgress(self: Record) CommitProgress {
-        if (self.phase == .decided or self.phase == .active) return .resolving;
+        if (self.phase == .decided or self.phase == .active or self.native_lock_releases != self.nativeLockMask()) return .resolving;
         if (self.visibility != self.visibilityMask()) return .indexing;
         return if (self.visibility_repairs != 0) .repair_required else .ready;
     }
     pub fn validate(self: Record, a: A) !void {
         try self.identity.validate();
+        for (self.participants) |part| if (part.sql_locks) |admission| {
+            const scope = self.identity.lock_scope orelse return error.InvalidCatalogRecord;
+            if (!scope.backend.eql(admission.source.lease.backend) or !std.meta.eql(scope.command, admission.parent_command) or
+                !std.mem.eql(u8, &self.identity.txn_id, &admission.transaction)) return error.InvalidCatalogRecord;
+        };
         if (self.revision == 0 or !std.mem.eql(u8, &try manifestDigest(a, self.participants, self.identity.metadata_incarnation), &self.identity.manifest_digest)) return error.InvalidCatalogRecord;
         const all = self.mask();
+        if (self.native_lock_releases & ~self.nativeLockMask() != 0 or
+            (self.native_lock_releases != 0 and self.phase != .resolved and self.phase != .retired) or
+            (self.phase == .retired and self.native_lock_releases != self.nativeLockMask())) return error.InvalidCatalogRecord;
         if ((self.votes | self.activations | self.resolutions) & ~all != 0) return error.InvalidCatalogRecord;
         if ((self.visibility | self.visibility_repairs) & ~self.visibilityMask() != 0 or self.visibility_repairs & ~self.visibility != 0) return error.InvalidCatalogRecord;
         if (self.phase != .resolved and self.phase != .retired and self.visibility != 0) return error.InvalidCatalogRecord;
@@ -259,6 +299,7 @@ pub const Action = union(enum) {
     lock_handoff,
     lock_release,
     lock_released,
+    native_locks_released: u64,
     commit: DecisionInput,
     abort: u64,
     activate: u64,
@@ -314,6 +355,10 @@ pub fn advance(a: A, record: Record, expected_revision: u64, owner: Owner, actio
             next.resolutions |= members;
             if (next.resolutions == all) next.phase = .resolved;
         },
+        .native_locks_released => |members| {
+            if (record.phase != .resolved or members == 0 or members & ~record.nativeLockMask() != 0) return error.InvalidPreparedTransactionPhase;
+            next.native_lock_releases |= members;
+        },
         .visibility => |progress| {
             if (record.phase != .resolved or record.identity.kind != .session_commit or progress.complete == 0 or
                 progress.complete & ~record.visibilityMask() != 0 or progress.repair & ~progress.complete != 0) return error.InvalidPreparedTransactionPhase;
@@ -324,7 +369,7 @@ pub fn advance(a: A, record: Record, expected_revision: u64, owner: Owner, actio
             next.visibility_repairs |= progress.repair;
         },
         .handoff => {
-            if (record.phase != .resolved or record.visibility != record.visibilityMask() or (record.hasPreparedLocks() and !record.locks_released)) return error.InvalidPreparedTransactionPhase;
+            if (record.phase != .resolved or record.visibility != record.visibilityMask() or record.native_lock_releases != record.nativeLockMask() or (record.hasPreparedLocks() and !record.locks_released)) return error.InvalidPreparedTransactionPhase;
             next.phase = .retired;
         },
     }
@@ -599,6 +644,7 @@ pub fn plan(a: A, txn: anytype, group: u64, catalog_revision: u64, request: Muta
             const receipt = (try readReceipt(a, txn, group, ack.owner.operation_id)) orelse return .{ .writes = &.{}, .deletes = &.{}, .result = .{ .revision = catalog_revision, .identity = null, .removed = 0, .no_op = true } };
             if (!receipt.owner.eql(ack.owner) or !std.mem.eql(u8, &receipt.txn_id, &ack.txn_id)) return error.ExternalTransactionDecisionChanged;
             if (receipt.status == .pending or receipt.progress == .resolving or receipt.progress == .indexing) return error.InvalidPreparedTransactionPhase;
+            if (try readOperation(a, txn, group, ack.owner.operation_id)) |pending| if (pending.native_lock_releases != pending.nativeLockMask()) return error.CatalogPublicationProofPending;
             try changeReceiptCount(a, txn, group, false, &writes, &deletes);
             try deletes.append(a, try receiptKey(a, group, ack.owner.operation_id));
             try deletes.append(a, try receiptNodeKey(a, group, receipt.session.owner_node_id, ack.owner.operation_id));

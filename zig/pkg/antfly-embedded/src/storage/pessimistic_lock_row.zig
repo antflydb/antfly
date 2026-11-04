@@ -55,7 +55,7 @@ pub const Request = struct {
 };
 pub const Result = struct {
     receipt: ledger.Receipt,
-    status: enum { matched, changed, absent, contended },
+    status: enum { matched, changed, absent, contended, write_pending },
 };
 const Record = struct { request: [32]u8, result: Result };
 fn address(buffer: []u8, admission: participant.Admission, sequence: u64) ![]const u8 {
@@ -126,7 +126,14 @@ pub fn acquire(a: A, txn: anytype, receiving: @import("db/doc_identity_namespace
     const acquisition = request.acquisition;
     const admission = acquisition.admission;
     const found = try current(a, txn, mode, acquisition.physical_key.?);
-    const result: Result = if (found == null or !std.meta.eql(found.?, request.witness)) .{
+    // Compare against native write intents under the same apply mutex as
+    // their admission. An old committed primary is not lockable while another
+    // transaction owns a pending update, even before external COMMIT activation.
+    const writing = try @import("transactions.zig").pendingIntentOwner(a, txn, acquisition.physical_key.?, admission.transaction);
+    const result: Result = if (writing != null) .{
+        .receipt = try participant.cancel(a, txn, receiving, acquisition, authority),
+        .status = .write_pending,
+    } else if (found == null or !std.meta.eql(found.?, request.witness)) .{
         .receipt = try participant.cancel(a, txn, receiving, acquisition, authority),
         .status = if (found == null) .absent else .changed,
     } else result: {

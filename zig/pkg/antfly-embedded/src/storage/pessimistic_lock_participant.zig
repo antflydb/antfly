@@ -184,13 +184,15 @@ pub fn finish(backing: std.mem.Allocator, txn: anytype, admission: Admission, au
 pub const SavepointControl = struct {
     admission: Admission,
     effect: scopes.ledger.Effect,
+    failed_root: bool = false,
 
     pub fn validate(self: SavepointControl) !void {
         try self.admission.validate();
         try self.effect.validate();
         if (self.admission.purpose != .execution or !self.effect.backend.eql((try self.admission.registration()).lease.backend) or self.effect.action != .control) return error.InvalidLockEffect;
+        if (self.failed_root and (self.effect.action.control != .rollback or self.effect.action.control.rollback.first_aborted != 0)) return error.InvalidLockEffect;
         switch (self.effect.action.control) {
-            .rollback => |value| if (value.first_aborted == 0 or !std.mem.eql(u8, &value.transaction, &self.admission.transaction)) return error.InvalidLockScope,
+            .rollback => |value| if ((value.first_aborted == 0 and !self.failed_root) or !std.mem.eql(u8, &value.transaction, &self.admission.transaction)) return error.InvalidLockScope,
             .release_savepoint => |value| if (!std.mem.eql(u8, &value.transaction, &self.admission.transaction)) return error.InvalidLockScope,
             else => return error.InvalidLockEffect,
         }
@@ -203,7 +205,7 @@ pub fn controlStep(backing: std.mem.Allocator, txn: anytype, receiving: @import(
     try authority.requireDataControl(txn, request.admission, request.effect);
     try requireOrigin(backing, txn, request.admission);
     const ns = request.admission.binding.namespace;
-    const context: Context(@TypeOf(authority)) = .{ .backing = backing, .admission = request.admission, .authority = authority };
+    const context: Context(@TypeOf(authority)) = .{ .backing = backing, .admission = request.admission, .authority = authority, .failed_root = request.failed_root };
     if (try scopes.ledger.observe(backing, txn, ns, request.effect, context)) |receipt| {
         if (receipt.outcome != .pending) return receipt;
         return scopes.ledger.step(backing, txn, ns, request.effect, context);
@@ -265,7 +267,9 @@ fn FenceContext(comptime Authority: type) type {
         authority: Authority,
         pub fn requireRegistration(self: @This(), txn: anytype, ns: scopes.ledger.Namespace, value: scopes.Registration) !void {
             if (!std.meta.eql(ns, self.admission.binding.namespace)) return error.InvalidLockScope;
-            try self.admission.requireRegistration(value);
+            var normalized = try self.admission.registration();
+            normalized.lease.expires_at_ms = value.lease.expires_at_ms;
+            if (!std.meta.eql(normalized, value)) return error.LockOwnerChanged;
             try self.authority.requireDataFence(txn, self.admission);
         }
         pub fn requireFence(self: @This(), txn: anytype, ns: scopes.ledger.Namespace, value: scopes.Record, _: scopes.Fence) !void {
@@ -360,6 +364,7 @@ fn Context(comptime Authority: type) type {
         backing: std.mem.Allocator,
         admission: Admission,
         authority: Authority,
+        failed_root: bool = false,
         fn registration(self: @This(), ns: scopes.ledger.Namespace, observed: scopes.Registration) !void {
             if (!std.meta.eql(ns, self.admission.binding.namespace)) return error.InvalidLockScope;
             var expected = try self.admission.registration();
@@ -389,7 +394,7 @@ fn Context(comptime Authority: type) type {
             const value = try scopes.guard(self.backing, txn, ns, lease.backend, try self.admission.command(), self);
             if (!std.meta.eql(lease, value.registration.lease) or !effect.backend.eql(lease.backend)) return error.LockOwnerChanged;
             if (effect.action == .control) {
-                const request: SavepointControl = .{ .admission = self.admission, .effect = effect };
+                const request: SavepointControl = .{ .admission = self.admission, .effect = effect, .failed_root = self.failed_root };
                 try request.validate();
                 try self.authority.requireDataControl(txn, self.admission, effect);
             } else {

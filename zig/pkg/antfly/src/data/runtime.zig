@@ -1356,6 +1356,19 @@ const RaftTableApplyStateMachine = struct {
         TemporalOverlapViolation,
         TemporalEmptyRange,
         SqlInvalidTextRepresentation,
+        InvalidLockClass,
+        InvalidLockEffect,
+        InvalidLockOwner,
+        InvalidLockResource,
+        InvalidLockScope,
+        LockEffectChanged,
+        LockEffectExpired,
+        LockEffectOutOfOrder,
+        LockLimitExceeded,
+        LockOwnerBusy,
+        LockOwnerChanged,
+        LockOwnerNotRegistered,
+        LockPlanLimitExceeded,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
@@ -1411,6 +1424,9 @@ const RaftTableApplyStateMachine = struct {
         }
 
         fn toError(self: ExpectedApplyFailure) anyerror {
+            inline for (@typeInfo(@import("antfly_local_sources").storage_pessimistic_lock_control.Rejection).error_set.error_names.?) |name| {
+                if (self == @field(ExpectedApplyFailure, name)) return @field(@import("antfly_local_sources").storage_pessimistic_lock_control.Rejection, name);
+            }
             inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
                 if (self == @field(ExpectedApplyFailure, field)) return @field(@import("antfly_local_sources").storage_db_online_source_contract.Rejection, field);
             }
@@ -1449,6 +1465,9 @@ const RaftTableApplyStateMachine = struct {
         }
 
         fn forRequest(err: anyerror, req: antfly.db.types.BatchRequest) ?ExpectedApplyFailure {
+            if (req.sql_lock != null) inline for (@typeInfo(@import("antfly_local_sources").storage_pessimistic_lock_control.Rejection).error_set.error_names.?) |name| {
+                if (err == @field(@import("antfly_local_sources").storage_pessimistic_lock_control.Rejection, name)) return @field(ExpectedApplyFailure, name);
+            };
             // A committed transaction decision cannot be converted into a
             // rejected participant mutation by late retention pressure or a
             // newly retired FK generation. Both conditions must be prevented

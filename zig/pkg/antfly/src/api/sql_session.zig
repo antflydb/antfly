@@ -102,6 +102,63 @@ pub const Coordinator = struct {
         return error.SqlConnectionBusy;
     }
 
+    /// Publish failure and rollback intent together, then drain only control
+    /// work under a bounded cleanup budget. The failed SQL shell stays attached.
+    pub fn failed(ptr: *anyopaque, scope: sql.Scope, id: sql.Id) !void {
+        const self: *Coordinator = @ptrCast(@alignCast(ptr));
+        const old = self.context;
+        defer self.context = old;
+        self.context.cancellation = .none;
+        self.context.deadline_io = null;
+        self.context.deadline_ns = platform_time.monotonicNs() +| 3 * std.time.ns_per_s;
+        const fence = self.context.sql_command_fence orelse return error.SqlConnectionBusy;
+        const store = self.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
+        var state = (try self.server.txn_sessions.getSqlState(self.server.alloc, id)) orelse return error.SqlTransactionNotActive;
+        defer state.deinit(self.server.alloc);
+        if (state.execution_started or state.terminal != null or state.terminal_prepare or state.terminal_abort) return error.TransactionCommitSealed;
+        const connection = state.connection_id orelse return error.SqlConnectionNotFound;
+        const producer = @import("sql_command_producer.zig");
+        const io = self.server.embedding_provider_runtime.io;
+        const instance = try self.server.sql_connection_admission.executionInstance(io);
+        const frame: @import("sql_advisory_execution.zig").Frame = .{ .source = store, .connection = connection, .principal = scope.principal, .instance = instance, .fence = fence.*, .actor = try @import("sql_authorization_recovery.zig").actor(self.server, self.identity.*) };
+        var native: producer.NativePort = .{ .server = self.server, .context = self.context };
+        while (true) {
+            try self.context.ensureActive();
+            const now = platform_time.realtimeNs() / std.time.ns_per_ms;
+            try frame.requireExecuting(self.server.alloc, now);
+            var owned = (try producer.load(store, self.server.alloc, connection)) orelse return error.SqlConnectionNotFound;
+            defer owned.deinit();
+            var nonce: [16]u8 = undefined;
+            try io.randomSecure(&nonce);
+            if (owned.value.control_effect != null) {
+                try self.drainControl(scope.principal, connection, instance, owned.value.ticket.?);
+                continue;
+            }
+            if (owned.value.pending != null and owned.value.pending.?.operation == .renew) {
+                producer.advance(store, self.server.alloc, scope.principal, owned.value, instance, now, nonce, native.port()) catch |err| switch (err) {
+                    error.MetadataMutationOutcomeUnknown, error.SqlConnectionChanged => {},
+                    else => return err,
+                };
+                continue;
+            }
+            var cut = try native.port().snapshot(self.server.alloc, owned.value);
+            defer cut.deinit();
+            if (cut.value.owner) |owner| if (owner.waiting) |waiting| {
+                const registration = owned.value.registration;
+                _ = try native.port().submit(self.server.alloc, .{ .admission = .{ .head = cut.value.head, .nonce = nonce }, .incarnation = registration.lease.backend.incarnation, .standalone = registration.standalone, .database = registration.lease.database, .actor = owned.value.actor, .backend = registration.lease.backend, .operation = .{ .cancel = .{ .command = owned.value.ticket.?.command, .effect = waiting } } });
+                continue;
+            };
+            var plan = try producer.observeControlPlan(self.server.alloc, owned.value, instance, id, now, nonce, native.port());
+            plan.failure = true;
+            self.server.txn_sessions.failSqlWithControl(self.server.alloc, id, plan) catch |err| switch (err) {
+                error.SqlConnectionChanged => continue,
+                else => return err,
+            };
+            try self.drainControl(scope.principal, connection, instance, owned.value.ticket.?);
+            return;
+        }
+    }
+
     /// Metadata-first DISCARD: reset the logical connection and its resources
     /// together with a durable unlock-all intent, then drain native control.
     pub fn discard(self: *Coordinator, connection: [32]u8, expected_revision: u64) !void {
@@ -295,6 +352,7 @@ pub const Adapter = struct {
     commit_fn: *const fn (*anyopaque, sql.Scope, sql.Id) anyerror!sql.CommitResult,
     rollback_fn: ?*const fn (*anyopaque, sql.Scope, sql.Id) anyerror!void = null,
     savepoint_fn: ?*const fn (*anyopaque, sql.Scope, sql.Id, []const u8, transactions.SessionRegistry.SqlSavepointAction) anyerror!void = null,
+    failed_fn: ?*const fn (*anyopaque, sql.Scope, sql.Id) anyerror!void = null,
     supports_range_guards: bool = false,
     connection_id: ?[32]u8 = null,
     connection_revision: ?u64 = null,
@@ -452,6 +510,7 @@ pub const Adapter = struct {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
+        if (self.failed_fn) |callback| return callback(self.commit_context, scope, id);
         try self.registry.setSqlFailed(self.alloc, id, true);
     }
 

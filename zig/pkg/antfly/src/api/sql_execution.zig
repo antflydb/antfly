@@ -621,7 +621,7 @@ pub const Adapter = struct {
             });
         }
         var coordinator = session_api.Coordinator{ .server = self.server, .identity = self.identity, .context = self.context, .sync_level = if (self.setting_overlay_source == .connection) try setting_catalog.mutationSyncLevel(self.setting_overlay) else null };
-        var owner = session_api.Adapter{ .command_fence = self.context.sql_command_fence, .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .rollback_fn = session_api.Coordinator.rollback, .savepoint_fn = if (self.context.sql_command_fence != null) session_api.Coordinator.savepoint else null, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = if (self.setting_overlay_source == .durable_session) self.setting_overlay else &.{}, .connection_search_path = if (self.connection_id != null and self.ddl_search_path != null) self.ddl_search_path.?.* else null };
+        var owner = session_api.Adapter{ .command_fence = self.context.sql_command_fence, .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .rollback_fn = session_api.Coordinator.rollback, .savepoint_fn = if (self.context.sql_command_fence != null) session_api.Coordinator.savepoint else null, .failed_fn = if (self.context.sql_command_fence != null) session_api.Coordinator.failed else null, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = if (self.setting_overlay_source == .durable_session) self.setting_overlay else &.{}, .connection_search_path = if (self.connection_id != null and self.ddl_search_path != null) self.ddl_search_path.?.* else null };
         var session = sessions.Session{ .owner = owner.owner(), .scope = .{ .principal = http_server.transactionPrincipal(self.identity.*) orelse "", .database = self.database, .namespace = self.session_namespace orelse self.namespace } };
         if (self.session_id) |encoded| {
             const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return zig017_failure: {
@@ -1079,10 +1079,16 @@ pub const Adapter = struct {
         };
     }
     pub fn lockingTransaction(self: *Adapter) ![16]u8 {
+        return self.lockingTransactionMode(false);
+    }
+    pub fn lockingReadTransaction(self: *Adapter) ![16]u8 {
+        return self.lockingTransactionMode(true);
+    }
+    fn lockingTransactionMode(self: *Adapter, read_only_allowed: bool) ![16]u8 {
         const id = if (self.active_transaction) |active| active else if (self.implicit_advisory) |scope| try scope.transaction() else return error.SqlTransactionNotActive;
         var state = (try self.server.txn_sessions.getSqlState(self.server.alloc, id)) orelse return error.SqlTransactionNotActive;
         defer state.deinit(self.server.alloc);
-        if (state.metadata.mode == .read_only) return error.SqlReadOnlyTransaction;
+        if (!read_only_allowed and state.metadata.mode == .read_only) return error.SqlReadOnlyTransaction;
         return id;
     }
     pub fn lockingReadCommitted(self: *Adapter) !bool {
@@ -2332,6 +2338,7 @@ pub const Adapter = struct {
 
     fn openNativeScan(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
+        if (self.context.sql_command_fence != null and (self.active_transaction != null or self.implicit_advisory != null)) try @import("sql_table_lock_execution.zig").table(self, alloc, table, .access_share, .block);
         if (request.index_equality != null) return error.SqlRangeTrackingRequired;
         const source = self.server.table_reads orelse return error.SqlStatementReadUnavailable;
         if (source.vtable.open_relational_read == null or source.route_fence != null) return null;
@@ -2564,6 +2571,12 @@ pub const Adapter = struct {
 
     fn openStatement(ptr: *anyopaque, alloc: std.mem.Allocator, requests: []const catalog.StatementScan) anyerror!catalog.StatementRead {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
+        // Retain ACCESS SHARE through the SQL transaction, including streamed
+        // autocommit delivery. A preflight conflict probe cannot protect a
+        // cursor against an ACCESS EXCLUSIVE grant admitted after its snapshot.
+        if (self.context.sql_command_fence != null and (self.active_transaction != null or self.implicit_advisory != null)) for (requests) |request| {
+            if (request.table.external_base_source == null) try @import("sql_table_lock_execution.zig").table(self, alloc, request.table, .access_share, .block);
+        };
         for (requests) |request| if (request.table.external_base_source != null) return self.openLakeStatement(alloc, requests);
         if (self.dynamic_snapshot != null) return self.openDynamicStatement(alloc, requests);
         if (requests.len == 0 or requests.len > 64) return error.SqlProgramLimitExceeded;

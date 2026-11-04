@@ -1359,6 +1359,12 @@ pub const DurableSessionStore = struct {
             if (!std.mem.eql(u8, &actual, &want)) return error.SqlWriteConflict;
         }
         if (plan) |publication| {
+            if (publication.failure) {
+                const metadata = session.sql orelse return error.SqlTransactionNotActive;
+                const action = control orelse return error.InvalidLockScope;
+                if (!metadata.failed or action != .rollback or action.rollback.first_aborted != session.current_subtransaction or
+                    !std.mem.eql(u8, &action.rollback.transaction, &session.txn_id) or session.commit_execution_started or session.external_preparation != null) return error.InvalidLockScope;
+            }
             if (session.connection_id == null or session.owner_node_id != publication.prior.registration.lease.node or
                 !std.mem.eql(u8, session.principal orelse "", publication.prior.principal)) return error.SqlConnectionNotFound;
         } else if (session.connection_id) |connection| {
@@ -2788,6 +2794,28 @@ pub const SessionRegistry = struct {
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
         self.publishCandidateLocked(alloc, publish_target, &candidate);
+    }
+
+    /// Failure and its native rollback intent are one durable publication.
+    /// Keep the failed SQL shell attached until ROLLBACK/ROLLBACK TO; cleanup
+    /// never evaluates SQL or invents a commit decision after response loss.
+    pub fn failSqlWithControl(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, plan: @import("sql_command_producer.zig").ControlPlan) !void {
+        if (!plan.failure) return error.InvalidLockScope;
+        const stripe = self.sessionLock(txn_id);
+        stripe.lock();
+        defer stripe.unlock();
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        errdefer candidate.deinit(alloc);
+        const expected = try self.refreshSavepointCandidate(alloc, &candidate, plan);
+        if (candidate.commit_execution_started or candidate.external_preparation != null or candidate.terminal_commit != null or candidate.terminal_abort) return error.TransactionCommitSealed;
+        if (candidate.sql) |*metadata| metadata.failed = true else return error.SqlTransactionNotActive;
+        touchSession(&candidate);
+        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
+        try self.persistSavepoint(candidate, expected, plan, .{ .rollback = .{ .transaction = txn_id, .first_aborted = candidate.current_subtransaction } });
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, target, &candidate);
     }
 
     /// Called under the SQL execution lease. The first query fixes snapshot

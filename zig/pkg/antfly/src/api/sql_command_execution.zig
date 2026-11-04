@@ -364,6 +364,28 @@ pub const Request = struct {
         return self.native.context.cancellation.isCancelled() or self.signal.lost.load(.acquire) or
             @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms >= self.signal.expires_at_ms.load(.acquire);
     }
+    /// Parse/bind and result-adaptation errors cross the same failure boundary
+    /// as execution errors. Never run a statement to clean up its resources.
+    pub fn failed(self: *Request, identity: ?@import("http_server.zig").AuthenticatedIdentity, failure: ?anyerror) !bool {
+        if (failure) |err| if (err == error.SqlWriteCapacityUnavailable) return false;
+        const loan = if (self.loan) |*value| value else return false;
+        errdefer self.signal.retire_required.store(true, .release);
+        const server = self.native.server;
+        const store = loan.controller.store;
+        var connection = try @import("sql_connections.zig").load(store, server.alloc, loan.controller.connection, loan.controller.principal, loan.controller.node, 0);
+        defer connection.deinit();
+        const id = connection.value.active_txn orelse return false;
+        var session = (try store.loadInto(server.alloc, id)) orelse return false;
+        defer session.deinit(server.alloc);
+        if (session.commit_execution_started or session.terminal_commit != null or session.terminal_abort or session.external_preparation != null) return false;
+        const metadata = session.sql orelse return false;
+        if (metadata.failed) return true;
+        var authenticated = identity;
+        var coordinator: @import("sql_session.zig").Coordinator = .{ .server = server, .identity = &authenticated, .context = self.attach(self.native.context) };
+        try @import("sql_session.zig").Coordinator.failed(&coordinator, .{ .principal = loan.controller.principal, .database = metadata.database, .namespace = metadata.namespace }, id);
+        return true;
+    }
+
     pub fn finish(self: *Request) !void {
         if (self.loan) |*loan| {
             const server = self.native.server;

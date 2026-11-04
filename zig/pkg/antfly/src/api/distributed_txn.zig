@@ -480,6 +480,7 @@ pub const HostedParticipantWorker = struct {
                 context.restore_staging_scope = req.restore_staging_scope;
                 context.restore_staging_plan_id = req.restore_staging_plan_id;
                 context.external_decision_owner = req.external_decision_owner;
+                context.sql_locks = req.sql_locks;
                 context.route_fence = req.route_fence;
                 const result = self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, context) catch |err| {
                     if (!isLocalPreDecisionCandidateMiss(err, self.writes.vtable.txn_begin_group_local_with_pre_decision_context != null)) return err;
@@ -632,6 +633,7 @@ pub const HostedParticipantWorker = struct {
             context.restore_staging_scope = req.restore_staging_scope;
             context.restore_staging_plan_id = req.restore_staging_plan_id;
             context.external_decision_owner = req.external_decision_owner;
+            context.sql_locks = req.sql_locks;
             context.route_fence = req.route_fence;
             const result = self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, context) catch |err| {
                 if (isLocalPreDecisionCandidateMiss(err, self.writes.vtable.txn_begin_group_local_with_pre_decision_context != null)) return false;
@@ -1072,7 +1074,7 @@ pub const LocalTableWriteParticipantWorker = struct {
 
     fn beginGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
-        _ = (try self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, .{ .restore_staging_scope = req.restore_staging_scope, .restore_staging_plan_id = req.restore_staging_plan_id, .external_decision_owner = req.external_decision_owner, .route_fence = req.route_fence })) orelse return error.UnknownGroup;
+        _ = (try self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, .{ .restore_staging_scope = req.restore_staging_scope, .restore_staging_plan_id = req.restore_staging_plan_id, .external_decision_owner = req.external_decision_owner, .sql_locks = req.sql_locks, .route_fence = req.route_fence })) orelse return error.UnknownGroup;
     }
 
     fn prepareGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
@@ -1225,6 +1227,10 @@ pub const ExternalAuthority = struct {
     admit: *const fn (*anyopaque, std.mem.Allocator, ExternalIdentity, []const ExternalParticipant) anyerror!ExternalRecord,
     advance: *const fn (*anyopaque, std.mem.Allocator, ExternalRecord, ExternalAction) anyerror!ExternalRecord,
     next_version: *const fn (*anyopaque, u64) anyerror!u64,
+    /// One durable custody or metadata detach quantum under the admitted
+    /// manifest. This callback never evaluates SQL or creates a new decision.
+    prepare_locks: ?*const fn (*anyopaque, std.mem.Allocator, ExternalRecord) anyerror!bool = null,
+    resolve_locks: ?*const fn (*anyopaque, std.mem.Allocator, ExternalRecord) anyerror!bool = null,
 };
 const external_registry = @import("../system_catalog/prepared_transactions.zig");
 const ExternalRecord = external_registry.Record;
@@ -1272,6 +1278,28 @@ pub const ExternalPreparation = struct {
         self.* = undefined;
     }
 
+    pub fn attachLocks(self: *ExternalPreparation, a: std.mem.Allocator, spec: @import("antfly_local_sources").storage_pessimistic_lock_authority.Data.Spec, admission: @import("antfly_local_sources").storage_pessimistic_lock_participant.Admission) !void {
+        for (self.manifest, self.participants.items) |*entry, *participant| {
+            if (entry.route.route.group_id != spec.route.route.group_id) continue;
+            if (entry.route.table_id != spec.route.table_id or entry.route.topology_epoch != spec.route.topology_epoch or
+                !std.meta.eql(entry.route.route, spec.route.route) or (entry.schema_version != null and entry.schema_version != spec.schema_version)) return error.CatalogGenerationChanged;
+            entry.route = spec.route;
+            entry.schema_version = spec.schema_version;
+            entry.sql_locks = admission;
+            participant.route_fence = spec.route;
+            participant.schema_version = spec.schema_version;
+            return;
+        }
+        if (self.manifest.len == external_registry.max_participants) return error.CatalogCommandTooLarge;
+        const id = try participantIdForGroupScoped(a, spec.table_name, spec.route.route.group_id, null, null);
+        errdefer a.free(id);
+        try self.participants.append(a, .{ .table_name = spec.table_name, .group_id = spec.route.route.group_id, .topology_epoch = spec.route.topology_epoch, .route_fence = spec.route, .schema_version = spec.schema_version });
+        self.manifest = try a.realloc(self.manifest, self.manifest.len + 1);
+        self.manifest[self.manifest.len - 1] = .{ .table_name = spec.table_name, .route = spec.route, .schema_version = spec.schema_version, .sql_locks = admission };
+        self.participant_ids = try a.realloc(self.participant_ids, self.participant_ids.len + 1);
+        self.participant_ids[self.participant_ids.len - 1] = id;
+    }
+
     /// A lost BEGIN/vote/publication reply leaves the immutable metadata job
     /// pending. Only its durable decision may authorize subsequent cleanup;
     /// ordinary coordinator status probes and best-effort aborts are forbidden.
@@ -1287,6 +1315,17 @@ pub const ExternalPreparation = struct {
         if (record.phase != .preparing) return error.InvalidPreparedTransactionPhase;
         var slots: [external_registry.max_participants]ExternalFanoutTask.Slot = undefined;
         try runExternalFanout(a, worker, record, self, .begin, &slots, options);
+        if (authority.prepare_locks) |prepare_locks| {
+            var quanta: u8 = 0;
+            while (!try prepare_locks(authority.ptr, a, record)) {
+                if (options.external_deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
+                quanta += 1;
+                if (quanta == 8) {
+                    if (options.fanout_io) |io| try io.sleep(.fromMilliseconds(1), .awake);
+                    quanta = 0;
+                }
+            }
+        } else for (record.participants) |part| if (part.sql_locks != null) return error.UnsupportedOperation;
         try runExternalFanout(a, worker, record, self, .vote, &slots, options);
         record = try authority.advance(authority.ptr, a, record, .prepare);
         if (record.phase == .locking) record = try recoverExternalTransaction(a, worker, authority, identity.operation_id, 0, options);
@@ -1325,6 +1364,7 @@ const ExternalFanoutTask = struct {
                 .retain_terminal = true,
                 .participants = preparation.?.participant_ids,
                 .external_decision_owner = owner,
+                .sql_locks = try p.lockReference(record.identity, a),
             }),
             .vote => {
                 var intent = preparation.?.participants.items[index].intent();
@@ -1421,6 +1461,16 @@ pub fn recoverExternalTransaction(a: std.mem.Allocator, worker: ParticipantWorke
                 if (failure) |err| return err;
             },
             .resolved => {
+                // Row-resolution ACKs are durable before lock retirement.
+                // Do not replay row resolution while its own lock owner is
+                // closing, and do not release native retention before this
+                // separately resumable control barrier completes.
+                if (record.native_lock_releases != record.nativeLockMask()) {
+                    const resolve_locks = authority.resolve_locks orelse return error.UnsupportedOperation;
+                    if (!try resolve_locks(authority.ptr, a, record)) continue;
+                    record = try authority.advance(authority.ptr, a, record, .{ .native_locks_released = record.nativeLockMask() });
+                    continue;
+                }
                 if (record.hasPreparedLocks() and !record.locks_released) {
                     record = try authority.advance(authority.ptr, a, record, .lock_release);
                     continue;

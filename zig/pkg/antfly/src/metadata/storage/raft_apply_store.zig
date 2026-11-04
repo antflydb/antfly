@@ -40867,12 +40867,19 @@ pub const RaftApplyStore = struct {
         if (request.standalone != standalone) return error.CatalogGenerationChanged;
         _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_prepared_transactions_version);
         const minimum_decoder = switch (request.operation) {
-            .admit => |admission| admission.identity.minimumDecoderVersion(),
-            .cancel_admission => |cancel| cancel.original.identity.minimumDecoderVersion(),
+            .admit => |admission| version: {
+                for (admission.participants) |part| if (part.sql_locks != null) break :version topology_protocol.sql_native_lock_custody_version;
+                break :version admission.identity.minimumDecoderVersion();
+            },
+            .cancel_admission => |cancel| version: {
+                for (cancel.original.participants) |part| if (part.sql_locks != null) break :version topology_protocol.sql_native_lock_custody_version;
+                break :version cancel.original.identity.minimumDecoderVersion();
+            },
             .advance => |change| blk: {
                 var scratch = std.heap.ArenaAllocator.init(self.alloc);
                 defer scratch.deinit();
                 const record = (try PreparedTransactions.readOperation(scratch.allocator(), txn, group, change.owner.operation_id)) orelse break :blk topology_protocol.sql_prepared_transactions_version;
+                for (record.participants) |part| if (part.sql_locks != null) break :blk topology_protocol.sql_native_lock_custody_version;
                 break :blk record.identity.minimumDecoderVersion();
             },
             .acknowledge_receipt => |ack| blk: {
@@ -40998,6 +41005,22 @@ pub const RaftApplyStore = struct {
                         // an orphan binding if the decision admission fails.
                         if (current.released_transaction) |released| if (std.mem.eql(u8, &released.id, &identity.txn_id)) return error.CatalogGenerationChanged;
                     }
+                    // The durable manifest must cover every enrolled data
+                    // owner. A missing lock-only table cannot be inferred from
+                    // row writes, nor dropped when its connection detaches.
+                    if (current.data) |directory| for (directory.slots) |generation| {
+                        if (generation == 0) continue;
+                        const part = try SqlLocks.scopes.Data.readParticipant(a, txn, ns, ref.backend, generation) orelse return error.InvalidCatalogRecord;
+                        if (!std.mem.eql(u8, &part.admission.transaction, &identity.txn_id)) continue;
+                        var represented = false;
+                        for (request.operation.admit.participants) |candidate| if (candidate.sql_locks) |locks| {
+                            if (locks.generation == generation and locks.source.lease.backend.eql(ref.backend)) {
+                                represented = true;
+                                break;
+                            }
+                        };
+                        if (!represented) return error.CatalogPublicationProofPending;
+                    };
                     const lock_owner = try SqlLocks.scopes.ledger.readOwner(a, txn, ns, ref.backend) orelse return error.InvalidCatalogRecord;
                     if (lock_owner.waiting != null or lock_owner.job != null) return error.CatalogPublicationProofPending;
                     if (identity.kind == .named and lock_owner.mixed_resources != 0) return error.MixedAdvisoryPrepareUnsupported;
@@ -41022,6 +41045,22 @@ pub const RaftApplyStore = struct {
                     metadata_table_manager.rangeDocIdentityShardId(range) != participant.route.route.identity_namespace.shard_id or
                     metadata_table_manager.rangeDocIdentityRangeId(range) != participant.route.route.identity_namespace.range_id or
                     participant.route.route.range_id != participant.route.route.identity_namespace.range_id) return error.CatalogGenerationChanged;
+                if (participant.sql_locks) |locks| {
+                    const ref = identity.lock_scope orelse return error.InvalidCatalogMutation;
+                    const ns: SqlLocks.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = request.incarnation };
+                    const root = try SqlLocks.scopes.read(a, txn, ns, ref.backend) orelse return error.InvalidCatalogRecord;
+                    const directory = root.data orelse return error.CatalogGenerationChanged;
+                    if (std.mem.indexOfScalar(u64, &directory.slots, locks.generation) == null) return error.CatalogGenerationChanged;
+                    const original = try SqlLocks.scopes.Data.readParticipant(a, txn, ns, ref.backend, locks.generation) orelse return error.InvalidCatalogRecord;
+                    if (original.command_open or !std.mem.eql(u8, &original.admission.transaction, &identity.txn_id)) return error.CatalogPublicationProofPending;
+                    var expected = original.admission;
+                    expected.purpose = .resolution;
+                    expected.serial = try std.math.add(u64, expected.serial, 1);
+                    expected.parent_command = ref.command;
+                    expected.source = root.registration;
+                    expected.source.lease.expires_at_ms = locks.source.lease.expires_at_ms;
+                    if (!std.meta.eql(expected, locks)) return error.CatalogGenerationChanged;
+                }
                 var seen = false;
                 for (request.operation.admit.participants[0..index]) |previous| if (previous.route.table_id == participant.route.table_id) {
                     if (!std.mem.eql(u8, previous.table_name, participant.table_name) or previous.schema_version != participant.schema_version or previous.route.topology_epoch != participant.route.topology_epoch) return error.InvalidCatalogMutation;
@@ -41039,7 +41078,7 @@ pub const RaftApplyStore = struct {
                 if (namespace.parent_id != request.database_id) return error.CatalogGenerationChanged;
                 if (participant.schema_version) |version| {
                     if (table.schema_json.len == 0) return error.CatalogGenerationChanged;
-                    var schema = try std.json.parseFromSlice(struct { version: u32 }, a, table.schema_json, .{ .ignore_unknown_fields = true });
+                    var schema = try std.json.parseFromSlice(struct { version: u32 = 0 }, a, table.schema_json, .{ .ignore_unknown_fields = true });
                     defer schema.deinit();
                     if (schema.value.version != version) return error.CatalogGenerationChanged;
                 }

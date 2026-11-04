@@ -22,14 +22,20 @@ const participant = @import("pessimistic_lock_participant.zig");
 const row = @import("pessimistic_lock_row.zig");
 const transactions = @import("transactions.zig");
 const frozen = @import("pessimistic_lock_transaction.zig");
+const command_control = @import("pessimistic_lock_command_control.zig");
 const Identity = @import("db/doc_identity_namespace.zig").Namespace;
 const A = std.mem.Allocator;
 const ledger = scopes.ledger;
+
+/// Deterministic private-command failures advance the committed Raft entry.
+/// Corrupt persisted records remain storage failures and are never consumed.
+pub const Rejection = error{ InvalidLockClass, InvalidLockEffect, InvalidLockOwner, InvalidLockResource, InvalidLockScope, LockEffectChanged, LockEffectExpired, LockEffectOutOfOrder, LockLimitExceeded, LockOwnerBusy, LockOwnerChanged, LockOwnerNotRegistered, LockPlanLimitExceeded };
 
 pub const Checked = struct {
     source: scopes.Record,
     participant: scopes.Data.Participant,
     admitted_at_ms: u64,
+    failed_transaction: bool = false,
 
     pub fn validate(self: Checked, admission: participant.Admission) !void {
         try admission.validate();
@@ -66,6 +72,7 @@ pub const Command = struct {
         row: struct { effect: ledger.Effect, key: []const u8, witness: row.Witness, wait: @FieldType(row.Request, "wait") },
         cancel: struct { effect: ledger.Effect, key: ?[]const u8 = null },
         control: ledger.Effect,
+        bound_control: command_control.Request,
         cancel_wait: ledger.Effect,
         finish,
         close,
@@ -82,6 +89,7 @@ pub const Command = struct {
                 try effect.validate();
                 if (effect.action != .acquire or !effect.backend.eql((try self.admission.registration()).lease.backend)) return error.InvalidLockEffect;
             },
+            .bound_control => |value| try value.validate(self.admission),
             .control => |effect| try (participant.SavepointControl{ .admission = self.admission, .effect = effect }).validate(),
             .prepare, .resolve => |decision| try decision.validate(),
             else => {},
@@ -92,7 +100,7 @@ pub const Command = struct {
     }
 };
 
-pub const Query = struct { admission: participant.Admission, effect: ?ledger.Effect = null, row_request: ?row.Request = null };
+pub const Query = struct { admission: participant.Admission, effect: ?ledger.Effect = null, row_request: ?row.Request = null, command_control: bool = false, intent_key: ?[]const u8 = null };
 pub const Snapshot = struct {
     scope: ?scopes.Record,
     owner: ?ledger.Owner,
@@ -100,6 +108,9 @@ pub const Snapshot = struct {
     row_result: ?row.Result = null,
     resource: ?ledger.ResourceStamp = null,
     frozen: ?frozen.Record = null,
+    prepared_owner: ?ledger.Owner = null,
+    bound_control: ?ledger.Effect = null,
+    intent_owner: ?transactions.TxnId = null,
 };
 
 pub fn snapshot(a: A, txn: anytype, receiving: Identity, query: Query) !Snapshot {
@@ -108,12 +119,19 @@ pub fn snapshot(a: A, txn: anytype, receiving: Identity, query: Query) !Snapshot
     const ns = query.admission.binding.namespace;
     const backend = (try query.admission.registration()).lease.backend;
     var result: Snapshot = .{ .scope = try scopes.read(a, txn, ns, backend), .owner = try ledger.readOwner(a, txn, ns, backend), .frozen = try frozen.read(a, txn, query.admission.transaction) };
+    if (result.frozen) |record| result.prepared_owner = try ledger.readOwner(a, txn, ns, try scopes.preparedBackend(ns, record.ref.decision));
+    if (query.command_control) result.bound_control = try command_control.effect(a, txn, query.admission);
+    if (query.intent_key) |key| {
+        _ = try query.admission.binding.row(key);
+        result.intent_owner = try transactions.pendingIntentOwner(a, txn, key, query.admission.transaction);
+    }
     const observed = result.scope orelse return result;
     const context: Observer = .{ .admission = query.admission, .registration = observed.registration };
     if (query.row_request) |request| {
         if (query.effect != null or !std.meta.eql(request.acquisition.admission, query.admission)) return error.InvalidLockEffect;
         result.row_result = try row.observe(a, txn, receiving, request, context);
         if (result.row_result) |value| result.receipt = value.receipt;
+        result.resource = try ledger.readResourceStamp(a, txn, ns, request.acquisition.effect.action.resource());
     } else if (query.effect) |effect| {
         result.receipt = try ledger.observe(a, txn, ns, effect, context);
         if (effect.action == .acquire) result.resource = try ledger.readResourceStamp(a, txn, ns, effect.action.resource());
@@ -143,6 +161,7 @@ pub fn apply(a: A, txn: anytype, receiving: Identity, group: u64, mode: @import(
         .acquire => |effect| _ = try participant.acquire(a, txn, receiving, .{ .admission = command.admission, .effect = effect }, context),
         .row => |value| _ = try row.acquire(a, txn, receiving, mode, command.rowRequest(value), context),
         .cancel => |value| _ = try participant.cancel(a, txn, receiving, .{ .admission = command.admission, .effect = value.effect, .physical_key = value.key }, context),
+        .bound_control => |value| _ = try command_control.apply(a, txn, receiving, command.admission, value, context),
         .control => |effect| _ = try participant.controlStep(a, txn, receiving, .{ .admission = command.admission, .effect = effect }, context),
         .cancel_wait => |effect| try participant.cancelWaiting(a, txn, receiving, command.admission, effect, context),
         .finish => try participant.finish(a, txn, command.admission, context),
@@ -157,11 +176,31 @@ pub fn apply(a: A, txn: anytype, receiving: Identity, group: u64, mode: @import(
         },
         .prepare => |decision| _ = try participant.prepareStep(a, txn, receiving, command.admission, decision, context),
         .resolve => |decision| {
+            try frozen.adoptAbortedIfMissing(a, txn, receiving, .{ .admission = command.admission, .decision = decision });
+            const source = try scopes.read(a, txn, command.admission.binding.namespace, (try command.admission.registration()).lease.backend) orelse return error.LockOwnerChanged;
+            const native = try transactions.externalParticipant(txn, command.admission.transaction) orelse return error.ExternalTransactionDecisionChanged;
+            const destination = try ledger.readOwner(a, txn, command.admission.binding.namespace, try scopes.preparedBackend(command.admission.binding.namespace, decision));
+            if (native.status == .aborted and destination == null and (source.transaction == null or source.transaction.?.decision == null)) {
+                try participant.fence(a, txn, receiving, command.admission, context);
+                const backend = (try command.admission.registration()).lease.backend;
+                if (source.transaction) |transaction| {
+                    _ = try scopes.releaseTransaction(a, txn, command.admission.binding.namespace, backend, transaction, context);
+                } else if (try scopes.closeStep(a, txn, command.admission.binding.namespace, backend, context)) {
+                    try frozen.complete(a, txn, command.admission.transaction, native.owner orelse return error.ExternalTransactionDecisionChanged);
+                }
+                return;
+            }
+            // An abort can race BEGIN or an unfinished transfer. Complete that
+            // admitted custody operation before releasing it; source grants
+            // must never be abandoned in the gap between the two owners.
+            if (destination == null or destination.?.state == .incoming) {
+                _ = try participant.prepareStep(a, txn, receiving, command.admission, decision, context);
+                return;
+            }
             if (try participant.resolvePreparedStep(a, txn, receiving, command.admission.binding, decision, command.admission.transaction, context)) {
                 const backend = (try command.admission.registration()).lease.backend;
                 try participant.fence(a, txn, receiving, command.admission, context);
                 if (try scopes.closeStep(a, txn, command.admission.binding.namespace, backend, context)) {
-                    const native = try transactions.externalParticipant(txn, command.admission.transaction) orelse return error.ExternalTransactionDecisionChanged;
                     try frozen.complete(a, txn, command.admission.transaction, native.owner orelse return error.ExternalTransactionDecisionChanged);
                 }
             }
@@ -194,8 +233,15 @@ const Authority = struct {
     pub fn requireDataObservation(self: @This(), _: anytype, value: participant.Admission, _: ledger.Effect) !void {
         try self.requireSame(value);
     }
-    pub fn requireDataControl(self: @This(), txn: anytype, value: participant.Admission, _: ledger.Effect) !void {
+    pub fn requireDataControl(self: @This(), txn: anytype, value: participant.Admission, effect: ledger.Effect) !void {
         try self.requireDataAdmission(txn, value);
+        if (effect.action == .control and effect.action.control == .rollback and effect.action.control.rollback.first_aborted == 0) {
+            // Only a durable failed SQL shell can release an executing root.
+            // An admitted native decision instead owns phase-two cleanup.
+            const checked = self.command.checked orelse return error.LockOwnerChanged;
+            if (!checked.failed_transaction or self.command.operation != .bound_control or !self.command.operation.bound_control.failed_root or
+                try transactions.externalParticipant(txn, value.transaction) != null or try frozen.read(self.a, txn, value.transaction) != null) return error.LockOwnerBusy;
+        }
     }
     fn requireNativeDecision(self: @This(), txn: anytype, selected: scopes.DecisionRef, terminal: bool) !void {
         const ref = try frozen.read(self.a, txn, self.command.admission.transaction) orelse return error.ExternalTransactionDecisionChanged;
@@ -207,7 +253,7 @@ const Authority = struct {
     }
     pub fn requireDataPreparedAdmission(self: @This(), txn: anytype, value: participant.Admission, selected: scopes.DecisionRef, _: scopes.Record) !void {
         try self.requireSame(value);
-        try self.requireNativeDecision(txn, selected, false);
+        try self.requireNativeDecision(txn, selected, self.command.operation == .resolve);
     }
     pub fn requirePreparedDataResolution(self: @This(), txn: anytype, binding: participant.Binding, selected: scopes.DecisionRef, id: [16]u8, _: ledger.Lease) !void {
         if (!binding.eql(self.command.admission.binding) or !std.mem.eql(u8, &id, &self.command.admission.transaction)) return error.LockOwnerChanged;

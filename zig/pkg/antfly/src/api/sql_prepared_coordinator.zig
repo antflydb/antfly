@@ -35,7 +35,7 @@ pub const Registry = struct {
     anchor: ?struct { incarnation: [16]u8, standalone: bool, head: u64 } = null,
 
     pub fn authority(self: *@This()) distributed.ExternalAuthority {
-        return .{ .ptr = self, .read = read, .admit = admit, .advance = advance, .next_version = nextVersion };
+        return .{ .ptr = self, .read = read, .admit = admit, .advance = advance, .next_version = nextVersion, .prepare_locks = prepareLocks, .resolve_locks = resolveLocks };
     }
 
     pub fn snapshot(self: *@This(), a: A, lookup: registry.Read) !registry.Snapshot {
@@ -120,6 +120,18 @@ pub const Registry = struct {
         // A concurrent decision is fenced by the native owner and the next
         // expected-revision CAS; another observation cannot eliminate that race.
         return .{ .identity = identity, .participants = participants };
+    }
+
+    fn prepareLocks(raw: *anyopaque, a: A, record: registry.Record) anyerror!bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const complete = try @import("sql_data_locks.zig").transactionQuantum(self.server, a, self.context, record, null);
+        self.anchor = null;
+        return complete;
+    }
+
+    fn resolveLocks(raw: *anyopaque, a: A, record: registry.Record) anyerror!bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return @import("sql_data_locks.zig").transactionQuantum(self.server, a, self.context, record, record.mask());
     }
 
     fn advance(raw: *anyopaque, a: A, record: registry.Record, action: registry.Action) anyerror!registry.Record {
@@ -332,7 +344,25 @@ fn recoverSessionWithContext(server: *http.ApiHttpServer, txn_id: [16]u8, bytes:
         }
         if (seal.identity.kind == .session_commit) {
             _ = (try server.txn_sessions.recordExternalCommitReceipt(server.alloc, txn_id, cut.receipts[0])) orelse return error.SqlTransactionNotActive;
-            if (cut.receipts[0].progress == .resolving) return error.MetadataMutationOutcomeUnknown;
+            if (cut.receipts[0].progress == .resolving or (cut.records.len == 1 and cut.records[0].native_lock_releases != cut.records[0].nativeLockMask())) {
+                // The synchronous caller owns this exact durable purpose. It
+                // can advance its admitted control graph directly rather than
+                // flooding metadata reads while waiting for a global worker.
+                if (cut.records.len != 1) return error.InvalidSqlBackendResponse;
+                var transport: ParticipantTransport = undefined;
+                try transport.init(server);
+                const pass_deadline = @import("antfly_platform").time.monotonicNs() +| distributed.external_recovery_pass_timeout_ns;
+                const deadline = if (context.deadline_ns) |value| @min(value, pass_deadline) else pass_deadline;
+                transport.local_worker.recovery_deadline_ns = deadline;
+                if (transport.hosted) transport.hosted_worker.recovery_deadline_ns = deadline;
+                _ = distributed.recoverExternalTransaction(a, transport.worker(), source.authority(), seal.identity.operation_id, @import("antfly_platform").time.realtimeNs(), .{ .fanout_io = server.sharedApiIo(), .external_deadline_ns = deadline }) catch |err| switch (err) {
+                    // A concurrent controller can advance the same immutable
+                    // purpose. Reload its record on the next control pass.
+                    error.CatalogGenerationChanged => return error.MetadataMutationOutcomeUnknown,
+                    else => return err,
+                };
+                return error.MetadataMutationOutcomeUnknown;
+            }
             if (cut.receipts[0].progress == .indexing) {
                 // Row intents have resolved: release transactional locks while
                 // the independent index barrier remains durable recovery debt.
@@ -502,6 +532,7 @@ pub fn commitScoped(server: *http.ApiHttpServer, user: ?http.AuthenticatedIdenti
     if (source.database_id != frame.database) return error.InvalidLockScope;
     var cohort = try distributed.ExternalPreparation.init(a, server.catalogSource(), tables);
     defer cohort.deinit(a);
+    try @import("sql_data_locks.zig").attachPreparation(server, a, context, id, &cohort);
     var transport: ParticipantTransport = undefined;
     if (cohort.manifest.len != 0) try transport.init(server);
     const encoded = try transactions.encodeExecutionPlan(a, tables);
@@ -537,7 +568,7 @@ pub fn commitScoped(server: *http.ApiHttpServer, user: ?http.AuthenticatedIdenti
     // same durable decision and release barriers, without requiring a fictitious
     // table participant or constructing a transport that will never be called.
     deliver: {
-        var record = if (cohort.manifest.len == 0)
+        var record = if (abort or cohort.manifest.len == 0)
             Registry.admit(&source, a, identity, cohort.manifest) catch break :deliver
         else
             cohort.prepare(a, transport.worker(), source.authority(), identity, .{ .fanout_io = server.sharedApiIo(), .external_deadline_ns = context.deadline_ns }) catch break :deliver;
@@ -549,6 +580,7 @@ pub fn commitScoped(server: *http.ApiHttpServer, user: ?http.AuthenticatedIdenti
             }
             _ = recoverEmptyCohort(&source, a, record, now) catch break :deliver;
         } else {
+            if (abort) record = Registry.advance(&source, a, record, .{ .abort = distributed.commitVersion(info.begin_timestamp) catch break :deliver }) catch break :deliver;
             _ = distributed.recoverExternalTransaction(a, transport.worker(), source.authority(), operation_id, now, .{ .fanout_io = server.sharedApiIo(), .external_deadline_ns = context.deadline_ns }) catch break :deliver;
         }
     }
@@ -611,7 +643,44 @@ pub fn execute(root: *execution.Adapter, session: *sql_session.Session, coordina
         root.outcome_transaction_id = std.fmt.bytesToHex(record.identity.txn_id, .lower);
         var transport: ParticipantTransport = undefined;
         transport.init(server) catch return error.SqlTransactionOutcomeUnknown;
-        _ = distributed.recoverExternalTransaction(scratch, transport.worker(), source.authority(), record.identity.operation_id, @import("antfly_platform").time.realtimeNs(), .{ .fanout_io = server.sharedApiIo() }) catch return error.SqlTransactionOutcomeUnknown;
+        const time = @import("antfly_platform").time;
+        const deadline = root.context.deadline_ns orelse time.monotonicNs() +| 30 * std.time.ns_per_s;
+        source.context.deadline_ns = deadline;
+        transport.local_worker.recovery_deadline_ns = deadline;
+        if (transport.hosted) transport.hosted_worker.recovery_deadline_ns = deadline;
+        while (true) {
+            root.context.ensureActive() catch return error.SqlTransactionOutcomeUnknown;
+            if (time.monotonicNs() >= deadline) return error.SqlTransactionOutcomeUnknown;
+            const finished = pass: {
+                // Reclaim each pass's snapshots and transport allocations. A
+                // large lock set must not accumulate one arena per quantum.
+                var pass_region = std.heap.ArenaAllocator.init(server.alloc);
+                defer pass_region.deinit();
+                const temporary = pass_region.allocator();
+                const advanced = distributed.recoverExternalTransaction(temporary, transport.worker(), source.authority(), record.identity.operation_id, time.realtimeNs(), .{ .fanout_io = server.sharedApiIo(), .external_deadline_ns = deadline }) catch |err| switch (err) {
+                    // The recovery driver yields after eight durable quanta. Its
+                    // incomplete-decision result is resumable for this exact
+                    // admitted operation, including lock-only participants.
+                    error.CommitDecisionUnknown, error.CatalogGenerationChanged, error.MetadataMutationOutcomeUnknown, error.CatalogPublicationProofPending => break :pass false,
+                    error.SqlPreparedTransactionNotFound => {
+                        // Another controller can finish this exact admitted
+                        // decision. Only absence in the same durable realm is
+                        // its retirement witness; SQL/GID lookup is not replayed.
+                        const completed = try source.snapshot(temporary, .{ .operation = record.identity.operation_id });
+                        try Registry.checkRealm(completed, record.identity);
+                        if (completed.records.len != 0) break :pass false;
+                        break :pass true;
+                    },
+                    else => {
+                        std.log.warn("prepared SQL resolution rejected err={s}", .{@errorName(err)});
+                        return error.SqlTransactionOutcomeUnknown;
+                    },
+                };
+                break :pass advanced.phase == .retired;
+            };
+            if (finished) break;
+            try server.embedding_provider_runtime.io.sleep(.fromMilliseconds(1), .awake);
+        }
         if (committed) result.output.mutation_outcome = .committed;
         return result;
     }
@@ -671,6 +740,7 @@ pub fn execute(root: *execution.Adapter, session: *sql_session.Session, coordina
     const signed = try server.signCurrentRowPolicyMutationParticipants(scratch, prepared.tables, commit_context);
     var cohort = try distributed.ExternalPreparation.init(scratch, server.catalogSource(), signed);
     defer cohort.deinit(scratch);
+    try @import("sql_data_locks.zig").attachPreparation(server, scratch, root.context, id, &cohort);
     var transport: ParticipantTransport = undefined;
     try transport.init(server);
     const encoded = try transactions.encodeExecutionPlan(server.alloc, signed);

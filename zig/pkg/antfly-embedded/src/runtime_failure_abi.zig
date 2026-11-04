@@ -898,6 +898,20 @@ pub const Status = enum(u32) {
     catalog_generation_exhausted = 939,
     sql_index_already_exists = 940,
     sql_constraint_already_exists = 941,
+    invalid_lock_class = 942,
+    invalid_lock_effect = 943,
+    invalid_lock_owner = 944,
+    invalid_lock_record = 945,
+    invalid_lock_resource = 946,
+    invalid_lock_scope = 947,
+    lock_effect_changed = 948,
+    lock_effect_expired = 949,
+    lock_effect_out_of_order = 950,
+    lock_limit_exceeded = 951,
+    lock_owner_busy = 952,
+    lock_owner_changed = 953,
+    lock_owner_not_registered = 954,
+    lock_plan_limit_exceeded = 955,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

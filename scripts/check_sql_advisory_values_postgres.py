@@ -261,6 +261,30 @@ def check():
                 0,
                 20,
             )
+        # ERROR aborts the current PostgreSQL transaction/subtransaction
+        # immediately. Other backends need not wait for ROLLBACK TO/ROLLBACK.
+        with psycopg.connect(connection.info.dsn, autocommit=True) as observer:
+            connection.execute("BEGIN")
+            value(connection, "SELECT pg_advisory_xact_lock(610)", "", 2278)
+            value(connection, "SELECT pg_advisory_lock(611)", "", 2278)
+            rejects(connection, "SELECT 1/0", "22012")
+            value(observer, "SELECT pg_try_advisory_lock(610)", True, 16)
+            value(observer, "SELECT pg_try_advisory_lock(611)", False, 16)
+            connection.execute("ROLLBACK")
+            connection.execute("SELECT pg_advisory_unlock_all()")
+            observer.execute("SELECT pg_advisory_unlock_all()")
+            connection.execute("BEGIN")
+            value(connection, "SELECT pg_advisory_xact_lock(612)", "", 2278)
+            connection.execute("SAVEPOINT child")
+            value(connection, "SELECT pg_advisory_xact_lock(613)", "", 2278)
+            rejects(connection, "SELECT 1/0", "22012")
+            value(observer, "SELECT pg_try_advisory_lock(612)", False, 16)
+            value(observer, "SELECT pg_try_advisory_lock(613)", True, 16)
+            connection.execute("ROLLBACK TO child")
+            observer.execute("SELECT pg_advisory_unlock_all()")
+            value(connection, "SELECT pg_try_advisory_xact_lock(613)", True, 16)
+            connection.execute("RELEASE child")
+            connection.execute("ROLLBACK")
         for format_, raw, expected in (
             (0, b"ignored", b""),
             (0, b"", b""),

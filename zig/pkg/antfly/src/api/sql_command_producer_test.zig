@@ -760,21 +760,27 @@ test "SQL command producer native scoped rollback retains its durable abort and 
                 for (0..authority.outcomes.retained + 1) |_| try std.testing.expectError(error.CatalogGenerationChanged, native.submit(source.value, .{ .bind = .{ .command = ticket.command, .transaction = id(999) } }));
             }
             native.block_cancel = false;
-        } else try adapter.owner().vtable.rollback(&adapter, scope, transaction.id);
+        } else {
+            // Successful rollback now drains its exact completion before
+            // returning. Inject the lost release request/reply before that
+            // synchronous drain, rather than after cleanup already finished.
+            native.before = failed;
+            native.after = !failed;
+            try adapter.owner().vtable.rollback(&adapter, scope, transaction.id);
+        }
         var finishing = (try producer.load(&durable, a, connection)).?;
         defer finishing.deinit();
         try producer.finish(&durable, "alice", finishing.value, instance, ticket, try native.head(), native.nonce());
         try native.step(&durable, instance, 3);
         var waiting = (try producer.load(&durable, a, connection)).?;
         defer waiting.deinit();
-        try std.testing.expectEqual(.finishing, waiting.value.phase);
+        try std.testing.expectEqual(if (rejected) producer.Phase.finishing else producer.Phase.idle, waiting.value.phase);
         try std.testing.expect(!waiting.value.recovery);
         if (!rejected) {
             // Do not run prepared-job maintenance. The source's own decision-
             // gated outbox must release this transaction and admit the next
             // command, including a lost release request/reply.
-            native.before = failed;
-            native.after = !failed;
+            try std.testing.expect(!native.before and !native.after);
             for (0..64) |_| {
                 if (try phase(&durable) == .idle) break;
                 native.step(&durable, instance, 3) catch |err| switch (err) {
@@ -2431,7 +2437,12 @@ test "SQL command producer native autocommit advisory reads lazily decide and re
             try context.ensureActive();
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            if (input == .sql_lock_mutate and input.sql_lock_mutate.operation == .effect) self.effects += 1;
+            if (input == .sql_lock_mutate and input.sql_lock_mutate.operation == .effect) {
+                const action = input.sql_lock_mutate.operation.effect.effect.action;
+                // Count statement effects separately from the completion
+                // control that now drains before the HTTP reply is returned.
+                if (action != .control or action.control == .unlock_all) self.effects += 1;
+            }
             if (input == .sql_prepared_read and input.sql_prepared_read == .operation and self.cancel.load(.acquire) and self.fail_abort.swap(false, .acq_rel)) {
                 self.store.fail_command_recovery_once_for_test.store(true, .release);
                 return error.GroupLeaderUnavailable;
@@ -2775,4 +2786,70 @@ test "SQL command producer native catalog preparation preserves remote fences an
     var malformed = request;
     malformed.command_fence.?.group = 0;
     try std.testing.expectError(error.InvalidLockScope, malformed.requireCommandFence(null));
+}
+
+test "SQL command producer native atomically publish failure rollback and resume cold lost replies" {
+    const advisory = @import("sql_advisory_execution.zig");
+    const Datum = local.sql_scalar.Datum;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |standalone| for ([_]bool{ false, true }) |replicated| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/failed-lock-control-{any}-{any}", .{ tmp.sub_path, standalone, replicated });
+        defer a.free(path);
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var source = transactions.DurableSessionStore.init(a, &metadata.store);
+        var registry = transactions.SessionRegistry.init(&source);
+        defer registry.deinit(a);
+        var native: Native = .{ .metadata = &metadata, .replicated = replicated };
+        try setup(&metadata, &source, standalone, &native);
+        try native.until(&source, .idle, 2);
+        const ticket = try begin(&native, &source, 20);
+        const fence = try execute(&source, ticket);
+        const txn = try attachedTransaction(&native, &source, &registry, fence);
+        try stageSavepointRow(&registry, txn, "root");
+        var root = try advisory.Machine.init(advisoryFrame(&source, fence), .pg_advisory_xact_lock, &.{Datum.json(.{ .integer = 610 })}, .{ .id = txn, .subtransaction = 0 }, native.nonce());
+        _ = try finishMachine(&native, &root);
+        var session_lock = try advisory.Machine.init(advisoryFrame(&source, fence), .pg_advisory_lock, &.{Datum.json(.{ .integer = 611 })}, null, native.nonce());
+        _ = try finishMachine(&native, &session_lock);
+        for ([_]@FieldType(transactions.DurableSessionStore, "fail_savepoint_publication_for_test"){ .session, .source }) |failure| {
+            var plan = try savepointPlan(&native, &source, txn);
+            defer plan.deinit();
+            plan.value.failure = true;
+            source.fail_savepoint_publication_for_test = failure;
+            try std.testing.expectError(error.InjectedSessionStoreFailure, registry.failSqlWithControl(a, txn, plan.value));
+            source.fail_savepoint_publication_for_test = null;
+            var persisted = (try source.loadInto(a, txn)).?;
+            defer persisted.deinit(a);
+            try std.testing.expect(!persisted.sql.?.failed);
+            var unchanged = (try producer.load(&source, a, connection)).?;
+            defer unchanged.deinit();
+            try std.testing.expect(unchanged.value.pending == null and unchanged.value.control_effect == null);
+            var cut = try nativeCut(&native, fence.backend, null);
+            defer cut.deinit();
+            try std.testing.expectEqual(@as(u32, 1), cut.value.owner.?.transaction_resources);
+            try std.testing.expectEqual(@as(u32, 2), cut.value.owner.?.resources);
+        }
+        {
+            var plan = try savepointPlan(&native, &source, txn);
+            defer plan.deinit();
+            plan.value.failure = true;
+            try registry.failSqlWithControl(a, txn, plan.value);
+        }
+        // Drop a native control reply and cold-open after every quantum.
+        // Only the persisted rollback intent is resumed, never the SQL body.
+        native.after = true;
+        try coldSavepointControl(&metadata, &source, &registry, &native, path, false);
+        var state = (try registry.getSqlState(a, txn)).?;
+        defer state.deinit(a);
+        try std.testing.expect(state.metadata.failed);
+        try std.testing.expectEqual(@as(usize, 1), try savepointRows(&registry, txn));
+        var cut = try nativeCut(&native, fence.backend, null);
+        defer cut.deinit();
+        try std.testing.expectEqual(@as(u32, 0), cut.value.owner.?.transaction_resources);
+        try std.testing.expectEqual(@as(u32, 1), cut.value.owner.?.resources);
+        try std.testing.expect(cut.value.owner.?.job == null and cut.value.owner.?.waiting == null);
+        try finishBody(&native, &source, ticket);
+        try native.until(&source, .idle, 2);
+    };
 }

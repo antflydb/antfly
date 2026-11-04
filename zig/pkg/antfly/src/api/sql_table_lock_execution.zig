@@ -35,6 +35,7 @@ pub const Owner = struct {
     arena: std.heap.ArenaAllocator,
     root: *Root,
     participants: std.ArrayList(*Participant) = .empty,
+    tables: std.AutoHashMapUnmanaged(u64, struct { schema_version: u32, modes: u8 }) = .empty,
     const Participant = struct { value: scopes.Data.Participant, next_effect: u64, table_modes: u8 = 0, range: local.storage_db_types.ByteRange };
     pub fn deinit(self: *Owner) void {
         const a = self.arena.child_allocator;
@@ -100,7 +101,7 @@ pub const Owner = struct {
         };
         var stage: enum { transaction, metadata_read, metadata_admit, metadata_confirm, native_admit, native_read } = .transaction;
         errdefer std.log.warn("native SQL lock enrollment rejected stage={s} metadata_group={} data_group={} table_id={} revision={}", .{ @tagName(stage), spec.route.metadata_group_id, spec.route.route.group_id, spec.route.table_id, spec.route.catalog_revision });
-        const id = try self.root.lockingTransaction();
+        const id = try self.root.lockingReadTransaction();
         const a = self.arena.allocator();
         const frame = try self.root.lockingFrame();
         var port: producer.NativePort = .{ .server = self.root.server, .context = self.root.context };
@@ -161,17 +162,26 @@ pub const Owner = struct {
         const acquisition: ledger.Acquisition = .{ .resource = try part.value.admission.binding.table(), .mode = .{ .table = mode }, .scope = .{ .transaction = .{ .id = part.value.admission.transaction, .subtransaction = self.root.active_subtransaction } } };
         const effect_value = try self.effect(part, if (wait == .block) .{ .acquire = acquisition } else .{ .try_acquire = acquisition });
         const request: Native.Command = .{ .admission = part.value.admission, .operation = .{ .acquire = effect_value } };
+        var submit_needed = true;
+        var waited_at: ?ledger.ResourceStamp = null;
         while (true) {
             try self.checkpoint();
             var scratch = std.heap.ArenaAllocator.init(self.root.server.alloc);
             defer scratch.deinit();
             const a = scratch.allocator();
-            try transport.submit(self.root.server, a, self.root.context, part.value.spec.table_name, request);
+            if (submit_needed) try transport.submit(self.root.server, a, self.root.context, part.value.spec.table_name, request);
             const cut = try transport.observe(self.root.server, a, self.root.context, part.value.spec.table_name, .{ .admission = request.admission, .effect = effect_value });
             const receipt = cut.receipt orelse return error.InvalidSqlBackendResponse;
             try receipt.requireFor(request.admission.binding.namespace, effect_value);
             switch (receipt.outcome) {
-                .pending => try self.pause(),
+                .pending => {
+                    // Re-propose only when a holder/queue revision changes.
+                    // Read-only observations still see cancellation/deadlock
+                    // receipts, without filling Raft with identical waiters.
+                    submit_needed = !submit_needed and !std.meta.eql(waited_at, cut.resource);
+                    waited_at = cut.resource;
+                    if (!submit_needed) try self.pause();
+                },
                 .granted => {
                     part.next_effect += 1;
                     part.table_modes |= bit;
@@ -223,8 +233,20 @@ pub fn authorize(raw: *anyopaque, a: A, target: catalog.Table, mode: locks.Table
 }
 pub fn table(raw: *anyopaque, _: A, target: catalog.Table, mode: locks.TableMode, wait: ast.LockWait) !void {
     const root: *Root = @ptrCast(@alignCast(raw));
+    if (mode != .access_share) _ = try root.lockingTransaction();
     const owner = try Owner.init(root);
     const a = owner.arena.allocator();
+    const bit = @as(u8, 1) << @as(u3, @intCast(@backingInt(mode)));
+    if (owner.tables.getPtr(target.id)) |held| {
+        if (held.schema_version != target.schema_version) return error.CatalogGenerationChanged;
+        if (held.modes & bit != 0) return;
+        // The first successful acquisition enrolled every native range and
+        // pins its membership until retirement. Reuse those exact admissions
+        // when another operator in this command needs a stronger table mode.
+        for (owner.participants.items) |part| if (part.value.spec.route.table_id == target.id) try owner.acquireTable(part, mode, wait);
+        held.modes |= bit;
+        return;
+    }
     var routing = (try TableCatalog.tableRoutingSnapshotForWrite(a, root.server.catalogSource(), target.physical_name, root.context.deadline_ns)) orelse return error.TableNotFound;
     defer routing.deinit(a);
     if (routing.table_id != target.id) return error.CatalogGenerationChanged;
@@ -235,6 +257,7 @@ pub fn table(raw: *anyopaque, _: A, target: catalog.Table, mode: locks.TableMode
         const spec: scopes.Data.Spec = .{ .table_name = target.physical_name, .route = routing.fenceForRoute(route), .schema_version = if (target.schema_json.len == 0) null else target.schema_version };
         try owner.acquireTable(try owner.enroll(spec, .{ .start = range.start_key, .end = range.end_key orelse "" }), mode, wait);
     }
+    try owner.tables.put(a, target.id, .{ .schema_version = target.schema_version, .modes = bit });
 }
 
 pub fn row(raw: *anyopaque, a: A, target: catalog.Table, identity: local.sql_locking.Identity, captured: catalog.Row, mode: locks.RowMode, wait: ast.LockWait, fields: []const []const u8) !?catalog.Row {
@@ -250,17 +273,22 @@ pub fn row(raw: *anyopaque, a: A, target: catalog.Table, identity: local.sql_loc
         const effect_value = try owner.effect(part, .{ .acquire = acquisition });
         const request: Native.Command = .{ .admission = part.value.admission, .operation = .{ .row = .{ .effect = effect_value, .key = identity.key, .witness = witness, .wait = if (wait == .block) .block else .try_lock } } };
         const row_request = request.rowRequest(request.operation.row);
+        var waited_for_write = false;
+        var submit_needed = true;
+        var waited_at: ?ledger.ResourceStamp = null;
         while (true) {
             try owner.checkpoint();
             var scratch = std.heap.ArenaAllocator.init(root.server.alloc);
             defer scratch.deinit();
             const tmp = scratch.allocator();
-            try transport.submit(root.server, tmp, root.context, part.value.spec.table_name, request);
+            if (submit_needed) try transport.submit(root.server, tmp, root.context, part.value.spec.table_name, request);
             const cut = try transport.observe(root.server, tmp, root.context, part.value.spec.table_name, .{ .admission = request.admission, .row_request = row_request });
             const result = cut.row_result orelse return error.InvalidSqlBackendResponse;
             try result.receipt.requireFor(request.admission.binding.namespace, effect_value);
             if (result.receipt.outcome == .pending) {
-                try owner.pause();
+                submit_needed = !submit_needed and !std.meta.eql(waited_at, cut.resource);
+                waited_at = cut.resource;
+                if (!submit_needed) try owner.pause();
                 continue;
             }
             part.next_effect += 1;
@@ -270,10 +298,30 @@ pub fn row(raw: *anyopaque, a: A, target: catalog.Table, identity: local.sql_loc
                 .absent => return null,
                 .contended => if (wait == .skip_locked) return null else return error.SqlLockNotAvailable,
                 .changed => break,
+                .write_pending => {
+                    if (wait != .block) return if (wait == .skip_locked) null else error.SqlLockNotAvailable;
+                    // Waiting on a write intent needs read-only point probes,
+                    // not repeated WAL proposals or replaying a false effect.
+                    while (true) {
+                        try owner.pause();
+                        var poll = std.heap.ArenaAllocator.init(root.server.alloc);
+                        defer poll.deinit();
+                        const observed = try transport.observe(root.server, poll.allocator(), root.context, part.value.spec.table_name, .{ .admission = request.admission, .intent_key = identity.key });
+                        if (observed.intent_owner == null) break;
+                    }
+                    waited_for_write = true;
+                    break;
+                },
             }
         }
-        if (!try root.lockingReadCommitted()) return error.SqlSerializationFailure;
-        current = (try root.lockingCurrentRow(a, target, identity.key, fields)) orelse return null;
-        witness = .{ .version = current.version, .digest = current.expected_content_digest orelse return error.InvalidSqlBackendResponse };
+        const read_committed = try root.lockingReadCommitted();
+        if (!waited_for_write and !read_committed) return error.SqlSerializationFailure;
+        current = (try root.lockingCurrentRow(a, target, identity.key, fields)) orelse {
+            if (!read_committed) return error.SqlSerializationFailure;
+            return null;
+        };
+        const refreshed: local.storage_pessimistic_lock_row.Witness = .{ .version = current.version, .digest = current.expected_content_digest orelse return error.InvalidSqlBackendResponse };
+        if (!read_committed and !std.meta.eql(witness, refreshed)) return error.SqlSerializationFailure;
+        witness = refreshed;
     }
 }

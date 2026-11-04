@@ -328,7 +328,8 @@ pub const Data = struct {
         try write(a, txn, ns, value);
     }
     /// Retained enrollment bodies fence delayed data RPCs after slot reuse.
-    /// Only independent native retirement releases catalog/topology debt.
+    /// Independent native retirement or custody transfer to an admitted 2PC
+    /// manifest releases this directory's catalog/topology debt.
     pub fn retire(a: A, txn: anytype, ns: ledger.Namespace, backend: locks.Backend, generation: u64, authority: anytype) !void {
         var value = try load(a, txn, ns, backend);
         var directory = value.data orelse return error.InvalidLockScope;

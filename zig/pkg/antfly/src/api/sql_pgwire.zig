@@ -200,6 +200,32 @@ pub const Adapter = struct {
         var state = (try self.server.txn_sessions.getSqlState(self.server.alloc, id)) orelse return error.SqlTransactionNotActive;
         defer state.deinit(self.server.alloc);
         if (state.terminal != null or !std.mem.eql(u8, state.metadata.database, request.database orelse "default") or !std.mem.eql(u8, state.metadata.namespace, request.session_namespace orelse request.namespace orelse "public")) return error.SqlTransactionNotActive;
+        if (state.metadata.failed or state.execution_started or state.terminal_abort or state.terminal_prepare) return;
+        if (state.connection_id) |connection| {
+            var authenticated: ?http.AuthenticatedIdentity = try credential.identity(self.server.alloc);
+            defer authenticated.?.deinit(self.server.alloc);
+            // Cleanup cannot borrow the canceled/expired SQL request's
+            // checkpoint. Principal access above and the exact command loan
+            // authorize control; this context cannot execute user row writes.
+            const context: operation.RequestContext = .{
+                .setting_admin = true,
+                .principal = .{ .kind = .user, .subject = authenticated.?.username },
+                .destination_authorization_principal = credential.principal,
+                .row_policy_credential = &authenticated,
+                .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 3 * std.time.ns_per_s,
+            };
+            const io = self.server.embedding_provider_runtime.io;
+            var lease = try self.server.sql_connection_admission.acquire(self.server.alloc, io, .init(connection, credential.sessionPrincipal()));
+            defer lease.release(io);
+            var command: @import("sql_command_execution.zig").Request = .{};
+            defer command.finish() catch {};
+            // Parse/Bind can fail before the execution owner takes a command.
+            // This fresh loan runs control only; the rejected SQL is not run.
+            if (try command.start(self.server, context, authenticated, &lease, .{ .failure_only = true, .transaction_id = id, .statement = request.statement })) {
+                _ = try command.failed(authenticated, null);
+                return;
+            }
+        }
         try self.server.txn_sessions.setSqlFailed(self.server.alloc, id, true);
     }
 
@@ -1277,6 +1303,9 @@ const Job = struct {
         var command_scope: @import("sql_command_execution.zig").Request = .{};
         var command_finished = false;
         defer if (!command_finished) command_scope.finish() catch {};
+        errdefer if (command_scope.failed(identity, null) catch true) {
+            if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = .failed;
+        };
         const native_connection = if (self.kind == .execute) try self.credential.ensureNativeConnection(server, identity, self.request) else null;
         if (native_connection) |id| {
             connection_lease = try server.sql_connection_admission.acquire(server.alloc, server.embedding_provider_runtime.io, .init(id, self.credential.sessionPrincipal()));
@@ -1404,9 +1433,8 @@ const Job = struct {
         var transferred = false;
         defer if (!transferred) result.deinit();
         if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = @fromBackingInt(@backingInt(native_adapter.transaction_status));
-        errdefer if (native_adapter.result_session_id) |id| {
-            const transaction_id = @import("distributed_txn.zig").parseTxnIdHex(&id) catch unreachable;
-            server.txn_sessions.setSqlFailed(server.alloc, transaction_id, true) catch {};
+        errdefer if (native_adapter.result_session_id != null) {
+            _ = command_scope.failed(identity, null) catch true;
             if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = .failed;
         };
         // After a durable commit, even acknowledgement-allocation failure must

@@ -742,6 +742,21 @@ const txn_record_v7_size = txn_record_v6_size + ExternalDecisionOwner.encoded_le
 /// by another transaction's unresolved exclusive intent. Shared read guards
 /// remain compatible. Reuse one lock-key buffer and the caller's point probe;
 /// no transaction-record scan or mutable-store snapshot is needed.
+/// Strict lock admission must see undecided external write intents too.
+/// Ordinary MVCC reads deliberately use the less restrictive IntentReadGuard.
+pub fn pendingIntentOwner(a: Allocator, view: anytype, user_key: []const u8, exclude: ?TxnId) !?TxnId {
+    const key = try std.mem.concat(a, u8, &.{ intent_locks_prefix, user_key });
+    defer a.free(key);
+    const bytes = view.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (bytes.len != @sizeOf(TxnId)) return error.InvalidTxnRecord;
+    const owner: TxnId = bytes[0..16].*;
+    if (exclude) |id| if (std.mem.eql(u8, &owner, &id)) return null;
+    return owner;
+}
+
 pub const IntentReadGuard = struct {
     alloc: Allocator,
     exclude_txn: ?TxnId,
@@ -1931,6 +1946,19 @@ pub const TxnManager = struct {
             if (try @import("pessimistic_lock_authority.zig").activeCount(read, binding.namespace) != 0) return true;
         }
 
+        return hasRowTransactionStateInView(alloc, read);
+    }
+
+    /// Range tracking adds row-version barriers; pure pessimistic owners do
+    /// not carry an older range proof and can safely cross this activation.
+    /// Keep pending native votes/intents/outboxes protected exactly as before.
+    pub fn hasRangeActivationTransactions(self: *TxnManager) !bool {
+        var read = try self.store.beginRead();
+        defer read.abort();
+        return hasRowTransactionStateInView(self.alloc, &read);
+    }
+
+    fn hasRowTransactionStateInView(alloc: Allocator, read: anytype) !bool {
         // Resolution normally removes intents and HA outboxes atomically before
         // a transaction becomes quiescent. Check the global prefixes once rather
         // than opening an intent cursor for every retained terminal record.
@@ -1952,6 +1980,14 @@ pub const TxnManager = struct {
             if (record_entry.key.len == records_prefix.len + 16) {
                 const record = try decodeRecord(record_entry.value);
                 if (record.status == .pending) return true;
+                // Metadata owns external cohort fan-out and its catalog pins.
+                // A terminal native participant with all local intents drained
+                // carries retention/ACK bookkeeping, not outstanding row work.
+                // Its copied roster is not a native coordinator resolution set.
+                if (record.external_decision_owner != null and record.intents_resolved_known and record.intents_resolved) {
+                    entry = try cursor.next();
+                    continue;
+                }
 
                 const txn_id = record_entry.key[records_prefix.len..][0..16].*;
                 const participant_key = makeSidecarKey(participants_prefix, txn_id);
@@ -2366,6 +2402,10 @@ pub const TxnManager = struct {
             }
 
             const refreshed = try self.loadTransactionRecord(txn_id);
+            if (!try self.nativeLockCleanupReady(txn_id)) {
+                stats.deferred_unresolved += 1;
+                continue;
+            }
             const no_intents = if (refreshed.intents_resolved_known and refreshed.intents_resolved)
                 true
             else
@@ -2851,15 +2891,9 @@ pub const TxnManager = struct {
             try self.applyMutationExtraBatch(extra_batch);
             return false;
         }
-        {
-            var arena = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena.deinit();
-            var read = try self.store.beginRead();
-            defer read.abort();
-            if (!try @import("pessimistic_lock_transaction.zig").cleanupReady(arena.allocator(), &read, txn_id)) {
-                try self.applyMutationExtraBatch(extra_batch);
-                return false;
-            }
+        if (!try self.nativeLockCleanupReady(txn_id)) {
+            try self.applyMutationExtraBatch(extra_batch);
+            return false;
         }
         const unresolved = try self.getUnresolvedParticipants(self.alloc, txn_id);
         defer freeParticipantList(self.alloc, unresolved);
@@ -3036,7 +3070,18 @@ pub const TxnManager = struct {
         return self.deleteTransactionMetadataKnownRecord(txn_id, try self.loadTransactionRecord(txn_id), extra_batch);
     }
 
+    fn nativeLockCleanupReady(self: *TxnManager, txn_id: TxnId) !bool {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var read = try self.store.beginRead();
+        defer read.abort();
+        return @import("pessimistic_lock_transaction.zig").cleanupReady(arena.allocator(), &read, txn_id);
+    }
+
     fn deleteTransactionMetadataKnownRecord(self: *TxnManager, txn_id: TxnId, record: TxnRecord, extra_batch: MutationExtraBatch) !void {
+        // All deletion paths retain the native decision until lock retirement,
+        // including bulk GC and direct cleanup after coordinator ACK.
+        if (!try self.nativeLockCleanupReady(txn_id)) return error.LockOwnerBusy;
         const record_key = makeRecordKey(txn_id);
         const participant_key = makeSidecarKey(participants_prefix, txn_id);
         const resolved_key = makeSidecarKey(resolved_participants_prefix, txn_id);

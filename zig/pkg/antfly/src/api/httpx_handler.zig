@@ -6645,6 +6645,7 @@ pub const AntflyApiHandler = struct {
         diagnostic_message_buffer: [256]u8 = undefined,
         compile_diagnostic_valid: bool = false,
         execution_entered: bool = false,
+        failure_published: bool = false,
         is_write: bool = false,
         preparation: *RequestAdmission.Lease,
         prepared_mode: SQLPreparedMode = .statement,
@@ -6807,11 +6808,19 @@ pub const AntflyApiHandler = struct {
             const original_context = self.adapter.context;
             defer {
                 self.adapter.releaseExecutionOwners();
+                if (self.failure) |failure| if (command_scope.failed(self.adapter.identity.*, failure) catch true) {
+                    self.failure_published = true;
+                    self.adapter.transaction_status = .failed;
+                };
                 command_scope.finish() catch |err| {
                     if (self.failure == null) self.failure = if (self.execution_entered or self.prepared_response != null) error.SqlMutationOutcomeUnknown else err;
                 };
                 self.adapter.context = original_context;
             }
+            errdefer if (command_scope.failed(self.adapter.identity.*, null) catch true) {
+                self.failure_published = true;
+                self.adapter.transaction_status = .failed;
+            };
             if (self.adapter.connection_id) |connection_id| {
                 const io = self.adapter.server.sharedApiIo() orelse return error.SqlConnectionUnavailable;
                 connection_admission = try self.adapter.server.sql_connection_admission.acquire(self.adapter.server.alloc, io, .init(connection_id, resource_principal));
@@ -7473,7 +7482,7 @@ pub const AntflyApiHandler = struct {
                 .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null,
                 .retryable = diagnostic.retryable,
                 .position = if (job.compile_diagnostic_valid and mode != .execute) sql_execution.characterPosition(statement, job.diagnostic.start) else null,
-                .transaction_status = if (!job.execution_entered) null else switch (job.adapter.transaction_status) {
+                .transaction_status = if (!job.execution_entered and !job.failure_published) null else switch (job.adapter.transaction_status) {
                     .idle => .idle,
                     .in_transaction => .in_transaction,
                     .failed => .failed,

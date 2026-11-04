@@ -23,9 +23,10 @@ pub const prepared = @import("prepared_transactions.zig");
 pub const outcomes = prepared.outcomes;
 const A = std.mem.Allocator;
 pub const max_bytes = 16384;
-pub const decoder_version: u16 = @import("../metadata/topology_protocol.zig").sql_lock_authority_version;
+pub const decoder_version: u16 = @import("../metadata/topology_protocol.zig").sql_native_lock_custody_version;
 pub const Ref = struct { backend: locks.Backend, command: scopes.Command };
 pub const EffectInput = struct { command: scopes.Command, effect: scopes.ledger.Effect };
+const DataRetirement = struct { generation: u64, native: local.storage_pessimistic_lock_control.Snapshot };
 pub const Request = struct {
     admission: outcomes.Admission,
     incarnation: [16]u8,
@@ -42,7 +43,8 @@ pub const Request = struct {
         bind: struct { command: scopes.Command, transaction: [16]u8 },
         data_enroll: struct { command: scopes.Command, transaction: [16]u8, spec: scopes.Data.Spec },
         data_ack: struct { generation: u64, command: scopes.Command, native: local.storage_pessimistic_lock_control.Snapshot },
-        data_retire: struct { generation: u64, native: local.storage_pessimistic_lock_control.Snapshot },
+        data_retire: DataRetirement,
+        data_handoff: DataRetirement,
         release: scopes.Transaction,
         /// Exact unadmitted purpose, retained locally before dispatch.
         /// Native journal absence/rejection, not that local claim, authorizes cleanup.
@@ -81,7 +83,7 @@ pub const Request = struct {
                 if (value.generation == 0) return error.InvalidCatalogMutation;
                 try value.command.validate();
             },
-            .data_retire => |value| if (value.generation == 0) return error.InvalidCatalogMutation,
+            .data_retire, .data_handoff => |value| if (value.generation == 0) return error.InvalidCatalogMutation,
             .release_unadmitted => |original| {
                 try original.validate();
                 if (original.operation != .admit or !std.mem.eql(u8, &original.incarnation, &self.incarnation) or original.standalone != self.standalone or original.database_id != self.database) return error.InvalidCatalogMutation;
@@ -135,6 +137,7 @@ pub const Context = struct {
     /// catalog binding, schema, physical route and transition fences.
     enrollment: ?scopes.Data.Spec = null,
     data_proof: ?local.storage_pessimistic_lock_control.Snapshot = null,
+    handoff: bool = false,
     fn nativeParticipant(self: Context, root: scopes.Record, part: scopes.Data.Participant) !struct { scope: scopes.Record, owner: scopes.ledger.Owner } {
         try self.requireOwner(root);
         const native = self.data_proof orelse return error.Forbidden;
@@ -152,8 +155,29 @@ pub const Context = struct {
         const native = try self.nativeParticipant(root, part);
         if (native.scope.command != null or !std.meta.eql(native.scope.completed, @as(?scopes.Command, try part.admission.command())) or native.owner.waiting != null or native.owner.job != null) return error.LockOwnerBusy;
     }
-    pub fn requireDataRetirement(self: Context, _: anytype, _: scopes.ledger.Namespace, root: scopes.Record, part: scopes.Data.Participant) !void {
+    pub fn requireDataRetirement(self: Context, txn: anytype, ns: scopes.ledger.Namespace, root: scopes.Record, part: scopes.Data.Participant) !void {
         const native = try self.nativeParticipant(root, part);
+        if (self.handoff) {
+            const proof = self.data_proof.?;
+            const frozen = proof.frozen orelse return error.LockOwnerBusy;
+            const prepared_record = try prepared.readOperation(self.a, txn, ns.group, frozen.ref.decision.operation) orelse return error.CatalogPublicationProofPending;
+            const ref = prepared_record.identity.lock_scope orelse return error.InvalidLockScope;
+            if (!ref.backend.eql(root.registration.lease.backend) or !std.mem.eql(u8, &prepared_record.identity.txn_id, &part.admission.transaction)) return error.InvalidLockScope;
+            var found = false;
+            for (prepared_record.participants) |item| if (try item.lockReference(prepared_record.identity, self.a)) |expected| {
+                if (std.meta.eql(expected, frozen.ref)) {
+                    found = true;
+                    break;
+                }
+            };
+            if (!found or frozen.ref.admission.generation != part.admission.generation or !frozen.ref.admission.binding.eql(part.admission.binding)) return error.InvalidLockScope;
+            const destination = proof.prepared_owner orelse return error.LockOwnerBusy;
+            const expected_lease = try scopes.preparedLease(part.admission.binding.namespace, root.registration.lease.database, root.registration.lease.node, frozen.ref.decision);
+            if (!std.meta.eql(destination.lease, expected_lease) or destination.state != .prepared or destination.job != null or destination.waiting != null or
+                !std.meta.eql(destination.transaction, @as(?[16]u8, prepared_record.identity.txn_id)) or native.scope.transaction != null or native.owner.resources != 0 or
+                !std.meta.eql(native.scope.released_transaction, @as(?scopes.Transaction, .{ .id = prepared_record.identity.txn_id, .decision = frozen.ref.decision }))) return error.LockOwnerBusy;
+            return;
+        }
         if (native.scope.state != .retired or native.scope.transaction != null or native.owner.state != .retired or native.owner.resources != 0 or native.owner.waiting != null or native.owner.job != null) return error.LockOwnerBusy;
         if (self.data_proof.?.frozen) |frozen| if (!frozen.retired or !std.mem.eql(u8, &frozen.ref.admission.transaction, &part.admission.transaction)) return error.LockOwnerBusy;
     }
@@ -274,11 +298,12 @@ pub fn apply(a: A, txn: anytype, group: u64, request: Request) !?outcomes.LockEf
 pub fn applyWithEnrollment(a: A, txn: anytype, group: u64, request: Request, checked: ?scopes.Data.Spec) !?outcomes.LockEffect {
     try request.validate();
     const ns: scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = request.incarnation };
-    const context: Context = .{ .a = a, .actor = request.actor, .database = request.database, .standalone = request.standalone, .maintenance = request.operation == .close_step or request.operation == .release or request.operation == .release_unadmitted or request.operation == .fence or request.operation == .data_ack or request.operation == .data_retire, .unadmitted = if (request.operation == .release_unadmitted) request.operation.release_unadmitted else null, .enrollment = checked };
+    const context: Context = .{ .a = a, .actor = request.actor, .database = request.database, .standalone = request.standalone, .maintenance = request.operation == .close_step or request.operation == .release or request.operation == .release_unadmitted or request.operation == .fence or request.operation == .data_ack or request.operation == .data_retire or request.operation == .data_handoff, .unadmitted = if (request.operation == .release_unadmitted) request.operation.release_unadmitted else null, .enrollment = checked };
     var checked_context = context;
+    checked_context.handoff = request.operation == .data_handoff;
     checked_context.data_proof = switch (request.operation) {
         .data_ack => |value| value.native,
-        .data_retire => |value| value.native,
+        .data_retire, .data_handoff => |value| value.native,
         else => null,
     };
     var receipt: ?scopes.ledger.Receipt = null;
@@ -289,7 +314,7 @@ pub fn applyWithEnrollment(a: A, txn: anytype, group: u64, request: Request, che
         .bind => |value| try scopes.bindTransaction(a, txn, ns, request.backend, value.command, value.transaction, context),
         .data_enroll => |value| _ = try scopes.Data.enroll(a, txn, ns, request.backend, value.command, value.transaction, value.spec, context),
         .data_ack => |value| try scopes.Data.acknowledge(a, txn, ns, request.backend, value.generation, value.command, checked_context),
-        .data_retire => |value| try scopes.Data.retire(a, txn, ns, request.backend, value.generation, checked_context),
+        .data_retire, .data_handoff => |value| try scopes.Data.retire(a, txn, ns, request.backend, value.generation, checked_context),
         .release => |value| _ = try scopes.releaseTransaction(a, txn, ns, request.backend, value, context),
         .release_unadmitted => |original| _ = try scopes.releaseTransaction(a, txn, ns, request.backend, .{ .id = original.operation.admit.identity.txn_id }, context),
         .renew => |value| try scopes.renew(a, txn, ns, request.backend, value.expected_expiry, value.expires_at_ms, context),

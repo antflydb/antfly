@@ -1566,3 +1566,192 @@ test "pessimistic locks native LSM compare and lock preserves false outcomes cur
         try txn.commit();
     }
 }
+
+test "pessimistic locks native LSM abort before BEGIN retires lock custody through bounded cold quanta and aborts every partial adoption" {
+    const native_control = @import("pessimistic_lock_control.zig");
+    const frozen = @import("pessimistic_lock_transaction.zig");
+    const path = try pathFor("abort-before-begin");
+    defer a.free(path);
+    defer cleanup(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    const admission = dataFixture();
+    const authority: DataAuthority = .{ .approved = admission };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try data_participant.admit(a, &txn, admission.binding.identity, admission, authority);
+        _ = try data_participant.acquire(a, &txn, admission.binding.identity, try dataGrant(admission, 1, "r", .update, 0), authority);
+        try data_participant.finish(a, &txn, admission, authority);
+        try txn.commit();
+    }
+    const decision: scopes.DecisionRef = .{ .operation = @splat(21), .admission = @splat(22) };
+    const owner: native_transactions.ExternalDecisionOwner = .{ .metadata_incarnation = std.fmt.bytesToHex(admission.binding.namespace.incarnation, .lower), .operation_id = decision.operation, .admission_digest = decision.admission, .expires_at_unix_ns = 10000 };
+    // Exercise the real native 2PC abort tombstone without ever delivering
+    // BEGIN. No synthetic transaction record or decision is injected.
+    {
+        var manager = try native_transactions.TxnManager.init(a, &store);
+        defer manager.deinit();
+        _ = try manager.resolveIntentsWithExtraBatch(admission.transaction, .aborted, 200, .{ .external_decision_owner = owner });
+    }
+    var resolution = admission;
+    resolution.purpose = .resolution;
+    resolution.serial += 1;
+    resolution.parent_command.sequence += 1;
+    resolution.parent_command.nonce = @splat(23);
+    const ref: frozen.Ref = .{ .admission = resolution, .decision = decision };
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        var changed = ref;
+        changed.decision.admission[0] ^= 1;
+        try std.testing.expectError(error.ExternalTransactionDecisionChanged, frozen.adoptAborted(a, &txn, admission.binding.identity, changed));
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        var fault: FaultTxn = .{ .txn = &txn, .remaining = 0 };
+        try std.testing.expectError(error.InjectedLockWriteFailure, frozen.adoptAborted(a, &fault, admission.binding.identity, ref));
+        txn.abort();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try frozen.read(a, &read, admission.transaction)) == null);
+        try std.testing.expect(try ledger.accessBlocked(a, &read, admission.binding.namespace, try admission.binding.row("r"), .{ .row = .update }, null));
+    }
+    var done = false;
+    for (0..16) |_| {
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try native_control.apply(a, &txn, admission.binding.identity, admission.binding.namespace.group, .document, .{ .admission = resolution, .operation = .{ .resolve = decision } });
+            try txn.commit();
+        }
+        store.close();
+        store = try DocStore.open(a, path, .{});
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        done = (try frozen.read(a, &read, admission.transaction)).?.retired;
+        if (done) break;
+    }
+    try std.testing.expect(done);
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect(!try ledger.accessBlocked(a, &read, admission.binding.namespace, try admission.binding.row("r"), .{ .row = .update }, null));
+    try std.testing.expectEqual(@as(u32, 0), try scopes.activeCount(&read, admission.binding.namespace));
+    try std.testing.expect(try frozen.cleanupReady(a, &read, admission.transaction));
+}
+
+test "pessimistic locks native LSM row admission excludes foreign write intents before commit activation and retains false results" {
+    const row_locks = @import("pessimistic_lock_row.zig");
+    const internal = @import("internal_keys.zig");
+    const path = try pathFor("row-intent-admission");
+    defer a.free(path);
+    defer cleanup(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    const admission = dataFixture();
+    const authority: DataAuthority = .{ .approved = admission };
+    const primary = try internal.documentKeyAlloc(a, "r");
+    defer a.free(primary);
+    const timestamp = try internal.ttlKeyAlloc(a, "r");
+    defer a.free(timestamp);
+    const intent = "\x00\x00__txn_intent_locks__:r";
+    const foreign: [16]u8 = @splat(47);
+    var witness: row_locks.Witness = undefined;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try data_participant.admit(a, &txn, admission.binding.identity, admission, authority);
+        try txn.put(primary, "{\"id\":1}");
+        var stamp: [8]u8 = undefined;
+        std.mem.writeInt(u64, &stamp, 11, .little);
+        try txn.put(timestamp, &stamp);
+        try txn.put(intent, &foreign);
+        witness = (try row_locks.current(a, &txn, .document, "r")).?;
+        try std.testing.expectEqualDeep(foreign, (try native_transactions.pendingIntentOwner(a, &txn, "r", admission.transaction)).?);
+        try std.testing.expect((try native_transactions.pendingIntentOwner(a, &txn, "r", foreign)) == null);
+        try txn.commit();
+    }
+    var acquisition = try dataGrant(admission, 1, "r", .update, 0);
+    const requested = acquisition.effect.action.try_acquire;
+    acquisition.effect.action = .{ .acquire = requested };
+    const request: row_locks.Request = .{ .acquisition = acquisition, .witness = witness, .wait = .block };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const blocked = try row_locks.acquire(a, &txn, admission.binding.identity, .document, request, authority);
+        try std.testing.expectEqual(.write_pending, blocked.status);
+        try std.testing.expectEqual(.cancelled, blocked.receipt.outcome);
+        const held = (try ledger.readOwner(a, &txn, admission.binding.namespace, acquisition.effect.backend)).?;
+        try std.testing.expectEqual(@as(u32, 0), held.resources);
+        try std.testing.expect(held.waiting == null);
+        try txn.commit();
+    }
+    store.close();
+    store = try DocStore.open(a, path, .{});
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(intent);
+        // Abort does not change the committed row. The old occurrence stays
+        // false across restart; only a new sequence can acquire the same row.
+        try std.testing.expectEqual(.write_pending, (try row_locks.acquire(a, &txn, admission.binding.identity, .document, request, authority)).status);
+        var next = request;
+        next.acquisition.effect.sequence = 2;
+        next.acquisition.effect.nonce = @splat(48);
+        try std.testing.expectEqual(.granted, (try row_locks.acquire(a, &txn, admission.binding.identity, .document, next, authority)).receipt.outcome);
+        try txn.commit();
+    }
+}
+
+test "pessimistic locks native LSM range activation permits pure lock owners while retaining native transaction barriers" {
+    const path = try pathFor("lock-range-activation");
+    defer a.free(path);
+    defer cleanup(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    const admission = dataFixture();
+    const authority: DataAuthority = .{ .approved = admission };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try data_participant.admit(a, &txn, admission.binding.identity, admission, authority);
+        _ = try data_participant.acquire(a, &txn, admission.binding.identity, try dataGrant(admission, 1, "r", .update, 0), authority);
+        try txn.commit();
+    }
+    var manager = try native_transactions.TxnManager.init(a, &store);
+    defer manager.deinit();
+    try std.testing.expect(try manager.hasTopologySensitiveTransactions());
+    try std.testing.expect(!try manager.hasRangeActivationTransactions());
+    // A real pending native decision still blocks activation, even before
+    // row intents are written. Topology/restore keep the stronger lock fence.
+    try manager.initTransaction(@splat(55), 100);
+    try std.testing.expect(try manager.hasRangeActivationTransactions());
+    try std.testing.expect(try manager.hasTopologySensitiveTransactions());
+}
+
+test "pessimistic locks native LSM terminal external participants leave range activation and topology free while metadata owns fanout" {
+    const path = try pathFor("external-local-quiescence");
+    defer a.free(path);
+    defer cleanup(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try native_transactions.TxnManager.init(a, &store);
+    defer manager.deinit();
+    const txn_id: [16]u8 = @splat(56);
+    const owner: native_transactions.ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(57), .admission_digest = @splat(58), .expires_at_unix_ns = 10000 };
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(txn_id, 100, 1, &.{ "data:1", "data:2" }, false, true, .{ .external_decision_owner = owner });
+    try manager.writeIntentsExtraBatch(txn_id, &.{}, &.{}, .{ .external_decision_owner = owner });
+    try std.testing.expect(try manager.hasRangeActivationTransactions());
+    try manager.activateExternalDecision(txn_id, owner, .{});
+    _ = try manager.resolveIntentsWithExtraBatch(txn_id, .committed, 200, .{ .external_decision_owner = owner });
+    try std.testing.expect(!try manager.hasRangeActivationTransactions());
+    try std.testing.expect(!try manager.hasTopologySensitiveTransactions());
+    // Legacy native coordinators still own their distributed roster and must
+    // drain it. Do not generalize metadata authority to an ordinary 2PC owner.
+    const legacy: [16]u8 = @splat(59);
+    try manager.initTransactionWithParticipants(legacy, 300, &.{ "data:1", "data:2" });
+    try manager.writeIntents(legacy, &.{}, &.{});
+    _ = try manager.resolveIntentsWithExtraBatch(legacy, .committed, 400, .{});
+    try std.testing.expect(try manager.hasRangeActivationTransactions());
+    try std.testing.expect(try manager.hasTopologySensitiveTransactions());
+}
