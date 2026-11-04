@@ -15316,6 +15316,8 @@ pub const Error = struct {
     @"error": []const u8,
     /// Human-readable error description when supplied by the endpoint.
     message: ?[]const u8 = null,
+    /// Optional RFC 6901 JSON Pointer identifying the invalid request field.
+    pointer: ?[]const u8 = null,
     /// Whether retrying the operation may succeed without changing the request.
     retryable: ?bool = null,
     /// Suggested minimum retry delay in milliseconds.
@@ -15326,6 +15328,7 @@ pub const Error = struct {
         .{ "code", "code", true },
         .{ "error", "error", false },
         .{ "message", "message", true },
+        .{ "pointer", "pointer", true },
         .{ "retryable", "retryable", true },
         .{ "retry_after_ms", "retry_after_ms", true },
     };
@@ -15348,6 +15351,10 @@ pub const Error = struct {
         try jw.write(self.@"error");
         if (self.message) |value| {
             try jw.objectField("message");
+            try jw.write(value);
+        }
+        if (self.pointer) |value| {
+            try jw.objectField("pointer");
             try jw.write(value);
         }
         if (self.retryable) |value| {
@@ -56699,6 +56706,8 @@ pub const TextChunkOptions = struct {
     target_tokens: ?i64 = null,
     /// Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers.
     overlap_tokens: ?i64 = null,
+    /// Minimum non-whitespace Unicode scalar values in a fixed text chunk. Shorter chunks are omitted before storage and embedding; original source offsets are preserved. Zero disables filtering (default). Does not filter model-aware media windows or image/audio chunks.
+    min_chars: ?i64 = null,
     /// Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size chunkers.
     separator: ?[]const u8 = null,
 
@@ -56706,6 +56715,7 @@ pub const TextChunkOptions = struct {
     pub const openApiFieldMetadata = .{
         .{ "target_tokens", "target_tokens", true },
         .{ "overlap_tokens", "overlap_tokens", true },
+        .{ "min_chars", "min_chars", true },
         .{ "separator", "separator", true },
     };
 
@@ -56725,6 +56735,10 @@ pub const TextChunkOptions = struct {
         }
         if (self.overlap_tokens) |value| {
             try jw.objectField("overlap_tokens");
+            try jw.write(value);
+        }
+        if (self.min_chars) |value| {
+            try jw.objectField("min_chars");
             try jw.write(value);
         }
         if (self.separator) |value| {

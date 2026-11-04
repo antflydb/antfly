@@ -7385,6 +7385,8 @@ export interface components {
             error: string;
             /** @description Human-readable error description when supplied by the endpoint. */
             message?: string;
+            /** @description Optional RFC 6901 JSON Pointer identifying the invalid request field. */
+            pointer?: string;
             /** @description Whether retrying the operation may succeed without changing the request. */
             retryable?: boolean;
             /**
@@ -15738,6 +15740,11 @@ export interface components {
             target_tokens?: number;
             /** @description Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers. */
             overlap_tokens?: number;
+            /**
+             * @description Minimum non-whitespace Unicode scalar values in a fixed text chunk. Shorter chunks are omitted before storage and embedding; original source offsets are preserved. Zero disables filtering (default). Does not filter model-aware media windows or image/audio chunks.
+             * @default 0
+             */
+            min_chars?: number;
             /** @description Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size chunkers. */
             separator?: string;
         };

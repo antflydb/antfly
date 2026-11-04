@@ -120,13 +120,16 @@ pub const CatalogOperation = union(enum) {
     create: lake_catalog.types.Commit,
     commit: lake_catalog.types.Commit,
     retire: lake_catalog.managed.Retirement,
+    references: lake_catalog.managed.ReferenceRequest,
     resolve: struct { id: []const u8, hash: []const u8 },
 };
 pub const CatalogResult = union(enum) {
     table: lake_catalog.types.Table,
+    references: lake_catalog.types.References,
     outcome: lake_catalog.types.Outcome,
     pub fn deinit(self: *CatalogResult, a: Allocator) void {
         if (self.* == .table) self.table.deinit(a);
+        if (self.* == .references) self.references.deinit(a);
     }
 };
 
@@ -134,7 +137,7 @@ pub fn executeLakeCatalogAlloc(a: Allocator, binding: catalog_binding.Binding, o
     try context.ensureActive();
     try binding.validateSupported();
     const config = binding.catalog orelse return error.InvalidLakeCatalog;
-    const mutation = operation == .create or operation == .commit or operation == .retire;
+    const mutation = operation == .create or operation == .commit or operation == .retire or operation == .references;
     if (mutation and binding.write_policy != .iceberg_writer) return error.ExternalLakeReadOnly;
     var source_options = options;
     source_options.read_only = !mutation or config.type == .rest;
@@ -227,6 +230,7 @@ fn executeCatalog(a: Allocator, catalog: *lake_catalog.Catalog, operation: Catal
         .create => |c| .{ .table = try catalog.create(a, c.id, c.body, c.timestamp_ms) },
         .commit => |c| .{ .table = try catalog.commit(a, c) },
         .retire => |r| .{ .table = try catalog.retire(a, r) },
+        .references => |request| .{ .references = try catalog.references(a, request) },
         .resolve => |c| .{ .outcome = try catalog.resolve(a, c.id, c.hash) },
     };
 }

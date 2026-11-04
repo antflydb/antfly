@@ -166,6 +166,8 @@ pub fn append(writer: *std.Io.Writer, memory: anytype, disk: anytype, query: any
         try prom.appendPromMetric(writer, "antfly_objectstore_" ++ name ++ "_calls_total", "counter", "Linked API runtime logical client calls including local and nested fallback calls; excludes separately owned runtime counters", object_stats.calls[i]);
         try prom.appendPromMetric(writer, "antfly_objectstore_" ++ name ++ "_errors_total", "counter", "Logical client errors including absence and conditional conflicts", object_stats.errors[i]);
         try prom.appendPromMetric(writer, "antfly_objectstore_" ++ name ++ "_nanoseconds_total", "counter", "Logical client elapsed time; nested and concurrent calls overlap", object_stats.nanoseconds[i]);
+        try prom.appendPromMetric(writer, "antfly_objectstore_" ++ name ++ "_input_bytes_total", "counter", "Recorded logical request body bytes, including failed writes and nested fallback calls; excludes metadata and transport overhead", object_stats.input_bytes[i]);
+        try prom.appendPromMetric(writer, "antfly_objectstore_" ++ name ++ "_output_bytes_total", "counter", "Recorded logical returned body bytes; excludes metadata, transport overhead and separately owned runtimes", object_stats.output_bytes[i]);
         try prom.appendPromMetric(writer, "antfly_objectstore_" ++ name ++ "_max_nanoseconds", "gauge", "Maximum logical client elapsed time since process start", object_stats.max_nanoseconds[i]);
     }
     try prom.appendPromMetric(writer, "antfly_objectstore_get_retries_total", "counter", "Client retries after mutable metadata precondition races", object_stats.retries);
@@ -208,6 +210,8 @@ test "external lake single request owner operation snapshot survives transport a
     var snapshot: Stats = .{};
     snapshot.object_operations.calls[@backingInt(@import("objectstore").operation_metrics.Operation.get)] = 12345;
     snapshot.object_operations.retries = 17;
+    snapshot.object_operations.input_bytes[@backingInt(@import("objectstore").operation_metrics.Operation.put)] = 7654;
+    snapshot.object_operations.output_bytes[@backingInt(@import("objectstore").operation_metrics.Operation.get)] = 9876;
     const a = std.testing.allocator;
     const encoded = try std.json.Stringify.valueAlloc(a, snapshot, .{});
     defer a.free(encoded);
@@ -218,6 +222,8 @@ test "external lake single request owner operation snapshot survives transport a
     try append(&output.writer, local.serverless_query_lake_serving_cache.Cache.Stats{}, @as(?local.serverless_query_lake_parquet_rowgroup.PersistentObjectRangeCacheStats, null), parsed.value);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "antfly_objectstore_get_calls_total 12345\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "antfly_objectstore_get_retries_total 17\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "antfly_objectstore_put_input_bytes_total 7654\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "antfly_objectstore_get_output_bytes_total 9876\n") != null);
 }
 
 test "external lake single request outlier profiles isolate interleaved phases and never wait" {

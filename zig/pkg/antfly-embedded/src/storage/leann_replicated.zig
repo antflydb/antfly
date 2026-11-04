@@ -156,7 +156,7 @@ pub fn encodeChunkRecords(alloc: Allocator, blob: Planned.Blob) ![][]u8 {
         std.mem.writeInt(u32, rec[17..21], @intCast(i), .little);
         std.mem.writeInt(u32, rec[21..25], @intCast(total), .little);
         @memcpy(rec[25..][0..data.len], data);
-        std.mem.writeInt(u32, rec[rec.len - 4 ..][0..4], std.hash.Crc32.hash(rec[0 .. rec.len - 4]), .little);
+        std.mem.writeInt(u32, rec[rec.len - 4 ..][0..4], @import("antfly_hash").Crc32.hash(rec[0 .. rec.len - 4]), .little);
         out[i] = rec;
         made += 1;
     }
@@ -186,7 +186,7 @@ pub fn encodeElideRecord(alloc: Allocator, entries: []const ElideEntry) ![]u8 {
         try writeBytes(wr, e.key);
         try wr.writeInt(u64, e.digest, .little);
     }
-    const crc = std.hash.Crc32.hash(w.written());
+    const crc = @import("antfly_hash").Crc32.hash(w.written());
     try wr.writeInt(u32, crc, .little);
     return w.toOwnedSlice();
 }
@@ -195,7 +195,7 @@ pub fn encodeElideRecord(alloc: Allocator, entries: []const ElideEntry) ![]u8 {
 pub fn decodeElideRecord(alloc: Allocator, record: []const u8) ![]ElideEntry {
     if (record.len < 9 or record[0] != elide_magic) return error.InvalidRecord;
     const body = record[0 .. record.len - 4];
-    if (std.hash.Crc32.hash(body) != std.mem.readInt(u32, record[record.len - 4 ..][0..4], .little)) return error.InvalidRecord;
+    if (@import("antfly_hash").Crc32.hash(body) != std.mem.readInt(u32, record[record.len - 4 ..][0..4], .little)) return error.InvalidRecord;
     var r: std.Io.Reader = .fixed(body[1..]);
     const n = r.takeInt(u32, .little) catch return error.InvalidRecord;
     if (n > body.len / 12) return error.InvalidRecord;
@@ -212,7 +212,7 @@ pub fn decodeElideRecord(alloc: Allocator, record: []const u8) ![]ElideEntry {
 /// Decodes a chunk record; `data` borrows from `record`.
 pub fn decodeChunkRecord(record: []const u8) !Chunk {
     if (record.len < 29 or record[0] != chunk_magic) return error.InvalidRecord;
-    if (std.hash.Crc32.hash(record[0 .. record.len - 4]) != std.mem.readInt(u32, record[record.len - 4 ..][0..4], .little)) return error.InvalidRecord;
+    if (@import("antfly_hash").Crc32.hash(record[0 .. record.len - 4]) != std.mem.readInt(u32, record[record.len - 4 ..][0..4], .little)) return error.InvalidRecord;
     const c = Chunk{
         .generation = std.mem.readInt(u64, record[1..9], .little),
         .digest = std.mem.readInt(u64, record[9..17], .little),
@@ -735,7 +735,7 @@ pub const ReplicatedState = struct {
             try writeBytes(wr, e.key_ptr.*);
             try wr.writeInt(u64, e.value_ptr.*, .little);
         }
-        const crc = std.hash.Crc32.hash(w.written());
+        const crc = @import("antfly_hash").Crc32.hash(w.written());
         try wr.writeInt(u32, crc, .little);
         return w.toOwnedSlice();
     }
@@ -743,7 +743,7 @@ pub const ReplicatedState = struct {
     pub fn decode(alloc: Allocator, opts: Options, bytes: []const u8) !ReplicatedState {
         if (bytes.len < magic.len + 16) return error.InvalidLeannState;
         const body = bytes[0 .. bytes.len - 4];
-        if (std.hash.Crc32.hash(body) != std.mem.readInt(u32, bytes[bytes.len - 4 ..][0..4], .little)) return error.InvalidLeannState;
+        if (@import("antfly_hash").Crc32.hash(body) != std.mem.readInt(u32, bytes[bytes.len - 4 ..][0..4], .little)) return error.InvalidLeannState;
         var r: std.Io.Reader = .fixed(body);
         const head = r.take(magic.len) catch return error.InvalidLeannState;
         if (!std.mem.eql(u8, head, magic)) return error.InvalidLeannState;

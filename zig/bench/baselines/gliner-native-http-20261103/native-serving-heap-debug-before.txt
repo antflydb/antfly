@@ -1,0 +1,81 @@
+CUDA artifact source policy passes: /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.cu (15 compiler-managed dev-only runtime-wired candidates included)
+quant kernel generated sources check: 69 files + Metal/CUDA runtime regions
+inference-test
++- run test
+   +- run test w
+[default] (warn): token_logprobs requires a standalone vocabulary token for value a_is_b
+failed command: cd pkg/inference/. && /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/.zig-cache/o/426ade0fcbc42a8d44adbc1eb09bb38d/test --cache-dir=/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/.zig-cache --seed=0x82c5f143 --listen=-
+
+inference-test
++- run test failure
+1/39 extractors.gliner_boundary_executor.test.boundary full context learned native base token capacity...native serving heap failure: .{ .kind = .declared_limit, .requested_bytes = 50322432, .live_bytes = 515489000, .peak_bytes = 515489000, .limit_bytes = 536870912 }
+native serving heap: peak=515489000 limit=536870912 live=0
+FAIL (OutOfMemory)
+/Users/ajroetker/bin/zig-0.17.0/lib/std/mem/Allocator.zig:325:82: 0x1049061e3 in allocBytesAligned__func_211 (test)
+    const byte_ptr = self.rawAlloc(byte_count, alignment, return_address) orelse return error.OutOfMemory;
+                                                                                 ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/mem/Allocator.zig:311:5: 0x104e28137 in allocWithSizeAndAlignment__func_3006 (test)
+    return self.allocBytesAligned(alignment, byte_count, return_address);
+    ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/mem/Allocator.zig:299:55: 0x1067c98e3 in allocAdvancedWithRetAddr (test)
+    const ptr: [*]align(a.toByteUnits()) T = @ptrCast(try self.allocWithSizeAndAlignment(@sizeOf(T), a, n, return_address));
+                                                      ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/mem/Allocator.zig:223:5: 0x1067c9953 in alloc__func_1396 (test)
+    return self.allocAdvancedWithRetAddr(T, null, n, @returnAddress());
+    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/deberta_tiled_attention.zig:218:20: 0x104fc02b3 in forward (test)
+    const output = try allocator.alloc(f32, workspace.output_elements);
+                   ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/native_compute.zig:37038:24: 0x104fc7783 in disentangledRelativeAttentionWithControlOp (test)
+        const output = try deberta_tiled.forward(self.allocator, .{ .batch = batch, .sequence = seq_len, .heads = num_heads, .head_dim = head_dim }, .{ .q = Q, .k = K, .v = V, .qr = Q_r, .kr = K_r, .mask = mask }, .{ .control = control, .io = self.io });
+                       ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/ops.zig:4640:13: 0x104aea4f7 in disentangledRelativeAttention (test)
+            try op(self.ptr, Q, K, V, Q_r, K_r, mask, batch, seq_len, num_heads, head_dim, self.execution_control)
+            ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:1093:22: 0x104aed27b in encoderLayer (test)
+    const attn_out = try cb.disentangledRelativeAttention(Q, K, V, Q_r, K_r, attention_mask, batch, seq_len, local_num_heads, head_dim);
+                     ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:615:28: 0x104af38c3 in forwardCtProfiled (test)
+        const new_hidden = try encoderLayer(cb, allocator, config, hidden, attention_mask, rel_emb, batch, seq_len, layer, resident_slots, profile);
+                           ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:548:5: 0x104af416f in forwardCt (test)
+    return forwardCtProfiled(cb, allocator, config, input_ids, attention_mask, batch, seq_len, prefer_weight_mirrors, null);
+    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:651:20: 0x104af428f in forward (test)
+    const hidden = try forwardCt(cb, allocator, config, input_ids, attention_mask, batch, seq_len, false);
+                   ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/gliner/boundary_engine.zig:390:9: 0x104b0bd2f in encodeNative (test)
+        try deberta.forward(&request_backend, allocator, config.encoder.toDeberta(), prepared.input_ids, prepared.attention_mask, checked.batch, prepared.sequence_length)
+        ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/extractors/gliner_boundary_long_executor.zig:952:27: 0x104b8efdb in encodeGroup__func_1578 (test)
+            var encoded = try engine.encodeNative(cb, allocator, config, prepared, engine_options);
+                          ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/extractors/gliner_boundary_long_executor.zig:108:37: 0x104e31b5b in evidenceAllocationError (test)
+    const failure = terminal orelse return err;
+                                    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/extractors/gliner_boundary_long_executor.zig:1049:17: 0x104bb462f in executeChecked (test)
+                return classified;
+                ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/extractors/gliner_boundary_long_executor.zig:920:5: 0x104bb5bbb in executeQualified (test)
+    return executeChecked(cb, allocator, config, tokenizer, item, supplied, gate);
+    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/extractors/gliner_boundary_executor.zig:401:17: 0x104bbffb7 in executeChecked (test)
+                try long_executor.executeQualified(cb, allocator, config, tokenizer, &item, long_options, active)
+                ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/extractors/gliner_boundary_executor.zig:166:5: 0x104adc68b in executeQualified (test)
+    return executeChecked(cb, allocator, config, tokenizer, request, prepared_options, &gate);
+    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/extractors/gliner_boundary_executor.zig:1311:28: 0x104adfedb in learnedFullContext__func_989 (test)
+    const dense_response = try executeQualified(&managed.backend, execution_allocator, &config, tok.tokenizer(), &request, .{ .identity = identity, .control = control });
+                           ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/extractors/gliner_boundary_executor.zig:1203:5: 0x104ae1033 in test.boundary full context learned native base token capacity (test)
+    try learnedFullContext(.native, .tokens, false);
+    ^
+1 selected; 0 passed; 0 skipped; 1 failed; 0 leaked.
+error: process exited with code 1 (expected exited with code 0)
+failed command: cd pkg/inference/. && /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/.zig-cache/o/ef86331926fb10b72e542c9de34e5308/test --test-filter "boundary full context learned native base token capacity"
+
+Build Summary: 29/31 steps succeeded (1 failed); 37/37 tests passed
+inference-test transitive failure
++- run test failure
+

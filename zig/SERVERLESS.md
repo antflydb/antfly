@@ -372,7 +372,8 @@ Remaining work is narrower now:
   - richer foreign-source planning/runtime polish beyond the current
     statistics/runtime seam
   - broader right-side filter parity
-  - any distributed/shuffle-style serverless execution
+  - any distributed/shuffle-style serverless execution (proposal:
+    [serverless multi-node SQL joins](../docs/design/serverless-distributed-joins.md))
   - broader foreign-source parity beyond the current slice; valid
     `foreign_sources` maps now normalize through the public query path, resolve
     `${secret:...}` DSNs, direct foreign-table reads and foreign RHS execution
