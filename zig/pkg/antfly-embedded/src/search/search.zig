@@ -941,13 +941,48 @@ fn freePhraseFilterTerms(alloc: Allocator, filter: query_mod.Filter) void {
     }
 }
 
+// Constrain deferred producers before they acquire source values, not merely
+// their resulting bitmap. The caller owns the small scratch clause arrays.
+fn filterWithDocNumConstraints(filter: query_mod.Filter, request: SearchRequest, must: *[2]query_mod.Filter, excluded: *[2]query_mod.Filter, stages: *[2]query_mod.Filter) query_mod.Filter {
+    if (!requestHasDocNumConstraints(request)) return filter;
+    var n: usize = 0;
+    var x: usize = 0;
+    if (request.filter_doc_bitmap) |bitmap| {
+        must[n] = .{ .doc_num = .{ .doc_nums = &.{}, .bitmap = bitmap } };
+        n += 1;
+    }
+    if (request.filter_doc_nums_positive) {
+        must[n] = .{ .doc_num = .{ .doc_nums = request.filter_doc_nums } };
+        n += 1;
+    }
+    if (request.exclude_doc_bitmap) |bitmap| {
+        excluded[x] = .{ .doc_num = .{ .doc_nums = &.{}, .bitmap = bitmap } };
+        x += 1;
+    }
+    if (request.exclude_doc_nums.len != 0) {
+        excluded[x] = .{ .doc_num = .{ .doc_nums = request.exclude_doc_nums } };
+        x += 1;
+    }
+    stages[0] = .{ .bool_filter = .{
+        .must = if (n == 0) &.{.{ .match_all = {} }} else must[0..n],
+        .should = &.{},
+        .must_not = excluded[0..x],
+    } };
+    stages[1] = filter;
+    return .{ .bool_filter = .{ .must = stages, .should = &.{}, .must_not = &.{} } };
+}
+
 fn executeFilterQuery(
     alloc: Allocator,
     snap: *const index_mod.IndexSnapshot,
-    filter: query_mod.Filter,
+    unscoped_filter: query_mod.Filter,
     request: SearchRequest,
     boost: f32,
 ) !SearchResult {
+    var required: [2]query_mod.Filter = undefined;
+    var stages: [2]query_mod.Filter = undefined;
+    var excluded: [2]query_mod.Filter = undefined;
+    const filter = filterWithDocNumConstraints(unscoped_filter, request, &required, &excluded, &stages);
     if (request.tie_rank == null and request.sort == null and request.aggregations.len == 0 and !requestHasDocNumConstraints(request)) {
         // Count each leased segment directly and seek only its requested page.
         // Complete producer facts never become a copied/rebased global bitmap.
@@ -5439,15 +5474,64 @@ fn executeBool(
     return executeBoolAllHit(alloc, snap, bq, request);
 }
 
-/// Correctness reference/fallback for boolean shapes that are not yet lowered
-/// to streaming scorers. Kept separate so differential tests can compare the
-/// bounded iterator tree against the former all-hit/hash-map implementation.
+fn queryHasDeferredProducer(query: SearchQuery) bool {
+    return switch (query) {
+        .doc_num => |d| d.producer != null,
+        .bool_query => |b| blk: {
+            for ([_][]const SearchQuery{ b.must, b.should, b.must_not }) |children| for (children) |child| {
+                if (queryHasDeferredProducer(child)) break :blk true;
+            };
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn queryHasIndexedMembership(query: SearchQuery) bool {
+    return switch (query) {
+        .knn, .hybrid => false,
+        .doc_num => |d| d.producer == null,
+        .bool_query => |b| blk: {
+            for ([_][]const SearchQuery{ b.must, b.should, b.must_not }) |children| for (children) |child| {
+                if (!queryHasIndexedMembership(child)) break :blk false;
+            };
+            break :blk true;
+        },
+        else => true,
+    };
+}
+
+// Only required clauses establish a safe candidate bound. Optional/disjunctive
+// producer branches must never be used to discard a different branch's rows.
+fn indexedMustCandidates(alloc: Allocator, snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest) !?roaring.RoaringBitmap {
+    if (!queryHasDeferredProducer(.{ .bool_query = bq })) return null;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var clauses = std.ArrayListUnmanaged(query_mod.Filter).empty;
+    for (bq.must) |child| {
+        if (child == .match_all or !queryHasIndexedMembership(child)) continue;
+        try clauses.append(arena.allocator(), try searchQueryToFilterArena(arena.allocator(), child));
+    }
+    if (clauses.items.len == 0) return null;
+    var required: [2]query_mod.Filter = undefined;
+    var stages: [2]query_mod.Filter = undefined;
+    var excluded: [2]query_mod.Filter = undefined;
+    const filter = filterWithDocNumConstraints(.{ .bool_filter = .{ .must = clauses.items, .should = &.{}, .must_not = &.{} } }, request, &required, &excluded, &stages);
+    return try snap.executeFilterBitmap(alloc, filter.withControl(request.control));
+}
+
+/// Scoring fallback for trees containing deferred membership. Indexed required
+/// clauses establish a bound first; score accumulation keeps caller order.
 fn executeBoolAllHit(
     alloc: Allocator,
     snap: *const index_mod.IndexSnapshot,
     bq: BoolQuery,
-    request: SearchRequest,
+    original_request: SearchRequest,
 ) anyerror!SearchResult {
+    var candidates = try indexedMustCandidates(alloc, snap, bq, original_request);
+    defer if (candidates) |*bitmap| bitmap.deinit();
+    var request = original_request;
+    if (candidates) |*bitmap| request.filter_doc_bitmap = bitmap;
     var combined: ScoreMap = .{};
     var initialized = false;
     errdefer combined.deinit(alloc);
@@ -5663,7 +5747,7 @@ pub fn searchQueryToFilterWithPreparation(alloc: Allocator, sq: SearchQuery, pre
             const must = try searchQuerySliceToFilterSliceArena(alloc, bq.must, prepared);
             const should = try searchQuerySliceToFilterSliceArena(alloc, bq.should, prepared);
             const must_not = try searchQuerySliceToFilterSliceArena(alloc, bq.must_not, prepared);
-            const filter_must = if (bq.pure_should_optional and must.len == 0) required: {
+            const filter_must = if (must.len == 0 and (bq.pure_should_optional or should.len == 0)) required: {
                 const match_all = try alloc.alloc(query_mod.Filter, 1);
                 match_all[0] = .{ .match_all = {} };
                 break :required match_all;
@@ -5674,9 +5758,8 @@ pub fn searchQueryToFilterWithPreparation(alloc: Allocator, sq: SearchQuery, pre
                 !bq.pure_should_optional) 1 else bq.min_should;
             break :blk .{
                 .bool_filter = .{
-                    // The bitmap engine uses a missing required branch to infer a
-                    // one-clause should minimum. Preserve optional scoring should
-                    // semantics with an internal match-all membership anchor.
+                    // Preserve optional should, empty Boolean and pure exclusion
+                    // semantics with a universe anchor in the membership engine.
                     .must = filter_must,
                     .should = should,
                     .must_not = must_not,
@@ -11433,4 +11516,90 @@ test "external lake metadata navigation phrase ceilings union alternatives and p
     phrase.groups = &.{};
     try std.testing.expectEqual(@as(u32, 0), plan.candidateUpperBound());
     std.debug.print("PHRASE_COST documents=10000 rare_upper=20 alternative_upper=50 unknown_upper=10000\n", .{});
+}
+
+test "logical value mixed conjunction bounds deferred verification before scoring" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "zero", .data = "{}", .terms = &.{.{ .term = "other", .freq = 1, .norm = 10 }} },
+        .{ .id = "one", .data = "{}", .terms = &.{.{ .term = "other", .freq = 1, .norm = 10 }} },
+        .{ .id = "two", .data = "{}", .terms = &.{.{ .term = "needle", .freq = 1, .norm = 10 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try writer.addSegment(bytes);
+    const Producer = struct {
+        probed: usize = 0,
+        bounded: bool = true,
+        fn produce(raw: *anyopaque, alloc: Allocator, _: u32, count: u32, incoming: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var result = roaring.RoaringBitmap.init(alloc);
+            errdefer result.deinit();
+            if (incoming) |candidates| {
+                if (self.bounded and candidates.cardinality() > 1) return error.VerificationBudgetExceeded;
+                self.probed += candidates.cardinality();
+                try result.orWith(candidates);
+            } else {
+                if (self.bounded) return error.ExpectedIndexedCandidates;
+                self.probed += count;
+                for (0..count) |doc| try result.add(@intCast(doc));
+            }
+            return result;
+        }
+    };
+    var state: Producer = .{};
+    const deferred: SearchQuery = .{ .doc_num = .{ .ids = &.{}, .producer = .{ .ptr = &state, .produce = Producer.produce } } };
+    const logical: SearchQuery = .{ .bool_query = .{ .should = &.{deferred} } };
+    const term: SearchQuery = .{ .term = .{ .field = "title", .term = "needle" } };
+    const other: SearchQuery = .{ .term = .{ .field = "title", .term = "other" } };
+    const missing: SearchQuery = .{ .term = .{ .field = "title", .term = "absent" } };
+    const complement: SearchQuery = .{ .bool_query = .{ .must_not = &.{other} } };
+    const indexed: SearchQuery = .{ .bool_query = .{ .should = &.{ missing, complement } } };
+    var expected = roaring.RoaringBitmap.init(a);
+    defer expected.deinit();
+    try expected.add(2);
+    try expected.add(5);
+    const reference_leaf: SearchQuery = .{ .doc_num = .{ .ids = &.{}, .bitmap = &expected } };
+    const reference: SearchQuery = .{ .bool_query = .{ .should = &.{reference_leaf} } };
+    for ([_]bool{ false, true }) |reverse| {
+        for (0..3) |scope| {
+            state.probed = 0;
+            const clauses = if (reverse) [_]SearchQuery{ indexed, logical } else [_]SearchQuery{ logical, indexed };
+            const oracle = if (reverse) [_]SearchQuery{ indexed, reference } else [_]SearchQuery{ reference, indexed };
+            var req: SearchRequest = .{ .query = .{ .bool_query = .{ .must = &clauses, .should = &.{term}, .min_should = 1, .boost = 1.25 } }, .k = 10, .include_stored = false };
+            if (scope != 0) {
+                req.filter_doc_bitmap = &expected;
+                req.filter_doc_nums_positive = true;
+                req.filter_doc_nums = if (scope == 1) &.{ 2, 5 } else &.{};
+                req.exclude_doc_nums = &.{5};
+            }
+            var result = try execute(a, writer.snapshot(), req);
+            defer result.deinit();
+            var reference_req = req;
+            reference_req.query = .{ .bool_query = .{ .must = &oracle, .should = &.{term}, .min_should = 1, .boost = 1.25 } };
+            var before = try execute(a, writer.snapshot(), reference_req);
+            defer before.deinit();
+            try std.testing.expectEqual(before.total_hits, result.total_hits);
+            try std.testing.expectEqual(before.hits.len, result.hits.len);
+            try std.testing.expectEqual(@as(usize, if (scope == 0) 2 else if (scope == 1) 1 else 0), state.probed);
+            for (before.hits, result.hits) |want, got| {
+                try std.testing.expectEqual(want.doc_id, got.doc_id);
+                try std.testing.expectApproxEqAbs(want.score, got.score, 0.000001);
+            }
+        }
+    }
+    // A term in a separate OR branch establishes no necessary bound.
+    state.bounded = false;
+    state.probed = 0;
+    var union_result = try execute(a, writer.snapshot(), .{ .query = .{ .bool_query = .{ .should = &.{ logical, term } } }, .k = 10, .include_stored = false });
+    defer union_result.deinit();
+    try std.testing.expectEqual(@as(usize, 6), union_result.hits.len);
+    try std.testing.expectEqual(@as(usize, 6), state.probed);
+    for ([_]SearchQuery{ .{ .bool_query = .{} }, complement }) |query| {
+        var result = try execute(a, writer.snapshot(), .{ .query = query, .k = 10, .include_stored = false });
+        defer result.deinit();
+        try std.testing.expectEqual(result.total_hits, try countMatches(a, writer.snapshot(), query));
+    }
 }

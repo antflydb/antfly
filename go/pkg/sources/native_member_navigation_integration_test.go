@@ -550,3 +550,71 @@ func nativeCertificateSchema() map[string]any {
 		},
 	}}}}
 }
+
+// Physical candidates must bound original-value work before source acquisition,
+// including uncertified revisions and a separately enforced source filter.
+func TestNativeCandidateBoundIntegration(t *testing.T) {
+	endpoint, binary := os.Getenv("ANTFLY_SOURCE_TEST_ENDPOINT"), os.Getenv("ANTFLY_GREP_TEST_BINARY")
+	if endpoint == "" || binary == "" {
+		t.Skip("set native source endpoint and grep binary")
+	}
+	p := &Publisher{Endpoint: endpoint}
+	table := fmt.Sprintf("native_bound_%d", time.Now().UnixNano())
+	_, err := p.call(t.Context(), "POST", tablePath(table), map[string]any{"num_shards": 1, "schema": nativeCertificateSchema()})
+	require.NoError(t, err)
+	defer p.call(context.Background(), "DELETE", tablePath(table), nil)
+	records := map[string]any{}
+	var allowed []string
+	for i := 0; i < 30; i++ {
+		id := fmt.Sprintf("doc-%02d", i)
+		text := "ordinary text"
+		if i >= 27 {
+			text = "needle"
+		}
+		set := map[string]bool{}
+		for j := 0; j+3 <= len(text); j++ {
+			set[fmt.Sprintf("%x", text[j:j+3])] = true
+		}
+		var grams []string
+		for gram := range set {
+			grams = append(grams, gram)
+		}
+		sort.Strings(grams)
+		record := map[string]any{"source": map[string]any{"uri": "gs://fixture/" + id, "path": id + ".txt", "revision": "1", "indexed_at": time.Now().Unix()}, "content": map[string]any{"text": text}, "permissions": map[string]any{"public": i != 27, "readers": []string{}}, "metadata": map[string]any{}, "certificate": "raw-byte-trigrams-v1", "trigrams": grams}
+		if i == 28 {
+			delete(record, "certificate")
+			delete(record, "trigrams")
+		}
+		if i != 27 {
+			allowed = append(allowed, id)
+		}
+		records[id] = record
+	}
+	require.NoError(t, p.Batch(t.Context(), table, records, nil))
+	require.Eventually(t, func() bool {
+		raw, err := p.call(t.Context(), "GET", tablePath(table)+"/indexes/full_text_index_v0", nil)
+		var body struct {
+			Status struct {
+				Readiness struct {
+					Complete bool `json:"complete"`
+				} `json:"readiness"`
+			} `json:"status"`
+		}
+		return err == nil && json.Unmarshal(raw, &body) == nil && body.Status.Readiness.Complete
+	}, 30*time.Second, 50*time.Millisecond)
+	file := filepath.Join(t.TempDir(), "grep.json")
+	// Explicit inline scope isolates text acceleration from the separate
+	// completeness scan required for unbound binary originals.
+	tableConfig := map[string]any{"name": table, "fields": CanonicalDocumentFields(), "streams": DefaultTextStreams(), "source_filter": map[string]any{"doc_id": map[string]any{"ids": allowed}}}
+	config := map[string]any{"version": 1, "endpoint": endpoint, "execution": map[string]any{"value_verification": map[string]any{"allow_scan": true, "max_documents": 2}}, "tables": []any{tableConfig}}
+	require.NoError(t, writeJSON(file, config, 1<<20))
+	output, err := exec.CommandContext(t.Context(), binary, "--table-config", file, "--artifact", "source", "-F", "needle").CombinedOutput()
+	var exit *exec.ExitError
+	require.ErrorAs(t, err, &exit, string(output))
+	require.Equal(t, 2, exit.ExitCode(), "baseline must exceed the two-document verification budget")
+	tableConfig["candidate_index"] = map[string]any{"version": 1, "field": "trigrams", "version_field": "certificate"}
+	require.NoError(t, writeJSON(file, config, 1<<20))
+	output, err = exec.CommandContext(t.Context(), binary, "--table-config", file, "--artifact", "source", "-F", "needle").CombinedOutput()
+	require.NoError(t, err, string(output))
+	require.Equal(t, "doc-28.txt:needle\ndoc-29.txt:needle\n", string(output))
+}
