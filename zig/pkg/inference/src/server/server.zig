@@ -20873,41 +20873,46 @@ pub const Node = struct {
         return downloadRemoteContentWithBudgetForRequestWithContext(self, a, .{ .io = io, .control = control }, url, &budget);
     }
 
-    pub fn invokeCloudflare(self: *Node, a: std.mem.Allocator, binding: document_contract.Binding, payload: std.json.Value, control: InferenceExecutionControl, run: *document_contract.Run) !std.json.Value {
-        try control.check();
-        const env_name = try a.dupeSentinel(u8, binding.token_env orelse return error.InvalidCloudflareConfig, 0);
-        const token = platform.env.getenvSlice(env_name) orelse return error.CloudflareCredentialMissing;
-        // One bounded, resource-accounted pool per run, shared by routing,
-        // extraction and verification. It outlives child scratch arenas.
-        const Session = struct {
-            allocator: std.mem.Allocator,
-            owned_io: ?std.Io.Threaded = null,
-            client: httpx.Client,
-            fn release(raw: ?*anyopaque) void {
-                const session: *@This() = @ptrCast(@alignCast(raw.?));
-                session.client.deinit();
-                if (session.owned_io) |*owned| owned.deinit();
-                session.allocator.destroy(session);
-            }
-        };
-        // The shared pool outlives all page scratch arenas. Serialize only
-        // lazy initialization; HTTP requests run concurrently on the pool.
+    const DocumentProviderSession = struct {
+        allocator: std.mem.Allocator,
+        owned_io: ?std.Io.Threaded = null,
+        client: httpx.Client,
+        fn release(raw: ?*anyopaque) void {
+            const session: *@This() = @ptrCast(@alignCast(raw.?));
+            session.client.deinit();
+            if (session.owned_io) |*owned| owned.deinit();
+            session.allocator.destroy(session);
+        }
+    };
+
+    fn documentProviderClient(self: *Node, a: std.mem.Allocator, control: InferenceExecutionControl, run: *document_contract.Run) !*httpx.Client {
+        // One pool per run, shared across modalities, routing and verification.
+        // The owner outlives child scratch arenas and all structured workers.
+        // Serialize only lazy initialization; requests use the pool concurrently.
         if (run.shared) |shared| shared.lock();
-        const session: *Session = session: {
+        const session: *DocumentProviderSession = session: {
             defer if (run.shared) |shared| shared.mutex.unlock();
             const owner = if (run.shared) |shared| &shared.provider_state else &run.provider_state;
             const release = if (run.shared) |shared| &shared.provider_deinit_fn else &run.provider_deinit_fn;
             break :session if (owner.*) |state| @ptrCast(@alignCast(state)) else init: {
                 const backing = run.work_allocator orelse a;
-                const state = try backing.create(Session);
+                const state = try backing.create(DocumentProviderSession);
                 state.* = .{ .allocator = backing, .client = undefined };
                 const io = self.inferenceIo(backing, control.io, &state.owned_io);
                 state.client = httpx.Client.init(backing, io);
                 owner.* = state;
-                release.* = Session.release;
+                release.* = DocumentProviderSession.release;
                 break :init state;
             };
         };
+        return &session.client;
+    }
+
+    pub fn invokeCloudflare(self: *Node, a: std.mem.Allocator, binding: document_contract.Binding, payload: std.json.Value, control: InferenceExecutionControl, run: *document_contract.Run) !std.json.Value {
+        try control.check();
+        const env_name = try a.dupeSentinel(u8, binding.token_env orelse return error.InvalidCloudflareConfig, 0);
+        const token = platform.env.getenvSlice(env_name) orelse return error.CloudflareCredentialMissing;
+        const client = try self.documentProviderClient(a, control, run);
         const Cancel = struct {
             fn cancelled(raw: *const anyopaque) bool {
                 const ctl: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
@@ -20918,7 +20923,7 @@ pub const Node = struct {
         if (binding.operation == .read) {
             if (!cloudflare_provider.routing.visionModel(binding.model)) return error.DocumentCapabilityMismatch;
             const base = try cloudflare_provider.routing.baseUrl(a, binding.account_id, null);
-            return cloudflare_provider.invokeNative(&session.client, a, .{
+            return cloudflare_provider.invokeNative(client, a, .{
                 .account_id = binding.account_id.?,
                 .model = binding.model,
                 .api_key = token,
@@ -20930,7 +20935,7 @@ pub const Node = struct {
                 .cancellation = @as(?httpx.CancellationToken, .{ .ptr = &control, .is_cancelled_fn = Cancel.cancelled }),
             });
         }
-        return cloudflare_provider.invoke(&session.client, a, .{
+        return cloudflare_provider.invoke(client, a, .{
             .account_id = binding.account_id orelse return error.InvalidCloudflareConfig,
             .model = binding.model,
             .api_key = token,
@@ -21080,17 +21085,13 @@ pub const Node = struct {
         return options;
     }
 
-    fn readHostedAudio(self: *Node, a: std.mem.Allocator, name: []const u8, original: transcribing_api.Config, bytes: []const u8, supplied: AudioOptions, control: InferenceExecutionControl) !AudioReadOutput {
+    fn readHostedAudio(self: *Node, a: std.mem.Allocator, name: []const u8, original: transcribing_api.Config, bytes: []const u8, supplied: AudioOptions, control: InferenceExecutionControl, run: *document_contract.Run) !AudioReadOutput {
         try control.check();
         const options = hostedAudioOptions(original, supplied);
         var cfg = original;
         // Hosted leaves consume the source already downloaded and verified by
         // the document service, including its aggregate byte budget.
-        var owned_io: ?std.Io.Threaded = null;
-        defer if (owned_io) |*owned| owned.deinit();
-        const io = self.inferenceIo(a, control.io, &owned_io);
-        var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
-        defer client.deinit();
+        const client = try self.documentProviderClient(a, control, run);
         if (cfg.provider == .cloudflare and cfg.bearer_token == null and cfg.api_key == null) cfg.bearer_token = platform.env.getenv("CLOUDFLARE_API_TOKEN");
         const Cancel = struct {
             fn cancelled(raw: *const anyopaque) bool {
@@ -21099,7 +21100,7 @@ pub const Node = struct {
                 return false;
             }
         };
-        var response = transcribing_api.transcribeWithConfig(a, &client, cfg, .{
+        var response = transcribing_api.transcribeWithConfig(a, client, cfg, .{
             .url = "antfly:resolved-audio",
             .language = options.language,
             .timestamps = (options.timestamps orelse false) or (options.diarization orelse false),
@@ -21188,25 +21189,24 @@ pub const Node = struct {
     /// Shared audio leaf for HTTP, embedded calls, planning and durable jobs.
     /// Source resolution, security and durable snapshots belong to the document
     /// service; this adapter owns physical decode/model admission and release.
-    pub fn documentReadAudio(self: *Node, a: std.mem.Allocator, model_path: []const u8, bytes: []const u8, prompt: ?[]const u8, max_tokens: ?i64, options: AudioOptions, supplied_control: InferenceExecutionControl) !AudioReadOutput {
+    pub fn documentReadAudio(self: *Node, a: std.mem.Allocator, model_path: []const u8, bytes: []const u8, prompt: ?[]const u8, max_tokens: ?i64, options: AudioOptions, supplied_control: InferenceExecutionControl, run: *document_contract.Run) !AudioReadOutput {
         try self.verifyAudioExecution(a, model_path, options, supplied_control);
-        const result = try self.documentReadAudioImpl(a, model_path, bytes, prompt, max_tokens, options, supplied_control);
+        const result = try self.documentReadAudioImpl(a, model_path, bytes, prompt, max_tokens, options, supplied_control, run);
         errdefer a.free(result.text);
         errdefer if (result.audio_json) |json| a.free(json);
         try self.verifyAudioExecution(a, model_path, options, supplied_control);
         return result;
     }
 
-    fn documentReadAudioImpl(self: *Node, a: std.mem.Allocator, model_path: []const u8, bytes: []const u8, prompt: ?[]const u8, max_tokens: ?i64, options: AudioOptions, supplied_control: InferenceExecutionControl) !AudioReadOutput {
+    fn documentReadAudioImpl(self: *Node, a: std.mem.Allocator, model_path: []const u8, bytes: []const u8, prompt: ?[]const u8, max_tokens: ?i64, options: AudioOptions, supplied_control: InferenceExecutionControl, run: *document_contract.Run) !AudioReadOutput {
         try self.documentValidateAudioOptions(a, model_path, options, prompt, max_tokens);
-        if (self.hostedAudioReader(model_path)) |cfg| return self.readHostedAudio(a, model_path, cfg, bytes, options, supplied_control);
+        if (self.hostedAudioReader(model_path)) |cfg| return self.readHostedAudio(a, model_path, cfg, bytes, options, supplied_control, run);
         const control = self.bindExecutionControl(null, supplied_control);
         try control.check();
         var manifest = try manifest_mod.loadListingFromDir(a, model_path);
         defer manifest.deinit();
         const whisper = manifest.model_type == .transcriber;
         const audio_admission = audioDecodeAdmission(self, bytes.len);
-        if (!whisper and audio_admission.max_decode_working_bytes < default_max_audio_decode_working_bytes) return error.AudioTooLarge;
         if (control.http_request_admitted) try self.reserveAdmissionUnits(audio_admission.units) else try self.acquireAdmissionUnits(audio_admission.units);
         var reserved_units = audio_admission.units;
         defer if (control.http_request_admitted) self.releaseSlotUnits(reserved_units) else self.releaseAdmissionUnits(reserved_units);
@@ -21272,7 +21272,10 @@ pub const Node = struct {
         var preflight = try directGeneratePreflightForMessages(&messages);
         preflight.enable_thinking = false;
         preflight.audio_transcription = true;
-        const tokens: i32 = @intCast((try validateReadMaxTokens(max_tokens)) orelse AudioReadInput.default_max_tokens);
+        // Deployment policy bounds omitted defaults; explicit values still
+        // reach authoritative invocation validation unchanged.
+        const contract = try resolvedGenerateExecutorContract(self, &manifest);
+        const tokens: i32 = @intCast(readers_mod.resolveOutputTokens(try validateReadMaxTokens(max_tokens), AudioReadInput.default_max_tokens, contract.batch.max_output_tokens_per_item).?);
         const required_units = @max(reserved_units, estimateGenerateAdmissionUnitsFromShape((prompt orelse @as([]const u8, AudioReadInput.default_prompt)).len, 1, tokens));
         try self.growAdmissionUnits(reserved_units, required_units);
         reserved_units = required_units;
@@ -48150,8 +48153,10 @@ test "audio read HTTP leaf shares request admission and releases work on decode 
     defer node.deinit();
     try std.testing.expect(node.tryAcquireRequestSlot());
     defer node.releaseRequestSlot();
+    var run = document_contract.Run{ .limits = .{} };
+    defer run.deinit();
     for (0..4) |_| {
-        if (node.documentReadAudio(a, path, "not an audio container", null, null, .{}, .{ .http_request_admitted = true })) |result| {
+        if (node.documentReadAudio(a, path, "not an audio container", null, null, .{}, .{ .http_request_admitted = true }, &run)) |result| {
             a.free(result.text);
             if (result.audio_json) |json| a.free(json);
             return error.TestUnexpectedResult;
@@ -48566,7 +48571,9 @@ test "hosted audio document cancellation polls the full execution checkpoint" {
     try node.attachIo(io);
     const start = platform.time.monotonicNs();
     var cutoff = start + 100 * std.time.ns_per_ms;
-    try std.testing.expectError(error.Cancelled, node.readHostedAudio(a, "transcribers/speech", .{ .provider = .openai, .base_url = upstream.baseUrl(), .model = "whisper-1", .api_key = "fixture", .timestamps = false }, "RIFF\x26\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80\x3e\x00\x00\x00\x7d\x00\x00\x02\x00\x10\x00data\x02\x00\x00\x00\x00\x00", .{}, .{ .io = io, .ptr = &cutoff, .check_fn = Helpers.check }));
+    var run = document_contract.Run{ .limits = .{}, .work_allocator = a };
+    defer run.deinit();
+    try std.testing.expectError(error.Cancelled, node.readHostedAudio(a, "transcribers/speech", .{ .provider = .openai, .base_url = upstream.baseUrl(), .model = "whisper-1", .api_key = "fixture", .timestamps = false }, "RIFF\x26\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80\x3e\x00\x00\x00\x7d\x00\x00\x02\x00\x10\x00data\x02\x00\x00\x00\x00\x00", .{}, .{ .io = io, .ptr = &cutoff, .check_fn = Helpers.check }, &run));
     try std.testing.expect(platform.time.monotonicNs() - start < 1500 * std.time.ns_per_ms);
     try group.await(io);
 }
@@ -48688,4 +48695,113 @@ test "hosted audio document Cloudflare aliases fail verifier preflight before so
     defer node.deinit();
     try node.attachIo(io);
     try std.testing.expectError(error.InvalidDocumentDefinition, node.readDocumentsJsonWithControl(a, "{\"model\":\"readers/test/plan\",\"audio\":\"AAAA\"}", .{ .io = io }));
+}
+
+test "audio read Gemma accepts tiny recordings within narrowed decode admission" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"generator\",\"inputs\":[\"text\",\"audio\"],\"capabilities\":[\"generation\"]}" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    const wav = try audio_mod.wav.encodeMono(a, &.{ 0, 0 }, .{ .audio_format = 1, .sample_rate = 16000, .bits_per_sample = 16 });
+    defer a.free(wav);
+    var node = try Node.init(a, .{ .max_work_units = 4 });
+    defer node.deinit();
+    var run = document_contract.Run{ .limits = .{} };
+    defer run.deinit();
+    const result = try node.documentReadAudio(a, path, wav, null, null, .{}, .{}, &run);
+    defer a.free(result.text);
+    defer if (result.audio_json) |json| a.free(json);
+    try std.testing.expect(result.silent_audio);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+
+    // Container size alone cannot authorize expanded PCM. Keep the decoder's
+    // actual allocation limit, even though the obsolete 512 MiB floor is gone.
+    try std.testing.expectError(error.AudioTooLarge, audio_mod.decodeBounded(a, wav, .{}, 1));
+}
+
+test "audio read Gemma defaults honor deployment output ceilings and reject explicit excess" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"generator\",\"inputs\":[\"text\",\"audio\"],\"capabilities\":[\"generation\"]}" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    const wav = try audio_mod.wav.encodeMono(a, &.{ 0.1, 0.2 }, .{ .audio_format = 1, .sample_rate = 16000, .bits_per_sample = 16 });
+    defer a.free(wav);
+    var node = try Node.init(a, .{ .models_dir = path, .max_work_units = 256, .request_limits = .{ .max_output_tokens_per_item = 64 } });
+    defer node.deinit();
+    var run = document_contract.Run{ .limits = .{} };
+    defer run.deinit();
+    // These requests must pass output policy and reach model acquisition. This
+    // hardware-independent fixture deliberately has no loadable weights.
+    for ([_]?i64{ null, 32, 64 }) |tokens| {
+        try std.testing.expectError(error.IncompatibleModel, node.documentReadAudio(a, path, wav, null, tokens, .{}, .{}, &run));
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    }
+    try std.testing.expectError(error.InferenceOutputTokensExceeded, node.documentReadAudio(a, path, wav, null, 65, .{}, .{}, &run));
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
+test "hosted audio document sources reuse one persistent provider connection" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var upstream = try httpx.TestServer.start(a, io, &.{});
+    defer upstream.deinit();
+    var failure: ?anyerror = null;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    const Serve = struct {
+        fn run(server: *httpx.TestServer, err: *?anyerror) std.Io.Cancelable!void {
+            serve(server) catch |problem| {
+                err.* = problem;
+            };
+        }
+        fn serve(server: *httpx.TestServer) !void {
+            // Accept exactly once. Closing/recreating the client between
+            // sources fails the second read instead of silently reconnecting.
+            const connection = try server.listener.accept();
+            var socket = connection.socket;
+            defer socket.close();
+            try socket.setRecvTimeout(3000);
+            for (0..2) |_| {
+                var parser = httpx.Parser.init(std.testing.allocator);
+                defer parser.deinit();
+                var buf: [4096]u8 = undefined;
+                while (!parser.isComplete()) {
+                    const count = try socket.reader().read(&buf);
+                    if (count == 0) return error.TruncatedProviderRequest;
+                    try std.testing.expectEqual(count, try parser.feed(buf[0..count]));
+                }
+                try std.testing.expectEqualStrings("/audio/transcriptions", parser.path.?);
+                try std.testing.expectEqualStrings("Bearer fixture", parser.headers.get("authorization").?);
+                try std.testing.expect(std.mem.indexOf(u8, parser.body_buffer.items, "RIFF") != null);
+                try socket.sendAll("HTTP/1.1 200 OK\r\nContent-Length: 16\r\nContent-Type: application/json\r\nConnection: keep-alive\r\n\r\n{\"text\":\"hello\"}");
+            }
+        }
+    };
+    try group.concurrent(io, Serve.run, .{ &upstream, &failure });
+    const configs = [_]transcribing_api.NamedConfig{.{ .name = "speech", .config = .{ .provider = .openai, .base_url = upstream.baseUrl(), .model = "whisper-1", .api_key = "fixture", .timestamps = false, .max_total_tokens = 100 } }};
+    var node = try Node.init(a, .{ .audio_readers = &configs });
+    defer node.deinit();
+    try node.attachIo(io);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const wav = try audio_mod.wav.encodeMono(work, &.{ 0.1, 0.2 }, .{ .audio_format = 1, .sample_rate = 16000, .bits_per_sample = 16 });
+    const encoded = try work.alloc(u8, std.base64.standard.Encoder.calcSize(wav.len));
+    _ = std.base64.standard.Encoder.encode(encoded, wav);
+    const uri = try std.fmt.allocPrint(work, "data:audio/wav;base64,{s}", .{encoded});
+    const body = try std.json.Stringify.valueAlloc(work, .{ .model = "transcribers/speech", .documents = .{ .{ .id = "first", .url = uri, .media_type = "audio/wav" }, .{ .id = "second", .url = uri, .media_type = "audio/wav" } } }, .{});
+    const output = try node.readDocumentsJsonWithControl(a, body, .{ .io = io, .deadline_ns = platform.time.monotonicNs() + 5 * std.time.ns_per_s });
+    defer a.free(output);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, work, output, .{});
+    const rows = parsed.object.get("data").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    for (rows) |row| try std.testing.expectEqualStrings("hello", row.object.get("text").?.string);
+    try group.await(io);
+    if (failure) |err| return err;
 }

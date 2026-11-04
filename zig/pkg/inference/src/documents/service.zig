@@ -972,7 +972,7 @@ pub fn Service(comptime Node: type) type {
                     if (control.audio_execution == null) return error.DocumentModelRevisionMismatch;
                 }
                 run.physicalCall();
-                const result = if (@hasDecl(Node, "documentReadAudio")) try self.node.documentReadAudio(work, pinned.path, self.source.bytes, self.prompt, self.max_tokens, options, control) else return error.DocumentCapabilityMismatch;
+                const result = if (@hasDecl(Node, "documentReadAudio")) try self.node.documentReadAudio(work, pinned.path, self.source.bytes, self.prompt, self.max_tokens, options, control, run) else return error.DocumentCapabilityMismatch;
                 defer work.free(result.text);
                 defer if (@hasField(@TypeOf(result), "audio_json")) {
                     if (result.audio_json) |json| work.free(json);
@@ -3626,7 +3626,7 @@ const AudioPlanTestNode = struct {
         self.downloads += 1;
         return .{ .data = try @import("../pipelines/audio.zig").wav.encodeMono(a, &.{ 0, 0 }, .{ .audio_format = 1, .sample_rate = 16000, .bits_per_sample = 16 }) };
     }
-    pub fn documentReadAudio(self: *@This(), a: A, model: []const u8, bytes: []const u8, _: ?[]const u8, _: ?i64, options: c.AudioReadOptions, control: Control) !struct { text: []const u8, prompt_tokens: ?usize, completion_tokens: ?usize, truncated: bool, silent_audio: bool, unresolved: bool, audio_json: ?[]const u8 = null } {
+    pub fn documentReadAudio(self: *@This(), a: A, model: []const u8, bytes: []const u8, _: ?[]const u8, _: ?i64, options: c.AudioReadOptions, control: Control, _: *c.Run) !struct { text: []const u8, prompt_tokens: ?usize, completion_tokens: ?usize, truncated: bool, silent_audio: bool, unresolved: bool, audio_json: ?[]const u8 = null } {
         try control.check();
         if (self.expected_allowance) |expected| {
             try std.testing.expectEqual(expected, control.audio_output_token_limit);
