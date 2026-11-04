@@ -327,8 +327,16 @@ def native_worker(config, index, ready, start, results, finish=None):
                 prefix = f"worker-{index}" if threads == 1 else f"worker-{index}-t{thread_index}"
                 try:
                     while time.monotonic() < deadline:
-                        key = f"{prefix}-{sequence if config['workload'] == 'append' else sequence % 128}"
-                        payload = {"inserts": {key: {"text": "v" * 1024, "sequence": sequence}}}
+                        # Several documents per call make one large journal record,
+                        # the shape that stresses background full-text replay.
+                        batch_docs = config.get("batch_docs", 1)
+                        keyspace = max(128, batch_docs)
+                        keys = [
+                            f"{prefix}-{(sequence * batch_docs + j) if config['workload'] == 'append' else (sequence * batch_docs + j) % keyspace}"
+                            for j in range(batch_docs)
+                        ]
+                        key = keys[-1]
+                        payload = {"inserts": {k: {"text": "v" * 1024, "sequence": sequence} for k in keys}}
                         began_call = time.perf_counter_ns()
                         try:
                             handle.batch_json(payload)
@@ -343,7 +351,8 @@ def native_worker(config, index, ready, start, results, finish=None):
                                 thread_successes[thread_index] += 1
                                 last_write = write
                                 if config["workload"] == "churn":
-                                    latest_churn_writes[key] = write
+                                    for k in keys:
+                                        latest_churn_writes[k] = {"key": k, "sequence": sequence}
                             max_gap = max(max_gap, elapsed - last_progress)
                             last_progress = elapsed
                         except af.BusyError:
@@ -829,6 +838,7 @@ def native_cases(args):
                 "progress_window_seconds": args.progress_window,
                 "status_interval": args.status_interval,
                 "threads_per_worker": args.threads_per_worker,
+                "batch_docs": args.batch_docs,
             }
             reader_stop, reader_results = context.Event(), context.Queue()
             reader = (
@@ -1063,6 +1073,12 @@ def main():
         help="native: seconds per per-worker progress window (a zero window marks a stall)",
     )
     parser.add_argument(
+        "--batch-docs",
+        type=int,
+        default=1,
+        help="native: documents per batch call (one journal record each)",
+    )
+    parser.add_argument(
         "--threads-per-worker",
         type=int,
         default=1,
@@ -1087,6 +1103,7 @@ def main():
         or args.progress_window <= 0
         or args.status_interval < 0
         or not 1 <= args.threads_per_worker <= 64
+        or not 1 <= args.batch_docs <= 4096
     ):
         parser.error(
             "counts/durations must be positive; concurrency <= 128; timeout >= 0"
