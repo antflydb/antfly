@@ -24,3 +24,5 @@ pub const lake_source = @import("lake_source.zig");
 pub const transport = @import("transport.zig");
 pub const driver = @import("driver.zig");
 pub const collector = @import("collector.zig");
+
+pub const deployment = @import("deployment.zig");

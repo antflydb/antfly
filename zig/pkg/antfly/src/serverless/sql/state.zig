@@ -23,7 +23,7 @@ pub const Digest = [64]u8;
 pub fn validateDigest(value: Digest) !void {
     for (value) |byte| if (!std.ascii.isHex(byte)) return error.InvalidSqlExecutionState;
 }
-pub const Output = struct { key: []const u8, hash: Digest, bytes: u64, rows: u64 = 0, partitions: u16 = 0, index_hash: ?Digest = null };
+pub const Output = struct { key: []const u8, hash: Digest, bytes: u64, rows: u64 = 0, partitions: u16 = 0, index_bytes: u32 = 0, index_hash: ?Digest = null };
 pub const Status = enum { pending, running, succeeded, failed, cancelled };
 pub const Record = struct {
     version: u8 = 1,
@@ -35,6 +35,9 @@ pub const Record = struct {
     until_ms: u64 = 0,
     stage: u32 = 0,
     cursor: u32 = 0,
+    pending: []const u32 = &.{},
+    reduce_boundaries: []const u16 = &.{},
+    adaptive: ?Output = null,
     output: ?Output = null,
     failure: ?[]const u8 = null,
     pub fn terminal(self: Record) bool {
@@ -88,6 +91,9 @@ pub const Store = struct {
         result.deinit(a);
     }
     pub fn create(self: Store, a: A, path: []const u8, plan: Digest, expires_ms: u64) !void {
+        _ = try self.ensure(a, path, plan, expires_ms);
+    }
+    pub fn ensure(self: Store, a: A, path: []const u8, plan: Digest, expires_ms: u64) !bool {
         if (expires_ms <= self.now_ms) return error.SqlQueryExpired;
         self.write(a, path, null, .{ .plan = plan, .expires_ms = expires_ms }) catch |err| {
             // Existing jobs and lost successful responses are both resolved by
@@ -95,7 +101,9 @@ pub const Store = struct {
             var existing = (self.load(a, path) catch return err) orelse return err;
             defer existing.deinit(a);
             if (!std.mem.eql(u8, &existing.value.plan, &plan) or existing.value.expires_ms != expires_ms) return error.SqlExecutionIdReused;
+            return false;
         };
+        return true;
     }
     pub fn claim(self: Store, a: A, path: []const u8, owner: []const u8, ttl_ms: u64) !?Claim {
         if (owner.len == 0 or owner.len > 256 or ttl_ms == 0 or ttl_ms > 60_000) return error.InvalidSqlExecutionClaim;
@@ -130,12 +138,36 @@ pub const Store = struct {
         try self.write(a, path, old, next);
     }
     pub fn checkpoint(self: Store, a: A, path: []const u8, claim_: Claim, stage: u32, cursor: u32) !void {
+        return self.checkpointTasks(a, path, claim_, stage, cursor, &.{});
+    }
+    pub fn checkpointTasks(self: Store, a: A, path: []const u8, claim_: Claim, stage: u32, cursor: u32, pending: []const u32) !void {
+        return self.checkpointTasksAndReducers(a, path, claim_, stage, cursor, pending, null);
+    }
+    pub fn checkpointTasksAndReducers(self: Store, a: A, path: []const u8, claim_: Claim, stage: u32, cursor: u32, pending: []const u32, boundaries: ?[]const u16) !void {
+        if (pending.len > 256) return error.InvalidSqlExecutionState;
+        for (pending, 0..) |id, index| {
+            if (id >= cursor or (index != 0 and id <= pending[index - 1])) return error.InvalidSqlExecutionState;
+        }
         var old = try self.owned(a, path, claim_);
         defer old.deinit(a);
         if (stage < old.value.stage or (stage == old.value.stage and cursor < old.value.cursor)) return error.InvalidSqlExecutionState;
         var next = old.value;
         next.stage = stage;
         next.cursor = cursor;
+        next.pending = pending;
+        if (boundaries) |value| {
+            if (old.value.stage != 0 or stage != 1 or old.value.reduce_boundaries.len != 0 or value.len < 2 or value.len > 1025) return error.InvalidSqlExecutionState;
+            next.reduce_boundaries = value;
+            next.adaptive = null;
+        }
+        try self.write(a, path, old, next);
+    }
+    pub fn saveAdaptive(self: Store, a: A, path: []const u8, claim_: Claim, output: Output) !void {
+        var old = try self.owned(a, path, claim_);
+        defer old.deinit(a);
+        if (old.value.stage != 0 or old.value.pending.len != 0) return error.InvalidSqlExecutionState;
+        var next = old.value;
+        next.adaptive = output;
         try self.write(a, path, old, next);
     }
     pub fn complete(self: Store, a: A, path: []const u8, claim_: Claim, output: Output) !void {
@@ -143,7 +175,7 @@ pub const Store = struct {
         defer old.deinit(a);
         // Exact accepted retries survive an ACK loss, including after expiry.
         if (old.value.status == .succeeded) {
-            if (old.value.epoch != claim_.epoch or !std.mem.eql(u8, old.value.owner, claim_.owner) or !std.meta.eql(old.value.output.?.hash, output.hash) or !std.mem.eql(u8, old.value.output.?.key, output.key) or old.value.output.?.bytes != output.bytes or old.value.output.?.rows != output.rows or old.value.output.?.partitions != output.partitions or !std.meta.eql(old.value.output.?.index_hash, output.index_hash)) return error.SqlExecutionFenced;
+            if (old.value.epoch != claim_.epoch or !std.mem.eql(u8, old.value.owner, claim_.owner) or !std.meta.eql(old.value.output.?.hash, output.hash) or !std.mem.eql(u8, old.value.output.?.key, output.key) or old.value.output.?.bytes != output.bytes or old.value.output.?.rows != output.rows or old.value.output.?.partitions != output.partitions or old.value.output.?.index_bytes != output.index_bytes or !std.meta.eql(old.value.output.?.index_hash, output.index_hash)) return error.SqlExecutionFenced;
             return;
         }
         if (old.value.expires_ms <= self.now_ms) return error.SqlQueryExpired;

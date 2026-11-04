@@ -81,6 +81,20 @@ pub const Plan = struct {
     partitions: u16,
     limits: Limits,
     aggregate: ?Aggregation = null,
+    /// Coordinator-owned physical reducer boundaries; absent in submitted IR.
+    reduce_boundaries: []const u16 = &.{},
+    pub fn reduceCount(self: Plan) u32 {
+        return if (self.reduce_boundaries.len == 0) self.partitions else @intCast(self.reduce_boundaries.len - 1);
+    }
+    pub fn withReducers(self: Plan, boundaries: []const u16) !Plan {
+        if (boundaries.len != 0) {
+            if (self.strategy != .shuffle or boundaries.len < 2 or boundaries.len > @as(usize, self.partitions) + 1 or boundaries[0] != 0 or boundaries[boundaries.len - 1] != self.partitions) return error.InvalidSqlExecutionState;
+            for (boundaries[1..], boundaries[0 .. boundaries.len - 1]) |end, start| if (end <= start) return error.InvalidSqlExecutionState;
+        }
+        var result = self;
+        result.reduce_boundaries = boundaries;
+        return result;
+    }
     pub fn validate(self: Plan, now_ms: u64) !void {
         if (self.version != 1 or self.expires_ms <= now_ms) return error.SqlQueryExpired;
         const limits = self.limits;
@@ -130,7 +144,7 @@ pub const Plan = struct {
     }
     pub fn stageTasks(self: Plan, stage: u32) !u32 {
         if (stage == 0) return if (self.strategy == .broadcast) self.right.splits else std.math.add(u32, self.left.splits, self.right.splits);
-        var count: u32 = if (self.strategy == .broadcast) self.left.splits else self.partitions;
+        var count: u32 = if (self.strategy == .broadcast) self.left.splits else self.reduceCount();
         if (stage == 1) return count;
         if (self.aggregate == null or stage > 8) return error.InvalidSqlDistributedPlan;
         for (2..stage + 1) |_| count = (count + 31) / 32;
@@ -138,7 +152,7 @@ pub const Plan = struct {
     }
     pub fn finalStage(self: Plan) u32 {
         if (self.aggregate == null) return 2;
-        var count: u32 = if (self.strategy == .broadcast) self.left.splits else self.partitions;
+        var count: u32 = if (self.strategy == .broadcast) self.left.splits else self.reduceCount();
         var stage: u32 = 2;
         while (count > 32) {
             count = (count + 31) / 32;
@@ -166,6 +180,7 @@ pub const Task = struct {
     kind: enum { scan_build, broadcast_probe, map_left, map_right, reduce, aggregate, results },
     split: u32 = 0,
     partition: u16 = 0,
+    partition_end: u16 = 1,
     finalize: bool = false,
 };
 /// No row payload travels through the dispatcher. The worker loads the durable

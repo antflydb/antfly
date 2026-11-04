@@ -23,8 +23,36 @@ const A = std.mem.Allocator;
 const prefix = "sql-lake1:";
 pub const ttl_ms: u64 = std.time.ms_per_hour;
 pub const max_bytes = 40 * 1024 * 1024;
+/// Pointer-free read authority. Allocation owners and runtime caches never
+/// enter a retained capability; source/schema fields are immutable views.
+pub const ReadTable = struct {
+    id: u64,
+    physical_name: []const u8,
+    schema_version: u32,
+    columns: []const catalog.Column,
+    scope: ?catalog.Table.Scope,
+    external_indexes: ?catalog.Table.ExternalIndexes,
+    binding: local.serverless_external_source_catalog_binding.Binding,
+    external_table_id: []const u8,
+    source_uri: []const u8,
+    credential_ref_id: ?[]const u8,
+    credential_scope: ?[]const u8,
+    snapshot_value: ?[]const u8,
+    schema_fingerprint: []const u8,
+    pub fn from(table: catalog.Table) ReadTable {
+        const source = table.external_base_source.?;
+        return .{ .id = table.id, .physical_name = table.physical_name, .schema_version = table.schema_version, .columns = table.columns, .scope = table.scope, .external_indexes = table.external_indexes, .binding = source.binding, .external_table_id = source.table_id, .source_uri = source.source_uri, .credential_ref_id = source.credential_ref_id, .credential_scope = source.credential_scope, .snapshot_value = source.snapshot_value, .schema_fingerprint = source.schema_fingerprint };
+    }
+    pub fn view(self: ReadTable) catalog.Table {
+        return .{ .id = self.id, .physical_name = self.physical_name, .schema_version = self.schema_version, .columns = self.columns, .scope = self.scope, .external_indexes = self.external_indexes, .external_base_source = .{ .binding = self.binding, .table_id = @constCast(self.external_table_id), .source_uri = @constCast(self.source_uri), .credential_ref_id = if (self.credential_ref_id) |v| @constCast(v) else null, .credential_scope = if (self.credential_scope) |v| @constCast(v) else null, .snapshot_value = if (self.snapshot_value) |v| @constCast(v) else null, .schema_fingerprint = @constCast(self.schema_fingerprint) } };
+    }
+};
 pub const Descriptor = struct {
     version: u16 = 1,
+    /// Issued only by an authenticated SQL admission owner. The immutable
+    /// artifact's domain, digest, expiry and opaque scope bind this read grant;
+    /// workers cannot replace its schema or source binding through a ticket.
+    authorization: ?struct { scope: [64]u8, table: ReadTable } = null,
     name: ?local.sql_ast.Name = null,
     table_id: u64,
     schema_version: u32,
@@ -35,6 +63,21 @@ pub const Descriptor = struct {
     table_uuid: []const u8,
     snapshot_id: []const u8,
     pending: @import("../serverless/lake_ingestion.zig").Pending,
+    pub fn jsonStringify(self: Descriptor, jw: anytype) !void {
+        try jw.beginObject();
+        inline for (@typeInfo(Descriptor).@"struct".field_names) |field| {
+            if (comptime std.mem.eql(u8, field, "authorization")) {
+                if (self.authorization) |grant| {
+                    try jw.objectField(field);
+                    try jw.write(grant);
+                }
+            } else {
+                try jw.objectField(field);
+                try jw.write(@field(self, field));
+            }
+        }
+        try jw.endObject();
+    }
 };
 fn domain(table: u64, identity: [32]u8) [32]u8 {
     var hash = std.crypto.hash.Blake3.init(.{});

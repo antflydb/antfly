@@ -22,6 +22,7 @@ pub const Driver = struct {
     service: runtime.Service,
     dispatcher: runtime.Dispatcher,
     interval_ms: u32 = 100,
+    principal_scopes: bool = false,
     after: ?[]u8 = null,
     group: std.Io.Group = .init,
     started: bool = false,
@@ -82,7 +83,15 @@ pub const Driver = struct {
             var current = (try records.load(a, key)) orelse continue;
             defer current.deinit(a);
             if (current.value.terminal()) continue;
-            _ = service.turn(query, self.dispatcher) catch |err| switch (err) {
+            var scoped = service;
+            if (self.principal_scopes) {
+                const plan_key = try std.fmt.allocPrint(a, "{s}/sql-execution/{s}/plan.json", .{ service.state_store.prefix, query });
+                var object = client.getObject(service.state_store.bucket, plan_key, .{ .skip_metadata_probe = true, .max_response_bytes = 1024 * 1024, .cancellation = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.contextCancellation(&service.context) }) catch continue;
+                defer object.deinit(a);
+                const identity = std.json.parseFromSliceLeaky(struct { tenant: @import("state.zig").Digest }, a, object.body, .{ .ignore_unknown_fields = true }) catch continue;
+                scoped.tenant = identity.tenant;
+            }
+            _ = scoped.turn(query, self.dispatcher) catch |err| switch (err) {
                 error.SqlExecutionFenced, error.PreconditionFailed, error.SqlExecutionNotFound => continue,
                 error.Canceled, error.Cancelled => return err,
                 else => {

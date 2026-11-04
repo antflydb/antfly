@@ -31,6 +31,7 @@ pub const Bridge = struct {
     /// API-role hosts forward orchestration to the query service.
     gateway: ?*@import("transport.zig").Client = null,
     limits: plan.Limits = .{},
+    principal_scopes: bool = false,
     local_bytes: u64 = 8 * 1024 * 1024,
     pub fn port(self: *Bridge) catalog.DistributedJoin {
         return .{ .ptr = self, .open = open };
@@ -48,7 +49,7 @@ pub const Bridge = struct {
         const right_export = cursors[right.index].export_snapshot orelse return null;
         if ((cursors[left.index].estimated_bytes orelse std.math.maxInt(u64)) +| (cursors[right.index].estimated_bytes orelse std.math.maxInt(u64)) <= self.local_bytes) return null;
         const owner = try a.create(Owner);
-        owner.* = .{ .a = a, .arena = .init(a), .decode = .init(a), .service = self.service, .request = request, .parent_context = self.service.context };
+        owner.* = .{ .a = a, .arena = .init(a), .decode = .init(a), .block_arena = .init(a), .service = self.service, .request = request, .parent_context = self.service.context };
         var transferred = false;
         defer if (!transferred) {
             owner.decode.deinit();
@@ -56,6 +57,7 @@ pub const Bridge = struct {
             a.destroy(owner);
         };
         var service = self.service;
+        if (self.principal_scopes) service.tenant = principalScope(service.tenant, request);
         const inherited = try request.platformDeadline();
         if (inherited.deadline_ns) |deadline| service.context.deadline_ns = if (service.context.deadline_ns) |parent| @min(parent, deadline) else deadline;
         service.context.cancellation = .{ .ptr = owner, .is_cancelled_fn = Owner.canceled };
@@ -90,9 +92,13 @@ pub const Bridge = struct {
         const query = if (self.gateway) |gateway| try gateway.submit(specification, service.context) else try service.submit(specification);
         while (true) {
             try service.context.ensureActive();
-            const result_ = if (self.gateway) |gateway| try gateway.result(scratch, .{ .tenant = service.tenant, .query = query }, service.context) else try service.pollResult(scratch, query);
+            var poll_arena = std.heap.ArenaAllocator.init(a);
+            defer poll_arena.deinit();
+            const result_ = if (self.gateway) |gateway| try gateway.result(poll_arena.allocator(), .{ .tenant = service.tenant, .query = query }, service.context) else try service.pollResult(poll_arena.allocator(), query);
             if (result_) |result| {
-                owner.pages = result.pages;
+                const pages = try scratch.dupe(state.Output, result.pages);
+                for (pages) |*page| page.key = try scratch.dupe(u8, page.key);
+                owner.pages = pages;
                 transferred = true;
                 return .{ .ptr = owner, .next = Owner.next, .close = Owner.close };
             }
@@ -142,10 +148,21 @@ pub const Bridge = struct {
         return .{ .instructions = instructions.items, .root = root.?, .output = .{ .kind = .boolean } };
     }
 };
+/// Scope identity is local authority, never a value accepted from a SQL body.
+pub fn principalScope(seed: plan.Digest, context: local.api_operation.RequestContext) plan.Digest {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly-distributed-sql-principal-v1");
+    hash.update(&seed);
+    hash.update(context.setting_read_principal orelse "anonymous");
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
 const Owner = struct {
     a: A,
     arena: std.heap.ArenaAllocator,
     decode: std.heap.ArenaAllocator,
+    block_arena: std.heap.ArenaAllocator,
     service: runtime.Service,
     request: local.api_operation.RequestContext,
     parent_context: local.serverless_query_lake_read_context.Context,
@@ -175,7 +192,7 @@ const Owner = struct {
                 self.block = null;
             }
             if (self.data) |*data| {
-                self.block = try data.next(self.decode.allocator(), @import("exchange.zig").max_object_bytes);
+                self.block = try data.nextBlock(&self.block_arena, @import("exchange.zig").max_object_bytes);
                 if (self.block != null) {
                     self.row = 0;
                     continue;
@@ -192,6 +209,7 @@ const Owner = struct {
     fn close(raw: *anyopaque) void {
         const self: *Owner = @ptrCast(@alignCast(raw));
         if (self.block) |block| block.deinit();
+        self.block_arena.deinit();
         self.decode.deinit();
         self.arena.deinit();
         self.a.destroy(self);

@@ -171,13 +171,15 @@ pub const Runner = struct {
         defer if (filter) |value| value.close();
         var decode = std.heap.ArenaAllocator.init(self.a);
         defer decode.deinit();
+        var block_arena = std.heap.ArenaAllocator.init(self.a);
+        defer block_arena.deinit();
         var row_arena = std.heap.ArenaAllocator.init(self.a);
         defer row_arena.deinit();
         var input_rows: u64 = 0;
         for (dependencies[0..build_count]) |ref| {
             _ = decode.reset(.free_all);
-            var data = try self.exchange_store.read(decode.allocator(), ref, if (broadcast) 0 else task.partition, @intCast(spec.limits.task_memory / 4));
-            while (try data.next(decode.allocator(), @intCast(spec.limits.task_memory / 4))) |block| {
+            var data = try self.exchange_store.readRange(decode.allocator(), ref, if (broadcast) 0 else task.partition, if (broadcast) 1 else task.partition_end, @intCast(spec.limits.task_memory / 4));
+            while (try data.nextBlock(&block_arena, @intCast(spec.limits.task_memory / 4))) |block| {
                 defer block.deinit();
                 for (0..block.count()) |index| {
                     try self.context.ensureActive();
@@ -219,8 +221,8 @@ pub const Runner = struct {
             }
         } else for (dependencies[build_count..]) |ref| {
             _ = decode.reset(.free_all);
-            var data = try self.exchange_store.read(decode.allocator(), ref, task.partition, @intCast(spec.limits.task_memory / 4));
-            while (try data.next(decode.allocator(), @intCast(spec.limits.task_memory / 4))) |block| {
+            var data = try self.exchange_store.readRange(decode.allocator(), ref, task.partition, task.partition_end, @intCast(spec.limits.task_memory / 4));
+            while (try data.nextBlock(&block_arena, @intCast(spec.limits.task_memory / 4))) |block| {
                 defer block.deinit();
                 for (0..block.count()) |index| {
                     try self.context.ensureActive();
@@ -251,14 +253,16 @@ pub const Runner = struct {
         defer join_.close();
         var decode = std.heap.ArenaAllocator.init(self.a);
         defer decode.deinit();
+        var block_arena = std.heap.ArenaAllocator.init(self.a);
+        defer block_arena.deinit();
         var scratch = std.heap.ArenaAllocator.init(self.a);
         defer scratch.deinit();
         var ordinal: usize = 0;
         for (dependencies, 0..) |ref, input| {
             try self.context.ensureActive();
             _ = decode.reset(.free_all);
-            var data = try self.exchange_store.read(decode.allocator(), ref, task.partition, @intCast(spec.limits.task_memory / 4));
-            while (try data.next(decode.allocator(), @intCast(spec.limits.task_memory / 4))) |block| {
+            var data = try self.exchange_store.readRange(decode.allocator(), ref, task.partition, task.partition_end, @intCast(spec.limits.task_memory / 4));
+            while (try data.nextBlock(&block_arena, @intCast(spec.limits.task_memory / 4))) |block| {
                 defer block.deinit();
                 for (0..block.count()) |row| {
                     _ = scratch.reset(.free_all);
@@ -303,6 +307,8 @@ pub const Runner = struct {
         if (aggregate.groups.len == 0) try grouped.ensureGlobalGroup();
         var decode = std.heap.ArenaAllocator.init(self.a);
         defer decode.deinit();
+        var block_arena = std.heap.ArenaAllocator.init(self.a);
+        defer block_arena.deinit();
         var scratch = std.heap.ArenaAllocator.init(self.a);
         defer scratch.deinit();
         var ordinal: u64 = 0;
@@ -310,7 +316,7 @@ pub const Runner = struct {
             try self.context.ensureActive();
             _ = decode.reset(.free_all);
             var data = try self.exchange_store.read(decode.allocator(), page, 0, @intCast(spec.limits.task_memory / 4));
-            while (try data.next(decode.allocator(), @intCast(spec.limits.task_memory / 4))) |block| {
+            while (try data.nextBlock(&block_arena, @intCast(spec.limits.task_memory / 4))) |block| {
                 defer block.deinit();
                 if (block.values.len != aggregate.groups.len + aggregate.specs.len) return error.InvalidSqlExchange;
                 for (0..block.count()) |row| {

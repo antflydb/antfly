@@ -37,12 +37,12 @@ pub const Host = struct {
     options: configured.BindingObjectStoreOpenOptions,
     cache: ?*local.serverless_query_lake_serving_cache.Cache = null,
     io: std.Io,
-    authorization: struct {
+    authorization: ?struct {
         ptr: *anyopaque,
         /// Scope is an authenticated principal/policy capability, not a table
         /// name supplied by an RPC caller. Returned metadata belongs to a.
         resolve: *const fn (*anyopaque, A, plan.Digest, u64, Context) anyerror!catalog.Table,
-    },
+    } = null,
     pub fn source(self: *Host) runner.Source {
         return .{ .ptr = self, .open = open };
     }
@@ -57,20 +57,24 @@ pub const Host = struct {
         defer a.free(bytes);
         return lake.types.digestHex(bytes);
     }
-    fn resolve(self: *Host, a: A, tenant: plan.Digest, input: plan.Input, context: Context) !catalog.Table {
-        const table = try self.authorization.resolve(self.authorization.ptr, a, tenant, input.table_id, context);
-        if (table.id != input.table_id or table.external_base_source == null or !std.mem.eql(u8, &try fingerprint(a, table), &input.schema)) return error.SqlExecutionUnauthorized;
+    fn admitted(self: *Host, a: A, tenant: plan.Digest, input: plan.Input, context: Context) !struct { table: catalog.Table, cut: retained.Descriptor } {
+        const now: u64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+        var scoped_artifacts = self.artifacts.*;
+        scoped_artifacts.allocator = a;
+        const cut = try retained.loadDescriptor(a, &scoped_artifacts, self.store_identity, input.cut, input.table_id, now, request(context).cancellation);
+        const table = if (self.authorization) |authority|
+            try authority.resolve(authority.ptr, a, tenant, input.table_id, context)
+        else grant: {
+            const grant = cut.authorization orelse return error.SqlExecutionUnauthorized;
+            if (!std.mem.eql(u8, &grant.scope, &tenant)) return error.SqlExecutionUnauthorized;
+            break :grant grant.table.view();
+        };
+        if (table.id != input.table_id or table.external_base_source == null or !std.mem.eql(u8, &try fingerprint(a, table), &input.schema) or cut.schema_version != table.schema_version or cut.object_generation != (if (table.external_indexes) |indexes| indexes.object_generation else 0) or !std.mem.eql(u8, cut.snapshot_id, input.snapshot) or cut.pending.lsn != input.wal_cut) return error.SqlExecutionUnauthorized;
         for (input.columns) |column| {
             const actual = try table.column(column.name);
             if (actual.type != column.type or actual.element_type != column.element_type) return error.SqlExecutionUnauthorized;
         }
-        return table;
-    }
-    fn load(self: *Host, a: A, table: catalog.Table, input: plan.Input, context: Context) !retained.Descriptor {
-        const now: u64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
-        const cut = try retained.load(a, self.artifacts, self.store_identity, input.cut, table, now, request(context).cancellation);
-        if (!std.mem.eql(u8, cut.snapshot_id, input.snapshot) or cut.pending.lsn != input.wal_cut) return error.SqlExecutionUnauthorized;
-        return cut;
+        return .{ .table = table, .cut = cut };
     }
     fn pin(self: *Host, a: A, table: catalog.Table, cut: retained.Descriptor, context: Context) !void {
         var options = self.options;
@@ -97,8 +101,9 @@ pub const Host = struct {
             defer arena.deinit();
             const scratch = arena.allocator();
             const input = @field(spec, side);
-            const table = try self.resolve(scratch, spec.tenant, input, context);
-            const cut = try self.load(scratch, table, input, context);
+            const admitted_ = try self.admitted(scratch, spec.tenant, input, context);
+            const table = admitted_.table;
+            const cut = admitted_.cut;
             if (cut.expires_ms < spec.expires_ms) return error.SqlQueryExpired;
             try self.pin(scratch, table, cut, context);
         }
@@ -106,7 +111,8 @@ pub const Host = struct {
     /// Capture once before dispatch. The capability copies all accepted WAL
     /// images, so WAL truncation cannot change a retry's overlay.
     pub fn capture(self: *Host, a: A, tenant: plan.Digest, table_id: u64, columns: []const plan.Column, splits: u32, expires_ms: u64, context: Context) !plan.Input {
-        const table = try self.authorization.resolve(self.authorization.ptr, a, tenant, table_id, context);
+        const authority = self.authorization orelse return error.SqlExecutionUnauthorized;
+        const table = try authority.resolve(authority.ptr, a, tenant, table_id, context);
         if (table.external_base_source == null or splits == 0 or splits > 65536) return error.SqlDistributedJoinUnsupported;
         var options = self.options;
         options.catalog_table_id = table.id;
@@ -118,7 +124,7 @@ pub const Host = struct {
         const root = try lake.metadata.parse(a, pinned.metadata_json);
         const coverage = try @import("../../api/lake_search_overlay.zig").snapshotCoverage(root, pinned_source.inventory.snapshot_id);
         const pending = try ingestion.pending(a, table.external_base_source.?.binding, options, context, coverage);
-        const cut: retained.Descriptor = .{ .table_id = table.id, .schema_version = table.schema_version, .object_generation = options.catalog_generation, .expires_ms = expires_ms, .metadata_location = pinned.metadata_location, .metadata_json = pinned.metadata_json, .table_uuid = try lake.metadata.str(try lake.metadata.get(root, "table-uuid")), .snapshot_id = pinned_source.inventory.snapshot_id, .pending = pending };
+        const cut: retained.Descriptor = .{ .authorization = .{ .scope = tenant, .table = retained.ReadTable.from(table) }, .table_id = table.id, .schema_version = table.schema_version, .object_generation = options.catalog_generation, .expires_ms = expires_ms, .metadata_location = pinned.metadata_location, .metadata_json = pinned.metadata_json, .table_uuid = try lake.metadata.str(try lake.metadata.get(root, "table-uuid")), .snapshot_id = pinned_source.inventory.snapshot_id, .pending = pending };
         try self.pin(a, table, cut, context);
         const token = try retained.save(a, self.artifacts, self.store_identity, self.io, cut, request(context).cancellation);
         const estimates = pinned_source.estimates() orelse blk: {
@@ -140,8 +146,9 @@ pub const Host = struct {
         owner.* = .{ .a = a, .arena = .init(a), .input = input, .filter = filter, .context = context };
         errdefer owner.arena.deinit();
         const scratch = owner.arena.allocator();
-        const table = try self.resolve(scratch, tenant, input, context);
-        const cut = try self.load(scratch, table, input, context);
+        const admitted_ = try self.admitted(scratch, tenant, input, context);
+        const table = admitted_.table;
+        const cut = admitted_.cut;
         try self.pin(scratch, table, cut, context);
         var options = self.options;
         options.catalog_table_id = table.id;

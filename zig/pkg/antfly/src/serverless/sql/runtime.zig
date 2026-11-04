@@ -67,6 +67,7 @@ pub const Service = struct {
     retention: Retention,
     source: runner.Source,
     spill: ?*local.sql_spill.Manager = null,
+    task_memory_ceiling: u64 = 1024 * 1024 * 1024,
     fn store(self: Service) state.Store {
         var result = self.state_store;
         result.now_ms = self.clock.now();
@@ -95,6 +96,8 @@ pub const Service = struct {
     pub fn submit(self: Service, specification: plan.Plan) !state.Digest {
         try self.requireQueryRole();
         try specification.validate(self.clock.now());
+        if (specification.reduce_boundaries.len != 0) return error.InvalidSqlDistributedPlan;
+        if (specification.limits.task_memory > self.task_memory_ceiling) return error.SqlJoinBudgetExceeded;
         if (!std.mem.eql(u8, &self.tenant, &specification.tenant)) return error.SqlExecutionUnauthorized;
         try self.retention.ensure(self.retention.ptr, self.a, specification, self.context);
         const bytes = try specification.encode(self.a);
@@ -125,6 +128,7 @@ pub const Service = struct {
         const specification = try std.json.parseFromSliceLeaky(plan.Plan, a, object.body, .{ .allocate = .alloc_always });
         if (!std.mem.eql(u8, &self.tenant, &specification.tenant)) return error.SqlExecutionUnauthorized;
         try specification.validate(self.clock.now());
+        if (specification.limits.task_memory > self.task_memory_ceiling) return error.SqlJoinBudgetExceeded;
         return specification;
     }
     pub fn acquire(self: Service, query: state.Digest) !?state.Claim {
@@ -140,7 +144,7 @@ pub const Service = struct {
         if (task >= try tasks(spec, stage)) return error.InvalidSqlDistributedPlan;
         if (stage >= 2) return .{ .stage = stage, .task = task, .kind = .aggregate, .finalize = stage + 1 == spec.finalStage() };
         if (stage == 0) return .{ .stage = stage, .task = task, .kind = if (spec.strategy == .broadcast) .scan_build else if (task < spec.right.splits) .map_right else .map_left, .split = if (task < spec.right.splits) task else task - spec.right.splits };
-        return .{ .stage = stage, .task = task, .kind = if (spec.strategy == .broadcast) .broadcast_probe else .reduce, .split = task, .partition = if (spec.strategy == .shuffle) @intCast(task) else 0 };
+        return .{ .stage = stage, .task = task, .kind = if (spec.strategy == .broadcast) .broadcast_probe else .reduce, .split = task, .partition = if (spec.strategy == .shuffle) (if (spec.reduce_boundaries.len != 0) spec.reduce_boundaries[task] else @intCast(task)) else 0, .partition_end = if (spec.strategy == .shuffle) (if (spec.reduce_boundaries.len != 0) spec.reduce_boundaries[task + 1] else @intCast(task + 1)) else 1 };
     }
     /// One bounded coordinator turn. A caller schedules subsequent turns while
     /// pending, renews ownership, and may move ownership to any query pod.
@@ -149,12 +153,13 @@ pub const Service = struct {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
-        const spec = try self.loadPlan(a, query);
+        var spec = try self.loadPlan(a, query);
         const query_key = try self.store().key(a, query, null, 0);
         try self.store().renew(a, query_key, claim, 60_000);
         try self.retention.ensure(self.retention.ptr, a, spec, self.context);
         var current = (try self.store().load(a, query_key)) orelse return error.SqlExecutionNotFound;
         defer current.deinit(a);
+        spec = try spec.withReducers(current.value.reduce_boundaries);
         if (current.value.stage == spec.finalStage()) {
             const count = try tasks(spec, spec.finalStage() - 1);
             const pages = try a.alloc(state.Output, count);
@@ -181,32 +186,59 @@ pub const Service = struct {
         const count = try tasks(spec, current.value.stage);
         var cursor = current.value.cursor;
         var tickets: std.ArrayList(plan.Ticket) = .empty;
-        var first_pending: ?u32 = null;
-        const end = @min(count, cursor +| spec.limits.concurrency);
-        while (cursor < end) : (cursor += 1) {
-            const key = try self.store().key(a, query, current.value.stage, cursor);
-            var value = try self.store().load(a, key);
-            defer if (value) |*record| record.deinit(a);
-            if (value) |record| {
-                if (record.value.status == .failed or record.value.status == .cancelled) {
-                    try self.store().terminate(a, query_key, claim, .failed, record.value.failure orelse "TaskFailed");
-                    return true;
-                }
-                if (record.value.status == .succeeded) continue;
-                if (record.value.status == .running and record.value.until_ms +| 30_000 >= self.clock.now()) {
-                    if (first_pending == null) first_pending = cursor;
-                    continue;
-                }
-            } else try self.store().create(a, key, query, spec.expires_ms);
-            if (first_pending == null) first_pending = cursor;
-            try tickets.append(a, .{ .tenant = self.tenant, .query = query, .stage = current.value.stage, .task = cursor });
+        var pending: std.ArrayList(u32) = .empty;
+        // Only unresolved tasks are revisited. A slow first task cannot pin a
+        // sliding window or force repeated GETs of an ever-growing prefix.
+        for (current.value.pending) |id| {
+            if (id >= count) return error.InvalidSqlExecutionState;
+            const key = try self.store().key(a, query, current.value.stage, id);
+            var value = (try self.store().load(a, key)) orelse return error.InvalidSqlExecutionState;
+            defer value.deinit(a);
+            if (value.value.status == .failed or value.value.status == .cancelled) {
+                try self.store().terminate(a, query_key, claim, .failed, value.value.failure orelse "TaskFailed");
+                return true;
+            }
+            if (value.value.status == .succeeded) continue;
+            try pending.append(a, id);
+            if (value.value.status != .running or value.value.until_ms +| 30_000 < self.clock.now()) try tickets.append(a, .{ .tenant = self.tenant, .query = query, .stage = current.value.stage, .task = id });
         }
+        while (cursor < count and pending.items.len < spec.limits.concurrency) : (cursor += 1) {
+            const key = try self.store().key(a, query, current.value.stage, cursor);
+            if (try self.store().ensure(a, key, query, spec.expires_ms)) {
+                try pending.append(a, cursor);
+                try tickets.append(a, .{ .tenant = self.tenant, .query = query, .stage = current.value.stage, .task = cursor });
+                continue;
+            }
+            var value = (try self.store().load(a, key)) orelse return error.InvalidSqlExecutionState;
+            defer value.deinit(a);
+            if (value.value.status == .failed or value.value.status == .cancelled) {
+                try self.store().terminate(a, query_key, claim, .failed, value.value.failure orelse "TaskFailed");
+                return true;
+            }
+            if (value.value.status == .succeeded) continue;
+            try pending.append(a, cursor);
+            if (value.value.status != .running or value.value.until_ms +| 30_000 < self.clock.now()) try tickets.append(a, .{ .tenant = self.tenant, .query = query, .stage = current.value.stage, .task = cursor });
+        }
+        // Persist the dispatch intent first. Lost acknowledgements and process
+        // loss replay only this bounded set, without relying on queue delivery.
+        if (pending.items.len == 0 and cursor == count) {
+            var boundaries: ?[]const u16 = null;
+            if (current.value.stage == 0 and spec.strategy == .shuffle) {
+                // First persist the completed scan cursor, then checkpoint at
+                // most sixteen authenticated map directories per turn.
+                try self.store().checkpointTasks(a, query_key, claim, 0, cursor, &.{});
+                const resolution = try self.coalesce(a, spec, query, current.value.adaptive);
+                switch (resolution) {
+                    .pending => |output| {
+                        try self.store().saveAdaptive(a, query_key, claim, output);
+                        return false;
+                    },
+                    .done => |value| boundaries = value,
+                }
+            }
+            try self.store().checkpointTasksAndReducers(a, query_key, claim, current.value.stage + 1, 0, &.{}, boundaries);
+        } else try self.store().checkpointTasks(a, query_key, claim, current.value.stage, cursor, pending.items);
         if (tickets.items.len != 0) try dispatcher.dispatch(dispatcher.ptr, tickets.items, self.context);
-        if (first_pending) |pending| {
-            try self.store().checkpoint(a, query_key, claim, current.value.stage, pending);
-        } else if (cursor == count) {
-            try self.store().checkpoint(a, query_key, claim, current.value.stage + 1, 0);
-        } else try self.store().checkpoint(a, query_key, claim, current.value.stage, cursor);
         return false;
     }
     /// Invoke only after authenticating the internal caller. Tickets contain no
@@ -214,48 +246,53 @@ pub const Service = struct {
     pub fn execute(self: Service, ticket: plan.Ticket) !void {
         try self.requireQueryRole();
         if (!std.mem.eql(u8, &ticket.tenant, &self.tenant)) return error.SqlExecutionUnauthorized;
-        var arena = std.heap.ArenaAllocator.init(self.a);
+        var task_memory: local.sql_memory_budget = .{ .backing = self.a, .limit = @intCast(self.task_memory_ceiling) };
+        const task_allocator = task_memory.allocator();
+        defer std.debug.assert(task_memory.live == 0);
+        var arena = std.heap.ArenaAllocator.init(task_allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const spec = try self.loadPlan(a, ticket.query);
-        const task = try taskFor(spec, ticket.stage, ticket.task);
         const query_key = try self.store().key(a, ticket.query, null, 0);
         var query = (try self.store().load(a, query_key)) orelse return error.SqlExecutionNotFound;
         defer query.deinit(a);
         if (query.value.terminal()) return;
         if (query.value.stage != ticket.stage or !std.mem.eql(u8, &query.value.plan, &ticket.query)) return error.SqlExecutionFenced;
         const key = try self.store().key(a, ticket.query, ticket.stage, ticket.task);
+        const claim_started = self.clock.now();
         const claim = (try self.store().claim(a, key, self.owner, 60_000)) orelse return;
-        if (claim.epoch > spec.limits.max_attempts) {
-            try self.store().terminate(a, key, claim, .failed, "TaskRetryBudgetExceeded");
+        var context = self.context;
+        const remaining = @min(query.value.expires_ms -| self.clock.now(), 55_000 -| (self.clock.now() -| claim_started));
+        const deadline = @import("antfly_platform").time.monotonicNs() +| remaining *| std.time.ns_per_ms;
+        context.deadline_ns = if (context.deadline_ns) |parent| @min(parent, deadline) else deadline;
+        var scoped_service = self;
+        scoped_service.context = context;
+        var spec = scoped_service.loadPlan(a, ticket.query) catch |err| {
+            if (err == error.OutOfMemory and task_memory.exhausted) {
+                try self.store().terminate(self.a, key, claim, .failed, "SqlJoinBudgetExceeded");
+                return;
+            }
+            return err;
+        };
+        spec = try spec.withReducers(query.value.reduce_boundaries);
+        const task = try taskFor(spec, ticket.stage, ticket.task);
+        if (task_memory.live > spec.limits.task_memory) {
+            try self.store().terminate(self.a, key, claim, .failed, "SqlJoinBudgetExceeded");
             return;
         }
-        var context = self.context;
-        const wall_remaining = spec.expires_ms -| self.clock.now();
-        const deadline = @import("antfly_platform").time.monotonicNs() +| @as(u64, @min(55_000, wall_remaining)) *| std.time.ns_per_ms;
-        context.deadline_ns = if (context.deadline_ns) |parent| @min(parent, deadline) else deadline;
-        try self.retention.ensure(self.retention.ptr, a, spec, context);
-        var dependencies: std.ArrayList(state.Output) = .empty;
-        if (ticket.stage >= 1) {
-            const previous = ticket.stage - 1;
-            const count = try tasks(spec, previous);
-            const begin = if (ticket.stage >= 2) ticket.task * 32 else 0;
-            const end = if (ticket.stage >= 2) @min(count, begin + 32) else count;
-            for (begin..end) |id| {
-                const dependency_key = try self.store().key(a, ticket.query, previous, @intCast(id));
-                var dependency = (try self.store().load(a, dependency_key)) orelse return error.InvalidSqlExecutionState;
-                defer dependency.deinit(a);
-                if (dependency.value.status != .succeeded) return error.InvalidSqlExecutionState;
-                var output = dependency.value.output.?;
-                output.key = try a.dupe(u8, output.key);
-                try dependencies.append(a, output);
-            }
+        task_memory.limit = @intCast(spec.limits.task_memory);
+        if (claim.epoch > spec.limits.max_attempts) {
+            try self.store().terminate(self.a, key, claim, .failed, "TaskRetryBudgetExceeded");
+            return;
         }
+        const inputs = scoped_service.loadDependencies(a, spec, ticket.query, ticket.stage, ticket.task) catch |err| {
+            if (err == error.OutOfMemory and task_memory.exhausted) {
+                try self.store().terminate(self.a, key, claim, .failed, "SqlJoinBudgetExceeded");
+                return;
+            }
+            return err;
+        };
         var objects = self.exchange_store;
         objects.context = context;
-        var task_memory: local.sql_memory_budget = .{ .backing = self.a, .limit = @intCast(spec.limits.task_memory) };
-        const task_allocator = task_memory.allocator();
-        defer std.debug.assert(task_memory.live == 0);
         var task_spill: ?local.sql_spill.Manager = if (self.spill) |parent| parent.scoped(task_allocator) else null;
         defer if (task_spill) |*manager| manager.deinit();
         if (task_spill) |*manager| {
@@ -269,12 +306,12 @@ pub const Service = struct {
             }.check;
         }
         const executor: runner.Runner = .{ .a = task_allocator, .source = self.source, .exchange_store = objects, .context = context, .spill = if (task_spill) |*manager| manager else null };
-        const output = executor.run(ticket.query, spec, task, dependencies.items) catch |raw_error| {
+        const output = executor.run(ticket.query, spec, task, inputs) catch |raw_error| {
             const err = if (raw_error == error.OutOfMemory and task_memory.exhausted) error.SqlJoinBudgetExceeded else raw_error;
             switch (err) {
                 error.SqlJoinBudgetExceeded, error.SqlProgramLimitExceeded, error.InvalidSqlBackendResponse, error.InvalidSqlExchange, error.SqlExecutionUnauthorized => {
                     std.log.warn("distributed SQL task failed query={s} stage={d} task={d} err={s}", .{ ticket.query, ticket.stage, ticket.task, @errorName(err) });
-                    try self.store().terminate(a, key, claim, .failed, @errorName(err));
+                    try self.store().terminate(self.a, key, claim, .failed, @errorName(err));
                     return;
                 },
                 else => return err,
@@ -283,7 +320,94 @@ pub const Service = struct {
         defer task_allocator.free(output.key);
         try context.ensureActive();
         // Uses a fresh wall-clock reading, never the claim's stale timestamp.
-        try self.store().complete(a, key, claim, output);
+        try scoped_service.store().complete(self.a, key, claim, output);
+    }
+    /// Resolve adjacent partitions once from accepted map statistics. The
+    /// boundary list is committed with the stage transition under the same CAS.
+    /// Worker count and subsequent coordinator placement cannot change it.
+    const Adaptive = struct { cursor: u32 = 0, bytes: []u64, rows: []u64 };
+    const Resolution = union(enum) { pending: state.Output, done: []const u16 };
+    fn coalesce(self: Service, a: A, spec: plan.Plan, query: state.Digest, previous: ?state.Output) !Resolution {
+        var progress: Adaptive = if (previous) |output| blk: {
+            var client = self.exchange_store.client;
+            client.allocator = a;
+            var object = try client.getObject(self.exchange_store.bucket, output.key, .{ .skip_metadata_probe = true, .max_response_bytes = 128 * 1024, .cancellation = local.serverless_external_source_mod.lake_catalog.types.contextCancellation(&self.context) });
+            defer object.deinit(a);
+            if (!std.mem.eql(u8, &digest(object.body), &output.hash)) return error.InvalidSqlExchange;
+            break :blk try std.json.parseFromSliceLeaky(Adaptive, a, object.body, .{ .allocate = .alloc_always });
+        } else blk: {
+            const bytes = try a.alloc(u64, spec.partitions);
+            const rows = try a.alloc(u64, spec.partitions);
+            @memset(bytes, 0);
+            @memset(rows, 0);
+            break :blk .{ .bytes = bytes, .rows = rows };
+        };
+        const bytes = progress.bytes;
+        const rows = progress.rows;
+        const count = try spec.stageTasks(0);
+        if (bytes.len != spec.partitions or rows.len != spec.partitions or progress.cursor > count) return error.InvalidSqlExecutionState;
+        const end = @min(count, progress.cursor + 16);
+        for (progress.cursor..end) |id| {
+            var scratch = std.heap.ArenaAllocator.init(self.a);
+            defer scratch.deinit();
+            const sa = scratch.allocator();
+            const key = try self.store().key(sa, query, 0, @intCast(id));
+            var value = (try self.store().load(sa, key)) orelse return error.InvalidSqlExecutionState;
+            defer value.deinit(sa);
+            if (value.value.status != .succeeded) return error.InvalidSqlExecutionState;
+            const directory = try self.exchange_store.footer(sa, value.value.output.?);
+            if (directory.partitions.len != spec.partitions) return error.InvalidSqlExchange;
+            for (directory.partitions, bytes, rows) |partition, *size, *row_count| {
+                size.* +|= partition.retained_bytes;
+                row_count.* +|= partition.rows;
+            }
+        }
+        progress.cursor = end;
+        if (end != count) {
+            const encoded = try std.json.Stringify.valueAlloc(a, progress, .{});
+            const hash = digest(encoded);
+            const key = try std.fmt.allocPrint(a, "{s}/sql-exchange/{d:0>20}/{s}/{s}.adaptive.json", .{ self.exchange_store.prefix, spec.expires_ms, query, hash });
+            var writer = self;
+            writer.state_store.client = self.exchange_store.client;
+            writer.state_store.bucket = self.exchange_store.bucket;
+            try writer.immutable(a, key, encoded, 128 * 1024);
+            return .{ .pending = .{ .key = key, .hash = hash, .bytes = encoded.len } };
+        }
+        var boundaries: std.ArrayList(u16) = .empty;
+        try boundaries.append(a, 0);
+        var total_bytes: u64 = 0;
+        var total_rows: u64 = 0;
+        for (bytes, rows, 0..) |size, row_count, index| {
+            // Reserve ample headroom for hash metadata, output and decoding.
+            if (index > boundaries.items[boundaries.items.len - 1] and (total_bytes +| size > spec.limits.task_memory / 8 or total_rows +| row_count > spec.limits.task_scan_rows / 2)) {
+                try boundaries.append(a, @intCast(index));
+                total_bytes = 0;
+                total_rows = 0;
+            }
+            total_bytes +|= size;
+            total_rows +|= row_count;
+        }
+        try boundaries.append(a, spec.partitions);
+        return .{ .done = boundaries.items };
+    }
+    fn loadDependencies(self: Service, a: A, spec: plan.Plan, query: state.Digest, stage: u32, task: u32) ![]const state.Output {
+        var dependencies: std.ArrayList(state.Output) = .empty;
+        if (stage >= 1) {
+            const previous = stage - 1;
+            const count = try tasks(spec, previous);
+            const begin = if (stage >= 2) task * 32 else 0;
+            const end = if (stage >= 2) @min(count, begin + 32) else count;
+            for (begin..end) |id| {
+                const dependency_key = try self.store().key(a, query, previous, @intCast(id));
+                var dependency = (try self.store().load(a, dependency_key)) orelse return error.InvalidSqlExecutionState;
+                defer dependency.deinit(a);
+                if (dependency.value.status != .succeeded) return error.InvalidSqlExecutionState;
+                var output = dependency.value.output.?;
+                output.key = try a.dupe(u8, output.key);
+                try dependencies.append(a, output);
+            }
+        }
+        return dependencies.items;
     }
     pub fn turn(self: Service, query: state.Digest, dispatcher: Dispatcher) !bool {
         const key = try self.store().key(self.a, query, null, 0);

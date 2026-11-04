@@ -5,47 +5,56 @@ This module implements the native execution service proposed in
 It is opt-in through host capabilities; it does not change small-query routing
 or enable an unauthenticated worker API by default.
 
-## Integration
+## Native deployment
 
-1. Open scope-isolated shared object-store lanes for execution state and
-   exchange. All pods participating in a scope use the same lanes. Keep these
-   credentials separate from table-publication authority.
-2. Construct `lake_source.Host` with a native artifact store, shared serving
-   cache, object-store options, and an authorization resolver. The resolver
-   re-establishes the authorized table incarnation and columns for the opaque
-   principal/policy scope. It must reject unsupported row policies.
-3. Construct `runtime.Service` for query/combined roles. `owner` must be unique
-   to a process incarnation, not a reusable pod or deployment name. Supply the
-   host's source and retention adapters.
-4. Install `transport.Server` through
-   `ServerlessHttpServerConfig.distributed_sql`, with the existing internal
-   service signing configuration and the query pool's foreground admission.
-   `runtime.Factory` resolves the authenticated scope to its service. Internal
-   requests carry tickets, not arbitrary source URLs or credentials. The
-   public API host can install the same factory through
-   `ApiHttpServerConfig.distributed_sql`.
-5. Supply a `transport.Client` dispatcher with trusted worker discovery URLs
-   and the node HTTP executor. Its bounded fan-out uses concurrent requests
-   only when the executor advertises that capability. Service discovery may
-   change on retries; no task has permanent pod ownership.
-6. Start `driver.Driver` through `ServerlessServerConfig.sql_driver`. It runs
-   independently of maintenance, discovers durable query submissions, and
-   resumes coordinator turns after failures. Query-only nodes do not run GC.
-7. Install `collector.Collector` through
-   `BootstrapConfig.sql_execution_gc` on maintenance/combined nodes. It walks
-   expiry-first indices and reclaims bounded batches of task/query records and
-   exchange artifacts. Existing retained-cut collection reclaims the copied WAL
-   capabilities after their own expiry.
-8. For ordinary SQL routing, install `bridge.Bridge.port()` through
-   `ApiHttpServerConfig.distributed_sql_join` (or `sql.catalog.Backend` for an
-   embedding). The bridge lowers direct lake equijoins above `local_bytes`.
-   SQL's normal filter, projection, aggregate, order, and limit operators remain
-   authoritative above the distributed relation. Captured statement cursors
-   export durable read capabilities; workers never reopen a fresh read cut.
+The API gateway and `serverless-query` / `serverless-maintenance` commands
+construct the execution service when these environment variables are present:
 
-The factories and discovery ports are deployment-owned. There is no new
-Kubernetes node role, per-task Kubernetes Job, operator CRD, or automatic CLI
-configuration for these capabilities in this change.
+```sh
+ANTFLY_SQL_STATE_URI=gs://execution/cluster/state
+ANTFLY_SQL_EXCHANGE_URI=gs://execution/cluster/exchange
+ANTFLY_SQL_STATE_CONNECTION=execution
+ANTFLY_SQL_EXCHANGE_CONNECTION=execution
+ANTFLY_SQL_QUERY_WORKERS='["http://query-pool:12390"]'
+ANTFLY_SQL_QUERY_DNS=query-pool.namespace.svc.cluster.local
+ANTFLY_SQL_SERVICE_SECRET=<dedicated-secret-of-at-least-32-bytes>
+ANTFLY_SQL_SERVICE_ISSUER=sql:cluster-incarnation
+ANTFLY_SQL_TASK_MEMORY_BYTES=134217728
+ANTFLY_SQL_CONCURRENCY=4
+ANTFLY_SQL_SPILL_DIR=/var/lib/antfly/sql-spill
+```
+
+`QUERY_DNS` and spill are optional. DNS discovery snapshots ready pod addresses
+for each dispatch; failed or busy workers fail over without changing task
+identity. Initial worker URLs also support fixed native deployments. Ports in
+DNS mode use the query listener's standard port 12390. State and exchange use
+configured connection aliases and their existing credential policy; file URIs
+without aliases support local development. All participants must use the same
+state/exchange URIs and issuer. Scope identities include the trusted SQL read
+principal. The dedicated SQL signing secret must differ from the principal
+credential signing secret. Secret values belong in a keystore or Secret-backed
+environment variables, never in a ConfigMap.
+
+Gateways export read-only, scope-bound table grants with retained cuts. Query
+workers validate the grant's scope, artifact-store identity, schema, table
+incarnation and expiry and reopen the captured snapshot and WAL suffix. They
+need source read access and snapshot-pin access, plus execution-store writes;
+they do not need table publication authority. Query pools run recovery and
+signed task/control RPCs. Maintenance pools collect expired execution records
+and exchange objects. API gateways never execute worker tasks.
+
+The companion Colony operator adds `AntflyCluster.spec.serverlessSQL` and
+owns long-lived query and maintenance Deployments, ready-pod DNS discovery,
+admission budgets, spill volumes, probes, optional HPA, disruption budgets,
+network policy and Secret rotation. Operator code lives in the Colony repository.
+Use an Antfly image containing this runtime with the companion operator change.
+
+Embeddings can still supply `runtime.Factory`, `lake_source.Host`,
+`transport.Client`, `driver.Driver`, `collector.Collector` and
+`bridge.Bridge.port()` directly. Custom authorization resolvers override the
+retained read grant and must enforce the same scope and unsupported-policy
+checks. Ordinary SQL keeps local filter/projection/aggregate/order/limit
+operators above the distributed relation and exports its existing statement cut.
 
 ## Durable protocol
 
@@ -76,10 +85,16 @@ workers validate the capability, schema incarnation, and snapshot on reopen.
   unmatched probe rows; right/full joins use shuffle rather than replicating
   unmatched build decisions.
 - Shuffle maps write one object containing contiguous partition runs. The
-  accepted output authenticates its footer index; a reducer needs one footer
-  range GET and one partition range GET per nonempty map input. Empty partitions
-  need only the footer. Columnar v2 blocks preserve SQL NULL independently of
+  accepted output authenticates a version-2 footer with per-block hashes,
+  offsets, row counts and retained-memory statistics. A reducer reads one
+  footer and one bounded range per consumed block, without retaining the whole
+  partition. Empty partitions need only the footer. Columnar v2 blocks preserve SQL NULL independently of
   JSON null, exact NUMERIC, arrays, and encoded payloads.
+- Adaptive coalescing groups adjacent small partitions from accepted map
+  statistics. Recovery checkpoints at most sixteen map directories per turn;
+  immutable progress objects and the final boundary list are fenced by the
+  query CAS. Workers never infer a layout from changing pod counts. Aggregation
+  fan-in uses the resolved reducer count.
 - Native reducers with a supplied spill manager reuse the existing grace/skew
   join kernel. Without local spill, oversized tasks fail their explicit budget.
   Semi/anti reducers use the bounded hash kernel.
@@ -99,6 +114,6 @@ workers validate the capability, schema incarnation, and snapshot on reopen.
 
 The service supplies native broadcast/shuffle execution and their common
 recovery contracts. Bucket-compatible planning/native bucketed writes, adaptive
-partition coalescing and skew replication, Cloudflare Queue/Durable Object
+distributed skew replication, Cloudflare Queue/Durable Object
 bindings and R2 recursive repartitioning remain subsequent strategy work.
 There is no claim of trillion-row or cloud-provider performance qualification.

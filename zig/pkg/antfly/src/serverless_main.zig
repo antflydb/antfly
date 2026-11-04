@@ -225,6 +225,12 @@ pub fn runFromIterator(
         return err;
     };
     defer srv.deinitWithDeadline(supervisor.deadline());
+    var sql_configuration = std.heap.ArenaAllocator.init(alloc);
+    defer sql_configuration.deinit();
+    const sql_deployment = @import("serverless/sql/deployment.zig");
+    const sql_config = try sql_deployment.Config.fromEnv(sql_configuration.allocator(), init.environ_map, if (secret_store) |*store| store else null);
+    const sql = if (sql_config) |cfg| try sql_deployment.Owned.init(alloc, runtime_io, cfg, bootstrap.role, bootstrap.node_config, bootstrap.secret_store, .serverless, null) else null;
+    if (sql) |owned| owned.attachServer(&srv);
     srv.start() catch |err| {
         reportStartupError(err);
         return err;

@@ -51,6 +51,7 @@ fn listenerHttpxConfig(cfg: ListenerConfig, http_runtime: ?*httpx.HttpRuntime) h
 }
 
 pub const ServerlessServer = struct {
+    sql_owned: ?*@import("sql/deployment.zig").Owned = null,
     sql_driver: ?*@import("sql/driver.zig").Driver = null,
     sql_io: ?std.Io = null,
     alloc: std.mem.Allocator,
@@ -125,6 +126,7 @@ pub const ServerlessServer = struct {
         self.alloc.destroy(self.owned_http_server);
         self.owned_http_runtime.deinit();
         self.alloc.destroy(self.owned_http_runtime);
+        if (self.sql_owned) |owned| owned.deinit();
         self.stack.deinit();
         self.alloc.destroy(self.stack);
         self.* = undefined;

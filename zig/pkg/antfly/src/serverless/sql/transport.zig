@@ -28,28 +28,78 @@ pub const submit_path = "/internal/v1/sql/queries/submit";
 pub const turn_path = "/internal/v1/sql/queries/turn";
 pub const result_path = "/internal/v1/sql/queries/result";
 pub const QueryRequest = struct { tenant: plan.Digest, query: plan.Digest };
+/// Resolve a bounded snapshot per call; concurrent requests never mutate the
+/// shared client's routing slice. Headless Services expose ready query pods.
+pub const Discovery = struct {
+    name: []const u8,
+    port: u16,
+    io: std.Io,
+    fn resolve(self: Discovery, a: A, context: Context) ![]const []const u8 {
+        try context.ensureActive();
+        var storage: [256]std.Io.net.HostName.LookupResult = undefined;
+        var queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&storage);
+        try (try std.Io.net.HostName.init(self.name)).lookup(self.io, &queue, .{ .port = self.port });
+        var urls: std.ArrayList([]const u8) = .empty;
+        while (queue.getOne(self.io)) |result| {
+            if (result == .address) try urls.append(a, try std.fmt.allocPrint(a, "http://{f}", .{result.address}));
+        } else |err| {
+            switch (err) {
+                error.Closed => {},
+                else => return err,
+            }
+        }
+        try context.ensureActive();
+        if (urls.items.len == 0) return error.SqlWorkerUnavailable;
+        std.mem.sort([]const u8, urls.items, {}, struct {
+            fn less(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.lessThan(u8, left, right);
+            }
+        }.less);
+        return urls.items;
+    }
+};
 pub const Client = struct {
     a: A,
     executor: http.RequestExecutor,
     authentication: auth.Config,
     workers: []const []const u8,
     io: ?std.Io = null,
+    discovery: ?Discovery = null,
     pub fn dispatcher(self: *Client) runtime.Dispatcher {
         return .{ .ptr = self, .dispatch = dispatch };
     }
     fn dispatch(raw: *anyopaque, tickets: []const plan.Ticket, context: Context) !void {
         const self: *Client = @ptrCast(@alignCast(raw));
+        if (self.discovery) |discovery| {
+            var arena = std.heap.ArenaAllocator.init(self.a);
+            defer arena.deinit();
+            var snapshot = self.*;
+            snapshot.discovery = null;
+            snapshot.workers = try discovery.resolve(arena.allocator(), context);
+            return dispatch(&snapshot, tickets, context);
+        }
         if (tickets.len > 256 or self.workers.len == 0) return error.SqlWorkerUnavailable;
+        var turn_context = context;
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 55_000 * std.time.ns_per_ms;
+        turn_context.deadline_ns = if (turn_context.deadline_ns) |parent| @min(parent, deadline) else deadline;
         var failures: [256]?anyerror = @splat(null);
         if (self.io != null and self.executor.supportsConcurrentRequests()) {
             var group: std.Io.Group = .init;
             defer group.cancel(self.io.?);
-            for (tickets, 0..) |ticket, index| group.async(self.io.?, send, .{ self, ticket, context, &failures[index] });
+            for (tickets, 0..) |ticket, index| group.async(self.io.?, send, .{ self, ticket, turn_context, &failures[index] });
             try group.await(self.io.?);
-        } else for (tickets, 0..) |ticket, index| send(self, ticket, context, &failures[index]);
+        } else for (tickets, 0..) |ticket, index| send(self, ticket, turn_context, &failures[index]);
         for (failures[0..tickets.len]) |failure| if (failure) |err| return err;
     }
     fn queryCall(self: *Client, path: []const u8, body: []const u8, context: Context) !http.HttpResponse {
+        if (self.discovery) |discovery| {
+            var arena = std.heap.ArenaAllocator.init(self.a);
+            defer arena.deinit();
+            var snapshot = self.*;
+            snapshot.discovery = null;
+            snapshot.workers = try discovery.resolve(arena.allocator(), context);
+            return snapshot.queryCall(path, body, context);
+        }
         var last_error: anyerror = error.SqlWorkerUnavailable;
         // All control operations are replayable against shared durable state.
         // Bound discovery failover; a dead first coordinator must not pin the
@@ -126,9 +176,20 @@ pub const Client = struct {
     pub fn execute(self: *Client, ticket: plan.Ticket, context: Context) !void {
         try context.ensureActive();
         if (self.workers.len == 0) return error.SqlWorkerUnavailable;
-        // Rendezvous ownership is unnecessary for correctness. A stable task
-        // hash distributes requests and lets service discovery change on retry.
-        const index = (std.hash.Wyhash.hash(ticket.stage, &ticket.query) +% ticket.task) % self.workers.len;
+        const first = (std.hash.Wyhash.hash(ticket.stage, &ticket.query) +% ticket.task) % self.workers.len;
+        var last_error: anyerror = error.SqlWorkerUnavailable;
+        for (0..@min(self.workers.len, 8)) |offset| {
+            self.executeAt((first + offset) % self.workers.len, ticket, context) catch |err| {
+                try context.ensureActive();
+                if (err == error.SqlExecutionUnauthorized) return err;
+                last_error = err;
+                continue;
+            };
+            return;
+        }
+        return last_error;
+    }
+    fn executeAt(self: *Client, index: usize, ticket: plan.Ticket, context: Context) !void {
         const uri = try std.fmt.allocPrint(self.a, "{s}{s}", .{ std.mem.trimEnd(u8, self.workers[index], "/"), task_path });
         defer self.a.free(uri);
         const body = try std.json.Stringify.valueAlloc(self.a, ticket, .{});

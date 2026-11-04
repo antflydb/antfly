@@ -180,6 +180,13 @@ test "distributed SQL runtime executes broadcast and shuffle SQL join semantics 
                 }
                 try std.testing.expect(complete);
                 const result = (try replacement.pollResult(sa, query)).?;
+                if (strategy == .shuffle) {
+                    const record_key = try replacement.state_store.key(sa, query, null, 0);
+                    var record = (try replacement.state_store.load(sa, record_key)).?;
+                    defer record.deinit(sa);
+                    try std.testing.expectEqualSlices(u16, &.{ 0, 4 }, record.value.reduce_boundaries);
+                    try std.testing.expectEqual(@as(usize, 1), result.pages.len);
+                }
                 try std.testing.expectEqual(if (aggregate) @as(u64, 1) else case.count, result.rows);
                 var actual: u64 = 0;
                 for (result.pages) |page| {
@@ -250,13 +257,27 @@ test "distributed SQL native lake source retains accepted WAL cuts across ingest
     var host: @import("lake_source.zig").Host = .{ .artifacts = &artifacts, .store_identity = try @import("../../api/native_retained_cut.zig").storeIdentity(sa, objects.locator), .options = options, .io = std.testing.io, .authorization = .{ .ptr = &auth, .resolve = Authorization.resolve } };
     const now: u64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
     const input = try host.capture(sa, @splat('a'), 7, &.{.{ .name = "id", .type = .integer }}, 2, now + 600000, .{ .io = std.testing.io });
+    // An independently opened worker needs no in-process catalog resolver.
+    // Its only authority is the immutable scope-bound admitted read grant.
+    var portable_host = host;
+    portable_host.authorization = null;
+    const portable = portable_host.source();
+    const probe = try portable.open(portable.ptr, sa, @splat('a'), input, 0, null, .{ .io = std.testing.io });
+    probe.close();
+    try std.testing.expectError(error.SqlExecutionUnauthorized, portable.open(portable.ptr, sa, @splat('b'), input, 0, null, .{ .io = std.testing.io }));
+    const execution_root = try std.fmt.allocPrint(sa, "{s}/execution", .{directory.path()});
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, try std.fmt.allocPrint(sa, "{s}/sql-state", .{execution_root}));
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, try std.fmt.allocPrint(sa, "{s}/sql-exchange", .{execution_root}));
+    const execution_uri = try std.fmt.allocPrint(sa, "file://{s}", .{execution_root});
+    const deployed = try @import("deployment.zig").Owned.init(a, std.testing.io, .{ .state_uri = execution_uri, .exchange_uri = execution_uri, .workers = &.{"http://127.0.0.1:1"}, .authentication = .{ .secret = "0123456789abcdef0123456789abcdef", .issuer = "sql-test" } }, .query_only, &config, null, .standalone, directory.path());
+    defer deployed.deinit();
+
     _ = try ingestion.accept(sa, binding.binding, options, .{}, "{\"batch_id\":\"later\",\"source\":\"s\",\"epoch\":\"1\",\"checkpoint\":\"3\",\"expected_checkpoint\":\"2\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"delete\",\"row\":{\"id\":1}},{\"op\":\"upsert\",\"row\":{\"id\":4}}]}");
     // Both publication and WAL truncation can advance after capture. Readers
     // must use the copied overlay, never acquire a fresh pending suffix.
     try std.testing.expect(try ingestion.drain(sa, binding.binding, options, .{}));
-    var queue = try ingestion.openQueue(a, binding.binding, options);
-    defer queue.deinit();
-    var service: runtime.Service = .{ .a = a, .state_store = .{ .client = queue.client, .bucket = queue.bucket, .prefix = "sql-runtime", .now_ms = now }, .exchange_store = .{ .client = queue.client, .bucket = queue.bucket, .prefix = "sql-runtime" }, .tenant = @splat('a'), .role = .query_only, .owner = "native-worker", .retention = host.retention(), .source = host.source(), .context = .{ .io = std.testing.io } };
+    var service = deployed.service;
+    service.tenant = @splat('a');
     const specification = try plan.choose(input, input, @splat('a'), now + 600000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{}, now);
     const query = try service.submit(specification);
     const claim = (try service.acquire(query)).?;
@@ -513,4 +534,69 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
         try std.testing.expectError(error.Canceled, local.sql_runtime.execute(a, distributed, &compiled, &.{}, .{}));
         try std.testing.expectEqual(@as(usize, 0), backend.scanned);
     }
+}
+
+test "distributed SQL coordinator fills idle capacity while an earlier task remains leased" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    const coordinator = fixture.service(a, memory.client(), "coordinator");
+    const SlowFirst = struct {
+        worker: runtime.Service,
+        fn run(raw: *anyopaque, tickets: []const plan.Ticket, _: Context) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (tickets) |ticket| {
+                if (ticket.stage == 0 and ticket.task == 0) {
+                    const key = try self.worker.state_store.key(self.worker.a, ticket.query, ticket.stage, ticket.task);
+                    defer self.worker.a.free(key);
+                    _ = try self.worker.state_store.claim(self.worker.a, key, "delayed-worker", 60000);
+                } else try self.worker.execute(ticket);
+            }
+        }
+    };
+    var dispatch: SlowFirst = .{ .worker = fixture.service(a, memory.client(), "worker") };
+    const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 8 };
+    var right = input;
+    right.table_id = 2;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    const spec = try plan.choose(input, right, @splat('a'), 1000000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .concurrency = 2 }, fixture.now);
+    const query = try coordinator.submit(spec);
+    const claim = (try coordinator.acquire(query)).?;
+    for (0..4) |_| _ = try coordinator.tick(query, claim, .{ .ptr = &dispatch, .dispatch = SlowFirst.run });
+    var first = (try coordinator.state_store.load(sa, try coordinator.state_store.key(sa, query, 0, 0))).?;
+    defer first.deinit(sa);
+    var later = (try coordinator.state_store.load(sa, try coordinator.state_store.key(sa, query, 0, 3))).?;
+    defer later.deinit(sa);
+    try std.testing.expectEqual(state.Status.running, first.value.status);
+    try std.testing.expectEqual(state.Status.succeeded, later.value.status);
+}
+
+test "distributed SQL task budget failure is terminal and reported to the query" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    const payload = try sa.alloc(u8, 1024 * 1024);
+    @memset(payload, 'x');
+    fixture.right[0][0] = Datum.json(.{ .string = payload });
+    const coordinator = fixture.service(a, memory.client(), "coordinator");
+    var dispatch: Dispatch = .{ .workers = .{ fixture.service(a, memory.client(), "worker-a"), fixture.service(a, memory.client(), "worker-b") }, .drop_once = false };
+    const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{.{ .name = "id", .type = .string }}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 2 };
+    var right = input;
+    right.table_id = 2;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    const spec = try plan.choose(input, right, @splat('a'), 1000000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .task_memory = 1024 * 1024 }, fixture.now);
+    const query = try coordinator.submit(spec);
+    const claim = (try coordinator.acquire(query)).?;
+    for (0..4) |_| if (try coordinator.tick(query, claim, .{ .ptr = &dispatch, .dispatch = Dispatch.run })) break;
+    try std.testing.expectError(error.SqlJoinBudgetExceeded, coordinator.pollResult(sa, query));
 }
