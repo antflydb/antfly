@@ -134,3 +134,23 @@ cache scope. Workerd tests exercise actual R2, Queue and Durable Object bindings
 progress without client turns, cancellation and result reuse after restart.
 Wrangler is invoked only with `--dry-run`; mutable test state stays under the
 worktree's ignored `dist/` directory and is removed after the test.
+
+
+## Bounded input fan-in and retained WAL
+
+Ordinary shuffle inputs and broadcast builds use fan-in-32 compaction trees when
+fragment counts exceed the direct-read threshold. Hot partitions retain their
+original map tiles; ordinary reducers consume compacted roots. Resolved task
+and output reservations include these stages.
+
+Large retained WAL cuts use immutable image pages plus a Bloom filter and exact
+sorted key pages. Workers load only their assigned image interval and bounded
+key/image caches. All base splits still suppress the complete changed-key set.
+The gateway includes WAL bytes and rows in its estimates, uses scan fragments of
+at most 128 rows for paged cuts, and falls back from bucket execution to shuffle.
+The cut's domain, expiry and content hashes authenticate every child page.
+
+Hosted regressions cover 320-fragment ordinary shuffle and broadcast builds
+under the 900-operation cap, plus 9,000 retained WAL changes, including a large
+individual row, applied over a 16,384-row pinned Parquet snapshot with an 8 MiB
+task memory ceiling.

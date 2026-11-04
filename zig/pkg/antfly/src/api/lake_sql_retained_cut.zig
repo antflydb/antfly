@@ -63,6 +63,7 @@ pub const Descriptor = struct {
     table_uuid: []const u8,
     snapshot_id: []const u8,
     pending: @import("../serverless/lake_ingestion.zig").Pending,
+    paged: ?Paged = null,
     pub fn jsonStringify(self: Descriptor, jw: anytype) !void {
         try jw.beginObject();
         inline for (@typeInfo(Descriptor).@"struct".field_names) |field| {
@@ -79,6 +80,82 @@ pub const Descriptor = struct {
         try jw.endObject();
     }
 };
+pub const ChangePage = struct { begin: u32, count: u32, token: []const u8 };
+pub const KeyPage = struct { first: [64]u8, last: [64]u8, token: []const u8 };
+pub const Paged = struct { count: u32, bytes: u64, changes: []const ChangePage, keys: []const KeyPage, bloom: []const u8 };
+pub const distributed_rows = 128;
+pub const Saved = struct { token: []const u8, rows: u64 = 0, bytes: u64 = 0, paged: bool = false };
+fn savePage(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, io: std.Io, descriptor: Descriptor, bytes: []const u8, cancellation: @import("antfly_cancellation").CancellationToken) ![]const u8 {
+    const scope = try artifacts.UploadScope.forPublication(domain(descriptor.table_id, identity), descriptor.expires_ms, io);
+    var object = try store.putScoped(scope, bytes, cancellation);
+    defer object.deinit(store.allocator);
+    return @import("lake_generation_envelope.zig").encode(a, "sql-page1:", object);
+}
+pub fn readPage(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, descriptor: Descriptor, token: []const u8, cancellation: @import("antfly_cancellation").CancellationToken) ![]const u8 {
+    const envelope = try @import("lake_generation_envelope.zig").decode(a, "sql-page1:", token, max_bytes);
+    defer if (envelope.generation) |generation| a.free(generation);
+    const scope = (try artifacts.uploadScopeFromArtifactId(envelope.id)) orelse return error.CatalogGenerationChanged;
+    if (!std.mem.eql(u8, &scope.domain, &domain(descriptor.table_id, identity)) or scope.fencingToken() != descriptor.expires_ms) return error.CatalogGenerationChanged;
+    var scoped = store.*;
+    scoped.allocator = a;
+    return @import("lake_generation_envelope.zig").read(&scoped, envelope, cancellation);
+}
+pub fn bloomBit(key: [64]u8, bits: usize, seed: u64) usize {
+    return @intCast(std.hash.Wyhash.hash(seed, &key) % bits);
+}
+pub fn saveDistributed(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, io: std.Io, descriptor: Descriptor, cancellation: @import("antfly_cancellation").CancellationToken) !Saved {
+    const pending = try descriptor.pending.materialized(a);
+    const encoded = try std.json.Stringify.valueAlloc(a, pending.changes, .{});
+    defer a.free(encoded);
+    if (encoded.len <= 64 * 1024) return .{ .token = try save(a, store, identity, io, descriptor, cancellation), .rows = pending.changes.len, .bytes = encoded.len };
+    if (encoded.len > max_bytes) return error.QueryCandidateBudgetExceeded;
+    const table = (descriptor.authorization orelse return error.SqlExecutionUnauthorized).table.view();
+    const normalized = try @import("lake_sql_overlay.zig").Cut.initForTable(a, pending, table);
+    const digests = try a.alloc([64]u8, normalized.pending.changes.len);
+    for (normalized.pending.changes, digests) |change, *key| key.* = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.digestHex(try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.row_commit.stable_key.identity(a, pending.key_fields, change.row, normalized.kinds));
+    std.mem.sort([64]u8, digests, {}, struct {
+        fn less(_: void, l: [64]u8, r: [64]u8) bool {
+            return std.mem.order(u8, &l, &r) == .lt;
+        }
+    }.less);
+    const bloom = try a.alloc(u8, @min(@as(usize, 256 * 1024), @max(@as(usize, 64), digests.len * 2)));
+    @memset(bloom, 0);
+    for (digests) |key| for (0..4) |seed| {
+        const bit = bloomBit(key, bloom.len * 8, seed);
+        bloom[bit / 8] |= @as(u8, 1) << @as(u3, @intCast(bit % 8));
+    };
+    var keys: std.ArrayList(KeyPage) = .empty;
+    var begin: usize = 0;
+    while (begin < digests.len) {
+        const end = @min(digests.len, begin + 1024);
+        const bytes = std.mem.sliceAsBytes(digests[begin..end]);
+        try keys.append(a, .{ .first = digests[begin], .last = digests[end - 1], .token = try savePage(a, store, identity, io, descriptor, bytes, cancellation) });
+        begin = end;
+    }
+    var changes: std.ArrayList(ChangePage) = .empty;
+    begin = 0;
+    while (begin < normalized.pending.changes.len) {
+        var end = begin;
+        var bytes: usize = 2;
+        while (end < normalized.pending.changes.len and end - begin < 4096) {
+            const row = try std.json.Stringify.valueAlloc(a, normalized.pending.changes[end], .{});
+            defer a.free(row);
+            if (row.len > max_bytes) return error.QueryCandidateBudgetExceeded;
+            if (end != begin and bytes + row.len + 1 > 32 * 1024) break;
+            bytes += row.len + 1;
+            end += 1;
+        }
+        const body = try std.json.Stringify.valueAlloc(a, normalized.pending.changes[begin..end], .{});
+        defer a.free(body);
+        try changes.append(a, .{ .begin = @intCast(begin), .count = @intCast(end - begin), .token = try savePage(a, store, identity, io, descriptor, body, cancellation) });
+        begin = end;
+    }
+    var root = descriptor;
+    root.pending = normalized.pending;
+    root.pending.changes = &.{};
+    root.paged = .{ .count = @intCast(normalized.pending.changes.len), .bytes = encoded.len, .changes = changes.items, .keys = keys.items, .bloom = try savePage(a, store, identity, io, descriptor, bloom, cancellation) };
+    return .{ .token = try save(a, store, identity, io, root, cancellation), .rows = normalized.pending.changes.len, .bytes = encoded.len, .paged = true };
+}
 fn domain(table: u64, identity: [32]u8) [32]u8 {
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("accepted-sql-transaction-cut-v1");
@@ -100,8 +177,23 @@ pub fn save(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, io: std.Io,
     return @import("lake_generation_envelope.zig").encode(a, prefix, object);
 }
 pub fn load(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, token: []const u8, table: catalog.Table, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) !Descriptor {
-    const value = try loadDescriptor(a, store, identity, token, table.id, now, cancellation);
+    var value = try loadDescriptor(a, store, identity, token, table.id, now, cancellation);
     if (value.schema_version != table.schema_version or value.object_generation != (if (table.external_indexes) |indexes| indexes.object_generation else 0)) return error.CatalogGenerationChanged;
+    if (value.paged) |index| {
+        const changes = try a.alloc(@import("../serverless/lake_ingestion.zig").Batch.Change, index.count);
+        var cursor: usize = 0;
+        for (index.changes) |page| {
+            if (page.begin != cursor) return error.CatalogGenerationChanged;
+            const bytes = try readPage(a, store, identity, value, page.token, cancellation);
+            const rows = try std.json.parseFromSliceLeaky([]const @import("../serverless/lake_ingestion.zig").Batch.Change, a, bytes, .{ .allocate = .alloc_always });
+            if (rows.len != page.count or page.begin > changes.len or rows.len > changes.len - page.begin) return error.CatalogGenerationChanged;
+            @memcpy(changes[page.begin..][0..rows.len], rows);
+            cursor += rows.len;
+        }
+        if (cursor != changes.len) return error.CatalogGenerationChanged;
+        value.pending.changes = changes;
+        value.paged = null;
+    }
     return value;
 }
 pub fn loadDescriptor(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, token: []const u8, table_id: u64, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) !Descriptor {

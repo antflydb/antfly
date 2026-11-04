@@ -23,9 +23,9 @@ import {createR2Transport} from '../../../zig/lib/objectstore/wasm/r2.mjs';
 // Generate with ANTFLY_SQL_HOSTED_FIXTURE=../examples/cloudflare-serverless/dist/sql-fixture.json
 // zig build distributed-sql-test, then instrument the WASM through npm run build.
 const module = await WebAssembly.compile(await readFile(new URL('../dist/antfly-serverless.wasm', import.meta.url)));
-for (const mode of ['shuffle','bucket','skew','range']) {
+for (const mode of ['shuffle','bucket','skew','range','wal']) {
 const bucketed=mode==='bucket';
-const fixture = JSON.parse(await readFile(new URL(mode==='range'?'../dist/sql-range-fixture.json':mode==='skew'?'../dist/sql-skew-fixture.json':bucketed?'../dist/sql-bucket-fixture.json':'../dist/sql-fixture.json', import.meta.url)));
+const fixture = JSON.parse(await readFile(new URL(mode==='wal'?'../dist/sql-wal-fixture.json':mode==='range'?'../dist/sql-range-fixture.json':mode==='skew'?'../dist/sql-skew-fixture.json':bucketed?'../dist/sql-bucket-fixture.json':'../dist/sql-fixture.json', import.meta.url)));
 test(mode==='skew'?'WASM skew kernel finalizes accepted native map tiles with global NULL ownership':`WASM ${mode} joins native retained Parquet cuts with WAL overlays and recovers accepted tasks`, async () => {
   const buckets = Object.fromEntries(['source','execution'].map(name => [name,new Bucket()]));
   for (const object of fixture.objects) await buckets[object.bucket].put(object.key, new Uint8Array(Buffer.from(object.body_base64,'base64')));
@@ -45,7 +45,7 @@ test(mode==='skew'?'WASM skew kernel finalizes accepted native map tiles with gl
       // the durable claim/output instead of rerunning and duplicating rows.
       const fault=async (call,body) => {
         const result=await transport(call,body);
-        if (!lost&&call.op==='put'&&call.key?.includes(bucketed?'/stage/0/':'/stage/1/')&&new TextDecoder().decode(body).includes('"status":"succeeded"')) {
+        if (!lost&&call.op==='put'&&(bucketed?call.key?.includes('/stage/0/'):call.key?.includes('/stage/')&&!call.key?.includes('/stage/0/'))&&new TextDecoder().decode(body).includes('"status":"succeeded"')) {
           lost=true;throw Error('lost completion response');
         }
         return result;
@@ -73,7 +73,7 @@ test(mode==='skew'?'WASM skew kernel finalizes accepted native map tiles with gl
     assert.equal(digest,typeof ref.hash==='string'?ref.hash:String.fromCharCode(...ref.hash));
     const chunk=JSON.parse(new TextDecoder().decode(bytes));assert.ok(chunk.pages.length<=64);pages.push(...chunk.pages);if(chunk.previous)manifests.push(chunk.previous);
   }
-  if(mode!=='range') assert.equal(pages.length,fixture.expected_pages??(bucketed?4:1));
+  if(mode!=='range'&&mode!=='wal') assert.equal(pages.length,fixture.expected_pages??(bucketed?4:1));
   assert.equal(pages.reduce((n,p)=>n+p.rows,0),result.rows);
   assert.ok(pages[0].index_bytes>0);
   const other=await instantiateHost(module,transport);
@@ -133,4 +133,27 @@ test('WASM result assembly stays bounded through 1000 pages, lost checkpoint ACK
     pages+=chunk.pages.length;rows+=chunk.rows;next=chunk.previous;
   }
   assert.equal(pages,1000);assert.equal(rows,result.rows);
+});
+
+for(const strategy of ['shuffle','broadcast']) test(`WASM ordinary ${strategy} consolidates 320 small build fragments within the production operation cap`,async()=>{
+ const fixture=JSON.parse(await readFile(new URL('../dist/sql-skew-fixture.json',import.meta.url)));
+ const plan=JSON.parse(fixture.raw_plan);plan.strategy=strategy;if(strategy==='broadcast')plan.join.kind='inner';plan.left.splits=1;plan.right.splits=320;plan.left.estimated_rows=2;plan.right.estimated_rows=320;
+ const raw=JSON.stringify(plan),id=Buffer.from(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(raw))).toString('hex'),query={id,expires_ms:plan.expires_ms};
+ const root=`state/sql-execution-v2/${String(query.expires_ms).padStart(20,'0')}/${id}`,original=typeof fixture.query.id==='string'?fixture.query.id:String.fromCharCode(...fixture.query.id);
+ const decode=i=>JSON.parse(Buffer.from(fixture.objects.find(o=>o.key.includes(original)&&o.key.endsWith('/stage/0/task/'+i+'.json')).body_base64,'base64'));
+ const right=decode(301),left=decode(300);right.plan=id;left.plan=id;
+ const buckets={source:new Bucket(),execution:new Bucket()};for(const o of fixture.objects)await buckets[o.bucket].put(o.key,Buffer.from(o.body_base64,'base64'));
+ const record={...left,status:'pending',owner:'',epoch:0,until_ms:0,stage:1,cursor:0,pending:[],reduce_boundaries:strategy==='broadcast'?[]:[0,1],skew:[],physical:null,adaptive:null,result_progress:null,output:null};
+ await buckets.execution.put(root+'/plan.json',raw);await buckets.execution.put(root+'/query.json',JSON.stringify(record));
+ for(let i=0;i<321;i++)await buckets.execution.put(root+`/stage/0/task/${i}.json`,JSON.stringify(i<320?right:left));
+ const host=await instantiateHost(module,createR2Transport(buckets),{clock:()=>query.expires_ms-100000});
+ const request={config:fixture.config,tenant:plan.tenant,query,owner:'consolidator'};let complete=false,maximum=0;
+ const options={maxOperations:900,onMetrics:m=>{maximum=Math.max(maximum,m.operations);}};
+ for(let turn=0;turn<32;turn++){
+  const result=await host.request({...request,op:'sql_turn'},options);
+  if(result.complete){complete=true;break;}
+  for(const ticket of result.tickets){const accepted=await host.request({...request,op:'sql_execute',owner:'worker',ticket},options);assert.equal(accepted.status,'succeeded');}
+ }
+ assert.ok(complete);assert.ok(maximum<150,`unbounded fan-in: ${maximum}`);
+ const result=await host.request({...request,op:'sql_result'},options);assert.equal(result.rows,strategy==='broadcast'?0:322);
 });

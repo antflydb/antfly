@@ -165,7 +165,7 @@ pub const Plan = struct {
         if (requests *| limits.max_attempts > limits.query_requests) return error.SqlJoinBudgetExceeded;
     }
     pub fn outputStage(self: Plan) u32 {
-        return if (self.skew.len != 0) 2 + self.matchLevels() else self.joinStage();
+        return if (self.skew.len != 0) self.joinStage() + 1 + self.matchLevels() else self.joinStage();
     }
     pub fn witnessLevels(count_: u32) u32 {
         if (count_ <= 32) return 0;
@@ -229,15 +229,58 @@ pub const Plan = struct {
         if (count > result.limits.max_tasks or @as(u64, count) *| result.limits.max_attempts *| result.limits.task_output_bytes > result.limits.query_exchange_bytes) return error.SqlJoinBudgetExceeded;
         return result;
     }
+    pub fn inputLevels(self: Plan) u32 {
+        if (self.strategy == .bucket) return 0;
+        var count = if (self.strategy == .broadcast) self.right.splits else @max(self.right.splits, self.left.splits);
+        if (count <= 32) return 0;
+        var levels: u32 = 0;
+        while (count > 1) : (levels += 1) count = (count + 31) / 32;
+        return levels;
+    }
+    pub fn inputGroups(count_: u32, level: u32) u32 {
+        var count = count_;
+        for (0..level) |_| count = (count + 31) / 32;
+        return count;
+    }
+    pub fn ordinaryCount(self: Plan) u32 {
+        return self.reduceCount() - @as(u32, @intCast(self.skew.len));
+    }
+    pub fn ordinaryReducer(self: Plan, ordinal: u32) !u32 {
+        var next = ordinal;
+        var part: usize = 0;
+        for (0..self.reduceCount()) |index| {
+            const partition = if (self.reduce_boundaries.len == 0) @as(u16, @intCast(index)) else self.reduce_boundaries[index];
+            if (part < self.skew.len and self.skew[part].partition == partition) {
+                part += 1;
+                continue;
+            }
+            if (next == 0) return @intCast(index);
+            next -= 1;
+        }
+        return error.InvalidSqlExecutionState;
+    }
+    pub fn ordinaryOrdinal(self: Plan, reducer: u32) !u32 {
+        const partition = if (self.reduce_boundaries.len == 0) @as(u16, @intCast(reducer)) else self.reduce_boundaries[reducer];
+        var removed: u32 = 0;
+        for (self.skew) |part| {
+            if (part.partition >= partition) break;
+            removed += 1;
+        }
+        return std.math.sub(u32, reducer, removed);
+    }
     pub fn joinStage(self: Plan) u32 {
-        return if (self.strategy == .bucket) 0 else 1;
+        return if (self.strategy == .bucket) 0 else 1 + self.inputLevels();
     }
     pub fn stageTasks(self: Plan, stage: u32) !u32 {
         const join_stage = self.joinStage();
-        if (stage < join_stage) return if (self.strategy == .broadcast) self.right.splits else std.math.add(u32, self.left.splits, self.right.splits);
+        if (stage == 0 and join_stage != 0) return if (self.strategy == .broadcast) self.right.splits else std.math.add(u32, self.left.splits, self.right.splits);
+        if (stage < join_stage) {
+            const groups = inputGroups(self.right.splits, stage) + (if (self.strategy == .broadcast) @as(u32, 0) else inputGroups(self.left.splits, stage));
+            return std.math.mul(u32, groups, if (self.strategy == .broadcast) 1 else self.ordinaryCount());
+        }
         var count: u32 = if (self.strategy == .broadcast) self.left.splits else if (self.skew.len != 0) try self.finalizerCount() else self.reduceCount();
-        if (self.skew.len != 0 and stage == 1) return physical.pairCount(self.skew, self.reduceCount());
-        if (self.skew.len != 0 and stage > 1 and stage < self.outputStage()) return self.witnessOffset(self.skew.len, false, stage - 1);
+        if (self.skew.len != 0 and stage == join_stage) return physical.pairCount(self.skew, self.reduceCount());
+        if (self.skew.len != 0 and stage > join_stage and stage < self.outputStage()) return self.witnessOffset(self.skew.len, false, stage - join_stage);
         if (stage == self.outputStage()) return count;
         if (self.aggregate == null or stage > 16) return error.InvalidSqlDistributedPlan;
         for (self.outputStage() + 1..stage + 1) |_| count = (count + 31) / 32;
@@ -270,8 +313,11 @@ pub const Plan = struct {
 pub const Task = struct {
     stage: u32,
     task: u32,
-    kind: enum { tile_pair, merge_probe_matches, merge_build_matches, finalize_probe, finalize_build, passthrough, bucket_join, scan_build, broadcast_probe, map_left, map_right, reduce, aggregate, results },
+    kind: enum { consolidate, tile_pair, merge_probe_matches, merge_build_matches, finalize_probe, finalize_build, passthrough, bucket_join, scan_build, broadcast_probe, map_left, map_right, reduce, aggregate, results },
     split: u32 = 0,
+    build: bool = false,
+    reducer: u32 = 0,
+    build_count: ?u32 = null,
     partition: u16 = 0,
     partition_end: u16 = 1,
     left_tile: physical.Tile = .{},
@@ -312,7 +358,7 @@ pub fn choose(left: Input, right: Input, tenant: Digest, expires_ms: u64, join: 
     };
     const broadcast = !join.preservesBuild() and estimatedRetained(right) <= @min(64 * 1024 * 1024, limits.task_memory / 8) and right.estimated_rows <= limits.task_scan_rows / 2;
     var partitions: u16 = 1;
-    if (!broadcast) while ((estimatedRetained(right) / partitions > limits.task_memory / 8 or (left.estimated_rows +| right.estimated_rows) / partitions > limits.task_scan_rows / 2) and partitions < limits.max_partitions) {
+    if (!broadcast) while (((estimatedRetained(left) +| estimatedRetained(right)) / partitions > limits.task_memory / 8 or (left.estimated_rows +| right.estimated_rows) / partitions > limits.task_scan_rows / 2) and partitions < limits.max_partitions) {
         if (partitions > limits.max_partitions / 2) break;
         partitions = std.math.mul(u16, partitions, 2) catch return error.SqlJoinBudgetExceeded;
     };

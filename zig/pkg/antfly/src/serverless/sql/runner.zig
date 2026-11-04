@@ -120,6 +120,7 @@ pub const Runner = struct {
         try self.context.ensureActive();
         return switch (task.kind) {
             .merge_probe_matches, .merge_build_matches => @import("skew_runner.zig").merge(self, query, specification, task, dependencies),
+            .consolidate => self.consolidate(query, specification, task, dependencies),
             .tile_pair => @import("skew_runner.zig").pair(self, query, specification, task, dependencies),
             .finalize_probe, .finalize_build => @import("skew_runner.zig").finalize(self, query, specification, task, dependencies),
             .passthrough => blk: {
@@ -134,6 +135,30 @@ pub const Runner = struct {
             .aggregate => self.merge(query, specification, dependencies, task.finalize),
             .results => error.SqlDistributedJoinUnsupported,
         };
+    }
+    fn consolidate(self: Runner, query: plan.Digest, spec: plan.Plan, task: plan.Task, dependencies: []const state.Output) !state.Output {
+        if (dependencies.len == 0 or dependencies.len > 32) return error.InvalidSqlExecutionState;
+        var result = try OutputRows.init(self.a, 1, @min(spec.limits.task_output_bytes, spec.limits.task_memory / 4));
+        defer result.deinit(self.a);
+        var decode = std.heap.ArenaAllocator.init(self.a);
+        defer decode.deinit();
+        var blocks = std.heap.ArenaAllocator.init(self.a);
+        defer blocks.deinit();
+        var scratch = std.heap.ArenaAllocator.init(self.a);
+        defer scratch.deinit();
+        for (dependencies) |ref| {
+            _ = decode.reset(.free_all);
+            var data = try self.exchange_store.readRange(decode.allocator(), ref, if (task.stage == 1) task.partition else 0, if (task.stage == 1) task.partition_end else 1, @intCast(spec.limits.task_memory / 4));
+            while (try data.nextBlock(&blocks, @intCast(spec.limits.task_memory / 4))) |block| {
+                defer block.deinit();
+                for (0..block.count()) |row| {
+                    try self.context.ensureActive();
+                    _ = scratch.reset(.free_all);
+                    try result.add(self.a, 0, try blockRow(scratch.allocator(), block, row));
+                }
+            }
+        }
+        return result.publish(self.a, self.exchange_store, query, spec.expires_ms, @intCast(spec.limits.task_output_bytes));
     }
     fn map(self: Runner, query: plan.Digest, spec: plan.Plan, task: plan.Task) !state.Output {
         const input = if (task.kind == .map_left) spec.left else spec.right;
@@ -170,9 +195,9 @@ pub const Runner = struct {
         const broadcast = task.kind == .broadcast_probe;
         const bucketed = task.kind == .bucket_join;
         if ((broadcast and spec.join.preservesBuild()) or task.partition >= spec.partitions) return error.SqlDistributedJoinUnsupported;
-        const build_count = spec.right.splits;
+        const build_count = task.build_count orelse spec.right.splits;
         if (!broadcast and !bucketed and self.spill != null and spec.join.kind != .semi and spec.join.kind != .anti) return self.grace(query, spec, task, dependencies);
-        if (dependencies.len != (if (bucketed) @as(usize, 0) else build_count + (if (broadcast) @as(usize, 0) else spec.left.splits))) return error.InvalidSqlDistributedPlan;
+        if (dependencies.len != (if (bucketed) @as(usize, 0) else build_count + (if (broadcast) @as(usize, 0) else (if (task.build_count != null) @as(u32, 1) else spec.left.splits)))) return error.InvalidSqlDistributedPlan;
         const hash = try operators.HashJoin.create(self.a, .{ .bytes = @intCast(spec.limits.task_memory / 2), .rows = @intCast(spec.limits.task_scan_rows), .spill = self.spill });
         defer hash.deinit();
         const columns = try self.a.alloc(local.sql_dynamic_filter.Column, spec.join.left_keys.len);
@@ -211,7 +236,7 @@ pub const Runner = struct {
             }
         } else for (dependencies[0..build_count]) |ref| {
             _ = decode.reset(.free_all);
-            var data = try self.exchange_store.readRange(decode.allocator(), ref, if (broadcast) 0 else task.partition, if (broadcast) 1 else task.partition_end, @intCast(spec.limits.task_memory / 4));
+            var data = try self.exchange_store.readRange(decode.allocator(), ref, if (broadcast or task.build_count != null) 0 else task.partition, if (broadcast or task.build_count != null) 1 else task.partition_end, @intCast(spec.limits.task_memory / 4));
             while (try data.nextBlock(&block_arena, @intCast(spec.limits.task_memory / 4))) |block| {
                 defer block.deinit();
                 for (0..block.count()) |index| {
@@ -256,7 +281,7 @@ pub const Runner = struct {
             }
         } else for (dependencies[build_count..]) |ref| {
             _ = decode.reset(.free_all);
-            var data = try self.exchange_store.readRange(decode.allocator(), ref, task.partition, task.partition_end, @intCast(spec.limits.task_memory / 4));
+            var data = try self.exchange_store.readRange(decode.allocator(), ref, if (task.build_count != null) 0 else task.partition, if (task.build_count != null) 1 else task.partition_end, @intCast(spec.limits.task_memory / 4));
             while (try data.nextBlock(&block_arena, @intCast(spec.limits.task_memory / 4))) |block| {
                 defer block.deinit();
                 for (0..block.count()) |index| {
@@ -283,7 +308,7 @@ pub const Runner = struct {
         return output.publish(self.a, self.exchange_store, query, spec.expires_ms, @intCast(spec.limits.task_output_bytes));
     }
     fn grace(self: Runner, query: plan.Digest, spec: plan.Plan, task: plan.Task, dependencies: []const state.Output) !state.Output {
-        if (dependencies.len != @as(usize, spec.right.splits) + spec.left.splits) return error.InvalidSqlDistributedPlan;
+        if (dependencies.len != (if (task.build_count != null) @as(usize, 2) else @as(usize, spec.right.splits) + spec.left.splits)) return error.InvalidSqlDistributedPlan;
         const join_ = try local.sql_partition_join.Join.create(self.a, self.spill.?, @intCast(spec.limits.task_memory / 2), @intCast(spec.limits.task_scan_rows), spec.limits.task_memory / 8, spec.join.preservesProbe(), spec.join.preservesBuild());
         defer join_.close();
         var decode = std.heap.ArenaAllocator.init(self.a);
@@ -296,14 +321,14 @@ pub const Runner = struct {
         for (dependencies, 0..) |ref, input| {
             try self.context.ensureActive();
             _ = decode.reset(.free_all);
-            var data = try self.exchange_store.readRange(decode.allocator(), ref, task.partition, task.partition_end, @intCast(spec.limits.task_memory / 4));
+            var data = try self.exchange_store.readRange(decode.allocator(), ref, if (task.build_count != null) 0 else task.partition, if (task.build_count != null) 1 else task.partition_end, @intCast(spec.limits.task_memory / 4));
             while (try data.nextBlock(&block_arena, @intCast(spec.limits.task_memory / 4))) |block| {
                 defer block.deinit();
                 for (0..block.count()) |row| {
                     _ = scratch.reset(.free_all);
                     const cells = try blockRow(scratch.allocator(), block, row);
                     var key: [32]Datum = undefined;
-                    const build = input < spec.right.splits;
+                    const build = input < (task.build_count orelse spec.right.splits);
                     const values = try keys(cells, if (build) spec.join.right_keys else spec.join.left_keys, &key);
                     if (ordinal >= spec.limits.task_scan_rows) return error.SqlJoinBudgetExceeded;
                     try join_.add(build, cells, values, ordinal);

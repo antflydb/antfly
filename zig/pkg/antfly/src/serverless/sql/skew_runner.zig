@@ -149,7 +149,7 @@ pub fn merge(self: anytype, query: plan.Digest, spec: plan.Plan, task: plan.Task
     const bits = try self.a.alloc(u8, @intCast((tile.rows + 7) / 8));
     defer self.a.free(bits);
     @memset(bits, 0);
-    try mergeBits(self, spec, dependencies, bits, task.stage == 2, build);
+    try mergeBits(self, spec, dependencies, bits, task.stage == spec.joinStage() + 1, build);
     var result = try runner.OutputRows.init(self.a, 1, spec.limits.task_memory / 8);
     defer result.deinit(self.a);
     try result.add(self.a, 0, &.{Datum.json(.{ .string = bits })});

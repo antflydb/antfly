@@ -130,7 +130,7 @@ pub const Bridge = struct {
             const original = try table.column(name);
             column.* = .{ .name = name, .type = original.type, .element_type = original.element_type };
         }
-        const rows = @max(@as(u64, 1), self.limits.task_scan_rows / 2);
+        const rows = @min(cut.max_split_rows orelse std.math.maxInt(u32), @max(@as(u64, 1), self.limits.task_scan_rows / 2));
         const bytes = @max(@as(u64, 1), self.limits.task_output_bytes / 8);
         const splits = @max(@as(u64, 1), @max((cut.estimated_rows +| rows - 1) / rows, (@max(cut.estimated_bytes, plan.estimatedRetained(.{ .table_id = table.id, .schema = cut.schema, .snapshot = cut.snapshot, .wal_cut = cut.wal_cut, .cut = cut.token, .columns = columns, .estimated_bytes = cut.estimated_bytes, .estimated_rows = cut.estimated_rows, .splits = 1 })) +| bytes - 1) / bytes));
         if (splits > 65536) return error.SqlJoinBudgetExceeded;

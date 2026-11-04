@@ -62,7 +62,7 @@ fn identity(a: A, keys: []const []const u8, row: V, kinds: []const stable_key.Ki
     return local.serverless_external_source_mod.lake_catalog.row_commit.stable_key.identity(a, keys, row, kinds);
 }
 // Base SQL rows carry nanoseconds, whereas integer WAL keys carry micros.
-fn baseIdentity(a: A, keys: []const []const u8, row: V, kinds: []const stable_key.Kind) ![]const u8 {
+pub fn baseIdentity(a: A, keys: []const []const u8, row: V, kinds: []const stable_key.Kind) ![]const u8 {
     if (row != .object or (kinds.len != 0 and kinds.len != keys.len)) return error.InvalidLakeKey;
     var normalized: V = .{ .object = .empty };
     for (keys, 0..) |key, i| {

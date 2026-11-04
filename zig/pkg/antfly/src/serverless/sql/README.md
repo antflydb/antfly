@@ -155,3 +155,25 @@ a finalizer consumes the merged root. Small fan-ins read pair proofs directly.
 The resolved plan reserves every tree task and output before dispatch. Tree
 identities, accepted outputs and result checkpoints survive at-least-once
 messages, lost acknowledgements and coordinator replacement.
+
+
+Ordinary shuffle partitions and broadcast builds with more than 32 original
+fragments use bounded fan-in-32 compaction stages. Each side stays separate;
+reducers consume compacted roots instead of reopening every original map.
+Adjacent-partition planning includes retained bytes from both sides so each
+ordinary compaction output stays within task memory. Oversized partitions keep
+their original map identities for skew tiles and match ownership. Admission
+reserves compaction tasks together with join, proof and aggregate tasks.
+
+Distributed cuts larger than 64 KiB of WAL images retain those images in
+immutable pages, with a Bloom filter and sorted exact changed-key digest pages.
+Every worker suppresses changed base rows against that full index, while it
+reads only its disjoint contiguous interval of recent WAL images. Key and image
+page caches are bounded and invocation-private; all child references bind the
+same table/store domain and expiry as the parent capability. Small cuts remain
+inline. Existing local cut readers can materialize paged capabilities normally.
+
+Paged cuts include WAL bytes/rows in planning and advertise a 128-row scan
+fragment ceiling to bound worst-case key-index I/O in hosted invocations.
+Bucket execution falls back to shuffle for these cuts. Pages target 32 KiB;
+individual larger rows remain subject to the existing task/query budgets.

@@ -706,10 +706,10 @@ test "distributed SQL task budget failure is terminal and reported to the query"
 }
 
 test "distributed SQL hosted bound-client execution reopens native cuts and typed Parquet" {
-    try hostedLakeSource(false, false);
-    try hostedLakeSource(true, false);
+    try hostedLakeSource(false, false, false);
+    try hostedLakeSource(true, false, false);
 }
-fn hostedLakeSource(bucketed: bool, large: bool) !void {
+fn hostedLakeSource(bucketed: bool, large: bool, paged: bool) !void {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -743,13 +743,31 @@ fn hostedLakeSource(bucketed: bool, large: bool) !void {
     const root = try lake.metadata.parse(sa, committed.metadata_json);
     const snapshot = try std.fmt.allocPrint(sa, "{d}", .{try lake.metadata.int(try lake.metadata.get(root, "current-snapshot-id"))});
     const recent = try std.json.parseFromSliceLeaky(std.json.Value, sa, "[{\"id\":2},{\"id\":3}]", .{});
-    const descriptor: @import("../../api/lake_sql_retained_cut.zig").Descriptor = .{ .table_id = 7, .schema_version = 1, .object_generation = 0, .expires_ms = expires, .metadata_location = committed.metadata_location, .metadata_json = committed.metadata_json, .table_uuid = try lake.metadata.str(try lake.metadata.get(root, "table-uuid")), .snapshot_id = snapshot, .pending = .{ .lsn = 2, .key_fields = &.{"id"}, .changes = &.{ .{ .op = .delete, .row = recent.array.items[0] }, .{ .op = .upsert, .row = recent.array.items[1] } } }, .authorization = .{ .scope = @splat('a'), .table = @import("../../api/lake_sql_retained_cut.zig").ReadTable.from(table) } };
+    var descriptor: @import("../../api/lake_sql_retained_cut.zig").Descriptor = .{ .table_id = 7, .schema_version = 1, .object_generation = 0, .expires_ms = expires, .metadata_location = committed.metadata_location, .metadata_json = committed.metadata_json, .table_uuid = try lake.metadata.str(try lake.metadata.get(root, "table-uuid")), .snapshot_id = snapshot, .pending = .{ .lsn = 2, .key_fields = &.{"id"}, .changes = &.{ .{ .op = .delete, .row = recent.array.items[0] }, .{ .op = .upsert, .row = recent.array.items[1] } } }, .authorization = .{ .scope = @splat('a'), .table = @import("../../api/lake_sql_retained_cut.zig").ReadTable.from(table) } };
+    if (paged) {
+        const changes = try sa.alloc(lake.row_commit.Batch.Change, 9000);
+        const payload = try sa.alloc(u8, 1024);
+        @memset(payload, 'x');
+        for (changes, 1..) |*change, id| change.* = .{ .op = if (id == 2) .delete else .upsert, .row = try std.json.parseFromSliceLeaky(std.json.Value, sa, try std.json.Stringify.valueAlloc(sa, .{ .id = id, .payload = payload }, .{}), .{}) };
+        const wide = try sa.alloc(u8, 64 * 1024);
+        @memset(wide, 'w');
+        try changes[0].row.object.put(sa, "payload", .{ .string = wide });
+        descriptor.pending.changes = changes;
+    }
     const identity = try @import("../../api/native_retained_cut.zig").storeIdentity(sa, config.artifacts);
-    const cut = try @import("../../api/lake_sql_retained_cut.zig").save(sa, &artifacts, identity, std.testing.io, descriptor, .none);
-    const input: plan.Input = .{ .table_id = 7, .schema = try @import("lake_source.zig").Host.fingerprint(sa, table), .snapshot = snapshot, .wal_cut = 2, .cut = cut, .columns = if (large) &.{ .{ .name = "id", .type = .integer }, .{ .name = "payload", .type = .string } } else &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = if (large) 4 * 1024 * 1024 else 100, .estimated_rows = if (large) 16384 else 2, .splits = if (large) 8 else 2, .bucket = if (bucketed) .{ .column = 0, .count = 4 } else null };
-    const spec: plan.Plan = .{ .tenant = @splat('a'), .expires_ms = expires, .left = input, .right = input, .join = .{ .left_keys = &.{0}, .right_keys = &.{0}, .projection = if (large) &.{0} else &.{} }, .strategy = if (bucketed) .bucket else .shuffle, .partitions = if (large) 16 else 4, .limits = .{ .task_memory = config.task_memory, .task_output_bytes = if (large) 2 * 1024 * 1024 else 16 * 1024 * 1024 } };
+    const saved = try @import("../../api/lake_sql_retained_cut.zig").saveDistributed(sa, &artifacts, identity, std.testing.io, descriptor, .none);
+    try std.testing.expectEqual(paged, saved.paged);
+    const cut = saved.token;
+    if (paged) {
+        const loaded = try @import("../../api/lake_sql_retained_cut.zig").load(sa, &artifacts, identity, cut, table, expires - 1000, .none);
+        try std.testing.expect(loaded.paged == null);
+        try std.testing.expectEqual(@as(usize, 9000), loaded.pending.changes.len);
+        try std.testing.expectEqual(@as(usize, 64 * 1024), loaded.pending.changes[0].row.object.get("payload").?.string.len);
+    }
+    const input: plan.Input = .{ .table_id = 7, .schema = try @import("lake_source.zig").Host.fingerprint(sa, table), .snapshot = snapshot, .wal_cut = 2, .cut = cut, .columns = if (large) &.{ .{ .name = "id", .type = .integer }, .{ .name = "payload", .type = .string } } else &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = if (large) 4 * 1024 * 1024 else 100, .estimated_rows = if (paged) 25384 else if (large) 16384 else 2, .splits = if (paged) 200 else if (large) 8 else 2, .bucket = if (bucketed) .{ .column = 0, .count = 4 } else null };
+    const spec: plan.Plan = .{ .tenant = @splat('a'), .expires_ms = expires, .left = input, .right = input, .join = .{ .left_keys = &.{0}, .right_keys = &.{0}, .projection = if (large) &.{0} else &.{} }, .strategy = if (bucketed) .bucket else .shuffle, .partitions = if (paged) 64 else if (large) 16 else 4, .limits = .{ .query_requests = if (paged) 1000000 else 100000, .query_exchange_bytes = if (paged) 16 * 1024 * 1024 * 1024 else 8 * 1024 * 1024 * 1024, .task_memory = config.task_memory, .task_output_bytes = if (large) 2 * 1024 * 1024 else 16 * 1024 * 1024 } };
     const raw_plan = try spec.encode(sa);
-    if (std.testing.environ.getPosix(if (large) "ANTFLY_SQL_HOSTED_RANGE_FIXTURE" else if (bucketed) "ANTFLY_SQL_HOSTED_BUCKET_FIXTURE" else "ANTFLY_SQL_HOSTED_FIXTURE")) |path| {
+    if (std.testing.environ.getPosix(if (paged) "ANTFLY_SQL_HOSTED_WAL_FIXTURE" else if (large) "ANTFLY_SQL_HOSTED_RANGE_FIXTURE" else if (bucketed) "ANTFLY_SQL_HOSTED_BUCKET_FIXTURE" else "ANTFLY_SQL_HOSTED_FIXTURE")) |path| {
         const Item = struct { bucket: []const u8, key: []const u8, body_base64: []const u8 };
         var items: std.ArrayList(Item) = .empty;
         var buckets = memory.buckets.iterator();
@@ -770,7 +788,7 @@ fn hostedLakeSource(bucketed: bool, large: bool) !void {
     request.query = (try std.json.parseFromSliceLeaky(struct { query: state.Query }, sa, submit, .{})).query;
     request.raw_plan = null;
     var complete = false;
-    for (0..64) |_| {
+    for (0..256) |_| {
         request.op = .sql_turn;
         const turn = try hosted.execute(sa, memory.client(), std.testing.io, .{ .io = std.testing.io }, try std.json.Stringify.valueAlloc(sa, request, .{}));
         const value = try std.json.parseFromSliceLeaky(struct { complete: bool, tickets: []const plan.Ticket }, sa, turn, .{});
@@ -953,7 +971,7 @@ fn exportSkewFixture(a: A, memory: *storage.MemoryClient, config: @import("hoste
 }
 
 test "distributed SQL row ranges bound a large single Parquet row group" {
-    try hostedLakeSource(false, true);
+    try hostedLakeSource(false, true, false);
 }
 
 test "distributed SQL paged layouts exceed legacy metadata sizes and remain recoverable" {
@@ -1040,9 +1058,16 @@ fn pagedLayout(maps: u32, partitions: u16, hot: bool, max_tasks: u32, budget_fai
     }
     try std.testing.expect(advanced);
     try std.testing.expect(moved);
+    var dispatch: Dispatch = .{ .workers = .{ service, service }, .drop_once = false };
+    for (0..256) |_| {
+        var record = (try records.load(sa, query_key)).?;
+        defer record.deinit(sa);
+        if (record.value.stage == spec.joinStage()) break;
+        _ = try service.tick(query, claim, .{ .ptr = &dispatch, .dispatch = Dispatch.run });
+    }
     _ = try service.tick(query, claim, .{ .ptr = &fixture, .dispatch = Ignore.dispatch });
-    try service.execute(.{ .tenant = spec.tenant, .query = query, .stage = 1, .task = 0 });
-    const task_key = try records.key(sa, query, 1, 0);
+    try service.execute(.{ .tenant = spec.tenant, .query = query, .stage = spec.joinStage(), .task = 0 });
+    const task_key = try records.key(sa, query, spec.joinStage(), 0);
     var task = (try records.load(sa, task_key)).?;
     defer task.deinit(sa);
     try std.testing.expectEqual(state.Status.succeeded, task.value.status);
@@ -1144,7 +1169,7 @@ test "distributed SQL bounded match trees preserve every join kind and partial a
                 var record = (try service.state_store.load(sa, try service.state_store.key(sa, query, null, 0))).?;
                 defer record.deinit(sa);
                 const resolved = try service.resolvePhysical(sa, spec, record.value);
-                if (!moved and record.value.stage == 2 and resolved.matchLevels() != 0) {
+                if (!moved and record.value.stage == resolved.joinStage() + 1 and resolved.matchLevels() != 0) {
                     fixture.now += 92001;
                     service = fixture.service(a, memory.client(), "tree-b");
                     claim = (try service.acquire(query)).?;
@@ -1165,4 +1190,8 @@ test "distributed SQL bounded match trees preserve every join kind and partial a
             };
         }
     }
+}
+
+test "distributed SQL paged WAL bounds worker memory and preserves global changed-key suppression" {
+    try hostedLakeSource(false, true, true);
 }

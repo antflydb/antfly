@@ -163,12 +163,12 @@ pub const Service = struct {
             }
             return error.InvalidSqlExecutionState;
         }
-        if (spec.skew.len != 0 and stage > 1 and stage < spec.outputStage()) {
+        if (spec.skew.len != 0 and stage > spec.joinStage() and stage < spec.outputStage()) {
             var next = task;
             for (spec.skew, 0..) |part, index| {
                 inline for (.{ false, true }) |build| {
                     if (if (build) spec.join.preservesBuild() else (spec.join.preservesProbe() or spec.join.kind == .semi)) {
-                        const groups = plan.Plan.witnessGroups(if (build) part.leftCount() else part.rightCount(), stage - 1);
+                        const groups = plan.Plan.witnessGroups(if (build) part.leftCount() else part.rightCount(), stage - spec.joinStage());
                         const tiles = if (build) part.rightCount() else part.leftCount();
                         const count = try std.math.mul(u32, groups, tiles);
                         if (next < count) return .{ .stage = stage, .task = task, .kind = if (build) .merge_build_matches else .merge_probe_matches, .physical_part = @intCast(index), .tile_left = if (build) 0 else next / groups, .tile_right = if (build) next / groups else 0, .witness_group = next % groups };
@@ -178,15 +178,23 @@ pub const Service = struct {
             }
             return error.InvalidSqlExecutionState;
         }
-        if (spec.skew.len != 0 and stage == 1) {
+        if (spec.skew.len != 0 and stage == spec.joinStage()) {
             switch (try physical.work(spec.skew, spec.reduce_boundaries, spec.reduceCount(), task)) {
                 .pair => |pair| return .{ .stage = stage, .task = task, .kind = .tile_pair, .physical_part = pair.part, .tile_left = pair.left, .tile_right = pair.right },
-                .reduce => |reducer| return .{ .stage = stage, .task = task, .kind = .reduce, .partition = spec.reduce_boundaries[reducer], .partition_end = spec.reduce_boundaries[reducer + 1] },
+                .reduce => |reducer| return .{ .stage = stage, .task = task, .kind = .reduce, .reducer = try spec.ordinaryOrdinal(reducer), .build_count = if (spec.inputLevels() != 0) 1 else null, .partition = spec.reduce_boundaries[reducer], .partition_end = spec.reduce_boundaries[reducer + 1] },
             }
+        }
+        if (stage > 0 and stage < spec.joinStage()) {
+            const right = plan.Plan.inputGroups(spec.right.splits, stage);
+            const left = if (spec.strategy == .broadcast) 0 else plan.Plan.inputGroups(spec.left.splits, stage);
+            const ordinal = task / (right + left);
+            const group = task % (right + left);
+            const reducer = if (spec.strategy == .broadcast) 0 else try spec.ordinaryReducer(ordinal);
+            return .{ .stage = stage, .task = task, .kind = .consolidate, .build = group < right, .dependent = if (group < right) group else group - right, .reducer = ordinal, .partition = if (spec.reduce_boundaries.len == 0) @intCast(reducer) else spec.reduce_boundaries[reducer], .partition_end = if (spec.reduce_boundaries.len == 0) @intCast(reducer + 1) else spec.reduce_boundaries[reducer + 1] };
         }
         if (spec.strategy == .bucket) return .{ .stage = stage, .task = task, .kind = .bucket_join, .partition = @intCast(task), .partition_end = @intCast(task + 1) };
         if (stage == 0) return .{ .stage = stage, .task = task, .kind = if (spec.strategy == .broadcast) .scan_build else if (task < spec.right.splits) .map_right else .map_left, .split = if (task < spec.right.splits) task else task - spec.right.splits };
-        return .{ .stage = stage, .task = task, .kind = if (spec.strategy == .broadcast) .broadcast_probe else .reduce, .split = task, .partition = if (spec.strategy == .shuffle) (if (spec.reduce_boundaries.len != 0) spec.reduce_boundaries[task] else @intCast(task)) else 0, .partition_end = if (spec.strategy == .shuffle) (if (spec.reduce_boundaries.len != 0) spec.reduce_boundaries[task + 1] else @intCast(task + 1)) else 1 };
+        return .{ .stage = stage, .task = task, .kind = if (spec.strategy == .broadcast) .broadcast_probe else .reduce, .reducer = if (spec.strategy == .broadcast) 0 else task, .build_count = if (spec.inputLevels() != 0) 1 else null, .split = task, .partition = if (spec.strategy == .shuffle) (if (spec.reduce_boundaries.len != 0) spec.reduce_boundaries[task] else @intCast(task)) else 0, .partition_end = if (spec.strategy == .shuffle) (if (spec.reduce_boundaries.len != 0) spec.reduce_boundaries[task + 1] else @intCast(task + 1)) else 1 };
     }
     /// One bounded coordinator turn. A caller schedules subsequent turns while
     /// pending, renews ownership, and may move ownership to any query pod.
@@ -500,7 +508,7 @@ pub const Service = struct {
                 progress.boundaries = boundaries.items;
                 var parts: std.ArrayList(physical.Part) = .empty;
                 for (0..spec.partitions) |index| {
-                    if (progress.right_bytes[index] <= spec.limits.task_memory / 8 and progress.rows[index] <= spec.limits.task_scan_rows / 2) continue;
+                    if (progress.bytes[index] <= spec.limits.task_memory / 8 and progress.rows[index] <= spec.limits.task_scan_rows / 2) continue;
                     const left = progress.left_counts[index];
                     const right = progress.right_counts[index];
                     try parts.append(a, .{ .partition = @intCast(index), .left_count = if (left == 0) null else left, .right_count = if (right == 0) null else right, .left = if (left == 0) &.{.{}} else &.{}, .right = if (right == 0) &.{.{}} else &.{} });
@@ -593,7 +601,7 @@ pub const Service = struct {
         const task = descriptor.task;
         if (descriptor.kind == .passthrough) {
             const refs = try a.alloc(state.Output, 1);
-            refs[0] = try self.loadAccepted(a, query, 1, descriptor.dependent);
+            refs[0] = try self.loadAccepted(a, query, spec.joinStage(), descriptor.dependent);
             return refs;
         }
         if (descriptor.kind == .tile_pair or descriptor.kind == .finalize_probe or descriptor.kind == .finalize_build or descriptor.kind == .merge_probe_matches or descriptor.kind == .merge_build_matches) {
@@ -608,7 +616,7 @@ pub const Service = struct {
                 const tile = if (build) descriptor.right_tile else descriptor.left_tile;
                 if (!merging) if (tile.map) |id| try refs.append(a, try self.loadAccepted(a, query, 0, id));
                 const opposite = if (build) part.leftCount() else part.rightCount();
-                const level = if (merging) descriptor.stage - 2 else plan.Plan.witnessLevels(opposite);
+                const level = if (merging) descriptor.stage - spec.joinStage() - 1 else plan.Plan.witnessLevels(opposite);
                 const groups = plan.Plan.witnessGroups(opposite, level);
                 const begin = if (merging) descriptor.witness_group * 32 else 0;
                 const end = if (merging) @min(groups, begin + 32) else groups;
@@ -616,12 +624,29 @@ pub const Service = struct {
                 for (begin..end) |index| {
                     if (level == 0) {
                         const pair_id = try physical.pairId(spec.skew, spec.reduce_boundaries, spec.reduceCount(), .{ .part = descriptor.physical_part, .left = if (build) @intCast(index) else ordinal, .right = if (build) ordinal else @intCast(index) });
-                        try refs.append(a, try self.loadAccepted(a, query, 1, pair_id));
+                        try refs.append(a, try self.loadAccepted(a, query, spec.joinStage(), pair_id));
                     } else {
                         const id = try spec.witnessOffset(descriptor.physical_part, build, level) + ordinal * groups + @as(u32, @intCast(index));
-                        try refs.append(a, try self.loadAccepted(a, query, 1 + level, id));
+                        try refs.append(a, try self.loadAccepted(a, query, spec.joinStage() + level, id));
                     }
                 }
+            }
+            return refs.items;
+        }
+        if (descriptor.kind == .consolidate or (stage == spec.joinStage() and spec.inputLevels() != 0 and descriptor.kind != .bucket_join)) {
+            var refs: std.ArrayList(state.Output) = .empty;
+            if (descriptor.kind == .consolidate) {
+                const previous = stage - 1;
+                const right = plan.Plan.inputGroups(spec.right.splits, previous);
+                const left = if (spec.strategy == .broadcast) 0 else plan.Plan.inputGroups(spec.left.splits, previous);
+                const begin = descriptor.dependent * 32;
+                const end = @min(if (descriptor.build) right else left, begin + 32);
+                const base = (if (previous == 0) @as(u32, 0) else descriptor.reducer * (right + left)) + (if (descriptor.build) @as(u32, 0) else right);
+                for (begin..end) |id| try refs.append(a, try self.loadAccepted(a, query, previous, base + @as(u32, @intCast(id))));
+            } else {
+                const reducer = descriptor.reducer;
+                const width: u32 = if (spec.strategy == .broadcast) 1 else 2;
+                for (0..width) |id| try refs.append(a, try self.loadAccepted(a, query, stage - 1, reducer * width + @as(u32, @intCast(id))));
             }
             return refs.items;
         }

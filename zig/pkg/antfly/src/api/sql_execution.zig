@@ -1250,8 +1250,8 @@ pub const Adapter = struct {
             var store = try @import("lake_index_store.zig").Store.openNative(a, adapter.server.cfg.node_config, adapter.server.cfg.secret_store, false, adapter.server.cfg.deployment_mode, adapter.server.cfg.native_lake_artifact_base_dir);
             defer store.deinit();
             var artifacts = store.artifactStore();
-            const token = try @import("lake_sql_retained_cut.zig").save(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), adapter.server.embedding_provider_runtime.io, .{ .table_id = self.table.id, .schema_version = self.table.schema_version, .object_generation = options.catalog_generation, .expires_ms = expires, .metadata_location = metadata.metadata_location, .metadata_json = metadata.metadata_json, .table_uuid = try lake.metadata.str(try lake.metadata.get(root, "table-uuid")), .snapshot_id = self.source.inventory.snapshot_id, .pending = pending, .authorization = if (adapter.server.cfg.distributed_sql_scope_seed) |seed| .{ .scope = @import("../serverless/sql/bridge.zig").principalScope(seed, adapter.context), .table = @import("lake_sql_retained_cut.zig").ReadTable.from(self.table) } else null }, adapter.context.cancellation);
-            return .{ .token = token, .schema = try @import("../serverless/sql/lake_source.zig").Host.fingerprint(a, self.table), .snapshot = try a.dupe(u8, self.source.inventory.snapshot_id), .wal_cut = pending.lsn, .expires_ms = expires, .estimated_bytes = estimates.bytes, .estimated_rows = estimates.rows, .bucket = try @import("../serverless/sql/lake_source.zig").Host.bucketLayout(a, self.source, pin.context) };
+            const token = try @import("lake_sql_retained_cut.zig").saveDistributed(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), adapter.server.embedding_provider_runtime.io, .{ .table_id = self.table.id, .schema_version = self.table.schema_version, .object_generation = options.catalog_generation, .expires_ms = expires, .metadata_location = metadata.metadata_location, .metadata_json = metadata.metadata_json, .table_uuid = try lake.metadata.str(try lake.metadata.get(root, "table-uuid")), .snapshot_id = self.source.inventory.snapshot_id, .pending = pending, .authorization = if (adapter.server.cfg.distributed_sql_scope_seed) |seed| .{ .scope = @import("../serverless/sql/bridge.zig").principalScope(seed, adapter.context), .table = @import("lake_sql_retained_cut.zig").ReadTable.from(self.table) } else null }, adapter.context.cancellation);
+            return .{ .token = token.token, .max_split_rows = if (token.paged) @import("lake_sql_retained_cut.zig").distributed_rows else null, .schema = try @import("../serverless/sql/lake_source.zig").Host.fingerprint(a, self.table), .snapshot = try a.dupe(u8, self.source.inventory.snapshot_id), .wal_cut = pending.lsn, .expires_ms = expires, .estimated_bytes = estimates.bytes +| token.bytes, .estimated_rows = estimates.rows +| token.rows, .bucket = if (token.paged) null else try @import("../serverless/sql/lake_source.zig").Host.bucketLayout(a, self.source, pin.context) };
         }
     };
 
@@ -1514,6 +1514,9 @@ pub const Adapter = struct {
                     const export_owner = try owner.overlay_arena.?.allocator().create(DistributedCut);
                     export_owner.* = .{ .adapter = self, .table = request.table, .source = owner.sources.get(request.table.id).?, .pending = owner.raw_pending.get(request.table.id) };
                     cursor.export_snapshot = .{ .ptr = export_owner, .export_cut = DistributedCut.capture };
+                    if (owner.raw_pending.get(request.table.id)) |pending| {
+                        if (cursor.estimated_bytes) |*bytes| bytes.* +|= try @import("../serverless/sql/lake_source.zig").overlayBytes(pending);
+                    }
                 }
                 try self.verify(scratch.allocator(), request.table);
             } else {

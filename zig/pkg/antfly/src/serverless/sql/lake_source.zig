@@ -31,6 +31,14 @@ const runtime = @import("runtime.zig");
 const A = std.mem.Allocator;
 const Context = local.serverless_query_lake_read_context.Context;
 const Datum = local.sql_scalar.Datum;
+pub fn overlayBytes(pending: ingestion.Pending) !u64 {
+    var bytes: u64 = 0;
+    for (pending.changes) |change| bytes +|= try local.sql_operators.datumBytes(Datum.json(change.row));
+    for (pending.change_blocks) |block| for (block) |change| {
+        bytes +|= try local.sql_operators.datumBytes(Datum.json(change.row));
+    };
+    return bytes;
+}
 pub const Host = struct {
     artifacts: *@import("../artifacts/store.zig").ArtifactStore,
     store_identity: [32]u8,
@@ -113,6 +121,7 @@ pub const Host = struct {
             const admitted_ = try self.admitted(scratch, spec.tenant, input, context);
             const table = admitted_.table;
             const cut = admitted_.cut;
+            if (cut.paged != null and (spec.strategy == .bucket or (input.estimated_rows +| (input.splits - 1)) / input.splits > retained.distributed_rows)) return error.SqlJoinBudgetExceeded;
             if (cut.expires_ms < spec.expires_ms) return error.SqlQueryExpired;
             try self.pin(scratch, table, cut, context);
         }
@@ -135,7 +144,7 @@ pub const Host = struct {
         const pending = try ingestion.pending(a, table.external_base_source.?.binding, options, context, coverage);
         const cut: retained.Descriptor = .{ .authorization = .{ .scope = tenant, .table = retained.ReadTable.from(table) }, .table_id = table.id, .schema_version = table.schema_version, .object_generation = options.catalog_generation, .expires_ms = expires_ms, .metadata_location = pinned.metadata_location, .metadata_json = pinned.metadata_json, .table_uuid = try lake.metadata.str(try lake.metadata.get(root, "table-uuid")), .snapshot_id = pinned_source.inventory.snapshot_id, .pending = pending };
         try self.pin(a, table, cut, context);
-        const token = try retained.save(a, self.artifacts, self.store_identity, self.io, cut, request(context).cancellation);
+        const token = try retained.saveDistributed(a, self.artifacts, self.store_identity, self.io, cut, request(context).cancellation);
         const estimates = pinned_source.estimates() orelse blk: {
             try pinned_source.ensureInventory(context);
             var bytes: u64 = 0;
@@ -146,7 +155,9 @@ pub const Host = struct {
             }
             break :blk serving.ServingSource.Estimates{ .bytes = bytes, .rows = rows };
         };
-        return .{ .table_id = table.id, .schema = try fingerprint(a, table), .snapshot = try a.dupe(u8, cut.snapshot_id), .wal_cut = pending.lsn, .cut = token, .columns = columns, .estimated_bytes = estimates.bytes, .estimated_rows = estimates.rows, .splits = splits, .bucket = if (try bucketLayout(a, &pinned_source, context)) |layout| blk: {
+        const selected_splits = if (token.paged) @max(splits, (estimates.rows +| token.rows +| (retained.distributed_rows - 1)) / retained.distributed_rows) else splits;
+        if (selected_splits > 65536) return error.SqlJoinBudgetExceeded;
+        return .{ .table_id = table.id, .schema = try fingerprint(a, table), .snapshot = try a.dupe(u8, cut.snapshot_id), .wal_cut = pending.lsn, .cut = token.token, .columns = columns, .estimated_bytes = estimates.bytes +| token.bytes, .estimated_rows = estimates.rows +| token.rows, .splits = @intCast(selected_splits), .bucket = if (token.paged) null else if (try bucketLayout(a, &pinned_source, context)) |layout| blk: {
             for (columns, 0..) |column, index| if (std.mem.eql(u8, column.name, layout.column)) break :blk plan.Bucket{ .column = @intCast(index), .count = layout.count };
             break :blk null;
         } else null };
@@ -193,6 +204,9 @@ pub const Host = struct {
         const scan: catalog.Scan = .{ .fields = names, .limit = 256 };
         const delta = try scratch.create(overlay.Cut);
         delta.* = try overlay.Cut.initForTable(scratch, cut.pending, table);
+        if (cut.paged != null) owner.paged = try PagedReader.init(a, self.artifacts, self.store_identity, cut, delta, input, split, context);
+        errdefer if (owner.paged) |*paged| paged.deinit();
+        if (owner.paged) |paged| owner.recent_at = paged.begin;
         const physical = try overlay.physicalRequest(scratch, scan, delta.*);
         const child = if (input.bucket_group) |group| blk: {
             const declared = input.bucket orelse return error.InvalidSqlDistributedPlan;
@@ -228,10 +242,14 @@ const Owner = struct {
     split: u32 = 0,
     base_done: bool = false,
     recent_at: usize = 0,
+    paged: ?PagedReader = null,
+    fn recentEnd(self: *const Owner) usize {
+        return if (self.paged) |paged| paged.end else self.cut.pending.changes.len;
+    }
     fn next(raw: *anyopaque, a: A, maximum: usize) !?[]const []const Datum {
         const self: *Owner = @ptrCast(@alignCast(raw));
         if (maximum == 0) return error.InvalidSqlBackendResponse;
-        while (!self.base_done or self.recent_at < self.cut.pending.changes.len) {
+        while (!self.base_done or self.recent_at < self.recentEnd()) {
             try self.context.ensureActive();
             // Scratch is reclaimed on every pull, including entirely filtered
             // pages. Only selected typed cells survive in the caller's page.
@@ -253,18 +271,18 @@ const Owner = struct {
                 if (page != null and row_at < page.?.selection.len) {
                     const index = row_at;
                     row_at += 1;
-                    if (self.cut.changed.count() != 0) {
+                    if (self.cut.changed.count() != 0 or self.paged != null) {
                         var key_row: std.json.Value = .{ .object = .empty };
                         for (self.cut.pending.key_fields) |key| try key_row.object.put(scratch, key, (try page.?.cell(scratch, index, (try self.table.column(key)).path)).value);
-                        if (try overlay.suppressesBase(scratch, self.cut, key_row)) continue;
+                        if (if (self.paged) |*paged| try paged.suppresses(scratch, key_row) else try overlay.suppressesBase(scratch, self.cut, key_row)) continue;
                     }
                     for (self.input.columns, cells) |column, *cell| cell.* = try column.datum(scratch, try page.?.typedCell(scratch, index, (try self.table.column(column.name)).path, column.element_type == .numeric));
                 } else {
-                    if (!self.base_done or self.recent_at == self.cut.pending.changes.len) break;
+                    if (!self.base_done or self.recent_at == self.recentEnd()) break;
                     const position = self.recent_at;
                     self.recent_at += 1;
-                    if (self.input.bucket_group == null and position % self.input.splits != self.split) continue;
-                    const row = (try overlay.recentRow(scratch, self.cut, position)) orelse continue;
+                    if (self.paged == null and self.input.bucket_group == null and position % self.input.splits != self.split) continue;
+                    const row = (if (self.paged) |*paged| try paged.recent(scratch, position) else try overlay.recentRow(scratch, self.cut, position)) orelse continue;
                     for (self.input.columns, cells) |column, *cell| cell.* = try column.datum(scratch, try row.cell(column.name));
                 }
                 if (self.input.bucket_group) |group| {
@@ -298,9 +316,125 @@ const Owner = struct {
     }
     fn close(raw: *anyopaque) void {
         const self: *Owner = @ptrCast(@alignCast(raw));
+        if (self.paged) |*paged| paged.deinit();
         self.cursor.close(self.cursor.ptr);
         self.source.deinit();
         self.arena.deinit();
         self.a.destroy(self);
+    }
+};
+
+const PagedReader = struct {
+    const KeyCache = struct { arena: std.heap.ArenaAllocator, page: ?usize = null, bytes: []const u8 = &.{}, used: u64 = 0 };
+    a: A,
+    artifacts: *@import("../artifacts/store.zig").ArtifactStore,
+    identity: [32]u8,
+    descriptor: retained.Descriptor,
+    cut: *const overlay.Cut,
+    context: Context,
+    key_cache: [8]KeyCache,
+    key_clock: u64 = 0,
+    change_arena: std.heap.ArenaAllocator,
+    bloom: []const u8,
+    keys: []const u8 = &.{},
+    changes: []const ingestion.Batch.Change = &.{},
+    change_page: ?usize = null,
+    begin: usize,
+    end: usize,
+    fn init(a: A, artifacts: *@import("../artifacts/store.zig").ArtifactStore, identity_: [32]u8, descriptor: retained.Descriptor, cut: *const overlay.Cut, input: plan.Input, split: u32, context: Context) !PagedReader {
+        const index = descriptor.paged.?;
+        if (input.bucket_group != null) return error.SqlDistributedJoinUnsupported;
+        const bloom = try retained.readPage(a, artifacts, identity_, descriptor, index.bloom, requestToken(&context));
+        errdefer a.free(bloom);
+        if (bloom.len == 0) return error.InvalidSqlExchange;
+        return .{ .a = a, .artifacts = artifacts, .identity = identity_, .descriptor = descriptor, .cut = cut, .context = context, .key_cache = blk: {
+            var slots: [8]KeyCache = undefined;
+            for (&slots) |*slot| slot.* = .{ .arena = .init(a) };
+            break :blk slots;
+        }, .change_arena = .init(a), .bloom = bloom, .begin = @intCast(@as(u64, index.count) * split / input.splits), .end = @intCast(@as(u64, index.count) * (split + 1) / input.splits) };
+    }
+    fn requestToken(context: *const Context) @import("antfly_cancellation").CancellationToken {
+        return .{ .ptr = context, .is_cancelled_fn = struct {
+            fn canceled(raw: *const anyopaque) bool {
+                const value: *const Context = @ptrCast(@alignCast(raw));
+                value.ensureActive() catch return true;
+                return false;
+            }
+        }.canceled };
+    }
+    fn suppresses(self: *PagedReader, a: A, row: std.json.Value) !bool {
+        const key = lake.types.digestHex(try overlay.baseIdentity(a, self.cut.pending.key_fields, row, self.cut.kinds));
+        for (0..4) |seed| {
+            const bit = retained.bloomBit(key, self.bloom.len * 8, seed);
+            if (self.bloom[bit / 8] & (@as(u8, 1) << @as(u3, @intCast(bit % 8))) == 0) return false;
+        }
+        const pages = self.descriptor.paged.?.keys;
+        var low: usize = 0;
+        var high = pages.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (std.mem.order(u8, &pages[middle].last, &key) == .lt) low = middle + 1 else high = middle;
+        }
+        if (low == pages.len or std.mem.order(u8, &key, &pages[low].first) == .lt) return false;
+        const cached = for (&self.key_cache) |*slot| {
+            if (slot.page == low) break slot;
+        } else null;
+        const slot = cached orelse blk: {
+            var victim = &self.key_cache[0];
+            for (&self.key_cache) |*candidate| {
+                if (candidate.page == null) {
+                    victim = candidate;
+                    break;
+                }
+                if (candidate.used < victim.used) victim = candidate;
+            }
+            _ = victim.arena.reset(.free_all);
+            victim.page = null;
+            victim.bytes = try retained.readPage(victim.arena.allocator(), self.artifacts, self.identity, self.descriptor, pages[low].token, requestToken(&self.context));
+            if (victim.bytes.len % 64 != 0) return error.InvalidSqlExchange;
+            victim.page = low;
+            break :blk victim;
+        };
+        self.key_clock += 1;
+        slot.used = self.key_clock;
+        self.keys = slot.bytes;
+        var begin: usize = 0;
+        var end = self.keys.len / 64;
+        while (begin < end) {
+            const middle = begin + (end - begin) / 2;
+            switch (std.mem.order(u8, self.keys[middle * 64 ..][0..64], &key)) {
+                .eq => return true,
+                .lt => begin = middle + 1,
+                .gt => end = middle,
+            }
+        }
+        return false;
+    }
+    fn recent(self: *PagedReader, a: A, position: usize) !?catalog.Row {
+        const pages = self.descriptor.paged.?.changes;
+        var low: usize = 0;
+        var high = pages.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (position >= @as(u64, pages[middle].begin) + pages[middle].count) low = middle + 1 else high = middle;
+        }
+        const index = low;
+        if (index == pages.len or position < pages[index].begin) return error.InvalidSqlExchange;
+        if (self.change_page == null or self.change_page.? != index) {
+            _ = self.change_arena.reset(.free_all);
+            const alloc = self.change_arena.allocator();
+            const bytes = try retained.readPage(alloc, self.artifacts, self.identity, self.descriptor, pages[index].token, requestToken(&self.context));
+            self.changes = try std.json.parseFromSliceLeaky([]const ingestion.Batch.Change, alloc, bytes, .{ .allocate = .alloc_always });
+            if (self.changes.len != pages[index].count) return error.InvalidSqlExchange;
+            self.change_page = index;
+        }
+        var cut = self.cut.*;
+        cut.pending.changes = self.changes;
+        return overlay.recentRow(a, &cut, position - pages[index].begin);
+    }
+    fn deinit(self: *PagedReader) void {
+        self.a.free(self.bloom);
+        for (&self.key_cache) |*slot| slot.arena.deinit();
+        self.change_arena.deinit();
     }
 };
