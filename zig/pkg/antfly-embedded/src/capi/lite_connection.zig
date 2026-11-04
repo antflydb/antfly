@@ -8670,7 +8670,6 @@ test "capi native maintenance named selection opens only its detached table runt
 
 test "capi native foreground namespace refresh retains predecessor inputs only through admission" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
-    const a = std.testing.allocator;
     const io = h.handleLockIo();
     const tables = @import("tables.zig");
     var fixture = try AdmissionFollowupFixture.init("foreground-namespace-input-handoff", 5000, .batch);
@@ -8732,7 +8731,7 @@ test "capi native foreground namespace refresh retains predecessor inputs only t
         opens_before = unbridged.owned_lite_backend.?.native_docstore.?.file.allocator_work.artifact_source_opens;
     }
     var child: ?*anyopaque = null;
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open_table(fixture.id, .fromSlice("active"), &child));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_open_table(fixture.id, .fromSlice("active"), &child));
     defer api.antfly_db_close(child);
     try std.testing.expect(@intFromPtr(owner.current.?) != old_address);
     try std.testing.expectEqual(@as(usize, 0), owner.current.?.refresh_references);
@@ -8755,7 +8754,7 @@ test "capi native foreground namespace refresh retains predecessor inputs only t
         try Peer.advance(&fixture);
     }
     var missing: ?*anyopaque = null;
-    try std.testing.expect(api.antfly_db_open_table(fixture.id, .fromSlice("missing"), &missing) != .ok);
+    try std.testing.expect(tables.antfly_db_open_table(fixture.id, .fromSlice("missing"), &missing) != .ok);
     try std.testing.expect(missing == null);
     try std.testing.expectEqual(@as(usize, 0), owner.current.?.refresh_references);
     try std.testing.expectEqual(@as(usize, 0), owner.retired.items.len);
