@@ -261,9 +261,10 @@ inputs into a padded encoder/classifier forward, subject to the checkpoint's
 Gemma generation batching and needs no generation-batching flag.
 
 That does not mean every concurrent GLiNER HTTP call is automatically merged.
-The typed `/decisions` API takes one input; its qualified span executor runs
-under the model's execution mutex without submitting those separate requests
-to the generic GLiNER microbatch broker. Other GLiNER architectures, artifacts
+The typed `/decisions` API accepts either one `input` or an `inputs` array;
+a live two-input request returns ordered answers for both inputs. Its qualified
+span executor runs under the model's execution mutex without submitting separate
+HTTP requests to the generic GLiNER microbatch broker. Other GLiNER architectures, artifacts
 and backends have their own batching contracts. In particular, the boundary
 extractor's conservative discovery must not be interpreted as this Decide
 checkpoint's eight-input classification contract.
