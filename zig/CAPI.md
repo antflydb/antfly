@@ -725,8 +725,39 @@ storage state rather than from an error's name:
   later flush, rotation or manifest step can fail after the write is visible.
   COMMIT and
   coordinated autocommit include the `transaction_id` receipt; reconcile it and
-  do not replay. Plain autocommit and batch calls have no receipt; after
-  reconciliation, read back the affected keys.
+  do not replay. Plain autocommit and batch calls return an outcome receipt
+  instead (below).
+
+### Outcome receipts
+
+When an autocommit SQL write or `antfly_db_batch*` returns
+`ANTFLY_OUTCOME_UNKNOWN`, call `antfly_last_error_outcome_receipt` on the same
+thread before any other Antfly call. SQL error bodies also carry it as
+`"outcome_receipt"`. Later, `antfly_db_outcome_receipt_status` on any handle for
+the same database answers `ANTFLY_OUTCOME_RECEIPT_APPLIED` or
+`ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED`, or returns `ANTFLY_STALLED` while the
+uncertain commit is not reconciled:
+
+- Lite connections reconcile on their next call; the status query itself enters
+  the connection, so retrying it settles.
+- Directory (LSM) databases settle only after the handle that issued the receipt
+  is closed and the database reopened (a durable WAL record may still be
+  unpublished). A clean close checkpoints and resets the WAL, so such a record
+  then resolves as not applied; after a crash, replay may apply it.
+
+How it works: each database handle owns a writer (a random id and a call
+sequence). Every tracked write commits the internal marker
+`writer -> sequence` atomically with its primary write. After an unknown
+outcome the handle retires that writer, so its marker never moves again;
+equal means applied, lower or absent means not applied. A SQL write to a named
+table commits the marker in that table's own database, and its receipt names
+the table and its durable table id, so status and forget read the database the
+write committed to. If that table has since been dropped, or dropped and
+recreated under the same name, status and forget fail with `ANTFLY_NOT_FOUND`:
+the write's outcome can no longer be read. The
+cost is one small internal key overwrite per exported write. A clean close removes the handle's
+current marker; `antfly_db_outcome_receipt_forget` removes a resolved
+receipt's marker, after which it can no longer be resolved.
 
 While an unknown outcome is unresolved, new statements and calls are refused
 before running, with SQLSTATE 55000 (`ANTFLY_STALLED`): they were not applied,

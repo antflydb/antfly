@@ -690,6 +690,56 @@ test "lite allocator v4 peer certificate validates a rebased cache before reuse"
     try std.testing.expect((try verifier.check()).valid);
 }
 
+test "lite allocator v4 copied cache certifies independently and leaves the donor warm" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "verified-cache-copy.aflite");
+    defer a.free(path);
+    var owner = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer owner.close();
+    owner.allocator_certificate_on_commit = true;
+    owner.incremental_checkpoints = true;
+    try owner.putDocument("seed", "original");
+    try std.testing.expect(try owner.certifyAllocator());
+    var peer = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true, .no_sync = true });
+    defer peer.close();
+    peer.allocator_certificate_on_commit = true;
+    peer.incremental_checkpoints = true;
+    try peer.inheritAllocatorVerification(&owner);
+    try peer.putDocument("peer", "new primary");
+    try std.testing.expect(try peer.certifyAllocator());
+    const donor_ledger = owner.ledger.?;
+    const donor_fingerprint = try donor_ledger.fingerprint();
+    var verifier = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true, .internal_reader = true });
+    defer verifier.close();
+    // An unverified donor never seeds a copy.
+    owner.free_pages_verified = false;
+    try std.testing.expect(!try verifier.copyAllocatorRebaseBase(&owner));
+    owner.free_pages_verified = true;
+    try std.testing.expect(try verifier.copyAllocatorRebaseBase(&owner));
+    try std.testing.expectEqual(@as(u64, 1), verifier.allocator_work.cache_copies);
+    try std.testing.expect(!verifier.free_pages_verified);
+    try std.testing.expect(verifier.ledger.? != donor_ledger);
+    // A warm receiver is never overwritten.
+    try std.testing.expect(!try verifier.copyAllocatorRebaseBase(&owner));
+    const full_loads = verifier.allocator_work.full_loads;
+    try std.testing.expect(try verifier.inheritAllocatorCertificate());
+    try std.testing.expect(verifier.free_pages_verified);
+    try std.testing.expectEqual(full_loads, verifier.allocator_work.full_loads);
+    var independent = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true, .internal_reader = true });
+    defer independent.close();
+    try std.testing.expect(try independent.inheritAllocatorCertificate());
+    try std.testing.expectEqual(try independent.ledger.?.fingerprint(), try verifier.ledger.?.fingerprint());
+    // The donor keeps its own cache, untouched by changes to the copy.
+    try std.testing.expectEqual(donor_ledger, owner.ledger.?);
+    verifier.ledger.?.counts.items[0] ^= 1;
+    try std.testing.expect(!try verifier.inheritAllocatorCertificate());
+    try std.testing.expectEqual(donor_fingerprint, try owner.ledger.?.fingerprint());
+    verifier.ledger.?.counts.items[0] ^= 1;
+    try std.testing.expect((try verifier.check()).valid);
+}
+
 test "lite allocator v4 detached proof follows an unchecked reopened writer" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5133,6 +5183,34 @@ pub const NativeFile = struct {
         return true;
     }
 
+    /// Like takeAllocatorRebaseBase, but copies the donor's ledger so the
+    /// donor keeps its warm cache. Only for a cold receiver: an existing
+    /// cache is never replaced. Grants no authority; the caller must still
+    /// authenticate the rebased copy (inheritAllocatorCertificate).
+    pub fn copyAllocatorRebaseBase(self: *NativeFile, donor: *NativeFile) !bool {
+        if (self.ledger != null or self.free_pages_verified) return false;
+        if (self == donor or !donor.free_pages_verified or donor.ledger == null or
+            !std.meta.eql(self.allocator, donor.allocator) or !std.mem.eql(u8, self.path, donor.path) or
+            !self.header.indexed_reclamation or !donor.header.indexed_reclamation or
+            self.header.page_size != donor.header.page_size or
+            self.activeCheckpoint().commit_sequence < donor.activeCheckpoint().commit_sequence or
+            self.transaction_header != null or donor.transaction_header != null or
+            self.durable_header != null or donor.durable_header != null or
+            self.checkpoint_publication_uncertain or donor.checkpoint_publication_uncertain) return false;
+        if ((try self.file.stat(self.runtime())).inode != (try donor.file.stat(donor.runtime())).inode) return false;
+        const source = donor.ledger.?;
+        if (source.root_page != donor.activeCheckpoint().free_map_root_page or source.digest_cache == null or
+            source.changes.count() != 0 or source.added.items.len != 0 or source.completed.items.len != 0) return false;
+        const state = try self.allocator.create(allocator_v4.State);
+        errdefer self.allocator.destroy(state);
+        state.* = try source.clone(self.allocator);
+        self.invalidateLedger();
+        self.ledger = state;
+        self.allocator_work.cache_copies +|= 1;
+        self.allocator_rebase_header = donor.header;
+        return true;
+    }
+
     /// Prepare reuse against a separately inode-fenced reader, without holding
     /// a caller's foreground publication gate. Publication must still compare
     /// the current inode and both checkpoints before using this proof.
@@ -5518,6 +5596,12 @@ pub const NativeFile = struct {
         return error.ReadOnly;
     }
 
+    /// Delta pages a cached ledger may replay before falling back to a full
+    /// load. Replay reads only the suffix written since the base; the
+    /// fallback reads and rehashes the whole ledger. Large foreground batches
+    /// between maintenance turns routinely exceed a few hundred pages.
+    const max_ledger_rebase_delta_pages = 1024;
+
     fn loadLedger(self: *NativeFile, checkpoint: CheckpointSlot) !*allocator_v4.State {
         return self.loadLedgerWithCancel(checkpoint, self.allocator_cancel_token);
     }
@@ -5542,7 +5626,7 @@ pub const NativeFile = struct {
                 .write = ledgerReadOnlyWrite,
                 .payload_bytes = self.maxPagePayloadBytes(),
                 .cancel_requested = if (cancel) |token| &token.requested else null,
-            }, checkpoint.free_map_root_page, 128) catch |err| switch (err) {
+            }, checkpoint.free_map_root_page, max_ledger_rebase_delta_pages) catch |err| switch (err) {
                 // Unprotected physical anchors may have been reused. An
                 // independent load distinguishes cache ancestry failure from
                 // corruption in the current generation.
