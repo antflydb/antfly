@@ -1,0 +1,93 @@
+{
+  "qualified": false,
+  "runtime_source_commit": "ae7265a9210c7f738c5cb0cb30e5aa1cfbf5a49d",
+  "mode": "Debug",
+  "compiler_sha256": "1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523",
+  "library_sha256": "ee5b6642a7d27e37ea096f551a2bc2a695eb98c92259dfd87bc4bf97fb552733",
+  "original_importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+  "changes": [
+    {
+      "component": "Cold text-index recovery",
+      "before": "Each recovered segment published another snapshot, copying and retaining the growing segment list.",
+      "after": "Collect admitted and ordinary readers and tombstones, then publish one complete initial snapshot. Reader admission consumes readers; data ownership transfers only at publication. Failures close unconsumed readers, staged data and caller-owned tombstones exactly once.",
+      "work_contract": "One snapshot publication for N recovered segments; linear snapshot assembly."
+    },
+    {
+      "component": "Aggregate field statistics",
+      "before": "Iteration over F fields called a named directory lookup for each field, adding quadratic field-name comparisons.",
+      "after": "Use the existing reader-local field ordinal. Named lookup delegates to the same bounds-checked accessor. Native/deferred readers use admitted statistics; contiguous readers preserve section validation.",
+      "work_contract": "Linear field traversal with unchanged statistics and no additional provider reads."
+    }
+  ],
+  "validation": {
+    "persistent_storage": {
+      "source_commit": "ae7265a9210c7f738c5cb0cb30e5aa1cfbf5a49d",
+      "passed": 70,
+      "skipped": 1,
+      "failed": 0,
+      "leaked": 0,
+      "log_sha256": "f04a57c9e4a91b8c242554011b641068af868cba7591f53991287d63d3f98693"
+    },
+    "index_and_segment": {
+      "source_commit": "ae7265a9210c7f738c5cb0cb30e5aa1cfbf5a49d",
+      "passed": 184,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "log_sha256": "65dc784d22ae9c992ea31a7606fd3cb51493b7b1666d383f55d02aeeae967523"
+    },
+    "native_core": {
+      "source_commit": "bba4b1c64503b7f21a2940d48d8c9e6489043110",
+      "passed": 771,
+      "skipped_benchmarks": 5,
+      "failed": 0,
+      "leaked": 0,
+      "backup_checks_passed": 2,
+      "log_sha256": "cc49c4ea43605c9d2c75cb3f69c5560082fe49da37486a7fa5b3b71ca4e76cfa",
+      "scope": "Full native gate after recovery batching, before the subsequent field-statistics accessor change. That change passes persistent, index/segment and integrated API gates on ae7265a921."
+    },
+    "integrated_api": {
+      "source_commit": "ae7265a9210c7f738c5cb0cb30e5aa1cfbf5a49d",
+      "passed": 153,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "build_exit_code": 0,
+      "public_exports": 134,
+      "abi_linkage_smoke": "passed",
+      "build_seconds": 431.3518711249344,
+      "log_sha256": "e48db4d628fb4a4b1d618cebd78c408e4cd64f764491a652212b3bfec35a8087"
+    },
+    "sdk": {
+      "passed": 209,
+      "failed": 0,
+      "seconds": 77.2,
+      "log_sha256": "dd82f7f2f92c0fd72fad89fff91bdb44270b4a2cdc2e58d3638dcbbd6a4f9069"
+    },
+    "regressions": [
+      "One initial publication for 32 recovered segments",
+      "Reopen retains tombstones and raw scoring statistics",
+      "Mixed native-admitted and ordinary readers survive all injected allocation failures",
+      "Ordinal/name statistics match for all 32 fields on native and contiguous readers",
+      "Statistics traversal adds no provider reads; invalid ordinals return absent"
+    ]
+  },
+  "preceding_candidate_failure": {
+    "source_commit": "b0c4777fddb177549f4e5584707d1e94248fb1be",
+    "library_sha256": "0b81b8264ae15e5b9e440d524b6429357c51eed3a17ce3fe4d607bb5895d7b46",
+    "result": "LiteReplayBacklogExceeded",
+    "qualified": false,
+    "seconds": 277.43125862500165,
+    "primary_batches": 45,
+    "profiled_replay_documents": 40058,
+    "namespace_opens": 208,
+    "source_turns": 166,
+    "source_reuses": 156,
+    "allocator_full_loads": 1,
+    "peak_overlapping_native_builds": 8,
+    "scope": "Local diagnostic with metrics and sampling, not a clean throughput comparison. The bounded runtime working set did not materially reduce this mixed-workload reopen count."
+  },
+  "current_seeded_importer": "Running using the exact frozen Debug artifact; outcome pending. No replay-capacity or optimized performance pass is claimed.",
+  "reference_policy": "No reference compilation or execution. Existing artifacts and observations retained. Wolfspider reserved for final qualification. Full factory belongs to Beads.",
+  "publication_status": "Two HTTPS pushes and one SSH push were rejected by GitHub server errors; retry pending. Remote head last confirmed at 26439e67a0."
+}
