@@ -47,6 +47,7 @@ pub const CancelHooks = struct {
     context: *anyopaque,
     register: *const fn (*anyopaque, *Session) anyerror!void,
     unregister: *const fn (*anyopaque, *Session) void,
+    rekey: ?*const fn (*anyopaque, *Session) anyerror!void = null,
     cancel: *const fn (*anyopaque, i32, i32) void,
 };
 
@@ -154,6 +155,7 @@ pub const Session = struct {
     timeout_transaction: ?struct { before: ?u32, committed: ?u32, namespace_before: ?commands.SearchPath, namespace_committed: ?commands.SearchPath, application_before: commands.ApplicationName, application_committed: commands.ApplicationName, lake_before: commands.ReadRequirements, lake_committed: commands.ReadRequirements } = null,
     savepoints: std.ArrayList(struct { name: []const u8, epoch: u64, timeout: ?u32, committed_timeout: ?u32, namespace: ?commands.SearchPath, committed_namespace: ?commands.SearchPath, application: commands.ApplicationName, committed_application: commands.ApplicationName, lake: commands.ReadRequirements, committed_lake: commands.ReadRequirements, catalog: ?settings_catalog.OverlayState.Savepoint = null }) = .empty,
     skip_until_sync: bool = false,
+    notification_backlog: bool = false,
     backend_pid: i32 = 0,
     cancel_key: i32 = 0,
     cancel_requested: std.atomic.Value(bool) = .init(false),
@@ -231,7 +233,7 @@ pub const Session = struct {
         if (!started) return;
         self.setDeadline(self.limits.idle_timeout_ms);
         while (true) {
-            const tag = self.reader.takeByte() catch |err| switch (err) {
+            const tag = self.readTag() catch |err| switch (err) {
                 error.EndOfStream => return,
                 else => return err,
             };
@@ -386,6 +388,30 @@ pub const Session = struct {
                     if (database) |value| self.database = try self.alloc.dupe(u8, value);
                     try self.captureLoginDefaults();
                     if (self.hooks) |hooks| try hooks.register(hooks.context, self);
+                    if (self.source.vtable.start_connection) |start_connection| {
+                        if (self.backend_pid <= 0) {
+                            var pid_bytes: [4]u8 = undefined;
+                            try self.io.randomSecure(&pid_bytes);
+                            self.backend_pid = @intCast(1 + std.mem.readInt(u32, &pid_bytes, .little) % std.math.maxInt(i32));
+                        }
+                        var accepted = false;
+                        for (0..8) |_| {
+                            start_connection(self.source.context, self.alloc, self.identity.?, self.request("", &.{}, &.{})) catch |err| {
+                                if (err != error.SqlBackendPidInUse) return err;
+                                if (self.hooks) |hooks| {
+                                    try (hooks.rekey orelse return err)(hooks.context, self);
+                                } else {
+                                    var pid_bytes: [4]u8 = undefined;
+                                    try self.io.randomSecure(&pid_bytes);
+                                    self.backend_pid = @intCast(1 + std.mem.readInt(u32, &pid_bytes, .little) % std.math.maxInt(i32));
+                                }
+                                continue;
+                            };
+                            accepted = true;
+                            break;
+                        }
+                        if (!accepted) return error.SqlBackendPidInUse;
+                    }
                     try self.message('R', &.{ 0, 0, 0, 0 });
                     if (self.identity.?.renewable) {
                         try self.parameterStatus("antfly_trusted_principal_refresh", "1");
@@ -430,8 +456,70 @@ pub const Session = struct {
         return if (self.request_namespace != null) self.request_search_path else self.namespace_setting;
     }
 
+    fn notificationsEnabled(self: *const Session) bool {
+        if (self.status != .idle or self.identity == null or self.source.vtable.notifications == null) return false;
+        if (self.source.vtable.has_notifications) |active| return active(self.source.context, self.identity.?);
+        return true;
+    }
+    fn deliverNotifications(self: *Session) !void {
+        if (!self.notificationsEnabled()) return;
+        const poll = self.source.vtable.notifications.?;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        self.notification_backlog = false;
+        // An idle CancelRequest must not poison subsequent notification ticks.
+        self.cancel_requested.store(false, .release);
+        const page = poll(self.source.context, a, self.identity.?, self.request("", &.{}, &.{}), .{ .poll = 128 }) catch |err| switch (err) {
+            error.SqlConnectionBusy, error.CatalogPublicationProofPending, error.MetadataMutationOutcomeUnknown, error.SqlWriteCapacityUnavailable, error.DeadlineExceeded, error.Canceled => return,
+            else => return err,
+        };
+        self.notification_backlog = page.pending and !page.waiting;
+        if (!page.subscribed or @import("antfly_local_sources").sql_ast.notifications.Cursor.order(page.cursor, page.acknowledged) != .gt) return;
+        for (page.events) |event| {
+            const payload = try a.alloc(u8, 4 + event.channel.len + 1 + event.payload.len + 1);
+            std.mem.writeInt(i32, payload[0..4], event.sender_pid, .big);
+            @memcpy(payload[4..][0..event.channel.len], event.channel);
+            payload[4 + event.channel.len] = 0;
+            @memcpy(payload[5 + event.channel.len ..][0..event.payload.len], event.payload);
+            payload[payload.len - 1] = 0;
+            try self.message('A', payload);
+        }
+        // A failed or cancelled flush leaves the offered prefix unacknowledged.
+        try self.writer.flush();
+        _ = try poll(self.source.context, a, self.identity.?, self.request("", &.{}, &.{}), .{ .acknowledge = page.cursor });
+    }
+    fn notificationTick(io: std.Io, backlog: bool) std.Io.Cancelable!void {
+        try std.Io.sleep(io, .fromMilliseconds(if (backlog) 1 else 100), .awake);
+    }
+    fn nextTag(reader: *std.Io.Reader) anyerror!u8 {
+        return reader.takeByte();
+    }
+    fn readTag(self: *Session) !u8 {
+        if (!self.notificationsEnabled()) return self.reader.takeByte();
+        try self.deliverNotifications();
+        if (!self.notificationsEnabled()) return self.reader.takeByte();
+        const Outcome = union(enum) { tag: anyerror!u8, tick: std.Io.Cancelable!void };
+        var outcomes: [2]Outcome = undefined;
+        var select = std.Io.Select(Outcome).init(self.io, &outcomes);
+        defer select.cancelDiscard();
+        // Keep one reader alive across timer ticks. Cancelling and restarting
+        // it can discard a byte that completed concurrently with the timer.
+        try select.concurrent(.tag, nextTag, .{self.reader});
+        try select.concurrent(.tick, notificationTick, .{ self.io, self.notification_backlog });
+        while (true) switch (try select.await()) {
+            .tag => |result| return result,
+            .tick => |result| {
+                try result;
+                try self.deliverNotifications();
+                if (self.notificationsEnabled()) try select.concurrent(.tick, notificationTick, .{ self.io, self.notification_backlog });
+            },
+        };
+    }
+
     fn request(self: *Session, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type) backend.Request {
         return .{
+            .backend_pid = self.backend_pid,
             .statement = statement,
             .scratch_allocator = self.alloc,
             .parameters = parameters,
@@ -976,6 +1064,12 @@ pub const Session = struct {
     fn executeDiscardAll(self: *Session) !backend.Result {
         if (self.status == .failed) return error.InFailedSqlTransaction;
         if (self.status != .idle) return error.ActiveSqlTransaction;
+        if (self.source.vtable.discard_connection) |discard| {
+            self.cancel_requested.store(false, .release);
+            self.executing.store(true, .release);
+            defer self.executing.store(false, .release);
+            try discard(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, self.request("DISCARD ALL", &.{}, &.{}));
+        }
         _ = try self.executeResetAll();
         // The current extended-protocol portal may own the statement and
         // result being serialized. Release resources only after CommandComplete.

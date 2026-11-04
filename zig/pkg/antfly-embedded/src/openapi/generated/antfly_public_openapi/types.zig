@@ -14070,6 +14070,83 @@ pub const SQLNotice = struct {
     message: []const u8,
 };
 
+pub const SQLNotification = struct {
+    channel: []const u8,
+    /// UTF-8 payload, fewer than 8000 bytes.
+    payload: []const u8,
+    /// Sender backend identifier; equals pgwire BackendKeyData for wire clients.
+    sender_pid: i32,
+};
+
+pub const SQLNotificationPage = struct {
+    notifications: []const SQLNotification,
+    /// Opaque connection-bound acknowledgement cursor for this page.
+    cursor: ?[]const u8 = null,
+    /// More queue work remains, or a committed notification is waiting for its visibility barrier. Poll again without replaying any SQL.
+    pending: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "notifications", "notifications", false },
+        .{ "cursor", "cursor", true },
+        .{ "pending", "pending", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("notifications");
+        try jw.write(self.notifications);
+        if (self.cursor) |value| {
+            try jw.objectField("cursor");
+            try jw.write(value);
+        }
+        try jw.objectField("pending");
+        try jw.write(self.pending);
+        try jw.endObject();
+    }
+};
+
+pub const SQLNotificationPollRequest = struct {
+    /// Cursor from a previously received page. Acknowledge only after consuming every notification in that page; omitted acknowledgements replay the same unconsumed prefix.
+    acknowledge: ?[]const u8 = null,
+    limit: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "acknowledge", "acknowledge", true },
+        .{ "limit", "limit", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.acknowledge) |value| {
+            try jw.objectField("acknowledge");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint. Bytea arguments are PostgreSQL bytea input strings; use hex text (a backslash followed by x and hexadecimal octets) for arbitrary binary data. SQL NULL remains a null cell.
 pub const SQLParameterDescriptor = struct {
     type: SQLColumnType,

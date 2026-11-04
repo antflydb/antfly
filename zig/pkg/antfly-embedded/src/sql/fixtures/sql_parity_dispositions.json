@@ -4709,6 +4709,33 @@
       ],
       "cwd": "zig",
       "timeout_seconds": 1800
+    },
+    "sql-original-notifications-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-notifications-test",
+        "antfly-sql-notification-journal-test",
+        "antfly-sql-notification-storage-test",
+        "antfly-sql-notification-decoder-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-original-notifications-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/check_sql_notifications_postgres.py"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -6693,18 +6720,54 @@
     },
     {
       "id": "sql-0126",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original executes through authenticated public SQL connections with native command ownership. The mounted campaign proves transactional registration, ordered and deduplicated delivery, savepoint rollback, aborted transactions, HTTP page replay/acknowledgement, idle pgwire delivery with the advertised sender PID, DISCARD and complete cold recovery. The same native Debug gate verifies bounded queue admission and reclamation, WAL/snapshot integrity, decoder floors and failed socket flushes. PostgreSQL 18 independently qualifies ordering, lifetime, payload and PREPARE semantics.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_notification_integration_test.zig",
+          "test": "mounted SQL original notifications preserve transactional registration ordered delivery savepoints replay and cold recovery",
+          "gate": "sql-original-notifications-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_notification_integration_test.zig",
+          "test": "mounted SQL original notifications preserve transactional registration ordered delivery savepoints replay and cold recovery",
+          "gate": "sql-original-notifications-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0127",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original executes through authenticated public SQL connections with native command ownership. The mounted campaign proves transactional registration, ordered and deduplicated delivery, savepoint rollback, aborted transactions, HTTP page replay/acknowledgement, idle pgwire delivery with the advertised sender PID, DISCARD and complete cold recovery. The same native Debug gate verifies bounded queue admission and reclamation, WAL/snapshot integrity, decoder floors and failed socket flushes. PostgreSQL 18 independently qualifies ordering, lifetime, payload and PREPARE semantics.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_notification_integration_test.zig",
+          "test": "mounted SQL original notifications preserve transactional registration ordered delivery savepoints replay and cold recovery",
+          "gate": "sql-original-notifications-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_notification_integration_test.zig",
+          "test": "mounted SQL original notifications preserve transactional registration ordered delivery savepoints replay and cold recovery",
+          "gate": "sql-original-notifications-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0128",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original executes through authenticated public SQL connections with native command ownership. The mounted campaign proves transactional registration, ordered and deduplicated delivery, savepoint rollback, aborted transactions, HTTP page replay/acknowledgement, idle pgwire delivery with the advertised sender PID, DISCARD and complete cold recovery. The same native Debug gate verifies bounded queue admission and reclamation, WAL/snapshot integrity, decoder floors and failed socket flushes. PostgreSQL 18 independently qualifies ordering, lifetime, payload and PREPARE semantics.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_notification_integration_test.zig",
+          "test": "mounted SQL original notifications preserve transactional registration ordered delivery savepoints replay and cold recovery",
+          "gate": "sql-original-notifications-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_notification_integration_test.zig",
+          "test": "mounted SQL original notifications preserve transactional registration ordered delivery savepoints replay and cold recovery",
+          "gate": "sql-original-notifications-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0129",

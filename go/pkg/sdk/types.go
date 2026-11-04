@@ -47,6 +47,9 @@ type (
 	ReadRequirements            = oapi.ReadRequirements
 	ReadRequirementsVisibility  = oapi.ReadRequirementsVisibility
 	SQLRequest                  = oapi.SQLRequest
+	SQLNotification             = oapi.SQLNotification
+	SQLNotificationPage         = oapi.SQLNotificationPage
+	SQLNotificationPollRequest  = oapi.SQLNotificationPollRequest
 	SQLPrepareRequest           = oapi.SQLPrepareRequest
 	SQLPreparedExecutionRequest = oapi.SQLPreparedExecutionRequest
 	SQLPreparedResponse         = oapi.SQLPreparedResponse

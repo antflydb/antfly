@@ -144,7 +144,7 @@ pub const Registry = struct {
             if (!std.mem.eql(u8, &record.identity.metadata_incarnation, &std.fmt.bytesToHex(anchor.incarnation, .lower))) return error.CatalogGenerationChanged;
             var nonce: [16]u8 = undefined;
             try self.server.embedding_provider_runtime.io.randomSecure(&nonce);
-            const request: registry.Mutation = .{ .admission = .{ .nonce = nonce, .head = anchor.head }, .incarnation = anchor.incarnation, .actor = if (action == .commit or action == .abort) self.actor else .{ .session_user = .bootstrap, .credential = "" }, .native_admin = self.native_admin, .standalone = anchor.standalone, .database_id = self.database_id, .operation = .{ .advance = .{ .owner = owner, .expected_revision = record.revision, .action = action } } };
+            const request: registry.Mutation = .{ .notification_control = if (record.identity.notification_plan != null) true else null, .admission = .{ .nonce = nonce, .head = anchor.head }, .incarnation = anchor.incarnation, .actor = if (action == .commit or action == .abort) self.actor else .{ .session_user = .bootstrap, .credential = "" }, .native_admin = self.native_admin, .standalone = anchor.standalone, .database_id = self.database_id, .operation = .{ .advance = .{ .owner = owner, .expected_revision = record.revision, .action = action } } };
             self.mutate(a, request) catch |err| {
                 if (err != error.SequenceAdmissionExpired or attempt != 0) return err;
                 // Refresh only a proven exhausted admission window. Reusing
@@ -276,7 +276,7 @@ pub const Registry = struct {
         if (cut.receipts.len == 0) return;
         var nonce: [16]u8 = undefined;
         try self.server.embedding_provider_runtime.io.randomSecure(&nonce);
-        try self.mutate(a, .{ .admission = .{ .nonce = nonce, .head = cut.head }, .incarnation = cut.incarnation, .actor = .{ .session_user = .bootstrap, .credential = "" }, .standalone = cut.standalone, .database_id = identity.database_id, .operation = .{ .acknowledge_receipt = .{ .owner = try identity.owner(a), .txn_id = identity.txn_id } } });
+        try self.mutate(a, .{ .notification_control = if (identity.notification_plan != null) true else null, .admission = .{ .nonce = nonce, .head = cut.head }, .incarnation = cut.incarnation, .actor = .{ .session_user = .bootstrap, .credential = "" }, .standalone = cut.standalone, .database_id = identity.database_id, .operation = .{ .acknowledge_receipt = .{ .owner = try identity.owner(a), .txn_id = identity.txn_id } } });
     }
 };
 
@@ -543,7 +543,13 @@ pub fn commitScoped(server: *http.ApiHttpServer, user: ?http.AuthenticatedIdenti
     const cut = try source.snapshot(a, .{ .operation = operation_id });
     if (cut.standalone != frame.standalone or !std.mem.eql(u8, &cut.incarnation, &frame.backend.incarnation)) return error.CatalogGenerationChanged;
     const now = @import("antfly_platform").time.realtimeNs();
+    const notification_plan: ?local.sql_ast.notifications.Plan = if (state.metadata.notifications.commands.items.len == 0) null else notification: {
+        var connection = try @import("sql_connections.zig").loadWithCommand(server.txn_sessions.durable.?, a, connection_id, http.transactionPrincipal(user) orelse "", server.localSessionNodeId(), now / std.time.ns_per_ms, context.sql_command_fence);
+        defer connection.deinit();
+        break :notification .{ .connection = connection_id, .generation = connection.value.generation, .sender_pid = connection.value.notificationPid(), .commands = state.metadata.notifications.commands.items, .discard = abort };
+    };
     const identity: registry.Identity = .{
+        .notification_plan = notification_plan,
         .kind = .session_commit,
         .lock_scope = .{ .backend = frame.backend, .command = frame.command },
         .commit_sync_level = if (info.sync_level == .propose) .write else info.sync_level,
@@ -720,6 +726,7 @@ pub fn execute(root: *execution.Adapter, session: *sql_session.Session, coordina
     var state = (try server.txn_sessions.getSqlState(server.alloc, id)) orelse return error.SqlTransactionNotActive;
     defer state.deinit(server.alloc);
     if (state.metadata.accepted_lake_reads) return error.UnsupportedSqlExecution;
+    if (state.metadata.notifications.commands.items.len != 0) return error.UnsupportedSqlExecution;
     try root.validateAcceptedSerializable(server.alloc, id);
     var request = try server.txn_sessions.cloneCommitRequest(server.alloc, id, null);
     defer if (request) |*value| value.deinit(server.alloc);

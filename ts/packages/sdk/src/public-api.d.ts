@@ -918,6 +918,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/sql/connections/{connection_id}/notifications": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Receive and acknowledge committed SQL notifications
+         * @description Poll a connection's database-scoped LISTEN registrations. This operation
+         *     never evaluates or retries SQL. Delivery is deferred while the connection
+         *     has an active or uncertain transaction. Pages contain at most 128 events
+         *     and 64 KiB of logical channel/payload bytes. A lost response is replayable
+         *     until its cursor is acknowledged. Queue capacity is reserved before the
+         *     sender's irreversible commit decision. Connection close and DISCARD ALL
+         *     retire registrations through the same durable source lifecycle.
+         */
+        post: operations["pollSQLNotifications"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/sql/prepared": {
         parameters: {
             query?: never;
@@ -7249,6 +7277,29 @@ export interface components {
             session_id?: string;
             /** @description Durable idle HTTP connection. Its scope and settings are inherited; active transaction IDs cannot be bypassed by omitting session_id. DISCARD ALL requires this identity and is rejected while a transaction is active or uncertain. */
             connection_id?: string;
+        };
+        SQLNotification: {
+            channel: string;
+            /** @description UTF-8 payload, fewer than 8000 bytes. */
+            payload: string;
+            /**
+             * Format: int32
+             * @description Sender backend identifier; equals pgwire BackendKeyData for wire clients.
+             */
+            sender_pid: number;
+        };
+        SQLNotificationPollRequest: {
+            /** @description Cursor from a previously received page. Acknowledge only after consuming every notification in that page; omitted acknowledgements replay the same unconsumed prefix. */
+            acknowledge?: string;
+            /** @default 128 */
+            limit?: number;
+        };
+        SQLNotificationPage: {
+            notifications: components["schemas"]["SQLNotification"][];
+            /** @description Opaque connection-bound acknowledgement cursor for this page. */
+            cursor?: string;
+            /** @description More queue work remains, or a committed notification is waiting for its visibility barrier. Poll again without replaying any SQL. */
+            pending: boolean;
         };
         /**
          * @description Authoritative native SQL session state after the statement. Failed sessions require ROLLBACK or ROLLBACK TO SAVEPOINT; uncertain commit outcomes must be reconciled by transaction_id, never replayed.
@@ -33406,6 +33457,41 @@ export interface operations {
                 };
             };
             /** @description Connection close rejected */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
+    pollSQLNotifications: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SQLNotificationPollRequest"];
+            };
+        };
+        responses: {
+            /** @description Bounded notification page; an active transaction yields no events. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLNotificationPage"];
+                };
+            };
+            /** @description Notification poll rejected; no SQL was executed. */
             default: {
                 headers: {
                     [name: string]: unknown;

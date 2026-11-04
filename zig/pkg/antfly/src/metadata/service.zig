@@ -3730,6 +3730,11 @@ fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.Transitio
 }
 
 fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    const notifications = switch (command) {
+        .apply_sql_lock_scope, .apply_sql_prepared_transaction => |bytes| @import("schema_reader_wire.zig").requiresSqlNotifications(bytes),
+        else => false,
+    };
+    if (notifications) return metadata_topology_protocol.sql_notifications_version;
     if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresSqlCatalogJournal(command.apply_system_catalog)) return metadata_topology_protocol.sql_catalog_journal_version;
     // This native home participant has a newer decoder than command fences.
     if (command == .apply_sql_prepared_transaction) return metadata_topology_protocol.sql_prepared_lock_handoff_version;

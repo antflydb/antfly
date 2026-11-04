@@ -27,6 +27,10 @@ pub const ttl_ms: u64 = 60 * 60 * 1000;
 pub const State = enum { idle, beginning, active, uncertain };
 
 pub const Record = struct {
+    wire_epoch: ?[16]u8 = null,
+    notification_pid: ?i32 = null,
+    notification_listen_seen: bool = false,
+
     id: [32]u8,
     principal: []const u8,
     owner_node_id: u64,
@@ -45,7 +49,13 @@ pub const Record = struct {
     statement_timeout_ms: ?u32 = null,
     lookup_path: ?@import("../pgwire/search_path.zig").Path = null,
 
+    pub fn notificationPid(self: Record) i32 {
+        return self.notification_pid orelse @as(i32, @intCast(1 + std.hash.Wyhash.hash(0, &self.id) % std.math.maxInt(i32)));
+    }
+
     pub fn validate(self: Record) !void {
+        if (self.wire_epoch) |epoch| if (std.mem.allEqual(u8, &epoch, 0)) return error.InvalidSqlConnection;
+        if (self.notification_pid) |pid| if (pid <= 0) return error.InvalidSqlConnection;
         try self.sequence_state.validate();
         if (self.lookup_path) |path| try path.validate();
         // Node zero is the standalone-local owner sentinel when no session

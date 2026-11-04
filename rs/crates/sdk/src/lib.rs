@@ -52,6 +52,16 @@ fn sql_catalog_recovery_preserves_unknown_receipts_and_exact_integer_strings() {
     assert_eq!(serde_json::to_value(failure).unwrap()["code"], "42501");
 }
 
+#[test]
+fn sql_notifications_preserve_opaque_cursors_and_sender_identity() {
+    let body = serde_json::json!({
+        "notifications": [{"channel": "events", "payload": "updated", "sender_pid": 42}],
+        "cursor": "ffffffffffffffff007f", "pending": false
+    });
+    let page: types::SqlNotificationPage = serde_json::from_value(body.clone()).unwrap();
+    assert_eq!(serde_json::to_value(page).unwrap(), body);
+}
+
 /// A successful metadata mutation. `Committed` is not a failed write: observe
 /// table/schema status instead of replaying the mutation. ResponseValue retains
 /// the HTTP status and headers, including the schema ETag.

@@ -375,6 +375,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-native-reporter-recovery-test", "Verify bounded native startup retirement, signed profiles, snapshots and cold recovery")
         .dependOn(&native_reporter_recovery_run.step);
     const media_status_step = b.step("antfly-media-status-test", "Verify output counters and rolling runtime status profiles");
+    const sql_notification_decoder_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{"SQL notification decoder"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_notification_decoder_run = addFilteredTestRunArtifact(b, sql_notification_decoder_tests);
+    sql_notification_decoder_run.addArg("--require-no-skips");
+    b.step("antfly-sql-notification-decoder-test", "Qualify notification capability barriers without parsing SQL payloads").dependOn(&sql_notification_decoder_run.step);
+    const sql_notification_storage_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{"SQL prepared transaction notification queue"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_notification_storage_run = addFilteredTestRunArtifact(b, sql_notification_storage_tests);
+    sql_notification_storage_run.addArg("--require-no-skips");
+    b.step("antfly-sql-notification-storage-test", "Qualify notification WAL atomicity and installed metadata snapshots").dependOn(&sql_notification_storage_run.step);
     const sql_command_fence_native_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "SQL command fence", "sequence catalog allocator commands" },

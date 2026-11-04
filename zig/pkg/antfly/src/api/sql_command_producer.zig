@@ -41,6 +41,7 @@ pub const Ticket = struct {
     }
 };
 pub const Record = struct {
+    notification_generation: ?u64 = null,
     revision: u64 = 1,
     registration: authority.scopes.Registration,
     actor: authority.prepared.Actor,
@@ -123,8 +124,18 @@ pub const Record = struct {
             else => {},
         }
     }
+    pub fn jsonStringify(self: Record, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Record).@"struct".field_names) |field| {
+            if (!(comptime std.mem.eql(u8, field, "notification_generation")) or self.notification_generation != null) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
     fn controlRequest(self: Record, head: u64, nonce: Id, operation: @FieldType(authority.Request, "operation")) authority.Request {
-        return .{ .admission = .{ .head = head, .nonce = nonce }, .incarnation = self.registration.lease.backend.incarnation, .standalone = self.registration.standalone, .database = self.registration.lease.database, .actor = self.actor, .backend = self.registration.lease.backend, .operation = operation };
+        return .{ .notification_generation = if (operation == .finish) self.notification_generation else null, .admission = .{ .head = head, .nonce = nonce }, .incarnation = self.registration.lease.backend.incarnation, .standalone = self.registration.standalone, .database = self.registration.lease.database, .actor = self.actor, .backend = self.registration.lease.backend, .operation = operation };
     }
     fn fence(self: Record) authority.scopes.CommandFence {
         return .{ .group = self.registration.group, .backend = self.registration.lease.backend, .command = self.ticket.?.command, .database = self.registration.lease.database, .principal = self.registration.lease.principal, .standalone = self.registration.standalone };
@@ -211,6 +222,7 @@ fn stageControlTxn(a: A, txn: anytype, plan: ControlPlan, connection: [32]u8, sc
         const effect: authority.scopes.ledger.Effect = .{ .backend = prior.registration.lease.backend, .sequence = plan.next_effect, .nonce = plan.nonce, .action = .{ .control = action } };
         try effect.validate();
         var next = prior;
+        if (scope == .idle and attached.value.notification_pid != null) next.notification_generation = std.math.add(u64, attached.value.generation, 1) catch return error.SqlProgramLimitExceeded;
         next.control_effect = effect;
         next.failure_control = if (plan.failure) scope.transaction else null;
         next.pending = next.controlRequest(plan.head, plan.nonce, .{ .effect = .{ .command = prior.ticket.?.command, .effect = effect } });
@@ -872,6 +884,7 @@ pub fn advance(store: *transactions.DurableSessionStore, a: A, principal: []cons
                     return;
                 }
                 next.phase = .idle;
+                next.notification_generation = null;
                 next.body_skipped = false;
                 next.ticket = null;
                 next.pending = null;
@@ -932,6 +945,31 @@ pub fn scanWork(store: *transactions.DurableSessionStore, a: A, after: ?[32]u8, 
 
 /// Both standalone and routed metadata use the existing authenticated catalog
 /// transport. It binds the frozen request body; this adapter never evaluates SQL.
+/// Finish only an already persisted command. This grants no execution permit.
+pub fn settleCompletion(server: *@import("http_server.zig").ApiHttpServer, a: A, context: @import("antfly_local_sources").api_operation.RequestContext, connection: [32]u8, principal: []const u8) !?std.json.Parsed(Record) {
+    const store = server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
+    var native: NativePort = .{ .server = server, .context = context };
+    const instance = try server.sql_connection_admission.executionInstance(server.embedding_provider_runtime.io);
+    for (0..16) |_| {
+        try context.ensureActive();
+        var source = (try load(store, a, connection)) orelse return null;
+        if (!std.mem.eql(u8, source.value.principal, principal)) {
+            source.deinit();
+            return error.Forbidden;
+        }
+        if (source.value.phase != .finishing or source.value.recovery) return source;
+        defer source.deinit();
+        var nonce: [16]u8 = undefined;
+        try server.embedding_provider_runtime.io.randomSecure(&nonce);
+        // Resume only persisted completion control, never a SQL permit.
+        advance(store, a, principal, source.value, instance, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, nonce, native.port()) catch |err| switch (err) {
+            error.SqlConnectionChanged => {},
+            else => return err,
+        };
+    }
+    return error.SqlConnectionBusy;
+}
+
 pub const NativePort = struct {
     server: *@import("http_server.zig").ApiHttpServer,
     context: @import("antfly_local_sources").api_operation.RequestContext,
@@ -1017,6 +1055,20 @@ pub fn advanceConnection(server: *@import("http_server.zig").ApiHttpServer, a: A
     var native: NativePort = .{ .server = server, .context = .{ .deadline_ns = time.monotonicNs() +| std.time.ns_per_s, .cancellation = cancellation } };
     const now_ms = time.realtimeNs() / std.time.ns_per_ms;
     const due = prior.registration.lease.expires_at_ms > now_ms and prior.registration.lease.expires_at_ms - now_ms <= renew_before_ms;
+    if (!prior.recovery and (due or !std.mem.eql(u8, &prior.instance, &instance))) {
+        var connection = @import("sql_connections.zig").load(store, a, connection_id, prior.principal, prior.registration.lease.node, 0) catch |err| switch (err) {
+            error.SqlConnectionNotFound => null,
+            else => return err,
+        };
+        defer if (connection) |*value| value.deinit();
+        if (connection) |value| if (value.value.wire_epoch) |epoch| {
+            if (!std.mem.eql(u8, &epoch, &instance)) {
+                try requestRecovery(store, prior.principal, prior);
+                return;
+            }
+            if (prior.phase == .idle) try @import("sql_connections.zig").keepWireAlive(store, a, connection_id, prior.principal, prior.registration.lease.node, instance, now_ms);
+        };
+    }
     const live: ?Liveness = if (!due or !std.mem.eql(u8, &prior.instance, &instance) or prior.recovery or (prior.pending != null and prior.pending.?.operation == .renew)) null else switch (prior.phase) {
         .executing => if (try server.sql_connection_admission.executing(io, .init(prior.registration.connection, prior.principal), prior.ticket.?.command)) .{ .command = prior.ticket.?.command } else null,
         .finishing => .control,

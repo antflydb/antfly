@@ -762,7 +762,10 @@ pub const EffectBlock = struct {
     recursive: bool = false,
 };
 
+pub const notifications = @import("notification.zig");
+
 pub const Statement = union(enum) {
+    notification: notifications.Command,
     effect_block: EffectBlock,
     /// Read plan plus output contract. Ordinary execute must never silently
     /// expose this as SELECT; the COPY-capable stream owns protocol framing.
@@ -797,7 +800,7 @@ pub const Statement = union(enum) {
         return switch (self) {
             .select => |query| query.locking != null,
             .explain, .copy_to, .copy_from => false,
-            .lock_table => true,
+            .lock_table, .notification => true,
             .effect_block, .call, .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints, .set_transaction, .prepared_transaction => true,
         };
     }

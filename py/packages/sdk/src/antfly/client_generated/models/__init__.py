@@ -2348,6 +2348,9 @@ from .sql_named_type_layout import SQLNamedTypeLayout
 from .sql_named_type_layout_kind import SQLNamedTypeLayoutKind
 from .sql_named_type_reference import SQLNamedTypeReference
 from .sql_notice import SQLNotice
+from .sql_notification import SQLNotification
+from .sql_notification_page import SQLNotificationPage
+from .sql_notification_poll_request import SQLNotificationPollRequest
 from .sql_numeric_modifier import SQLNumericModifier
 from .sql_parameter_descriptor import SQLParameterDescriptor
 from .sql_prepare_request import SQLPrepareRequest
@@ -4694,6 +4697,9 @@ __all__ = (
     "SQLNamedTypeLayoutKind",
     "SQLNamedTypeReference",
     "SQLNotice",
+    "SQLNotification",
+    "SQLNotificationPage",
+    "SQLNotificationPollRequest",
     "SQLNumericModifier",
     "SQLParameterDescriptor",
     "SQLPreparedExecutionRequest",

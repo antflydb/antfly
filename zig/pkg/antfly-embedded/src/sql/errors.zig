@@ -138,6 +138,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlPreparedTransactionCapacityExceeded => .{ .code = "53200", .message = "The prepared transaction or durable delivery capacity is exhausted.", .hint = "Resolve existing prepared transactions or restore their API receipt owners." },
         error.InvalidPreparedTransactionPhase, error.ExternalTransactionDecisionChanged => .{ .code = "40003", .message = "The prepared transaction decision must be reconciled.", .hint = "Do not replay the original mutations or reuse this GID while reconciling its recorded decision." },
         error.SqlPreparedNotFound => .{ .code = "26000", .message = "The prepared resource is unknown, expired or inaccessible.", .retryable = false },
+        error.SqlBackendPidInUse => .{ .code = "55006", .message = "The SQL backend notification identity is already reserved.", .hint = "Reconnect before using notifications.", .retryable = false },
         error.SqlConnectionNotFound => .{ .code = "08003", .message = "The SQL connection is unknown, expired or inaccessible.", .retryable = false },
         error.SqlConnectionWrongOwner => .{ .code = "55000", .message = "The SQL connection belongs to another API node.", .hint = "Send the request to the owner_node_id returned when the connection was opened.", .retryable = false },
         error.SqlConnectionExecutionBusy => .{ .code = "55006", .message = "This SQL connection is already executing a request.", .hint = "Wait for the current request to finish before submitting another command on this connection.", .retryable = true },

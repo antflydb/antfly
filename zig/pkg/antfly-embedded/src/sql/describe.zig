@@ -433,6 +433,11 @@ pub fn bindInternal(allocator: std.mem.Allocator, backend: catalog.Backend, comp
     if (compiled.statement == .select and compiled.statement.select.locking != null) return @import("locking.zig").bind(allocator, backend, compiled, explicit_parameter_types);
     if (compiled.uses_row_locks and compiled.statement != .explain) return error.UnsupportedSqlExecution;
     if (compiled.statement == .lock_table) return @import("locking.zig").bindTables(allocator, backend, compiled.statement.lock_table);
+    if (compiled.statement == .notification) {
+        if (backend.notification_provider == null) return error.UnsupportedSqlExecution;
+        try compiled.statement.notification.validate();
+        return .{ .table = null, .action = .read_write, .columns = &.{}, .parameter_types = &.{}, .json_literals = .empty };
+    }
     if (compiled.statement == .copy_to) {
         const read = try copyRead(allocator, backend, compiled);
         return bindInternal(allocator, read.binding_backend, &read.compiled, explicit_parameter_types);

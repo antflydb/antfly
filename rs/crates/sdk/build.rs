@@ -74,6 +74,7 @@ fn expand_sql_default_error_responses(spec: &mut serde_yaml::Value) {
                 "executePreparedSQL",
                 "closePreparedSQL",
                 "getSQLCatalogOperation",
+                "pollSQLNotifications",
             ]
             .contains(&id)
             {

@@ -30,7 +30,13 @@ NDJSON_HEADER = 'headers["Content-Type"] = "application/x-ndjson"'
 RELATIONAL_QUERY = Path("api/data_operations/query_relational_rows.py")
 SQL_OPERATIONS = [
     Path(f"api/data_operations/{operation}.py")
-    for operation in ("execute_sql", "prepare_sql", "execute_prepared_sql", "close_prepared_sql")
+    for operation in (
+        "execute_sql",
+        "prepare_sql",
+        "execute_prepared_sql",
+        "close_prepared_sql",
+        "poll_sql_notifications",
+    )
 ]
 EMBED_REQUEST = Path("models/inference_embed_request.py")
 NDJSON_RESPONSE = "response_200 = cast(str, response.content)"
@@ -162,15 +168,19 @@ def fix_generated_client(root: Path) -> None:
     for operation in SQL_OPERATIONS:
         path = root / operation
         source = path.read_text(encoding="utf-8")
+        limit = " max_response_bytes=1 << 20," if operation.stem == "poll_sql_notifications" else ""
         for original, replacement in (
             (
                 "from ...client import",
                 "from ....sql_transport import sql_request, sql_request_async\nfrom ...client import",
             ),
-            ("response = client.get_httpx_client().request(", "response = sql_request(client.get_httpx_client(),"),
+            (
+                "response = client.get_httpx_client().request(",
+                "response = sql_request(client.get_httpx_client()," + limit,
+            ),
             (
                 "response = await client.get_async_httpx_client().request(",
-                "response = await sql_request_async(client.get_async_httpx_client(),",
+                "response = await sql_request_async(client.get_async_httpx_client()," + limit,
             ),
         ):
             if source.count(original) != 1:

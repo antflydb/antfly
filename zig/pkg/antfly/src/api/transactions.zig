@@ -450,7 +450,10 @@ pub const BeginRequest = struct {
     sql: ?SqlMetadata = null,
 };
 
+const notification_types = @import("antfly_local_sources").sql_ast.notifications;
+
 pub const SqlMetadata = struct {
+    notifications: notification_types.Pending = .{},
     database: []const u8,
     namespace: []const u8,
     isolation: @import("antfly_local_sources").sql_session.Isolation,
@@ -470,10 +473,24 @@ pub const SqlMetadata = struct {
         var out = self;
         out.database = database;
         out.namespace = try alloc.dupe(u8, self.namespace);
+        errdefer alloc.free(out.namespace);
+        out.notifications = try self.notifications.clone(alloc);
         return out;
     }
 
+    pub fn jsonStringify(self: SqlMetadata, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(SqlMetadata).@"struct".field_names) |field| {
+            if (!(comptime std.mem.eql(u8, field, "notifications")) or self.notifications.commands.items.len != 0) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+
     pub fn deinit(self: *SqlMetadata, alloc: std.mem.Allocator) void {
+        self.notifications.deinit(alloc);
         alloc.free(self.database);
         alloc.free(self.namespace);
         self.* = undefined;
@@ -713,7 +730,7 @@ pub const ExternalPreparationSeal = struct {
     pub fn admissionRequest(self: @This()) !@import("../system_catalog/prepared_transactions.zig").Mutation {
         var incarnation: [16]u8 = undefined;
         _ = std.fmt.hexToBytes(&incarnation, &self.identity.metadata_incarnation) catch return error.InvalidTransactionSessionRecord;
-        const request: @import("../system_catalog/prepared_transactions.zig").Mutation = .{ .admission = .{ .nonce = self.identity.operation_id, .head = self.admission_head }, .incarnation = incarnation, .actor = self.actor, .standalone = self.standalone, .database_id = self.identity.database_id, .operation = .{ .admit = .{ .identity = self.identity, .participants = self.participants, .admitted_at_ns = self.admitted_at_ns } } };
+        const request: @import("../system_catalog/prepared_transactions.zig").Mutation = .{ .notification_control = if (self.identity.notification_plan != null) true else null, .admission = .{ .nonce = self.identity.operation_id, .head = self.admission_head }, .incarnation = incarnation, .actor = self.actor, .standalone = self.standalone, .database_id = self.identity.database_id, .operation = .{ .admit = .{ .identity = self.identity, .participants = self.participants, .admitted_at_ns = self.admitted_at_ns } } };
         try request.validate();
         return request;
     }
@@ -727,6 +744,10 @@ pub const ExternalPreparationSeal = struct {
         if (self.identity.session == null or !std.meta.eql(self.identity.session.?.connection_id, session.connection_id) or
             !std.mem.eql(u8, &self.identity.txn_id, &session.txn_id) or self.identity.begin_timestamp != session.begin_timestamp or
             !std.mem.eql(u8, &self.identity.manifest_digest, &try registry.manifestDigest(a, self.participants, self.identity.metadata_incarnation))) return error.InvalidTransactionSessionRecord;
+        const pending = if (session.sql) |metadata| metadata.notifications.commands.items else &.{};
+        if (self.identity.notification_plan) |notifications| {
+            if (!notification_types.commandsEqual(notifications.commands, pending)) return error.InvalidTransactionSessionRecord;
+        } else if (pending.len != 0) return error.InvalidTransactionSessionRecord;
         const private = self.identity.kind == .session_commit;
         if (private) {
             const effective_sync = if (session.sync_level == .propose) db_mod.types.SyncLevel.write else session.sync_level;
@@ -1026,6 +1047,7 @@ pub const SavepointInfo = struct {
 
 pub const Savepoint = struct {
     id: u64,
+    notification_count: usize = 0,
     name: ?[]u8 = null,
     snapshot: OwnedTransactionCommitRequest,
     transaction_mode: ?@import("antfly_local_sources").sql_session.ReadMode = null,
@@ -1053,6 +1075,7 @@ pub const Savepoint = struct {
         };
         var out: Savepoint = .{
             .id = self.id,
+            .notification_count = self.notification_count,
             .name = name,
             .snapshot = snapshot,
             .transaction_mode = self.transaction_mode,
@@ -3046,6 +3069,28 @@ pub const SessionRegistry = struct {
         self.publishCandidateLocked(alloc, publish_target, &candidate);
     }
 
+    /// Owned notification intents are sealed with the ordinary SQL decision.
+    /// The ingress command lease serializes staging with row/control effects.
+    pub fn stageSqlNotification(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: ?[]const u8, command: notification_types.Command) !void {
+        const stripe = self.sessionLock(txn_id);
+        stripe.lock();
+        defer stripe.unlock();
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        errdefer candidate.deinit(alloc);
+        if (!principalsEqual(candidate.principal, principal)) return error.Forbidden;
+        const metadata = if (candidate.sql) |*value| value else return error.SqlTransactionNotActive;
+        if (metadata.failed) return error.SqlTransactionAborted;
+        if (candidate.commit_body_digest != null or candidate.commit_execution_started) return error.TransactionCommitSealed;
+        try metadata.notifications.append(alloc, command);
+        touchSession(&candidate);
+        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
+        try self.persistLocked(candidate);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, target, &candidate);
+    }
+
     pub const StageValidator = struct {
         ptr: *anyopaque,
         validate: *const fn (*anyopaque, std.mem.Allocator, ?*const OwnedTransactionCommitRequest, *OwnedTransactionCommitRequest, *const OwnedTransactionCommitRequest) anyerror!void,
@@ -4036,6 +4081,7 @@ pub const SessionRegistry = struct {
             .{ .sync_level = candidate.sync_level };
         var new_savepoint: Savepoint = .{
             .id = savepoint_id,
+            .notification_count = if (candidate.sql) |metadata| metadata.notifications.commands.items.len else 0,
             .snapshot = snapshot,
             .transaction_mode = if (candidate.sql) |metadata| metadata.mode else null,
             .transaction_deferrable = if (candidate.sql) |metadata| metadata.deferrable else null,
@@ -4124,6 +4170,8 @@ pub const SessionRegistry = struct {
             candidate.setting_committed = committed;
             if (candidate.sql) |*metadata| {
                 metadata.failed = false;
+                if (savepoint.notification_count > metadata.notifications.commands.items.len) return error.InvalidTransactionSessionRecord;
+                metadata.notifications.truncate(alloc, savepoint.notification_count);
                 if (savepoint.transaction_mode) |mode| metadata.mode = mode;
                 if (savepoint.transaction_deferrable) |deferrable| metadata.deferrable = deferrable;
                 metadata.search_path_active = savepoint.search_path_active;
@@ -6952,6 +7000,7 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
         first = false;
         try out.appendSlice(alloc, "{\"id\":");
         try out.print(alloc, "{d}", .{entry.key_ptr.*});
+        if (entry.value_ptr.notification_count != 0) try out.print(alloc, ",\"notification_count\":{d}", .{entry.value_ptr.notification_count});
         try out.appendSlice(alloc, ",\"name\":");
         if (entry.value_ptr.name) |name| try appendJsonString(alloc, &out, name) else try out.appendSlice(alloc, "null");
         const mode = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.transaction_mode, .{});
@@ -7231,8 +7280,15 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
         errdefer if (!transferred) deinitSettingEntries(alloc, &setting_active);
         var setting_committed = if (entry_obj.get("setting_committed")) |value| try decodeSettingEntries(alloc, value) else SettingEntries.empty;
         errdefer if (!transferred) deinitSettingEntries(alloc, &setting_committed);
+        const notification_count: usize = if (entry_obj.get("notification_count")) |value| std.math.cast(usize, switch (value) {
+            .integer => |count| try nonNegativeRecordInteger(count),
+            .number_string => |text| try recordNumber(text),
+            else => return error.InvalidTransactionSessionRecord,
+        }) orelse return error.InvalidTransactionSessionRecord else 0;
+        if (notification_count > if (session.sql) |metadata| metadata.notifications.commands.items.len else @as(usize, 0)) return error.InvalidTransactionSessionRecord;
         try session.savepoints.put(alloc, id, .{
             .id = id,
+            .notification_count = notification_count,
             .name = name,
             .snapshot = snapshot,
             .search_path_active = try decodeSearchPath(alloc, entry_obj.get("search_path_active")),
@@ -10170,4 +10226,29 @@ test "SQL execution lease borrowing rejects another registry and colliding trans
     try std.testing.expect(found);
     try std.testing.expect(!held.matches(&first_registry, colliding));
     try std.testing.expect(first_registry.tryAcquireCommitExecution(colliding) == null);
+}
+
+test "pgwire notifications retain owned intents and savepoint frontiers in durable session records" {
+    const a = std.testing.allocator;
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(a);
+    const info = try registry.beginForPrincipal(a, .{ .sql = .{ .database = "app", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 9, "alice");
+    try registry.stageSqlNotification(a, info.txn_id, "alice", .{ .notify = .{ .channel = "events", .payload = "first" } });
+    const point = (try registry.createNamedSavepoint(a, info.txn_id, "child")).?;
+    const bytes = try encodeSessionRecord(a, registry.sessions.get(info.txn_id).?);
+    defer a.free(bytes);
+    var decoded = try decodeSessionRecord(a, info.txn_id, bytes);
+    defer decoded.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), decoded.sql.?.notifications.commands.items.len);
+    try std.testing.expectEqual(@as(usize, 1), decoded.savepoints.get(point.savepoint_id).?.notification_count);
+    const recovered = try decoded.clone(a);
+    const original = registry.sessions.getPtr(info.txn_id).?;
+    original.deinit(a);
+    original.* = recovered;
+    try registry.stageSqlNotification(a, info.txn_id, "alice", .{ .notify = .{ .channel = "events", .payload = "removed" } });
+    _ = try registry.rollbackToNamedSavepoint(a, info.txn_id, "child");
+    var state = (try registry.getSqlState(a, info.txn_id)).?;
+    defer state.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), state.metadata.notifications.commands.items.len);
+    try std.testing.expectEqualStrings("first", state.metadata.notifications.commands.items[0].notify.payload);
 }

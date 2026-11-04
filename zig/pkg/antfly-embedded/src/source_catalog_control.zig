@@ -669,9 +669,10 @@ pub const storage_pessimistic_lock_ledger = @import("storage/pessimistic_lock_le
 pub const storage_pessimistic_lock_authority = @import("storage/pessimistic_lock_authority.zig");
 pub const storage_pessimistic_lock_resource = @import("storage/pessimistic_lock_resource.zig");
 pub const storage_pessimistic_lock_participant = @import("storage/pessimistic_lock_participant.zig");
-pub const storage_pessimistic_lock_control = @import("storage/pessimistic_lock_control.zig");
-pub const storage_pessimistic_lock_transaction = @import("storage/pessimistic_lock_transaction.zig");
 pub const storage_pessimistic_lock_row = @import("storage/pessimistic_lock_row.zig");
+pub const storage_pessimistic_lock_transaction = @import("storage/pessimistic_lock_transaction.zig");
+pub const storage_pessimistic_lock_control = @import("storage/pessimistic_lock_control.zig");
+
 pub const storage_persistent = @import("storage/persistent.zig");
 pub const storage_persistent_sim_fixture = @import("storage/persistent_sim_fixture.zig");
 pub const storage_portable_backup = @import("storage/portable_backup.zig");

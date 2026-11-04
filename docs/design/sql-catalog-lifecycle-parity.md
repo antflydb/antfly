@@ -18686,3 +18686,34 @@ The five private `view_mappings` originals remain unresolved. The source stores
 those declarations inside index metadata rather than the public SQL-view
 catalog. Rejecting an absent view would not certify its intended type/index/
 generation/fingerprint checks, so this campaign claims no closures for them.
+
+### Original notification cohort qualified (2026-11-04)
+
+The unchanged LISTEN, NOTIFY and UNLISTEN originals (sql-0126–sql-0128) now
+execute through the authenticated public SQL owner and its native durable
+transaction machinery. The ledger is **926 implemented / 138 rejected /
+449 superseded / 73 unresolved**, including **56 unresolved DDL/catalog cases**.
+No original SQL or source expectation changed to obtain this credit.
+
+Registration and notification intents belong to the existing SQL transaction;
+savepoints rewind them, aborts discard them and commit publishes them through
+the same immutable decision and native writer as the transaction. Queue capacity
+is reserved before the irreversible decision. Delivery waits for native commit
+visibility and participant retirement. Polling and recovery advance persisted
+controls without evaluating SQL again. Pgwire uses its advertised, natively
+reserved sender PID and flushes before acknowledging delivery; HTTP exposes
+bounded pages with opaque acknowledgement cursors.
+
+The [implementation record](sql-notifications.md) describes bounds, ownership,
+restore validation, polling, idle-head caching and incremental reclamation.
+The native Debug qualification passed six public/socket/session campaigns, nine
+journal/cache/maintenance tests, one actual LSM/WAL/snapshot fault campaign and
+one decoder-floor test, with zero skips, failures or leaks. Shared regressions
+also passed all 52 command-source lifecycle tests and 11 locking campaigns.
+PostgreSQL 18 passed 27 independent notification assertions. Python passed 127
+SQL, notification and generator-policy tests; TypeScript passed 117 SQL and
+notification tests plus typechecking; Go SQL/notification tests and the generated
+Rust notification model test passed. Generated sync and async Python endpoints
+also enforce the 1 MiB polling response cap and refuse redirects on borrowed
+clients. These checks qualify these three originals, not the separate
+publication/subscription or `pg_notify()` function surfaces.

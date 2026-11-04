@@ -38,7 +38,7 @@ pub const AddTestsResult = struct {
     run_lib_api_standalone_backup_restore_tests: *std.Build.Step.Run,
     distributed_query_availability_step: *std.Build.Step,
     run_public_api_parity_aggregate_tests: *std.Build.Step.Run,
-    run_sql_owner_lifecycle_tests: [37]*std.Build.Step.Run,
+    run_sql_owner_lifecycle_tests: [38]*std.Build.Step.Run,
     run_lib_api_auth_tests: *std.Build.Step.Run,
     run_algebraic_dynamic_template_tests: *std.Build.Step.Run,
     run_lib_api_connections_tests: *std.Build.Step.Run,
@@ -2281,6 +2281,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL original advisory locks",
             "mounted SQL original table and row locks",
             "mounted SQL original joins",
+            "mounted SQL original notifications",
+            "pgwire notifications",
             "mounted SQL native sync controls",
             "pgwire native sync controls",
             "pgwire transaction preparation",
@@ -2448,6 +2450,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // release/Linux bounds retain their independently measured profiles.
         .max_rss = @as(usize, if (target.result.os.tag == .macos) (if (optimize == .debug) 21 else 12) else 7) * 1024 * 1024 * 1024,
     });
+    const notification_journal_tests = b.addTest(.{
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = &.{ "SQL notification journal", "SQL notifications share", "SQL notifications fence", "SQL notifications maintenance" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const notification_journal_run = addFilteredTestRunArtifact(b, notification_journal_tests);
+    notification_journal_run.addArg("--require-no-skips");
+    b.step("antfly-sql-notification-journal-test", "Qualify notification reservation visibility pagination and bounded recovery").dependOn(&notification_journal_run.step);
+    const sql_notification_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original notifications", "pgwire notifications" });
+    sql_notification_run.addArg("--require-no-skips");
+    const notification_inventory = b.addRunArtifact(sql_owner_lifecycle_tests);
+    notification_inventory.addArg("--list-tests");
+    const notification_audit = b.addSystemCommand(&.{"python3"});
+    notification_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
+    notification_audit.addArgs(&.{ "--filter", "mounted SQL original notifications preserve transactional registration ordered delivery savepoints replay and cold recovery", "--inventory" });
+    notification_audit.addFileArg2(notification_inventory.captureStdErr(.{}), .{ .make_absolute = true });
+    sql_notification_run.step.dependOn(&notification_audit.step);
+    b.step("antfly-api-sql-notifications-test", "Qualify notification originals through authenticated connections and cold native owners").dependOn(&sql_notification_run.step);
     const sql_join_read_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original joins"});
     sql_join_read_run.addArg("--require-no-skips");
     const sql_join_inventory = b.addRunArtifact(sql_owner_lifecycle_tests);
@@ -3164,7 +3184,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_lib_api_standalone_backup_restore_tests = run_lib_api_standalone_backup_restore_tests,
         .distributed_query_availability_step = lib_api_distributed_query_availability_test_step,
         .run_public_api_parity_aggregate_tests = run_public_api_parity_aggregate_tests,
-        .run_sql_owner_lifecycle_tests = .{ sql_prepared_transaction_run, sql_domain_rows_run, sql_domain_handoff_run, sql_maintenance_run, sql_enum_catalog_run, sql_cast_run, sql_procedure_run, sql_aggregate_run, sql_operator_run, sql_routine_run, sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run, sql_covering_constraint_run, sql_role_defaults_run, fk_validation_run, sql_resource_comment_run, sql_temporal_arithmetic_run, sql_range_run, sql_temporal_key_run, sql_fk_validation_run, document_alias_run, document_generated_run, temporal_bin_run, temporal_domain_run, view_domain_run, collection_run, explain_run, text_predicate_run, sql_document_integrity_run, cursor_lifecycle_run, copy_input_run, characteristics_run, tablespace_run, drop_retirement_run, sql_writable_cte_run, sql_join_read_run },
+        .run_sql_owner_lifecycle_tests = .{ sql_prepared_transaction_run, sql_domain_rows_run, sql_domain_handoff_run, sql_maintenance_run, sql_enum_catalog_run, sql_cast_run, sql_procedure_run, sql_aggregate_run, sql_operator_run, sql_routine_run, sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run, sql_covering_constraint_run, sql_role_defaults_run, fk_validation_run, sql_resource_comment_run, sql_temporal_arithmetic_run, sql_range_run, sql_temporal_key_run, sql_fk_validation_run, document_alias_run, document_generated_run, temporal_bin_run, temporal_domain_run, view_domain_run, collection_run, explain_run, text_predicate_run, sql_document_integrity_run, cursor_lifecycle_run, copy_input_run, characteristics_run, tablespace_run, drop_retirement_run, sql_writable_cte_run, sql_join_read_run, sql_notification_run },
         .run_lib_api_auth_tests = run_lib_api_auth_tests,
         .run_algebraic_dynamic_template_tests = run_algebraic_dynamic_template_tests,
         .run_lib_api_connections_tests = run_lib_api_connections_tests,

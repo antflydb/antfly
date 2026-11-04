@@ -173,7 +173,32 @@ pub const Adapter = struct {
     server: *http.ApiHttpServer,
 
     pub fn backend(self: *Adapter) wire.Backend {
-        return .{ .context = self, .vtable = &.{ .native_parameters = true, .authenticate = authenticate, .refresh = refresh, .describe = describe, .execute = execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .evaluate_parameter_cells = evaluateParameterCells, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect, .completion_safe = completionSafe, .pin_completion = pinCompletion, .reserve_completion = reserveCompletion, .completion_ready = completionReady } };
+        return .{ .context = self, .vtable = &.{ .native_parameters = true, .start_connection = startConnection, .discard_connection = discardConnection, .notifications = notifications, .has_notifications = hasNotifications, .authenticate = authenticate, .refresh = refresh, .describe = describe, .execute = execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .evaluate_parameter_cells = evaluateParameterCells, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect, .completion_safe = completionSafe, .pin_completion = pinCompletion, .reserve_completion = reserveCompletion, .completion_ready = completionReady } };
+    }
+
+    fn startConnection(raw: *anyopaque, a: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !void {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        if (!self.server.source.vtable.supports_sql_command_ownership) return;
+        var job: Job = .{ .adapter = self, .alloc = a, .credential = @ptrCast(@alignCast(identity.context)), .request = request, .kind = .notification_connect };
+        try self.dispatch(&job);
+    }
+
+    fn hasNotifications(_: *anyopaque, identity: wire.Identity) bool {
+        const credential: *Credential = @ptrCast(@alignCast(identity.context));
+        return credential.notification_interest;
+    }
+
+    fn notifications(raw: *anyopaque, a: std.mem.Allocator, identity: wire.Identity, request: wire.Request, control: @import("antfly_local_sources").sql_ast.notifications.DeliveryControl) !@import("antfly_local_sources").sql_ast.notifications.Page {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        var job: Job = .{ .adapter = self, .alloc = a, .credential = @ptrCast(@alignCast(identity.context)), .request = request, .kind = .notifications, .notification_control = control };
+        try self.dispatch(&job);
+        return job.notification_page;
+    }
+
+    fn discardConnection(raw: *anyopaque, a: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !void {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        var job: Job = .{ .adapter = self, .alloc = a, .credential = @ptrCast(@alignCast(identity.context)), .request = request, .kind = .discard_connection };
+        try self.dispatch(&job);
     }
 
     fn loadSettings(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !@import("antfly_local_sources").sql_setting_catalog.RawSnapshot {
@@ -466,7 +491,7 @@ pub const Adapter = struct {
     }
 
     fn dispatch(self: *Adapter, job: *Job) !void {
-        try validateRequest(job.request);
+        if (job.kind == .notifications or job.kind == .notification_connect) try job.request.io.checkCancel() else try validateRequest(job.request);
         if (self.server.cfg.user_manager != job.credential.manager) return error.Unauthorized;
         const io = http.ApiHttpServer.configuredDurableIo(self.server.cfg) orelse return error.SqlWriteCapacityUnavailable;
         var future = io.concurrent(Job.run, .{job}) catch return error.SqlWriteCapacityUnavailable;
@@ -1066,10 +1091,16 @@ const Credential = struct {
     session_cleanup_complete: bool = true,
     /// A socket owns one native command identity, independently of its transaction.
     native_connection: ?[32]u8 = null,
+    notification_interest: bool = false,
+    notification_observation: @import("sql_notification_hub.zig").Observation = .{},
 
     fn ensureNativeConnection(self: *Credential, server: *http.ApiHttpServer, identity_value: ?http.AuthenticatedIdentity, request: wire.Request) !?[32]u8 {
         if (!server.source.vtable.supports_sql_command_ownership) return null;
-        if (self.native_connection) |id| return id;
+        if (self.native_connection) |id| {
+            const store = server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
+            try @import("sql_connections.zig").keepWireAlive(store, server.alloc, id, http.transactionPrincipal(identity_value) orelse return error.Unauthorized, server.localSessionNodeId(), try server.sql_connection_admission.executionInstance(server.embedding_provider_runtime.io), @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+            return id;
+        }
         const store = server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
         try self.validate();
         var random: [16]u8 = undefined;
@@ -1082,6 +1113,7 @@ const Credential = struct {
             .principal = principal,
             .owner_node_id = server.localSessionNodeId(),
             .expires_at_ms = now_ms +| @import("sql_connection_record.zig").ttl_ms,
+            .wire_epoch = try server.sql_connection_admission.executionInstance(server.embedding_provider_runtime.io),
             .database = request.database orelse "default",
             .namespace = request.namespace orelse "public",
             .baseline = request.setting_baseline orelse &.{},
@@ -1231,7 +1263,9 @@ const Job = struct {
     alloc: std.mem.Allocator,
     credential: *Credential,
     request: wire.Request,
-    kind: enum { describe, execute },
+    kind: enum { describe, execute, notifications, notification_connect, discard_connection },
+    notification_control: @import("antfly_local_sources").sql_ast.notifications.DeliveryControl = .{ .poll = 128 },
+    notification_page: @import("antfly_local_sources").sql_ast.notifications.Page = .{},
     description: ?wire.Description = null,
     result: ?wire.Result = null,
     failure: ?anyerror = null,
@@ -1260,7 +1294,93 @@ const Job = struct {
         };
     }
 
+    fn runNotificationConnect(self: *Job) !void {
+        const server = self.adapter.server;
+        var user: ?http.AuthenticatedIdentity = try self.credential.identity(server.alloc);
+        defer user.?.deinit(server.alloc);
+        var authority_owner: Authority = .{ .credential = self.credential, .identity = &user, .request = self.request };
+        const context = try authority_owner.context();
+        const locks = @import("../system_catalog/lock_authority.zig");
+        var native_port: @import("sql_command_producer.zig").NativePort = .{ .server = server, .context = context };
+        const actor = try @import("sql_authorization_recovery.zig").actor(server, user);
+        const bytes = try native_port.port().call(native_port.port().ptr, self.alloc, .{ .sql_lock_read = .{ .incarnation = @splat(0), .standalone = server.cfg.deployment_mode == .standalone, .actor = actor, .database = 0, .discovery = self.request.database orelse "default" } });
+        defer self.alloc.free(bytes);
+        var cut = try std.json.parseFromSlice(locks.Snapshot, self.alloc, bytes, .{});
+        defer cut.deinit();
+        if (!cut.value.notification_capable) return;
+        const id = (try self.credential.ensureNativeConnection(server, user, self.request)) orelse return;
+        const io = server.embedding_provider_runtime.io;
+        var lease = try server.sql_connection_admission.acquire(server.alloc, io, .init(id, self.credential.sessionPrincipal()));
+        defer lease.release(io);
+        var command: @import("sql_command_execution.zig").Request = .{};
+        var finished = false;
+        defer if (!finished) command.finish() catch {};
+        if (!try command.start(server, context, user, &lease, .{ .native_backend_identity = self.request.backend_pid })) return error.SqlConnectionUnavailable;
+        var root: execution.Adapter = .{ .server = server, .identity = &user, .context = command.attach(context), .database = self.request.database orelse "default", .namespace = self.request.namespace orelse "public", .connection_id = id, .backend_pid = self.request.backend_pid };
+        if (try @import("sql_notification_execution.zig").bindIdentity(&root, self.alloc) == null) return error.TableTopologyProtocolUpgradeRequired;
+        try command.finish();
+        finished = true;
+    }
+
+    fn runNotifications(self: *Job) !void {
+        try self.request.io.checkCancel();
+        if (self.credential.native_connection == null) return;
+        const server = self.adapter.server;
+        var user: ?http.AuthenticatedIdentity = try self.credential.identity(server.alloc);
+        defer user.?.deinit(server.alloc);
+        const id = (try self.credential.ensureNativeConnection(server, user, self.request)) orelse return;
+        const io = server.sharedApiIo() orelse return error.SqlConnectionUnavailable;
+        var lease = try server.sql_connection_admission.acquire(server.alloc, io, .init(id, self.credential.sessionPrincipal()));
+        defer lease.release(io);
+        var authority: Authority = .{ .credential = self.credential, .identity = &user, .request = self.request };
+        var context = try (try authority.context()).platformDeadline();
+        context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 250 * std.time.ns_per_ms);
+        const owner: @import("sql_notification_delivery.zig").Owner = .{ .server = server, .user = user, .context = context, .connection = id, .observation = &self.credential.notification_observation };
+        switch (self.notification_control) {
+            .poll => |maximum| {
+                self.notification_page = try owner.poll(self.alloc, null, maximum);
+                if (!self.notification_page.subscribed and !self.notification_page.deferred) self.credential.notification_interest = false;
+            },
+            .acknowledge => |cursor| try owner.acknowledge(self.alloc, cursor),
+        }
+    }
+
+    fn runDiscard(self: *Job) !void {
+        const server = self.adapter.server;
+        if (!server.source.vtable.supports_sql_command_ownership) return;
+        var user: ?http.AuthenticatedIdentity = try self.credential.identity(server.alloc);
+        defer user.?.deinit(server.alloc);
+        const id = (try self.credential.ensureNativeConnection(server, user, self.request)) orelse return;
+        const io = server.embedding_provider_runtime.io;
+        var lease = try server.sql_connection_admission.acquire(server.alloc, io, .init(id, self.credential.sessionPrincipal()));
+        defer lease.release(io);
+        var authority: Authority = .{ .credential = self.credential, .identity = &user, .request = self.request };
+        const context = try authority.context();
+        var command: @import("sql_command_execution.zig").Request = .{};
+        defer command.finish() catch {};
+        if (!try command.start(server, context, user, &lease, .{ .discard_connection = true })) return error.SqlConnectionUnavailable;
+        var connection = try @import("sql_connections.zig").loadWithCommand(server.txn_sessions.durable.?, self.alloc, id, self.credential.sessionPrincipal(), server.localSessionNodeId(), @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, command.attach(context).sql_command_fence);
+        defer connection.deinit();
+        if (connection.value.state != .idle) return error.ActiveSqlTransaction;
+        var coordinator: @import("sql_session.zig").Coordinator = .{ .server = server, .identity = &user, .context = command.attach(context) };
+        // Once publication starts, only its persisted control may resume. An
+        // uncertain reply is never permission to execute DISCARD a second time.
+        coordinator.discard(id, connection.value.revision) catch return error.SqlMutationOutcomeUnknown;
+        command.finish() catch return error.SqlMutationOutcomeUnknown;
+        var settled = (@import("sql_command_producer.zig").settleCompletion(server, self.alloc, context, id, self.credential.sessionPrincipal()) catch return error.SqlMutationOutcomeUnknown) orelse return error.SqlMutationOutcomeUnknown;
+        defer settled.deinit();
+        if (settled.value.phase != .idle or settled.value.recovery) return error.SqlMutationOutcomeUnknown;
+        self.credential.notification_interest = false;
+        self.credential.notification_observation = .{};
+    }
+
     fn runInner(self: *Job) !void {
+        if (self.kind == .discard_connection) return self.runDiscard();
+        if (self.kind == .notification_connect) return self.runNotificationConnect();
+        if (self.kind == .notifications) return self.runNotifications();
+        // Every SQL completion boundary, including streamed/routine execution
+        // and errors, must observe incoming messages beyond an older cache cut.
+        if (self.kind == .execute) self.credential.notification_observation.revision = null;
         try validateRequest(self.request);
         var preparation = self.adapter.server.sql_preparation_admission.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
         defer preparation.release();
@@ -1313,6 +1433,8 @@ const Job = struct {
                 context = command_scope.attach(context);
         }
         var native_adapter = execution.Adapter{
+            .backend_pid = self.request.backend_pid,
+            .notification_interest = &self.credential.notification_interest,
             .copy_input = self.request.copy_input or compiled.statement == .copy_from,
             .copy_filter = copy_filter,
             .statement_instant = self.request.statement_instant,
@@ -1359,7 +1481,7 @@ const Job = struct {
         self.request.parameter_descriptors = try @import("sql_type_schema.zig").parameterDescriptorsLeaky(server, self.alloc, identity, context, self.request.parameter_descriptors, self.request.parameter_oids);
         if (self.kind == .describe) {
             switch (compiled.statement) {
-                .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints, .set_transaction, .prepared_transaction => {
+                .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints, .set_transaction, .prepared_transaction, .notification => {
                     if (self.request.parameter_types.len != 0) return error.InvalidSqlParameters;
                     self.description = .{ .columns = &.{} };
                     return;
@@ -1591,7 +1713,7 @@ fn commandTag(alloc: std.mem.Allocator, command: []const u8, rows: u64, affected
     if (std.mem.eql(u8, command, "UPDATE") or std.mem.eql(u8, command, "DELETE") or std.mem.eql(u8, command, "MERGE")) return std.fmt.allocPrint(alloc, "{s} {d}", .{ command, affected });
     if (std.mem.eql(u8, command, "REFRESH MATERIALIZED VIEW")) return alloc.dupe(u8, command);
     if (std.mem.startsWith(u8, command, "CREATE ") or std.mem.startsWith(u8, command, "DROP ") or std.mem.startsWith(u8, command, "ALTER ")) return alloc.dupe(u8, command);
-    inline for (.{ "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "SET CONSTRAINTS", "TRUNCATE TABLE" }) |tag| if (std.mem.eql(u8, command, tag)) return alloc.dupe(u8, command);
+    inline for (.{ "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "SET CONSTRAINTS", "TRUNCATE TABLE", "LISTEN", "NOTIFY", "UNLISTEN", "LOCK TABLE", "PREPARE TRANSACTION", "COMMIT PREPARED", "ROLLBACK PREPARED" }) |tag| if (std.mem.eql(u8, command, tag)) return alloc.dupe(u8, command);
     return error.UnsupportedSqlExecution;
 }
 
@@ -2927,4 +3049,12 @@ test "SQL pgwire native void public results retain OID nullness and both wire fo
     };
     try Harness.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "pgwire notifications preserve utility completion tags without row count suffixes" {
+    for ([_][]const u8{ "LISTEN", "NOTIFY", "UNLISTEN", "LOCK TABLE", "PREPARE TRANSACTION", "COMMIT PREPARED", "ROLLBACK PREPARED" }) |expected| {
+        const actual = try commandTag(std.testing.allocator, expected, 0, 0);
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualStrings(expected, actual);
+    }
 }

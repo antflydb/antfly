@@ -62,6 +62,7 @@ pub const Identity = struct {
 };
 
 pub const Request = struct {
+    backend_pid: i32 = 0,
     completion: ?*@import("completion.zig").Completion = null,
     completion_allocator: ?std.mem.Allocator = null,
     statement: []const u8,
@@ -280,6 +281,10 @@ pub const Backend = struct {
 
     pub const VTable = struct {
         native_parameters: bool = false,
+        start_connection: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!void = null,
+        discard_connection: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!void = null,
+        has_notifications: ?*const fn (*anyopaque, Identity) bool = null,
+        notifications: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request, @import("antfly_local_sources").sql_ast.notifications.DeliveryControl) anyerror!@import("antfly_local_sources").sql_ast.notifications.Page = null,
         // Called even when a deployment permits anonymous access. The backend
         // alone decides whether credentials authorize a principal; a startup
         // username/database never itself grants access.

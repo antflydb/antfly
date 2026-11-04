@@ -66,6 +66,8 @@ from antfly.client_generated.models import (
     SQLPreparedExecutionRequest,
     SQLPreparedResponse,
     SQLPrepareRequest,
+    SQLNotificationPage,
+    SQLNotificationPollRequest,
     SQLRequest,
     SQLResponse,
     SyncLevel,
@@ -1493,6 +1495,68 @@ class AntflyClient:
         """
         return self._sql_result(self._sql_request("POST", "/db/v1/sql", request.to_dict()))
 
+    def poll_sql_notifications(
+        self, connection_id: str, request: SQLNotificationPollRequest | None = None
+    ) -> SQLNotificationPage:
+        """Receive LISTEN events; acknowledge only a completely consumed prior page.
+
+        Lost responses are replayable. This method never executes or retries SQL.
+        Delivery waits until the connection's transaction has ended.
+        """
+        if (
+            not isinstance(connection_id, str)
+            or len(connection_id) != 32
+            or any(char not in "0123456789abcdef" for char in connection_id)
+        ):
+            raise AntflyException("SQL connection ID must be 32 lowercase hexadecimal characters")
+        value = request.to_dict() if request is not None else {}
+        cursor = value.get("acknowledge")
+        if cursor is not None and (
+            not isinstance(cursor, str) or len(cursor) != 20 or any(char not in "0123456789abcdef" for char in cursor)
+        ):
+            raise AntflyException("Invalid SQL notification acknowledgement cursor")
+        limit = value.get("limit", 128)
+        if type(limit) is not int or not 1 <= limit <= 128:
+            raise AntflyException("SQL notification limit must be between 1 and 128")
+        body = self._sql_request(
+            "POST", f"/db/v1/sql/connections/{connection_id}/notifications", value, max_response_bytes=1 << 20
+        )
+        events = body.get("notifications")
+        page_cursor = body.get("cursor")
+        if (
+            not isinstance(events, list)
+            or len(events) > limit
+            or type(body.get("pending")) is not bool
+            or (
+                page_cursor is not None
+                and (
+                    not isinstance(page_cursor, str)
+                    or len(page_cursor) != 20
+                    or any(char not in "0123456789abcdef" for char in page_cursor)
+                )
+            )
+            or (events and page_cursor is None)
+        ):
+            raise AntflyException("Invalid SQL notification page")
+        size = 0
+        for event in events:
+            if (
+                not isinstance(event, dict)
+                or not isinstance(event.get("channel"), str)
+                or not isinstance(event.get("payload"), str)
+                or "\0" in event["channel"]
+                or "\0" in event["payload"]
+                or type(event.get("sender_pid")) is not int
+                or not 1 <= event["sender_pid"] <= 2147483647
+            ):
+                raise AntflyException("Invalid SQL notification event")
+            channel_bytes = len(event["channel"].encode("utf-8"))
+            payload_bytes = len(event["payload"].encode("utf-8"))
+            size += channel_bytes + payload_bytes
+            if not 1 <= channel_bytes <= 63 or payload_bytes > 7999 or size > 65536:
+                raise AntflyException("SQL notification page exceeds delivery bounds")
+        return SQLNotificationPage.from_dict(body)
+
     def prepare_sql(self, request: SQLPrepareRequest) -> SQLPreparedResponse:
         """Create an owner-bound durable resource independent of transactions."""
         return SQLPreparedResponse.from_dict(self._sql_request("POST", "/db/v1/sql/prepared", request.to_dict()))
@@ -1529,7 +1593,13 @@ class AntflyClient:
         )
 
     def _sql_request(
-        self, method: str, path: str, value: dict[str, Any] | None, *, connection_id: str | None = None
+        self,
+        method: str,
+        path: str,
+        value: dict[str, Any] | None,
+        *,
+        connection_id: str | None = None,
+        max_response_bytes: int = 16 << 20,
     ) -> dict[str, Any]:
         from .sql_transport import encode_sql_request
 
@@ -1547,7 +1617,7 @@ class AntflyClient:
             },
             follow_redirects=False,
             _expected_status=200,
-            _max_response_bytes=16 << 20,
+            _max_response_bytes=max_response_bytes,
         )
 
     @staticmethod

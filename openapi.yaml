@@ -3872,6 +3872,61 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/sql/connections/{connection_id}/notifications:
+    parameters:
+      - name: connection_id
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: ^[0-9a-f]{32}$
+    post:
+      operationId: pollSQLNotifications
+      summary: Receive and acknowledge committed SQL notifications
+      tags:
+        - data_operations
+      description: >
+        Poll a connection's database-scoped LISTEN registrations. This operation
+
+        never evaluates or retries SQL. Delivery is deferred while the connection
+
+        has an active or uncertain transaction. Pages contain at most 128 events
+
+        and 64 KiB of logical channel/payload bytes. A lost response is replayable
+
+        until its cursor is acknowledged. Queue capacity is reserved before the
+
+        sender's irreversible commit decision. Connection close and DISCARD ALL
+
+        retire registrations through the same durable source lifecycle.
+      x-antfly-client-request-policy:
+        max_retries: 0
+        follow_redirects: false
+        cookies_enabled: false
+        max_response_size: 1048576
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SQLNotificationPollRequest'
+      responses:
+        '200':
+          description: Bounded notification page; an active transaction yields no events.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLNotificationPage'
+        default:
+          description: Notification poll rejected; no SQL was executed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLDiagnostic'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/sql/prepared:
     post:
       operationId: prepareSQL
@@ -22733,6 +22788,59 @@ components:
           description: Durable idle HTTP connection. Its scope and settings are inherited; active transaction
             IDs cannot be bypassed by omitting session_id. DISCARD ALL requires this identity and is rejected
             while a transaction is active or uncertain.
+    SQLNotification:
+      type: object
+      additionalProperties: false
+      required:
+        - channel
+        - payload
+        - sender_pid
+      properties:
+        channel:
+          type: string
+          maxLength: 63
+        payload:
+          type: string
+          description: UTF-8 payload, fewer than 8000 bytes.
+        sender_pid:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Sender backend identifier; equals pgwire BackendKeyData for wire clients.
+    SQLNotificationPollRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        acknowledge:
+          type: string
+          pattern: ^[0-9a-f]{20}$
+          description: Cursor from a previously received page. Acknowledge only after consuming every
+            notification in that page; omitted acknowledgements replay the same unconsumed prefix.
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 128
+          default: 128
+    SQLNotificationPage:
+      type: object
+      additionalProperties: false
+      required:
+        - notifications
+        - pending
+      properties:
+        notifications:
+          type: array
+          maxItems: 128
+          items:
+            $ref: '#/components/schemas/SQLNotification'
+        cursor:
+          type: string
+          pattern: ^[0-9a-f]{20}$
+          description: Opaque connection-bound acknowledgement cursor for this page.
+        pending:
+          type: boolean
+          description: More queue work remains, or a committed notification is waiting for its visibility
+            barrier. Poll again without replaying any SQL.
     SQLTransactionStatus:
       type: string
       enum:

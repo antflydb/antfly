@@ -1731,6 +1731,10 @@ pub const Backend = struct {
     sequence_provider: ?@import("sequence_effects.zig").Provider = null,
     advisory_provider: ?@import("advisory_effects.zig").Provider = null,
     locking_provider: ?*const @import("locking.zig").Provider = null,
+    notification_provider: ?struct {
+        ptr: *anyopaque,
+        stage: *const fn (*anyopaque, std.mem.Allocator, ast.notifications.Command) anyerror!void,
+    } = null,
     decision_provider: ?@import("../functions/decisions.zig").DecisionProvider = null,
     ptr: *anyopaque,
     vtable: *const VTable,

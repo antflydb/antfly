@@ -83,6 +83,10 @@ pub fn requiresSqlCast(bytes: []const u8) bool {
     return requiresMarker(bytes, "sql_cast");
 }
 
+pub fn requiresSqlNotifications(bytes: []const u8) bool {
+    return requiresMarker(bytes, "@sql-notifications");
+}
+
 pub fn requiresSqlCatalogJournal(bytes: []const u8) bool {
     return requiresMarker(bytes, "sql_catalog_admission");
 }
@@ -259,6 +263,10 @@ fn walk(comptime Requirements: type, comptime mode: Projection, comptime marker_
                 const Marker = enum { none, present, non_null, empty_database, comment_action };
                 const Match = struct {
                     fn keyKind(name: []const u8) Marker {
+                        if (comptime std.mem.eql(u8, marker_name, "@sql-notifications")) {
+                            inline for (.{ "notification_plan", "notification_control", "notification_generation", "notification_bind", "notification_offer", "notification_ack", "notification_gc" }) |notification| if (std.mem.eql(u8, name, notification)) return .non_null;
+                            return .none;
+                        }
                         if (comptime std.mem.eql(u8, marker_name, "@catalog-resource-comments")) return if (std.mem.eql(u8, name, "action")) .comment_action else .none;
                         if (comptime std.mem.eql(u8, marker_name, "@sql-role-defaults")) {
                             if (std.mem.eql(u8, name, "principal_instance") or std.mem.eql(u8, name, "role_defaults_only") or std.mem.eql(u8, name, "database_id")) return .present;
@@ -522,4 +530,9 @@ test "SQL command fence decoder projection finds escaped fields without parsing 
 test "SQL command fence decoder catalog journal cannot be hidden in escaped fields or source text" {
     for ([_][]const u8{ "{}", "{\"source_json\":\"sql_catalog_admission\"}", "{\"sql_catalog_admission\":null}" }) |bytes| try std.testing.expect(!requiresSqlCatalogJournal(bytes));
     for ([_][]const u8{ "{\"sql_catalog_admission\":{}}", "{\"sql_catalog_admiss\\u0069on\":{}}", "{" }) |bytes| try std.testing.expect(requiresSqlCatalogJournal(bytes));
+}
+
+test "SQL notification decoder admission follows frozen intents and exact control markers not payload text" {
+    for ([_][]const u8{ "{}", "{\"notification_plan\":null}", "{\"notification_generation\":null}", "{\"payload\":\"notification_control notification_ack\"}" }) |legacy| try std.testing.expect(!requiresSqlNotifications(legacy));
+    for ([_][]const u8{ "{\"notification_control\":true}", "{\"notification_generation\":2}", "{\"notification_gen\\u0065ration\":2}", "{\"operation\":{\"notification_gc\":{}}}", "{\"identity\":{\"notification_plan\":{}}}", "{" }) |current| try std.testing.expect(requiresSqlNotifications(current));
 }

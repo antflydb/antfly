@@ -191,6 +191,8 @@ fn loadCommandTxn(txn: anytype, alloc: std.mem.Allocator, id: [32]u8, principal:
 }
 
 pub const Action = union(enum) {
+    wire_keepalive: struct { id: [32]u8, epoch: [16]u8 },
+    notification_identity: struct { id: [32]u8, generation: u64, sender_pid: i32 },
     create: record.Record,
     discard: [32]u8,
     discard_scoped: struct { id: [32]u8, expected_revision: u64, plan: @import("sql_command_producer.zig").ControlPlan },
@@ -205,6 +207,16 @@ pub const Action = union(enum) {
     discard_sequences: [32]u8,
     sequence_state: struct { id: [32]u8, generation: u64, sequence_epoch: u64, active_txn: ?[16]u8, value: @import("antfly_local_sources").sql_sequence_session.Snapshot },
 };
+
+/// Only the current authenticated socket can renew this process-bound record.
+/// The native source still owns its independent lease and retirement protocol.
+pub fn keepWireAlive(store: *transactions.DurableSessionStore, a: std.mem.Allocator, id: [32]u8, principal: []const u8, node: u64, epoch: [16]u8, now: u64) !void {
+    var connection = try load(store, a, id, principal, node, 0);
+    defer connection.deinit();
+    if (connection.value.wire_epoch == null or !std.mem.eql(u8, &connection.value.wire_epoch.?, &epoch)) return error.SqlConnectionChanged;
+    if (connection.value.expires_at_ms -| now > record.ttl_ms / 2) return;
+    _ = try mutate(store, .{ .wire_keepalive = .{ .id = id, .epoch = epoch } }, principal, node, now);
+}
 
 pub fn mutate(store: *transactions.DurableSessionStore, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64) !usize {
     return mutateWithCommand(store, action, principal, owner_node_id, now_ms, null);
@@ -304,6 +316,8 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
     }
     const id: [32]u8 = switch (action) {
         .create => unreachable,
+        .notification_identity => |value| value.id,
+        .wire_keepalive => |value| value.id,
         .discard, .close => |value| value,
         .discard_scoped => |value| value.id,
         .begin => |value| value.id,
@@ -316,13 +330,52 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
         .discard_sequences => |value| value,
         .sequence_state => |value| value.id,
     };
-    var owned = try loadTxn(txn, alloc, id, principal, owner_node_id, if (fence != null) 0 else now_ms);
+    var owned = try loadTxn(txn, alloc, id, principal, owner_node_id, if (fence != null or action == .wire_keepalive) 0 else now_ms);
     defer owned.deinit();
     var next = owned.value;
+    if (action == .wire_keepalive) {
+        const epoch = action.wire_keepalive.epoch;
+        if (next.wire_epoch == null or !std.mem.eql(u8, &next.wire_epoch.?, &epoch)) return error.SqlConnectionChanged;
+        var source = try @import("sql_command_producer.zig").readTxn(alloc, txn, id);
+        defer if (source) |*value| value.deinit();
+        if (source) |value| if (!std.mem.eql(u8, value.value.principal, principal) or value.value.registration.lease.node != owner_node_id or !std.mem.eql(u8, &value.value.registration.connection, &id) or !std.mem.eql(u8, &value.value.instance, &epoch) or value.value.recovery or value.value.phase == .fencing or value.value.phase == .closing or value.value.phase == .retired or value.value.registration.lease.expires_at_ms <= now_ms) return error.SqlConnectionNotFound;
+        if (next.expires_at_ms -| now_ms > record.ttl_ms / 2) return 0;
+        next.expires_at_ms = now_ms +| record.ttl_ms;
+        const raw = try txn.get(directory_key);
+        var directory = try std.json.parseFromSlice(Directory, alloc, raw, .{ .allocate = .alloc_always });
+        defer directory.deinit();
+        if (directory.value.entries.len > max_connections) return error.InvalidSqlConnection;
+        const entries = try alloc.dupe(Entry, directory.value.entries);
+        defer alloc.free(entries);
+        var found = false;
+        for (entries) |*entry| if (std.mem.eql(u8, &entry.id, &id)) {
+            entry.expires_at_ms = next.expires_at_ms;
+            found = true;
+            break;
+        };
+        if (!found) return error.InvalidSqlConnection;
+        const encoded = try std.json.Stringify.valueAlloc(alloc, Directory{ .entries = entries }, .{});
+        defer alloc.free(encoded);
+        try txn.put(directory_key, encoded);
+        try record.putTxn(txn, alloc, next);
+        return 0;
+    }
     const can_reconcile = reconciliation and try @import("sql_command_producer.zig").reconciliationReadyTxn(alloc, txn, id);
     if (!can_reconcile and (action != .close or fence != null)) try @import("sql_command_producer.zig").requireCommandTxn(alloc, txn, id, fence, now_ms);
     return switch (action) {
-        .create => unreachable,
+        .create, .wire_keepalive => unreachable,
+        .notification_identity => |value| blk: {
+            if (fence == null or next.generation != value.generation or value.sender_pid <= 0) return error.SqlConnectionChanged;
+            if (next.notification_pid) |pid| {
+                if (pid != value.sender_pid) return error.SqlConnectionChanged;
+            } else {
+                // This once-only descriptor does not change settings or the
+                // SQL lifecycle revision captured by the enclosing command.
+                next.notification_pid = value.sender_pid;
+                try record.putTxn(txn, alloc, next);
+            }
+            break :blk 0;
+        },
         .discard_sequences => blk: {
             if (next.state == .beginning or next.state == .uncertain) return error.SqlConnectionBusy;
             if (next.sequence_epoch == std.math.maxInt(u64) or next.revision == std.math.maxInt(u64)) return error.SqlProgramLimitExceeded;
@@ -435,6 +488,9 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
             if (session.terminal_commit != null or session.external_preparation_prepared) {
                 next.overlay = session.setting_committed.items;
                 next.lookup_path = (session.sql orelse return error.InvalidTransactionSessionRecord).search_path_committed;
+                if (session.terminal_commit != null) for (session.sql.?.notifications.commands.items) |command| {
+                    if (command == .listen) next.notification_listen_seen = true;
+                };
             }
             try record.putTxn(txn, alloc, next);
             break :blk 0;
@@ -761,4 +817,25 @@ test "HTTP connection directory preserves concurrent creates and closes" {
             };
         }
     }
+}
+
+test "pgwire notifications renew only the live socket epoch without changing SQL lifecycle revisions" {
+    const a = std.testing.allocator;
+    var backend = @import("antfly_local_sources").storage_mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var native = try backend.runtimeStore(a, .{ .name = "wire-notification-liveness" });
+    defer native.deinit();
+    var store = transactions.DurableSessionStore.initRuntime(a, &native);
+    const id: [32]u8 = @splat('a');
+    const epoch: [16]u8 = @splat(7);
+    _ = try mutate(&store, .{ .create = .{ .id = id, .principal = "alice", .owner_node_id = 7, .expires_at_ms = record.ttl_ms, .wire_epoch = epoch, .database = "main", .namespace = "public" } }, "alice", 7, 0);
+    try std.testing.expectError(error.SqlConnectionChanged, keepWireAlive(&store, a, id, "alice", 7, @splat(8), record.ttl_ms / 2));
+    try keepWireAlive(&store, a, id, "alice", 7, epoch, record.ttl_ms / 2);
+    var current = try load(&store, a, id, "alice", 7, record.ttl_ms + 1);
+    defer current.deinit();
+    try std.testing.expectEqual(record.ttl_ms + record.ttl_ms / 2, current.value.expires_at_ms);
+    try std.testing.expectEqual(@as(u64, 1), current.value.revision);
+    try std.testing.expectEqual(@as(u64, 1), current.value.generation);
+    try keepWireAlive(&store, a, id, "alice", 7, epoch, current.value.expires_at_ms + 1);
+    try std.testing.expectError(error.SqlConnectionNotFound, keepWireAlive(&store, a, id, "bob", 7, epoch, record.ttl_ms));
 }

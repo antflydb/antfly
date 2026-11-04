@@ -74,8 +74,9 @@ def test_required_ndjson_body_is_not_made_optional(tmp_path: Path) -> None:
     for relative in SQL_OPERATIONS:
         source = (tmp_path / relative).read_text()
         assert "from ....sql_transport import sql_request, sql_request_async" in source
-        assert "response = sql_request(client.get_httpx_client(),**kwargs)" in source
-        assert "response = await sql_request_async(client.get_async_httpx_client(),**kwargs)" in source
+        limit = " max_response_bytes=1 << 20," if relative.stem == "poll_sql_notifications" else ""
+        assert f"response = sql_request(client.get_httpx_client(),{limit}**kwargs)" in source
+        assert f"response = await sql_request_async(client.get_async_httpx_client(),{limit}**kwargs)" in source
     embed_source = (tmp_path / EMBED_REQUEST).read_text()
     assert embed_source.count("if isinstance(self.input_, list):") == 1
     assert "ordered content inputs cannot be mixed" in embed_source

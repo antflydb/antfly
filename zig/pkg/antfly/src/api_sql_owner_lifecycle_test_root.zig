@@ -26,6 +26,8 @@ pub const storage_backend_erased = @import("antfly_local_sources").storage_backe
 pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
 
 test {
+    _ = @import("pgwire/notification_test.zig");
+    _ = @import("api/sql_notification_integration_test.zig");
     _ = @import("api/sql_join_read_integration_test.zig");
     _ = @import("api/sql_locking_integration_test.zig");
     _ = @import("api/sql_table_lock_integration_test.zig");

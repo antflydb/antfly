@@ -4142,6 +4142,12 @@ pub const ApiHttpServer = struct {
     lake_index_recovery_cursor: usize = 0,
     lake_index_recovery_after_ns: u64 = 0,
     backup_maintenance_closing: std.atomic.Value(bool) = .init(false),
+    sql_notification_hub: @import("sql_notification_hub.zig").Hub = .{},
+    sql_notification_work_cursor: @import("sql_notification_maintenance.zig").Cursor = .{},
+    sql_notification_work_in_flight: std.atomic.Value(bool) = .init(false),
+    sql_notification_work_due_ns: std.atomic.Value(u64) = .init(0),
+    sql_notification_work_completed: std.atomic.Value(u64) = .init(0),
+    sql_notification_work_failures: std.atomic.Value(u64) = .init(0),
     sql_prepared_work_mutex: std.atomic.Mutex = .unlocked,
     sql_prepared_work_cursor: ?[16]u8 = null,
     sql_lock_work_cursor: ?@import("../system_catalog/lock_authority.zig").scopes.Work = null,
@@ -5673,6 +5679,7 @@ pub const ApiHttpServer = struct {
                 };
             }
         }
+        self.scheduleSqlNotificationMaintenance() catch {};
         self.runSqlLockMaintenanceOnce();
         try self.runLocalSessionMaintenanceOnce();
         // Durable index controls and cancellation are server-owned work.
@@ -5794,6 +5801,41 @@ pub const ApiHttpServer = struct {
                 return err;
             };
         }
+    }
+
+    const NotificationMaintenanceWork = struct {
+        server: *ApiHttpServer,
+        fn run(raw: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.server.advanceSqlNotificationMaintenance();
+        }
+        fn deinit(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.server.sql_notification_work_in_flight.store(false, .release);
+            self.server.alloc.destroy(self);
+        }
+    };
+    fn scheduleSqlNotificationMaintenance(self: *ApiHttpServer) !void {
+        if (!self.source.vtable.supports_sql_command_ownership or !@import("sql_notification_maintenance.zig").owns(self)) return;
+        if (platform_time.monotonicNs() < self.sql_notification_work_due_ns.load(.acquire) or self.sql_notification_work_in_flight.swap(true, .acq_rel)) return;
+        var submitted = false;
+        defer if (!submitted) self.sql_notification_work_in_flight.store(false, .release);
+        const runtime = self.cfg.backend_runtime orelse return self.advanceSqlNotificationMaintenance();
+        if (runtime.threaded_jobs == null or self.session_maintenance_owner_id == 0) return self.advanceSqlNotificationMaintenance();
+        const work = try self.alloc.create(NotificationMaintenanceWork);
+        errdefer self.alloc.destroy(work);
+        work.* = .{ .server = self };
+        try runtime.durable_jobs.submit(.{ .owner_id = self.session_maintenance_owner_id, .class = .maintenance, .ptr = work, .run = NotificationMaintenanceWork.run, .deinit = NotificationMaintenanceWork.deinit });
+        submitted = true;
+    }
+    fn advanceSqlNotificationMaintenance(self: *ApiHttpServer) !void {
+        const next = @import("sql_notification_maintenance.zig").advance(self, &self.sql_notification_work_cursor) catch |err| {
+            self.sql_notification_work_due_ns.store(platform_time.monotonicNs() +| std.time.ns_per_s, .release);
+            _ = self.sql_notification_work_failures.fetchAdd(1, .monotonic);
+            return err;
+        };
+        _ = self.sql_notification_work_completed.fetchAdd(1, .monotonic);
+        self.sql_notification_work_due_ns.store(platform_time.monotonicNs() +| @as(u64, if (next) 10 * std.time.ns_per_ms else std.time.ns_per_s), .release);
     }
 
     const MemoryMaintenanceWork = struct {

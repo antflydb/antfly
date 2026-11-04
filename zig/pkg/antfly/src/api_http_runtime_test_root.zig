@@ -19,6 +19,9 @@
 
 const http_server = @import("api/http_server.zig");
 test {
+    _ = @import("system_catalog/sql_notifications.zig");
+    _ = @import("api/sql_notification_hub.zig");
+    _ = @import("api/sql_notification_maintenance.zig");
     _ = @import("api/relational_expression_contract.zig");
     _ = @import("api/row_policy_publication_coordinator.zig");
     _ = @import("api/retained_read_rpc.zig");

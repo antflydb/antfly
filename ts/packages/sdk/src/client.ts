@@ -100,6 +100,8 @@ import type {
   SQLCatalogOperationReceipt,
   SQLConnectionOpenRequest,
   SQLConnectionResponse,
+  SQLNotificationPage,
+  SQLNotificationPollRequest,
   SQLDiagnostic,
   SQLPreparedExecutionRequest,
   SQLPreparedResponse,
@@ -1175,6 +1177,62 @@ export class AntflyClient {
     )
       throw new Error("Invalid SQL connection response");
     return data;
+  }
+
+  /** Receive committed LISTEN events. Retain the cursor and acknowledge only consumed pages. */
+  async pollSQLNotifications(
+    connectionId: string,
+    request: SQLNotificationPollRequest = {},
+    options?: WriteOptions
+  ): Promise<SQLNotificationPage> {
+    if (!/^[0-9a-f]{32}$/.test(connectionId))
+      throw new Error("SQL connection ID must be 32 lowercase hexadecimal characters");
+    if (
+      request.acknowledge !== undefined &&
+      (typeof request.acknowledge !== "string" || !/^[0-9a-f]{20}$/.test(request.acknowledge))
+    )
+      throw new Error("Invalid SQL notification acknowledgement cursor");
+    if (
+      request.limit !== undefined &&
+      (!Number.isInteger(request.limit) || request.limit < 1 || request.limit > 128)
+    )
+      throw new Error("SQL notification limit must be between 1 and 128");
+    const page = await this.sqlRequest<SQLNotificationPage>(
+      `/db/v1/sql/connections/${connectionId}/notifications`,
+      request,
+      { ...options, maxResponseBytes: Math.min(options?.maxResponseBytes ?? 1 << 20, 1 << 20) }
+    );
+    const encoder = new TextEncoder();
+    let bytes = 0;
+    if (
+      !page ||
+      !Array.isArray(page.notifications) ||
+      page.notifications.length > (request.limit ?? 128) ||
+      typeof page.pending !== "boolean" ||
+      (page.cursor !== undefined &&
+        (typeof page.cursor !== "string" || !/^[0-9a-f]{20}$/.test(page.cursor))) ||
+      (page.notifications.length > 0 && page.cursor === undefined)
+    )
+      throw new Error("Invalid SQL notification page");
+    for (const event of page.notifications) {
+      if (
+        !event ||
+        typeof event.channel !== "string" ||
+        typeof event.payload !== "string" ||
+        event.channel.includes("\0") ||
+        event.payload.includes("\0") ||
+        !Number.isInteger(event.sender_pid) ||
+        event.sender_pid <= 0 ||
+        event.sender_pid > 2147483647
+      )
+        throw new Error("Invalid SQL notification event");
+      const channelBytes = encoder.encode(event.channel).length;
+      const payloadBytes = encoder.encode(event.payload).length;
+      bytes += channelBytes + payloadBytes;
+      if (channelBytes < 1 || channelBytes > 63 || payloadBytes > 7999 || bytes > 65536)
+        throw new Error("SQL notification page exceeds delivery bounds");
+    }
+    return page;
   }
 
   /** Close an idle SQL connection on its owner. Unknown mutation outcomes are never replayed. */

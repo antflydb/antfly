@@ -168,7 +168,9 @@ const std = @import("std");
 // unreleased SQL profile reserves floors above 78; historical notes above
 // describe its development sequence before this rebasing. Published transition
 // tag 81 remains SQL completion references; private SQL tags begin at 82.
-pub const current_version: u16 = 161;
+pub const current_version: u16 = 162;
+/// Transaction-bound notification intents and visibility-gated ordered delivery.
+pub const sql_notifications_version: u16 = 162;
 /// Native SQL lock custody is part of the admitted 2PC manifest.
 pub const sql_native_lock_custody_version: u16 = 161;
 /// Ordinary catalog DDL binds a prepared command to a retained native outcome.

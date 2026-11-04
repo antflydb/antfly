@@ -3488,6 +3488,19 @@ pub const Client = struct {
         return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
     }
 
+    /// Receive and acknowledge committed SQL notifications
+    /// POST /db/v1/sql/connections/{connection_id}/notifications
+    pub fn pollSQLNotifications(self: *@This(), connection_id: []const u8, body: types.SQLNotificationPollRequest) !ApiResponse(types.SQLNotificationPage) {
+        const encoded_connection_id = try httpx.PercentEncoding.encode(self.allocator, connection_id);
+        defer self.allocator.free(encoded_connection_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sql/connections/{s}/notifications", .{ self.base_url, encoded_connection_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders(), .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 1048576 });
+        return ApiResponse(types.SQLNotificationPage).fromResponse(self.allocator, &resp);
+    }
+
     /// Observe an exact retained SQL catalog operation
     /// POST /db/v1/sql/operations/status
     pub fn getSQLCatalogOperation(self: *@This(), body: types.SQLCatalogRecoveryRequest) !ApiResponse(types.SQLCatalogOperationReceipt) {

@@ -365,7 +365,7 @@ pub fn compileDiagnostic(allocator: std.mem.Allocator, sql: []const u8, limits: 
             // PostgreSQL row locks belong to a SELECT producer, not to the
             // mutation itself. Likewise UPDATE/DELETE do not accept ORDER/LIMIT.
             // Never execute a valid mutation prefix while discarding its suffix.
-            .lock_table => error.InvalidSqlSyntax,
+            .lock_table, .notification => error.InvalidSqlSyntax,
             .update, .delete => if (tokens.items[parser.pos].isKeyword(.@"for") or
                 tokens.items[parser.pos].isKeyword(.order) or tokens.items[parser.pos].isKeyword(.limit) or
                 tokens.items[parser.pos].isKeyword(.offset) or tokens.items[parser.pos].isKeyword(.fetch))
@@ -4348,7 +4348,25 @@ const Parser = struct {
         return true;
     }
 
+    fn notificationChannel(self: *Parser) Error![]const u8 {
+        const channel_name = try self.identifier();
+        var size = @min(channel_name.len, ast.notifications.max_channel_bytes);
+        while (size != 0 and !std.unicode.utf8ValidateSlice(channel_name[0..size])) size -= 1;
+        if (size == 0) return self.fail(error.InvalidSqlSyntax, "notification channel cannot be empty");
+        return channel_name[0..size];
+    }
     fn statement(self: *Parser) Error!ast.Statement {
+        if (self.keyword(.listen)) return .{ .notification = .{ .listen = try self.notificationChannel() } };
+        if (self.keyword(.unlisten)) return .{ .notification = if (self.take(.star)) .unlisten_all else .{ .unlisten = try self.notificationChannel() } };
+        if (self.keyword(.notify)) {
+            const channel = try self.notificationChannel();
+            const payload = if (self.take(.comma)) blk: {
+                const payload_value = try self.value();
+                if (payload_value != .string) return self.fail(error.InvalidSqlSyntax, "NOTIFY payload requires a string literal");
+                break :blk payload_value.string;
+            } else "";
+            return .{ .notification = .{ .notify = .{ .channel = channel, .payload = payload } } };
+        }
         if (self.ddlWord("LOCK")) return .{ .lock_table = try self.tableLock() };
         if (self.ddlWord("GRANT")) return .{ .catalog_ddl = try self.authorizationDdl(false, null) };
         if (self.ddlWord("REVOKE")) return .{ .catalog_ddl = try self.authorizationDdl(true, null) };
@@ -6919,4 +6937,24 @@ test "SQL locking admission retains nested row effects through CTE derived and E
     defer inspected.deinit();
     try std.testing.expect(inspected.uses_row_locks);
     try std.testing.expect(!inspected.requiresWriteAdmission());
+}
+
+test "compiler SQL notifications preserve original channels payloads and PostgreSQL utility grammar" {
+    const examples = [_]struct { sql: []const u8, command: ast.notifications.Command }{
+        .{ .sql = "LISTEN usage_events", .command = .{ .listen = "usage_events" } },
+        .{ .sql = "NOTIFY usage_events, 'updated'", .command = .{ .notify = .{ .channel = "usage_events", .payload = "updated" } } },
+        .{ .sql = "UNLISTEN usage_events", .command = .{ .unlisten = "usage_events" } },
+        .{ .sql = "NOTIFY usage_events", .command = .{ .notify = .{ .channel = "usage_events" } } },
+        .{ .sql = "UNLISTEN *", .command = .unlisten_all },
+        .{ .sql = "LISTEN \"Case Sensitive\"", .command = .{ .listen = "Case Sensitive" } },
+    };
+    for (examples) |example| {
+        var compiled = try compile(std.testing.allocator, example.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqualDeep(example.command, compiled.statement.notification);
+        try std.testing.expect(compiled.requiresWriteAdmission());
+    }
+    for ([_][]const u8{ "LISTEN", "NOTIFY x, 123", "NOTIFY x, $1", "LISTEN x.y", "UNLISTEN x,y" }) |sql| {
+        try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, sql, .{}));
+    }
 }

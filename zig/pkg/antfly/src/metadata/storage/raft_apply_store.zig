@@ -30965,6 +30965,7 @@ pub const RaftApplyStore = struct {
         sql_lock_work,
         sql_lock_connections,
         sql_lock_ledger,
+        sql_notifications,
         schema_validation,
         schema_validation_dependency,
     };
@@ -30977,6 +30978,7 @@ pub const RaftApplyStore = struct {
         key: MetadataSnapshotKey,
     };
     const metadata_snapshot_projections = [_]MetadataSnapshotProjectionDescriptor{
+        .{ .projection = .sql_notifications, .key = .{ .prefix = @import("../../system_catalog/sql_notifications.zig").prefixForGroup } },
         .{ .projection = .sql_lock_scopes, .key = .{ .prefix = SqlLocks.scopePrefixForGroup } },
         .{ .projection = .sql_lock_work, .key = .{ .prefix = SqlLocks.workPrefixForGroup } },
         .{ .projection = .sql_lock_connections, .key = .{ .prefix = SqlLocks.connectionPrefixForGroup } },
@@ -31100,8 +31102,8 @@ pub const RaftApplyStore = struct {
             .ack_initial_fk_retirement => metadataSnapshotProjectionBit(.fk_initial_replica) | metadataSnapshotProjectionBit(.fk_initial_retire),
             .activate_topology_protocol => metadataSnapshotProjectionBit(.topology_activation),
             .apply_store_report_baseline => metadataSnapshotProjectionBit(.store) | metadataSnapshotProjectionBit(.store_report_cursor) | metadataSnapshotProjectionBit(.store_report_baseline) | metadataSnapshotProjectionBit(.store_report_generation),
-            .apply_sql_lock_scope => metadataSnapshotProjectionBit(.system_catalog) | (metadataSnapshotProjectionBit(.sql_lock_scopes) | metadataSnapshotProjectionBit(.sql_lock_work) | metadataSnapshotProjectionBit(.sql_lock_connections) | metadataSnapshotProjectionBit(.sql_lock_ledger)),
-            .apply_sql_prepared_transaction => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.sql_prepared_transactions) | (metadataSnapshotProjectionBit(.sql_lock_scopes) | metadataSnapshotProjectionBit(.sql_lock_work) | metadataSnapshotProjectionBit(.sql_lock_connections) | metadataSnapshotProjectionBit(.sql_lock_ledger)),
+            .apply_sql_lock_scope => metadataSnapshotProjectionBit(.sql_notifications) | metadataSnapshotProjectionBit(.system_catalog) | (metadataSnapshotProjectionBit(.sql_lock_scopes) | metadataSnapshotProjectionBit(.sql_lock_work) | metadataSnapshotProjectionBit(.sql_lock_connections) | metadataSnapshotProjectionBit(.sql_lock_ledger)),
+            .apply_sql_prepared_transaction => metadataSnapshotProjectionBit(.sql_notifications) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.sql_prepared_transactions) | (metadataSnapshotProjectionBit(.sql_lock_scopes) | metadataSnapshotProjectionBit(.sql_lock_work) | metadataSnapshotProjectionBit(.sql_lock_connections) | metadataSnapshotProjectionBit(.sql_lock_ledger)),
             .apply_system_catalog => metadataSnapshotProjectionBit(.system_catalog) |
                 metadataSnapshotProjectionBit(.sql_sequence_counters) |
                 metadataSnapshotProjectionBit(.sql_column_identities) | metadataSnapshotProjectionBit(.sql_object_identities) | metadataSnapshotProjectionBit(.sql_object_annotations) |
@@ -40698,12 +40700,12 @@ pub const RaftApplyStore = struct {
         if (!std.mem.eql(u8, &try catalogIncarnationTxn(txn, group), &request.incarnation)) return error.CatalogGenerationChanged;
         const standalone = group == group_ids.main_metadata_group_id and try stagingGet(txn, standalone_catalog_key) != null;
         if (request.standalone != standalone) return error.CatalogGenerationChanged;
-        _ = try self.standbyRelationActivationTxn(txn, group, SqlLocks.decoder_version);
+        _ = try self.standbyRelationActivationTxn(txn, group, if (request.notification_generation != null or request.operation == .notification_gc or request.operation == .notification_bind or request.operation == .notification_offer or request.operation == .notification_ack) topology_protocol.sql_notifications_version else SqlLocks.decoder_version);
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch.deinit();
         const a = scratch.allocator();
         const view: system_catalog_storage.View = .{ .alloc = a, .txn = txn, .group_id = group, .meta = try system_catalog_storage.readMeta(a, txn, group) };
-        if (try view.byId(.database, request.database) == null) return error.DatabaseNotFound;
+        if (request.operation != .notification_gc and try view.byId(.database, request.database) == null) return error.DatabaseNotFound;
     }
     pub fn sqlLockOutcome(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: SqlLocks.Request) ![]u8 {
         var scratch = std.heap.ArenaAllocator.init(alloc);
@@ -40726,13 +40728,19 @@ pub const RaftApplyStore = struct {
         if (!std.mem.allEqual(u8, &query.incarnation, 0) and !std.mem.eql(u8, &incarnation, &query.incarnation)) return error.CatalogGenerationChanged;
         const standalone = group == group_ids.main_metadata_group_id and try stagingGet(&txn, standalone_catalog_key) != null;
         if (query.standalone != standalone) return error.CatalogGenerationChanged;
-        _ = try self.standbyRelationActivationTxn(&txn, group, SqlLocks.decoder_version);
+        const activation = try self.standbyRelationActivationTxn(&txn, group, SqlLocks.decoder_version);
+        if (query.notification_work) |selection| {
+            const journal: SqlLocks.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = incarnation };
+            const capable = activation.version >= topology_protocol.sql_notifications_version;
+            const work = if (capable) try @import("../../system_catalog/sql_notifications.zig").readWork(a, &txn, group, incarnation, selection.after) else null;
+            return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .notification_capable = capable, .notification_work = work, .group = group, .incarnation = incarnation, .standalone = standalone, .head = try journal.head(a), .scope = null, .owner = null, .next_work = null }, .{});
+        }
         if (query.discovery) |name| {
             const view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = group, .meta = try system_catalog_storage.readMeta(a, &txn, group) };
             const database = (try view.lookup(.database, 0, name)) orelse return error.DatabaseNotFound;
             const journal: SqlLocks.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = incarnation };
             try context.ensureActive();
-            return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .group = group, .incarnation = incarnation, .standalone = standalone, .head = try journal.head(a), .scope = null, .owner = null, .next_work = null, .database_id = database.id }, .{});
+            return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .notification_capable = activation.version >= topology_protocol.sql_notifications_version, .group = group, .incarnation = incarnation, .standalone = standalone, .head = try journal.head(a), .scope = null, .owner = null, .next_work = null, .database_id = database.id }, .{});
         }
         const ns: SqlLocks.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = incarnation };
         const item: ?SqlLocks.scopes.WorkItem = if (query.work) |work| blk: {
@@ -40762,7 +40770,14 @@ pub const RaftApplyStore = struct {
                 .route => |selection| try SqlLocks.scopes.Data.find(a, &txn, ns, parent.registration.lease.backend, selection.spec, selection.transaction),
             };
         } else null;
-        return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .group = group, .incarnation = incarnation, .standalone = standalone, .head = try outcomes.head(a), .scope = scope, .owner = owner, .next_work = work, .receipt = receipt, .wait_resource = wait_resource, .participant = participant }, .{});
+        const notification_page: ?@import("../../system_catalog/sql_notifications.zig").Page = if (query.notifications) |selection| page: {
+            if (activation.version < topology_protocol.sql_notifications_version) return error.TableTopologyProtocolUpgradeRequired;
+            const root = scope orelse return error.SqlConnectionNotFound;
+            const notification_context: SqlLocks.Context = .{ .a = a, .actor = query.actor, .database = query.database, .standalone = standalone };
+            if (!try SqlLocks.requireNotificationConnection(a, &txn, root, selection.generation, notification_context, false)) break :page .{};
+            break :page try @import("../../system_catalog/sql_notifications.zig").readPage(a, &txn, group, root.registration.connection, selection.generation, selection.maximum);
+        } else null;
+        return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .notification_binding = if (backend) |source_backend| try @import("../../system_catalog/sql_notifications.zig").readBinding(a, &txn, group, source_backend) else null, .notifications = notification_page, .notification_capable = activation.version >= topology_protocol.sql_notifications_version, .group = group, .incarnation = incarnation, .standalone = standalone, .head = try outcomes.head(a), .scope = scope, .owner = owner, .next_work = work, .receipt = receipt, .wait_resource = wait_resource, .participant = participant }, .{});
     }
     /// Every route/schema check shares the enrollment's native metadata
     /// writer. A resolved table name or a frontend routing cache is no proof.
@@ -40868,18 +40883,18 @@ pub const RaftApplyStore = struct {
         _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_prepared_transactions_version);
         const minimum_decoder = switch (request.operation) {
             .admit => |admission| version: {
-                for (admission.participants) |part| if (part.sql_locks != null) break :version topology_protocol.sql_native_lock_custody_version;
+                for (admission.participants) |part| if (part.sql_locks != null) break :version @max(topology_protocol.sql_native_lock_custody_version, admission.identity.minimumDecoderVersion());
                 break :version admission.identity.minimumDecoderVersion();
             },
             .cancel_admission => |cancel| version: {
-                for (cancel.original.participants) |part| if (part.sql_locks != null) break :version topology_protocol.sql_native_lock_custody_version;
+                for (cancel.original.participants) |part| if (part.sql_locks != null) break :version @max(topology_protocol.sql_native_lock_custody_version, cancel.original.identity.minimumDecoderVersion());
                 break :version cancel.original.identity.minimumDecoderVersion();
             },
             .advance => |change| blk: {
                 var scratch = std.heap.ArenaAllocator.init(self.alloc);
                 defer scratch.deinit();
                 const record = (try PreparedTransactions.readOperation(scratch.allocator(), txn, group, change.owner.operation_id)) orelse break :blk topology_protocol.sql_prepared_transactions_version;
-                for (record.participants) |part| if (part.sql_locks != null) break :blk topology_protocol.sql_native_lock_custody_version;
+                for (record.participants) |part| if (part.sql_locks != null) break :blk @max(topology_protocol.sql_native_lock_custody_version, record.identity.minimumDecoderVersion());
                 break :blk record.identity.minimumDecoderVersion();
             },
             .acknowledge_receipt => |ack| blk: {
@@ -40889,7 +40904,8 @@ pub const RaftApplyStore = struct {
                 break :blk if (receipt.lock_scope != null and receipt.kind == .named) topology_protocol.sql_prepared_lock_handoff_version else if (receipt.lock_scope != null) topology_protocol.sql_lock_authority_version else if (receipt.kind == .session_commit or receipt.session.standalone) topology_protocol.sql_connection_transactions_version else topology_protocol.sql_prepared_transactions_version;
             },
         };
-        if (minimum_decoder > topology_protocol.sql_prepared_transactions_version) _ = try self.standbyRelationActivationTxn(txn, group, minimum_decoder);
+        const required = if (request.notification_control != null) @max(minimum_decoder, topology_protocol.sql_notifications_version) else minimum_decoder;
+        if (required > topology_protocol.sql_prepared_transactions_version) _ = try self.standbyRelationActivationTxn(txn, group, required);
     }
 
     fn completeSqlLockReceiptTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, request: PreparedTransactions.Mutation, release: bool) !void {
@@ -40973,6 +40989,7 @@ pub const RaftApplyStore = struct {
         if (request.operation == .advance) {
             const change = request.operation.advance;
             if (try PreparedTransactions.readOperation(a, txn, group, change.owner.operation_id)) |record| {
+                if (record.identity.notification_plan != null and request.notification_control == null) return error.InvalidCatalogMutation;
                 if (record.hasPreparedLocks()) {
                     if (change.action == .handoff and !record.locks_released) return error.CatalogPublicationProofPending;
                     if ((change.action == .prepare and record.phase == .locking) or change.action == .lock_released) {
@@ -41084,7 +41101,17 @@ pub const RaftApplyStore = struct {
                 }
             }
         }
-        return PreparedTransactions.plan(a, txn, group, meta.revision, request);
+        const planned = try PreparedTransactions.plan(a, txn, group, meta.revision, request);
+        if (request.operation == .admit) {
+            const identity = request.operation.admit.identity;
+            if (identity.notification_plan) |notifications| {
+                const notification_journal = @import("../../system_catalog/sql_notifications.zig");
+                const binding = (try notification_journal.readBinding(a, txn, group, identity.lock_scope.?.backend)) orelse return error.CatalogGenerationChanged;
+                if (binding.generation != notifications.generation or binding.sender_pid != notifications.sender_pid or !std.mem.eql(u8, &binding.connection, &notifications.connection)) return error.CatalogGenerationChanged;
+                try notification_journal.validateReserve(a, txn, try notification_journal.decisionScope(a, group, request.incarnation, identity), identity.operation_id, identity.txn_id, notifications);
+            }
+        }
+        return planned;
     }
 
     pub fn prepareSqlPreparedTransaction(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: PreparedTransactions.Mutation) ![]u8 {
@@ -41140,6 +41167,7 @@ pub const RaftApplyStore = struct {
                         try SqlLocks.scopes.ledger.reclaimPrepared(a, txn, .{ .home = .metadata, .group = group, .incarnation = request.incarnation }, lease, record.identity.txn_id, context);
                     }
                 }
+                try applySqlNotificationsTxn(a, txn, group, request);
                 try planned.apply(txn);
                 if (request.operation == .admit) if (request.operation.admit.identity.lock_scope) |ref| {
                     const identity = request.operation.admit.identity;
@@ -41152,6 +41180,25 @@ pub const RaftApplyStore = struct {
                 try self.advancePreparedLocksTxn(a, txn, group, request);
                 try journal.append(a, ordinal, request.admission, hash, .{ .success = planned.result });
             },
+        }
+    }
+
+    fn applySqlNotificationsTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, request: PreparedTransactions.Mutation) !void {
+        const notifications = @import("../../system_catalog/sql_notifications.zig");
+        if (request.operation == .admit) {
+            const identity = request.operation.admit.identity;
+            if (identity.notification_plan) |plan| try notifications.reserve(a, txn, try notifications.decisionScope(a, group, request.incarnation, identity), identity.operation_id, identity.txn_id, plan);
+        } else if (request.operation == .advance) {
+            const change = request.operation.advance;
+            const record = (try PreparedTransactions.readOperation(a, txn, group, change.owner.operation_id)) orelse return error.InvalidCatalogRecord;
+            const plan = record.identity.notification_plan orelse return;
+            const scope = try notifications.decisionScope(a, group, request.incarnation, record.identity);
+            switch (change.action) {
+                .commit => try notifications.commit(a, txn, scope, record.identity.operation_id, record.identity.txn_id, plan),
+                .abort => try notifications.abort(a, txn, scope, record.identity.operation_id, record.identity.txn_id, plan),
+                .handoff => if (record.decision.?.status == .committed) try notifications.ready(a, txn, scope, record.identity.operation_id, record.identity.txn_id, plan),
+                else => {},
+            }
         }
     }
 
@@ -50418,6 +50465,10 @@ fn validateMetadataSnapshotRowsCancelable(alloc: std.mem.Allocator, group_id: u6
         }
     };
     var reference_reader: ReferenceReader = .{ .values = &seen };
+    @import("../../system_catalog/sql_notification_snapshot.zig").verify(alloc, group_id, &reference_reader, rows, cancelled) catch |err| switch (err) {
+        error.OutOfMemory, error.SnapshotBuildCancelled => return err,
+        else => return error.InvalidMetadataSnapshot,
+    };
     var expected_annotations: usize = 0;
     var actual_annotations: usize = 0;
     for (rows) |row| {

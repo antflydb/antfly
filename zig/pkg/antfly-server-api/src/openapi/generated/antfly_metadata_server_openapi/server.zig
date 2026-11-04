@@ -984,6 +984,16 @@ pub const CloseSQLConnectionPathParams = struct {
     connection_id: []const u8,
 };
 
+/// Receive and acknowledge committed SQL notifications
+pub const PollSQLNotificationsPathParams = struct {
+    connection_id: []const u8,
+};
+
+/// Parse the JSON request body for pollSQLNotifications.
+pub fn parsePollSQLNotificationsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SQLNotificationPollRequest) {
+    return std.json.parseFromSlice(types.SQLNotificationPollRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for getSQLCatalogOperation.
 pub fn parseGetSQLCatalogOperationBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SQLCatalogRecoveryRequest) {
     return std.json.parseFromSlice(types.SQLCatalogRecoveryRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -2068,6 +2078,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/sql", .operation_id = "executeSQL", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/sql/connections", .operation_id = "openSQLConnection", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/sql/connections/{connection_id}", .operation_id = "closeSQLConnection", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/sql/connections/{connection_id}/notifications", .operation_id = "pollSQLNotifications", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/sql/operations/status", .operation_id = "getSQLCatalogOperation", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/sql/prepared", .operation_id = "prepareSQL", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/sql/prepared/{prepared_id}", .operation_id = "closePreparedSQL", .request_body = .none, .streaming_response = false },
@@ -2291,6 +2302,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "executeSQL")) @compileError("ServerRouter: Impl missing required method 'executeSQL'");
         if (!@hasDecl(Impl, "openSQLConnection")) @compileError("ServerRouter: Impl missing required method 'openSQLConnection'");
         if (!@hasDecl(Impl, "closeSQLConnection")) @compileError("ServerRouter: Impl missing required method 'closeSQLConnection'");
+        if (!@hasDecl(Impl, "pollSQLNotifications")) @compileError("ServerRouter: Impl missing required method 'pollSQLNotifications'");
         if (!@hasDecl(Impl, "getSQLCatalogOperation")) @compileError("ServerRouter: Impl missing required method 'getSQLCatalogOperation'");
         if (!@hasDecl(Impl, "prepareSQL")) @compileError("ServerRouter: Impl missing required method 'prepareSQL'");
         if (!@hasDecl(Impl, "closePreparedSQL")) @compileError("ServerRouter: Impl missing required method 'closePreparedSQL'");
@@ -2512,6 +2524,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/sql", httpx.Handler.bind(self.impl, executeSQL));
             try server.post("/sql/connections", httpx.Handler.bind(self.impl, openSQLConnection));
             try server.delete("/sql/connections/:connection_id", httpx.Handler.bind(self.impl, closeSQLConnection));
+            try server.post("/sql/connections/:connection_id/notifications", httpx.Handler.bind(self.impl, pollSQLNotifications));
             try server.post("/sql/operations/status", httpx.Handler.bind(self.impl, getSQLCatalogOperation));
             try server.post("/sql/prepared", httpx.Handler.bind(self.impl, prepareSQL));
             try server.delete("/sql/prepared/:prepared_id", httpx.Handler.bind(self.impl, closePreparedSQL));
@@ -3515,6 +3528,13 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.closeSQLConnection(ctx, connection_id);
         }
 
+        /// Receive and acknowledge committed SQL notifications
+        /// POST /sql/connections/{connection_id}/notifications
+        fn pollSQLNotifications(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const connection_id = ctx.param("connection_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: connection_id" });
+            return impl.pollSQLNotifications(ctx, connection_id);
+        }
+
         /// Observe an exact retained SQL catalog operation
         /// POST /sql/operations/status
         fn getSQLCatalogOperation(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -4463,6 +4483,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn executeSQL(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn openSQLConnection(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn closeSQLConnection(self: *Impl, ctx: *httpx.Context, connection_id: []const u8) !httpx.Response
+//   fn pollSQLNotifications(self: *Impl, ctx: *httpx.Context, connection_id: []const u8) !httpx.Response
 //   fn getSQLCatalogOperation(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn prepareSQL(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn closePreparedSQL(self: *Impl, ctx: *httpx.Context, prepared_id: []const u8) !httpx.Response

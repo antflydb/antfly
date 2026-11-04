@@ -7220,6 +7220,67 @@ pub const AntflyApiHandler = struct {
         return ctx.status(200).json(struct {}{});
     }
 
+    pub fn pollSQLNotifications(self: *AntflyApiHandler, ctx: *httpx.Context, connection_id_raw: []const u8) !httpx.Response {
+        if (try self.admitCompletion(ctx)) |response| return response;
+        const response = self.pollSQLNotificationsOwned(ctx, connection_id_raw) catch |err| try sqlConnectionError(ctx, err);
+        return self.finishOwnedSQLResponse(ctx, response);
+    }
+    fn pollSQLNotificationsOwned(self: *AntflyApiHandler, ctx: *httpx.Context, connection_id_raw: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const decoded = distributed_txn.parseTxnIdHex(connection_id_raw) catch return error.SqlInvalidParameterValue;
+        const connection_id = std.fmt.bytesToHex(decoded, .lower);
+        const body = (try ctx.body()) orelse "{}";
+        if (body.len > 4096) return error.SqlProgramLimitExceeded;
+        if (try self.forwardSQLResource(ctx, &connection_id, .connection, body)) |response| return response;
+        var parsed = try std.json.parseFromSlice(sql_wire.SQLNotificationPollRequest, ctx.allocator, body, .{});
+        defer parsed.deinit();
+        const limit = parsed.value.limit orelse 128;
+        if (limit < 1 or limit > 128) return error.SqlInvalidParameterValue;
+        const delivery = @import("sql_notification_delivery.zig");
+        const acknowledgement = if (parsed.value.acknowledge) |token| try delivery.decodeCursor(token) else null;
+        const io = self.api_server.sharedApiIo() orelse return error.SqlConnectionUnavailable;
+        const Job = struct {
+            owner: delivery.Owner,
+            acknowledgement: ?@import("antfly_local_sources").sql_ast.notifications.Cursor,
+            limit: u16,
+            network: std.Io,
+            done: std.Io.Event = .unset,
+            encoded: ?[]u8 = null,
+            failure: ?anyerror = null,
+            fn run(job: *@This()) void {
+                defer job.done.set(job.network);
+                job.runInner() catch |err| {
+                    job.failure = err;
+                };
+            }
+            fn runInner(job: *@This()) !void {
+                const server = job.owner.server;
+                const worker_io = server.sharedApiIo() orelse return error.SqlConnectionUnavailable;
+                var lease = try server.sql_connection_admission.acquire(server.alloc, worker_io, .init(job.owner.connection, http_server_mod.transactionPrincipal(job.owner.user) orelse ""));
+                defer lease.release(worker_io);
+                var budget: SQLMemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 16 << 20 };
+                var arena = std.heap.ArenaAllocator.init(budget.allocator());
+                defer arena.deinit();
+                const a = arena.allocator();
+                const page = try job.owner.poll(a, job.acknowledgement, job.limit);
+                const events = try a.alloc(sql_wire.SQLNotification, page.events.len);
+                for (page.events, events) |event, *out| out.* = .{ .channel = event.channel, .payload = event.payload, .sender_pid = event.sender_pid };
+                const cursor = delivery.encodeCursor(page.cursor);
+                const output: sql_wire.SQLNotificationPage = .{ .notifications = events, .cursor = if (page.subscribed) &cursor else null, .pending = page.pending };
+                job.encoded = try std.json.Stringify.valueAlloc(server.alloc, output, .{ .emit_null_optional_fields = false });
+            }
+        };
+        var job: Job = .{ .owner = .{ .server = self.api_server, .user = identity, .context = operationContext(ctx, identity), .connection = connection_id }, .acknowledgement = acknowledgement, .limit = @intCast(limit), .network = ctx.io };
+        var future = try io.concurrent(Job.run, .{&job});
+        job.done.waitUncancelable(ctx.io);
+        @import("protected_future.zig").wait(io, &future);
+        defer if (job.encoded) |encoded| self.api_server.alloc.free(encoded);
+        if (job.failure) |err| return err;
+        return jsonResponse(ctx, 200, job.encoded orelse return error.InvalidSqlBackendResponse);
+    }
+
     fn attachSQLCompletion(response: *httpx.Response, completion: @import("../pgwire/completion.zig").Completion) !void {
         const raw = try completion.encode(response.allocator);
         defer response.allocator.free(raw);

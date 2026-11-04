@@ -103,6 +103,7 @@ pub const SessionRef = struct {
 };
 
 pub const Identity = struct {
+    notification_plan: ?local.sql_ast.notifications.Plan = null,
     kind: Kind = .named,
     lock_scope: ?@import("lock_authority.zig").Ref = null,
     commit_sync_level: local.storage_db_types.SyncLevel = .write,
@@ -121,6 +122,7 @@ pub const Identity = struct {
 
     pub fn minimumDecoderVersion(self: Identity) u16 {
         const protocol = @import("../metadata/topology_protocol.zig");
+        if (self.notification_plan != null) return protocol.sql_notifications_version;
         return if (self.lock_scope != null and self.kind == .named) protocol.sql_prepared_lock_handoff_version else if (self.lock_scope != null) protocol.sql_lock_authority_version else if (self.requiresConnectionDecoder()) protocol.sql_connection_transactions_version else protocol.sql_prepared_transactions_version;
     }
     pub fn preparedLockLease(self: Identity, a: A, group: u64) !local.storage_pessimistic_lock_ledger.Lease {
@@ -135,6 +137,10 @@ pub const Identity = struct {
     }
 
     pub fn validate(self: Identity) !void {
+        if (self.notification_plan) |notifications| {
+            try notifications.validate();
+            if (self.kind != .session_commit or self.lock_scope == null or self.session == null or self.session.?.connection_id == null or !std.mem.eql(u8, &notifications.connection, &self.session.?.connection_id.?)) return error.InvalidCatalogMutation;
+        }
         if (self.lock_scope) |scope| {
             try scope.backend.validate();
             try scope.command.validate();
@@ -155,10 +161,10 @@ pub const Identity = struct {
     pub fn jsonStringify(self: Identity, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Identity).@"struct".field_names) |field| {
-            if (comptime std.mem.eql(u8, field, "lock_scope")) {
-                if (self.lock_scope != null) {
+            if (comptime std.mem.eql(u8, field, "lock_scope") or std.mem.eql(u8, field, "notification_plan")) {
+                if (@field(self, field) != null) {
                     try writer.objectField(field);
-                    try writer.write(self.lock_scope);
+                    try writer.write(@field(self, field));
                 }
             } else if (comptime std.mem.eql(u8, field, "kind") or std.mem.eql(u8, field, "commit_sync_level")) {
                 if (self.kind == .session_commit) {
@@ -336,6 +342,7 @@ pub fn advance(a: A, record: Record, expected_revision: u64, owner: Owner, actio
             if (action == .lock_released) next.locks_released = true;
         },
         .commit => |decision| {
+            if (record.identity.notification_plan) |notifications| if (notifications.discard) return error.InvalidPreparedTransactionPhase;
             if (record.phase != .prepared or decision.version <= record.identity.begin_timestamp or (record.identity.kind == .session_commit and decision.sync_level != record.identity.commit_sync_level)) return error.InvalidPreparedTransactionPhase;
             next.decision = .{ .status = .committed, .version = decision.version, .sync_level = decision.sync_level };
             next.phase = if (all == 0) .resolved else .decided;
@@ -391,6 +398,8 @@ pub fn recoveryDecision(record: Record, now_ns: u64) ?enum { abort, commit } {
 pub const AdmissionInput = struct { identity: Identity, participants: []const Participant, admitted_at_ns: u64 };
 
 pub const Mutation = struct {
+    /// Capability marker travels with advances after the manifest was frozen.
+    notification_control: ?bool = null,
     admission: outcomes.Admission,
     incarnation: [16]u8,
     actor: Actor,
@@ -406,7 +415,19 @@ pub const Mutation = struct {
         acknowledge_receipt: struct { owner: Owner, txn_id: [16]u8 },
     },
 
+    pub fn jsonStringify(self: Mutation, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Mutation).@"struct".field_names) |field| {
+            if (!(comptime std.mem.eql(u8, field, "notification_control")) or self.notification_control != null) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+
     pub fn validate(self: Mutation) !void {
+        if (self.notification_control) |active| if (!active) return error.InvalidCatalogMutation;
         try self.admission.validate();
         try self.actor.validate();
         if (self.native_admin and self.actor.current_role != null) return error.InvalidCatalogMutation;
@@ -438,6 +459,7 @@ pub const Mutation = struct {
 fn validateAdmission(self: Mutation, request: AdmissionInput, actor: Actor) !void {
     try actor.validate();
     try request.identity.validate();
+    if ((request.identity.notification_plan != null) != (self.notification_control != null)) return error.InvalidCatalogMutation;
     if (request.identity.session) |session| try session.requireRealm(self.standalone);
     if (request.identity.database_id != self.database_id or !request.identity.principal.eql(actor.principal()) or
         !std.mem.eql(u8, &request.identity.operation_id, &self.admission.nonce) or

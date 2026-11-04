@@ -677,6 +677,12 @@ pub const Context = struct {
         if (context.binding.merge_mutation) |merge| return @import("merge_mutation.zig").execute(context, merge.*);
         return switch (input) {
             .select => |statement| try context.selectOutput(statement),
+            .notification => |command| blk: {
+                const provider = context.backend.notification_provider orelse return error.UnsupportedSqlExecution;
+                try context.checkpoint();
+                try provider.stage(provider.ptr, context.arena, command);
+                break :blk .{ .command_tag = command.tag() };
+            },
             .lock_table => try @import("locking.zig").executeTables(context, &(context.binding.locking orelse return error.InvalidSqlBackendResponse).tables),
             .call => try @import("procedure.zig").execute(context, context.binding.procedure orelse return error.InvalidSqlBackendResponse),
             .insert => |input_insert| blk: {
