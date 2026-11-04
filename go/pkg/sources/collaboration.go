@@ -612,8 +612,13 @@ func (c *CollaborationConnector) materialItems(ctx context.Context, r Request, c
 			items = append(items, input)
 		}
 	}
-	// Lazy Gmail invitations contribute relationship metadata after acquisition.
-	items[0] = makeInput(ref, m.Text, metadata)
+	// Native parent revisions describe canonical text and provider metadata.
+	// Attachment-derived relationships remain on the parent, but cannot alter
+	// that revision: parent reads and media authorization never acquire siblings.
+	// A text snapshot still includes its locally interpreted attachment metadata.
+	if !c.NativeAttachments {
+		items[0] = makeInput(ref, m.Text, metadata)
+	}
 	return items, nil
 }
 func (c *CollaborationConnector) load(ctx context.Context, config CollaborationConfig, ref collaborationRef) (collaborationMaterial, error) {

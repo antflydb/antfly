@@ -236,9 +236,12 @@ func TestNativeWorkspaceBaselineRequiresMatchingAcquisitionLayout(t *testing.T) 
 		}
 	})}
 	r := Request{Mode: ImportModeSource, SourceNamespace: "job/" + testSourceID, Config: SourceConfig(`{"resource":"gmail"}`)}
-	c.Baseline = &Inventory{Authoritative: true, ProviderState: map[string]string{"config": workspaceSelectionKey(r), "hydration": "old-text-layout", "account": "alice@example.com", "gmail": "10"}}
-	inventory, err := c.Enumerate(t.Context(), r)
-	require.NoError(t, err)
-	require.True(t, inventory.Authoritative)
-	require.Positive(t, full)
+	for _, layout := range []string{"old-text-layout", acquisitionKey(c.ProviderName + "\x00" + workspaceSelectionKey(r) + "\x00native-attachments-v3")} {
+		before := full
+		c.Baseline = &Inventory{Authoritative: true, ProviderState: map[string]string{"config": workspaceSelectionKey(r), "hydration": layout, "account": "alice@example.com", "gmail": "10"}}
+		inventory, err := c.Enumerate(t.Context(), r)
+		require.NoError(t, err)
+		require.True(t, inventory.Authoritative)
+		require.Equal(t, before+1, full, "a prior acquisition layout must rediscover canonical parent revisions")
+	}
 }
