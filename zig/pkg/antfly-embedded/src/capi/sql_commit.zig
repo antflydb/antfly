@@ -747,6 +747,63 @@ test "capi SQL outcome receipt markers in named tables are removed at a clean cl
     try std.testing.expectEqual(@as(?u64, null), try table.readOutcomeMarker(writer));
 }
 
+test "capi SQL outcome receipt from a table handle batch names that table" {
+    const api = @import("db.zig");
+    const receipts = @import("outcome_receipts.zig");
+    var f = try OutcomeFixture.init("receipt-table-handle");
+    defer f.deinit();
+    var table_id: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, @import("tables.zig").antfly_db_open_table(f.id, .fromSlice("t"), &table_id));
+    defer api.antfly_db_close(table_id);
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(table_id, .fromSlice("{\"inserts\":{\"handle-key\":{\"n\":1}}}"), &out));
+    // The table handle shares its database handle's writer.
+    const writer = &f.wrapper.outcome_writer;
+    const marker: receipts.Marker = .{ .writer = writer.id.?, .sequence = writer.sequence };
+    var buf: [receipts.max_text_len]u8 = undefined;
+    const named = receipts.Receipt.init(marker, "t");
+    const status = try receiptStatus(f.id, receipts.format(&named, &buf));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, status.code);
+    try std.testing.expectEqual(api.ANTFLY_OUTCOME_RECEIPT_APPLIED, status.status);
+}
+
+test "capi SQL outcome receipt for a named table on a directory handle resolves after reopen through the root" {
+    const api = @import("db.zig");
+    const Backend = @import("../storage/lsm_backend.zig").Backend;
+    var directory = try api.TestDirectory.init("receipt-lsm-named");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}", .{directory.path()}, 0);
+    defer std.testing.allocator.free(path);
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open(path, &id));
+    var open = true;
+    defer if (open) api.antfly_db_close(id);
+    var created: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&created);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_sql_json(id, .fromSlice("{\"statement\":\"CREATE TABLE t (n BIGINT)\"}"), &created));
+    // The write is published to t's memtable, then a flush step fails.
+    Backend.test_commit_fault = .{ .at = .after_publish, .err = error.InputOutput };
+    var reply: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&reply);
+    const code = api.antfly_db_sql_json(id, .fromSlice(insert_one), &reply);
+    Backend.test_commit_fault = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, code);
+    const receipt = try lastReceiptAlloc();
+    defer std.testing.allocator.free(receipt);
+    try std.testing.expect(std.mem.endsWith(u8, receipt, ":74"));
+    api.antfly_db_close(id);
+    open = false;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open(path, &id));
+    open = true;
+    // Queried through the root handle, it resolves in t's database.
+    const resolved = try receiptStatus(id, receipt);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, resolved.code);
+    try std.testing.expectEqual(api.ANTFLY_OUTCOME_RECEIPT_APPLIED, resolved.status);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_outcome_receipt_forget(id, .fromSlice(receipt)));
+}
+
 test "capi SQL outcome receipt for a Lite batch export of unknown outcome" {
     const api = @import("db.zig");
     var f = try OutcomeFixture.init("receipt-batch");

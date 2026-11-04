@@ -1271,7 +1271,7 @@ pub fn batchInternal(
         .predicates = predicates,
         .timestamp_ns = timestamp_ns,
         .sync_level = level,
-    }, primary_committed, null);
+    }, primary_committed, handle.selected_table_name);
 }
 
 /// A tracked exported batch. When this thread runs an exported write (see
@@ -4928,7 +4928,8 @@ pub fn antfly_db_batch_json(
     const receipt_scope = beginOutcomeReceipts(guard.lock_handle);
     defer receipt_scope.end();
     var primary_committed = false;
-    trackedBatch(handle.database(), owned.req, &primary_committed, null) catch |err| return batchFailureCode(err, primary_committed);
+    // A table handle commits to its table's database, which holds the marker.
+    trackedBatch(handle.database(), owned.req, &primary_committed, handle.selected_table_name) catch |err| return batchFailureCode(err, primary_committed);
     // Committed: a response failure must not read as a failed batch.
     const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch
         return capi.recordError(.stalled, "batch committed; its response could not be encoded; do not retry the batch");

@@ -158,7 +158,8 @@ pub const Writer = struct {
         if (!self.marker_written and self.written_tables.items.len == 0) return null;
         const tables = self.written_tables.toOwnedSlice(tables_allocator) catch blk: {
             self.clearTables();
-            break :blk &.{};
+            // Zero-length: freeing it in `Cleanup.deinit` is a no-op.
+            break :blk @constCast(@as([]const []u8, &.{}));
         };
         const cleanup: Cleanup = .{ .writer = id, .root = self.marker_written, .tables = tables };
         self.marker_written = false;
