@@ -1473,6 +1473,7 @@ def test_privacy_multifield_batches_release_detector_scratch(stateful_api):
             sync_level="full_index",
         )
         policy["fields"] = fields[:1]
+        policy["producer"]["config"]["batch"] = {"max_input_bytes": 4 * 1024 * 1024}
         for keys in (
             ["large-unselected"],
             ["large-selected"],
