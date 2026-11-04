@@ -92,6 +92,29 @@ fn external(server: anytype, producer: contract.Producer) bool {
     return routes.externalPrivacy(producer);
 }
 
+/// Configuration writes run on the metadata owner, but the public data API
+/// owns inference execution for previews and its table work. Keep disclosure
+/// consistent across PUT and GET even when the two nodes route differently.
+fn localizeProcessingDisclosure(server: anytype, a: A, response: *Response) !void {
+    if (response.response.status < 200 or response.response.status >= 300 or
+        std.mem.indexOf(u8, response.response.body, "\"external_processing\"") == null) return;
+    var arena = std.heap.ArenaAllocator.init(platform_allocator.reclaimingScratch(a));
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tree = try std.json.parseFromSliceLeaky(std.json.Value, scratch, response.response.body, .{ .parse_numbers = false });
+    if (tree != .object) return;
+    const recorded = tree.object.get("external_processing") orelse return;
+    const raw = tree.object.get("resolved_producer") orelse return;
+    const producer = try std.json.parseFromValue(contract.Producer, scratch, raw, .{ .ignore_unknown_fields = true });
+    defer producer.deinit();
+    const actual = external(server, producer.value);
+    if (recorded == .bool and recorded.bool == actual) return;
+    try tree.object.put(scratch, "external_processing", .{ .bool = actual });
+    const body = try std.json.Stringify.valueAlloc(a, tree, .{});
+    a.free(response.response.body);
+    response.response.body = body;
+}
+
 const RawJson = struct {
     bytes: []const u8,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
@@ -292,7 +315,12 @@ fn execute(server: anytype, a: A, table: []const u8, action: Action, args: Argum
 fn executeAttempt(server: anytype, a: A, table: []const u8, action: Action, args: Arguments, request: operation.RequestContext, uploads: ?*key_checkpoints.RetryCache) !Response {
     try request.ensureActive();
     if (comptime @hasDecl(@TypeOf(server.source), "forwardPrivacyMutation")) {
-        if (action == .put or action == .start_scan) if (try server.source.forwardPrivacyMutation(a, table, args.body, args.if_match, action == .start_scan, request)) |response| return response;
+        if (action == .put or action == .start_scan) if (try server.source.forwardPrivacyMutation(a, table, args.body, args.if_match, action == .start_scan, request)) |response| {
+            var owned = response;
+            errdefer owned.deinit(a);
+            try localizeProcessingDisclosure(server, a, &owned);
+            return owned;
+        };
     }
     const before = (try server.loadOwnedTableRecord(a, table)) orelse return failure(a, 404, "table_not_found", "Table not found.");
     defer metadata.freeTable(a, before);
@@ -1555,4 +1583,35 @@ test "privacy preview streaming bounds partial rows and stops at the row limit" 
     try PreviewSamples.write(&final, "{\"_id\":\"tail\"}");
     try final.row();
     try std.testing.expectEqualStrings("tail", final.documents.items[0].key);
+}
+
+test "privacy forwarded status discloses issuer routing and preserves opaque numeric metadata" {
+    const a = std.testing.allocator;
+    const Server = struct {
+        antfly_provider: @TypeOf(@as(@import("http_server.zig").ApiHttpServer, undefined).antfly_provider) = null,
+        pub fn configuredInferenceAPIURL(_: @This()) ?[]const u8 {
+            return "https://data-inference.example/ai/v1";
+        }
+    };
+    var response = Response{ .response = .{
+        .status = 202,
+        .json = true,
+        .body = try a.dupe(u8, "{\"external_processing\":false,\"resolved_producer\":{\"type\":\"extractor\",\"config\":{\"provider\":\"antfly\",\"model\":\"extractor\"},\"revision\":\"v1\",\"future\":\"kept\"},\"opaque\":9007199254740993}"),
+    }, .etag = try a.dupe(u8, "unchanged") };
+    defer response.deinit(a);
+    try localizeProcessingDisclosure(Server{}, a, &response);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, response.response.body, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("external_processing").?.bool);
+    try std.testing.expectEqualStrings("9007199254740993", parsed.value.object.get("opaque").?.number_string);
+    try std.testing.expectEqualStrings("unchanged", response.etag.?);
+    try std.testing.expectEqualStrings("kept", parsed.value.object.get("resolved_producer").?.object.get("future").?.string);
+    const unchanged = response.response.body;
+    try localizeProcessingDisclosure(Server{}, a, &response);
+    try std.testing.expectEqual(unchanged.ptr, response.response.body.ptr);
+    var scan = try json(a, 202, .{ .phase = "queued" });
+    defer scan.deinit(a);
+    const original = scan.response.body;
+    try localizeProcessingDisclosure(Server{}, a, &scan);
+    try std.testing.expectEqual(original.ptr, scan.response.body.ptr);
 }
