@@ -31,6 +31,13 @@ pub const Cut = struct {
         return initKinds(a, pending, &.{});
     }
     pub fn initForTable(a: A, pending: ingestion.Pending, table: catalog.Table) !Cut {
+        const normalized = try normalizeForTable(a, pending, table);
+        return initKinds(a, normalized.pending, normalized.kinds);
+    }
+    /// Publication needs normalized images and key kinds without a second
+    /// complete changed-key hash map.
+    pub const Normalized = struct { pending: ingestion.Pending, kinds: []const stable_key.Kind };
+    pub fn normalizeForTable(a: A, pending: ingestion.Pending, table: catalog.Table) !Normalized {
         const kinds = try a.alloc(stable_key.Kind, pending.key_fields.len);
         for (pending.key_fields, kinds) |key, *kind| kind.* = switch ((try table.column(key)).type) {
             .datetime => .timestamp,
@@ -49,7 +56,7 @@ pub const Cut = struct {
                 if (value.* != .null) value.* = try stable_key.normalize(a, value.*, .timestamp);
             };
         };
-        return initKinds(a, normalized, kinds);
+        return .{ .pending = normalized, .kinds = kinds };
     }
     fn initKinds(a: A, pending: ingestion.Pending, kinds: []const stable_key.Kind) !Cut {
         const normalized = try pending.materialized(a);

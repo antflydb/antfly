@@ -93,3 +93,26 @@ test('SQL byte caching is opt-in, physical-binding scoped and excludes mutable q
  await other(request);assert.equal(reads,2);
  const mutable={...request,key:key.replace('plan.json','query.json')};await first(mutable);await first(mutable);assert.equal(reads,4);
 });
+
+test('SQL discovery drains completed backlogs through durable alarms after eviction',async()=>{
+ const bucket=new Bucket(),storage=new Storage(),kicks=[];
+ const initial=100000,expiry=initial+3600000;let now=initial;
+ const config={state:{bucket:'execution',prefix:'state'},exchange:{bucket:'execution',prefix:'exchange'},artifacts:{bucket:'execution',prefix:'artifacts'},source_buckets:['execution']};
+ const env={SQL_CONFIG:JSON.stringify(config),SQL_BUCKET_BINDINGS:JSON.stringify({execution:'R2'}),R2:bucket,SQL_TASKS:{},SQL_COORDINATORS:{getByName(){return{async kick(value){kicks.push(value);}};}}};
+ for(let i=0;i<1001;i++){
+  const expires_ms=expiry+(i===1000?1:0),raw=JSON.stringify({tenant:locator.tenant,expires_ms,index:i}),id=createHash('sha256').update(raw).digest('hex'),stamp=String(expires_ms).padStart(20,'0');
+  await bucket.put(`state/sql-query-expiry/${stamp}/${id}.json`,'{}');
+  await bucket.put(`state/sql-execution-v2/${stamp}/${id}/plan.json`,raw);
+  await bucket.put(`state/sql-execution-v2/${stamp}/${id}/query.json`,JSON.stringify({version:2,plan:id,expires_ms,status:i===1000?'pending':['succeeded','failed','cancelled'][i%3]}));
+ }
+ const control=()=>new SQLControl({storage},env,()=>{throw Error('unexpected kernel call');},{now:()=>now});
+ await control().recover();
+ let turns=1;
+ while(storage.alarm!==null){now=storage.alarm;await control().alarm();assert.ok(++turns<100);}
+ assert.equal(turns,63);assert.equal(kicks.length,1);assert.ok(now<initial+60000);
+ assert.equal(await storage.get('cursor'),undefined);
+ // A failed listing retains a durable retry even with no cron invocation.
+ const list=bucket.list.bind(bucket);bucket.list=async()=>{throw Error('transient list failure');};
+ await assert.rejects(control().recover(),/transient list failure/);assert.ok(storage.alarm);
+ bucket.list=list;now=storage.alarm;await control().alarm();assert.ok(await storage.get('cursor'));
+});

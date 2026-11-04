@@ -90,29 +90,48 @@ export class SQLControl {
   }catch(error){if(retired(error)){await this.retire();return{complete:true};}throw error;}
   finally{this.active=false;}
  }
- async alarm(){await this.advance();}
+ async alarm(){if(await this.ctx.storage.get('discovery'))await this.recover();else await this.advance();}
  async recover(){
-  const {config,bindings}=sqlConfig(this.env),bucket=bindings[config.state.bucket],prefix=config.state.prefix+'/sql-query-expiry/';
-  const cursor=await this.ctx.storage.get('cursor');
-  const page=await bucket.list({prefix,limit:16,...(cursor?{cursor}:{})});
-  let recovered=0;
-  for(const object of page.objects){
-   try{
-    const suffix=object.key.slice(prefix.length),match=/^(\d{20})\/([a-f0-9]{64})\.json$/.exec(suffix);if(!match)continue;
-    const expires_ms=Number(match[1]);if(!Number.isSafeInteger(expires_ms)||expires_ms<=this.now())continue;
-    const raw=await bucket.get(`${config.state.prefix}/sql-execution-v2/${match[1]}/${match[2]}/plan.json`);if(!raw)continue;
-    if(raw.size>1024*1024)throw Error('InvalidSqlDistributedPlan');
-    const bytes=new Uint8Array(await new Response(raw.body).arrayBuffer());
-    const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),b=>b.toString(16).padStart(2,'0')).join('');
-    if(digest!==match[2])throw Error('InvalidSqlDistributedPlan');
-    const plan=JSON.parse(new TextDecoder().decode(bytes));
-    if(plan.expires_ms!==expires_ms)throw Error('InvalidSqlDistributedPlan');
-    const locator={tenant:plan.tenant,query:{id:Array.from(match[2],c=>c.charCodeAt(0)),expires_ms}};
-    await this.env.SQL_COORDINATORS.getByName(locatorName(locator)).kick(locator);recovered++;
-   }catch(error){console.warn('SQL query recovery deferred',String(error));}
-  }
-  if(page.truncated)await this.ctx.storage.put('cursor',page.cursor);else await this.ctx.storage.delete('cursor');
-  return{recovered};
+  if(this.active){await this.ctx.storage.setAlarm(this.now()+1000);return{recovered:0};}
+  this.active=true;
+  try{
+   // Persist the continuation before I/O: eviction or a failed list/kick must
+   // not turn the minute cron into the throughput limit for discovery.
+   await this.ctx.storage.put('discovery',true);
+   await this.ctx.storage.setAlarm(this.now()+1000);
+   const {config,bindings}=sqlConfig(this.env),bucket=bindings[config.state.bucket],prefix=config.state.prefix+'/sql-query-expiry/';
+   const cursor=await this.ctx.storage.get('cursor');
+   const page=await bucket.list({prefix,limit:16,...(cursor?{cursor}:{})});
+   let recovered=0;
+   for(const object of page.objects){
+    try{
+     const suffix=object.key.slice(prefix.length),match=/^(\d{20})\/([a-f0-9]{64})\.json$/.exec(suffix);if(!match)continue;
+     const expires_ms=Number(match[1]);if(!Number.isSafeInteger(expires_ms)||expires_ms<=this.now())continue;
+     const base=`${config.state.prefix}/sql-execution-v2/${match[1]}/${match[2]}`;
+     const record=await bucket.get(`${base}/query.json`);
+     if(record){
+      if(record.size>1024*1024)throw Error('InvalidSqlExecutionState');
+      const state=await record.json();
+      if(state.version===2&&digestText(state.plan)===match[2]&&state.expires_ms===expires_ms&&['succeeded','failed','cancelled'].includes(state.status))continue;
+     }
+     const raw=await bucket.get(`${base}/plan.json`);if(!raw)continue;
+     if(raw.size>1024*1024)throw Error('InvalidSqlDistributedPlan');
+     const bytes=new Uint8Array(await new Response(raw.body).arrayBuffer());
+     const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),b=>b.toString(16).padStart(2,'0')).join('');
+     if(digest!==match[2])throw Error('InvalidSqlDistributedPlan');
+     const plan=JSON.parse(new TextDecoder().decode(bytes));
+     if(plan.expires_ms!==expires_ms)throw Error('InvalidSqlDistributedPlan');
+     const locator={tenant:plan.tenant,query:{id:Array.from(match[2],c=>c.charCodeAt(0)),expires_ms}};
+     await this.env.SQL_COORDINATORS.getByName(locatorName(locator)).kick(locator);recovered++;
+    }catch(error){console.warn('SQL query recovery deferred',String(error));}
+   }
+   if(page.truncated){
+    await this.ctx.storage.put('cursor',page.cursor);
+    // Drain at the speed of storage, with a new bounded invocation per page.
+    await this.ctx.storage.setAlarm(this.now()+1);
+   }else{await this.ctx.storage.delete('cursor');await this.ctx.storage.deleteAlarm();}
+   return{recovered};
+  }finally{this.active=false;}
  }
 }
 export async function consumeSQL(batch,env,run,{now=()=>Date.now()}={}){

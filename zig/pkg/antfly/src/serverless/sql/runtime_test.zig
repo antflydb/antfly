@@ -755,7 +755,12 @@ fn hostedLakeSource(bucketed: bool, large: bool, paged: bool) !void {
         descriptor.pending.changes = changes;
     }
     const identity = try @import("../../api/native_retained_cut.zig").storeIdentity(sa, config.artifacts);
-    const saved = try @import("../../api/lake_sql_retained_cut.zig").saveDistributed(sa, &artifacts, identity, std.testing.io, descriptor, .none);
+    var publication_budget: local.sql_memory_budget = .{ .backing = a, .limit = 16 * 1024 * 1024 };
+    var publication_arena = std.heap.ArenaAllocator.init(publication_budget.allocator());
+    defer publication_arena.deinit();
+    const saved = try @import("../../api/lake_sql_retained_cut.zig").saveDistributed(publication_arena.allocator(), &artifacts, identity, std.testing.io, descriptor, .none);
+    // Only the capability survives publication, including for a 9 MB WAL.
+    try std.testing.expect(publication_budget.live < 64 * 1024);
     try std.testing.expectEqual(paged, saved.paged);
     const cut = saved.token;
     if (paged) {

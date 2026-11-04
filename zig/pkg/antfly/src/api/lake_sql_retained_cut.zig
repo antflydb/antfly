@@ -104,15 +104,35 @@ pub fn bloomBit(key: [64]u8, bits: usize, seed: u64) usize {
     return @intCast(std.hash.Wyhash.hash(seed, &key) % bits);
 }
 pub fn saveDistributed(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, io: std.Io, descriptor: Descriptor, cancellation: @import("antfly_cancellation").CancellationToken) !Saved {
+    // Reclaim publication scratch even when the result allocator is a query
+    // arena. Keep accounting through the statement memory budget.
+    var arena = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+    defer arena.deinit();
+    var publisher = store.*;
+    publisher.allocator = local.sql_memory_budget.reclaimingAllocator(a);
+    const saved = try publishDistributed(arena.allocator(), &publisher, identity, io, descriptor, cancellation);
+    return .{ .token = try a.dupe(u8, saved.token), .rows = saved.rows, .bytes = saved.bytes, .paged = saved.paged };
+}
+fn encodedSize(value: anytype) !usize {
+    var buffer: [4096]u8 = undefined;
+    var count = std.Io.Writer.Discarding.init(&buffer);
+    try std.json.Stringify.value(value, .{}, &count.writer);
+    return @intCast(count.fullCount());
+}
+fn publishDistributed(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, io: std.Io, descriptor: Descriptor, cancellation: @import("antfly_cancellation").CancellationToken) !Saved {
     const pending = try descriptor.pending.materialized(a);
-    const encoded = try std.json.Stringify.valueAlloc(a, pending.changes, .{});
-    defer a.free(encoded);
-    if (encoded.len <= 64 * 1024) return .{ .token = try save(a, store, identity, io, descriptor, cancellation), .rows = pending.changes.len, .bytes = encoded.len };
-    if (encoded.len > max_bytes) return error.QueryCandidateBudgetExceeded;
+    const encoded_len = try encodedSize(pending.changes);
+    if (encoded_len <= 64 * 1024) return .{ .token = try save(a, store, identity, io, descriptor, cancellation), .rows = pending.changes.len, .bytes = encoded_len };
+    if (encoded_len > max_bytes) return error.QueryCandidateBudgetExceeded;
     const table = (descriptor.authorization orelse return error.SqlExecutionUnauthorized).table.view();
-    const normalized = try @import("lake_sql_overlay.zig").Cut.initForTable(a, pending, table);
+    const normalized = try @import("lake_sql_overlay.zig").Cut.normalizeForTable(a, pending, table);
     const digests = try a.alloc([64]u8, normalized.pending.changes.len);
-    for (normalized.pending.changes, digests) |change, *key| key.* = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.digestHex(try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.row_commit.stable_key.identity(a, pending.key_fields, change.row, normalized.kinds));
+    var key_arena = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+    defer key_arena.deinit();
+    for (normalized.pending.changes, digests) |change, *key| {
+        _ = key_arena.reset(.retain_capacity);
+        key.* = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.digestHex(try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.row_commit.stable_key.identity(key_arena.allocator(), pending.key_fields, change.row, normalized.kinds));
+    }
     std.mem.sort([64]u8, digests, {}, struct {
         fn less(_: void, l: [64]u8, r: [64]u8) bool {
             return std.mem.order(u8, &l, &r) == .lt;
@@ -138,23 +158,23 @@ pub fn saveDistributed(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, 
         var end = begin;
         var bytes: usize = 2;
         while (end < normalized.pending.changes.len and end - begin < 4096) {
-            const row = try std.json.Stringify.valueAlloc(a, normalized.pending.changes[end], .{});
-            defer a.free(row);
-            if (row.len > max_bytes) return error.QueryCandidateBudgetExceeded;
-            if (end != begin and bytes + row.len + 1 > 32 * 1024) break;
-            bytes += row.len + 1;
+            const row_len = try encodedSize(normalized.pending.changes[end]);
+            if (row_len > max_bytes) return error.QueryCandidateBudgetExceeded;
+            if (end != begin and bytes + row_len + 1 > 32 * 1024) break;
+            bytes += row_len + 1;
             end += 1;
         }
-        const body = try std.json.Stringify.valueAlloc(a, normalized.pending.changes[begin..end], .{});
-        defer a.free(body);
+        const page_allocator = local.sql_memory_budget.reclaimingAllocator(a);
+        const body = try std.json.Stringify.valueAlloc(page_allocator, normalized.pending.changes[begin..end], .{});
+        defer page_allocator.free(body);
         try changes.append(a, .{ .begin = @intCast(begin), .count = @intCast(end - begin), .token = try savePage(a, store, identity, io, descriptor, body, cancellation) });
         begin = end;
     }
     var root = descriptor;
     root.pending = normalized.pending;
     root.pending.changes = &.{};
-    root.paged = .{ .count = @intCast(normalized.pending.changes.len), .bytes = encoded.len, .changes = changes.items, .keys = keys.items, .bloom = try savePage(a, store, identity, io, descriptor, bloom, cancellation) };
-    return .{ .token = try save(a, store, identity, io, root, cancellation), .rows = normalized.pending.changes.len, .bytes = encoded.len, .paged = true };
+    root.paged = .{ .count = @intCast(normalized.pending.changes.len), .bytes = encoded_len, .changes = changes.items, .keys = keys.items, .bloom = try savePage(a, store, identity, io, descriptor, bloom, cancellation) };
+    return .{ .token = try save(a, store, identity, io, root, cancellation), .rows = normalized.pending.changes.len, .bytes = encoded_len, .paged = true };
 }
 fn domain(table: u64, identity: [32]u8) [32]u8 {
     var hash = std.crypto.hash.Blake3.init(.{});

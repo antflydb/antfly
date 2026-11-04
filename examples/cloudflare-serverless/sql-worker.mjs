@@ -62,7 +62,7 @@ export default {
  async queue(batch,env){await consumeSQL(batch,env,runSQL);},
  async scheduled(_controller,env,ctx){
   ctx.waitUntil((async()=>{
-   // Bounded round-robin discovery repairs a lost submit-to-alarm handoff.
+   // Start/resume discovery; durable alarms drain its bounded pages between cron ticks.
    await env.SQL_COORDINATORS.getByName('discovery').recover();
    for(let turn=0;turn<4;turn++){
     const result=await runSQL(env,{op:'sql_collect',tenant:Array(64).fill(97),owner:crypto.randomUUID()});
