@@ -4,6 +4,15 @@
   "private": false,
   "license": "Apache-2.0",
   "description": "Force-directed graph component for the Antfly design system",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/antflydb/antfly.git",
+    "directory": "ts/packages/graph"
+  },
+  "homepage": "https://github.com/antflydb/antfly/tree/main/ts/packages/graph",
+  "bugs": {
+    "url": "https://github.com/antflydb/antfly/issues"
+  },
   "type": "module",
   "sideEffects": [
     "**/*.css"
