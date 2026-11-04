@@ -1988,27 +1988,25 @@ pub const Owner = struct {
         defer if (count_admission) recordMaintenanceAdmission(root, admission_started);
         root.maintenance_admission_mutex.lockUncancelable(h.handleLockIo());
         defer root.maintenance_admission_mutex.unlock(h.handleLockIo());
+        if (self.stopping.load(.acquire)) return error.Canceled;
+        if (needsOutcomeReconciliation(root)) return error.OutcomeReconciliationRequired;
+        // A primary publication can rebase onto changed index inputs while
+        // recording completed replay progress. Nesting shares its writer
+        // lease, but cannot grant its stale index runtimes new authority.
+        if (scope == .index or scope == .index_read) if (root.maintenance_publication) |p| if (p.index_inputs_changed) {
+            self.publication_stats.index_input_refusals +|= 1;
+            return error.EnrichmentWaitCanceled;
+        };
         if (root.maintenance_writer_references != 0) {
             count_admission = false; // Included in the outer publication's hold.
             root.maintenance_writer_references += 1;
             return;
         }
-        if (self.stopping.load(.acquire)) return error.Canceled;
-        if (needsOutcomeReconciliation(root)) return error.OutcomeReconciliationRequired;
         if (scope != .reclamation) self.gate.mutex.lockUncancelable(h.handleLockIo()) else if (!self.gate.mutex.tryLock()) return error.EnrichmentWaitCanceled;
         errdefer self.gate.mutex.unlock(h.handleLockIo());
         if (self.stopping.load(.acquire)) return error.Canceled;
         self.publication_stats.attempts +|= 1;
         errdefer self.publication_stats.refused +|= 1;
-        // A resolver publication can change index inputs before its replay
-        // watermark is saved. Fence subsequent immutable index work, while
-        // allowing primary transactions to read the rebased checkpoint and
-        // persist that completed progress. Otherwise replay repeats its own
-        // output forever without advancing its durable watermark.
-        if (scope == .index or scope == .index_read) if (root.maintenance_publication) |p| if (p.index_inputs_changed) {
-            self.publication_stats.index_input_refusals +|= 1;
-            return error.EnrichmentWaitCanceled;
-        };
         if (self.current) |current| if (needsOutcomeReconciliation(current)) return error.EnrichmentWaitCanceled;
         var lease = (if (scope == .reclamation) self.tryWriterLeaseAssumeLocked() else self.acquireMaintenancePathLeaseAssumeLocked()) catch |err| switch (err) {
             error.FileBusy, error.WouldBlock => return error.EnrichmentWaitCanceled,
@@ -2602,17 +2600,11 @@ pub const Owner = struct {
             try pending.construction.?.seal(run.len());
             pending.ready = true;
         }
-        if (self.maintenance_snapshot == pending.root) if (self.text_source_runtime_cache) |cache| {
-            if (cache.root == pending.root) {
-                // Admission verified the prior recovery/configuration cut;
-                // this publication only staged private artifact bytes. Keep
-                // that known storage progress from reopening a shared runtime.
-                const logical = store.file.activeCheckpoint().logical;
-                cache.indexes = logical.indexes;
-                for (cache.proofs) |*proof| proof.metadata_identity = logical.metadata;
-                self.maintenance_retained_logical = logical;
-            }
-        };
+        // Private construction changes no logical index/catalog identity.
+        // Keep the runtime's original witnesses: allocator-service admission
+        // may have adopted a foreign index publication without reloading its
+        // LSM state. Certifying that newer header here would hide a stale
+        // journal sequence from the next source/artifact reuse check.
     }
 
     fn finishPendingTextMerge(self: *Owner, root: *h.Handle, database: *h.db_mod.DB, name: []const u8) !bool {
@@ -6130,6 +6122,85 @@ test "capi native asynchronous text merge coowns reusable runtimes through repla
     try fixture.expectWritten(.batch, true);
 }
 
+test "capi native asynchronous text merge staging cannot certify foreign index publications" {
+    inline for (.{ false, true }) |foreign| {
+        if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+        var fixture = try AdmissionFollowupFixture.init("merge-stage-foreign-input", 5000, .batch);
+        defer fixture.deinit();
+        defer test_pause_private_merge.store(false, .release);
+        const pending = try seedPausedPrivateMergeFixture(&fixture, "staged-merge", false, true);
+        const owner = fixture.connection.owner;
+        {
+            var lease = try fixture.connection.acquire();
+            defer {
+                lease.close();
+                fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            }
+            const foreground = try owner.refresh();
+            const table = try @import("tables.zig").get(foreground, "staged-merge");
+            owner.clearTextSourceRuntimeCache();
+            if (owner.maintenance_snapshot != pending.root) {
+                if (owner.maintenance_snapshot) |old| Owner.closeMaintenanceSnapshot(old);
+                Owner.retainMaintenanceSnapshot(pending.root);
+                owner.maintenance_snapshot = pending.root;
+            }
+            const store = pending.root.owned_lite_backend.?.native_docstore.?;
+            try store.refreshIndexPublicationCheckpoint(foreground.owned_lite_backend.?.native_docstore.?.file.header);
+            owner.text_source_runtime_cache = (try TextSourceRuntimeCache.capture(pending.root)) orelse return error.TestUnexpectedResult;
+            owner.maintenance_retained_logical = store.file.activeCheckpoint().logical;
+            // Advance the actual LSM journal behind the detached runtime. Its next
+            // edit must come from a fresh runtime even if private staging rebases
+            // the old NativeFile to the new physical checkpoint first.
+            for (0..@as(usize, if (foreign) 2 else 0)) |i| {
+                var writer = segment_mod.SegmentWriter.init(std.testing.allocator);
+                defer writer.deinit();
+                var id: [32]u8 = undefined;
+                try writer.addStoredDoc(try std.fmt.bufPrint(&id, "foreign-{d}", .{i}), "{}");
+                const bytes = try writer.build();
+                defer std.testing.allocator.free(bytes);
+                try table.core.index_manager.textIndexEntry("text").?.persistent.indexSegment(bytes);
+            }
+            try std.testing.expectEqual(!foreign, try owner.text_source_runtime_cache.?.matches(&foreground.owned_lite_backend.?.native_docstore.?.file));
+        }
+        test_pause_private_merge.store(false, .release);
+        for (0..1000) |_| {
+            if (pending.done.load(.acquire)) break;
+            try h.handleLockIo().sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(pending.done.load(.acquire));
+        try owner.stagePendingTextMerge(pending);
+        const cache = owner.text_source_runtime_cache orelse return error.TestUnexpectedResult;
+        const staged_file = &pending.root.owned_lite_backend.?.native_docstore.?.file;
+        try std.testing.expectEqual(!foreign, try cache.matches(staged_file));
+        try std.testing.expectEqual(!foreign, std.meta.eql(owner.maintenance_retained_logical.?, staged_file.activeCheckpoint().logical));
+        {
+            var lease = try fixture.connection.acquire();
+            defer {
+                lease.close();
+                fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            }
+            const foreground = try owner.refresh();
+            const replacement = try owner.refreshMaintenanceSnapshot(foreground, .source);
+            try std.testing.expectEqual(foreign, replacement != pending.root);
+            const table = try @import("tables.zig").get(replacement, "staged-merge");
+            // Publish from the replacement and cold-open its journal. This rejects
+            // a stale sequence even when physical integrity remains valid.
+            var writer = segment_mod.SegmentWriter.init(std.testing.allocator);
+            defer writer.deinit();
+            try writer.addStoredDoc("after-stage", "{}");
+            const bytes = try writer.build();
+            defer std.testing.allocator.free(bytes);
+            const index = &table.core.index_manager.textIndexEntry("text").?.persistent;
+            try index.indexSegment(bytes);
+            const reopened = try owner.refresh();
+            const reopened_table = try @import("tables.zig").get(reopened, "staged-merge");
+            try std.testing.expectEqual(index.snapshot().segments.len, reopened_table.core.index_manager.textIndexEntry("text").?.persistent.snapshot().segments.len);
+            try std.testing.expect((try reopened.owned_lite_backend.?.native_docstore.?.file.check()).valid);
+        }
+        owner.discardPendingTextMerge();
+    }
+}
+
 test "capi native asynchronous text merge removes inputs already fully deleted at capture" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("private-merge-all-deleted", 5000, .batch);
@@ -6748,6 +6819,56 @@ test "capi native allocator proof issue1362 storage publication fences a named t
     try txn.commit();
     try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateStorageCurrent(&root.owned_lite_backend.?.native_docstore.?.file));
     try std.testing.expect(!root.embedded_tables.contains("numbers"));
+}
+
+test "capi native maintenance nested admission preserves index and outcome fences" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("nested-publication-fences", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    const owner = fixture.connection.owner;
+    const root = blk: {
+        var lease = try fixture.connection.acquire();
+        defer {
+            lease.close();
+            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        break :blk try owner.refreshMaintenanceSnapshot(try owner.refresh(), .source);
+    };
+    var publication: PreparedPublication = .{
+        .owner = owner,
+        .name = "default",
+        .identity = root.db.core.identity_namespace,
+        .incarnation = root.db.root_incarnation,
+        .catalog = null,
+        .index_prefix = "unused/",
+        .snapshot_root = root,
+        .snapshot_database = &root.db,
+        .source_read = null,
+        .relational_rows = false,
+    };
+    root.maintenance_owner = owner;
+    root.maintenance_publication = &publication;
+    defer {
+        root.maintenance_owner = null;
+        root.maintenance_publication = null;
+    }
+    try Owner.enterMaintenanceWriter(root, .primary);
+    defer Owner.leaveMaintenanceWriter(root);
+    publication.index_inputs_changed = true;
+    for ([_]PublicationScope{ .index, .index_read }) |scope|
+        try std.testing.expectError(error.EnrichmentWaitCanceled, Owner.enterMaintenanceWriter(root, scope));
+    try std.testing.expectEqual(@as(usize, 1), root.maintenance_writer_references);
+    // A completed primary publication may still record its replay watermark.
+    try Owner.enterMaintenanceWriter(root, .primary);
+    try std.testing.expectEqual(@as(usize, 2), root.maintenance_writer_references);
+    Owner.leaveMaintenanceWriter(root);
+    const file = &root.owned_lite_backend.?.native_docstore.?.file;
+    file.checkpoint_publication_uncertain = true;
+    defer file.checkpoint_publication_uncertain = false;
+    for ([_]PublicationScope{ .primary, .index, .index_read, .allocator_service, .reclamation }) |scope|
+        try std.testing.expectError(error.OutcomeReconciliationRequired, Owner.enterMaintenanceWriter(root, scope));
+    try std.testing.expectEqual(@as(usize, 1), root.maintenance_writer_references);
 }
 
 test "capi native allocator proof live commits carry a checked peer certificate" {

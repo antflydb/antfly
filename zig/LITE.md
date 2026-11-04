@@ -1280,6 +1280,11 @@ and replay control records, resets mutable primary observations, and acquires a
 fresh source epoch. Idle visits retire invalidated inputs as well. Active merge
 borrows retain independent ownership, and unsupported provider/index runtimes
 still reopen. An artifact-only continuation cannot grant source reuse authority.
+Private merge staging preserves the runtime's original logical witnesses even
+when allocator admission adopts a newer physical checkpoint. Private bytes do
+not grant authority over a foreign index publication. Nested writer leases also
+retain index-input and uncertain-outcome fences; only completed primary progress
+may be recorded after an index-input change.
 Text planning owns one bounded projection window through capacity admission;
 preparation builds segments from that projection without parsing/projecting its
 documents again. Configuration changes replan only the unpublished suffix.
