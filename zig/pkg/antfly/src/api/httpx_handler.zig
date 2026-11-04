@@ -1597,6 +1597,11 @@ pub const AntflyApiHandler = struct {
         const table_prefix = group_prefix ++ "/tables/:table_name";
         const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
         try server.get(routes.internal_capabilities, httpx.Handler.bind(self, internalCapabilities));
+        const sql_transport = @import("../serverless/sql/transport.zig");
+        try server.post(sql_transport.task_path, httpx.Handler.bind(self, internalSqlTask));
+        try server.post(sql_transport.submit_path, httpx.Handler.bind(self, internalSqlSubmit));
+        try server.post(sql_transport.turn_path, httpx.Handler.bind(self, internalSqlTurn));
+        try server.post(sql_transport.result_path, httpx.Handler.bind(self, internalSqlResult));
         try server.get(group_prefix ++ routes.group_db_median_key_suffix, httpx.Handler.bind(self, internalGroupMedianKey));
         try server.post(group_prefix ++ routes.group_db_index_activation_suffix, httpx.Handler.bind(self, internalGroupIndexActivation));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key", httpx.Handler.bind(self, internalGroupLookup));
@@ -3007,6 +3012,67 @@ pub const AntflyApiHandler = struct {
             try ctx.setHeader("X-Antfly-Primary-Digest", &hex);
         }
         return ownedJsonResponse(ctx, 200, &result.json, ctx.allocator);
+    }
+
+    fn internalSqlService(self: *AntflyApiHandler, ctx: *httpx.Context, tenant: @import("../serverless/sql/plan.zig").Digest) !@import("../serverless/sql/runtime.zig").Service {
+        // New task RPCs never accept the rolling-upgrade unsigned escape hatch.
+        const token = ctx.header(internal_service_auth.header_name) orelse return error.SqlExecutionUnauthorized;
+        var identity = self.api_server.authenticateInternalServiceRequest(token) catch return error.SqlExecutionUnauthorized;
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return error.SqlExecutionUnauthorized;
+        const factory = self.api_server.cfg.distributed_sql orelse return error.SqlWorkerUnavailable;
+        const request = try operationContext(ctx, null).platformDeadline();
+        return factory.open(factory.ptr, ctx.allocator, tenant, .{ .deadline_ns = request.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(request.cancellation.ptr, request.cancellation.is_cancelled_fn) });
+    }
+    fn internalSqlError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return textResponse(ctx, switch (err) {
+            error.SqlExecutionUnauthorized => 403,
+            error.SqlWorkerUnavailable, error.SqlQueryRoleRequired, error.SqlExecutionFenced, error.PreconditionFailed => 503,
+            error.SqlExecutionNotFound => 404,
+            error.SqlQueryExpired => 410,
+            error.DeadlineExceeded => 504,
+            error.Canceled => 408,
+            error.SqlJoinBudgetExceeded => 422,
+            else => 500,
+        }, @errorName(err));
+    }
+    fn internalSqlTask(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing SQL task ticket");
+        if (body.len > 1024) return textResponse(ctx, 413, "SQL task ticket too large");
+        var input = std.json.parseFromSlice(@import("../serverless/sql/plan.zig").Ticket, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid SQL task ticket");
+        defer input.deinit();
+        const service = self.internalSqlService(ctx, input.value.tenant) catch |err| return internalSqlError(ctx, err);
+        var admission = self.api_server.acquireSqlExecution(false) catch return textResponse(ctx, 503, "query capacity exhausted");
+        defer admission.release();
+        service.execute(input.value) catch |err| return internalSqlError(ctx, err);
+        return ctx.json(.{ .accepted = true });
+    }
+    fn internalSqlSubmit(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing SQL fragment plan");
+        if (body.len > 1024 * 1024) return textResponse(ctx, 413, "SQL fragment plan too large");
+        var input = std.json.parseFromSlice(@import("../serverless/sql/plan.zig").Plan, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid SQL fragment plan");
+        defer input.deinit();
+        const service = self.internalSqlService(ctx, input.value.tenant) catch |err| return internalSqlError(ctx, err);
+        const query = service.submit(input.value) catch |err| return internalSqlError(ctx, err);
+        return ctx.json(.{ .query = query });
+    }
+    fn internalSqlTurn(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing SQL query handle");
+        if (body.len > 1024) return textResponse(ctx, 413, "SQL query handle too large");
+        var input = std.json.parseFromSlice(@import("../serverless/sql/transport.zig").QueryRequest, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid SQL query handle");
+        defer input.deinit();
+        const service = self.internalSqlService(ctx, input.value.tenant) catch |err| return internalSqlError(ctx, err);
+        const done = service.turn(input.value.query, self.api_server.cfg.distributed_sql.?.dispatcher) catch |err| return internalSqlError(ctx, err);
+        return ctx.json(.{ .complete = done });
+    }
+    fn internalSqlResult(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing SQL query handle");
+        if (body.len > 1024) return textResponse(ctx, 413, "SQL query handle too large");
+        var input = std.json.parseFromSlice(@import("../serverless/sql/transport.zig").QueryRequest, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid SQL query handle");
+        defer input.deinit();
+        const service = self.internalSqlService(ctx, input.value.tenant) catch |err| return internalSqlError(ctx, err);
+        const result = service.pollResult(ctx.allocator, input.value.query) catch |err| return internalSqlError(ctx, err);
+        return ctx.json(result);
     }
 
     fn internalJoinJobState(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -21779,4 +21845,27 @@ test "SQL pgwire native HTTP commit retry preserves an unknown earlier execution
     const completion = try AntflyApiHandler.requestCompletion(&ctx);
     try std.testing.expect(!completion.unknown and completion.outcomes.items.len == 1);
     try std.testing.expect(!try @import("sql_completion.zig").settled(&api, a, .{ .outcomes = completion.outcomes.items }, .{}));
+}
+
+test "distributed SQL API worker RPC requires signed service authority even during legacy migration" {
+    const a = std.testing.allocator;
+    const secret = "0123456789abcdef0123456789abcdef";
+    var api = ApiHttpServer.init(a, .{ .internal_service_secret = secret, .internal_service_issuer = "sql-workers", .internal_service_accept_legacy_unauthenticated = true }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer api.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api };
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "sql-workers" }, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    const ticket = try std.json.Stringify.valueAlloc(a, @import("../serverless/sql/plan.zig").Ticket{ .tenant = @splat('a'), .query = @splat('b'), .stage = 0, .task = 0 }, .{});
+    defer a.free(ticket);
+    for ([_]?[]const u8{ null, "invalid", token }, 0..) |credential, index| {
+        var request = try httpx.Request.init(a, .POST, "http://localhost/internal/v1/sql/tasks/execute");
+        defer request.deinit();
+        request.body = ticket;
+        if (credential) |value| try request.headers.set(internal_service_auth.header_name, value);
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.internalSqlTask(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, if (index == 2) 503 else 403), response.status.code);
+    }
 }

@@ -29,6 +29,7 @@ const maintenance_cancellation = @import("../maintenance_cancellation.zig");
 const wal_collection = @import("../wal/collector.zig");
 
 pub const RuntimeConfig = struct {
+    sql_execution_gc: ?@import("../sql/collector.zig").Collector = null,
     tick_interval_ms: u64 = 25,
     role: api_mod.RuntimeRole = .combined,
     publish_enabled: bool = true,
@@ -39,6 +40,7 @@ pub const RuntimeConfig = struct {
 };
 
 pub const RuntimeRunStats = struct {
+    sql_execution_gc_steps: usize = 0,
     published_namespaces: usize = 0,
     publish_budget_rejected_namespaces: usize = 0,
     publish_head_conflicts: usize = 0,
@@ -220,6 +222,17 @@ pub const ManagedRuntime = struct {
         defer self.run_mu.unlock();
 
         var stats = RuntimeRunStats{};
+        if (self.cfg.sql_execution_gc) |collector| {
+            const Bridge = struct {
+                fn canceled(raw: *const anyopaque) bool {
+                    const value: *maintenance_cancellation.GraphBridge = @ptrCast(@alignCast(@constCast(raw)));
+                    return value.token().isCancelled();
+                }
+            };
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            stats.sql_execution_gc_steps = try collector.run(arena.allocator(), .{ .io = self.io, .cancellation = .{ .ptr = &bridge, .is_cancelled_fn = Bridge.canceled } });
+        }
         if (self.cfg.publish_enabled) {
             try self.chargeWork(.publish_round, 1);
             const publish_stats = try self.publisher.runOnceWithCancellation(bridge.token());
@@ -593,6 +606,7 @@ pub const ManagedRuntime = struct {
     fn recordStats(self: *ManagedRuntime, stats: RuntimeRunStats) void {
         lockAtomic(&self.stats_mu);
         defer self.stats_mu.unlock();
+        self.cumulative_stats.sql_execution_gc_steps += stats.sql_execution_gc_steps;
         self.cumulative_stats.published_namespaces += stats.published_namespaces;
         self.cumulative_stats.publish_budget_rejected_namespaces += stats.publish_budget_rejected_namespaces;
         self.cumulative_stats.publish_head_conflicts += stats.publish_head_conflicts;

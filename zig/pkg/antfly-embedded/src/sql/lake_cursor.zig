@@ -125,6 +125,27 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     if (!source.canEnumerate() or request.physical_selection != null or request.after != null or request.before != null) try source.ensureInventory(read_context);
     return openPinnedMaterialized(alloc, table, request, context, source);
 }
+/// Open one deterministic, disjoint split of an immutable pinned source.
+/// Unlike split_scan's local work queue this assignment can be reconstructed
+/// on another process after a task retry without sharing mutable iterators.
+pub fn openPinnedPartition(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *serving.ServingSource, index: usize, count: usize) !catalog.Cursor {
+    if (count == 0 or count > 65536 or index >= count) return error.InvalidSqlBackendResponse;
+    const cursor = try openPinned(alloc, table, request, context, source);
+    errdefer cursor.close(cursor.ptr);
+    if (count == 1) return cursor;
+    const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+    if (owner.stream.iterator) |iterator| {
+        const split = iterator.split orelse return error.UnsupportedSqlExecution;
+        const part = try split(iterator.ptr, alloc, index, count, owner.stream.context);
+        iterator.close(iterator.ptr);
+        owner.stream.iterator = part;
+    } else {
+        owner.stream.partition_index = index;
+        owner.stream.partition_count = count;
+    }
+    return cursor;
+}
+
 fn openPinnedMaterialized(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *serving.ServingSource) !catalog.Cursor {
     if (request.include_primary_digest or request.include_document or request.index_equality != null) return error.UnsupportedSqlExecution;
     try context.ensureActive();

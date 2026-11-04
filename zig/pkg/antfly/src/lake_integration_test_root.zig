@@ -114,6 +114,13 @@ test {
 }
 
 comptime {
+    _ = @import("serverless/sql/expression.zig");
+    _ = @import("serverless/sql/state.zig");
+    _ = @import("serverless/sql/plan.zig");
+    _ = @import("serverless/sql/runner.zig");
+    _ = @import("serverless/sql/runtime.zig");
+    _ = @import("serverless/sql/runtime_test.zig");
+    _ = @import("serverless/sql/exchange.zig");
     _ = @import("serverless/lake_snapshot_pins.zig");
     _ = @import("serverless/lake_compaction.zig");
     _ = @import("serverless/lake_vacuum.zig");

@@ -23,6 +23,7 @@ const runtime_lifecycle = @import("../common/runtime_lifecycle.zig");
 const health_server = @import("../common/health_server.zig");
 
 pub const ServerlessServerConfig = struct {
+    sql_driver: ?*@import("sql/driver.zig").Driver = null,
     bootstrap: runtime_mod.BootstrapConfig,
     http: serverless_http_server.ServerlessHttpServerConfig = .{},
     listener: ?ListenerConfig = null,
@@ -50,6 +51,8 @@ fn listenerHttpxConfig(cfg: ListenerConfig, http_runtime: ?*httpx.HttpRuntime) h
 }
 
 pub const ServerlessServer = struct {
+    sql_driver: ?*@import("sql/driver.zig").Driver = null,
+    sql_io: ?std.Io = null,
     alloc: std.mem.Allocator,
     stack: *runtime_mod.OwnedStack,
     owned_http_server: *serverless_http_server.ServerlessHttpServer,
@@ -58,6 +61,7 @@ pub const ServerlessServer = struct {
     listener_task: ?httpx.ListenerTask = null,
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io, cfg: ServerlessServerConfig) !ServerlessServer {
+        if ((cfg.sql_driver != null or cfg.http.distributed_sql != null) and cfg.bootstrap.role != .query_only and cfg.bootstrap.role != .combined) return error.SqlQueryRoleRequired;
         const stack = try alloc.create(runtime_mod.OwnedStack);
         errdefer alloc.destroy(stack);
         try stack.init(alloc, cfg.bootstrap, io);
@@ -97,6 +101,8 @@ pub const ServerlessServer = struct {
 
         return .{
             .alloc = alloc,
+            .sql_driver = cfg.sql_driver,
+            .sql_io = io,
             .stack = stack,
             .owned_http_server = http_server,
             .owned_http_runtime = http_runtime,
@@ -110,6 +116,7 @@ pub const ServerlessServer = struct {
     }
 
     pub fn deinitWithDeadline(self: *ServerlessServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
+        if (self.sql_driver) |driver| driver.stop();
         if (self.owned_listener) |listener| {
             self.stopListenerWithDeadline(deadline);
             listener.deinit();
@@ -127,6 +134,8 @@ pub const ServerlessServer = struct {
         try self.stack.runtime.start();
         errdefer self.stack.runtime.stop();
         try self.startListener();
+        errdefer self.stopListener();
+        if (self.sql_driver) |driver| try driver.start(self.sql_io.?);
     }
 
     pub fn stop(self: *ServerlessServer) void {
@@ -134,6 +143,7 @@ pub const ServerlessServer = struct {
     }
 
     pub fn stopWithDeadline(self: *ServerlessServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
+        if (self.sql_driver) |driver| driver.stop();
         self.stopListenerWithDeadline(deadline);
         self.stack.runtime.stopWithDeadline(deadline);
     }

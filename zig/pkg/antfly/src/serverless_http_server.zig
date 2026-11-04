@@ -21,6 +21,7 @@ const serverless_http_types = @import("serverless/api/http_types.zig");
 
 const secrets = @import("antfly_local_sources").common_secrets;
 pub const ServerlessHttpServerConfig = struct {
+    distributed_sql: ?@import("serverless/sql/transport.zig").Server = null,
     secret_store: ?*secrets.FileStore = null,
     // Explicit credential required even on otherwise unauthenticated serverless
     // deployments. TLS terminates at the deployment's trusted ingress.
@@ -96,6 +97,16 @@ pub const ServerlessHttpServer = struct {
     }
 
     pub fn handle(self: *ServerlessHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
+        if (@import("serverless/sql/transport.zig").Server.handles(req.uri)) {
+            const sql = self.cfg.distributed_sql orelse return self.secretResponse(503, "{}");
+            if (req.method != .POST) return self.secretResponse(405, "{}");
+            return sql.handle(self.alloc, req.uri, req.header(@import("api/internal_service_auth.zig").header_name), req.body, .{ .cancellation = if (req.cancellation) |value| .{ .ptr = value, .is_cancelled_fn = struct {
+                fn canceled(raw: *const anyopaque) bool {
+                    const token: *const http_common.RequestCancellation = @ptrCast(@alignCast(raw));
+                    return token.isCancelled();
+                }
+            }.canceled } else null });
+        }
         if (isSecretPath(req.uri)) return self.handleSecrets(req);
         const method: serverless_http_routes.HttpMethod = switch (req.method) {
             .GET => .get,
@@ -194,6 +205,21 @@ pub const ServerlessHttpServer = struct {
     /// the transport edge; the serverless handler receives its canonical
     /// transport-neutral request exactly once.
     pub fn handleHttpx(self: *ServerlessHttpServer, ctx: *httpx.Context) !httpx.Response {
+        if (@import("serverless/sql/transport.zig").Server.handles(ctx.request.uri.path)) {
+            if (ctx.request.method != .POST) return ctx.status(405).text("method not allowed");
+            const sql = self.cfg.distributed_sql orelse return ctx.status(503).text("SQL query runtime unavailable");
+            var response = try sql.handle(self.alloc, ctx.request.uri.path, ctx.header(@import("api/internal_service_auth.zig").header_name), (try ctx.body()) orelse "", .{ .cancellation = .{ .ptr = ctx, .is_cancelled_fn = struct {
+                fn canceled(raw: *const anyopaque) bool {
+                    const c: *const httpx.Context = @ptrCast(@alignCast(raw));
+                    return c.isCancellationRequested();
+                }
+            }.canceled } });
+            defer response.deinit(self.alloc);
+            _ = ctx.status(response.status);
+            try ctx.setHeader("Content-Type", "application/json");
+            _ = ctx.response.body(response.body);
+            return ctx.response.build();
+        }
         if (isSecretPath(ctx.request.uri.path)) {
             const method: http_common.Method = switch (ctx.request.method) {
                 .GET => .GET,

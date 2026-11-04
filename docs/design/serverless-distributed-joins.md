@@ -1,13 +1,16 @@
 # Serverless multi-node SQL joins
 
-Status: proposal. Nothing here is implemented yet. It describes how stateless
-serverless query workers could execute SQL joins over lake tables that are far
-larger than one worker, up to roughly a trillion rows. It builds on existing
-pieces wherever possible.
+Status: native broadcast/shuffle execution and shared recovery contracts are
+implemented as opt-in host capabilities in `zig/pkg/antfly/src/serverless/sql`.
+See that module's README for integration, supported lowering and remaining
+strategies. Bucket/adaptive execution and Cloudflare bindings below remain
+proposals. The scale target, up to roughly a trillion rows, is not a qualified
+performance claim.
 
 ## Where joins run today
 
-SQL joins run inside one process:
+Default SQL execution runs joins inside one process; the opt-in distributed
+bridge now handles supported direct lake equijoins:
 
 - `sql/relation_runtime.zig` starts with an in-memory hash join. When the
   build side exceeds three quarters of `retained_bytes` (256 MiB by default),
@@ -38,8 +41,9 @@ Pieces that already exist and that a distributed design can reuse:
 | Expiring objects | `api/lake_expiring_objects.zig` | Clean up exchange data |
 | Distributed JSON joins: broadcast at 10 MiB, 8 shuffle partitions, durable shuffle leases | `api/distributed_join.zig`, `zig/JOINS.md` | Strategy thresholds and lease lifecycle, proven in Raft mode |
 
-What is missing: a serializable plan fragment, an exchange format, a query
-coordinator that owns tasks, and a planner that reads partition specs for joins.
+The native execution module now supplies serializable fragments, typed exchange,
+and durable coordinator/task ownership. Join planning from partition specs
+remains strategy work.
 
 ## Design principles
 

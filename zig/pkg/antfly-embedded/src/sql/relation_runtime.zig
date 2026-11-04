@@ -956,6 +956,7 @@ fn Engine(comptime Context: type) type {
             pages: usize = 0,
             eof: bool = false,
             emitted: bool = false,
+            remote_join: ?catalog.RelationCursor = null,
             hash_join: ?*operators.HashJoin = null,
             membership_index: ?*operators.TupleMembership = null,
             borrowed_membership: bool = false,
@@ -1032,6 +1033,12 @@ fn Engine(comptime Context: type) type {
                 switch (node.operation) {
                     .materialized_ref => |source| self.cached_reader = try (try engine.staticRows(source)).openReader(),
                     .join => |join| {
+                        if (recursive_id == null and !apply_mode and !join.correlation and join.membership == null) {
+                            if (engine.context.backend.distributed_join) |remote| {
+                                self.remote_join = try remote.open(remote.ptr, alloc, node, engine.context.binding.relation.?.scans, engine.cursors, engine.context.parameters);
+                                if (self.remote_join != null) return self;
+                            }
+                        }
                         // Always probe the delta and build the invariant side.
                         // Keep output ordinals in the original SQL FROM order.
                         self.flipped_join = if (join.membership != null) false else if (apply_mode and outerMask(node) != 0) outerMask(join.left) == 0 and outerMask(join.right) != 0 else if (recursive_id) |id| !dependsOn(join.left, id) and dependsOn(join.right, id) else try engine.preferLeftBuild(join);
@@ -1050,6 +1057,7 @@ fn Engine(comptime Context: type) type {
                 return self;
             }
             pub fn deinit(self: *Iterator) void {
+                if (self.remote_join) |remote| remote.close(remote.ptr);
                 if (self.prepared_reader) |reader| reader.close();
                 if (self.cached_reader) |reader| reader.close();
                 if (self.result_cursor) |cursor| cursor.close();
@@ -1090,6 +1098,7 @@ fn Engine(comptime Context: type) type {
             }
             fn nextBatchMeasured(self: *Iterator, a: Allocator, maximum: usize, failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
                 if (maximum == 0) return .{ .rows = &.{} };
+                if (self.remote_join) |remote| return remote.next(remote.ptr, a, maximum);
                 if (self.sampled) |sample| {
                     const count = @min(maximum, sample.len() - self.sampled_index);
                     if (count != 0) {
@@ -1264,6 +1273,10 @@ fn Engine(comptime Context: type) type {
             }
             fn nextMeasured(self: *Iterator, alloc: Allocator) anyerror!?[]const Datum {
                 try self.engine.checkpoint();
+                if (self.remote_join) |remote| {
+                    const batch = try remote.next(remote.ptr, alloc, 1);
+                    return if (batch.len() == 0) null else try batch.row(alloc, 0);
+                }
                 if (self.sampled) |sample| {
                     if (self.sampled_index < sample.len()) {
                         const row = try sample.row(alloc, self.sampled_index);

@@ -1625,6 +1625,9 @@ test "session maintenance activation follows current range leadership without fo
 }
 
 pub const ApiHttpServerConfig = struct {
+    /// Optional query-role distributed SQL service; scoped by authenticated capabilities.
+    distributed_sql: ?@import("../serverless/sql/runtime.zig").Factory = null,
+    distributed_sql_join: ?@import("antfly_local_sources").sql_catalog.DistributedJoin = null,
     /// Node-local personal connection owner; never populated by distributed configuration.
     chatgpt: ?*@import("antfly_local_sources").chatgpt_manager.Manager = null,
     pgwire: ?common_config.Config.PgwireConfig = null,
