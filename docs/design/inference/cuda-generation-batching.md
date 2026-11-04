@@ -6,7 +6,7 @@ KV storage, admission lease, cancellation lifetime and output stream. Prefill
 chunks retain singleton turns, avoiding padding a decoder token to a long
 prefill's query length.
 
-Enable both controls explicitly:
+The shipped read-pool configuration enables both controls. Equivalent settings:
 
 ```json
 {
@@ -18,15 +18,18 @@ Enable both controls explicitly:
     "generation_batching": {
       "mode": "on",
       "max_step_items": 2,
-      "max_decode_wait_us": 1000,
+      "max_decode_wait_us": 0,
       "max_idle_prefill_chunk_size": 512
     }
   }
 }
 ```
 
-Both controls remain off by default. Cooperative execution with row batching
-off continues to interleave one request per forward. Row batching alone does
+The read service batches eligible requests automatically; callers need no
+batching flag. A zero batch-fill wait combines work already queued without
+delaying a ready decoder for a peer. The general runtime defaults outside this
+deployment profile remain off. Cooperative execution with row batching off
+continues to interleave one request per forward. Row batching alone does
 not opt a model into cooperative sharing. The current envelope remains two
 active requests and two decode rows. Graph, prompt-cache, speculative,
 selected-KV and multimodal requests retain exclusive ownership.
@@ -139,9 +142,22 @@ its exact reference and both active work and transient KV return to zero.
 predefined 10% gain gate. Embedding p95 rises 2.11 times, exceeding the two-times
 relative gate despite remaining below 51 ms. Short completion rises 11–12%,
 within its 25% gate. All absolute smaller-model latency gates pass. Batching
-therefore remains an explicit experiment, and the selected read profile keeps
-one-row cooperative execution. Functional qualification is not reported as
-production performance qualification.
+remained an explicit experiment after this campaign. The read deployment now
+selects ready-only batching, as requested, without changing these historical
+gate results. Functional qualification is not reported as production performance
+qualification.
+
+There are several limits on this initial speedup. Only the overlapping decode
+portion can share a forward; the 512-token request continues alone after the
+256-token peer finishes, and prefill stays singleton. The output head still
+projects each row separately to preserve the canonical quantized result. Each
+cohort drains and invalidates backend ownership: the streaming pair records
+763 owner resets versus 297 in the one-row control (buffered: 773 versus 264).
+Those counters identify extra state transitions, not their GPU time cost.
+The original campaign also allowed a 1 ms batch-fill delay. The current read
+configuration removes that deliberate delay, while retaining the drain and
+ownership checks. A shared GPU and these counters do not isolate how much each
+factor contributes to the measured embedding tail.
 
 The one-row campaign has 614 valid memory samples and the two-row campaign has
 646, with no sampling failures and complete evidence in every workload phase.
@@ -183,3 +199,77 @@ unit tests, license headers and the Apache product-boundary check pass.
 All serving measurements use the shared GB10 machine; they do not establish
 A100 performance or production SLOs. Remote PR CI still requires its normal
 maintainer approval.
+
+## Read deployment with no batch-fill wait
+
+The read deployment now enables cooperative execution and two decode rows in
+`configs/inference-read-pool-40g.json`. `max_decode_wait_us: 0` combines ready
+requests without holding a decoder to fill a batch. Callers need no request
+flag. Global defaults for other configurations are unchanged; disabling row
+batching remains an explicit rollback to one-row cooperative execution.
+
+The controlled repeat uses the same `0faa7f34...` executable and 512/256-token
+workload above. Both controls have zero batch-fill wait and differ only in row
+mode and limit. Exact streaming/buffered references, two seven-request queue
+turnover rounds, stable model IDs, cancellation and healthy-peer recovery pass.
+Mandatory managed-memory and service-NVML evidence is complete in every phase,
+with no sampling failures. Two-row managed peak is 11,233,105,168 bytes and NVML
+peak is 11,586,879,488 bytes, below the unchanged 38 GiB guard.
+
+| Client-observed metric | One row | Ready-only two rows |
+| --- | ---: | ---: |
+| Streaming aggregate output tokens/s | 31.84 | 32.54 |
+| Buffered aggregate output tokens/s | 31.81 | 32.70 |
+| Short first content | 1.68 s | 1.69 s |
+| Short streaming completion | 14.22 s | 13.58 s |
+| Short buffered completion | 14.23 s | 13.93 s |
+| Embedding p95 | 26.53 ms | 44.32 ms |
+| Decide p95 | 72.08 ms | 73.16 ms |
+
+Both throughput gates still fail: gains are 2.2% / 2.8%, below 10%. All
+request-latency and smaller-model gates pass, including the embedding relative
+gate at 1.67 times. The deployment selects this latency-oriented batching policy
+without claiming that throughput promotion passed. Embedding median is nearly
+unchanged (11.65 / 11.89 ms); its higher tail occurs while sharing the GPU with
+Gemma. That is consistent with contention from wider generation steps, but is
+not an isolated measurement of GPU scheduling or memory-bandwidth effects.
+
+Reports are `ready-control/`, `ready-candidate/` and
+`ready-performance-gates/batching-gates.json` in the same evidence directory.
+
+The ready-only profile also passes a streaming decode-overlap regression with
+31,332-token and 1,956-token prompts, using the existing independent references.
+The short request arrives after the long request starts decoding. Twelve real
+two-row steps execute during that phase; both outputs match their references.
+Long completion is 88.13 seconds, short completion 11.13 seconds after arrival,
+and short first content 4.21 seconds. Disconnect/healthy-peer recovery and
+complete per-phase memory evidence pass. This report is `ready-long-overlap/`;
+it is a functional long-context check, not a paired performance comparison.
+
+Ordinary streaming and buffered HTTP requests also pass exact independent
+references with no backend, cache-dtype, prompt-cache or batching flags. They
+execute 56 real two-row steps and return active work and KV usage to zero.
+The receipt is `ready-api-checks.json`.
+
+## GLiNER batching is a separate path
+
+The read pool's FP32 DeBERTa GLiNER 2.5-Decide already supports native CUDA
+classification batches of up to eight compatible inputs through
+`POST /ai/v1/extract` with `schema_version: 2`. The span executor packs those
+inputs into a padded encoder/classifier forward, subject to the checkpoint's
+512-token per-sequence and aggregate resource limits. It is independent of
+Gemma generation batching and needs no generation-batching flag.
+
+That does not mean every concurrent GLiNER HTTP call is automatically merged.
+The typed `/decisions` API takes one input; its qualified span executor runs
+under the model's execution mutex without submitting those separate requests
+to the generic GLiNER microbatch broker. Other GLiNER architectures, artifacts
+and backends have their own batching contracts. In particular, the boundary
+extractor's conservative discovery must not be interpreted as this Decide
+checkpoint's eight-input classification contract.
+
+The live read service also passes an eight-input classification request with
+distinct texts, preserving order and exactly matching singleton results
+(maximum numeric difference zero). A ninth input receives HTTP 413 before
+execution, consistent with this read profile's eight-item request limit. The
+same `ready-api-checks.json` receipt records this existing GLiNER capability.

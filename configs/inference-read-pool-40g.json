@@ -55,14 +55,14 @@
       "ttl_ms": 600000
     },
     "generation_batching": {
-      "mode": "off",
-      "max_step_items": 1,
+      "mode": "on",
+      "max_step_items": 2,
       "max_step_query_tokens": 512,
-      "max_decode_wait_us": 1000,
+      "max_decode_wait_us": 0,
       "max_idle_prefill_chunk_size": 512
     },
     "cooperative_execution": {
-      "mode": "off",
+      "mode": "on",
       "max_active_requests": 2,
       "short_context_burst": 8,
       "decode_handoff_wait_us": 5000

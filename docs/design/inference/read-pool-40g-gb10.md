@@ -78,10 +78,11 @@ The generic main default and this explicit Flash profile are separate cases.
 The Flash profile is not admitted on A100; retain the separate conservative
 A100 profile until hardware-specific qualification is available.
 
-The canonical config starts with a 32,768-token input ceiling and both
-`cooperative_execution.mode: off` and `generation_batching.mode: off`.
-Current reproduction enables `cooperative_execution.mode: on` and keeps row
-batching off with `max_step_items: 1`. The historical campaigns below used the
+The canonical config has a 32,768-token input ceiling and enables both
+`cooperative_execution.mode: on` and `generation_batching.mode: on`, with
+`max_step_items: 2` and `max_decode_wait_us: 0`. It combines ready decoders
+without waiting to fill a batch. The earlier one-row comparisons explicitly
+disable row batching with `max_step_items: 1`. The historical campaigns below used the
 former combined batching switch. See [cooperative execution ownership](cooperative-execution.md)
 for the current independent controls, recovery contract and validation gates.
 Do not interpret high GPU utilization as proof that decode batches formed or
@@ -475,8 +476,9 @@ Decide's tail changed little. The 256-token campaign starts a fresh service;
 absolute lifetime memory peaks and warm-cache state are therefore not a
 controlled before/after comparison. This is preliminary tuning evidence on a
 shared GPU, and the completed 32K campaign remains the 512-token configuration.
-The canonical read config keeps experimental batching off; reproduction of
-this follow-up explicitly opts into one-row cooperative execution.
+This historical follow-up explicitly uses one-row cooperative execution.
+The current read profile enables ready-only two-row batching; see the
+[batching record](cuda-generation-batching.md) for its separate measurements.
 
 Source snapshots include untracked implementation files, and final environment
 receipts pin executable/model/configuration hashes and filtered CUDA feature

@@ -1,7 +1,9 @@
 # Cooperative CUDA execution ownership
 
 Cooperative execution interleaves independently owned generation requests on a
-shared backend. It is an explicit opt-in, independent of row batching:
+shared backend. Its control is independent of row batching. This example selects
+one-row interleaving; the shipped read-pool configuration enables two-row
+batching by default:
 
 ```json
 {
@@ -21,15 +23,17 @@ shared backend. It is an explicit opt-in, independent of row batching:
 }
 ```
 
-The default remains off. `generation_batching.mode: on` controls row batching
+The general runtime defaults remain off. `generation_batching.mode: on` controls row batching
 and does not enable cooperative execution. A cooperative request that also
 requests more rows than the backend declares receives
 `UNQUALIFIED_COOPERATIVE_BATCH`. The original qualified read profile uses two
-active requests and one row per GPU step. Opt-in decode batching can combine
+active requests and one row per GPU step. Decode batching can combine
 two rows when the resident backend declares its quantized numerical contract;
 see [multi-request CUDA generation batches](cuda-generation-batching.md).
 The earlier mixed two-row path did not pass its latency gate. Performance
 promotion of the decode-only path uses its own controlled comparison gates.
+The read-pool deployment selects batching for ready requests without a batch-fill
+wait; this deployment choice does not turn a failed performance gate into a pass.
 The decoder's backend declaration currently fences sharing to eagerly uploaded
 dense Gemma 4 E4B CUDA geometry. Other backends default to exclusive execution.
 Graph, prompt-cache, speculative, selected-KV and multimodal requests retain

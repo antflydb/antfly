@@ -219,13 +219,20 @@ explicit request limits and scratch/KV admission constrain the final immutable
 plan before execution; queued callers do not force a serialized GPU request to
 retain a tiny shared-execution plan.
 
-With `inference.generation_batching.mode: on`, dense Gemma 4 E4B CUDA text
-requests can instead share two active slots and interleave scheduler steps.
-Each step binds its request's memory budget while holding the model mutex.
+With `inference.cooperative_execution.mode: on`, eligible dense Gemma 4 E4B
+CUDA text requests share two active slots and interleave scheduler steps.
+Enabling `inference.generation_batching.mode: on` additionally combines two
+ready decode requests into one forward when the backend declares support.
+Each step binds its owners' memory budget while holding the model mutex.
 Graph, draft, prefix-cache, selected-KV and multimodal routes retain exclusive
-ownership. This remains opt-in; the tested GB10 concurrency configuration uses
-`max_step_items: 1` because two-row execution regressed latency. The cooperative
-policy prefers shorter contexts for up to eight consecutive turns, then grants
+ownership. The shipped `configs/inference-read-pool-40g.json` enables both
+controls, with `max_step_items: 2` and `max_decode_wait_us: 0`: it batches ready
+requests without waiting to fill a batch. No request flag is needed. Setting
+`generation_batching.mode: off` restores one-row cooperative execution;
+disabling cooperative execution restores exclusive generation. Other runtime
+configurations retain their existing defaults. See the
+[measurements and tradeoffs](../design/inference/cuda-generation-batching.md).
+The cooperative policy prefers shorter contexts for up to eight consecutive turns, then grants
 the next round-robin owner. Manual final-prefill turns participate in that
 selection, so queued long chunks cannot hide a short request's final chunk.
 Other scheduling policies retain strict round robin.
