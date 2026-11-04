@@ -8176,6 +8176,7 @@ pub const AntflyApiHandler = struct {
         const settings = @import("antfly_local_sources").system_catalog_settings;
         var parsed = std.json.parseFromSlice(settings.Request, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid setting mutation");
         defer parsed.deinit();
+        if (parsed.value != .put and parsed.value != .drop) return textResponse(ctx, 400, "use ALTER ROLE or ALTER DATABASE for scoped defaults");
         var context = operationContext(ctx, identity);
         context.setting_admin = true;
         const result = self.api_server.source.systemCatalog(ctx.allocator, context, .{ .setting_mutate = parsed.value }) catch |err|
@@ -11881,6 +11882,15 @@ test "system catalog SQL setting publication requires cluster admin and forwards
     defer allowed.deinit();
     try std.testing.expectEqual(@as(u16, 200), allowed.status.code);
     try std.testing.expectEqual(@as(usize, 1), source.calls);
+    for ([_][]const u8{
+        "{\"database_default\":{\"name\":\"timezone\",\"database\":\"main\",\"value\":{\"string\":\"UTC\"}}}",
+        "{\"role_default\":{\"name\":\"app.mode\",\"principal\":\"settings_reader\",\"database\":\"\",\"value\":{\"string\":\"alpha\"}}}",
+    }) |private_body| {
+        var rejected = try requestWithRetry(&client, io.io(), .POST, url, private_body, &admin_headers, 20);
+        defer rejected.deinit();
+        try std.testing.expectEqual(@as(u16, 400), rejected.status.code);
+        try std.testing.expectEqual(@as(usize, 1), source.calls);
+    }
 }
 
 test "public index publication recovery requires table admin and preserves exact logical scope" {

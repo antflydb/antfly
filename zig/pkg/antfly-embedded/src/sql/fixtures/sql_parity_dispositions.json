@@ -4736,6 +4736,56 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-original-database-defaults-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-setting-defaults-test",
+        "antfly-api-sql-authorization-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-original-database-defaults-metadata-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-metadata-sql-role-defaults-test",
+        "antfly-sql-command-fence-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-original-database-defaults-kernel-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Dtest-filter=SQL database defaults",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-original-database-defaults-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/check_sql_database_defaults_postgres.py"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -6577,8 +6627,40 @@
     },
     {
       "id": "sql-0107",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original executes through authenticated public SQL with native command ownership, and its exact UTC database-default record survives cold metadata/session/data-owner recovery. The shared scoped-setting pipeline qualifies typed SET/RESET/DEFAULT and atomic RESET ALL, old/new login baselines, role precedence, scoped authorization, protected-default rejection before proposal, rename/drop/name reuse, API-key role inheritance without weakening credential policy or overrides, and admitted user incarnations. Native decoder/replay and command-fence contracts and an independent PostgreSQL 18 oracle provide separate evidence. This closes the original UTC setting; arbitrary IANA zones and transactional settings DDL are not claimed.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig",
+          "test": "mounted SQL original database defaults retain native command authority and cold multi-owner login baselines",
+          "gate": "sql-original-database-defaults-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig",
+          "test": "mounted SQL original database defaults preserve scope login baselines reset authorization and cold recovery",
+          "gate": "sql-original-database-defaults-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/system_catalog/settings.zig",
+          "test": "SQL database defaults inherit managed API key roles without broadening credential policy or credential overrides",
+          "gate": "sql-original-database-defaults-kernel-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL database defaults decoder fences native baseline patches preserves definitions and survives cold replay",
+          "gate": "sql-original-database-defaults-metadata-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig",
+          "test": "mounted SQL original database defaults retain native command authority and cold multi-owner login baselines",
+          "gate": "sql-original-database-defaults-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sync_control_integration_test.zig",
+          "test": "mounted SQL native sync controls preserve original SET lifetimes and durable multi-owner visibility choices",
+          "gate": "sql-qualified-table-row-locks-native-debug"
+        }
+      ]
     },
     {
       "id": "sql-0108",

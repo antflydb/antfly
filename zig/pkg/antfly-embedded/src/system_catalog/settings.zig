@@ -30,11 +30,36 @@ pub const Scope = struct {
     database: []const u8,
     /// Filled only by the authoritative catalog visibility cut.
     database_id: ?u64 = null,
+    /// Authenticated managed role for non-policy login defaults. Ownership and
+    /// policy settings remain bound to principal, including API-key identity.
+    role_principal: ?[]const u8 = null,
+
+    pub fn validate(self: Scope) !void {
+        if (self.principal.len == 0 or self.database.len == 0) return error.InvalidSettingRecord;
+        if (self.role_principal) |role| try validateScopeName(role);
+    }
+
+    pub fn matchesRequest(self: Scope, request: Scope) bool {
+        if (!std.mem.eql(u8, self.principal, request.principal) or !std.mem.eql(u8, self.database, request.database)) return false;
+        if (self.role_principal) |role| return if (request.role_principal) |other| std.mem.eql(u8, role, other) else false;
+        return request.role_principal == null;
+    }
 
     pub fn jsonStringify(self: Scope, writer: anytype) !void {
+        try writer.beginObject();
+        try writer.objectField("principal");
+        try writer.write(self.principal);
+        try writer.objectField("database");
+        try writer.write(self.database);
         if (self.database_id) |id| {
-            try writer.write(.{ .principal = self.principal, .database = self.database, .database_id = id });
-        } else try writer.write(.{ .principal = self.principal, .database = self.database });
+            try writer.objectField("database_id");
+            try writer.write(id);
+        }
+        if (self.role_principal) |role| {
+            try writer.objectField("role_principal");
+            try writer.write(role);
+        }
+        try writer.endObject();
     }
 };
 pub const Definition = struct {
@@ -95,15 +120,15 @@ pub const Record = struct {
         if (self.identity.id == native_sync_identity.id or std.ascii.eqlIgnoreCase(self.name, native_sync_name)) return error.InvalidSettingRecord;
         try validateName(self.name);
         try validateValue(self.kind, self.default);
-        const builtin = builtinInput(self.name) != null;
-        if (builtin) {
-            if (self.kind != .integer or self.policy_sensitive or !self.session_writable) return error.InvalidSettingRecord;
-            try validateTimeout(self.default);
+        const builtin = builtinInput(self.name);
+        if (builtin) |definition| {
+            if (self.kind != definition.kind or self.policy_sensitive or self.session_writable != definition.session_writable) return error.InvalidSettingRecord;
+            try validateBuiltin(self.name, self.default);
         }
         for (self.database_defaults, 0..) |entry, i| {
             try validateScopeName(entry.database);
             try validateValue(self.kind, entry.value);
-            if (builtin) try validateTimeout(entry.value);
+            if (builtin != null) try validateBuiltin(self.name, entry.value);
             for (self.database_defaults[0..i]) |prior| if (std.mem.eql(u8, prior.database, entry.database)) return error.InvalidSettingRecord;
         }
         var role_order: [1024]u16 = undefined;
@@ -114,7 +139,7 @@ pub const Record = struct {
             if (entry.database_id) |id| if (id == 0 or entry.database.len == 0 or self.policy_sensitive) return error.InvalidSettingRecord;
             try validateScopeName(entry.principal);
             try validateValue(self.kind, entry.value);
-            if (builtin) try validateTimeout(entry.value);
+            if (builtin != null) try validateBuiltin(self.name, entry.value);
             if (entry.principal_instance) |instance| {
                 if (std.mem.allEqual(u8, &instance, 0) or self.policy_sensitive) return error.InvalidSettingRecord;
             }
@@ -168,11 +193,20 @@ pub const Record = struct {
     }
 
     pub fn effectiveAlloc(self: Record, a: std.mem.Allocator, scope: Scope) !Definition {
-        var definition = self.effective(scope.principal, scope.database);
+        var principal = scope.principal;
+        if (!self.policy_sensitive) if (scope.role_principal) |role| {
+            // Preserve administrator-published credential-specific defaults.
+            // Otherwise inherit the managed user's SQL defaults in this cut.
+            const credential_override = for (self.role_defaults) |entry| {
+                if (std.mem.eql(u8, entry.principal, scope.principal) and roleDatabaseMatches(entry, scope)) break true;
+            } else false;
+            if (!credential_override) principal = role;
+        };
+        var definition = self.effective(principal, scope.database);
         var count: usize = 0;
         var bound = false;
         for (self.role_defaults) |entry| {
-            if (!std.mem.eql(u8, entry.principal, scope.principal) or !roleDatabaseMatches(entry, scope)) continue;
+            if (!std.mem.eql(u8, entry.principal, principal) or !roleDatabaseMatches(entry, scope)) continue;
             count += 1;
             bound = bound or entry.principal_instance != null or entry.database_id != null;
         }
@@ -181,7 +215,7 @@ pub const Record = struct {
         const candidates = try a.alloc(RoleDefault, count);
         var index: usize = 0;
         for (self.role_defaults) |entry| {
-            if (!std.mem.eql(u8, entry.principal, scope.principal) or !roleDatabaseMatches(entry, scope)) continue;
+            if (!std.mem.eql(u8, entry.principal, principal) or !roleDatabaseMatches(entry, scope)) continue;
             candidates[index] = entry;
             index += 1;
         }
@@ -262,6 +296,24 @@ fn roleNameLess(entries: []const RoleDefault, left: u16, right: u16) bool {
     return entries[left].database_id == null and entries[right].database_id != null;
 }
 
+pub fn parseValue(kind: Kind, raw: []const u8) !Value {
+    return switch (kind) {
+        .boolean => .{ .boolean = if (std.ascii.eqlIgnoreCase(raw, "true") or std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "on")) true else if (std.ascii.eqlIgnoreCase(raw, "false") or std.mem.eql(u8, raw, "0") or std.ascii.eqlIgnoreCase(raw, "off")) false else return error.InvalidSettingValue },
+        .integer => .{ .integer = std.fmt.parseInt(i64, raw, 10) catch return error.InvalidSettingValue },
+        .string => blk: {
+            if (raw.len > 4096 or !std.unicode.utf8ValidateSlice(raw)) return error.InvalidSettingValue;
+            break :blk .{ .string = raw };
+        },
+    };
+}
+
+fn configuredDefault(kind: Kind, value: ?Value) !?Value {
+    const supplied = value orelse return null;
+    if (supplied == .string and kind != .string) return try parseValue(kind, supplied.string);
+    try validateValue(kind, supplied);
+    return supplied;
+}
+
 fn valueEqual(left: Value, right: Value) bool {
     if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
     return switch (left) {
@@ -280,7 +332,20 @@ pub fn builtinInput(name: []const u8) ?Input {
         .session_writable = true,
         .default = .{ .integer = 0 },
     };
+    if (std.ascii.eqlIgnoreCase(name, "timezone")) return .{
+        .name = "timezone",
+        .kind = .string,
+        .session_writable = false,
+        .default = .{ .string = "UTC" },
+    };
     return null;
+}
+
+fn validateBuiltin(name: []const u8, value: Value) !void {
+    if (std.ascii.eqlIgnoreCase(name, "statement_timeout")) return validateTimeout(value);
+    // Formatting and temporal execution currently pin the same UTC profile.
+    // Never persist another zone while the executor would still use UTC.
+    if (std.ascii.eqlIgnoreCase(name, "timezone") and (value != .string or !std.ascii.eqlIgnoreCase(value.string, "UTC"))) return error.InvalidSettingValue;
 }
 
 fn validateTimeout(value: Value) !void {
@@ -308,6 +373,19 @@ test "role defaults bootstrap only known typed controls and reject invalid nativ
     try std.testing.expectError(error.InvalidSettingRecord, invalid_definition.validate());
 }
 
+pub const CommandFence = @import("../storage/pessimistic_lock_authority.zig").CommandFence;
+
+fn stringifyScoped(value: anytype, writer: anytype) !void {
+    try writer.beginObject();
+    inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |field| {
+        if (!(comptime std.mem.eql(u8, field, "command_fence")) or value.command_fence != null) {
+            try writer.objectField(field);
+            try writer.write(@field(value, field));
+        }
+    }
+    try writer.endObject();
+}
+
 pub const RoleDefaultChange = struct {
     name: []const u8,
     principal: []const u8,
@@ -316,13 +394,18 @@ pub const RoleDefaultChange = struct {
     database_id: ?u64 = null,
     /// null means RESET, not a SQL NULL setting value.
     value: ?Value,
+    command_fence: ?CommandFence = null,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try stringifyScoped(self, writer);
+    }
 
     pub fn validate(self: RoleDefaultChange) !void {
+        if (self.command_fence) |fence| try fence.validate();
         try validateName(self.name);
         try validateScopeName(self.principal);
         if (self.database.len != 0) try validateScopeName(self.database);
         if (self.database_id) |id| if (id == 0 or self.database.len == 0) return error.InvalidSettingRecord;
-        if (builtinInput(self.name) != null) if (self.value) |value| try validateTimeout(value);
+        if (builtinInput(self.name) != null) if (self.value) |value| try validateBuiltin(self.name, value);
     }
 
     /// Run in the catalog mutation lane, not after an ingress-side snapshot.
@@ -338,7 +421,7 @@ pub const RoleDefaultChange = struct {
             if (prior.policy_sensitive) return error.SettingWriteForbidden;
         }
         if (!std.ascii.eqlIgnoreCase(self.name, prior.name)) return error.InvalidSettingRecord;
-        if (self.value) |value| try validateValue(prior.kind, value);
+        const configured = try configuredDefault(prior.kind, self.value);
         var matched: usize = 0;
         for (prior.role_defaults) |entry| if (self.matches(entry)) {
             matched += 1;
@@ -352,7 +435,7 @@ pub const RoleDefaultChange = struct {
             output[index] = entry;
             index += 1;
         }
-        if (self.value) |value| {
+        if (configured) |value| {
             output[index] = .{ .principal = self.principal, .database = self.database, .value = value, .principal_instance = self.principal_instance, .database_id = self.database_id };
             index += 1;
         }
@@ -367,30 +450,88 @@ pub const RoleDefaultChange = struct {
     }
 };
 
-pub const Request = union(enum) { put: Input, drop: []const u8, role_default: RoleDefaultChange };
+/// Patches one database scope in the accepting catalog cut. A null value is
+/// RESET; other databases, role defaults and the immutable definition survive.
+pub const DatabaseDefaultChange = struct {
+    name: []const u8,
+    all: bool = false,
+    database: []const u8,
+    value: ?Value,
+    command_fence: ?CommandFence = null,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try stringifyScoped(self, writer);
+    }
+
+    pub fn validate(self: @This()) !void {
+        if (self.command_fence) |fence| try fence.validate();
+        if (self.all) {
+            if (self.name.len != 0 or self.value != null) return error.InvalidSettingRecord;
+        } else try validateName(self.name);
+        try validateScopeName(self.database);
+        if (builtinInput(self.name) != null) if (self.value) |value| try validateBuiltin(self.name, value);
+    }
+    pub fn applyAlloc(self: @This(), a: std.mem.Allocator, prior: Record) ![]DatabaseDefault {
+        try self.validate();
+        if (self.all) return error.InvalidSettingRecord;
+        try prior.validate();
+        if (prior.policy_sensitive) return error.SettingWriteForbidden;
+        if (!std.ascii.eqlIgnoreCase(self.name, prior.name)) return error.InvalidSettingRecord;
+        const configured = try configuredDefault(prior.kind, self.value);
+        var count: usize = @intFromBool(self.value != null);
+        for (prior.database_defaults) |entry| if (!std.mem.eql(u8, entry.database, self.database)) {
+            count += 1;
+        };
+        if (count > 256) return error.SettingLimitExceeded;
+        const result = try a.alloc(DatabaseDefault, count);
+        var index: usize = 0;
+        for (prior.database_defaults) |entry| if (!std.mem.eql(u8, entry.database, self.database)) {
+            result[index] = entry;
+            index += 1;
+        };
+        if (configured) |value| result[index] = .{ .database = self.database, .value = value };
+        return result;
+    }
+};
+
+pub const Request = union(enum) { put: Input, drop: []const u8, role_default: RoleDefaultChange, database_default: DatabaseDefaultChange };
 pub const Command = struct {
     version: u16 = 1,
+    command_fence: ?CommandFence = null,
     expected_revision: u64,
     /// Defaults change only future connections. Their publication must not
     /// invalidate an existing connection's pinned type/authorization identity.
     role_defaults_only: bool = false,
-    change: union(enum) { put: Record, drop: Identity },
+    database_defaults_only: bool = false,
+    change: union(enum) { put: Record, drop: Identity, reset_database_defaults: []const u8 },
 
     pub fn requiresRoleDefaultReaders(self: Command) bool {
         return self.role_defaults_only or switch (self.change) {
             .put => |record| roleDefaultsRequireReaders(record.role_defaults),
-            .drop => false,
+            .drop, .reset_database_defaults => false,
         };
     }
 
     pub fn jsonStringify(self: Command, writer: anytype) !void {
-        // Preserve the established command shape for ordinary publications.
-        // The additional intent is emitted only under the role-default floor.
+        try writer.beginObject();
+        try writer.objectField("version");
+        try writer.write(self.version);
+        try writer.objectField("expected_revision");
+        try writer.write(self.expected_revision);
+        try writer.objectField("change");
+        try writer.write(self.change);
         if (self.role_defaults_only) {
-            try writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .change = self.change, .role_defaults_only = true });
-        } else {
-            try writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .change = self.change });
+            try writer.objectField("role_defaults_only");
+            try writer.write(true);
         }
+        if (self.database_defaults_only) {
+            try writer.objectField("database_defaults_only");
+            try writer.write(true);
+        }
+        if (self.command_fence) |fence| {
+            try writer.objectField("command_fence");
+            try writer.write(fence);
+        }
+        try writer.endObject();
     }
 };
 
@@ -444,6 +585,25 @@ pub fn requireDatabaseBindings(a: std.mem.Allocator, record: Record, prior: ?Rec
     };
 }
 
+/// Bound the complete settings payload before a scoped batch transition. Count
+/// physical JSON bytes (including escaping) without duplicating nested values.
+pub fn requireCapacity(records: []const Record, replacement: ?Record) !void {
+    var buffer: [1024]u8 = undefined;
+    var counter = std.Io.Writer.Discarding.init(&buffer);
+    for (records) |record| {
+        if (replacement) |value| if (value.identity.id == record.identity.id) continue;
+        std.json.Stringify.value(record, .{}, &counter.writer) catch unreachable;
+        if (counter.fullCount() > @import("domain.zig").max_command_bytes) return error.SettingLimitExceeded;
+    }
+    if (replacement) |record| std.json.Stringify.value(record, .{}, &counter.writer) catch unreachable;
+    if (counter.fullCount() > @import("domain.zig").max_command_bytes) return error.SettingLimitExceeded;
+}
+
+pub fn sameDatabaseDefaultDefinition(left: Record, right: Record) bool {
+    const input: Input = .{ .name = left.name, .kind = left.kind, .policy_sensitive = left.policy_sensitive, .session_writable = left.session_writable, .default = left.default, .database_defaults = right.database_defaults, .role_defaults = left.role_defaults };
+    return input.matches(right);
+}
+
 pub fn sameDefinition(left: Record, right: Record) bool {
     const input: Input = .{ .name = left.name, .kind = left.kind, .policy_sensitive = left.policy_sensitive, .session_writable = left.session_writable, .default = left.default, .database_defaults = left.database_defaults, .role_defaults = right.role_defaults };
     return input.matches(right);
@@ -456,6 +616,7 @@ pub const DatabaseChanges = struct {
     names: std.AutoHashMapUnmanaged(u64, []const u8) = .empty,
     removed: std.AutoHashMapUnmanaged(u64, void) = .empty,
     removed_names: std.StringHashMapUnmanaged(void) = .empty,
+    renamed_names: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     pub fn init(a: std.mem.Allocator, removals: anytype, upserts: anytype, next_id: u64) !DatabaseChanges {
         var self: DatabaseChanges = .{};
@@ -463,17 +624,33 @@ pub const DatabaseChanges = struct {
         for (upserts) |resource| if (resource.kind == .database and resource.id < next_id) {
             try self.names.put(a, resource.id, resource.name);
         };
-        for (removals) |resource| if (resource.kind == .database and !self.names.contains(resource.id)) {
-            try self.removed.put(a, resource.id, {});
-            try self.removed_names.put(a, resource.name, {});
+        for (removals) |resource| if (resource.kind == .database) {
+            if (self.names.get(resource.id)) |name| {
+                try self.renamed_names.put(a, resource.name, name);
+            } else {
+                try self.removed.put(a, resource.id, {});
+                try self.removed_names.put(a, resource.name, {});
+            }
         };
         return self;
+    }
+
+    /// Upsert-only renames supply the prior name from the same catalog writer
+    /// transaction. Never infer a prior binding from a name supplied by SQL.
+    pub fn bindPreviousName(self: *DatabaseChanges, a: std.mem.Allocator, id: u64, name: []const u8) !void {
+        const next = self.names.get(id) orelse return error.InvalidSettingRecord;
+        if (std.mem.eql(u8, name, next)) {
+            _ = self.names.remove(id);
+            return;
+        }
+        try self.renamed_names.put(a, name, next);
     }
 
     pub fn deinit(self: *DatabaseChanges, a: std.mem.Allocator) void {
         self.names.deinit(a);
         self.removed.deinit(a);
         self.removed_names.deinit(a);
+        self.renamed_names.deinit(a);
     }
 
     pub fn empty(self: DatabaseChanges) bool {
@@ -488,8 +665,22 @@ pub const DatabaseChanges = struct {
                 renamed.database = name;
                 return renamed;
             }
-        } else if (self.removed_names.contains(entry.database)) return null;
+        } else {
+            if (self.removed_names.contains(entry.database)) return null;
+            if (self.renamed_names.get(entry.database)) |name| {
+                var renamed = entry;
+                renamed.database = name;
+                return renamed;
+            }
+        }
         return entry;
+    }
+
+    fn database(self: DatabaseChanges, entry: DatabaseDefault) ?DatabaseDefault {
+        if (self.removed_names.contains(entry.database)) return null;
+        var next = entry;
+        if (self.renamed_names.get(entry.database)) |name| next.database = name;
+        return next;
     }
 
     /// Nested strings/values borrow the source or catalog delta. The two
@@ -506,7 +697,10 @@ pub const DatabaseChanges = struct {
         }
         var databases: usize = 0;
         for (prior.database_defaults) |entry| {
-            if (self.removed_names.contains(entry.database)) changed = true else databases += 1;
+            if (self.database(entry)) |next| {
+                databases += 1;
+                changed = changed or !std.mem.eql(u8, entry.database, next.database);
+            } else changed = true;
         }
         if (!changed) return null;
         const role_defaults = try a.alloc(RoleDefault, roles);
@@ -518,8 +712,8 @@ pub const DatabaseChanges = struct {
             index += 1;
         };
         index = 0;
-        for (prior.database_defaults) |entry| if (!self.removed_names.contains(entry.database)) {
-            database_defaults[index] = entry;
+        for (prior.database_defaults) |entry| if (self.database(entry)) |next| {
+            database_defaults[index] = next;
             index += 1;
         };
         var replacement = prior;
@@ -566,7 +760,9 @@ pub const Snapshot = struct {
             var seen_scoped = false;
             for (definition.role_overrides) |entry| {
                 if (entry.database_id) |id| if (id == 0 or entry.database.len == 0) return error.InvalidSettingCatalogSnapshot;
-                if (!std.mem.eql(u8, entry.principal, self.scope.principal) or !roleDatabaseMatches(entry, self.scope)) return error.InvalidSettingCatalogSnapshot;
+                const credential = std.mem.eql(u8, entry.principal, self.scope.principal);
+                const role = if (self.scope.role_principal) |name| std.mem.eql(u8, entry.principal, name) else false;
+                if ((!credential and !role) or !roleDatabaseMatches(entry, self.scope)) return error.InvalidSettingCatalogSnapshot;
                 try validateValue(definition.kind, entry.value);
                 if (entry.database.len == 0) {
                     if (seen_global) return error.InvalidSettingCatalogSnapshot;
@@ -618,6 +814,7 @@ test "role defaults bind database identities across rename reset drop and name r
                 .name = "app.mode",
                 .kind = .string,
                 .default = .{ .string = "base" },
+                .database_defaults = &.{.{ .database = "old", .value = .{ .string = "database" } }},
                 .role_defaults = &.{
                     .{ .principal = "alice", .principal_instance = instance, .database = "", .value = .{ .string = "global" } },
                     .{ .principal = "alice", .principal_instance = instance, .database = "old", .database_id = 17, .value = .{ .string = "scoped" } },
@@ -659,11 +856,15 @@ test "role defaults bind database identities across rename reset drop and name r
             sensitive.policy_sensitive = true;
             const forbidden: RoleDefaultChange = .{ .name = record.name, .principal = "alice", .database = "old", .database_id = 17, .value = .{ .string = "unsigned" } };
             try std.testing.expectError(error.SettingWriteForbidden, forbidden.applyAlloc(a, sensitive));
-            var changes = try DatabaseChanges.init(a, &[_]Resource{before}, &[_]Resource{after}, 20);
+            // The real planner represents rename as an upsert without removals.
+            var changes = try DatabaseChanges.init(a, &[_]Resource{}, &[_]Resource{after}, 20);
             defer changes.deinit(a);
+            try changes.bindPreviousName(a, before.id, before.name);
             const renamed = (try changes.applyAlloc(a, record)).?;
             try std.testing.expectEqualDeep(record.identity, renamed.identity);
             try std.testing.expectEqualStrings("renamed", renamed.role_defaults[1].database);
+            try std.testing.expectEqualStrings("renamed", renamed.database_defaults[0].database);
+            try std.testing.expectEqualStrings("database", renamed.database_defaults[0].value.string);
             for ([_]struct { id: u64, expected: []const u8 }{ .{ .id = 17, .expected = "scoped" }, .{ .id = 18, .expected = "global" } }) |test_case| {
                 const scope: Scope = .{ .principal = "alice", .database = "renamed", .database_id = test_case.id };
                 const definition = try renamed.effectiveAlloc(a, scope);
@@ -676,15 +877,17 @@ test "role defaults bind database identities across rename reset drop and name r
             try std.testing.expectEqual(@as(usize, 1), (try reset.applyAlloc(a, record)).len);
             var dropped = try DatabaseChanges.init(a, &[_]Resource{after}, &[_]Resource{}, 20);
             defer dropped.deinit(a);
-            var at_drop = renamed;
-            at_drop.database_defaults = &.{.{ .database = "renamed", .value = .{ .string = "database" } }};
-            const pruned = (try dropped.applyAlloc(a, at_drop)).?;
+            const pruned = (try dropped.applyAlloc(a, renamed)).?;
             try std.testing.expectEqual(@as(usize, 1), pruned.role_defaults.len);
             try std.testing.expectEqual(@as(usize, 0), pruned.database_defaults.len);
             try std.testing.expectEqualDeep(record.identity, pruned.identity);
             var created = try DatabaseChanges.init(a, &[_]Resource{}, &[_]Resource{.{ .kind = .database, .id = 20, .name = "new" }}, 20);
             defer created.deinit(a);
             try std.testing.expect(created.empty());
+            var unchanged = try DatabaseChanges.init(a, &[_]Resource{}, &[_]Resource{before}, 20);
+            defer unchanged.deinit(a);
+            try unchanged.bindPreviousName(a, before.id, before.name);
+            try std.testing.expect(unchanged.empty());
         }
     };
     try Check.run(std.testing.allocator);
@@ -825,4 +1028,101 @@ test "durable setting records validate typed and scoped defaults" {
         .{ .principal = "bob", .database = "main", .value = .{ .string = "bob" } },
     };
     try std.testing.expect(reordered.matches(matching));
+}
+
+test "SQL database defaults patch only one scope preserve login identities and reject policy or type escalation" {
+    const a = std.testing.allocator;
+    const prior: Record = .{ .identity = .{ .id = 7, .generation = 3 }, .name = "app.mode", .kind = .string, .session_writable = true, .default = .{ .string = "base" }, .database_defaults = &.{ .{ .database = "first", .value = .{ .string = "old" } }, .{ .database = "other", .value = .{ .string = "isolated" } } }, .role_defaults = &.{.{ .principal = "alice", .database = "", .value = .{ .string = "role" } }} };
+    const change: DatabaseDefaultChange = .{ .name = "APP.MODE", .database = "first", .value = .{ .string = "new" } };
+    const patched = try change.applyAlloc(a, prior);
+    defer a.free(patched);
+    var next = prior;
+    next.database_defaults = patched;
+    try next.validate();
+    try std.testing.expect(sameDatabaseDefaultDefinition(prior, next));
+    try std.testing.expectEqualStrings("new", next.effective("bob", "first").database_default.?.string);
+    try std.testing.expectEqualStrings("isolated", next.effective("bob", "other").database_default.?.string);
+    try std.testing.expectEqualStrings("role", next.effective("alice", "first").role_default.?.string);
+    const reset: DatabaseDefaultChange = .{ .name = "app.mode", .database = "first", .value = null };
+    const removed = try reset.applyAlloc(a, next);
+    defer a.free(removed);
+    try std.testing.expectEqual(@as(usize, 1), removed.len);
+    try std.testing.expectEqualStrings("other", removed[0].database);
+    var invalid = prior;
+    invalid.policy_sensitive = true;
+    invalid.session_writable = false;
+    try std.testing.expectError(error.SettingWriteForbidden, change.applyAlloc(a, invalid));
+    const wrong: DatabaseDefaultChange = .{ .name = "app.mode", .database = "first", .value = .{ .integer = 1 } };
+    try std.testing.expectError(error.InvalidSettingValue, wrong.applyAlloc(a, prior));
+    const forged_role = [_]RoleDefault{.{ .principal = "alice", .database = "", .value = .{ .string = "forged" } }};
+    next.role_defaults = &forged_role;
+    try std.testing.expect(!sameDatabaseDefaultDefinition(prior, next));
+    try std.testing.expectError(error.InvalidSettingValue, (DatabaseDefaultChange{ .name = "TimeZone", .database = "first", .value = .{ .string = "America/New_York" } }).validate());
+    try (DatabaseDefaultChange{ .name = "TimeZone", .database = "first", .value = .{ .string = "UTC" } }).validate();
+}
+
+test "SQL database defaults validate UTC bootstrap records and distinguish reset-all from a named setting" {
+    const record = builtinInput("TimeZone").?.record(.{ .id = 3, .generation = 1 });
+    try record.validate();
+    var invalid = record;
+    invalid.default = .{ .string = "America/New_York" };
+    try std.testing.expectError(error.InvalidSettingValue, invalid.validate());
+    try (DatabaseDefaultChange{ .name = "", .all = true, .database = "appdb", .value = null }).validate();
+    try std.testing.expectError(error.InvalidSettingRecord, (DatabaseDefaultChange{ .name = "app.mode", .all = true, .database = "appdb", .value = null }).validate());
+}
+
+test "SQL database defaults bound batch work by physical catalog bytes including escaping" {
+    const escaped: [4096]u8 = @splat('"');
+    const record: Record = .{ .identity = .{ .id = 3, .generation = 1 }, .name = "app.mode", .kind = .string, .default = .{ .string = &escaped } };
+    const records: [400]Record = @splat(record);
+    try requireCapacity(records[0..300], null);
+    try std.testing.expectError(error.SettingLimitExceeded, requireCapacity(&records, null));
+}
+
+test "SQL database defaults share session SET typed coercion without changing definitions or borrowing temporary scalars" {
+    const a = std.testing.allocator;
+    const prior: Record = .{ .identity = .{ .id = 3, .generation = 1 }, .name = "app.quota", .kind = .integer, .session_writable = true, .default = .{ .integer = 0 } };
+    const change: DatabaseDefaultChange = .{ .name = "app.quota", .database = "main", .value = .{ .string = "17" } };
+    const defaults = try change.applyAlloc(a, prior);
+    defer a.free(defaults);
+    try std.testing.expectEqual(@as(i64, 17), defaults[0].value.integer);
+    const role: RoleDefaultChange = .{ .name = "app.quota", .principal = "alice", .database = "", .value = .{ .string = "19" } };
+    const roles = try role.applyAlloc(a, prior);
+    defer a.free(roles);
+    try std.testing.expectEqual(@as(i64, 19), roles[0].value.integer);
+    try std.testing.expectEqual(true, (try parseValue(.boolean, "on")).boolean);
+    try std.testing.expectError(error.InvalidSettingValue, configuredDefault(.integer, .{ .string = "not-an-integer" }));
+}
+
+test "SQL database defaults inherit managed API key roles without broadening credential policy or credential overrides" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const scope: Scope = .{ .principal = "api-key:first", .role_principal = "alice", .database = "main", .database_id = 17 };
+    const instance: [16]u8 = @splat(7);
+    const record: Record = .{ .identity = .{ .id = 9, .generation = 1 }, .name = "app.mode", .kind = .string, .default = .{ .string = "base" }, .database_defaults = &.{.{ .database = "main", .value = .{ .string = "database" } }}, .role_defaults = &.{.{ .principal = "alice", .principal_instance = instance, .database = "main", .database_id = 17, .value = .{ .string = "role" } }} };
+    const definition = try record.effectiveAlloc(owned, scope);
+    const authorized = try Snapshot.init(scope, 3, &.{definition}).authorizeRoleDefaultsLeaky(owned, instance);
+    try std.testing.expectEqualStrings("role", authorized.definitions[0].role_default.?.string);
+    const stale = try Snapshot.init(scope, 3, &.{definition}).authorizeRoleDefaultsLeaky(owned, @as([16]u8, @splat(8)));
+    try std.testing.expect(stale.definitions[0].role_default == null);
+    var policy = record;
+    policy.policy_sensitive = true;
+    policy.role_defaults = &.{ .{ .principal = "alice", .database = "", .value = .{ .string = "must-not-inherit" } }, .{ .principal = "api-key:first", .database = "", .value = .{ .string = "restricted" } } };
+    try policy.validate();
+    try std.testing.expectEqualStrings("restricted", (try policy.effectiveAlloc(owned, scope)).role_default.?.string);
+    var other = scope;
+    other.principal = "api-key:second";
+    try std.testing.expect((try policy.effectiveAlloc(owned, other)).role_default == null);
+    policy.policy_sensitive = false;
+    try std.testing.expectEqualStrings("restricted", (try policy.effectiveAlloc(owned, scope)).role_default.?.string);
+    try std.testing.expectEqualStrings("must-not-inherit", (try policy.effectiveAlloc(owned, other)).role_default.?.string);
+    const encoded = try std.json.Stringify.valueAlloc(a, scope, .{});
+    defer a.free(encoded);
+    var decoded = try std.json.parseFromSlice(Scope, a, encoded, .{});
+    defer decoded.deinit();
+    try std.testing.expect(decoded.value.matchesRequest(scope));
+    other.role_principal = "mallory";
+    try std.testing.expect(!other.matchesRequest(scope));
 }

@@ -2930,7 +2930,12 @@ pub const StatusSource = struct {
             switch (input) {
                 .sql_completion_ready, .sql_completion_reference, .fk_publication_completion, .fk_generation_publication_status, .fk_generation_publication_work, .fk_generation_publication_decision, .fk_generation_publication_source_decision, .fk_initial_create_prepare, .fk_initial_child_decision, .fk_initial_create_status, .fk_generation_table_locked, .fk_initial_create_work, .fk_initial_parent_decision => if (!context.fk_generation_publication_authority) return error.Forbidden,
                 .policy_install_snapshot, .policy_publication_work => if (!context.row_policy_install_authority) return error.Forbidden,
-                .setting_snapshot => |scope| if (context.principal != null and (context.setting_read_principal == null or !std.mem.eql(u8, context.setting_read_principal.?, scope.principal))) return error.Forbidden,
+                .setting_snapshot => |scope| {
+                    if (context.principal) |principal| {
+                        if (context.setting_read_principal == null or !std.mem.eql(u8, context.setting_read_principal.?, scope.principal)) return error.Forbidden;
+                        if (scope.role_principal) |role| if (principal.kind != .user or !std.mem.eql(u8, role, principal.subject)) return error.Forbidden;
+                    }
+                },
                 .policy_snapshot => |scope| if (context.principal != null and (context.setting_read_principal == null or !std.mem.eql(u8, context.setting_read_principal.?, scope.principal))) return error.Forbidden,
                 else => {},
             }
@@ -29709,7 +29714,7 @@ pub fn foreignKeyParentsAllowed(alloc: std.mem.Allocator, identity: ?Authenticat
 pub fn authorizeSqlRoleDefaults(server: *ApiHttpServer, alloc: std.mem.Allocator, raw: @import("antfly_local_sources").sql_setting_catalog.RawSnapshot) !@import("antfly_local_sources").sql_setting_catalog.RawSnapshot {
     if (!raw.needsRoleAuthorization()) return raw;
     const instance: ?[16]u8 = if (server.cfg.user_manager) |manager|
-        manager.currentUserInstance(raw.scope.principal) catch null
+        manager.currentUserInstance(raw.scope.role_principal orelse raw.scope.principal) catch null
     else
         null;
     return raw.authorizeRoleDefaultsLeaky(alloc, instance);
@@ -29721,7 +29726,11 @@ pub fn sqlPrincipalInstance(server: *ApiHttpServer, identity: ?AuthenticatedIden
     // connections are native capabilities and bind the managed incarnation.
     if (!std.mem.startsWith(u8, authenticated.credential_principal, "basic:") and !std.mem.startsWith(u8, authenticated.credential_principal, "api-key:")) return null;
     const manager = authenticated.live_user_manager orelse server.cfg.user_manager orelse return null;
-    return manager.currentUserInstance(authenticated.username) catch return error.Unauthorized;
+    const current = manager.currentUserInstance(authenticated.username) catch return error.Unauthorized;
+    // The request authenticated one immutable user. A deletion/recreation
+    // during settings capture must not bind its connection to the replacement.
+    if (authenticated.user_instance_id) |admitted| if (!std.mem.eql(u8, &admitted, &current)) return error.Unauthorized;
+    return current;
 }
 
 pub fn requireSqlPrincipalInstance(server: *ApiHttpServer, identity: ?AuthenticatedIdentity, expected: ?[16]u8) !void {
@@ -62713,5 +62722,51 @@ test "admission routing table creation preserves permanent validation refusals o
             try std.testing.expectEqualStrings("MODEL_RESOURCE_LIMIT", parsed.value.object.get("error").?.string);
             try std.testing.expect(!parsed.value.object.get("retryable").?.bool);
         }
+    }
+}
+
+test "SQL database defaults read authority binds managed roles without broadening credential scope" {
+    const Call = @import("../system_catalog/server_call.zig").Call;
+    const context: api_operation.RequestContext = .{ .principal = .{ .kind = .user, .subject = "alice" }, .setting_read_principal = "api-key:first" };
+    const read: Call = .{ .setting_snapshot = .{ .principal = "api-key:first", .role_principal = "alice", .database = "main" } };
+    try StatusSource.HttpRoutedCatalog.authorizeRead(context, read);
+    var substituted = read;
+    substituted.setting_snapshot.role_principal = "mallory";
+    try std.testing.expectError(error.Forbidden, StatusSource.HttpRoutedCatalog.authorizeRead(context, substituted));
+    substituted = read;
+    substituted.setting_snapshot.principal = "api-key:second";
+    try std.testing.expectError(error.Forbidden, StatusSource.HttpRoutedCatalog.authorizeRead(context, substituted));
+
+    const alloc = std.testing.allocator;
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    const Source = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var server = ApiHttpServer.init(alloc, .{ .user_manager = &auth.manager }, .{ .ptr = undefined, .vtable = &.{ .status = Source.status } }, null, null);
+    defer server.deinit();
+    for ([_][]const u8{ "basic:alice", "api-key:first" }) |credential| {
+        var before = try auth.manager.createUser("alice", "old-password", &.{});
+        defer before.deinit(alloc);
+        const name = try alloc.dupe(u8, "alice");
+        defer alloc.free(name);
+        const key = try alloc.dupe(u8, credential);
+        defer alloc.free(key);
+        var identity: AuthenticatedIdentity = .{ .username = name, .credential_principal = key, .user_instance_id = before.instance_id, .live_user_manager = &auth.manager };
+        try std.testing.expectEqualDeep(@as(?[16]u8, before.instance_id), try sqlPrincipalInstance(&server, identity));
+        try auth.manager.deleteUser("alice");
+        var after = try auth.manager.createUser("alice", "new-password", &.{});
+        defer after.deinit(alloc);
+        try std.testing.expect(!std.mem.eql(u8, &before.instance_id, &after.instance_id));
+        try std.testing.expectError(error.Unauthorized, sqlPrincipalInstance(&server, identity));
+        identity.user_instance_id = after.instance_id;
+        try std.testing.expectEqualDeep(@as(?[16]u8, after.instance_id), try sqlPrincipalInstance(&server, identity));
+        try std.testing.expectError(error.SqlConnectionNotFound, requireSqlPrincipalInstance(&server, identity, before.instance_id));
+        try auth.manager.deleteUser("alice");
     }
 }

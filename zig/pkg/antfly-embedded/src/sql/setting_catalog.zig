@@ -41,6 +41,13 @@ pub const Owner = struct {
     /// null is an unpinned request; an empty slice is a real login which
     /// predated every currently registered setting.
     baseline: ?[]const OverlayEntry = null,
+    /// Derived by authenticated ingress. Durable session owners retain their
+    /// own credential/database identity when constructing a setting request.
+    role_principal: ?[]const u8 = null,
+
+    pub fn scopeFor(self: Owner, principal: []const u8, database: []const u8) Scope {
+        return .{ .principal = principal, .database = database, .role_principal = self.role_principal };
+    }
 };
 
 pub const OverlayEntry = struct { identity: Identity, value: Value };
@@ -350,16 +357,7 @@ pub const OverlayState = struct {
     }
 };
 
-pub fn parseValue(kind: Kind, raw: []const u8) !Value {
-    return switch (kind) {
-        .boolean => .{ .boolean = if (std.ascii.eqlIgnoreCase(raw, "true") or std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "on")) true else if (std.ascii.eqlIgnoreCase(raw, "false") or std.mem.eql(u8, raw, "0") or std.ascii.eqlIgnoreCase(raw, "off")) false else return error.InvalidSettingValue },
-        .integer => .{ .integer = std.fmt.parseInt(i64, raw, 10) catch return error.InvalidSettingValue },
-        .string => blk: {
-            if (raw.len > 4096 or !std.unicode.utf8ValidateSlice(raw)) return error.InvalidSettingValue;
-            break :blk .{ .string = raw };
-        },
-    };
-}
+pub const parseValue = durable.parseValue;
 
 /// Deep-owned immutable input to binding and evaluation. Keep one View alive
 /// through all bound programs and remote read requests for the statement.
@@ -385,8 +383,7 @@ pub const View = struct {
         const alloc = arena.allocator();
         const raw = try owner.load(owner.ptr, alloc, scope);
         if (raw.definitions.len > 1024) return error.SettingLimitExceeded;
-        if (!std.mem.eql(u8, raw.scope.principal, scope.principal) or
-            !std.mem.eql(u8, raw.scope.database, scope.database) or raw.epoch == 0)
+        if (!raw.scope.matchesRequest(scope) or raw.epoch == 0)
             return error.InvalidSettingCatalogSnapshot;
         if (overlay.len > 1024) return error.SettingLimitExceeded;
         // Append the immutable control while building the owned view. A
@@ -444,6 +441,7 @@ pub const View = struct {
         const owned_scope: Scope = .{
             .principal = try alloc.dupe(u8, scope.principal),
             .database = try alloc.dupe(u8, scope.database),
+            .role_principal = if (scope.role_principal) |role| try alloc.dupe(u8, role) else null,
         };
         return .{ .arena = arena, .scope = owned_scope, .epoch = raw.epoch, .definitions = definitions, .values = values, .by_id = by_id, .by_name = by_name };
     }
@@ -856,4 +854,29 @@ test "SQL native sync control shares overlays savepoints and immutable definitio
     };
     try Fixture.run(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL database defaults owned views retain managed role authority and reject substituted snapshots" {
+    const Fake = struct {
+        substitute: bool = false,
+        fn load(ptr: *anyopaque, _: std.mem.Allocator, scope: Scope) !RawSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var returned = scope;
+            if (self.substitute) returned.role_principal = "mallory";
+            return .{ .scope = returned, .epoch = 3, .definitions = &.{} };
+        }
+    };
+    var fake: Fake = .{};
+    var name = "alice".*;
+    const owner: Owner = .{ .ptr = &fake, .load = Fake.load, .role_principal = &name };
+    const scope = owner.scopeFor("api-key:first", "main");
+    try std.testing.expectEqualStrings("api-key:first", scope.principal);
+    try std.testing.expectEqualStrings("alice", scope.role_principal.?);
+    var view = try View.capture(std.testing.allocator, owner, scope, &.{});
+    defer view.deinit();
+    name[0] = 'x';
+    try std.testing.expectEqualStrings("alice", view.scope.role_principal.?);
+    try std.testing.expectEqualStrings("api-key:first", view.scope.principal);
+    fake.substitute = true;
+    try std.testing.expectError(error.InvalidSettingCatalogSnapshot, View.capture(std.testing.allocator, owner, scope, &.{}));
 }

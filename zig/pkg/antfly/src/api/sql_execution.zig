@@ -1123,13 +1123,19 @@ pub const Adapter = struct {
         return null;
     }
 
+    fn settingScope(self: *const Adapter) setting_catalog.Scope {
+        const role: ?[]const u8 = if (self.identity.*) |identity| if (std.mem.startsWith(u8, identity.credential_principal, "api-key:")) identity.username else null else null;
+        return .{ .principal = http_server.transactionPrincipal(self.identity.*) orelse "", .database = self.database, .role_principal = role };
+    }
+
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
-        return .{ .owner = .{ .ptr = self, .load = loadSettings, .baseline = self.setting_baseline }, .scope = .{ .principal = http_server.transactionPrincipal(self.identity.*) orelse "", .database = self.database }, .sql_user = if (self.identity.*) |identity| identity.username else null, .overlay = self.setting_overlay };
+        const scope = self.settingScope();
+        return .{ .owner = .{ .ptr = self, .load = loadSettings, .baseline = self.setting_baseline, .role_principal = scope.role_principal }, .scope = scope, .sql_user = if (self.identity.*) |identity| identity.username else null, .overlay = self.setting_overlay };
     }
 
     fn loadSettings(ptr: *anyopaque, alloc: std.mem.Allocator, scope: setting_catalog.Scope) !setting_catalog.RawSnapshot {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
-        if (!std.mem.eql(u8, scope.principal, http_server.transactionPrincipal(self.identity.*) orelse "") or !std.mem.eql(u8, scope.database, self.database)) return error.Forbidden;
+        if (!scope.matchesRequest(self.settingScope())) return error.Forbidden;
         if (scope.principal.len == 0) {
             // Runtime-owned controls remain available when authentication is
             // disabled. This grants no access to administrator/policy settings.
@@ -1199,7 +1205,7 @@ pub const Adapter = struct {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         // Catalog jobs are not transaction participants yet. Never commit
         // their namespace change independently of an explicit SQL transaction.
-        if (input == .populate and self.active_transaction != null) return error.UnsupportedSqlExecution;
+        if ((input == .populate or (input == .catalog_ddl and input.catalog_ddl.action == .setting_default)) and self.active_transaction != null) return error.UnsupportedSqlExecution;
         if (input == .catalog_ddl and input.catalog_ddl.action == .maintenance) return @import("sql_maintenance.zig").execute(self, allocators, input.catalog_ddl);
         if (input == .catalog_ddl and input.catalog_ddl.kind == .named_type) return @import("sql_type_ddl.zig").execute(self, allocators, input.catalog_ddl);
         if (input == .catalog_ddl and input.catalog_ddl.kind == .cast) return @import("sql_cast_ddl.zig").execute(self, allocators, input.catalog_ddl);

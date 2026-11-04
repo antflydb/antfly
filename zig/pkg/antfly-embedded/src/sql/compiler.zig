@@ -3120,6 +3120,7 @@ const Parser = struct {
             target_name.table = try self.identifier();
         }
         var ddl: ast.CatalogDdl = .{ .kind = kind, .action = action, .name = target_name, .conditional = conditional };
+        if (action == .rename and kind == .database and (self.pos < self.tokens.len and ((self.tokens[self.pos].isKeyword(.set) and (self.pos + 1 >= self.tokens.len or !self.tokens[self.pos + 1].isKeyword(.tablespace))) or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "RESET")))) return self.settingDefaultDdl(.database, target_name.table);
         if (action == .rename) {
             if (kind == .table and self.keyword(.add)) {
                 if (self.keyword(.constraint)) {
@@ -4720,7 +4721,7 @@ const Parser = struct {
             if (self.ddlWord("TYPE")) return .{ .catalog_ddl = try self.enumDdl(.alter_schema) };
             if (self.ddlWord("DOMAIN")) return .{ .catalog_ddl = try self.domainDdl(.alter_schema) };
             if (self.ddlWord("SEQUENCE")) return .{ .catalog_ddl = try self.sequenceDdl(.alter_sequence) };
-            if (self.ddlWord("ROLE")) return .{ .catalog_ddl = try self.roleDefaultDdl() };
+            if (self.ddlWord("ROLE")) return .{ .catalog_ddl = try self.settingDefaultDdl(.role, try self.identifier()) };
             if (self.ddlWord("VIEW")) return .{ .catalog_ddl = try self.viewDdl(.rename, false) };
             if (self.ddlWord("POLICY")) return .{ .policy_ddl = try self.policyDdl(.alter) };
             const before_table = self.pos;
@@ -4908,34 +4909,43 @@ const Parser = struct {
         return .{ .kind = .role, .action = .alter_schema, .name = .{ .table = "" }, .authorization = intent };
     }
 
-    fn roleDefaultDdl(self: *Parser) Error!ast.CatalogDdl {
-        const role = try self.identifier();
+    fn settingDefaultDdl(self: *Parser, kind: @FieldType(ast.CatalogDdl, "kind"), target: []const u8) Error!ast.CatalogDdl {
         var database: ?[]const u8 = null;
-        if (self.keyword(.in)) {
+        if (kind == .role and self.keyword(.in)) {
             try self.expectKeyword(.database);
             database = try self.identifier();
         }
         const reset = self.ddlWord("RESET");
         if (!reset) try self.expectKeyword(.set);
-        const first = try self.identifier();
+        const all = reset and self.keyword(.all);
+        const first = if (all) "" else try self.identifier();
         var setting_name = first;
-        if (setting_name.len > 128) return self.fail(error.SqlLimitExceeded, "role setting name limit exceeded");
-        while (self.take(.dot)) {
+        if (setting_name.len > 128) return self.fail(error.SqlLimitExceeded, "default setting name limit exceeded");
+        while (!all and self.take(.dot)) {
             const part = try self.identifier();
-            if (part.len + 1 > 128 - setting_name.len) return self.fail(error.SqlLimitExceeded, "role setting name limit exceeded");
+            if (part.len + 1 > 128 - setting_name.len) return self.fail(error.SqlLimitExceeded, "default setting name limit exceeded");
             setting_name = try std.fmt.allocPrint(self.alloc, "{s}.{s}", .{ setting_name, part });
         }
         var setting: ?ast.Value = null;
         if (!reset) {
             if (!self.take(.eq)) try self.expectKeyword(.to);
             if (!self.keyword(.default)) {
-                if (!self.peek(.string) and !self.peek(.number) and !self.peek(.minus) and !self.peek(.plus) and !self.peek(.placeholder) and !(self.pos < self.tokens.len and (self.tokens[self.pos].isKeyword(.true) or self.tokens[self.pos].isKeyword(.false) or self.tokens[self.pos].isKeyword(.null))))
-                    return self.fail(error.InvalidSqlSyntax, "role defaults require a literal value");
-                setting = try self.value();
-                if (setting.? == .null or setting.? == .parameter) return self.fail(error.InvalidSqlSyntax, "role defaults require a literal value");
+                if (self.ddlWord("ON")) {
+                    setting = .{ .string = "on" };
+                } else if (self.ddlWord("OFF")) {
+                    setting = .{ .string = "off" };
+                } else if (self.peek(.identifier) and self.tokens[self.pos].keyword == null) {
+                    setting = .{ .string = try self.identifier() };
+                    if (self.peek(.lparen)) return self.fail(error.InvalidSqlSyntax, "setting defaults require a literal value");
+                } else {
+                    if (!self.peek(.string) and !self.peek(.number) and !self.peek(.minus) and !self.peek(.plus) and !self.peek(.placeholder) and !(self.pos < self.tokens.len and (self.tokens[self.pos].isKeyword(.true) or self.tokens[self.pos].isKeyword(.false) or self.tokens[self.pos].isKeyword(.null))))
+                        return self.fail(error.InvalidSqlSyntax, "setting defaults require a literal value");
+                    setting = try self.value();
+                    if (setting.? == .null or setting.? == .parameter) return self.fail(error.InvalidSqlSyntax, "setting defaults require a literal value");
+                }
             }
         }
-        return .{ .kind = .role, .action = .role_default, .name = .{ .table = role }, .role_setting = .{ .name = setting_name, .database = database, .value = setting } };
+        return .{ .kind = kind, .action = .setting_default, .name = .{ .table = target }, .setting_default = .{ .name = setting_name, .all = all, .database = database, .value = setting } };
     }
 
     fn transactionOptions(self: *Parser) Error!ast.Begin {
@@ -5025,9 +5035,9 @@ test "compiler role defaults retain exact role database literal and RESET intent
         defer compiled.deinit();
         const ddl = compiled.statement.catalog_ddl;
         try std.testing.expectEqual(.role, ddl.kind);
-        try std.testing.expectEqual(.role_default, ddl.action);
+        try std.testing.expectEqual(.setting_default, ddl.action);
         try std.testing.expectEqualStrings("app_writer", ddl.name.table);
-        const setting = ddl.role_setting.?;
+        const setting = ddl.setting_default.?;
         try std.testing.expectEqualStrings(if (index < 3) "app.tenant_id" else "statement_timeout", setting.name);
         try std.testing.expectEqual(index == 1 or index == 4, setting.database != null);
         if (setting.database) |database| try std.testing.expectEqualStrings("appdb", database);
@@ -6956,5 +6966,38 @@ test "compiler SQL notifications preserve original channels payloads and Postgre
     }
     for ([_][]const u8{ "LISTEN", "NOTIFY x, 123", "NOTIFY x, $1", "LISTEN x.y", "UNLISTEN x,y" }) |sql| {
         try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, sql, .{}));
+    }
+}
+
+test "compiler SQL database defaults preserve original scope and share bounded role default syntax" {
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(std.testing.allocator);
+    defer corpus.deinit();
+    const original = try corpus.get("sql-0107");
+    var parsed = try compile(std.testing.allocator, original.sql, .{});
+    defer parsed.deinit();
+    const ddl = parsed.statement.catalog_ddl;
+    try std.testing.expectEqual(.database, ddl.kind);
+    try std.testing.expectEqual(.setting_default, ddl.action);
+    try std.testing.expectEqualStrings("tenant_ops", ddl.name.table);
+    try std.testing.expectEqualStrings("UTC", ddl.setting_default.?.value.?.string);
+    var quoted = try compile(std.testing.allocator, "ALTER DATABASE tenant_ops RESET \"all\"", .{});
+    defer quoted.deinit();
+    try std.testing.expect(!quoted.statement.catalog_ddl.setting_default.?.all);
+    var tablespace = try compile(std.testing.allocator, "ALTER DATABASE tenant_ops SET TABLESPACE fastspace", .{});
+    defer tablespace.deinit();
+    try std.testing.expectEqual(.set_tablespace, tablespace.statement.catalog_ddl.action);
+
+    for ([_][]const u8{ "ALTER DATABASE tenant_ops RESET timezone", "ALTER DATABASE tenant_ops RESET ALL", "ALTER DATABASE tenant_ops SET timezone TO UTC", "ALTER DATABASE tenant_ops SET timezone = DEFAULT", "ALTER DATABASE tenant_ops SET app.mode = 'strict'" }) |sql| {
+        var command = try compile(std.testing.allocator, sql, .{});
+        defer command.deinit();
+        try std.testing.expectEqual(.database, command.statement.catalog_ddl.kind);
+        try std.testing.expectEqual(.setting_default, command.statement.catalog_ddl.action);
+    }
+    for ([_][]const u8{ "ALTER DATABASE tenant_ops SET app.mode = $1", "ALTER DATABASE tenant_ops SET app.mode = NULL", "ALTER DATABASE tenant_ops SET app.mode = 'ok'; SELECT 1" }) |sql| {
+        if (compile(std.testing.allocator, sql, .{})) |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.ExpectedDatabaseDefaultSyntaxRejection;
+        } else |_| {}
     }
 }

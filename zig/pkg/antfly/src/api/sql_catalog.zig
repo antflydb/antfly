@@ -1126,8 +1126,8 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
         var adapter: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = &actor, .context = context, .database = database, .namespace = namespace, .ddl_search_path = path };
         return @import("sql_authorization_ddl.zig").execute(&adapter, allocators, input.catalog_ddl);
     }
-    if (input == .catalog_ddl and input.catalog_ddl.kind == .role)
-        return @import("sql_role_ddl.zig").execute(server, identity, context, allocators, input.catalog_ddl);
+    if (input == .catalog_ddl and (input.catalog_ddl.kind == .role or input.catalog_ddl.action == .setting_default))
+        return @import("sql_setting_defaults.zig").execute(server, identity, context, allocators, input.catalog_ddl);
     if (input == .catalog_ddl and input.catalog_ddl.kind == .index)
         return executeIndex(server, identity, context, database, namespace, allocators, input.catalog_ddl, path);
     if (input == .catalog_ddl and input.catalog_ddl.kind == .view)
@@ -1166,7 +1166,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
         .create_table => .create,
         .drop_table => .drop,
         .catalog_ddl => |ddl| switch (ddl.action) {
-            .alter_schema, .truncate, .role_default, .comment, .alter_sequence, .maintenance => unreachable,
+            .alter_schema, .truncate, .setting_default, .comment, .alter_sequence, .maintenance => unreachable,
             .populate => return error.UnsupportedSqlExecution,
             inline else => |tag| @field(domain.Action, @tagName(tag)),
         },

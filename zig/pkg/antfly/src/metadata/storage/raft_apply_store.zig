@@ -25857,6 +25857,8 @@ pub const RaftApplyStore = struct {
         if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
         var parsed = try std.json.parseFromSlice(sql_settings.Command, self.alloc, bytes, .{});
         defer parsed.deinit();
+        if (parsed.value.database_defaults_only or parsed.value.command_fence != null or parsed.value.change == .reset_database_defaults or @import("../schema_reader_wire.zig").requiresDatabaseDefaults(bytes))
+            _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.sql_database_defaults_version);
         if (parsed.value.requiresRoleDefaultReaders() or @import("../schema_reader_wire.zig").requiresRoleDefaults(bytes))
             _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.sql_role_defaults_version);
         const previous = try system_catalog_storage.readMeta(self.alloc, txn, group_id);
@@ -69507,7 +69509,7 @@ test "SQL command fence ordinary catalog DDL journals exact topology outcomes ac
                 try H.apply(&store, a, first, 1, replicated);
                 try std.testing.expectEqual(@as(?C.Outcome, null), try H.outcome(&store, a, first));
                 try std.testing.expectEqual(first.expected_revision, (try store.systemCatalogMeta(a, T.group)).revision);
-                try H.activation(&store, a, topology_protocol.sql_catalog_journal_version);
+                try H.activation(&store, a, @max(topology_protocol.sql_catalog_journal_version, L.decoder_version));
                 try store.applyStandaloneCommand(T.group, .{ .upsert_table = .{ .table_id = 17, .name = "owner_rows" } });
                 try adoptRelationWriterForTest(&store, a, T.group);
                 _ = try publishLiveRelationRootWithCoverageForTest(&store, a, T.group, .constraint_names);
@@ -69663,4 +69665,95 @@ test "SQL command fence ordinary catalog DDL journals exact topology outcomes ac
             }
         }
     };
+}
+
+test "SQL database defaults decoder fences native baseline patches preserves definitions and survives cold replay" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/database-defaults", .{tmp.sub_path});
+    defer a.free(root);
+    const record: sql_settings.Record = .{ .identity = .{ .id = 3, .generation = 1 }, .name = "app.mode", .kind = .string, .session_writable = true, .default = .{ .string = "base" } };
+    const base_bytes = try std.json.Stringify.valueAlloc(a, sql_settings.Command{ .expected_revision = 0, .change = .{ .put = record } }, .{});
+    defer a.free(base_bytes);
+    var next = record;
+    next.database_defaults = &.{.{ .database = "default", .value = .{ .string = "database" } }};
+    const bytes = try std.json.Stringify.valueAlloc(a, sql_settings.Command{ .expected_revision = 1, .database_defaults_only = true, .change = .{ .put = next } }, .{});
+    defer a.free(bytes);
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        try store.applyStandaloneCommand(21, .{ .apply_sql_settings = base_bytes });
+        const incarnation: metadata_incarnation.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
+        try store.applyStandaloneCommand(21, .{ .initialize_metadata_incarnation = incarnation });
+        var activation: topology_protocol.Activation = .{ .version = topology_protocol.sql_database_defaults_version - 1, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(1) };
+        const older = try std.json.Stringify.valueAlloc(a, activation, .{});
+        defer a.free(older);
+        try store.applyStandaloneCommand(21, .{ .activate_topology_protocol = older });
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.applyStandaloneCommand(21, .{ .apply_sql_settings = bytes }));
+        try std.testing.expectEqual(@as(u64, 1), (try store.systemCatalogMeta(a, 21)).revision);
+        activation.version = topology_protocol.sql_database_defaults_version;
+        const current = try std.json.Stringify.valueAlloc(a, activation, .{});
+        defer a.free(current);
+        try store.applyStandaloneCommand(21, .{ .activate_topology_protocol = current });
+        try store.applyStandaloneCommand(21, .{ .apply_sql_settings = bytes });
+        try store.applyStandaloneCommand(21, .{ .apply_sql_settings = bytes });
+        const committed = try store.systemCatalogMeta(a, 21);
+        try std.testing.expectEqual(@as(u64, 2), committed.revision);
+        var active_incarnation: [16]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&active_incarnation, &incarnation);
+        const absent_owner: sql_settings.CommandFence = .{ .group = 21, .backend = .{ .incarnation = active_incarnation, .id = @splat(3), .fence = 1 }, .command = .{ .sequence = 1, .nonce = @splat(4), .executor = @splat(5) }, .database = 1, .principal = @splat(6), .standalone = false };
+        const fenced = try std.json.Stringify.valueAlloc(a, sql_settings.Command{ .expected_revision = 2, .command_fence = absent_owner, .database_defaults_only = true, .change = .{ .put = next } }, .{});
+        defer a.free(fenced);
+        try std.testing.expectError(error.CatalogGenerationChanged, store.applyStandaloneCommand(21, .{ .apply_sql_settings = fenced }));
+        try std.testing.expectEqualDeep(committed, try store.systemCatalogMeta(a, 21));
+        var forged = next;
+        forged.default = .{ .string = "forged-definition" };
+        const forged_bytes = try std.json.Stringify.valueAlloc(a, sql_settings.Command{ .expected_revision = 2, .database_defaults_only = true, .change = .{ .put = forged } }, .{});
+        defer a.free(forged_bytes);
+        try std.testing.expectError(error.SettingCatalogChanged, store.applyStandaloneCommand(21, .{ .apply_sql_settings = forged_bytes }));
+        try std.testing.expectEqualDeep(committed, try store.systemCatalogMeta(a, 21));
+    }
+    var reopened = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer reopened.deinit();
+    var recovered = try reopened.systemCatalogSnapshot(a, 21);
+    defer recovered.deinit();
+    try std.testing.expectEqualDeep(next, recovered.value.settings[0]);
+    const reset_bytes = try std.json.Stringify.valueAlloc(a, sql_settings.Command{ .expected_revision = 2, .database_defaults_only = true, .change = .{ .reset_database_defaults = "default" } }, .{});
+    defer a.free(reset_bytes);
+    try reopened.applyStandaloneCommand(21, .{ .apply_sql_settings = reset_bytes });
+    try reopened.applyStandaloneCommand(21, .{ .apply_sql_settings = reset_bytes });
+    try std.testing.expectEqual(@as(u64, 3), (try reopened.systemCatalogMeta(a, 21)).revision);
+    var reset = try reopened.systemCatalogSnapshot(a, 21);
+    defer reset.deinit();
+    try std.testing.expectEqual(record.identity, reset.value.settings[0].identity);
+    try std.testing.expectEqual(@as(usize, 0), reset.value.settings[0].database_defaults.len);
+    try std.testing.expectEqual(@as(usize, 1), recovered.value.settings[0].database_defaults.len);
+}
+
+test "SQL database defaults decoder retains implicit default identities on first catalog publication" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const T = SessionCommitRegistryFixture;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/default-database-first", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    try store.applyStandaloneCommand(T.group, .{ .initialize_metadata_incarnation = T.seed });
+    try store.applyStandaloneCommand(T.group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(scratch, topology_protocol.Activation{ .version = topology_protocol.current_version, .incarnation = T.seed, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+    try std.testing.expectEqual(@as(u64, 0), (try store.systemCatalogMeta(a, T.group)).revision);
+    // Default catalog identities exist before they have physical KV rows.
+    // The accepting writer must use the same canonical reader as its planner.
+    const command: SystemCatalogCommand = .{ .expected_revision = 0, .mutation = .{ .kind = .database, .action = .set_tablespace, .name = system_catalog.default_database_name } };
+    try store.applyStandaloneCommand(T.group, .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(scratch, command, .{}) });
+    try std.testing.expectEqual(@as(u64, 1), (try store.systemCatalogMeta(a, T.group)).revision);
+    var txn = try store.store.beginReadTxn();
+    defer txn.abort();
+    var row = (try system_catalog_storage.getById(a, &txn, T.group, .database, system_catalog.default_database_id)).?;
+    defer row.deinit();
+    try std.testing.expectEqualStrings(system_catalog.default_database_name, row.value.name);
+    try std.testing.expectEqual(system_catalog.default_database_id, row.value.id);
 }

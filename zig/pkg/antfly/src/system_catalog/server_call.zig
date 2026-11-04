@@ -250,6 +250,18 @@ pub const Call = union(enum) {
                 if (!std.meta.eql(old, value)) return error.InvalidCatalogMutation;
                 return result;
             },
+            .setting_mutate => |*request| {
+                switch (request.*) {
+                    inline .role_default, .database_default => |*change| {
+                        if (change.command_fence) |old| {
+                            if (!std.meta.eql(old, value)) return error.InvalidCatalogMutation;
+                        } else if (!bind) return error.InvalidCatalogMutation;
+                        change.command_fence = value;
+                        return result;
+                    },
+                    .put, .drop => return error.TableTopologyProtocolUpgradeRequired,
+                }
+            },
             .sql_sequence_counter_mutate, .sql_sequence_counter_outcome => |*request| {
                 if (request.request.command_fence) |old| {
                     if (!std.meta.eql(old, value)) return error.InvalidCatalogMutation;
@@ -729,6 +741,21 @@ test "SQL command fence binds forwarded identities and rejects substitution and 
     try std.testing.expectEqualDeep(observation, try observation.withCommandFence(&foreign));
     try std.testing.expectError(error.InvalidCatalogMutation, bound.withCommandFence(&foreign));
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, (Call{ .relation_schema_mutate = .{ .guard = undefined, .schema_json = "{}" } }).withCommandFence(&fence));
+    inline for (.{
+        Call{ .setting_mutate = .{ .database_default = .{ .name = "timezone", .database = "app", .value = .{ .string = "UTC" } } } },
+        Call{ .setting_mutate = .{ .role_default = .{ .name = "app.mode", .principal = "alice", .database = "", .value = .{ .string = "ready" } } } },
+    }) |scoped| {
+        try std.testing.expectError(error.InvalidCatalogMutation, scoped.requireCommandFence(&fence));
+        const owned = try scoped.withCommandFence(&fence);
+        try std.testing.expectEqualDeep(owned, try owned.requireCommandFence(&fence));
+        try std.testing.expectError(error.InvalidCatalogMutation, owned.withCommandFence(&foreign));
+        const scoped_json = try std.json.Stringify.valueAlloc(a, owned, .{});
+        defer a.free(scoped_json);
+        var scoped_decoded = try std.json.parseFromSlice(Call, a, scoped_json, .{});
+        defer scoped_decoded.deinit();
+        try std.testing.expectEqualDeep(owned, try scoped_decoded.value.requireCommandFence(&fence));
+    }
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, (Call{ .setting_mutate = .{ .drop = "app.mode" } }).withCommandFence(&fence));
     try std.testing.expectEqualDeep(call, try call.withCommandFence(null));
     const old = call.sql_sequence_mutate.admission;
     const encoded = try std.json.Stringify.valueAlloc(a, old, .{});

@@ -118,7 +118,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, inpu
             },
             .comment => "COMMENT",
             .populate => return error.UnsupportedSqlExecution,
-            .role_default => "ALTER ROLE",
+            .setting_default => if (ddl.kind == .database) "ALTER DATABASE" else "ALTER ROLE",
             .alter_sequence => "ALTER SEQUENCE",
             .truncate => "TRUNCATE TABLE",
             .alter_schema => if (ddl.kind == .named_type) (if (ddl.named_type_kind == .domain) "ALTER DOMAIN" else "ALTER TYPE") else switch (ddl.schema_change orelse return error.InvalidSqlSyntax) {

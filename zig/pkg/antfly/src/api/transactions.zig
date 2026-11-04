@@ -2991,7 +2991,7 @@ pub const SessionRegistry = struct {
         const metadata = candidate.sql orelse return error.SqlTransactionNotActive;
         if (metadata.failed) return error.SqlTransactionAborted;
         if (candidate.commit_body_digest != null or candidate.commit_execution_started) return error.TransactionCommitSealed;
-        var view = try setting_catalog.View.capture(alloc, owner, .{ .principal = principal orelse "", .database = metadata.database }, candidate.setting_active.items);
+        var view = try setting_catalog.View.capture(alloc, owner, owner.scopeFor(principal orelse "", metadata.database), candidate.setting_active.items);
         defer view.deinit();
         const definition = try view.writable(name);
         const value = try setting_catalog.normalizeDefinedValue(definition, switch (input) {
@@ -3029,7 +3029,7 @@ pub const SessionRegistry = struct {
         const metadata = candidate.sql orelse return error.SqlTransactionNotActive;
         if (metadata.failed) return error.SqlTransactionAborted;
         if (candidate.commit_body_digest != null or candidate.commit_execution_started) return error.TransactionCommitSealed;
-        var view = try setting_catalog.View.capture(alloc, owner, .{ .principal = principal orelse "", .database = metadata.database }, candidate.setting_active.items);
+        var view = try setting_catalog.View.capture(alloc, owner, owner.scopeFor(principal orelse "", metadata.database), candidate.setting_active.items);
         defer view.deinit();
         const definition = try view.writable(name);
         removeSettingEntry(alloc, &candidate.setting_active, definition.identity.id);

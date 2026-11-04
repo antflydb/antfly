@@ -513,14 +513,28 @@ pub fn loadSettings(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
 
 pub fn applySettingCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: settings.Command, command_hash: [32]u8) !void {
     if (command.version != 1) return error.InvalidSettingRecord;
-    if (command.role_defaults_only and command.change != .put) return error.InvalidSettingRecord;
+    if ((command.role_defaults_only and command.change != .put) or (command.database_defaults_only and command.change != .put and command.change != .reset_database_defaults)) return error.InvalidSettingRecord;
+    if (command.role_defaults_only and command.database_defaults_only) return error.InvalidSettingRecord;
+    if (command.change == .reset_database_defaults and !command.database_defaults_only) return error.InvalidSettingRecord;
     const meta = try readMeta(alloc, txn, group_id);
     if (meta.revision != command.expected_revision) return;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
+    if (command.command_fence) |fence| try @import("command_fence.zig").check(a, txn, group_id, fence.backend.incarnation, fence);
     const records = try loadSettings(a, txn, group_id);
+    if (command.database_defaults_only) try settings.requireCapacity(records, switch (command.change) {
+        .put => |record| record,
+        .reset_database_defaults => null,
+        .drop => unreachable,
+    });
     const publication_sensitive = switch (command.change) {
+        .reset_database_defaults => |database| blk: {
+            for (records) |record| if (record.policy_sensitive) {
+                for (record.database_defaults) |entry| if (std.mem.eql(u8, entry.database, database)) return error.SettingWriteForbidden;
+            };
+            break :blk false;
+        },
         .put => |record| blk: {
             if (record.policy_sensitive) break :blk true;
             for (records) |prior| if (prior.identity.id == record.identity.id and prior.policy_sensitive) break :blk true;
@@ -537,6 +551,25 @@ pub fn applySettingCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn
     }
     var next_id = meta.next_id;
     switch (command.change) {
+        .reset_database_defaults => |database| {
+            try domain.validateName(database);
+            if (!std.mem.eql(u8, database, domain.default_database_name)) {
+                var target = (try find(a, txn, group_id, .database, 0, database)) orelse return error.DatabaseNotFound;
+                target.deinit();
+            }
+            for (records) |record| {
+                const affected = for (record.database_defaults) |entry| {
+                    if (std.mem.eql(u8, entry.database, database)) break true;
+                } else false;
+                if (!affected) continue;
+                const change: settings.DatabaseDefaultChange = .{ .name = record.name, .database = database, .value = null };
+                var replacement = record;
+                replacement.database_defaults = try change.applyAlloc(a, record);
+                try replacement.validate();
+                const key = try settingKeyAlloc(a, group_id, record.identity.id);
+                try txn.put(key, try std.json.Stringify.valueAlloc(a, replacement, .{}));
+            }
+        },
         .put => |record| {
             try record.validate();
             var existing: ?settings.Record = null;
@@ -546,19 +579,33 @@ pub fn applySettingCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn
             }
             if (existing) |prior| {
                 if (!std.mem.eql(u8, prior.name, record.name)) return error.SettingCatalogChanged;
-                if (command.role_defaults_only) {
+                if (command.database_defaults_only) {
+                    if (!std.meta.eql(prior.identity, record.identity) or !settings.sameDatabaseDefaultDefinition(prior, record)) return error.SettingCatalogChanged;
+                } else if (command.role_defaults_only) {
                     if (!std.meta.eql(prior.identity, record.identity) or !settings.sameDefinition(prior, record)) return error.SettingCatalogChanged;
                 } else {
                     if (!settings.databaseBindingsRetained(record.role_defaults, prior)) return error.InvalidSettingRecord;
                     if (record.identity.generation != try std.math.add(u64, prior.identity.generation, 1)) return error.SettingCatalogChanged;
                 }
             } else {
-                if (command.role_defaults_only) {
+                if (command.database_defaults_only) {
+                    const native_input = settings.builtinInput(record.name) orelse return error.SettingCatalogChanged;
+                    if (!settings.sameDatabaseDefaultDefinition(native_input.record(record.identity), record)) return error.SettingCatalogChanged;
+                } else if (command.role_defaults_only) {
                     const native_input = settings.builtinInput(record.name) orelse return error.SettingCatalogChanged;
                     if (!settings.sameDefinition(native_input.record(record.identity), record)) return error.SettingCatalogChanged;
                 } else if (!settings.databaseBindingsRetained(record.role_defaults, null)) return error.InvalidSettingRecord;
                 if (record.identity.id != meta.next_id or record.identity.generation != 1) return error.SettingCatalogChanged;
                 next_id = try std.math.add(u64, meta.next_id, 1);
+            }
+            if (command.database_defaults_only) {
+                if (record.policy_sensitive) return error.SettingWriteForbidden;
+                for (record.database_defaults) |entry| {
+                    try (settings.DatabaseDefaultChange{ .name = record.name, .database = entry.database, .value = entry.value }).validate();
+                    if (std.mem.eql(u8, entry.database, domain.default_database_name)) continue;
+                    var database = (try find(a, txn, group_id, .database, 0, entry.database)) orelse return error.DatabaseNotFound;
+                    database.deinit();
+                }
             }
             try settings.requireDatabaseBindings(a, record, existing, SettingDatabaseReader{ .alloc = a, .txn = txn, .group = group_id });
             const key = try settingKeyAlloc(a, group_id, record.identity.id);
@@ -1296,6 +1343,13 @@ pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_i
         const a = arena.allocator();
         var changes = try settings.DatabaseChanges.init(a, delta.removes, delta.upserts, previous.next_id);
         defer changes.deinit(a);
+        // Rename deltas contain only the replacement. Read the old binding by
+        // immutable ID before any resource writes, in this same transaction.
+        const before: View = .{ .alloc = a, .txn = txn, .group_id = group_id, .meta = previous };
+        for (delta.upserts) |resource| if (resource.kind == .database and resource.id < previous.next_id) {
+            const prior = (try before.byId(.database, resource.id)) orelse return error.InvalidCatalogMutation;
+            try changes.bindPreviousName(a, resource.id, prior.name);
+        };
         if (!changes.empty()) {
             const records = try loadSettings(a, txn, group_id);
             for (records) |record| if (try changes.applyAlloc(a, record)) |replacement| {

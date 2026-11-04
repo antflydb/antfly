@@ -3670,6 +3670,9 @@ test "system catalog schema reader publication fences clock readers across catal
 }
 
 test "SQL role defaults decoder admission gates raw proposals without widening legacy scoped writes" {
+    try std.testing.expectEqual(metadata_topology_protocol.sql_database_defaults_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_sql_settings = "{\"database_defaults_only\":true}" }));
+    try std.testing.expectEqual(metadata_topology_protocol.sql_database_defaults_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_sql_settings = "{\"change\":{\"reset_database_defaults\":\"default\"}}" }));
+
     const required = metadata_topology_protocol.sql_role_defaults_version;
     try std.testing.expectEqual(required, transitionRequiredCoordinatedDecoderVersion(.{ .apply_sql_settings = "{\"change\":{\"put\":{\"role_defaults\":[{\"database\":\"\"}]}}}" }));
     try std.testing.expectEqual(required, transitionRequiredCoordinatedDecoderVersion(.{ .apply_sql_settings = "{\"role_defaults_only\":true}" }));
@@ -3804,6 +3807,7 @@ fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCom
     if (command == .comment_column) return metadata_topology_protocol.sql_column_comments_version;
     if (command == .comment_object) return metadata_topology_protocol.sql_object_annotations_version;
     if (command == .apply_sql_sequence_counter) return metadata_topology_protocol.sql_sequence_catalog_version;
+    if (command == .apply_sql_settings and @import("schema_reader_wire.zig").requiresDatabaseDefaults(command.apply_sql_settings)) return metadata_topology_protocol.sql_database_defaults_version;
     if (command == .apply_sql_settings and @import("schema_reader_wire.zig").requiresRoleDefaults(command.apply_sql_settings)) return metadata_topology_protocol.sql_role_defaults_version;
     if (command == .apply_schema_validation) return @import("schema_validation_ledger.zig").requiredDecoderVersion(command.apply_schema_validation);
     const bound_text = switch (command) {

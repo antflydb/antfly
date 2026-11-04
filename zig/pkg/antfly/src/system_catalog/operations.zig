@@ -1029,14 +1029,18 @@ pub fn snapshotJson(svc: anytype, alloc: std.mem.Allocator, context: operation.R
 
 pub fn settingSnapshotJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, scope: settings.Scope) ![]u8 {
     try context.ensureActive();
-    if (scope.principal.len == 0 or scope.database.len == 0) return error.InvalidSettingRecord;
+    try scope.validate();
     // Native callers carry the authenticated principal. The metadata HTTP
     // transport drops that identity, but authenticates the internal service;
     // public API ingress must derive Scope, never accept it from SQL text.
-    if (context.principal != null) {
+    if (context.principal) |principal| {
+        if (scope.role_principal) |role| if (principal.kind != .user or !std.mem.eql(u8, role, principal.subject)) return error.Forbidden;
         const admitted = context.setting_read_principal orelse return error.Forbidden;
         if (!std.mem.eql(u8, admitted, scope.principal)) return error.Forbidden;
     }
+    // This read interprets existing records and has no Raft effects. Mutating
+    // defaults install the decoder barrier; do not probe or activate membership
+    // on every credential-scoped read. The reply must echo the complete scope.
     try svc.ensureLinearizableReadWithContext(context);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     return store.sqlSettingSnapshotJson(alloc, svc.metadata_group_id, scope);
@@ -2385,18 +2389,27 @@ pub fn mutatePolicyDefinition(svc: anytype, alloc: std.mem.Allocator, context: o
 pub fn mutateSetting(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: settings.Request) ![]u8 {
     if (!context.setting_admin) return error.Forbidden;
     try context.ensureActive();
-    const required = if (request == .role_default or (request == .put and requiresRoleDefaultReaders(request.put.role_defaults))) protocol.sql_role_defaults_version else protocol.sql_setting_catalog_version;
+    const fence: ?settings.CommandFence = switch (request) {
+        .database_default => |change| change.command_fence,
+        .role_default => |change| change.command_fence,
+        .put, .drop => null,
+    };
+    if (fence) |value| try value.validate();
+    if (context.sql_command_fence) |current| if (!std.meta.eql(fence, @as(?settings.CommandFence, current.*))) return error.InvalidCatalogMutation;
+    const required = if (request == .database_default or fence != null) protocol.sql_database_defaults_version else if (request == .role_default or (request == .put and requiresRoleDefaultReaders(request.put.role_defaults))) protocol.sql_role_defaults_version else protocol.sql_setting_catalog_version;
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    const database: ?[]const u8 = if (request == .role_default and request.role_default.database.len != 0) request.role_default.database else null;
+    const database: ?[]const u8 = if (request == .database_default) request.database_default.database else if (request == .role_default and request.role_default.database.len != 0) request.role_default.database else null;
     var snapshot = try store.sqlSettingMutationCut(alloc, svc.metadata_group_id, database);
     defer snapshot.deinit();
     const state = .{ .revision = snapshot.meta.revision, .next_id = snapshot.meta.next_id, .settings = snapshot.records };
-    var command: settings.Command = .{ .expected_revision = state.revision, .change = undefined };
+    var command: settings.Command = .{ .expected_revision = state.revision, .command_fence = fence, .change = undefined };
+    var patched_database_defaults: ?[]settings.DatabaseDefault = null;
+    defer if (patched_database_defaults) |owned| alloc.free(owned);
     var patched_defaults: ?[]settings.RoleDefault = null;
     defer if (patched_defaults) |owned| alloc.free(owned);
     switch (request) {
@@ -2420,6 +2433,39 @@ pub fn mutateSetting(svc: anytype, alloc: std.mem.Allocator, context: operation.
                 if (std.ascii.eqlIgnoreCase(record.name, name)) break record;
             } else return std.json.Stringify.valueAlloc(alloc, snapshot.meta, .{});
             command.change = .{ .drop = prior.identity };
+        },
+        .database_default => |change| {
+            try change.validate();
+            if (!snapshot.database_exists) return error.DatabaseNotFound;
+            if (change.all) {
+                if (change.value != null) return error.InvalidSettingValue;
+                var needed = false;
+                for (state.settings) |record| for (record.database_defaults) |entry| {
+                    if (!std.mem.eql(u8, entry.database, change.database)) continue;
+                    if (record.policy_sensitive) return error.SettingWriteForbidden;
+                    needed = true;
+                    break;
+                };
+                if (!needed) return std.json.Stringify.valueAlloc(alloc, snapshot.meta, .{});
+                command.change = .{ .reset_database_defaults = change.database };
+            } else {
+                const existing = for (state.settings) |record| {
+                    if (std.ascii.eqlIgnoreCase(record.name, change.name)) break record;
+                } else null;
+                const prior = existing orelse blk: {
+                    const builtin = settings.builtinInput(change.name) orelse return error.UnknownSetting;
+                    if (change.value == null) return std.json.Stringify.valueAlloc(alloc, snapshot.meta, .{});
+                    break :blk builtin.record(.{ .id = state.next_id, .generation = 1 });
+                };
+                const defaults = try change.applyAlloc(alloc, prior);
+                patched_database_defaults = defaults;
+                const input: settings.Input = .{ .name = prior.name, .kind = prior.kind, .policy_sensitive = prior.policy_sensitive, .session_writable = prior.session_writable, .default = prior.default, .database_defaults = defaults, .role_defaults = prior.role_defaults };
+                if (input.matches(prior)) return std.json.Stringify.valueAlloc(alloc, snapshot.meta, .{});
+                const record = input.record(prior.identity);
+                try record.validate();
+                command.change = .{ .put = record };
+            }
+            command.database_defaults_only = true;
         },
         .role_default => |change| {
             try change.validate();
@@ -2447,6 +2493,11 @@ pub fn mutateSetting(svc: anytype, alloc: std.mem.Allocator, context: operation.
             command.role_defaults_only = true;
         },
     }
+    if (command.database_defaults_only) try settings.requireCapacity(state.settings, switch (command.change) {
+        .put => |record| record,
+        .reset_database_defaults => null,
+        .drop => unreachable,
+    });
     const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
     defer alloc.free(bytes);
     if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;

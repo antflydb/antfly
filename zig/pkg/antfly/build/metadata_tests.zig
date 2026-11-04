@@ -69,7 +69,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&sequence_counter_run.step);
     const role_default_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "SQL role defaults decoder", "metadata module compiles", "metadata storage module compiles" },
+        .filters = &.{ "SQL role defaults decoder", "SQL database defaults decoder", "metadata module compiles", "metadata storage module compiles" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const role_default_run = addFilteredTestRunArtifact(b, role_default_tests);

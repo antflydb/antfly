@@ -157,6 +157,10 @@ test "system catalog resource comments decoder projects actions without copying 
     for ([_][]const u8{ "{\"mutation\":{\"action\":\"comment\",\"description\":null}}", "{\"mutation\":{\"act\\u0069on\":\"comm\\u0065nt\"}}", "{" }) |bytes| try std.testing.expect(requiresResourceComments(bytes));
 }
 
+pub fn requiresDatabaseDefaults(bytes: []const u8) bool {
+    return requiresMarker(bytes, "database_defaults_only") or requiresMarker(bytes, "reset_database_defaults") or requiresMarker(bytes, "command_fence");
+}
+
 pub fn requiresRoleDefaults(bytes: []const u8) bool {
     return requiresMarker(bytes, "@sql-role-defaults");
 }
@@ -535,4 +539,9 @@ test "SQL command fence decoder catalog journal cannot be hidden in escaped fiel
 test "SQL notification decoder admission follows frozen intents and exact control markers not payload text" {
     for ([_][]const u8{ "{}", "{\"notification_plan\":null}", "{\"notification_generation\":null}", "{\"payload\":\"notification_control notification_ack\"}" }) |legacy| try std.testing.expect(!requiresSqlNotifications(legacy));
     for ([_][]const u8{ "{\"notification_control\":true}", "{\"notification_generation\":2}", "{\"notification_gen\\u0065ration\":2}", "{\"operation\":{\"notification_gc\":{}}}", "{\"identity\":{\"notification_plan\":{}}}", "{" }) |current| try std.testing.expect(requiresSqlNotifications(current));
+}
+
+test "SQL database defaults decoder gates scoped baseline mutations without matching string payloads" {
+    for ([_][]const u8{ "{}", "{\"description\":\"database_defaults_only\"}", "{\"role_defaults_only\":true}" }) |bytes| try std.testing.expect(!requiresDatabaseDefaults(bytes));
+    for ([_][]const u8{ "{\"database_defaults_only\":true}", "{\"database_defaults_\\u006fnly\":true}", "{" }) |bytes| try std.testing.expect(requiresDatabaseDefaults(bytes));
 }

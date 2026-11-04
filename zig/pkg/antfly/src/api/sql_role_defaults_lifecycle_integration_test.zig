@@ -42,7 +42,7 @@ fn command(ctx: *fixture.Context, statement: []const u8, sqlstate: ?[]const u8) 
     var response = try send(ctx, ctx.admin_headers, statement, null);
     defer response.deinit(ctx.alloc);
     if (sqlstate) |code| {
-        try std.testing.expectEqual(@as(u16, 400), response.status);
+        try std.testing.expectEqual(@as(u16, if (std.mem.eql(u8, code, "0A000")) 501 else 400), response.status);
         var parsed = try std.json.parseFromSlice(struct { code: []const u8 }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         try std.testing.expectEqualStrings(code, parsed.value.code);
@@ -372,4 +372,269 @@ test "mounted SQL original role defaults retain old logins admit future defaults
     try std.testing.expectEqual(@as(usize, 7), parsed.value.entries.len);
     for ([_]bool{ false, true }) |scoped_bootstrap|
         try fixture.runWithState(Campaign, .{ .entries = parsed.value.entries, .scoped_bootstrap = scoped_bootstrap });
+}
+
+const DatabaseCampaign = struct {
+    pub const native_sessions = true;
+    old: [32]u8 = undefined,
+    fresh: [32]u8 = undefined,
+    pub fn configureAuth(manager: *users.UserManager) !void {
+        try Campaign.configureAuth(manager);
+    }
+    pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+        const authorization = try Campaign.authorization(ctx);
+        defer ctx.alloc.free(authorization);
+        const headers = [_]transport.RequestHeader{.{ .name = "authorization", .value = authorization }};
+        try command(ctx, "CREATE DATABASE tenant_ops", null);
+        try command(ctx, "CREATE DATABASE appdb", null);
+        const source = http.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+        for ([_]local.system_catalog_settings.Input{
+            .{ .name = "app.mode", .kind = .string, .session_writable = true, .default = .{ .string = "base" } },
+            .{ .name = "app.quota", .kind = .integer, .session_writable = true, .default = .{ .integer = 0 } },
+            .{ .name = "app.enabled", .kind = .boolean, .session_writable = true, .default = .{ .boolean = false } },
+        }) |input| {
+            const bytes = try source.systemCatalog(ctx.alloc, .{ .setting_admin = true }, .{ .setting_mutate = .{ .put = input } });
+            ctx.alloc.free(bytes);
+        }
+        self.old = try openDatabase(ctx, &headers, "tenant_ops");
+        try expectQueryValue(ctx, &headers, &self.old, "app.mode", "base");
+        var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
+        defer corpus.deinit();
+        try command(ctx, (try corpus.get("sql-0107")).sql, null);
+        try command(ctx, "ALTER DATABASE tenant_ops SET timezone TO UTC", null);
+        try command(ctx, "ALTER DATABASE tenant_ops SET app.mode TO current_setting('app.mode')", "42601");
+        try command(ctx, "ALTER DATABASE tenant_ops SET app.mode TO 'database'", null);
+        try expectQueryValue(ctx, &headers, &self.old, "app.mode", "base");
+        self.fresh = try openDatabase(ctx, &headers, "tenant_ops");
+        try expectQueryValue(ctx, &headers, &self.fresh, "app.mode", "database");
+        const other = try openDatabase(ctx, &headers, "appdb");
+        defer close(ctx, &headers, &other) catch {};
+        try expectQueryValue(ctx, &headers, &other, "app.mode", "base");
+        var denied = try send(ctx, &headers, "ALTER DATABASE tenant_ops SET app.mode TO 'forged'", null);
+        defer denied.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 403), denied.status);
+        try command(ctx, "ALTER DATABASE absent SET app.mode TO 'missing'", "3D000");
+        try command(ctx, "ALTER DATABASE tenant_ops SET timezone TO 'America/New_York'", "22023");
+        try command(ctx, "ALTER DATABASE tenant_ops SET app.quota TO 'not-an-integer'", "22023");
+        var changed = try send(ctx, &headers, "SET app.mode TO 'session'", &self.fresh);
+        defer changed.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), changed.status);
+        try expectQueryValue(ctx, &headers, &self.fresh, "app.mode", "session");
+        var reset = try send(ctx, &headers, "RESET app.mode", &self.fresh);
+        defer reset.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), reset.status);
+        try expectQueryValue(ctx, &headers, &self.fresh, "app.mode", "database");
+        try command(ctx, "ALTER DATABASE tenant_ops RESET app.mode", null);
+        const reset_login = try openDatabase(ctx, &headers, "tenant_ops");
+        defer close(ctx, &headers, &reset_login) catch {};
+        try expectQueryValue(ctx, &headers, &reset_login, "app.mode", "base");
+        try expectQueryValue(ctx, &headers, &self.fresh, "app.mode", "database");
+        try command(ctx, "ALTER DATABASE tenant_ops SET app.mode TO 'cold'", null);
+        try command(ctx, "ALTER DATABASE tenant_ops SET app.quota TO '17'", null);
+        try command(ctx, "ALTER DATABASE tenant_ops SET app.enabled TO on", null);
+    }
+    pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        const authorization = try Campaign.authorization(ctx);
+        defer ctx.alloc.free(authorization);
+        const headers = [_]transport.RequestHeader{.{ .name = "authorization", .value = authorization }};
+        try expectQueryValue(ctx, &headers, &self.old, "app.mode", "base");
+        try expectQueryValue(ctx, &headers, &self.fresh, "app.mode", "database");
+        const fresh = try openDatabase(ctx, &headers, "tenant_ops");
+        defer close(ctx, &headers, &fresh) catch {};
+        try expectQueryValue(ctx, &headers, &fresh, "app.mode", "cold");
+        try expectQueryValue(ctx, &headers, &fresh, "app.quota", "17");
+        try expectQueryValue(ctx, &headers, &fresh, "app.enabled", "true");
+        try command(ctx, "ALTER DATABASE tenant_ops RESET \"all\"", "0A000");
+        try command(ctx, "ALTER ROLE app_writer SET app.quota TO '19'", null);
+        const quota_role = try openDatabase(ctx, &headers, "tenant_ops");
+        try expectQueryValue(ctx, &headers, &quota_role, "app.quota", "19");
+        try close(ctx, &headers, &quota_role);
+        try command(ctx, "ALTER ROLE app_writer RESET app.quota", null);
+        try command(ctx, "ALTER ROLE app_writer SET app.mode TO 'role-global'", null);
+        const global = try openDatabase(ctx, &headers, "tenant_ops");
+        try expectQueryValue(ctx, &headers, &global, "app.mode", "role-global");
+        try close(ctx, &headers, &global);
+        try command(ctx, "ALTER ROLE app_writer IN DATABASE tenant_ops SET app.mode TO 'role-database'", null);
+        const scoped = try openDatabase(ctx, &headers, "tenant_ops");
+        try expectQueryValue(ctx, &headers, &scoped, "app.mode", "role-database");
+        try close(ctx, &headers, &scoped);
+        try command(ctx, "ALTER DATABASE appdb SET app.mode TO 'other-database'", null);
+        try command(ctx, "ALTER DATABASE tenant_ops SET statement_timeout TO '1000ms'", null);
+        const timed = try openDatabase(ctx, &headers, "tenant_ops");
+        const api = ctx.metadata.server.owned_public_http_server orelse return error.MissingCatalogApi;
+        var timed_record = try @import("sql_connections.zig").load(api.txn_sessions.durable.?, ctx.alloc, timed, "app_writer", api.localSessionNodeId(), @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+        defer timed_record.deinit();
+        try std.testing.expectEqual(@as(?u32, 1000), timed_record.value.statement_timeout_ms);
+        try close(ctx, &headers, &timed);
+        try command(ctx, "ALTER DATABASE tenant_ops RESET ALL", null);
+        try command(ctx, "ALTER DATABASE tenant_ops RESET ALL", null);
+        const inherited_role = try openDatabase(ctx, &headers, "tenant_ops");
+        try expectQueryValue(ctx, &headers, &inherited_role, "app.mode", "role-database");
+        try expectQueryValue(ctx, &headers, &inherited_role, "app.quota", "0");
+        try expectQueryValue(ctx, &headers, &inherited_role, "app.enabled", "false");
+        try expectValue(ctx, &headers, &inherited_role, "statement_timeout", "0");
+        try close(ctx, &headers, &inherited_role);
+        try command(ctx, "ALTER ROLE app_writer IN DATABASE tenant_ops RESET app.mode", null);
+        try command(ctx, "ALTER ROLE app_writer RESET app.mode", null);
+        try expectQueryValue(ctx, &headers, &fresh, "app.mode", "cold");
+        try command(ctx, "ALTER DATABASE tenant_ops SET app.mode TO DEFAULT", null);
+        const reset = try openDatabase(ctx, &headers, "tenant_ops");
+        defer close(ctx, &headers, &reset) catch {};
+        try expectQueryValue(ctx, &headers, &reset, "app.mode", "base");
+        try close(ctx, &headers, &self.old);
+        try close(ctx, &headers, &self.fresh);
+        try close(ctx, &headers, &fresh);
+        try close(ctx, &headers, &reset);
+        try command(ctx, "ALTER DATABASE tenant_ops SET app.mode TO 'renamed-default'", null);
+        try command(ctx, "ALTER DATABASE tenant_ops RENAME TO renamed_ops", null);
+        const renamed = try openDatabase(ctx, &headers, "renamed_ops");
+        try expectQueryValue(ctx, &headers, &renamed, "app.mode", "renamed-default");
+        try close(ctx, &headers, &renamed);
+        try command(ctx, "DROP DATABASE renamed_ops", null);
+        try command(ctx, "CREATE DATABASE renamed_ops", null);
+        const recreated = try openDatabase(ctx, &headers, "renamed_ops");
+        try expectQueryValue(ctx, &headers, &recreated, "app.mode", "base");
+        try close(ctx, &headers, &recreated);
+        const other = try openDatabase(ctx, &headers, "appdb");
+        try expectQueryValue(ctx, &headers, &other, "app.mode", "other-database");
+        try close(ctx, &headers, &other);
+        // RESET ALL must reject protected slots before proposal, preserving
+        // both the catalog revision and the ordinary slots in the same scope.
+        const source = http.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+        const protected = try source.systemCatalog(ctx.alloc, .{ .setting_admin = true }, .{ .setting_mutate = .{ .put = .{ .name = "app.protected", .kind = .string, .policy_sensitive = true, .default = .{ .string = "base" }, .database_defaults = &.{.{ .database = "appdb", .value = .{ .string = "locked" } }} } } });
+        ctx.alloc.free(protected);
+        const svc = ctx.metadata.server.svc;
+        const store = svc.projectedStore().?;
+        const before = try store.systemCatalogMeta(ctx.alloc, svc.metadata_group_id);
+        var denied = try send(ctx, ctx.admin_headers, "ALTER DATABASE appdb RESET ALL", null);
+        defer denied.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 403), denied.status);
+        var diagnostic = try std.json.parseFromSlice(struct { code: []const u8 }, ctx.alloc, denied.body, .{ .ignore_unknown_fields = true });
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings("42501", diagnostic.value.code);
+        try std.testing.expectEqualDeep(before, try store.systemCatalogMeta(ctx.alloc, svc.metadata_group_id));
+    }
+};
+
+test "mounted SQL original database defaults preserve scope login baselines reset authorization and cold recovery" {
+    // sql-0107 executes unchanged through the shared native settings catalog.
+    try fixture.runWithState(DatabaseCampaign, .{});
+}
+
+const NativeDefaultCampaign = struct {
+    const native_fixture = @import("sql_owner_test_fixture.zig");
+    const native_client = @import("sql_owner_test_client.zig");
+    pub const native_auth = true;
+    pub const native_sessions = true;
+    pub const cold_catalog = true;
+    credentials: native_client.ApiKeyHeaders = .{},
+    old: [32]u8 = undefined,
+    pub fn configureAuth(manager: *users.UserManager) !void {
+        inline for (.{ users.ResourceType.database, users.ResourceType.namespace, users.ResourceType.user }) |kind| {
+            var permission = try users.Permission.initOwned(manager.alloc, kind, "*", .admin);
+            defer permission.deinit(manager.alloc);
+            try manager.addPermissionToUser("pk-rewriter", permission);
+        }
+    }
+    fn activate(self: *@This(), ctx: *native_fixture.Context) !void {
+        const manager = ctx.metadata.server.owned_public_http_server.?.cfg.user_manager.?;
+        var permissions: [4]users.Permission = undefined;
+        var initialized: usize = 0;
+        defer for (permissions[0..initialized]) |*permission| permission.deinit(ctx.alloc);
+        inline for (.{ users.ResourceType.table, users.ResourceType.database, users.ResourceType.namespace, users.ResourceType.user }, 0..) |kind, i| {
+            permissions[i] = try users.Permission.initOwned(ctx.alloc, kind, "*", .admin);
+            initialized += 1;
+        }
+        var key = try manager.createApiKey("pk-rewriter", "native-setting-defaults", &permissions, &.{}, null);
+        defer key.deinit(manager.alloc);
+        const authorization = try std.fmt.bufPrint(&self.credentials.authorization[0], "ApiKey {s}", .{key.encoded});
+        self.credentials.admin[0] = .{ .name = "authorization", .value = authorization };
+        ctx.admin_headers = &self.credentials.admin;
+    }
+    fn expectTimezoneCatalog(ctx: *native_fixture.Context) !void {
+        const svc = ctx.metadata.server.svc;
+        const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+        var cut = try store.sqlSettingMutationCut(ctx.alloc, svc.metadata_group_id, "tenant_ops");
+        defer cut.deinit();
+        for (cut.records) |record| if (std.mem.eql(u8, record.name, "timezone")) {
+            for (record.database_defaults) |entry| if (std.mem.eql(u8, entry.database, "tenant_ops")) {
+                try std.testing.expectEqualStrings("UTC", entry.value.string);
+                return;
+            };
+        };
+        return error.MissingCommittedDatabaseDefault;
+    }
+    fn send(self: *@This(), ctx: *native_fixture.Context, connection: ?[]const u8, sql: []const u8, expected: ?[]const u8) !void {
+        var authenticated = ctx.*;
+        authenticated.headers = &self.credentials.admin;
+        var response = try native_client.executeConnected(&authenticated, null, connection, sql, .never);
+        defer response.deinit(ctx.alloc);
+        if (response.status != 200) std.debug.print("native database defaults sql={s} status={d} body={s}\n", .{ sql, response.status, response.body });
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        if (expected) |value| {
+            var result = try std.json.parseFromSlice(struct { rows: []const []const std.json.Value }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
+            try std.testing.expectEqualStrings(value, result.value.rows[0][0].string);
+        }
+    }
+    fn open(self: *@This(), ctx: *native_fixture.Context) ![32]u8 {
+        var response = try native_fixture.request(ctx.alloc, ctx.transport, &self.credentials.admin, ctx.base, "/db/v1/sql/connections", .POST, "{\"database\":\"tenant_ops\"}");
+        defer response.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var result = try std.json.parseFromSlice(struct { connection_id: []const u8 }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 32), result.value.connection_id.len);
+        return result.value.connection_id[0..32].*;
+    }
+    fn close(self: *@This(), ctx: *native_fixture.Context, connection: [32]u8) !void {
+        const path = try std.fmt.allocPrint(ctx.alloc, "/db/v1/sql/connections/{s}", .{connection});
+        defer ctx.alloc.free(path);
+        var response = try native_fixture.request(ctx.alloc, ctx.transport, &self.credentials.admin, ctx.base, path, .DELETE, null);
+        defer response.deinit(ctx.alloc);
+        try std.testing.expect(response.status == 200 or response.status == 204);
+    }
+    pub fn beforeRestart(self: *@This(), ctx: *native_fixture.Context) !void {
+        try self.activate(ctx);
+        try self.send(ctx, null, "CREATE DATABASE tenant_ops", null);
+        const source = http.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+        const bytes = try source.systemCatalog(ctx.alloc, .{ .setting_admin = true }, .{ .setting_mutate = .{ .put = .{ .name = "app.mode", .kind = .string, .session_writable = true, .default = .{ .string = "base" } } } });
+        ctx.alloc.free(bytes);
+        self.old = try self.open(ctx);
+        var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
+        defer corpus.deinit();
+        try self.send(ctx, &self.old, (try corpus.get("sql-0107")).sql, null);
+        try expectTimezoneCatalog(ctx);
+        try self.send(ctx, &self.old, "ALTER DATABASE tenant_ops SET app.mode TO 'cold'", null);
+        try self.send(ctx, &self.old, "SELECT current_setting('app.mode')", "base");
+        const fresh = try self.open(ctx);
+        try self.send(ctx, &fresh, "SELECT current_setting('app.mode')", "cold");
+        try self.close(ctx, fresh);
+        try self.send(ctx, &self.old, "ALTER ROLE \"pk-rewriter\" SET app.mode TO 'role-cold'", null);
+        const role_login = try self.open(ctx);
+        try self.send(ctx, &role_login, "SELECT current_setting('app.mode')", "role-cold");
+        try self.close(ctx, role_login);
+    }
+    pub fn afterRestart(self: *@This(), ctx: *native_fixture.Context) !void {
+        try expectTimezoneCatalog(ctx);
+        try self.send(ctx, &self.old, "SELECT current_setting('app.mode')", "base");
+        const fresh = try self.open(ctx);
+        try self.send(ctx, &fresh, "SELECT current_setting('app.mode')", "role-cold");
+        try self.send(ctx, &fresh, "ALTER DATABASE tenant_ops RESET ALL", null);
+        try self.send(ctx, &fresh, "SELECT current_setting('app.mode')", "role-cold");
+        const still_role = try self.open(ctx);
+        try self.send(ctx, &still_role, "SELECT current_setting('app.mode')", "role-cold");
+        try self.close(ctx, still_role);
+        try self.send(ctx, &fresh, "ALTER ROLE \"pk-rewriter\" RESET app.mode", null);
+        const reset = try self.open(ctx);
+        try self.send(ctx, &reset, "SELECT current_setting('app.mode')", "base");
+        try self.close(ctx, reset);
+        try self.close(ctx, fresh);
+        try self.close(ctx, self.old);
+    }
+};
+
+test "mounted SQL original database defaults retain native command authority and cold multi-owner login baselines" {
+    // sql-0107 executes unchanged with an actual native SQL command fence.
+    try @import("sql_owner_test_fixture.zig").run(NativeDefaultCampaign);
 }

@@ -5,10 +5,10 @@ at `2c0905501d` (2026-11-03). This is an implementation and qualification
 backlog, not a completion claim. PostgreSQL is the SQL standard and independent
 oracle.
 
-## Current original-case qualification (2026-11-03)
+## Current original-case qualification (2026-11-04)
 
-The ledger records **923 implemented / 138 rejected / 449 superseded /
-76 unresolved**, including **59 unresolved DDL/catalog cases**. The immutable
+The ledger records **927 implemented / 138 rejected / 449 superseded /
+72 unresolved**, including **55 unresolved DDL/catalog cases**. The immutable
 inventory still contains the same 1,586 originals. The ledger is authoritative;
 counts in earlier checkpoints below describe their recorded historical state.
 
@@ -32,7 +32,7 @@ through public SQL against independent PostgreSQL witnesses. Soundex/difference
 use bounded native kernels without scratch allocation; `uuid_generate_v4` shares
 the existing volatile UUIDv4 implementation. Extension lifecycle cases remain
 unresolved. These four closures are original cases; supplemental witnesses do
-not increase their count. Final Debug regression passes 1,683 local and 254
+not increase their count. The earlier full Debug regression passed 1,683 local and 254
 server-owner SQL contracts with zero failures or leaks. Four existing benchmark
 contracts skip under Debug; no correctness contract skips.
 
@@ -18717,3 +18717,78 @@ Rust notification model test passed. Generated sync and async Python endpoints
 also enforce the 1 MiB polling response cap and refuse redirects on borrowed
 clients. These checks qualify these three originals, not the separate
 publication/subscription or `pg_notify()` function surfaces.
+
+### Database defaults share the durable scoped-setting pipeline
+
+`ALTER DATABASE ... SET`, `RESET`, `SET ... DEFAULT` and `RESET ALL` use the
+existing setting catalog, immutable login baselines and native SQL command
+owners. The parser and DDL handler are shared with role defaults. Literal
+coercion uses the session-setting type kernel; statement timeout additionally
+uses the existing duration parser and hard execution limit. Timezone accepts
+UTC, matching the currently supported execution profile; this does not claim
+arbitrary IANA-zone execution.
+
+Database changes preserve definition IDs, generations and role overrides.
+Database defaults are below global-role and role-in-database defaults in the
+login precedence order. Existing logins retain their captured baseline through
+session RESET and cold restart. A rename remaps name-bound defaults only from
+the old and new resource with the same catalog database ID. DROP removes those
+slots in the same catalog transaction, so reusing a name cannot adopt them.
+
+A native SQL mutation carries its exact command fence through the signed
+catalog request and receiving transaction. The dispatcher rejects substitution
+and unbound prepared identities. The receiver checks actual native owner
+liveness before effects, and decoder profile 163 fences database-default
+commands and scoped command frames. A lost apply observation returns an unknown
+mutation outcome rather than replaying SQL. The public settings endpoint still
+accepts only its advertised definition PUT/DROP operations; SQL-private scoped
+controls are not additional public request variants.
+
+RESET ALL is one metadata transaction and one catalog revision, not separate
+requests per setting. Streaming byte accounting limits the catalog data admitted
+to that transition to the existing 3 MiB command budget without constructing a
+second encoded catalog. Loading definitions still uses the existing catalog
+snapshot machinery and its 1,024-record limit; this is not a streaming-loader
+memory guarantee. The accepting writer repeats capacity and policy checks before
+effects;
+policy-sensitive definitions cannot acquire unsigned defaults through this SQL
+path. Settings DDL inside an explicit SQL transaction remains fail-closed; this
+qualification does not claim transactional catalog DDL.
+
+API-key login keeps two identities in that same catalog cut: the credential
+principal owns the connection and policy-sensitive settings, while the managed
+user supplies ordinary SQL role defaults when no explicit per-key override
+exists. Existing credential overrides keep precedence. The API derives the role
+from the authenticated identity; the routed source and metadata operation reject
+role substitution. Immutable setting views own and verify the echoed role scope,
+and managed defaults still require the current user incarnation. This avoids a
+second catalog fetch and preserves API-key isolation and existing RLS authority.
+
+Connection creation also checks that a locally authenticated user's admitted
+incarnation still matches the live account. A deletion/recreation during login
+cannot rebind that request or its captured defaults to the replacement user.
+Fresh credentials can open fresh connections, while the replacement cannot
+adopt a connection owned by the old incarnation.
+
+Qualification closes exactly `sql-0107`. The native Debug gate passes five
+public/default/authority campaigns and the existing authorization/RLS campaign,
+including current Basic/API-key account-incarnation checks. Eight metadata
+contracts, thirteen native command-fence contracts and three decoder contracts
+pass, along with eight focused compiler/type/scope contracts, allocation-failure
+rename/drop coverage and all 112 SQL compiler tests. The public settings HTTP
+contract passes its private-variant rejection test. PostgreSQL 18 independently
+passes 32 scope, login, precedence and RESET assertions. Generation, formatting,
+source-catalog and Apache/license checks pass. The broad unfiltered SQL sweep
+was not completed; its unchanged Debug parallel-spill fixture remained CPU-bound.
+The ledger is now **927 implemented / 138 rejected / 449 superseded /
+72 unresolved**, with **55 unresolved DDL/catalog cases**. No other original
+is reclassified by these shared regressions.
+
+The registered locking Debug gate also passes all eleven campaigns after the
+managed-role changes. Durable HTTP SET/RESET derives the requested scope through
+its authenticated settings owner while retaining the session's stored credential
+and database. Pure settings reads perform no capability activation; mutations
+retain the accepting-writer decoder/fence checks. The rename writer uses the
+same canonical point reader as catalog planning, including implicit default
+identities before their first physical publication. Its native bootstrap
+regression passes without weakening missing-identity validation.

@@ -505,7 +505,7 @@ pub const DomainDefinition = union(enum) {
 
 pub const CatalogDdl = struct {
     kind: enum { database, namespace, tablespace, table, index, view, role, sequence, function, procedure, operator, aggregate, cast, named_type },
-    action: enum { create, drop, rename, set_tablespace, alter_schema, truncate, role_default, comment, alter_sequence, populate, maintenance },
+    action: enum { create, drop, rename, set_tablespace, alter_schema, truncate, setting_default, comment, alter_sequence, populate, maintenance },
     name: Name,
     new_name: ?[]const u8 = null,
     tablespace: ?[]const u8 = null,
@@ -521,7 +521,7 @@ pub const CatalogDdl = struct {
     index_targets: []const Name = &.{},
     concurrently: bool = false,
     view_definition: ?ViewDefinition = null,
-    role_setting: ?struct { name: []const u8, database: ?[]const u8, value: ?Value } = null,
+    setting_default: ?struct { name: []const u8, all: bool = false, database: ?[]const u8, value: ?Value } = null,
     authorization: ?Authorization = null,
     comment_value: ?[]const u8 = null,
     comment_column: ?[]const u8 = null,
