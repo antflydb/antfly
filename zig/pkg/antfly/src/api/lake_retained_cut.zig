@@ -568,23 +568,7 @@ fn loadImpl(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, 
 /// Bounded discovery over a dedicated domain; archive generations use a
 /// different domain and cannot be collected by this path.
 pub fn collect(store: *stores.ArtifactStore, table: u64, store_identity: catalog.Digest, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) !void {
-    const Visitor = struct {
-        store: *stores.ArtifactStore,
-        now: u64,
-        deleted: usize = 0,
-        fn visit(raw: *anyopaque, scope: stores.UploadScope, artifact_id: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            if (scope.fencingToken() +| 30_000 >= self.now) return;
-            if (self.deleted == 128) return error.RetainedCutCollectionBound;
-            try self.store.delete(artifact_id);
-            self.deleted += 1;
-        }
-    };
-    var visitor: Visitor = .{ .store = store, .now = now };
-    store.visitScopedUploads(domain(table, store_identity), .{ .ptr = &visitor, .visit = Visitor.visit, .fencing_cutoff = now -| 30_000, .max_entries = 128 }, cancellation) catch |err| switch (err) {
-        error.RetainedCutCollectionBound => {},
-        else => return err,
-    };
+    try @import("lake_cleanup_budget.zig").collectExpiredScopes(store, domain(table, store_identity), now -| 30_000, cancellation);
 }
 
 const CursorEnvelope = struct { version: u16 = 1, expires_ms: u64, payload: []const u8 };
@@ -974,3 +958,63 @@ test "external lake retained cursor cohorts preserve requested retention and max
     try std.testing.expectError(error.InvalidQueryRequest, cursorExpiry(now, 0));
     try std.testing.expectError(error.InvalidQueryRequest, cursorExpiry(now, max_ttl_ms + 1));
 }
+
+test "external lake vacuum cursor cleanup propagates cancellation into version deletion" {
+    var fixture: CollectionFixture = .{ .cancel_during_delete = true };
+    var store = fixture.store();
+    try std.testing.expectError(error.Canceled, collect(&store, 4, @splat(1), 100_000, @import("antfly_cancellation").CancellationToken.fromAtomic(&fixture.canceled)));
+    try std.testing.expectEqual(@as(usize, 0), fixture.deleted);
+    fixture.cancel_during_delete = false;
+    fixture.canceled.store(false, .release);
+    try collect(&store, 4, @splat(1), 100_000, @import("antfly_cancellation").CancellationToken.fromAtomic(&fixture.canceled));
+    try std.testing.expectEqual(@as(usize, 1), fixture.deleted);
+}
+
+test "external lake vacuum cursor cleanup yields normally at its enumeration bound" {
+    var fixture: CollectionFixture = .{ .entries = 129 };
+    var store = fixture.store();
+    try collect(&store, 4, @splat(1), 100_000, .none);
+    try std.testing.expectEqual(@as(usize, 128), fixture.deleted);
+}
+
+const CollectionFixture = struct {
+    entries: usize = 1,
+    deleted: usize = 0,
+    cancel_during_delete: bool = false,
+    canceled: std.atomic.Value(bool) = .init(false),
+    fn store(self: *@This()) stores.ArtifactStore {
+        return .{ .allocator = std.testing.allocator, .ptr = self, .vtable = &.{ .deinit = deinit, .put = put, .get_alloc = get, .get_range_alloc = range, .stat = stat, .delete = legacyDelete, .delete_with_cancellation = delete, .visit_scoped_uploads = visit } };
+    }
+    fn deinit(_: A, _: *anyopaque) void {}
+    fn put(_: *anyopaque, _: A, _: []const u8) !stores.ArtifactMetadata {
+        return error.TestUnexpectedResult;
+    }
+    fn get(_: *anyopaque, _: A, _: []const u8) ![]u8 {
+        return error.TestUnexpectedResult;
+    }
+    fn range(_: *anyopaque, _: A, _: []const u8, _: u64, _: usize) ![]u8 {
+        return error.TestUnexpectedResult;
+    }
+    fn stat(_: *anyopaque, _: A, _: []const u8) !stores.ArtifactMetadata {
+        return error.TestUnexpectedResult;
+    }
+    fn legacyDelete(_: *anyopaque, _: []const u8) !void {
+        return error.UncancelableDeletion;
+    }
+    fn delete(raw: *anyopaque, _: []const u8, token: @import("antfly_cancellation").CancellationToken) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.cancel_during_delete) self.canceled.store(true, .release);
+        try token.check();
+        self.deleted += 1;
+    }
+    fn visit(raw: *anyopaque, domain_: [32]u8, visitor: stores.ScopedUploadVisitor, token: @import("antfly_cancellation").CancellationToken) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const scope = try stores.UploadScope.forPublication(domain_, 1, std.testing.io);
+        const id = try scope.artifactId(&@as([64]u8, @splat('a')));
+        for (0..self.entries) |i| {
+            try token.check();
+            if (visitor.max_entries) |maximum| if (i == maximum) return error.ArtifactEnumerationPaused;
+            try visitor.visit(visitor.ptr, scope, &id);
+        }
+    }
+};

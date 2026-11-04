@@ -535,16 +535,8 @@ pub fn collect(store: *Store, table: u64, context: Context) !void {
     try @import("lake_expiring_objects.zig").collect(std.heap.smp_allocator, store, table, "recent-search", context);
     try @import("lake_expiring_objects.zig").collect(std.heap.smp_allocator, store, table, "row-enrichment", context);
     var artifacts = store.artifactStore();
-    const Visitor = struct {
-        store: *stores.ArtifactStore,
-        fn visit(raw: *anyopaque, _: stores.UploadScope, id: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            try self.store.delete(id);
-        }
-    };
-    var visitor: Visitor = .{ .store = &artifacts };
     const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
-    try artifacts.visitScopedUploads(scopeDomain(table, store.identity), .{ .ptr = &visitor, .visit = Visitor.visit, .fencing_cutoff = now -| 30_000, .max_entries = 128 }, cancellation(context));
+    try @import("lake_cleanup_budget.zig").collectExpiredScopes(&artifacts, scopeDomain(table, store.identity), now -| 30_000, @import("lake_cleanup_budget.zig").contextToken(&context));
 }
 
 test "external lake bounded WAL interrupted enrichment claims release conditionally without replacing a newer worker" {

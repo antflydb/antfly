@@ -17,6 +17,9 @@ pub const antfly_sources = @import("source_owner_physical.zig");
 
 test {
     _ = @import("serverless/lake_vacuum.zig");
+    _ = @import("api/lake_retained_cut.zig");
+    _ = @import("api/lake_cleanup_budget.zig");
+    _ = @import("api/lake_expiring_objects.zig");
     _ = @import("serverless/lake_vacuum_plan.zig");
     _ = @import("serverless/lake_vacuum_inputs.zig");
 }

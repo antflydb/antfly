@@ -3168,10 +3168,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lake_vacuum_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lake_vacuum_tests = b.addTest(.{
         .root_module = lake_vacuum_mod,
-        .filters = selectTestFilters(b, &.{"external lake vacuum"}),
+        .filters = selectTestFilters(b, &.{ "external lake vacuum", "external lake expiring", "external lake bounded WAL retained cuts" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("lake-vacuum-test", "Run bounded lake vacuum planning, fencing and recovery tests").dependOn(&addFilteredTestRunArtifact(b, lake_vacuum_tests).step);
+    b.step("lake-vacuum-test", "Run bounded lake maintenance, fencing and recovery tests").dependOn(&addFilteredTestRunArtifact(b, lake_vacuum_tests).step);
     const text_frontier_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_text_frontier_test_root.zig"),
         .target = target,

@@ -20,51 +20,104 @@ const std = @import("std");
 const Store = @import("lake_index_store.zig").Store;
 const Context = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
 const A = std.mem.Allocator;
-const Progress = struct { version: u16 = 1, cursor: ?[]const u8 = null };
+const Progress = struct { version: u16 = 2, cursor: ?[]const u8 = null, after_key: ?[]const u8 = null };
 pub fn collect(a: A, store: *Store, table: u64, kind: []const u8, context: Context) !void {
     try context.ensureActive();
+    const bounded = @import("lake_cleanup_budget.zig").turnContext(context);
+    collectTurn(a, store, table, kind, bounded) catch |err| {
+        try context.ensureActive();
+        if (err == error.LakeCleanupTurnYield) return;
+        if ((err == error.Canceled or err == error.Cancelled or err == error.DeadlineExceeded) and @import("antfly_platform").time.monotonicNs() >= bounded.deadline_ns.?) return;
+        return err;
+    };
+}
+fn collectTurn(a: A, store: *Store, table: u64, kind: []const u8, context: Context) !void {
+    try context.ensureActive();
     var client = store.opened.client;
-    const token: ?@import("objectstore").CancellationToken = if (context.cancellation) |cancel| .{ .ptr = cancel.ptr, .is_cancelled_fn = cancel.is_cancelled_fn } else null;
+    const types = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types;
+    const checkpoint_token = types.contextCancellation(&context);
+    var work = context;
+    work.deadline_ns = context.deadline_ns.? -| std.time.ns_per_s;
+    if (@import("antfly_platform").time.monotonicNs() >= work.deadline_ns.?) return;
+    const token = types.contextCancellation(&work);
     const prefix = try std.fmt.allocPrint(a, "{s}{s}{s}/{d}/", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", kind, table });
     defer a.free(prefix);
     const checkpoint = try std.fmt.allocPrint(a, "{s}{s}expiring-gc/{d}/{s}.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", table, kind });
     defer a.free(checkpoint);
     var previous = client.getObject(store.opened.bucket, checkpoint, .{ .skip_metadata_probe = true, .max_response_bytes = 16384, .cancellation = token }) catch |err| switch (err) {
         error.NotFound, error.ObjectNotFound, error.FileNotFound => null,
-        else => return err,
+        else => {
+            try context.ensureActive();
+            if (workExpired(work, err)) return error.LakeCleanupTurnYield;
+            return err;
+        },
     };
     defer if (previous) |*value| value.deinit(client.allocator);
     var parsed: ?std.json.Parsed(Progress) = if (previous) |value| try std.json.parseFromSlice(Progress, a, value.body, .{}) else null;
     defer if (parsed) |*value| value.deinit();
-    var page = try client.listObjects(store.opened.bucket, .{ .prefix = prefix, .max_keys = 128, .continuation_token = if (parsed) |value| value.value.cursor else null, .cancellation = token });
+    const progress: Progress = if (parsed) |value| value.value else .{};
+    if ((progress.version != 1 and progress.version != 2) or (progress.cursor != null and progress.after_key != null)) return error.InvalidExpiringLakeObject;
+    if (progress.after_key) |key| if (progress.version == 1 or !std.mem.startsWith(u8, key, prefix) or key.len > 4096) return error.InvalidExpiringLakeObject;
+    var page = client.listObjects(store.opened.bucket, .{ .prefix = prefix, .max_keys = 128, .continuation_token = progress.cursor, .start_after = progress.after_key, .cancellation = token }) catch |err| {
+        try context.ensureActive();
+        if (workExpired(work, err)) return error.LakeCleanupTurnYield;
+        return err;
+    };
     defer page.deinit(client.allocator);
     const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+    var processed: usize = 0;
+    var last_key = progress.after_key;
     for (page.entries) |object| {
         try context.ensureActive();
-        var value = client.getObject(store.opened.bucket, object.key, .{ .skip_metadata_probe = true, .max_response_bytes = 2 * 1024 * 1024, .cancellation = token }) catch |err| switch (err) {
-            error.NotFound, error.ObjectNotFound, error.FileNotFound => continue,
-            else => return err,
+        // Provider I/O uses an earlier deadline than the progress CAS. If an
+        // in-flight operation reaches that boundary, retain the previous key
+        // and checkpoint only records whose complete processing was observed.
+        if (processed == 16 or @import("antfly_platform").time.monotonicNs() >= work.deadline_ns.?) break;
+        if (!std.mem.startsWith(u8, object.key, prefix) or object.key.len > 4096) return error.InvalidExpiringLakeObject;
+        collectRecord(a, client, store.opened.bucket, object.key, now, work) catch |err| {
+            try context.ensureActive();
+            if (workExpired(work, err)) break;
+            return err;
         };
-        defer value.deinit(client.allocator);
-        var document = try std.json.parseFromSlice(std.json.Value, a, value.body, .{});
-        defer document.deinit();
-        if (document.value != .object) return error.InvalidExpiringLakeObject;
-        const expires = document.value.object.get("expires_ms") orelse continue;
-        if (expires != .integer or expires.integer <= 0) return error.InvalidExpiringLakeObject;
-        if (@as(u64, @intCast(expires.integer)) +| 30_000 >= now) continue;
-        if (document.value.object.get("lease_until_ms")) |lease| if (lease == .integer and lease.integer > 0 and @as(u64, @intCast(lease.integer)) > now) continue;
-        client.compareAndDelete(store.opened.bucket, object.key, value.metadata.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = token }) catch |err| switch (err) {
-            error.PreconditionFailed, error.NotFound, error.ObjectNotFound, error.FileNotFound => {},
-            else => return err,
-        };
+        processed += 1;
+        last_key = object.key;
     }
-    const bytes = try std.json.Stringify.valueAlloc(a, Progress{ .cursor = page.next_continuation_token }, .{});
+    if (processed == 0 and page.entries.len != 0) return;
+    if (previous == null and page.entries.len == 0) return;
+    const complete_page = processed == page.entries.len;
+    const bytes = try std.json.Stringify.valueAlloc(a, Progress{ .cursor = if (complete_page) page.next_continuation_token else null, .after_key = if (complete_page) null else last_key }, .{});
     defer a.free(bytes);
-    var saved = client.compareAndPut(store.opened.bucket, checkpoint, bytes, if (previous) |value| value.metadata.writeRevision() orelse return error.MissingObjectRevision else null, .{ .cancellation = token }) catch |err| switch (err) {
+    if (previous) |value| if (std.mem.eql(u8, bytes, value.body)) return;
+    var saved = client.compareAndPut(store.opened.bucket, checkpoint, bytes, if (previous) |value| value.metadata.writeRevision() orelse return error.MissingObjectRevision else null, .{ .cancellation = checkpoint_token }) catch |err| switch (err) {
         error.PreconditionFailed, error.ObjectAlreadyExists => return,
         else => return err,
     };
     saved.deinit(client.allocator);
+}
+
+fn workExpired(work: Context, err: anyerror) bool {
+    return (err == error.Canceled or err == error.Cancelled or err == error.DeadlineExceeded) and @import("antfly_platform").time.monotonicNs() >= work.deadline_ns.?;
+}
+fn collectRecord(a: A, client_value: @import("objectstore").Client, bucket: []const u8, key: []const u8, now: u64, context: Context) !void {
+    try context.ensureActive();
+    var client = client_value;
+    const token = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.contextCancellation(&context);
+    var value = client.getObject(bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = 2 * 1024 * 1024, .cancellation = token }) catch |err| switch (err) {
+        error.NotFound, error.ObjectNotFound, error.FileNotFound => return,
+        else => return err,
+    };
+    defer value.deinit(client.allocator);
+    var document = try std.json.parseFromSlice(std.json.Value, a, value.body, .{});
+    defer document.deinit();
+    if (document.value != .object) return error.InvalidExpiringLakeObject;
+    const expires = document.value.object.get("expires_ms") orelse return;
+    if (expires != .integer or expires.integer <= 0) return error.InvalidExpiringLakeObject;
+    if (@as(u64, @intCast(expires.integer)) +| 30_000 >= now) return;
+    if (document.value.object.get("lease_until_ms")) |lease| if (lease == .integer and lease.integer > 0 and @as(u64, @intCast(lease.integer)) > now) return;
+    client.compareAndDelete(bucket, key, value.metadata.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = token }) catch |err| switch (err) {
+        error.PreconditionFailed, error.NotFound, error.ObjectNotFound, error.FileNotFound => {},
+        else => return err,
+    };
 }
 
 test "external lake expiring cleanup respects active leases and advances beyond one page" {
@@ -94,9 +147,26 @@ test "external lake expiring cleanup respects active leases and advances beyond 
     defer a.free(bytes);
     var written = try client.putObject(store.opened.bucket, leased, bytes, .{});
     written.deinit(client.allocator);
+    const legacy_key = try std.fmt.allocPrint(a, "{s}{s}expiring-gc/7/recent-search.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/" });
+    defer a.free(legacy_key);
+    var legacy = try client.putObject(store.opened.bucket, legacy_key, "{\"version\":1,\"cursor\":null}", .{});
+    legacy.deinit(client.allocator);
     const context: Context = .{ .io = std.testing.io };
+    const metrics = @import("objectstore").operation_metrics;
+    const get_index = @backingInt(metrics.Operation.get);
+    const before = metrics.runtime.snapshot().calls[get_index];
     try collect(a, &store, 7, "recent-search", context);
-    try collect(a, &store, 7, "recent-search", context);
+    try std.testing.expect(metrics.runtime.snapshot().calls[get_index] - before <= 20);
+    var checkpoint = try client.getObject(store.opened.bucket, legacy_key, .{});
+    defer checkpoint.deinit(client.allocator);
+    var migrated = try std.json.parseFromSlice(Progress, a, checkpoint.body, .{});
+    defer migrated.deinit();
+    try std.testing.expectEqual(@as(u16, 2), migrated.value.version);
+    try std.testing.expect(migrated.value.after_key != null and migrated.value.cursor == null);
+    try std.testing.expect(std.mem.endsWith(u8, migrated.value.after_key.?, "0015.json"));
+    // Small turns must checkpoint past live records, including partial pages,
+    // so an active early prefix cannot starve the expired records at its end.
+    for (0..15) |_| try collect(a, &store, 7, "recent-search", context);
     const prefix = try std.fmt.allocPrint(a, "{s}{s}recent-search/7/", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/" });
     defer a.free(prefix);
     var remaining = try client.listObjects(store.opened.bucket, .{ .prefix = prefix, .max_keys = 256 });

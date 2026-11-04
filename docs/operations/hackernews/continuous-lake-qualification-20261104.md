@@ -677,6 +677,41 @@ gate for these contracts. These concurrent changes were isolated from the frozen
 `e7fc61d1d0` engine; its running provider qualification does not qualify the newer
 candidate-buffer implementation.
 
+
+The bounded restart diagnosis of the failed Debug coverage run completed in
+284.90 seconds, preserving all 103 expected row images and verifying 94 current
+manifests and 292 Parquet files. History coverage reached LSN 160 at 213.22 seconds
+and indexed coverage reached LSN 169 at 213.46 seconds. Three live Debug stack
+samples located the sole reconciliation worker inside expired cursor cleanup,
+between GCS version enumeration and deletion, before publication construction.
+This attributes that observed stall to cleanup; it does not establish a cause for
+the separate, transient `UnexpectedEof` publication warning.
+
+Expired cursor and recent-artifact cleanup now share a five-second cooperative
+work budget. The existing 128-entry ceiling and expiry/grace rules remain;
+cancellation reaches permanent version deletion and local closure invalidation.
+Provider enumeration and per-artifact version-deletion limits yield normally.
+An exhausted cleanup turn leaves garbage for the next pass while allowing normal
+reconciliation to continue; parent cancellation remains an error.
+
+Expiring job/memo cleanup similarly processes at most 16 records per turn. It
+persists a lexical position when stopping partway through a provider page, so
+live early keys cannot starve expired later records. An earlier provider-I/O
+deadline reserves one second for the conditional checkpoint write; an interrupted
+record is retried rather than recorded as processed. Version-one checkpoints are
+read and migrated to version two. Empty scans avoid creating empty checkpoints,
+and unchanged progress avoids an unnecessary rewrite.
+
+The old cleanup failed two controls: deletion completed despite cancellation
+raised inside the operation, and enumeration exhaustion escaped as an error.
+The expiring-record control also exceeded a 20-GET turn ceiling. After the fixes,
+30 focused Debug maintenance tests passed without skips or leaks; additional
+controls passed for legacy checkpoint migration/partial-page progress and retained
+cuts surviving reopen, expiry and shared-state cleanup. The final engine sources
+for these fixes have not yet been qualified against GCS. The separately frozen
+`e7fc61d1d0` ReleaseFast engine passed its smoke and is running the original full
+filesystem/GCS controls; those results cannot qualify the newer cleanup code.
+
 Next work should:
 
 1. Monitor accepted searches with live public stages,
