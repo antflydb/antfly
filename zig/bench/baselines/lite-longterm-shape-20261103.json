@@ -225,6 +225,33 @@
         "zig/pkg/antfly-embedded/tests/writer_queue_process_fixture.zig": "59eb2f8e311a521d3a9ea193675c17eb5690c63b",
         "zig/pkg/antfly-embedded/tests/test_writer_queue_process.py": "82667076a39f46e82078f8930248e9d5fe01e9af"
       }
+    },
+    {
+      "suite": "Integrated Debug producer at 08316e366a9fd3c8c5117c1c63573b783369450c",
+      "whole_build_returncode": 0,
+      "public_exports": 134,
+      "smoke_and_linkage": "passed",
+      "admission_unit_tests_passed": 19,
+      "admission_real_process_cases_passed": 7,
+      "native_api_passed": 151,
+      "native_api_skipped": 0,
+      "native_api_failed": 0,
+      "native_api_leaked": 0,
+      "library_sha256": "09b426e45d16cca46308b51d0f35aa52d3fa5e8f44a4b1977a920fa447def07c",
+      "library_bytes": 285085776,
+      "build_report_sha256": "fff2f28a9a535a3b399e9f69b8050aa68e787b4c38e269ab53705424698b6a0a",
+      "native_tests_log_sha256": "705b2d072e285110628ef1bb24320db7746af428359bfc7fea1f21dbd824a86e"
+    },
+    {
+      "suite": "Embedded SDK SQL/concurrency/catalog/search/outcomes on frozen 083 Debug library",
+      "passed": 209,
+      "failed": 0,
+      "initial_run_passed": 208,
+      "initial_run_failed": 1,
+      "initial_seconds": 104.51,
+      "targeted_corrected_fixture_passed": 1,
+      "targeted_seconds": 0.43,
+      "correction": "A refused writer may create its persistent queue directory before acquiring the safety sidecar. Fixture now permits only that directory, requires the sidecar absent, and requires the second reader to create nothing. Two Busy mutations, snapshot/cursor preservation, post-close write and reopen remain checked. Runtime library unchanged; no recompile or repeated reference run."
     }
   ],
   "remaining": [
@@ -729,7 +756,8 @@
     "component_builds_passed": false,
     "benchmark_report_tests_passed": 23,
     "main_admission_source": "270057158c",
-    "main_merge_pushed": true
+    "main_merge_pushed": true,
+    "status": "Integrated Debug build, native API and segmented 209 SDK cases pass. Current-candidate importer and final optimized qualification remain pending."
   },
   "local_runtime_diagnostic": {
     "qualification": false,

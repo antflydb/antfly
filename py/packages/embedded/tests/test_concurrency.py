@@ -218,11 +218,22 @@ def test_readonly_snapshot_without_sidecar_in_readonly_directory(tmp_path: Path)
                 with antfly_embedded.open(snapshot, no_sync=True) as writer:
                     with pytest.raises(antfly_embedded.BusyError):
                         writer.sql("UPDATE items SET name = 'after' WHERE id = 1")
-                    # A second reader must not switch lock authorities while
-                    # the first reader still owns the fallback inode fence.
+                    # A refused writer may create its ordering queue before
+                    # acquiring the safety sidecar. The inode fence must still
+                    # prevent installation of that sidecar, and a second reader
+                    # must create nothing or switch lock authorities.
+                    sidecar = Path(str(snapshot) + ".lock")
+                    queue = Path(str(sidecar) + ".q")
+                    expected_entries = set(directory.iterdir())
+                    assert snapshot in expected_entries
+                    assert expected_entries <= {snapshot, queue}
+                    assert not sidecar.exists()
+                    if queue in expected_entries:
+                        assert queue.is_dir()
                     with antfly_embedded.open(snapshot, mode=antfly_embedded.OpenMode.READONLY) as second:
                         assert second.sql("SELECT name FROM items")["rows"] == [["before"]]
-                        assert list(directory.iterdir()) == [snapshot]
+                        assert set(directory.iterdir()) == expected_entries
+                        assert not sidecar.exists()
                         with pytest.raises(antfly_embedded.BusyError):
                             writer.sql("UPDATE items SET name = 'after' WHERE id = 1")
                     assert cursor.fetch(10)["result"]["rows"] == [["before"]]
