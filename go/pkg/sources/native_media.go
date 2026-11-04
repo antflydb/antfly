@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 )
 
 // Collaboration attachments are bounded during acquisition. Reacquire their
@@ -46,6 +47,14 @@ func (c *CollaborationConnector) nativeAttachment(ctx context.Context, r Request
 	if json.Unmarshal([]byte(configString(item.Metadata, "acquisition")), &ref) != nil || ref.Attachment == "" {
 		return collaborationFile{}, ErrInvalidInput
 	}
+
+	expectedID, _ := c.collaborationIdentity(r.SourceNamespace, ref)
+	parentRef := ref
+	parentRef.Attachment = ""
+	expectedParent, _ := c.collaborationIdentity(r.SourceNamespace, parentRef)
+	if item.ID != expectedID || configString(item.Metadata, "parent_identity") != expectedParent || item.Size < 0 || item.Size > maxImportSourceObjectBytes || !ValidContentRef(configString(item.Metadata, "parent_revision")) || !ValidContentRef(configString(item.Metadata, "attachment_sha256")) {
+		return collaborationFile{}, ErrInvalidInput
+	}
 	defer c.beginDiscordReadPass()()
 	if err := c.validateRef(ctx, config, ref); err != nil {
 		return collaborationFile{}, err
@@ -54,6 +63,35 @@ func (c *CollaborationConnector) nativeAttachment(ctx context.Context, r Request
 		if err := c.checkGmailContentAccess(ctx); err != nil {
 			return collaborationFile{}, err
 		}
+	}
+
+	if ref.Resource == "gmail" {
+		// Gmail messages have immutable MIME content. A live history revision
+		// and label selection pin the discovered part without requesting the
+		// full payload (which may contain inline attachment bytes).
+		var message gmailMessage
+		if err := c.get(ctx, "gmail", "/messages/"+url.PathEscape(ref.ID)+"?format=metadata&fields=id,historyId,labelIds", &message); err != nil {
+			return collaborationFile{}, err
+		}
+		expected := configString(item.Metadata, "history_id")
+		if message.ID != ref.ID || expected == "" || message.HistoryID != expected {
+			return collaborationFile{}, &RevisionChangedError{Expected: expected, Actual: message.HistoryID}
+		}
+		for _, selected := range config.LabelIDs {
+			found := false
+			for _, label := range message.LabelIDs {
+				if label == selected {
+					found = true
+				}
+			}
+			if !found {
+				return collaborationFile{}, ErrInvalidInput
+			}
+		}
+		if !config.Attachments || configString(item.Metadata, "attachment_id") != ref.Attachment {
+			return collaborationFile{}, ErrInvalidInput
+		}
+		return collaborationFile{ID: ref.Attachment, Name: item.Filename, MIME: configString(item.Metadata, "mime_type"), gmailMessageID: ref.ID, gmailAttachmentID: configString(item.Metadata, "gmail_attachment_id"), size: item.Size}, nil
 	}
 	attachment := ref.Attachment
 	ref.Attachment = ""
@@ -100,9 +138,42 @@ func (c *CollaborationConnector) nativeMediaBytes(ctx context.Context, r Request
 			return nil, &RevisionChangedError{Expected: configString(item.Metadata, "drive_revision"), Actual: file.Revision}
 		}
 	}
+
+	if file.gmailMessageID != "" && file.gmailAttachmentID == "" {
+		// Small inline MIME parts have no separate attachment endpoint. Only
+		// acquisition needs the bounded full container; HEAD never enters here.
+		var ref collaborationRef
+		if json.Unmarshal([]byte(configString(item.Metadata, "acquisition")), &ref) != nil {
+			return nil, ErrInvalidInput
+		}
+		config, err := decodeSourceConfig[CollaborationConfig](r.Config)
+		if err != nil {
+			return nil, err
+		}
+		ref.Attachment = ""
+		material, err := c.gmailLoad(ctx, config, ref)
+		if err != nil {
+			return nil, err
+		}
+		parent := c.collaborationInput(r, ref, material, material.Text, collaborationMetadata(ref, material))
+		if parent.Revision != configString(item.Metadata, "parent_revision") {
+			return nil, &RevisionChangedError{Expected: configString(item.Metadata, "parent_revision"), Actual: parent.Revision}
+		}
+		found := false
+		for _, part := range material.Files {
+			if part.ID == file.ID {
+				file = part
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, ErrInvalidInput
+		}
+	}
 	data := file.Data
 	if file.gmailMessageID != "" {
-		data, err = c.readGmailAttachment(ctx, file, maxImportSourceObjectBytes)
+		data, err = c.readGmailAttachment(ctx, file, int(item.Size))
 	}
 	if err == nil && file.URL != "" {
 		data, err = c.downloadAttachment(ctx, file.URL)

@@ -468,23 +468,27 @@ func collaborationMetadata(ref collaborationRef, m collaborationMaterial) map[st
 	metadata["attachments"] = attachments
 	return metadata
 }
-func (c *CollaborationConnector) collaborationInput(r Request, ref collaborationRef, m collaborationMaterial, text []byte, meta map[string]any) Input {
-	raw, _ := json.Marshal(ref)
-	meta["acquisition"] = string(raw)
+func (c *CollaborationConnector) collaborationIdentity(namespace string, ref collaborationRef) (string, string) {
 	key := ref.Resource + "/" + url.PathEscape(ref.Container) + "/" + url.PathEscape(ref.ID)
 	if ref.Attachment != "" {
 		key += "/attachments/" + url.PathEscape(ref.Attachment)
 	}
+	scheme := c.ProviderName
+	if scheme == ProviderGoogleWorkspace {
+		scheme = "workspace"
+	}
+	return scheme + "://" + namespace + "/" + key, key
+}
+func (c *CollaborationConnector) collaborationInput(r Request, ref collaborationRef, m collaborationMaterial, text []byte, meta map[string]any) Input {
+	raw, _ := json.Marshal(ref)
+	meta["acquisition"] = string(raw)
+	id, key := c.collaborationIdentity(r.SourceNamespace, ref)
 	// Include canonical metadata so edits to links/sharing context are revisions.
 	h := sha256.New()
 	h.Write(text)
 	b, _ := json.Marshal(meta)
 	h.Write(b)
-	scheme := c.ProviderName
-	if scheme == ProviderGoogleWorkspace {
-		scheme = "workspace"
-	}
-	return Input{Item: Item{ID: scheme + "://" + r.SourceNamespace + "/" + key, Path: key, Filename: m.Title, URL: m.URL, Revision: hex.EncodeToString(h.Sum(nil)), Size: int64(len(text)), SourceKind: c.ProviderName, ReadMode: sourceReadBytes, Metadata: meta}, Bytes: text}
+	return Input{Item: Item{ID: id, Path: key, Filename: m.Title, URL: m.URL, Revision: hex.EncodeToString(h.Sum(nil)), Size: int64(len(text)), SourceKind: c.ProviderName, ReadMode: sourceReadBytes, Metadata: meta}, Bytes: text}
 }
 func (c *CollaborationConnector) materialItems(ctx context.Context, r Request, config CollaborationConfig, ref collaborationRef, m collaborationMaterial) ([]Input, error) {
 	if config.preview && len(m.Files) > PreviewItemLimit-1 {
@@ -561,6 +565,9 @@ func (c *CollaborationConnector) materialItems(ctx context.Context, r Request, c
 			meta["parent_identity"] = parent.ID
 			if c.NativeAttachments {
 				meta["parent_revision"] = parent.Revision
+				if file.gmailMessageID != "" {
+					meta["gmail_attachment_id"] = file.gmailAttachmentID
+				}
 			}
 			meta["attachment_id"] = file.ID
 			if file.Revision != "" {

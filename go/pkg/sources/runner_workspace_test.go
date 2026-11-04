@@ -56,7 +56,7 @@ func newWorkspaceRunnerFixture(t *testing.T) *workspaceRunnerFixture {
 			return 200, map[string]any{"historyId": "20", "history": []any{}}
 		case "/gmail/messages/message1":
 			f.bodies++
-			return 200, map[string]any{"id": "message1", "labelIds": []string{"INBOX"}, "payload": map[string]any{"mimeType": "multipart/mixed", "parts": []any{
+			return 200, map[string]any{"id": "message1", "historyId": "10", "labelIds": []string{"INBOX"}, "payload": map[string]any{"mimeType": "multipart/mixed", "parts": []any{
 				map[string]any{"partId": "0", "mimeType": "text/plain", "body": map[string]any{"data": base64.RawURLEncoding.EncodeToString([]byte("body"))}},
 				map[string]any{"partId": "1", "filename": "notes.txt", "mimeType": "text/plain", "body": map[string]any{"attachmentId": "attachment1", "size": 5}},
 			}}}

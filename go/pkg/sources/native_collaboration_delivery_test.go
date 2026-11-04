@@ -42,6 +42,8 @@ func TestNativeCollaborationDeliveryUsesSelectedAttachment(t *testing.T) {
 	changed := false
 	brokenSibling := false
 	changedBytes := false
+	inline := false
+	fullReads := 0
 	c.HTTPClient = &http.Client{Transport: collaborationTransport(func(r *http.Request) (*http.Response, error) {
 		if strings.Contains(r.URL.Path, "/attachments/attachment") {
 			if brokenSibling && strings.HasSuffix(r.URL.Path, "/attachment3") {
@@ -74,11 +76,25 @@ func TestNativeCollaborationDeliveryUsesSelectedAttachment(t *testing.T) {
 			if changed {
 				message["historyId"] = "changed"
 			}
+			if r.URL.Query().Get("format") == "metadata" {
+				delete(message, "payload")
+				data, err = json.Marshal(message)
+				require.NoError(t, err)
+				response.Body = io.NopCloser(bytes.NewReader(data))
+				return response, nil
+			}
+			fullReads++
 			payload := message["payload"].(map[string]any)
 			parts := payload["parts"].([]any)
 			parts = parts[:1]
 			for i := 1; i <= 3; i++ {
 				parts = append(parts, map[string]any{"partId": fmt.Sprint(i), "mimeType": "image/png", "filename": fmt.Sprintf("original-%d.png", i), "body": map[string]any{"attachmentId": fmt.Sprintf("attachment%d", i), "size": 5}})
+			}
+			if inline {
+				for _, raw := range parts[1:] {
+					part := raw.(map[string]any)
+					part["body"] = map[string]any{"data": base64.RawURLEncoding.EncodeToString([]byte("notes")), "size": 5}
+				}
 			}
 			payload["parts"] = parts
 			data, err = json.Marshal(message)
@@ -101,11 +117,13 @@ func TestNativeCollaborationDeliveryUsesSelectedAttachment(t *testing.T) {
 	require.Len(t, media, 3)
 	t.Run("head_guard", func(t *testing.T) {
 		downloads = 0
+		fullReads = 0
 		require.NoError(t, checkMediaAccess(t.Context(), c, c, request, media[0].Item))
 		recorder := httptest.NewRecorder()
 		ServeMedia(recorder, httptest.NewRequest("HEAD", "https://proxy.test/item", nil), c, request, media[0].Item, fmt.Sprintf("%x", sha256.Sum256(media[0].Bytes)))
 		require.Equal(t, 200, recorder.Code)
 		require.Zero(t, downloads)
+		require.Zero(t, fullReads)
 		t.Logf("HEAD authorization downloaded %d attachment bodies", downloads)
 	})
 	t.Run("sibling_fetch_amplification", func(t *testing.T) {
@@ -160,6 +178,23 @@ func TestNativeCollaborationDeliveryUsesSelectedAttachment(t *testing.T) {
 		_, _, err := c.AcquireMedia(t.Context(), request, media[0].Item)
 		require.Error(t, err)
 		require.Equal(t, 1, downloads)
+	})
+
+	t.Run("inline_head_and_acquisition", func(t *testing.T) {
+		inline = true
+		defer func() { inline = false }()
+		inputs, err := c.hydrate(t.Context(), request, config, collaborationRef{Resource: "gmail", Container: f.account, ID: "message1"}, nil)
+		require.NoError(t, err)
+		fullReads = 0
+		downloads = 0
+		require.NoError(t, c.CheckMedia(t.Context(), request, inputs[1].Item))
+		require.Zero(t, fullReads)
+		require.Zero(t, downloads)
+		data, _, err := c.AcquireMedia(t.Context(), request, inputs[1].Item)
+		require.NoError(t, err)
+		require.Equal(t, "notes", string(data))
+		require.Equal(t, 1, fullReads)
+		require.Zero(t, downloads)
 	})
 	t.Run("deleted_head", func(t *testing.T) {
 		deleted = true
