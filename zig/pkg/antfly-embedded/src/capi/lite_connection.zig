@@ -2172,6 +2172,10 @@ pub const Owner = struct {
         return self.refreshMaintenanceSnapshotAt(foreground, capture, null);
     }
 
+    fn refreshMaintenanceSnapshotNamed(self: *Owner, foreground: *h.Handle, capture: MaintenanceCapture, name: ?[]const u8) !*h.Handle {
+        return self.refreshMaintenanceSnapshotNamedAt(foreground, capture, null, name);
+    }
+
     fn clearTextSourceRuntimeCache(self: *Owner) void {
         if (self.text_source_runtime_cache) |cache| cache.destroy();
         self.text_source_runtime_cache = null;
@@ -2246,8 +2250,13 @@ pub const Owner = struct {
     /// DB. The optional authority is borrowed under path admission and may
     /// donate only its exact verified allocator cache, never logical runtimes.
     fn refreshMaintenanceSnapshotAt(self: *Owner, foreground: *h.Handle, capture: MaintenanceCapture, physical_tip: ?*native.NativeFile) !*h.Handle {
+        return self.refreshMaintenanceSnapshotNamedAt(foreground, capture, physical_tip, null);
+    }
+
+    fn refreshMaintenanceSnapshotNamedAt(self: *Owner, foreground: *h.Handle, capture: MaintenanceCapture, physical_tip: ?*native.NativeFile, name: ?[]const u8) !*h.Handle {
         const need_database = capture != .storage;
         std.debug.assert(physical_tip == null or !need_database);
+        std.debug.assert(name == null or need_database);
         const file = physical_tip orelse &foreground.owned_lite_backend.?.native_docstore.?.file;
         if (self.maintenance_snapshot) |snapshot| {
             const cached_store = snapshot.owned_lite_backend.?.native_docstore.?;
@@ -2272,7 +2281,11 @@ pub const Owner = struct {
                     std.mem.eql(u8, &expected.metadata, &logical.metadata) and std.mem.eql(u8, &expected.indexes, &logical.indexes)
             else
                 false;
-            if (same_inode and (!need_database or snapshot.db_live) and
+            const merge_borrows = if (name) |selected_name|
+                !snapshot.embedded_tables.contains(selected_name) and if (self.pending_text_merge) |job| job.root == snapshot else false
+            else
+                false;
+            if (!merge_borrows and same_inode and (!need_database or snapshot.db_live) and
                 ((std.meta.eql(file.header, captured.header) and !snapshot.db_live) or retained_inputs_match or source_inputs_match))
             {
                 // Primary commits do not invalidate immutable index continuations.
@@ -2297,6 +2310,7 @@ pub const Owner = struct {
                 snapshot.sql_ddl_recovery_needed = physical_tip != null or foreground.sql_ddl_recovery_needed;
                 snapshot.sql_ddl_recovery_generation = foreground.sql_ddl_recovery_generation;
                 self.configureRetirementBudget(cached_store);
+                if (name) |selected_name| _ = try self.openMaintenanceNamespace(snapshot, selected_name);
                 return snapshot;
             }
         }
@@ -2362,6 +2376,12 @@ pub const Owner = struct {
         store.file.reader_coordinator = self.reader_coordinator;
         store.file.writer_allocator_cache = &self.gate.writer_allocator_cache;
         try store.file.inheritAllocatorVerification(file);
+        // Named indexes must open before the old wrapper closes. The source
+        // pool can then hand unchanged immutable ranges to the new runtime
+        // without republishing one durable lease per segment. Mutable actors
+        // are still freshly constructed, and inode/root identities fence each
+        // pooled range. A failed open leaves the old snapshot owned here.
+        if (name) |selected_name| _ = try self.openMaintenanceNamespace(snapshot, selected_name);
         if (self.maintenance_snapshot) |old| {
             try store.file.inheritAllocatorVerification(&old.owned_lite_backend.?.native_docstore.?.file);
             // Policy scheduling and telemetry belong to this connection;
@@ -2876,7 +2896,7 @@ pub const Owner = struct {
             // it on the serving wrapper first duplicated all index/provider
             // startup merely to discover this turn's work.
             const namespace_root = if (self.options.profile == .native) blk: {
-                selected_root = try self.refreshMaintenanceSnapshot(foreground, .source);
+                selected_root = try self.refreshMaintenanceSnapshotNamed(foreground, .source, name);
                 // A merge can co-own the selected runtime. A namespace switch
                 // must retire that whole cache reference, never close the
                 // table whose immutable merge inputs still borrow its owner.
@@ -2886,7 +2906,7 @@ pub const Owner = struct {
                         self.maintenance_retained_logical = null;
                         self.maintenance_snapshot = null;
                         closeMaintenanceSnapshot(selected_root.?);
-                        selected_root = try self.refreshMaintenanceSnapshot(foreground, .source);
+                        selected_root = try self.refreshMaintenanceSnapshotNamed(foreground, .source, name);
                     };
                 }
                 const selected_store = selected_root.?.owned_lite_backend.?.native_docstore.?;
@@ -3056,7 +3076,7 @@ pub const Owner = struct {
         // merely because inference or segment construction is still running.
         // Hosted/manual runtimes retain their caller-supplied provider borrow.
         const independent = self.options.profile == .native;
-        const root = selected_root orelse if (independent) try self.refreshMaintenanceSnapshot(foreground, if (run_source) .source else if (run_database) .artifacts else .storage) else foreground;
+        const root = selected_root orelse if (independent) try self.refreshMaintenanceSnapshotNamed(foreground, if (run_source) .source else if (run_database) .artifacts else .storage, if (selected) |table| table.name else null) else foreground;
         if (independent and run_database) {
             database = if (selected) |table| try @import("tables.zig").get(root, table.name) else &root.db;
             // Immutable inputs retain durable range leases throughout replay;
@@ -3752,6 +3772,7 @@ pub const Owner = struct {
         if (self.current) |current| {
             const work = current.owned_lite_backend.?.native_docstore.?.file.allocatorWorkSnapshot();
             std.log.info("antfly_bench_native_allocator full_loads={d} full_load_ns={d} digest_rebuilds={d} digest_rebuild_ns={d} journal_rebases={d} journal_rebase_ns={d} cache_transfers={d}", .{ work.full_loads, work.full_load_ns, work.digest_rebuilds, work.digest_rebuild_ns, work.journal_rebases, work.journal_rebase_ns, work.cache_transfers });
+            std.log.info("antfly_bench_native_artifact_sources opens={d} reuses={d}", .{ work.artifact_source_opens, work.artifact_source_reuses });
         }
         const f = p.maintenance_failures;
         std.log.info("antfly_bench_native_runtime maintenance_opens={d} namespace_opens={d} source_reuses={d}", .{ p.maintenance_runtime_opens, p.maintenance_namespace_opens, p.maintenance_source_runtime_reuses });
@@ -8549,6 +8570,44 @@ test "capi native maintenance named selection opens only its detached table runt
     try std.testing.expect(!probe.serving_open);
 }
 
+test "capi native named runtime replacement hands off immutable artifact sources before closing" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("named-runtime-artifact-handoff", 5000, .batch);
+    defer fixture.deinit();
+    var lease = try fixture.connection.acquire();
+    defer {
+        lease.close();
+        fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    }
+    const owner = fixture.connection.owner;
+    const foreground = try owner.refresh();
+    const tables = @import("tables.zig");
+    try tables.create(foreground, "active", "{}", false);
+    const table = try tables.get(foreground, "active");
+    try table.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    try table.batch(.{ .writes = &.{.{ .key = "one", .value = "{\"text\":\"immutable handoff canary\"}" }}, .sync_level = .full_text });
+    // No serving runtime may keep a pooled source alive for this test. The
+    // only possible donor on the second open is the previous detached table.
+    tables.closeAll(foreground);
+    const first = try owner.refreshMaintenanceSnapshotNamed(foreground, .source, "active");
+    try std.testing.expect(first.embedded_tables.contains("active"));
+    try std.testing.expect(first.owned_lite_backend.?.native_docstore.?.file.allocator_work.artifact_source_opens != 0);
+    try foreground.owned_lite_backend.?.native_docstore.?.file.putDocument("handoff-primary-tip", "fresh");
+    // No mutable-runtime witness is installed. This is a real replacement,
+    // even though every immutable input remains identical.
+    try std.testing.expect(owner.text_source_runtime_cache == null);
+    const second = try owner.refreshMaintenanceSnapshotNamed(foreground, .source, "active");
+    try std.testing.expect(second != first);
+    const file = &second.owned_lite_backend.?.native_docstore.?.file;
+    try std.testing.expectEqual(@as(u64, 0), file.allocator_work.artifact_source_opens);
+    try std.testing.expect(file.allocator_work.artifact_source_reuses != 0);
+    var row = (try (try tables.get(second, "active")).lookup(std.testing.allocator, "one", .{})) orelse return error.TestUnexpectedResult;
+    defer row.deinit(std.testing.allocator);
+    const fresh = (try file.getDocumentAlloc(std.testing.allocator, "handoff-primary-tip")) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(fresh);
+    try std.testing.expectEqualStrings("fresh", fresh);
+}
+
 test "capi native maintenance relational replay diagnoses bounded runtime reuse" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -8866,15 +8925,17 @@ test "capi native retirement selection never materializes primary payload pages"
         fixture.connection.gate.mutex.unlock(h.handleLockIo());
     }
     const root = try fixture.connection.owner.refresh();
-    const file = &root.owned_lite_backend.?.native_docstore.?.file;
     const value = try std.testing.allocator.alloc(u8, 1024 * 1024);
     defer std.testing.allocator.free(value);
     @memset(value, 'v');
     try root.db.core.store.put("retirement-payload", value);
-    const cached = file.page_cache_enabled.swap(false, .monotonic);
-    defer file.page_cache_enabled.store(cached, .monotonic);
     var txn = try root.db.core.store.beginReadTxn();
     defer txn.abort();
+    // Read transactions use their own checkpoint-generation file, rather
+    // than the writer's file and counters.
+    const file = &root.owned_lite_backend.?.native_docstore.?.read_generation.?.file;
+    const cached = file.page_cache_enabled.swap(false, .monotonic);
+    defer file.page_cache_enabled.store(cached, .monotonic);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const pages = @import("../storage/db/group_source_page.zig");

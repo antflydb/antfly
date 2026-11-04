@@ -1280,6 +1280,11 @@ and replay control records, resets mutable primary observations, and acquires a
 fresh source epoch. Idle visits retire invalidated inputs as well. Active merge
 borrows retain independent ownership, and unsupported provider/index runtimes
 still reopen. An artifact-only continuation cannot grant source reuse authority.
+When a named runtime needs replacement, its successor opens the selected table
+before releasing the predecessor. Unchanged immutable artifact ranges transfer
+through the inode/root-fenced source pool, so fresh mutable replay actors do not
+require fresh durable leases for every unchanged segment. Failed construction
+leaves the predecessor owned; an active merge keeps its independent reference.
 Private merge staging preserves the runtime's original logical witnesses even
 when allocator admission adopts a newer physical checkpoint. Private bytes do
 not grant authority over a foreign index publication. Nested writer leases also
