@@ -8361,10 +8361,9 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(400);
                 return ctx.text(public_table_http.inference_endpoint_access_denied_message);
             },
-            error.EmbeddingProbeUnavailable => {
-                _ = ctx.status(503);
-                try ctx.setHeader("Retry-After", "1");
-                return ctx.text("table index validation probe unavailable");
+            error.ResourceLimitExceeded, error.MemoryBudgetExceeded, error.EmbeddingProbeUnavailable => {
+                var failure = try public_table_http.embeddingValidationFailureResponse(alloc, err);
+                return respondOwnedApiResponse(ctx, &failure);
             },
             else => return err,
         };
@@ -8391,10 +8390,9 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(400);
                 return ctx.text(public_table_http.inference_endpoint_access_denied_message);
             },
-            error.EmbeddingProbeUnavailable => {
-                _ = ctx.status(503);
-                try ctx.setHeader("Retry-After", "1");
-                return ctx.text("table index validation probe unavailable");
+            error.ResourceLimitExceeded, error.MemoryBudgetExceeded, error.EmbeddingProbeUnavailable => {
+                var failure = try public_table_http.embeddingValidationFailureResponse(alloc, err);
+                return respondOwnedApiResponse(ctx, &failure);
             },
             error.InvalidCreateTableRequest, error.ChatGPTInteractiveOnly => {
                 _ = ctx.status(400);

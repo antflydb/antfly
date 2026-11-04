@@ -22785,6 +22785,9 @@ components:
         message:
           type: string
           description: Human-readable error description when supplied by the endpoint.
+        pointer:
+          type: string
+          description: Optional RFC 6901 JSON Pointer identifying the invalid request field.
         retryable:
           type: boolean
           description: Whether retrying the operation may succeed without changing the request.

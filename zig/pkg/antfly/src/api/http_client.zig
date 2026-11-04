@@ -3893,6 +3893,13 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         if (resp.status != 201) {
+            if (resp.status == 400) {
+                const failure = std.json.parseFromSlice(struct { @"error": []const u8 = "" }, self.alloc, resp.body, .{ .ignore_unknown_fields = true }) catch null;
+                if (failure) |parsed| {
+                    defer parsed.deinit();
+                    if (std.mem.eql(u8, parsed.value.@"error", "MODEL_RESOURCE_LIMIT")) return error.ResourceLimitExceeded;
+                }
+            }
             if (resp.status == 503 and std.mem.indexOf(
                 u8,
                 resp.body,

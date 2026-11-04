@@ -6376,6 +6376,8 @@ pub const HttpHandler = struct {
         ) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
             error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.ModelNotFound => return error.ModelNotFound,
             else => return error.InternalFailure,
@@ -6387,6 +6389,8 @@ pub const HttpHandler = struct {
         }) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
             error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.ModelNotFound => return error.ModelNotFound,
             else => return error.InternalFailure,
@@ -12518,6 +12522,7 @@ test "serverless http handler create index expands schema-derived algebraic conf
 test "serverless create index normalization resolves and persists one probed embedding dimension" {
     const FakeProvider = struct {
         calls: usize = 0,
+        failure: ?anyerror = null,
 
         fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
@@ -12530,6 +12535,7 @@ test "serverless create index normalization resolves and persists one probed emb
         fn embedDense(ptr: *anyopaque, alloc: Allocator, _: []const u8, texts: []const []const u8) ![][]f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
+            if (self.failure) |failure| return failure;
             const vectors = try alloc.alloc([]f32, texts.len);
             errdefer alloc.free(vectors);
             var initialized: usize = 0;
@@ -12583,6 +12589,12 @@ test "serverless create index normalization resolves and persists one probed emb
         "{\"name\":\"semantic_idx\",\"type\":\"embeddings\",\"publication_policy\":\"progressive\",\"field\":\"body\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"dimension\":3}",
         response,
     );
+    for ([_]anyerror{ error.ResourceLimitExceeded, error.MemoryBudgetExceeded }) |failure| {
+        provider.failure = failure;
+        try std.testing.expectError(failure, normalizeServerlessCreateIndexConfig(alloc, "semantic_idx",
+            \\{"type":"embeddings","field":"body","embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+        , options));
+    }
 }
 
 test "serverless index catalog validation rejects malformed configs" {
