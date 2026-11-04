@@ -134,7 +134,7 @@ fn planningTurn(a: A, client_value: @import("objectstore").Client, bucket: []con
             progress.partial = null;
             continue;
         }
-        var sources: usize = 1;
+        var sources: catalog.manifest_inventory.BootstrapBudget = .{ .remaining_sources = 1 };
         const list = (try inventories.load(a, candidate.uri, true, &sources)) orelse return error.InvalidLakeVacuumPlan;
         const source_bytes = inventories.source_bytes_read;
         inventories.source_bytes_read = 0;
