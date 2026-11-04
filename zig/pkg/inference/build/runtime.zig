@@ -196,8 +196,15 @@ pub fn create(config: Config) Graph {
     };
     const fst_mod = shared.fst orelse createSharedModule(config, "lib/fst/src/mod.zig");
     const google_mod = shared.google orelse blk: {
+        const cancellation = createSharedModule(config, "lib/runtime/src/cancellation.zig");
+        cancellation.addImport("antfly_runtime_abi", runtime_abi_mod);
+        const credentials = createSharedModule(config, "lib/credentials/src/root.zig");
+        credentials.addImport("httpx", httpx_mod);
+        credentials.addImport("antfly_cancellation", cancellation);
+        credentials.addImport("antfly_platform", platform_mod);
         const mod = createSharedModule(config, "lib/google/src/root.zig");
         mod.addImport("httpx", httpx_mod);
+        mod.addImport("antfly_credentials", credentials);
         mod.addImport("antfly_platform", platform_mod);
         break :blk mod;
     };

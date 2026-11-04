@@ -445,6 +445,17 @@ antfly_error_code antfly_db_batch_json_with_receipt(
     antfly_buffer *out,
     antfly_buffer *receipt_out
 );
+/* antfly_db_batch with the same-call receipt, as above. */
+antfly_error_code antfly_db_batch_with_receipt(
+    antfly_db *db,
+    const antfly_write_intent *writes,
+    size_t write_count,
+    const antfly_version_predicate *predicates,
+    size_t predicate_count,
+    uint64_t timestamp_ns,
+    uint8_t sync_level,
+    antfly_buffer *receipt_out
+);
 antfly_error_code antfly_db_outcome_receipt_status(
     antfly_db *db,
     antfly_slice receipt,
@@ -725,8 +736,8 @@ antfly_error_code antfly_db_match_pattern_json(antfly_db *db, antfly_slice reque
  * use and stay cached until the handle closes. Each call takes the request
  * JSON and returns the response JSON of the matching /ai/v1 route of the
  * Antfly inference HTTP API (see specs/openapi/inference/api.yaml): embed,
- * rerank, chunk, generate, generate/batch, rewrite, decide, extract, read (OCR),
- * transcribe, and models. Binary inputs such as images and audio are passed inline, as base64
+ * rerank, chunk, generate, generate/batch, rewrite, decide, extract, read (images, documents, audio),
+ * and models. Binary inputs such as images and audio are passed inline, as base64
  * or data: URIs. The _json calls return complete responses: a generate
  * request with "stream": true fails with ANTFLY_INVALID_ARGUMENT; use
  * antfly_inference_generate_stream_json to stream.
@@ -820,7 +831,6 @@ antfly_error_code antfly_inference_rewrite_json(antfly_inference *inference, ant
 antfly_error_code antfly_inference_decide_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_inference_extract_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_inference_read_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
-antfly_error_code antfly_inference_transcribe_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 /* The installed models, as returned by GET /ai/v1/models. */
 antfly_error_code antfly_inference_list_models_json(antfly_inference *inference, antfly_buffer *out);
 

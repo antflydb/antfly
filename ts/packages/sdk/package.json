@@ -11,6 +11,11 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
+    },
+    "./sources": {
+      "types": "./dist/sources-client.d.ts",
+      "import": "./dist/sources-client.js",
+      "require": "./dist/sources-client.cjs"
     }
   },
   "files": [

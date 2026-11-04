@@ -261,6 +261,19 @@ export interface NativeLibrary {
       syncLevel: number
     ) => number
   >;
+  /** Struct batch that returns the outcome receipt in the same call. */
+  dbBatchWithReceipt: KoffiFunc<
+    (
+      handle: unknown,
+      writes: object[] | null,
+      writeCount: number,
+      predicates: object[] | null,
+      predicateCount: number,
+      timestampNs: number | bigint,
+      syncLevel: number,
+      receiptOut: object
+    ) => number
+  >;
   dbBatchJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
   /** Batch JSON that returns the outcome receipt in the same call. */
   dbBatchJsonWithReceipt: KoffiFunc<
@@ -406,7 +419,6 @@ export interface NativeLibrary {
   inferenceDecideJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
   inferenceExtractJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
   inferenceReadJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
-  inferenceTranscribeJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
   inferenceListModelsJson: KoffiFunc<(handle: unknown, out: object) => number>;
   inferencePullJson: KoffiFunc<
     (
@@ -586,6 +598,16 @@ function buildNative(): NativeLibrary {
       "size_t",
       "uint64_t",
       "uint8_t",
+    ]),
+    dbBatchWithReceipt: f("antfly_db_batch_with_receipt", "uint32_t", [
+      PAntflyDb,
+      PAntflyWriteIntentArray,
+      "size_t",
+      PAntflyVersionPredicateArray,
+      "size_t",
+      "uint64_t",
+      "uint8_t",
+      PAntflyBufferOut,
     ]),
     dbBatchJson: f("antfly_db_batch_json", "uint32_t", [PAntflyDb, AntflySlice, PAntflyBufferOut]),
     dbBatchJsonWithReceipt: f("antfly_db_batch_json_with_receipt", "uint32_t", [
@@ -882,11 +904,6 @@ function buildNative(): NativeLibrary {
       PAntflyBufferOut,
     ]),
     inferenceReadJson: f("antfly_inference_read_json", "uint32_t", [
-      PAntflyInference,
-      AntflySlice,
-      PAntflyBufferOut,
-    ]),
-    inferenceTranscribeJson: f("antfly_inference_transcribe_json", "uint32_t", [
       PAntflyInference,
       AntflySlice,
       PAntflyBufferOut,

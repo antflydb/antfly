@@ -2593,6 +2593,7 @@ pub const Runtime = struct {
             else
                 return error.BatchIncompatible;
             defer transcribing.deinitResponse(alloc, &result);
+            try transcribing.requireComplete(result);
 
             // Diarized transcripts keep their speaker turns in the text
             // form too (`SPEAKER_00: ...` lines); JSON carries them as fields.
@@ -3580,7 +3581,7 @@ pub const Runtime = struct {
         cfg_parsed.value.max_response_bytes = self.responseLimitForTask(.transcriber, 1);
         if (request.media.len > 0) {
             if (!request.inline_media_trusted) return error.UntrustedInlineMedia;
-            if ((cfg_parsed.value.provider != .apple and cfg_parsed.value.provider != .cloudflare) or request.media.len != 1) return error.UnsupportedTranscriptionMedia;
+            if (!cfg_parsed.value.provider.supportsResolvedAudio() or request.media.len != 1) return error.UnsupportedTranscriptionMedia;
         }
         const antfly_model = if (cfg_parsed.value.provider == .antfly)
             try requiredAntflyTranscriberModel(cfg_parsed.value)
@@ -3612,6 +3613,7 @@ pub const Runtime = struct {
             else
                 return error.UnsupportedTranscriberProvider;
             defer transcribing.deinitResponse(alloc, &result);
+            try transcribing.requireComplete(result);
 
             if (isJsonContentType(request.content_type)) {
                 return try std.json.Stringify.valueAlloc(alloc, result, .{});
@@ -3700,6 +3702,7 @@ pub const Runtime = struct {
             return err;
         };
         defer transcribing.deinitResponse(alloc, &result);
+        try transcribing.requireComplete(result);
 
         if (isJsonContentType(request.content_type)) {
             return try std.json.Stringify.valueAlloc(alloc, result, .{});
@@ -7261,7 +7264,8 @@ test "generator item failures preserve remote retry guidance" {
         \\{"index":1,"error":{"code":"CONTENT_TOO_LARGE","retryable":false}}
         \\],"execution":{"requested_items":2,"native_batches":0,"native_items":0,"serial_items":2,"rejected_items":0,"fallback_items":0}}
     ;
-    var batch = try parseAntflyGenerateBatchResponseAlloc(std.testing.allocator, payload, &requests);
+    const parsed = try parseAntflyGenerateBatchResponseAlloc(std.testing.allocator, payload, &requests);
+    var batch = asset_producer.ProducedBatch{ .items = parsed.items, .execution = parsed.execution };
     defer batch.deinit(std.testing.allocator);
 
     const transient = batch.items[0].result.item_error;

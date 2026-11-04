@@ -25416,17 +25416,7 @@ pub const IndexManager = struct {
                     defer producer.deinit(self.alloc);
                     if (producer.type == .media_output) {
                         const upstream = self.getEnrichment(.chunk, cfg.source_artifact_name) orelse return error.InvalidEnrichmentConfig;
-                        var chunk_config = try @import("../../../chunking/types.zig").parseConfigFromSlice(self.alloc, upstream.chunker_json);
-                        defer chunk_config.deinit(self.alloc);
-                        if (chunk_config.outputs_json.len == 0) return error.InvalidEnrichmentConfig;
-                        var output_config = try std.json.parseFromSlice(@import("inference_chunker").outputs.Config, self.alloc, chunk_config.outputs_json, .{});
-                        defer output_config.deinit();
-                        var consumer = try @import("../enrichment/media_output.zig").parse(self.alloc, producer.config_json);
-                        defer consumer.deinit();
-                        const found = for (output_config.value.targets) |target| {
-                            if (std.mem.eql(u8, target.name, consumer.value.output_name)) break true;
-                        } else false;
-                        if (!found or upstream.source_artifact_name.len != 0) return error.InvalidEnrichmentConfig;
+                        try enrichment_config_validation.validateMediaOutputSource(self.alloc, cfg.producer_json, upstream.chunker_json, upstream.source_artifact_name);
                         return;
                     }
                     if (producer.type == .vector_labels) {
@@ -25440,6 +25430,7 @@ pub const IndexManager = struct {
                     while (current.len > 0) {
                         if (std.mem.eql(u8, current, cfg.name)) return error.InvalidEnrichmentConfig;
                         const upstream = self.getEnrichment(.asset, current) orelse return error.InvalidEnrichmentConfig;
+                        if (try enrichment_config_validation.assetSourceChainEndsHere(self.alloc, upstream.producer_json)) break;
                         current = upstream.source_artifact_name;
                         hops += 1;
                         if (hops > self.enrichments.items.len) return error.InvalidEnrichmentConfig;

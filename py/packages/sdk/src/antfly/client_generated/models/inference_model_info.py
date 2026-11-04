@@ -10,6 +10,7 @@ from ..models.inference_model_info_compatibility import InferenceModelInfoCompat
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.inference_audio_read_capabilities import InferenceAudioReadCapabilities
     from ..models.inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
     from ..models.inference_model_info_dense_output import InferenceModelInfoDenseOutput
     from ..models.inference_model_info_error import InferenceModelInfoError
@@ -25,6 +26,7 @@ class InferenceModelInfo:
     """Information about a model including its capabilities
 
     Attributes:
+        audio_read (InferenceAudioReadCapabilities | Unset):
         chunking_limits (InferenceModelInfoChunkingLimits | Unset): Effective model-aware chunk operational ceilings for
             working/output/event
             bytes, chunk/dependency/index counts and remote fetched bytes, requests
@@ -36,6 +38,9 @@ class InferenceModelInfo:
         dense_output (InferenceModelInfoDenseOutput | Unset): Proven native dense output width and inclusive supported
             truncation range, read from resolved metadata without loading weights. Omitted when unknown or for non-embedding
             tasks.
+        model_revision_pinning (bool | Unset): The embedding endpoint enforces model_revision and acknowledges
+            successful execution in X-Antfly-Model-Revision for both JSON and numeric responses. An observed model_revision
+            alone does not establish this support. Default: False.
         model_revision (str | Unset): Immutable resolved embedding or generator generation, returned for scoped
             model/task discovery without loading weights.
         qualified_limits (InferenceModelInfoQualifiedLimits | Unset): Pull-time qualified request profiles for this
@@ -57,9 +62,11 @@ class InferenceModelInfo:
         inputs (list[str] | Unset): List of input modalities this model accepts, such as `text`, `image`, or `audio`
     """
 
+    audio_read: InferenceAudioReadCapabilities | Unset = UNSET
     chunking_limits: InferenceModelInfoChunkingLimits | Unset = UNSET
     inference_capabilities: InferenceModelInfoInferenceCapabilities | Unset = UNSET
     dense_output: InferenceModelInfoDenseOutput | Unset = UNSET
+    model_revision_pinning: bool | Unset = False
     model_revision: str | Unset = UNSET
     qualified_limits: InferenceModelInfoQualifiedLimits | Unset = UNSET
     compatibility: InferenceModelInfoCompatibility | Unset = UNSET
@@ -70,6 +77,10 @@ class InferenceModelInfo:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        audio_read: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.audio_read, Unset):
+            audio_read = self.audio_read.to_dict()
+
         chunking_limits: dict[str, Any] | Unset = UNSET
         if not isinstance(self.chunking_limits, Unset):
             chunking_limits = self.chunking_limits.to_dict()
@@ -81,6 +92,8 @@ class InferenceModelInfo:
         dense_output: dict[str, Any] | Unset = UNSET
         if not isinstance(self.dense_output, Unset):
             dense_output = self.dense_output.to_dict()
+
+        model_revision_pinning = self.model_revision_pinning
 
         model_revision = self.model_revision
 
@@ -109,12 +122,16 @@ class InferenceModelInfo:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if audio_read is not UNSET:
+            field_dict["audio_read"] = audio_read
         if chunking_limits is not UNSET:
             field_dict["chunking_limits"] = chunking_limits
         if inference_capabilities is not UNSET:
             field_dict["inference_capabilities"] = inference_capabilities
         if dense_output is not UNSET:
             field_dict["dense_output"] = dense_output
+        if model_revision_pinning is not UNSET:
+            field_dict["model_revision_pinning"] = model_revision_pinning
         if model_revision is not UNSET:
             field_dict["model_revision"] = model_revision
         if qualified_limits is not UNSET:
@@ -134,6 +151,7 @@ class InferenceModelInfo:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.inference_audio_read_capabilities import InferenceAudioReadCapabilities
         from ..models.inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
         from ..models.inference_model_info_dense_output import InferenceModelInfoDenseOutput
         from ..models.inference_model_info_error import InferenceModelInfoError
@@ -141,6 +159,13 @@ class InferenceModelInfo:
         from ..models.inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 
         d = dict(src_dict)
+        _audio_read = d.pop("audio_read", UNSET)
+        audio_read: InferenceAudioReadCapabilities | Unset
+        if isinstance(_audio_read, Unset):
+            audio_read = UNSET
+        else:
+            audio_read = InferenceAudioReadCapabilities.from_dict(_audio_read)
+
         _chunking_limits = d.pop("chunking_limits", UNSET)
         chunking_limits: InferenceModelInfoChunkingLimits | Unset
         if isinstance(_chunking_limits, Unset):
@@ -161,6 +186,8 @@ class InferenceModelInfo:
             dense_output = UNSET
         else:
             dense_output = InferenceModelInfoDenseOutput.from_dict(_dense_output)
+
+        model_revision_pinning = d.pop("model_revision_pinning", UNSET)
 
         model_revision = d.pop("model_revision", UNSET)
 
@@ -192,9 +219,11 @@ class InferenceModelInfo:
         inputs = cast(list[str], d.pop("inputs", UNSET))
 
         inference_model_info = cls(
+            audio_read=audio_read,
             chunking_limits=chunking_limits,
             inference_capabilities=inference_capabilities,
             dense_output=dense_output,
+            model_revision_pinning=model_revision_pinning,
             model_revision=model_revision,
             qualified_limits=qualified_limits,
             compatibility=compatibility,

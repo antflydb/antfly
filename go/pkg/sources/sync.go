@@ -26,7 +26,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
 )
 
 const ScopedMergeContentType = "application/vnd.antfly.scoped-merge.v1+json"
@@ -77,6 +76,14 @@ type SyncClient interface {
 	Batch(context.Context, string, map[string]any, []string) error
 }
 
+// SyncMergeValidator optionally enforces application policy against the exact
+// serialized request before dispatch. Implementations must be read-only and
+// must never dispatch writes. Rejection leaves that page unverified while
+// allowing other pages to proceed. Any Merge error still fences the writer.
+type SyncMergeValidator interface {
+	ValidateMerge(context.Context, string, []byte) error
+}
+
 // SyncWriter performs non-destructive writes first. Finish reconciles missing
 // records only after every item in a complete pinned inventory is query-visible.
 // Runtimes must serialize writers for the same source; different source ranges
@@ -120,15 +127,15 @@ func (w *SyncWriter) Upsert(ctx context.Context, documents map[string]Document) 
 	ids := make([]string, 0, len(documents))
 	for id, doc := range documents {
 		key, err := RecordKey(w.sourceID, configString(doc.Metadata, "identity"))
-		if err != nil || key != id || !w.inventory[id] || configString(doc.Metadata, "source_id") != w.sourceID || doc.Version != 1 || configString(doc.Metadata, "sha256") == "" {
+		if err != nil || key != id || !w.inventory[id] || configString(doc.Metadata, "source_id") != w.sourceID {
 			w.failed = true
 			return MergeResult{}, fmt.Errorf("record outside pinned source inventory")
 		}
-		digest := sha256.Sum256([]byte(doc.Content))
-		if !utf8.ValidString(doc.Content) || strings.ContainsRune(doc.Content, 0) || configString(doc.Metadata, "sha256") != hex.EncodeToString(digest[:]) {
+		if err := validateDocumentContent(doc); err != nil {
 			w.failed = true
-			return MergeResult{}, fmt.Errorf("source content digest does not match normalized text")
+			return MergeResult{}, err
 		}
+
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
@@ -152,7 +159,7 @@ func (w *SyncWriter) Upsert(ctx context.Context, documents map[string]Document) 
 			return MergeResult{}, fmt.Errorf("unexpected source metadata identity")
 		}
 		seen[hit.ID] = true
-		before, after := hit.Source.Grep, doc
+		before, after := hit.Source.Document, doc
 		before.IndexedAt, after.IndexedAt = 0, 0
 		a, err := projectionDigest(before)
 		if err != nil {
@@ -163,7 +170,7 @@ func (w *SyncWriter) Upsert(ctx context.Context, documents map[string]Document) 
 			return MergeResult{}, err
 		}
 		if a == b && sourceRowMatches(hit, w.sourceID) {
-			doc.IndexedAt = hit.Source.Grep.IndexedAt
+			doc.IndexedAt = hit.Source.Document.IndexedAt
 			documents[hit.ID] = doc
 			unchanged[hit.ID] = true
 		}
@@ -178,7 +185,10 @@ func (w *SyncWriter) Upsert(ctx context.Context, documents map[string]Document) 
 		doc := documents[id]
 		changed[id] = doc
 		changedIDs = append(changedIDs, id)
-		rows[id] = map[string]any{"id": id, "source_id": w.sourceID, "doc_type": "source_item", "grep": doc}
+		rows[id], err = SourceRow(id, w.sourceID, doc)
+		if err != nil {
+			return MergeResult{}, err
+		}
 	}
 	result := MergeResult{Status: "success", Skipped: len(unchanged)}
 	if len(changedIDs) > 0 {
@@ -251,6 +261,21 @@ func (w *SyncWriter) Finish(ctx context.Context) (MergeResult, error) {
 	return result, nil
 }
 func (w *SyncWriter) merge(ctx context.Context, page ScopedMergePage, expectedTo string, count int) (result MergeResult, err error) {
+	body, err := json.Marshal(ScopedMergeRequest{ScopedMerge: page})
+	if err != nil {
+		return MergeResult{}, err
+	}
+	if len(body) > 64<<20 {
+		return MergeResult{}, fmt.Errorf("source merge page exceeds 64 MiB")
+	}
+	// A caller-owned policy may reject an exact serialized request before any
+	// mutation is dispatched. Failed items remain unverified and cannot authorize
+	// reconciliation, but independent siblings can still be written safely.
+	if validator, ok := w.client.(SyncMergeValidator); ok {
+		if err := validator.ValidateMerge(ctx, w.table, body); err != nil {
+			return MergeResult{}, err
+		}
+	}
 	// A lost/invalid acknowledgement cannot authorize another mutation or cleanup
 	// on this writer. Recover with a new inventory writer and fresh visibility.
 	defer func() {
@@ -259,13 +284,6 @@ func (w *SyncWriter) merge(ctx context.Context, page ScopedMergePage, expectedTo
 		}
 	}()
 
-	body, err := json.Marshal(ScopedMergeRequest{ScopedMerge: page})
-	if err != nil {
-		return MergeResult{}, err
-	}
-	if len(body) > 64<<20 {
-		return MergeResult{}, fmt.Errorf("source merge page exceeds 64 MiB")
-	}
 	raw, err := w.client.Merge(ctx, w.table, body)
 	if err != nil {
 		return MergeResult{}, err
@@ -289,7 +307,7 @@ type syncHit struct {
 		ID       string   `json:"id"`
 		SourceID string   `json:"source_id"`
 		DocType  string   `json:"doc_type"`
-		Grep     Document `json:"grep"`
+		Document Document `json:"-"`
 	} `json:"_source"`
 }
 

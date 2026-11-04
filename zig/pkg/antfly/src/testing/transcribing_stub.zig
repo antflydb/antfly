@@ -22,6 +22,16 @@ pub const Provider = enum {
     antfly,
     openai,
     google,
+    cloudflare,
+    vertex,
+    apple,
+
+    pub fn supportsResolvedAudio(self: @This()) bool {
+        return switch (self) {
+            .openai, .google, .cloudflare, .vertex, .apple => true,
+            .antfly => false,
+        };
+    }
 };
 
 pub const Config = struct {
@@ -57,6 +67,7 @@ pub const Speaker = struct {
 };
 
 pub const Response = struct {
+    status: ?[]const u8 = null,
     text: ?[]const u8 = null,
     language: ?[]const u8 = null,
     segments: ?[]const Segment = null,
@@ -226,7 +237,17 @@ pub fn deinitConfig(alloc: Allocator, cfg: *Config) void {
     cfg.* = undefined;
 }
 
+pub fn requireComplete(response: Response) !void {
+    if (response.status) |status| {
+        if (std.mem.eql(u8, status, "complete")) return;
+        if (std.mem.eql(u8, status, "truncated")) return error.ReadOutputTruncated;
+        if (std.mem.eql(u8, status, "unresolved")) return error.DocumentUnresolved;
+        return error.InvalidInferenceResponse;
+    }
+}
+
 pub fn deinitResponse(alloc: Allocator, response: *Response) void {
+    freeOpt(alloc, response.status);
     freeOpt(alloc, response.text);
     freeOpt(alloc, response.language);
     if (response.segments) |segments| {

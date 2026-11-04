@@ -458,3 +458,23 @@ Unsafe integer numbers are rejected because their original value is already lost
 `parseMemoryJSON` and `stringifyMemoryJSON` provide the same codec for external
 persistence or logging. The ordinary `client.api` surface retains its existing
 number types; native memory endpoints live on `client.memoryApi`.
+
+## Optional source management
+
+Import from `@antfly/sdk/sources`. The explicit base URL points to the Go source
+server or Colony's instance-scoped management mount, not the database listener.
+
+```typescript
+import { SourcesClient } from "@antfly/sdk/sources";
+const sources = new SourcesClient({
+  baseUrl: "https://sources.example.com/sources/v1",
+  token: sourceManagementToken,
+});
+const run = await sources.startRun(sourceId, submissionKey);
+const receipt = await sources.run(sourceId, run.id);
+```
+
+Reuse a submission key after an ambiguous response; use a new key for new work.
+Inspect both execution state and publication outcome. Provider credentials and
+media delivery stay in the selected runtime. `StandaloneSourcesClient` exposes
+standalone-only credential installation and legacy whole-profile operations.

@@ -867,6 +867,7 @@ test "capi SQL outcome receipt resolves a Lite autocommit write of unknown outco
         defer reply.deinit();
         try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, reply.code);
         const receipt = try lastReceiptAlloc();
+        errdefer std.testing.allocator.free(receipt);
         // The SQL error body carries the same receipt, naming table `t`
         // and its durable id, whose database holds the marker.
         try std.testing.expectEqualStrings(receipt, reply.parsed.?.value.object.get("outcome_receipt").?.string);
@@ -928,11 +929,11 @@ test "capi SQL outcome receipt for a dropped and recreated table fails closed" {
     // The write applied to the old `t`. A new `t` holds no marker for it, so
     // reading there would wrongly answer "not applied" and invite a retry.
     try f.expectOk("{\"statement\":\"DROP TABLE t\"}");
-    try std.testing.expect((try receiptStatus(f.id, text)).code != .ok);
+    try std.testing.expectEqual(h.capi.ErrorCode.not_found, (try receiptStatus(f.id, text)).code);
     try f.expectOk("{\"statement\":\"CREATE TABLE t (n BIGINT)\"}");
     try std.testing.expect((try tableT(f.id)).id != original.id);
     const replaced = try receiptStatus(f.id, text);
-    try std.testing.expect(replaced.code != .ok);
+    try std.testing.expectEqual(h.capi.ErrorCode.not_found, replaced.code);
     try std.testing.expectEqual(@as(u8, 0), replaced.status);
     try std.testing.expect(@import("db.zig").antfly_db_outcome_receipt_forget(f.id, .fromSlice(text)) != .ok);
 }
@@ -1081,6 +1082,17 @@ test "capi SQL outcome receipt for a Lite batch export of unknown outcome" {
     try std.testing.expect(std.mem.startsWith(u8, second, "or1:"));
     try std.testing.expect(!std.mem.eql(u8, second, receipt));
     try std.testing.expectEqual(if (found) api.ANTFLY_OUTCOME_RECEIPT_APPLIED else api.ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED, resolved.status);
+    // The struct batch has a same-call variant too.
+    var third_fault: PrimaryFault = .{ .fixture = &f, .err = error.InputOutput, .publication = true };
+    third_fault.arm();
+    var struct_receipt: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&struct_receipt);
+    const writes = [_]h.capi.WriteIntent{.{ .key = .fromSlice("receipt-key-3"), .value = .fromSlice("{\"v\":1}") }};
+    try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, api.antfly_db_batch_with_receipt(f.id, &writes, writes.len, null, 0, 0, 0, &struct_receipt));
+    PrimaryFault.disarm();
+    const third = struct_receipt.ptr.?[0..struct_receipt.len];
+    try std.testing.expect(std.mem.startsWith(u8, third, "or1:"));
+    try std.testing.expect(!std.mem.eql(u8, third, second));
 }
 
 test "capi SQL outcome receipt on a directory handle stays pending until reopen, then resolves" {

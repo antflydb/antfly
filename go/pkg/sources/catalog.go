@@ -15,7 +15,10 @@
 
 package sources
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"reflect"
+)
 
 // Catalog describes search bindings, not credentials or authority. An endpoint
 // is an ordinary Antfly API base URL. Hosted adapters may use an origin-pinned
@@ -27,11 +30,15 @@ type Catalog struct {
 	Principals []string  `json:"principals"`
 }
 type Binding struct {
+	Fields            *DocumentFields `json:"fields,omitempty"`
+	Streams           []TextStream    `json:"streams,omitempty"`
+	Publication       string          `json:"publication,omitempty"`
+	DocumentVersion   int             `json:"document_version,omitempty"`
 	PublishedRevision string          `json:"published_revision,omitempty"`
 	ID                string          `json:"id"`
 	Alias             string          `json:"alias"`
 	Table             string          `json:"table"`
-	DocumentField     string          `json:"document_field"`
+	DocumentField     string          `json:"document_field,omitempty"`
 	Filter            json.RawMessage `json:"filter"`
 	Status            string          `json:"status"`
 	AccessID          string          `json:"access_id,omitempty"`
@@ -41,4 +48,10 @@ type Binding struct {
 func SourceFilter(id string) json.RawMessage {
 	raw, _ := json.Marshal(map[string]any{"conjuncts": []any{map[string]any{"equals": id, "field": "source_id"}, map[string]any{"equals": "source_item", "field": "doc_type"}}})
 	return raw
+}
+
+// SameRecordLayout prevents a retained publication from advertising a row
+// format that its inventory has not completely published yet.
+func (b Binding) SameRecordLayout(other Binding) bool {
+	return b.DocumentVersion == other.DocumentVersion && b.DocumentField == other.DocumentField && reflect.DeepEqual(b.Fields, other.Fields)
 }

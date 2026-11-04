@@ -25,6 +25,13 @@ from . import _ffi, errors
 
 
 class SQLStateError(RuntimeError):
+    """A SQL failure with its SQLSTATE diagnostic.
+
+    `outcome_receipt` is set when an autocommit write ended with
+    ANTFLY_OUTCOME_UNKNOWN and the database issued a receipt for it; resolve
+    it later with Database.outcome_receipt_status.
+    """
+
     def __init__(
         self,
         diagnostic: dict[str, Any],

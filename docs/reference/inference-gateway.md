@@ -10,8 +10,10 @@ Select a model explicitly. Canonical IDs include `generators/support`,
 `chains/interactive`, `deciders/triage`, `embedders/dense`, `readers/ocr`,
 `transcribers/speech`, `synthesizers/voice`, `predictors/risk`,
 `connections/gpu-east/models/owner/model` and `local/owner/model`. Bare aliases
-resolve within the endpoint's task namespace. A collision with a raw local model
-returns an ambiguity error. Existing raw model IDs remain valid.
+resolve within the endpoint's task namespace. Reading spans reader, transcriber,
+and generator bindings. Collisions across these bindings or with a raw local
+model return an ambiguity error; select a qualified identity to disambiguate.
+Existing raw model IDs remain valid.
 
 ```yaml
 public_inference:
@@ -199,7 +201,7 @@ the total response ceiling is not a preallocated or whole-stream buffer.
 | `/ai/v1/embeddings`, `/embed` | Dense floats or little-endian float32 base64; sparse `{indices, values}` and ordered multimodal parts use the Antfly extensions |
 | `/ai/v1/generate`, `/generate/batch` | Existing generation envelopes; native options require an Antfly executor; batches share a deadline and preserve item IDs |
 | `/ai/v1/rerank`, `/chunk`, `/read`, `/extract`, `/rewrite` | Existing task envelopes, source indices, coordinates and schemas |
-| `/ai/v1/transcribe`, `/dictate`, `/transcription/sessions/...` | Existing audio and session contracts; native dictation cleanup options require an Antfly runtime |
+| `/ai/v1/read`, `/dictate`, `/transcription/sessions/...` | Unified media reading, dictation and session contracts; native dictation cleanup options require an Antfly runtime |
 | `/ai/v1/synthesize` | `{model, text, voice?, format?, speed?}`; returns audio bytes |
 | `/ml/v1/predict`, `/models`, `/predictors` | Existing ordered feature-vector requests and predictor schemas |
 
@@ -397,12 +399,40 @@ meaning. There is no cross-model embedding or decision fallback.
 
 Named transcription defaults apply to language, timestamp-aware decoding and
 diarization. Request values take precedence, including explicit `false`.
-Native timestamp decoding retains its historical defaults when omitted: off for
-`transcribe`, on for `dictate`. The TypeScript transcription helper forwards the
-same options as the public request contract. Named transcribers retain their
+Audio reads request temporal segments with `audio_options.timestamps` or
+`audio_options.diarization`; dictation keeps timestamp decoding enabled by
+default. The TypeScript `readAudio` helper forwards the typed audio options. Named transcribers retain their
 credentials when inheriting the runtime URL: `bearer_token` takes precedence
 over `api_key`, followed by the default runtime credential. Sessions preserve
 the selected alias and its credential policy for every follow-up.
+
+Hosted OpenAI, Cloudflare, Vertex, and Apple recognizers are audio leaves in the
+same document service as local ASR. Configure the named `transcribers` on the
+inference host (standalone forwards these configs to its embedded runtime).
+Reads accept audio document sources and `retain_artifact`, preserving source
+IDs and temporal evidence. Composed readers bind `transcribers/<name>` with
+`input: audio`; hosted network calls require `allow_remote: true` throughout
+the composition. Provider credentials stay in deployment configuration.
+
+Durable `/read/jobs` submissions use the same model resolution and recognition
+defaults as synchronous `/read`, including `readers/`, `transcribers/`, and
+`generators/` targets. Request options, including explicit `false`, override
+configured defaults. Both read and extraction jobs accept typed `audio_options`.
+The effective backend selector and request options are persisted before dispatch.
+Hosted provider configurations stay runtime-owned, and the document executor pins
+model identities for replay. Non-audio read results carry `audio: null`; audio
+reads carry metadata with nullable duration and optional temporal evidence.
+
+Hosted recognition does not currently provide token measurements. Configure
+`max_total_tokens` on each hosted transcriber (or its document binding) using the
+provider/deployment's hard per-call token bound. A missing or zero bound rejects
+reading before provider I/O. Each call spends that full allowance against the
+shared document budget, including refinement and verification. Responses report
+this capacity as `usage.unmeasured_tokens`; `usage.total_tokens` includes it,
+while `prompt_tokens` and `completion_tokens` contain only measurements. This is
+budget accounting, not a billing estimate. Durable checkpoints preserve and
+restore these charges once without invoking the provider again. Unknown duration
+remains `audio.duration_ms: null`.
 
 Synthesis uses existing `text_to_speech` configs. OpenAI supports its configured
 speech formats; Vertex supports MP3, WAV and Ogg Opus; ElevenLabs currently
@@ -563,7 +593,7 @@ when owner-affinity routing is unavailable.
 
 The proxy serves canonical `/ai/v1/decisions`; `/ai/v1/decide` remains a legacy
 alias using the same scoped `decide` policy operation. Operator operations also
-include read, rewrite, transcribe, dictate, transcription sessions, synthesis and
+include read, rewrite, dictate, transcription sessions, synthesis and
 prediction. Capability leases remain bound to authorization, operation, route
 generation and endpoint incarnation.
 

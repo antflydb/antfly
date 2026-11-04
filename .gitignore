@@ -67,7 +67,6 @@ py/.venv/
 !antfly.go
 !antfly_test.go
 !antfly-genkit
-!evalaf/plugins/antfly
 !antfly-operator
 !pkg/antfly-operator/manifests/crd/antfly.io_*.yaml
 !.github/workflows/antfly-operator-container.yml

@@ -2892,7 +2892,7 @@ fn bindOrdinalFields(
     layout: *const relational_row_codec.PhysicalLayout,
 ) !void {
     switch (filter) {
-        .match_all, .match_none, .doc_id => {},
+        .match_all, .match_none, .doc_id, .logical_value => {},
         .conjuncts, .disjuncts => |items| for (items) |item|
             try bindOrdinalFields(alloc, ordinals, item, table_schema, layout),
         .bool_query => |query| {
@@ -3218,6 +3218,7 @@ pub const CompiledPatternFilter = union(enum) {
     disjuncts: []CompiledPatternFilter,
     bool_query: BoolQuery,
     field_matcher: FieldMatcher,
+    logical_value: *@import("../../../search/value_query.zig").Matcher,
 
     pub const BoolQuery = struct {
         must: []CompiledPatternFilter = &.{},
@@ -3433,6 +3434,42 @@ pub const CompiledPatternFilter = union(enum) {
         prefix_len: u8,
     };
 
+    pub fn hasLogicalValues(self: CompiledPatternFilter) bool {
+        return switch (self) {
+            .logical_value => true,
+            .conjuncts, .disjuncts => |items| blk: {
+                for (items) |item| if (item.hasLogicalValues()) break :blk true;
+                break :blk false;
+            },
+            .bool_query => |b| blk: {
+                for (b.must) |item| if (item.hasLogicalValues()) break :blk true;
+                for (b.should) |item| if (item.hasLogicalValues()) break :blk true;
+                for (b.must_not) |item| if (item.hasLogicalValues()) break :blk true;
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
+    pub const VerificationInput = enum { scan, known_keys };
+
+    pub fn bindValueWork(self: CompiledPatternFilter, work: *@import("../../../search/value_query.zig").Work, policy: @import("../../../search/value_query.zig").Policy, input: VerificationInput) !void {
+        switch (self) {
+            .logical_value => |matcher| {
+                if (!policy.allow_scan and input != .known_keys) return error.ValueSearchRequiresScan;
+                matcher.work = work;
+                matcher.policy = policy;
+            },
+            .conjuncts, .disjuncts => |items| for (items) |item| try item.bindValueWork(work, policy, input),
+            .bool_query => |b| {
+                for (b.must) |item| try item.bindValueWork(work, policy, input);
+                for (b.should) |item| try item.bindValueWork(work, policy, input);
+                for (b.must_not) |item| try item.bindValueWork(work, policy, input);
+            },
+            else => {},
+        }
+    }
+
     pub fn needsStoredDoc(self: CompiledPatternFilter) bool {
         return switch (self) {
             .match_all, .match_none, .doc_id => false,
@@ -3450,12 +3487,13 @@ pub const CompiledPatternFilter = union(enum) {
                 for (bool_query.must_not) |item| if (item.needsStoredDoc()) break :blk true;
                 break :blk false;
             },
-            .field_matcher => true,
+            .field_matcher, .logical_value => true,
         };
     }
 
     pub fn matches(self: CompiledPatternFilter, alloc: Allocator, key: []const u8, doc: std.json.Value) !bool {
         return switch (self) {
+            .logical_value => |matcher| try matcher.document(doc),
             .match_all => true,
             .match_none => false,
             .doc_id => |ids| blk: {
@@ -3524,6 +3562,7 @@ pub const CompiledPatternFilter = union(enum) {
         ordinal_bindings: ?*const std.StringHashMapUnmanaged(?u32),
     ) !?bool {
         return switch (self) {
+            .logical_value => null,
             .match_all => true,
             .match_none => false,
             .doc_id => |ids| blk: {
@@ -3783,6 +3822,13 @@ fn compilePatternFilterBounded(
     remaining_nodes.* -= 1;
     _ = try pattern_filter_contract.requireSingleRoot(filter_query);
 
+    if (filter_query.object.get("value")) |value| {
+        const values = @import("../../../search/value_query.zig");
+        const spec = try std.json.parseFromValue(values.Spec, alloc, value, .{});
+        const matcher = try alloc.create(values.Matcher);
+        try matcher.init(alloc, spec.value);
+        return .{ .logical_value = matcher };
+    }
     if (filter_query.object.get("match_all") != null) return .match_all;
     if (filter_query.object.get("match_none") != null) return .match_none;
     if (filter_query.object.get("doc_id")) |doc_id| {

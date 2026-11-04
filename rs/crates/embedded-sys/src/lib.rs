@@ -582,6 +582,16 @@ unsafe extern "C" {
     /// `antfly_db_batch_json` that also returns the receipt in `receipt_out`
     /// (only on `ANTFLY_OUTCOME_UNKNOWN`), for callers whose consecutive
     /// native calls may run on different threads.
+    pub fn antfly_db_batch_with_receipt(
+        db: *mut antfly_db,
+        writes: *const antfly_write_intent,
+        write_count: usize,
+        predicates: *const antfly_version_predicate,
+        predicate_count: usize,
+        timestamp_ns: u64,
+        sync_level: u8,
+        receipt_out: *mut antfly_buffer,
+    ) -> antfly_error_code;
     pub fn antfly_db_batch_json_with_receipt(
         db: *mut antfly_db,
         request_json: antfly_slice,
@@ -1084,11 +1094,6 @@ unsafe extern "C" {
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
     pub fn antfly_inference_read_json(
-        inference: *mut antfly_inference,
-        request_json: antfly_slice,
-        out: *mut antfly_buffer,
-    ) -> antfly_error_code;
-    pub fn antfly_inference_transcribe_json(
         inference: *mut antfly_inference,
         request_json: antfly_slice,
         out: *mut antfly_buffer,

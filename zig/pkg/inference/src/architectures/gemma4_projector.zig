@@ -1130,12 +1130,29 @@ pub fn encodeProjectedAudioFromStore(
     return encodeProjectedAudioWithWeights(cb, allocator, &weights, audio_clips);
 }
 
+/// Internal borrowed audio input. Encoded transports and already admitted PCM
+/// share the same projector frontend, without re-encoding or decoding PCM.
+pub const AudioInput = union(enum) { encoded: []const u8, pcm: audio.PcmAudio };
+
+pub fn encodeProjectedAudioInputs(cb: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, inputs: []const AudioInput) !ProjectedAudio {
+    var weights = ProjectorWeights.init(cb, allocator, projector.gguf, projector);
+    defer weights.deinit();
+    return encodeProjectedAudioInputsWithWeights(cb, allocator, &weights, inputs);
+}
+
 fn encodeProjectedAudioWithWeights(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     store: *ProjectorWeights,
     audio_clips: []const []const u8,
 ) !ProjectedAudio {
+    const inputs = try allocator.alloc(AudioInput, audio_clips.len);
+    defer allocator.free(inputs);
+    for (inputs, audio_clips) |*input, bytes| input.* = .{ .encoded = bytes };
+    return encodeProjectedAudioInputsWithWeights(cb, allocator, store, inputs);
+}
+
+fn encodeProjectedAudioInputsWithWeights(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, inputs: []const AudioInput) !ProjectedAudio {
     const cfg = try parseAudioConfig(&store.gguf.?.parsed);
 
     var all_embeddings = std.ArrayListUnmanaged(f32).empty;
@@ -1143,8 +1160,11 @@ fn encodeProjectedAudioWithWeights(
     var tokens_per_audio = std.ArrayListUnmanaged(usize).empty;
     errdefer tokens_per_audio.deinit(allocator);
 
-    for (audio_clips) |audio_bytes| {
-        const encoded = try encodeSingleAudio(cb, allocator, store, cfg, audio_bytes);
+    for (inputs) |input| {
+        const encoded = switch (input) {
+            .encoded => |bytes| try encodeSingleAudio(cb, allocator, store, cfg, bytes),
+            .pcm => |pcm| try encodeSingleAudioPcm(cb, allocator, store, cfg, pcm),
+        };
         defer allocator.free(encoded.embeddings);
         try all_embeddings.appendSlice(allocator, encoded.embeddings);
         try tokens_per_audio.append(allocator, encoded.tokens);
@@ -1172,6 +1192,12 @@ pub const EncodedAudio = struct {
 // upstream implementation. This hook is absent from production builds.
 fn embeddingGemma2Stage(a: std.mem.Allocator, name: []const u8, values: []const f32) !void {
     if (comptime !@import("builtin").is_test) return;
+    if (platform.env.getenv("ANTFLY_GEMMA4_AUDIO_CAPTURE_STAGES")) |directory| {
+        const capture_path = try std.fmt.allocPrint(a, "{s}/{s}.f32", .{ directory, name });
+        defer a.free(capture_path);
+        const compat = @import("../io/compat.zig");
+        try compat.cwd().writeFile(compat.io(), .{ .sub_path = capture_path, .data = std.mem.sliceAsBytes(values) });
+    }
     const directory = platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") orelse return;
     const path = try std.fmt.allocPrint(a, "{s}/{s}.f32", .{ directory, name });
     defer a.free(path);
@@ -1194,7 +1220,7 @@ fn embeddingGemma2Stage(a: std.mem.Allocator, name: []const u8, values: []const 
 
 fn embeddingGemma2StageTensor(cb: *const ComputeBackend, a: std.mem.Allocator, name: []const u8, tensor: CT) !void {
     if (comptime !@import("builtin").is_test) return;
-    if (platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null) return;
+    if (platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null and platform.env.getenv("ANTFLY_GEMMA4_AUDIO_CAPTURE_STAGES") == null) return;
     const values = try cb.toFloat32(tensor, a);
     defer a.free(values);
     try embeddingGemma2Stage(a, name, values);
@@ -1203,6 +1229,22 @@ fn embeddingGemma2StageTensor(cb: *const ComputeBackend, a: std.mem.Allocator, n
 fn encodeSingleAudio(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, audio_bytes: []const u8) !EncodedAudio {
     if (cfg.direct_unified) return encodeUnifiedDirectAudio(cb, allocator, store, cfg, audio_bytes);
     const result = try encodeSingleAudioResident(cb, allocator, store, cfg, audio_bytes);
+    defer cb.free(result.embeddings);
+    return .{ .embeddings = try cb.toFloat32(result.embeddings, allocator), .tokens = result.tokens };
+}
+
+fn encodeSingleAudioPcm(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, pcm: audio.PcmAudio) !EncodedAudio {
+    for (pcm.samples) |sample| if (!std.math.isFinite(sample)) return error.InvalidAudioSamples;
+    if (cfg.direct_unified) {
+        const frames = try prepareGemma4RawAudioFramesPcm(allocator, pcm, cfg.raw_samples_per_token, cfg.max_direct_audio_tokens);
+        defer allocator.free(frames);
+        return encodeUnifiedDirectAudioFrames(cb, allocator, store, cfg, frames);
+    }
+    var prepared = try prepareAudioPcmBounded(allocator, pcm, cfg.mel_bins, cfg.reject_audio_truncation, !audioHostOps().features and supportsGemma4LogMel(cb), cfg.max_audio_samples, false);
+    defer prepared.deinit();
+    var features = try audioFeaturesFromPrepared(cb, allocator, &prepared);
+    defer features.deinit();
+    const result = try encodeAudioFeaturesResident(cb, allocator, store, cfg, &features);
     defer cb.free(result.embeddings);
     return .{ .embeddings = try cb.toFloat32(result.embeddings, allocator), .tokens = result.tokens };
 }
@@ -1221,7 +1263,7 @@ fn encodeSingleAudioResident(cb: *const ComputeBackend, allocator: std.mem.Alloc
         var prepared = try prepareAudioCpuBounded(allocator, audio_bytes, cfg.audio_decode_options, cfg.mel_bins, cfg.reject_audio_truncation, !audioHostOps().features and supportsGemma4LogMel(cb), cfg.max_audio_samples, cfg.max_audio_decode_working_bytes, true);
         defer prepared.deinit();
         break :bounded try audioFeaturesFromPrepared(cb, allocator, &prepared);
-    } else try prepareGemma4AudioFeatures(cb, allocator, audio_bytes, cfg.mel_bins);
+    } else try prepareGemma4AudioFeatures(cb, allocator, audio_bytes, cfg);
     defer features.deinit();
     return encodeAudioFeaturesResident(cb, allocator, store, cfg, &features);
 }
@@ -1264,7 +1306,7 @@ fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.me
         active_audio_profile = null;
     };
 
-    if (store.gguf == null) {
+    if (@import("builtin").is_test) {
         if (features.resident) |tensor| try embeddingGemma2StageTensor(cb, allocator, "audio_features", tensor) else try embeddingGemma2Stage(allocator, "audio_features", features.data);
     }
     audioProfileMark(.features);
@@ -1285,7 +1327,7 @@ fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.me
     var hidden = subsampled.hidden;
     var hidden_live = true;
     errdefer if (hidden_live) cb.free(hidden);
-    if (store.gguf == null) try embeddingGemma2StageTensor(cb, allocator, "audio_subsample", subsampled.hidden);
+    if (@import("builtin").is_test) try embeddingGemma2StageTensor(cb, allocator, "audio_subsample", subsampled.hidden);
     audioProfileMark(.subsample);
 
     var layer_inputs = try AudioLayerInputs.initCached(cb, allocator, store, cfg, subsampled.valid_mask);
@@ -1340,7 +1382,7 @@ fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.me
             }
         }
         store.releaseCompletedNativeLayer();
-        if (store.gguf == null) {
+        if (@import("builtin").is_test) {
             var name_buf: [128]u8 = undefined;
             try embeddingGemma2StageTensor(cb, allocator, try fmt(&name_buf, "audio_layer_{d}", .{layer - 1}), hidden);
         }
@@ -1351,7 +1393,7 @@ fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.me
     cb.free(hidden);
     hidden_live = false;
     defer cb.free(output);
-    if (store.gguf == null) try embeddingGemma2StageTensor(cb, allocator, "audio_output", output);
+    if (@import("builtin").is_test) try embeddingGemma2StageTensor(cb, allocator, "audio_output", output);
 
     const normed = try cb.rmsNorm(output, layer_inputs.ones, cfg.output_hidden, cfg.layer_norm_eps);
     defer cb.free(normed);
@@ -1370,7 +1412,7 @@ fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.me
         if (cohort and cb.kind() == .metal) try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
     }
 
-    if (store.gguf == null) try embeddingGemma2StageTensor(cb, allocator, "audio_projected", projected);
+    if (@import("builtin").is_test) try embeddingGemma2StageTensor(cb, allocator, "audio_projected", projected);
     const valid_count = countTrue(subsampled.valid_mask);
     const valid_rows = try allocator.alloc(u32, valid_count);
     defer allocator.free(valid_rows);
@@ -1414,6 +1456,10 @@ fn encodeUnifiedDirectAudio(
 ) !EncodedAudio {
     const frames = try prepareGemma4RawAudioFrames(allocator, audio_bytes, cfg.raw_samples_per_token, cfg.max_direct_audio_tokens);
     defer allocator.free(frames);
+    return encodeUnifiedDirectAudioFrames(cb, allocator, store, cfg, frames);
+}
+
+fn encodeUnifiedDirectAudioFrames(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, frames: []const f32) !EncodedAudio {
     const token_count = frames.len / cfg.raw_samples_per_token;
     if (token_count == 0) {
         return .{
@@ -1446,12 +1492,15 @@ fn prepareGemma4RawAudioFrames(
     samples_per_token: usize,
     max_tokens: usize,
 ) ![]f32 {
+    var decoded = try audio.decodeBounded(allocator, audio_bytes, .{}, audio.default_decode_working_bytes);
+    defer decoded.deinit();
+    return prepareGemma4RawAudioFramesPcm(allocator, .{ .samples = decoded.samples, .sample_rate = decoded.sample_rate }, samples_per_token, max_tokens);
+}
+
+fn prepareGemma4RawAudioFramesPcm(allocator: std.mem.Allocator, decoded: audio.PcmAudio, samples_per_token: usize, max_tokens: usize) ![]f32 {
     if (samples_per_token == 0) return error.InvalidTensorShape;
     const target_rate: u32 = 16_000;
     const max_samples = std.math.mul(usize, samples_per_token, max_tokens) catch return error.InvalidTensorShape;
-
-    var decoded = try audio.decodeBounded(allocator, audio_bytes, .{}, audio.default_decode_working_bytes);
-    defer decoded.deinit();
     const source_limit = try sourceSampleLimitForResample(max_samples, decoded.sample_rate, target_rate);
     if (decoded.samples.len > source_limit) return error.AudioInputTooLong;
     const resampled = try audio.copyOrResample(allocator, decoded.samples, decoded.sample_rate, target_rate);
@@ -1690,12 +1739,18 @@ pub fn embeddingGemma2EncodedAudioSequenceBoundWithOptions(bytes: []const u8, op
 }
 
 pub fn prepareEmbeddingGemma2AudioForBackend(a: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, backend: @import("../backends/backends.zig").BackendType) !PreparedAudio {
-    if (backend != .cuda) return prepareEmbeddingGemma2AudioWithPacking(a, bytes, options, backend != .native);
+    return prepareEmbeddingGemma2AudioForBackendBounded(a, bytes, options, backend, audio.default_decode_working_bytes);
+}
+pub fn prepareEmbeddingGemma2AudioForBackendBounded(a: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, backend: @import("../backends/backends.zig").BackendType, max_decode_working_bytes: usize) !PreparedAudio {
+    if (backend != .cuda) return prepareEmbeddingGemma2AudioWithPackingBounded(a, bytes, options, backend != .native, max_decode_working_bytes);
     const cfg = embeddingGemma2AudioConfig();
-    return prepareAudioCpuBounded(a, bytes, options, cfg.mel_bins, cfg.reject_audio_truncation, true, cfg.max_audio_samples, 64 * 1024 * 1024, true);
+    return prepareAudioCpuBounded(a, bytes, options, cfg.mel_bins, cfg.reject_audio_truncation, true, cfg.max_audio_samples, max_decode_working_bytes, true);
 }
 pub fn prepareEmbeddingGemma2AudioWithPacking(allocator: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, pack_device: bool) !PreparedAudio {
-    return prepareAudioCpu(allocator, bytes, options, 128, true, pack_device);
+    return prepareEmbeddingGemma2AudioWithPackingBounded(allocator, bytes, options, pack_device, audio.default_decode_working_bytes);
+}
+pub fn prepareEmbeddingGemma2AudioWithPackingBounded(allocator: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, pack_device: bool, max_decode_working_bytes: usize) !PreparedAudio {
+    return prepareAudioCpuBounded(allocator, bytes, options, 128, true, pack_device, 480_000, max_decode_working_bytes, false);
 }
 fn prepareAudioCpu(allocator: std.mem.Allocator, audio_bytes: []const u8, decode_options: audio.DecodeOptions, mel_bins: usize, strict: bool, pack_gpu: bool) !PreparedAudio {
     return prepareAudioCpuBounded(allocator, audio_bytes, decode_options, mel_bins, strict, pack_gpu, 480_000, audio.default_decode_working_bytes, false);
@@ -1803,8 +1858,8 @@ fn prepareAudioPcmBounded(allocator: std.mem.Allocator, pcm: audio.PcmAudio, mel
     }
     return prepared;
 }
-fn prepareGemma4AudioFeatures(cb: *const ComputeBackend, allocator: std.mem.Allocator, bytes: []const u8, mel_bins: usize) !AudioFeatures {
-    var prepared = try prepareAudioCpu(allocator, bytes, .{}, mel_bins, false, !audioHostOps().features and supportsGemma4LogMel(cb));
+fn prepareGemma4AudioFeatures(cb: *const ComputeBackend, allocator: std.mem.Allocator, bytes: []const u8, cfg: AudioConfig) !AudioFeatures {
+    var prepared = try prepareAudioCpuBounded(allocator, bytes, cfg.audio_decode_options, cfg.mel_bins, cfg.reject_audio_truncation, !audioHostOps().features and supportsGemma4LogMel(cb), cfg.max_audio_samples, cfg.max_audio_decode_working_bytes, false);
     defer prepared.deinit();
     return audioFeaturesFromPrepared(cb, allocator, &prepared);
 }
@@ -3330,7 +3385,7 @@ const AudioLayerInputs = struct {
     segment_valid: ?CT = null,
     /// `[output_hidden]` ones for the final no-scale RMS norm.
     ones: CT,
-    /// Per-block query scales (`q_scale * softplus(per_dim_scale)`), host
+    /// Per-block query scales (applying softplus only to original HF weights), host
     /// copies for the reference path and device tensors for the kernel.
     scales_host: [][]f32,
     scales: []CT,
@@ -3387,7 +3442,7 @@ const AudioLayerInputs = struct {
                     break :dims loaded.?.data;
                 } else per_dim_scales[layer];
                 if (per_dim.len != head_dim) return error.InvalidTensorShape;
-                break :blk try audioQueryDimScales(allocator, head_dim, per_dim);
+                break :blk try audioQueryDimScales(allocator, head_dim, per_dim, if (store) |weights| weights.gguf != null else false);
             };
             {
                 errdefer allocator.free(host);
@@ -3600,7 +3655,7 @@ fn audioLayer(
     const rows = inputs.valid_mask.len;
     const ff1 = try audioFeedForward(cb, allocator, store, cfg, input, rows, layer, false);
     defer cb.free(ff1);
-    if (store.gguf == null and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_feed_forward1", ff1);
+    if (@import("builtin").is_test and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_feed_forward1", ff1);
     audioProfileMark(.ffn);
 
     var buf: [128]u8 = undefined;
@@ -3610,7 +3665,7 @@ fn audioLayer(
     audioProfileMark(.norms);
     const attn = try audioSelfAttention(cb, allocator, store, cfg, normed, inputs, layer);
     defer cb.free(attn);
-    if (store.gguf == null and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_self_attn", attn);
+    if (@import("builtin").is_test and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_self_attn", attn);
     audioProfileMark(.attn_out);
     const attn_post = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.attn_post_norm.weight", .{layer}), cfg.audio_hidden);
     const fused_residual = if (store.gguf == null) try cb.rmsNormResidual(attn, attn_post, ff1, cfg.audio_hidden, cfg.layer_norm_eps, 1, 1) else null;
@@ -3624,11 +3679,11 @@ fn audioLayer(
 
     const lconv = try audioLightConv(cb, allocator, store, cfg, res_attn, rows, layer, inputs.segments, inputs.segment_starts);
     defer cb.free(lconv);
-    if (store.gguf == null and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_lconv1d", lconv);
+    if (@import("builtin").is_test and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_lconv1d", lconv);
     audioProfileMark(.lconv);
     const ff2 = try audioFeedForward(cb, allocator, store, cfg, lconv, rows, layer, true);
     defer cb.free(ff2);
-    if (store.gguf == null and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_feed_forward2", ff2);
+    if (@import("builtin").is_test and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_feed_forward2", ff2);
     audioProfileMark(.ffn);
     const out_norm = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.ln2.weight", .{layer}), cfg.audio_hidden);
     const out = try cb.rmsNorm(ff2, out_norm, cfg.audio_hidden, cfg.layer_norm_eps);
@@ -3689,6 +3744,37 @@ fn scaleRows(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT,
     return cb.fromFloat32Shape(data, &shape);
 }
 
+fn audioConvNormNames(gguf: bool) struct { pre: []const u8, post: []const u8 } {
+    return if (gguf) .{ .pre = "conv_norm", .post = "norm_conv" } else .{ .pre = "norm_conv", .post = "conv_norm" };
+}
+
+test "gemma4 audio HF and converted GGUF query scales agree without double softplus" {
+    const a = std.testing.allocator;
+    const raw = [_]f32{ -5, -2, 0, 1 };
+    var converted: [4]f32 = undefined;
+    for (raw, &converted) |x, *y| y.* = softplus(x);
+    const hf = try audioQueryDimScales(a, raw.len, &raw, false);
+    defer a.free(hf);
+    const gguf = try audioQueryDimScales(a, raw.len, &converted, true);
+    defer a.free(gguf);
+    for (hf, gguf) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0048441), gguf[0], 1e-6);
+}
+
+test "gemma4 audio converted GGUF convolution norms preserve original HF roles" {
+    const a = std.testing.allocator;
+    const hf = audioConvNormNames(false);
+    const gguf = audioConvNormNames(true);
+    var buf: [128]u8 = undefined;
+    const hf_pre = try @import("embedding_gemma2_media_weights.zig").name(a, try fmt(&buf, "a.blk.0.{s}.weight", .{hf.pre}));
+    defer a.free(hf_pre);
+    try std.testing.expectEqualStrings("audio_tower.layers.0.lconv1d.pre_layer_norm.weight", hf_pre);
+    // Upstream GGUF maps pre_layer_norm -> conv_norm, conv_norm -> norm_conv.
+    try std.testing.expectEqualStrings("conv_norm", gguf.pre);
+    try std.testing.expectEqualStrings("norm_conv", gguf.post);
+    try std.testing.expectEqualStrings("conv_norm", hf.post);
+}
+
 fn audioLightConv(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -3701,7 +3787,10 @@ fn audioLightConv(
     segment_starts: ?CT,
 ) !CT {
     var buf: [128]u8 = undefined;
-    const pre_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.norm_conv.weight", .{layer}), cfg.audio_hidden);
+    // GGUF's inherited tensor mapping swaps the two convolution norm names.
+    // Keep HF's logical names intact for the EmbeddingGemma 2 path.
+    const norm_names = audioConvNormNames(store.gguf != null);
+    const pre_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.{s}.weight", .{ layer, norm_names.pre }), cfg.audio_hidden);
     const normed = try cb.rmsNorm(input, pre_w, cfg.audio_hidden, cfg.layer_norm_eps);
     defer cb.free(normed);
     const pw1 = try linearNoBiasMaybeClipped(cb, allocator, store, normed, try fmt(&buf, "a.blk.{d}.conv_pw1", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden * 2);
@@ -3710,7 +3799,7 @@ fn audioLightConv(
     defer cb.free(glu);
     const conv = try depthwiseCausalConvSegments(cb, allocator, store, glu, rows, cfg.audio_hidden, cfg.conv_kernel_size, segments, segment_starts, try fmt(&buf, "a.blk.{d}.conv_dw.weight", .{layer}));
     defer cb.free(conv);
-    const conv_norm_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.conv_norm.weight", .{layer}), cfg.audio_hidden);
+    const conv_norm_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.{s}.weight", .{ layer, norm_names.post }), cfg.audio_hidden);
     const conv_normed = try cb.rmsNorm(conv, conv_norm_w, cfg.audio_hidden, cfg.layer_norm_eps);
     defer cb.free(conv_normed);
     const activated = try cb.silu(conv_normed);
@@ -3847,10 +3936,12 @@ fn audioSelfAttention(
     return linearNoBiasMaybeClipped(cb, allocator, store, out_ct, try fmt(&buf, "a.blk.{d}.attn_out", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden);
 }
 
-fn audioQueryDimScales(allocator: std.mem.Allocator, head_dim: usize, per_dim_scale: []const f32) ![]f32 {
+fn audioQueryDimScales(allocator: std.mem.Allocator, head_dim: usize, per_dim_scale: []const f32, gguf: bool) ![]f32 {
     const q_scale = @as(f32, @floatFromInt(1)) / @sqrt(@as(f32, @floatFromInt(head_dim))) / @log(@as(f32, 2.0));
     const scales = try allocator.alloc(f32, head_dim);
-    for (scales, 0..) |*scale, i| scale.* = q_scale * softplus(per_dim_scale[i]);
+    // GGUF conversion stores softplus(per_dim_scale), unlike the original HF
+    // checkpoint. Applying softplus again inflates small learned query scales.
+    for (scales, 0..) |*scale, i| scale.* = q_scale * (if (gguf) per_dim_scale[i] else softplus(per_dim_scale[i]));
     return scales;
 }
 
@@ -4583,6 +4674,9 @@ fn parseAudioConfig(file: *const gguf_format.File) !AudioConfig {
         .max_direct_audio_tokens = @intCast(view.getU64("clip.audio.max_tokens") orelse default_max_direct_audio_tokens),
         .mel_bins = @intCast(view.getU64("clip.audio.num_mel_bins") orelse 128),
         .layer_norm_eps = view.getF32("clip.audio.attention.layer_norm_epsilon") orelse 1e-5,
+        // Conformer attention admits distances strictly less than max_past=12.
+        .exclude_farthest_key = !direct_unified,
+        .reject_audio_truncation = !direct_unified,
     };
 }
 
@@ -4681,6 +4775,8 @@ test "regular gemma4 audio config derives its projection input width from GGUF" 
     defer parsed.deinit(allocator);
 
     const cfg = try parseAudioConfig(&parsed);
+    try std.testing.expect(cfg.exclude_farthest_key);
+    try std.testing.expect(cfg.reject_audio_truncation);
     try std.testing.expectEqual(@as(usize, 4), cfg.audio_hidden);
     try std.testing.expectEqual(@as(usize, 5), cfg.output_hidden);
     try std.testing.expectEqual(@as(usize, 6), cfg.text_hidden);
@@ -6992,7 +7088,8 @@ fn checkGemma4AudioFeaturesResidency(cb: ComputeBackend, _: ComputeBackend) !voi
     const hop = 160;
     const length = 320;
     const fft = 512;
-    const mel_bins = 16;
+    // Exercise the 128-bin production frontend, including fused CUDA FFT routing.
+    const mel_bins = 128;
     var samples: [(frames - 1) * hop + length]f32 = undefined;
     for (&samples, 0..) |*v, i| v.* = 0.3 * @sin(@as(f32, @floatFromInt(i)) * 0.037) + 0.1 * @cos(@as(f32, @floatFromInt(i)) * 0.11);
     var window: [length]f32 = undefined;
@@ -9356,4 +9453,65 @@ test "embeddinggemma2 FLAC duration admission rejects forged counts on every pre
     var unknown = try prepareEmbeddingGemma2AudioWithPacking(a, bytes, .{}, true);
     defer unknown.deinit();
     try std.testing.expect(unknown.tokenCount() > 1);
+}
+
+// Opt-in real-weight diagnostic. Keep the raw projected audio boundary
+// independently inspectable against the pinned upstream mtmd encoder.
+test "gemma4 GGUF audio exports projected parity fixture" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const projector_path = platform.env.getenv("ANTFLY_GEMMA4_AUDIO_PARITY_PROJECTOR") orelse return error.SkipZigTest;
+    const audio_path = platform.env.getenv("ANTFLY_GEMMA4_AUDIO_PARITY_INPUT") orelse return error.SkipZigTest;
+    const output_path = platform.env.getenv("ANTFLY_GEMMA4_AUDIO_PARITY_OUTPUT") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const bytes = try @import("../util/c_file.zig").readFile(a, audio_path);
+    defer a.free(bytes);
+    var compute = try @import("../ops/cuda/cuda_compute.zig").CudaCompute.initWithKernelJitForProfile(a, .{}, .gemma4);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var projected = try encodeProjectedAudioFromPath(&cb, a, projector_path, &.{bytes});
+    defer projected.deinit();
+    try std.testing.expectEqual(@as(usize, 1), projected.tokens_per_audio.len);
+    try std.testing.expect(projected.tokens_per_audio[0] > 0);
+    for (projected.embeddings) |value| try std.testing.expect(std.math.isFinite(value));
+    const compat = @import("../io/compat.zig");
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = output_path, .data = std.mem.sliceAsBytes(projected.embeddings) });
+    std.debug.print("gemma4 audio projected tokens={d} hidden={d}\n", .{ projected.tokens_per_audio[0], projected.hidden_size });
+}
+
+test "gemma4 bounded audio rejects duration overflow before resampling" {
+    const a = std.testing.allocator;
+    const samples = try a.alloc(f32, 480001);
+    defer a.free(samples);
+    @memset(samples, 0);
+    try std.testing.expectError(error.EmbeddingSequenceTooLong, prepareAudioPcmBounded(a, .{ .samples = samples, .sample_rate = 16000 }, 128, true, false, 480000, true));
+    var weights = @import("../ops/native_compute.zig").WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    var compute = @import("../ops/native_compute.zig").NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var cfg = embeddingGemma2AudioConfig();
+    cfg.max_audio_samples = 480000;
+    // Exercise the encoded GGUF feature route, which must consume the config's
+    // duration policy rather than silently applying the old truncating helper.
+    const bytes = try audio.wav.encodeMono(a, samples, .{ .sample_rate = 16000, .audio_format = 3, .bits_per_sample = 32 });
+    defer a.free(bytes);
+    try std.testing.expectError(error.AudioTooLong, prepareGemma4AudioFeatures(&cb, a, bytes, cfg));
+}
+
+test "gemma4 decoded PCM frontend matches encoded audio without codec work" {
+    const a = std.testing.allocator;
+    var samples: [1600]f32 = undefined;
+    for (&samples, 0..) |*v, i| v.* = 0.005 * @sin(@as(f32, @floatFromInt(i)) * 0.1);
+    const bytes = try audio.wav.encodeMono(a, &samples, .{ .audio_format = 3, .bits_per_sample = 32, .sample_rate = 16000 });
+    defer a.free(bytes);
+    const pcm = audio.PcmAudio{ .samples = &samples, .sample_rate = 16000 };
+    var encoded = try prepareAudioCpuBounded(a, bytes, .{}, 128, true, false, 480000, audio.default_decode_working_bytes, false);
+    defer encoded.deinit();
+    var decoded = try prepareAudioPcmBounded(a, pcm, 128, true, false, 480000, false);
+    defer decoded.deinit();
+    const encoded_frames = try prepareGemma4RawAudioFrames(a, bytes, 640, 750);
+    defer a.free(encoded_frames);
+    const pcm_frames = try prepareGemma4RawAudioFramesPcm(a, pcm, 640, 750);
+    defer a.free(pcm_frames);
+    try std.testing.expectEqualSlices(f32, encoded_frames, pcm_frames);
+    try std.testing.expectEqualSlices(f32, encoded.samples, decoded.samples);
 }

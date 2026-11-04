@@ -114,6 +114,9 @@ pub const Message = struct {
     /// Raw encoded audio bytes for multimodal messages.
     /// Null or empty for text/image-only messages.
     audio_bytes: ?[]const []const u8 = null,
+    /// Trusted borrowed PCM, aligned with audio_bytes. Internal callers retain
+    /// it until generation returns; public message parsing never supplies it.
+    decoded_audio: ?[]const @import("audio.zig").PcmAudio = null,
     /// Optional structured content parts preserving text/image ordering.
     /// Image/audio parts store the index into `image_bytes`/`audio_bytes`.
     content_parts: ?[]const ContentPart = null,
@@ -5843,7 +5846,7 @@ pub const NativeGenerationPipeline = struct {
                         null;
                     defer if (projected_images) |*projected| projected.deinit();
                     var projected_audio = if (audio_clips.len > 0)
-                        try gemma4_projector.encodeProjectedAudio(&self.cb, allocator, projector, audio_clips)
+                        try gemma4_projector.encodeProjectedAudioInputs(&self.cb, allocator, projector, audio_clips)
                     else
                         null;
                     defer if (projected_audio) |*projected| projected.deinit();
@@ -19269,11 +19272,12 @@ fn collectImagesInPromptOrder(allocator: std.mem.Allocator, messages: []const Me
     return try images.toOwnedSlice(allocator);
 }
 
-fn collectAudioInPromptOrder(allocator: std.mem.Allocator, messages: []const Message) ![]const []const u8 {
-    var clips = std.ArrayListUnmanaged([]const u8).empty;
+fn collectAudioInPromptOrder(allocator: std.mem.Allocator, messages: []const Message) ![]const gemma4_projector.AudioInput {
+    var clips = std.ArrayListUnmanaged(gemma4_projector.AudioInput).empty;
     errdefer clips.deinit(allocator);
 
     for (messages) |msg| {
+        if (msg.decoded_audio) |pcm| if (pcm.len != (if (msg.audio_bytes) |bytes| bytes.len else 0)) return error.InvalidMessageAudioIndex;
         if (msg.content_parts) |parts| {
             const msg_audio = msg.audio_bytes orelse &.{};
             for (parts) |part| {
@@ -19282,12 +19286,12 @@ fn collectAudioInPromptOrder(allocator: std.mem.Allocator, messages: []const Mes
                     .image => {},
                     .audio => |audio_idx| {
                         if (audio_idx >= msg_audio.len) return error.InvalidMessageAudioIndex;
-                        try clips.append(allocator, msg_audio[audio_idx]);
+                        try clips.append(allocator, if (msg.decoded_audio) |pcm| .{ .pcm = pcm[audio_idx] } else .{ .encoded = msg_audio[audio_idx] });
                     },
                 }
             }
         } else if (msg.audio_bytes) |msg_audio| {
-            for (msg_audio) |audio_bytes| try clips.append(allocator, audio_bytes);
+            for (msg_audio, 0..) |audio_bytes, i| try clips.append(allocator, if (msg.decoded_audio) |pcm| .{ .pcm = pcm[i] } else .{ .encoded = audio_bytes });
         }
     }
 
@@ -20776,4 +20780,19 @@ test "LightOnOCR3 device vision cancellation retires independent page features o
         try std.testing.expect(mutex.tryLock());
         mutex.unlock();
     }
+}
+
+test "generation audio PCM follows content part order and validates alignment" {
+    const a = std.testing.allocator;
+    const samples = [_]f32{0.001};
+    const pcm = [_]@import("audio.zig").PcmAudio{ .{ .samples = &samples, .sample_rate = 16000 }, .{ .samples = &.{0}, .sample_rate = 8000 } };
+    const encoded = [_][]const u8{ "first", "second" };
+    const parts = [_]Message.ContentPart{ .{ .audio = 1 }, .{ .text = "transcribe" }, .{ .audio = 0 } };
+    var message = Message{ .role = "user", .content = "transcribe", .audio_bytes = &encoded, .decoded_audio = &pcm, .content_parts = &parts };
+    const inputs = try collectAudioInPromptOrder(a, &.{message});
+    defer a.free(inputs);
+    try std.testing.expectEqual(@as(u32, 8000), inputs[0].pcm.sample_rate);
+    try std.testing.expectEqual(@intFromPtr(samples[0..].ptr), @intFromPtr(inputs[1].pcm.samples.ptr));
+    message.decoded_audio = pcm[0..1];
+    try std.testing.expectError(error.InvalidMessageAudioIndex, collectAudioInPromptOrder(a, &.{message}));
 }

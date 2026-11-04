@@ -424,6 +424,8 @@ pub const STTConfig = struct {
     timestamps: ?bool = null,
     /// Explicitly permit preparing and installing the selected Speech assets.
     download_assets: ?bool = null,
+    /// Provider-declared hard per-call token bound. Required for hosted document reading when measurements are unavailable; the full allowance is charged against the document budget, never as measured usage.
+    max_total_tokens: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -443,6 +445,7 @@ pub const STTConfig = struct {
         .{ "api_url", "api_url", true },
         .{ "timestamps", "timestamps", true },
         .{ "download_assets", "download_assets", true },
+        .{ "max_total_tokens", "max_total_tokens", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -517,6 +520,10 @@ pub const STTConfig = struct {
         }
         if (self.download_assets) |value| {
             try jw.objectField("download_assets");
+            try jw.write(value);
+        }
+        if (self.max_total_tokens) |value| {
+            try jw.objectField("max_total_tokens");
             try jw.write(value);
         }
         try jw.endObject();
@@ -621,8 +628,9 @@ pub const STTRequest = struct {
     }
 };
 
-/// Response from speech transcription.
+/// Response from speech recognition used by internal providers and streaming workflows.
 pub const STTResponse = struct {
+    status: ?[]const u8 = null,
     /// Full transcribed text.
     text: ?[]const u8 = null,
     /// Detected or specified language code.
@@ -634,6 +642,7 @@ pub const STTResponse = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "status", "status", true },
         .{ "text", "text", true },
         .{ "language", "language", true },
         .{ "duration_ms", "duration_ms", true },
@@ -651,6 +660,10 @@ pub const STTResponse = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
         if (self.text) |value| {
             try jw.objectField("text");
             try jw.write(value);

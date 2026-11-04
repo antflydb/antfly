@@ -39,14 +39,15 @@ pub const Filter = union(enum) {
         predicate: *const graph.CompiledPatternFilter.FieldPredicate,
     };
 
-    fn bindMany(alloc: Allocator, source: []const graph.CompiledPatternFilter, bindings: *const std.StringHashMapUnmanaged(?u32)) Allocator.Error![]Filter {
+    fn bindMany(alloc: Allocator, source: []const graph.CompiledPatternFilter, bindings: *const std.StringHashMapUnmanaged(?u32)) (Allocator.Error || error{UnsupportedQueryRequest})![]Filter {
         const result = try alloc.alloc(Filter, source.len);
         for (source, result) |*item, *out| out.* = try bind(alloc, item, bindings);
         return result;
     }
 
-    fn bind(alloc: Allocator, source: *const graph.CompiledPatternFilter, bindings: *const std.StringHashMapUnmanaged(?u32)) Allocator.Error!Filter {
+    fn bind(alloc: Allocator, source: *const graph.CompiledPatternFilter, bindings: *const std.StringHashMapUnmanaged(?u32)) (Allocator.Error || error{UnsupportedQueryRequest})!Filter {
         return switch (source.*) {
+            .logical_value => error.UnsupportedQueryRequest,
             .match_all => .match_all,
             .match_none => .match_none,
             .doc_id => |ids| .{ .doc_id = ids },

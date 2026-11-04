@@ -341,47 +341,35 @@ rejects image requests whose spend cannot be bounded. Do not point an OCR reader
 at that gateway and assume it works. Managed image billing/capability qualification,
 BYO Vertex connection UI/CLI, and Document AI OCR are separate follow-ups.
 
-## Canonical grep in Cloud
+## Native artifact grep
 
-The projection copies native page text byte-for-byte, without a second PDF/OCR
-pipeline. Each item is **one page**: regex and multiline matches are exact within
-that page. Cross-page multiline matching is not promised. Parts retain original
-page offsets; grep paths identify the source record and original page.
+`grep` writes a binding to the existing corpus. It performs no extraction, TXT
+export, derived-bucket upload, or source re-ingestion:
 
 ```sh
-./grepstein grep --state ./grepstein-corpus --url "$ANTFLY_URL" \
-  --gcs-projection-bucket antfly-showcases-derived \
-  --provider-auth-id "$COLONY_GCS_CONNECTION_ID"
-# Review grepstein-corpus/cloud-jobs.json, then supply a Colony user access token
-# securely through GREPSTEIN_CLOUD_TOKEN. This is not the table's read API key.
-./grepstein cloud-jobs --plan ./grepstein-corpus/cloud-jobs.json \
-  --jobs-url "$COLONY_INSTANCE_IMPORT_JOBS_URL"
+./grepstein grep --state ./grepstein-corpus --url "$ANTFLY_URL"
+antfly-grep --table-config ./grepstein-corpus/grep.json 'pattern'
+antfly-grep --table-config ./grepstein-corpus/grep.json --artifact chunks 'pattern'
 ```
 
-The GCS connection reads the derived bucket with a separate read-only Google
-identity. The plan uses existing scheduled `source` jobs, one per populated
-dataset/hash partition, at most 10,000 pages each. It does not feed binary PDFs
-into the text-only source importer. Jobs refresh hourly with a 24-hour permission
-lease. Leave `max_objects` unset: an explicit value requests a non-authoritative
-subset and cannot promote a searchable catalog or renew its permission lease.
-The connector already enforces a 10,000-object hard ceiling. Colony owns job
-UUIDs, catalog rows, readiness, and revocation policy.
-`cloud-jobs` reuses identical jobs after a lost response and refuses a conflicting
-existing job; it does not archive or replace jobs automatically. New extraction
-snapshots require a reviewed job lifecycle/config update.
+The default `extracted` stream reads `document_units_v1` through
+`document_units_text`. Each native extraction unit is a matching boundary; a
+regex never spans pages or transcript units. The optional `chunks` stream uses
+`document_text`; its semantic overlap is deliberately excluded from default
+lexical search. Both use the same originals, extraction, revision fencing and
+artifact lifecycle as the explorer and semantic/graph indexes. Native index
+readiness is checked separately from source publication, including failed OCR.
 
-Once Colony reports source jobs searchable, use Antfly grep's ordinary Cloud
-source selection. For self-hosting, omit `--gcs-projection-bucket`: `grep` uses the
-shared publisher directly and writes `grep-sync/catalog.json`. For example:
+The binding maps the corpus's existing fields to source identity and permissions.
+New prepared rows include `indexed_at` and private `user:self` reader metadata;
+regenerate and publish older prepared rows before using the new binding. Local
+principal filtering narrows results; exposed APIs still require their own current
+caller authorization/RLS. The ordinary Antfly API and binding format are the
+same in Cloud and self-hosted deployments. Never distribute a write/admin key
+with the binding.
 
-```sh
-antfly-grep --source-catalog ./grepstein-corpus/grep-sync/catalog.json \
-  --source grepstein-doj-12-a 'pattern'
-```
-
-Use a populated alias from the catalog. Standalone catalogs need refresh before
-their 24-hour lease expires. Do not publish a standalone catalog through Cloud
-and expect it to substitute for Colony's source job authorization policy.
+The former `--grep-table`, `--gcs-projection-bucket` and page source-job workflow
+are retired. Existing projection tables/buckets are not automatically deleted.
 
 ## Explorer and hosting
 
