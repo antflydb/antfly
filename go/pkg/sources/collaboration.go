@@ -509,6 +509,17 @@ func (c *CollaborationConnector) materialItems(ctx context.Context, r Request, c
 	totalBytes := len(m.Text)
 	if config.Attachments {
 		for _, file := range m.Files {
+			if c.NativeAttachments && r.Preview {
+				meta := cloneSourceMetadata(metadata)
+				meta["parent_identity"], meta["parent_revision"] = parent.ID, parent.Revision
+				meta["attachment_id"], meta["filename"], meta["mime_type"] = file.ID, file.Name, file.MIME
+				attachment := ref
+				attachment.Attachment = file.ID
+				input := makeInput(attachment, nil, meta)
+				input.Filename = file.Name
+				items = append(items, input)
+				continue
+			}
 			remaining := maxImportSourceObjectBytes - totalBytes
 			if remaining <= 0 {
 				return nil, fmt.Errorf("%w: attachment budget exhausted", ErrInvalidInput)

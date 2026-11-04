@@ -17,6 +17,7 @@ package sources
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -206,4 +207,23 @@ func TestNativeCollaborationDeliveryUsesSelectedAttachment(t *testing.T) {
 		require.Error(t, err)
 		require.Zero(t, downloads)
 	})
+}
+
+func TestNativePreviewReturnsAttachmentDescriptorsWithoutAcquisition(t *testing.T) {
+	calls := 0
+	c := &CollaborationConnector{ProviderName: ProviderSlack, NativeAttachments: true,
+		Extractor: func(context.Context, string, string, []byte) ([]byte, error) {
+			calls++
+			return nil, fmt.Errorf("unexpected extraction")
+		},
+		DownloadTransport: collaborationTransport(func(*http.Request) (*http.Response, error) { calls++; return nil, fmt.Errorf("unexpected download") }),
+	}
+	items, err := c.materialItems(t.Context(), Request{SourceNamespace: "preview/test", Preview: true}, CollaborationConfig{Attachments: true}, collaborationRef{Resource: "slack", Container: "C1", ID: "1"}, collaborationMaterial{Text: []byte("message"), Files: []collaborationFile{{ID: "audio", Name: "interview.wav", MIME: "audio/wav", URL: "https://files.example/audio"}}})
+	require.NoError(t, err)
+	require.Len(t, items, 2)
+	require.Equal(t, "message", string(items[0].Bytes))
+	require.Empty(t, items[1].Bytes)
+	require.Equal(t, "audio", items[1].Metadata["attachment_id"])
+	require.Equal(t, "audio/wav", items[1].Metadata["mime_type"])
+	require.Zero(t, calls)
 }
