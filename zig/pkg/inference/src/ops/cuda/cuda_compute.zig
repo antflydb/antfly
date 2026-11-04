@@ -4219,6 +4219,8 @@ pub const CudaCompute = struct {
     decoder_runtime_next_dynamic_slot: usize = 1,
     decoder_runtime_family_state: CudaDecoderRuntimeFamilyState = .{},
     run_budget: ?*run_memory.RunBudget = null,
+    /// Execution scope distinguishes decode cohorts from prefill matrices.
+    cooperative_decode_rows: usize = 0,
     cooperative_owner: @import("../execution_scope.zig").OwnerState = .{},
     dense_stream_entries: std.ArrayListUnmanaged(DenseStreamEntry) = .empty,
     dense_stream_epoch: u64 = 1,
@@ -5677,8 +5679,45 @@ pub const CudaCompute = struct {
     /// The caller owns the model mutex for setup and every compute/cleanup
     /// step. Unlike a whole-request scoped handle, deinit does not mutate the
     /// shared binding while a different request may be executing.
+    /// Numerical qualification belongs to the resident backend inventory.
+    /// Geometry alone cannot qualify a dense/BF16 or differently quantized head.
+    pub fn cooperativeDecodeBatchRows(self: *const CudaCompute, tied: bool) usize {
+        const embedding = self.resident_weights.getPtr("model.embed_tokens.weight") orelse
+            self.resident_weights.getPtr("model.language_model.embed_tokens.weight") orelse
+            self.resident_weights.getPtr("token_embd.weight");
+        const output = if (tied) embedding else self.resident_weights.getPtr("lm_head.weight") orelse
+            self.resident_weights.getPtr("model.lm_head.weight") orelse
+            self.resident_weights.getPtr("output.weight") orelse embedding;
+        const head = output orelse return 1;
+        if (!isKnownQuant(head, .Q6_K) or !self.tuned_route_gates.q6_k_lm_head_q8_1) return 1;
+        var q4_backbone = false;
+        var weights = self.resident_weights.valueIterator();
+        while (weights.next()) |weight| if (isKnownQuant(weight, .Q4_0)) {
+            q4_backbone = true;
+            break;
+        };
+        if (!q4_backbone or self.kernels.linear_q6_k_q8_1_f32_tile8_e4b == null) return 1;
+        return 2;
+    }
+
     pub fn computeBackendWithStepRunBudget(self: *CudaCompute, budget: *run_memory.RunBudget, owner: u64) ops.ComputeBackend {
-        return .{ .ptr = self, .vtable = &vtable, .execution_budget = budget, .execution_budget_bind = &bindStepRunBudget, .execution_owner = owner, .execution_enter = &enterExecutionOwner, .execution_cleanup = &cleanupExecutionOwner, .execution_release = &releaseExecutionOwner };
+        return .{ .ptr = self, .vtable = &vtable, .execution_budget = budget, .execution_budget_bind = &bindStepRunBudget, .execution_owner = owner, .execution_batch_rows = &setCooperativeDecodeRows, .execution_batch_drain = &drainCooperativeDecode, .execution_enter = &enterExecutionOwner, .execution_cleanup = &cleanupExecutionOwner, .execution_release = &releaseExecutionOwner };
+    }
+
+    fn setCooperativeDecodeRows(raw: *anyopaque, rows: usize) void {
+        const self: *CudaCompute = @ptrCast(@alignCast(raw));
+        std.debug.assert(rows == 0 or rows == 2);
+        // A cohort touched both requests' backend metadata. The next single
+        // owner must enter through the normal transition contract, even when
+        // it was the leader of this cohort. Ordinary singleton reuses remain
+        // unchanged. Called after the scope's confirmed stream drain.
+        if (rows == 0 and self.cooperative_decode_rows != 0) self.cooperative_owner.cleanup();
+        self.cooperative_decode_rows = rows;
+    }
+
+    fn drainCooperativeDecode(raw: *anyopaque) !void {
+        const self: *CudaCompute = @ptrCast(@alignCast(raw));
+        try self.ctx.synchronize();
     }
 
     fn enterExecutionOwner(raw: *anyopaque, owner: u64) !void {
@@ -11064,7 +11103,16 @@ fn tryDebertaMaterializedAttentionF16(
 // BF16 mirror, return the mirror when the matmul is prefill-shaped
 // (rows > 1) so cuBLASLt handles it; decode (rows == 1) stays on the
 // native Q4/F32 kernels.
+/// A multi-row matrix is still decoding only while its execution scope says
+/// so. Keep output-head eligibility identical for sampled and greedy paths.
+fn cudaQuantizedDecodeRowsEligible(rows: usize, cohort_rows: usize) bool {
+    return rows == 1 or (cohort_rows > 1 and rows == cohort_rows);
+}
+
 fn weightBf16MirrorForRows(self: *const CudaCompute, weight: *const CudaTensor, rows: usize) ?buffer_mod.DeviceBuffer {
+    // A decode cohort retains singleton quantized math. Two rows alone do
+    // not authorize prefill mirrors or their different arithmetic.
+    if (self.cooperative_decode_rows != 0) return null;
     if (!self.bf16_mirror_row_selector.accepts(rows)) return null;
     if (weight.bf16_mirror.ptr == 0) return null;
     if (weight.bf16_mirror.len < weight.elem_count * @sizeOf(u16)) return null;
@@ -19852,7 +19900,7 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
     var prefill_profile_scope = beginPrefillProfile(self, prefillProfileCategoryForLinearNoBias(weight_tensor, rows, in_dim, out_dim), rows);
     defer if (prefill_profile_scope) |*scope| scope.end();
     const bf16_mirror = weightBf16MirrorForRows(self, weight_tensor, rows);
-    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill, rows, bf16_mirror != null) and
+    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill and self.cooperative_decode_rows == 0, rows, bf16_mirror != null) and
         try launchQ4_0TcHmmaNoBias(self, .tc_hmma, device, input_tensor, weight_tensor, rows, in_dim, out_dim))
     {
         // W4A16 tensor-core prefill route (default on SM89). It DEFERS to the
@@ -19881,7 +19929,7 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
             self.stats.f16_scalar_linear_calls += 1;
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .f16, .dense_cuda, .none, .none, rows, in_dim, out_dim, 0);
         }
-    } else if (rows == 1 and weight_tensor.quant_type == null and weight_tensor.dtype == .f32 and
+    } else if (cudaQuantizedDecodeRowsEligible(rows, self.cooperative_decode_rows) and weight_tensor.quant_type == null and weight_tensor.dtype == .f32 and
         weight_tensor.bf16_mirror.ptr != 0 and
         weight_tensor.bf16_mirror.len >= weight_tensor.elem_count * @sizeOf(u16))
     {
@@ -20081,8 +20129,9 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
                     // Full-logits lm-head fast path: Q8_1 activations + DP4A,
                     // same math as the greedy argmax kernels. Feeds sampled
                     // decoding, which needs the whole distribution.
-                    if (rows == 1 and in_dim == 2560 and out_dim >= 32768 and out_dim % 8 == 0 and cudaQ6KLmHeadQ8_1Enabled(self)) q6_q8_blk: {
-                        var q8_input = allocDeviceBuffer(self, (in_dim / 32) * 36) catch |err| switch (err) {
+                    if (cudaQuantizedDecodeRowsEligible(rows, self.cooperative_decode_rows) and in_dim == 2560 and out_dim >= 32768 and out_dim % 8 == 0 and cudaQ6KLmHeadQ8_1Enabled(self)) q6_q8_blk: {
+                        const row_bytes = (in_dim / 32) * 36;
+                        var q8_input = allocDeviceBuffer(self, try checkedMul(rows, row_bytes)) catch |err| switch (err) {
                             error.CudaGraphCaptureUnsafeTempAlloc => break :q6_q8_blk,
                             else => return err,
                         };
@@ -20091,10 +20140,17 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
                             error.CudaKernelUnavailable, error.InvalidCudaState => break :q6_q8_blk,
                             else => return err,
                         };
-                        self.kernels.launchLinearQ6KQ8_1F32Tile8E4B(&self.ctx, device, q8_input, weight_tensor.buffer, in_dim, out_dim) catch |err| switch (err) {
-                            error.CudaKernelUnavailable, error.InvalidCudaState => break :q6_q8_blk,
-                            else => return err,
-                        };
+                        // The sampled path needs every logit. Reuse the exact
+                        // singleton Q8_1 head for each row; only the projection
+                        // tail is split, while the decoder backbone stays fused.
+                        for (0..rows) |row| {
+                            const output_row = buffer_mod.DeviceBuffer{ .ptr = device.ptr + row * out_dim * @sizeOf(f32), .len = out_dim * @sizeOf(f32) };
+                            const input_row = buffer_mod.DeviceBuffer{ .ptr = q8_input.ptr + row * row_bytes, .len = row_bytes };
+                            self.kernels.launchLinearQ6KQ8_1F32Tile8E4B(&self.ctx, output_row, input_row, weight_tensor.buffer, in_dim, out_dim) catch |err| switch (err) {
+                                error.CudaKernelUnavailable, error.InvalidCudaState => break :q6_q8_blk,
+                                else => return err,
+                            };
+                        }
                         self.dispatch_stats.note(self.allocator, .linear_no_bias, .q6_k, .q6_simt, .none, tcUnavailableReason(), rows, in_dim, out_dim, 0);
                         self.stats.launch_linear += 1;
                         return createTensor(self, device, shape, out_count);
@@ -21417,7 +21473,7 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
     // attached, defer to the individual linearNoBias path (which routes Q4_0
     // prefill through tc_hmma). When a mirror IS present, keep the fused
     // BF16-mirror triple (cuBLASLt is faster + equal quality).
-    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill, rows, use_hybrid_bf16) and
+    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill and self.cooperative_decode_rows == 0, rows, use_hybrid_bf16) and
         tcQuantBuffer(q_weight_tensor, .q4_0_hmma) != null and
         tcQuantBuffer(k_weight_tensor, .q4_0_hmma) != null and
         tcQuantBuffer(v_weight_tensor, .q4_0_hmma) != null) return null;
@@ -21989,7 +22045,7 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
     var prefill_profile_scope = beginPrefillProfile(self, if (use_bf16) .bf16_pair else if (use_q4_0) .q4_pair else null, rows);
     defer if (prefill_profile_scope) |*scope| scope.end();
 
-    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill, rows, use_hybrid_bf16) and
+    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill and self.cooperative_decode_rows == 0, rows, use_hybrid_bf16) and
         tcQuantBuffer(weight_a_tensor, .q4_0_hmma) != null and
         tcQuantBuffer(weight_b_tensor, .q4_0_hmma) != null and
         try launchQ4_0TcHmmaNoBias(self, .tc_hmma, device_a, input_tensor, weight_a_tensor, rows, in_dim, out_dim) and
@@ -22299,7 +22355,7 @@ fn linearNoBiasPairActivationQ4_0(
     try ensureF32(input_tensor);
     try ensureF32Bf16OrQuantized(weight_gate_tensor);
     try ensureF32Bf16OrQuantized(weight_up_tensor);
-    if (rows != 1) return null;
+    if (!cudaQuantizedDecodeRowsEligible(rows, self.cooperative_decode_rows)) return null;
     if (!isKnownQuant(weight_gate_tensor, .Q4_0) or !isKnownQuant(weight_up_tensor, .Q4_0)) return null;
     const input_expected = try checkedMul(rows, in_dim);
     if (input_tensor.elem_count != input_expected) return error.InvalidShape;
@@ -37486,4 +37542,51 @@ test "Whisper CUDA residual normalization returns the sum and matching normaliza
     const actual_norm = try cb.toFloat32(fused.normed, a);
     defer a.free(actual_norm);
     for (expected_norm, actual_norm) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
+}
+
+test "cooperative decode batches preserve quantized routing without changing prefill mirrors" {
+    var compute: CudaCompute = undefined;
+    compute.cooperative_decode_rows = 0;
+    compute.cooperative_owner = .{};
+    compute.cooperative_owner.last_owner = 7;
+    compute.bf16_mirror_row_selector = .production;
+    var weight: CudaTensor = undefined;
+    weight.elem_count = 16;
+    weight.bf16_mirror = .{ .ptr = 128, .len = 32 };
+    try std.testing.expect(weightBf16MirrorForRows(&compute, &weight, 1) == null);
+    try std.testing.expect(weightBf16MirrorForRows(&compute, &weight, 2) != null);
+    CudaCompute.setCooperativeDecodeRows(&compute, 2);
+    try std.testing.expect(weightBf16MirrorForRows(&compute, &weight, 2) == null);
+    CudaCompute.setCooperativeDecodeRows(&compute, 0);
+    try std.testing.expectEqual(@as(u64, 0), compute.cooperative_owner.last_owner);
+    try std.testing.expectEqual(@as(u64, 1), compute.cooperative_owner.snapshot().cleanups);
+    try std.testing.expect(weightBf16MirrorForRows(&compute, &weight, 512) != null);
+}
+
+test "cooperative decode batches require the qualified quantized head and honor weight tying" {
+    const a = std.testing.allocator;
+    var shape = [_]i64{ 1, 32 };
+    var compute: CudaCompute = undefined;
+    compute.resident_weights = .{};
+    defer compute.resident_weights.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), compute.cooperativeDecodeBatchRows(true));
+    compute.tuned_route_gates = .{};
+    compute.tuned_route_gates.q6_k_lm_head_q8_1 = true;
+    compute.kernels.linear_q6_k_q8_1_f32_tile8_e4b = @ptrFromInt(1);
+    try compute.resident_weights.put(a, "model.embed_tokens.weight", .{ .buffer = .{}, .dtype = .u8, .shape = &shape, .elem_count = 32, .quant_type = .{ .known = .Q6_K } });
+    try compute.resident_weights.put(a, "gate.weight", .{ .buffer = .{}, .dtype = .u8, .shape = &shape, .elem_count = 32, .quant_type = .{ .known = .Q4_0 } });
+    try std.testing.expectEqual(@as(usize, 2), compute.cooperativeDecodeBatchRows(true));
+    try compute.resident_weights.put(a, "lm_head.weight", .{ .buffer = .{}, .dtype = .f32, .shape = &shape, .elem_count = 32 });
+    try std.testing.expectEqual(@as(usize, 1), compute.cooperativeDecodeBatchRows(false));
+    try std.testing.expectEqual(@as(usize, 2), compute.cooperativeDecodeBatchRows(true));
+    compute.tuned_route_gates.q6_k_lm_head_q8_1 = false;
+    try std.testing.expectEqual(@as(usize, 1), compute.cooperativeDecodeBatchRows(true));
+}
+
+test "cooperative decode batches keep sampled and greedy Q6 heads on the same quantized row contract" {
+    try std.testing.expect(cudaQuantizedDecodeRowsEligible(1, 0));
+    try std.testing.expect(!cudaQuantizedDecodeRowsEligible(2, 0));
+    try std.testing.expect(cudaQuantizedDecodeRowsEligible(2, 2));
+    try std.testing.expect(!cudaQuantizedDecodeRowsEligible(3, 2));
+    try std.testing.expect(!cudaQuantizedDecodeRowsEligible(0, 0));
 }

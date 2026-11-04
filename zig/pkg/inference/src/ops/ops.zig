@@ -1695,6 +1695,8 @@ pub const ComputeBackend = struct {
     execution_budget_bind: ?*const fn (*anyopaque, ?*runtime.tier.memory.RunBudget) void = null,
     /// Only an execution scope transitions a shared backend under its mutex.
     execution_owner: u64 = 0,
+    execution_batch_rows: ?*const fn (*anyopaque, usize) void = null,
+    execution_batch_drain: ?*const fn (*anyopaque) anyerror!void = null,
     execution_enter: ?*const fn (*anyopaque, u64) anyerror!void = null,
     execution_cleanup: ?*const fn (*anyopaque, u64) void = null,
     execution_release: ?*const fn (*anyopaque, u64) void = null,

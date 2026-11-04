@@ -2796,6 +2796,10 @@ test "CUDA prefill KV reservation respects admitted length and supported geometr
 }
 
 pub const NativeDecodeState = struct {
+    /// Borrowed through claimed-step retirement; each row retains its own
+    /// admission, cancellation lifetime and request budget.
+    execution_backend: ?ops.ComputeBackend = null,
+    execution_control: ?InferenceExecutionControl = null,
     allocator: std.mem.Allocator,
     kv_manager: ?*runtime.kv.manager.KvManager = null,
     kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
@@ -8698,7 +8702,10 @@ pub const NativeGenerationPipeline = struct {
                 // scheduler still admits only full-geometry-compatible work,
                 // and incompatible peers do not pay a coalescing delay.
                 const route_decode_through_scheduler = self.execution_lock != null and self.scheduler_lease != null and
-                    (if (self.scheduler) |scheduler| scheduler.shouldCoordinateCurrentRequests() else false);
+                    (self.cb.execution_owner != 0 or (if (self.scheduler) |scheduler| scheduler.shouldCoordinateCurrentRequests() else false));
+                // A cooperative CUDA request uses the same canonical logits
+                // path while alone and shared. Admission/retirement of a peer
+                // must not switch its numerical policy mid-generation.
                 if (route_decode_through_scheduler and self.cb.kind() == .metal and
                     isPureGreedyConfig(config) and token_table == null and json_grammar.* == null and gbnf_grammar == null and
                     !has_cached_prefill_logits)
@@ -12970,7 +12977,17 @@ pub const NativeGenerationPipeline = struct {
         }
     };
 
+    fn cancelledDecodeWork(work: *PendingDecodeBatchWork) bool {
+        if (work.decode_state.execution_control) |control| control.check() catch |err| {
+            work.failure = err;
+            work.ready.store(true, .release);
+            return true;
+        };
+        return false;
+    }
+
     fn publishGreedyToken(work: *PendingDecodeBatchWork, token: u32) void {
+        if (cancelledDecodeWork(work)) return;
         if (work.sequence) |sequence| {
             sequence.acceptToken(token) catch |err| {
                 work.failure = err;
@@ -14431,11 +14448,53 @@ pub const NativeGenerationPipeline = struct {
         lease: *runtime.scheduler.native_generate.Lease,
         claimed: []const runtime.scheduler.native_generate.StepItem,
     ) void {
+        // A claimed CUDA cohort drains as one operation. One row's deadline
+        // must not abort a healthy peer or retire its borrowed KV pointers.
+        const shared_batch = self.cb.kind() == .cuda and self.cb.execution_owner != 0 and claimed.len > 1;
+        var batch_budget: @import("../ops/execution_batch.zig").Budget = undefined;
+        if (shared_batch) {
+            var owners: [2]*runtime.tier.memory.RunBudget = undefined;
+            if (claimed.len > owners.len) {
+                completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = error.InvalidBatchDecodeState });
+                return;
+            }
+            for (claimed, 0..) |item, row| {
+                if (item.phase != .decode or item.query_sequence_len != 1) {
+                    completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = error.InvalidBatchDecodeState });
+                    return;
+                }
+                const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                const backend = work.decode_state.execution_backend orelse {
+                    completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = error.InvalidBatchDecodeState });
+                    return;
+                };
+                if (backend.ptr != self.cb.ptr or backend.execution_owner == 0 or backend.execution_budget == null) {
+                    completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = error.InvalidBatchDecodeState });
+                    return;
+                }
+                owners[row] = backend.execution_budget.?;
+            }
+            batch_budget = @import("../ops/execution_batch.zig").Budget.init(owners[0..claimed.len]) catch |err| {
+                completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = err });
+                return;
+            };
+        }
+        const original_control = self.execution_control;
+        const original_backend_control = self.cb.execution_control;
+        if (shared_batch) {
+            self.execution_control = null;
+            self.cb.execution_control = null;
+        }
+        defer {
+            self.execution_control = original_control;
+            self.cb.execution_control = original_backend_control;
+        }
         var execution_scope = if (self.execution_lock) |mutex| self.lockExecution(mutex) catch |err| {
             completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = err });
             return;
         } else null;
         defer if (execution_scope) |*scope| scope.deinit();
+        if (shared_batch) execution_scope.?.bindDecodeBatch(&batch_budget.run, claimed.len);
         self.claimed_execution_scope = if (execution_scope) |*scope| scope else null;
         defer self.claimed_execution_scope = null;
 
@@ -14477,6 +14536,7 @@ pub const NativeGenerationPipeline = struct {
         };
 
         var result = self.forwardScheduledStep(claimed) catch |err| {
+            if (self.claimed_execution_scope) |scope| scope.drainBatch();
             completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = err });
             return;
         };
@@ -14486,6 +14546,7 @@ pub const NativeGenerationPipeline = struct {
         defer if (result.packed_greedy_tokens) |tokens| self.allocator.free(tokens);
         defer if (result.second_greedy_tokens) |tokens| self.allocator.free(tokens);
 
+        if (self.claimed_execution_scope) |scope| scope.drainBatch();
         completeClaimedStepBeforePublish(scheduler, lease, claimed, SuccessfulStepPublisher{
             .vocab_size = self.gpt_config.vocab_size,
             .logits = result.logits,
@@ -14679,6 +14740,7 @@ pub const NativeGenerationPipeline = struct {
             switch (item.phase) {
                 .decode => {
                     const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                    if (cancelledDecodeWork(work)) continue;
                     if (work.sequence) |sequence| {
                         const allocator = work.allocator;
                         const masked = allocator.dupe(f32, slice) catch |err| {
@@ -20880,4 +20942,37 @@ test "generation audio PCM follows content part order and validates alignment" {
     try std.testing.expectEqual(@intFromPtr(samples[0..].ptr), @intFromPtr(inputs[1].pcm.samples.ptr));
     message.decoded_audio = pcm[0..1];
     try std.testing.expectError(error.InvalidMessageAudioIndex, collectAudioInPromptOrder(a, &.{message}));
+}
+
+test "cooperative decode publication cancels only the expired row after a shared step" {
+    const a = std.testing.allocator;
+    var expired = NativeDecodeState.initContiguous(a);
+    defer expired.deinit();
+    var healthy = NativeDecodeState.initContiguous(a);
+    defer healthy.deinit();
+    const Probe = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.DeadlineExceeded;
+        }
+    };
+    expired.execution_control = .{ .check_fn = Probe.check };
+    var x = NativeGenerationPipeline.PendingDecodeBatchWork{ .allocator = a, .decode_state = &expired, .token_id = 1, .seq_len = 100 };
+    var y = NativeGenerationPipeline.PendingDecodeBatchWork{ .allocator = a, .decode_state = &healthy, .token_id = 2, .seq_len = 9000 };
+    NativeGenerationPipeline.publishGreedyToken(&x, 17);
+    NativeGenerationPipeline.publishGreedyToken(&y, 29);
+    try std.testing.expectEqual(@as(?anyerror, error.DeadlineExceeded), x.failure);
+    try std.testing.expect(x.greedy_token == null and x.ready.load(.acquire));
+    try std.testing.expect(y.failure == null and y.ready.load(.acquire));
+    try std.testing.expectEqual(@as(?u32, 29), y.greedy_token);
+    // Buffered/sampling results obey the same per-row lifetime contract.
+    x.ready.store(false, .release);
+    y.ready.store(false, .release);
+    const items = [_]runtime.scheduler.native_generate.StepItem{
+        .{ .work_ptr = &x, .phase = .decode, .query_sequence_len = 1, .total_sequence_len = 100, .kv_sequence_len = 100, .kv_position_offset = 0 },
+        .{ .work_ptr = &y, .phase = .decode, .query_sequence_len = 1, .total_sequence_len = 9000, .kv_sequence_len = 9000, .kv_position_offset = 0 },
+    };
+    NativeGenerationPipeline.dispatchStepLogitsLayout(3, &items, &.{ 1, 2, 3, 4, 5, 6 }, 1, false);
+    try std.testing.expect(x.logits == null and x.ready.load(.acquire));
+    defer a.free(y.logits.?);
+    try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, y.logits.?);
 }

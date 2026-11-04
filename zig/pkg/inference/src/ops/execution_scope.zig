@@ -79,6 +79,8 @@ pub const Scope = struct {
     backend: ?ops.ComputeBackend = null,
     phase: Phase,
     active: bool = true,
+    batch_active: bool = false,
+    batch_drained: bool = false,
 
     pub const Options = struct {
         mutex: *std.atomic.Mutex,
@@ -122,6 +124,28 @@ pub const Scope = struct {
         self.backend = backend;
     }
 
+    /// The scope owns this borrowed aggregate until GPU work and publication
+    /// drain. The request-local backend wrapper remains unchanged.
+    pub fn bindDecodeBatch(self: *Scope, budget: *@import("../runtime/tier/memory.zig").RunBudget, rows: usize) void {
+        var backend = self.backend orelse unreachable;
+        backend.execution_budget = budget;
+        backend.bindExecutionBudget();
+        self.backend = backend;
+        if (backend.execution_batch_rows) |set| set(backend.ptr, rows);
+        self.batch_active = true;
+    }
+
+    /// No borrowed row may publish ready before its queued GPU accesses drain.
+    /// A sticky driver failure poisons this worker; unwinding borrowed pointers
+    /// would permit use-after-free and is not a recoverable request error.
+    pub fn drainBatch(self: *Scope) void {
+        if (!self.batch_active or self.batch_drained) return;
+        const backend = self.backend.?;
+        if (backend.execution_batch_drain) |drain| drain(backend.ptr) catch |err|
+            std.debug.panic("CUDA cohort stream cannot drain; worker restart required: {s}", .{@errorName(err)});
+        self.batch_drained = true;
+    }
+
     pub fn bindCleanup(self: *Scope, backend: ops.ComputeBackend) void {
         std.debug.assert(self.phase == .cleanup or self.phase == .release);
         self.bind(backend) catch unreachable;
@@ -129,7 +153,11 @@ pub const Scope = struct {
 
     pub fn deinit(self: *Scope) void {
         if (!self.active) return;
-        if (self.backend) |backend| backend.clearExecutionBudget();
+        self.drainBatch();
+        if (self.backend) |backend| {
+            if (self.batch_active) if (backend.execution_batch_rows) |set| set(backend.ptr, 0);
+            backend.clearExecutionBudget();
+        }
         self.mutex.unlock();
         if (self.lane) |lease| lease.release();
         self.active = false;
@@ -230,4 +258,42 @@ test "execution resource release preserves same owner and invalidates a peer wit
     try std.testing.expectEqual(@as(u64, 2), state.snapshot().transitions);
     state.cleanup();
     try std.testing.expectEqual(@as(u64, 0), state.last_owner);
+}
+
+test "execution scope binds a borrowed cohort budget only until shared retirement" {
+    const Memory = @import("../runtime/tier/memory.zig");
+    const Probe = struct {
+        bound: ?*Memory.RunBudget = null,
+        rows: usize = 0,
+        drains: usize = 0,
+        fn bind(raw: *anyopaque, budget: ?*Memory.RunBudget) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.bound = budget;
+        }
+        fn setRows(raw: *anyopaque, rows: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.rows = rows;
+        }
+        fn drain(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.bound != null and self.rows == 2);
+            self.drains += 1;
+        }
+    };
+    var probe = Probe{};
+    var leader = Memory.RunBudget.init(.{});
+    var cohort = Memory.RunBudget.init(.{});
+    const cb = ops.ComputeBackend{ .ptr = &probe, .vtable = undefined, .execution_budget = &leader, .execution_budget_bind = Probe.bind, .execution_batch_rows = Probe.setRows, .execution_batch_drain = Probe.drain };
+    var mutex = std.atomic.Mutex.unlocked;
+    var scope = try Scope.acquire(.{}, .{ .mutex = &mutex });
+    try scope.bind(cb);
+    try std.testing.expect(probe.bound == &leader);
+    scope.bindDecodeBatch(&cohort, 2);
+    try std.testing.expect(probe.bound == &cohort);
+    try std.testing.expect(cb.execution_budget == &leader);
+    scope.drainBatch();
+    try std.testing.expectEqual(@as(usize, 1), probe.drains);
+    scope.deinit();
+    try std.testing.expect(probe.bound == null and probe.rows == 0);
+    try std.testing.expectEqual(@as(usize, 1), probe.drains);
 }

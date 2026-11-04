@@ -684,6 +684,8 @@ pub const ExecutionCapabilities = struct {
     cooperative_steps: bool = false,
     max_active_requests: usize = 1,
     max_batch_rows: usize = 1,
+    /// Mixed prefill/decode padding is excluded unless explicitly qualified.
+    decode_only_batching: bool = true,
     /// Eager, immutable weight inventory; excludes KV and retained scratch.
     measured_resident_weights: ?usize = null,
 };

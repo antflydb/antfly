@@ -8605,7 +8605,8 @@ fn archExecutionCapabilities(raw: *anyopaque) @import("../backends/session.zig")
     return .{
         .cooperative_steps = cooperative,
         .max_active_requests = if (cooperative) 2 else 1,
-        .max_batch_rows = 1,
+        .max_batch_rows = if (cooperative) compute.cooperativeDecodeBatchRows(cfg.weight_tying) else 1,
+        .decode_only_batching = true,
         .measured_resident_weights = if (eager) compute.stats.resident_weight_bytes else null,
     };
 }
@@ -12884,6 +12885,7 @@ test "cooperative backend declaration uses eager weight inventory independently 
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
     var compute: cuda_compute_mod.CudaCompute = undefined;
     compute.capability_profile = .gemma4;
+    compute.resident_weights = .{};
     compute.lazy_host_store = null;
     compute.a4b_inference = null;
     compute.resident_training_cache = false;

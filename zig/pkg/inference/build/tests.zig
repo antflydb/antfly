@@ -263,8 +263,18 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     const run_cooperative_tests = ctx.addRunArtifact(cooperative_tests);
     test_step.dependOn(&run_cooperative_tests.step);
     ctx.step("test-cooperative-admission", "Verify sustained cooperative/exclusive turnover and queued deadlines").dependOn(&run_cooperative_tests.step);
+    const batch_root = b.createModule(.{ .root_source_file = ctx.path("src/test_execution_batch.zig"), .target = ctx.target, .optimize = ctx.optimize });
+    var batch_imports = suite.tests.root_module.import_table.iterator();
+    while (batch_imports.next()) |entry| batch_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    batch_root.link_libc = true;
+    // Focused aarch64 CPU/CUDA builds peak at 1 GiB; reserve 2 GiB for cold CI.
+    const batch_tests = b.addTest(.{ .max_rss = 2 * 1024 * 1024 * 1024, .root_module = batch_root, .filters = &.{ "execution scope", "execution owner transitions", "execution resource release", "execution batch", "cooperative decode batches", "cooperative decode publication", "runtime.scheduler.native_generate", "test_0" } });
+    const run_batch_tests = ctx.addRunArtifact(batch_tests);
+    test_step.dependOn(&run_batch_tests.step);
+    ctx.step("test-execution-batch", "Verify cohort budgets, scope retirement and decode arithmetic without a GPU").dependOn(&run_batch_tests.step);
     const inference_unit = ctx.step("test-inference-unit", "Run inference unit tests with optional filters, without independent library suites");
     inference_unit.dependOn(&run_tests.step);
+    inference_unit.dependOn(&run_batch_tests.step);
     inference_unit.dependOn(&run_cooperative_tests.step);
     const cancellation_e2e_step = ctx.step("test-cancellation-e2e", "Run HTTP inference cancellation and worker recovery E2E tests");
     if (ctx.target.result.os.tag == .linux or ctx.target.result.os.tag == .macos) {

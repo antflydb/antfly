@@ -1365,8 +1365,9 @@ pub const CooperativeExecutionConfig = struct {
 };
 
 pub const GenerationBatchingConfig = struct {
-    // Experimental CUDA batching: prefill remains singleton and decode batches
-    // homogeneous sequence positions within the bounded row-2 envelope. Keep
+    // Experimental CUDA batching: cooperative backends declare whether decode
+    // rows may have independent sequence positions. Prefill remains singleton
+    // inside the current two-request, two-row envelope. Keep
     // the default and `auto` serialized until the promotion gate passes;
     // `mode: on` is an explicit opt-in for validation and benchmarking.
     mode: GenerationBatchingMode = .off,
@@ -13170,13 +13171,15 @@ pub const Node = struct {
         self: *const Node,
         coordinator: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
         admission: runtime.scheduler.native_generate.Admission,
+        capabilities: @import("../backends/session.zig").ExecutionCapabilities,
     ) !runtime.scheduler.native_generate.Lease {
         var policy = self.config.generation_batching.schedulerPolicy();
         policy.allow_mixed_sequence_lengths = true;
-        policy.max_step_items = 1;
+        policy.max_step_items = if (self.config.generation_batching.mode == .on) policy.max_step_items else 1;
+        policy.decode_only_batching = capabilities.decode_only_batching;
         policy.short_context_burst = self.config.cooperative_execution.short_context_burst;
         policy.decode_handoff_wait_us = self.config.cooperative_execution.decode_handoff_wait_us;
-        policy.max_decode_wait_us = 0;
+        policy.max_decode_wait_us = if (policy.max_step_items > 1) self.config.generation_batching.max_decode_wait_us else 0;
         policy.max_step_prefill_items = 1;
         policy.decode_coalesce_rows = policy.max_step_items;
         policy.decode_coalesce_ready_only = true;
@@ -15917,7 +15920,7 @@ pub const Node = struct {
             generateMessagesHaveMedia(effective_messages),
         );
         if (cooperative_cuda and self.config.generation_batching.mode == .on and self.config.generation_batching.max_step_items > model.session.executionCapabilities().max_batch_rows)
-            return ctx.status(400).json(.{ .@"error" = "UNQUALIFIED_COOPERATIVE_BATCH", .message = "Cooperative execution currently supports one row per step; disable row batching or set max_step_items to 1" });
+            return ctx.status(400).json(.{ .@"error" = "UNQUALIFIED_COOPERATIVE_BATCH", .message = "Requested row count exceeds the backend cooperative decode-batching capability" });
         const native_isolated = native_transfer == null and canIsolateGeneration(backend_kind, effective_compiled_partition_backend != null, effective_draft_model_name != null or auto_draft_sibling != null, config.prompt_cache_enabled, want_stream);
         // Queued callers own neither scheduler work nor device KV/scratch.
         // Exclusive requests fence the shared backend's cache/graph lifetime.
@@ -15944,7 +15947,7 @@ pub const Node = struct {
                 .max_tokens = configured_max_tokens,
             };
             native_generate_lease = (if (cooperative_cuda)
-                self.acquireCooperativeGenerateLease(coordinator, admission)
+                self.acquireCooperativeGenerateLease(coordinator, admission, model.session.executionCapabilities())
             else
                 self.acquireNativeGenerateLease(coordinator, admission)) catch |err| blk: {
                 // A discovered drafter is an optimization: give back its extra
@@ -16626,6 +16629,10 @@ pub const Node = struct {
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         }
         var decode_state = generation.NativeDecodeState.initPaged(execution_allocator, active_kv_manager, pool_id, model.shared_moe_cache);
+        if (cooperative_cuda) {
+            decode_state.execution_backend = cb;
+            decode_state.execution_control = execution_control;
+        }
         if (active_kv_storage) |storage| {
             decode_state.kv_storage = storage;
         } else if (kv_storage) |*storage| {

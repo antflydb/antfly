@@ -47,6 +47,7 @@ def serving_identity(args, campaign):
         assert '--config' in argv and Path(argv[argv.index('--config')+1]).resolve()==args.config.resolve()
         assert '--port' in argv and argv[argv.index('--port')+1]==expected_port
         values=dict(x.decode().split('=',1) for x in (proc/'environ').read_bytes().split(b'\0') if b'=' in x)
+        keys.update(k for k in values if k.startswith('ANTFLY_INFERENCE_CUDA_'))
         selected={k:values.get(k) for k in sorted(keys)}
         assert not environment or selected==environment
         environment=selected; owners.append(int(pid))
@@ -109,6 +110,79 @@ def compare(serialized, cooperative, output):
     assert result['status'] == 'passed', 'cooperative performance acceptance criteria failed'
 
 
+def compare_batching(single, batched, output):
+    a, b = (json.loads((path/'comparison.json').read_text()) for path in (single, batched))
+    assert a['status']==b['status']=='passed'
+    assert a['mode']==b['mode']=='cooperative' and a['rows']==1 and b['rows']==2
+    assert a['workload']==b['workload'] and a['references']==b['references']
+    for field in ('binary_sha256','gpu','runtime_environment'):
+        assert a['identity'][field]==b['identity'][field], field
+    configs=[json.loads(json.dumps(x['identity']['configuration'])) for x in (a,b)]
+    for cfg in configs:
+        for field in ('mode','max_step_items'): cfg['inference']['generation_batching'].pop(field)
+    assert configs[0]==configs[1], 'configuration differs beyond row batching'
+    gates={}
+    for mode in a['pairs']:
+        x,y=a['pairs'][mode],b['pairs'][mode]
+        gates[mode+'_throughput']={'ratio':x['wall_seconds']/y['wall_seconds'],'minimum':1.10}
+        for request in ('short','long'):
+            gates[mode+'_'+request+'_completion']={'ratio':y[request+'_seconds']/x[request+'_seconds'],'maximum':1.25}
+    gates['short_first_content']={'ratio':b['pairs']['stream']['short_first_content_seconds']/a['pairs']['stream']['short_first_content_seconds'],'maximum':1.25}
+    for kind in ('embed','decide'):
+        x,y=a['probes'][kind]['p95_ms'],b['probes'][kind]['p95_ms']
+        assert x is not None and y is not None
+        gates[kind+'_p95_relative']={'ratio':y/x,'maximum':2.0}
+        gates[kind+'_p95_absolute_ms']={'value':y,'maximum':1000}
+    for gate in gates.values():
+        value=gate.get('ratio',gate.get('value'))
+        gate['passed']=value>=gate['minimum'] if 'minimum' in gate else value<=gate['maximum']
+    result={'status':'passed' if all(g['passed'] for g in gates.values()) else 'failed','gates':gates,'scope':'GB10 two-row experiment; no A100 or production SLO claim'}
+    output.mkdir(parents=True,exist_ok=True)
+    (output/'batching-gates.json').write_text(json.dumps(result,indent=2)+'\n')
+    print(json.dumps(result,indent=2),flush=True)
+    assert result['status']=='passed', 'row-batching acceptance criteria failed'
+
+
+def batch_peer_disconnect(c, args, healthy_body, cancelled_body, reference):
+    """Retire one streaming row after real shared steps; its peer must finish."""
+    c.set_phase('batch-peer-disconnect')
+    code, raw, _ = q.http(args.url,'/metrics',text=True)
+    assert code==200
+    before=q.metrics(raw)['antfly_inference_native_scheduler_step_batch_size_2_total']
+    body={**cancelled_body,'max_tokens':1024,'stream':True,'stream_options':{'include_usage':True},'chat_template_kwargs':{'enable_thinking':False}}
+    request=q.urllib.request.Request(args.url+'/ai/v1/generate',data=json.dumps(body).encode(),headers={'Content-Type':'application/json','X-Antfly-Inference-Timeout-Ms':str(args.generation_timeout*1000)})
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with q.urllib.request.urlopen(request,timeout=args.generation_timeout) as response:
+            for line in response:
+                if not line.startswith(b'data:'): continue
+                payload=line[5:].strip()
+                assert payload!=b'[DONE]', 'cancel target finished before first content'
+                event=json.loads(payload)
+                assert 'error' not in event,event
+                if any(choice.get('delta',{}).get('content') for choice in event.get('choices',[])): break
+            else: raise AssertionError('cancel target produced no content')
+            survivor=pool.submit(c.request,'generate',healthy_body)
+            deadline=time.monotonic()+30
+            while True:
+                code, raw, _ = q.http(args.url,'/metrics',text=True)
+                assert code==200
+                observed=q.metrics(raw)
+                if observed['antfly_inference_native_scheduler_decode_requests']>=2 and observed['antfly_inference_native_scheduler_step_batch_size_2_total']>before: break
+                assert not survivor.done() and time.monotonic()<deadline, 'disconnect target never shared a GPU step with its peer'
+                time.sleep(.01)
+        result=survivor.result()
+    assert result['response']['choices']==reference, 'peer output changed after cohort cancellation'
+    deadline=time.monotonic()+30
+    while True:
+        code, raw, _ = q.http(args.url,'/metrics',text=True)
+        assert code==200
+        current=q.metrics(raw)
+        if current['antfly_inference_generation_active_requests']==0 and current['antfly_inference_admission_backend_kv_bytes']==0: break
+        assert time.monotonic()<deadline, 'cancelled cohort did not retire'
+        time.sleep(.05)
+    return {'two_row_steps_before_disconnect':observed['antfly_inference_native_scheduler_step_batch_size_2_total']-before,'healthy_peer_matches_reference':True,'active_and_kv_recovered':True}
+
+
 def run(args):
     args.pressure = False
     args.stream_generations = False
@@ -119,11 +193,13 @@ def run(args):
     c = q.Campaign(args)
     long = prompt(args.long_records,args.long_output,'cobalt-lantern-7319','warehouse')
     short = prompt(args.short_records,args.short_output,'tulip-harbor-9462','garden')
+    long['temperature'] = short['temperature'] = args.temperature
     workload = {'long':long,'short':short,'probe_interval':args.probe_interval,'turnover_rounds':args.turnover_rounds}
     if args.scenario=='decode-overlap': workload['scenario']='decode-overlap'
     references = json.loads(args.references.read_text()) if args.references else {}
     pairs = {}
     identity = None
+    batch_recovery = {}
     monitor = threading.Thread(target=c.monitor,daemon=True)
     monitor.start()
     def validated(body, label):
@@ -149,7 +225,7 @@ def run(args):
         declared=q.metrics(raw)
         assert declared['antfly_inference_generation_cooperative_capable_models']==1, 'E4B backend did not declare safe sharing'
         assert declared['antfly_inference_generation_cooperative_configured']==(1 if args.mode=='cooperative' else 0)
-        assert declared['antfly_inference_generation_row_batching_configured']==0, 'row batching must be disabled for this campaign'
+        assert declared['antfly_inference_generation_row_batching_configured']==(1 if args.rows>1 else 0), 'row batching configuration differs from requested envelope'
         c.set_phase('warmup')
         c.request('embed',c.embed()); c.request('decide',c.decide())
         c.set_phase('sharing-preflight')
@@ -164,6 +240,8 @@ def run(args):
         assert code==200
         entered=q.metrics(raw)['antfly_inference_generation_owner_transitions_total']-before_preflight['antfly_inference_generation_owner_transitions_total']
         assert entered>0 if args.mode=='cooperative' else entered==0, 'requested sharing mode never entered its backend ownership path'
+        if args.rows>1:
+            assert q.metrics(raw)['antfly_inference_native_scheduler_step_batch_size_2_total'] > before_preflight['antfly_inference_native_scheduler_step_batch_size_2_total'], 'preflight formed no real two-row steps'
         print('sharing-preflight',args.mode,'owner_transitions',entered,flush=True)
         if args.scenario=='decode-overlap':
             previous=json.loads((args.references.parent/'comparison.json').read_text())
@@ -219,10 +297,15 @@ def run(args):
                     pairs[label]['both_decode_observed']=both_decode
                 else:
                     assert progress > y['response']['usage']['prompt_tokens'] + args.short_output, 'no long-request GPU progress while short request ran'
-                assert y['scheduler_at_completion']['antfly_inference_native_scheduler_step_batch_size_2_total'] == before['antfly_inference_native_scheduler_step_batch_size_2_total'], 'cooperative row-1 envelope widened'
+                if args.rows == 1:
+                    assert y['scheduler_at_completion']['antfly_inference_native_scheduler_step_batch_size_2_total'] == before['antfly_inference_native_scheduler_step_batch_size_2_total'], 'cooperative row-1 envelope widened'
+                elif args.scenario=='decode-overlap':
+                    assert y['scheduler_at_completion']['antfly_inference_native_scheduler_step_batch_size_2_total'] > before['antfly_inference_native_scheduler_step_batch_size_2_total'], 'two-row decode execution was never observed'
             pairs[label]['execution_owner_counters'] = {k:v-before[k] for k,v in y['scheduler_at_completion'].items() if k.startswith('antfly_inference_generation_owner_')}
             print(label,json.dumps(pairs[label]),flush=True)
         args.stream_generations = False
+        if args.rows>1:
+            batch_recovery = batch_peer_disconnect(c,args,short,short,references['short'])
         if args.turnover_rounds:
             c.set_phase('ownership-references')
             bodies={'turnover_large':q.Campaign.generate(256,8),'turnover_small':q.Campaign.generate(4,8),'turnover_cache':q.Campaign.generate(8,8,'cooperative-ownership-turnover')}
@@ -271,7 +354,7 @@ def run(args):
         try: c.stop_monitor(monitor)
         finally:
             probes = {kind:q.summary([r for r in c.rows if r['kind']==kind and r['phase'].startswith('mixed-')]) for kind in ('embed','decide')}
-            result = {'status':c.status,'error':c.error,'mode':args.mode,'workload':workload,'references':references,'pairs':pairs,'probes':probes,'identity':identity}
+            result = {'status':c.status,'error':c.error,'mode':args.mode,'rows':args.rows,'workload':workload,'references':references,'pairs':pairs,'probes':probes,'identity':identity,'batch_recovery':batch_recovery}
             (args.output/'comparison.json').write_text(json.dumps(result,indent=2)+'\n')
 
 
@@ -279,12 +362,14 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--url',default='http://127.0.0.1:18840')
     p.add_argument('--mode',choices=('serialized','cooperative'))
+    p.add_argument('--rows',type=int,choices=(1,2),default=1)
     p.add_argument('--scenario',choices=('mixed-context','decode-overlap'),default='mixed-context')
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--cgroup',type=Path)
     p.add_argument('--references',type=Path)
     p.add_argument('--binary',type=Path)
     p.add_argument('--config',type=Path)
+    p.add_argument('--temperature',type=float,default=0)
     p.add_argument('--long-records',type=int,default=1024)
     p.add_argument('--short-records',type=int,default=64)
     p.add_argument('--long-output',type=int,default=64)
@@ -292,9 +377,11 @@ def main():
     p.add_argument('--generation-timeout',type=int,default=600)
     p.add_argument('--probe-interval',type=float,default=.25)
     p.add_argument('--turnover-rounds',type=int,default=2)
+    p.add_argument('--compare-batching',type=Path,nargs=2,metavar=('SINGLE_ROW','TWO_ROWS'))
     p.add_argument('--compare',type=Path,nargs=2,metavar=('SERIALIZED','COOPERATIVE'))
     args = p.parse_args()
-    if args.compare: compare(*args.compare,args.output)
+    if args.compare_batching: compare_batching(*args.compare_batching,args.output)
+    elif args.compare: compare(*args.compare,args.output)
     else:
         p.error('--mode is required for a serving campaign') if not args.mode else run(args)
 

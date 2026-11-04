@@ -24,8 +24,12 @@ shared backend. It is an explicit opt-in, independent of row batching:
 The default remains off. `generation_batching.mode: on` controls row batching
 and does not enable cooperative execution. A cooperative request that also
 requests more rows than the backend declares receives
-`UNQUALIFIED_COOPERATIVE_BATCH`. Two active requests and one row per GPU step
-are the current envelope. Two-row performance has not passed its latency gate.
+`UNQUALIFIED_COOPERATIVE_BATCH`. The original qualified read profile uses two
+active requests and one row per GPU step. Opt-in decode batching can combine
+two rows when the resident backend declares its quantized numerical contract;
+see [multi-request CUDA generation batches](cuda-generation-batching.md).
+The earlier mixed two-row path did not pass its latency gate. Performance
+promotion of the decode-only path uses its own controlled comparison gates.
 The decoder's backend declaration currently fences sharing to eagerly uploaded
 dense Gemma 4 E4B CUDA geometry. Other backends default to exclusive execution.
 Graph, prompt-cache, speculative, selected-KV and multimodal requests retain
@@ -211,9 +215,9 @@ This is a scaled allocation-guard and recovery result on GB10, rather than a
 claim about physical exhaustion at 38 GiB or any A100 measurement.
 
 
-## Controlled serving results on GB10
+## Controlled one-row serving results on GB10
 
-The final serving executable is the ARM64 CUDA HTTP-only production entry point,
+The one-row serving campaign used the ARM64 CUDA HTTP-only production entry point,
 built with `zig build http-server -Dcuda=true -Dmetal=false
 -Doptimize=ReleaseFast -Dstrip=true -Dcpu=baseline+sha2`. Its SHA-256 is
 `a05fbc05a498539bcb886c903169566727742bec953c5f24b217d518cf54789e`.

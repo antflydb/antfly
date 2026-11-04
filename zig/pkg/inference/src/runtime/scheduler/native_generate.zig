@@ -218,6 +218,9 @@ pub const Policy = struct {
     /// Backends opt in after heterogeneous position/KV batching passes their
     /// response-equivalence gate.
     allow_mixed_sequence_lengths: bool = false,
+    /// Fuse only single-token decodes. Prefill keeps its own turn so padded
+    /// query geometry cannot multiply work for latency-sensitive decoders.
+    decode_only_batching: bool = false,
     /// Prefer cheaper contexts for this many consecutive turns, then grant
     /// the next round-robin owner. Zero preserves strict round robin.
     short_context_burst: usize = 0,
@@ -1131,7 +1134,7 @@ pub const NativeGenerateCoordinator = struct {
             .waiting => return false,
         }
 
-        if (leader_exclusive) {
+        if (leader_exclusive or (self.policy.decode_only_batching and leader_phase != .decode)) {
             self.in_turn = lease.request_id;
             self.in_turn_phase = leader_phase;
             return true;
@@ -1186,6 +1189,7 @@ pub const NativeGenerateCoordinator = struct {
         // on the first oversize chunk, so a smaller chunk later in the queue
         // can still be admitted.
         for (self.pending_prefill.items) |pending| {
+            if (self.policy.decode_only_batching) break;
             if (out.items.len >= max_items) break;
             if (budget.max_prefill_items) |limit| if (prefill_items >= limit) break;
             if (pending.work_ptr == leader_work_ptr) continue;
@@ -4125,4 +4129,41 @@ test "cooperative manual readiness prevents a paused CPU owner from blocking pre
     try std.testing.expectEqual(short.request_id, coordinator.pickNextTurn().?);
     coordinator.setManualTurnReady(short.request_id, null);
     try std.testing.expectEqual(long.request_id, coordinator.pickNextTurn().?);
+}
+
+test "decode-only batching fuses unequal decode rows while keeping prefill singleton" {
+    const allocator = std.testing.allocator;
+    var c = NativeGenerateCoordinator.init(allocator);
+    defer c.deinit();
+    c.setPolicy(.{ .max_step_items = 2, .allow_mixed_sequence_lengths = true, .decode_only_batching = true });
+    var a = try c.acquire(.{ .requested_units = 1, .prompt_bytes = 100, .max_tokens = 8 });
+    defer c.release(a);
+    var b = try c.acquire(.{ .requested_units = 1, .prompt_bytes = 100, .max_tokens = 8 });
+    defer c.release(b);
+    var wa: usize = 0;
+    var wb: usize = 0;
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(allocator);
+    c.notePrefillProgress(&a, 0, 128);
+    try std.testing.expect(c.tryAcquireTurn(&a, .prefill));
+    c.beginDecode(&b, 8192);
+    try c.enqueuePrefillWork(a, &wa, 128, 128, 0, 0, .{});
+    try c.enqueueDecodeWork(b, &wb, 8192, 8192, 0, .{});
+    try std.testing.expect(try c.claimStep(allocator, &a, &wa, .prefill, c.defaultStepBudget(), &step));
+    try std.testing.expectEqual(@as(usize, 1), step.items.len);
+    c.completeStep(&a, step.items);
+    c.beginDecode(&a, 128);
+    try c.enqueueDecodeWork(a, &wa, 129, 129, 0, .{});
+    try std.testing.expect(try c.claimStep(allocator, &a, &wa, .decode, c.defaultStepBudget(), &step));
+    try std.testing.expectEqual(@as(usize, 2), step.items.len);
+    for (step.items) |item| try std.testing.expectEqual(Phase.decode, item.phase);
+    c.completeStep(&a, step.items);
+    c.notePrefillProgress(&a, 0, 1024);
+    try c.enqueueDecodeWork(b, &wb, 8193, 8193, 0, .{});
+    try std.testing.expect(c.tryAcquireTurn(&b, .decode));
+    try c.enqueuePrefillWork(a, &wa, 512, 512, 0, 0, .{});
+    try std.testing.expect(try c.claimStep(allocator, &b, &wb, .decode, c.defaultStepBudget(), &step));
+    try std.testing.expectEqual(@as(usize, 1), step.items.len);
+    c.completeStep(&b, step.items);
+    c.cancelPrefillWork(&wa);
 }
