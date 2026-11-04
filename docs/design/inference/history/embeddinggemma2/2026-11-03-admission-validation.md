@@ -109,7 +109,7 @@ non-retryable admission-looking bodies, and permanent 400/507 resource failures.
 `zig/e2e/inference/test_cpu_admission.py` is an opt-in real-model regression for
 native execution with default inference budgets. It checks the first HTTP
 response without capacity retries: flat/grouped text through 384 words,
-retained outputs across eight cohorts, precise concurrent-capacity refusals
+retained outputs across an eight-item multi-cohort batch, precise concurrent-capacity refusals
 and serial recovery after contention, and permanent
 refusal of an oversized request. Against a running native server with the local
 BF16 bundle and an 8 or 14 GiB process/runtime envelope, run:
@@ -154,3 +154,19 @@ The complete CPU production database build passed for source commit
 -Doptimize=ReleaseFast`. Both real HTTP regressions passed with no leaks and
 also exited zero with strict unexpected-error-log enforcement. The installed
 executable returned its version successfully.
+
+Main was subsequently merged cleanly through `6817ccb184` (merge
+`ea7ec6e0d6`). The generated engine-error registry was refreshed for the new
+lake reachability errors. On that merged source, the CPU admission suite again
+passed 81 tests with 17 accelerator-dependent skips, and the standalone
+inference executable type check passed. Focused strict API and shared provider
+contracts, generated registry/catalog checks, and formatting checks passed.
+
+The retention regression was strengthened to keep three distinct outputs live
+through later allocator scopes. The real-model eight-item batch now uses
+distinct inputs and compares each row against an independent scalar request.
+This strengthened case passed on the qualified server binaries under Linux
+8 GiB, Linux 14 GiB, and macOS native 8 GiB policies. These binaries and the
+complete production database build above predate the final main refresh; a
+complete database rebuild of that final merge was not repeated locally.
+Repository-wide integration CI remains subject to the repository approval gate.

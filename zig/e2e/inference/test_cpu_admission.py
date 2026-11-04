@@ -74,9 +74,14 @@ def test_cpu_admission_text_lengths(api, words, grouped):
 
 
 def test_cpu_admission_retains_outputs_between_cohorts(api):
-    vectors = _vectors(_post(api, ["hello " * 256] * 8), 8)
-    for vector in vectors[1:]:
-        assert max(abs(a - b) for a, b in zip(vectors[0], vector)) < 1e-5
+    words = ["hello", "world", "good", "bad", "yes", "no", "one", "two"]
+    texts = [(word + " ") * 256 for word in words]
+    vectors = _vectors(_post(api, texts), len(texts))
+    # Distinct rows catch aliasing/overwrites by later cohorts and verify that
+    # length bucketing restores input order. Compare with independent calls.
+    for text, vector in zip(texts, vectors):
+        reference = _vectors(_post(api, [text]), 1)[0]
+        assert max(abs(a - b) for a, b in zip(reference, vector)) < 1e-5
 
 
 def test_cpu_admission_concurrent_requests_recover_after_contention(api):

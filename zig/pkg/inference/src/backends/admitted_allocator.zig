@@ -322,9 +322,11 @@ test "admission native encoder allocations consume prepaid workspace and retain 
     var admitted = AdmittedAllocator{ .backing = std.testing.allocator, .session = session };
     defer admitted.deinit();
     const a = admitted.allocator();
-    const prep = try a.alloc(u8, 64 * 1024);
-    for ([_]usize{ 135, 263, 391 }) |rows| {
-        var output: []f32 = undefined;
+    var prep: ?[]u8 = try a.alloc(u8, 64 * 1024);
+    defer if (prep) |values| a.free(values);
+    var outputs: [3]?[]f32 = @splat(null);
+    defer for (outputs) |vector| if (vector) |values| a.free(values);
+    for ([_]usize{ 135, 263, 391 }, 0..) |rows, index| {
         {
             var scope = try admitted.admitRun(try @import("../pipelines/embedding_gemma2_admission.zig").nativeTextEncoderRequest(4096, rows, 768));
             defer scope.deinit();
@@ -332,14 +334,23 @@ test "admission native encoder allocations consume prepaid workspace and retain 
             const compute = try a.alloc(u8, 80 * MiB);
             defer a.free(compute);
             try std.testing.expectEqual(charged, controller.snapshot().host_scratch_bytes);
-            output = try a.alloc(f32, 768);
+            outputs[index] = try a.alloc(f32, 768);
+            @memset(outputs[index].?, @as(f32, @floatFromInt(index + 1)));
         }
-        // The vector remains admitted without reacquiring capacity on return.
+        // Every earlier vector stays live, admitted and unchanged while the
+        // next cohort reuses encoder workspace and returns its own output.
         try std.testing.expect(controller.snapshot().host_scratch_bytes >= admitted.live_bytes);
         try std.testing.expect(controller.snapshot().host_scratch_bytes < MiB);
-        a.free(output);
+        for (outputs[0 .. index + 1], 0..) |vector, prior| {
+            for (vector.?) |value| try std.testing.expectEqual(@as(f32, @floatFromInt(prior + 1)), value);
+        }
     }
-    a.free(prep);
+    for (&outputs) |*vector| {
+        a.free(vector.*.?);
+        vector.* = null;
+    }
+    a.free(prep.?);
+    prep = null;
     try admitted.trim();
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
 }
