@@ -1571,7 +1571,8 @@ pub const Owner = struct {
     }
 
     const ReplayProgress = struct {
-        const Index = struct { name: []const u8, applied: u64 };
+        const Fragment = @import("../storage/db/derived/replay_fragment.zig").Position;
+        const Index = struct { name: []const u8, applied: u64, fragment: ?Fragment };
         indexes: []Index,
         generated: u64,
         resolution: u64,
@@ -1604,7 +1605,8 @@ pub const Owner = struct {
 
         fn capture(a: std.mem.Allocator, database: *h.db_mod.DB, managed: anytype) !ReplayProgress {
             const indexes = try a.alloc(Index, managed.len);
-            for (managed, indexes) |index, *captured| captured.* = .{ .name = index.name, .applied = database.executor.appliedSequence(index.name) orelse 0 };
+            errdefer a.free(indexes);
+            for (managed, indexes) |index, *captured| captured.* = .{ .name = index.name, .applied = database.executor.appliedSequence(index.name) orelse 0, .fragment = try fragment(database, index.name) };
             return .{
                 .indexes = indexes,
                 .generated = if (database.core.hasGeneratedEnrichmentTargets()) try lane(database, "generated") else 0,
@@ -1615,7 +1617,16 @@ pub const Owner = struct {
         }
 
         fn advanced(self: ReplayProgress, database: *h.db_mod.DB) bool {
-            for (self.indexes) |index| if ((database.executor.appliedSequence(index.name) orelse 0) > index.applied) return true;
+            for (self.indexes) |index| {
+                if ((database.executor.appliedSequence(index.name) orelse 0) > index.applied) return true;
+                if (fragment(database, index.name) catch null) |now| {
+                    const before = index.fragment;
+                    // Durable partial progress earns another fair source
+                    // slice, without pretending the whole record is applied.
+                    if (before == null or now.sequence > before.?.sequence or
+                        (now.sequence == before.?.sequence and now.next_item > before.?.next_item)) return true;
+                }
+            }
             if (database.core.hasGeneratedEnrichmentTargets() and (lane(database, "generated") catch 0) > self.generated) return true;
             if (database.hasConfiguredResolvers()) {
                 if ((lane(database, "resolution") catch 0) > self.resolution) return true;
@@ -1626,6 +1637,16 @@ pub const Owner = struct {
                 }
             }
             return false;
+        }
+
+        fn fragment(database: *h.db_mod.DB, name: []const u8) !?Fragment {
+            const cfg = database.core.index_manager.get(name) orelse return null;
+            if (cfg.kind != .full_text or cfg.coverage_generation == 0) return null;
+            return @import("../storage/db/derived/apply_state.zig").loadReplayFragment(alloc, database.core.store, name, .{
+                .generation = cfg.coverage_generation,
+                .config_hash = h.db_mod.types.indexConfigHash(cfg.*),
+                .incarnation = database.root_incarnation,
+            });
         }
     };
 
@@ -7529,6 +7550,37 @@ test "capi native maintenance namespaces source capture does not borrow an artif
     const source = try owner.refreshMaintenanceSnapshot(foreground, .source);
     try std.testing.expect(source.db_live);
     try std.testing.expectEqual(opened + 1, owner.test_runtime_snapshot_opens);
+}
+
+test "capi native maintenance partial text replay earns another source turn without advancing coverage" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("fragment-source-priority", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
+    var lease = try fixture.connection.acquire();
+    defer {
+        lease.close();
+        fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    }
+    const database = &fixture.connection.owner.current.?.db;
+    const cfg = database.core.index_manager.get("text").?;
+    try std.testing.expect(cfg.coverage_generation != 0);
+    const a = std.testing.allocator;
+    const managed = [_]@import("../storage/db/catalog/index_manager.zig").ManagedIndexRef{.{ .name = "text", .kind = .full_text }};
+    const before = try Owner.ReplayProgress.capture(a, database, &managed);
+    defer a.free(before.indexes);
+    const scalar = try database.core.loadAppliedSequence(a, "text");
+    try @import("../storage/db/derived/apply_state.zig").saveReplayFragment(a, database.core.store, "text", .{
+        .generation = cfg.coverage_generation,
+        .config_hash = h.db_mod.types.indexConfigHash(cfg.*),
+        .incarnation = database.root_incarnation,
+    }, .{ .sequence = scalar + 1, .next_item = 8, .total_items = 1024, .fingerprint = @splat(1), .applied = true });
+    try std.testing.expect(before.advanced(database));
+    try std.testing.expectEqual(scalar, try database.core.loadAppliedSequence(a, "text"));
+    const after = try Owner.ReplayProgress.capture(a, database, &managed);
+    defer a.free(after.indexes);
+    try std.testing.expect(!after.advanced(database));
 }
 
 test "capi native maintenance text source reuse refreshes primary observations and rejects changed configurations" {
