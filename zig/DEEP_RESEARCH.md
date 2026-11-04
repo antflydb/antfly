@@ -154,8 +154,6 @@ Deep web research needs full pages, so the retrieval agent's `fetch` tool (`web_
 - TypeScript SDK: `researchAgent`, `streamResearchAgent`, job helpers, and `runResearchJob`; `@antfly/components`
   adds `useResearchStream` and `ResearchReport`.
 - Python and Rust SDKs are generated from the spec.
-- evalaf: research evaluators for citation coverage, citation precision, sub-question coverage, and evidence
-  diversity.
 - A2A: the `research` skill maps onto the same native agent.
 
 ## Open work
