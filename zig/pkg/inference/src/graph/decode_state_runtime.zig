@@ -559,7 +559,7 @@ pub const NativeDecodeState = struct {
             self.kv_block_ids.clearRetainingCapacity();
             return;
         };
-        _ = try manager.logicalBlocksWithReservations(sequence_id, &self.kv_block_ids);
+        _ = try manager.logicalBlocksWithReservationsWithAllocator(sequence_id, &self.kv_block_ids, self.allocator);
     }
 
     fn syncPagedKvViewForPrefill(self: *NativeDecodeState) void {
@@ -827,7 +827,7 @@ pub const NativeDecodeState = struct {
         new_state.compacted = true;
         var new_block_ids = std.ArrayListUnmanaged(runtime.kv.block.KvBlockId).empty;
         errdefer new_block_ids.deinit(self.allocator);
-        _ = try manager.logicalBlocksWithReservations(new_seq_id, &new_block_ids);
+        _ = try manager.logicalBlocksWithReservationsWithAllocator(new_seq_id, &new_block_ids, self.allocator);
 
         // Swap: release old sequence, adopt new one.
         try manager.releaseSequence(seq_id);
@@ -1161,4 +1161,39 @@ test "borrowed decode cursors share reservations without owning persistent state
     try std.testing.expectEqual(@as(usize, 3), owner.currentTokenCount());
     const context = owner.makeDecodeContextForMode(3, 1, .full_recompute);
     try std.testing.expectEqual(gpt_arch.DecodeContext.AttentionMode.full_recompute, context.attention_mode);
+}
+
+test "decode state KV metadata uses its own distinct allocator for initial reserved growth and retirement" {
+    var manager_alloc = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var state_alloc = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var manager = runtime.kv.manager.KvManager.init(manager_alloc.allocator());
+    var manager_live = true;
+    defer if (manager_live) manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 2 });
+    var state = NativeDecodeState.initPaged(state_alloc.allocator(), &manager, pool, null);
+    var state_live = true;
+    defer if (state_live) state.deinit();
+    try state.notePrefill(3);
+    const sequence = state.sequence_id orelse return error.MissingActualKvSequence;
+    try manager.reserveTokenCapacity(sequence, 33);
+    try state.syncPagedKvBlockTable();
+    try std.testing.expect(state.kv_block_ids.items.len >= 17);
+    try std.testing.expect(state_alloc.allocations > 0);
+    // Existing manager-owned wrapper retains its original allocator contract.
+    {
+        var legacy: std.ArrayListUnmanaged(runtime.kv.block.KvBlockId) = .empty;
+        defer legacy.deinit(manager_alloc.allocator());
+        const state_allocations = state_alloc.alloc_index;
+        _ = try manager.logicalBlocksWithReservations(sequence, &legacy);
+        try std.testing.expectEqualSlices(runtime.kv.block.KvBlockId, state.kv_block_ids.items, legacy.items);
+        try std.testing.expectEqual(state_allocations, state_alloc.alloc_index);
+    }
+    state.deinit();
+    state_live = false;
+    try std.testing.expectEqual(state_alloc.allocated_bytes, state_alloc.freed_bytes);
+    try std.testing.expectEqual(state_alloc.allocations, state_alloc.deallocations);
+    manager.deinit();
+    manager_live = false;
+    try std.testing.expectEqual(manager_alloc.allocated_bytes, manager_alloc.freed_bytes);
+    try std.testing.expectEqual(manager_alloc.allocations, manager_alloc.deallocations);
 }

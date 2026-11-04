@@ -226,10 +226,15 @@ pub const KvManager = struct {
         sequence_id: SequenceId,
         out: *std.ArrayListUnmanaged(block.KvBlockId),
     ) ![]const block.KvBlockId {
+        return self.logicalBlocksWithReservationsWithAllocator(sequence_id, out, self.allocator);
+    }
+    /// The caller owns the destination's allocator and its eventual free.
+    /// Manager storage ownership grants no allocation authority for that list.
+    pub fn logicalBlocksWithReservationsWithAllocator(self: *const KvManager, sequence_id: SequenceId, out: *std.ArrayListUnmanaged(block.KvBlockId), destination_allocator: std.mem.Allocator) ![]const block.KvBlockId {
         const sequence_state = try self.sequenceState(sequence_id);
         out.clearRetainingCapacity();
-        try out.appendSlice(self.allocator, sequence_state.block_table.blocks.items);
-        try out.appendSlice(self.allocator, sequence_state.reserved_tail_blocks.items);
+        try out.appendSlice(destination_allocator, sequence_state.block_table.blocks.items);
+        try out.appendSlice(destination_allocator, sequence_state.reserved_tail_blocks.items);
         return out.items;
     }
 
