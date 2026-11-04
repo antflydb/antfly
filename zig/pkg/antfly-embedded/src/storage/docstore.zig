@@ -458,6 +458,7 @@ pub const ReplayRetirement = struct {
     // replay creates journal debt once cleanup is outstanding.
     pub const record_cap = max_keys / (replay_hints.len + 1);
     watermark: u64 = 0,
+    partial_pending: bool = false,
     lane: usize = 0,
     clean_lanes: usize = 0,
     sweep_bound: u64 = 0,
@@ -2946,6 +2947,17 @@ pub const DocStore = struct {
                     if (sequence > up_to_sequence) break;
                     if (ordinal == internal_keys.replay_all_kind and txn.current_scan.?.vtable.get != null and
                         !try @import("db/derived/replay_reference.zig").canonicalMayRetire(&txn, sequence)) continue;
+                    const chunk_codec = @import("db/derived/replay_chunks.zig");
+                    if (ordinal == internal_keys.replay_all_kind and chunk_codec.isManifest(kv.value)) {
+                        const manifest = try chunk_codec.Manifest.decode(kv.value);
+                        if (deletes.items.len + manifest.count + 1 > ReplayRetirement.max_keys) break;
+                        for (manifest.retired_chunks..manifest.count) |chunk_ordinal| {
+                            const chunk_key = chunk_codec.chunkKey(sequence, @intCast(chunk_ordinal));
+                            const owned_chunk_key = try alloc.dupe(u8, &chunk_key);
+                            errdefer alloc.free(owned_chunk_key);
+                            try deletes.append(alloc, owned_chunk_key);
+                        }
+                    }
                     const key = try alloc.dupe(u8, kv.key);
                     errdefer alloc.free(key);
                     try deletes.append(alloc, key);
@@ -3004,6 +3016,17 @@ pub const DocStore = struct {
                         if (std.mem.order(u8, kv.key, &upper) != .lt) break;
                         const sequence = internal_keys.parseReplayEntrySequence(kv.key, ordinal) orelse break;
                         if (sequence > up_to_sequence) break;
+                        const chunk_codec = @import("db/derived/replay_chunks.zig");
+                        if (ordinal == internal_keys.replay_all_kind and chunk_codec.isManifest(kv.value)) {
+                            const manifest = try chunk_codec.Manifest.decode(kv.value);
+                            if (deletes.items.len + manifest.count + 1 > replay_truncate_batch_keys) break;
+                            for (manifest.retired_chunks..manifest.count) |chunk_ordinal| {
+                                const chunk_key = chunk_codec.chunkKey(sequence, @intCast(chunk_ordinal));
+                                const owned_chunk_key = try alloc.dupe(u8, &chunk_key);
+                                errdefer alloc.free(owned_chunk_key);
+                                try deletes.append(alloc, owned_chunk_key);
+                            }
+                        }
                         const key = try alloc.dupe(u8, kv.key);
                         errdefer alloc.free(key);
                         try deletes.append(alloc, key);

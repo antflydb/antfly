@@ -20,6 +20,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const journal = @import("change_journal.zig");
 const keys = @import("../../internal_keys.zig");
+const chunks = @import("replay_chunks.zig");
 const magic = "AFRREF01";
 pub const reference_size = 21;
 
@@ -36,9 +37,29 @@ pub fn isReference(raw: []const u8) bool {
     return std.mem.startsWith(u8, raw, magic);
 }
 
+/// Borrow the canonical encoding through the caller's captured transaction.
+/// The descriptor binds sequence and hint, including before seekable reads.
+pub fn canonicalRaw(txn: anytype, sequence: u64, lane: u8, raw: []const u8) ![]const u8 {
+    if (!isReference(raw)) return raw;
+    if (raw.len != reference_size or lane > 7 or raw[16] != lane or
+        std.mem.readInt(u64, raw[8..16], .little) != sequence or
+        std.mem.readInt(u32, raw[17..21], .little) != std.hash.Crc32.hash(raw[0..17])) return error.InvalidReplayReference;
+    const key = keys.replayEntryKey(keys.replay_all_kind, sequence);
+    const canonical = txn.get(&key) catch |err| switch (err) {
+        error.NotFound => return error.InvalidReplayReference,
+        else => return err,
+    };
+    if (isReference(canonical)) return error.InvalidReplayReference;
+    return canonical;
+}
+
 /// Null preserves the legacy inline lane payload. A malformed or dangling
 /// reference is a recovery error, never an empty lane or a skipped record.
 pub fn resolve(a: Allocator, txn: anytype, sequence: u64, lane: u8, raw: []const u8) !?[]u8 {
+    if (chunks.isManifest(raw)) {
+        if (lane != keys.replay_all_kind or (try chunks.Manifest.decode(raw)).sequence != sequence) return error.InvalidReplayReference;
+        return try chunks.resolveAll(a, txn, raw);
+    }
     if (!isReference(raw)) return null;
     if (raw.len != reference_size or lane > 7 or raw[16] != lane or
         std.mem.readInt(u64, raw[8..16], .little) != sequence or
@@ -51,9 +72,12 @@ pub fn resolve(a: Allocator, txn: anytype, sequence: u64, lane: u8, raw: []const
     };
     if (isReference(canonical)) return error.InvalidReplayReference;
     const hint: journal.TargetHint = @fromBackingInt(@intCast(lane));
-    var decoded = try journal.decodeRecord(a, canonical);
+    const canonical_payload = if (chunks.isManifest(canonical)) try chunks.resolveAll(a, txn, canonical) else null;
+    defer if (canonical_payload) |owned| a.free(owned);
+    const encoded = canonical_payload orelse canonical;
+    var decoded = try journal.decodeRecord(a, encoded);
     defer decoded.deinit();
-    if (decoded.record.sequence != sequence or !try journal.encodedRecordHasHint(canonical, hint))
+    if (decoded.record.sequence != sequence or !try journal.encodedRecordHasHint(encoded, hint))
         return error.InvalidReplayReference;
     return try encodeForHint(a, decoded.record, hint);
 }
@@ -141,7 +165,7 @@ test "replay references validate sequence lane checksum and canonical ownership"
     const Fixture = struct {
         canonical: ?[]const u8,
         reference: ?[]const u8 = null,
-        fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+        pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
             if (std.mem.eql(u8, key, &keys.replayEntryKey(keys.replay_all_kind, 11))) return self.canonical orelse error.NotFound;
             if (std.mem.eql(u8, key, &keys.replayEntryKey(1, 11))) return self.reference orelse error.NotFound;
             return error.NotFound;

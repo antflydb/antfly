@@ -405,7 +405,7 @@ const ManualRuntime = struct {
         };
         var budget = if (wait.replay_budget) |controller| controller.budget(lane) else @import("replay_budget.zig").Budget{};
         budget.records = @min(budget.records, wait.replay_record_cap);
-        const fragments = if (wait.replay_budget != null and worker.kind.kind == .full_text) enabled: {
+        const fragments = if (worker.kind.kind == .full_text) enabled: {
             const port = wait.fragments orelse break :enabled null;
             break :enabled if (try port.supports(port.ptr, worker.name)) port else null;
         } else null;
@@ -431,8 +431,8 @@ const ManualRuntime = struct {
                 .max_records_per_window = if (wait.replay_budget != null) budget.records else derived_worker.catch_up_max_records_per_window_default,
                 .max_collected_items_per_window = if (wait.replay_budget != null) budget.records else 0,
                 .max_chunk_bytes = if (wait.replay_budget != null) budget.bytes else derived_worker.catch_up_max_chunk_bytes_default,
-                .max_windows_per_call = if (wait.replay_budget != null) 1 else 0,
-                .release_read_snapshot_after_collect = wait.replay_budget != null,
+                .max_windows_per_call = if (wait.replay_budget != null or fragments != null) 1 else 0,
+                .release_read_snapshot_after_collect = wait.replay_budget != null or fragments != null,
                 .max_call_ns = if (wait.replay_budget != null) @import("replay_budget.zig").Controller.quantum_ns else 0,
                 .max_call_bytes = if (wait.replay_budget != null) budget.bytes else 0,
                 .target_sequence = if (wait.replay_budget != null) @min(worker.target_sequence, wait.replay_target_cap) else 0,
@@ -456,37 +456,41 @@ const ManualRuntime = struct {
             if (worker.paused) return error.DerivedWorkerPaused;
             try wait.check();
 
-            const result = try self.catchUpWorker(worker, wait);
-            var session_open = true;
-            defer {
-                if (session_open) if (self.finish_catch_up_fn) |finish_catch_up| {
-                    _ = finish_catch_up(self.ctx, worker.kind, result.token, worker.applied_sequence, false) catch {};
-                };
-            }
-            const stats = result.stats;
-            try wait.check();
-            const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
-                applied_sequence
-            else if (stats.shouldTryTargetAdvance(worker.applied_sequence, target) and
-                try self.canAdvanceToTarget(worker, worker.applied_sequence, target))
-                target
-            else
-                worker.applied_sequence;
-            session_open = false;
-            const finish_result = if (self.finish_catch_up_fn) |finish_catch_up|
-                try finish_catch_up(self.ctx, worker.kind, result.token, caught_up_sequence, true)
-            else
-                CatchUpFinishResult{};
-            if (caught_up_sequence > worker.applied_sequence) {
-                if (!finish_result.applied_sequence_persisted) {
-                    while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
-                        try wait.check();
-                        if (wait.replay_budget != null) return error.EnrichmentWaitCanceled;
-                        std.atomic.spinLoopHint();
-                    }
+            while (worker.applied_sequence < target) {
+                const before_applied = worker.applied_sequence;
+                const result = try self.catchUpWorker(worker, wait);
+                var session_open = true;
+                defer {
+                    if (session_open) if (self.finish_catch_up_fn) |finish_catch_up| {
+                        _ = finish_catch_up(self.ctx, worker.kind, result.token, worker.applied_sequence, false) catch {};
+                    };
                 }
-                worker.applied_sequence = caught_up_sequence;
-                if (self.applied_sequence_advanced_fn) |callback| callback(self.ctx, worker.name, caught_up_sequence);
+                const stats = result.stats;
+                try wait.check();
+                const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
+                    applied_sequence
+                else if (stats.shouldTryTargetAdvance(worker.applied_sequence, target) and
+                    try self.canAdvanceToTarget(worker, worker.applied_sequence, target))
+                    target
+                else
+                    worker.applied_sequence;
+                session_open = false;
+                const finish_result = if (self.finish_catch_up_fn) |finish_catch_up|
+                    try finish_catch_up(self.ctx, worker.kind, result.token, caught_up_sequence, true)
+                else
+                    CatchUpFinishResult{};
+                if (caught_up_sequence > worker.applied_sequence) {
+                    if (!finish_result.applied_sequence_persisted) {
+                        while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
+                            try wait.check();
+                            if (wait.replay_budget != null) return error.EnrichmentWaitCanceled;
+                            std.atomic.spinLoopHint();
+                        }
+                    }
+                    worker.applied_sequence = caught_up_sequence;
+                    if (self.applied_sequence_advanced_fn) |callback| callback(self.ctx, worker.name, caught_up_sequence);
+                }
+                if (wait.replay_budget != null or (stats.partial_sequence == 0 and worker.applied_sequence == before_applied)) break;
             }
         }
 
@@ -508,37 +512,41 @@ const ManualRuntime = struct {
             if (worker.paused) return error.DerivedWorkerPaused;
             try wait.check();
 
-            const result = try self.catchUpWorker(worker, wait);
-            var session_open = true;
-            defer {
-                if (session_open) if (self.finish_catch_up_fn) |finish_catch_up| {
-                    _ = finish_catch_up(self.ctx, worker.kind, result.token, worker.applied_sequence, false) catch {};
-                };
-            }
-            const stats = result.stats;
-            try wait.check();
-            const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
-                applied_sequence
-            else if (stats.shouldTryTargetAdvance(worker.applied_sequence, target) and
-                try self.canAdvanceToTarget(worker, worker.applied_sequence, target))
-                target
-            else
-                worker.applied_sequence;
-            session_open = false;
-            const finish_result = if (self.finish_catch_up_fn) |finish_catch_up|
-                try finish_catch_up(self.ctx, worker.kind, result.token, caught_up_sequence, true)
-            else
-                CatchUpFinishResult{};
-            if (caught_up_sequence > worker.applied_sequence) {
-                if (!finish_result.applied_sequence_persisted) {
-                    while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
-                        try wait.check();
-                        if (wait.replay_budget != null) return error.EnrichmentWaitCanceled;
-                        std.atomic.spinLoopHint();
-                    }
+            while (worker.applied_sequence < target) {
+                const before_applied = worker.applied_sequence;
+                const result = try self.catchUpWorker(worker, wait);
+                var session_open = true;
+                defer {
+                    if (session_open) if (self.finish_catch_up_fn) |finish_catch_up| {
+                        _ = finish_catch_up(self.ctx, worker.kind, result.token, worker.applied_sequence, false) catch {};
+                    };
                 }
-                worker.applied_sequence = caught_up_sequence;
-                if (self.applied_sequence_advanced_fn) |callback| callback(self.ctx, worker.name, caught_up_sequence);
+                const stats = result.stats;
+                try wait.check();
+                const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
+                    applied_sequence
+                else if (stats.shouldTryTargetAdvance(worker.applied_sequence, target) and
+                    try self.canAdvanceToTarget(worker, worker.applied_sequence, target))
+                    target
+                else
+                    worker.applied_sequence;
+                session_open = false;
+                const finish_result = if (self.finish_catch_up_fn) |finish_catch_up|
+                    try finish_catch_up(self.ctx, worker.kind, result.token, caught_up_sequence, true)
+                else
+                    CatchUpFinishResult{};
+                if (caught_up_sequence > worker.applied_sequence) {
+                    if (!finish_result.applied_sequence_persisted) {
+                        while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
+                            try wait.check();
+                            if (wait.replay_budget != null) return error.EnrichmentWaitCanceled;
+                            std.atomic.spinLoopHint();
+                        }
+                    }
+                    worker.applied_sequence = caught_up_sequence;
+                    if (self.applied_sequence_advanced_fn) |callback| callback(self.ctx, worker.name, caught_up_sequence);
+                }
+                if (wait.replay_budget != null or (stats.partial_sequence == 0 and worker.applied_sequence == before_applied)) break;
             }
         }
 

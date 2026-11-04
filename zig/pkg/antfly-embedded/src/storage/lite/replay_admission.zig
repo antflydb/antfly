@@ -92,8 +92,13 @@ pub fn isReservation(physical: []const u8) bool {
     return logical.len == reservation_prefix.len + 16 and std.mem.startsWith(u8, logical, reservation_prefix);
 }
 
+pub fn isChunk(physical: []const u8) bool {
+    const logical = logicalKey(physical);
+    return logical.len == 14 and logical[0] == 2 and logical[1] == 0xfd;
+}
+
 pub fn isTracked(physical: []const u8) bool {
-    return isEntry(physical) or isReservation(physical);
+    return isEntry(physical) or isChunk(physical) or isReservation(physical);
 }
 
 pub const Cost = struct {
@@ -116,7 +121,10 @@ pub fn validReservationLength(length: u64) bool {
 }
 
 pub fn cost(physical: []const u8, value_len: u64, descriptor: []const u8) !Cost {
-    if (!isReservation(physical)) return .{ .bytes = try charge(physical, value_len), .records = 1 };
+    // Chunks contribute their exact physical byte charge. Record credits
+    // count canonical/lane records, preserving the single atomic-record
+    // oversized exception and the durable intent's conservative reservation.
+    if (!isReservation(physical)) return .{ .bytes = try charge(physical, value_len), .records = if (isChunk(physical)) 0 else 1 };
     // One durable intent admission reserves every possible replay hint lane.
     // Resolution deletes this descriptor atomically with its source/replay
     // commit. Credits therefore survive crash, refresh and process changes.

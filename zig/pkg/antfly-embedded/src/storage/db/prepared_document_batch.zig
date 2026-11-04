@@ -32,7 +32,7 @@ pub const Plan = struct {
     namespace: identity.Namespace,
     incarnation: u128,
     rows: std.StringHashMapUnmanaged(Entry) = .empty,
-    const Entry = struct { value: []const u8, extracted: ?mapper.ExtractedWrite };
+    const Entry = struct { value: []const u8, template: mapper.ExtractedWrite, extracted: ?mapper.ExtractedWrite = null };
 
     /// Called under the short catalog lifetime fence. No borrowed DB pointer
     /// or primary snapshot survives this capture.
@@ -51,7 +51,10 @@ pub const Plan = struct {
 
     pub fn deinit(self: *Plan) void {
         var entries = self.rows.valueIterator();
-        while (entries.next()) |entry| if (entry.extracted) |*row| row.deinit(self.alloc);
+        while (entries.next()) |entry| {
+            if (entry.extracted) |*row| row.deinit(self.alloc);
+            entry.template.deinit(self.alloc);
+        }
         self.rows.deinit(self.alloc);
         self.catalog.release();
         self.inputs.deinit();
@@ -59,6 +62,14 @@ pub const Plan = struct {
     }
 
     pub fn prepare(self: *Plan, request: types.BatchRequest) !void {
+        // Preparation is optional acceleration, with explicit request-local
+        // limits. Larger atomic batches retain the ordinary authoritative path.
+        if (request.writes.len > 8192) return;
+        var input_bytes: usize = 0;
+        for (request.writes) |write| {
+            input_bytes +|= write.key.len +| write.value.len;
+            if (input_bytes > 8 * 1024 * 1024) return;
+        }
         const a = self.alloc;
         const owned = self.inputs.allocator();
         const plan = self.catalog.plan();
@@ -86,8 +97,19 @@ pub const Plan = struct {
                 try plan.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(a, key, parsed.value, &row);
             }
             const entry = try self.rows.getOrPut(a, key);
-            if (entry.found_existing) if (entry.value_ptr.extracted) |*old| old.deinit(a);
-            entry.value_ptr.* = .{ .value = value, .extracted = row };
+            std.debug.assert(!entry.found_existing);
+            entry.value_ptr.* = .{ .value = value, .template = row };
+        }
+        try self.prepareAttempt();
+    }
+
+    /// Replenish mutable commit copies outside admission after a pre-commit
+    /// refusal. Expensive parsing and field projection stay in the immutable
+    /// template, even when capacity contention causes repeated attempts.
+    pub fn prepareAttempt(self: *Plan) !void {
+        var entries = self.rows.valueIterator();
+        while (entries.next()) |entry| {
+            if (entry.extracted == null) entry.extracted = try entry.template.clone(self.alloc);
         }
     }
 

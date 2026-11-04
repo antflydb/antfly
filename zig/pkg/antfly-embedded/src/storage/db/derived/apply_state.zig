@@ -226,7 +226,12 @@ pub fn saveReplayFragment(alloc: Allocator, store: anytype, index_name: []const 
     };
     if (previous_raw) |raw| {
         const previous = try replay_fragment.decode(raw);
-        if (std.meta.eql(previous.identity, identity) and previous.position.sequence > applied) {
+        if (std.meta.eql(previous.identity, identity) and previous.position.sequence > applied and
+            !(previous.position.sequence < position.sequence and previous.position.next_item == previous.position.total_items and !previous.position.applied))
+        {
+            // A completely scanned no-op record carries no output/seal debt.
+            // Its successor may replace that scan witness without inventing
+            // an applied scalar watermark for the no-op.
             if (previous.position.sequence != position.sequence or previous.position.total_items != position.total_items or
                 !std.mem.eql(u8, &previous.position.fingerprint, &position.fingerprint)) return error.InvalidDerivedApplyState;
             if (previous.position.next_item > position.next_item) {
@@ -1520,6 +1525,24 @@ test "projection metadata rejects corrupt recovery identities (#1207)" {
     try std.testing.expectError(error.InvalidDerivedApplyState, decodeProjectionMetadata(encoded[0..8]));
     encoded[17] ^= 1;
     try std.testing.expectError(error.InvalidDerivedApplyState, decodeProjectionMetadata(&encoded));
+}
+
+test "derived replay fragments advance past complete no-op records without skipping unfinished output" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "fragments" });
+    defer runtime.deinit();
+    const identity: replay_fragment.Identity = .{ .generation = 7, .config_hash = 8, .incarnation = 9 };
+    const empty: replay_fragment.Position = .{ .sequence = 1, .next_item = 64, .total_items = 64, .fingerprint = @splat(1) };
+    try saveReplayFragment(a, runtime, "index", identity, empty);
+    const next: replay_fragment.Position = .{ .sequence = 2, .next_item = 8, .total_items = 64, .fingerprint = @splat(2), .applied = true };
+    try saveReplayFragment(a, runtime, "index", identity, next);
+    try std.testing.expectEqualDeep(next, (try loadReplayFragment(a, runtime, "index", identity)).?);
+    try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequence(a, runtime, "index"));
+    var skipped = next;
+    skipped.sequence = 3;
+    try std.testing.expectError(error.InvalidDerivedApplyState, saveReplayFragment(a, runtime, "index", identity, skipped));
 }
 
 test "derived replay fragment checkpoints fence identities preserve monotonic progress and clear on reset" {

@@ -1166,16 +1166,29 @@ The naming recommendation is:
 
 ## Native throughput and online compaction
 
-Native owners create revision-10 files (`AFLITE\x0aP`) with packed records and
+Native owners create revision-11 files (`AFLITE\x0bP`) with packed records and
 durable page ownership. Existing revision-3 signatures (`AFLITE\x03N` for
 unpacked records and `AFLITE\x03P` for packed records) remain readable. Writable
-owners migrate revisions 3, 7, 8 and 9 through an atomic compact-generation replacement;
+owners migrate revisions 3, 7, 8, 9 and 10 through an atomic compact-generation replacement;
 read-only opens preserve the existing encoding. The Zig `page_reuse = false`
 option preserves revision-3 creation/open behavior. Raw native primitives also
 retain their revision-3 default for compatibility. Revision 2 remains unsupported,
-and older binaries reject the revision-10 signature before checkpoint selection.
+and older binaries reject the revision-11 signature before checkpoint selection.
 Unreleased revision-4/5/6 prototypes are rejected rather than mixing reader,
-logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-10 image.
+logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-11 image.
+
+Revision 11 adds seekable canonical family chunks with a fixed-size Merkle-root
+manifest. A replay turn decodes at most 64 families before selecting its bounded
+application slice. All effects of one document family remain together. Chunk
+bytes retain their physical replay charge until safe deletion; chunk rows do
+not multiply logical record credits. A checked retirement turn takes the minimum
+of every index instance's durable progress and the producer, resolver, replacement
+and repair fences. It deletes completed chunks and advances the retained frontier
+atomically; an in-memory cursor alone returns no quota. Full drains resume durable
+family continuations too, including after a restart or earlier prefix retirement. A maximum of 256 chunks keeps each record's
+final retirement bounded and atomic; exceptionally large records retain the
+inline representation. Revisions 9 and 10 remain readable without rewriting on
+read-only opens.
 
 Revision 10 stores one canonical replay payload with checksummed hint-lane
 references. Readers resolve each reference in the same captured checkpoint.

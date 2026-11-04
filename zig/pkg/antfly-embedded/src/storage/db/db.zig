@@ -32242,7 +32242,7 @@ pub const DB = struct {
                 return self.executor.waitForIndexesWithVisibilityWait(sequence, options.index_names, wait);
             }
             self.executor.notifySequence(sequence);
-            return self.executor.waitForAllWithVisibilityWait(sequence, wait);
+            return self.executor.waitForAllWithVisibilityWait(sequence, replayVisibilityWait(self.async_context, wait));
         }
         if (options.cancellation.ptr != null) {
             return try self.runDerivedUntilWithVisibilityWait(sequence, .{
@@ -32264,9 +32264,9 @@ pub const DB = struct {
             // firing and re-check) resumes waiting.
             var guard = TargetAdvanceStallGuard{ .db = self, .timeout_ns = options.no_progress_timeout_ns };
             while (true) {
-                const outcome = self.executor.waitForAllWithVisibilityWait(sequence, .{
+                const outcome = self.executor.waitForAllWithVisibilityWait(sequence, replayVisibilityWait(self.async_context, .{
                     .cancellation = guard.token(),
-                });
+                }));
                 outcome catch |err| switch (err) {
                     error.EnrichmentWaitCanceled => {
                         try self.checkTargetAdvanceNoProgress(options.no_progress_timeout_ns);
@@ -32277,7 +32277,7 @@ pub const DB = struct {
                 return;
             }
         }
-        try self.executor.waitForAll(sequence);
+        try self.executor.waitForAllWithVisibilityWait(sequence, replayVisibilityWait(self.async_context, .{}));
     }
 
     /// Cancellation checkpoint that interrupts a threaded derived wait when
@@ -32323,7 +32323,7 @@ pub const DB = struct {
             return;
         }
         self.executor.notifySequence(sequence);
-        try self.executor.waitForAllWithVisibilityWait(sequence, wait);
+        try self.executor.waitForAllWithVisibilityWait(sequence, replayVisibilityWait(self.async_context, wait));
     }
 
     /// Resolve through the loaded-index selector used by filter execution.
@@ -32355,7 +32355,7 @@ pub const DB = struct {
         if (sequence == 0 or index_names.len == 0) return;
         if (!self.executor.hasWorkers()) return;
         self.executor.notifyIndexes(sequence, index_names);
-        try self.executor.waitForIndexes(sequence, index_names);
+        try self.executor.waitForIndexesWithVisibilityWait(sequence, index_names, replayVisibilityWait(self.async_context, .{}));
     }
 
     fn runDerivedUntilTargetsWithVisibilityWait(
@@ -32368,7 +32368,7 @@ pub const DB = struct {
         try wait.check();
         if (!self.executor.hasWorkers()) return;
         self.executor.notifyIndexes(sequence, index_names);
-        try self.executor.waitForIndexesWithVisibilityWait(sequence, index_names, wait);
+        try self.executor.waitForIndexesWithVisibilityWait(sequence, index_names, replayVisibilityWait(self.async_context, wait));
     }
 
     pub fn runEnrichmentUntil(self: *DB, sequence: u64) !void {
@@ -32551,7 +32551,7 @@ pub const DB = struct {
             const next_target = self.core.nextDerivedSequence();
             if (options.bounded_replay or next_target <= stable_target) {
                 if (!options.source_work_only) try waitForManagedIndexesApplied(self, sequence, sync_targets.all_indexes);
-                _ = try self.runArtifactRepairMetadataMaintenancePass();
+                if (!options.source_work_only) _ = try self.runArtifactRepairMetadataMaintenancePass();
                 return;
             }
             stable_target = next_target;
@@ -34599,7 +34599,7 @@ pub const DB = struct {
         if (split_retirement) self.core.store.deferred_replay_retirement = &state.replay_retirement;
         if (phase == .retirement) {
             self.core.store.bounded_replay_retirement = true;
-            if (state.replay_retirement.watermark != 0) try truncateReplaySequenceAsync(self.async_context, state.replay_retirement.watermark);
+            if (state.replay_retirement.watermark != 0 or state.replay_retirement.partial_pending) try truncateReplaySequenceAsync(self.async_context, state.replay_retirement.watermark);
             return state.replay_retirement.runnable;
         }
         if (phase == .artifacts or phase == .pressure_artifacts or phase == .index_storage) {
@@ -53581,14 +53581,14 @@ fn runDerivedUntilContext(ctx: *const BatchExecutionContext, sequence: u64) !voi
         return;
     }
     ctx.executor.notifySequence(sequence);
-    try ctx.executor.waitForAll(sequence);
+    try ctx.executor.waitForAllWithVisibilityWait(sequence, if (ctx.async_context) |async_ctx| replayVisibilityWait(async_ctx, .{}) else .{});
 }
 
 fn runDerivedUntilTargetsContext(ctx: *const BatchExecutionContext, sequence: u64, index_names: []const []const u8) !void {
     if (sequence == 0 or index_names.len == 0) return;
     if (!ctx.executor.hasWorkers()) return;
     ctx.executor.notifyIndexes(sequence, index_names);
-    try ctx.executor.waitForIndexes(sequence, index_names);
+    try ctx.executor.waitForIndexesWithVisibilityWait(sequence, index_names, if (ctx.async_context) |async_ctx| replayVisibilityWait(async_ctx, .{}) else .{});
 }
 
 fn runEnrichmentUntilContext(ctx: *const BatchExecutionContext, sequence: u64) !void {
@@ -55654,6 +55654,9 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
             managedIndexReplayHint(index_ref.kind),
         );
         const use_dense_maintenance = index_ref.kind == .dense_vector;
+        const fragments = ctx.async_context != null and index_ref.kind == .full_text and
+            ctx.store.runtime_store.capabilities().bounded_replay_admission and
+            try supportsReplayFragmentsAsync(ctx.async_context.?, index_ref.name);
         const stats = try derived_worker.catchUpIndexWithOptions(
             ctx.alloc,
             ctx.replay_source,
@@ -55667,6 +55670,12 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
                 .begin_window_fn = @field(@This(), "beginDerivedCatchUpWindowContext"),
                 .finish_window_fn = @field(@This(), "finishDerivedCatchUpWindowContext"),
                 .target_sequence = target_sequence,
+                .max_fragment_families = if (fragments) 64 else 0,
+                .fragment_ctx = ctx.async_context,
+                .load_fragment_fn = if (fragments) loadReplayFragmentAsync else null,
+                .save_fragment_fn = if (fragments) saveReplayFragmentAsync else null,
+                .persist_ctx = ctx.async_context,
+                .persist_progress_fn = if (fragments) persistFragmentRecordProgress else null,
             },
         );
         if (openProfileEnabled()) logReplayCatchUpProfile(index_ref, applied, stats);
@@ -55938,6 +55947,17 @@ fn checkpointManagedProjectionEffectsForAppliedSequenceUpdates(
     }
 }
 
+fn replayVisibilityWait(ctx: *AsyncContext, requested: derived_executor_mod.VisibilityWait) derived_executor_mod.VisibilityWait {
+    var wait = requested;
+    if (wait.fragments == null and ctx.store.runtime_store.capabilities().bounded_replay_admission) wait.fragments = .{
+        .ptr = ctx,
+        .supports = supportsReplayFragmentsAsync,
+        .load = loadReplayFragmentAsync,
+        .save = saveReplayFragmentAsync,
+    };
+    return wait;
+}
+
 fn supportsReplayFragmentsAsync(ptr: *anyopaque, name: []const u8) !bool {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
     const cfg = ctx.index_manager.get(name) orelse return error.IndexNotFound;
@@ -55964,6 +55984,7 @@ fn saveReplayFragmentAsync(ptr: *anyopaque, name: []const u8, position: apply_st
     if (port) |publication| try publication.enter(publication.ptr);
     defer if (port) |publication| publication.leave(publication.ptr);
     try apply_state.saveReplayFragment(ctx.alloc, ctx.store, name, try replayFragmentIdentityAsync(ctx, name), position);
+    if (ctx.store.deferred_replay_retirement) |state| state.partial_pending = true;
 }
 
 fn replayPendingDerivedBatches(
@@ -56206,7 +56227,7 @@ fn replayPendingDerivedBatches(
             .algebraic => 4,
         };
         const adaptive_budget = replay_state.replay_budget.budget(replay_lane);
-        const fragment_replay = options.bounded_replay and index_ref.kind == .full_text and
+        const fragment_replay = index_ref.kind == .full_text and
             self.core.store.runtime_store.capabilities().bounded_replay_admission and
             (self.core.index_manager.get(index_ref.name) orelse return error.IndexNotFound).coverage_generation != 0;
         const replay_started = monotonicTimeNs();
@@ -57824,7 +57845,18 @@ fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
     if (ctx.repair_replay_mutex) |mutex| mutex.lockUncancelable(ctx.index_manager.checkpointIo());
     defer if (ctx.repair_replay_mutex) |mutex| mutex.unlock(ctx.index_manager.checkpointIo());
-    var effective = sequence;
+    const effective = try clampReplayForNonIndexConsumers(ctx, sequence);
+    try ctx.store.truncateReplayUpTo(ctx.alloc, effective);
+    if (ctx.store.deferred_replay_retirement) |state| if (state.partial_pending) {
+        // A checked refusal is not runnable debt: the next durable consumer
+        // advancement will notify this lane again rather than busy-polling.
+        _ = try retireConsumedReplayChunkPrefix(ctx);
+        state.partial_pending = false;
+    };
+}
+
+fn clampReplayForNonIndexConsumers(ctx: *AsyncContext, requested: u64) !u64 {
+    var effective = requested;
     // Generated enrichment consumes the same durable replay journal as the
     // managed-index executor, but advances independently. The executor may
     // reach `sequence` while a provider outage leaves enrichment behind. Clamp
@@ -57850,9 +57882,63 @@ fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
     if (ctx.promotion_runtime) |runtime| {
         effective = clampReplayTruncationForReplayStage(effective, ctx.index_manager, runtime.stats());
     }
+    if (ctx.index_manager.resolvers.items.len != 0) {
+        inline for (.{ resolution_runtime_mod.scope_name, promotion_runtime_mod.scope_name }) |scope|
+            effective = @min(effective, try enrichment_state.loadAppliedSequence(ctx.alloc, ctx.store, scope));
+    }
     effective = try ctx.index_manager.clampReplayForGraphReplacementBuilds(ctx.store, effective);
     effective = try clampReplayTruncationForRepairPins(ctx.alloc, ctx.index_repair_checkpoint, effective);
-    try ctx.store.truncateReplayUpTo(ctx.alloc, effective);
+    return effective;
+}
+
+/// The owner holds native publication admission and repair_replay_mutex.
+/// Every consumer contributes its durable prefix; same-hint indexes remain
+/// independent participants. A fragment from another incarnation/config never
+/// authorizes physical reclamation.
+fn retireConsumedReplayChunkPrefix(ctx: *AsyncContext) !bool {
+    if (ctx.index_manager.failedIndexLoadSummary().total != 0) return false;
+    const managed = try ctx.index_manager.managedIndexes(ctx.alloc);
+    defer {
+        for (managed) |ref| ctx.alloc.free(@constCast(ref.name));
+        ctx.alloc.free(managed);
+    }
+    if (managed.len == 0) return false;
+    const applied = try ctx.alloc.alloc(u64, managed.len);
+    defer ctx.alloc.free(applied);
+    var minimum: u64 = std.math.maxInt(u64);
+    for (managed, applied) |ref, *sequence| {
+        sequence.* = try loadManagedAppliedSequenceContext(ctx.alloc, ctx.index_manager, ctx.store, ctx.applied_sequence_checkpoint_path, ref);
+        minimum = @min(minimum, sequence.*);
+    }
+    if (minimum == std.math.maxInt(u64)) return false;
+    const candidate = minimum + 1;
+    if (try clampReplayForNonIndexConsumers(ctx, candidate) < candidate) return false;
+    const chunks = @import("derived/replay_chunks.zig");
+    var txn = try ctx.store.beginWriteTxn();
+    var committed = false;
+    defer if (!committed) txn.abort();
+    const key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, candidate);
+    const raw = txn.get(&key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    if (!chunks.isManifest(raw)) return false;
+    const manifest = try chunks.Manifest.decode(raw);
+    if (manifest.sequence != candidate) return error.InvalidReplayChunk;
+    var families: u64 = manifest.families;
+    for (managed, applied) |ref, sequence| {
+        if (sequence >= candidate) continue;
+        if (ref.kind != .full_text) return false;
+        const position = (try loadReplayFragmentAsync(ctx, ref.name)) orelse return false;
+        if (position.sequence != candidate or position.total_items != manifest.families or
+            !std.mem.eql(u8, &position.fingerprint, &manifest.fingerprint(ref.name))) return false;
+        if (position.next_item < @min(@as(u64, manifest.families), @as(u64, manifest.retired_chunks) * chunks.families_per_chunk)) return error.InvalidDerivedApplyState;
+        families = @min(families, position.next_item);
+    }
+    if (!try chunks.retirePrefix(&txn, manifest, families)) return false;
+    try txn.commit();
+    committed = true;
+    return true;
 }
 
 const truncateReplayJournalIfSafeContext = local_mutation.truncateReplayJournalIfSafeContext;
@@ -61487,6 +61573,10 @@ fn rebuildSparseIndexFromStoredEmbeddingArtifactsSliceContext(ctx: *AsyncContext
     const next_key = state.resume_key;
     state.resume_key = null;
     return .{ .rebuilt = state.rebuilt, .resume_key = next_key };
+}
+
+fn persistFragmentRecordProgress(ctx: *anyopaque, index_name: []const u8, sequence: u64) !void {
+    _ = try persistAppliedSequenceAsync(ctx, index_name, sequence, true);
 }
 
 fn persistAppliedSequenceAsync(ctx_ptr: *anyopaque, index_name: []const u8, sequence: u64, force: bool) !bool {
@@ -76894,6 +76984,8 @@ test "db owned document preparation transfers effects and rejects changed identi
     try database.batchTrackedWithPreparedDocuments(request, &committed, null, &prepared);
     try std.testing.expect(committed);
     try std.testing.expect(prepared.rows.get("你好").?.extracted == null);
+    try prepared.prepareAttempt();
+    try std.testing.expect(prepared.rows.get("你好").?.extracted != null);
     const value = (try database.get(a, "你好")).?;
     defer a.free(value);
     try std.testing.expectEqualStrings("{\"message\":\"κόσμος\"}", value);

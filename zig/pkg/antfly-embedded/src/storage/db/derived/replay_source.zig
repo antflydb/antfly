@@ -14,6 +14,8 @@
 // limitations under the License.
 
 const std = @import("std");
+const replay_chunks = @import("replay_chunks.zig");
+const replay_fragment = @import("replay_fragment.zig");
 const replay_reference = @import("replay_reference.zig");
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("../../backend_erased.zig");
@@ -83,6 +85,53 @@ pub const MatchingCursor = struct {
             .primary_store => |*cursor| cursor.deinit(),
         }
         self.* = undefined;
+    }
+
+    pub const FamilySlice = struct { payload: []u8, position: replay_fragment.Position };
+
+    /// Native family continuations read one authenticated chunk rather than
+    /// reconstructing and sorting the entire canonical record on every turn.
+    /// Null retains the portable/legacy record iterator unchanged.
+    pub fn readFamilySlice(self: *MatchingCursor, a: Allocator, index_name: []const u8, saved: ?replay_fragment.Position, max_families: usize, target_sequence: u64) !?FamilySlice {
+        const cursor = switch (self.state) {
+            .journal => return null,
+            .primary_store => |*value| value,
+        };
+        const entry = cursor.entry orelse return null;
+        if (cursor.scan_txn.?.current_scan.?.vtable.get == null) return null;
+        const sequence = internal_keys.parseReplayEntrySequence(entry.key, cursor.scan_lane_ordinal) orelse return error.InvalidReplayEntryKey;
+        if (target_sequence != 0 and sequence > target_sequence) return null;
+        const canonical = try replay_reference.canonicalRaw(&cursor.scan_txn.?, sequence, cursor.scan_lane_ordinal, entry.value);
+        if (!replay_chunks.isManifest(canonical)) return null;
+        const manifest = try replay_chunks.Manifest.decode(canonical);
+        if (manifest.sequence != sequence or manifest.hints & change_journal_mod.singleHintMask(cursor.hint) == 0) return error.InvalidReplayChunk;
+        const fingerprint = manifest.fingerprint(index_name);
+        var start: u64 = 0;
+        var applied = false;
+        if (saved) |position| {
+            if (position.sequence == sequence) {
+                if (position.total_items != manifest.families or !std.mem.eql(u8, &position.fingerprint, &fingerprint) or position.next_item >= position.total_items) return error.InvalidDerivedApplyState;
+                start = position.next_item;
+                applied = position.applied;
+            } else if (position.sequence > sequence or position.next_item != position.total_items) return error.InvalidDerivedApplyState;
+        }
+        const ordinal: u32 = @intCast(start / replay_chunks.families_per_chunk);
+        if (ordinal < manifest.retired_chunks) return error.ReplayHistoryUnavailable;
+        const key = replay_chunks.chunkKey(sequence, ordinal);
+        const raw = try cursor.scan_txn.?.get(&key);
+        const slice = try replay_chunks.sliceFamilies(a, manifest, ordinal, raw, @intCast(start % replay_chunks.families_per_chunk), max_families);
+        defer a.free(slice.payload);
+        var decoded = try change_journal_mod.decodeRecord(a, slice.payload);
+        defer decoded.deinit();
+        const payload = try replay_reference.encodeForHint(a, decoded.record, cursor.hint);
+        errdefer a.free(payload);
+        const next = start + slice.families;
+        if (next > manifest.families) return error.InvalidReplayChunk;
+        if (next == manifest.families) {
+            cursor.next_sequence = sequence;
+            cursor.entry = try cursor.cursor.?.next();
+        }
+        return .{ .payload = payload, .position = .{ .sequence = sequence, .next_item = next, .total_items = manifest.families, .fingerprint = fingerprint, .applied = applied } };
     }
 
     pub fn forEachNext(
@@ -386,7 +435,10 @@ fn primaryStoreMatchingCursorForEachNext(
             cursor.entry = null;
             break;
         };
-        if (cursor.fallback_all and !try change_journal_mod.encodedRecordHasHint(entry.value, cursor.hint)) {
+        const resolved = try replay_reference.resolve(cursor.store.alloc, &cursor.scan_txn.?, sequence, cursor.scan_lane_ordinal, entry.value);
+        defer if (resolved) |owned| cursor.store.alloc.free(owned);
+        const payload = resolved orelse entry.value;
+        if (cursor.fallback_all and !try change_journal_mod.encodedRecordHasHint(payload, cursor.hint)) {
             stats.scanned_entries += 1;
             stats.hint_filter_skips += 1;
             stats.last_sequence = sequence;
@@ -396,9 +448,7 @@ fn primaryStoreMatchingCursorForEachNext(
             continue;
         }
 
-        const resolved = try replay_reference.resolve(cursor.store.alloc, &cursor.scan_txn.?, sequence, cursor.scan_lane_ordinal, entry.value);
-        defer if (resolved) |owned| cursor.store.alloc.free(owned);
-        consume(ctx, sequence, resolved orelse entry.value) catch |err| switch (err) {
+        consume(ctx, sequence, payload) catch |err| switch (err) {
             // Keep this entry current: the builder rejected it before taking
             // ownership, so the following replay window must retry it.
             StopReplayChunk.StopReplayChunk => return stats,

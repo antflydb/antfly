@@ -4988,6 +4988,10 @@ fn waitForReplayCapacity(ptr: ?*anyopaque, path: []const u8, hint: lite_backend.
 /// commit. Registry/runtime/path access is released during sleep. Request data
 /// is caller-owned or allocated independently of a refreshed runtime.
 pub fn executeBatchWithReplayAdmissionRetry(ptr: ?*anyopaque, request: *anyopaque, apply: *const fn (*anyopaque, *Handle, *bool) anyerror!void) capi.ErrorCode {
+    return executeBatchWithReplayPreparation(ptr, request, null, apply);
+}
+
+fn executeBatchWithReplayPreparation(ptr: ?*anyopaque, request: *anyopaque, prepare_attempt: ?*const fn (*anyopaque) anyerror!void, apply: *const fn (*anyopaque, *Handle, *bool) anyerror!void) capi.ErrorCode {
     const alloc = std.heap.c_allocator;
     var entry = HandleEntry.capture(ptr) orelse return capi.mapError(error.InvalidArgument);
     const timeout_ms = if (entry.lock_handle.lite_connection) |connection| connection.options.busy_timeout_ms else 0;
@@ -4997,6 +5001,14 @@ pub fn executeBatchWithReplayAdmissionRetry(ptr: ?*anyopaque, request: *anyopaqu
     var wait_path: ?[]u8 = null;
     defer if (wait_path) |path| alloc.free(path);
     while (true) {
+        if (prepare_attempt) |prepare| {
+            const started = std.Io.Clock.awake.now(io).nanoseconds;
+            prepare(request) catch |err| return capi.mapError(err);
+            // The admission budget excludes active owned preparation, just
+            // as it excludes the body after a pre-commit capacity refusal.
+            deadline += @max(0, std.Io.Clock.awake.now(io).nanoseconds - started);
+        }
+
         const guard = enterWithAdmissionBudget(entry, ptr, .write, .mutation, false, @max(0, deadline - std.Io.Clock.awake.now(io).nanoseconds)) orelse return capi.mapError(error.InvalidArgument);
         var held = true;
         defer if (held) guard.leave();
@@ -5109,13 +5121,17 @@ pub fn antfly_db_batch_json(
     const Request = struct {
         owned: *@TypeOf(owned),
         prepared: ?*Prepared,
+        fn prepare(raw: *anyopaque) !void {
+            const request: *@This() = @ptrCast(@alignCast(raw));
+            if (request.prepared) |plan| try plan.prepareAttempt();
+        }
         fn apply(raw: *anyopaque, handle: *Handle, primary_committed: *bool) !void {
             const request: *@This() = @ptrCast(@alignCast(raw));
             try trackedBatchWithPreparedDocuments(handle.database(), request.owned.req, primary_committed, handle.selected_table_name, request.prepared);
         }
     };
     var request: Request = .{ .owned = &owned, .prepared = if (prepared) |*plan| plan else null };
-    const code = executeBatchWithReplayAdmissionRetry(handle_ptr, &request, Request.apply);
+    const code = executeBatchWithReplayPreparation(handle_ptr, &request, Request.prepare, Request.apply);
     if (code != .ok) return code;
     out_buf.* = .{ .ptr = response.?.ptr, .len = response.?.len };
     response = null;

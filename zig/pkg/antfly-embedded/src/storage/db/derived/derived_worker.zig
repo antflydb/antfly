@@ -295,7 +295,7 @@ pub fn catchUpIndexFromMatchingCursor(
 ) !CatchUpStats {
     var stats = CatchUpStats{};
     const fragments = options.max_fragment_families != 0 and options.load_fragment_fn != null and options.save_fragment_fn != null;
-    if (fragments) std.debug.assert(index_ref.kind == .full_text and options.max_windows_per_call == 1);
+    if (fragments) std.debug.assert(index_ref.kind == .full_text);
     var completed_windows: usize = 0;
     const call_started_ns = monotonicTimeNs();
     var call_bytes: u64 = 0;
@@ -347,7 +347,12 @@ pub fn catchUpIndexFromMatchingCursor(
         var retried_fresh = false;
         var collection_limit = if (fragments) @as(usize, 1) else options.max_records_per_window;
         var retry_stats = replay_source_mod.MatchingRecordStats{};
-        const chunk_stats = collect: while (true) {
+        const seekable_slice = if (fragments) try replay_cursor.readFamilySlice(scratch_alloc, index_ref.name, try options.load_fragment_fn.?(options.fragment_ctx.?, index_ref.name), options.max_fragment_families, options.target_sequence) else null;
+        defer if (seekable_slice) |slice| scratch_alloc.free(slice.payload);
+        const chunk_stats = if (seekable_slice) |slice| bounded: {
+            try replayChunkConsumeRecord(&builder, slice.position.sequence, slice.payload);
+            break :bounded replay_source_mod.MatchingRecordStats{ .scan_batches = 1, .scanned_entries = 1, .matched_entries = 1, .last_sequence = slice.position.sequence };
+        } else collect: while (true) {
             const collected = replay_cursor.forEachNext(collection_limit, &builder, replayChunkConsumeRecord) catch |err| {
                 // An empty window gets one retry after reclaiming cached
                 // scratch and key-block slack. The failed record has not
@@ -406,7 +411,12 @@ pub fn catchUpIndexFromMatchingCursor(
         var previously_applied = false;
         var fragment_complete = true;
         var apply_batch = batch;
-        if (fragments) {
+        if (seekable_slice) |slice| {
+            previously_applied = slice.position.applied;
+            fragment_position = slice.position;
+            fragment_complete = slice.position.next_item == slice.position.total_items;
+            stats.collected_items += builder.item_count;
+        } else if (fragments) {
             var saved = try options.load_fragment_fn.?(options.fragment_ctx.?, index_ref.name);
             if (saved) |previous| if (previous.sequence < batch.sequence and previous.next_item == previous.total_items) {
                 saved = null;
@@ -483,9 +493,11 @@ pub fn catchUpIndexFromMatchingCursor(
             try options.save_fragment_fn.?(options.fragment_ctx.?, index_ref.name, position);
             if (!fragment_complete) {
                 stats.partial_sequence = chunk_stats.last_sequence;
-                return stats;
+                if (options.max_windows_per_call != 0) return stats;
+                continue;
             }
         }
+        stats.partial_sequence = 0;
         if (options.persist_progress_fn) |persist| {
             if (applied) {
                 persist(options.persist_ctx.?, index_ref.name, chunk_stats.last_sequence) catch |err| {

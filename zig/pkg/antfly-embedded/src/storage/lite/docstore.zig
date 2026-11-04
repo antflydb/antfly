@@ -4764,6 +4764,7 @@ pub const Cursor = struct {
 };
 
 const replay_reference = @import("../db/derived/replay_reference.zig");
+const replay_chunks = @import("../db/derived/replay_chunks.zig");
 
 const replay_hints = [_]change_journal_mod.TargetHint{
     .enrichment,
@@ -4825,6 +4826,14 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
         return;
     };
     defer decoded.deinit();
+    if (decoded.record.sequence != sequence) return error.InvalidReplayReference;
+    if (txn.store.?.file.header.indexed_reclamation and txn.store.?.file.header.indexed_revision >= 11) {
+        if (try replay_chunks.prepare(alloc, decoded.record)) |value| {
+            var chunked = value;
+            defer chunked.deinit();
+            try chunked.stage(txn);
+        }
+    }
 
     for (replay_hints) |hint| {
         if ((mask & change_journal_mod.singleHintMask(hint)) == 0) continue;
@@ -4951,6 +4960,19 @@ fn truncateReplayLane(store: *Store, prefix: []const u8, yielding: bool, kind: u
             };
             while (true) {
                 const sequence = internal_keys.parseReplayEntrySequence(key, kind) orelse return error.InvalidReplayEntryKey;
+                if (kind == internal_keys.replay_all_kind) {
+                    const value = try write.get(key);
+                    if (replay_chunks.isManifest(value)) {
+                        const manifest = try replay_chunks.Manifest.decode(value);
+                        if (count + manifest.count + 1 > replay_cleanup_max_keys) break;
+                        for (manifest.retired_chunks..manifest.count) |ordinal| {
+                            const chunk_key = replay_chunks.chunkKey(sequence, @intCast(ordinal));
+                            try write.delete(&chunk_key);
+                            count += 1;
+                            bytes += prefix.len + chunk_key.len;
+                        }
+                    }
+                }
                 try write.delete(key);
                 count += 1;
                 bytes += prefix.len + key.len;
@@ -4964,7 +4986,9 @@ fn truncateReplayLane(store: *Store, prefix: []const u8, yielding: bool, kind: u
         }
         try write.commit();
         committed = true;
-        if (count < replay_cleanup_max_keys and bytes < replay_cleanup_max_key_bytes) return;
+        // A chunk group can leave slack without exhausting the lane. Keep
+        // scanning from the last fully retired sequence after committing it.
+        if (count == 0) return;
     }
 }
 
@@ -5251,6 +5275,111 @@ test "lite native write cursors merge pending writes and deletes in order" {
     entry = try cursor.next();
     try std.testing.expectEqualStrings("doc:d", entry.key);
     try std.testing.expectError(error.NotFound, cursor.next());
+}
+
+test "lite seekable replay resumes bounded families and retires charged chunks atomically" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "seekable-replay.aflite");
+    defer a.free(path);
+    var native_store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    defer native_store.close();
+    const namespace = "\x02db/embedded/tables/7\x00";
+    var runtime = try native_store.runtimeStoreWithPrefix(a, namespace);
+    defer runtime.deinit();
+    const facade = @import("../docstore.zig");
+    var store = try facade.DocStore.openRuntime(a, &runtime);
+    defer store.close();
+    var key_buffer: [130][32]u8 = undefined;
+    var doc_keys: [130][]const u8 = undefined;
+    for (&doc_keys, 0..) |*key, ordinal| key.* = try std.fmt.bufPrint(&key_buffer[ordinal], "document-{d:0>4}", .{ordinal});
+    doc_keys[0] = "a\x00escaped";
+    doc_keys[1] = "你好";
+    const payload = try change_journal_mod.encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &doc_keys, .deleted_doc_keys = &.{doc_keys[0]}, .overwritten_doc_keys = &.{doc_keys[0]}, .target_hints = &.{ .full_text, .algebraic } });
+    defer a.free(payload);
+    {
+        var write = try store.beginWriteBatch();
+        errdefer write.abort();
+        try write.setReplayOpaque(1, payload);
+        try write.commit();
+    }
+    const charged = (try native_store.file.replayAdmission()).?;
+    try std.testing.expectEqual(@as(u64, 3), charged.records);
+    try std.testing.expectEqualDeep(charged, try native_store.file.scanReplayAdmission());
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var iterator = seen.keyIterator();
+        while (iterator.next()) |key| a.free(key.*);
+        seen.deinit(a);
+    }
+    const source = @import("../db/derived/replay_source.zig").Source.fromPrimaryStore(&store, null, null);
+    var position: ?@import("../db/derived/replay_fragment.zig").Position = null;
+    var slices: usize = 0;
+    var deletion_families: usize = 0;
+    while (position == null or position.?.next_item != position.?.total_items) {
+        var cursor = try source.openMatchingCursor(a, 0, .full_text);
+        defer cursor.deinit(a);
+        const slice = (try cursor.readFamilySlice(a, "text", position, 8, 0)).?;
+        defer a.free(slice.payload);
+        var decoded = try change_journal_mod.decodeRecord(a, slice.payload);
+        defer decoded.deinit();
+        try std.testing.expect(decoded.record.changed_doc_keys.len <= 8);
+        for (decoded.record.changed_doc_keys) |key| {
+            try std.testing.expect(!seen.contains(key));
+            const owned = try a.dupe(u8, key);
+            errdefer a.free(owned);
+            try seen.put(a, owned, {});
+        }
+        if (decoded.record.deleted_doc_keys.len != 0) {
+            deletion_families += 1;
+            try std.testing.expectEqualStrings(doc_keys[0], decoded.record.deleted_doc_keys[0]);
+            try std.testing.expectEqualStrings(doc_keys[0], decoded.record.overwritten_doc_keys[0]);
+            try std.testing.expect(seen.contains(doc_keys[0]));
+        }
+        position = slice.position;
+        if (position.?.next_item == 64) {
+            // Model two durable consumers: one at 64 and one still at 63.
+            // No chunk credit is returned until their minimum crosses 64.
+            var writer = try store.beginWriteTxn();
+            var done = false;
+            defer if (!done) writer.abort();
+            const canonical_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+            const manifest = try replay_chunks.Manifest.decode(try writer.get(&canonical_key));
+            try std.testing.expect(!try replay_chunks.retirePrefix(&writer, manifest, 63));
+            try std.testing.expect(try replay_chunks.retirePrefix(&writer, manifest, 64));
+            try writer.commit();
+            done = true;
+            const updated = (try native_store.file.replayAdmission()).?;
+            try std.testing.expectEqual(charged.records, updated.records);
+            try std.testing.expect(updated.bytes < charged.bytes);
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            const retained = try replay_chunks.Manifest.decode(try read.get(&canonical_key));
+            try std.testing.expectEqual(@as(u32, 1), retained.retired_chunks);
+            try std.testing.expectEqual(manifest.fingerprint("text"), retained.fingerprint("text"));
+            try std.testing.expectError(error.ReplayHistoryUnavailable, replay_chunks.resolveAll(a, &read, &retained.encode()));
+        }
+        slices += 1;
+        try std.testing.expect(slices <= 17);
+    }
+    try std.testing.expectEqual(@as(usize, 17), slices);
+    try std.testing.expectEqual(@as(usize, 130), seen.count());
+    try std.testing.expectEqual(@as(usize, 1), deletion_families);
+    const before_retirement = try native_store.checkWithCancel(null);
+    if (!before_retirement.valid) std.debug.print("before chunk retirement: {f}\n", .{std.json.fmt(before_retirement, .{})});
+    try std.testing.expect(before_retirement.valid);
+    var retirement: facade.ReplayRetirement = .{ .lane = 8, .watermark = 1 };
+    store.deferred_replay_retirement = &retirement;
+    store.bounded_replay_retirement = true;
+    try store.truncateReplayUpTo(a, 1);
+    try store.truncateReplayUpTo(a, 1);
+    const retired = (try native_store.file.replayAdmission()).?;
+    try std.testing.expectEqual(@as(u64, 0), retired.bytes);
+    try std.testing.expectEqual(@as(u64, 0), retired.records);
+    const checked = try native_store.checkWithCancel(null);
+    if (!checked.valid) std.debug.print("seekable replay integrity: {f}\n", .{std.json.fmt(checked, .{})});
+    try std.testing.expect(checked.valid);
 }
 
 test "lite canonical replay facade resolves cursors and protects rotating retirement" {
