@@ -71,6 +71,7 @@ pub const Scheduler = struct {
     const Node = struct { ticket: ?plan.Ticket = null, next: ?u16 = null, slot: u16 = 0, failures: u8 = 0, not_before_ns: u64 = 0 };
     const Slot = struct { query: ?state.Query = null, tenant: state.Digest = undefined, head: ?u16 = null, tail: ?u16 = null, active: u16 = 0, dirty: bool = false };
     io: std.Io,
+    clock: runtime.Clock = .{},
     delivery: runtime.Dispatcher,
     notification: ?runtime.Notification = null,
     mutex: std.Io.Mutex = .init,
@@ -139,7 +140,9 @@ pub const Scheduler = struct {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
         if (self.stopping.load(.acquire)) return error.Canceled;
+        self.retireExpired();
         for (tickets) |ticket| {
+            if (ticket.query.expires_ms <= self.clock.now()) continue;
             var slot_id: ?usize = null;
             var free_slot: ?usize = null;
             for (self.slots, 0..) |slot, i| {
@@ -175,7 +178,23 @@ pub const Scheduler = struct {
     }
     // Caller holds mutex. One ticket per query in round-robin order prevents
     // a large query's concurrency window from monopolizing queued delivery.
+    fn retireExpired(self: *Scheduler) void {
+        const now = self.clock.now();
+        for (&self.slots) |*slot| if (slot.query) |query| {
+            if (query.expires_ms > now) continue;
+            var pending = slot.head;
+            while (pending) |id| {
+                pending = self.nodes[id].next;
+                self.nodes[id] = .{};
+            }
+            slot.head = null;
+            slot.tail = null;
+            // In-flight nodes remain owned by their worker until it joins.
+            if (slot.active == 0) slot.* = .{};
+        };
+    }
     fn take(self: *Scheduler) ?u16 {
+        self.retireExpired();
         const now = @import("antfly_platform").time.monotonicNs();
         for (0..self.slots.len) |offset| {
             const i = (self.cursor + offset) % self.slots.len;
@@ -193,7 +212,9 @@ pub const Scheduler = struct {
     fn retryDelay(self: *Scheduler) ?u64 {
         var earliest: ?u64 = null;
         for (self.slots) |slot| if (slot.head) |id| {
-            const due = self.nodes[id].not_before_ns;
+            const lifetime = slot.query.?.expires_ms -| self.clock.now();
+            const expiry = @import("antfly_platform").time.monotonicNs() +| lifetime *| std.time.ns_per_ms;
+            const due = @min(self.nodes[id].not_before_ns, expiry);
             earliest = if (earliest) |value| @min(value, due) else due;
         };
         return if (earliest) |value| value -| @import("antfly_platform").time.monotonicNs() else null;
@@ -248,9 +269,17 @@ pub const Scheduler = struct {
             };
             const ticket = self.nodes[id].ticket.?;
             self.mutex.unlock(self.io);
+            // Query expiry bounds even a slow/unreachable worker RPC.
+            var delivery_context = context;
+            const remaining: u64 = @min(@as(u64, 55_000), ticket.query.expires_ms -| self.clock.now());
+            delivery_context.deadline_ns = @import("antfly_platform").time.monotonicNs() +| remaining * std.time.ns_per_ms;
+            if (remaining == 0) {
+                self.finish(id);
+                continue;
+            }
             // No request-owned context or pointer escapes into delivery.
-            self.delivery.dispatch(self.delivery.ptr, &.{ticket}, context) catch |err| {
-                if (!self.stopping.load(.acquire) and self.nodes[id].failures < 7) {
+            self.delivery.dispatch(self.delivery.ptr, &.{ticket}, delivery_context) catch |err| {
+                if (!self.stopping.load(.acquire) and self.clock.now() < ticket.query.expires_ms and self.nodes[id].failures < 7) {
                     // Retain identity through backpressure; immediate completion
                     // notifications would turn 503 responses into a hot loop.
                     self.deferDelivery(id);
@@ -264,8 +293,12 @@ pub const Scheduler = struct {
     }
 };
 
+fn testClock(_: ?*anyopaque) u64 {
+    return 1000;
+}
+
 test "distributed SQL scheduler fairly rotates bounded queues and deduplicates in-flight tickets" {
-    var scheduler: Scheduler = .{ .io = std.testing.io, .delivery = undefined };
+    var scheduler: Scheduler = .{ .io = std.testing.io, .clock = .{ .read = testClock }, .delivery = undefined };
     defer scheduler.stop();
     const a: plan.Ticket = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 100000 }, .stage = 0, .task = 0 };
     var a2 = a;
@@ -341,7 +374,7 @@ test "distributed SQL delivery backpressure retries independently with bounded d
         }
     };
     var delivery: Delivery = .{};
-    var scheduler: Scheduler = .{ .io = std.testing.io, .delivery = .{ .ptr = &delivery, .dispatch = Delivery.run } };
+    var scheduler: Scheduler = .{ .io = std.testing.io, .clock = .{ .read = testClock }, .delivery = .{ .ptr = &delivery, .dispatch = Delivery.run } };
     const ticket: plan.Ticket = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 100000 }, .stage = 0, .task = 0 };
     const port = scheduler.dispatcher();
     try port.dispatch(port.ptr, &.{ticket}, .{});
@@ -364,4 +397,77 @@ test "distributed SQL delivery backpressure retries independently with bounded d
     try port.dispatch(port.ptr, &.{ticket}, .{});
     try delivery.accepted.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
     try std.testing.expectEqual(@as(u32, 2), delivery.calls.load(.acquire));
+}
+
+test "distributed SQL scheduler retires expired queues and caps RPC lifetime" {
+    const Clock = struct {
+        now: u64 = 1000,
+        fn read(raw: ?*anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return self.now;
+        }
+    };
+    const Delivery = struct {
+        calls: std.atomic.Value(u32) = .init(0),
+        received: std.Io.Event = .unset,
+        fn run(raw: *anyopaque, _: []const plan.Ticket, context: Context) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const remaining = context.deadline_ns.? -| @import("antfly_platform").time.monotonicNs();
+            std.debug.assert(remaining <= 100 * std.time.ns_per_ms);
+            _ = self.calls.fetchAdd(1, .monotonic);
+            self.received.set(context.io.?);
+        }
+    };
+    var clock: Clock = .{};
+    var delivery: Delivery = .{};
+    var scheduler: Scheduler = .{ .io = std.testing.io, .clock = .{ .ptr = &clock, .read = Clock.read }, .delivery = .{ .ptr = &delivery, .dispatch = Delivery.run } };
+    var ticket: plan.Ticket = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 2000 }, .stage = 0, .task = 0 };
+    const port = scheduler.dispatcher();
+    for (0..1024) |i| {
+        ticket.task = @intCast(i);
+        try port.dispatch(port.ptr, &.{ticket}, .{});
+    }
+    // Expiry alone frees a saturated queue before workers or retries run.
+    clock.now = 3000;
+    ticket.query.id = @splat('c');
+    ticket.query.expires_ms = 3100;
+    ticket.task = 0;
+    try port.dispatch(port.ptr, &.{ticket}, .{});
+    try scheduler.start(1);
+    defer scheduler.stop();
+    try delivery.received.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try std.testing.expectEqual(@as(u32, 1), delivery.calls.load(.acquire));
+}
+
+test "distributed SQL expired delivery failure is retired without retry" {
+    const Fixture = struct {
+        now: u64 = 1000,
+        calls: std.atomic.Value(u32) = .init(0),
+        expired: std.Io.Event = .unset,
+        fn read(raw: ?*anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return self.now;
+        }
+        fn retired(raw: *anyopaque, _: state.Digest, _: state.Query) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.expired.set(std.testing.io);
+        }
+        fn run(raw: *anyopaque, _: []const plan.Ticket, context: Context) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            _ = context;
+            self.now = 2000;
+            return error.DeadlineExceeded;
+        }
+    };
+    var fixture: Fixture = .{};
+    var scheduler: Scheduler = .{ .io = std.testing.io, .clock = .{ .ptr = &fixture, .read = Fixture.read }, .delivery = .{ .ptr = &fixture, .dispatch = Fixture.run } };
+    scheduler.notification = .{ .ptr = &fixture, .notify = Fixture.retired };
+    const ticket: plan.Ticket = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 1500 }, .stage = 0, .task = 0 };
+    const port = scheduler.dispatcher();
+    try port.dispatch(port.ptr, &.{ticket}, .{});
+    try scheduler.start(1);
+    try fixture.expired.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    scheduler.stop();
+    try std.testing.expectEqual(@as(u32, 1), fixture.calls.load(.acquire));
 }

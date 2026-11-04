@@ -1411,7 +1411,11 @@ test "distributed SQL asynchronous delivery isolates short queries and renews le
     const scheduler_mod = @import("scheduler.zig");
     var turns: scheduler_mod.Turns = .{};
     service.coordination = turns.port();
-    var scheduler: scheduler_mod.Scheduler = .{ .io = std.testing.io, .delivery = .{ .ptr = &delivery, .dispatch = Delivery.run } };
+    var scheduler: scheduler_mod.Scheduler = .{ .io = std.testing.io, .clock = .{ .read = struct {
+        fn read(_: ?*anyopaque) u64 {
+            return 1000;
+        }
+    }.read }, .delivery = .{ .ptr = &delivery, .dispatch = Delivery.run } };
     turns.scheduler = &scheduler;
     var driver: @import("driver.zig").Driver = .{ .service = service, .dispatcher = scheduler.dispatcher(), .io = std.testing.io };
     defer driver.stop();
@@ -1466,4 +1470,105 @@ test "distributed SQL asynchronous delivery isolates short queries and renews le
     _ = try driver.tick();
     try std.testing.expectError(error.Canceled, service.pollResult(a, delivery.slow));
     // stop joins/cancels the parked delivery; no request contexts are borrowed.
+}
+
+test "distributed SQL control binds tenant scope before results or ownership changes" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    const service = fixture.service(a, memory.client(), "owner");
+    const column: plan.Column = .{ .name = "id", .type = .integer };
+    const left: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{column}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 1 };
+    var right = left;
+    right.table_id = 2;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    const spec = try plan.choose(left, right, service.tenant, fixture.now + 120000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{}, fixture.now);
+    const query = try service.submit(spec);
+    var dispatch: Dispatch = .{ .workers = .{ fixture.service(a, memory.client(), "worker-a"), fixture.service(a, memory.client(), "worker-b") }, .drop_once = false };
+    for (0..32) |_| {
+        if (try service.turn(query, .{ .ptr = &dispatch, .dispatch = Dispatch.run })) break;
+    }
+    var stranger = service;
+    stranger.tenant = @splat('c');
+    try std.testing.expectError(error.SqlExecutionUnauthorized, stranger.loadPlan(arena.allocator(), query));
+    try std.testing.expectError(error.SqlExecutionUnauthorized, stranger.pollResult(arena.allocator(), query));
+    const get = @backingInt(storage.operation_metrics.Operation.get);
+    const get_before = storage.operation_metrics.runtime.snapshot().calls[get];
+    try std.testing.expectEqual(@as(u64, 2), (try service.pollResult(arena.allocator(), query)).?.rows);
+    try std.testing.expectEqual(@as(u64, 2), storage.operation_metrics.runtime.snapshot().calls[get] - get_before);
+    // Pre-scope jobs remain readable only after validating their immutable plan.
+    const result_key = try service.state_store.key(arena.allocator(), query, null, 0);
+    var legacy = (try service.state_store.load(a, result_key)).?;
+    defer legacy.deinit(a);
+    var legacy_record = legacy.value;
+    legacy_record.tenant = null;
+    const legacy_bytes = try std.json.Stringify.valueAlloc(arena.allocator(), legacy_record, .{});
+    var raw_client = memory.client();
+    var written = try raw_client.compareAndPut(service.state_store.bucket, result_key, legacy_bytes, legacy.object.metadata.writeRevision(), .{});
+    written.deinit(a);
+    try std.testing.expectError(error.SqlExecutionUnauthorized, stranger.pollResult(arena.allocator(), query));
+    try std.testing.expectEqual(@as(u64, 2), (try service.pollResult(arena.allocator(), query)).?.rows);
+    var second_spec = spec;
+    second_spec.expires_ms -= 1;
+    const pending = try service.submit(second_spec);
+    stranger.owner = "other-pod";
+    try std.testing.expectError(error.SqlExecutionUnauthorized, stranger.turn(pending, .{ .ptr = &dispatch, .dispatch = Dispatch.run }));
+    const key = try service.state_store.key(arena.allocator(), pending, null, 0);
+    var claimed = (try service.state_store.load(a, key)).?;
+    defer claimed.deinit(a);
+    try std.testing.expectEqual(state.Status.pending, claimed.value.status);
+    try std.testing.expectEqualStrings("", claimed.value.owner);
+    try std.testing.expectError(error.SqlExecutionUnauthorized, stranger.acquire(pending));
+    try std.testing.expectError(error.SqlExecutionUnauthorized, stranger.requestCancel(pending));
+    const legitimate = (try service.acquire(pending)).?;
+    try std.testing.expectError(error.SqlExecutionUnauthorized, stranger.cancel(pending, legitimate));
+    try std.testing.expectError(error.SqlExecutionUnauthorized, stranger.execute(.{ .tenant = stranger.tenant, .query = pending, .stage = 0, .task = 0 }));
+}
+
+test "distributed SQL empty collection backs off independently of maintenance ticks" {
+    const a = std.testing.allocator;
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    const collector: @import("collector.zig").Collector = .{
+        .state_store = .{ .client = memory.client(), .bucket = "state", .prefix = "sql", .now_ms = 0 },
+        .exchange_store = .{ .client = memory.client(), .bucket = "exchange", .prefix = "sql" },
+    };
+    const list = @backingInt(storage.operation_metrics.Operation.list);
+    const before = storage.operation_metrics.runtime.snapshot().calls[list];
+    var schedule: @import("collector.zig").Schedule = .{};
+    for (0..10) |tick| try std.testing.expectEqual(@as(usize, 0), try schedule.runAt(a, collector, .{}, tick * 10));
+    const after = storage.operation_metrics.runtime.snapshot().calls[list];
+    try std.testing.expectEqual(@as(u64, 3), after - before);
+    var now: u64 = schedule.next_ms;
+    for (0..16) |_| {
+        _ = try schedule.runAt(a, collector, .{}, now);
+        now = schedule.next_ms;
+    }
+    try std.testing.expectEqual(@as(u32, 30_000), schedule.delay_ms);
+    try std.testing.expectEqual(@as(u64, 30_000), schedule.waitMs(now - 30_000));
+    // Newly visible expired objects drain promptly after the bounded idle wait.
+    const store = collector.state_store;
+    const query: state.Query = .{ .id = @splat('b'), .expires_ms = 1 };
+    const key = try store.key(a, query, null, 0);
+    defer a.free(key);
+    try store.create(a, key, query.id, query.expires_ms);
+    try std.testing.expectEqual(@as(usize, 1), try schedule.runAt(a, collector, .{}, now));
+    try std.testing.expectEqual(now + 1, schedule.next_ms);
+    try std.testing.expectEqual(@as(u32, 100), schedule.delay_ms);
+    // Transient DELETE failure preserves a bounded retry instead of hot polling.
+    try store.create(a, key, query.id, query.expires_ms);
+    var faults = storage.ScriptedFaultClient.init(a, memory.client());
+    defer faults.deinit();
+    faults.next_delete = .{ .fail_before = error.ConnectionResetByPeer };
+    var faulty = collector;
+    faulty.state_store.client = faults.client();
+    now = schedule.next_ms;
+    try std.testing.expectError(error.ConnectionResetByPeer, schedule.runAt(a, faulty, .{}, now));
+    try std.testing.expect(schedule.next_ms > now);
+    try std.testing.expectEqual(@as(usize, 0), try schedule.runAt(a, faulty, .{}, now + 1));
+    try std.testing.expectEqual(@as(usize, 1), try schedule.runAt(a, faulty, .{}, schedule.next_ms));
 }

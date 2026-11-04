@@ -49,6 +49,7 @@ pub fn collect(a: A, store: state.Store, max_steps: usize) !usize {
 }
 
 pub const Collector = struct {
+    jitter_seed: u64 = 0,
     state_store: state.Store,
     exchange_store: @import("exchange.zig").Store,
     pub fn run(self: Collector, a: A, context: @import("antfly_local_sources").serverless_query_lake_read_context.Context) !usize {
@@ -84,3 +85,29 @@ test "distributed SQL expiry roots rediscover writes arriving after discovery cl
     try std.testing.expectEqual(@as(usize, 1), try collect(sa, store, 1));
     try std.testing.expect((try store.load(sa, key)) == null);
 }
+
+/// Process-owned scheduling, separate from the legacy maintenance tick. Empty
+/// walks back off while nonempty pages drain promptly; failed passes are retried.
+pub const Schedule = struct {
+    next_ms: u64 = 0,
+    delay_ms: u32 = 100,
+    pub fn waitMs(self: Schedule, now_ms: u64) u64 {
+        return @max(@as(u64, 1), self.next_ms -| now_ms);
+    }
+    fn deferPass(self: *Schedule, collector: Collector, now_ms: u64) void {
+        self.delay_ms = @min(@as(u32, 30_000), self.delay_ms * 2);
+        const jitter = if (collector.jitter_seed == 0) 0 else std.hash.Wyhash.hash(collector.jitter_seed, std.mem.asBytes(&now_ms)) % @max(@as(u32, 1), self.delay_ms / 8);
+        self.next_ms = now_ms +| self.delay_ms +| jitter;
+    }
+    pub fn runAt(self: *Schedule, a: A, collector: Collector, context: @import("antfly_local_sources").serverless_query_lake_read_context.Context, now_ms: u64) !usize {
+        try context.ensureActive();
+        if (now_ms < self.next_ms) return 0;
+        errdefer self.deferPass(collector, now_ms);
+        const steps = try collector.run(a, context);
+        if (steps == 0) self.deferPass(collector, now_ms) else {
+            self.delay_ms = 100;
+            self.next_ms = now_ms +| 1;
+        }
+        return steps;
+    }
+};

@@ -94,8 +94,21 @@ pub const Service = struct {
     fn store(self: Service) state.Store {
         var result = self.state_store;
         result.now_ms = self.clock.now();
+        result.tenant = self.tenant;
         result.context = self.context;
         return result;
+    }
+    fn authorize(self: Service, a: A, query: state.Query, record: state.Record) !void {
+        if (!std.meta.eql(record.plan, query.id) or record.expires_ms != query.expires_ms) return error.InvalidSqlExecutionState;
+        if (record.tenant) |tenant| {
+            if (!std.meta.eql(tenant, self.tenant)) return error.SqlExecutionUnauthorized;
+        } else {
+            // Compatibility is limited to pre-scope jobs' immutable lifetime.
+            // Newly admitted jobs use only the compact record on polling paths.
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            _ = try self.loadPlan(arena.allocator(), query);
+        }
     }
     fn requireQueryRole(self: Service) !void {
         if (self.role != .query_only and self.role != .combined) return error.SqlQueryRoleRequired;
@@ -161,6 +174,9 @@ pub const Service = struct {
         try self.requireQueryRole();
         const key = try self.store().key(self.a, query, null, 0);
         defer self.a.free(key);
+        var current = (try self.store().load(self.a, key)) orelse return error.SqlExecutionNotFound;
+        defer current.deinit(self.a);
+        try self.authorize(self.a, query, current.value);
         return self.store().claim(self.a, key, self.owner, 60_000);
     }
     fn tasks(spec: plan.Plan, stage: u32) !u32 {
@@ -328,6 +344,7 @@ pub const Service = struct {
         const query_key = try self.store().key(a, ticket.query, null, 0);
         var query = (try self.store().load(a, query_key)) orelse return error.SqlExecutionNotFound;
         defer query.deinit(a);
+        try self.authorize(a, ticket.query, query.value);
         if (query.value.terminal()) return;
         if (query.value.stage != ticket.stage or !std.mem.eql(u8, &query.value.plan, &ticket.query.id)) return error.SqlExecutionFenced;
         const key = try self.store().key(a, ticket.query, ticket.stage, ticket.task);
@@ -698,6 +715,7 @@ pub const Service = struct {
         defer self.a.free(key);
         var current = (try self.store().load(self.a, key)) orelse return error.SqlExecutionNotFound;
         defer current.deinit(self.a);
+        try self.authorize(self.a, query, current.value);
         if (current.value.status == .succeeded) return true;
         if (current.value.status == .failed or current.value.status == .cancelled) return error.SqlExecutionFailed;
         // Native delivery completion wakes orchestration. While a bounded
@@ -707,7 +725,7 @@ pub const Service = struct {
         if (!current.value.cancel_requested and current.value.pending.len != 0 and current.value.status == .running and std.mem.eql(u8, current.value.owner, self.owner) and current.value.until_ms > self.clock.now() +| 20_000) {
             if (self.coordination) |coordination| if (!coordination.delivery_ready(coordination.ptr, query)) return false;
         }
-        const claim: state.Claim = if (current.value.status == .running and std.mem.eql(u8, current.value.owner, self.owner) and current.value.until_ms > self.clock.now()) .{ .owner = self.owner, .epoch = current.value.epoch } else (try self.acquire(query)) orelse return false;
+        const claim: state.Claim = if (current.value.status == .running and std.mem.eql(u8, current.value.owner, self.owner) and current.value.until_ms > self.clock.now()) .{ .owner = self.owner, .epoch = current.value.epoch } else (try self.store().claim(self.a, key, self.owner, 60_000)) orelse return false;
         self.notify(query);
         return self.tick(query, claim, dispatcher);
     }
@@ -715,14 +733,19 @@ pub const Service = struct {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
-        _ = try self.loadPlan(a, query); // Bind the request to its admitted scope.
         const key = try self.store().key(a, query, null, 0);
+        var current = (try self.store().load(a, key)) orelse return error.SqlExecutionNotFound;
+        defer current.deinit(a);
+        try self.authorize(a, query, current.value);
         try self.store().requestCancel(a, key);
         self.notify(query);
     }
     pub fn cancel(self: Service, query: state.Query, claim: state.Claim) !void {
         const key = try self.store().key(self.a, query, null, 0);
         defer self.a.free(key);
+        var current = (try self.store().load(self.a, key)) orelse return error.SqlExecutionNotFound;
+        defer current.deinit(self.a);
+        try self.authorize(self.a, query, current.value);
         try self.store().terminate(self.a, key, claim, .cancelled, "Cancelled");
     }
     pub fn pollResult(self: Service, a: A, query: state.Query) !?Result {
@@ -730,6 +753,7 @@ pub const Service = struct {
         defer a.free(key);
         var current = (try self.store().load(a, key)) orelse return error.SqlExecutionNotFound;
         defer current.deinit(a);
+        try self.authorize(a, query, current.value);
         if (current.value.expires_ms <= self.clock.now()) return error.SqlQueryExpired;
         if (current.value.status == .failed) {
             if (current.value.failure) |failure| {

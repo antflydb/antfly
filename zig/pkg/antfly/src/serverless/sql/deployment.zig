@@ -192,7 +192,7 @@ pub const Owned = struct {
         return .{ .ptr = self, .open = open, .dispatcher = self.scheduler.dispatcher() };
     }
     pub fn collector(self: *Owned) @import("collector.zig").Collector {
-        return .{ .state_store = self.service.state_store, .exchange_store = self.service.exchange_store };
+        return .{ .state_store = self.service.state_store, .exchange_store = self.service.exchange_store, .jitter_seed = std.hash.Wyhash.hash(0, self.service.owner) };
     }
     pub fn attachApi(self: *Owned, server: *@import("../../api/http_server.zig").ApiHttpServer) void {
         server.cfg.distributed_sql_join = self.bridge.port();

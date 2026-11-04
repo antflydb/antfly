@@ -66,6 +66,8 @@ fn sameWitness(left: ?Witness, right: ?Witness) bool {
 }
 pub const Status = enum { pending, running, succeeded, failed, cancelled };
 pub const Record = struct {
+    /// Absent only on pre-scope records; services validate their immutable plan.
+    tenant: ?Digest = null,
     version: u8 = 2,
     plan: Digest,
     expires_ms: u64,
@@ -104,6 +106,7 @@ pub const Store = struct {
     prefix: []const u8,
     context: catalog.types.Context = .{},
     now_ms: u64,
+    tenant: ?Digest = null,
     pub fn key(self: Store, a: A, query: Query, stage: ?u32, task: u32) ![]const u8 {
         try query.validate();
         if (stage) |s| return std.fmt.allocPrint(a, "{s}/sql-execution-v2/{d:0>20}/{s}/stage/{d}/task/{d}.json", .{ self.prefix, query.expires_ms, query.id, s, task });
@@ -121,6 +124,9 @@ pub const Store = struct {
         const parsed = try std.json.parseFromSlice(Record, a, object.body, .{ .allocate = .alloc_always });
         errdefer parsed.deinit();
         const value = parsed.value;
+        if (self.tenant) |scope| if (value.tenant) |admitted| {
+            if (!std.meta.eql(scope, admitted)) return error.SqlExecutionUnauthorized;
+        };
         if (value.version != 2 or value.owner.len > 256 or (value.status == .succeeded and value.output == null)) return error.InvalidSqlExecutionState;
         return .{ .object = object, .value = value, .parsed = parsed };
     }
@@ -139,7 +145,7 @@ pub const Store = struct {
     }
     pub fn ensure(self: Store, a: A, path: []const u8, plan: Digest, expires_ms: u64) !bool {
         if (expires_ms <= self.now_ms) return error.SqlQueryExpired;
-        self.write(a, path, null, .{ .plan = plan, .expires_ms = expires_ms }) catch |err| {
+        self.write(a, path, null, .{ .plan = plan, .expires_ms = expires_ms, .tenant = self.tenant }) catch |err| {
             // Existing jobs and lost successful responses are both resolved by
             // identity. Never overwrite state advanced by another participant.
             var existing = (self.load(a, path) catch return err) orelse return err;

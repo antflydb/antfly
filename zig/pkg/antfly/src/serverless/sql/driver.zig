@@ -208,7 +208,9 @@ pub const Driver = struct {
             // discoverable for takeover after failure, without reopening plans.
             if (current.value.status == .running and !std.mem.eql(u8, current.value.owner, service.owner) and current.value.until_ms +| 30_000 >= service.clock.now()) continue;
             var scoped = service;
-            if (self.principal_scopes) {
+            if (self.principal_scopes and current.value.tenant != null) {
+                scoped.tenant = current.value.tenant.?;
+            } else if (self.principal_scopes) {
                 const plan_key = try std.fmt.allocPrint(a, "{s}/sql-execution-v2/{d:0>20}/{s}/plan.json", .{ service.state_store.prefix, query.expires_ms, query.id });
                 var object = client.getObject(service.state_store.bucket, plan_key, .{ .skip_metadata_probe = true, .max_response_bytes = 1024 * 1024, .cancellation = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.contextCancellation(&service.context) }) catch continue;
                 defer object.deinit(a);

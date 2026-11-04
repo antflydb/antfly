@@ -98,6 +98,7 @@ pub const ManagedRuntime = struct {
     pruner: build_mod.Pruner,
     wal_collector: ?*wal_collection.Collector = null,
     wal_collection_cursor: usize = 0,
+    sql_gc_schedule: @import("../sql/collector.zig").Schedule = .{},
     stats_mu: std.atomic.Mutex = .unlocked,
     run_mu: std.atomic.Mutex = .unlocked,
     cumulative_stats: RuntimeRunStats = .{},
@@ -231,7 +232,13 @@ pub const ManagedRuntime = struct {
             };
             var arena = std.heap.ArenaAllocator.init(self.alloc);
             defer arena.deinit();
-            stats.sql_execution_gc_steps = try collector.run(arena.allocator(), .{ .io = self.io, .cancellation = .{ .ptr = &bridge, .is_cancelled_fn = Bridge.canceled } });
+            stats.sql_execution_gc_steps = self.sql_gc_schedule.runAt(arena.allocator(), collector, .{ .io = self.io, .cancellation = .{ .ptr = &bridge, .is_cancelled_fn = Bridge.canceled } }, platform_time.awakeNs(self.io) / std.time.ns_per_ms) catch |err| switch (err) {
+                error.Canceled, error.Cancelled => return err,
+                else => blk: {
+                    std.log.warn("distributed SQL expiry collection deferred: {s}", .{@errorName(err)});
+                    break :blk 0;
+                },
+            };
         }
         if (self.cfg.publish_enabled) {
             try self.chargeWork(.publish_round, 1);
@@ -633,6 +640,14 @@ pub const ManagedRuntime = struct {
         self.cumulative_stats.work_lease_takeovers += stats.work_lease_takeovers;
     }
 
+    fn nextMaintenanceDelayMs(self: *ManagedRuntime) u64 {
+        lockAtomic(&self.run_mu);
+        defer self.run_mu.unlock();
+        if (self.cfg.sql_execution_gc != null and !self.cfg.publish_enabled and !self.cfg.compaction_enabled and !self.cfg.prune_enabled and !self.cfg.enrichment_enabled and self.wal_collector == null) {
+            return self.sql_gc_schedule.waitMs(platform_time.awakeNs(self.io) / std.time.ns_per_ms);
+        }
+        return self.publisher.nextWakeDelayMs(self.cfg.tick_interval_ms);
+    }
     fn runLoop(self: *ManagedRuntime) void {
         defer self.run_finished.set(self.io);
         while (!self.stop_requested.load(.monotonic)) {
@@ -644,7 +659,7 @@ pub const ManagedRuntime = struct {
                 return;
             };
             self.stop_wake.waitTimeout(self.io, .{ .duration = .{
-                .raw = .fromMilliseconds(@intCast(self.publisher.nextWakeDelayMs(self.cfg.tick_interval_ms))),
+                .raw = .fromMilliseconds(@intCast(self.nextMaintenanceDelayMs())),
                 .clock = .awake,
             } }) catch |err| switch (err) {
                 error.Timeout => continue,

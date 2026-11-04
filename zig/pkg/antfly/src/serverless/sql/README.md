@@ -213,3 +213,18 @@ index page count, rather than physical row order or cache misses. Object I/O
 budgets remain bounded.
 Bucket execution falls back to shuffle for these cuts. Image pages target 32 KiB;
 individual larger rows remain subject to the existing task/query budgets.
+
+Query records now retain the admitted tenant digest. Control operations validate
+that compact scope before returning status/results or changing ownership. Jobs
+written before the scope field was added validate their immutable plan instead;
+new result polling reads only the query record and result manifest. Task records
+also carry scope, and recovery can reopen new jobs without rereading a plan just
+to discover their tenant.
+
+Native delivery purges expired queued tickets before capacity admission or
+selection. In-flight RPC deadlines are capped by query expiry, and expired
+failures cannot enter retry backoff. SQL execution GC has a separate monotonic
+schedule: empty or failed passes back off to thirty seconds with boot jitter;
+nonempty pages continue promptly. SQL-only maintenance sleeps until that
+schedule, while mixed-role maintenance retains its other work deadlines.
+Collection errors retry on this schedule without stopping unrelated maintenance.
