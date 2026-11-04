@@ -17,11 +17,11 @@
     },
     {
       "component": "One bounded text projection",
-      "implementation": "Planning retains one source-byte-bounded window with ordinals, owned schema/analyzer dependencies and chunk-local field observations. Producer admission precedes segment allocation; preparation consumes the retained projection. Configuration changes replan only unpublished input. Projection memory is resource-accounted."
+      "implementation": "Planning retains one source-byte-bounded window with ordinals, owned schema/analyzer dependencies and chunk-local field observations. Producer admission precedes segment allocation; preparation consumes the retained projection. Configuration changes replan only unpublished input. Projection memory is resource-accounted. Planning and preparation have separate numeric timing counters so cost cannot disappear by moving between stages."
     },
     {
       "component": "Detached source and immutable text runtime separation",
-      "implementation": "Eligible text-only runtimes retain immutable index inputs under inode/index/catalog/namespace witnesses, with a fresh primary epoch and reset replay/source/visibility observations each turn. Residency is bounded to root plus one namespace and ends when work settles. Other index/provider runtimes retain conservative reopen behavior. Named-table maintenance discovers and executes on the detached runtime instead of also opening a serving table."
+      "implementation": "Eligible text runtimes, including relational text tables, retain immutable index inputs under inode/index/catalog/namespace and table/policy-control witnesses, with a fresh primary epoch and reset replay/source/visibility observations each turn. Durable worker positions and table catalogs reload at rebinding. Residency is bounded to root plus one namespace and ends when work settles. Cache, active turns and immutable merge jobs own independent strong references; starting a merge does not evict a reusable runtime, and retired owners remain alive until their jobs are joined. Unsupported index/provider state reopens conservatively. Named-table maintenance discovers and executes on its detached runtime instead of also opening a serving table."
     },
     {
       "component": "Preparation feedback under contention",
@@ -105,21 +105,147 @@
       "skipped": 0,
       "failed": 0,
       "leaked": 0
+    },
+    {
+      "suite": "Replay ownership/allocation and preparation-controller Debug contracts",
+      "source_commit": "0579d092c6",
+      "passed": 148,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    {
+      "suite": "Bounded text publication, multilingual keyword analyzer, catalog replacement and projection invalidation",
+      "source_commit": "f17ebca50a",
+      "passed": 4,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    {
+      "suite": "Native allocator-cache generation replacement and semantic revision regressions",
+      "source_commit": "f17ebca50a",
+      "passed": 6,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    {
+      "suite": "Focused retained runtime, detached namespace, durable fragment and immutable merge lifecycle Debug contracts",
+      "source_commit": "a6f3d4afed948bcc35547e86dce8437ebf4d1452",
+      "passed": 36,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    {
+      "suite": "Integrated model-free native C API Debug contracts",
+      "source_commit": "a6f3d4afed948bcc35547e86dce8437ebf4d1452",
+      "passed": 107,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    {
+      "suite": "C API ABI, linkage and smoke",
+      "source_commit": "a6f3d4afed948bcc35547e86dce8437ebf4d1452",
+      "public_exports": 134,
+      "failed": 0,
+      "whole_producing_build_returncode": 0
+    },
+    {
+      "suite": "Embedded Python SQL, concurrency, catalog and outcome contracts",
+      "source_commit": "a6f3d4afed948bcc35547e86dce8437ebf4d1452",
+      "passed": 209,
+      "failed": 0
+    },
+    {
+      "suite": "Storage test ownership and embedded source boundary audit",
+      "source_commit": "a6f3d4afed948bcc35547e86dce8437ebf4d1452",
+      "sources": 1061,
+      "tool_tests_passed": 21,
+      "failed": 0
     }
   ],
   "remaining": [
-    "Build and validate retained projection, source-view rebinding, feedback accounting and generation descriptor regressions; integrate current main.",
-    "Recheck SQL overlay operation counts with the current candidate only.",
-    "Run the unchanged original importer locally for diagnosis, with correctly bound native snapshots or a fresh database; no baseline/reference reruns.",
-    "Measure candidate runtime-open/projection service counters and original-importer progress before claiming E2E service capacity is fixed.",
-    "Candidate-only optimized final qualification on wolfspider, including importer contention and ten-minute active-write storage/visibility qualification.",
-    "Applicable CI/model gates; full factory qualification remains with Beads."
+    "Complete the unchanged original-importer populated-prefix diagnostic with native snapshot publication; investigate any remaining service or namespace-switch costs before optimized qualification.",
+    "Candidate-only optimized final qualification on wolfspider, including full frozen corpus, importer contention, and ten-minute active-write storage/visibility qualification.",
+    "Applicable CI/model gates; full factory qualification remains with Beads. Reconcile the overlapping draft queue/outcome PR before both land."
   ],
   "limits": [
     "This is an implementation checkpoint, not an E2E performance or merge-readiness claim.",
     "Replay family limits are scheduling bounds; one large family retains existing memory limits and a soft time bound.",
     "Legacy index configurations lacking a coverage generation retain whole-record replay.",
     "No baseline/reference binary was rebuilt or rerun; wolfspider was not used for local development.",
-    "Retained source runtime reuse currently covers eligible text-only, nonrelational runtimes without provider/group or replacement state. Other runtimes still reopen conservatively; selecting named maintenance namespaces avoids duplicate serving opens for all native index kinds."
-  ]
+    "Retained source runtime reuse covers eligible text runtimes, including relational tables, without active policies, providers/groups, query leases, replacement, restore or migration state. Other runtimes reopen conservatively. The cache retains root plus one namespace; original-importer counters must establish whether alternating active namespaces still cause significant opens."
+  ],
+  "implementation_source_commit": "a6f3d4afed948bcc35547e86dce8437ebf4d1452",
+  "candidate_debug_library_sha256": "4cffa2602385174036b912bd05926a78af6e99dc7131d3a348dfa4bc6e38d11c",
+  "local_mechanism_diagnostics": {
+    "qualification": false,
+    "source_commit": "a6f3d4afed948bcc35547e86dce8437ebf4d1452",
+    "sql_overlay": {
+      "statements": 16,
+      "cases": {
+        "quiet": {
+          "delta": {
+            "sql_constraint_overlay_hits": 15,
+            "sql_constraint_overlay_rebuilds": 1,
+            "sql_constraint_overlay_rebuild_entries": 0,
+            "sql_constraint_overlay_evictions": 0,
+            "sql_constraint_staged_statements": 16
+          },
+          "rows": 16,
+          "integrity_valid": true
+        },
+        "unrelated_primary_writes": {
+          "delta": {
+            "sql_constraint_overlay_hits": 15,
+            "sql_constraint_overlay_rebuilds": 1,
+            "sql_constraint_overlay_rebuild_entries": 0,
+            "sql_constraint_overlay_evictions": 0,
+            "sql_constraint_staged_statements": 16
+          },
+          "rows": 16,
+          "integrity_valid": true
+        }
+      },
+      "scope": "Same-candidate SQL overlay operation counts; no throughput claim"
+    },
+    "synthetic_replay": {
+      "rows": 2176,
+      "fields": 8,
+      "pending_records": 8,
+      "initial_debt": [
+        {
+          "index_name": "full_text_index_v0",
+          "kind": "full_text",
+          "applied_sequence": 2,
+          "target_sequence": 10,
+          "catch_up_required": true,
+          "replay_document_not_visible_skipped": 0
+        }
+      ],
+      "debt_before_explicit_drain": [
+        {
+          "index_name": "full_text_index_v0",
+          "kind": "full_text",
+          "applied_sequence": 10,
+          "target_sequence": 10,
+          "catch_up_required": false,
+          "replay_document_not_visible_skipped": 0
+        }
+      ],
+      "runtime_counters_before_explicit_drain": {
+        "maintenance_runtime_opens": 2,
+        "maintenance_namespace_opens": 0,
+        "maintenance_source_runtime_reuses": 7,
+        "maintenance_source_turns": 8
+      },
+      "explicit_drain_seconds": 0.005303042009472847,
+      "integrity_search_acknowledgement_reopen": true,
+      "peak_native_builds": 3,
+      "scope": "Debug mechanism diagnostic on a shared host with unrelated builds; no throughput or optimized qualification claim. Background replay caught up before explicit drain."
+    }
+  }
 }
