@@ -1475,7 +1475,7 @@ class CliTests(unittest.TestCase):
         self.assertIn(b"ConflictingCloudSourceOptions", result.stderr)
         self.raw_cli("--source-catalog", "missing.json", "--help")
         source.pop("valid_until")
-        for missing in ("filter", "status", "document_field"):
+        for missing in ("filter", "status"):
             incomplete = dict(source)
             incomplete.pop(missing)
             catalog["sources"] = [incomplete]

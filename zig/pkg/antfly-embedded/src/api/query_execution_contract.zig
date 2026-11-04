@@ -3417,6 +3417,7 @@ pub fn encodeQueryRequestWithGraphWireMode(
     if (req.identity_read_generation) |generation| {
         try appendJsonFieldU64(alloc, &out, &first, "_identity_read_generation", generation);
     }
+    if (req.hierarchy_parent_admitted) try appendJsonFieldBool(alloc, &out, &first, "_hierarchy_parent_admitted", true);
     if (req.hierarchy_children != null or req.defer_hierarchy_child_hydration) {
         try appendJsonFieldBool(alloc, &out, &first, "_defer_hierarchy_child_hydration", true);
     }
@@ -3905,9 +3906,21 @@ pub fn appendQueryHierarchyField(
     try appendJsonFieldName(alloc, out, first, "hierarchy");
     try out.append(alloc, '{');
     if (req.hierarchy_children) |children| {
-        try out.appendSlice(alloc, "\"children\":{\"parent\":{\"level\":\"source\",\"id\":");
-        try appendJsonString(alloc, out, children.parent_id);
-        try out.appendSlice(alloc, "},\"level\":\"unit\"}");
+        try out.appendSlice(alloc, "\"children\":{\"parent\":{\"level\":\"source\",");
+        if (children.parent_ids.len != 0) {
+            try out.appendSlice(alloc, "\"ids\":");
+            const ids_json = try std.json.Stringify.valueAlloc(alloc, children.parent_ids, .{});
+            defer alloc.free(ids_json);
+            try out.appendSlice(alloc, ids_json);
+        } else {
+            try out.appendSlice(alloc, "\"id\":");
+            try appendJsonString(alloc, out, children.parent_id);
+        }
+        if (children.artifact_name) |name| {
+            try out.appendSlice(alloc, "},\"level\":\"member\",\"artifact\":");
+            try appendJsonString(alloc, out, name);
+            try out.append(alloc, '}');
+        } else try out.appendSlice(alloc, "},\"level\":\"unit\"}");
     } else {
         // `group_by` is its own opt-in control (grouped matches, or explicit
         // unit-level grouping); `ancestors` (hydrating a chunk hit's source/
@@ -5257,8 +5270,15 @@ pub fn parseRemoteHierarchyArtifactRefAlloc(
     errdefer alloc.free(owned_name);
     const owned_unit_id = if (artifact.unit_id) |unit_id| try alloc.dupe(u8, unit_id) else null;
     errdefer if (owned_unit_id) |unit_id| alloc.free(unit_id);
-    const source = if (artifact.source) |source| try parseRemoteArtifactSourceRefAlloc(alloc, source) else null;
+    var source = if (artifact.source) |source| try parseRemoteArtifactSourceRefAlloc(alloc, source) else null;
+    errdefer if (source) |*value| value.deinit(alloc);
+    const revision = if (artifact.revision) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (revision) |value| alloc.free(value);
+    const derivation_revision = if (artifact.derivation_revision) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (derivation_revision) |value| alloc.free(value);
     return db_mod.types.ArtifactRef{
+        .revision = revision,
+        .derivation_revision = derivation_revision,
         .document_id = owned_document_id,
         .name = owned_name,
         .kind = kind,

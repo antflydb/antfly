@@ -39,6 +39,15 @@ pub const Provider = enum {
     vertex,
     apple,
 
+    /// These adapters consume an already acquired recording through
+    /// RemoteOptions.resolved_audio. Antfly's local callback remains URL-based.
+    pub fn supportsResolvedAudio(self: @This()) bool {
+        return switch (self) {
+            .openai, .vertex, .cloudflare, .apple => true,
+            .antfly => false,
+        };
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.write(switch (self) {
             .antfly => "antfly",

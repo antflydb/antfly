@@ -211,6 +211,11 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     b.step("grep-fixture-build", "Build the portable local inference fixture without executing it").dependOn(&b.addInstallArtifact(fixture, .{}).step);
     integration.addArtifactArg(fixture);
     test_step.dependOn(&integration.step);
+    const native_streams = b.addSystemCommand(&.{"python3"});
+    native_streams.addFileArg(b.path("pkg/antfly-grep/tests/test_native_streams.py"));
+    native_streams.addArtifactArg(cli_tests);
+    b.step("grep-native-streams", "Test native textual artifact stream contracts").dependOn(&native_streams.step);
+    test_step.dependOn(&native_streams.step);
     const cloud_integration = b.addSystemCommand(&.{"python3"});
     cloud_integration.addFileArg(b.path("pkg/antfly-grep/tests/test_cloud.py"));
     cloud_integration.addArtifactArg(cli_tests);

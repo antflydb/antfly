@@ -86,7 +86,7 @@ func TestSourceScopedRunPreservesOtherCatalogBindings(t *testing.T) {
 	runner, _, _ := runnerFixture(t)
 	sibling := "00000000-0000-4000-8000-000000000099"
 	runner.Profile.Sources = append(runner.Profile.Sources, Source{ID: sibling, Alias: "sibling", Connection: "docs", Table: "sources", Config: json.RawMessage(`{"bucket":"docs"}`), Permissions: &Permissions{Readers: []string{"user:self"}}})
-	previous := Catalog{Version: 2, Endpoint: runner.Profile.Endpoint, Principals: []string{"user:self"}, Sources: []Binding{{ID: sibling, Alias: "sibling", Table: "sources", DocumentField: "grep", Filter: SourceFilter(sibling), Status: "searchable", PublishedRevision: "sibling-revision"}}}
+	previous := Catalog{Version: 2, Endpoint: runner.Profile.Endpoint, Principals: []string{"user:self"}, Sources: []Binding{{ID: sibling, Alias: "sibling", Table: "sources", DocumentVersion: SourceRecordVersion, Fields: CanonicalDocumentFields(), Filter: SourceFilter(sibling), Status: "searchable", PublishedRevision: "sibling-revision"}}}
 	require.NoError(t, writeJSON(runner.CatalogPath, previous, 32<<20))
 	runner.SourceID = testSourceID
 	require.NoError(t, runner.Sync(context.Background()))
@@ -197,4 +197,18 @@ func TestManagementSourcePagesBoundEncodedBytes(t *testing.T) {
 	}
 	require.Len(t, seen, 30)
 	require.Greater(t, pages, 1)
+}
+
+func TestSourceScopedRunDoesNotUpgradeUnpublishedSiblingLayout(t *testing.T) {
+	runner, _, _ := runnerFixture(t)
+	sibling := "00000000-0000-4000-8000-000000000099"
+	runner.Profile.Sources = append(runner.Profile.Sources, Source{ID: sibling, Connection: "docs", Table: "sources", Config: json.RawMessage(`{"bucket":"docs"}`), Permissions: &Permissions{Readers: []string{"user:self"}}})
+	prior := Catalog{Version: 2, Endpoint: runner.Profile.Endpoint, Principals: []string{"user:self"}, Sources: []Binding{{ID: sibling, Table: "sources", DocumentVersion: 1, DocumentField: "grep", Status: "searchable", PublishedRevision: "old-layout", Filter: SourceFilter(sibling)}}}
+	require.NoError(t, writeJSON(runner.CatalogPath, prior, 32<<20))
+	runner.SourceID = testSourceID
+	require.NoError(t, runner.Sync(t.Context()))
+	var catalog Catalog
+	require.NoError(t, loadJSON(runner.CatalogPath, &catalog, 32<<20))
+	require.Empty(t, catalog.Sources[1].PublishedRevision)
+	require.NotEqual(t, "searchable", catalog.Sources[1].Status)
 }

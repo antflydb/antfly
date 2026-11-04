@@ -46,6 +46,8 @@ pub struct Source {
     pub permissions: Permissions,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_ttl_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streams: Option<Vec<TextStream>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,4 +104,23 @@ pub struct RunInput {
     pub restart: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextStream {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
+    pub field: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location_field: Option<String>,
+    pub default: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary: Option<String>,
 }

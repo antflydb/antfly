@@ -72,11 +72,17 @@ func (c *FileAcquisitionCache) Save(_ context.Context, key string, data []byte) 
 	if len(data) > limit || !json.Valid(data) {
 		return fmt.Errorf("invalid acquisition page")
 	}
-	if err := os.MkdirAll(c.Directory, 0700); err != nil {
+	return writeAcquisitionBytes(c.Directory, key, data)
+}
+
+// JSON checkpoints and binary representations share durable private writes;
+// callers own format, size and digest validation.
+func writeAcquisitionBytes(directory, key string, data []byte) error {
+	if err := os.MkdirAll(directory, 0700); err != nil {
 		return err
 	}
-	name := filepath.Join(c.Directory, acquisitionKey(key)+".json")
-	f, err := os.CreateTemp(c.Directory, ".page-")
+	name := filepath.Join(directory, acquisitionKey(key)+".json")
+	f, err := os.CreateTemp(directory, ".page-")
 	if err != nil {
 		return err
 	}
@@ -95,7 +101,7 @@ func (c *FileAcquisitionCache) Save(_ context.Context, key string, data []byte) 
 	if err = os.Rename(f.Name(), name); err != nil {
 		return err
 	}
-	dir, err := os.Open(c.Directory)
+	dir, err := os.Open(directory)
 	if err != nil {
 		return err
 	}

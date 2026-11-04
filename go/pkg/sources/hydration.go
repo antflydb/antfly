@@ -73,7 +73,7 @@ func (s *FileAcquisitionContentStore) Save(ctx context.Context, ref string, data
 	if !ValidContentRef(ref) || hex.EncodeToString(sum[:]) != ref || len(data) > MaxAcquisitionContentBytes {
 		return ErrInvalidInput
 	}
-	return (&FileAcquisitionCache{Directory: s.Directory, maxBytes: MaxAcquisitionContentBytes}).Save(ctx, ref, data)
+	return writeAcquisitionBytes(s.Directory, ref, data)
 }
 func (s *FileAcquisitionContentStore) Prune(items []Item) error {
 	keep := map[string]bool{}
@@ -111,6 +111,9 @@ type hydrationCheckpoint struct {
 
 func (c *CollaborationConnector) hydrationSelection(r Request) string {
 	version := c.ExtractorVersion
+	if c.NativeAttachments {
+		version = "native-attachments-v3"
+	}
 	if version == "" {
 		version = "attachment-text-v3"
 	}
@@ -140,7 +143,7 @@ func (c *CollaborationConnector) hydrate(ctx context.Context, r Request, config 
 			}
 			out := make([]Input, 0, len(checkpoint.Items))
 			for _, item := range checkpoint.Items {
-				if !ownedID(item.ID, r.SourceNamespace) || !ValidContentRef(item.ContentRef) || item.Revision == "" || item.Size < 0 || item.Size > maxImportSourceObjectBytes {
+				if !ownedID(item.ID, r.SourceNamespace) || (!ValidContentRef(item.ContentRef) && !(c.NativeAttachments && UsesNativeResource(Source{}, item) && item.ContentRef == "")) || item.Revision == "" || item.Size < 0 || item.Size > maxImportSourceObjectBytes {
 					return nil, ErrInvalidInput
 				}
 				out = append(out, Input{Item: item})
@@ -186,7 +189,19 @@ func (c *CollaborationConnector) hydrate(ctx context.Context, r Request, config 
 	if c.Extractor != nil && c.ExtractorVersion == "" {
 		return nil, fmt.Errorf("%w: cached custom extractors require a version", ErrInvalidInput)
 	}
-	payload, err := json.Marshal(hydrationEnvelope{Version: 1, Namespace: r.SourceNamespace, Selection: c.hydrationSelection(r), Provider: c.ProviderName, Inputs: inputs})
+	// Canonical text may participate in the existing resumable acquisition
+	// checkpoint. Original media never enters that durable payload: its proxy
+	// always reacquires and verifies the provider representation on delivery.
+	retained := inputs
+	if c.NativeAttachments {
+		retained = nil
+		for _, input := range inputs {
+			if !UsesNativeResource(Source{}, input.Item) {
+				retained = append(retained, input)
+			}
+		}
+	}
+	payload, err := json.Marshal(hydrationEnvelope{Version: 1, Namespace: r.SourceNamespace, Selection: c.hydrationSelection(r), Provider: c.ProviderName, Inputs: retained})
 	if err != nil {
 		return nil, err
 	}
@@ -200,7 +215,9 @@ func (c *CollaborationConnector) hydrate(ctx context.Context, r Request, config 
 	}
 	checkpoint := hydrationCheckpoint{Version: 1, Selection: c.hydrationSelection(r)}
 	for i := range inputs {
-		inputs[i].ContentRef = contentRef
+		if !c.NativeAttachments || !UsesNativeResource(Source{}, inputs[i].Item) {
+			inputs[i].ContentRef = contentRef
+		}
 		checkpoint.Items = append(checkpoint.Items, inputs[i].Item)
 	}
 	c.rememberHydration(key, checkpoint.Items)
