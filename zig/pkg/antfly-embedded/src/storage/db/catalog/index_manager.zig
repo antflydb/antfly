@@ -3640,6 +3640,29 @@ pub const IndexManager = struct {
         self.schema_registry = registry;
     }
 
+    /// Data-plane controls that can alter an existing text runtime without
+    /// changing immutable segment inputs or the index definition directory.
+    /// Caller owns the returned keys; source-cache witnesses fence these too.
+    pub fn retainedTextRuntimeControlKeysAlloc(self: *IndexManager, a: Allocator) ![][]u8 {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const result = try a.alloc([]u8, 1 + 2 * self.text_indexes.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |key| a.free(key);
+            a.free(result);
+        }
+        result[0] = try a.dupe(u8, resolver_catalog.minimum_reader_key);
+        initialized = 1;
+        for (self.text_indexes.items) |entry| {
+            result[initialized] = try textFieldAnalyzersKey(a, entry.config.name);
+            initialized += 1;
+            result[initialized] = try internal_keys.managedIndexAdmissionKeyAlloc(a, entry.config.name);
+            initialized += 1;
+        }
+        return result;
+    }
+
     /// Snapshot the active schema identity without borrowing catalog state.
     /// Prepared request-local projections use this together with the write-plan
     /// generation to fail safely to AROW materialization after publication.

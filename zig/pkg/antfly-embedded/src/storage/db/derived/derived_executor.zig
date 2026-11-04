@@ -93,6 +93,10 @@ pub const Executor = struct {
         return self.vtable.has_workers(self.ptr);
     }
 
+    pub fn isManual(self: *const Executor) bool {
+        return self.vtable == &manual_vtable;
+    }
+
     pub fn failIfUnhealthy(self: *Executor) !void {
         return try self.vtable.fail_if_unhealthy(self.ptr);
     }

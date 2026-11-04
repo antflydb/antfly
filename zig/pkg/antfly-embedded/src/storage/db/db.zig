@@ -5011,7 +5011,8 @@ pub const DB = struct {
     /// source-view rebinding, rather than borrowing stale mutable caches.
     pub fn canRefreshDetachedTextSource(self: *DB) bool {
         const indexes = self.core.index_manager;
-        return !indexes.relational_base_rows and self.enrichment_runtime == null and
+        return self.executor.isManual() and !indexes.relational_base_rows and self.enrichment_runtime == null and
+            indexes.failed_index_loads.count() == 0 and indexes.managed_admission_indexes.count() == 0 and
             !self.hasConfiguredResolvers() and !self.core.hasGeneratedEnrichmentTargets() and
             self.core.shard_manager.getSplitState() == null and
             !indexes.hasGroupSources() and indexes.dense_indexes.items.len == 0 and
@@ -5027,6 +5028,8 @@ pub const DB = struct {
     /// address, while its source observations are reconstructed from that cut.
     pub fn refreshDetachedTextSource(self: *DB) !void {
         if (!self.canRefreshDetachedTextSource()) return error.UnsupportedOperation;
+        self.core.lockApply();
+        defer self.core.unlockApply();
         try self.core.store.invalidateDetachedSourceObservations();
         const range = try range_state_mod.loadRange(self.alloc, self.core.store);
         defer range_state_mod.freeRange(self.alloc, range);
@@ -5036,6 +5039,7 @@ pub const DB = struct {
         if (shard.getSplitState() != null or !std.mem.eql(u8, previous_range.start, range.start) or
             !std.mem.eql(u8, previous_range.end, range.end)) return error.UnsupportedOperation;
         const summary = try doc_identity.visibilitySummaryFromStore(self.core.store);
+        try self.refreshManagedIndexWorkersLocked();
         self.core.shard_manager.deinit();
         self.core.shard_manager.* = shard;
         self.core.identity_visibility.clearLive();

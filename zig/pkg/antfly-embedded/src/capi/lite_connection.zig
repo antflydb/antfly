@@ -210,11 +210,13 @@ const PublicationCatalog = struct {
 /// read is acquired separately for each bounded turn and released before this
 /// cache becomes idle. At most root plus one selected namespace is retained.
 const TextSourceRuntimeCache = struct {
+    const Control = struct { path: []const u8, fingerprint: ?[32]u8 };
     arena: std.heap.ArenaAllocator,
     root: *h.Handle,
     indexes: [16]u8,
     proofs: []PublicationCatalog,
     table_name: ?[]const u8 = null,
+    controls: []Control = &.{},
 
     fn capture(root: *h.Handle) !?*TextSourceRuntimeCache {
         if (!root.db.canRefreshDetachedTextSource() or root.embedded_tables.count() > 1) return null;
@@ -226,14 +228,40 @@ const TextSourceRuntimeCache = struct {
         const a = self.arena.allocator();
         self.proofs = try a.alloc(PublicationCatalog, 1 + root.embedded_tables.count());
         self.proofs[0] = try PublicationCatalog.captureForStoragePublication(a, root, &root.db, "default");
+        var controls: std.ArrayList(Control) = .empty;
+        if (!try self.captureControls(a, &root.db, &controls)) {
+            self.destroy();
+            return null;
+        }
         tables = root.embedded_tables.valueIterator();
         var i: usize = 1;
         while (tables.next()) |table| : (i += 1) {
             self.table_name = try a.dupe(u8, table.*.name);
             self.proofs[i] = try PublicationCatalog.captureForStoragePublication(a, root, &table.*.db, table.*.name);
+            if (!try self.captureControls(a, &table.*.db, &controls)) {
+                self.destroy();
+                return null;
+            }
         }
+        self.controls = try controls.toOwnedSlice(a);
         self.indexes = root.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().logical.indexes;
         return self;
+    }
+
+    fn captureControls(self: *TextSourceRuntimeCache, a: std.mem.Allocator, database: *h.db_mod.DB, controls: *std.ArrayList(Control)) !bool {
+        const backend = &self.root.owned_lite_backend.?;
+        const prefix = if (database == &self.root.db) "" else try backend.documentPrefixAlloc(a, try @import("../storage/lite/embedded_catalog.zig").namespaceAlloc(a, database.core.identity_namespace.table_id));
+        const logical_keys = try database.core.index_manager.retainedTextRuntimeControlKeysAlloc(a);
+        var read = try backend.native_docstore.?.beginRead();
+        defer read.abort();
+        const admission_prefix = keys.globalReplayPrefix(.managed_admission);
+        for (logical_keys) |key| {
+            const path = try std.mem.concat(a, u8, &.{ prefix, key });
+            const fingerprint = try read.valueFingerprint(path);
+            if (fingerprint != null and std.mem.startsWith(u8, key, &admission_prefix)) return false;
+            try controls.append(a, .{ .path = path, .fingerprint = fingerprint });
+        }
+        return true;
     }
 
     fn destroy(self: *TextSourceRuntimeCache) void {
@@ -255,6 +283,7 @@ const TextSourceRuntimeCache = struct {
             error.EnrichmentSourceChanged, error.EnrichmentWaitCanceled => return false,
             else => return err,
         };
+        for (self.controls) |control| if (!std.meta.eql(control.fingerprint, try file.documentFingerprintAtCheckpoint(file.activeCheckpoint(), control.path))) return false;
         return true;
     }
 };
@@ -1606,7 +1635,7 @@ pub const Owner = struct {
         fn capture(a: std.mem.Allocator, database: *h.db_mod.DB, managed: anytype) !ReplayProgress {
             const indexes = try a.alloc(Index, managed.len);
             errdefer a.free(indexes);
-            for (managed, indexes) |index, *captured| captured.* = .{ .name = index.name, .applied = database.executor.appliedSequence(index.name) orelse 0, .fragment = try fragment(database, index.name) };
+            for (managed, indexes) |index, *captured| captured.* = .{ .name = index.name, .applied = try database.core.loadAppliedSequence(a, index.name), .fragment = try fragment(database, index.name) };
             return .{
                 .indexes = indexes,
                 .generated = if (database.core.hasGeneratedEnrichmentTargets()) try lane(database, "generated") else 0,
@@ -1618,7 +1647,7 @@ pub const Owner = struct {
 
         fn advanced(self: ReplayProgress, database: *h.db_mod.DB) bool {
             for (self.indexes) |index| {
-                if ((database.executor.appliedSequence(index.name) orelse 0) > index.applied) return true;
+                if ((database.core.loadAppliedSequence(alloc, index.name) catch index.applied) > index.applied) return true;
                 if (fragment(database, index.name) catch null) |now| {
                     const before = index.fragment;
                     // Durable partial progress earns another fair source
@@ -7599,8 +7628,8 @@ test "capi native maintenance partial text replay earns another source turn with
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("fragment-source-priority", 5000, .batch);
     defer fixture.deinit();
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
     var lease = try fixture.connection.acquire();
     defer {
         lease.close();
@@ -7630,8 +7659,8 @@ test "capi native maintenance text source reuse refreshes primary observations a
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("text-source-runtime-reuse", 5000, .batch);
     defer fixture.deinit();
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
     const owner = fixture.connection.owner;
     var lease = try fixture.connection.acquire();
     defer {
@@ -7644,6 +7673,9 @@ test "capi native maintenance text source reuse refreshes primary observations a
     const opened = owner.test_runtime_snapshot_opens;
     const store = source.db.core.store;
     _ = store.lastReplaySequence(0);
+    const applied = try source.db.core.loadAppliedSequence(std.testing.allocator, "text");
+    source.db.executor.removeWorker("text");
+    try source.db.executor.addWorker("text", .{ .name = "text", .kind = .full_text }, applied + 100);
     const token = store.source_certificates.capture();
     const generation = store.query_generation_revision.load(.acquire);
     var next: [8]u8 = undefined;
@@ -7659,11 +7691,24 @@ test "capi native maintenance text source reuse refreshes primary observations a
     try std.testing.expectEqual(source, try owner.refreshMaintenanceSnapshot(foreground, .source));
     try std.testing.expectEqual(opened, owner.test_runtime_snapshot_opens);
     try std.testing.expectEqual(@as(u64, 12), store.lastReplaySequence(0));
+    try std.testing.expectEqual(applied, source.db.executor.appliedSequence("text").?);
     try std.testing.expect(store.source_certificates.confirm(token) == null);
     try std.testing.expect(store.query_generation_revision.load(.acquire) > generation);
     const value = try store.get(std.testing.allocator, "source-view-canary");
     defer std.testing.allocator.free(value);
     try std.testing.expectEqualStrings("fresh", value);
+    const cache = owner.text_source_runtime_cache.?;
+    const analysis_path = for (cache.controls) |control| {
+        if (std.mem.indexOf(u8, control.path, "text_field_analyzers:") != null) break control.path;
+    } else return error.TestUnexpectedResult;
+    const previous_analysis = try file.getDocumentAlloc(std.testing.allocator, analysis_path);
+    defer if (previous_analysis) |raw| std.testing.allocator.free(raw);
+    const index_identity = file.activeCheckpoint().logical.indexes;
+    try file.putDocument(analysis_path, "foreign analysis publication");
+    try std.testing.expectEqual(index_identity, file.activeCheckpoint().logical.indexes);
+    try std.testing.expect(!try cache.matches(file));
+    if (previous_analysis) |raw| try file.putDocument(analysis_path, raw) else try file.deleteDocument(analysis_path);
+    try std.testing.expect(try cache.matches(file));
     try file.putDocument(@import("../storage/db/resolver_projection.zig").epoch_key, "changed");
     try std.testing.expect(!try owner.text_source_runtime_cache.?.matches(file));
 }
