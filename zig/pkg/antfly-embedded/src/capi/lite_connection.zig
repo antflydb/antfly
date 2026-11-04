@@ -246,6 +246,7 @@ const TextRuntimeCacheDiagnostics = struct {
     blocked_split: u64 = 0,
     blocked_groups: u64 = 0,
     blocked_nontext_indexes: u64 = 0,
+    blocked_source_epochs: u64 = 0,
     blocked_replacement: u64 = 0,
     blocked_repairs: u64 = 0,
     blocked_coalescer: u64 = 0,
@@ -380,6 +381,7 @@ const ImmutableTextHandoff = struct {
     table_id: u64,
     incarnation: @FieldType(h.db_mod.DB, "root_incarnation"),
     expires_ns: u64,
+    generation_bytes: u64,
 
     fn capture(root: *h.Handle, database: *h.db_mod.DB) !?ImmutableTextHandoff {
         const backend = &root.owned_lite_backend.?;
@@ -387,13 +389,18 @@ const ImmutableTextHandoff = struct {
         // A borrowed/external resource manager needs its own lifetime
         // capability. Keep those runtimes on the ordinary cold path.
         if (database.core.index_manager.resource_manager != manager or database.core.index_manager.owned_resource_manager != null) return null;
-        const resource_owner = backend.native_docstore.?.artifact_registry orelse return null;
+        const store = backend.native_docstore.?;
+        // Only one handoff exists per file. Its ranges cannot exceed one
+        // captured file generation, independently of the resident-memory cap.
+        const generation_bytes = std.math.mul(u64, store.file.activeCheckpoint().page_count, store.file.header.page_size) catch return null;
+        const resource_owner = store.artifact_registry orelse return null;
         resource_owner.retainOwner();
         var result: ImmutableTextHandoff = .{
             .resource_owner = resource_owner,
             .table_id = database.core.identity_namespace.table_id,
             .incarnation = database.root_incarnation,
             .expires_ns = @import("antfly_platform").time.monotonicNs() +| lifetime_ns,
+            .generation_bytes = generation_bytes,
         };
         errdefer result.deinit();
         const indexes = database.core.index_manager;
@@ -401,7 +408,7 @@ const ImmutableTextHandoff = struct {
         defer indexes.catalog_mutex.unlockShared();
         for (indexes.text_indexes.items, 0..) |*entry, ordinal| {
             if (ordinal == 128 or result.pins.visited == max_segments or result.pins.bytes == max_bytes) break;
-            _ = try result.pins.append(entry.persistent.acquireSnapshot(), max_bytes, max_segments);
+            _ = try result.pins.appendWithSourceLimit(entry.persistent.acquireSnapshot(), max_bytes, max_segments, generation_bytes);
         }
         if (result.pins.leases.items.len == 0) {
             result.deinit();
@@ -1688,7 +1695,7 @@ pub const Owner = struct {
         while (i < self.retired.items.len) {
             const retired = self.retired.items[i];
             const retained = retained: {
-                if (retired.query_borrows > 0 or retired.maintenance_references != 0 or retired.allocator_verification_references != 0) break :retained true;
+                if (retired.query_borrows > 0 or retired.refresh_references != 0 or retired.maintenance_references != 0 or retired.allocator_verification_references != 0) break :retained true;
                 for (self.connections.items) |connection| {
                     // attach moves this connection's registry onto the current
                     // root. Inspect its actual owner during query resume too.
@@ -8661,6 +8668,106 @@ test "capi native maintenance named selection opens only its detached table runt
     try std.testing.expect(!probe.serving_open);
 }
 
+test "capi native foreground namespace refresh retains predecessor inputs only through admission" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    const tables = @import("tables.zig");
+    var fixture = try AdmissionFollowupFixture.init("foreground-namespace-input-handoff", 5000, .batch);
+    defer fixture.deinit();
+    const owner = fixture.connection.owner;
+    const Probe = struct {
+        fn rewrite(f: *AdmissionFollowupFixture, path: []const u8, payload: []const u8) !void {
+            var peer = try native.NativeFile.openWithIo(std.testing.allocator, h.handleLockIo(), f.path, .{ .externally_locked = true, .no_sync = true, .reader_coordinator = f.connection.owner.reader_coordinator });
+            defer peer.close();
+            try peer.inheritAllocatorVerification(&f.connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file);
+            try peer.putIndexCatalogRecord(path, payload);
+        }
+    };
+    var key: []u8 = &.{};
+    defer a.free(key);
+    var bytes: []u8 = &.{};
+    defer a.free(bytes);
+    var source_ptr: *anyopaque = undefined;
+    var segment_id: u64 = undefined;
+    var old_address: usize = undefined;
+    var opens_before: u64 = undefined;
+    {
+        var lease = try fixture.connection.acquire();
+        defer {
+            lease.close();
+            fixture.connection.gate.mutex.unlock(io);
+        }
+        const root = try owner.refresh();
+        try tables.create(root, "active", "{}", false);
+        const table = try tables.get(root, "active");
+        try table.createIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+        try table.batch(.{ .writes = &.{.{ .key = "one", .value = "{\"text\":\"first canary\"}" }}, .sync_level = .full_text });
+        try table.batch(.{ .writes = &.{.{ .key = "two", .value = "{\"text\":\"second canary\"}" }}, .sync_level = .full_text });
+        const persistent = table.core.index_manager.textIndex("text").?;
+        {
+            const snapshot = persistent.acquireSnapshot();
+            defer snapshot.release();
+            try std.testing.expectEqual(@as(usize, 2), snapshot.segments.len);
+            const source = snapshot.segments[0].reader.immutableSource();
+            try std.testing.expect(source == .ranges);
+            source_ptr = source.ranges.ptr;
+            segment_id = snapshot.segments[0].id;
+            key = try std.fmt.allocPrint(a, "{s}/{d}.seg", .{ persistent.segment_files.?.root_dir, snapshot.segments[1].id });
+            bytes = (try root.owned_lite_backend.?.native_docstore.?.file.getIndexCatalogRecordAlloc(a, key)) orelse return error.TestUnexpectedResult;
+        }
+        old_address = @intFromPtr(root);
+        try Probe.rewrite(&fixture, key, bytes);
+        const before_unbridged = root.owned_lite_backend.?.native_docstore.?.file.allocator_work.artifact_source_opens;
+        // A direct refresh has no admission bridge. Establish the negative
+        // control with the same native inputs, without a reference binary.
+        const unbridged = try owner.refresh();
+        try std.testing.expect(@intFromPtr(unbridged) != old_address);
+        const cold_table = try tables.get(unbridged, "active");
+        try std.testing.expect(unbridged.owned_lite_backend.?.native_docstore.?.file.allocator_work.artifact_source_opens >= before_unbridged + 2);
+        {
+            const inventory = cold_table.core.index_manager.textIndex("text").?.acquireSnapshot();
+            defer inventory.release();
+            source_ptr = inventory.segments[0].reader.immutableSource().ranges.ptr;
+            segment_id = inventory.segments[0].id;
+        }
+        old_address = @intFromPtr(unbridged);
+        try Probe.rewrite(&fixture, key, bytes);
+        opens_before = unbridged.owned_lite_backend.?.native_docstore.?.file.allocator_work.artifact_source_opens;
+    }
+    var child: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open_table(fixture.id, .fromSlice("active"), &child));
+    defer api.antfly_db_close(child);
+    try std.testing.expect(@intFromPtr(owner.current.?) != old_address);
+    try std.testing.expectEqual(@as(usize, 0), owner.current.?.refresh_references);
+    try std.testing.expectEqual(@as(usize, 0), owner.retired.items.len);
+    {
+        var lease = try fixture.connection.acquire();
+        defer {
+            lease.close();
+            fixture.connection.gate.mutex.unlock(io);
+        }
+        const table = try tables.get(owner.current.?, "active");
+        const snapshot = table.core.index_manager.textIndex("text").?.acquireSnapshot();
+        defer snapshot.release();
+        const unchanged = for (snapshot.segments) |*entry| {
+            if (entry.id == segment_id) break entry.reader.immutableSource();
+        } else return error.TestUnexpectedResult;
+        try std.testing.expectEqual(source_ptr, unchanged.ranges.ptr);
+        // Only the rewritten artifact needs a new durable lease. Unchanged
+        // inputs must be borrowed while the predecessor still owns them.
+        try std.testing.expectEqual(opens_before + 1, owner.current.?.owned_lite_backend.?.native_docstore.?.file.allocator_work.artifact_source_opens);
+        try std.testing.expect((try owner.current.?.owned_lite_backend.?.native_docstore.?.file.check()).valid);
+        try Probe.rewrite(&fixture, key, bytes);
+    }
+    var missing: ?*anyopaque = null;
+    try std.testing.expect(api.antfly_db_open_table(fixture.id, .fromSlice("missing"), &missing) != .ok);
+    try std.testing.expect(missing == null);
+    try std.testing.expectEqual(@as(usize, 0), owner.current.?.refresh_references);
+    try std.testing.expectEqual(@as(usize, 0), owner.retired.items.len);
+    h.capi.clearLastError();
+}
+
 test "capi native named runtime replacement hands off immutable artifact sources before closing" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("named-runtime-artifact-handoff", 5000, .batch);
@@ -8696,6 +8803,8 @@ test "capi native named runtime replacement hands off immutable artifact sources
     owner.preserveImmutableTextHandoff(first, selected);
     try std.testing.expect(owner.immutable_text_handoff != null);
     try std.testing.expect(owner.immutable_text_handoff.?.pins.bytes <= ImmutableTextHandoff.max_bytes);
+    try std.testing.expect(owner.immutable_text_handoff.?.pins.source_bytes <= owner.immutable_text_handoff.?.generation_bytes);
+    try std.testing.expect(original_source.ranges.retention_artifact_only);
     // Exercise the actual unsupported-runtime boundary: every mutable actor
     // and DB is closed before construction of its replacement starts.
     tables.closeAll(first);

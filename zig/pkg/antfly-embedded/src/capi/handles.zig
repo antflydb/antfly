@@ -141,6 +141,9 @@ pub const Handle = struct {
     query_producer_mutex: std.Io.Mutex = .init,
     /// Protected by the native path gate; pins provider and extractor lifetime.
     query_borrows: usize = 0,
+    /// Keep predecessor inputs alive only while an admitted API call opens
+    /// its replacement namespaces. This borrows neither allocator nor queries.
+    refresh_references: usize = 0,
 
     // Serialized threading mode (see CAPI.md "Thread Safety"): every export
     // enters through `enterHandle`, which takes `api_lock` shared for reads

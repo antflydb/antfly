@@ -123,6 +123,12 @@ pub const Source = union(enum) {
         /// Visitor slices are borrowed only for the duration of the callback.
         visit_range: ?*const fn (*anyopaque, u64, u64, SourceVisitor) anyerror!void = null,
         retained_bytes: ?*const fn (*anyopaque) usize = null,
+        /// Conservative additional resident capacity/state for an idle owner
+        /// retaining this source. This is unrelated to its logical file size.
+        retention_overhead_bytes: usize = 0,
+        /// This pin protects only an immutable artifact; it retains no primary
+        /// read epoch, allocator frontier or request/query capability.
+        retention_artifact_only: bool = false,
         /// Bind an independent query capability without changing the shared source.
         bind_read_context: ?*const fn (*anyopaque, std.mem.Allocator, *anyopaque) anyerror!Source = null,
         seal_read_context: ?*const fn (*anyopaque) void = null,

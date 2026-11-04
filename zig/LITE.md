@@ -1285,6 +1285,13 @@ before releasing the predecessor. Unchanged immutable artifact ranges transfer
 through the inode/root-fenced source pool, so fresh mutable replay actors do not
 require fresh durable leases for every unchanged segment. Failed construction
 leaves the predecessor owned; an active merge keeps its independent reference.
+Foreground admission also pins its predecessor's lifetime while opening the
+replacement namespace requested by that export. This reference grants no old
+query, publication or allocator capability. Named child admission releases it
+as soon as the replacement table has acquired its exact immutable inputs;
+root table-open exports release it on exit. Error and detached-query paths
+release it too. Retired wrappers remain eligible to donate an exclusive
+allocator loan, so preserving immutable inputs does not restore ledger reloads.
 
 Text upserts and deletions seek immutable external-ID routing instead of
 scanning all retained stored identities for every replay fragment. Segment
@@ -1301,10 +1308,16 @@ with persisted routing. A process or reader reconstruction can rebuild this
 compatibility routing; this fallback is not a persistent migration cache.
 
 When providers require ending the old runtime before replacement, a separate
-handoff pins individual immutable text readers, with one file-wide limit of
-256 MiB and 1,024 segment visits. Oversized ranges are skipped, so a large
-inventory can still share its smaller inputs. It retains no entire inventory,
-primary epoch or provider/query capability. The reader's accounting owner stays
+handoff pins individual immutable text readers. Its independent file-wide
+limits are 256 MiB of admitted reader memory, 1,024 segment visits, and protected
+ranges totaling no more than one captured native file generation. Admission
+counts decoder navigation, compatibility ID routing, bitmap capacity and
+provider-declared cache/state overhead. An artifact's logical file length is
+not its resident memory cost; large disk-backed artifacts can share their small
+readers. Oversized metadata or ranges beyond the captured-generation bound are
+skipped. Only artifact-lease sources are eligible: inode/epoch-fenced and query
+sources cannot enter either immutable runtime cache. It retains no entire
+inventory, primary epoch or provider/query capability. The accounting owner stays
 alive until its decoder metadata is released, even across pooled generations.
 The successor consumes the pins after opening the same namespace; unused pins
 expire after five seconds and are released by the maintenance audit or close.

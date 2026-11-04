@@ -5027,6 +5027,7 @@ pub const DB = struct {
         split,
         groups,
         nontext_indexes,
+        source_epochs,
         replacement,
         repairs,
         coalescer,
@@ -5045,6 +5046,14 @@ pub const DB = struct {
         if (self.core.shard_manager.getSplitState() != null) return .split;
         if (indexes.hasGroupSources()) return .groups;
         if (indexes.dense_indexes.items.len != 0 or indexes.sparse_indexes.items.len != 0 or indexes.graph_indexes.items.len != 0 or indexes.algebraic_indexes.items.len != 0) return .nontext_indexes;
+        for (indexes.text_indexes.items) |*entry| {
+            const inventory = entry.persistent.acquireSnapshot();
+            defer inventory.release();
+            for (inventory.segments) |*segment| {
+                const source = segment.reader.immutableSource();
+                if (source == .ranges and (!source.ranges.retention_artifact_only or source.ranges.check_read_context != null)) return .source_epochs;
+            }
+        }
         if (self.shadow != null or self.graph_replacement_manager != null) return .replacement;
         if (self.active_index_repairs.count() != 0) return .repairs;
         if (self.async_context.applied_sequence_coalescer.pending.count() != 0) return .coalescer;

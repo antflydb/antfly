@@ -26,6 +26,7 @@ const Allocator = std.mem.Allocator;
 
 const key_prefix = native.NativeFile.artifact_lease_key_prefix;
 const marker_prefix = ".aflite-lease-";
+const source_cache_bytes = 160 * 1024;
 
 const ArtifactIdentity = struct {
     path: []const u8,
@@ -418,7 +419,7 @@ pub const Registry = struct {
         identity_digest.update(std.mem.asBytes(&state.value.length));
         identity_digest.update(state.value.inline_bytes);
         state.immutable_identity = identity_digest.finalResult();
-        state.cache = try @import("../../segment_source.zig").ConcurrentBlockCache.init(a, .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.readUncached, .checksum = State.checksum, .visit_range = State.visitUncached, .close = State.closeUncached, .resource_manager = owner.resource_manager } }, 160 * 1024);
+        state.cache = try @import("../../segment_source.zig").ConcurrentBlockCache.init(a, .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.readUncached, .checksum = State.checksum, .visit_range = State.visitUncached, .close = State.closeUncached, .resource_manager = owner.resource_manager } }, source_cache_bytes);
         self.mutex.lockUncancelable(runtime);
         state.next = self.first;
         self.first = state;
@@ -631,7 +632,7 @@ const State = struct {
     resource_manager: ?*@import("../resource_manager.zig").ResourceManager = null,
 
     fn source(self: *State) Source {
-        return .{ .ranges = .{ .ptr = self, .length = self.value.length, .read_into = read, .visit_range = visit, .checksum = checksum, .read_authenticated = authenticate, .close = close, .retained_bytes = retainedBytes, .resource_manager = self.resource_manager, .acquire_use = acquireUse, .release_use = releaseUse, .enable_idle_expiry = enableIdleExpiry, .immutable_identity = self.immutable_identity } };
+        return .{ .ranges = .{ .ptr = self, .length = self.value.length, .read_into = read, .visit_range = visit, .checksum = checksum, .read_authenticated = authenticate, .close = close, .retained_bytes = retainedBytes, .retention_overhead_bytes = 2 * source_cache_bytes + 64 * 1024 + @sizeOf(State) + self.value.inline_bytes.len + self.artifact_key.len + self.lease_key.len + self.marker_path.len, .retention_artifact_only = self.marker != null, .resource_manager = self.resource_manager, .acquire_use = acquireUse, .release_use = releaseUse, .enable_idle_expiry = enableIdleExpiry, .immutable_identity = self.immutable_identity } };
     }
 
     fn closeResources(self: *State) void {

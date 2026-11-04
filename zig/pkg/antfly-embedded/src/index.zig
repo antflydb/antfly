@@ -289,6 +289,24 @@ pub const SegmentShared = struct {
         self.identity_lookup_reservation = null;
     }
 
+    fn retainedMetadataBytes(self: *SegmentShared) u64 {
+        // Match deletion -> lookup lock order used by update publication.
+        self.lockDeletionShared();
+        defer self.unlockDeletionShared();
+        @import("antfly_platform").sync.lockYielding(&self.identity_lookup_mutex);
+        defer self.identity_lookup_mutex.unlock();
+        var bytes: u64 = @sizeOf(SegmentShared) + self.typed_doc_values_coverage.len * @sizeOf(TypedDocValuesFieldCoverage);
+        if (self.identity_lookup_entries) |entries| bytes +|= entries.len * @sizeOf(@import("document_identity_lookup.zig").Entry);
+        if (self.deleted) |*deleted| bytes +|= deleted.retainedBytes();
+        for (self.typed_doc_values_coverage) |*field| {
+            bytes +|= field.field.len;
+            if (field.initialized.load(.acquire)) if (field.membership_doc_ids) |*membership| {
+                bytes +|= membership.retainedBytes();
+            };
+        }
+        return bytes;
+    }
+
     fn observeResidency(self: *SegmentShared, manager: ?*resource_manager_mod.ResourceManager) void {
         while (!self.residency_mutex.tryLock()) spinOrYield();
         defer self.residency_mutex.unlock();
@@ -721,10 +739,20 @@ pub const SegmentEntry = struct {
         }
     };
 
+    /// Admission cost for retaining a decoder, rather than its logical file
+    /// length. Provider overhead includes the remaining bounded source cache.
+    pub fn immutableRetainedBytes(self: *const SegmentEntry) u64 {
+        const owned = self.shared.retainedMetadataBytes();
+        if (self.shared.physical_parent) |parent| return owned +| parent.immutableRetainedBytes();
+        const source = self.reader.immutableSource();
+        return owned +| self.reader.nativeNavigationBytes() +|
+            (if (source == .ranges) source.ranges.retention_overhead_bytes else 0);
+    }
+
     pub fn retainImmutable(self: *const SegmentEntry) ?ImmutableLease {
         if (self.query_base_reader != null or self.query_source != null) return null;
         const source = self.reader.immutableSource();
-        if (source != .ranges or source.ranges.immutable_identity == null or source.ranges.check_read_context != null) return null;
+        if (source != .ranges or !source.ranges.retention_artifact_only or source.ranges.immutable_identity == null or source.ranges.check_read_context != null) return null;
         if (!source.acquireUse()) return null;
         self.retain();
         return .{ .entry = self.*, .source = source };
@@ -3889,6 +3917,7 @@ test "identity lookup compatibility cache obeys residency admission and releases
         defer writer.deinit();
         try writer.addSegmentWithIdData(1, .fromNative(.{ .ranges = .{ .ptr = &state, .length = bytes.len, .read_into = State.read, .close = State.close, .resource_manager = &manager } }));
         const entry = &writer.snapshot().segments[0];
+        const before = entry.immutableRetainedBytes();
         for (entry.reader.fields) |field| for (field.sections) |*section| {
             if (section.section_type == .doc_id_lookup) section.section_type = .doc_key_range;
         };
@@ -3901,6 +3930,13 @@ test "identity lookup compatibility cache obeys residency admission and releases
         held.release();
         try std.testing.expect(try writer.deleteById("a"));
         try std.testing.expectEqual(@as(u64, 32), manager.sliceStats(.full_text_segment_residency).used_bytes);
+        try std.testing.expect(entry.immutableRetainedBytes() >= before + 32);
+        const backing = &entry.reader.native.?.range.paged_source.?.original.ranges;
+        backing.immutable_identity = @splat(1);
+        try std.testing.expect(entry.retainImmutable() == null);
+        backing.retention_artifact_only = true;
+        var pin = entry.retainImmutable() orelse return error.TestUnexpectedResult;
+        pin.deinit();
     }
     try std.testing.expect(state.closed);
     try std.testing.expectEqual(@as(u64, 0), state.used_at_close);

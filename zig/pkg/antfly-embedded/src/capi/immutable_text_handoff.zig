@@ -22,7 +22,9 @@ pub fn Handoff(comptime Snapshot: type, comptime Lease: type) type {
         const Self = @This();
         allocator: std.mem.Allocator,
         leases: std.ArrayList(Lease) = .empty,
+        // Reader memory and protected on-disk ranges are different resources.
         bytes: u64 = 0,
+        source_bytes: u64 = 0,
         visited: usize = 0,
 
         /// Consumes the inventory reference on every path. Retain individual
@@ -30,8 +32,12 @@ pub fn Handoff(comptime Snapshot: type, comptime Lease: type) type {
         /// keeping its entire inventory/global statistics alive. Both visits
         /// and retained ranges share one file-wide budget across indexes.
         pub fn append(self: *Self, snapshot: *Snapshot, byte_limit: u64, segment_limit: usize) !bool {
+            return self.appendWithSourceLimit(snapshot, byte_limit, segment_limit, std.math.maxInt(u64));
+        }
+
+        pub fn appendWithSourceLimit(self: *Self, snapshot: *Snapshot, byte_limit: u64, segment_limit: usize, source_limit: u64) !bool {
             defer snapshot.release();
-            if (snapshot.read_context != null or self.bytes >= byte_limit) return false;
+            if (snapshot.read_context != null or self.bytes >= byte_limit or self.source_bytes >= source_limit) return false;
             const visits = @min(snapshot.segments.len, segment_limit -| self.visited);
             if (visits == 0) return false;
             try self.leases.ensureUnusedCapacity(self.allocator, visits);
@@ -41,12 +47,15 @@ pub fn Handoff(comptime Snapshot: type, comptime Lease: type) type {
                 position -= 1;
                 self.visited += 1;
                 const segment = &snapshot.segments[position];
-                const bytes = segment.reader.immutableSource().len();
+                const source_bytes = segment.reader.immutableSource().len();
+                if (source_bytes > source_limit -| self.source_bytes) continue;
+                const bytes = segment.immutableRetainedBytes();
                 if (bytes > byte_limit -| self.bytes) continue;
                 const lease = segment.retainImmutable() orelse continue;
                 self.leases.appendAssumeCapacity(lease);
                 self.bytes += bytes;
-                if (self.bytes == byte_limit) break;
+                self.source_bytes += source_bytes;
+                if (self.bytes == byte_limit or self.source_bytes == source_limit) break;
             }
             return self.leases.items.len != before;
         }
@@ -83,6 +92,10 @@ const Fixture = struct {
     };
     const Segment = struct {
         reader: Reader,
+        resident_bytes: ?u64 = null,
+        pub fn immutableRetainedBytes(self: *const Segment) u64 {
+            return self.resident_bytes orelse self.reader.source.len();
+        }
         pub fn retainImmutable(self: *const Segment) ?Lease {
             const owner = self.reader.source.owner;
             if (owner.refuse) return null;
@@ -187,4 +200,33 @@ test "immutable handoff bounds visits even when every range exceeds the budget" 
     try std.testing.expectEqual(@as(usize, 4), handoff.visited);
     try std.testing.expectEqual(@as(usize, 0), fixture.references);
     try std.testing.expectEqual(@as(usize, 2), fixture.releases);
+}
+
+test "immutable handoff admits large file ranges by resident cost within one generation" {
+    var fixture: Fixture = .{};
+    const source_bytes = 800 * 1024 * 1024;
+    const segments = [_]Fixture.Segment{.{ .reader = .{ .source = .{ .owner = &fixture, .bytes = source_bytes } }, .resident_bytes = 16 }};
+    var snapshot: Fixture.Snapshot = .{ .segments = &segments, .owner = &fixture };
+    var handoff: Handoff(Fixture.Snapshot, Fixture.Lease) = .{ .allocator = std.testing.allocator };
+    defer handoff.deinit();
+    try std.testing.expect(try handoff.appendWithSourceLimit(&snapshot, 32, 4, source_bytes));
+    try std.testing.expectEqual(@as(u64, 16), handoff.bytes);
+    try std.testing.expectEqual(@as(u64, source_bytes), handoff.source_bytes);
+    // RAM is still available, but a second artifact generation cannot fit.
+    try std.testing.expect(!try handoff.appendWithSourceLimit(&snapshot, 32, 4, source_bytes));
+    try std.testing.expectEqual(@as(usize, 1), fixture.references);
+    try std.testing.expectEqual(@as(usize, 2), fixture.releases);
+}
+
+test "immutable handoff rejects memory and generation excess independently" {
+    var fixture: Fixture = .{};
+    const segments = [_]Fixture.Segment{.{ .reader = .{ .source = .{ .owner = &fixture, .bytes = 800 * 1024 * 1024 } }, .resident_bytes = 16 }};
+    var snapshot: Fixture.Snapshot = .{ .segments = &segments, .owner = &fixture };
+    var handoff: Handoff(Fixture.Snapshot, Fixture.Lease) = .{ .allocator = std.testing.allocator };
+    defer handoff.deinit();
+    try std.testing.expect(!try handoff.appendWithSourceLimit(&snapshot, 15, 4, 1024 * 1024 * 1024));
+    try std.testing.expect(!try handoff.appendWithSourceLimit(&snapshot, 32, 4, 256 * 1024 * 1024));
+    try std.testing.expectEqual(@as(usize, 0), fixture.references);
+    try std.testing.expectEqual(@as(u64, 0), handoff.bytes);
+    try std.testing.expectEqual(@as(u64, 0), handoff.source_bytes);
 }

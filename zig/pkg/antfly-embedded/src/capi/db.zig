@@ -798,11 +798,23 @@ pub const HandleGuard = struct {
     entry_sequence: u64 = 0,
     pinned_store_readonly: ?bool = null,
     suspended_query_root: ?*Handle = null,
+    refresh_predecessor: ?*Handle = null,
     /// Busy-wait budget left for this export call. The busy timeout bounds
     /// total admission waiting across every re-entry of one call (for
     /// example after inference), not each admission separately. Null means
     /// the connection has no busy timeout.
     admission_budget_ns: ?i96 = null,
+
+    /// Named admission has acquired its own exact immutable inputs. End the
+    /// predecessor bridge before document work or detached provider execution.
+    pub fn finishRefresh(self: *HandleGuard) void {
+        if (self.refresh_predecessor) |previous| {
+            std.debug.assert(self.connection_gate_held and previous.refresh_references != 0);
+            previous.refresh_references -= 1;
+            self.refresh_predecessor = null;
+            self.connection.?.collectRetired();
+        }
+    }
 
     /// Keep registry references and the provider snapshot alive, releasing both
     /// process and file locks while inference runs on an owned request plan.
@@ -812,6 +824,7 @@ pub const HandleGuard = struct {
         const root = connection.current.?;
         root.query_borrows += 1;
         self.suspended_query_root = root;
+        self.finishRefresh();
         // Owned memory plans can release after catalog provisioning. Publish
         // those already-committed primary changes before dropping the lease.
         if (self.path_lease != null and root.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence != self.entry_sequence) connection.notifyMutation();
@@ -883,6 +896,10 @@ pub const HandleGuard = struct {
             }
             if (self.connection_gate_held) {
                 connection.detach();
+                if (self.refresh_predecessor) |previous| {
+                    std.debug.assert(previous.refresh_references != 0);
+                    previous.refresh_references -= 1;
+                }
                 connection.collectRetired();
             }
             if (self.path_lease) |lease| {
@@ -1098,6 +1115,14 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
             };
         } else connection.gate.mutex.lockUncancelable(handleLockIo());
         guard.connection_gate_held = true;
+        if (!pinned) if (connection.owner.current) |previous| {
+            // Owner.refresh constructs the default namespace first. Keep the
+            // previous named-table inputs alive until this export has opened
+            // the namespace it actually requests. The pool still checks exact
+            // inode/value identity; no mutable table or old query is reused.
+            previous.refresh_references += 1;
+            guard.refresh_predecessor = previous;
+        };
         const root = (if (pinned) connection.pin() else connection.refresh(&guard.path_lease, intent)) catch |err| {
             guard.entry_error = capi.mapError(err);
             return guard;
@@ -1132,6 +1157,7 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
             handle.selected_db = database;
             handle.parent_handle = root;
             guard.handle = handle;
+            if (!pinned) guard.finishRefresh();
         }
         if (access == .catalog) requireEmbeddedCatalogOwnership(guard.handle) catch |err| {
             guard.entry_error = catalogOwnershipError(err);
