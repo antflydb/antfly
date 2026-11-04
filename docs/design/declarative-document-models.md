@@ -107,7 +107,9 @@ A recording is one bounded source unit with `kind: "audio"` and
 The planner preserves source identity, model revisions, completion status,
 measured usage, events, and the same deadline/call/token/output limits as
 image and document reads. Audio/video sources reject page selection and slide
-options. Each source must match its reader's declared input modality. Ogg
+options. Each source must match its reader's declared input modality. Audio MIME
+type/subtype matching is case-insensitive, including generic octet-stream inline
+input; accepted sources still publish the detected canonical media type. Ogg
 container declarations also accept Opus; codec-specific declarations are not
 treated as generic Ogg aliases. Source identity records the
 canonical detected media type, including across inline, framed and durable reads.
@@ -137,7 +139,10 @@ budget; small recordings do not require a fixed 512 MiB allowance. Generator
 audio reads clamp an omitted output-token default to the effective executor
 ceiling, while explicit values above that ceiling remain errors. Hosted audio
 leaves borrow the same run-owned HTTP pool as routing, extraction and verification,
-including across sources and nested readers. Pool state outlives page scratch
+including across sources and nested readers. These leaves borrow the already
+resolved recording through provider serialization rather than allocate a second
+full-size source buffer. Downloads and decoded inline sources retain their own
+cleanup ownership. Pool state outlives page scratch
 arenas and is released after all workers finish. Cancellation and deadlines remain
 per-call and poll the complete request checkpoint throughout provider I/O. Vertex
 OAuth sources and tokens belong to the runtime and are keyed by credential

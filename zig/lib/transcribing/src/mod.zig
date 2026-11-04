@@ -1177,9 +1177,10 @@ const CloudflareTranscriberState = struct {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const work = arena.allocator();
-        const content = try resolveAudioContentWithContext(work, self.http.io, req.url, self.cfg.max_download_bytes, self.options, control);
-        const encoded = try work.alloc(u8, std.base64.standard.Encoder.calcSize(content.data.len));
-        _ = std.base64.standard.Encoder.encode(encoded, content.data);
+        var content = try resolveAudioContentWithContext(work, self.http.io, req.url, self.cfg.max_download_bytes, self.options, control);
+        defer content.deinit(work);
+        const encoded = try work.alloc(u8, std.base64.standard.Encoder.calcSize(content.bytes().len));
+        _ = std.base64.standard.Encoder.encode(encoded, content.bytes());
         const cf = @import("antfly_cloudflare");
         const wire = try std.json.Stringify.valueAlloc(work, cloudflare.wire.types.WhisperLargeV3TurboInput{
             .audio = cf.string(encoded),
@@ -1320,10 +1321,9 @@ const OpenAiTranscriberState = struct {
         const self: *OpenAiTranscriberState = @ptrCast(@alignCast(ptr));
         if (req.diarization orelse false) return error.UnsupportedTranscriptionOptions;
         const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
-        const content = try resolveAudioContentWithContext(alloc, self.http.io, req.url, self.max_download_bytes, self.options, control);
-        defer alloc.free(content.content_type);
-        const audio_bytes = content.data;
-        defer alloc.free(audio_bytes);
+        var content = try resolveAudioContentWithContext(alloc, self.http.io, req.url, self.max_download_bytes, self.options, control);
+        defer content.deinit(alloc);
+        const audio_bytes = content.bytes();
 
         const content_type = "application/octet-stream";
         const multipart = try buildOpenAiMultipartAlloc(alloc, self.model, req.language orelse self.language_code, audio_bytes, content_type);
@@ -1517,10 +1517,9 @@ const VertexTranscriberState = struct {
     fn transcribe(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
         const self: *VertexTranscriberState = @ptrCast(@alignCast(ptr));
         const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
-        const content = try resolveAudioContentWithContext(alloc, self.http.io, req.url, self.max_download_bytes, self.options, control);
-        defer alloc.free(content.content_type);
-        const audio_bytes = content.data;
-        defer alloc.free(audio_bytes);
+        var content = try resolveAudioContentWithContext(alloc, self.http.io, req.url, self.max_download_bytes, self.options, control);
+        defer content.deinit(alloc);
+        const audio_bytes = content.bytes();
 
         const encoded_len = std.base64.standard.Encoder.calcSize(audio_bytes.len);
         const encoded = try alloc.alloc(u8, encoded_len);
@@ -2060,15 +2059,36 @@ fn appendMultipartFile(
     try buf.appendSlice(alloc, "\r\n");
 }
 
-fn resolveAudioContentWithContext(a: Allocator, io: std.Io, url: []const u8, max_bytes: ?usize, options: RemoteOptions, control: google_auth.RequestControl) !scraping.DownloadedContent {
+/// Trusted document sources remain owned by their caller until recognition
+/// returns. Downloads and decoded data URIs retain their explicit cleanup owner.
+const ResolvedAudioContent = union(enum) {
+    borrowed: []const u8,
+    owned: scraping.DownloadedContent,
+
+    fn bytes(self: @This()) []const u8 {
+        return switch (self) {
+            .borrowed => |data| data,
+            .owned => |content| content.data,
+        };
+    }
+    fn deinit(self: *@This(), a: Allocator) void {
+        switch (self.*) {
+            .borrowed => {},
+            .owned => |*content| content.deinit(a),
+        }
+        self.* = undefined;
+    }
+};
+
+fn resolveAudioContentWithContext(a: Allocator, io: std.Io, url: []const u8, max_bytes: ?usize, options: RemoteOptions, control: google_auth.RequestControl) !ResolvedAudioContent {
     try control.check();
     if (options.resolved_audio) |bytes| {
         if (bytes.len > effectiveMaxDownloadBytes(max_bytes)) return error.ResponseTooLarge;
-        return .{ .data = try a.dupe(u8, bytes), .content_type = try a.dupe(u8, "audio/wav") };
+        return .{ .borrowed = bytes };
     }
-    if (scraping.data_uri.hasScheme(url)) return resolveAudioContentAlloc(a, url, max_bytes);
+    if (scraping.data_uri.hasScheme(url)) return .{ .owned = try resolveAudioContentAlloc(a, url, max_bytes) };
     const security = remoteFetchSecurity(max_bytes);
-    return scraping.downloadContentAllocWithContext(a, .{ .io = io, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = if (options.cancellation) |token| scraping.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null }, url, &security, null);
+    return .{ .owned = try scraping.downloadContentAllocWithContext(a, .{ .io = io, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = if (options.cancellation) |token| scraping.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null }, url, &security, null) };
 }
 
 fn resolveAudioInputAlloc(alloc: Allocator, url: []const u8, max_download_bytes: ?usize) ![]u8 {
@@ -2806,4 +2826,42 @@ test "audio read Vertex runtime credentials reuse tokens across calls and refres
     if (failure) |err| return err;
     try std.testing.expectEqual(@as(usize, 3), upstream.routeHitCount(1));
     try std.testing.expectEqual(@as(usize, 1), manager.sources.count());
+}
+
+test "audio read resolved recording is borrowed with constant memory and keeps limits and cancellation" {
+    const a = std.testing.allocator;
+    const recording = try a.alloc(u8, 8 * 1024 * 1024);
+    defer a.free(recording);
+    @memset(recording, 0);
+    var scratch: [64]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&scratch);
+    var content = try resolveAudioContentWithContext(bounded.allocator(), std.testing.io, "http://127.0.0.1:1/must-not-fetch", null, .{ .resolved_audio = recording }, .{});
+    try std.testing.expect(content == .borrowed);
+    try std.testing.expect(content.bytes().ptr == recording.ptr);
+    try std.testing.expectEqual(recording.len, content.bytes().len);
+    content.deinit(bounded.allocator());
+    try std.testing.expectEqual(@as(usize, 0), bounded.end_index);
+    // Caller ownership survives provider cleanup, including writable storage.
+    recording[0] = 42;
+    try std.testing.expectEqual(@as(u8, 42), recording[0]);
+    try std.testing.expectError(error.ResponseTooLarge, resolveAudioContentWithContext(bounded.allocator(), std.testing.io, "unused", recording.len - 1, .{ .resolved_audio = recording }, .{}));
+    const Cancel = struct {
+        fn check(_: *const anyopaque) bool {
+            return true;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, resolveAudioContentWithContext(bounded.allocator(), std.testing.io, "unused", null, .{ .resolved_audio = recording }, .{ .cancellation = httpx.CancellationToken.fromCallback(recording.ptr, Cancel.check) }));
+    try std.testing.expectEqual(@as(usize, 0), bounded.end_index);
+}
+
+test "audio read owned inline content releases every allocation" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            var content = try resolveAudioContentWithContext(a, std.testing.io, "data:Audio/Wav;base64,ZmFrZQ==", null, .{}, .{});
+            defer content.deinit(a);
+            try std.testing.expect(content == .owned);
+            try std.testing.expectEqualStrings("fake", content.bytes());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

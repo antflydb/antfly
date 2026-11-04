@@ -49,7 +49,7 @@ pub fn audioInput(a: A, value: []const u8) !Input {
     var mime: []const u8 = "";
     if (try uri.parse(url)) |parsed| {
         const declared = parsed.effectiveMediaTypeEssence();
-        if (!std.mem.eql(u8, declared, "application/octet-stream")) {
+        if (!std.ascii.eqlIgnoreCase(declared, "application/octet-stream")) {
             if (!isAudioMediaType(declared)) return error.UnsupportedInferenceMimeType;
             mime = parsed.media_type;
         }
@@ -845,4 +845,33 @@ test "document Ogg container MIME accepts Opus and preserves explicit codec decl
     }
     const declared = try audioInput(a, "data:audio/ogg;codecs=vorbis;base64,T2dnUwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE9wdXNIZWFk");
     try std.testing.expectEqualStrings("audio/ogg;codecs=vorbis", declared.media_type);
+}
+
+test "document audio MIME case and inline generic types preserve canonical source identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try audio.wav.encodeMono(a, &.{ 0, 0 }, .{ .audio_format = 1, .sample_rate = 16000, .bits_per_sample = 16 });
+    var lower = try Source.init(a, .{ .id = "clip", .url = "fixture", .media_type = "audio/wav" }, bytes, .{}, .{});
+    defer lower.deinit();
+    for ([_][]const u8{ "Audio/Wav", "AUDIO/WAV", "Audio/Wav; charset=binary" }) |mime| {
+        try std.testing.expect(isAudioMediaType(mime));
+        var source = try Source.init(a, .{ .id = "clip", .url = "fixture", .media_type = mime }, bytes, .{}, .{});
+        defer source.deinit();
+        try std.testing.expect(source.parsed == .audio);
+        try std.testing.expectEqualStrings("audio/wav", source.input.media_type);
+        try std.testing.expectEqual(lower.fingerprint, source.fingerprint);
+    }
+    const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+    _ = std.base64.standard.Encoder.encode(encoded, bytes);
+    for ([_][]const u8{ "Audio/Wav", "Application/Octet-Stream" }) |mime| {
+        const uri = try std.fmt.allocPrint(a, "data:{s};base64,{s}", .{ mime, encoded });
+        var input = try audioInput(a, uri);
+        if (input.media_type.len == 0) input.media_type = try audioMime(bytes);
+        var source = try Source.init(a, input, bytes, .{}, .{});
+        defer source.deinit();
+        try std.testing.expectEqualStrings("audio/wav", source.input.media_type);
+        try std.testing.expectEqual(lower.fingerprint, source.fingerprint);
+    }
+    try std.testing.expectError(error.UnsupportedInferenceMimeType, audioInput(a, "data:Image/Png;base64,AA=="));
 }
