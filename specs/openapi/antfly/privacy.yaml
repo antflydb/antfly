@@ -54,6 +54,7 @@ components:
         categories:
           type: array
           maxItems: 128
+          description: Add categories or override group categories. The union of explicit and expanded group categories must contain at most 128 distinct names.
           items: {$ref: '#/components/schemas/PrivacyCategory'}
         sensitivity: {type: string, enum: [conservative, balanced, thorough], default: balanced}
         replacement: {type: string, enum: [category, mask, remove], default: category}

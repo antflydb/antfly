@@ -41453,6 +41453,9 @@ pub const DB = struct {
             projection_context: *TransactionProjectionContext,
             privacy_policy: ?privacy.PolicySnapshot,
             privacy_status_published: bool,
+            // Reuse independently reclaimable row scratch even when the
+            // request allocator is an arena retaining NDJSON output.
+            privacy_row_arena: std.heap.ArenaAllocator,
             values_authenticated: bool,
             ttl_key_scratch: std.ArrayListUnmanaged(u8) = .empty,
             document_key_scratch: std.ArrayListUnmanaged(u8) = .empty,
@@ -41466,6 +41469,7 @@ pub const DB = struct {
             resume_after_key: ?[]const u8 = null,
 
             pub fn deinit(state: *@This()) void {
+                state.privacy_row_arena.deinit();
                 if (state.transient_schema_plan) |*plan| plan.deinit();
                 state.ttl_key_scratch.deinit(state.alloc);
                 state.document_key_scratch.deinit(state.alloc);
@@ -41587,8 +41591,8 @@ pub const DB = struct {
                     if ((state.opts.exclusive_to and order != .lt) or (!state.opts.exclusive_to and order == .gt))
                         return .stop;
                 }
-                var privacy_row_arena = std.heap.ArenaAllocator.init(state.alloc);
-                defer privacy_row_arena.deinit();
+                const privacy_row_arena = &state.privacy_row_arena;
+                defer _ = privacy_row_arena.reset(.retain_capacity);
                 const protected_row = !state.opts.privacy_status and if (state.privacy_policy) |configured| configured.policy.mode != .monitor else false;
                 const safe_stored = if (protected_row) privacy.project(privacy_row_arena.allocator(), state.privacy_policy.?, raw_key, stored_value, state.read_txn) catch |err| {
                     if (privacy.pending(err)) return .@"continue";
@@ -41665,7 +41669,11 @@ pub const DB = struct {
                 // Scan callbacks pin their borrowed storage slices until they
                 // return. A synchronous plain-document producer can keep that
                 // borrow instead of copying the entire input before projection.
-                const borrow_plain = !relational and state.visitor.borrow_documents and state.stream_plan != null;
+                // Every consumer finishes synchronously inside this callback.
+                // ID-only and hash-only scans need the same borrowing path;
+                // copying into a request arena can retain whole documents
+                // behind the visitor's much smaller output allocations.
+                const borrow_plain = !relational;
                 const logical_value: ?[]const u8 = if (needs_logical_value)
                     if (ordinal_row) |row|
                         try row.reconstructValueAlloc(state.alloc)
@@ -41752,6 +41760,7 @@ pub const DB = struct {
             .projection_context = &projection_context,
             .privacy_policy = policy,
             .privacy_status_published = privacy_status_published,
+            .privacy_row_arena = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)),
             .values_authenticated = self.core.store.valuesAreAuthenticated(),
             .visitor = visitor,
             .count = columnar_progress.delivered,
@@ -144383,6 +144392,46 @@ test "inline resolver replacement isolates serving graph consumers and releases 
             }
         }
     }
+}
+
+test "privacy ID scans retain bounded request memory with large original documents" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("privacy-id-scan-memory");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .open_mode = .writer_no_replay, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    const padding = try a.alloc(u8, 1024 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'p');
+    const raw = try std.json.Stringify.valueAlloc(a, .{ .body = "small selected field", .padding = padding }, .{});
+    defer a.free(raw);
+    for (0..12) |i| {
+        const id = try std.fmt.allocPrint(a, "doc-{d:0>2}", .{i});
+        defer a.free(id);
+        try db.batch(.{ .writes = &.{.{ .key = id, .value = raw }}, .sync_level = .write });
+    }
+    var tracker = std.testing.FailingAllocator.init(a, .{});
+    var request_arena = std.heap.ArenaAllocator.init(tracker.allocator());
+    defer request_arena.deinit();
+    const Visitor = struct {
+        a: Allocator,
+        tracker: *std.testing.FailingAllocator,
+        expected_hash: u64,
+        count: usize = 0,
+        output: std.ArrayList(u8) = .empty,
+        fn visit(ptr: ?*anyopaque, row: types.ScanVisitEntry) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            try std.testing.expect(row.document_json == null and row.document_stream == null);
+            try std.testing.expectEqual(self.expected_hash, row.hash);
+            // Interleave retained output with storage scratch, as NDJSON does.
+            try self.output.appendSlice(self.a, row.id);
+            try std.testing.expect(self.tracker.allocated_bytes - self.tracker.freed_bytes < 256 * 1024);
+            self.count += 1;
+        }
+    };
+    var visitor = Visitor{ .a = request_arena.allocator(), .tracker = &tracker, .expected_hash = std.hash.Wyhash.hash(0, raw) };
+    try db.scanVisit(request_arena.allocator(), "", "", .{ .privacy_original = true, .include_documents = false }, .{ .context = &visitor, .visit = Visitor.visit });
+    try std.testing.expectEqual(@as(usize, 12), visitor.count);
 }
 
 test "public graph metric borrowed wire document scan producers preserve projection and cancellation" {

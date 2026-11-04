@@ -26,6 +26,7 @@ const operation = local.api_operation;
 const http = @import("public_table_http.zig");
 const A = std.mem.Allocator;
 const platform_time = @import("antfly_platform").time;
+const platform_allocator = @import("antfly_platform").allocator;
 pub const Action = enum { get, put, preview, start_scan, get_scan, findings };
 pub const Arguments = struct {
     body: []const u8 = "",
@@ -154,7 +155,7 @@ fn coverageForRange(server: anytype, a: A, table: []const u8, resource: catalog.
             }
         }
     };
-    var census = Census{ .a = a, .version = resource.policy_version, .line_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    var census = Census{ .a = a, .version = resource.policy_version, .line_arena = std.heap.ArenaAllocator.init(platform_allocator.reclaimingScratch(a)) };
     defer census.totals.deinit(a);
     defer census.buffer.deinit(a);
     defer census.line_arena.deinit();
@@ -216,7 +217,7 @@ fn execute(server: anytype, a: A, table: []const u8, action: Action, args: Argum
     for (0..8) |attempt| {
         // The request allocator may itself be an arena. Independent backing
         // ensures contention releases each attempt before loading another cut.
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var arena = std.heap.ArenaAllocator.init(platform_allocator.reclaimingScratch(a));
         defer arena.deinit();
         const scratch = arena.allocator();
         var result = executeAttempt(server, scratch, table, action, args, request) catch |err| {
@@ -311,11 +312,10 @@ fn acknowledged(installed: catalog.Resource, visible: catalog.Resource) bool {
         (visible.resource_version == installed.resource_version and std.mem.eql(u8, &visible.policy_version, &installed.policy_version));
 }
 fn acknowledgePolicy(server: anytype, a: A, table: []const u8, installed: catalog.Resource, request: operation.RequestContext) !void {
-    _ = a;
     const deadline = platform_time.monotonicNs() +| 10 * std.time.ns_per_s;
     while (true) {
         try request.ensureActive();
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var arena = std.heap.ArenaAllocator.init(platform_allocator.reclaimingScratch(a));
         defer arena.deinit();
         const scratch = arena.allocator();
         if (try server.loadOwnedTableRecord(scratch, table)) |record| {
@@ -475,7 +475,7 @@ fn findings(server: anytype, a: A, table: []const u8, resource: catalog.Resource
         }
         // Request arenas cannot reclaim interleaved per-document allocations.
         // Give each document independently releasable backing.
-        var document_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var document_arena = std.heap.ArenaAllocator.init(platform_allocator.reclaimingScratch(a));
         defer document_arena.deinit();
         const doc = document_arena.allocator();
         try request.ensureActive();
@@ -667,15 +667,9 @@ pub fn advanceOnce(server: anytype, a: A) !void {
                             updated.last_error = "PrivacyInspectionFailed";
                         } else if (updated.verification_pending == 0 and updated.verification_blocked == 0) {
                             if (resource.policy.mode == .redact_for_search_and_ai) {
-                                const reads = server.table_reads orelse return error.PrivacyReadUnavailable;
-                                var ready = reads.preflightQuery(a, table.name, .{ .privacy_policy_version = resource.policy_version }, .read_index, 10000) catch |err| switch (err) {
-                                    error.IndexRebuilding, error.StorageBusy, error.StorageReadTemporarilyUnavailable => null,
-                                    else => return err,
-                                };
-                                defer if (ready) |*value| value.deinit(a);
-                                if (ready != null) updated.phase = .succeeded;
+                                if (try verifyServing(server, a, table.name, resource.policy_version, updated, now)) updated.phase = .succeeded;
                             } else updated.phase = .succeeded;
-                            updated.last_error = null;
+                            if (updated.phase == .succeeded) updated.last_error = null;
                         }
                         if (updated.phase == .processing) {
                             updated.verification_page_size = 100;
@@ -700,7 +694,15 @@ pub fn advanceOnce(server: anytype, a: A) !void {
                     .shard_cursors = if (parsed_resumes) |value| value.value else &.{},
                 }) catch |err| {
                     switch (err) {
-                        error.NotLeader, error.Canceled, error.Cancelled, error.OutOfMemory => return err,
+                        error.Canceled, error.Cancelled, error.OutOfMemory => return err,
+                        error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => {
+                            // A shard election is not loss of this metadata
+                            // worker's authority. Yield its queue position;
+                            // persistScan independently fences our own term.
+                            verificationUnavailable(updated, now, @errorName(err));
+                            try persistScan(server, a, table, resource, work.term);
+                            return;
+                        },
                         else => {},
                     }
                     scanError(updated, now, @errorName(err));
@@ -744,6 +746,40 @@ pub fn advanceOnce(server: anytype, a: A) !void {
             return;
         }
     }
+}
+
+/// A readiness probe is availability work, not a terminal inspection failure.
+/// Persist its backoff through the ordinary term-fenced CAS even for routing
+/// and transport errors, so one unavailable table cannot pin the global head.
+fn verifyServing(server: anytype, a: A, table: []const u8, version: [64]u8, scan: *catalog.Scan, now: i64) !bool {
+    const reads = server.table_reads orelse {
+        verificationUnavailable(scan, now, "PrivacyReadUnavailable");
+        return false;
+    };
+    var ready = reads.preflightQuery(a, table, .{
+        .privacy_policy_version = version,
+        .execution_deadline_ns = platform_time.monotonicNs() +| 2 * std.time.ns_per_s,
+    }, .read_index, 10000) catch |err| switch (err) {
+        error.OutOfMemory, error.Canceled, error.Cancelled => return err,
+        else => {
+            verificationUnavailable(scan, now, @errorName(err));
+            return false;
+        },
+    };
+    defer if (ready) |*value| value.deinit(a);
+    if (ready == null) {
+        verificationUnavailable(scan, now, "PrivacyReadUnavailable");
+        return false;
+    }
+    scan.consecutive_errors = 0;
+    scan.last_error = null;
+    return true;
+}
+
+fn verificationUnavailable(scan: *catalog.Scan, now: i64, code: []const u8) void {
+    scan.consecutive_errors +|= 1;
+    scan.last_error = code;
+    scan.retry_after_millis = now + @min(@as(i64, 30000), @as(i64, 1000) << @intCast(@min(scan.consecutive_errors, 5)));
 }
 
 // A full-table job shares the policy's durable census instead of generating
@@ -985,4 +1021,78 @@ test "privacy full-table verification shares only a fresh completed census" {
     try std.testing.expectEqual(@as(u64, 3), scan.verification_failed);
     try std.testing.expectEqual(@as(u64, 10), scan.verification_blocked);
     try std.testing.expectEqual(@as(i64, 100), scan.verification_started_at_millis);
+}
+
+test "privacy readiness transport failures persist backoff and release the global scheduler head" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Types = local.storage_db_types;
+    const Consistency = local.storage_read_consistency.ReadConsistency;
+    const Reads = struct {
+        failure: ?anyerror,
+        const Summary = struct {
+            fn deinit(_: *@This(), _: A) void {}
+        };
+        fn preflightQuery(self: *@This(), _: A, _: []const u8, request: Types.SearchRequest, _: Consistency, _: u32) !?Summary {
+            try std.testing.expect(request.execution_deadline_ns.? > platform_time.monotonicNs());
+            if (self.failure) |err| return err;
+            return .{};
+        }
+        fn scanStream(_: *@This(), _: A, _: []const u8, _: []const u8, _: []const u8, _: Types.ScanOptions, _: Consistency, _: local.api_table_read_source.ScanStreamSink) !bool {
+            unreachable;
+        }
+    };
+    const Writes = struct {
+        failure: ?anyerror,
+        fn reprocessDocumentArtifactRange(self: *@This(), _: A, _: []const u8, _: []const u8, _: Types.DocumentArtifactTableReprocessRequest) !?Types.DocumentArtifactTableReprocessResult {
+            if (self.failure) |err| return err;
+            unreachable;
+        }
+    };
+    const Source = struct {
+        a: A,
+        table: metadata.TableRecord,
+        fn nextPrivacyWork(self: *@This(), out: A, _: i64) !?metadata.PrivacyWork {
+            return .{ .table = try metadata.cloneTable(out, self.table), .term = 7 };
+        }
+        fn privacyAuthorityTerm(_: *@This()) !?u64 {
+            return 7;
+        }
+        fn replaceTableDefinition(self: *@This(), expected: metadata.TableRecord, replacement: metadata.TableRecord) !void {
+            try std.testing.expectEqualStrings(self.table.indexes_json, expected.indexes_json);
+            self.table = try metadata.cloneTable(self.a, replacement);
+        }
+    };
+    const Mode = enum { standalone };
+    for ([_]@FieldType(catalog.Scan, "phase"){ .processing, .running }) |phase| for ([_]anyerror{ error.Timeout, error.DeadlineExceeded, error.CatalogRoutingSnapshotTimeout, error.NotLeader, error.StorageReadTemporarilyUnavailable }) |err| {
+        var resource = try catalog.next(a, null, .{ .mode = .redact_for_search_and_ai, .fields = &.{"body"} }, null);
+        _ = try catalog.startScan(a, &resource, "", "", 100);
+        const scans = @constCast(resource.scans);
+        scans[0].phase = phase;
+        scans[0].updated_at_millis = 10;
+        scans[0].verification_started_at_millis = 1;
+        resource.coverage = .{ .updated_at_millis = 5000, .retry_after_millis = std.math.maxInt(i64), .snapshot = .{ .counts = .{}, .started_at_millis = 2, .completed_at_millis = 3 } };
+        var source = Source{ .a = a, .table = .{ .table_id = 1, .name = "blocked", .indexes_json = try catalog.install(a, "{}", resource) } };
+        var reads = Reads{ .failure = err };
+        var writes = Writes{ .failure = err };
+        var server = .{ .cfg = .{ .deployment_mode = Mode.standalone, .catalog_publication_authority_available = true, .privacy_scan_coordinator = false }, .table_reads = @as(?*Reads, &reads), .table_writes = @as(?*Writes, &writes), .source = &source };
+        var index: catalog.WorkIndex = .{};
+        defer index.deinit(a);
+        try index.update(a, 1, try catalog.workDue(a, source.table.indexes_json));
+        try index.update(a, 2, 20);
+        try std.testing.expectEqual(@as(?u64, 1), index.first(100));
+        try advanceOnce(&server, a);
+        const saved = (try load(a, source.table.indexes_json)).?.value;
+        try std.testing.expectEqual(phase, saved.scans[0].phase);
+        try std.testing.expectEqualStrings(@errorName(err), saved.scans[0].last_error.?);
+        try std.testing.expect(saved.scans[0].retry_after_millis > saved.scans[0].updated_at_millis);
+        try index.update(a, 1, try catalog.workDue(a, source.table.indexes_json));
+        try std.testing.expectEqual(@as(?u64, 2), index.first(std.math.maxInt(i64)));
+        reads.failure = null;
+        var recovered = saved.scans[0];
+        try std.testing.expect(try verifyServing(&server, a, "blocked", saved.policy_version, &recovered, recovered.retry_after_millis));
+        try std.testing.expectEqual(@as(u8, 0), recovered.consecutive_errors);
+        try std.testing.expect(recovered.last_error == null);
+    };
 }

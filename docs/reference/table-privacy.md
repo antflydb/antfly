@@ -91,6 +91,10 @@ empty, environment references, or supported secret references; literal
 credentials are rejected. Remote producers receive original selected text;
 the preview and policy response disclose external processing.
 
+The union of expanded category groups and explicit custom categories is limited
+to 128 categories. Overrides of an existing group category count once. This
+limit is checked before preview or policy installation.
+
 `execution.batch_items` (1–8) and `execution.max_attempts` (1–5) tune batching
 and invalid-evidence retries. Changing them preserves semantic policy identity
 and accepted inspection results. Transport backoff remains owned by the

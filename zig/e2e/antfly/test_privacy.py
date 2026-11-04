@@ -629,7 +629,14 @@ def test_privacy_preview_policy_cas_backfill_and_findings(
             return scan if scan["phase"] == "succeeded" else None
 
         assert wait_until(replacement_finished, timeout_s=60, interval_s=0.2), (
-            json.dumps(stateful_api.get(path))
+            json.dumps(
+                {
+                    "status": stateful_api.get(path),
+                    "scan": stateful_api.get(f"{path}/scans/{replacement_scan}"),
+                    "vectors": stateful_api.get_index(table, "body_vectors"),
+                    "logs": stateful_api.debug_logs(),
+                }
+            )
         )
         assert stateful_api.get(f"/tables/{table}/documents/doc")["body"] == (
             "retry: [REDACTED]"
@@ -873,6 +880,36 @@ def test_privacy_empty_table_and_null_source(stateful_api, mode):
     assert wait_until(current, timeout_s=30, interval_s=0.2), stateful_api.get(path)
     assert stateful_api.get(f"{path}/findings")["findings"] == []
     assert stateful_api.get(f"/tables/{table}/documents/null")["body"] is None
+
+
+def test_privacy_resolved_category_limit_matches_preview_and_installation(stateful_api):
+    table = f"privacy_categories_{uuid4().hex[:8]}"
+    stateful_api.create_table(table)
+    path = f"/tables/{table}/privacy"
+    policy = {
+        "mode": "monitor",
+        "fields": ["body"],
+        "category_groups": ["credentials"],
+        "categories": [{"name": f"custom_{i}"} for i in range(128)],
+    }
+    for method, suffix, body in (
+        ("POST", "/preview", {"policy": policy}),
+        ("PUT", "", policy),
+    ):
+        result = stateful_api._request(method, path + suffix, body)
+        assert result.status_code == 422, result.text
+        assert result.json()["code"] == "InvalidPrivacyCategories", result.text
+    assert stateful_api.get(path)["configured"] is False
+    # The credentials group contributes five distinct categories. One
+    # explicit override counts once, leaving 123 custom categories available.
+    policy["categories"] = policy["categories"][:123] + [
+        {"name": "password", "threshold": 0.8}
+    ]
+    preview = stateful_api.post(path + "/preview", {"policy": policy})
+    assert preview["sampled"] == 0
+    saved = stateful_api.put(path, policy)
+    assert saved["configured"] is True
+    assert saved["policy_version"] == preview["policy_version"]
 
 
 @pytest.mark.parametrize("mode", ["monitor", "redact_for_search_and_ai"])

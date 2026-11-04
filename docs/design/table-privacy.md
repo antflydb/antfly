@@ -4,6 +4,7 @@ Implements the table-scoped **Privacy** design in
 [issue #1401](https://github.com/antflydb/antfly/issues/1401). The user-facing
 contract and examples are in [Table privacy](../reference/table-privacy.md).
 The branch starts at `f2b3baaee1cb508005451843c17fa07f2e069d4b`.
+Main was merged at `6817ccb184`; privacy uses metadata protocol version 79.
 
 ## Policy and user experience
 
@@ -171,12 +172,20 @@ and persist the learned size, cursor and accumulated evidence together. Full-tab
 jobs share the durable coverage census, accepting only a completed pass started
 strictly after the job entered verification. Active jobs do not multiply the
 shard-wide census workload; protected completion still requires serving readiness.
+Readiness probes have a two-second execution budget. Routing, transport and
+readiness failures persist bounded backoff without marking inspection failed;
+the table advances its due entry so other tables can run. Publication still
+rechecks metadata authority and term before that progress can commit.
 
 Policy PUT acknowledges a logical resource version, independently of mutable
 job JSON. A bounded CAS retry recomposes against current progress while
 preserving the caller's exact policy ETag precondition. Executable policy
 normalization sorts selected fields, resolves category groups/thresholds and
 canonicalizes producer configuration before deriving managed enrichments.
+Validation bounds the resolved union of group and explicit categories to 128,
+so authored and canonical executable policies obey the same admission limit.
+Finding deduplication uses a hash index preserving first-seen order and maximum
+confidence across repeated field/window evidence, with expected linear cost.
 
 Findings enumeration reads identifiers only. A per-document arena holds the
 manifest, authoritative source and validation scratch; only accepted findings
@@ -184,27 +193,53 @@ survive into the response arena. Inspection and output each have an 8 MiB page
 budget, with one complete document admitted before inspection yields. The
 continuation includes the next unexamined document or finding ordinal, bound
 to the policy and filters, including pages with zero accepted findings.
+The storage scanner borrows plain document bytes for the duration of each
+callback, including ID-only and hash-only scans. Privacy projection scratch
+uses an independently backed row arena reused between callbacks; retained
+response allocations cannot pin whole-document temporary copies.
+Scratch backing uses the platform allocator's arena-unwrapping helper, retaining
+allocation accounting and failure injection beneath request arenas.
 
 ## Validation
 
-- Focused API target: `zig build antfly-privacy-test` — 20 API/metadata tests and 37 storage/runtime tests passed,
+- ReleaseFast deduplication microbenchmark (three repetitions): 65,536 distinct
+  valid findings improved from a median 965 ms to 10.3 ms; 16,384 improved from
+  58.4 ms to 2.75 ms. This measures normalization, not model inference.
+- Focused API target: `zig build antfly-privacy-test` — 21 API/metadata tests and 62 storage/runtime tests passed,
   including scan bounds, adaptive verification, evidence ownership, byte-budgeted findings,
   scheduling index allocation failures/snapshot restore, and transport policy fences.
+- Storage contract target: 15 checks passed, including real DB ID-scan memory,
+  borrowed projection/cancellation, allocation ownership and publication contracts.
+  The ID-scan regression reads twelve 1 MiB originals while retained request
+  allocations remain below 256 KiB.
+- Scheduler regression drives complete passes through durable progress updates
+  for both backfill and verification, including shard-leader, routing and timeout
+  failures, and verifies another table can become the next runnable entry.
+- Pure catalog/inspection suite: 26 passed. Privacy TypeScript SDK: 3 passed;
+  dashboard privacy tests: 6 passed. Generated Go SDK tests passed. Full
+  API/SDK/dashboard generation, formatting and license checks passed.
+- Standalone HTTP: 9 passed, 1 optional model-weight test skipped (260 seconds).
+  Raft HTTP: 9 passed, 1 optional model-weight test skipped (486 seconds).
+  Both include resolved-category admission and policy replacement. The large
+  membership cases took 24/23 seconds in standalone and 157/92 seconds in Raft
+  for monitor/protective modes respectively.
+- An initial standalone one-shard policy-replacement check timed out waiting
+  for serving readiness. It passed in an isolated run, in the preceding-monitor
+  sequence, and in the complete rerun with unchanged code and binary. The cause
+  remains unconfirmed; the test retains scan, vector-index and server diagnostics.
+- Large Raft membership tests enforce a 90-second no-progress watchdog and a
+  ten-minute hard convergence cap, accounting for bounded publication backpressure.
+
+### Earlier broader validation
+
+The following results were recorded during implementation before this main merge.
+
 - Compiled metadata owner regression verifies indexed due selection and point reads
   across the storage archive. Table-read regression checks both static vtable
   variants across capability selection; the full table-read target passed 125 checks.
-- Large Raft membership tests enforce a 90-second no-progress watchdog and a
-  ten-minute hard convergence cap, accounting for bounded publication backpressure.
-- Storage batch contracts: 11 passed, including source updates after accepted
-  absence, catalog-change receipt recovery,
-  managed dense output-name
-  authorization, ordered deletion/resurrection,
-  orphan-tail rejection and dense/sparse accepted-stream
-  replay and publication preparation, with zero leaks and allocation-failure
-  coverage.
 - Runtime error transport: 43 tests passed, including privacy retry/corruption
   identities; SQL diagnostics: 7 passed. Remote scan transport: 2 passed.
-- Pure catalog suite: 18 tests passed; standalone publication witnesses: 4;
+- Standalone publication witnesses: 4;
   current-status/serving suites: 10 each.
 - Python SDK: 779 passed; Go SDK tests passed; Rust SDK check passed.
 - TypeScript SDK: 535 passed, one unrelated skip. Dashboard: 280 passed;

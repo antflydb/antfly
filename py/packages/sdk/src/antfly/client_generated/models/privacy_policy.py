@@ -28,7 +28,8 @@ class PrivacyPolicy:
             substituted with asynchronous inspection.
         fields (list[str]): Literal source document field names, matching artifact source field semantics.
         category_groups (list[PrivacyPolicyCategoryGroupsItem] | Unset):
-        categories (list[PrivacyCategory] | Unset):
+        categories (list[PrivacyCategory] | Unset): Add categories or override group categories. The union of explicit
+            and expanded group categories must contain at most 128 distinct names.
         sensitivity (PrivacyPolicySensitivity | Unset):  Default: PrivacyPolicySensitivity.BALANCED.
         replacement (PrivacyPolicyReplacement | Unset):  Default: PrivacyPolicyReplacement.CATEGORY.
         producer (PrivacyProducer | Unset):

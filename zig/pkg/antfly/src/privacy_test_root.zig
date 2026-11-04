@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub const antfly_sources = @import("source_owner_common.zig");
+// Metadata store tests and publication regressions also own physical DB
+// fixtures; keep their restore decoder and source identities in this root.
+pub const antfly_sources = @import("source_owner_physical.zig");
 pub const local_test_sources = @import("local_test_sources.zig");
 pub const storage_backend_erased = @import("antfly_local_sources").storage_backend_erased;
 pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;

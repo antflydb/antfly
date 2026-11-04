@@ -112,7 +112,8 @@ pub fn inspect(a: A, policy: contract.Policy, document: std.json.Value, inspecto
             else => return error.InvalidPrivacyFieldType,
         };
         const plan = if (source.len == 0) try scratch.dupe(Window, &.{.{ .start = 0, .end = 0 }}) else try windows(scratch, source, try inspector.tokenize(inspector.ptr, scratch, policy, source), inspector.windowing);
-        var findings: std.ArrayList(contract.Finding) = .empty;
+        var findings: FindingSet = .{};
+        defer findings.positions.deinit(scratch);
         var offset: usize = 0;
         while (offset < plan.len) {
             try inspector.check(inspector.ptr);
@@ -144,7 +145,7 @@ pub fn inspect(a: A, policy: contract.Policy, document: std.json.Value, inspecto
                     var owned = finding;
                     owned.field = try scratch.dupe(u8, finding.field);
                     owned.category = try scratch.dupe(u8, finding.category);
-                    try appendUnique(scratch, &findings, owned);
+                    try findings.append(scratch, owned);
                 }
                 break;
             }
@@ -153,8 +154,8 @@ pub fn inspect(a: A, policy: contract.Policy, document: std.json.Value, inspecto
         out.* = .{
             .field = try scratch.dupe(u8, field),
             .source_fingerprint = contract.fingerprint(source),
-            .text = try contract.redact(scratch, source, findings.items, policy.replacement),
-            .findings = findings.items,
+            .text = try contract.redact(scratch, source, findings.items.items, policy.replacement),
+            .findings = findings.items.items,
             .receipt = .{ .policy_version = version, .source_fingerprint = contract.fingerprint(source), .producer_revision = try scratch.dupe(u8, revision), .inspected_windows = @intCast(plan.len), .required_windows = @intCast(plan.len), .state = .inspected },
         };
     }
@@ -164,7 +165,9 @@ pub fn inspect(a: A, policy: contract.Policy, document: std.json.Value, inspecto
 fn inspectBatch(a: A, policy: contract.Policy, categories: []const contract.Category, inputs: []const Input, inspector: Inspector) ![]contract.Finding {
     const outputs = try inspector.produce(inspector.ptr, a, policy, inputs);
     if (outputs.len != inputs.len) return error.InvalidPrivacyOutputCardinality;
-    var accepted: std.ArrayList(contract.Finding) = .empty;
+    var accepted: FindingSet = .{};
+    defer accepted.positions.deinit(a);
+    errdefer accepted.items.deinit(a);
     for (outputs, inputs) |raw, input| {
         var tree = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
         defer tree.deinit();
@@ -173,10 +176,10 @@ fn inspectBatch(a: A, policy: contract.Policy, categories: []const contract.Cate
             var rebased = finding;
             rebased.start = try std.math.add(usize, finding.start, input.window.start);
             rebased.end = try std.math.add(usize, finding.end, input.window.start);
-            try appendUnique(a, &accepted, rebased);
+            try accepted.append(a, rebased);
         }
     }
-    return accepted.toOwnedSlice(a);
+    return accepted.items.toOwnedSlice(a);
 }
 
 pub fn fieldValue(document: std.json.Value, field: []const u8) !std.json.Value {
@@ -193,8 +196,9 @@ pub fn normalize(a: A, field: []const u8, source: []const u8, value: std.json.Va
         if (unit != .string or !std.mem.eql(u8, unit.string, "utf8_bytes")) return error.InvalidPrivacyOffsetUnit;
     }
     const entries = value.object.get("findings") orelse value.object.get("entities") orelse return error.InvalidPrivacyOutput;
-    var result: std.ArrayList(contract.Finding) = .empty;
-    errdefer result.deinit(a);
+    var result: FindingSet = .{};
+    defer result.positions.deinit(a);
+    errdefer result.items.deinit(a);
     switch (entries) {
         .array => |array| for (array.items) |entry| try appendEntry(a, &result, field, source, entry, categories, null),
         .object => |object| {
@@ -207,10 +211,10 @@ pub fn normalize(a: A, field: []const u8, source: []const u8, value: std.json.Va
         },
         else => return error.InvalidPrivacyOutput,
     }
-    return result.toOwnedSlice(a);
+    return result.items.toOwnedSlice(a);
 }
 
-fn appendEntry(a: A, result: *std.ArrayList(contract.Finding), field: []const u8, source: []const u8, entry: std.json.Value, categories: []const contract.Category, group: ?[]const u8) !void {
+fn appendEntry(a: A, result: *FindingSet, field: []const u8, source: []const u8, entry: std.json.Value, categories: []const contract.Category, group: ?[]const u8) !void {
     if (entry != .object) return error.InvalidPrivacyOutput;
     const name: []const u8 = if (group) |name| name else name: {
         const value = entry.object.get("category") orelse entry.object.get("label") orelse return error.InvalidPrivacyOutput;
@@ -237,19 +241,89 @@ fn appendEntry(a: A, result: *std.ArrayList(contract.Finding), field: []const u8
     const threshold = category.threshold orelse return error.InvalidPrivacyThreshold;
     if (!std.math.isFinite(threshold) or threshold < 0 or threshold > 1) return error.InvalidPrivacyThreshold;
     if (score) |p| if (p < threshold) return;
-    try appendUnique(a, result, finding);
+    try result.append(a, finding);
 }
 
-fn appendUnique(a: A, list: *std.ArrayList(contract.Finding), finding: contract.Finding) !void {
-    for (list.items) |*prior| if (prior.start == finding.start and prior.end == finding.end and
-        std.mem.eql(u8, prior.field, finding.field) and std.mem.eql(u8, prior.category, finding.category))
-    {
-        if (finding.confidence) |score| if (prior.confidence == null or score > prior.confidence.?) {
-            prior.confidence = score;
-        };
-        return;
+/// Preserve detector order and maximum confidence in expected linear time.
+/// Keys borrow the field/category strings owned by the inspection arena.
+const FindingSet = struct {
+    const Key = struct { field: []const u8, category: []const u8, start: usize, end: usize };
+    const Context = struct {
+        pub fn hash(_: @This(), key: Key) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            hasher.update(key.field);
+            hasher.update(key.category);
+            hasher.update(std.mem.asBytes(&key.start));
+            hasher.update(std.mem.asBytes(&key.end));
+            return hasher.final();
+        }
+        pub fn eql(_: @This(), left: Key, right: Key) bool {
+            return left.start == right.start and left.end == right.end and
+                std.mem.eql(u8, left.field, right.field) and std.mem.eql(u8, left.category, right.category);
+        }
     };
-    try list.append(a, finding);
+    items: std.ArrayList(contract.Finding) = .empty,
+    positions: std.HashMapUnmanaged(Key, usize, Context, std.hash_map.default_max_load_percentage) = .empty,
+
+    fn append(self: *FindingSet, a: A, finding: contract.Finding) !void {
+        // Reserve before inserting so allocation failure cannot leave a key
+        // pointing outside the result array.
+        try self.items.ensureUnusedCapacity(a, 1);
+        const entry = try self.positions.getOrPut(a, .{ .field = finding.field, .category = finding.category, .start = finding.start, .end = finding.end });
+        if (entry.found_existing) {
+            const prior = &self.items.items[entry.value_ptr.*];
+            if (finding.confidence) |score| if (prior.confidence == null or score > prior.confidence.?) {
+                prior.confidence = score;
+            };
+        } else {
+            entry.value_ptr.* = self.items.items.len;
+            self.items.appendAssumeCapacity(finding);
+        }
+    }
+};
+
+test "privacy deduplication preserves first order strongest confidence and distinct identities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var set: FindingSet = .{};
+    defer set.positions.deinit(a);
+    for (0..32768) |i| try set.append(a, .{ .field = "body", .category = "person", .start = i, .end = i + 1 });
+    // Reversed detector/window duplicates must not reorder retained evidence.
+    var i: usize = 32768;
+    while (i != 0) {
+        i -= 1;
+        try set.append(a, .{ .field = "body", .category = "person", .start = i, .end = i + 1, .confidence = 0.9 });
+        try set.append(a, .{ .field = "body", .category = "person", .start = i, .end = i + 1, .confidence = 0.5 });
+    }
+    try std.testing.expectEqual(@as(usize, 32768), set.items.items.len);
+    for (set.items.items, 0..) |finding, index| {
+        try std.testing.expectEqual(index, finding.start);
+        try std.testing.expectEqual(@as(?f32, 0.9), finding.confidence);
+    }
+    try set.append(a, .{ .field = "other", .category = "person", .start = 0, .end = 1 });
+    try set.append(a, .{ .field = "body", .category = "email", .start = 0, .end = 1 });
+    try set.append(a, .{ .field = "body", .category = "person", .start = 0, .end = 2 });
+    try std.testing.expectEqual(@as(usize, 32771), set.items.items.len);
+}
+
+test "privacy deduplication retains coherent ownership on allocation failure" {
+    const Attempt = struct {
+        fn run(a: A) !void {
+            var set: FindingSet = .{};
+            defer set.items.deinit(a);
+            defer set.positions.deinit(a);
+            for (0..32) |i| try set.append(a, .{ .field = "body", .category = "person", .start = i, .end = i + 1 });
+            try set.append(a, .{ .field = "body", .category = "person", .start = 0, .end = 1, .confidence = 0.9 });
+        }
+    };
+    // ArrayList can grow in place depending on allocator addresses. Exercise
+    // both allocation and resize failures without assuming a fixed count.
+    for (0..48) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = fail_index });
+        Attempt.run(failing.allocator()) catch |err| if (err != error.OutOfMemory) return err;
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }
 
 test "privacy windowing accounts for schema tokens and covers original bytes" {

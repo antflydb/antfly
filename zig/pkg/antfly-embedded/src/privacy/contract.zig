@@ -20,6 +20,7 @@ const A = std.mem.Allocator;
 pub const default_model = "fastino/gliner2-privacy-filter-PII-multi";
 pub const default_revision = "1cb4166094dc58fa8d836429f060d6c95f62b495";
 pub const contract_version = 1;
+pub const max_categories = 128;
 pub const Mode = enum { monitor, redact_for_search_and_ai, redact_before_storage };
 pub const Sensitivity = enum { conservative, balanced, thorough };
 pub const Replacement = enum { category, mask, remove };
@@ -81,7 +82,7 @@ pub const Policy = struct {
             for (self.fields[0..i]) |prior| if (std.mem.eql(u8, prior, field)) return error.InvalidPrivacyFields;
         }
         if (self.category_groups.len == 0 and self.categories.len == 0) return error.InvalidPrivacyCategories;
-        if (self.category_groups.len > 4 or self.categories.len > 128) return error.InvalidPrivacyCategories;
+        if (self.category_groups.len > 4 or self.categories.len > max_categories) return error.InvalidPrivacyCategories;
         for (self.category_groups, 0..) |group, i| for (self.category_groups[0..i]) |prior| {
             if (group == prior) return error.InvalidPrivacyCategories;
         };
@@ -90,6 +91,23 @@ pub const Policy = struct {
             if (category.threshold) |value| if (!std.math.isFinite(value) or value < 0 or value > 1) return error.InvalidPrivacyThreshold;
             for (self.categories[0..i]) |prior| if (std.mem.eql(u8, prior.name, category.name)) return error.InvalidPrivacyCategories;
         }
+        // Canonical policies expand groups into explicit categories. Apply the
+        // same bound to both shapes before preview or producer admission.
+        var resolved_count = self.categories.len;
+        for (self.category_groups, 0..) |group, i| for (groupLabels(group)) |name| {
+            const overridden = for (self.categories) |category| {
+                if (std.mem.eql(u8, name, category.name)) break true;
+            } else false;
+            if (overridden) continue;
+            const prior_group = for (self.category_groups[0..i]) |prior| {
+                const included = for (groupLabels(prior)) |prior_name| {
+                    if (std.mem.eql(u8, name, prior_name)) break true;
+                } else false;
+                if (included) break true;
+            } else false;
+            if (!prior_group) resolved_count += 1;
+        };
+        if (resolved_count > max_categories) return error.InvalidPrivacyCategories;
         if (self.execution.batch_items == 0 or self.execution.batch_items > 8 or self.execution.max_attempts == 0 or
             self.execution.max_attempts > 5) return error.InvalidPrivacyExecution;
         if (self.producer) |producer| {

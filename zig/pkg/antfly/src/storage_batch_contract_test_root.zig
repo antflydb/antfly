@@ -19,6 +19,7 @@
 pub const antfly_sources = @import("source_owner_physical.zig");
 pub const local_test_sources = @import("local_test_sources.zig");
 test {
+    _ = antfly_sources.physical_db;
     _ = @import("antfly_local_sources").storage_db_result_collectors;
     _ = @import("antfly_local_sources").storage_db_enrichment_enrichment_runtime;
     _ = @import("antfly_local_sources").storage_db_artifact_chunk_vector_publication;

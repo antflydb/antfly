@@ -43312,6 +43312,7 @@ pub const PrivacyPolicy = struct {
     /// Literal source document field names, matching artifact source field semantics.
     fields: []const []const u8,
     category_groups: ?[]const []const u8 = null,
+    /// Add categories or override group categories. The union of explicit and expanded group categories must contain at most 128 distinct names.
     categories: ?[]const PrivacyCategory = null,
     sensitivity: ?[]const u8 = null,
     replacement: ?[]const u8 = null,

@@ -676,6 +676,29 @@ test "privacy executable catalog is invariant to equivalent authored ordering" {
     try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, one.value.object.get("enrichments").?, .{}), try std.json.Stringify.valueAlloc(a, two.value.object.get("enrichments").?, .{}));
 }
 
+test "privacy category limit applies before and after group expansion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const group = contract.groupLabels(.credentials);
+    const categories = try a.alloc(contract.Category, contract.max_categories - group.len + 1);
+    for (categories, 0..) |*category, i| category.* = .{ .name = try std.fmt.allocPrint(a, "custom_{d}", .{i}) };
+    var policy = contract.Policy{ .mode = .monitor, .fields = &.{"body"}, .category_groups = &.{.credentials}, .categories = categories[0 .. categories.len - 1] };
+    try policy.validate();
+    const executable = try policy.executable(a);
+    try executable.validate();
+    try std.testing.expectEqual(contract.max_categories, executable.categories.len);
+    try std.testing.expectEqual(try policy.identity(a), try executable.identity(a));
+    _ = try install(a, "{}", try next(a, null, policy, null));
+    policy.categories = categories;
+    try std.testing.expectError(error.InvalidPrivacyCategories, policy.validate());
+    try std.testing.expectError(error.InvalidPrivacyCategories, next(a, null, policy, null));
+    // Explicit threshold/description overrides do not add another category.
+    categories[categories.len - 1] = .{ .name = group[0], .threshold = 0.8 };
+    try policy.validate();
+    _ = try install(a, "{}", try next(a, null, policy, null));
+}
+
 test "privacy due index replaces nodes and preserves fairness without history growth" {
     const a = std.testing.allocator;
     var index: WorkIndex = .{};

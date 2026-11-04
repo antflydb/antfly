@@ -7039,6 +7039,7 @@ export interface components {
             /** @description Literal source document field names, matching artifact source field semantics. */
             fields: string[];
             category_groups?: ("contact_details" | "personal_identifiers" | "financial" | "credentials")[];
+            /** @description Add categories or override group categories. The union of explicit and expanded group categories must contain at most 128 distinct names. */
             categories?: components["schemas"]["PrivacyCategory"][];
             /**
              * @default balanced
