@@ -208,6 +208,11 @@ def configuration(args):
         "lake_cache": {"root": str(state / "cache"), "max_disk_bytes": 1024**3},
         "lake_indexes": {"query_cursors": {"retention_ms": 300000}},
     }
+    if args.provider == "local":
+        # Explicit storage.artifacts connections admit S3/GCS only. Standalone
+        # supplies its native filesystem artifact owner from the local data dir.
+        del config["storage"]["artifacts"]
+        del config["connections"]["artifacts"]
     return config, warehouses
 
 
@@ -263,6 +268,7 @@ class Run:
         self.pending_vacuum = {}
         self.snapshot_lists = {}
         self.continuous_seconds = 0
+        self.deletions_during_continuous = 0
         self.events = (self.state / "events.jsonl").open("a", buffering=1)
         self.config, self.warehouses = configuration(args)
         if args.provider == "local":
@@ -618,6 +624,21 @@ class Run:
             else:
                 record["manifest_count"] = len(entries)
                 record["manifest_bytes"] = sum(e.manifest_length for e in entries)
+                for kind, content in (("data", 0), ("delete", 1)):
+                    group = [entry for entry in entries if entry.content == content]
+                    record[kind + "_manifests"] = len(group)
+                    counts = [
+                        (entry.added_files_count, entry.existing_files_count)
+                        for entry in group
+                    ]
+                    record["reported_live_" + kind + "_files"] = (
+                        sum(added + existing for added, existing in counts)
+                        if all(
+                            added is not None and existing is not None
+                            for added, existing in counts
+                        )
+                        else None
+                    )
         with self.lock:
             self.metadata.append(record)
         self.event("catalog", **record)
@@ -628,6 +649,7 @@ class Run:
         published = result.get("published_revision")
         if published is not None:
             self.generations.add(published)
+        self.event("index_status", status=result)
         return result
 
     def query(self, visibility):
@@ -663,7 +685,7 @@ class Run:
                         )
         if self.anchor_id not in {int(hit["_source"]["hn_id"]) for hit in hits}:
             raise AssertionError("query lost the stable seed anchor")
-        if hits and not any(h.get("highlight") for h in hits):
+        if hits and not all(h.get("_highlights", {}).get("body") for h in hits):
             raise AssertionError("query omitted requested highlights")
         return {
             "row_versions": {
@@ -674,6 +696,21 @@ class Run:
             "elapsed_ms": (now - started) * 1000,
             "hits": len(hits),
         }
+
+    def record_vacuum(self, name, request, result):
+        # Managed vacuum reports work done by this turn, not a job-wide total.
+        # Lost responses can censor deletions; independent object checks remain
+        # the proof of physical removal rather than treating this as billing.
+        with self.lock:
+            previous = self.vacuum_jobs.get((name, request["operation_id"]), {})
+            self.vacuum_jobs[(name, request["operation_id"])] = {
+                "table": name,
+                "operation_id": request["operation_id"],
+                "result": result,
+                "acknowledged_turns": previous.get("acknowledged_turns", 0) + 1,
+                "deleted_objects_observed": previous.get("deleted_objects_observed", 0)
+                + result.get("deleted_objects", 0),
+            }
 
     def worker(self, function):
         try:
@@ -771,12 +808,7 @@ class Run:
                             self.event("vacuum_retry", table=name, failure=error.record)
                             continue
                         raise
-                    with self.lock:
-                        self.vacuum_jobs[(name, request["operation_id"])] = {
-                            "table": name,
-                            "operation_id": request["operation_id"],
-                            "result": result,
-                        }
+                    self.record_vacuum(name, request, result)
                     self.event("vacuum", table=name, request=request, result=result)
                     if result.get("complete"):
                         del pending[name]
@@ -807,6 +839,9 @@ class Run:
         for thread in self.threads:
             thread.join()
         self.continuous_seconds = time.monotonic() - started
+        self.deletions_during_continuous = sum(
+            job["deleted_objects_observed"] for job in self.vacuum_jobs.values()
+        )
 
     def run(self):
         report = {
@@ -943,11 +978,7 @@ class Run:
                     result = self.call(
                         "POST", f"/tables/{name}/lake/maintenance", request
                     )
-                    self.vacuum_jobs[(name, request["operation_id"])] = {
-                        "table": name,
-                        "operation_id": request["operation_id"],
-                        "result": result,
-                    }
+                    self.record_vacuum(name, request, result)
                     self.event(
                         "resumed_vacuum", table=name, request=request, result=result
                     )
@@ -1013,6 +1044,7 @@ class Run:
                 observed_published_revisions=len(self.generations),
                 observer_requests=self.observer_requests,
                 continuous_seconds=self.continuous_seconds,
+                deletions_during_continuous=self.deletions_during_continuous,
             )
             report["query_distributions_ms"] = {
                 visibility: distribution(
@@ -1033,8 +1065,7 @@ class Run:
             }
             report["vacuum_jobs"] = list(self.vacuum_jobs.values())
             report["deleted_objects_observed"] = sum(
-                job["result"].get("deleted_objects", 0)
-                for job in self.vacuum_jobs.values()
+                job["deleted_objects_observed"] for job in self.vacuum_jobs.values()
             )
             report["query_failures"] = sum(
                 "failure" in sample for sample in self.samples
@@ -1080,6 +1111,10 @@ class Run:
                 )
                 < self.args.burst_transactions
                 if self.args.burst_transactions >= 2
+                else None,
+                "vacuum_progress_during_continuous": self.deletions_during_continuous
+                > 0
+                if self.args.duration_seconds >= 660
                 else None,
                 "vacuum_deleted_objects": report["deleted_objects_observed"] > 0
                 if self.args.duration_seconds >= 660

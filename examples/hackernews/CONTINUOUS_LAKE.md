@@ -70,8 +70,8 @@ pending write/maintenance intent, fixture and executable hashes, source revision
 query successes and failures, catalog observations, and `report.json`. Do not
 commit raw logs, bearer tokens, or environment dumps. `complete` describes the
 functional run; `qualified` additionally requires the full profile, successful
-queries, observed manifest merging and commit grouping, retention aging and
-independently observed deletion. Failed attempts retain evidence and do not count
+queries, observed manifest merging and commit grouping, retention aging,
+deletions reported during the continuous phase and independently observed deletion. Failed attempts retain evidence and do not count
 as successful qualification.
 
 Catalog and publication lag are measured from the acceptance ACK to first sampled
@@ -87,7 +87,8 @@ publication, foreground traffic and maintenance, ending before restart. They
 exclude direct observer reads and separately owned runtimes. They are logical
 operations, not exact provider requests, billable operations, or isolated
 publication amplification. Observer calls are counted separately. Restart metrics
-are retained separately.
+are retained separately. Managed vacuum deletion counts sum acknowledged turns;
+a lost response may censor work, so these are not an exact durable job total.
 
 The fixture intentionally normalizes nulls, limits body size, and puts a common
 search term in every row. It tests correctness under dense matches and small

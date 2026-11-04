@@ -208,3 +208,50 @@ def test_fixture_nulls_are_normalized_without_modifying_input(tmp_path):
     assert rows[1]["title"] == ""
     assert len(rows[1]["body"]) == len("database ") + 1024
     assert all(set(row) == set(lake.KINDS) for row in rows)
+
+
+def test_vacuum_deletion_counts_accumulate_acknowledged_turns(run):
+    request = {"operation_id": "stable-job"}
+    run.record_vacuum(
+        lake.TABLES[0], request, {"deleted_objects": 16, "complete": False}
+    )
+    run.record_vacuum(
+        lake.TABLES[0], request, {"deleted_objects": 3, "complete": False}
+    )
+    run.record_vacuum(lake.TABLES[0], request, {"deleted_objects": 0, "complete": True})
+    job = run.vacuum_jobs[(lake.TABLES[0], "stable-job")]
+    assert job["deleted_objects_observed"] == 19
+    assert job["acknowledged_turns"] == 3
+    assert job["result"]["complete"]
+
+
+def test_local_configuration_uses_standalone_artifact_owner(tmp_path):
+    config, _ = lake.configuration(SimpleNamespace(state=tmp_path, provider="local"))
+    assert "artifacts" not in config["storage"]
+    assert "artifacts" not in config["connections"]
+    assert config["connections"]["source"]["capabilities"] == [
+        "lake.read",
+        "lake.write",
+    ]
+
+
+def test_query_requires_per_hit_public_highlights_and_unique_keys(run, monkeypatch):
+    row = {
+        name: (7 if kind == "integer" else "database")
+        for name, kind in lake.KINDS.items()
+    }
+    run.anchor_id = row["hn_id"]
+    run.known[(row["hn_id"], row["qual_version"])] = row
+    hit = {"_source": row, "_highlights": {"body": ["<mark>database</mark>"]}}
+    hits = [hit]
+    monkeypatch.setattr(
+        run, "call", lambda *_: {"responses": [{"hits": {"hits": hits}}]}
+    )
+    assert run.query("published")["hits"] == 1
+    hit.pop("_highlights")
+    hit["highlight"] = {"body": ["wrong response contract"]}
+    with pytest.raises(AssertionError, match="omitted requested highlights"):
+        run.query("published")
+    hits.append(hit)
+    with pytest.raises(AssertionError, match="duplicate HN keys"):
+        run.query("published")
