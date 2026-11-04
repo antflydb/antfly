@@ -17,6 +17,7 @@ import queue
 from contextlib import nullcontext
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -176,6 +177,101 @@ class ContentionReportTests(unittest.TestCase):
         self.assertEqual(result["last_write"], {"key": "worker-4-0", "sequence": 0})
         self.assertEqual(result["proofs"]["allocator_proof_ns"], 500)
         self.assertIn("worker-4-0", database.payload["inserts"])
+
+    def test_threaded_worker_writes_distinct_keys_and_reports_each_thread(self):
+        class Database:
+            def __init__(self):
+                self.keys = set()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            def batch_json(self, payload):
+                self.keys.update(payload["inserts"])
+                time.sleep(0.001)
+
+        database = Database()
+        opened = []
+
+        def open_handle(*_a, **_k):
+            opened.append(1)
+            return database
+
+        api = SimpleNamespace(open=open_handle, BusyError=RuntimeError)
+        zero = dict.fromkeys(bench.PROOF_FIELDS, 0)
+        zero.update(
+            mutation_admission_count=0,
+            mutation_admission_ns=0,
+            mutation_admission_max_ns=0,
+            mutation_admission_log2_ns=[0] * 64,
+        )
+        ready, results = queue.Queue(), queue.Queue()
+        config = {
+            "library": "fake",
+            "database": "fresh",
+            "no_sync": True,
+            "timeout_ms": 5,
+            "watchdog": 1,
+            "seconds": 0.05,
+            "workload": "churn",
+            "threads_per_worker": 3,
+        }
+        with (
+            patch.object(bench, "sdk", return_value=api),
+            patch.object(bench, "measurement_stats", return_value=zero),
+        ):
+            bench.native_worker(
+                config, 2, ready, SimpleNamespace(wait=lambda _: True), results
+            )
+        result = results.get_nowait()
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(len(result["thread_max_progress_gap_seconds"]), 3)
+        # One handle for diagnostics plus one per writer thread.
+        self.assertEqual(len(opened), 4)
+        self.assertEqual(sum(result["thread_successful_calls"]), len(result["success_latency_ns"]))
+        prefixes = {key.rsplit("-", 1)[0] for key in database.keys}
+        self.assertEqual(prefixes, {"worker-2-t0", "worker-2-t1", "worker-2-t2"})
+        written = {write["key"] for write in result["latest_churn_writes"]}
+        self.assertEqual(written, database.keys)
+
+    def test_thread_starvation_fails_the_run_even_when_the_process_progresses(self):
+        def worker(thread_calls, thread_windows):
+            return {
+                "started": 0,
+                "ended": 120,
+                "proof_observed_from": 0,
+                "proof_observed_until": 120,
+                "success_latency_ns": [10] * sum(thread_calls),
+                "success_windows": [sum(w) for w in zip(*thread_windows)],
+                "thread_successful_calls": thread_calls,
+                "thread_success_windows": thread_windows,
+                "thread_max_progress_gap_seconds": [1, 120],
+                "admission": admission(),
+                "busy_latency_ns": [],
+                "proofs": dict.fromkeys(bench.PROOF_FIELDS, 0),
+                "cpu_seconds": 0,
+                "voluntary_context_switches": 0,
+                "involuntary_context_switches": 0,
+            }
+
+        starved = bench.aggregate([worker([50, 0], [[25, 25], [0, 0]])])
+        self.assertEqual(starved["status"], "starved_workers")
+        stalled = bench.aggregate([worker([50, 1], [[25, 25], [1, 0]])])
+        self.assertEqual(stalled["status"], "stalled_workers")
+        healthy = bench.aggregate([worker([50, 50], [[25, 25], [25, 25]])])
+        self.assertEqual(healthy["status"], "ok")
+
+    def test_threaded_runs_require_observed_handoffs(self):
+        lease = {"foreground_lease": {"handoffs": 0}}
+        self.assertEqual(bench.handoff_problem({"lease": lease}, 4), "no_handoffs")
+        self.assertIsNone(bench.handoff_problem({"lease": lease}, 1))
+        self.assertIsNone(
+            bench.handoff_problem({"lease": {"foreground_lease": {"handoffs": 3}}}, 4)
+        )
+        self.assertIsNone(bench.handoff_problem({"lease": None}, 4))
 
     def test_worker_close_failure_emits_one_error_and_no_success(self):
         class Database:
@@ -341,6 +437,83 @@ class ContentionReportTests(unittest.TestCase):
         self.assertIn("missing library", notice["diagnostic"])
         self.assertEqual(results.get_nowait(), notice)
 
+    def test_status_reader_startup_failure_is_reported_not_silent(self):
+        results = queue.Queue()
+        stop = SimpleNamespace(wait=lambda _interval: True)
+        with patch.object(bench, "sdk", side_effect=OSError("library missing")):
+            with self.assertRaises(OSError):
+                bench.status_reader(
+                    {"library": "x", "status_interval": 1, "database": "d", "timeout_ms": 5000},
+                    stop,
+                    results,
+                )
+        result = results.get_nowait()
+        self.assertEqual(result["reads"], 0)
+        self.assertIn("library missing", result["startup_error"])
+        self.assertEqual(
+            bench.status_reader_problem(result, 1), "status_reader_failed"
+        )
+
+    def test_status_reader_problem_requires_successful_reads_and_clean_exit(self):
+        clean = {"reads": 3, "errors": 0, "startup_error": None}
+        self.assertIsNone(bench.status_reader_problem(clean, 0))
+        self.assertEqual(bench.status_reader_problem(None, 0), "status_reader_failed")
+        self.assertEqual(bench.status_reader_problem(clean, -9), "status_reader_failed")
+        self.assertEqual(
+            bench.status_reader_problem({**clean, "reads": 0}, 0), "status_reader_failed"
+        )
+        self.assertEqual(
+            bench.status_reader_problem({**clean, "errors": 2}, 0), "status_reader_errors"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LeaseAndFairnessTests(unittest.TestCase):
+    def lease_snapshot(self, acquisitions, waits, holds, busy=0):
+        group = dict.fromkeys(bench.LEASE_COUNTERS, 0)
+        wait_h, hold_h = [0] * 64, [0] * 64
+        for value in waits:
+            wait_h[max(0, value.bit_length() - 1)] += 1
+        for value in holds:
+            hold_h[max(0, value.bit_length() - 1)] += 1
+        group.update(
+            acquisitions=acquisitions,
+            queued=acquisitions,
+            busy=busy,
+            wait_ns=sum(waits),
+            holds=len(holds),
+            hold_ns=sum(holds),
+            wait_log2_ns=wait_h,
+            hold_log2_ns=hold_h,
+            wait_max_ns=max(waits, default=0),
+            hold_max_ns=max(holds, default=0),
+        )
+        empty = dict.fromkeys(bench.LEASE_COUNTERS, 0)
+        empty.update(wait_log2_ns=[0] * 64, hold_log2_ns=[0] * 64, wait_max_ns=0, hold_max_ns=0)
+        return {"foreground_lease": group, "maintenance_lease": empty, "gate_wait_ns": 7}
+
+    def test_lease_delta_is_none_for_a_library_without_lease_timing(self):
+        self.assertIsNone(bench.lease_delta({}, {"maintenance_rounds": 1}))
+
+    def test_lease_summary_reports_per_worker_tails_and_busy(self):
+        zero = self.lease_snapshot(0, [], [])
+        workers = [
+            {"lease": bench.lease_delta(zero, self.lease_snapshot(2, [1000, 3000], [500, 700]))},
+            {"lease": bench.lease_delta(zero, self.lease_snapshot(1, [1 << 30], [900], busy=3))},
+        ]
+        summary = bench.lease_summary(workers)
+        fg = summary["foreground_lease"]
+        self.assertEqual(fg["acquisitions"], 3)
+        self.assertEqual(fg["per_worker_busy"], [0, 3])
+        self.assertEqual(fg["per_worker_wait_p99_upper_ns"], [(1 << 12) - 1, (1 << 31) - 1])
+        self.assertEqual(fg["wait_p99_upper_ns"], (1 << 31) - 1)
+        self.assertEqual(summary["gate_wait_ns"], 0)
+
+    def test_fairness_flags_a_starved_worker(self):
+        self.assertEqual(bench.fairness([10, 10, 10])["jain_index"], 1.0)
+        starved = bench.fairness([30, 0, 0])
+        self.assertAlmostEqual(starved["jain_index"], 1 / 3)
+        self.assertEqual(starved["min_max_ratio"], 0)
