@@ -2124,6 +2124,19 @@ pub const Owner = struct {
         return false;
     }
 
+    /// File-wide uncertainty outlives a detached runtime. Preserve its fence
+    /// on the serving wrapper before retiring cached immutable readers.
+    fn preserveMaintenanceOutcomeFence(self: *Owner) void {
+        const current = self.current orelse return;
+        for ([_]?*h.Handle{ self.maintenance_snapshot, if (self.pending_text_merge) |pending| pending.root else null }) |maybe_root| {
+            const root = maybe_root orelse continue;
+            current.sql_decision_uncertain = current.sql_decision_uncertain or root.sql_decision_uncertain;
+            current.secret_store_uncertain = current.secret_store_uncertain or root.secret_store_uncertain;
+            const file = &current.owned_lite_backend.?.native_docstore.?.file;
+            file.checkpoint_publication_uncertain = file.checkpoint_publication_uncertain or root.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain;
+        }
+    }
+
     fn noteMaintenanceFailure(self: *Owner, err: anyerror, table_id: u64, phase: MaintenanceFailurePhase) void {
         self.publication_stats.maintenance_errors +|= 1;
         switch (phase) {
@@ -2160,8 +2173,8 @@ pub const Owner = struct {
         self.text_source_runtime_cache = null;
     }
 
-    /// The owner gate and background turn make the cache quiescent. A merge
-    /// owns its own reference, so retiring this cache cannot close its inputs.
+    /// Caller owns the gate and a quiescent local turn. A merge owns its own
+    /// reference, so retiring this cache cannot close its inputs.
     fn discardTextSourceRuntime(self: *Owner) void {
         const cache = self.text_source_runtime_cache orelse return;
         const root = cache.root;
@@ -2637,6 +2650,16 @@ pub const Owner = struct {
         const turn_io = h.handleLockIo();
         self.gate.mutex.lockUncancelable(turn_io);
         self.maintenance_turn_deferred = false;
+        if (self.hasUncertainOutcome()) {
+            // Closing private readers needs no peer's background turn. Keep
+            // the refusal on the serving wrapper after its source is retired,
+            // including when refresh() would throw before returning a wrapper.
+            self.preserveMaintenanceOutcomeFence();
+            if (self.maintenance_turn_references == 0) self.discardTextSourceRuntime();
+            self.maintenance_turn_deferred = true;
+            self.gate.mutex.unlock(turn_io);
+            return error.OutcomeReconciliationRequired;
+        }
         const retained = self.retainMaintenanceTurnAssumeLocked() catch |err| {
             self.maintenance_turn_deferred = true;
             self.gate.mutex.unlock(turn_io);
@@ -8205,6 +8228,51 @@ test "capi native maintenance keeps settled text inputs warm across artifact tur
     }
     _ = try owner.maintenanceTurnForTest();
     try std.testing.expect(owner.text_source_runtime_cache == null);
+}
+
+test "capi native maintenance retires uncertain cached readers without clearing the owner fence" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    inline for (.{ "sql", "checkpoint", "secret" }) |kind| {
+        var fixture = try AdmissionFollowupFixture.init("uncertain-cache-" ++ kind, 5000, .batch);
+        defer fixture.deinit();
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
+        const owner = fixture.connection.owner;
+        const key: Owner.MaintenanceKey = .{ .table_id = owner.current.?.db.core.identity_namespace.table_id, .incarnation = owner.current.?.db.root_incarnation };
+        for (0..64) |_| {
+            _ = try owner.maintenanceTurnForTest();
+            if (owner.maintenance_schedules.getPtr(key)) |schedule| {
+                if (!schedule.database_pending and schedule.next_database_audit_ns != 0 and !owner.maintenance_storage_pending) break;
+            }
+        }
+        const source = (owner.text_source_runtime_cache orelse return error.TestUnexpectedResult).root;
+        try std.testing.expect(!Owner.needsOutcomeReconciliation(owner.current.?));
+        const peer_turn = (try owner.acquireMaintenanceTurnGuard()) orelse return error.TestUnexpectedResult;
+        defer peer_turn.close(h.handleLockIo());
+        if (comptime std.mem.eql(u8, kind, "sql")) source.sql_decision_uncertain = true else if (comptime std.mem.eql(u8, kind, "checkpoint")) source.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain = true else source.secret_store_uncertain = true;
+        defer {
+            // These flags model uncertainty without changing the fixture's
+            // durable state. Clear the propagated fence only for teardown.
+            owner.current.?.sql_decision_uncertain = false;
+            owner.current.?.secret_store_uncertain = false;
+            owner.current.?.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain = false;
+        }
+        owner.maintenance_storage_pending = true;
+        try std.testing.expectError(error.OutcomeReconciliationRequired, owner.maintenanceTurnForTest());
+        try std.testing.expect(owner.text_source_runtime_cache == null);
+        try std.testing.expect(Owner.needsOutcomeReconciliation(owner.current.?));
+        try std.testing.expectEqual(@as(usize, 0), owner.maintenance_turn_references);
+        owner.maintenance_storage_pending = true;
+        try std.testing.expect(owner.maintenanceWaitMillisForTest(true) > 0);
+        const refused = blk: {
+            owner.gate.mutex.lockUncancelable(h.handleLockIo());
+            defer owner.gate.mutex.unlock(h.handleLockIo());
+            var lease = try native.lockWriterPathWithIo(alloc, h.handleLockIo(), fixture.path);
+            defer lease.close();
+            break :blk owner.refresh();
+        };
+        try std.testing.expectError(error.OutcomeReconciliationRequired, refused);
+    }
 }
 
 test "capi native maintenance namespaces source capture does not borrow an artifact runtime" {

@@ -162,7 +162,9 @@ one named namespace, including after catching the current source target and
 through compatible artifact/control turns. Every admitted background turn checks
 its witnesses before idle readiness can skip the namespace. Changed inputs retire
 the cache and promptly schedule released artifact leases for storage cleanup;
-uncertain outcomes discard it. Thus an idle cache retains no primary epoch and
+uncertain outcomes discard it after preserving the file-wide refusal on the
+serving wrapper. The fenced worker backs off even if cleanup remains pending.
+Thus an idle cache retains no primary epoch and
 cannot indefinitely hold a peer's superseded index generation. Other
 index/provider runtimes reopen until they define an equivalent rebinding
 contract. Selecting a named namespace uses the detached runtime directly,
