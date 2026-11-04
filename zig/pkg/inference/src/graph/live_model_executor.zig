@@ -76,6 +76,7 @@ const RuntimeContext = struct {
         ));
 
         const ctx = try allocator.create(RuntimeContext);
+        errdefer allocator.destroy(ctx);
         ctx.* = .{
             .allocator = allocator,
             .cb = cb,
@@ -92,10 +93,17 @@ const RuntimeContext = struct {
             shared_moe_cache,
         );
         ctx.decode_runtime.configureForGptConfig(gpt_config);
+        errdefer ctx.decode_runtime.deinit();
+        try ctx.decode_runtime.state.ensureQwen35LinearCache(gpt_config);
         return ctx;
     }
 
     fn resetState(self: *RuntimeContext) !void {
+        // Recurrent storage belongs to this immutable model/runtime, not one
+        // prefill call. Reset its contents while retaining the same warmed
+        // host/device backing; KV and other request state keep their teardown.
+        const recurrent = self.decode_runtime.state.qwen35_linear_cache;
+        self.decode_runtime.state.qwen35_linear_cache = null;
         self.decode_runtime.deinit();
         self.decode_runtime = decode_state_runtime.DecodeStateRuntime.initPaged(
             self.allocator,
@@ -104,6 +112,8 @@ const RuntimeContext = struct {
             self.shared_moe_cache,
         );
         self.decode_runtime.configureForGptConfig(self.definition.configuration.value);
+        self.decode_runtime.state.qwen35_linear_cache = recurrent;
+        self.decode_runtime.state.resetQwen35LinearCache();
     }
 
     pub fn deinit(self: *RuntimeContext) void {
@@ -347,4 +357,105 @@ test "live model executor supports native and metal backends" {
     try std.testing.expect(supportsBackend(.native));
     try std.testing.expect(supportsBackend(.metal));
     try std.testing.expect(!supportsBackend(.pjrt));
+}
+
+test "native whole model recurrent state preserves chunked prefill decode and warm reset backing" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data =
+        \\{"model_type":"qwen3_5","tie_word_embeddings":true,"text_config":{"model_type":"qwen3_5_text","hidden_size":4,"intermediate_size":8,"vocab_size":16,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":4,"max_position_embeddings":32,"tie_word_embeddings":true,"rms_norm_eps":0.000001,"full_attention_interval":4,"linear_conv_kernel_dim":4,"linear_key_head_dim":2,"linear_value_head_dim":2,"linear_num_key_heads":1,"linear_num_value_heads":1}}
+    });
+    const Spec = struct { name: []const u8, shape: []const i64, constant: ?f32 = null };
+    const specs = [_]Spec{
+        .{ .name = "model.embed_tokens.weight", .shape = &.{ 16, 4 } },
+        .{ .name = "model.norm.weight", .shape = &.{4}, .constant = 0.125 },
+        .{ .name = "model.layers.0.input_layernorm.weight", .shape = &.{4}, .constant = 0.125 },
+        .{ .name = "model.layers.0.post_attention_layernorm.weight", .shape = &.{4}, .constant = 0.125 },
+        .{ .name = "model.layers.0.mlp.gate_proj.weight", .shape = &.{ 8, 4 } },
+        .{ .name = "model.layers.0.mlp.up_proj.weight", .shape = &.{ 8, 4 } },
+        .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = &.{ 4, 8 } },
+        .{ .name = "model.layers.0.linear_attn.in_proj_qkv.weight", .shape = &.{ 6, 4 } },
+        .{ .name = "model.layers.0.linear_attn.in_proj_z.weight", .shape = &.{ 2, 4 } },
+        .{ .name = "model.layers.0.linear_attn.in_proj_a.weight", .shape = &.{ 1, 4 } },
+        .{ .name = "model.layers.0.linear_attn.in_proj_b.weight", .shape = &.{ 1, 4 } },
+        .{ .name = "model.layers.0.linear_attn.out_proj.weight", .shape = &.{ 4, 2 } },
+        .{ .name = "model.layers.0.linear_attn.conv1d.weight", .shape = &.{ 6, 1, 4 }, .constant = 0.25 },
+        .{ .name = "model.layers.0.linear_attn.A_log", .shape = &.{1}, .constant = -1 },
+        .{ .name = "model.layers.0.linear_attn.dt_bias", .shape = &.{1}, .constant = 0.1 },
+        .{ .name = "model.layers.0.linear_attn.norm.weight", .shape = &.{2}, .constant = 1 },
+    };
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var header = std.ArrayListUnmanaged(u8).empty;
+    var payload = std.ArrayListUnmanaged(u8).empty;
+    try header.append(arena, '{');
+    for (specs, 0..) |spec, index| {
+        var count: usize = 1;
+        for (spec.shape) |dim| count *= @intCast(dim);
+        const offset = payload.items.len;
+        for (0..count) |i| {
+            const value = spec.constant orelse @as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + spec.name.len) % 23)) - 11)) / 32;
+            var bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &bytes, @bitCast(value), .little);
+            try payload.appendSlice(arena, &bytes);
+        }
+        const shape = try std.json.Stringify.valueAlloc(arena, spec.shape, .{});
+        const entry = try std.fmt.allocPrint(arena, "{s}\"{s}\":{{\"dtype\":\"F32\",\"shape\":{s},\"data_offsets\":[{d},{d}]}}", .{ if (index == 0) "" else ",", spec.name, shape, offset, payload.items.len });
+        try header.appendSlice(arena, entry);
+    }
+    try header.append(arena, '}');
+    while (header.items.len % 8 != 0) try header.append(arena, ' ');
+    const checkpoint = try arena.alloc(u8, 8 + header.items.len + payload.items.len);
+    std.mem.writeInt(u64, checkpoint[0..8], header.items.len, .little);
+    @memcpy(checkpoint[8..][0..header.items.len], header.items);
+    @memcpy(checkpoint[8 + header.items.len ..], payload.items);
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = checkpoint });
+    const path = try directory.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    const session = try session_factory.createNativeSession(a, path);
+    defer session.close();
+    const cfg = session_factory.getGptConfig(session) orelse return error.MissingDecoderConfig;
+    var executor = try createModelExecutor(a, session, cfg, .f32, null);
+    defer executor.deinit();
+    var decoder = try executor.createRuntime(a);
+    defer decoder.deinit();
+    const ids = [_]i64{ 1, 2, 3, 4 };
+    var full = try decoder.prefill(a, .{ .input_ids = &ids, .seq_len = 4, .query_seq_len = 4, .attention_mode = .paged_prefill });
+    defer full.deinit(a);
+    const expected = try a.dupe(f32, try full.hostLogits(a));
+    defer a.free(expected);
+    var full_next = try decoder.decode(a, .{ .token_id = 5, .position = 4 });
+    defer full_next.deinit(a);
+    const expected_next = try a.dupe(f32, try full_next.hostLogits(a));
+    defer a.free(expected_next);
+    try decoder.reset();
+    var first = try decoder.prefill(a, .{ .input_ids = ids[0..2], .seq_len = 2, .query_seq_len = 2, .attention_mode = .paged_prefill });
+    defer first.deinit(a);
+    var second = try decoder.prefill(a, .{ .input_ids = ids[2..], .seq_len = 4, .query_seq_len = 2, .attention_mode = .paged_prefill });
+    defer second.deinit(a);
+    for (expected, try second.hostLogits(a)) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00001);
+    var next = try decoder.decode(a, .{ .token_id = 5, .position = 4 });
+    defer next.deinit(a);
+    for (expected_next, try next.hostLogits(a)) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00001);
+    const context: *RuntimeContext = @ptrCast(@alignCast(decoder.ptr));
+    const cache = context.decode_runtime.state.qwen35_linear_cache orelse return error.MissingRetainedRecurrentState;
+    const conv = cache.layers[0].conv.ptr;
+    const recurrent = cache.layers[0].recurrent.ptr;
+    try decoder.reset();
+    const reset_cache = context.decode_runtime.state.qwen35_linear_cache.?;
+    try std.testing.expectEqual(cache.layers.ptr, reset_cache.layers.ptr);
+    try std.testing.expectEqual(conv, reset_cache.layers[0].conv.ptr);
+    try std.testing.expectEqual(recurrent, reset_cache.layers[0].recurrent.ptr);
+    for (reset_cache.layers[0].conv) |value| try std.testing.expectEqual(@as(f32, 0), value);
+    for (reset_cache.layers[0].recurrent) |value| try std.testing.expectEqual(@as(f32, 0), value);
+    const Construction = struct {
+        fn run(allocator: std.mem.Allocator, source: *const model_runtime.ModelExecutor) !void {
+            var instance = try source.createRuntime(allocator);
+            defer instance.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Construction.run, .{&executor});
 }
