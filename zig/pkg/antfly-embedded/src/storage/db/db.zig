@@ -34057,7 +34057,7 @@ pub const DB = struct {
         // human-facing catalog snapshot once at an explicit idle boundary,
         // then let the normal LSM idle drain include this small control write.
         _ = try finalizeCoveredDenseProjectionCheckpointsIfIdle(self.async_context);
-        try self.saveAllLiveIndexStatusSnapshots(self.alloc);
+        try self.saveAllLiveIndexStatusSnapshotsWithMode(self.alloc, options.source_work_only);
         if (options.source_work_only) {
             _ = try self.runSourcePinCleanupStep();
         } else _ = try self.runLsmMaintenanceUntilIdle();
@@ -37493,6 +37493,16 @@ pub const DB = struct {
         index_manager: *index_manager_mod.IndexManager,
         updates: []const apply_state.AppliedSequenceUpdate,
     ) !void {
+        return saveIndexStatusSnapshotsWithMode(alloc, store, index_manager, updates, false);
+    }
+
+    fn saveIndexStatusSnapshotsWithMode(
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        index_manager: *index_manager_mod.IndexManager,
+        updates: []const apply_state.AppliedSequenceUpdate,
+        changed_only: bool,
+    ) !void {
         if (updates.len == 0) return;
 
         const PendingStatusWrite = struct {
@@ -37505,9 +37515,27 @@ pub const DB = struct {
             pending.deinit(alloc);
         }
 
+        // Probe all advisory rows from one cut before opening a writer. In
+        // particular, a timestamp-only refresh must not manufacture a primary
+        // generation and invalidate detached replay's source observations.
+        var previous = if (changed_only) try store.beginReadTxn() else null;
+        defer if (previous) |*read| read.abort();
         for (updates) |update| {
             const status_snapshot = collectLiveIndexStatusSnapshot(index_manager, update.index_name) orelse continue;
             const key = try indexStatusKeyAlloc(alloc, update.index_name);
+            if (previous) |*read| {
+                const raw = read.get(key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => {
+                        alloc.free(key);
+                        return err;
+                    },
+                };
+                if (raw) |bytes| if (status_projection.indexStatusContentsEqual(bytes, status_snapshot)) {
+                    alloc.free(key);
+                    continue;
+                };
+            }
             var encoded: [index_status_encoded_len]u8 = undefined;
             encodeIndexStatusSnapshot(status_snapshot, &encoded);
             errdefer alloc.free(key);
@@ -37517,6 +37545,8 @@ pub const DB = struct {
             });
         }
 
+        if (previous) |*read| read.abort();
+        previous = null;
         if (pending.items.len == 0) return;
         var status_batch = try store.beginWriteBatch();
         errdefer status_batch.abort();
@@ -37525,6 +37555,10 @@ pub const DB = struct {
     }
 
     fn saveAllLiveIndexStatusSnapshots(self: *DB, alloc: Allocator) !void {
+        return self.saveAllLiveIndexStatusSnapshotsWithMode(alloc, false);
+    }
+
+    fn saveAllLiveIndexStatusSnapshotsWithMode(self: *DB, alloc: Allocator, changed_only: bool) !void {
         const configs = try self.core.listIndexes(alloc);
         defer types.freeIndexConfigs(alloc, configs);
         if (configs.len == 0) return;
@@ -37537,7 +37571,7 @@ pub const DB = struct {
                 .sequence = try self.core.loadAppliedSequence(alloc, cfg.name),
             });
         }
-        try saveIndexStatusSnapshots(alloc, self.core.store, self.core.index_manager, updates.items);
+        try saveIndexStatusSnapshotsWithMode(alloc, self.core.store, self.core.index_manager, updates.items, changed_only);
     }
 
     fn loadIndexStatusSnapshot(self: *DB, alloc: Allocator, index_name: []const u8) !?IndexStatusSnapshot {
@@ -64924,6 +64958,9 @@ test "db implicit batch timestamps use the borrowed runtime clock" {
     const status = (try db.loadIndexStatusSnapshot(alloc, "clock_graph")).?;
     try std.testing.expectEqual(@as(u64, 123 * std.time.ns_per_ms), status.updated_at_ns);
     vopr_io.monotonic_ns = 456 * std.time.ns_per_ms;
+    try db.saveAllLiveIndexStatusSnapshotsWithMode(alloc, true);
+    const unchanged = (try db.loadIndexStatusSnapshot(alloc, "clock_graph")).?;
+    try std.testing.expectEqual(status.updated_at_ns, unchanged.updated_at_ns);
     try db.saveAllLiveIndexStatusSnapshots(alloc);
     const later = (try db.loadIndexStatusSnapshot(alloc, "clock_graph")).?;
     try std.testing.expectEqual(@as(u64, 456 * std.time.ns_per_ms), later.updated_at_ns);

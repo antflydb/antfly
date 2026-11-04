@@ -32,6 +32,38 @@ def sample(seconds, applied, target):
     }
 
 
+class CounterDeltaTests(unittest.TestCase):
+    def test_attributes_nested_writer_holds_without_subtracting_maxima(self):
+        before = {
+            "maintenance_hold_sites": {
+                "writer_index": {"count": 2, "ns": 10, "max_ns": 8}
+            },
+            "foreground_lease": {"hold_ns": 20, "hold_log2_ns": [1, 2]},
+        }
+        after = {
+            "maintenance_hold_sites": {
+                "writer_index": {"count": 5, "ns": 40, "max_ns": 15}
+            },
+            "foreground_lease": {"hold_ns": 50, "hold_log2_ns": [2, 4]},
+        }
+        self.assertEqual(
+            bench.delta(before, after),
+            {
+                "maintenance_hold_sites": {"writer_index": {"count": 3, "ns": 30}},
+                "foreground_lease": {"hold_ns": 30, "hold_log2_ns": [1, 2]},
+            },
+        )
+
+    def test_missing_reset_and_gauge_evidence_is_not_a_zero_counter(self):
+        self.assertEqual(
+            bench.delta(
+                {"gate_wait_ns": 30, "replay_budget": {"records": 8}},
+                {"gate_wait_ns": 10, "replay_budget": {"records": 64}, "new": 2},
+            ),
+            {"gate_wait_ns": None},
+        )
+
+
 class ActiveVisibilityTests(unittest.TestCase):
     def test_follows_an_earlier_prefix_while_targets_keep_moving(self):
         report = bench.active_progress(

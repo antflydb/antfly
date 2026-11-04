@@ -252,6 +252,16 @@ pub fn decodeIndexStatusSnapshot(raw: []const u8) !IndexStatusSnapshot {
     };
 }
 
+/// Advisory refresh timestamps describe the last persisted observation. An
+/// unchanged observation need not write another durable primary generation.
+/// Decode first so legacy encodings compare semantically and malformed rows
+/// are replaced rather than mistaken for an unchanged snapshot.
+pub fn indexStatusContentsEqual(raw: []const u8, current: IndexStatusSnapshot) bool {
+    var previous = decodeIndexStatusSnapshot(raw) catch return false;
+    previous.updated_at_ns = current.updated_at_ns;
+    return std.meta.eql(previous, current);
+}
+
 pub fn applyIndexStatusSnapshot(item: *types.DBIndexStats, status_snapshot: IndexStatusSnapshot) void {
     if (status_snapshot.kind != item.kind) return;
     item.doc_count = status_snapshot.doc_count;
@@ -503,4 +513,18 @@ pub fn durableGenerationBuildActive(item: *const types.DBIndexStats) bool {
         std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.projection_generation_invalid));
     return generation_build and
         !std.mem.eql(u8, item.index_repair_phase, @tagName(index_repair_state.Phase.terminal));
+}
+
+test "index status change detection preserves graph pending transitions and repairs invalid rows" {
+    var snapshot: IndexStatusSnapshot = .{ .kind = .graph, .doc_count = 7, .updated_at_ns = 10 };
+    var encoded: [index_status_encoded_len]u8 = undefined;
+    encodeIndexStatusSnapshot(snapshot, &encoded);
+    snapshot.updated_at_ns = 20;
+    try std.testing.expect(indexStatusContentsEqual(&encoded, snapshot));
+    snapshot.graph_counts_pending = true;
+    try std.testing.expect(!indexStatusContentsEqual(&encoded, snapshot));
+    snapshot.graph_counts_pending = false;
+    snapshot.doc_count += 1;
+    try std.testing.expect(!indexStatusContentsEqual(&encoded, snapshot));
+    try std.testing.expect(!indexStatusContentsEqual("invalid", snapshot));
 }

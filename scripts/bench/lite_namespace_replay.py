@@ -80,16 +80,51 @@ def ensure_text_index(db):
 
 def delta(before, after):
     # Missing instrumentation is unknown, not zero. Preserve resets explicitly.
-    return {
-        key: (value - before[key] if value >= before[key] else None)
-        for key, value in after.items()
-        if key in before
-        and type(value) is int
-        and type(before[key]) is int
-        and key not in ("retirement_work_pages", "replay_budget_table_id")
-        and not key.endswith("_table_id")
-        and not key.endswith("_max_ns")
+    # Only these nested structures contain cumulative timing counters; budgets
+    # and current allocator/replay state are gauges, not counter deltas.
+    timing_groups = {
+        "path_leases",
+        "foreground_lease",
+        "maintenance_lease",
+        "maintenance_hold_sites",
+        "capture_steps",
+        "writer_primary",
+        "writer_index",
+        "writer_index_read",
+        "writer_reclamation",
+        "writer_artifact_lease",
+        "writer_allocator_service",
+        "publish_replay",
+        "generated_commit",
+        "generated_store",
+        "heartbeat",
+        "turn_capture",
+        "storage_turn",
+        "idle_adopt",
     }
+    result = {}
+    for key, value in after.items():
+        if key not in before:
+            continue
+        old = before[key]
+        if key in timing_groups and isinstance(value, dict) and isinstance(old, dict):
+            result[key] = delta(old, value)
+        elif (
+            key.endswith("_log2_ns")
+            and isinstance(value, list)
+            and isinstance(old, list)
+        ):
+            if len(value) == len(old) and all(type(v) is int for v in old + value):
+                result[key] = [v - p if v >= p else None for p, v in zip(old, value)]
+        elif (
+            type(value) is int
+            and type(old) is int
+            and key not in ("retirement_work_pages", "replay_budget_table_id", "max_ns")
+            and not key.endswith("_table_id")
+            and not key.endswith("_max_ns")
+        ):
+            result[key] = value - old if value >= old else None
+    return result
 
 
 def active_progress(samples, deadline, *, excluded_indexes=()):
