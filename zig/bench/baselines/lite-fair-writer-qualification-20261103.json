@@ -1,337 +1,1427 @@
 {
  "issue": "antflydb/antfly#1431",
- "purpose": "Cross-process writer fairness: per-writer progress, lease wait and hold times, with a concurrent status-only reader. Synthetic churn writers, not the Codex importer; does not measure the single-process replay slowdown.",
+ "purpose": "Cross-process Lite writer admission: FIFO queue, in-process handoff, status reader latency. Synthetic churn workload; not the original importer.",
  "host": {
   "system": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
   "cpu_count": 14
  },
  "candidate": {
-  "revision": "953ae7f93a19e8acd1f5975e6e364599c4513fa8",
-  "library_sha256": "57603ba0a51cb31421edd4348fd65168c19a499181902eb538fdd7fc5d46f031",
+  "revision": "efc1e4d9dd",
+  "library_sha256": "3bffd13edb2066a161b25b13ddb5538566c7dfbc809be270e72a8c7b0015792c",
   "build": "zig build capi -Doptimize=ReleaseFast"
  },
  "control": {
-  "revision": "f46cf111a83f857cb0b947a95deaafd506b7c0e2",
-  "library_sha256": "950cbdd84f9ac6564de4d4b7f78e9b98128600456ab8b64e24c055f622d14e43",
+  "revision": "7cf3812a34",
+  "library_sha256": "a1fdeb2d77370535b57ee2e4d8bbb224762d4b64b711bf2c550aac7bb8413114",
   "build": "zig build capi -Doptimize=ReleaseFast"
  },
- "command": "python3 scripts/bench/lite_contention.py native --library <libantfly> --output <out>.jsonl --concurrency {3,8} --repeats 1 --seconds 120 --timeout-ms 5000 --seed-records 1024 --workload churn --watchdog 240 --progress-window 5 --status-interval 1",
+ "command": "python3 scripts/bench/lite_contention.py native --library <lib> --concurrency {3,8} --threads-per-worker {1,4} --repeats 1 --seconds 120 --timeout-ms 5000 --seed-records 1024 --workload churn --watchdog 240 --progress-window 5 --status-interval 1 (3 repeats, candidate and control alternated per configuration)",
  "notes": [
-  "One repeat per configuration; run sequentially on an otherwise idle host.",
+  "Configurations: 3 and 8 single-threaded writer processes; 3 processes x 4 threads with one handle per thread.",
   "Percentiles of lease wait/hold are log2-bucket upper bounds.",
-  "handoffs is 0 because each writer process issues calls from one thread.",
-  "The control library predates lease timing, so it has no lease section."
+  "The control library predates lease timing, so it has no lease section.",
+  "Every run verified each writer's last acknowledged writes and passed check()."
  ],
+ "summary": {
+  "candidate-c3-t1": {
+   "runs": 3,
+   "statuses": [
+    "ok",
+    "ok",
+    "ok"
+   ],
+   "calls": [
+    6855,
+    5892,
+    5711
+   ],
+   "busy": [
+    0,
+    0,
+    0
+   ],
+   "gap": [
+    0.55,
+    1.82,
+    2.18
+   ],
+   "p99": [
+    284,
+    792,
+    808
+   ],
+   "mx": [
+    549,
+    1821,
+    2178
+   ],
+   "rp50": [
+    21,
+    24,
+    24
+   ],
+   "rmax": [
+    87,
+    437,
+    854
+   ],
+   "fileMB": [
+    972,
+    609,
+    606
+   ],
+   "handoffs": [
+    0,
+    0,
+    0
+   ],
+   "queued": [
+    6856,
+    5892,
+    5713
+   ],
+   "valid": [
+    true,
+    true,
+    true
+   ],
+   "checked": [
+    384,
+    384,
+    384
+   ]
+  },
+  "candidate-c3-t4": {
+   "runs": 3,
+   "statuses": [
+    "ok",
+    "ok",
+    "ok"
+   ],
+   "calls": [
+    51142,
+    47219,
+    40556
+   ],
+   "busy": [
+    0,
+    0,
+    0
+   ],
+   "gap": [
+    2.09,
+    2.32,
+    1.6
+   ],
+   "p99": [
+    305,
+    332,
+    457
+   ],
+   "mx": [
+    2090,
+    2321,
+    1603
+   ],
+   "rp50": [
+    17,
+    20,
+    17
+   ],
+   "rmax": [
+    190,
+    1888,
+    820
+   ],
+   "fileMB": [
+    557,
+    427,
+    285
+   ],
+   "handoffs": [
+    45015,
+    41625,
+    35332
+   ],
+   "queued": [
+    6128,
+    5595,
+    5225
+   ],
+   "valid": [
+    true,
+    true,
+    true
+   ],
+   "checked": [
+    1536,
+    1536,
+    1536
+   ]
+  },
+  "candidate-c8-t1": {
+   "runs": 3,
+   "statuses": [
+    "ok",
+    "ok",
+    "ok"
+   ],
+   "calls": [
+    12962,
+    12219,
+    12110
+   ],
+   "busy": [
+    0,
+    0,
+    0
+   ],
+   "gap": [
+    1.09,
+    2.46,
+    1.66
+   ],
+   "p99": [
+    443,
+    1043,
+    1097
+   ],
+   "mx": [
+    1087,
+    2459,
+    1663
+   ],
+   "rp50": [
+    14,
+    17,
+    16
+   ],
+   "rmax": [
+    255,
+    1472,
+    1045
+   ],
+   "fileMB": [
+    703,
+    518,
+    511
+   ],
+   "handoffs": [
+    0,
+    0,
+    0
+   ],
+   "queued": [
+    12969,
+    12225,
+    12116
+   ],
+   "valid": [
+    true,
+    true,
+    true
+   ],
+   "checked": [
+    1024,
+    1024,
+    1024
+   ]
+  },
+  "control-c3-t1": {
+   "runs": 3,
+   "statuses": [
+    "ok",
+    "ok",
+    "ok"
+   ],
+   "calls": [
+    6724,
+    5450,
+    6056
+   ],
+   "busy": [
+    0,
+    0,
+    0
+   ],
+   "gap": [
+    0.68,
+    1.55,
+    1.61
+   ],
+   "p99": [
+    297,
+    863,
+    808
+   ],
+   "mx": [
+    677,
+    1547,
+    1612
+   ],
+   "rp50": [
+    94,
+    102,
+    94
+   ],
+   "rmax": [
+    257,
+    1105,
+    1054
+   ],
+   "fileMB": [
+    870,
+    606,
+    604
+   ],
+   "handoffs": [
+    null,
+    null,
+    null
+   ],
+   "queued": [
+    null,
+    null,
+    null
+   ],
+   "valid": [
+    true,
+    true,
+    true
+   ],
+   "checked": [
+    384,
+    384,
+    384
+   ]
+  },
+  "control-c3-t4": {
+   "runs": 3,
+   "statuses": [
+    "ok",
+    "ok",
+    "ok"
+   ],
+   "calls": [
+    14384,
+    14390,
+    13917
+   ],
+   "busy": [
+    0,
+    0,
+    0
+   ],
+   "gap": [
+    2.07,
+    1.57,
+    1.64
+   ],
+   "p99": [
+    1297,
+    1179,
+    1340
+   ],
+   "mx": [
+    2067,
+    1566,
+    1639
+   ],
+   "rp50": [
+    57,
+    46,
+    52
+   ],
+   "rmax": [
+    933,
+    691,
+    992
+   ],
+   "fileMB": [
+    622,
+    434,
+    505
+   ],
+   "handoffs": [
+    null,
+    null,
+    null
+   ],
+   "queued": [
+    null,
+    null,
+    null
+   ],
+   "valid": [
+    true,
+    true,
+    true
+   ],
+   "checked": [
+    1536,
+    1536,
+    1536
+   ]
+  },
+  "control-c8-t1": {
+   "runs": 3,
+   "statuses": [
+    "ok",
+    "ok",
+    "ok"
+   ],
+   "calls": [
+    12572,
+    12520,
+    12234
+   ],
+   "busy": [
+    7,
+    0,
+    0
+   ],
+   "gap": [
+    6.42,
+    1.62,
+    2.09
+   ],
+   "p99": [
+    657,
+    890,
+    1022
+   ],
+   "mx": [
+    6352,
+    1619,
+    2095
+   ],
+   "rp50": [
+    187,
+    207,
+    205
+   ],
+   "rmax": [
+    5596,
+    1233,
+    1503
+   ],
+   "fileMB": [
+    580,
+    564,
+    518
+   ],
+   "handoffs": [
+    null,
+    null,
+    null
+   ],
+   "queued": [
+    null,
+    null,
+    null
+   ],
+   "valid": [
+    true,
+    true,
+    true
+   ],
+   "checked": [
+    1024,
+    1024,
+    1024
+   ]
+  }
+ },
  "runs": [
   {
-   "status": "ok",
+   "library_role": "candidate",
    "concurrency": 3,
-   "timeout_ms": 5000,
-   "workload": "churn",
-   "per_worker_successful_calls": [
-    2116,
-    2125,
-    2189
-   ],
-   "throughput_fairness": {
-    "jain_index": 0.9997701333202561,
-    "min_max_ratio": 0.966651439013248
-   },
-   "per_worker_max_progress_gap_seconds": [
-    0.444367665797472,
-    0.48354333313181996,
-    0.5353893330320716
-   ],
-   "max_progress_gap_seconds": 0.5353893330320716,
-   "successful_calls": 6430,
+   "threads_per_worker": 1,
+   "repeat": 1,
+   "status": "ok",
+   "successful_calls": 6855,
    "busy_calls": 0,
-   "successful_calls_per_second": 53.496838307715976,
-   "success_p50_ns": 24060458,
-   "success_p99_ns": 288121083,
-   "success_max_ns": 535382250,
-   "status_reader": {
-    "errors": 0,
-    "first_errors": [],
-    "max_ns": 98130833,
-    "p50_ns": 20447333,
-    "reads": 112
+   "max_progress_gap_seconds": 0.549343166872859,
+   "success_p50_ns": 13667334,
+   "success_p99_ns": 284437666,
+   "success_max_ns": 549335417,
+   "throughput_fairness": {
+    "jain_index": 0.9998374847386616,
+    "min_max_ratio": 0.9720550300945829
    },
-   "peak_file_bytes": 977932288,
-   "file_bytes": 977932288,
-   "library": "candidate",
-   "verified_latest_writes": true,
-   "lease": {
-    "foreground_lease": {
-     "acquisitions": 6433,
-     "uncontended": 2,
-     "queued": 6431,
-     "handoffs": 0,
-     "busy": 0,
-     "wait_p50_upper_ns": 16777215,
-     "wait_p99_upper_ns": 134217727,
-     "hold_p50_upper_ns": 8388607,
-     "hold_p99_upper_ns": 67108863,
-     "per_worker_acquisitions": [
-      2117,
-      2126,
-      2190
-     ],
-     "per_worker_busy": [
-      0,
-      0,
-      0
-     ],
-     "per_worker_wait_p99_upper_ns": [
-      134217727,
-      134217727,
-      134217727
-     ]
-    },
-    "maintenance_lease": {
-     "acquisitions": 1149,
-     "uncontended": 2,
-     "queued": 1147,
-     "handoffs": 0,
-     "busy": 0,
-     "wait_p50_upper_ns": 33554431,
-     "wait_p99_upper_ns": 134217727,
-     "hold_p50_upper_ns": 16777215,
-     "hold_p99_upper_ns": 67108863,
-     "per_worker_acquisitions": [
-      412,
-      400,
-      337
-     ],
-     "per_worker_busy": [
-      0,
-      0,
-      0
-     ],
-     "per_worker_wait_p99_upper_ns": [
-      134217727,
-      134217727,
-      268435455
-     ]
-    }
+   "per_thread_successful_calls": [
+    [
+     2268
+    ],
+    [
+     2261
+    ],
+    [
+     2326
+    ]
+   ],
+   "peak_file_bytes": 972320768,
+   "file_bytes": 972320768,
+   "status_reader": {
+    "reads": 111,
+    "errors": 0,
+    "p50_ns": 21044458,
+    "max_ns": 86563625
+   },
+   "verified": {
+    "checked_last_writes": 384,
+    "integrity_valid": true
+   },
+   "foreground_lease": {
+    "acquisitions": 6858,
+    "uncontended": 2,
+    "queued": 6856,
+    "handoffs": 0,
+    "busy": 0,
+    "wait_p99_upper_ns": 134217727,
+    "hold_p99_upper_ns": 67108863
+   },
+   "maintenance_lease": {
+    "acquisitions": 1228,
+    "queued": 1228,
+    "busy": 0
    }
   },
   {
+   "library_role": "candidate",
+   "concurrency": 3,
+   "threads_per_worker": 1,
+   "repeat": 2,
    "status": "ok",
-   "concurrency": 8,
-   "timeout_ms": 5000,
-   "workload": "churn",
-   "per_worker_successful_calls": [
-    1532,
-    1631,
-    1588,
-    1626,
-    1619,
-    1534,
-    1565,
-    1552
-   ],
-   "throughput_fairness": {
-    "jain_index": 0.999413904268477,
-    "min_max_ratio": 0.9393010423053342
-   },
-   "per_worker_max_progress_gap_seconds": [
-    1.2762204157188535,
-    1.2693825419992208,
-    1.7227339576929808,
-    1.3159943749196827,
-    1.3156195408664644,
-    1.2782118753530085,
-    1.3157418328337371,
-    1.5327244577929378
-   ],
-   "max_progress_gap_seconds": 1.7227339576929808,
-   "successful_calls": 12647,
+   "successful_calls": 5892,
    "busy_calls": 0,
-   "successful_calls_per_second": 105.16191326337558,
-   "success_p50_ns": 20905167,
-   "success_p99_ns": 564252041,
-   "success_max_ns": 1722726250,
-   "status_reader": {
-    "errors": 0,
-    "first_errors": [],
-    "max_ns": 393865375,
-    "p50_ns": 14179709,
-    "reads": 111
+   "max_progress_gap_seconds": 1.8208722081035376,
+   "success_p50_ns": 11173959,
+   "success_p99_ns": 792007375,
+   "success_max_ns": 1820860125,
+   "throughput_fairness": {
+    "jain_index": 0.9997447913327888,
+    "min_max_ratio": 0.9646414342629482
    },
-   "peak_file_bytes": 637440000,
-   "file_bytes": 637440000,
-   "library": "candidate",
-   "verified_latest_writes": true,
-   "lease": {
-    "foreground_lease": {
-     "acquisitions": 12655,
-     "uncontended": 1,
-     "queued": 12654,
-     "handoffs": 0,
-     "busy": 0,
-     "wait_p50_upper_ns": 33554431,
-     "wait_p99_upper_ns": 536870911,
-     "hold_p50_upper_ns": 4194303,
-     "hold_p99_upper_ns": 67108863,
-     "per_worker_acquisitions": [
-      1533,
-      1632,
-      1589,
-      1627,
-      1620,
-      1535,
-      1566,
-      1553
-     ],
-     "per_worker_busy": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "per_worker_wait_p99_upper_ns": [
-      536870911,
-      536870911,
-      536870911,
-      536870911,
-      536870911,
-      536870911,
-      536870911,
-      536870911
-     ]
-    },
-    "maintenance_lease": {
-     "acquisitions": 856,
-     "uncontended": 36,
-     "queued": 820,
-     "handoffs": 0,
-     "busy": 0,
-     "wait_p50_upper_ns": 16777215,
-     "wait_p99_upper_ns": 536870911,
-     "hold_p50_upper_ns": 2097151,
-     "hold_p99_upper_ns": 67108863,
-     "per_worker_acquisitions": [
-      151,
-      52,
-      95,
-      58,
-      64,
-      149,
-      119,
-      168
-     ],
-     "per_worker_busy": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "per_worker_wait_p99_upper_ns": [
-      134217727,
-      33554431,
-      2147483647,
-      536870911,
-      536870911,
-      134217727,
-      268435455,
-      536870911
-     ]
-    }
+   "per_thread_successful_calls": [
+    [
+     2008
+    ],
+    [
+     1937
+    ],
+    [
+     1947
+    ]
+   ],
+   "peak_file_bytes": 609443840,
+   "file_bytes": 609443840,
+   "status_reader": {
+    "reads": 108,
+    "errors": 0,
+    "p50_ns": 23868000,
+    "max_ns": 437467583
+   },
+   "verified": {
+    "checked_last_writes": 384,
+    "integrity_valid": true
+   },
+   "foreground_lease": {
+    "acquisitions": 5895,
+    "uncontended": 3,
+    "queued": 5892,
+    "handoffs": 0,
+    "busy": 0,
+    "wait_p99_upper_ns": 536870911,
+    "hold_p99_upper_ns": 268435455
+   },
+   "maintenance_lease": {
+    "acquisitions": 1055,
+    "queued": 1054,
+    "busy": 0
    }
   },
   {
-   "status": "ok",
+   "library_role": "candidate",
    "concurrency": 3,
-   "timeout_ms": 5000,
-   "workload": "churn",
-   "per_worker_successful_calls": [
-    1935,
-    1968,
-    1949
-   ],
-   "throughput_fairness": {
-    "jain_index": 0.9999519381678398,
-    "min_max_ratio": 0.9832317073170732
-   },
-   "per_worker_max_progress_gap_seconds": [
-    4.695466457866132,
-    4.778787999879569,
-    4.6888079168275
-   ],
-   "max_progress_gap_seconds": 4.778787999879569,
-   "successful_calls": 5852,
+   "threads_per_worker": 1,
+   "repeat": 3,
+   "status": "ok",
+   "successful_calls": 5711,
    "busy_calls": 0,
-   "successful_calls_per_second": 47.139454326557185,
-   "success_p50_ns": 13886125,
-   "success_p99_ns": 731079375,
-   "success_max_ns": 4778779041,
-   "status_reader": {
-    "errors": 0,
-    "first_errors": [],
-    "max_ns": 4668834209,
-    "p50_ns": 89548667,
-    "reads": 95
+   "max_progress_gap_seconds": 2.1784563749097288,
+   "success_p50_ns": 11282333,
+   "success_p99_ns": 807769167,
+   "success_max_ns": 2178442042,
+   "throughput_fairness": {
+    "jain_index": 0.9977306006444169,
+    "min_max_ratio": 0.8898854010961634
    },
-   "peak_file_bytes": 692715520,
-   "file_bytes": 692715520,
-   "library": "control",
-   "verified_latest_writes": true
+   "per_thread_successful_calls": [
+    [
+     1786
+    ],
+    [
+     2007
+    ],
+    [
+     1918
+    ]
+   ],
+   "peak_file_bytes": 606486528,
+   "file_bytes": 606486528,
+   "status_reader": {
+    "reads": 105,
+    "errors": 0,
+    "p50_ns": 24088917,
+    "max_ns": 854341291
+   },
+   "verified": {
+    "checked_last_writes": 384,
+    "integrity_valid": true
+   },
+   "foreground_lease": {
+    "acquisitions": 5714,
+    "uncontended": 1,
+    "queued": 5713,
+    "handoffs": 0,
+    "busy": 0,
+    "wait_p99_upper_ns": 536870911,
+    "hold_p99_upper_ns": 268435455
+   },
+   "maintenance_lease": {
+    "acquisitions": 990,
+    "queued": 990,
+    "busy": 0
+   }
   },
   {
+   "library_role": "candidate",
+   "concurrency": 3,
+   "threads_per_worker": 4,
+   "repeat": 1,
    "status": "ok",
-   "concurrency": 8,
-   "timeout_ms": 5000,
-   "workload": "churn",
-   "per_worker_successful_calls": [
-    1603,
-    1493,
-    1486,
-    1552,
-    1513,
-    1630,
-    1610,
-    1638
-   ],
-   "throughput_fairness": {
-    "jain_index": 0.9986088407814095,
-    "min_max_ratio": 0.9072039072039072
-   },
-   "per_worker_max_progress_gap_seconds": [
-    2.3579146252013743,
-    1.4744172501377761,
-    1.2310075843706727,
-    1.2838693750090897,
-    1.2217241670005023,
-    1.2151735830120742,
-    1.7678223750554025,
-    1.3114680419676006
-   ],
-   "max_progress_gap_seconds": 2.3579146252013743,
-   "successful_calls": 12525,
+   "successful_calls": 51142,
    "busy_calls": 0,
-   "successful_calls_per_second": 103.63120376729351,
-   "success_p50_ns": 20692459,
-   "success_p99_ns": 608615084,
-   "success_max_ns": 2357906792,
-   "status_reader": {
-    "errors": 0,
-    "first_errors": [],
-    "max_ns": 1344097208,
-    "p50_ns": 186303000,
-    "reads": 95
+   "max_progress_gap_seconds": 2.08963012509048,
+   "success_p50_ns": 3826417,
+   "success_p99_ns": 304596833,
+   "success_max_ns": 2089621666,
+   "throughput_fairness": {
+    "jain_index": 0.9999327226608067,
+    "min_max_ratio": 0.9810244470314319
    },
-   "peak_file_bytes": 631988224,
-   "file_bytes": 631988224,
-   "library": "control",
-   "verified_latest_writes": true
+   "per_thread_successful_calls": [
+    [
+     4214,
+     4214,
+     4213,
+     4213
+    ],
+    [
+     4295,
+     4295,
+     4295,
+     4295
+    ],
+    [
+     4277,
+     4277,
+     4277,
+     4277
+    ]
+   ],
+   "peak_file_bytes": 557002752,
+   "file_bytes": 557002752,
+   "status_reader": {
+    "reads": 111,
+    "errors": 0,
+    "p50_ns": 17305167,
+    "max_ns": 190369041
+   },
+   "verified": {
+    "checked_last_writes": 1536,
+    "integrity_valid": true
+   },
+   "foreground_lease": {
+    "acquisitions": 51145,
+    "uncontended": 2,
+    "queued": 6128,
+    "handoffs": 45015,
+    "busy": 0,
+    "wait_p99_upper_ns": 67108863,
+    "hold_p99_upper_ns": 33554431
+   },
+   "maintenance_lease": {
+    "acquisitions": 852,
+    "queued": 806,
+    "busy": 0
+   }
+  },
+  {
+   "library_role": "candidate",
+   "concurrency": 3,
+   "threads_per_worker": 4,
+   "repeat": 2,
+   "status": "ok",
+   "successful_calls": 47219,
+   "busy_calls": 0,
+   "max_progress_gap_seconds": 2.3214417076669633,
+   "success_p50_ns": 3874625,
+   "success_p99_ns": 332217792,
+   "success_max_ns": 2321438334,
+   "throughput_fairness": {
+    "jain_index": 0.9985359194566503,
+    "min_max_ratio": 0.9166051206302314
+   },
+   "per_thread_successful_calls": [
+    [
+     3724,
+     3723,
+     3723,
+     3723
+    ],
+    [
+     4020,
+     4020,
+     4019,
+     4019
+    ],
+    [
+     4062,
+     4062,
+     4062,
+     4062
+    ]
+   ],
+   "peak_file_bytes": 427118592,
+   "file_bytes": 427118592,
+   "status_reader": {
+    "reads": 109,
+    "errors": 0,
+    "p50_ns": 19803083,
+    "max_ns": 1888332792
+   },
+   "verified": {
+    "checked_last_writes": 1536,
+    "integrity_valid": true
+   },
+   "foreground_lease": {
+    "acquisitions": 47222,
+    "uncontended": 2,
+    "queued": 5595,
+    "handoffs": 41625,
+    "busy": 0,
+    "wait_p99_upper_ns": 67108863,
+    "hold_p99_upper_ns": 33554431
+   },
+   "maintenance_lease": {
+    "acquisitions": 756,
+    "queued": 755,
+    "busy": 0
+   }
+  },
+  {
+   "library_role": "candidate",
+   "concurrency": 3,
+   "threads_per_worker": 4,
+   "repeat": 3,
+   "status": "ok",
+   "successful_calls": 40556,
+   "busy_calls": 0,
+   "max_progress_gap_seconds": 1.6025862921960652,
+   "success_p50_ns": 4910334,
+   "success_p99_ns": 456786500,
+   "success_max_ns": 1602582584,
+   "throughput_fairness": {
+    "jain_index": 0.9969334408472055,
+    "min_max_ratio": 0.88062366920805
+   },
+   "per_thread_successful_calls": [
+    [
+     3294,
+     3294,
+     3294,
+     3294
+    ],
+    [
+     3206,
+     3205,
+     3205,
+     3205
+    ],
+    [
+     3640,
+     3640,
+     3639,
+     3640
+    ]
+   ],
+   "peak_file_bytes": 284962816,
+   "file_bytes": 284962816,
+   "status_reader": {
+    "reads": 109,
+    "errors": 0,
+    "p50_ns": 17324875,
+    "max_ns": 819707542
+   },
+   "verified": {
+    "checked_last_writes": 1536,
+    "integrity_valid": true
+   },
+   "foreground_lease": {
+    "acquisitions": 40559,
+    "uncontended": 2,
+    "queued": 5225,
+    "handoffs": 35332,
+    "busy": 0,
+    "wait_p99_upper_ns": 67108863,
+    "hold_p99_upper_ns": 33554431
+   },
+   "maintenance_lease": {
+    "acquisitions": 698,
+    "queued": 695,
+    "busy": 0
+   }
+  },
+  {
+   "library_role": "candidate",
+   "concurrency": 8,
+   "threads_per_worker": 1,
+   "repeat": 1,
+   "status": "ok",
+   "successful_calls": 12962,
+   "busy_calls": 0,
+   "max_progress_gap_seconds": 1.0867493748664856,
+   "success_p50_ns": 21247625,
+   "success_p99_ns": 443175583,
+   "success_max_ns": 1086740042,
+   "throughput_fairness": {
+    "jain_index": 0.9995349440866819,
+    "min_max_ratio": 0.9257950530035336
+   },
+   "per_thread_successful_calls": [
+    [
+     1606
+    ],
+    [
+     1605
+    ],
+    [
+     1601
+    ],
+    [
+     1609
+    ],
+    [
+     1572
+    ],
+    [
+     1635
+    ],
+    [
+     1698
+    ],
+    [
+     1636
+    ]
+   ],
+   "peak_file_bytes": 702836736,
+   "file_bytes": 702836736,
+   "status_reader": {
+    "reads": 111,
+    "errors": 0,
+    "p50_ns": 14427666,
+    "max_ns": 255053750
+   },
+   "verified": {
+    "checked_last_writes": 1024,
+    "integrity_valid": true
+   },
+   "foreground_lease": {
+    "acquisitions": 12970,
+    "uncontended": 1,
+    "queued": 12969,
+    "handoffs": 0,
+    "busy": 0,
+    "wait_p99_upper_ns": 536870911,
+    "hold_p99_upper_ns": 67108863
+   },
+   "maintenance_lease": {
+    "acquisitions": 841,
+    "queued": 841,
+    "busy": 0
+   }
+  },
+  {
+   "library_role": "candidate",
+   "concurrency": 8,
+   "threads_per_worker": 1,
+   "repeat": 2,
+   "status": "ok",
+   "successful_calls": 12219,
+   "busy_calls": 0,
+   "max_progress_gap_seconds": 2.458599666133523,
+   "success_p50_ns": 20559375,
+   "success_p99_ns": 1042578041,
+   "success_max_ns": 2458589625,
+   "throughput_fairness": {
+    "jain_index": 0.9996899704174611,
+    "min_max_ratio": 0.9532351057014734
+   },
+   "per_thread_successful_calls": [
+    [
+     1508
+    ],
+    [
+     1488
+    ],
+    [
+     1534
+    ],
+    [
+     1558
+    ],
+    [
+     1557
+    ],
+    [
+     1561
+    ],
+    [
+     1506
+    ],
+    [
+     1507
+    ]
+   ],
+   "peak_file_bytes": 518254592,
+   "file_bytes": 518254592,
+   "status_reader": {
+    "reads": 107,
+    "errors": 0,
+    "p50_ns": 16902708,
+    "max_ns": 1471706708
+   },
+   "verified": {
+    "checked_last_writes": 1024,
+    "integrity_valid": true
+   },
+   "foreground_lease": {
+    "acquisitions": 12227,
+    "uncontended": 2,
+    "queued": 12225,
+    "handoffs": 0,
+    "busy": 0,
+    "wait_p99_upper_ns": 1073741823,
+    "hold_p99_upper_ns": 134217727
+   },
+   "maintenance_lease": {
+    "acquisitions": 820,
+    "queued": 780,
+    "busy": 0
+   }
+  },
+  {
+   "library_role": "candidate",
+   "concurrency": 8,
+   "threads_per_worker": 1,
+   "repeat": 3,
+   "status": "ok",
+   "successful_calls": 12110,
+   "busy_calls": 0,
+   "max_progress_gap_seconds": 1.6626907498575747,
+   "success_p50_ns": 19512750,
+   "success_p99_ns": 1096912875,
+   "success_max_ns": 1662680167,
+   "throughput_fairness": {
+    "jain_index": 0.9995167220126785,
+    "min_max_ratio": 0.9415167095115681
+   },
+   "per_thread_successful_calls": [
+    [
+     1553
+    ],
+    [
+     1495
+    ],
+    [
+     1518
+    ],
+    [
+     1465
+    ],
+    [
+     1467
+    ],
+    [
+     1518
+    ],
+    [
+     1556
+    ],
+    [
+     1538
+    ]
+   ],
+   "peak_file_bytes": 510697472,
+   "file_bytes": 510697472,
+   "status_reader": {
+    "reads": 108,
+    "errors": 0,
+    "p50_ns": 16260291,
+    "max_ns": 1045465416
+   },
+   "verified": {
+    "checked_last_writes": 1024,
+    "integrity_valid": true
+   },
+   "foreground_lease": {
+    "acquisitions": 12118,
+    "uncontended": 2,
+    "queued": 12116,
+    "handoffs": 0,
+    "busy": 0,
+    "wait_p99_upper_ns": 1073741823,
+    "hold_p99_upper_ns": 134217727
+   },
+   "maintenance_lease": {
+    "acquisitions": 819,
+    "queued": 786,
+    "busy": 0
+   }
+  },
+  {
+   "library_role": "control",
+   "concurrency": 3,
+   "threads_per_worker": 1,
+   "repeat": 1,
+   "status": "ok",
+   "successful_calls": 6724,
+   "busy_calls": 0,
+   "max_progress_gap_seconds": 0.6769931670278311,
+   "success_p50_ns": 12234291,
+   "success_p99_ns": 296996083,
+   "success_max_ns": 676983458,
+   "throughput_fairness": {
+    "jain_index": 0.9998269349921745,
+    "min_max_ratio": 0.9719667104686815
+   },
+   "per_thread_successful_calls": [
+    [
+     2222
+    ],
+    [
+     2219
+    ],
+    [
+     2283
+    ]
+   ],
+   "peak_file_bytes": 869789696,
+   "file_bytes": 869789696,
+   "status_reader": {
+    "reads": 104,
+    "errors": 0,
+    "p50_ns": 94385917,
+    "max_ns": 256837250
+   },
+   "verified": {
+    "checked_last_writes": 384,
+    "integrity_valid": true
+   }
+  },
+  {
+   "library_role": "control",
+   "concurrency": 3,
+   "threads_per_worker": 1,
+   "repeat": 2,
+   "status": "ok",
+   "successful_calls": 5450,
+   "busy_calls": 0,
+   "max_progress_gap_seconds": 1.5471161250025034,
+   "success_p50_ns": 15786333,
+   "success_p99_ns": 862625750,
+   "success_max_ns": 1547108416,
+   "throughput_fairness": {
+    "jain_index": 0.9995684381566898,
+    "min_max_ratio": 0.9561497326203209
+   },
+   "per_thread_successful_calls": [
+    [
+     1792
+    ],
+    [
+     1788
+    ],
+    [
+     1870
+    ]
+   ],
+   "peak_file_bytes": 606478336,
+   "file_bytes": 606478336,
+   "status_reader": {
+    "reads": 92,
+    "errors": 0,
+    "p50_ns": 102328333,
+    "max_ns": 1104829416
+   },
+   "verified": {
+    "checked_last_writes": 384,
+    "integrity_valid": true
+   }
+  },
+  {
+   "library_role": "control",
+   "concurrency": 3,
+   "threads_per_worker": 1,
+   "repeat": 3,
+   "status": "ok",
+   "successful_calls": 6056,
+   "busy_calls": 0,
+   "max_progress_gap_seconds": 1.6115963337942958,
+   "success_p50_ns": 8995583,
+   "success_p99_ns": 808063334,
+   "success_max_ns": 1611586709,
+   "throughput_fairness": {
+    "jain_index": 0.9999461244385872,
+    "min_max_ratio": 0.9823356231599607
+   },
+   "per_thread_successful_calls": [
+    [
+     2002
+    ],
+    [
+     2016
+    ],
+    [
+     2038
+    ]
+   ],
+   "peak_file_bytes": 604241920,
+   "file_bytes": 604241920,
+   "status_reader": {
+    "reads": 92,
+    "errors": 0,
+    "p50_ns": 93910458,
+    "max_ns": 1054320375
+   },
+   "verified": {
+    "checked_last_writes": 384,
+    "integrity_valid": true
+   }
+  },
+  {
+   "library_role": "control",
+   "concurrency": 3,
+   "threads_per_worker": 4,
+   "repeat": 1,
+   "status": "ok",
+   "successful_calls": 14384,
+   "busy_calls": 0,
+   "max_progress_gap_seconds": 2.067043333314359,
+   "success_p50_ns": 23664209,
+   "success_p99_ns": 1296943375,
+   "success_max_ns": 2067035417,
+   "throughput_fairness": {
+    "jain_index": 0.9999098097344961,
+    "min_max_ratio": 0.9796254373327845
+   },
+   "per_thread_successful_calls": [
+    [
+     1192,
+     1191,
+     1191,
+     1191
+    ],
+    [
+     1215,
+     1215,
+     1215,
+     1214
+    ],
+    [
+     1190,
+     1190,
+     1190,
+     1190
+    ]
+   ],
+   "peak_file_bytes": 621752320,
+   "file_bytes": 621752320,
+   "status_reader": {
+    "reads": 96,
+    "errors": 0,
+    "p50_ns": 57089458,
+    "max_ns": 933119625
+   },
+   "verified": {
+    "checked_last_writes": 1536,
+    "integrity_valid": true
+   }
+  },
+  {
+   "library_role": "control",
+   "concurrency": 3,
+   "threads_per_worker": 4,
+   "repeat": 2,
+   "status": "ok",
+   "successful_calls": 14390,
+   "busy_calls": 0,
+   "max_progress_gap_seconds": 1.565649624913931,
+   "success_p50_ns": 27928083,
+   "success_p99_ns": 1179416667,
+   "success_max_ns": 1565640084,
+   "throughput_fairness": {
+    "jain_index": 0.9999855028442772,
+    "min_max_ratio": 0.991479634247714
+   },
+   "per_thread_successful_calls": [
+    [
+     1202,
+     1202,
+     1202,
+     1201
+    ],
+    [
+     1193,
+     1193,
+     1193,
+     1192
+    ],
+    [
+     1203,
+     1203,
+     1203,
+     1203
+    ]
+   ],
+   "peak_file_bytes": 434122752,
+   "file_bytes": 434122752,
+   "status_reader": {
+    "reads": 101,
+    "errors": 0,
+    "p50_ns": 46230750,
+    "max_ns": 691042625
+   },
+   "verified": {
+    "checked_last_writes": 1536,
+    "integrity_valid": true
+   }
+  },
+  {
+   "library_role": "control",
+   "concurrency": 3,
+   "threads_per_worker": 4,
+   "repeat": 3,
+   "status": "ok",
+   "successful_calls": 13917,
+   "busy_calls": 0,
+   "max_progress_gap_seconds": 1.6394340000115335,
+   "success_p50_ns": 27666583,
+   "success_p99_ns": 1339707416,
+   "success_max_ns": 1639426291,
+   "throughput_fairness": {
+    "jain_index": 0.9999923483759048,
+    "min_max_ratio": 0.9933419243986255
+   },
+   "per_thread_successful_calls": [
+    [
+     1156,
+     1157,
+     1156,
+     1156
+    ],
+    [
+     1159,
+     1159,
+     1159,
+     1159
+    ],
+    [
+     1164,
+     1164,
+     1164,
+     1164
+    ]
+   ],
+   "peak_file_bytes": 504758272,
+   "file_bytes": 504758272,
+   "status_reader": {
+    "reads": 97,
+    "errors": 0,
+    "p50_ns": 51946916,
+    "max_ns": 991895292
+   },
+   "verified": {
+    "checked_last_writes": 1536,
+    "integrity_valid": true
+   }
+  },
+  {
+   "library_role": "control",
+   "concurrency": 8,
+   "threads_per_worker": 1,
+   "repeat": 1,
+   "status": "ok",
+   "successful_calls": 12572,
+   "busy_calls": 7,
+   "max_progress_gap_seconds": 6.424725791905075,
+   "success_p50_ns": 18618083,
+   "success_p99_ns": 656622792,
+   "success_max_ns": 6351941000,
+   "throughput_fairness": {
+    "jain_index": 0.99963995168188,
+    "min_max_ratio": 0.9443069306930693
+   },
+   "per_thread_successful_calls": [
+    [
+     1554
+    ],
+    [
+     1586
+    ],
+    [
+     1611
+    ],
+    [
+     1548
+    ],
+    [
+     1579
+    ],
+    [
+     1526
+    ],
+    [
+     1552
+    ],
+    [
+     1616
+    ]
+   ],
+   "peak_file_bytes": 579837952,
+   "file_bytes": 579837952,
+   "status_reader": {
+    "reads": 90,
+    "errors": 0,
+    "p50_ns": 187171792,
+    "max_ns": 5595693500
+   },
+   "verified": {
+    "checked_last_writes": 1024,
+    "integrity_valid": true
+   }
+  },
+  {
+   "library_role": "control",
+   "concurrency": 8,
+   "threads_per_worker": 1,
+   "repeat": 2,
+   "status": "ok",
+   "successful_calls": 12520,
+   "busy_calls": 0,
+   "max_progress_gap_seconds": 1.6193430828861892,
+   "success_p50_ns": 17441958,
+   "success_p99_ns": 889522916,
+   "success_max_ns": 1619334625,
+   "throughput_fairness": {
+    "jain_index": 0.9996417497184557,
+    "min_max_ratio": 0.9434431323803605
+   },
+   "per_thread_successful_calls": [
+    [
+     1577
+    ],
+    [
+     1543
+    ],
+    [
+     1567
+    ],
+    [
+     1549
+    ],
+    [
+     1550
+    ],
+    [
+     1518
+    ],
+    [
+     1607
+    ],
+    [
+     1609
+    ]
+   ],
+   "peak_file_bytes": 564027392,
+   "file_bytes": 564027392,
+   "status_reader": {
+    "reads": 90,
+    "errors": 0,
+    "p50_ns": 207208958,
+    "max_ns": 1232999917
+   },
+   "verified": {
+    "checked_last_writes": 1024,
+    "integrity_valid": true
+   }
+  },
+  {
+   "library_role": "control",
+   "concurrency": 8,
+   "threads_per_worker": 1,
+   "repeat": 3,
+   "status": "ok",
+   "successful_calls": 12234,
+   "busy_calls": 0,
+   "max_progress_gap_seconds": 2.0948914168402553,
+   "success_p50_ns": 16101542,
+   "success_p99_ns": 1022178625,
+   "success_max_ns": 2094882584,
+   "throughput_fairness": {
+    "jain_index": 0.9995563693784972,
+    "min_max_ratio": 0.9416195856873822
+   },
+   "per_thread_successful_calls": [
+    [
+     1517
+    ],
+    [
+     1593
+    ],
+    [
+     1536
+    ],
+    [
+     1511
+    ],
+    [
+     1504
+    ],
+    [
+     1500
+    ],
+    [
+     1569
+    ],
+    [
+     1504
+    ]
+   ],
+   "peak_file_bytes": 518238208,
+   "file_bytes": 518238208,
+   "status_reader": {
+    "reads": 87,
+    "errors": 0,
+    "p50_ns": 204792959,
+    "max_ns": 1502752875
+   },
+   "verified": {
+    "checked_last_writes": 1024,
+    "integrity_valid": true
+   }
   }
  ]
 }
