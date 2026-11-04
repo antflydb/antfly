@@ -12054,19 +12054,15 @@ fn stageF16ActivationForCublasLt(self: *CudaCompute, input: *const CudaTensor, r
 // a small set of model-session-owned buffers and convert each F32 graph tensor
 // once per layer. The streaming attention kernel accumulates into F32 and
 // writes F32 output, preserving the residual/norm contract around it.
-fn stageDebertaAttentionF16(
+fn acquireF16AttentionInput(
     self: *CudaCompute,
     scratch: *scratch_mod.DeviceScratch,
     input: *const CudaTensor,
     count: usize,
 ) !?buffer_mod.DeviceBuffer {
     if (input.dtype != .f32 or input.quant_type != null or input.elem_count != count) return null;
-    if (self.ctx.info.compute_major < 8 or self.kernels.deberta_attention_stream_f16 == null) return null;
     const bytes = try checkedMul(count, @sizeOf(u16));
-    const staged = scratch.acquire(&self.ctx, bytes) catch return null;
-    self.kernels.launchF32ToF16(&self.ctx, staged, input.buffer, count) catch return null;
-    self.stats.deberta_stream_f16_staging_calls += 1;
-    return staged;
+    return scratch.acquire(&self.ctx, bytes) catch return null;
 }
 
 const deberta_materialized_workspace_alignment: usize = 256;
@@ -12238,19 +12234,39 @@ fn tryDebertaMaterializedAttentionF16(
     const probabilities_f16 = debertaWorkspaceRegion(arena, layout.probabilities_f16, probability_bytes);
     const output_packed = debertaWorkspaceRegion(arena, layout.output_packed, output_bytes);
 
-    // Launch faults return false rather than propagating so the caller's
-    // documented fallback chain runs and its fallback counter ticks; dst is
-    // only written by the final unpack, so a partial pipeline leaves no state.
-    if (!(self.kernels.launchDebertaPackHeadsF16(&self.ctx, q_f16, k_f16, v_f16, q_r_f16, k_r_f16, q.buffer, k.buffer, v.buffer, q_r.buffer, k_r.buffer, batch, seq_len, num_heads, head_dim) catch return false)) return false;
     const blas = &(self.cublaslt orelse return false);
     const workspace = cublasLtWorkspace(self);
-    blas.matmulF16StridedBatchedF32Out(&self.ctx, content_scores, q_f16, k_f16, workspace, matrices, seq_len, head_dim, seq_len) catch return false;
-    blas.matmulF16StridedBatchedF32Out(&self.ctx, c2p_scores, q_f16, k_r_f16, workspace, matrices, seq_len, head_dim, rel_len) catch return false;
-    blas.matmulF16StridedBatchedF32Out(&self.ctx, p2c_scores, k_f16, q_r_f16, workspace, matrices, seq_len, head_dim, rel_len) catch return false;
-    if (!(self.kernels.launchDebertaScoresSoftmaxF32(&self.ctx, content_scores, c2p_scores, p2c_scores, mask, batch, seq_len, num_heads, head_dim) catch return false)) return false;
-    self.kernels.launchF32ToF16(&self.ctx, probabilities_f16, content_scores, score_count) catch return false;
-    blas.matmulF16StridedBatchedF32Out(&self.ctx, output_packed, probabilities_f16, v_f16, workspace, matrices, seq_len, seq_len, head_dim) catch return false;
-    if (!(self.kernels.launchDebertaUnpackHeadsF32(&self.ctx, dst, output_packed, batch, seq_len, num_heads, head_dim) catch return false)) return false;
+    // All four original GEMM plans precede the first pack/cast. Only a
+    // metadata-only unsupported decision may select the ordinary fallback.
+    var content = blas.preflightF16StridedBatched(&self.ctx, .{ .dst = content_scores, .input = q_f16, .weight = k_f16, .workspace = workspace }, matrices, seq_len, head_dim, seq_len) catch |err| switch (err) {
+        error.CublasLtUnsupported => return false,
+        else => return err,
+    };
+    defer content.deinit();
+    var c2p = blas.preflightF16StridedBatched(&self.ctx, .{ .dst = c2p_scores, .input = q_f16, .weight = k_r_f16, .workspace = workspace }, matrices, seq_len, head_dim, rel_len) catch |err| switch (err) {
+        error.CublasLtUnsupported => return false,
+        else => return err,
+    };
+    defer c2p.deinit();
+    var p2c = blas.preflightF16StridedBatched(&self.ctx, .{ .dst = p2c_scores, .input = k_f16, .weight = q_r_f16, .workspace = workspace }, matrices, seq_len, head_dim, rel_len) catch |err| switch (err) {
+        error.CublasLtUnsupported => return false,
+        else => return err,
+    };
+    defer p2c.deinit();
+    var product = blas.preflightF16StridedBatched(&self.ctx, .{ .dst = output_packed, .input = probabilities_f16, .weight = v_f16, .workspace = workspace }, matrices, seq_len, seq_len, head_dim) catch |err| switch (err) {
+        error.CublasLtUnsupported => return false,
+        else => return err,
+    };
+    defer product.deinit();
+    errdefer self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+    if (!try self.kernels.launchDebertaPackHeadsF16(&self.ctx, q_f16, k_f16, v_f16, q_r_f16, k_r_f16, q.buffer, k.buffer, v.buffer, q_r.buffer, k_r.buffer, batch, seq_len, num_heads, head_dim)) return error.CudaKernelUnavailable;
+    try content.submit(&self.ctx);
+    try c2p.submit(&self.ctx);
+    try p2c.submit(&self.ctx);
+    if (!try self.kernels.launchDebertaScoresSoftmaxF32(&self.ctx, content_scores, c2p_scores, p2c_scores, mask, batch, seq_len, num_heads, head_dim)) return error.CudaKernelUnavailable;
+    try self.kernels.launchF32ToF16(&self.ctx, probabilities_f16, content_scores, score_count);
+    try product.submit(&self.ctx);
+    if (!try self.kernels.launchDebertaUnpackHeadsF32(&self.ctx, dst, output_packed, batch, seq_len, num_heads, head_dim)) return error.CudaKernelUnavailable;
     self.stats.deberta_materialized_f16_attention_calls += 1;
     return true;
 }
@@ -27904,10 +27920,10 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
     if (mask.len < try checkedMul(batch, seq_len)) return error.InvalidShape;
 
     const mask_device = try uploadCachedAttentionMaskI64(self, mask);
-    const shape = try dupeShape(self.allocator, q_tensor.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
+    var output = try OwnedF32Output.alloc(self, q_tensor.shape, count);
+    defer output.deinit();
+    const device = output.buffer;
+    errdefer self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
     const attention_mode = debertaAttentionExecutionMode(self.qualified_span_fp32, cudaDebertaAttentionMode());
     if ((attention_mode == .generated_tc or (attention_mode == .auto and cudaDebertaGeneratedTcAutoEnabled())) and seq_len <= 256 and head_dim == 64) {
         const requested_variant = cudaDebertaGeneratedTcVariant();
@@ -27963,7 +27979,7 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
                 self.stats.deberta_generated_tc_m16_attention_calls += 1;
             }
             self.stats.launch_attention += 1;
-            return createTensor(self, device, shape, count);
+            return output.intoTensor();
         }
         self.stats.deberta_generated_tc_attention_fallbacks += 1;
     }
@@ -27976,38 +27992,43 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
     if (attention_mode == .materialized_f16 or auto_materialized_f16) {
         if (try tryDebertaMaterializedAttentionF16(self, device, q_tensor, k_tensor, v_tensor, q_r_tensor, k_r_tensor, mask_device, batch, seq_len, num_heads, head_dim)) {
             self.stats.launch_attention += 1;
-            return createTensor(self, device, shape, count);
+            return output.intoTensor();
         }
         self.stats.deberta_materialized_f16_attention_fallbacks += 1;
     }
     if (attention_mode == .streaming_f16 and seq_len <= 256 and head_dim == 64) {
-        const q_f16 = try stageDebertaAttentionF16(self, &self.deberta_q_f16_scratch, q_tensor, count);
-        const k_f16 = try stageDebertaAttentionF16(self, &self.deberta_k_f16_scratch, k_tensor, count);
-        const v_f16 = try stageDebertaAttentionF16(self, &self.deberta_v_f16_scratch, v_tensor, count);
-        const qr_f16 = try stageDebertaAttentionF16(self, &self.deberta_qr_f16_scratch, q_r_tensor, rel_count);
-        const kr_f16 = try stageDebertaAttentionF16(self, &self.deberta_kr_f16_scratch, k_r_tensor, rel_count);
-        if (q_f16 != null and k_f16 != null and v_f16 != null and qr_f16 != null and kr_f16 != null) {
-            const launched = self.kernels.launchDebertaAttentionStreamF16(
-                &self.ctx,
-                device,
-                q_f16.?,
-                k_f16.?,
-                v_f16.?,
-                qr_f16.?,
-                kr_f16.?,
-                mask_device,
-                batch,
-                seq_len,
-                num_heads,
-                head_dim,
-            ) catch |err| switch (err) {
-                error.CudaKernelUnavailable => false,
-                else => return err,
-            };
-            if (launched) {
-                self.stats.deberta_stream_f16_attention_calls += 1;
-                self.stats.launch_attention += 1;
-                return createTensor(self, device, shape, count);
+        if (self.ctx.info.compute_major >= 8 and self.kernels.deberta_attention_stream_f16 != null) {
+            const q_f16 = try acquireF16AttentionInput(self, &self.deberta_q_f16_scratch, q_tensor, count);
+            const k_f16 = try acquireF16AttentionInput(self, &self.deberta_k_f16_scratch, k_tensor, count);
+            const v_f16 = try acquireF16AttentionInput(self, &self.deberta_v_f16_scratch, v_tensor, count);
+            const qr_f16 = try acquireF16AttentionInput(self, &self.deberta_qr_f16_scratch, q_r_tensor, rel_count);
+            const kr_f16 = try acquireF16AttentionInput(self, &self.deberta_kr_f16_scratch, k_r_tensor, rel_count);
+            if (q_f16 != null and k_f16 != null and v_f16 != null and qr_f16 != null and kr_f16 != null) {
+                // Every optional scratch decision precedes the first conversion.
+                inline for (.{ q_f16.?, k_f16.?, v_f16.?, qr_f16.?, kr_f16.? }, .{ q_tensor, k_tensor, v_tensor, q_r_tensor, k_r_tensor }) |staged, source| {
+                    try self.kernels.launchF32ToF16(&self.ctx, staged, source.buffer, source.elem_count);
+                    self.stats.deberta_stream_f16_staging_calls += 1;
+                }
+                const launched = try self.kernels.launchDebertaAttentionStreamF16(
+                    &self.ctx,
+                    device,
+                    q_f16.?,
+                    k_f16.?,
+                    v_f16.?,
+                    qr_f16.?,
+                    kr_f16.?,
+                    mask_device,
+                    batch,
+                    seq_len,
+                    num_heads,
+                    head_dim,
+                );
+                if (!launched) return error.CudaKernelUnavailable;
+                {
+                    self.stats.deberta_stream_f16_attention_calls += 1;
+                    self.stats.launch_attention += 1;
+                    return output.intoTensor();
+                }
             }
         }
         self.stats.deberta_stream_f16_attention_fallbacks += 1;
@@ -28033,7 +28054,7 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
         if (launched) {
             self.stats.deberta_fused_attention_calls += 1;
             self.stats.launch_attention += 1;
-            return createTensor(self, device, shape, count);
+            return output.intoTensor();
         }
         // Count only attempted-but-failed fused launches: disabled or
         // ineligible shapes reaching the base kernel are not fallbacks.
@@ -28041,7 +28062,7 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
     }
     try self.kernels.launchDebertaAttentionF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, q_r_tensor.buffer, k_r_tensor.buffer, mask_device, batch, seq_len, num_heads, head_dim);
     self.stats.launch_attention += 1;
-    return createTensor(self, device, shape, count);
+    return output.intoTensor();
 }
 
 fn debertaDisentangledAttentionBackward(
@@ -48364,6 +48385,9 @@ test "CUDA owned host upload frees every host input once and refuses metadata OO
             try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, tensorFromCt(result).shape);
         }
     };
+    // Stabilize the backend's optional scratch-planner metadata before
+    // enumerating this operation's owned host/shape/header failures.
+    try Case.run(std.testing.allocator, &compute);
     try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{&compute});
 }
 
@@ -48438,4 +48462,116 @@ fn checkFlorenceMlpCommitBoundary(compute: *CudaCompute, cb: *const ops.ComputeB
         try std.testing.expect(compute.ctx.stats.stream_syncs > waits);
         try std.testing.expectEqual(completed, compute.florence_fused_mlp_calls);
     }
+}
+
+test "CUDA materialized relative attention preflights all four GEMMs and never retries after committed work" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    if (compute.ctx.info.compute_major < 8 or compute.cublaslt == null) return error.SkipZigTest;
+    const cb = compute.computeBackend();
+    const batch = 2;
+    const seq = 8;
+    const heads = 2;
+    const dim = 64;
+    const hidden = heads * dim;
+    const count = batch * seq * hidden;
+    const zeros: [count]f32 = @splat(0);
+    const relatives: [(2 * seq - 1) * hidden]f32 = @splat(0);
+    var values: [count]f32 = undefined;
+    for (&values, 0..) |*value, index| value.* = @as(f32, @floatFromInt((index * 7 + index / hidden) % 31)) * 0.0625;
+    const q = try cb.fromFloat32Shape(&zeros, &.{ batch, seq, hidden });
+    defer cb.free(q);
+    const v = try cb.fromFloat32Shape(&values, &.{ batch, seq, hidden });
+    defer cb.free(v);
+    const relative = try cb.fromFloat32Shape(&relatives, &.{ 2 * seq - 1, hidden });
+    defer cb.free(relative);
+    const destination = try cb.fromFloat32Shape(&zeros, &.{ batch, seq, hidden });
+    defer cb.free(destination);
+    const mask_values: [batch * seq]i64 = @splat(1);
+    const mask = try uploadCachedAttentionMaskI64(&compute, &mask_values);
+    const Invoker = struct {
+        fn run(owner: *CudaCompute, dst: CT, queries: CT, value: CT, rel: CT, m: buffer_mod.DeviceBuffer) !bool {
+            return tryDebertaMaterializedAttentionF16(owner, tensorFromCt(dst).buffer, tensorFromCt(queries), tensorFromCt(queries), tensorFromCt(value), tensorFromCt(rel), tensorFromCt(rel), m, batch, seq, heads, dim);
+        }
+    };
+    const Heuristic = @TypeOf(compute.cublaslt.?.fns.cublasLtMatmulAlgoGetHeuristic);
+    const H = @typeInfo(@typeInfo(Heuristic).pointer.child).@"fn".param_types;
+    const Metadata = struct {
+        var actual: Heuristic = undefined;
+        var calls: usize = 0;
+        var fail_at: usize = 0;
+        var status: c_int = 15;
+        fn heuristic(p0: H[0].?, p1: H[1].?, p2: H[2].?, p3: H[3].?, p4: H[4].?, p5: H[5].?, p6: H[6].?, p7: H[7].?, p8: H[8].?, p9: H[9].?) callconv(.c) c_int {
+            calls += 1;
+            if (calls == fail_at) return status;
+            return actual(p0, p1, p2, p3, p4, p5, p6, p7, p8, p9);
+        }
+    };
+    const Launch = @TypeOf(compute.ctx.driver.fns.cuLaunchKernel);
+    const L = @typeInfo(@typeInfo(Launch).pointer.child).@"fn".param_types;
+    const Probe = struct {
+        var actual: Launch = undefined;
+        var calls: usize = 0;
+        fn launch(p0: L[0].?, p1: L[1].?, p2: L[2].?, p3: L[3].?, p4: L[4].?, p5: L[5].?, p6: L[6].?, p7: L[7].?, p8: L[8].?, p9: L[9].?, p10: L[10].?) callconv(.c) driver_mod.CUresult {
+            calls += 1;
+            return actual(p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10);
+        }
+    };
+    Metadata.actual = compute.cublaslt.?.fns.cublasLtMatmulAlgoGetHeuristic;
+    Probe.actual = compute.ctx.driver.fns.cuLaunchKernel;
+    compute.ctx.driver.fns.cuLaunchKernel = Probe.launch;
+    defer compute.ctx.driver.fns.cuLaunchKernel = Probe.actual;
+    compute.cublaslt.?.fns.cublasLtMatmulAlgoGetHeuristic = Metadata.heuristic;
+    for ([_]c_int{ 15, 13 }) |status| for (1..5) |member| {
+        Metadata.status = status;
+        Metadata.calls = 0;
+        Metadata.fail_at = member;
+        Probe.calls = 0;
+        const completed = compute.stats.deberta_materialized_f16_attention_calls;
+        const result = Invoker.run(&compute, destination, q, v, relative, mask);
+        if (status == 15) try std.testing.expect(!try result) else try std.testing.expectError(error.CublasLtError, result);
+        try std.testing.expectEqual(member, Metadata.calls);
+        try std.testing.expectEqual(@as(usize, 0), Probe.calls);
+        try std.testing.expectEqual(completed, compute.stats.deberta_materialized_f16_attention_calls);
+        try std.testing.expectEqual(@as(usize, 0), compute.cublaslt.?.tensor_core_plans.count());
+    };
+    compute.cublaslt.?.fns.cublasLtMatmulAlgoGetHeuristic = Metadata.actual;
+    const Matmul = @TypeOf(compute.cublaslt.?.fns.cublasLtMatmul);
+    const M = @typeInfo(@typeInfo(Matmul).pointer.child).@"fn".param_types;
+    const Submit = struct {
+        var actual: Matmul = undefined;
+        var calls: usize = 0;
+        var fail_at: usize = 0;
+        fn matmul(p0: M[0].?, p1: M[1].?, p2: M[2].?, p3: M[3].?, p4: M[4].?, p5: M[5].?, p6: M[6].?, p7: M[7].?, p8: M[8].?, p9: M[9].?, p10: M[10].?, p11: M[11].?, p12: M[12].?, p13: M[13].?, p14: M[14].?, p15: M[15].?) callconv(.c) c_int {
+            calls += 1;
+            const status = actual(p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15);
+            return if (status != 0) status else if (calls == fail_at) 13 else 0;
+        }
+    };
+    Submit.actual = compute.cublaslt.?.fns.cublasLtMatmul;
+    compute.cublaslt.?.fns.cublasLtMatmul = Submit.matmul;
+    defer compute.cublaslt.?.fns.cublasLtMatmul = Submit.actual;
+    for (1..5) |member| {
+        Submit.calls = 0;
+        Submit.fail_at = member;
+        Probe.calls = 0;
+        const waits = compute.ctx.stats.stream_syncs;
+        const completed = compute.stats.deberta_materialized_f16_attention_calls;
+        try std.testing.expectError(error.CublasLtError, Invoker.run(&compute, destination, q, v, relative, mask));
+        try std.testing.expectEqual(member, Submit.calls);
+        try std.testing.expectEqual(@as(usize, if (member == 4) 3 else 1), Probe.calls);
+        try std.testing.expect(compute.ctx.stats.stream_syncs > waits);
+        try std.testing.expectEqual(completed, compute.stats.deberta_materialized_f16_attention_calls);
+    }
+    Submit.fail_at = 0;
+    try std.testing.expect(try Invoker.run(&compute, destination, q, v, relative, mask));
+    const actual = try cb.toFloat32(destination, a);
+    defer a.free(actual);
+    for (0..batch) |b| for (0..seq) |qi| for (0..hidden) |feature| {
+        var expected: f32 = 0;
+        for (0..seq) |ki| expected += values[(b * seq + ki) * hidden + feature] / seq;
+        try std.testing.expectApproxEqAbs(expected, actual[(b * seq + qi) * hidden + feature], 0.00001);
+    };
 }

@@ -610,7 +610,7 @@ pub const CublasLt = struct {
         try checkRawBytes(workspace, plan.workspace_size);
         if (bias) |value| try self.setBias(plan.op_desc, value, output_type);
 
-        try self.submitDensePlan(ctx, plan, invocation, residual);
+        try self.submitMatmulPlan(ctx, plan, invocation, residual);
         if (!plan_lease.publish(self) and tuning.normalized().enabled) {
             // A tuned request promises reusable measured inference. If cache
             // publication fails, drain the accepted launch before returning
@@ -666,7 +666,7 @@ pub const CublasLt = struct {
         try validateWeightOutInvocation(request.kind(), request.precision.native(), request.output_precision.native(), request.rows, request.in_dim, request.out_dim, invocation, residual);
     }
 
-    inline fn submitDensePlan(self: *CublasLt, ctx: *context_mod.CudaContext, plan: TensorCorePlan, invocation: TensorCoreInvocation, residual: ?buffer_mod.DeviceBuffer) Error!void {
+    inline fn submitMatmulPlan(self: *CublasLt, ctx: *context_mod.CudaContext, plan: TensorCorePlan, invocation: TensorCoreInvocation, residual: ?buffer_mod.DeviceBuffer) Error!void {
         const dst = invocation.dst;
         const input = invocation.input;
         const weight = invocation.weight;
@@ -868,7 +868,7 @@ pub const CublasLt = struct {
             try self.validate(invocation);
             try self.owner.validateContext(ctx);
             if (invocation.bias) |bias| try self.owner.setBias(self.plan.op_desc, bias, CUDA_R_32F);
-            try self.owner.submitDensePlan(ctx, self.plan, invocation, null);
+            try self.owner.submitMatmulPlan(ctx, self.plan, invocation, null);
             return self.plan.selection;
         }
     };
@@ -1005,8 +1005,10 @@ pub const CublasLt = struct {
     /// Synchronous borrowed binding. All owned descriptors are held through
     /// submission; no plan-map pointer or caller buffer ownership escapes.
     /// Unlike tuned preparation this entry never submits numerical probes.
-    pub const UntunedDenseDispatch = DenseDispatch;
-    pub const DenseDispatch = struct {
+    // Compatibility names for the original dense projection API.
+    pub const DenseDispatch = MatmulDispatch;
+    pub const UntunedDenseDispatch = MatmulDispatch;
+    pub const MatmulDispatch = struct {
         owner: *CublasLt,
         lease: TensorCorePlanLease,
         invocation: TensorCoreInvocation,
@@ -1016,14 +1018,14 @@ pub const CublasLt = struct {
         tuning: MatmulTuning = .{},
         tuning_fallback: bool = false,
 
-        pub fn deinit(self: *DenseDispatch) void {
+        pub fn deinit(self: *MatmulDispatch) void {
             self.lease.deinit(self.owner);
             self.* = undefined;
         }
-        pub fn submit(self: *DenseDispatch, ctx: *context_mod.CudaContext) Error!void {
+        pub fn submit(self: *MatmulDispatch, ctx: *context_mod.CudaContext) Error!void {
             _ = try self.submitSelection(ctx);
         }
-        pub fn submitSelection(self: *DenseDispatch, ctx: *context_mod.CudaContext) Error!MatmulSelection {
+        pub fn submitSelection(self: *MatmulDispatch, ctx: *context_mod.CudaContext) Error!MatmulSelection {
             if (self.submitted) return error.CublasLtUnsupported;
             self.submitted = true;
             errdefer if (self.canonical_decode) {
@@ -1064,7 +1066,7 @@ pub const CublasLt = struct {
             defer if (self.invocation.bias != null) self.owner.bias_submission_mutex.unlock();
             errdefer ctx.synchronize() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
             if (self.invocation.bias) |bias| try self.owner.setBias(self.lease.plan.op_desc, bias, self.output_type);
-            try self.owner.submitDensePlan(ctx, self.lease.plan, self.invocation, null);
+            try self.owner.submitMatmulPlan(ctx, self.lease.plan, self.invocation, null);
             if (!self.lease.publish(self.owner) and self.tuning.enabled and !self.tuning_fallback) return error.CublasLtUnsupported;
             return self.lease.plan.selection;
         }
@@ -1078,7 +1080,7 @@ pub const CublasLt = struct {
         return self.preflightDense(ctx, request, invocation);
     }
 
-    pub fn preflightDense(self: *CublasLt, ctx: *context_mod.CudaContext, request: DenseRequest, invocation: TensorCoreInvocation) Error!DenseDispatch {
+    pub fn preflightDense(self: *CublasLt, ctx: *context_mod.CudaContext, request: DenseRequest, invocation: TensorCoreInvocation) Error!MatmulDispatch {
         if (request.with_bias and request.tuning.enabled) return error.CublasLtUnsupported;
         const canonical_decode = request.precision == .f16 and self.canonicalDecodeRows(request.kind(), CUDA_R_16F, CUDA_R_32F, 1, request.rows, request.in_dim, request.out_dim, .{}) != 0;
         errdefer if (canonical_decode) {
@@ -1530,7 +1532,16 @@ pub const CublasLt = struct {
         in_dim: usize,
         out_dim: usize,
     ) Error!void {
-        try self.validateContext(ctx);
+        var dispatch = try self.preflightF16StridedBatched(ctx, .{ .dst = dst, .input = input_f16, .weight = weight_f16, .workspace = workspace }, batch_count, rows, in_dim, out_dim);
+        defer dispatch.deinit();
+        try dispatch.submit(ctx);
+    }
+
+    /// Acquire the original strided plan using real storage, before any
+    /// producer kernel. Submission shares the same held-plan owner as dense
+    /// projections and never discovers metadata or declines after commitment.
+    pub fn preflightF16StridedBatched(self: *CublasLt, ctx: *context_mod.CudaContext, invocation: TensorCoreInvocation, batch_count: usize, rows: usize, in_dim: usize, out_dim: usize) Error!MatmulDispatch {
+        if (invocation.bias != null) return error.CublasLtUnsupported;
         if (batch_count == 0 or batch_count > std.math.maxInt(i32) or rows == 0 or in_dim == 0 or out_dim == 0) return error.CublasLtUnsupported;
         if (rows > std.math.maxInt(u32) or in_dim > std.math.maxInt(u32) or out_dim > std.math.maxInt(u32)) return error.CublasLtUnsupported;
         const input_stride = std.math.mul(usize, rows, in_dim) catch return error.CublasLtUnsupported;
@@ -1539,56 +1550,24 @@ pub const CublasLt = struct {
         const input_count = std.math.mul(usize, batch_count, input_stride) catch return error.CublasLtUnsupported;
         const weight_count = std.math.mul(usize, batch_count, weight_stride) catch return error.CublasLtUnsupported;
         const output_count = std.math.mul(usize, batch_count, output_stride) catch return error.CublasLtUnsupported;
-        try checkRawBytes(input_f16, std.math.mul(usize, input_count, @sizeOf(u16)) catch return error.CublasLtUnsupported);
-        try checkRawBytes(weight_f16, std.math.mul(usize, weight_count, @sizeOf(u16)) catch return error.CublasLtUnsupported);
-        try checkRawBytes(dst, std.math.mul(usize, output_count, @sizeOf(f32)) catch return error.CublasLtUnsupported);
+        try checkRawBytes(invocation.input, std.math.mul(usize, input_count, @sizeOf(u16)) catch return error.CublasLtUnsupported);
+        try checkRawBytes(invocation.weight, std.math.mul(usize, weight_count, @sizeOf(u16)) catch return error.CublasLtUnsupported);
+        try checkRawBytes(invocation.dst, std.math.mul(usize, output_count, @sizeOf(f32)) catch return error.CublasLtUnsupported);
         const input_bytes = std.math.mul(usize, input_count, @sizeOf(u16)) catch return error.CublasLtUnsupported;
         const weight_bytes = std.math.mul(usize, weight_count, @sizeOf(u16)) catch return error.CublasLtUnsupported;
         const dst_bytes = std.math.mul(usize, output_count, @sizeOf(f32)) catch return error.CublasLtUnsupported;
-        try requireDisjoint(dst, dst_bytes, input_f16, input_bytes);
-        try requireDisjoint(dst, dst_bytes, weight_f16, weight_bytes);
-        try requireDisjoint(workspace, workspace.len, input_f16, input_bytes);
-        try requireDisjoint(workspace, workspace.len, weight_f16, weight_bytes);
-        try requireDisjoint(workspace, workspace.len, dst, dst_bytes);
-        try validateWorkspaceAlignment(workspace);
+        try requireDisjoint(invocation.dst, dst_bytes, invocation.input, input_bytes);
+        try requireDisjoint(invocation.dst, dst_bytes, invocation.weight, weight_bytes);
+        try requireDisjoint(invocation.workspace, invocation.workspace.len, invocation.input, input_bytes);
+        try requireDisjoint(invocation.workspace, invocation.workspace.len, invocation.weight, weight_bytes);
+        try requireDisjoint(invocation.workspace, invocation.workspace.len, invocation.dst, dst_bytes);
+        try validateWorkspaceAlignment(invocation.workspace);
 
-        const invocation = TensorCoreInvocation{
-            .dst = dst,
-            .input = input_f16,
-            .weight = weight_f16,
-            .workspace = workspace,
-        };
-        var plan_lease = try self.tensorCorePlanFor(.strided_batched, CUDA_R_16F, CUDA_R_32F, batch_count, rows, in_dim, out_dim, workspace.len, .{}, ctx, invocation, false);
-        defer plan_lease.deinit(self);
-        const plan = plan_lease.plan;
-        try checkRawBytes(workspace, plan.workspace_size);
-        var alpha: f32 = 1.0;
-        var beta: f32 = 0.0;
-        const workspace_ptr: ?*anyopaque = if (workspace.ptr != 0 and plan.workspace_size > 0) try devicePointer(workspace.ptr) else null;
-        ctx.makeCurrent() catch return error.CublasLtError;
-        const submit_status = self.fns.cublasLtMatmul(
-            self.handle,
-            plan.op_desc,
-            &alpha,
-            try devicePointer(weight_f16.ptr),
-            plan.a_desc,
-            try devicePointer(input_f16.ptr),
-            plan.b_desc,
-            &beta,
-            try devicePointer(dst.ptr),
-            plan.c_desc,
-            try devicePointer(dst.ptr),
-            plan.d_desc,
-            &plan.algo,
-            workspace_ptr,
-            plan.workspace_size,
-            ctx.stream,
-        );
-        self.check(submit_status) catch |err| {
-            ctx.synchronize() catch {};
-            return err;
-        };
-        _ = plan_lease.publish(self);
+        try self.validateContext(ctx);
+        var lease = try self.tensorCorePlanFor(.strided_batched, CUDA_R_16F, CUDA_R_32F, batch_count, rows, in_dim, out_dim, invocation.workspace.len, .{}, ctx, invocation, true);
+        errdefer lease.deinit(self);
+        try checkRawBytes(invocation.workspace, lease.plan.workspace_size);
+        return .{ .owner = self, .lease = lease, .invocation = invocation, .canonical_decode = false };
     }
 
     fn configureStridedBatch(self: *CublasLt, layout: MatrixLayout, batch_count: i32, stride: i64) Error!void {
@@ -2589,4 +2568,24 @@ test "BF16 deferred tuning event metadata decline preserves preflighted exact or
     try std.testing.expectEqual(@as(usize, 2), VendorDispatchTestContext.submissions); // warmup + ordinary final submit
     try std.testing.expectEqual(discovery_calls, VendorTestSdk.calls); // no postcommit heuristic discovery
     try std.testing.expectEqual(@as(usize, 1), blas.tensor_core_plans.count());
+}
+
+test "strided vendor preflight rejects every malformed binding before context SDK or producer access" {
+    var blas: CublasLt = undefined;
+    var no_driver: context_mod.CudaContext = undefined;
+    const valid = TensorCoreInvocation{ .input = .{ .ptr = 0x10000, .len = 2 * 3 * 32 * 2 }, .weight = .{ .ptr = 0x20000, .len = 2 * 16 * 32 * 2 }, .dst = .{ .ptr = 0x30000, .len = 2 * 3 * 16 * 4 }, .workspace = .{ .ptr = 0x40000, .len = 4096 } };
+    for (0..6) |index| {
+        var malformed = valid;
+        switch (index) {
+            0 => malformed.input.len -= 1,
+            1 => malformed.weight.len -= 1,
+            2 => malformed.dst.len -= 1,
+            3 => malformed.dst.ptr = malformed.input.ptr,
+            4 => malformed.workspace.ptr = malformed.weight.ptr,
+            else => malformed.bias = malformed.weight,
+        }
+        try std.testing.expectError(error.CublasLtUnsupported, blas.preflightF16StridedBatched(&no_driver, malformed, 2, 3, 32, 16));
+    }
+    try std.testing.expectError(error.CublasLtUnsupported, blas.preflightF16StridedBatched(&no_driver, valid, 0, 3, 32, 16));
+    try std.testing.expectError(error.CublasLtUnsupported, blas.preflightF16StridedBatched(&no_driver, valid, 2, 3, std.math.maxInt(usize), 16));
 }
