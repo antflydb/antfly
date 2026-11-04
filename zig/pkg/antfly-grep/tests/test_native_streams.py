@@ -292,16 +292,31 @@ class NativeStreams(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('"complete":true', result.stdout)
         self.assertNotIn('"type":"error"', result.stdout)
-        config["tables"][0]["streams"] = config["tables"][0]["streams"][:1]
-        self.config.write_text(json.dumps(config))
-        result = subprocess.run(
-            [BINARY, "--table-config", str(self.config), "Tuesday"],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("NativeArtifactStreamRequired", result.stderr)
+        source = config["tables"][0]["streams"][0]
+        for extra in [
+            [],
+            [{"name": "title", "field": "metadata.title", "default": False}],
+            [
+                {
+                    "name": "summary",
+                    "artifact": "summary",
+                    "index": "summary_text",
+                    "field": "$",
+                    "default": False,
+                }
+            ],
+        ]:
+            config["tables"][0]["streams"] = [source] + extra
+            self.config.write_text(json.dumps(config))
+            for flags in [[], ["--json"]]:
+                result = subprocess.run(
+                    [BINARY, "--table-config", str(self.config), *flags, "Tuesday"],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("NativeArtifactStreamRequired", result.stderr)
         queries = [
             body.get("query") for method, body in self.requests if method == "POST"
         ]

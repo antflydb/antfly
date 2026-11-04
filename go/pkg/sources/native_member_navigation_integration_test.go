@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -380,7 +381,7 @@ func TestNativeMemberSourceAuthorityIntegration(t *testing.T) {
 	}
 	p := &Publisher{Endpoint: endpoint}
 	table := fmt.Sprintf("native_authority_%d", time.Now().UnixNano())
-	_, err := p.call(t.Context(), "POST", tablePath(table), map[string]any{"num_shards": 1, "indexes": map[string]any{"copies": map[string]any{"type": "full_text", "sources": []any{map[string]any{"artifact": "copied", "field": "text"}}, "enrichments": []any{map[string]any{"name": "copied", "kind": "asset", "field": "payload", "content_type": "application/json", "producer_json": `{"type":"copy"}`}}}}})
+	_, err := p.call(t.Context(), "POST", tablePath(table), map[string]any{"num_shards": 1, "schema": nativeCertificateSchema(), "indexes": map[string]any{"copies": map[string]any{"type": "full_text", "sources": []any{map[string]any{"artifact": "copied", "field": "text"}}, "enrichments": []any{map[string]any{"name": "copied", "kind": "asset", "field": "payload", "content_type": "application/json", "producer_json": `{"type":"copy"}`}}}}})
 	require.NoError(t, err)
 	defer p.call(context.Background(), "DELETE", tablePath(table), nil)
 	records := map[string]any{}
@@ -394,7 +395,14 @@ func TestNativeMemberSourceAuthorityIntegration(t *testing.T) {
 	require.NoError(t, p.Batch(t.Context(), table, records, nil))
 	require.Eventually(t, func() bool {
 		raw, err := p.call(t.Context(), "GET", tablePath(table)+"/indexes/copies", nil)
-		return err == nil && strings.Contains(string(raw), `"complete":true`)
+		var body struct {
+			Status struct {
+				Readiness struct {
+					Complete bool `json:"complete"`
+				} `json:"readiness"`
+			} `json:"status"`
+		}
+		return err == nil && json.Unmarshal(raw, &body) == nil && body.Status.Readiness.Complete
 	}, 30*time.Second, 50*time.Millisecond)
 	raw, err := p.call(t.Context(), "POST", tablePath(table)+"/query", map[string]any{"full_text_index": "copies", "full_text_search": map[string]any{"match_all": map[string]any{}}, "filter_query": map[string]any{"bool": true, "field": "permissions.public"}, "execution": map[string]any{"value_verification": map[string]any{"allow_scan": true}}, "hierarchy": map[string]any{"ancestors": map[string]any{"source": map[string]any{"fields": []string{"marker", "permissions"}}}}, "fields": []string{"text"}, "limit": 10})
 	require.NoError(t, err)
@@ -421,11 +429,15 @@ func TestNativeMemberSourceAuthorityIntegration(t *testing.T) {
 	require.Equal(t, 200, result.Responses[0].Status, string(raw))
 	require.Len(t, result.Responses[0].Hits.Hits, 1, string(raw))
 	require.Equal(t, "allowed", result.Responses[0].Hits.Hits[0].Hierarchy.Ancestors.Source.Document.Marker, string(raw))
-	streams := []TextStream{{Name: "source", Field: "content.text", Default: true}, {Name: "extracted", Artifact: "copied", Index: "copies", Field: "text", Default: true}}
-	for _, mixed := range []bool{true, false} {
-		if !mixed {
-			streams = streams[:1]
-		}
+	source := TextStream{Name: "source", Field: "content.text", Default: true}
+	for _, streams := range [][]TextStream{
+		{source, {Name: "extracted", Artifact: "copied", Index: "copies", Field: "text", Default: true}},
+		{source},
+		{source, {Name: "title", Field: "metadata.title", Default: false}},
+		{source, {Name: "summary", Artifact: "copied", Index: "copies", Field: "text", Default: false}},
+	} {
+		mixed := len(streams) > 1 && streams[1].Default
+
 		file := filepath.Join(t.TempDir(), "grep.json")
 		require.NoError(t, writeJSON(file, map[string]any{"version": 1, "endpoint": endpoint, "principals": []string{"user:self"}, "tables": []any{map[string]any{"name": table, "candidate_index": map[string]any{"version": 1, "field": "trigrams", "version_field": "certificate"}, "fields": CanonicalDocumentFields(), "source_filter": map[string]any{"doc_id": map[string]any{"ids": []string{"allowed"}}}, "streams": streams}}}, 1<<20))
 		for _, flags := range [][]string{nil, {"--json"}} {
@@ -444,4 +456,97 @@ func TestNativeMemberSourceAuthorityIntegration(t *testing.T) {
 		require.ErrorAs(t, err, &exit, string(output))
 		require.Equal(t, 1, exit.ExitCode(), string(output))
 	}
+}
+
+// A complete certificate over a modest original can exceed the generic JSON
+// traversal cap. Candidate membership is an indexed-term operation, independent
+// of the original-value matcher used for the final source-text predicate.
+func TestNativeIndexedCertificateIntegration(t *testing.T) {
+	endpoint, binary := os.Getenv("ANTFLY_SOURCE_TEST_ENDPOINT"), os.Getenv("ANTFLY_GREP_TEST_BINARY")
+	if endpoint == "" || binary == "" {
+		t.Skip("set native source endpoint and grep binary")
+	}
+	// De Bruijn sequence: every lowercase three-byte window occurs once.
+	// This gives 17,576 valid certificate terms for only 17,578 source bytes.
+	var digits [79]int
+	var sequence []byte
+	var visit func(int, int)
+	visit = func(t, period int) {
+		if t > 3 {
+			if 3%period == 0 {
+				for _, value := range digits[1 : period+1] {
+					sequence = append(sequence, byte('a'+value))
+				}
+			}
+			return
+		}
+		digits[t] = digits[t-period]
+		visit(t+1, period)
+		for value := digits[t-period] + 1; value < 26; value++ {
+			digits[t] = value
+			visit(t+1, t)
+		}
+	}
+	visit(1, 1)
+	sequence = append(sequence, sequence[:2]...)
+	content := string(sequence)
+	set := map[string]bool{}
+	for i := 0; i+3 <= len(content); i++ {
+		set[fmt.Sprintf("%x", content[i:i+3])] = true
+	}
+	grams := make([]string, 0, len(set))
+	for gram := range set {
+		grams = append(grams, gram)
+	}
+	sort.Strings(grams)
+	require.Greater(t, len(grams), 16384)
+	p := &Publisher{Endpoint: endpoint}
+	table := fmt.Sprintf("native_certificate_%d", time.Now().UnixNano())
+	_, err := p.call(t.Context(), "POST", tablePath(table), map[string]any{"num_shards": 1, "schema": nativeCertificateSchema()})
+	require.NoError(t, err)
+	defer p.call(context.Background(), "DELETE", tablePath(table), nil)
+	require.NoError(t, p.Batch(t.Context(), table, map[string]any{"text": map[string]any{
+		"source":  map[string]any{"uri": "gs://fixture/text.txt", "path": "text.txt", "revision": "1", "indexed_at": time.Now().Unix()},
+		"content": map[string]any{"text": content}, "permissions": map[string]any{"public": true, "readers": []string{}}, "metadata": map[string]any{},
+		"certificate": "raw-byte-trigrams-v1", "trigrams": grams,
+	}}, nil))
+	require.Eventually(t, func() bool {
+		raw, err := p.call(t.Context(), "GET", tablePath(table)+"/indexes/full_text_index_v0", nil)
+		var body struct {
+			Status struct {
+				Readiness struct {
+					Complete bool `json:"complete"`
+				} `json:"readiness"`
+			} `json:"status"`
+		}
+		return err == nil && json.Unmarshal(raw, &body) == nil && body.Status.Readiness.Complete
+	}, 30*time.Second, 50*time.Millisecond)
+	var baseline []byte
+	for _, accelerated := range []bool{false, true} {
+		binding := map[string]any{"name": table, "fields": CanonicalDocumentFields(), "streams": DefaultTextStreams()}
+		if accelerated {
+			binding["candidate_index"] = map[string]any{"version": 1, "field": "trigrams", "version_field": "certificate"}
+		}
+		file := filepath.Join(t.TempDir(), "grep.json")
+		require.NoError(t, writeJSON(file, map[string]any{"version": 1, "endpoint": endpoint, "tables": []any{binding}}, 1<<20))
+		output, err := exec.CommandContext(t.Context(), binary, "--table-config", file, "zzz").CombinedOutput()
+		require.NoError(t, err, string(output))
+		require.Contains(t, string(output), "zzz")
+		if accelerated {
+			require.Equal(t, string(baseline), string(output), "candidate acceleration must preserve exact results")
+		} else {
+			baseline = output
+		}
+	}
+}
+
+func nativeCertificateSchema() map[string]any {
+	// Candidate certificates are declared keyword representations, not analyzed
+	// prose or implicitly inferred fields (which may initially be empty).
+	return map[string]any{"default_type": "doc", "document_schemas": map[string]any{"doc": map[string]any{"schema": map[string]any{
+		"type": "object", "additionalProperties": true, "properties": map[string]any{
+			"trigrams":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "x-antfly-types": []string{"keyword"}},
+			"certificate": map[string]any{"type": "string", "x-antfly-types": []string{"keyword"}},
+		},
+	}}}}
 }

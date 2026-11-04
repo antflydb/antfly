@@ -415,8 +415,13 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
     const filter_arena = filters.allocator();
     const extra_filter: ?std.json.Value = if (search.options.table_filter) |raw| (try std.json.parseFromSlice(std.json.Value, filter_arena, raw, .{ .allocate = .alloc_always })).value else null;
     const user_filter: ?std.json.Value = if (table.source_filter) |source_filter| (if (extra_filter) |extra| try std.json.parseFromSliceLeaky(std.json.Value, filter_arena, try std.json.Stringify.valueAlloc(filter_arena, .{ .conjuncts = .{ source_filter, extra } }, .{}), .{}) else source_filter) else extra_filter;
-    const text_query = try contentQuery(filter_arena, search, table);
-    const filter = try candidateFilter(filter_arena, search, table, user_filter);
+    // Candidate certificates describe indexed terms, while user filters may
+    // contain storage-only predicates. Compose acceleration with the text
+    // query so it uses the indexed-term executor without rewriting ACL filters.
+    const content_query = try contentQuery(filter_arena, search, table);
+    const candidates = try candidateQuery(filter_arena, search, table);
+    const text_query = if (content_query) |content| (if (candidates) |candidate| try std.json.parseFromSliceLeaky(std.json.Value, filter_arena, try std.json.Stringify.valueAlloc(filter_arena, .{ .conjuncts = .{ content, candidate } }, .{}), .{}) else content) else candidates;
+    const filter = user_filter;
     var fetcher = Fetch{ .table = table, .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .access_id = table.access_id, .source_id = table.source_id, .valid_until = table.valid_until, .document_field = table.document_field, .filter = filter, .text_query = text_query, .http = http, .fields = try tableProjectionFields(filter_arena, search.options, table) };
     defer search.summary.index_requests += fetcher.summary.index_requests;
     // Finite decision budgets preserve foreground order: speculative page
@@ -1393,14 +1398,14 @@ fn contentQuery(a: A, search: anytype, table: Table) !?std.json.Value {
 fn canPrune(o: *const @import("options.zig").Options) bool {
     return o.media == .text and !((o.ask != null and (o.patterns.items.len == 0 or o.jev_mode)) or o.files or o.invert or o.files_without_match or o.include_zero or o.passthru or o.json or o.stats or o.null_data or (!std.mem.eql(u8, o.encoding, "auto") and !std.mem.eql(u8, o.encoding, "none")));
 }
-fn candidateFilter(a: A, search: anytype, table: Table, user_filter: ?std.json.Value) !?std.json.Value {
-    if (table.selected_stream) |stream| if (stream.artifact != null) return user_filter;
-    const index = table.candidate_index orelse return user_filter;
+fn candidateQuery(a: A, search: anytype, table: Table) !?std.json.Value {
+    if (table.selected_stream) |stream| if (stream.artifact != null) return null;
+    const index = table.candidate_index orelse return null;
     const o = search.options;
-    if (!canPrune(o)) return user_filter;
-    const literals = (try search.matcher.requiredLiterals(a)) orelse return user_filter;
+    if (!canPrune(o)) return null;
+    const literals = (try search.matcher.requiredLiterals(a)) orelse return null;
     var grams: std.ArrayList(std.json.Value) = .empty;
-    const certificate_bytes = try std.json.Stringify.valueAlloc(a, .{ .equals = "raw-byte-trigrams-v1", .field = index.version_field }, .{});
+    const certificate_bytes = try std.json.Stringify.valueAlloc(a, .{ .term = "raw-byte-trigrams-v1", .field = index.version_field }, .{});
     const certificate = (try std.json.parseFromSlice(std.json.Value, a, certificate_bytes, .{ .allocate = .alloc_always })).value;
     var alternatives: std.ArrayList(std.json.Value) = .empty;
     // A text certificate never certifies the availability of binary extraction.
@@ -1422,7 +1427,7 @@ fn candidateFilter(a: A, search: anytype, table: Table, user_filter: ?std.json.V
             if (duplicate) continue;
             seen[seen_count] = gram;
             seen_count += 1;
-            const encoded = try std.json.Stringify.valueAlloc(a, .{ .equals = gram[0..], .field = index.field }, .{});
+            const encoded = try std.json.Stringify.valueAlloc(a, .{ .term = gram[0..], .field = index.field }, .{});
             const term = try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .allocate = .alloc_always });
             try grams.append(a, term.value);
         }
@@ -1437,15 +1442,17 @@ fn candidateFilter(a: A, search: anytype, table: Table, user_filter: ?std.json.V
         .{ .conjuncts = .{ certificate, union_value } },
         .{ .bool = .{ .must_not = .{certificate} } },
     } }, .{});
-    const candidates = (try std.json.parseFromSlice(std.json.Value, a, candidates_bytes, .{ .allocate = .alloc_always })).value;
-    if (user_filter == null) return candidates;
-    const encoded = try std.json.Stringify.valueAlloc(a, .{ .conjuncts = .{ user_filter.?, candidates } }, .{});
-    return (try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .allocate = .alloc_always })).value;
+    return (try std.json.parseFromSlice(std.json.Value, a, candidates_bytes, .{ .allocate = .alloc_always })).value;
 }
 
 fn requiresNativeStreamCheck(o: *const @import("options.zig").Options, table: Table) bool {
     const stream = table.selected_stream orelse return false;
-    return table.fields != null and stream.artifact == null and table.streams.len == 1 and o.artifacts.items.len == 0;
+    if (table.fields == null or stream.artifact != null or o.artifacts.items.len != 0) return false;
+    // Unselected declarations cannot establish coverage of binary originals.
+    for (table.streams) |candidate| {
+        if (candidate.artifact != null and record_view.selected(candidate, o.artifacts.items, o.all_artifacts)) return false;
+    }
+    return true;
 }
 
 fn metadataListing(o: *const @import("options.zig").Options) bool {

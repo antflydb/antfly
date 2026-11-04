@@ -746,6 +746,8 @@ fetches remote attachments by their pinned attachment ID. Inline MIME parts use
 a bounded full-message acquisition only when their bytes are requested. A GET
 fetches only the selected attachment and checks its pinned byte digest. Deleted
 or edited parents fail closed, and an unavailable sibling cannot block delivery.
+Canonical parent-text reads likewise reload only text and provider metadata,
+validate the pinned parent identity and revision, and acquire no attachment bodies.
 Exports and collaboration attachments retain
 bounded acquisition limits; large S3/GCS originals use streaming. Unsupported
 whole-workbook export is rejected. Explicit `publication: text` retains the optional text-extractor path;

@@ -1382,7 +1382,9 @@ class CliTests(unittest.TestCase):
         second = self.raw_cli("--table-config", config, *args)
         self.assertEqual(second.stdout, first.stdout)
         self.assertLessEqual(len(self.server.index_requests), before)
-        self.assertIn("filter_query", self.server.index_requests[0][2])
+        self.assertIn(
+            "grep_trigrams", json.dumps(self.server.index_requests[0][2]["query"])
+        )
 
     def test_indexed_source_scope_survives_disabled_score_caching(self):
         config = self.table_config([self.indexed_doc()])
@@ -1680,10 +1682,12 @@ class CliTests(unittest.TestCase):
         result = self.raw_cli("--table-config", config, *args)
         self.assertEqual(result.stdout, baseline)
         self.assertEqual(len(self.server.index_requests), 2)
-        filters = self.server.index_requests[0][2]["filter_query"]["disjuncts"][0][
-            "conjuncts"
-        ][1]["disjuncts"][0]["conjuncts"]
-        self.assertTrue(all(term["field"] == "grep_trigrams" for term in filters))
+        filters = self.server.index_requests[0][2]["query"]["conjuncts"][1][
+            "disjuncts"
+        ][0]["conjuncts"][1]["disjuncts"][0]["conjuncts"]
+        self.assertTrue(
+            all(term["field"] == "grep_trigrams" and "term" in term for term in filters)
+        )
         self.server.index_documents[1]["_source"].pop("grep_trigrams_version")
         self.server.index_requests = []
         self.assertEqual(self.raw_cli("--table-config", config, *args).stdout, baseline)
@@ -1701,7 +1705,11 @@ class CliTests(unittest.TestCase):
         ):
             self.server.index_requests = []
             self.raw_cli("--table-config", config, *flags)
-            self.assertNotIn("filter_query", self.server.index_requests[0][2], flags)
+            self.assertNotIn(
+                "grep_trigrams",
+                json.dumps(self.server.index_requests[0][2].get("query")),
+                flags,
+            )
         self.server.index_requests = []
         self.raw_cli(
             "--table-config",
@@ -1711,7 +1719,7 @@ class CliTests(unittest.TestCase):
             *args,
         )
         self.assertEqual(
-            self.server.index_requests[0][2]["filter_query"]["conjuncts"][0],
+            self.server.index_requests[0][2]["filter_query"],
             {"term": "active", "field": "state"},
         )
 
@@ -1833,7 +1841,10 @@ class CliTests(unittest.TestCase):
             with self.subTest(args=args):
                 self.server.index_requests = []
                 optimized = self.raw_cli("--table-config", config, *args).stdout
-                self.assertIn("filter_query", self.server.index_requests[0][2])
+                self.assertIn(
+                    "grep_trigrams",
+                    json.dumps(self.server.index_requests[0][2]["query"]),
+                )
                 self.assertEqual(
                     len(self.server.index_requests), 2 if len(args) == 1 else 3
                 )
