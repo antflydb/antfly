@@ -1946,7 +1946,7 @@ pub const Store = struct {
     pub fn getCatalogRecordAlloc(self: *Store, a: Allocator, key: []const u8) !?[]u8 {
         lockStore(self);
         defer self.mutex.unlock();
-        if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
+        if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
         return self.file.getCatalogRecordAlloc(a, key);
     }
 
@@ -2119,7 +2119,7 @@ pub const Store = struct {
             const previous_cancel = self.file.allocator_cancel_token;
             self.file.allocator_cancel_token = cancel;
             defer self.file.allocator_cancel_token = previous_cancel;
-            if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
+            if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
             _ = try artifact_source.cleanupOrphans(&self.file, &self.artifact_cleanup_cursor);
             try self.artifact_marker_sweep.run(&self.file);
             if (try self.file.retirementNeedsService()) {
@@ -2157,7 +2157,7 @@ pub const Store = struct {
             self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
             const retry_due = self.maintenance_policy.rewriteRetryDue(std.Io.Clock.awake.now(self.file.runtime()).nanoseconds);
             if (!force and !self.maintenance_policy.due(size) and !retry_due) return;
-            if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
+            if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
             assessed_checkpoint = self.file.activeCheckpoint();
             assessed_size = size;
             assessed_indexed = self.file.header.indexed_reclamation or self.file.vacuum_target_indexed;
@@ -2457,7 +2457,7 @@ pub const Store = struct {
         var snapshot, const size = blk: {
             lockStore(self);
             defer self.mutex.unlock();
-            if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
+            if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
             var file = try native.NativeFile.openWithIo(self.allocator, self.file.runtime(), self.file.path, .{ .read_only = true, .resource_manager = self.resource_manager });
             errdefer file.close();
             file.page_cache_policy = .metadata_only;
@@ -2496,7 +2496,7 @@ pub const Store = struct {
                 std.log.warn("lite vacuum refused: another maintenance cycle owns the workspace", .{});
                 return error.FileBusy;
             }
-            if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
+            if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
             var snapshot = try self.file.captureFullReadSnapshot();
             snapshot.page_cache_policy = .metadata_only;
             snapshot.vacuum_target_indexed = self.file.vacuum_target_indexed;
@@ -2612,7 +2612,7 @@ pub const Store = struct {
                     if (!self.file.no_sync) try image.prepared.file.sync(io);
                 }
                 if (capture.count == 0) {
-                    if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
+                    if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
                     image.report.before_size = (try self.file.file.stat(io)).size;
                     image.report.reclaimed_bytes = image.report.before_size -| image.report.after_size;
                     image.prepared.no_sync = self.file.no_sync;
@@ -2720,7 +2720,7 @@ pub const Store = struct {
         lockStore(self);
         defer self.mutex.unlock();
         if (self.generation_workspace_active or self.maintenance_running or self.file.change_capture != null) return error.FileBusy;
-        if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
+        if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
         const status = try self.reclamationStatusAssumeLocked();
         var options = self.maintenance_policy.options;
         const minimum = native.NativeFile.minimumOwnerStorageBytes(options.page_reuse);
@@ -2765,7 +2765,7 @@ pub const Store = struct {
         // Portable archives omit secrets. Check at publication while reserving
         // the writer slot so a secret committed during preparation cannot be lost.
         if (self.file.change_capture != null) return error.FileBusy;
-        if (self.secret_store_uncertain or self.file.checkpoint_publication_uncertain) return error.OutcomeUnknown;
+        if (self.secret_store_uncertain or self.file.checkpoint_publication_uncertain) return error.OutcomeReconciliationRequired;
         if (try self.file.hasSecretState()) return error.LiteImportTargetNotEmpty;
         const old_bytes = (try self.file.file.stat(io)).size;
         try self.admitPreparedGenerationAssumeLocked(&prepared.file, old_bytes);
@@ -2837,7 +2837,7 @@ pub const Store = struct {
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         lockStore(self);
         defer self.mutex.unlock();
-        if (self.secret_store_uncertain or self.file.checkpoint_publication_uncertain) return error.OutcomeUnknown;
+        if (self.secret_store_uncertain or self.file.checkpoint_publication_uncertain) return error.OutcomeReconciliationRequired;
         try self.file.sync();
     }
 
@@ -2909,7 +2909,7 @@ pub const Store = struct {
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         lockStore(self);
         defer self.mutex.unlock();
-        if (self.secret_store_uncertain) return error.OutcomeUnknown;
+        if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
         try self.refreshAdmissionAssumeLocked();
         try self.initializeReadGenerationAssumeLocked();
         errdefer self.publishReadCheckpointAssumeLocked();
@@ -3248,7 +3248,8 @@ pub const Txn = struct {
             store.read_mutex.lockUncancelable(io);
         }
         defer store.read_mutex.unlock(io);
-        if (store.read_outcome_unknown) return error.OutcomeUnknown;
+        // Refused, not unknown: the read never ran. Reopen to reconcile.
+        if (store.read_outcome_unknown) return error.OutcomeReconciliationRequired;
         const checkpoint = store.read_generation.?.checkpoint;
         // Nested reads borrow the current writer's publication lease. Taking
         // another inode lock here would conflict with its page allocator's
@@ -6176,9 +6177,14 @@ test "lite grouped durability failures recover all roots at one checkpoint" {
             Fault.remaining = barrier;
             defer Fault.remaining = 0;
             var context: u8 = 0;
-            try std.testing.expectError(error.InputOutput, store.submitMutation(&context, Fault.apply));
+            // The first barrier precedes checkpoint publication, so nothing
+            // committed. Later barriers fail while the checkpoint is being
+            // published, which leaves the commit's durability unknown.
+            const expected: anyerror = if (barrier == 1) error.InputOutput else error.OutcomeUnknown;
+            try std.testing.expectError(expected, store.submitMutation(&context, Fault.apply));
             try std.testing.expectEqual(@as(usize, 0), Fault.remaining);
-            if (barrier > 1) try std.testing.expectError(error.OutcomeUnknown, store.submitMutation(&context, Fault.apply));
+            // Later mutations never run until the outcome is reconciled.
+            if (barrier > 1) try std.testing.expectError(error.OutcomeReconciliationRequired, store.submitMutation(&context, Fault.apply));
         }
         var reopened = try Store.open(alloc, path, true);
         defer reopened.close();
@@ -6880,7 +6886,8 @@ test "lite reclamation worker backs off failed publication fences" {
     lockStore(&store);
     defer store.mutex.unlock();
     try std.testing.expectEqual(reclamation.State.failed, store.maintenance_policy.status.state);
-    try std.testing.expectEqualStrings("OutcomeUnknown", store.maintenance_policy.status.last_error.?);
+    // Maintenance is refused, not of unknown outcome, while publication is uncertain.
+    try std.testing.expectEqualStrings("OutcomeReconciliationRequired", store.maintenance_policy.status.last_error.?);
 }
 
 test "lite scoped reads release values without growing parent point reads" {
