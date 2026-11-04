@@ -1,0 +1,400 @@
+{
+  "qualified": false,
+  "source_commit": "09e462d1ef396c3a7d315f9a04bf77f00f1bd586",
+  "mode": "Debug",
+  "scope": "Candidate-only local diagnosis on a shared host with metrics and one three-second sample. No clean timing claim; no reference build or execution.",
+  "result": {
+    "input_index": 7,
+    "importer_exit_code": 1,
+    "censored": false,
+    "importer_succeeded": false,
+    "summary": [
+      0,
+      0,
+      1
+    ],
+    "seconds": 142.8031559169758,
+    "peak_native_builds": 5,
+    "metrics_enabled": true,
+    "library_sha256": "5fa5d640e7907c5cfa63b6e33c25e2fabfce2cf82ad01caf2bd4ed80e4d0fee1",
+    "public_errors": [
+      "LiteReplayBacklogExceeded"
+    ],
+    "seed_sha256": "27ea0ac6beecde2ca727132143e214c17ef5f38010db3762f605551806673519",
+    "seed_copy_method": "native_stable_snapshot",
+    "scope": "Local diagnosis only. Metrics and any overlapping compilation prevent clean performance attribution."
+  },
+  "validation": {
+    "foreground_lifecycle_regression": {
+      "source": "80ebe93cf7bddfe6d16ba43afac6e830a4e5b76d",
+      "passed": 1,
+      "skips": 0,
+      "leaks": 0,
+      "mechanism": "An unbridged foreign metadata refresh performs a cold source open; scoped C API admission reuses the exact source with zero new opens. Success/error paths release predecessor references."
+    },
+    "selected_capi_sql_passed": 161,
+    "sdk_passed": 209,
+    "index_segment_passed": 190,
+    "persistent_delete_passed": 3,
+    "strict_executor_passed": 7,
+    "handoff_contracts_passed": 7,
+    "benchmark_reporting_passed": 40,
+    "catalog_accounting_passed": 1,
+    "cabi_exports": 134,
+    "leaks": 0
+  },
+  "events": {
+    "antfly_bench_native_artifact_sources": {
+      "count": 1,
+      "sum": {
+        "opens": 1310,
+        "reuses": 1833
+      },
+      "max": {
+        "opens": 1310,
+        "reuses": 1833
+      }
+    },
+    "antfly_bench_native_runtime": {
+      "count": 1,
+      "sum": {
+        "maintenance_opens": 42,
+        "namespace_opens": 129,
+        "source_reuses": 111
+      },
+      "max": {
+        "maintenance_opens": 42,
+        "namespace_opens": 129,
+        "source_reuses": 111
+      }
+    },
+    "antfly_bench_native_service": {
+      "count": 1,
+      "sum": {
+        "refresh_ns": 2546570000,
+        "replay_publication_overhead_ns": 47333692084,
+        "index_admission_ns": 7349239000,
+        "metadata_admission_ns": 9500586000,
+        "publication_hold_ns": 11812573874
+      },
+      "max": {
+        "refresh_ns": 2546570000,
+        "replay_publication_overhead_ns": 47333692084,
+        "index_admission_ns": 7349239000,
+        "metadata_admission_ns": 9500586000,
+        "publication_hold_ns": 11812573874
+      }
+    },
+    "antfly_bench_native_owner": {
+      "count": 1,
+      "sum": {
+        "source_turns": 108,
+        "capture_ns": 6624866000,
+        "replay_ns": 52520085000,
+        "artifacts_ns": 32574175000,
+        "storage_ns": 23436463000,
+        "runtime_refreshes": 251,
+        "maintenance_errors": 49,
+        "maintenance_timeouts": 0,
+        "merge_started": 27,
+        "merge_applied": 26,
+        "merge_discarded": 1,
+        "merge_prepare_ns": 7007973000,
+        "merge_staging_ns": 861748000,
+        "merge_staged_bytes": 25364462,
+        "merge_publication_ns": 10137719000,
+        "sql_overlay_hits": 217,
+        "sql_overlay_scope_extensions": 23,
+        "sql_overlay_rebuilds": 40,
+        "sql_overlay_rebuild_entries": 0,
+        "sql_overlay_evictions": 0,
+        "sql_staged_statements": 140,
+        "replay_waits": 2,
+        "replay_refused_prepare_ns": 1451582666
+      },
+      "max": {
+        "source_turns": 108,
+        "capture_ns": 6624866000,
+        "replay_ns": 52520085000,
+        "artifacts_ns": 32574175000,
+        "storage_ns": 23436463000,
+        "runtime_refreshes": 251,
+        "maintenance_errors": 49,
+        "maintenance_timeouts": 0,
+        "merge_started": 27,
+        "merge_applied": 26,
+        "merge_discarded": 1,
+        "merge_prepare_ns": 7007973000,
+        "merge_staging_ns": 861748000,
+        "merge_staged_bytes": 25364462,
+        "merge_publication_ns": 10137719000,
+        "sql_overlay_hits": 217,
+        "sql_overlay_scope_extensions": 23,
+        "sql_overlay_rebuilds": 40,
+        "sql_overlay_rebuild_entries": 0,
+        "sql_overlay_evictions": 0,
+        "sql_staged_statements": 140,
+        "replay_waits": 2,
+        "replay_refused_prepare_ns": 1451582666
+      }
+    },
+    "antfly_bench_native_owner_failures": {
+      "count": 1,
+      "sum": {
+        "capture": 1,
+        "source": 0,
+        "retirement": 0,
+        "artifacts": 1,
+        "storage": 47
+      },
+      "max": {
+        "capture": 1,
+        "source": 0,
+        "retirement": 0,
+        "artifacts": 1,
+        "storage": 47
+      }
+    },
+    "antfly_bench_replay_refusal": {
+      "count": 2,
+      "sum": {
+        "bytes_before": 33368767,
+        "bytes_after": 33869127,
+        "records_before": 787,
+        "records_after": 795,
+        "byte_limit": 33554432,
+        "record_limit": 8192
+      },
+      "max": {
+        "bytes_before": 16803205,
+        "bytes_after": 17053385,
+        "records_before": 414,
+        "records_after": 418,
+        "byte_limit": 16777216,
+        "record_limit": 4096
+      }
+    }
+  },
+  "primary_batch_profiles": 20,
+  "full_text_profiles": 75,
+  "full_text_sums": {
+    "documents": 1511,
+    "total_ms": 13788,
+    "full_text_collect_ms": 672,
+    "full_text_plan_ms": 122,
+    "full_text_prepare_ms": 431,
+    "full_text_apply_lock_held_ms": 3540
+  },
+  "sample": {
+    "sample_seconds": 3,
+    "sample_exit": 0,
+    "elapsed_at_sample": 85.92877479200251,
+    "scope": "Sampled local diagnosis, not clean timing",
+    "sample_sha256": "6ea526629d2dec36dee121d9dd7fafb8afbda1e7359f0ebe57e3d36836c8e295"
+  },
+  "stopped_writer_service": {
+    "seconds": 60,
+    "samples": 12,
+    "open_seconds": 0.2840767080197111,
+    "copy_method": "native_stable_snapshot",
+    "peak_native_builds": 5,
+    "file_bytes": 1272930304,
+    "selected_namespace_ordinal": 13,
+    "observations": [
+      {
+        "seconds": 5.830079317092896e-07,
+        "replay_backlog": {
+          "bytes": 16802420,
+          "records": 368,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        },
+        "budget": {
+          "records": [
+            64,
+            64,
+            64,
+            64,
+            64
+          ],
+          "bytes": [
+            1048576,
+            1048576,
+            1048576,
+            1048576,
+            1048576
+          ],
+          "observations": 0,
+          "overruns": 0,
+          "retention_pressure": false,
+          "target_quantum_ns": 25000000
+        },
+        "debt": [
+          {
+            "applied_sequence": 33,
+            "target_sequence": 98,
+            "catch_up_required": true,
+            "replay_document_not_visible_skipped": 0
+          },
+          {
+            "applied_sequence": 49,
+            "target_sequence": 49,
+            "catch_up_required": false,
+            "replay_document_not_visible_skipped": 0
+          }
+        ]
+      },
+      {
+        "seconds": 20.01094974996522,
+        "replay_backlog": {
+          "bytes": 16802420,
+          "records": 368,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        },
+        "budget": {
+          "records": [
+            8,
+            64,
+            64,
+            64,
+            64
+          ],
+          "bytes": [
+            131072,
+            1048576,
+            1048576,
+            1048576,
+            1048576
+          ],
+          "observations": 29,
+          "overruns": 11,
+          "retention_pressure": false,
+          "target_quantum_ns": 25000000
+        },
+        "debt": [
+          {
+            "applied_sequence": 33,
+            "target_sequence": 98,
+            "catch_up_required": true,
+            "replay_document_not_visible_skipped": 0
+          },
+          {
+            "applied_sequence": 66,
+            "target_sequence": 66,
+            "catch_up_required": false,
+            "replay_document_not_visible_skipped": 0
+          }
+        ]
+      },
+      {
+        "seconds": 40.01866458298173,
+        "replay_backlog": {
+          "bytes": 16517165,
+          "records": 341,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        },
+        "budget": {
+          "records": [
+            8,
+            64,
+            64,
+            64,
+            64
+          ],
+          "bytes": [
+            131072,
+            1048576,
+            1048576,
+            1048576,
+            1048576
+          ],
+          "observations": 55,
+          "overruns": 16,
+          "retention_pressure": false,
+          "target_quantum_ns": 25000000
+        },
+        "debt": [
+          {
+            "applied_sequence": 33,
+            "target_sequence": 98,
+            "catch_up_required": true,
+            "replay_document_not_visible_skipped": 0
+          },
+          {
+            "applied_sequence": 81,
+            "target_sequence": 81,
+            "catch_up_required": false,
+            "replay_document_not_visible_skipped": 0
+          }
+        ]
+      },
+      {
+        "seconds": 55.02979433303699,
+        "replay_backlog": {
+          "bytes": 16296305,
+          "records": 317,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        },
+        "budget": {
+          "records": [
+            8,
+            64,
+            64,
+            64,
+            64
+          ],
+          "bytes": [
+            131072,
+            1048576,
+            1048576,
+            1048576,
+            1048576
+          ],
+          "observations": 79,
+          "overruns": 20,
+          "retention_pressure": false,
+          "target_quantum_ns": 25000000
+        },
+        "debt": [
+          {
+            "applied_sequence": 33,
+            "target_sequence": 98,
+            "catch_up_required": true,
+            "replay_document_not_visible_skipped": 0
+          },
+          {
+            "applied_sequence": 96,
+            "target_sequence": 96,
+            "catch_up_required": false,
+            "replay_document_not_visible_skipped": 0
+          }
+        ]
+      }
+    ],
+    "sample": {
+      "seconds": 3,
+      "sample_exit": 0,
+      "sha256": "107e68a9fda34c3cb59aeb7a9015c20d70805c4a640f306f79946dff83bc28d8"
+    },
+    "scope": "No foreground writer. The owner still rotates the other namespaces; this is not a per-namespace exclusive-service throughput result."
+  },
+  "conclusion": "Scoped lifetime fixes reduce some durable source churn but do not clear the replay-capacity refusal. Stopped-writer sampling still shows repeated index opening/lease publication and legacy ID-lookup construction across wrappers. Whole-record position remains unchanged while bounded fragments are serviced; this observation alone is not proof that fragment continuation is broken.",
+  "next_design": "Investigate source-owned, resource-bounded immutable decoded metadata that can survive mutable wrapper replacement, including legacy ID routing. Keep deletion visibility and fresh primary epochs separate. Check error feedback for cancellation-induced window shrinkage.",
+  "limitations": [
+    "Metrics and unrelated builds prevent matched elapsed-time attribution.",
+    "No additional optimized build or wolfspider qualification was started after this failure.",
+    "Full importer/concurrency/semantic-drain/storage-plateau gates remain pending.",
+    "Private inputs, namespace names, raw stacks and databases stay under ignored .tools."
+  ]
+}
