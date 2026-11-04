@@ -66,6 +66,7 @@ class RequestFailure(RuntimeError):
             "resource_exhausted",
             "too_many_requests",
             "temporarily_unavailable",
+            "metadata_leader_unavailable",
             "invalid_request",
             "unsupported_exact_sort",
             "unsupported_query",
@@ -118,6 +119,7 @@ def gcs_bearer(project, minimum_seconds=1800):
             check=True,
             capture_output=True,
             text=True,
+            timeout=60,
         )
         credential = json.loads(result.stdout)["credential"]
         expiry = datetime.datetime.fromisoformat(credential["token_expiry"])

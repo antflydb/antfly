@@ -22,6 +22,7 @@ search while vacuum runs against both exclusively owned qualification tables.
 """
 
 import argparse
+import errno
 import hashlib
 import io
 import json
@@ -29,6 +30,7 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import socket
 import statistics
 import struct
 import subprocess
@@ -52,6 +54,23 @@ KINDS = {
     "item_type": "string",
     "qual_version": "integer",
 }
+
+
+def require_available_ports(ports):
+    # Refuse an existing listener before sending any API requests. The bind
+    # check also catches a reserved port; REUSEADDR permits our own TIME_WAIT
+    # sockets after a clean restart. Process publication stays serialized.
+    for port in ports:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.2)
+                if probe.connect_ex(("127.0.0.1", port)) != errno.ECONNREFUSED:
+                    raise OSError("port is already listening or unavailable")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+                reservation.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                reservation.bind(("127.0.0.1", port))
+        except OSError:
+            raise RuntimeError("qualification listen ports are unavailable") from None
 
 
 def distribution(values):
@@ -81,6 +100,11 @@ def manifest_entries(payload):
             return io.BytesIO(payload)
 
     return list(read_manifest_list(MemoryInput("qualification-memory")))
+
+
+def sha256_file(path):
+    with path.open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
 
 
 def atomic_json(path, value):
@@ -219,8 +243,18 @@ def configuration(args):
 def fixture(path, count):
     import pyarrow.parquet as pq
 
+    records = []
+    with pq.ParquetFile(path) as source:
+        available = set(source.schema_arrow.names)
+        columns = [
+            name for name in KINDS if name != "qual_version" and name in available
+        ]
+        for batch in source.iter_batches(batch_size=count, columns=columns):
+            records.extend(batch.to_pylist()[: count - len(records)])
+            if len(records) >= count:
+                break
     rows = []
-    for source in pq.read_table(path).slice(0, count).to_pylist():
+    for source in records:
         row = {
             key: source.get(key)
             if source.get(key) is not None
@@ -249,6 +283,7 @@ class Run:
         self.stop = threading.Event()
         self.lock = threading.RLock()
         self.process = None
+        self.process_lock = threading.Lock()
         self.server_log = None
         self.token = None
         self.samples = []
@@ -261,6 +296,7 @@ class Run:
         self.publication_seen = set()
         self.generations = set()
         self.observer_requests = 0
+        self.request_sequence = 0
         self.vacuum_jobs = {}
         self.anchor_id = None
         self.namespace_checked = False
@@ -281,6 +317,8 @@ class Run:
 
     def event(self, kind, **values):
         with self.lock:
+            if self.events.closed:
+                return
             self.events.write(
                 json.dumps(
                     {
@@ -299,6 +337,10 @@ class Run:
     def call(self, method, route, body=None, timeout=60):
         self.checkpoint()
         started = time.monotonic()
+        with self.lock:
+            self.request_sequence += 1
+            request_id = self.request_sequence
+        self.event("request_start", request_id=request_id, method=method, route=route)
         request = Request(
             self.base + route,
             data=json.dumps(body).encode() if body is not None else None,
@@ -318,16 +360,18 @@ class Run:
                 error.read(65536),
                 (time.monotonic() - started) * 1000,
             )
-            self.event("request_failure", **failure.record)
+            self.event("request_failure", request_id=request_id, **failure.record)
             raise failure from None
         except (URLError, TimeoutError, ConnectionError, OSError) as error:
             failure = RequestFailure.transport(
                 method, route, error, (time.monotonic() - started) * 1000
             )
-            self.event("request_failure", **failure.record)
+            self.event("request_failure", request_id=request_id, **failure.record)
             raise failure from None
+        self.checkpoint()
         self.event(
             "request",
+            request_id=request_id,
             method=method,
             route=route,
             elapsed_ms=round((time.monotonic() - started) * 1000, 3),
@@ -370,6 +414,7 @@ class Run:
                 return {"objects": len(items), "bytes": total_bytes}
 
     def start(self):
+        self.checkpoint()
         env = dict(os.environ)
         if self.args.provider == "gcs":
             self.token = gcs_bearer(self.args.project, 3300)
@@ -380,36 +425,41 @@ class Run:
                     raise ValueError("qualification GCS prefix must be empty")
                 self.namespace_checked = True
                 self.event("fresh_namespace", **existing)
-        self.server_log = (self.state / "server.log").open("a")
-        self.process = subprocess.Popen(
-            [
-                str(self.args.binary.resolve()),
-                "standalone",
-                "--config",
-                str(self.state / "config.json"),
-                "--data-dir",
-                str(self.state / "data"),
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(self.args.port),
-                "--health",
-                "true",
-                "--health-port",
-                str(self.args.port + 1),
-                "--auth",
-                "false",
-                "--models-dir",
-                str(self.state / "empty-models"),
-                "--process-memory-budget-mb",
-                "4096",
-            ],
-            env=env,
-            stdout=self.server_log,
-            stderr=subprocess.STDOUT,
-        )
+        with self.process_lock:
+            self.checkpoint()
+            require_available_ports((self.args.port, self.args.port + 1))
+            self.checkpoint()
+            self.server_log = (self.state / "server.log").open("a")
+            self.process = subprocess.Popen(
+                [
+                    str(self.args.binary.resolve()),
+                    "standalone",
+                    "--config",
+                    str(self.state / "config.json"),
+                    "--data-dir",
+                    str(self.state / "data"),
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(self.args.port),
+                    "--health",
+                    "true",
+                    "--health-port",
+                    str(self.args.port + 1),
+                    "--auth",
+                    "false",
+                    "--models-dir",
+                    str(self.state / "empty-models"),
+                    "--process-memory-budget-mb",
+                    "4096",
+                ],
+                env=env,
+                stdout=self.server_log,
+                stderr=subprocess.STDOUT,
+            )
         deadline = min(self.deadline, time.monotonic() + 90)
         while True:
+            self.checkpoint()
             if self.process.poll() is not None:
                 raise RuntimeError("engine exited; retained server log has diagnostics")
             try:
@@ -421,15 +471,29 @@ class Run:
                 time.sleep(0.2)
 
     def stop_server(self):
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(30)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
-        if self.server_log:
-            self.server_log.close()
+        with self.process_lock:
+            if self.process and self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(30)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+            if self.server_log:
+                self.server_log.close()
+
+    def deadline_watchdog(self):
+        # This owner can terminate the engine even if foreground observation is
+        # stuck in a resolver outside the socket timeout. Serialize with process
+        # publication so an expiring run cannot race a restart into a new daemon.
+        def expire():
+            self.stop.set()
+            self.stop_server()
+
+        timer = threading.Timer(max(0, self.deadline - time.monotonic()), expire)
+        timer.daemon = True
+        timer.start()
+        return timer
 
     def metrics(self):
         with open_request(
@@ -726,6 +790,7 @@ class Run:
                     }
                 )
             self.stop.set()
+            self.stop_server()
 
     def continuous(self, rows):
         started = time.monotonic()
@@ -821,6 +886,7 @@ class Run:
                 for name in TABLES:
                     self.observe(name, True)
                 self.index_status()
+                self.event("metrics", metrics=self.metrics())
                 self.event("host", load=os.getloadavg())
                 if (
                     self.args.provider == "gcs"
@@ -831,13 +897,23 @@ class Run:
                 self.stop.wait(15)
 
         self.threads = [
-            threading.Thread(target=self.worker, args=(fn,))
-            for fn in (produce, churn, search, maintain, observe)
+            threading.Thread(target=self.worker, args=(fn,), daemon=True)
+            for fn in (
+                produce,
+                churn,
+                *([search] * self.args.query_workers),
+                maintain,
+                observe,
+            )
         ]
         for thread in self.threads:
             thread.start()
         for thread in self.threads:
-            thread.join()
+            thread.join(timeout=max(0, self.deadline - time.monotonic()))
+        if any(thread.is_alive() for thread in self.threads):
+            self.stop.set()
+            self.stop_server()
+            raise TimeoutError("qualification workers exceeded wall-clock limit")
         self.continuous_seconds = time.monotonic() - started
         self.deletions_during_continuous = sum(
             job["deleted_objects_observed"] for job in self.vacuum_jobs.values()
@@ -852,15 +928,14 @@ class Run:
                 for key, value in vars(self.args).items()
             },
             "engine_commit": self.args.engine_commit,
-            "binary_sha256": hashlib.sha256(self.args.binary.read_bytes()).hexdigest(),
+            "binary_sha256": sha256_file(self.args.binary),
             "host_timing_label": "contended developer host; not a production SLO or same-region qualification",
         }
+        watchdog = self.deadline_watchdog()
         try:
             rows = fixture(self.args.fixture, self.args.seed_rows)
             self.anchor_id = rows[0]["hn_id"]
-            report["fixture_sha256"] = hashlib.sha256(
-                self.args.fixture.read_bytes()
-            ).hexdigest()
+            report["fixture_sha256"] = sha256_file(self.args.fixture)
             report["seed_sha256"] = hashlib.sha256(
                 json.dumps(rows, sort_keys=True).encode()
             ).hexdigest()
@@ -956,8 +1031,12 @@ class Run:
                 time.monotonic() - publication_started
             )
             time.sleep(6.1)
+            report["serving_api_metrics"] = self.metrics()
             report["object_io"] = publication_profile(
-                before, self.metrics(), time.monotonic() - self.started, True
+                before,
+                report["serving_api_metrics"],
+                time.monotonic() - self.started,
+                True,
             )
             report["object_io"]["scope"] = (
                 "API-runtime logical operations from before registration through continuous writes, queries, catalog observations and maintenance; ends before restart. Includes background/nested calls, excludes direct source-observer reads and separately owned runtimes. Not publication-only or billing."
@@ -1031,10 +1110,16 @@ class Run:
             }
             raise
         finally:
+            watchdog.cancel()
             self.stop.set()
-            for thread in self.threads:
-                thread.join()
             self.stop_server()
+            # A resolver stalled outside Python's socket timeout must not keep
+            # the engine producing objects past the workload deadline. Worker
+            # threads retain their own Python state but cannot outlive process
+            # teardown or admit another engine call after deadline expiry.
+            drain_deadline = time.monotonic() + 5
+            for thread in self.threads:
+                thread.join(timeout=max(0, drain_deadline - time.monotonic()))
             report.update(
                 elapsed_seconds=time.monotonic() - self.started,
                 failures=self.failures,
@@ -1160,6 +1245,7 @@ def arguments():
     parser.add_argument("--max-storage-bytes", type=int, default=1024**3)
     parser.add_argument("--update-interval", type=float, default=3)
     parser.add_argument("--query-interval", type=float, default=2)
+    parser.add_argument("--query-workers", type=int, default=1)
     parser.add_argument("--maintenance-interval", type=float, default=15)
     parser.add_argument("--run", action="store_true")
     args = parser.parse_args()
@@ -1178,6 +1264,7 @@ def arguments():
         parser.error("run requires an existing engine binary and Parquet fixture")
     if (
         not 1024 <= args.port <= 65534
+        or not 1 <= args.query_workers <= 8
         or args.seed_rows < 2
         or args.seed_rows > 128
         or not 1 <= args.history_commits <= 256
@@ -1216,6 +1303,8 @@ def main():
         return
     args.state.mkdir(parents=True, exist_ok=False)
     report = Run(args).run()
+    if not report["checks"]["queries_succeeded"]:
+        raise SystemExit("search failures observed; partial evidence retained")
     if report["full_profile"] and not report["qualified"]:
         raise SystemExit("qualification criteria not met; partial evidence retained")
 

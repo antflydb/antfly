@@ -255,3 +255,220 @@ def test_query_requires_per_hit_public_highlights_and_unique_keys(run, monkeypat
     hits.append(hit)
     with pytest.raises(AssertionError, match="duplicate HN keys"):
         run.query("published")
+
+
+def test_transport_evidence_pairs_attempt_start_and_failure_without_exception_text(
+    run, monkeypatch
+):
+    def lost(*args, **kwargs):
+        raise lake.URLError("SECRET transport detail")
+
+    monkeypatch.setattr(lake, "open_request", lost)
+    for _ in range(2):
+        with pytest.raises(lake.RequestFailure):
+            run.call("GET", "/tables")
+    evidence = (run.state / "events.jsonl").read_text()
+    assert "SECRET" not in evidence
+    rows = [json.loads(line) for line in evidence.splitlines()]
+    assert [(row["kind"], row["request_id"]) for row in rows] == [
+        ("request_start", 1),
+        ("request_failure", 1),
+        ("request_start", 2),
+        ("request_failure", 2),
+    ]
+
+
+def test_short_smoke_still_exits_nonzero_after_search_failures(tmp_path, monkeypatch):
+    args = SimpleNamespace(run=True, state=tmp_path / "attempt")
+    monkeypatch.setattr(lake, "arguments", lambda: args)
+    monkeypatch.setattr(
+        lake,
+        "Run",
+        lambda _: SimpleNamespace(
+            run=lambda: {
+                "full_profile": False,
+                "checks": {"queries_succeeded": False},
+            }
+        ),
+    )
+    with pytest.raises(SystemExit, match="search failures observed"):
+        lake.main()
+
+
+@pytest.mark.parametrize("workers", [0, 9])
+def test_query_fanout_is_bounded(tmp_path, monkeypatch, workers):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "continuous_lake.py",
+            "--binary",
+            "antfly",
+            "--engine-commit",
+            "e" * 40,
+            "--fixture",
+            "seed.parquet",
+            "--state",
+            str(tmp_path / "state"),
+            "--query-workers",
+            str(workers),
+        ],
+    )
+    with pytest.raises(SystemExit):
+        lake.arguments()
+
+
+def test_builtin_metadata_admission_failure_keeps_only_public_code():
+    failure = lake.RequestFailure.http(
+        "POST",
+        "/query",
+        503,
+        b'{"code":"metadata_leader_unavailable","message":"SECRET", "retryable":true}',
+        5000,
+    )
+    assert failure.record["code"] == "metadata_leader_unavailable"
+    assert failure.record["retryable"] is True
+    assert "SECRET" not in json.dumps(failure.record)
+
+
+def test_stalled_workers_cannot_keep_the_engine_past_the_workload_deadline(
+    run, monkeypatch
+):
+    release = lake.threading.Event()
+    run.args.duration_seconds = 1
+    run.args.query_workers = 1
+    run.deadline = lake.time.monotonic() + 0.01
+    monkeypatch.setattr(run, "worker", lambda _: release.wait(2))
+    try:
+        with pytest.raises(TimeoutError, match="workers exceeded wall-clock limit"):
+            run.continuous([])
+        assert run.stop.is_set()
+        assert all(thread.daemon for thread in run.threads)
+    finally:
+        release.set()
+        for thread in run.threads:
+            thread.join(2)
+
+
+def test_stalled_credential_helper_has_a_bound_and_redacts_captured_output(monkeypatch):
+    def hung(command, **options):
+        assert 0 < options["timeout"] <= 60
+        raise lake.subprocess.TimeoutExpired(
+            command, options["timeout"], output="SECRET", stderr="SECRET"
+        )
+
+    monkeypatch.setattr(lake.subprocess, "run", hung)
+    with pytest.raises(RuntimeError, match="Unable to acquire") as failure:
+        lake.gcs_bearer("qualification")
+    assert "SECRET" not in str(failure.value)
+
+
+def test_independent_watchdog_stops_the_owned_process_and_fences_restart(run):
+    terminated = lake.threading.Event()
+
+    class Process:
+        def poll(self):
+            return 0 if terminated.is_set() else None
+
+        def terminate(self):
+            terminated.set()
+
+        def wait(self, timeout):
+            assert terminated.is_set()
+
+    run.process = Process()
+    run.deadline = lake.time.monotonic() + 0.01
+    watchdog = run.deadline_watchdog()
+    try:
+        assert terminated.wait(2)
+        assert run.stop.is_set()
+        with pytest.raises(TimeoutError, match="wall-clock limit"):
+            run.start()
+    finally:
+        watchdog.cancel()
+        watchdog.join(2)
+
+
+@pytest.mark.parametrize("listening", [True, False])
+def test_foreign_or_reserved_port_prevents_daemon_and_api_admission(
+    run, monkeypatch, listening
+):
+    class Socket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def settimeout(self, value):
+            pass
+
+        def connect_ex(self, address):
+            return 0 if listening else lake.errno.ECONNREFUSED
+
+        def setsockopt(self, *args):
+            pass
+
+        def bind(self, address):
+            raise OSError("SECRET reserved listener detail")
+
+    monkeypatch.setattr(lake.socket, "socket", lambda *_: Socket())
+    monkeypatch.setattr(
+        lake.subprocess, "Popen", lambda *a, **kw: pytest.fail("must not start")
+    )
+    with pytest.raises(RuntimeError, match="listen ports are unavailable") as failure:
+        run.start()
+    assert "SECRET" not in str(failure.value)
+
+
+def test_worker_failure_stops_the_engine_without_waiting_for_other_workers(
+    run, monkeypatch
+):
+    stopped = lake.threading.Event()
+    monkeypatch.setattr(run, "stop_server", stopped.set)
+
+    def exceeds_storage_guard():
+        raise AssertionError("qualification object storage envelope exceeded")
+
+    run.worker(exceeds_storage_guard)
+    assert stopped.is_set()
+    assert run.stop.is_set()
+    assert run.failures == [
+        {
+            "type": "AssertionError",
+            "code": "qualification object storage envelope exceeded",
+        }
+    ]
+
+
+def test_seed_reader_projects_columns_and_stops_at_the_row_budget(monkeypatch):
+    import pyarrow.parquet as pq
+
+    closed = []
+
+    class File:
+        schema_arrow = SimpleNamespace(names=["hn_id", "body", "unused"])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            closed.append(True)
+
+        def iter_batches(self, *, batch_size, columns):
+            assert batch_size == 2
+            assert columns == ["hn_id", "body"]
+            yield SimpleNamespace(
+                to_pylist=lambda: [
+                    {"hn_id": 1, "body": "first"},
+                    {"hn_id": 2, "body": "second"},
+                ]
+            )
+            pytest.fail("seed reader advanced beyond its bounded sample")
+
+    monkeypatch.setattr(pq, "ParquetFile", lambda _: File())
+    monkeypatch.setattr(
+        pq, "read_table", lambda *_: pytest.fail("must not read the full archive")
+    )
+    assert len(lake.fixture(Path("archive.parquet"), 2)) == 2
+    assert closed == [True]

@@ -52,10 +52,12 @@ is not an unattended credential-lifetime test.
 The driver neither creates VMs nor exports BigQuery data nor changes IAM. Default
 limits are 2,700 seconds per run, 128 seed rows, 120 paced history commits,
 32 burst transactions, and at most 256 subsequent updates per table. The 780-second
-continuous phase allows retention to elapse naturally. GCS inventory checks run
-at least every 60 seconds and stop the workload above 50,000 objects or 1 GiB.
-These checks bound this experiment's storage footprint; they are not billing or
-hard provider spending controls. Use an approved project/budget and reuse an
+continuous phase allows retention to elapse naturally. Search uses one worker by
+default; `--query-workers` permits up to eight for separate contention probes.
+GCS inventory is sampled about once a minute; slow observation can extend the
+interval. A sampled count above 50,000 objects or 1 GiB stops the engine, with
+bounded termination grace. These checks are not billing or hard provider
+spending controls. Use an approved project/budget and reuse an
 existing export.
 
 Each attempt requires a fresh state directory and, for GCS, a fresh prefix.
@@ -67,12 +69,17 @@ explicitly unqualified for manifest-threshold and retention behavior.
 
 The private state directory retains engine logs, redacted structured events,
 pending write/maintenance intent, fixture and executable hashes, source revision,
-query successes and failures, catalog observations, and `report.json`. Do not
+paired request-start/completion IDs, query successes and failures, catalog
+observations, periodic/pre-restart phase counters, and `report.json`. Do not
 commit raw logs, bearer tokens, or environment dumps. `complete` describes the
 functional run; `qualified` additionally requires the full profile, successful
 queries, observed manifest merging and commit grouping, retention aging,
-deletions reported during the continuous phase and independently observed deletion. Failed attempts retain evidence and do not count
-as successful qualification.
+deletions reported during the continuous phase and independently observed
+deletion. Failed attempts retain evidence and do not count as successful
+qualification. Even short smoke profiles exit unsuccessfully after
+search failures. An independent deadline owner stops the engine if foreground
+observation stalls; teardown allows bounded termination/drain grace. Credential
+helper execution is bounded separately.
 
 Catalog and publication lag are measured from the acceptance ACK to first sampled
 visibility. They are sampling upper bounds. Superseded changes and deletes without
@@ -96,3 +103,7 @@ continuous changes, not the archive's natural term distribution or scale. Host
 load is sampled; results from a contended developer machine must retain that
 label. Do not compare these timings directly to earlier static fixtures or claim
 an isolated speedup without a matched control run.
+
+The [2026-11-04 UTC baseline](../../docs/operations/hackernews/continuous-lake-qualification-20261104.md)
+records the successful catalog checks and remaining availability/maintenance gaps.
+Both full provider profiles failed the strict qualification criteria.
