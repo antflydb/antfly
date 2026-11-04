@@ -1305,11 +1305,16 @@ preparation builds segments from that projection without parsing/projecting its
 documents again. Configuration changes replan only the unpublished suffix.
 Producer replay services one
 adaptive prefix per background turn, initially eight document groups and 256 KiB,
-with ceilings of 128 groups and 4 MiB. Managed indexes consume only the completed
-producer prefix, and retain later targets for subsequent turns. Replay-capacity
-pressure yields to those downstream consumers without charging a provider retry.
-The direct replay fallback without registered workers obeys the same completed
-prefix and document-fan-out bounds as the registered manual executor.
+with ceilings of 128 groups and 4 MiB. Only indexes whose configuration consumes
+generated artifacts inherit the completed producer prefix. Raw-document indexes
+can advance independently while inference or group work is pending. Bounded
+turns rotate their starting stage across independent indexes, producers and
+dependent indexes, preserving that rotation across runtime replacement. An
+interrupted slow stage therefore cannot always consume the deadline before
+another stage starts. Replay-capacity pressure yields to consumers without
+charging a provider retry. The direct replay fallback without registered workers
+obeys the same dependency cuts and document-fan-out bounds as the registered
+manual executor.
 Explicit idle drains continue to inspect and complete all relevant work.
 Promotion's SQL coordinator uses the same bounded consumer reserve as its
 replay caller. A full producer quota still refuses new foreground decisions,

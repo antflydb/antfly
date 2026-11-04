@@ -8953,6 +8953,65 @@ test "capi native maintenance text source reuse refreshes relational rows and fe
     try std.testing.expect(!try owner.text_source_runtime_cache.?.matches(file));
 }
 
+test "capi native cooperative replay separates raw text from generated artifact dependencies" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const background = @import("../storage/background_runtime.zig");
+    for ([_]bool{ false, true }) |workers| {
+        var host = try background.BackendRuntimeHandle.init(a, .{
+            .backend = .manual,
+            .borrowed_io = .{ .general = std.testing.io },
+        });
+        defer host.deinit();
+        var tmp = try api.TestDirectory.init("independent-text-replay");
+        defer tmp.cleanup();
+        var db = try h.db_mod.DB.open(a, tmp.path(), .{
+            .backend_runtime = host.ptr(),
+            .executor = .{ .backend = .manual },
+            .primary_backend = .{ .mem = .{} },
+            .physical_root_mode = .external_backend,
+            .start_index_workers = workers,
+            .start_optional_runtimes = true,
+            .start_optional_runtime_workers = false,
+            .enrichment = .{ .enable_without_producers = true },
+        });
+        defer db.close();
+        try db.addEnrichment(.{ .name = "copy", .kind = .asset, .field = "text", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+        try db.addIndex(.{ .name = "raw", .kind = .full_text, .config_json = "{}" });
+        try db.addIndex(.{ .name = "generated", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"copy\"}]}" });
+        try std.testing.expect(!try db.core.indexRequiresEnrichmentReplay("raw"));
+        try std.testing.expect(try db.core.indexRequiresEnrichmentReplay("generated"));
+        var names: [32][32]u8 = undefined;
+        var writes: [32]h.db_mod.types.BatchWrite = undefined;
+        for (&writes, 0..) |*write, i| write.* = .{
+            .key = try std.fmt.bufPrint(&names[i], "source-{d}", .{i}),
+            .value = "{\"text\":\"silver submarine\"}",
+        };
+        try db.batch(.{ .writes = &writes, .sync_level = .write });
+        const target = db.core.nextDerivedSequence();
+        const generated_before = try db.core.loadAppliedSequence(a, "generated");
+        _ = try db.runBackgroundTurnWithCancellation(.none, .replay);
+        const produced = db.enrichment_runtime.?.stats().applied_sequence;
+        // The producer yields inside this one 32-document revision. Raw text
+        // is already visible, while its artifact-backed sibling cannot seal it.
+        try std.testing.expect(produced < target);
+        try std.testing.expect(try db.core.loadAppliedSequence(a, "raw") >= target);
+        try std.testing.expect(try db.core.loadAppliedSequence(a, "generated") <= @max(generated_before, produced));
+        try db.runUntilIdle();
+        try std.testing.expect(try db.core.loadAppliedSequence(a, "generated") >= target);
+        // Repeat across all three scheduling offsets and an overwrite, then
+        // verify the full drain still completes both dependency classes.
+        for (0..3) |_| {
+            try db.batch(.{ .writes = &.{.{ .key = "source-0", .value = "{\"text\":\"gold submarine\"}" }}, .sync_level = .write });
+            _ = try db.runBackgroundTurnWithCancellation(.none, .replay);
+        }
+        try db.runUntilIdle();
+        const latest = db.core.nextDerivedSequence();
+        try std.testing.expect(try db.core.loadAppliedSequence(a, "raw") >= latest);
+        try std.testing.expect(try db.core.loadAppliedSequence(a, "generated") >= latest);
+    }
+}
+
 test "capi native maintenance partial text replay earns another source turn without advancing coverage" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("fragment-source-priority", 5000, .batch);

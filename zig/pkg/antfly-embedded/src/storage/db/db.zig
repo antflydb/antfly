@@ -32141,7 +32141,7 @@ pub const DB = struct {
         drain_relational_indexes: bool = true,
         drain_graph_replacements: bool = true,
         bounded_replay: bool = false,
-        /// A background consumer may only inspect the completed producer cut.
+        /// A background consumer may only inspect its selected dependency cut.
         replay_target_cap: u64 = std.math.maxInt(u64),
         /// Native replay releases its primary snapshot before artifact work.
         /// Explicit idle and hosted owners retain the complete drain below.
@@ -32180,14 +32180,19 @@ pub const DB = struct {
         }
         if (options.bounded_replay) {
             const state = options.group_source_state orelse self.borrowed_group_source_state orelse &self.group_source_owner.state;
-            self.executor.notifySequence(sequence);
-            return self.executor.waitForAllWithVisibilityWait(sequence, .{
+            const wait: derived_executor_mod.VisibilityWait = .{
                 .cancellation = options.cancellation,
                 .replay_budget = &state.replay_budget,
                 .replay_target_cap = sequence,
                 .publication_overhead_ns = &state.publication_overhead_ns,
                 .replay_record_cap = if (state.replay_retirement.watermark != 0) docstore_mod.ReplayRetirement.record_cap else 2048,
-            });
+            };
+            if (options.index_names.len != 0) {
+                self.executor.notifyIndexes(sequence, options.index_names);
+                return self.executor.waitForIndexesWithVisibilityWait(sequence, options.index_names, wait);
+            }
+            self.executor.notifySequence(sequence);
+            return self.executor.waitForAllWithVisibilityWait(sequence, wait);
         }
         if (options.cancellation.ptr != null) {
             return try self.runDerivedUntilWithVisibilityWait(sequence, .{
@@ -32441,25 +32446,56 @@ pub const DB = struct {
         }
     }
 
+    /// Independent consumers can advance before a producer
+    /// starts inference or waits for output capacity. Only consumers of
+    /// generated artifacts inherit the producer's completed source prefix.
+    fn runBoundedDerivedDependencyStage(self: *DB, sequence: u64, generated: bool, options: ReplayDrainOptions) !void {
+        if (sequence == 0) return;
+        std.debug.assert(options.bounded_replay);
+        const indexes = try self.core.managedIndexes(self.alloc);
+        defer {
+            for (indexes) |index_ref| self.alloc.free(@constCast(index_ref.name));
+            self.alloc.free(indexes);
+        }
+        var names = std.ArrayListUnmanaged([]const u8).empty;
+        defer names.deinit(self.alloc);
+        for (indexes) |index_ref| {
+            if (options.index_names.len != 0 and !containsName(options.index_names, index_ref.name)) continue;
+            if (try self.core.indexRequiresEnrichmentReplay(index_ref.name) != generated) continue;
+            try names.append(self.alloc, index_ref.name);
+        }
+        // An empty selector means all indexes to the underlying executor.
+        if (names.items.len == 0) return;
+        var selected = options;
+        selected.index_names = names.items;
+        try self.runDerivedUntilWithOptions(sequence, selected);
+    }
+
     fn runMaintenanceUntilWithOptions(self: *DB, sequence: u64, sync_targets: ManagedSyncTargets, options: ReplayDrainOptions) !void {
         _ = try self.drainStandaloneGraphEndpointCleanup();
         var stable_target = @max(sequence, self.currentMaintenanceTargetSequence());
         while (true) {
-            // Enrichment is a producer for the managed derived indexes: it can
-            // append embedding/chunk artifacts at the same source revision as
-            // the document being drained. Waiting for a derived consumer
-            // first creates a cycle when that consumer correctly refuses to
-            // checkpoint an incomplete generation outcome. More importantly,
-            // bypassing that wait can publish the source revision before its
-            // later artifacts exist and make those artifacts unreplayable.
-            // Drain the producer boundary first, then every consumer observes
-            // the complete revision and can advance from durable evidence.
-            try self.runEnrichmentUntilForDrain(stable_target, options);
-            const consumer_target = if (options.bounded_replay) prefix: {
-                if (self.enrichment_runtime) |runtime| break :prefix @min(stable_target, runtime.stats().applied_sequence);
-                break :prefix stable_target;
-            } else stable_target;
-            try self.runDerivedUntilWithOptions(consumer_target, options);
+            if (options.bounded_replay and self.enrichment_runtime != null) {
+                const state = options.group_source_state orelse self.borrowed_group_source_state orelse &self.group_source_owner.state;
+                const first = state.source_replay_stage.fetchAdd(1, .monotonic) % 3;
+                for (0..3) |offset| switch ((first + offset) % 3) {
+                    0 => try self.runBoundedDerivedDependencyStage(stable_target, false, options),
+                    1 => try self.runEnrichmentUntilForDrain(stable_target, options),
+                    2 => {
+                        // Generated artifacts may share a source revision with
+                        // a primary document. Never let their consumer seal a
+                        // revision whose producer has not completed it.
+                        const prefix = @min(stable_target, self.enrichment_runtime.?.stats().applied_sequence);
+                        try self.runBoundedDerivedDependencyStage(prefix, true, options);
+                    },
+                    else => unreachable,
+                };
+            } else {
+                // Foreground/full drains complete the producer boundary before
+                // consumers wait for the complete generated revision.
+                try self.runEnrichmentUntilForDrain(stable_target, options);
+                try self.runDerivedUntilWithOptions(stable_target, options);
+            }
             if (options.no_progress_timeout_ns != 0) try self.checkTargetAdvanceNoProgress(options.no_progress_timeout_ns);
 
             const next_target = self.core.nextDerivedSequence();
@@ -146120,7 +146156,7 @@ test "db manual text producers merge capacity without optional workers visibilit
     try std.testing.expectEqual(@as(i64, 1), completed.value.object.get("count").?.integer);
 }
 
-test "background enrichment turn checkpoints a producer prefix before yielding to indexes" {
+test "background enrichment turn fences artifact consumers at the producer prefix" {
     const alloc = std.testing.allocator;
     var backend_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
@@ -146141,7 +146177,7 @@ test "background enrichment turn checkpoints a producer prefix before yielding t
     });
     defer db.close();
     try db.addEnrichment(.{ .name = "copy", .kind = .asset, .field = "text", .producer_json = "{\"type\":\"copy\"}" });
-    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"copy\"}]}" });
     for (0..32) |i| {
         var key: [32]u8 = undefined;
         const name = try std.fmt.bufPrint(&key, "source-{d}", .{i});

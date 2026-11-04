@@ -1,0 +1,53 @@
+{
+  "qualified": false,
+  "source_commit": "0296b7df2f6265c23a2d844deb536f5035fe767d",
+  "mode": "Debug",
+  "scope": "Local diagnostic run with metrics and concurrent SDK validation; not a controlled throughput comparison.",
+  "compiler_sha256": "1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523",
+  "library_sha256": "8fe94c7f783821d17ea5cc413cad14219a0255e3c0b190a91d8a0c137233fc8b",
+  "original_importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+  "seed_sha256": "27ea0ac6beecde2ca727132143e214c17ef5f38010db3762f605551806673519",
+  "validation": {
+    "selected_capi_and_sql_tests_passed": 158,
+    "skipped": 0,
+    "leaks": 0,
+    "abi_exports_smoke_and_linkage": "passed",
+    "sdk_sql_and_concurrency_tests_passed": 209,
+    "immutable_handoff_tests_passed": 5
+  },
+  "populated_database_import": {
+    "input_index": 7,
+    "exit_code": 1,
+    "seconds": 252.7466478330316,
+    "successful_primary_batches": 40,
+    "successful_primary_writes": 40960,
+    "public_errors": ["LiteReplayBacklogExceeded"],
+    "invalid_manifest_errors": 0,
+    "native_build_overlap_samples": 0,
+    "censored": false,
+    "artifact_source_opens": 2140,
+    "artifact_source_reuses": 3986,
+    "maintenance_errors": 55,
+    "maintenance_timeouts": 0
+  },
+  "durable_replay_credit_accounting": {
+    "aggregate_bytes": 16742557,
+    "aggregate_records": 325,
+    "producer_byte_limit": 16777216,
+    "producer_record_limit": 4096,
+    "independent_ledger_scan_matches_aggregate": true,
+    "unresolved_reservations": 0,
+    "largest_namespace": {
+      "records_per_lane": 67,
+      "credit_bytes_per_lane": 4021972,
+      "lanes": ["enrichment", "full_text", "algebraic", "all"]
+    },
+    "second_namespace": {
+      "records_per_lane": 19,
+      "credit_bytes_per_lane": 218223,
+      "lanes": ["full_text", "algebraic", "all"]
+    }
+  },
+  "reference_policy": "Preserved reference artifacts and results only; no baseline build or execution.",
+  "conclusion": "Immutable source reuse is active, but the original importer still exhausts replay capacity. Actual retained journal payloads explain the credit total. These observations do not establish a throughput improvement or a complete root-cause fix. Dependency-specific scheduling and safe retirement remain investigation points. Final optimized qualification remains outstanding; wolfspider was not used for this diagnostic."
+}
