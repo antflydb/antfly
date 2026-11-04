@@ -2075,8 +2075,11 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool, adjudication_mode: b
     try std.testing.expectEqual(if (change_config) h.capi.ErrorCode.busy else h.capi.ErrorCode.ok, first.code);
     try std.testing.expectEqual(if (change_config) h.capi.ErrorCode.busy else h.capi.ErrorCode.ok, second.code);
     {
-        const pinned = api.enterHandle(reader, .read).?;
+        var pinned = api.enterHandle(reader, .read).?;
         defer pinned.leave();
+        // Observe query/cursor pins after ending this observation's own
+        // temporary bridge through default-namespace admission.
+        pinned.finishRefresh();
         // resumeQuery collected while this registry was attached to the new root.
         // A background publication may have refreshed the root between cursor
         // creation and query setup. Pinning follows the cursor's actual root,
@@ -2088,8 +2091,20 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool, adjudication_mode: b
     try std.testing.expect(std.mem.indexOf(u8, sql_output.ptr.?[0..sql_output.len], "7") != null);
     api.antfly_buffer_free(&sql_output);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, sql_cursor.antfly_db_sql_close_cursor(reader, cursor));
-    const finished = api.enterHandle(reader, .read).?;
+    // Force the final observation to reconstruct its serving runtime. Without
+    // this cut, a background publication only intermittently exposes the
+    // admission bridge and makes an exact retired-root count timing-dependent.
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_create_table_json(writer, .fromSlice("after_cursor_close"), .fromSlice("{}")));
+    var finished = api.enterHandle(reader, .read).?;
     defer finished.leave();
+    try std.testing.expectEqual(@as(?h.capi.ErrorCode, null), finished.entry_error);
+    const predecessor = finished.refresh_predecessor orelse return error.TestUnexpectedResult;
+    try std.testing.expect(predecessor != finished.handle);
+    try std.testing.expectEqual(@as(usize, 0), predecessor.query_borrows);
+    try std.testing.expectEqual(@as(usize, 1), predecessor.refresh_references);
+    try std.testing.expectEqual(@as(usize, 1), finished.connection.?.owner.retired.items.len);
+    try std.testing.expect(finished.connection.?.owner.retired.items[0] == predecessor);
+    finished.finishRefresh();
     try std.testing.expectEqual(@as(usize, 0), finished.connection.?.owner.retired.items.len);
 }
 
