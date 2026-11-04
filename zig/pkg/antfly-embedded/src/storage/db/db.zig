@@ -7532,6 +7532,47 @@ pub const DB = struct {
         }
     }
 
+    /// Like `batch`, also reporting whether the primary write became durable.
+    /// Callers classify a failure from the flag: after the primary write it
+    /// is committed (pending or needing repair); before it, the batch was not
+    /// applied unless the error is an unknown outcome. Keeps `batch`'s
+    /// ANTFLY_BENCH_METRICS phase profile.
+    pub fn batchTracked(self: *DB, req: types.BatchRequest, primary_committed: *bool) anyerror!void {
+        primary_committed.* = false;
+        // Storage commits keep their original error; this records whether a
+        // failed commit may still have applied (for example, LSM WAL appended
+        // and then a sync or flush failed). For an exported call that is an
+        // unknown outcome, never "not applied".
+        var progress: backend_types.CommitProgress = .{};
+        const previous = backend_types.commit_progress;
+        backend_types.commit_progress = &progress;
+        defer backend_types.commit_progress = previous;
+        self.batchTrackedProfiled(req, primary_committed) catch |err| {
+            if (progress.maybe_applied and !primary_committed.* and !isOutcomeUnknownError(err)) {
+                std.log.warn("batch failed after its write may have applied: {s}", .{@errorName(err)});
+                return error.OutcomeUnknown;
+            }
+            return err;
+        };
+    }
+
+    fn isOutcomeUnknownError(err: anyerror) bool {
+        return switch (err) {
+            error.OutcomeUnknown, error.WriteOutcomeUnknown, error.DurabilityOutcomeUnknown, error.CommitDecisionUnknown => true,
+            else => false,
+        };
+    }
+
+    fn batchTrackedProfiled(self: *DB, req: types.BatchRequest, primary_committed: *bool) anyerror!void {
+        if (benchMetricsEnabled()) {
+            var profile = BatchProfile{};
+            try self.batchInternal(req, &profile, .{ .primary_committed = primary_committed });
+            logBatchProfile(req, profile);
+        } else {
+            try self.batchInternal(req, null, .{ .primary_committed = primary_committed });
+        }
+    }
+
     pub fn batchWithVisibilityCancellation(self: *DB, req: types.BatchRequest, cancellation: types.CancellationToken) anyerror!void {
         if (benchMetricsEnabled()) {
             var profile = BatchProfile{};
@@ -8710,6 +8751,9 @@ pub const DB = struct {
                 error.EnrichmentWaitTimeout,
                 error.EnrichmentRetryInProgress,
                 => return error.CommitVisibilityNotSatisfied,
+                // Other errors keep their identity for internal callers that
+                // act on them. Exported calls classify a failure after the
+                // primary write from `batchTracked`'s flag, not from its name.
                 else => {},
             };
             return err;

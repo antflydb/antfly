@@ -25,6 +25,7 @@ invented decomposition. Proof counters separately measure detached graph walks.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -175,6 +176,40 @@ ADMISSION_FIELDS = (
 )
 
 
+LEASE_GROUPS = ("foreground_lease", "maintenance_lease")
+LEASE_COUNTERS = (
+    "acquisitions",
+    "uncontended",
+    "queued",
+    "handoffs",
+    "busy",
+    "busy_wait_ns",
+    "wait_ns",
+    "holds",
+    "hold_ns",
+)
+
+
+def lease_delta(before: dict, after: dict) -> dict | None:
+    """Per-worker lease timing between two snapshots; None if not exposed."""
+    if any(group not in after for group in LEASE_GROUPS):
+        return None
+    delta = {}
+    for group in LEASE_GROUPS:
+        old, new = before.get(group, {}), after[group]
+        row = {field: new[field] - old.get(field, 0) for field in LEASE_COUNTERS}
+        for field in ("wait_log2_ns", "hold_log2_ns"):
+            row[field] = [
+                b - a for a, b in zip(old.get(field, [0] * 64), new[field], strict=True)
+            ]
+        # Lifetime maxima: exact only when the worker started from zero.
+        for field in ("wait_max_ns", "hold_max_ns"):
+            row[field] = new[field] if not old.get("acquisitions") else None
+        delta[group] = row
+    delta["gate_wait_ns"] = after.get("gate_wait_ns", 0) - before.get("gate_wait_ns", 0)
+    return delta
+
+
 def measurement_stats(db) -> dict:
     from antfly_embedded import BusyError
 
@@ -241,11 +276,32 @@ def native_worker(config, index, ready, start, results, finish=None):
     completed_workload = None
     try:
         af = sdk(config["library"])
-        with af.open(
-            config["database"],
-            no_sync=config["no_sync"],
-            busy_timeout=config["timeout_ms"] / 1000,
-        ) as db:
+        with (
+            af.open(
+                config["database"],
+                no_sync=config["no_sync"],
+                busy_timeout=config["timeout_ms"] / 1000,
+            ) as db,
+            contextlib.ExitStack() as thread_handles,
+        ):
+            threads = max(1, config.get("threads_per_worker", 1))
+            # Each writer thread gets its own handle on the same database, so
+            # threads contend at the process-wide path gate (where the lease
+            # is handed off), not on one connection's mutex.
+            handles = (
+                [db]
+                if threads == 1
+                else [
+                    thread_handles.enter_context(
+                        af.open(
+                            config["database"],
+                            no_sync=config["no_sync"],
+                            busy_timeout=config["timeout_ms"] / 1000,
+                        )
+                    )
+                    for _ in range(threads)
+                ]
+            )
             initial_stats = measurement_stats(db)
             proof_observed_from = time.monotonic()
             ready.put({"index": index, "status": "ok"})
@@ -256,8 +312,20 @@ def native_worker(config, index, ready, start, results, finish=None):
             began = time.monotonic()
             deadline = began + config["seconds"]
             success, busy = [], []
-            success_windows = [0] * max(1, math.ceil(config["seconds"] / 60))
-            sequence = 0
+            window_seconds = config.get("progress_window_seconds", 60)
+            success_windows = [0] * max(
+                1, math.ceil(config["seconds"] / window_seconds)
+            )
+            lock = threading.Lock()
+            last_write = None
+            latest_churn_writes = {}
+            # Longest interval without an acknowledged write, per thread: the
+            # direct measure of starvation, independent of total throughput.
+            thread_gaps = [0.0] * threads
+            thread_last_progress = [0.0] * threads
+            thread_successes = [0] * threads
+            thread_windows = [[0] * len(success_windows) for _ in range(threads)]
+            thread_errors = []
             visibility_samples = []
             visibility_interval = config.get("visibility_interval", 0)
             next_visibility = began + visibility_interval
@@ -266,72 +334,120 @@ def native_worker(config, index, ready, start, results, finish=None):
                 if config.get("text_payload") in ("words", "changing-words")
                 else "v" * 1024
             )
-            last_write = None
-            latest_churn_writes = {}
-            while time.monotonic() < deadline:
-                key = f"worker-{index}-{sequence if config['workload'] == 'append' else sequence % 128}"
-                token = (
-                    f"churnworker{index}sequence{sequence}"
-                    if config.get("text_payload") == "changing-words"
-                    else None
+
+            def write_loop(thread_index):
+                nonlocal last_write, next_visibility
+                handle = handles[thread_index]
+                last_progress = 0.0
+                max_gap = 0.0
+                sequence = 0
+                prefix = (
+                    f"worker-{index}"
+                    if threads == 1
+                    else f"worker-{index}-t{thread_index}"
                 )
-                payload = {
-                    "inserts": {
-                        key: {
-                            "text": f"{token} {text_payload}"
-                            if token
-                            else text_payload,
-                            "sequence": sequence,
-                        }
-                    }
-                }
-                began_call = time.perf_counter_ns()
                 try:
-                    db.batch_json(payload)
-                    success.append(time.perf_counter_ns() - began_call)
-                    window = min(
-                        len(success_windows) - 1, int((time.monotonic() - began) / 60)
-                    )
-                    success_windows[window] += 1
-                    last_write = {"key": key, "sequence": sequence}
-                    if token:
-                        last_write["text_token"] = token
-                        previous = latest_churn_writes.get(key)
-                        if previous is not None:
-                            last_write["replaced_text_token"] = previous["text_token"]
-                    if config["workload"] == "churn":
-                        latest_churn_writes[key] = last_write
-                except af.BusyError:
-                    busy.append(time.perf_counter_ns() - began_call)
-                sequence += 1
-                if (
-                    index == 0
-                    and visibility_interval > 0
-                    and time.monotonic() >= next_visibility
-                ):
-                    observed = time.monotonic()
-                    try:
-                        state = db.pending_work_stats()
-                        visibility_samples.append(
-                            {
-                                "started_seconds": observed - began,
-                                "ended_seconds": time.monotonic() - began,
-                                "debt": state.get("index_replay_debt", []),
-                                "backlog": state.get("background_publications", {}).get(
-                                    "replay_backlog"
-                                ),
-                            }
+                    while time.monotonic() < deadline:
+                        key = f"{prefix}-{sequence if config['workload'] == 'append' else sequence % 128}"
+                        token = (
+                            f"churnworker{index}thread{thread_index}sequence{sequence}"
+                            if config.get("text_payload") == "changing-words"
+                            else None
                         )
-                    except af.BusyError:
-                        visibility_samples.append(
-                            {
-                                "started_seconds": observed - began,
-                                "ended_seconds": time.monotonic() - began,
-                                "error": "Busy",
+                        payload = {
+                            "inserts": {
+                                key: {
+                                    "text": f"{token} {text_payload}"
+                                    if token
+                                    else text_payload,
+                                    "sequence": sequence,
+                                }
                             }
-                        )
-                    next_visibility = time.monotonic() + visibility_interval
+                        }
+                        began_call = time.perf_counter_ns()
+                        try:
+                            handle.batch_json(payload)
+                            latency = time.perf_counter_ns() - began_call
+                            elapsed = time.monotonic() - began
+                            write = {"key": key, "sequence": sequence}
+                            with lock:
+                                success.append(latency)
+                                window = min(
+                                    len(success_windows) - 1,
+                                    int(elapsed / window_seconds),
+                                )
+                                success_windows[window] += 1
+                                thread_windows[thread_index][window] += 1
+                                thread_successes[thread_index] += 1
+                                if token:
+                                    write["text_token"] = token
+                                    previous = latest_churn_writes.get(key)
+                                    if previous is not None:
+                                        write["replaced_text_token"] = previous[
+                                            "text_token"
+                                        ]
+                                last_write = write
+                                if config["workload"] == "churn":
+                                    latest_churn_writes[key] = write
+                            max_gap = max(max_gap, elapsed - last_progress)
+                            last_progress = elapsed
+                        except af.BusyError:
+                            with lock:
+                                busy.append(time.perf_counter_ns() - began_call)
+                        sequence += 1
+                        if (
+                            index == 0
+                            and thread_index == 0
+                            and visibility_interval > 0
+                            and time.monotonic() >= next_visibility
+                        ):
+                            observed = time.monotonic()
+                            try:
+                                state = handle.pending_work_stats()
+                                visibility_samples.append(
+                                    {
+                                        "started_seconds": observed - began,
+                                        "ended_seconds": time.monotonic() - began,
+                                        "debt": state.get("index_replay_debt", []),
+                                        "backlog": state.get(
+                                            "background_publications", {}
+                                        ).get("replay_backlog"),
+                                    }
+                                )
+                            except af.BusyError:
+                                visibility_samples.append(
+                                    {
+                                        "started_seconds": observed - began,
+                                        "ended_seconds": time.monotonic() - began,
+                                        "error": "Busy",
+                                    }
+                                )
+                            next_visibility = time.monotonic() + visibility_interval
+                except BaseException:  # noqa: BLE001 - surfaced as a worker failure below
+                    thread_errors.append(traceback.format_exc())
+                thread_gaps[thread_index] = max_gap
+                thread_last_progress[thread_index] = last_progress
+
+            if threads == 1:
+                write_loop(0)
+            else:
+                pool = [
+                    threading.Thread(target=write_loop, args=(t,))
+                    for t in range(threads)
+                ]
+                for thread in pool:
+                    thread.start()
+                for thread in pool:
+                    thread.join()
+            if thread_errors:
+                raise RuntimeError(thread_errors[0])
             ended = time.monotonic()
+            # The trailing interval after each thread's last acknowledged write.
+            thread_gaps = [
+                max(gap, (ended - began) - last)
+                for gap, last in zip(thread_gaps, thread_last_progress, strict=True)
+            ]
+            max_progress_gap = max(thread_gaps)
             # Preserve measured progress if a later diagnostic or close fails.
             # The terminal result remains an error and cannot pass qualification.
             completed_workload = {
@@ -382,6 +498,12 @@ def native_worker(config, index, ready, start, results, finish=None):
                 "ended": ended,
                 "success_latency_ns": success,
                 "success_windows": success_windows,
+                "max_progress_gap_seconds": max_progress_gap,
+                "thread_max_progress_gap_seconds": thread_gaps,
+                "thread_successful_calls": thread_successes,
+                "thread_success_windows": thread_windows,
+                "progress_window_seconds": window_seconds,
+                "lease": lease_delta(initial_stats, final_stats),
                 "busy_latency_ns": busy,
                 "proofs": proofs,
                 "background_publication_deltas": {
@@ -431,6 +553,75 @@ def native_worker(config, index, ready, start, results, finish=None):
         if not announced:
             ready.put(failure)
         results.put(failure)
+
+
+def status_reader(config, stop, results):
+    """The #1431 shape: an independent status-only reader once per interval."""
+    reads, errors, latencies, startup_error = 0, [], [], None
+    try:
+        try:
+            af = sdk(config["library"])
+        except Exception as error:  # noqa: BLE001 - reported, and fails the run
+            startup_error = f"{type(error).__name__}: {error}"[:300]
+            raise
+        while not stop.wait(config["status_interval"]):
+            began = time.perf_counter_ns()
+            try:
+                options = af.OpenOptions(
+                    mode=af.OpenMode.STATUS_ONLY,
+                    profile=af.Profile.NATIVE,
+                    busy_timeout=config["timeout_ms"] / 1000,
+                )
+                with af.open_with_options(config["database"], options) as db:
+                    db.status()
+                reads += 1
+                latencies.append(time.perf_counter_ns() - began)
+            except Exception as error:  # noqa: BLE001 - every failure is a reported reader error
+                errors.append(f"{type(error).__name__}: {error}"[:300])
+    finally:
+        results.put(
+            {
+                "reads": reads,
+                "errors": len(errors),
+                "startup_error": startup_error,
+                "first_errors": errors[:5],
+                "p50_ns": percentile(latencies, 50),
+                "max_ns": max(latencies, default=None),
+            }
+        )
+
+
+def status_reader_problem(result: dict | None, exitcode: int | None) -> str | None:
+    """Why the status reader cannot vouch for this run, or None.
+
+    A reader that never started, crashed, or completed no read reports nothing
+    about reader latency, so it must fail the run rather than read as clean.
+    """
+    if result is None:
+        return "status_reader_failed"
+    if result.get("startup_error") or exitcode not in (0, None):
+        return "status_reader_failed"
+    if result.get("reads", 0) == 0:
+        return "status_reader_failed"
+    if result.get("errors"):
+        return "status_reader_errors"
+    return None
+
+
+def handoff_problem(row: dict, threads_per_worker: int) -> str | None:
+    """A multi-threaded run exists to exercise in-process lease handoff.
+
+    It qualifies only if handoffs were observed. A library without lease
+    timing (an older control) cannot report them and is not judged here.
+    """
+    if threads_per_worker <= 1:
+        return None
+    lease = row.get("lease")
+    if lease is None:
+        return None
+    if lease["foreground_lease"]["handoffs"] == 0:
+        return "no_handoffs"
+    return None
 
 
 def acknowledged_writes(workers: list[dict]) -> list[dict]:
@@ -486,6 +677,53 @@ def histogram_percentile_bounds(
     raise AssertionError("inconsistent admission histogram")
 
 
+def lease_summary(workers: list[dict]) -> dict | None:
+    rows = [row.get("lease") for row in workers]
+    if not rows or any(row is None for row in rows):
+        return None
+    summary = {}
+    for group in LEASE_GROUPS:
+        merged = {
+            field: sum(row[group][field] for row in rows) for field in LEASE_COUNTERS
+        }
+        for field in ("wait_log2_ns", "hold_log2_ns"):
+            merged[field] = [
+                sum(row[group][field][i] for row in rows) for i in range(64)
+            ]
+        for kind, histogram in (
+            ("wait", merged["wait_log2_ns"]),
+            ("hold", merged["hold_log2_ns"]),
+        ):
+            for percent in (50, 99):
+                lower, upper = histogram_percentile_bounds(histogram, percent)
+                merged[f"{kind}_p{percent}_lower_ns"] = lower
+                merged[f"{kind}_p{percent}_upper_ns"] = upper
+        merged["per_worker_acquisitions"] = [row[group]["acquisitions"] for row in rows]
+        merged["per_worker_busy"] = [row[group]["busy"] for row in rows]
+        merged["per_worker_hold_ns"] = [row[group]["hold_ns"] for row in rows]
+        merged["per_worker_wait_p99_upper_ns"] = [
+            histogram_percentile_bounds(row[group]["wait_log2_ns"], 99)[1]
+            for row in rows
+        ]
+        summary[group] = merged
+    summary["gate_wait_ns"] = sum(row["gate_wait_ns"] for row in rows)
+    return summary
+
+
+def fairness(per_worker: list[int]) -> dict:
+    """Jain's index (1.0 = equal shares) and min/max share ratio."""
+    total = sum(per_worker)
+    squares = sum(value * value for value in per_worker)
+    return {
+        "jain_index": (total * total) / (len(per_worker) * squares)
+        if squares
+        else None,
+        "min_max_ratio": (min(per_worker) / max(per_worker))
+        if max(per_worker, default=0)
+        else None,
+    }
+
+
 def aggregate(workers: list[dict]) -> dict:
     successful = [value for row in workers for value in row["success_latency_ns"]]
     busy = [value for row in workers for value in row["busy_latency_ns"]]
@@ -499,8 +737,20 @@ def aggregate(workers: list[dict]) -> dict:
     )
     if proof_elapsed <= 0:
         raise RuntimeError("invalid proof-observation interval")
-    starved = sum(not row["success_latency_ns"] for row in workers)
-    stalled = sum(0 in row.get("success_windows", []) for row in workers)
+    # Judge progress per writer thread when workers report it: a process can
+    # make progress while one of its threads starves.
+    starved = sum(
+        sum(count == 0 for count in row["thread_successful_calls"])
+        if row.get("thread_successful_calls") is not None
+        else int(not row["success_latency_ns"])
+        for row in workers
+    )
+    stalled = sum(
+        sum(0 in windows for windows in row["thread_success_windows"])
+        if row.get("thread_success_windows") is not None
+        else int(0 in row.get("success_windows", []))
+        for row in workers
+    )
     status = "ok"
     if not successful:
         status = "no_progress"
@@ -512,9 +762,25 @@ def aggregate(workers: list[dict]) -> dict:
         "status": status,
         "workers_without_success": starved,
         "workers_with_stalled_windows": stalled,
-        "progress_window_seconds": 60,
+        "progress_window_seconds": workers[0].get("progress_window_seconds", 60),
+        "per_worker_max_progress_gap_seconds": [
+            row.get("max_progress_gap_seconds") for row in workers
+        ],
+        "max_progress_gap_seconds": max(
+            (row.get("max_progress_gap_seconds") or 0 for row in workers), default=None
+        ),
+        "throughput_fairness": fairness(
+            [len(row["success_latency_ns"]) for row in workers]
+        ),
+        "lease": lease_summary(workers),
         "per_worker_success_windows": [
             row.get("success_windows", []) for row in workers
+        ],
+        "per_thread_successful_calls": [
+            row.get("thread_successful_calls") for row in workers
+        ],
+        "per_thread_max_progress_gap_seconds": [
+            row.get("thread_max_progress_gap_seconds") for row in workers
         ],
         "per_worker_background_publication_deltas": [
             row.get("background_publication_deltas", {}) for row in workers
@@ -661,7 +927,18 @@ def native_cases(args):
                 "allocator_diagnostics": args.allocator_diagnostics,
                 "visibility_interval": getattr(args, "visibility_interval", 0),
                 "text_payload": getattr(args, "text_payload", "opaque"),
+                "progress_window_seconds": args.progress_window,
+                "status_interval": args.status_interval,
+                "threads_per_worker": args.threads_per_worker,
             }
+            reader_stop, reader_results = context.Event(), context.Queue()
+            reader = (
+                context.Process(
+                    target=status_reader, args=(config, reader_stop, reader_results)
+                )
+                if args.status_interval > 0
+                else None
+            )
             processes = [
                 context.Process(
                     target=native_worker,
@@ -716,6 +993,8 @@ def native_cases(args):
                         raise RuntimeError(notice["diagnostic"])
                 sample_thread = threading.Thread(target=sample_file_size, daemon=True)
                 sample_thread.start()
+                if reader is not None:
+                    reader.start()
                 start.set()
                 finish_by = (
                     time.monotonic()
@@ -731,6 +1010,14 @@ def native_cases(args):
                     process.join(timeout=max(0.01, finish_by - time.monotonic()))
                 if any(process.is_alive() for process in processes):
                     raise TimeoutError("worker close exceeded watchdog")
+                if reader is not None:
+                    reader_stop.set()
+                    try:
+                        row["status_reader"] = reader_results.get(timeout=args.watchdog)
+                    except queue.Empty:
+                        row["status_reader"] = None
+                    reader.join(timeout=args.watchdog)
+                    row["status_reader_exitcode"] = reader.exitcode
                 if any(worker["status"] != "ok" for worker in workers):
                     row.update(status="error", workers=workers)
                 elif any(process.exitcode != 0 for process in processes):
@@ -740,6 +1027,16 @@ def native_cases(args):
                     )
                 else:
                     row.update(aggregate(workers))
+                    if row["status"] == "ok":
+                        problem = handoff_problem(row, args.threads_per_worker)
+                        if problem:
+                            row.update(status=problem)
+                    if reader is not None:
+                        problem = status_reader_problem(
+                            row["status_reader"], row["status_reader_exitcode"]
+                        )
+                        if problem:
+                            row.update(status=problem)
             except RuntimeError as error:
                 row.update(status="error", diagnostic=str(error))
             except (queue.Empty, TimeoutError):
@@ -751,6 +1048,12 @@ def native_cases(args):
             finally:
                 start.set()
                 finish.abort()
+                reader_stop.set()
+                if reader is not None and reader.is_alive():
+                    reader.join(timeout=5)
+                    if reader.is_alive():
+                        reader.kill()
+                        reader.join()
                 for process in processes:
                     if process.is_alive():
                         process.terminate()
@@ -975,6 +1278,24 @@ def main():
         help="require >=10 minutes of bounded active-write growth and stable throughput",
     )
     parser.add_argument("--watchdog", type=float, default=30)
+    parser.add_argument(
+        "--progress-window",
+        type=float,
+        default=60,
+        help="native: seconds per per-worker progress window (a zero window marks a stall)",
+    )
+    parser.add_argument(
+        "--threads-per-worker",
+        type=int,
+        default=1,
+        help="native: writer threads per process sharing one handle (exercises in-process lease handoff)",
+    )
+    parser.add_argument(
+        "--status-interval",
+        type=float,
+        default=0,
+        help="native: run a status-only reader process every N seconds (0 disables)",
+    )
     args = parser.parse_args()
     if (
         min(args.concurrency) < 1
@@ -985,6 +1306,9 @@ def main():
         or args.watchdog <= 0
         or args.timeout_ms < 0
         or args.seed_records < 1
+        or args.progress_window <= 0
+        or args.status_interval < 0
+        or not 1 <= args.threads_per_worker <= 64
     ):
         parser.error(
             "counts/durations must be positive; concurrency <= 128; timeout >= 0"

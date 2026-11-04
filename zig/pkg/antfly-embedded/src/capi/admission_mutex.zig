@@ -20,20 +20,57 @@ const BroadcastCondition = @import("antfly_platform").sync.BroadcastCondition;
 /// before returning, so neither an abandoned ticket nor a borrowed pointer can
 /// outlive the call. Every node and condition epoch is protected by `state`.
 pub fn QueuedMutex(comptime defaultIo: fn () std.Io) type {
+    return QueuedMutexWithLease(defaultIo, void);
+}
+
+pub fn QueuedMutexWithLease(comptime defaultIo: fn () std.Io, comptime Lease: type) type {
     return struct {
         const Self = @This();
-        const Waiter = struct { previous: ?*Waiter = null, next: ?*Waiter = null };
+        const Waiter = struct { previous: ?*Waiter = null, next: ?*Waiter = null, wants_lease: bool = false };
 
         state: std.Io.Mutex = .init,
         ready: BroadcastCondition = .init,
         held: bool = false,
         head: ?*Waiter = null,
         tail: ?*Waiter = null,
+        retained: ?Lease = null,
         // Enrollment/completion counters also expose the number of live
         // admissions: next -% serving == held + queued. Cancellation completes
         // an enrollment, without changing the ordering of remaining nodes.
         next: u64 = 0,
         serving: u64 = 0,
+
+        pub const retain_quantum_ns: i96 = 50 * std.time.ns_per_ms;
+        pub const contended_quantum_ns: i96 = 20 * std.time.ns_per_ms;
+
+        pub fn retainForWaiter(self: *Self, io: std.Io, lease: *Lease) bool {
+            if (self.retained != null) return false;
+            const age = std.Io.Clock.awake.now(io).nanoseconds - lease.acquired_ns;
+            if (age >= retain_quantum_ns) return false;
+            self.state.lockUncancelable(io);
+            const next_wants_lease = if (self.head) |head| head.wants_lease else false;
+            self.state.unlock(io);
+            if (!next_wants_lease) return false;
+            if (age >= contended_quantum_ns and lease.othersWaiting()) return false;
+            if (lease.reader_registration_batch) |batch| batch.end();
+            lease.reader_registration_batch = null;
+            lease.endHold();
+            self.retained = lease.*;
+            return true;
+        }
+
+        pub fn takeRetained(self: *Self) ?Lease {
+            const lease = self.retained orelse return null;
+            self.retained = null;
+            return lease;
+        }
+
+        pub fn dropRetained(self: *Self) void {
+            if (self.takeRetained()) |lease| {
+                var owned = lease;
+                owned.close();
+            }
+        }
 
         fn append(self: *Self, waiter: *Waiter) void {
             waiter.previous = self.tail;
@@ -47,6 +84,14 @@ pub fn QueuedMutex(comptime defaultIo: fn () std.Io) type {
         }
 
         pub fn lockUncancelable(self: *Self, io: std.Io) void {
+            self.lockUncancelableWithIntent(io, false);
+        }
+
+        pub fn lockForLease(self: *Self, io: std.Io) void {
+            self.lockUncancelableWithIntent(io, true);
+        }
+
+        fn lockUncancelableWithIntent(self: *Self, io: std.Io, wants_lease: bool) void {
             self.state.lockUncancelable(io);
             defer self.state.unlock(io);
             self.next +%= 1;
@@ -54,7 +99,7 @@ pub fn QueuedMutex(comptime defaultIo: fn () std.Io) type {
                 self.held = true;
                 return;
             }
-            var waiter: Waiter = .{};
+            var waiter: Waiter = .{ .wants_lease = wants_lease };
             self.append(&waiter);
             while (self.held or self.head != &waiter) self.ready.waitUncancelable(io, &self.state);
             self.remove(&waiter);
@@ -65,6 +110,14 @@ pub fn QueuedMutex(comptime defaultIo: fn () std.Io) type {
         /// Once queued, expiry or cancellation removes this admission rather
         /// than leaving a hole for the next holder to discover.
         pub fn lockUntil(self: *Self, io: std.Io, deadline_ns: i96) !void {
+            return self.lockUntilWithIntent(io, deadline_ns, false);
+        }
+
+        pub fn lockForLeaseUntil(self: *Self, io: std.Io, deadline_ns: i96) !void {
+            return self.lockUntilWithIntent(io, deadline_ns, true);
+        }
+
+        fn lockUntilWithIntent(self: *Self, io: std.Io, deadline_ns: i96, wants_lease: bool) !void {
             self.state.lockUncancelable(io);
             defer self.state.unlock(io);
             try io.checkCancel();
@@ -73,7 +126,7 @@ pub fn QueuedMutex(comptime defaultIo: fn () std.Io) type {
                 self.held = true;
                 return;
             }
-            var waiter: Waiter = .{};
+            var waiter: Waiter = .{ .wants_lease = wants_lease };
             self.append(&waiter);
             errdefer {
                 self.remove(&waiter);
@@ -125,6 +178,7 @@ pub fn QueuedMutex(comptime defaultIo: fn () std.Io) type {
             std.debug.assert(self.held);
             self.held = false;
             self.serving +%= 1;
+            if (comptime Lease != void) if (self.head == null) self.dropRetained();
             self.ready.broadcast(io);
         }
     };

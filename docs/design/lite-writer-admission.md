@@ -1,58 +1,34 @@
 # Lite writer admission
 
 The data-path sidecar flock remains the authority that excludes incompatible
-database operations. A bounded coordination queue orders cooperating processes
+database operations. A crash-safe coordination queue orders cooperating writers
 before they seek that flock. This separates turn ordering from storage safety and
 preserves exclusion when a binary using the older flock-only protocol is present.
 Fairness applies to callers participating in the queue.
 
 ## Queue protocol
 
-The versioned coordination file has a bounded hashed name beside the canonical
-safety-lock path. Its size is 8,256 bytes: a 64-byte header and 1,024 ticket slots.
-An OFD byte-range lock protects enrollment; a distinct range belongs to each live
-ticket. These kernel locks belong to open file descriptions. Independent owners
-inside one process exclude each other, and closing an unrelated descriptor does
-not release their ownership.
+The queue uses main's crash-safe writer ticket protocol. A bounded-length
+coordination directory beside the canonical safety-lock path contains a checked
+monotonic tail counter and one flock-protected file per live ticket. Enrollment
+locks the ticket before publishing it and advances the tail under its own lock.
+An uncontended writer can skip ticket creation while holding the tail fence.
 
-Enrollment holds the short queue guard, removes entries whose descriptions have
-closed, and locks a free slot before publishing its sequence and access kind.
-The sequence follows the greatest live sequence. An empty queue can restart at
-one. A full table waits within the caller's remaining admission budget. The file
-does not grow with the number of completed requests or the retained database.
+A writer waits on its predecessor. Granted/done predecessors establish a turn;
+abandoned or dead waiters are skipped only while holding their unlocked ticket.
+A missing file is safe because a later grant proved all earlier tickets finished.
+Ticket numbers are never reused. Granted holders reclaim prior ticket files, and
+counter recovery cannot assign a number below a live ticket after an interrupted
+write. Cancellation and process death release kernel ownership.
 
-A writer waits behind every earlier live ticket. A reader waits behind earlier
-writers while sharing a cohort with earlier readers. A later reader therefore
-cannot continually overtake a queued writer. The nearest conflicting predecessor
-is a wake hint: every disappearance, cancellation, or slot reuse causes another
-guarded ordering check. Removing a middle waiter cannot grant a successor a turn
-while an earlier conflicting owner remains alive.
+The safety flock closes before the queue turn is released. Legacy callers and
+primitive native opens still use that safety flock, preserving exclusion while
+only participating writers receive FIFO ordering. Readers retain their shared
+safety lock and inode-fenced fallback. Namespace construction and read-snapshot
+alias/replacement protections remain independent of queue ordering.
 
-Liveness queries do not acquire a predecessor's range. This prevents several
-successors from accidentally keeping a dead predecessor locked. Generation checks
-detect slot reuse; authority to proceed always comes from the guarded live-table
-check, followed by acquisition of the safety flock.
-
-The safety descriptor closes before the ticket descriptor. Cancellation closes
-both in that order, and process death releases their kernel ownership. The next
-visit reaps stale metadata. Interrupted initialization can be repaired only while
-the queue guard and the entire ticket-lock range prove that no live ticket exists.
-Failed enrollment retains the guard through descriptor close. A partial new-slot
-write therefore cannot appear live to a peer while its failed description is
-still draining.
-
-Queue metadata needs no data-durability barrier: after a machine restart all its
-former descriptions are gone, so their records cannot authorize a new operation.
-
-The range-lock shim issues nonblocking operations; cancellable `std.Io` waits
-separate failed attempts. It cannot leave a raw blocking syscall that acquires a
-lock after its caller has returned. The existing joined kernel-wait helper still
-handles a safety flock held by an older binary.
-
-Read-only callers retain the existing inode-fenced fallback when they cannot
-access a coordination sidecar. Namespace construction follows the established
-canonical safety-lock identity. Native read-snapshot alias and replacement
-protections remain required independently of turn ordering.
+This branch uses the queue landed in #1479; it does not add another queue around
+native opens or retain the earlier byte-range-lock implementation.
 
 ## Admission budget and lifetime
 
@@ -72,8 +48,9 @@ the transition into a timed wait.
 
 A successful detached allocator proof may outlast its waiting budget. Admission
 must retain that finished proof, allow an uncontended stable-tip acquisition, and
-refuse new contention waits after expiry. The completed verification witness is retained against its matching cached
-checkpoint or checked append-only lineage before lease reacquisition. A Busy
+refuse new contention waits after expiry. The completed verification witness is retained as a checked proof receipt before
+lease reacquisition and accepted only against its matching checkpoint or checked
+append-only lineage. A Busy
 refusal therefore cannot force another full walk on a stable tip. No mutable
 verifier ledger is shared with borrowed runtimes. Both local handoffs after
 verification and reader teardown use the original admission budget; mandatory
@@ -85,8 +62,11 @@ finishes.
 
 Fairness bounds the number of earlier turns, not their duration. Replay and
 immutable merge preparation run outside path writer admission. Publications and
-existing mutation groups retain bounded work and release their ticket at their
-boundary. A public call releases its lease before another public call starts.
+existing mutation groups retain bounded work. A queued local writer may receive
+its predecessor's lease directly. Handoff chains stop after 50 ms, or after
+20 ms when another process is queued. An idle gate closes any retained lease;
+a timed-out local waiter unlinks before returning, so it cannot strand a lease.
+Reader registration batches end at each handoff.
 
 Per-process path statistics separate acquisition duration from closed-lease hold
 duration, including maxima and a logarithmic hold histogram. Acquisition includes
@@ -184,6 +164,12 @@ Both producer and consumer controllers size preparation windows from elapsed
 time minus measured admission/publication overhead. That fixed cost still
 counts toward call deadlines and yield decisions. Contention therefore does
 not by itself shrink preparation windows and multiply admission and sync work.
+
+Automatic full-generation format conversion follows the same replay/quiet
+admission and primary-publication preemption as automatic shrinking. A legacy
+file may continue serving supported operations while conversion is deferred.
+Manual conversion retains its explicit execution semantics. This avoids
+restarting a whole-database upgrade on every maintenance turn under active writes.
 
 ## Qualification
 

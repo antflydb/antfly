@@ -396,14 +396,18 @@ pub const Session = struct {
         var arena = std.heap.ArenaAllocator.init(self.handle.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const requests = try self.commitRequests(a);
+        // Everything before `sql_commit.commit` only reads and plans: a
+        // failure here is "not applied", and the session stays usable for
+        // ROLLBACK as with any failed statement.
+        const outcomes = d.sql_errors;
+        const requests = self.commitRequests(a) catch |err| return outcomes.notApplied(err);
         if (requests.len == 0) {
             self.reset();
             return .committed;
         }
-        var adapter = sql.Adapter(h.antfly){ .handle = self.handle, .db = try @import("tables.zig").get(self.handle, requests[0].table_name), .table_name = requests[0].table_name };
-        const metadata = try adapter.localCatalog(a, requests[0].schema_version.?);
-        var prepared = try d.api_relational_integrity_commit.prepareWithRepairAdmission(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, requests, adapter.repairAdmission(), .{});
+        var adapter = sql.Adapter(h.antfly){ .handle = self.handle, .db = @import("tables.zig").get(self.handle, requests[0].table_name) catch |err| return outcomes.notApplied(err), .table_name = requests[0].table_name };
+        const metadata = adapter.localCatalog(a, requests[0].schema_version.?) catch |err| return outcomes.notApplied(err);
+        var prepared = d.api_relational_integrity_commit.prepareWithRepairAdmission(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, requests, adapter.repairAdmission(), .{}) catch |err| return outcomes.notApplied(err);
         defer prepared.deinit();
         const outcome = @import("sql_commit.zig").commit(self.handle, prepared.tables, out_id) catch |err| {
             self.failed = true;
@@ -414,7 +418,9 @@ pub const Session = struct {
     }
 
     pub fn control(self: *Session, statement: d.sql_ast.Statement, out_id: *?types.TxnId) !?sql.runtime.Result {
-        if (self.handle.sql_decision_uncertain) return error.SqlMutationOutcomeUnknown;
+        // An earlier COMMIT's outcome is unresolved: refuse new statements.
+        // They were not applied, so this is not itself an unknown outcome.
+        if (self.handle.sql_decision_uncertain) return error.SqlReconciliationRequired;
         const tag: []const u8 = switch (statement) {
             .begin => |options| blk: {
                 if (self.active) return error.SqlTransactionAlreadyActive;

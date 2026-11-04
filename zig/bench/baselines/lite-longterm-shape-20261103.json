@@ -168,9 +168,9 @@
     }
   ],
   "remaining": [
-    "Complete the unchanged original-importer populated-prefix diagnostic with native snapshot publication; investigate any remaining service or namespace-switch costs before optimized qualification.",
+    "Validate integration with landed #1479 and cooperative format conversion; complete unchanged-importer current-format diagnosis before optimized qualification.",
     "Candidate-only optimized final qualification on wolfspider, including full frozen corpus, importer contention, and ten-minute active-write storage/visibility qualification.",
-    "Applicable CI/model gates; full factory qualification remains with Beads. Reconcile the overlapping draft queue/outcome PR before both land."
+    "Applicable CI/model gates; full factory qualification remains with Beads."
   ],
   "limits": [
     "This is an implementation checkpoint, not an E2E performance or merge-readiness claim.",
@@ -246,6 +246,44 @@
       "integrity_search_acknowledgement_reopen": true,
       "peak_native_builds": 3,
       "scope": "Debug mechanism diagnostic on a shared host with unrelated builds; no throughput or optimized qualification claim. Background replay caught up before explicit drain."
+    },
+    "populated_legacy_import": {
+      "source_commit": "a6f3d4afed948bcc35547e86dce8437ebf4d1452",
+      "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+      "input_index": 7,
+      "importer_exit_code": 1,
+      "censored": false,
+      "importer_succeeded": false,
+      "summary": [
+        0,
+        0,
+        1
+      ],
+      "seconds": 183.4263500419911,
+      "peak_native_builds": 2,
+      "metrics_enabled": true,
+      "library_sha256": "4cffa2602385174036b912bd05926a78af6e99dc7131d3a348dfa4bc6e38d11c",
+      "public_errors": [
+        "FileBusy"
+      ],
+      "seed_sha256": "2002c183a24efebf17a7bc1d1a0e90658d5b7c9270857b874a7b0528e43fc8d1",
+      "seed_copy_method": "native_stable_snapshot",
+      "scope": "Local diagnosis only. Metrics and any overlapping compilation prevent clean performance attribution.",
+      "seed_format_revision": 8,
+      "final_format_revision": 8,
+      "primary_batches": 14,
+      "storage_ns": 152577474000,
+      "storage_failures": 8,
+      "admission_refusals": {
+        "local_gate": 1
+      },
+      "attribution": "Legacy format conversion takes the full-generation vacuum branch before ordinary maintenance; this fixture never adopted revision 9. The failed run is not evidence of current-format replay service capacity. A fresh revision-9 run is in progress."
     }
+  },
+  "integration_pending_validation": {
+    "main_commit": "270057158c",
+    "work": "Use landed writer queue and boundary classification once; preserve cancellation-safe timed local admission, add bounded lease handoff, retain precommit replay-capacity retries and preallocated JSON responses. Automatic format conversion now observes replay/quiet admission and primary-publication preemption. Remove superseded byte-range queue shim.",
+    "component_builds_passed": false,
+    "benchmark_report_tests_passed": 23
   }
 }
