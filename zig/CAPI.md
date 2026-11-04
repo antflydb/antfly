@@ -298,6 +298,14 @@ tip still requires a new proof; an exhausted budget returns `ANTFLY_BUSY` safely
 A cancelled backoff returns before another lease acquisition or proof starts.
 Mutation bodies are never replayed by admission retries.
 
+The budget covers waiting only, and once per exported call: the cross-process
+writer queue and kernel lock, backoff between attempts, and waiting for another
+thread's allocator proof. It excludes active work: SQL parsing and preparation
+(before admission), this call's own allocator proof walk, and anything the call
+does between suspending and resuming admission (for example inference in
+resolve-query or memory). A resumed admission receives what is left of the
+original budget, plus the time its earlier admissions spent on their own proof.
+
 Ordinary admission retries release registry references between attempts, so a
 concurrent close may invalidate the handle before it is reacquired. Prepared
 SQL retains its original references until its plan and shared preparation-budget
@@ -325,6 +333,16 @@ excluded. Histogram bucket `i` covers `[2^i, 2^(i+1)-1]` nanoseconds (bucket zer
 also includes zero; bucket 63 ends at `UINT64_MAX`), so percentile estimates are
 ranges rather than exact timings. A successfully admitted mutation can still
 fail later in its body; these counters do not assert mutation success.
+
+`foreground_lease` and `maintenance_lease` time the cross-process writer lease
+for exported calls and for background publication, replay and reclamation:
+`acquisitions` split into `uncontended`, `queued` (waited in the FIFO) and
+`handoffs` (passed directly from another thread of this process); `busy` and
+`busy_wait_ns` for refusals at the deadline; `wait_ns`, `wait_max_ns` and
+`wait_log2_ns` from the start of acquisition to holding the lease; and `holds`,
+`hold_ns`, `hold_max_ns` and `hold_log2_ns` from acquisition to release or
+handoff. `gate_wait_ns` and `gate_wait_max_ns` measure time exported calls spent
+queued behind other threads of the same process before that.
 
 After an external commit or atomic file replacement, the shared owner reopens
 its cached runtime before the next operation. An in-process handoff between
@@ -680,7 +698,42 @@ Interrupted preparation is aborted on recovery; decided commits finish
 participant intent resolution without replaying SQL. A committed-pending
 outcome remains committed. An unknown decision returns SQLSTATE 40003 and a
 transaction receipt; do not replay it. Close and reopen the database to
-recover/reconcile that receipt. Commit responses reserve a fallback buffer
+recover/reconcile that receipt.
+
+An INSERT, UPDATE, DELETE, COMMIT or `antfly_db_batch*` call ends in exactly
+one of three ways. Each is assigned at the commit boundary that knows it, from
+storage state rather than from an error's name:
+
+- **Applied.** Success, possibly with `mutation_outcome` `committed_pending` or
+  `committed_repair_required`. Once a batch's primary write is durable, or a
+  COMMIT's coordinator decision reads back as committed, any later failure is
+  reported this way. Batch exports return `ANTFLY_STALLED` with a "committed; do
+  not retry" detail. A batch response that fails to encode after commit is
+  reported the same way.
+- **Not applied.** The failure happened before the decision: before the primary
+  write (autocommit and batches), before `commitTransaction`, or with the
+  decision still pending and no checkpoint publication in flight (it is then
+  aborted, so recovery can never commit it). Specific diagnostics keep their
+  codes (40001 conflicts, 55P03 locks, 57014 cancellation, constraint codes).
+  Contention and backpressure become 55P03 (`ANTFLY_BUSY`), storage exhaustion
+  53100, and any other cause 58000 ("not applied; safe to retry"). None
+  carries a transaction receipt.
+- **Unknown.** The checkpoint publication that would make the decision durable
+  failed or was cancelled part-way (40003, `ANTFLY_OUTCOME_UNKNOWN`). On
+  directory (LSM) handles, any failure after the WAL append was attempted or
+  the memtable was published is also unknown: the record may be durable, and a
+  later flush, rotation or manifest step can fail after the write is visible.
+  COMMIT and
+  coordinated autocommit include the `transaction_id` receipt; reconcile it and
+  do not replay. Plain autocommit and batch calls have no receipt; after
+  reconciliation, read back the affected keys.
+
+While an unknown outcome is unresolved, new statements and calls are refused
+before running, with SQLSTATE 55000 (`ANTFLY_STALLED`): they were not applied,
+and are not themselves of unknown outcome. Lite connections reconcile by
+reopening on their next call; other handles must be reopened.
+
+XX000 is reserved for internal defects and never reports a commit outcome. Commit responses reserve a fallback buffer
 before mutation, so response allocation cannot erase a committed outcome.
 
 `sql_open_cursor_json` pins a read statement without a total row limit.
