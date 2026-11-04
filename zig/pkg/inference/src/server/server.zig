@@ -24351,12 +24351,15 @@ pub const Node = struct {
         var retained = ParsedDenseEmbedInputs{};
         defer retained.deinit(a);
         var media_budget = RequestMediaBudget.init(admission.media.byte_cap);
+        // The framed payload remains resident alongside inline and fetched
+        // media. Charge it once before parsing, as on the flat request path.
+        for (attachments) |attachment| try media_budget.add(attachment.data.len);
         var errors = std.ArrayListUnmanaged(EmbedItemError).empty;
         var request_budget: EmbeddingGroupRequestBudget = .{};
         var decoded_budget = ReadDecodedImageBudget.init(admission.media, effectiveRequestContentSecurity(self).max_image_dimension);
         for (raw_groups, 0..) |raw, index| {
             groups[index] = parseEmbeddingGroup(self, a, manifest, raw, &retained, &media_budget, .{ .io = ctx.io, .control = control }, attachments) catch |err| {
-                if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err) or err == error.ImageTooLarge or err == error.ImageBatchTooLarge) return err;
+                if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err) or err == error.RemoteContentTooLarge or err == error.ImageTooLarge or err == error.ImageBatchTooLarge) return err;
                 try errors.append(a, embedItemFailure(index, err, "input"));
                 continue;
             };
@@ -49207,4 +49210,38 @@ test "grouped embedding request expanded admission capacity failure is retryable
     defer body.deinit();
     try std.testing.expect(body.value.object.get("retryable").?.bool);
     try std.testing.expectEqualStrings("inference_admission", body.value.object.get("reason").?.string);
+}
+
+test "grouped embedding request charges framed attachments before inline media" {
+    const a = std.testing.allocator;
+    const rgba: [4]u8 = @splat(0);
+    const png = try @import("antfly_image").png.encodeRgba(a, 1, 1, &rgba);
+    defer a.free(png);
+    const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
+    defer a.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, png);
+    var node = try Node.init(a, .{ .content_security = .{ .max_download_size_bytes = encoded.len } });
+    defer node.deinit();
+    var inputs = [_][]const u8{"image"};
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .model_type = .embedder, .embedding_style = .embedding_gemma2, .inputs = &inputs };
+    const contract = try resolvedInferenceExecutorContract(&node, "embed", &manifest);
+    const json = try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"attachment\",\"attachment_index\":0}},{{\"type\":\"media\",\"mime_type\":\"image/png\",\"data\":\"{s}\"}}]}}", .{encoded});
+    defer a.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    const attachments = [_]httpx.attachment_envelope.Attachment{.{ .mime_type = "image/png", .data = png }};
+    const media = requestMediaAdmission(&node, denseEmbedRequestMediaShapeWithAttachments(parsed.value, &attachments));
+    // Either input fits alone; their combined charge must fail before weights.
+    try std.testing.expect(png.len <= media.byte_cap and encoded.len <= media.byte_cap);
+    try node.acquireAdmissionUnits(media.units);
+    var units = media.units;
+    defer node.releaseAdmissionUnits(units);
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    for ([_]EmbedErrorPolicy{ .fail_fast, .per_item }) |policy| {
+        try std.testing.expectError(error.RemoteContentTooLarge, node.createGroupedEmbeddingTracked(&ctx, "missing-model", &manifest, contract, .{ .model = "missing", .input = parsed.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = policy }, &attachments, .{ .media = media, .reserved_units = &units }, .{}));
+    }
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
 }

@@ -1516,7 +1516,7 @@ test "explicit credential and invalid credential inputs render permanent 403 fai
 test "HTTP error bodies consume the aggregate render byte budget" {
     const Hint = struct {
         value: u64 = 0,
-        fn note(ptr: *anyopaque, milliseconds: u64) void {
+        fn note(ptr: *anyopaque, _: u64, milliseconds: u64, _: ?[32]u8) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.value = @max(self.value, milliseconds);
         }

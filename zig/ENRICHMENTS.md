@@ -255,8 +255,9 @@ every lane-side helper takes the identity from the scope
 `noteEmbedBatchStartedFor`). A successful publish credits durable retry
 progress to the scope's request, unless that request is the one that
 deferred a retry, so a sibling's success cannot clear another request's
-debt. When a lane's quantum ends with its deferred retryable error, the
-error and the identity travel together in a `LaneOutcome`. Every place that
+debt. A retry durably parked in the scoped workset yields a successful lane
+outcome with outstanding document debt. Other deferred errors and their
+identities travel together in a `LaneOutcome`. Every place that
 finishes lane work -- a dispatch draining a lane's previous quantum or
 running one inline, and the end-of-pass drain -- first selects which of the
 two lanes' outcomes the supervisor will see (`selectLaneOutcome`, asset
@@ -273,18 +274,38 @@ Shared runtime sets touched from both lanes and the scanner
 (`retry_failure_fingerprint`, attempt counts, embedding activity) was
 already behind the runtime mutex.
 
-Replay skip-ahead on the next pass still requires *both* per-stream cursors
-to cover a document group before that group is skipped
-(`replayCursorsCoverGroup`); a group covered by only one lane's cursor is
-re-derived (cheaply, since chunk/document parsing is not the bottleneck) so
-the lagging lane's work is retried. The final `applied_sequence` watermark --
-the actual crash-recovery/visibility boundary -- still only advances after
-*every* group in the pass has been fully handled by both lanes; per-stream
-cursors are a resume optimization layered on top of that unchanged
-durability contract, not a new source of truth. As already documented above,
-a cursor (of either stream) is purely an optimization: the underlying
-artifact-level source-hash skip checks make re-deriving a group's work safe
-and idempotent even when a stale or missing cursor forces a redo.
+Request retries use a durable scoped workset, separate from discovery and the
+contiguous `applied_sequence`. A failed producer parks its document/source
+identity, normalized producer definition, attempt budget and full retry deadline.
+Independent producers and newer documents remain eligible; dependents of a
+parked producer wait without being marked terminal. Physical provider rebatching
+and derived replay notifications do not reset logical retry budgets. Batches
+with different attempt/wait budgets are dispatched separately so an exhausted
+member cannot terminalize a fresh source. Unattempted batches stopped behind a
+provider-key failure inherit its deadline without consuming attempts. Changed
+producer definitions or primary inputs start a new episode. Deleted primaries
+retire their tickets even though enrichment replay omits deletion groups.
+
+The workset holds at most 128 document tickets, 1024 producer budgets per ticket,
+and 16 MiB of serialized metadata. It retains no document payloads or credentials.
+A discovery cursor includes a document key when a single atomic journal record
+exceeds available slots. Capacity backpressure bounds admission; newly notified
+primary revisions still receive one bounded maintenance pass when the workset
+is full, allowing deletions and replacements to free slots without polling in a
+busy loop. Successful publications remain reusable through their normal source
+guards. Full
+`Retry-After` clocks survive restart; scheduler wakeups are bounded independently
+and never shorten those clocks. No provider lease is held during the delay.
+
+Workset writes use the live ownership/catalog publication fence and precede
+watermark advancement. Completion tokens retire only the producer revision
+actually attempted, preserving other clocks and failures scheduled during the
+pass. The contiguous applied watermark stays behind the earliest deferred
+source, retaining its journal history while healthy discovery advances. Legacy
+per-lane cursors cannot certify completion during scoped replay. If a metadata
+commit fails, the runtime retains the bounded uncommitted state and flushes it
+before invoking another provider. Artifact source guards keep crash replay
+idempotent; volatile publication receipts are cleared after each durable scan.
 
 One behavior changed deliberately from the historical strictly-sequential
 implementation: a fatal (non-retryable) error in one lane no longer aborts
@@ -292,8 +313,8 @@ the sibling lane's attempt within the same quantum. Previously, a fatal
 asset-producer error skipped the dense-embedding stage entirely for that
 quantum; now both lanes still run to completion (each independently safe
 and crash-idempotent) before the fatal error propagates to the replay pass.
-Retryable-failure handling is unchanged: each producer class remains an
-independent availability domain, and a retryable failure in one lane never
+Each producer remains an independent availability domain, and a retryable
+failure in one lane never
 discards the sibling lane's successful, durably published output.
 
 Model residency across the two lanes relies on the embedded inference node

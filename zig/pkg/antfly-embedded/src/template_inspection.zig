@@ -23,9 +23,21 @@ const ContentPart = @import("antfly_template_content").ContentPart;
 /// Borrowed request-lifetime observer; durable owners decide scheduling.
 pub const RetryHintObserver = struct {
     ptr: *anyopaque,
-    note_fn: *const fn (*anyopaque, u64) void,
+    note_fn: *const fn (*anyopaque, u64, u64, ?[32]u8) void,
+    source_bytes: ?[]const u8 = null,
+    request_fingerprint: u64 = 0,
+    pub fn scoped(self: @This(), fingerprint: u64) @This() {
+        var result = self;
+        result.request_fingerprint = fingerprint;
+        return result;
+    }
     pub fn note(self: @This(), milliseconds: u64) void {
-        self.note_fn(self.ptr, milliseconds);
+        const digest: ?[32]u8 = if (self.source_bytes) |bytes| blk: {
+            var value: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &value, .{});
+            break :blk value;
+        } else null;
+        self.note_fn(self.ptr, self.request_fingerprint, milliseconds, digest);
     }
 };
 

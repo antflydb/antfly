@@ -950,6 +950,7 @@ test "PDF image embedding has a media-sized batch byte default" {
 }
 
 const GeneratedTextBatchPolicy = struct {
+    retry_fingerprint: u64 = 0,
     max_items: usize,
     /// Only speculative windows defer scratch failures until their predecessor drains.
     defer_render_pressure: bool = false,
@@ -969,6 +970,7 @@ fn requestGeneratedTextBatchPolicy(alloc: Allocator, request: enrichment_types.G
     const operator_max_items = generatedOcrBatchMaxItems();
     const requested_items = enrichment_types.executionBatchItemsOrDefault(alloc, request.execution_json, generatedOcrBatchItems());
     return .{
+        .retry_fingerprint = requestFailureFingerprint(request),
         .max_items = @max(@as(usize, 1), @min(requested_items, operator_max_items)),
         .max_bytes = enrichment_types.executionBatchBytesOrDefault(alloc, request.execution_json, generatedOcrBatchBytes()),
     };
@@ -2584,8 +2586,18 @@ fn clearRequestRetryAuthorization(runtime: *EnrichmentRuntime) void {
     runtime.retry_error_has_request_identity = false;
 }
 
-fn noteRemoteFetchRetryHint(ptr: *anyopaque, milliseconds: u64) void {
+fn noteRemoteFetchRetryHint(ptr: *anyopaque, fingerprint: u64, milliseconds: u64, digest: ?[32]u8) void {
     const runtime: *EnrichmentRuntime = @ptrCast(@alignCast(ptr));
+    if (digest) |value| if (runtime.retry_scheduler) |scheduler| scheduler.rememberSource(runtime, fingerprint, value);
+    setRetryAfterHintFor(runtime, fingerprint, milliseconds);
+}
+
+fn setRetryAfterHintFor(runtime: *EnrichmentRuntime, fingerprint: u64, hint: ?u64) void {
+    const milliseconds = hint orelse return;
+    if (runtime.retry_scheduler) |scheduler| {
+        scheduler.hint(runtime, fingerprint, milliseconds);
+        return;
+    }
     setRetryAfterHint(runtime, milliseconds);
 }
 
@@ -2615,12 +2627,7 @@ fn restoreDeferredRequestRetryAuthorization(runtime: *EnrichmentRuntime, fingerp
 fn requestAttemptNumber(runtime: *EnrichmentRuntime) u64 {
     const maybe_io = lockRuntime(runtime);
     defer unlockRuntime(runtime, maybe_io);
-    const prior_attempts = requestPriorAttempts(
-        runtime.active_failure_fingerprint,
-        runtime.retry_failure_fingerprint,
-        runtime.retry_failure_count,
-    );
-    return @as(u64, prior_attempts) +| 1;
+    return @as(u64, retryBudgetFor(runtime, runtime.active_failure_fingerprint).failures) +| 1;
 }
 
 fn requestPriorAttempts(active_fingerprint: u64, retry_fingerprint: u64, persisted_attempts: u32) u32 {
@@ -2662,6 +2669,7 @@ fn requestRetryBudgetAllows(prior_attempts: u32, max_attempts: u32, spares_attem
 }
 
 fn activeRequestRetryBudgetAllowsYield(runtime: *EnrichmentRuntime, err: anyerror) bool {
+    if (runtime.retry_scheduler != null) return true;
     const maybe_io = lockRuntime(runtime);
     defer unlockRuntime(runtime, maybe_io);
     if (runtime.active_failure_fingerprint == 0) {
@@ -2691,11 +2699,8 @@ fn requestRetryBudgetAllowsYieldFor(runtime: *EnrichmentRuntime, fingerprint: u6
     const maybe_io = lockRuntime(runtime);
     defer unlockRuntime(runtime, maybe_io);
     const spares_attempt_budget = enrichmentFailureSparesAttemptBudget(err);
-    const prior_attempts = requestPriorAttempts(
-        fingerprint,
-        runtime.retry_failure_fingerprint,
-        if (spares_attempt_budget) runtime.transient_retry_count else runtime.retry_failure_count,
-    );
+    const budget = retryBudgetFor(runtime, fingerprint);
+    const prior_attempts = if (spares_attempt_budget) budget.waits else budget.failures;
     return requestRetryBudgetAllows(prior_attempts, runtime.config.worker_retry_max_attempts, spares_attempt_budget);
 }
 
@@ -2714,12 +2719,390 @@ fn shouldYieldRequestErrorFor(runtime: *EnrichmentRuntime, fingerprint: u64, err
 fn requestAttemptNumberFor(runtime: *EnrichmentRuntime, fingerprint: u64) u64 {
     const maybe_io = lockRuntime(runtime);
     defer unlockRuntime(runtime, maybe_io);
-    const prior_attempts = requestPriorAttempts(
-        fingerprint,
-        runtime.retry_failure_fingerprint,
-        runtime.retry_failure_count,
-    );
-    return @as(u64, prior_attempts) +| 1;
+    return @as(u64, retryBudgetFor(runtime, fingerprint).failures) +| 1;
+}
+
+const scoped_retries = @import("scoped_retries.zig");
+
+/// Borrowed only until the current invocation's error boundary. Durable tickets
+/// retain document identities; current catalog requests are re-planned on retry.
+const FailureOwner = union(enum) {
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    plain: []const PlainDenseBatchItem,
+    chunked: []const ChunkedDenseWindowItem,
+    assets: []const AssetProducerBatchItem,
+};
+
+fn logicalRequestFingerprint(supplied: enrichment_types.GeneratedEnrichmentRequest) u64 {
+    var request = supplied;
+    // Generated replay can re-notify an unchanged primary at a new journal
+    // sequence. Producer/source identity, not that notification, owns retries.
+    request.sequence = 0;
+    var hash = std.hash.Wyhash.init(requestFailureFingerprint(request));
+    // These are the catalog's normalized producer definitions. Execution batch
+    // sizes and consumer routing do not change the semantic unit of retry.
+    inline for (.{ "source_field", "source_template", "producer_json", "chunker_json", "content_type", "upstream_artifact_name", "neighbor_context_json", "prior_context_json", "group_source_json", "group_artifact_name" }) |field| {
+        const bytes = @field(request, field);
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, bytes.len, .little);
+        hash.update(&length);
+        hash.update(bytes);
+    }
+    inline for (.{ "expected_dims", "chunk_size", "chunk_overlap", "reprocess_generation" }) |field| {
+        var value: [8]u8 = undefined;
+        std.mem.writeInt(u64, &value, @field(request, field), .little);
+        hash.update(&value);
+    }
+    hash.update(&request.group_configuration);
+    return finishFailureFingerprint(&hash);
+}
+
+const ScopedReplay = struct {
+    state: scoped_retries.State,
+    unsaved: bool = false,
+    mutex: Io.Mutex = .init,
+    hints: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    recorded_requests: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    sources: std.AutoHashMapUnmanaged(u64, [32]u8) = .empty,
+    hint_failed: bool = false,
+
+    fn retainUncommitted(self: *@This(), runtime: *EnrichmentRuntime) void {
+        if (!self.unsaved) return;
+        std.debug.assert(runtime.pending_scoped_retries == null);
+        runtime.pending_scoped_retries = self.state;
+        self.state = .{};
+    }
+    fn deinit(self: *@This(), a: Allocator) void {
+        self.state.deinit(a);
+        self.hints.deinit(a);
+        self.recorded_requests.deinit(a);
+        self.sources.deinit(a);
+    }
+    fn rememberSource(self: *@This(), runtime: *EnrichmentRuntime, fingerprint: u64, digest: [32]u8) void {
+        const io = concurrencyIo(runtime);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.sources.count() >= scoped_retries.max_documents * 1024 and !self.sources.contains(fingerprint)) {
+            self.hint_failed = true;
+            return;
+        }
+        self.sources.put(runtime.alloc, fingerprint, digest) catch {
+            self.hint_failed = true;
+        };
+    }
+    fn prior(self: *@This(), runtime: *EnrichmentRuntime, fingerprint: u64) scoped_retries.Budget {
+        const io = concurrencyIo(runtime);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.state.prior(fingerprint);
+    }
+    fn hint(self: *@This(), runtime: *EnrichmentRuntime, fingerprint: u64, milliseconds: u64) void {
+        const io = concurrencyIo(runtime);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.hints.count() >= scoped_retries.max_documents * 1024 and !self.hints.contains(fingerprint)) {
+            self.hint_failed = true;
+            return;
+        }
+        const entry = self.hints.getOrPut(runtime.alloc, fingerprint) catch {
+            self.hint_failed = true;
+            return;
+        };
+        if (!entry.found_existing) entry.value_ptr.* = 0;
+        entry.value_ptr.* = @max(entry.value_ptr.*, milliseconds);
+    }
+    fn appendOwner(a: Allocator, pending_members: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest), request: enrichment_types.GeneratedEnrichmentRequest) !void {
+        const logical = logicalRequestFingerprint(request);
+        for (pending_members.items) |member| if (member.sequence == request.sequence and logicalRequestFingerprint(member) == logical) return;
+        try pending_members.append(a, request);
+    }
+    fn members(a: Allocator, owner: FailureOwner) ![]enrichment_types.GeneratedEnrichmentRequest {
+        var result: std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest) = .empty;
+        errdefer result.deinit(a);
+        switch (owner) {
+            .request => |request| try appendOwner(a, &result, request),
+            inline else => |items| for (items) |item| try appendOwner(a, &result, item.request),
+        }
+        return result.toOwnedSlice(a);
+    }
+    fn ownerSource(self: *@This(), runtime: *EnrichmentRuntime, owner: FailureOwner, request: enrichment_types.GeneratedEnrichmentRequest) !?[32]u8 {
+        const fingerprint = requestFailureFingerprint(request);
+        switch (owner) {
+            .request => {},
+            .plain => |items| for (items) |item| {
+                if (requestFailureFingerprint(item.request) == fingerprint) return item.source_record_digest;
+            },
+            .assets => |items| for (items) |item| {
+                if (requestFailureFingerprint(item.request) != fingerprint) continue;
+                if (item.raw_doc.len != 0) return sourceRecordDigest(item.raw_doc);
+                if (item.producer_context) |context| return context.source.content_digest;
+            },
+            .chunked => |items| for (items) |item| {
+                if (requestFailureFingerprint(item.request) == fingerprint and item.source_record_is_parent) return item.source_record_digest;
+            },
+        }
+        const io = concurrencyIo(runtime);
+        self.mutex.lockUncancelable(io);
+        const captured = self.sources.get(fingerprint);
+        self.mutex.unlock(io);
+        if (captured) |digest| return digest;
+        return sourceDigest(runtime, request.doc_key);
+    }
+    fn inputBudget(self: *@This(), runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, observed: ?[32]u8, raw: ?[]const u8) !scoped_retries.Budget {
+        const logical = logicalRequestFingerprint(request);
+        const io = concurrencyIo(runtime);
+        self.mutex.lockUncancelable(io);
+        const present = outer: for (self.state.tickets.items) |ticket| {
+            for (ticket.budgets.items) |budget| if (budget.logical_fingerprint == logical) break :outer true;
+        } else false;
+        self.mutex.unlock(io);
+        // Healthy batching does no extra primary read or source hashing.
+        if (!present) return .{ .fingerprint = 0, .logical_fingerprint = logical };
+        const digest = observed orelse if (raw) |bytes| sourceRecordDigest(bytes) else try sourceDigest(runtime, request.doc_key);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.state.priorLogical(logical, digest);
+    }
+    fn sameInputBudget(self: *@This(), runtime: *EnrichmentRuntime, left: enrichment_types.GeneratedEnrichmentRequest, left_digest: ?[32]u8, right: enrichment_types.GeneratedEnrichmentRequest, right_digest: ?[32]u8) !bool {
+        const lhs = try self.inputBudget(runtime, left, left_digest, null);
+        const rhs = try self.inputBudget(runtime, right, right_digest, null);
+        return lhs.failures == rhs.failures and lhs.waits == rhs.waits;
+    }
+    fn sameAssetBudget(self: *@This(), runtime: *EnrichmentRuntime, left: AssetProducerBatchItem, right: AssetProducerBatchItem) !bool {
+        const lhs = try self.inputBudget(runtime, left.request, null, if (left.raw_doc.len != 0) left.raw_doc else null);
+        const rhs = try self.inputBudget(runtime, right.request, null, if (right.raw_doc.len != 0) right.raw_doc else null);
+        return lhs.failures == rhs.failures and lhs.waits == rhs.waits;
+    }
+    fn ownerBudget(self: *@This(), runtime: *EnrichmentRuntime, owner: FailureOwner, fingerprint: u64) !scoped_retries.Budget {
+        var result = scoped_retries.Budget{ .fingerprint = fingerprint };
+        const prior_io = lockRuntime(runtime);
+        if (runtime.retry_failure_fingerprint == fingerprint) {
+            result.failures = runtime.retry_failure_count;
+            result.waits = runtime.transient_retry_count;
+        }
+        unlockRuntime(runtime, prior_io);
+        const requests = try members(runtime.alloc, owner);
+        defer runtime.alloc.free(requests);
+        for (requests) |request| {
+            const digest = try self.ownerSource(runtime, owner, request);
+            const io = concurrencyIo(runtime);
+            self.mutex.lockUncancelable(io);
+            const prior_budget = self.state.priorLogical(logicalRequestFingerprint(request), digest);
+            self.mutex.unlock(io);
+            result.failures = @max(result.failures, prior_budget.failures);
+            result.waits = @max(result.waits, prior_budget.waits);
+        }
+        return result;
+    }
+    fn ownerScheduled(self: *@This(), runtime: *EnrichmentRuntime, owner: FailureOwner) !bool {
+        const requests = try members(runtime.alloc, owner);
+        defer runtime.alloc.free(requests);
+        const io = concurrencyIo(runtime);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (requests.len == 0) return false;
+        for (requests) |request| if (!self.recorded_requests.contains(requestFailureFingerprint(request))) return false;
+        return true;
+    }
+    fn ownerHint(self: *@This(), request: enrichment_types.GeneratedEnrichmentRequest) u64 {
+        return self.hints.get(requestFailureFingerprint(request)) orelse 0;
+    }
+    fn sourceDigest(runtime: *EnrichmentRuntime, doc_key: []const u8) !?[32]u8 {
+        const key = try documentSourceStoreKeyAlloc(runtime, doc_key);
+        defer runtime.alloc.free(key);
+        const raw = try storeGetOptionalDocumentAllocWithRetry(runtime, key) orelse return null;
+        defer runtime.alloc.free(raw);
+        return sourceRecordDigest(raw);
+    }
+    fn documentKey(a: Allocator, key: []const u8) ![]u8 {
+        const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(key.len));
+        _ = std.base64.standard.Encoder.encode(encoded, key);
+        return encoded;
+    }
+    fn prepareDocument(self: *@This(), runtime: *EnrichmentRuntime, group: enrichment_worker.PendingDocumentGroup, planned: []const enrichment_types.GeneratedEnrichmentRequest) ![]u64 {
+        const key = try documentKey(runtime.alloc, group.doc_key);
+        defer runtime.alloc.free(key);
+        const io = concurrencyIo(runtime);
+        self.mutex.lockUncancelable(io);
+        const present = self.state.hasDocument(key);
+        self.mutex.unlock(io);
+        if (!present) return runtime.alloc.alloc(u64, 0);
+        const digest = try sourceDigest(runtime, group.doc_key);
+        const definitions = try runtime.alloc.alloc(u64, planned.len);
+        defer runtime.alloc.free(definitions);
+        for (planned, definitions) |request, *definition| definition.* = logicalRequestFingerprint(request);
+        var publication = try RuntimePublicationStore.init(runtime);
+        defer publication.deinit();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const delayed = try self.state.prepareDocument(runtime.alloc, key, digest, definitions, runtime.clock.nowRealtimeMs());
+        errdefer runtime.alloc.free(delayed.delayed);
+        // Definition pruning precedes the next invocation, under the same
+        // live namespace and catalog fence as ticket publication.
+        if (delayed.changed) try self.saveAssumeLocked(runtime, publication.store(runtime).*);
+        return delayed.delayed;
+    }
+    /// Deletions are absent from enrichment replay groups. Check the bounded
+    /// ticket set against primary storage before admitting new source work.
+    fn pruneObsoleteSources(self: *@This(), runtime: *EnrichmentRuntime) !void {
+        var i: usize = 0;
+        while (i < self.state.tickets.items.len) {
+            const ticket = &self.state.tickets.items[i];
+            const size = try std.base64.standard.Decoder.calcSizeForSlice(ticket.document);
+            const key = try runtime.alloc.alloc(u8, size);
+            defer runtime.alloc.free(key);
+            try std.base64.standard.Decoder.decode(key, ticket.document);
+            if (!std.meta.eql(ticket.source_digest, try sourceDigest(runtime, key))) {
+                self.unsaved = true;
+                ticket.deinit(runtime.alloc);
+                _ = self.state.tickets.swapRemove(i);
+            } else i += 1;
+        }
+        if (self.unsaved) try self.save(runtime);
+    }
+    fn retireSuperseded(self: *@This(), runtime: *EnrichmentRuntime, groups: []const enrichment_worker.PendingDocumentGroup) !void {
+        for (groups) |group| {
+            const key = try documentKey(runtime.alloc, group.doc_key);
+            defer runtime.alloc.free(key);
+            if (!self.state.hasDocument(key)) continue;
+            self.state.retireSuperseded(runtime.alloc, group, key, try sourceDigest(runtime, group.doc_key));
+        }
+    }
+    fn park(self: *@This(), runtime: *EnrichmentRuntime, owner: FailureOwner, fingerprint: u64, err: anyerror) !void {
+        const requests = try members(runtime.alloc, owner);
+        defer runtime.alloc.free(requests);
+        const digests = try runtime.alloc.alloc(?[32]u8, requests.len);
+        defer runtime.alloc.free(digests);
+        for (requests, digests) |request, *digest| digest.* = try self.ownerSource(runtime, owner, request);
+        const prior_io = lockRuntime(runtime);
+        const legacy = if (runtime.retry_failure_fingerprint == fingerprint)
+            scoped_retries.Budget{ .fingerprint = fingerprint, .failures = runtime.retry_failure_count, .waits = runtime.transient_retry_count }
+        else
+            scoped_retries.Budget{ .fingerprint = fingerprint };
+        unlockRuntime(runtime, prior_io);
+        var publication = try RuntimePublicationStore.init(runtime);
+        defer publication.deinit();
+        const io = concurrencyIo(runtime);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.hint_failed) return error.OutOfMemory;
+        self.unsaved = true;
+        const batch_hint = self.hints.get(fingerprint) orelse 0;
+        for (requests, digests) |request, digest| {
+            const logical = logicalRequestFingerprint(request);
+            var budget = self.state.priorLogical(logical, digest);
+            budget.fingerprint = fingerprint;
+            budget.failures = @max(budget.failures, legacy.failures);
+            budget.waits = @max(budget.waits, legacy.waits);
+            if (enrichmentFailureSparesAttemptBudget(err)) budget.waits +|= 1 else budget.failures +|= 1;
+            const hint_ms = @max(batch_hint, self.ownerHint(request));
+            const deadline = runtime.clock.nowRealtimeMs() +| workerRetryDelayWithHintMs(budget.failures +| budget.waits, hint_ms);
+            try self.state.park(runtime.alloc, .{ .doc_key = request.doc_key, .sequence = request.sequence }, deadline, budget, digest);
+        }
+        try self.saveAssumeLocked(runtime, publication.store(runtime).*);
+        for (requests) |request| try self.recorded_requests.put(runtime.alloc, requestFailureFingerprint(request), {});
+    }
+    fn deferUnattempted(self: *@This(), runtime: *EnrichmentRuntime, fingerprint: u64, requests: []const enrichment_types.GeneratedEnrichmentRequest, seed: enrichment_types.GeneratedEnrichmentRequest, comptime same_key: anytype) !void {
+        // A provider-key failure stops later batches for that key. They still
+        // own replay debt, but have not spent an invocation attempt. Preserve
+        // the failed call's clock without charging those waiting sources.
+        const io = concurrencyIo(runtime);
+        self.mutex.lockUncancelable(io);
+        var deadline: u64 = 0;
+        for (self.state.tickets.items) |ticket| for (ticket.budgets.items) |budget| {
+            if (budget.fingerprint == fingerprint) deadline = @max(deadline, budget.deadline_ms);
+        };
+        self.mutex.unlock(io);
+        if (deadline == 0) return error.InvalidEnrichmentState;
+        const digests = try runtime.alloc.alloc(?[32]u8, requests.len);
+        defer runtime.alloc.free(digests);
+        @memset(digests, null);
+        for (requests, digests) |request, *digest| {
+            if (!same_key(seed, request)) continue;
+            digest.* = try sourceDigest(runtime, request.doc_key);
+        }
+        var publication = try RuntimePublicationStore.init(runtime);
+        defer publication.deinit();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        for (requests, digests) |request, digest| {
+            if (digest == null or !same_key(seed, request)) continue;
+            const request_fp = requestFailureFingerprint(request);
+            if (self.recorded_requests.contains(request_fp)) continue;
+            var budget = self.state.priorLogical(logicalRequestFingerprint(request), digest);
+            budget.fingerprint = request_fp;
+            self.unsaved = true;
+            try self.state.park(runtime.alloc, .{ .doc_key = request.doc_key, .sequence = request.sequence }, deadline, budget, digest);
+            try self.recorded_requests.put(runtime.alloc, request_fp, {});
+        }
+        if (self.unsaved) try self.saveAssumeLocked(runtime, publication.store(runtime).*);
+    }
+    fn saveAssumeLocked(self: *@This(), runtime: *EnrichmentRuntime, store: backend_erased.Store) !void {
+        self.unsaved = true;
+        const raw = try self.state.encode(runtime.alloc);
+        defer runtime.alloc.free(raw);
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            enrichment_state.saveScopedRetries(store, raw) catch |err| {
+                if (err == error.WriterLocked and attempt < writer_locked_retry_count) {
+                    backoffWriterLockRetry();
+                    continue;
+                }
+                return err;
+            };
+            self.unsaved = false;
+            return;
+        }
+    }
+    fn save(self: *@This(), runtime: *EnrichmentRuntime) !void {
+        var publication = try RuntimePublicationStore.init(runtime);
+        defer publication.deinit();
+        const io = concurrencyIo(runtime);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        try self.saveAssumeLocked(runtime, publication.store(runtime).*);
+    }
+    fn refreshRuntime(self: *@This(), runtime: *EnrichmentRuntime) void {
+        const scheduler_io = concurrencyIo(runtime);
+        self.mutex.lockUncancelable(scheduler_io);
+        const pending = self.state.tickets.items.len != 0;
+        const scanned = self.state.scanned_sequence;
+        const full = self.state.tickets.items.len >= scoped_retries.max_documents;
+        const has_tail = self.state.scan_document.len != 0;
+        const deadline = self.state.deadline();
+        self.mutex.unlock(scheduler_io);
+        const io = lockRuntime(runtime);
+        defer unlockRuntime(runtime, io);
+        runtime.scoped_retry_pending = pending;
+        runtime.scoped_retry_scan_sequence = scanned;
+        runtime.scoped_retry_observed_target = @max(runtime.scoped_retry_observed_target, scanned);
+        runtime.scoped_retry_full = full;
+        runtime.scoped_retry_has_tail = has_tail;
+        runtime.scoped_retry_wait = pending;
+        if (pending) {
+            runtime.retrying = true;
+            runtime.next_retry_at_ms = deadline;
+            markScheduledIndexEmbeddingRetryAssumeLocked(runtime);
+        }
+    }
+};
+
+fn retryBudgetFor(runtime: *EnrichmentRuntime, fingerprint: u64) scoped_retries.Budget {
+    var result = scoped_retries.Budget{ .fingerprint = fingerprint };
+    if (runtime.retry_scheduler) |scheduler| result = scheduler.prior(runtime, fingerprint);
+    if (runtime.retry_failure_fingerprint == fingerprint) {
+        result.failures = @max(result.failures, runtime.retry_failure_count);
+        result.waits = @max(result.waits, runtime.transient_retry_count);
+    }
+    return result;
+}
+
+fn scopedRetryHint(observer: ?template_remote.RetryHintObserver, request: enrichment_types.GeneratedEnrichmentRequest, raw: []const u8) ?template_remote.RetryHintObserver {
+    var result = if (observer) |value| value.scoped(requestFailureFingerprint(request)) else return null;
+    // Borrowed only by the synchronous render/download. Hash on failure, never
+    // duplicate or hash large healthy document payloads just for scheduling.
+    result.source_bytes = raw;
+    return result;
 }
 
 /// Failure identity for one execution lane's quantum. The runtime-global
@@ -2740,6 +3123,23 @@ const FailureScope = struct {
     /// Publication errors belong to the pipeline, even when their error tag
     /// matches a provider error deferred earlier in this quantum.
     publication_failed: bool = false,
+    owner: ?FailureOwner = null,
+    invocation: u64 = 0,
+    scheduled_invocation: ?u64 = null,
+    first_scheduled_fingerprint: u64 = 0,
+    current_attempt_number: ?u64 = null,
+
+    fn enterRequest(self: *FailureScope, request: enrichment_types.GeneratedEnrichmentRequest) void {
+        self.enter(requestFailureFingerprint(request));
+        self.owner = .{ .request = request };
+    }
+    fn enterAsset(self: *FailureScope, item: *const AssetProducerBatchItem) void {
+        self.enterOwned(requestFailureFingerprint(item.request), .{ .assets = item[0..1] });
+    }
+    fn enterOwned(self: *FailureScope, fingerprint: u64, owner: FailureOwner) void {
+        self.enter(fingerprint);
+        self.owner = owner;
+    }
 
     fn publicationFailure(self: *FailureScope, err: anyerror) anyerror {
         self.publication_failed = true;
@@ -2759,11 +3159,42 @@ const FailureScope = struct {
 
     fn enter(self: *FailureScope, fingerprint: u64) void {
         self.fingerprint = fingerprint;
+        self.owner = null;
+        self.current_attempt_number = null;
+        self.invocation +|= 1;
         // Publication failure is sticky for this quantum. Request transitions
         // must never erase pipeline provenance, even if error tags coincide.
     }
 
-    fn shouldYield(self: *const FailureScope, runtime: *EnrichmentRuntime, err: anyerror) bool {
+    fn attemptNumber(self: *const FailureScope, runtime: *EnrichmentRuntime) u64 {
+        return self.current_attempt_number orelse requestAttemptNumberFor(runtime, self.fingerprint);
+    }
+    fn shouldYield(self: *FailureScope, runtime: *EnrichmentRuntime, err: anyerror) !bool {
+        if (isEnrichmentControlError(err)) return true;
+        if (enrichmentErrorDisposition(err) == .fatal_worker) return true;
+        if (self.scheduled_invocation == self.invocation) return true;
+        if (runtime.retry_scheduler) |scheduler| if (self.owner) |owner| {
+            if (try scheduler.ownerScheduled(runtime, owner)) {
+                self.scheduled_invocation = self.invocation;
+                if (self.first_scheduled_fingerprint == 0) self.first_scheduled_fingerprint = self.fingerprint;
+                return true;
+            }
+            const budget = try scheduler.ownerBudget(runtime, owner, self.fingerprint);
+            self.current_attempt_number = @as(u64, budget.failures) +| 1;
+            if (enrichmentErrorDisposition(err) == .terminal_request) return false;
+            const transient = enrichmentFailureSparesAttemptBudget(err);
+            if (!requestRetryBudgetAllows(if (transient) budget.waits else budget.failures, runtime.config.worker_retry_max_attempts, transient)) return false;
+            scheduler.park(runtime, owner, self.fingerprint, err) catch |save_err| return self.publicationFailure(save_err);
+            const io = lockRuntime(runtime);
+            runtime.error_count +|= 1;
+            runtime.retryable_error_count +|= 1;
+            runtime.last_error_code = types.RuntimeErrorName.init(@errorName(err));
+            unlockRuntime(runtime, io);
+            scheduler.refreshRuntime(runtime);
+            self.scheduled_invocation = self.invocation;
+            if (self.first_scheduled_fingerprint == 0) self.first_scheduled_fingerprint = self.fingerprint;
+            return true;
+        };
         return shouldYieldRequestErrorFor(runtime, self.fingerprint, err);
     }
 
@@ -3472,6 +3903,38 @@ fn runtimeStatusSnapshot(runtime: *EnrichmentRuntime) enrichment_state.RuntimeSt
         .retrying = runtime.retrying,
         .worker_failed = runtime.worker_failed,
     };
+}
+
+fn restoreScopedRetryCache(runtime: anytype) !void {
+    var state = try enrichment_state.loadScopedRetries(runtime.alloc, runtime.store);
+    defer state.deinit(runtime.alloc);
+    const had_scoped_debt = state.tickets.items.len != 0;
+    // A certified repair checkpoint can supersede persisted retry tickets.
+    // Ignore that stale debt immediately on reopen rather than waiting for
+    // an obsolete server deadline before the next pass can clean it up.
+    var stale: usize = 0;
+    while (stale < state.tickets.items.len) {
+        if (state.tickets.items[stale].sequence <= runtime.applied_sequence) {
+            state.tickets.items[stale].deinit(runtime.alloc);
+            _ = state.tickets.swapRemove(stale);
+        } else stale += 1;
+    }
+    const config_changed = state.config_hash != 0 and state.config_hash != try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
+    runtime.scoped_retry_scan_sequence = @max(state.scanned_sequence, runtime.applied_sequence);
+    runtime.target_sequence = @max(runtime.target_sequence, state.scanned_sequence);
+    runtime.scoped_retry_observed_target = runtime.scoped_retry_scan_sequence;
+    runtime.scoped_retry_pending = state.tickets.items.len != 0;
+    if (had_scoped_debt and !runtime.scoped_retry_pending and runtime.retry_failure_fingerprint == 0 and runtime.consecutive_retry_count == 0) {
+        runtime.retrying = false;
+        runtime.next_retry_at_ms = 0;
+    }
+    runtime.scoped_retry_full = state.tickets.items.len >= scoped_retries.max_documents;
+    runtime.scoped_retry_has_tail = state.scan_document.len != 0;
+    runtime.scoped_retry_wait = runtime.scoped_retry_pending and runtime.retry_failure_fingerprint == 0 and runtime.consecutive_retry_count == 0;
+    if (runtime.scoped_retry_wait) {
+        runtime.retrying = true;
+        runtime.next_retry_at_ms = if (config_changed) 0 else state.deadline();
+    }
 }
 
 fn runtimeProjectionStatus(retrying: bool, worker_failed: bool) enrichment_state.ProjectionStatus {
@@ -5441,6 +5904,7 @@ fn getOrCreateRequestChunksWithProbe(runtime: *EnrichmentRuntime, request: enric
     defer runtime.alloc.free(doc_store_key);
     const raw = try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key);
     const source_digest: ?[32]u8 = if (raw) |value| sourceRecordDigest(value) else null;
+    errdefer if (source_digest) |digest| if (runtime.retry_scheduler) |scheduler| scheduler.rememberSource(runtime, requestFailureFingerprint(request), digest);
     // A replay window can contain a newer update for the same document. Keep
     // old cache entries alive for already queued provider inputs, but reuse
     // only an entry captured from this exact source version.
@@ -6383,6 +6847,14 @@ const UnsupportedEnrichmentRuntime = struct {
     consecutive_retry_count: u32 = 0,
     next_retry_at_ms: u64 = 0,
     retry_after_hint_ms: u64 = 0,
+    retry_scheduler: ?*ScopedReplay = null,
+    pending_scoped_retries: ?scoped_retries.State = null,
+    scoped_retry_pending: bool = false,
+    scoped_retry_full: bool = false,
+    scoped_retry_has_tail: bool = false,
+    scoped_retry_wait: bool = false,
+    scoped_retry_scan_sequence: u64 = 0,
+    scoped_retry_observed_target: u64 = 0,
     retry_failure_fingerprint: u64 = 0,
     retry_failure_count: u32 = 0,
     /// Transient refusals of the current failure identity. They pace the
@@ -6524,6 +6996,7 @@ const UnsupportedEnrichmentRuntime = struct {
         runtime.applied_sequence = try enrichment_state.loadAppliedSequence(alloc, store, scope_name);
         const persisted_status = try enrichment_state.loadRuntimeStatus(alloc, store, scope_name);
         restorePersistedRuntimeStatus(&runtime, persisted_status);
+        try restoreScopedRetryCache(&runtime);
         return runtime;
     }
 
@@ -6534,6 +7007,7 @@ const UnsupportedEnrichmentRuntime = struct {
         self.applied_sequence = try enrichment_state.loadAppliedSequence(self.alloc, self.store, scope_name);
         const persisted_status = try enrichment_state.loadRuntimeStatus(self.alloc, self.store, scope_name);
         restorePersistedRuntimeStatus(self, persisted_status);
+        try restoreScopedRetryCache(self);
         self.retry_error_has_request_identity = false;
     }
 
@@ -6542,6 +7016,7 @@ const UnsupportedEnrichmentRuntime = struct {
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
         self.inference_recovery.deinit(self.alloc);
+        if (self.pending_scoped_retries) |*state| state.deinit(self.alloc);
         if (self.owns_store) self.store.deinit();
         if (self.config.dense_embedder) |dense_embedder| dense_embedder.deinit(self.alloc);
         if (self.config.sparse_embedder) |sparse_embedder| sparse_embedder.deinit(self.alloc);
@@ -6916,6 +7391,14 @@ const PlatformEnrichmentRuntime = struct {
     consecutive_retry_count: u32 = 0,
     next_retry_at_ms: u64 = 0,
     retry_after_hint_ms: u64 = 0,
+    retry_scheduler: ?*ScopedReplay = null,
+    pending_scoped_retries: ?scoped_retries.State = null,
+    scoped_retry_pending: bool = false,
+    scoped_retry_full: bool = false,
+    scoped_retry_has_tail: bool = false,
+    scoped_retry_wait: bool = false,
+    scoped_retry_scan_sequence: u64 = 0,
+    scoped_retry_observed_target: u64 = 0,
     retry_failure_fingerprint: u64 = 0,
     retry_failure_count: u32 = 0,
     /// Transient refusals of the current failure identity. They pace the
@@ -7081,6 +7564,7 @@ const PlatformEnrichmentRuntime = struct {
         runtime.applied_sequence = try enrichment_state.loadAppliedSequence(alloc, store, scope_name);
         const persisted_status = try enrichment_state.loadRuntimeStatus(alloc, store, scope_name);
         restoreThreadedRuntimeStatus(&runtime, persisted_status);
+        try restoreScopedRetryCache(&runtime);
         return runtime;
     }
 
@@ -7092,6 +7576,7 @@ const PlatformEnrichmentRuntime = struct {
         self.applied_sequence = try enrichment_state.loadAppliedSequence(self.alloc, self.store, scope_name);
         const persisted_status = try enrichment_state.loadRuntimeStatus(self.alloc, self.store, scope_name);
         restoreThreadedRuntimeStatus(self, persisted_status);
+        try restoreScopedRetryCache(self);
         self.last_error_name = null;
         self.retry_error_has_request_identity = false;
     }
@@ -7103,6 +7588,7 @@ const PlatformEnrichmentRuntime = struct {
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
         self.inference_recovery.deinit(self.alloc);
+        if (self.pending_scoped_retries) |*state| state.deinit(self.alloc);
         self.ownership.deinit(self.alloc);
         if (self.owns_store) self.store.deinit();
         if (self.config.dense_embedder) |dense_embedder| dense_embedder.deinit(self.alloc);
@@ -7491,9 +7977,11 @@ const PlatformEnrichmentRuntime = struct {
             const failed = self.worker_failed or self.last_error_name != null;
             const retrying = self.retrying;
             const next_retry_at_ms = self.next_retry_at_ms;
+            const new_work = self.scoped_retry_wait and (self.graph_stage_recovery_pending or sequence > self.scoped_retry_observed_target or
+                (!self.scoped_retry_full and (sequence > self.scoped_retry_scan_sequence or self.scoped_retry_has_tail)));
             self.mutex.unlock(io);
 
-            const retry_due = retrying and self.clock.nowRealtimeMs() >= next_retry_at_ms;
+            const retry_due = retrying and (new_work or self.clock.nowRealtimeMs() >= next_retry_at_ms);
             switch (foregroundCatchUpDecision(applied, sequence, runtime_target, failed, retrying, retry_due)) {
                 .complete => if (!recovery_pending) return,
                 .worker_failed => if (!recovery_pending) return RuntimeError.EnrichmentWorkerFailed,
@@ -7739,6 +8227,7 @@ const PlatformEnrichmentRuntime = struct {
         const delay_ms = workerRetryDelayWithHintMs(retry_ordinal, if (awaiting_publication) 0 else self.retry_after_hint_ms);
         self.retry_after_hint_ms = 0;
         self.next_retry_at_ms = self.clock.nowRealtimeMs() +| delay_ms;
+        self.scoped_retry_wait = false;
         self.retrying = true;
         markScheduledIndexEmbeddingRetryAssumeLocked(self);
         self.retry_error_has_request_identity = false;
@@ -9062,10 +9551,14 @@ fn workerStep(runtime: *EnrichmentRuntime) ?u64 {
         runtime.mutex.unlock(io);
         return 25;
     }
-    const delay = if (runtime.retrying) runtime.next_retry_at_ms -| runtime.clock.nowRealtimeMs() else 0;
+    const new_work = runtime.scoped_retry_wait and (runtime.graph_stage_recovery_pending or runtime.target_sequence > runtime.scoped_retry_observed_target or
+        (!runtime.scoped_retry_full and (runtime.target_sequence > runtime.scoped_retry_scan_sequence or runtime.scoped_retry_has_tail)));
+    const delay = if (runtime.retrying and !new_work) runtime.next_retry_at_ms -| runtime.clock.nowRealtimeMs() else 0;
     const target = runtime.target_sequence;
     runtime.mutex.unlock(io);
-    if (delay > 0) return delay;
+    // Bound scheduler wakeups, never the persisted request deadline. This
+    // also keeps overflow-sized Retry-After values out of duration casts.
+    if (delay > 0) return @min(delay, transient_worker_retry_max_sleep_ms);
     runForegroundCatchUpPass(runtime, io, target) catch {};
     return 0;
 }
@@ -9108,7 +9601,9 @@ fn beginReplayPass(
         runtime.mutex.unlock(io);
         return false;
     }
-    if (runtime.retrying and runtime.clock.nowRealtimeMs() < runtime.next_retry_at_ms) {
+    const new_work = runtime.scoped_retry_wait and (runtime.graph_stage_recovery_pending or target_sequence > runtime.scoped_retry_observed_target or
+        (!runtime.scoped_retry_full and (target_sequence > runtime.scoped_retry_scan_sequence or runtime.scoped_retry_has_tail)));
+    if (runtime.retrying and !new_work and runtime.clock.nowRealtimeMs() < runtime.next_retry_at_ms) {
         runtime.mutex.unlock(io);
         return RuntimeError.EnrichmentRetryInProgress;
     }
@@ -9267,27 +9762,82 @@ fn runForegroundCatchUpPassOwned(
     runtime.mutex.unlock(io);
     if (already_failed) return;
     try scavengeSharedPdfConsumerAttempts(runtime);
-    // A worker pass checkpoints a complete bounded prefix. Rebuilding and
-    // sorting the full remaining corpus on every retry makes discovery cost
-    // grow with ingestion backlog instead of the work this pass can publish.
-    // Cap distinct work at 128 documents while letting repeated updates
-    // coalesce across up to 4096 records before paying for another checkpoint.
-    // The byte limit also bounds discovery of large repeated-update records;
-    // one complete record may exceed either soft limit.
-    const replay_window = try runtime.replay_source.collectEnrichmentDocumentGroupsWindow(runtime.alloc, runtime.applied_sequence, .{
-        .max_records = 4096,
-        .max_document_groups = 128,
-        .max_input_bytes = 4 * 1024 * 1024,
-    });
-    const pending = replay_window.groups;
-    defer enrichment_worker.freePendingDocumentGroups(runtime.alloc, pending);
-    var replay_cursor_assets = try loadReplayCursorForPass(runtime, runtime.applied_sequence, .assets);
+    const pending_state = runtime.pending_scoped_retries;
+    var scheduler = ScopedReplay{ .state = pending_state orelse try enrichment_state.loadScopedRetries(runtime.alloc, runtime.store), .unsaved = pending_state != null };
+    runtime.pending_scoped_retries = null;
+    defer {
+        // A failed metadata commit must retry persistence before another provider
+        // call. Transfer ownership without allocating on the failure path.
+        scheduler.retainUncommitted(runtime);
+        scheduler.deinit(runtime.alloc);
+    }
+    if (scheduler.unsaved) try scheduler.save(runtime);
+    try scheduler.pruneObsoleteSources(runtime);
+    const config_hash = try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
+    const config_changed = scheduler.state.config_hash != 0 and scheduler.state.config_hash != config_hash;
+    if (config_changed) {
+        scheduler.state.scanned_sequence = runtime.applied_sequence;
+        scheduler.state.clearScanDocument(runtime.alloc);
+    }
+    scheduler.state.config_hash = config_hash;
+    scheduler.state.scanned_sequence = @max(scheduler.state.scanned_sequence, runtime.applied_sequence);
+    // Explicit repair may already have certified a later applied boundary.
+    var stale: usize = 0;
+    while (stale < scheduler.state.tickets.items.len) {
+        if (scheduler.state.tickets.items[stale].sequence <= runtime.applied_sequence) {
+            scheduler.state.tickets.items[stale].deinit(runtime.alloc);
+            _ = scheduler.state.tickets.swapRemove(stale);
+        } else stale += 1;
+    }
+    runtime.retry_scheduler = &scheduler;
+    defer runtime.retry_scheduler = null;
+    const due = if (config_changed)
+        try scheduler.state.replan(runtime.alloc, runtime.clock.nowRealtimeMs())
+    else
+        try scheduler.state.due(runtime.alloc, runtime.clock.nowRealtimeMs());
+    defer due.deinit(runtime.alloc);
+    var processed_request_count: u64 = 0;
+    if (due.groups.len != 0) {
+        var due_pipeline = LanePipeline.init(runtime);
+        const due_result = runGeneratedCatchUpQuanta(runtime, due.groups, null, null, guard, &due_pipeline, &processed_request_count);
+        const drain_due = due_pipeline.drainAll(if (due_result) |_| true else |_| false);
+        _ = due_result catch |err| {
+            drain_due catch {};
+            return err;
+        };
+        try drain_due;
+        try replay_lease_guard.check();
+        scheduler.state.retire(runtime.alloc, due.tokens);
+        try scheduler.save(runtime);
+    }
+    const available_documents = scoped_retries.max_documents - scheduler.state.tickets.items.len;
+    // No new window is admitted while every durable scheduling slot is in use.
+    // One slot is reserved per document before any external invocation begins.
+    const replay_window: @import("../derived/replay_source.zig").Source.EnrichmentWindow = if (available_documents != 0)
+        try runtime.replay_source.collectEnrichmentDocumentGroupsWindow(runtime.alloc, scheduler.state.scanned_sequence -| @as(u64, if (scheduler.state.scan_document.len != 0) 1 else 0), .{
+            .max_records = 4096,
+            .max_document_groups = available_documents,
+            .max_input_bytes = 4 * 1024 * 1024,
+        })
+    else
+        .{ .groups = try runtime.alloc.alloc(enrichment_worker.PendingDocumentGroup, 0), .last_sequence = scheduler.state.scanned_sequence };
+    defer enrichment_worker.freePendingDocumentGroups(runtime.alloc, replay_window.groups);
+    const scan_key = try scheduler.state.scanDocumentAlloc(runtime.alloc);
+    defer runtime.alloc.free(scan_key);
+    var start: usize = 0;
+    if (scan_key.len != 0) while (start < replay_window.groups.len) : (start += 1) {
+        const group = replay_window.groups[start];
+        if (group.sequence > scheduler.state.scanned_sequence or
+            (group.sequence == scheduler.state.scanned_sequence and std.mem.order(u8, group.doc_key, scan_key) == .gt)) break;
+    };
+    const end = start + @min(available_documents, replay_window.groups.len - start);
+    const pending = replay_window.groups[start..end];
+    var replay_cursor_assets = if (config_changed) null else try loadReplayCursorForPass(runtime, runtime.applied_sequence, .assets);
     defer if (replay_cursor_assets) |*cursor| cursor.deinit(runtime.alloc);
-    var replay_cursor_dense = try loadReplayCursorForPass(runtime, runtime.applied_sequence, .dense);
+    var replay_cursor_dense = if (config_changed) null else try loadReplayCursorForPass(runtime, runtime.applied_sequence, .dense);
     defer if (replay_cursor_dense) |*cursor| cursor.deinit(runtime.alloc);
     try guard.check();
 
-    var processed_request_count: u64 = 0;
     var pipeline = LanePipeline.init(runtime);
     if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
     // Draining unconditionally (not just on the success path) is what keeps
@@ -9303,52 +9853,54 @@ fn runForegroundCatchUpPassOwned(
     };
     try drain_result;
     try replay_lease_guard.check();
-    // Empty records still consume a bounded window. Advance only through the
-    // scanned prefix; an empty group list does not prove the tail is empty.
-    max_seen = @max(max_seen, replay_window.last_sequence);
-    if (pending.len == 0 and replay_window.last_sequence == 0) max_seen = target_sequence;
-
-    if (max_seen > runtime.applied_sequence) {
-        setActiveFailureFingerprint(runtime, 0);
-        try saveAppliedSequenceWithRetry(runtime, scope_name, max_seen);
-        try clearReplayCursorWithRetry(runtime);
-        var status: enrichment_state.RuntimeStatus = .{};
-        runtime.mutex.lockUncancelable(io);
-        runtime.applied_sequence = max_seen;
-        runtime.processed_requests += processed_request_count;
-        runtime.retrying = false;
-        clearScheduledIndexEmbeddingRetriesAssumeLocked(runtime);
-        runtime.worker_failed = false;
-        runtime.consecutive_retry_count = 0;
-        runtime.next_retry_at_ms = 0;
-        runtime.retry_failure_fingerprint = 0;
-        runtime.retry_failure_count = 0;
-        runtime.active_failure_fingerprint = 0;
-        runtime.retry_error_has_request_identity = false;
-        clearPublishedGeneratedArtifacts(runtime);
-        status = runtimeStatusSnapshot(runtime);
-        broadcastRuntimeStateChanged(runtime, io);
-        unlockRuntime(runtime, io);
-        try saveRuntimeStatusWithRetry(runtime, scope_name, status);
-        runtime.notifyStatusHook();
-    } else if (pending.len == 0) {
-        var status: enrichment_state.RuntimeStatus = .{};
-        runtime.mutex.lockUncancelable(io);
-        runtime.retrying = false;
-        clearScheduledIndexEmbeddingRetriesAssumeLocked(runtime);
-        runtime.worker_failed = false;
-        runtime.consecutive_retry_count = 0;
-        runtime.next_retry_at_ms = 0;
-        runtime.retry_failure_fingerprint = 0;
-        runtime.retry_failure_count = 0;
-        runtime.active_failure_fingerprint = 0;
-        runtime.retry_error_has_request_identity = false;
-        status = runtimeStatusSnapshot(runtime);
-        broadcastRuntimeStateChanged(runtime, io);
-        unlockRuntime(runtime, io);
-        try saveRuntimeStatusWithRetry(runtime, scope_name, status);
-        runtime.notifyStatusHook();
+    if (available_documents != 0) {
+        if (end < replay_window.groups.len) {
+            try scheduler.state.setScanDocument(runtime.alloc, pending[pending.len - 1]);
+        } else {
+            max_seen = @max(max_seen, replay_window.last_sequence);
+            if (pending.len == 0 and replay_window.last_sequence == 0) max_seen = target_sequence;
+            scheduler.state.scanned_sequence = @max(scheduler.state.scanned_sequence, max_seen);
+            scheduler.state.clearScanDocument(runtime.alloc);
+        }
     }
+    // A newer committed source owns replacement/deletion. Retire old tickets
+    // only after that new source's work published or acquired its own ticket.
+    try scheduler.retireSuperseded(runtime, pending);
+    // This write precedes the contiguous watermark: a crash can replay healthy
+    // publications, but can never advance retention past deferred work.
+    try scheduler.save(runtime);
+    const applied = @max(runtime.applied_sequence, scheduler.state.appliedThrough(scheduler.state.completedSequence()));
+    if (applied > runtime.applied_sequence) {
+        try saveAppliedSequenceWithRetry(runtime, scope_name, applied);
+        try clearReplayCursorWithRetry(runtime);
+    }
+    runtime.mutex.lockUncancelable(io);
+    runtime.applied_sequence = applied;
+    // A full queue still checks a newly notified primary revision once, so
+    // deletion/replacement can release slots without a busy polling loop.
+    runtime.scoped_retry_observed_target = @max(runtime.scoped_retry_observed_target, target_sequence);
+    runtime.processed_requests += processed_request_count;
+    runtime.retrying = false;
+    clearScheduledIndexEmbeddingRetriesAssumeLocked(runtime);
+    runtime.worker_failed = false;
+    runtime.consecutive_retry_count = 0;
+    runtime.next_retry_at_ms = 0;
+    runtime.retry_failure_fingerprint = 0;
+    runtime.retry_failure_count = 0;
+    runtime.transient_retry_count = 0;
+    runtime.active_failure_fingerprint = 0;
+    runtime.retry_error_has_request_identity = false;
+    // Successful discovery windows are durable independently of a pinned
+    // contiguous watermark. Do not retain their in-memory receipts indefinitely.
+    clearPublishedGeneratedArtifacts(runtime);
+    runtime.mutex.unlock(io);
+    scheduler.refreshRuntime(runtime);
+    runtime.mutex.lockUncancelable(io);
+    const status = runtimeStatusSnapshot(runtime);
+    broadcastRuntimeStateChanged(runtime, io);
+    runtime.mutex.unlock(io);
+    try saveRuntimeStatusWithRetry(runtime, scope_name, status);
+    runtime.notifyStatusHook();
 }
 
 /// Task-neutral identity of the physical page transformation. Provider names,
@@ -9634,6 +10186,7 @@ const SharedPdfWindowScheduler = struct {
     requests: []const enrichment_types.GeneratedEnrichmentRequest,
     sequence: u64,
     current: usize = 0,
+    delayed_requests: []const u64 = &.{},
     consumers: ?[]Consumer = null,
     prepared_sources: ?*PreparedDocumentSourceCache = null,
     raw_doc: ?[]const u8 = null,
@@ -9780,6 +10333,7 @@ const SharedPdfWindowScheduler = struct {
 
     fn prepareConsumer(self: *@This(), consumer: *Consumer, request: enrichment_types.GeneratedEnrichmentRequest, raw: []const u8) !void {
         consumer.prepared = true;
+        if (std.mem.indexOfScalar(u64, self.delayed_requests, logicalRequestFingerprint(request)) != null) return;
         if (requestHasChunkSource(request)) return;
         if (request.kind == .asset) return self.prepareTextConsumer(consumer, request, raw);
         // Page-vector publication has a separate precommit sink. Never send
@@ -10796,7 +11350,7 @@ const SharedPdfWindowScheduler = struct {
             // Parts live in the independently admitted result segment, so the
             // flush helper must not release them through the invocation allocator.
             var empty_parts = std.ArrayListUnmanaged([]u8).empty;
-            flushRuntimeGeneratedTextBatch(runtime, alloc, invocation.allocator(), scoped, requests.items, if (consumer.transform.raster) rasters[0..requests.items.len] else null, indices.items, &empty_parts, units.items, "ocr_text", .ocr, consumer.config.ocr_quality, document_extraction_mod.effectiveOcrPrompt(consumer.config), source.fingerprint) catch |err| return invocation.mapError(err);
+            flushRuntimeGeneratedTextBatch(runtime, alloc, invocation.allocator(), scoped, requests.items, if (consumer.transform.raster) rasters[0..requests.items.len] else null, indices.items, &empty_parts, units.items, "ocr_text", .ocr, consumer.config.ocr_quality, document_extraction_mod.effectiveOcrPrompt(consumer.config), source.fingerprint, requestFailureFingerprint(self.requests[index])) catch |err| return invocation.mapError(err);
             var writes = std.ArrayListUnmanaged(KVPair).empty;
             defer {
                 for (writes.items) |write| {
@@ -10829,7 +11383,7 @@ const SharedPdfWindowScheduler = struct {
     }
 
     fn commitTextOutput(self: *@This(), alloc: Allocator, consumer: *Consumer, index: usize, units: []document_extraction_mod.Unit, indices: []const usize, batch: ?*asset_producer_mod.ProducedBatch) !void {
-        if (batch) |output| try applyRuntimeGeneratedTextBatch(self.runtime, alloc, alloc, units, indices, "ocr_text", .ocr, runtimeGeneratedTextOutputMode(.ocr, document_extraction_mod.ocrProducerType(consumer.config)), consumer.config.ocr_quality, document_extraction_mod.effectiveOcrPrompt(consumer.config), output);
+        if (batch) |output| try applyRuntimeGeneratedTextBatch(self.runtime, alloc, alloc, units, indices, "ocr_text", .ocr, runtimeGeneratedTextOutputMode(.ocr, document_extraction_mod.ocrProducerType(consumer.config)), consumer.config.ocr_quality, document_extraction_mod.effectiveOcrPrompt(consumer.config), output, requestFailureFingerprint(self.requests[index]));
         var writes = std.ArrayListUnmanaged(KVPair).empty;
         defer {
             for (writes.items) |write| {
@@ -13769,6 +14323,13 @@ pub fn servicePendingArtifactUnitJobs(runtime: *EnrichmentRuntime, document: []c
     return error.ArtifactPublicationPending;
 }
 
+fn scheduleScannerRetry(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, err: anyerror) !bool {
+    if (runtime.retry_scheduler == null or isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request) return false;
+    var scope = FailureScope{};
+    scope.enterRequest(request);
+    return try scope.shouldYield(runtime, err);
+}
+
 fn processPendingDocumentGroup(
     runtime: *EnrichmentRuntime,
     pending: enrichment_worker.PendingDocumentGroup,
@@ -13788,11 +14349,18 @@ fn processPendingDocumentGroup(
     const planned = try runtime.alloc.dupe(enrichment_types.GeneratedEnrichmentRequest, templates);
     defer runtime.alloc.free(planned);
     for (planned) |*request| {
+        request.sequence = pending.sequence;
         if (request.kind != .dense_embedding and request.kind != .sparse_embedding) continue;
         request.reprocess_generation = try embeddingReprocessGeneration(runtime, request.doc_key, requestEmbeddingName(request.*), request.producer_json);
     }
+    const delayed_requests = if (runtime.retry_scheduler) |scheduler|
+        try scheduler.prepareDocument(runtime, pending, planned)
+    else
+        try runtime.alloc.alloc(u64, 0);
+    defer runtime.alloc.free(delayed_requests);
     var shared_windows = SharedPdfWindowScheduler.init(runtime, planned, pending.sequence);
     shared_windows.prepared_sources = prepared_sources;
+    shared_windows.delayed_requests = delayed_requests;
     defer shared_windows.deinit();
     // Attempt recovery is indexed and runs once per exclusively owned replay
     // pass. Ordinary documents need no shared-PDF transaction or prefix seek.
@@ -13801,6 +14369,8 @@ fn processPendingDocumentGroup(
     defer runtime.shared_pdf_windows = previous_shared_windows;
     var failed_artifacts = std.StringHashMapUnmanaged(anyerror).empty;
     defer failed_artifacts.deinit(runtime.alloc);
+    var delayed_artifacts = std.StringHashMapUnmanaged(void).empty;
+    defer delayed_artifacts.deinit(runtime.alloc);
     for (planned, 0..) |planned_request, request_index| {
         shared_windows.current = request_index;
         try guard.check();
@@ -13810,7 +14380,17 @@ fn processPendingDocumentGroup(
         if (window.hasDerivedItems()) try flushGeneratedReplayWindow(runtime, window);
         try guard.check();
         processed_request_count.* += 1;
+        if (std.mem.indexOfScalar(u64, delayed_requests, logicalRequestFingerprint(request)) != null) {
+            try delayed_artifacts.put(runtime.alloc, if (request.kind == .dense_embedding or request.kind == .sparse_embedding) requestEmbeddingName(request) else requestArtifactName(request), {});
+            continue;
+        }
         const input_name = if (request.upstream_artifact_name.len != 0) request.upstream_artifact_name else if (request.input_kind != .document) request.artifact_name else "";
+        if (delayed_artifacts.contains(input_name)) {
+            // Its owner ticket re-plans this entire document when due. A
+            // temporary dependency is never a terminal coverage outcome.
+            try delayed_artifacts.put(runtime.alloc, if (request.kind == .dense_embedding or request.kind == .sparse_embedding) requestEmbeddingName(request) else requestArtifactName(request), {});
+            continue;
+        }
         if (failed_artifacts.get(input_name)) |err| {
             try recordIsolatedRequestError(runtime, window, request, err);
             if (request.kind == .asset or request.kind == .chunk_text)
@@ -13825,7 +14405,12 @@ fn processPendingDocumentGroup(
         if (shared_windows.completed(request_index)) continue;
         if (shared_windows.failure(request_index)) |err| {
             setActiveFailureFingerprint(runtime, requestFailureFingerprint(request));
-            if (shouldYieldRequestError(runtime, err)) return err;
+            if (try scheduleScannerRetry(runtime, request, err)) {
+                try delayed_artifacts.put(runtime.alloc, if (request.kind == .dense_embedding or request.kind == .sparse_embedding) requestEmbeddingName(request) else requestArtifactName(request), {});
+                continue;
+            }
+            if ((runtime.retry_scheduler == null or isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request) and
+                shouldYieldRequestErrorFor(runtime, requestFailureFingerprint(request), err)) return err;
             // An asset owner must publish its failure manifest before settling
             // debt. Reuse the cached failed preparation through processAsset;
             // sibling consumers can record dependency failure immediately.
@@ -13856,7 +14441,12 @@ fn processPendingDocumentGroup(
         switch (request.kind) {
             .asset => {
                 const succeeded = processPlannedAsset(runtime, request, planned[request_index + 1 ..], deferred_assets, prepared_sources, window) catch |err| {
-                    if (shouldYieldRequestError(runtime, err)) return err;
+                    if (try scheduleScannerRetry(runtime, request, err)) {
+                        try delayed_artifacts.put(runtime.alloc, if (request.kind == .dense_embedding or request.kind == .sparse_embedding) requestEmbeddingName(request) else requestArtifactName(request), {});
+                        continue;
+                    }
+                    if ((runtime.retry_scheduler == null or isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request) and
+                        shouldYieldRequestErrorFor(runtime, requestFailureFingerprint(request), err)) return err;
                     try failed_artifacts.put(runtime.alloc, requestArtifactName(request), err);
                     try recordIsolatedRequestError(runtime, window, request, err);
                     continue;
@@ -13864,21 +14454,36 @@ fn processPendingDocumentGroup(
                 if (!succeeded) try failed_artifacts.put(runtime.alloc, requestArtifactName(request), error.ArtifactDependencyFailed);
             },
             .chunk_text => processChunkText(runtime, request, chunk_cache, window, prepared_sources) catch |err| {
-                if (shouldYieldRequestError(runtime, err)) return err;
+                if (try scheduleScannerRetry(runtime, request, err)) {
+                    try delayed_artifacts.put(runtime.alloc, if (request.kind == .dense_embedding or request.kind == .sparse_embedding) requestEmbeddingName(request) else requestArtifactName(request), {});
+                    continue;
+                }
+                if ((runtime.retry_scheduler == null or isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request) and
+                    shouldYieldRequestErrorFor(runtime, requestFailureFingerprint(request), err)) return err;
                 try failed_artifacts.put(runtime.alloc, requestArtifactName(request), err);
                 try recordIsolatedRequestError(runtime, window, request, err);
                 continue;
             },
             .dense_embedding => {
                 processDenseEmbedding(runtime, request, chunk_cache, prepared_sources, window) catch |err| {
-                    if (shouldYieldRequestError(runtime, err)) return err;
+                    if (try scheduleScannerRetry(runtime, request, err)) {
+                        try delayed_artifacts.put(runtime.alloc, if (request.kind == .dense_embedding or request.kind == .sparse_embedding) requestEmbeddingName(request) else requestArtifactName(request), {});
+                        continue;
+                    }
+                    if ((runtime.retry_scheduler == null or isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request) and
+                        shouldYieldRequestErrorFor(runtime, requestFailureFingerprint(request), err)) return err;
                     try recordIsolatedRequestError(runtime, window, request, err);
                     continue;
                 };
                 if (requestHasChunkSource(request)) try retireMediaPassForDenseRequest(runtime, request);
             },
             .sparse_embedding => processSparseEmbedding(runtime, request, chunk_cache, window) catch |err| {
-                if (shouldYieldRequestError(runtime, err)) return err;
+                if (try scheduleScannerRetry(runtime, request, err)) {
+                    try delayed_artifacts.put(runtime.alloc, if (request.kind == .dense_embedding or request.kind == .sparse_embedding) requestEmbeddingName(request) else requestArtifactName(request), {});
+                    continue;
+                }
+                if ((runtime.retry_scheduler == null or isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request) and
+                    shouldYieldRequestErrorFor(runtime, requestFailureFingerprint(request), err)) return err;
                 try recordIsolatedRequestError(runtime, window, request, err);
                 continue;
             },
@@ -14097,6 +14702,7 @@ const LaneOutcome = struct {
         const retry_fingerprint: u64 = if (result) |_| 0 else |err| blk: {
             if (scope.publication_failed) break :blk 0;
             const deferred = scope.retry_error orelse break :blk 0;
+            if (scope.first_scheduled_fingerprint != 0 and deferred == err and scope.retry_fingerprint == scope.first_scheduled_fingerprint) return .ok;
             break :blk if (deferred == err) scope.retry_fingerprint else 0;
         };
         return .{ .result = result, .retry_fingerprint = retry_fingerprint };
@@ -14467,14 +15073,20 @@ fn processAsset(
     // must not wait for earlier pending work just to reuse its current output.
     if (request.prior_context_json.len > 0 and observed != null) {
         const Render = struct {
+            runtime: *EnrichmentRuntime,
+            request: enrichment_types.GeneratedEnrichmentRequest,
+            primary: []const u8,
             fn render(ptr: *anyopaque, a: Allocator, prior_template: []const u8, item: std.json.Value) ![]const u8 {
-                const owner: *EnrichmentRuntime = @ptrCast(@alignCast(ptr));
+                const owner: *@This() = @ptrCast(@alignCast(ptr));
                 const json = try @import("antfly-json").stringifyValueAlloc(a, item);
                 defer a.free(json);
-                return renderSourceTemplateText(a, owner.config, json, prior_template);
+                var scoped_config = owner.runtime.config;
+                scoped_config.fetch_retry_hint = scopedRetryHint(scoped_config.fetch_retry_hint, owner.request, owner.primary);
+                return renderSourceTemplateText(a, scoped_config, json, prior_template);
             }
         };
-        prior_input = try @import("group_prior_input.zig").capture(runtime.alloc, runtime.artifact_store orelse return error.ArtifactCatalogDrift, request, observed.?, if (context) |*value| value else null, .{ .ptr = runtime, .render = Render.render });
+        var render_context = Render{ .runtime = runtime, .request = request, .primary = observed.? };
+        prior_input = try @import("group_prior_input.zig").capture(runtime.alloc, runtime.artifact_store orelse return error.ArtifactCatalogDrift, request, observed.?, if (context) |*value| value else null, .{ .ptr = &render_context, .render = Render.render });
     }
     const raw = observed orelse {
         try retireIndexDocumentCheckpoint(runtime, request, if (context) |*value| value else null);
@@ -14487,6 +15099,7 @@ fn processAsset(
         }
         return;
     };
+    errdefer if (runtime.retry_scheduler) |scheduler| scheduler.rememberSource(runtime, requestFailureFingerprint(request), sourceRecordDigest(raw));
     var producer_cfg = try asset_producer_mod.parseProducerConfig(runtime.alloc, request.producer_json);
     defer producer_cfg.deinit(runtime.alloc);
 
@@ -14586,11 +15199,11 @@ fn processAsset(
                 // Partial embedded text must not acknowledge failed OCR pages.
                 // Publication is durable already; use the existing per-request
                 // retry budget/backoff and repair ledger for remaining work.
-                if (coverage.retryable and scope.shouldYield(runtime, error.ReadTransientFailure))
+                if (coverage.retryable and try scope.shouldYield(runtime, error.ReadTransientFailure))
                     return error.ReadTransientFailure;
                 const cause = try documentExtractionFailureCauseAlloc(runtime.alloc, value);
                 defer if (cause) |name| runtime.alloc.free(name);
-                try recordIsolatedRequestErrorNamed(runtime, window, request, cause orelse @errorName(error.DocumentExtractionProducedNoUsableText), requestAttemptNumberFor(runtime, scope.fingerprint));
+                try recordIsolatedRequestErrorNamed(runtime, window, request, cause orelse @errorName(error.DocumentExtractionProducedNoUsableText), scope.attemptNumber(runtime));
             } else if (!try documentExtractionManifestHasLastError(runtime.alloc, value) and
                 !try documentExtractionEmptyCoverageIsTerminalFailure(runtime.alloc, value))
                 try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
@@ -15013,13 +15626,13 @@ fn processDeferredAssets(
     for (order) |index| {
         const request = requests[index];
         if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
-        scope.enter(requestFailureFingerprint(request));
+        scope.enterRequest(request);
         processAsset(runtime, request, &batch, prepared_sources, window, scope) catch |err| {
             if (scope.publication_failed) return err;
-            if (scope.shouldYield(runtime, err)) {
+            if (try scope.shouldYield(runtime, err)) {
                 try batch.retainRetry(scope, err);
             } else {
-                try recordIsolatedRequestErrorFor(runtime, window, request, err, requestAttemptNumberFor(runtime, scope.fingerprint));
+                try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
             }
         };
         try batch.flushIfFull(runtime, window, scope);
@@ -15089,6 +15702,8 @@ fn flushAssetProducerBatch(
         while (end < items.items.len) : (end += 1) {
             const item = items.items[end];
             if (end > start and !sameAssetProducerBatchKey(items.items[start], item)) break;
+            if (runtime.retry_scheduler) |scheduler| if (end > start and
+                !try scheduler.sameAssetBudget(runtime, items.items[start], item)) break;
             const item_bytes = assetProducerBatchItemBytes(item);
             if (end > start and
                 (end - start >= policy.max_items or
@@ -15124,7 +15739,7 @@ fn flushAssetProducerBatchItems(
     scope: *FailureScope,
 ) !void {
     std.debug.assert(items.len > 0);
-    scope.enter(assetProducerBatchFailureFingerprint(items));
+    scope.enterOwned(assetProducerBatchFailureFingerprint(items), .{ .assets = items });
     yieldToInteractiveGeneration(runtime);
 
     // A generator asset producer running a local LLM (e.g. autoschema triple
@@ -15166,7 +15781,7 @@ fn flushAssetProducerBatchItems(
     var retry_error: ?anyerror = null;
     for (items, produced_batch.items) |*item, *produced| {
         if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
-        scope.enter(requestFailureFingerprint(item.request));
+        scope.enterAsset(item);
         switch (produced.result) {
             .item_error => |failure| {
                 if (isEnrichmentControlError(failure.cause) or enrichmentErrorDisposition(failure.cause) == .fatal_worker)
@@ -15174,13 +15789,13 @@ fn flushAssetProducerBatchItems(
                 // The exact item identity is consulted for its durable
                 // budget. Independent successful items publish even when a
                 // sibling still needs another attempt.
-                if (failure.retryable and scope.shouldYield(runtime, failure.cause)) {
+                setRetryAfterHintFor(runtime, scope.fingerprint, failure.retry_after_ms);
+                if (failure.retryable and try scope.shouldYield(runtime, failure.cause)) {
                     if (retry_error == null) {
                         retry_error = failure.cause;
                         scope.deferRetry(failure.cause);
                     }
-                    setRetryAfterHint(runtime, failure.retry_after_ms);
-                } else try recordIsolatedRequestErrorFor(runtime, window, item.request, failure.cause, requestAttemptNumberFor(runtime, scope.fingerprint));
+                } else try recordIsolatedRequestErrorFor(runtime, window, item.request, failure.cause, scope.attemptNumber(runtime));
             },
             .value => |output| {
                 applyAssetProducerBatchOutput(runtime, item, output, window) catch |err| {
@@ -15189,12 +15804,12 @@ fn flushAssetProducerBatchItems(
                         continue;
                     }
                     if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
-                    if (scope.shouldYield(runtime, err)) {
+                    if (try scope.shouldYield(runtime, err)) {
                         if (retry_error == null) {
                             retry_error = err;
                             scope.deferRetry(err);
                         }
-                    } else try recordIsolatedRequestErrorFor(runtime, window, item.request, err, requestAttemptNumberFor(runtime, scope.fingerprint));
+                    } else try recordIsolatedRequestErrorFor(runtime, window, item.request, err, scope.attemptNumber(runtime));
                     continue;
                 };
                 runtime.alloc.free(output);
@@ -15250,15 +15865,15 @@ fn flushIndexDocumentBatch(runtime: *EnrichmentRuntime, producer: asset_producer
             runtime.alloc.free(bytes);
         };
         for (results[0..count], items[offset..][0..count]) |result, *item| {
-            scope.enter(requestFailureFingerprint(item.request));
+            scope.enterAsset(item);
             const bytes = result catch |err| {
                 if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
-                if (scope.shouldYield(runtime, err)) {
+                if (try scope.shouldYield(runtime, err)) {
                     if (retry_error == null) {
                         retry_error = err;
                         scope.deferRetry(err);
                     }
-                } else try recordIsolatedRequestErrorFor(runtime, window, item.request, err, requestAttemptNumberFor(runtime, scope.fingerprint));
+                } else try recordIsolatedRequestErrorFor(runtime, window, item.request, err, scope.attemptNumber(runtime));
                 continue;
             };
             applyAssetProducerBatchOutput(runtime, item, bytes, window) catch |err| {
@@ -15267,12 +15882,12 @@ fn flushIndexDocumentBatch(runtime: *EnrichmentRuntime, producer: asset_producer
                     continue;
                 }
                 if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
-                if (scope.shouldYield(runtime, err)) {
+                if (try scope.shouldYield(runtime, err)) {
                     if (retry_error == null) {
                         retry_error = err;
                         scope.deferRetry(err);
                     }
-                } else try recordIsolatedRequestErrorFor(runtime, window, item.request, err, requestAttemptNumberFor(runtime, scope.fingerprint));
+                } else try recordIsolatedRequestErrorFor(runtime, window, item.request, err, scope.attemptNumber(runtime));
             };
         }
         offset += count;
@@ -15290,16 +15905,16 @@ fn flushAssetProducerBatchSequential(
     var retry_error: ?anyerror = null;
     for (items) |*item| {
         if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
-        scope.enter(requestFailureFingerprint(item.request));
+        scope.enterAsset(item);
         const request = item.asRequest();
         const produced = assetProducerProduceGuarded(runtime, producer, runtime.alloc, request) catch |err| {
             if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
-            if (scope.shouldYield(runtime, err)) {
+            if (try scope.shouldYield(runtime, err)) {
                 if (retry_error == null) {
                     retry_error = err;
                     scope.deferRetry(err);
                 }
-            } else try recordIsolatedRequestErrorFor(runtime, window, item.request, err, requestAttemptNumberFor(runtime, scope.fingerprint));
+            } else try recordIsolatedRequestErrorFor(runtime, window, item.request, err, scope.attemptNumber(runtime));
             continue;
         };
         defer runtime.alloc.free(produced);
@@ -15309,12 +15924,12 @@ fn flushAssetProducerBatchSequential(
                 continue;
             }
             if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
-            if (scope.shouldYield(runtime, err)) {
+            if (try scope.shouldYield(runtime, err)) {
                 if (retry_error == null) {
                     retry_error = err;
                     scope.deferRetry(err);
                 }
-            } else try recordIsolatedRequestErrorFor(runtime, window, item.request, err, requestAttemptNumberFor(runtime, scope.fingerprint));
+            } else try recordIsolatedRequestErrorFor(runtime, window, item.request, err, scope.attemptNumber(runtime));
         };
     }
     if (retry_error) |err| return err;
@@ -16375,7 +16990,7 @@ fn processDocumentExtractionAsset(
             runtime.config.io,
             runtime.config.cancellation,
             null,
-            runtime.config.fetch_retry_hint,
+            scopedRetryHint(runtime.config.fetch_retry_hint, request, raw_doc),
         ),
     ) catch |raw_err| {
         const err: anyerror = if (raw_err == error.OutOfMemory and
@@ -16407,7 +17022,7 @@ fn processDocumentExtractionAsset(
         .ok => |lease| lease,
         .http_error => |http_error| {
             if (shouldYieldRemoteHttpFailure(runtime, http_error.status)) {
-                setRetryAfterHint(runtime, http_error.retry_after_ms);
+                setRetryAfterHintFor(runtime, requestFailureFingerprint(request), http_error.retry_after_ms);
                 return error.RemoteDocumentFetchFailed;
             }
             const message = try std.fmt.allocPrint(runtime.alloc, "{s}: HTTP {d}", .{ http_error.message, http_error.status });
@@ -21060,7 +21675,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
                     if (pdf_render_window) |*window| {
                         const window_alloc = window.allocator();
                         if (requests.items.len > 0)
-                            try flushRuntimeGeneratedTextBatch(runtime, alloc, window_alloc, invocation_producer, requests.items, if (raster_values.items.len > 0) raster_values.items else null, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, source_fingerprint);
+                            try flushRuntimeGeneratedTextBatch(runtime, alloc, window_alloc, invocation_producer, requests.items, if (raster_values.items.len > 0) raster_values.items else null, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, source_fingerprint, batch_policy.retry_fingerprint);
                         try SharedPdfWindowScheduler.WindowWork.finish(&shared_work);
                         clearRuntimeGeneratedTextBatchParts(window_alloc, &parts_values);
                         clearRuntimeGeneratedTextBatchMedia(window_alloc, &rendered_values, &media_values);
@@ -21213,7 +21828,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             continue;
         }
         if (requests.items.len > 0 and (requests.items.len >= admitted_batch_policy.max_items or batch_bytes + request_bytes > admitted_batch_policy.max_bytes or batch_pixels +| request_pixels > admitted_batch_policy.max_pixels)) {
-            try flushRuntimeGeneratedTextBatch(runtime, alloc, item_alloc, invocation_producer, requests.items, if (raster_values.items.len > 0) raster_values.items else null, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, source_fingerprint);
+            try flushRuntimeGeneratedTextBatch(runtime, alloc, item_alloc, invocation_producer, requests.items, if (raster_values.items.len > 0) raster_values.items else null, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, source_fingerprint, batch_policy.retry_fingerprint);
             try SharedPdfWindowScheduler.WindowWork.finish(&shared_work);
             clearRuntimeGeneratedTextBatchMedia(item_alloc, &rendered_values, &media_values);
             clearRuntimeGeneratedTextBatchRasters(item_alloc, &rendered_raster_values, &raster_values);
@@ -21257,7 +21872,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
     }
     if (requests.items.len > 0) {
         const item_alloc = if (pdf_render_window) |*window| window.allocator() else working_alloc;
-        try flushRuntimeGeneratedTextBatch(runtime, alloc, item_alloc, invocation_producer, requests.items, if (raster_values.items.len > 0) raster_values.items else null, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, source_fingerprint);
+        try flushRuntimeGeneratedTextBatch(runtime, alloc, item_alloc, invocation_producer, requests.items, if (raster_values.items.len > 0) raster_values.items else null, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, source_fingerprint, batch_policy.retry_fingerprint);
         try SharedPdfWindowScheduler.WindowWork.finish(&shared_work);
         clearRuntimeGeneratedTextBatchMedia(item_alloc, &rendered_values, &media_values);
         clearRuntimeGeneratedTextBatchRasters(item_alloc, &rendered_raster_values, &raster_values);
@@ -21484,6 +22099,7 @@ fn flushRuntimeGeneratedTextBatch(
     quality_config: document_extraction_mod.OcrQualityConfig,
     ocr_prompt: []const u8,
     source_fingerprint: []const u8,
+    retry_fingerprint: u64,
 ) !void {
     if (requests.len == 0) return;
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
@@ -21517,7 +22133,7 @@ fn flushRuntimeGeneratedTextBatch(
     else
         assetProducerProduceBatchReportedGuarded(runtime, producer, working_alloc, requests)) catch |err| {
         if (runtime.shared_pdf_windows) |shared| if (try shared.drainOwnerAdmission(err))
-            return flushRuntimeGeneratedTextBatch(runtime, alloc, working_alloc, producer, requests, borrowed_rasters, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint);
+            return flushRuntimeGeneratedTextBatch(runtime, alloc, working_alloc, producer, requests, borrowed_rasters, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, retry_fingerprint);
         logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, "serial_fallback", @errorName(err), started_ns);
         return recoverRuntimeGeneratedTextBatch(runtime, alloc, working_alloc, producer, requests, borrowed_rasters, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, err);
     };
@@ -21527,7 +22143,7 @@ fn flushRuntimeGeneratedTextBatch(
         if (runtime.shared_pdf_windows) |shared| if (try shared.drainOwnerAdmission(error.QueueFull)) {
             produced_batch.deinit(working_alloc);
             batch_owned = false;
-            return flushRuntimeGeneratedTextBatch(runtime, alloc, working_alloc, producer, requests, borrowed_rasters, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint);
+            return flushRuntimeGeneratedTextBatch(runtime, alloc, working_alloc, producer, requests, borrowed_rasters, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, retry_fingerprint);
         };
     }
     const execution = if (produced_batch.execution.fallback_items > 0)
@@ -21542,7 +22158,7 @@ fn flushRuntimeGeneratedTextBatch(
         null;
     logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, execution, fallback_reason, started_ns);
 
-    try applyRuntimeGeneratedTextBatch(runtime, alloc, working_alloc, units, unit_indices, method, kind, try runtimeGeneratedTextBatchOutputMode(kind, requests), quality_config, ocr_prompt, &produced_batch);
+    try applyRuntimeGeneratedTextBatch(runtime, alloc, working_alloc, units, unit_indices, method, kind, try runtimeGeneratedTextBatchOutputMode(kind, requests), quality_config, ocr_prompt, &produced_batch, retry_fingerprint);
     clearRuntimeGeneratedTextBatchParts(working_alloc, parts_values);
 }
 
@@ -21587,6 +22203,7 @@ fn applyRuntimeGeneratedTextBatch(
     quality_config: document_extraction_mod.OcrQualityConfig,
     ocr_prompt: []const u8,
     produced_batch: *asset_producer_mod.ProducedBatch,
+    retry_fingerprint: u64,
 ) !void {
 
     // Retryable envelope failures must be observed before applying any valid
@@ -21594,7 +22211,7 @@ fn applyRuntimeGeneratedTextBatch(
     // later failure yields the whole request for retry, violating apply-once
     // semantics even though durable publication has not started yet.
     if (runtimeGeneratedTextBatchFailureToYield(runtime, produced_batch.items)) |failure| {
-        setRetryAfterHint(runtime, failure.retry_after_ms);
+        setRetryAfterHintFor(runtime, retry_fingerprint, failure.retry_after_ms);
         return failure.cause;
     }
 
@@ -26618,6 +27235,7 @@ fn replayModelChunkVector(runtime: *EnrichmentRuntime, a: Allocator, request: en
     defer runtime.alloc.free(parent_key);
     const parent = try storeGetOptionalDocumentAllocWithRetry(runtime, parent_key) orelse return error.EnrichmentSourceChanged;
     defer runtime.alloc.free(parent);
+    errdefer if (runtime.retry_scheduler) |scheduler| scheduler.rememberSource(runtime, requestFailureFingerprint(request), sourceRecordDigest(parent));
     var source_request = request;
     source_request.source_field = source_field;
     source_request.source_template = "";
@@ -26880,22 +27498,22 @@ fn flushChunkedDenseItems(
 
     const batch_texts = chunk_texts.items;
     const batch_items = chunk_items.items;
-    scope.enter(chunkedDenseBatchFailureFingerprint(batch_items));
+    scope.enterOwned(chunkedDenseBatchFailureFingerprint(batch_items), .{ .chunked = batch_items });
     const batch_stats = textBatchByteStats(batch_texts);
     yieldToInteractiveEmbeds(runtime);
     noteEmbedBatchStartedFor(runtime, scope.fingerprint, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
     const embed_started_ns = runtime.clock.nowRealtimeNs();
     const vectors = embedModelChunkBatch(dense_embedder, runtime, embedding_artifact_name, batch_texts, expected_dims, batch_items) catch |err| {
         noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
-        if (scope.shouldYield(runtime, err)) return err;
-        try recordUniqueChunkedDenseRequestErrors(runtime, window, batch_items, err, requestAttemptNumberFor(runtime, scope.fingerprint));
+        if (try scope.shouldYield(runtime, err)) return err;
+        try recordUniqueChunkedDenseRequestErrors(runtime, window, batch_items, err, scope.attemptNumber(runtime));
         clearChunkedDenseBatch(runtime.alloc, chunk_texts, chunk_items, owns_texts);
         return false;
     };
     defer embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
     if (vectors.len != batch_items.len) {
         noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
-        try recordUniqueChunkedDenseRequestErrors(runtime, window, batch_items, error.InvalidEmbeddingResponse, requestAttemptNumberFor(runtime, scope.fingerprint));
+        try recordUniqueChunkedDenseRequestErrors(runtime, window, batch_items, error.InvalidEmbeddingResponse, scope.attemptNumber(runtime));
         clearChunkedDenseBatch(runtime.alloc, chunk_texts, chunk_items, owns_texts);
         return false;
     }
@@ -27894,6 +28512,7 @@ fn collectPlainDenseBatchItem(
     defer runtime.alloc.free(doc_store_key);
     const raw = (storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key) catch |err| return scope.publicationFailure(err)) orelse return null;
     defer runtime.alloc.free(raw);
+    errdefer if (runtime.retry_scheduler) |scheduler| scheduler.rememberSource(runtime, requestFailureFingerprint(request), sourceRecordDigest(raw));
     var input = captureProducerInput(runtime, request, doc_store_key, raw) catch |err| return scope.publicationFailure(err);
     errdefer if (input) |*token| token.deinit();
 
@@ -27988,7 +28607,7 @@ fn flushPlainDenseItems(
     scope: *FailureScope,
 ) !void {
     if (items.len == 0) return;
-    scope.enter(plainDenseBatchFailureFingerprint(items));
+    scope.enterOwned(plainDenseBatchFailureFingerprint(items), .{ .plain = items });
 
     const texts = try runtime.alloc.alloc([]const u8, items.len);
     defer runtime.alloc.free(texts);
@@ -28329,10 +28948,10 @@ fn processPlainDenseWindow(
             if (!samePlainDenseBatchKey(seed, request)) continue;
             processed[j] = true;
 
-            scope.enter(requestFailureFingerprint(request));
+            scope.enterRequest(request);
             const collected = collectPlainDenseBatchItem(runtime, request, consumer_indexes, window, scope, &generation_cache) catch |err| {
                 if (scope.publication_failed) return err;
-                if (scope.shouldYield(runtime, err)) {
+                if (try scope.shouldYield(runtime, err)) {
                     if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request) return err;
                     if (deferred_retry_error == null) {
                         deferred_retry_error = err;
@@ -28340,10 +28959,18 @@ fn processPlainDenseWindow(
                     }
                     continue;
                 }
-                try recordIsolatedRequestErrorFor(runtime, window, request, err, requestAttemptNumberFor(runtime, scope.fingerprint));
+                try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
                 continue;
             };
             if (collected) |item| {
+                if (runtime.retry_scheduler) |scheduler| if (items.items.len > 0 and
+                    !try scheduler.sameInputBudget(runtime, items.items[0].request, items.items[0].source_record_digest, item.request, item.source_record_digest))
+                {
+                    var single = [_]PlainDenseBatchItem{item};
+                    freePlainDenseBatchItems(runtime.alloc, &single);
+                    processed[j] = false;
+                    continue;
+                };
                 if (items.items.len > 0 and batch_source_bytes + item.source_text.len > max_batch_bytes) {
                     var single = [_]PlainDenseBatchItem{item};
                     freePlainDenseBatchItems(runtime.alloc, &single);
@@ -28365,7 +28992,7 @@ fn processPlainDenseWindow(
             try dense_embedder.requireTextGenerationWithContext(runtime.alloc, embedding_artifact_name, generation, assetProviderRequestContext(runtime));
         flushPlainDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, items.items, window, scope) catch |err| {
             if (scope.publication_failed) return err;
-            if (scope.shouldYield(runtime, err)) {
+            if (try scope.shouldYield(runtime, err)) {
                 if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
                     return err;
                 // One provider/config key must not monopolize the group-wide
@@ -28383,9 +29010,10 @@ fn processPlainDenseWindow(
                 while (remaining < requests.len) : (remaining += 1) {
                     if (samePlainDenseBatchKey(seed, requests[remaining])) processed[remaining] = true;
                 }
+                if (runtime.retry_scheduler) |scheduler| scheduler.deferUnattempted(runtime, scope.fingerprint, requests[i..], seed, samePlainDenseBatchKey) catch |save_err| return scope.publicationFailure(save_err);
                 continue;
             }
-            for (items.items) |item| try recordIsolatedRequestErrorFor(runtime, window, item.request, err, requestAttemptNumberFor(runtime, scope.fingerprint));
+            for (items.items) |item| try recordIsolatedRequestErrorFor(runtime, window, item.request, err, scope.attemptNumber(runtime));
             continue;
         };
     }
@@ -28453,12 +29081,13 @@ fn processChunkedDenseWindow(
             const request = requests[j];
             if (!sameChunkedDenseBatchKey(seed, request)) continue;
             processed[j] = true;
-            scope.enter(requestFailureFingerprint(request));
+            scope.enterRequest(request);
 
             const chunk_artifact_name = requestArtifactName(request);
             if (requestUsesMaterializedChunkArtifact(request)) {
                 processMaterializedChunkDenseRequest(runtime, request, chunk_artifact_name, embedding_artifact_name, dense_embedder, consumer_indexes, window, scope) catch |err| {
-                    if (scope.shouldYield(runtime, err)) {
+                    if (scope.publication_failed) return err;
+                    if (try scope.shouldYield(runtime, err)) {
                         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
                             return err;
                         if (deferred_retry_error == null) {
@@ -28469,9 +29098,10 @@ fn processChunkedDenseWindow(
                         while (remaining < requests.len) : (remaining += 1) {
                             if (sameChunkedDenseBatchKey(seed, requests[remaining])) processed[remaining] = true;
                         }
+                        if (runtime.retry_scheduler) |scheduler| scheduler.deferUnattempted(runtime, scope.fingerprint, requests[i..], seed, sameChunkedDenseBatchKey) catch |save_err| return scope.publicationFailure(save_err);
                         continue :request_key;
                     }
-                    try recordIsolatedRequestErrorFor(runtime, window, request, err, requestAttemptNumberFor(runtime, scope.fingerprint));
+                    try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
                 };
                 continue;
             }
@@ -28525,6 +29155,7 @@ fn processChunkedDenseWindow(
                     if (!try modelChunkTargetCompatible(runtime.alloc, dense_embedder, request, metadata)) return error.IncompatibleChunkEmbeddingTarget;
                     const chunk_config = runtime.index_manager.getEnrichment(.chunk, chunk_artifact_name);
                     owned_vector = replayModelChunkVector(runtime, runtime.alloc, request, metadata, if (chunk_config) |value| value.source_field else request.source_field) catch |err| {
+                        if (scope.publication_failed) return err;
                         if (isEnrichmentControlError(err) or err == error.EnrichmentSourceChanged or enrichmentErrorDisposition(err) == .fatal_worker) return err;
                         request_complete = false;
                         if (deferred_retry_error == null) {
@@ -28535,13 +29166,18 @@ fn processChunkedDenseWindow(
                     };
                     precomputed = owned_vector;
                 }
+                const same_retry_budget = if (runtime.retry_scheduler) |scheduler| if (chunk_items.items.len > 0)
+                    try scheduler.sameInputBudget(runtime, chunk_items.items[0].request, if (chunk_items.items[0].source_record_is_parent) chunk_items.items[0].source_record_digest else null, request, if (source.source_record_is_parent) source.source_record_digest else null)
+                else
+                    true else true;
                 if (chunk_items.items.len > 0 and
-                    (chunk_items.items.len >= max_batch_items or batch_source_bytes + source.text.len > max_batch_bytes))
+                    (!same_retry_budget or chunk_items.items.len >= max_batch_items or batch_source_bytes + source.text.len > max_batch_bytes))
                 {
                     // A shared batch may contain only an earlier request. A
                     // terminal failure there must not park this request.
                     const failed_batch_includes_request = request_batch_items_pending;
                     const complete = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope, &rejected_requests) catch |err| {
+                        if (scope.publication_failed) return err;
                         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
                             return err;
                         if (deferred_retry_error == null) {
@@ -28552,6 +29188,7 @@ fn processChunkedDenseWindow(
                         while (remaining < requests.len) : (remaining += 1) {
                             if (sameChunkedDenseBatchKey(seed, requests[remaining])) processed[remaining] = true;
                         }
+                        if (runtime.retry_scheduler) |scheduler| scheduler.deferUnattempted(runtime, scope.fingerprint, requests[i..], seed, sameChunkedDenseBatchKey) catch |save_err| return scope.publicationFailure(save_err);
                         continue :request_key;
                     };
                     try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
@@ -28585,6 +29222,7 @@ fn processChunkedDenseWindow(
                 batch_source_bytes += source_text_len;
                 if (chunk_items.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
                     const complete = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope, &rejected_requests) catch |err| {
+                        if (scope.publication_failed) return err;
                         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
                             return err;
                         if (deferred_retry_error == null) {
@@ -28595,6 +29233,7 @@ fn processChunkedDenseWindow(
                         while (remaining < requests.len) : (remaining += 1) {
                             if (sameChunkedDenseBatchKey(seed, requests[remaining])) processed[remaining] = true;
                         }
+                        if (runtime.retry_scheduler) |scheduler| scheduler.deferUnattempted(runtime, scope.fingerprint, requests[i..], seed, sameChunkedDenseBatchKey) catch |save_err| return scope.publicationFailure(save_err);
                         continue :request_key;
                     };
                     try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
@@ -28617,6 +29256,7 @@ fn processChunkedDenseWindow(
                 // no stale keys and retain cross-request batching.
                 const failed_batch_includes_request = request_batch_items_pending;
                 const complete = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope, &rejected_requests) catch |err| {
+                    if (scope.publication_failed) return err;
                     if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
                         return err;
                     if (deferred_retry_error == null) {
@@ -28627,6 +29267,7 @@ fn processChunkedDenseWindow(
                     while (remaining < requests.len) : (remaining += 1) {
                         if (sameChunkedDenseBatchKey(seed, requests[remaining])) processed[remaining] = true;
                     }
+                    if (runtime.retry_scheduler) |scheduler| scheduler.deferUnattempted(runtime, scope.fingerprint, requests[i..], seed, sameChunkedDenseBatchKey) catch |save_err| return scope.publicationFailure(save_err);
                     continue :request_key;
                 };
                 batch_source_bytes = 0;
@@ -28643,6 +29284,7 @@ fn processChunkedDenseWindow(
 
         if (chunk_items.items.len == 0) continue;
         _ = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope, &rejected_requests) catch |err| {
+            if (scope.publication_failed) return err;
             if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
                 return err;
             if (deferred_retry_error == null) {
@@ -28653,6 +29295,7 @@ fn processChunkedDenseWindow(
             while (remaining < requests.len) : (remaining += 1) {
                 if (sameChunkedDenseBatchKey(seed, requests[remaining])) processed[remaining] = true;
             }
+            if (runtime.retry_scheduler) |scheduler| scheduler.deferUnattempted(runtime, scope.fingerprint, requests[i..], seed, sameChunkedDenseBatchKey) catch |save_err| return scope.publicationFailure(save_err);
             continue :request_key;
         };
         try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
@@ -29861,6 +30504,7 @@ fn processPdfPageImageEmbeddingWithAllocator(
         else => return err,
     };
     defer metadata_alloc.free(raw);
+    errdefer if (runtime.retry_scheduler) |scheduler| scheduler.rememberSource(runtime, requestFailureFingerprint(request), sourceRecordDigest(raw));
     const source_url = try extractSourceText(metadata_alloc, runtime.config, raw, request) orelse {
         try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
         return;
@@ -29878,7 +30522,7 @@ fn processPdfPageImageEmbeddingWithAllocator(
             runtime.config.io,
             runtime.config.cancellation,
             null,
-            runtime.config.fetch_retry_hint,
+            scopedRetryHint(runtime.config.fetch_retry_hint, request, raw),
         ),
     );
     try embedding_lease_guard.check();
@@ -31086,6 +31730,7 @@ fn processDenseEmbedding(
     defer runtime.alloc.free(doc_store_key);
     const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key)) orelse return;
     defer runtime.alloc.free(raw);
+    errdefer if (runtime.retry_scheduler) |scheduler| scheduler.rememberSource(runtime, requestFailureFingerprint(request), sourceRecordDigest(raw));
     var input = try captureProducerInput(runtime, request, doc_store_key, raw);
     defer if (input) |*token| token.deinit();
 
@@ -35869,7 +36514,7 @@ fn extractModelChunkSourceCached(a: Allocator, config: Config, raw: []const u8, 
         .none => return .{},
         .text => |value| {
             if (@import("../../../chunking/chunk.zig").isRemoteModelLocator(value)) {
-                var render_config = remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, null, config.fetch_retry_hint);
+                var render_config = remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, null, scopedRetryHint(config.fetch_retry_hint, request, raw));
                 render_config.deadline_ns = if (context) |controlled| controlled.deadline_ns else null;
                 if (comptime @hasField(template_remote.RenderConfig, "cancellation")) {
                     if (context) |controlled| if (controlled.cancellation) |token| {
@@ -35942,7 +36587,9 @@ fn extractSourceText(
 ) !?[]const u8 {
     if (request.source_template.len > 0) {
         // Render via Handlebars template
-        const rendered = renderSourceTemplateText(alloc, config, raw_doc, request.source_template) catch |err| {
+        var scoped_config = config;
+        scoped_config.fetch_retry_hint = scopedRetryHint(config.fetch_retry_hint, request, raw_doc);
+        const rendered = renderSourceTemplateText(alloc, scoped_config, raw_doc, request.source_template) catch |err| {
             if (sourceTemplateHasNoInput(err)) return null;
             return err;
         };
@@ -35991,7 +36638,9 @@ fn extractAssetSourceValue(
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !?[]const u8 {
     if (request.source_template.len > 0) {
-        const rendered = renderSourceTemplateText(alloc, config, raw_doc, request.source_template) catch |err| {
+        var scoped_config = config;
+        scoped_config.fetch_retry_hint = scopedRetryHint(config.fetch_retry_hint, request, raw_doc);
+        const rendered = renderSourceTemplateText(alloc, scoped_config, raw_doc, request.source_template) catch |err| {
             if (sourceTemplateHasNoInput(err)) return null;
             return err;
         };
@@ -36063,7 +36712,7 @@ fn renderSourceParts(
 ) !?[]template.ContentPart {
     if (request.source_template.len == 0) return null;
     const parts = if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig"))
-        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, max_media_parts, config.fetch_retry_hint)) catch |err| {
+        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, max_media_parts, scopedRetryHint(config.fetch_retry_hint, request, raw_doc))) catch |err| {
             if (sourceTemplateHasNoInput(err)) return null;
             return err;
         }
@@ -42470,11 +43119,24 @@ test "model aware media URL fields fetch bounded binary input and preserve plain
     const App = struct {
         calls: std.atomic.Value(usize) = .init(0),
         status: std.atomic.Value(u16) = .init(200),
+        retry_after: std.atomic.Value(bool) = .init(false),
         fn execute(ptr: *anyopaque, alloc: Allocator, request: http.HttpRequest) !http.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(http.Method.GET, request.method);
             _ = self.calls.fetchAdd(1, .monotonic);
-            return .{ .status = self.status.load(.acquire), .content_type = try alloc.dupe(u8, "application/pdf"), .body = try alloc.dupe(u8, "%PDF fixture") };
+            var response = http.HttpResponse{ .status = self.status.load(.acquire) };
+            errdefer response.deinit(alloc);
+            response.content_type = try alloc.dupe(u8, "application/pdf");
+            response.body = try alloc.dupe(u8, "%PDF fixture");
+            if (self.retry_after.load(.acquire)) {
+                const name = try alloc.dupe(u8, "Retry-After");
+                errdefer alloc.free(name);
+                const value = try alloc.dupe(u8, "3600");
+                errdefer alloc.free(value);
+                response.headers = try alloc.alloc(http.Header, 1);
+                response.headers[0] = .{ .name = name, .value = value };
+            }
+            return response;
         }
     };
     var app = App{};
@@ -42574,4 +43236,154 @@ test "model aware media URL fields fetch bounded binary input and preserve plain
         defer isolated.deinit();
         try std.testing.expectError(expected, extractModelChunkSourceCached(a, config, raw, request, null, &isolated));
     }
+    const Hint = struct {
+        fingerprint: u64 = 0,
+        milliseconds: u64 = 0,
+        digest: ?[32]u8 = null,
+        fn note(ptr: *anyopaque, fingerprint: u64, milliseconds: u64, digest: ?[32]u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.* = .{ .fingerprint = fingerprint, .milliseconds = milliseconds, .digest = digest };
+        }
+    };
+    var hint = Hint{};
+    var hint_config = config;
+    hint_config.fetch_retry_hint = .{ .ptr = &hint, .note_fn = Hint.note };
+    var asset_request = request;
+    asset_request.kind = .asset;
+    asset_request.source_template = "{{remoteText url=body}}";
+    app.status.store(429, .release);
+    app.retry_after.store(true, .release);
+    try std.testing.expectError(error.TransientPromptFailure, extractModelChunkSource(a, hint_config, raw, request, null));
+    try std.testing.expectEqual(requestFailureFingerprint(request), hint.fingerprint);
+    try std.testing.expectEqual(@as(u64, 3_600_000), hint.milliseconds);
+    try std.testing.expectEqual(sourceRecordDigest(raw), hint.digest.?);
+    // Storage unit tests use a host-renderer boundary. Verify that the asset
+    // path forwards its own scope through that boundary as well; native
+    // remote-helper rendering is qualified by antfly-template-test.
+    const Renderer = struct {
+        fn renderText(_: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8, render_config: template_remote.RenderConfig) anyerror![]const u8 {
+            const observer = render_config.retry_hint orelse return error.MissingRetryObserver;
+            observer.note(3_600_000);
+            return error.TransientPromptFailure;
+        }
+    };
+    template_remote.setHostRenderer(.{ .render_json_to_text = Renderer.renderText });
+    defer template_remote.setHostRenderer(null);
+    hint = .{};
+    try std.testing.expectError(error.TransientPromptFailure, extractAssetSourceValue(a, hint_config, raw, asset_request));
+    try std.testing.expectEqual(requestFailureFingerprint(asset_request), hint.fingerprint);
+    try std.testing.expectEqual(@as(u64, 3_600_000), hint.milliseconds);
+    try std.testing.expectEqual(sourceRecordDigest(raw), hint.digest.?);
+}
+
+test "durable enrichment scoped retry permits healthy targets and restores exact budgets" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer store.deinit();
+    var erased = try backend_erased.storeFrom(a, store);
+    defer erased.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/indexes", .{tmp.sub_path});
+    var indexes = try index_manager_mod.IndexManager.init(a, path);
+    defer indexes.deinit();
+    var clock: platform_clock.ManualClock = .{};
+    clock.setRealtimeNs(1_000 * std.time.ns_per_ms);
+    var runtime = EnrichmentRuntime{
+        .alloc = a,
+        .io_impl = .{ .borrowed = std.testing.io },
+        .store = erased,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &indexes,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 2 },
+        .ownership = undefined,
+        .clock = clock.clock(),
+        .applied_sequence = 1,
+        .target_sequence = 100,
+    };
+    var scheduler = ScopedReplay{ .state = .{ .scanned_sequence = 100 } };
+    defer scheduler.deinit(a);
+    runtime.retry_scheduler = &scheduler;
+    const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .asset, .index_name = "asset", .doc_key = "bad", .source_field = "body", .sequence = 2 };
+    const fingerprint = requestFailureFingerprint(request);
+    setRetryAfterHintFor(&runtime, fingerprint, 3_600_000);
+    var scope = FailureScope{};
+    scope.enterRequest(request);
+    try std.testing.expect(try scope.shouldYield(&runtime, error.RemoteDocumentFetchFailed));
+    scope.deferRetry(error.RemoteDocumentFetchFailed);
+    try (LaneOutcome.of(&scope, error.RemoteDocumentFetchFailed)).result;
+    try std.testing.expectEqual(@as(u64, 1), scheduler.state.appliedThrough(100));
+    const deadline = runtime.next_retry_at_ms;
+    try std.testing.expectEqual(@as(u64, 3_601_000), deadline);
+    try std.testing.expectError(RuntimeError.EnrichmentRetryInProgress, beginReplayPass(&runtime, std.testing.io, 100, .{}));
+    runtime.scoped_retry_full = true;
+    try std.testing.expect(try beginReplayPass(&runtime, std.testing.io, 101, .{}));
+    endReplayPass(&runtime, std.testing.io);
+    runtime.scoped_retry_observed_target = 101;
+    try std.testing.expectError(RuntimeError.EnrichmentRetryInProgress, beginReplayPass(&runtime, std.testing.io, 101, .{}));
+    runtime.graph_stage_recovery_pending = true;
+    try std.testing.expect(try beginReplayPass(&runtime, std.testing.io, 101, .{}));
+    endReplayPass(&runtime, std.testing.io);
+    runtime.graph_stage_recovery_pending = false;
+    var restarted = ScopedReplay{ .state = try enrichment_state.loadScopedRetries(a, erased) };
+    defer restarted.deinit(a);
+    runtime.retry_scheduler = &restarted;
+    try restoreScopedRetryCache(&runtime);
+    try std.testing.expectEqual(deadline, runtime.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u64, 2), requestAttemptNumberFor(&runtime, fingerprint));
+    var fresh = request;
+    fresh.doc_key = "fresh";
+    try std.testing.expect(!try restarted.sameInputBudget(&runtime, request, null, fresh, null));
+    try std.testing.expect(!requestRetryBudgetAllowsYieldFor(&runtime, fingerprint, error.RemoteDocumentFetchFailed));
+    const early = try restarted.state.due(a, deadline - 1);
+    defer early.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), early.groups.len);
+    const ready = try restarted.state.due(a, deadline);
+    defer ready.deinit(a);
+    try std.testing.expectEqualStrings("bad", ready.groups[0].doc_key);
+    // The retry identity follows the producer, not journal notifications or
+    // physical rebatching. A new model/template owns a new retry episode.
+    var changed = request;
+    changed.sequence += 1;
+    changed.execution_json = "{\"batch_size\":1}";
+    try std.testing.expectEqual(logicalRequestFingerprint(request), logicalRequestFingerprint(changed));
+    changed.producer_json = "{\"model\":\"replacement\"}";
+    try std.testing.expect(logicalRequestFingerprint(request) != logicalRequestFingerprint(changed));
+    // A metadata failure retains ownership without allocating. Recovery must
+    // flush that exact clock before another provider invocation is admitted.
+    const Failing = struct {
+        fn begin(_: Allocator, _: *anyopaque) anyerror!backend_erased.WriteTxn {
+            return error.InputOutput;
+        }
+    };
+    var vtable = erased.vtable.*;
+    vtable.begin_write = Failing.begin;
+    var failing = erased;
+    failing.vtable = &vtable;
+    try std.testing.expectError(error.InputOutput, restarted.saveAssumeLocked(&runtime, failing));
+    restarted.retainUncommitted(&runtime);
+    try std.testing.expectEqual(@as(usize, 0), restarted.state.tickets.items.len);
+    var recovered = ScopedReplay{ .state = runtime.pending_scoped_retries.?, .unsaved = true };
+    runtime.pending_scoped_retries = null;
+    defer recovered.deinit(a);
+    try std.testing.expectEqual(deadline, recovered.state.deadline());
+    try recovered.saveAssumeLocked(&runtime, erased);
+    try std.testing.expect(!recovered.unsaved);
+    runtime.applied_sequence = 100;
+    runtime.retrying = true;
+    runtime.next_retry_at_ms = deadline;
+    try restoreScopedRetryCache(&runtime);
+    try std.testing.expect(!runtime.scoped_retry_pending);
+    try std.testing.expect(!runtime.scoped_retry_wait);
+    try std.testing.expect(!runtime.retrying);
+    try std.testing.expectEqual(@as(u64, 0), runtime.next_retry_at_ms);
 }

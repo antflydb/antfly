@@ -380,13 +380,16 @@ pub fn encodeArtifactEnrichmentList(
     indexes_json: []const u8,
 ) ![]u8 {
     var enrichments = try collectArtifactEnrichmentsFromTableIndexesJson(alloc, indexes_json);
-    var unique_len: usize = 0;
+    // Retain ownership of every collected config through fallible sorting.
+    // Compaction below has no fallible operations and then narrows this span.
+    var unique_len: usize = enrichments.len;
     defer {
         for (enrichments[0..unique_len]) |*cfg| cfg.deinit(alloc);
         alloc.free(enrichments);
     }
 
     try sortArtifactEnrichmentsByDependency(alloc, enrichments);
+    unique_len = 0;
     for (enrichments, 0..) |*cfg, i| {
         var duplicate = false;
         for (enrichments[0..unique_len]) |prior| {
@@ -11283,4 +11286,17 @@ test "external lake native interrupted publication is pending while integrity an
         try std.testing.expectEqualStrings(if (i < pending_errors.len) "publication" else "load_failure", readiness.object.get("pending_reasons").?.array.items[0].string);
         try std.testing.expectEqualStrings(reason, status.object.get("error").?.string);
     }
+}
+
+test "ordered artifact inventory enrichment list owns configs through allocation failures" {
+    const Harness = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const recipe =
+                \\{"enrichments":[{"name":"first","kind":"chunk","field":"body","chunk_size":10},{"name":"second","kind":"chunk","field":"body","chunk_size":10}]}
+            ;
+            const listed = try encodeArtifactEnrichmentList(a, "docs", recipe);
+            defer a.free(listed);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }

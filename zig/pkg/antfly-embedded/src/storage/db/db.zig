@@ -96267,6 +96267,8 @@ test "db enrichment retry makes monotonic progress across provider batches" {
         error.EnrichmentRetryInProgress,
         db.runUntilIdleWithoutWaitingForEnrichmentRetries(),
     );
+    // A provider-key failure delays unattempted batches without spending
+    // their budgets. Each source must actually exhaust its own two attempts.
     sleepNs(550 * std.time.ns_per_ms);
     try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(sequence));
     sleepNs(550 * std.time.ns_per_ms);
@@ -146652,4 +146654,156 @@ test "db document quality policy reprocess retires text and vectors across reope
         defer a.free(original);
         try std.testing.expectEqualStrings("{\"url\":\"data:text/plain,scrap\"}", original);
     }
+}
+
+test "db scoped retry workset processes healthy batches across restart before a server deadline" {
+    const a = std.testing.allocator;
+    const Mock = struct {
+        bad_calls: usize = 0,
+        healthy_calls: usize = 0,
+        recover: bool = false,
+        db: ?*DB = null,
+        replace_during_call: bool = false,
+        fn produce(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            return error.UnexpectedSingleInvocation;
+        }
+        fn controlled(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request, context: asset_producer_mod.InvocationContext) ![]u8 {
+            _ = context;
+            return produce(ptr, alloc, request);
+        }
+        fn reported(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer_mod.Request, context: asset_producer_mod.InvocationContext) !asset_producer_mod.ProducedBatch {
+            _ = context;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const items = try alloc.alloc(asset_producer_mod.ProducedItem, requests.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (items[0..initialized]) |item| if (item.result == .value) alloc.free(item.result.value);
+                alloc.free(items);
+            }
+            for (requests, items) |request, *item| {
+                const moving = std.mem.eql(u8, request.source_text, "change-during-call");
+                const bad = std.mem.eql(u8, request.source_text, "bad") or moving;
+                if (moving and self.replace_during_call) {
+                    self.replace_during_call = false;
+                    try self.db.?.batch(.{ .writes = &.{.{ .key = "moving", .value = "{\"body\":\"healthy\"}" }}, .sync_level = .write });
+                }
+                if (bad) self.bad_calls += 1 else self.healthy_calls += 1;
+                item.* = .{
+                    .identity = .{ .item_id = request.item_id, .source_fingerprint = request.source_fingerprint, .page_number = request.page_number },
+                    .result = if (bad and !self.recover)
+                        .{ .item_error = .{ .cause = error.EmbedRateLimited, .retryable = true, .retry_after_ms = 3_600_000 } }
+                    else
+                        .{ .value = try std.json.Stringify.valueAlloc(alloc, .{ .value = request.source_text }, .{}) },
+                };
+                initialized += 1;
+            }
+            return .{ .items = items, .execution = inference_work.ExecutionReport.compatibility(requests.len) };
+        }
+        fn interface(self: *@This()) asset_producer_mod.Producer {
+            return .{ .ptr = self, .vtable = &.{ .produce = produce, .produce_with_context = controlled, .produce_batch_reported_with_context = reported, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } };
+        }
+    };
+    var mock = Mock{};
+    var clock: @import("antfly_platform").clock.ManualClock = .{};
+    clock.setRealtimeNs(1_000 * std.time.ns_per_ms);
+    var tmp = try TestDirectory.init("scoped-retry-workset");
+    defer tmp.cleanup();
+    const options = OpenOptions{ .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "scoped-retry", .asset_producer = mock.interface(), .clock = clock.clock(), .inline_retry_max_attempts = 1, .worker_retry_max_attempts = 4 } };
+    var db = try DB.open(a, tmp.path(), options);
+    var opened = true;
+    defer if (opened) db.close();
+    try db.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "application/json", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}" });
+    try db.batch(.{ .writes = &.{.{ .key = "bad", .value = "{\"body\":\"bad\"}" }}, .sync_level = .write });
+    const bad_target = db.core.nextEnrichmentSequence();
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(bad_target));
+    try std.testing.expectEqual(@as(usize, 1), mock.bad_calls);
+    const deadline = db.enrichment_runtime.?.next_retry_at_ms;
+    try std.testing.expectEqual(@as(u64, 3_601_000), deadline);
+    db.close();
+    opened = false;
+    clock.advanceMs(30_000);
+    db = try DB.open(a, tmp.path(), options);
+    opened = true;
+    // Catalog activation may require an immediate discovery pass, but it
+    // cannot shorten the persisted provider clock or repeat the failed call.
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(bad_target));
+    try std.testing.expectEqual(@as(usize, 1), mock.bad_calls);
+    try std.testing.expectEqual(deadline, db.enrichment_runtime.?.next_retry_at_ms);
+    // One atomic journal record exceeds the scheduling workset's 128 slots.
+    // Its document cursor must resume without replaying accepted prefixes.
+    const writes = try a.alloc(types.BatchWrite, 140);
+    defer a.free(writes);
+    var initialized: usize = 0;
+    defer for (writes[0..initialized]) |write| a.free(write.key);
+    for (writes, 0..) |*write, i| {
+        write.* = .{ .key = try std.fmt.allocPrint(a, "healthy-{d:0>3}", .{i}), .value = "{\"body\":\"healthy\"}" };
+        initialized += 1;
+    }
+    try db.batch(.{ .writes = writes, .sync_level = .write });
+    const healthy_target = db.core.nextEnrichmentSequence();
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(healthy_target));
+    try std.testing.expectEqual(@as(usize, 1), mock.bad_calls);
+    try std.testing.expectEqual(@as(usize, 140), mock.healthy_calls);
+    const key = try internal_keys.artifactNamedPrefixAlloc(a, writes[139].key, "asset", "summary");
+    defer a.free(key);
+    const value = try db.core.store.get(a, key);
+    defer a.free(value);
+    try std.testing.expect(std.mem.indexOf(u8, value, "healthy") != null);
+    try std.testing.expect(db.enrichment_runtime.?.applied_sequence < bad_target);
+    try std.testing.expectEqual(deadline, db.enrichment_runtime.?.next_retry_at_ms);
+    mock.recover = true;
+    clock.advanceMs(3_600_000);
+    try db.runEnrichmentUntil(healthy_target);
+    try std.testing.expectEqual(@as(usize, 2), mock.bad_calls);
+    try std.testing.expectEqual(@as(usize, 140), mock.healthy_calls);
+    try std.testing.expect(db.enrichment_runtime.?.applied_sequence >= healthy_target);
+    // A failure of an older in-flight input must not attach its clock/budget
+    // to the primary replacement committed while that provider was running.
+    mock.recover = false;
+    mock.db = &db;
+    mock.replace_during_call = true;
+    const calls_before_move = mock.bad_calls;
+    try db.batch(.{ .writes = &.{.{ .key = "moving", .value = "{\"body\":\"change-during-call\"}" }}, .sync_level = .write });
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(db.core.nextEnrichmentSequence()));
+    try std.testing.expectEqual(calls_before_move + 1, mock.bad_calls);
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    try std.testing.expectEqual(calls_before_move + 1, mock.bad_calls);
+    const moving_key = try internal_keys.artifactNamedPrefixAlloc(a, "moving", "asset", "summary");
+    defer a.free(moving_key);
+    const moved = try db.core.store.get(a, moving_key);
+    defer a.free(moved);
+    try std.testing.expect(std.mem.indexOf(u8, moved, "healthy") != null);
+    // Deletion retires obsolete deferred work without waiting for its clock.
+    try db.batch(.{ .writes = &.{.{ .key = "gone", .value = "{\"body\":\"bad\"}" }}, .sync_level = .write });
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(db.core.nextEnrichmentSequence()));
+    const before_delete = mock.bad_calls;
+    try db.batch(.{ .deletes = &.{"gone"}, .sync_level = .write });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    try std.testing.expectEqual(before_delete, mock.bad_calls);
+    // Saturating the bounded workset applies backpressure to the unscanned
+    // tail. A deletion must release a slot before any long provider clock.
+    const capacity_writes = try a.alloc(types.BatchWrite, 129);
+    defer a.free(capacity_writes);
+    var capacity_initialized: usize = 0;
+    defer for (capacity_writes[0..capacity_initialized]) |write| a.free(write.key);
+    for (capacity_writes, 0..) |*write, i| {
+        write.* = .{ .key = try std.fmt.allocPrint(a, "capacity-{d:0>3}", .{i}), .value = if (i < 128) "{\"body\":\"bad\"}" else "{\"body\":\"healthy\"}" };
+        capacity_initialized += 1;
+    }
+    const before_capacity = mock.bad_calls;
+    const healthy_before_capacity = mock.healthy_calls;
+    try db.batch(.{ .writes = capacity_writes, .sync_level = .write });
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(db.core.nextEnrichmentSequence()));
+    try std.testing.expectEqual(before_capacity + 128, mock.bad_calls);
+    try std.testing.expectEqual(healthy_before_capacity, mock.healthy_calls);
+    try std.testing.expect(db.enrichment_runtime.?.scoped_retry_full);
+    try db.batch(.{ .deletes = &.{capacity_writes[0].key}, .sync_level = .write });
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(db.core.nextEnrichmentSequence()));
+    try std.testing.expectEqual(before_capacity + 128, mock.bad_calls);
+    try std.testing.expectEqual(healthy_before_capacity + 1, mock.healthy_calls);
+    var deletes: [127][]const u8 = undefined;
+    for (&deletes, capacity_writes[1..128]) |*delete_key, write| delete_key.* = write.key;
+    try db.batch(.{ .deletes = &deletes, .sync_level = .write });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    try std.testing.expectEqual(before_capacity + 128, mock.bad_calls);
 }

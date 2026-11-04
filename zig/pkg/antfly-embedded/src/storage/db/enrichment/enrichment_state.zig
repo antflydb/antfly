@@ -778,3 +778,24 @@ test "admission wait budget survives disk close and WAL replay" {
         try saveRuntimeStatus(store, "admission-test", status);
     }
 }
+
+pub const scoped_retries = @import("scoped_retries.zig");
+const scoped_retry_key = "\x00\x00__metadata__:enrichment_scoped_retries:v1";
+
+pub fn loadScopedRetries(alloc: Allocator, store: anytype) !scoped_retries.State {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginProbe();
+    defer txn.abort();
+    const raw = txn.get(scoped_retry_key) catch |err| if (err == error.NotFound) return .{} else return err;
+    return scoped_retries.State.decode(alloc, raw);
+}
+
+pub fn saveScopedRetries(store: anytype, raw: []const u8) !void {
+    var runtime = try initRuntimeStore(std.heap.page_allocator, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    try txn.put(scoped_retry_key, raw);
+    try txn.commit();
+}
