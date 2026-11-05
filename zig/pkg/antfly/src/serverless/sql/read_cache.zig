@@ -18,6 +18,7 @@
 const std = @import("std");
 const A = std.mem.Allocator;
 pub const Cache = struct {
+    pub const max_entry_bytes = 128 * 1024;
     a: A,
     mutex: std.atomic.Mutex = .unlocked,
     entries: [64]?Entry = @splat(null),
@@ -39,7 +40,7 @@ pub const Cache = struct {
     }
     pub fn put(self: *Cache, key: [32]u8, bytes: []const u8) void {
         // Fixed entry and byte caps bound this worker to at most 8 MiB.
-        if (bytes.len > 128 * 1024 or !self.mutex.tryLock()) return;
+        if (bytes.len > max_entry_bytes or !self.mutex.tryLock()) return;
         defer self.mutex.unlock();
         for (self.entries) |slot| if (slot) |entry| {
             if (std.mem.eql(u8, &entry.key, &key)) return;

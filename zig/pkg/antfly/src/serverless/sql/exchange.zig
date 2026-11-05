@@ -213,6 +213,9 @@ pub const Store = struct {
         if (!std.mem.startsWith(u8, ref.key, allowed) or std.mem.indexOf(u8, ref.key[allowed.len..], "..") != null or offset > ref.bytes or length > ref.bytes - offset or ref.bytes > max_object_bytes) return error.InvalidSqlExchange;
         if (self.read_cache) |cache| {
             const whole = ref.bytes <= 16 * 1024;
+            // Large windows/indexes bypass residency without extra copies or
+            // cache-key allocation. Their provider response is already bounded.
+            if (!whole and length > @import("read_cache.zig").Cache.max_entry_bytes) return self.fetchRange(a, ref, offset, length);
             const requested_offset = if (whole) 0 else offset;
             const requested_length = if (whole) @as(usize, @intCast(ref.bytes)) else length;
             const identity = try std.json.Stringify.valueAlloc(a, .{ .bucket = self.bucket, .ref = ref, .offset = requested_offset, .length = requested_length }, .{});
