@@ -16929,6 +16929,63 @@ export interface components {
             /** @description Row field holding the source last-modified timestamp. */
             last_modified_field?: string;
         };
+        /** @description Text-quality thresholds. `native_text.quality` assesses native document text and selects fallback independently of whether OCR is configured; `ocr.quality` assesses OCR output. Quality flags are not guarantees of correct reading order or complete document semantics. */
+        DocumentExtractionTextQualityConfig: {
+            /**
+             * @description Minimum non-whitespace Unicode characters before text passes the length check.
+             * @default 50
+             */
+            min_chars?: number;
+            /**
+             * @description Minimum words before the garbled-text check applies.
+             * @default 20
+             */
+            garbled_min_words?: number;
+            /**
+             * @description Words sampled by the garbled-text check.
+             * @default 50
+             */
+            garbled_sample_words?: number;
+            /**
+             * Format: double
+             * @description Maximum ratio of single-character words before text counts as garbled.
+             * @default 0.4
+             */
+            max_single_char_word_ratio?: number;
+            /**
+             * @description Minimum non-whitespace Unicode characters for a line to count in the corrupted-line check.
+             * @default 15
+             */
+            min_line_chars?: number;
+            /**
+             * Format: double
+             * @description Maximum ratio of corrupted lines.
+             * @default 0.2
+             */
+            max_corrupted_line_ratio?: number;
+            /**
+             * Format: double
+             * @description Font corruption score above which a substantial line counts as corrupted.
+             * @default 0.5
+             */
+            max_font_corruption?: number;
+            /**
+             * Format: double
+             * @description Maximum ratio of Unicode replacement characters.
+             * @default 0.05
+             */
+            max_replacement_ratio?: number;
+        };
+        /** @description Native document text policy and quality assessment. No OCR model is required. Native quality diagnostics are recorded independently of extraction completion and OCR availability. */
+        DocumentExtractionNativeTextConfig: {
+            /**
+             * @description `source` retains decoded source text, including off-page runs, for auditing. `page` excludes runs wholly outside the page or a known clipping box while retaining hidden OCR/accessibility text. `visible` additionally excludes nonpainting and fully transparent text. These policies do not claim pixel-perfect occlusion analysis. All policies honor semantic ActualText replacements.
+             * @default page
+             * @enum {string}
+             */
+            policy?: "source" | "page" | "visible";
+            quality?: components["schemas"]["DocumentExtractionTextQualityConfig"];
+        };
         /** @description Reader provider for OCR. Every provider except `apple` requires `model`; Apple uses Vision text recognition and accepts no model, credentials, or prompt. */
         DocumentExtractionReaderConfig: {
             /** @enum {string} */
@@ -17005,59 +17062,12 @@ export interface components {
              */
             max_dimension?: number;
         };
-        /** @description Thresholds that decide when a PDF page's native text is too poor to keep, in `auto` mode. */
-        DocumentExtractionOcrQualityConfig: {
-            /**
-             * @description Pages with fewer meaningful characters are read with OCR.
-             * @default 50
-             */
-            min_content_chars?: number;
-            /**
-             * @description Minimum words before the garbled-text check applies.
-             * @default 20
-             */
-            garbled_min_words?: number;
-            /**
-             * @description Words sampled by the garbled-text check.
-             * @default 50
-             */
-            garbled_sample_words?: number;
-            /**
-             * Format: double
-             * @description Maximum ratio of single-character words before text counts as garbled.
-             * @default 0.4
-             */
-            max_single_char_word_ratio?: number;
-            /**
-             * @description Minimum characters for a line to count in the corrupted-line check.
-             * @default 15
-             */
-            substantial_line_min_chars?: number;
-            /**
-             * Format: double
-             * @description Maximum ratio of corrupted lines.
-             * @default 0.2
-             */
-            max_corrupted_line_ratio?: number;
-            /**
-             * Format: double
-             * @description Font corruption score at which text is replaced by OCR.
-             * @default 0.5
-             */
-            font_corruption_score_threshold?: number;
-            /**
-             * Format: double
-             * @description Maximum ratio of Unicode replacement characters.
-             * @default 0.05
-             */
-            max_replacement_char_ratio?: number;
-        };
         /** @description Reads scanned pages and images. Name exactly one of `reader` or `generator`. Readers run their own OCR task; generators receive a transcription instruction. */
         DocumentExtractionOcrConfig: {
             reader?: components["schemas"]["DocumentExtractionReaderConfig"];
             generator?: components["schemas"]["GeneratorConfig"];
             /**
-             * @description `auto` reads PDF pages whose native text fails the `quality` checks, and images. `always` reads every page.
+             * @description `auto` reads PDF pages whose native text fails `native_text.quality`, and images. `always` reads every page.
              * @default auto
              * @enum {string}
              */
@@ -17065,7 +17075,7 @@ export interface components {
             /** @description Overrides the OCR prompt. Omit it to let the reader run its own OCR task. Apple readers reject prompts. */
             prompt?: string;
             render?: components["schemas"]["DocumentExtractionRenderConfig"];
-            quality?: components["schemas"]["DocumentExtractionOcrQualityConfig"];
+            quality?: components["schemas"]["DocumentExtractionTextQualityConfig"];
         };
         /** @description Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN. */
         CloudflareSTTConfig: {
@@ -17284,6 +17294,7 @@ export interface components {
              * @default true
              */
             html_strip_tags?: boolean;
+            native_text?: components["schemas"]["DocumentExtractionNativeTextConfig"];
             ocr?: components["schemas"]["DocumentExtractionOcrConfig"];
             transcription?: components["schemas"]["DocumentExtractionTranscriptionConfig"];
             /**
