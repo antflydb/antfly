@@ -260,6 +260,9 @@ binary payloads while the gateway resolves and adapts metadata. Generation batch
 validate attachment ownership before dispatch and give each item its own rebased
 envelope. Typed hosted media adapters resolve attachment references into their
 existing inline media formats within the request memory budget.
+Each chain attempt releases its adaptation and upstream response buffers before
+retrying or falling back. Pinned source bytes remain available for reuse across
+attempts, so retries do not download the source again or accumulate encoded copies.
 
 Generated decision and extraction requests select their generator through
 `generator.model`, with no top-level `model`. Native generator IDs and configured
