@@ -2375,6 +2375,20 @@ pub const RecordPageReader = struct {
         return !entry.is_delete;
     }
 
+    /// The document's real logical size (key plus value) without touching
+    /// external value pages: an external value stores its length inline in
+    /// the document's own index-page header record (`external_value_len`),
+    /// so this costs exactly the same one bounded page read as
+    /// `documentIsLive`, never the external value's own pages. WS5's
+    /// journal-retirement ledger release uses this so a large document's
+    /// replay entry is never materialized just to account for its deletion.
+    pub fn documentValueLen(self: *RecordPageReader, file: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, indexed: DocumentIndexEntry) !?usize {
+        const entry = try decodeDocumentEntry(try self.read(file, allocator, checkpoint, indexed.document_page_id, .document));
+        if (!std.mem.eql(u8, entry.key, indexed.key)) return error.InvalidDocumentIndex;
+        if (entry.is_delete) return null;
+        return if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+    }
+
     pub fn documentValueAlloc(self: *RecordPageReader, file: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, indexed: DocumentIndexEntry) !?[]u8 {
         const entry = try decodeDocumentEntry(try self.read(file, allocator, checkpoint, indexed.document_page_id, .document));
         if (!std.mem.eql(u8, entry.key, indexed.key)) return error.InvalidDocumentIndex;

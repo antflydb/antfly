@@ -165,6 +165,14 @@ pub const GlobalReplayKind = enum(u8) {
     promoted_keys_state = 0x44,
     graph_expiration = 0x54,
     outcome_receipt = 0x55,
+    /// WS5: durable replay-journal format version. Absent (on a store that
+    /// already has replay entries) means the pre-ledger v1 layout, which this
+    /// build refuses rather than silently reinterpreting.
+    journal_format_version = 0x56,
+    /// WS5: journal credit ledger, {bytes, records} charged by every replay
+    /// append and released only once the matching retirement transaction
+    /// durably deletes the entries. See `JournalCreditLedger`.
+    journal_credit_ledger = 0x57,
 };
 
 pub fn globalReplayPrefix(comptime kind: GlobalReplayKind) [3]u8 {
@@ -186,6 +194,62 @@ pub const derived_coverage_outcome_count_kind: u8 = 0xff;
 pub const replay_key_len: usize = 1 + 1 + @sizeOf(u64);
 pub const replay_meta_init_key = globalReplayPrefix(.replay_init);
 pub const replay_meta_next_sequence_key = globalReplayPrefix(.next_sequence);
+
+/// WS5 replay-journal format. v1 (unversioned) stores have no credit ledger
+/// and no format-version key. Antfly is unreleased: this build never writes
+/// or reads v1 layouts. `requireCurrentReplayJournalFormat` refuses them.
+pub const replay_journal_format_v2: u32 = 2;
+pub const replay_journal_format_version_key = globalReplayPrefix(.journal_format_version);
+pub const journal_credit_ledger_key = globalReplayPrefix(.journal_credit_ledger);
+
+pub fn encodeReplayJournalFormatVersion(version: u32) [4]u8 {
+    var raw: [4]u8 = undefined;
+    std.mem.writeInt(u32, &raw, version, .little);
+    return raw;
+}
+
+pub fn decodeReplayJournalFormatVersion(raw: []const u8) ?u32 {
+    if (raw.len != 4) return null;
+    return std.mem.readInt(u32, raw[0..4], .little);
+}
+
+/// Journal credit ledger: the durable count of bytes and records currently
+/// held across every replay lane. Charged in the same transaction as the
+/// append that grows the journal; released in the same transaction as the
+/// retirement that physically deletes the entries. A scan over every replay
+/// lane must always reproduce this value exactly -- there is no other
+/// bookkeeping path.
+pub const JournalCreditLedger = struct {
+    bytes: u64 = 0,
+    records: u64 = 0,
+
+    pub const encoded_len: usize = 16;
+
+    pub fn encode(self: JournalCreditLedger) [encoded_len]u8 {
+        var raw: [encoded_len]u8 = undefined;
+        std.mem.writeInt(u64, raw[0..8], self.bytes, .little);
+        std.mem.writeInt(u64, raw[8..16], self.records, .little);
+        return raw;
+    }
+
+    pub fn decode(raw: []const u8) ?JournalCreditLedger {
+        if (raw.len != encoded_len) return null;
+        return .{
+            .bytes = std.mem.readInt(u64, raw[0..8], .little),
+            .records = std.mem.readInt(u64, raw[8..16], .little),
+        };
+    }
+
+    pub fn charged(self: JournalCreditLedger, bytes: u64, records: u64) JournalCreditLedger {
+        return .{ .bytes = self.bytes + bytes, .records = self.records + records };
+    }
+
+    /// Saturating: a retirement chunk must never be refused merely because
+    /// rounding or a concurrently-corrected ledger would otherwise underflow.
+    pub fn released(self: JournalCreditLedger, bytes: u64, records: u64) JournalCreditLedger {
+        return .{ .bytes = self.bytes -| bytes, .records = self.records -| records };
+    }
+};
 pub const replay_meta_latest_sequence_kind: u8 = @backingInt(GlobalReplayKind.latest_sequence);
 pub const replication_applied_lsn_key = globalReplayPrefix(.replication_applied);
 /// Latest document-store mutation applied from the local data Raft log. The
@@ -3687,4 +3751,38 @@ pub fn isGraphOwnerReplayJobKey(key: []const u8) bool {
     if (!std.mem.startsWith(u8, key, graph_owner_replay_prefix) or key.len != graph_owner_replay_prefix.len + 64) return false;
     for (key[graph_owner_replay_prefix.len..]) |byte| if (!std.ascii.isHex(byte)) return false;
     return true;
+}
+
+test "journal credit ledger round trips and charges/releases saturate" {
+    const empty = JournalCreditLedger{};
+    try std.testing.expectEqual(@as(u64, 0), empty.bytes);
+    try std.testing.expectEqual(@as(u64, 0), empty.records);
+
+    const charged = empty.charged(128, 2);
+    try std.testing.expectEqual(@as(u64, 128), charged.bytes);
+    try std.testing.expectEqual(@as(u64, 2), charged.records);
+
+    const raw = charged.encode();
+    const decoded = JournalCreditLedger.decode(&raw) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(charged.bytes, decoded.bytes);
+    try std.testing.expectEqual(charged.records, decoded.records);
+
+    try std.testing.expectEqual(@as(?JournalCreditLedger, null), JournalCreditLedger.decode(raw[0..8]));
+
+    // Releasing more than charged saturates at zero rather than underflowing:
+    // a retirement chunk racing a concurrently-corrected ledger must never
+    // wrap around to a huge outstanding balance.
+    const over_released = decoded.released(1_000, 1_000);
+    try std.testing.expectEqual(@as(u64, 0), over_released.bytes);
+    try std.testing.expectEqual(@as(u64, 0), over_released.records);
+
+    const partially_released = decoded.released(28, 1);
+    try std.testing.expectEqual(@as(u64, 100), partially_released.bytes);
+    try std.testing.expectEqual(@as(u64, 1), partially_released.records);
+}
+
+test "replay journal format version round trips" {
+    const raw = encodeReplayJournalFormatVersion(replay_journal_format_v2);
+    try std.testing.expectEqual(@as(?u32, replay_journal_format_v2), decodeReplayJournalFormatVersion(&raw));
+    try std.testing.expectEqual(@as(?u32, null), decodeReplayJournalFormatVersion(raw[0..2]));
 }

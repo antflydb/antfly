@@ -20,7 +20,7 @@ const runtime_mod = @import("../background_runtime.zig");
 /// data preparation and publication fences; server upload policy is already
 /// supplied through its separate dispatcher.
 pub const Owner = struct {
-    pub const Work = enum { upload, baseline, producer, footprint, repair, column, index, authority };
+    pub const Work = enum { upload, baseline, producer, footprint, repair, column, index, authority, replay_retirement };
     pub const Activity = struct {
         artifacts: bool = false,
         producers: bool = false,
@@ -149,6 +149,14 @@ pub const Owner = struct {
         _ = port.run(port.ptr, .index) catch |err| switch (err) {
             error.Canceled, error.PreparedGenerationChanged, error.IntentConflict, error.ResourceBudgetExceeded, error.PortableRuntimeActivationPending, error.IndexNotFound => {},
             else => std.log.warn("relational index maintenance failed: {s}", .{@errorName(err)}),
+        };
+        // WS5: owner-only journal retirement, same cadence as every other
+        // background slice here. `error.NotLeader`/`error.ReadOnly` mean a
+        // non-owner (hosted: not the Raft leader; standalone: read-only)
+        // correctly skipped its turn, not a failure.
+        _ = port.run(port.ptr, .replay_retirement) catch |err| switch (err) {
+            error.NotLeader, error.ReadOnly, error.Canceled, error.RetirementRequiresOwner => {},
+            else => std.log.warn("replay journal retirement failed: {s}", .{@errorName(err)}),
         };
     }
 };

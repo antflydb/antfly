@@ -22,6 +22,8 @@ const backend_adapter = @import("../backend_adapter.zig");
 const backend_erased = @import("../backend_erased.zig");
 const backend_types = @import("../backend_types.zig");
 const change_journal_mod = @import("../db/derived/change_journal.zig");
+const replay_chunks = @import("../db/derived/replay_chunks.zig");
+const replay_reference = @import("../db/derived/replay_reference.zig");
 const internal_keys = @import("../internal_keys.zig");
 const native = @import("native.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
@@ -1526,6 +1528,15 @@ pub const Store = struct {
     next_writer_ticket: u64 = 0,
     serving_writer_ticket: u64 = 0,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    // WS5: owner-queued journal retirement. `retirement_queue` is the
+    // foreground-raised watermark; `active_consumer_hint_mask` gates which
+    // hinted lanes an append writes (see replay_reference.zig); the credit
+    // policy bounds how large the unretired journal may grow before a
+    // producer append is refused.
+    retirement_queue: replay_chunks.RetirementQueue = .{},
+    active_consumer_hint_mask: std.atomic.Value(u8) = .init(replay_reference.all_hints_mask),
+    journal_credit_capacity_bytes: u64 = std.math.maxInt(u64),
+    journal_credit_progress_reserve_bytes: u64 = 0,
 
     pub const MaintenancePhase = enum { assessment, copy, verification };
     pub const MaintenanceTestHook = struct {
@@ -3100,12 +3111,42 @@ pub const Store = struct {
 
     pub fn truncateReplayUpTo(self: *Store, alloc: Allocator, up_to_sequence: u64) !void {
         _ = alloc;
-        try truncateReplay(self, "", false, up_to_sequence);
+        try drainRetireReplaySlice(self, "", false, up_to_sequence);
     }
 
     pub fn truncateReplayUpToYielding(self: *Store, alloc: Allocator, up_to_sequence: u64) !void {
         _ = alloc;
-        try truncateReplay(self, "", true, up_to_sequence);
+        try drainRetireReplaySlice(self, "", true, up_to_sequence);
+    }
+
+    /// WS5: raise the foreground retirement watermark. Foreground/ack
+    /// callers only ever call this -- never `retireReplaySlice` directly --
+    /// so a write's acknowledgement never pays for a physical delete.
+    pub fn requestRetirement(self: *Store, min_progress: u64) void {
+        self.retirement_queue.request(min_progress);
+    }
+
+    /// WS5: gate which hinted lanes future appends write. Derived from the
+    /// DB layer's consumer catalog (see replay_reference.zig); callers that
+    /// never call this keep the safe all-hints default.
+    pub fn setActiveConsumerHintMask(self: *Store, mask: u8) void {
+        self.active_consumer_hint_mask.store(mask, .release);
+    }
+
+    pub fn setJournalCreditPolicy(self: *Store, capacity_bytes: u64, progress_reserve_bytes: u64) void {
+        self.journal_credit_capacity_bytes = capacity_bytes;
+        self.journal_credit_progress_reserve_bytes = progress_reserve_bytes;
+    }
+
+    /// WS5 owner-only retirement entry point: one bounded, single-transaction
+    /// chunk, across every lane, draining the watermark `requestRetirement`
+    /// raised. The caller must already know it is the active owner (the Lite
+    /// path-lease holder or the Raft leader) -- `is_owner` is not derived
+    /// here, it is asserted, so a caller cannot mistake a skipped turn for a
+    /// completed one.
+    pub fn serviceRetirement(self: *Store, is_owner: bool, budget: replay_chunks.RetirementBudget) !replay_chunks.RetirementStats {
+        if (!is_owner) return error.RetirementRequiresOwner;
+        return try retireReplaySlice(self, "", false, self.retirement_queue.requested(), budget);
     }
 };
 
@@ -3172,7 +3213,7 @@ const RuntimeStore = struct {
 
     pub fn truncateReplayUpTo(self: *RuntimeStore, alloc: Allocator, up_to_sequence: u64) !void {
         _ = alloc;
-        try truncateReplay(self.store, self.prefix, true, up_to_sequence);
+        try drainRetireReplaySlice(self.store, self.prefix, true, up_to_sequence);
     }
 };
 
@@ -4236,9 +4277,30 @@ pub const Cursor = struct {
     owned_value: ?[]u8 = null,
     disk_candidate: ?native.DocumentIndexEntry = null,
     last_direction: ?Direction = null,
+    // WS5: a third mode alongside full/keys-only. Set by `setLengthOnly`.
+    // `readValue` then asks the native layer for the document's real
+    // logical size (one bounded page read; never the external value's own
+    // pages, same cost class as `documentIsLive`) and stashes it here for
+    // the caller to read back via `lastValueLen`.
+    length_only: bool = false,
+    last_value_len: usize = 0,
 
     pub fn setKeysOnly(self: *Cursor) void {
         self.load_values = false;
+    }
+
+    /// Like `setKeysOnly`, but additionally records each visited entry's
+    /// real value length (see `last_value_len`) via a page read that never
+    /// touches external value pages. Call before the first move.
+    pub fn setLengthOnly(self: *Cursor) void {
+        self.load_values = false;
+        self.length_only = true;
+    }
+
+    /// The real value length of the entry last returned by this cursor,
+    /// valid only when `setLengthOnly` was called. Zero otherwise.
+    pub fn lastValueLen(self: *const Cursor) usize {
+        return self.last_value_len;
     }
 
     pub fn close(self: *Cursor) void {
@@ -4423,6 +4485,11 @@ pub const Cursor = struct {
     fn readValue(self: *Cursor, file: *native.NativeFile, indexed: native.DocumentIndexEntry) !?[]u8 {
         if (self.load_values)
             return try self.records.documentValueAlloc(file, self.txn.allocator, self.txn.checkpoint, indexed);
+        if (self.length_only) {
+            const len = (try self.records.documentValueLen(file, self.txn.allocator, self.txn.checkpoint, indexed)) orelse return null;
+            self.last_value_len = len;
+            return try self.txn.allocator.alloc(u8, 0);
+        }
         if (!try self.records.documentIsLive(file, self.txn.allocator, self.txn.checkpoint, indexed)) return null;
         return try self.txn.allocator.alloc(u8, 0);
     }
@@ -4484,6 +4551,9 @@ pub const Cursor = struct {
     ) !backend_adapter.Entry {
         var disk = buffered_disk;
         errdefer if (disk) |*candidate| candidate.deinit(self.txn.allocator);
+        // Overlay values are already in memory: no page read is needed to
+        // know their length, unlike the disk path in `readValue`.
+        if (self.length_only) self.last_value_len = value.len;
         const owned_key = try self.txn.allocator.dupe(u8, full_key);
         errdefer self.txn.allocator.free(owned_key);
         const owned_value = try self.txn.allocator.dupe(u8, if (self.load_values) value else "");
@@ -4625,7 +4695,74 @@ fn writeOriginalReplayHintEntries(txn: anytype, sequence: u64, mask: u8, payload
     }
 }
 
+/// WS5: journal credit ledger helpers shared by the append path
+/// (`writeReplayEntries`) and the retirement path (`retireReplaySlice`).
+/// A missing ledger key means an untouched (or pre-ledger) store, which is
+/// exactly the zero balance a fresh ledger should start from.
+fn loadJournalCreditLedger(txn: anytype) !internal_keys.JournalCreditLedger {
+    const raw = txn.get(internal_keys.journal_credit_ledger_key[0..]) catch |err| switch (err) {
+        error.NotFound => return internal_keys.JournalCreditLedger{},
+        else => return err,
+    };
+    return internal_keys.JournalCreditLedger.decode(raw) orelse return error.CorruptReplayMetadata;
+}
+
+fn storeJournalCreditLedger(txn: anytype, ledger: internal_keys.JournalCreditLedger) !void {
+    const raw = ledger.encode();
+    try txn.put(internal_keys.journal_credit_ledger_key[0..], raw[0..]);
+}
+
+/// WS5: Antfly is unreleased, so this build never speaks the pre-ledger v1
+/// replay layout. An already-initialized journal without a current version
+/// marker is refused outright rather than silently reinterpreted.
+fn requireCurrentReplayJournalFormat(txn: anytype) !void {
+    const raw = txn.get(internal_keys.replay_journal_format_version_key[0..]) catch |err| switch (err) {
+        error.NotFound => return error.UnsupportedReplayJournalFormat,
+        else => return err,
+    };
+    const version = internal_keys.decodeReplayJournalFormatVersion(raw) orelse return error.UnsupportedReplayJournalFormat;
+    if (version != internal_keys.replay_journal_format_v2) return error.UnsupportedReplayJournalFormat;
+}
+
 fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []const u8) !void {
+    // WS5: refuse a pre-ledger journal on the very first real append it
+    // sees, and stamp a fresh journal with the current version so every
+    // later append (and the retirement transactions that eventually charge
+    // against it) can tell the layout apart from an old one. Low-level tests
+    // that hand-construct replay state never call this function, so they
+    // are unaffected either way.
+    const already_initialized = (txn.get(internal_keys.replay_meta_init_key[0..]) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    }) != null;
+    if (already_initialized) {
+        try requireCurrentReplayJournalFormat(txn);
+    } else {
+        const version_raw = internal_keys.encodeReplayJournalFormatVersion(internal_keys.replay_journal_format_v2);
+        try txn.put(internal_keys.replay_journal_format_version_key[0..], version_raw[0..]);
+    }
+
+    // WS5: this append is charged against the journal credit ledger in the
+    // same transaction that grows the journal, using the entry's real
+    // key+payload bytes (already in hand here, no extra read needed).
+    // Admission is checked against an upper bound (every lane gets the full
+    // unfiltered payload) before any key is written, so a refused append
+    // leaves no partial state behind. Retirement recovers the same real
+    // bytes cheaply too -- via `documentValueLen`, a page read that never
+    // touches external value pages -- so the ledger can equal a scan of
+    // real bytes without ever materializing a large document's value just
+    // to account for its deletion.
+    const consumer_mask = if (txn.store) |store| store.active_consumer_hint_mask.load(.acquire) else replay_reference.all_hints_mask;
+    const mask_all = change_journal_mod.encodedRecordHintMask(payload) catch 0;
+    const mask = mask_all & consumer_mask;
+    const lane_count: u64 = 1 + @popCount(mask);
+    const upper_bound_charge: u64 = lane_count * (internal_keys.replay_key_len + payload.len);
+    if (txn.store) |store| {
+        const ledger = try loadJournalCreditLedger(txn);
+        const admissible = store.journal_credit_capacity_bytes -| store.journal_credit_progress_reserve_bytes;
+        if (ledger.bytes + upper_bound_charge > admissible) return error.JournalCreditCapacityExceeded;
+    }
+
     try txn.put(internal_keys.replay_meta_init_key[0..], "");
     const next_raw = encodeReplaySequence(sequence + 1);
     try txn.put(internal_keys.replay_meta_next_sequence_key[0..], next_raw[0..]);
@@ -4636,23 +4773,37 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
     const all_latest_key = internal_keys.replayLatestSequenceKey(internal_keys.replay_all_kind);
     try txn.put(all_latest_key[0..], latest_raw[0..]);
 
-    const mask = change_journal_mod.encodedRecordHintMask(payload) catch return;
-    if (mask == 0) return;
+    var charged_bytes: u64 = internal_keys.replay_key_len + payload.len;
+    var charged_records: u64 = 1;
 
-    var decoded = change_journal_mod.decodeRecord(alloc, payload) catch {
-        try writeOriginalReplayHintEntries(txn, sequence, mask, payload);
-        return;
-    };
-    defer decoded.deinit();
+    write_hints: {
+        if (mask == 0) break :write_hints;
 
-    for (replay_hints) |hint| {
-        if ((mask & change_journal_mod.singleHintMask(hint)) == 0) continue;
-        const lane_payload = try encodeReplayPayloadForHint(alloc, decoded.record, hint);
-        defer alloc.free(lane_payload);
-        const key = internal_keys.replayEntryKey(replayHintOrdinal(hint), sequence);
-        try txn.put(key[0..], lane_payload);
-        const latest_key = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
-        try txn.put(latest_key[0..], latest_raw[0..]);
+        var decoded = change_journal_mod.decodeRecord(alloc, payload) catch {
+            try writeOriginalReplayHintEntries(txn, sequence, mask, payload);
+            charged_bytes += @as(u64, @popCount(mask)) * (internal_keys.replay_key_len + payload.len);
+            charged_records += @popCount(mask);
+            break :write_hints;
+        };
+        defer decoded.deinit();
+
+        for (replay_hints) |hint| {
+            if ((mask & change_journal_mod.singleHintMask(hint)) == 0) continue;
+            const lane_payload = try encodeReplayPayloadForHint(alloc, decoded.record, hint);
+            defer alloc.free(lane_payload);
+            const key = internal_keys.replayEntryKey(replayHintOrdinal(hint), sequence);
+            try txn.put(key[0..], lane_payload);
+            const latest_key = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
+            try txn.put(latest_key[0..], latest_raw[0..]);
+            charged_bytes += internal_keys.replay_key_len + lane_payload.len;
+            charged_records += 1;
+        }
+    }
+
+    if (txn.store != null) {
+        var ledger = try loadJournalCreditLedger(txn);
+        ledger = ledger.charged(charged_bytes, charged_records);
+        try storeJournalCreditLedger(txn, ledger);
     }
 }
 
@@ -4722,59 +4873,113 @@ fn collectReplayEntries(store: *Store, prefix: []const u8, alloc: Allocator, fro
 
 const replay_cleanup_max_keys = 512;
 const replay_cleanup_max_key_bytes = 256 * 1024;
+const default_retirement_budget = replay_chunks.RetirementBudget{
+    .max_keys = replay_cleanup_max_keys,
+    .max_bytes = replay_cleanup_max_key_bytes,
+};
 
-/// Cleanup is resumable: each bounded chunk commits atomically, and any later
-/// error is returned to the caller. A retry safely continues the remaining work.
-/// Reserve the writer while scanning and deleting, so no concurrent replacement
-/// can be deleted using an older read snapshot. Release it between chunks.
-fn truncateReplay(store: *Store, prefix: []const u8, yielding: bool, up_to_sequence: u64) !void {
-    if (up_to_sequence == 0) return;
-    try truncateReplayLane(store, prefix, yielding, internal_keys.replay_all_kind, up_to_sequence);
-    for (replay_hints) |hint|
-        try truncateReplayLane(store, prefix, yielding, replayHintOrdinal(hint), up_to_sequence);
-}
+/// WS5: one bounded, single-transaction retirement chunk across every lane
+/// (the all-lane plus every hinted lane), replacing the former one-commit-
+/// per-lane `truncateReplay`/`truncateReplayLane` pair. Deletes and the
+/// matching credit-ledger release happen in the same commit, so a crash
+/// mid-turn can never durably delete an entry without also releasing its
+/// credit, or the reverse. Resumable: a caller whose budget was exhausted
+/// (`stats.done == false`) simply calls again: already-deleted keys are
+/// never re-encountered, so no cross-call cursor state is needed.
+fn retireReplaySlice(
+    store: *Store,
+    prefix: []const u8,
+    yielding: bool,
+    up_to_sequence: u64,
+    budget: replay_chunks.RetirementBudget,
+) !replay_chunks.RetirementStats {
+    var stats = replay_chunks.RetirementStats{ .done = true, .no_op = true };
+    if (up_to_sequence == 0) return stats;
 
-fn truncateReplayLane(store: *Store, prefix: []const u8, yielding: bool, kind: u8, up_to_sequence: u64) !void {
-    var resume_sequence: u64 = 0;
-    while (resume_sequence < up_to_sequence) {
-        var write = if (yielding)
-            try Txn.openWriteYieldingWithPrefix(store, prefix)
-        else
-            try Txn.openWriteWithPrefix(store, prefix);
-        var committed = false;
-        defer if (!committed) write.abort();
-        _ = write.get(internal_keys.replay_meta_init_key[0..]) catch |err| switch (err) {
-            error.NotFound => return,
+    var write = if (yielding)
+        try Txn.openWriteYieldingWithPrefix(store, prefix)
+    else
+        try Txn.openWriteWithPrefix(store, prefix);
+    var committed = false;
+    defer if (!committed) write.abort();
+
+    _ = write.get(internal_keys.replay_meta_init_key[0..]) catch |err| switch (err) {
+        error.NotFound => return stats,
+        else => return err,
+    };
+
+    var freed_bytes: u64 = 0;
+    var freed_records: u64 = 0;
+    var budget_exhausted = false;
+    var max_retired_exclusive: u64 = 0;
+    var all_lanes_done = true;
+
+    for (0..replay_hints.len + 1) |lane_index| {
+        const kind = if (lane_index == 0) internal_keys.replay_all_kind else replayHintOrdinal(replay_hints[lane_index - 1]);
+        if (budget_exhausted) {
+            all_lanes_done = false;
+            continue;
+        }
+
+        // Length-only: a retirement turn must never materialize a large
+        // document's replay value just to delete its entry, but it still
+        // needs the entry's real size for the credit-ledger release. One
+        // bounded page read per entry (never the external value's own
+        // pages) gives us that for free.
+        var cursor = try write.openCursor();
+        cursor.setLengthOnly();
+        defer cursor.close();
+        const lower = internal_keys.replayRangeLower(kind, 0);
+        const upper = internal_keys.replayEntryKey(kind, up_to_sequence);
+        cursor.setUpperBound(&upper);
+        var entry = cursor.seekAtOrAfter(&lower) catch |err| switch (err) {
+            error.NotFound => continue,
             else => return err,
         };
-        var count: usize = 0;
-        var bytes: usize = 0;
-        {
-            var cursor = try write.openKeyCursor();
-            defer cursor.close();
-            const lower = internal_keys.replayRangeLower(kind, resume_sequence);
-            const upper = internal_keys.replayEntryKey(kind, up_to_sequence);
-            cursor.setUpperBound(&upper);
-            var key = cursor.seekAtOrAfter(&lower) catch |err| switch (err) {
-                error.NotFound => return,
+        while (true) {
+            const sequence = internal_keys.parseReplayEntrySequence(entry.key, kind) orelse return error.InvalidReplayEntryKey;
+            if (sequence >= up_to_sequence) break;
+            const entry_bytes: u64 = entry.key.len + cursor.lastValueLen();
+            try write.delete(entry.key);
+            freed_bytes += entry_bytes;
+            freed_records += 1;
+            stats.keys_deleted += 1;
+            stats.bytes_deleted += entry_bytes;
+            if (sequence + 1 > max_retired_exclusive) max_retired_exclusive = sequence + 1;
+            if (stats.keys_deleted >= budget.max_keys or stats.bytes_deleted >= budget.max_bytes) {
+                budget_exhausted = true;
+                all_lanes_done = false;
+                break;
+            }
+            entry = cursor.next() catch |err| switch (err) {
+                error.NotFound => break,
                 else => return err,
             };
-            while (true) {
-                const sequence = internal_keys.parseReplayEntrySequence(key, kind) orelse return error.InvalidReplayEntryKey;
-                try write.delete(key);
-                count += 1;
-                bytes += prefix.len + key.len;
-                resume_sequence = sequence + 1; // Exclusive bound prevents overflow.
-                if (count >= replay_cleanup_max_keys or bytes >= replay_cleanup_max_key_bytes) break;
-                key = cursor.next() catch |err| switch (err) {
-                    error.NotFound => break,
-                    else => return err,
-                };
-            }
         }
-        try write.commit();
-        committed = true;
-        if (count < replay_cleanup_max_keys and bytes < replay_cleanup_max_key_bytes) return;
+    }
+
+    if (freed_records == 0) return stats;
+    stats.no_op = false;
+
+    var ledger = try loadJournalCreditLedger(&write);
+    ledger = ledger.released(freed_bytes, freed_records);
+    try storeJournalCreditLedger(&write, ledger);
+
+    try write.commit();
+    committed = true;
+
+    stats.retired_through = if (max_retired_exclusive == 0) 0 else max_retired_exclusive - 1;
+    stats.done = all_lanes_done;
+    return stats;
+}
+
+/// Back-compat full drain used directly by low-level tests and by the
+/// shard-transfer donor/receiver paths: loop bounded chunks until retirement
+/// catches up to `up_to_sequence` or there is nothing left to do.
+fn drainRetireReplaySlice(store: *Store, prefix: []const u8, yielding: bool, up_to_sequence: u64) !void {
+    while (true) {
+        const stats = try retireReplaySlice(store, prefix, yielding, up_to_sequence, default_retirement_budget);
+        if (stats.done) return;
     }
 }
 
@@ -6481,6 +6686,181 @@ test "lite replay cleanup propagates record corruption without deleting a partia
     try std.testing.expect((try store.file.getDocumentAlloc(a, &first)) == null);
     try std.testing.expect((try store.file.getDocumentAlloc(a, &second)) == null);
     try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
+fn expectLedgerMatchesScanForTest(store: *Store) !void {
+    const Collector = struct {
+        bytes: u64 = 0,
+        records: u64 = 0,
+        fn collect(ptr: *anyopaque, _: u64, payload: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.bytes += internal_keys.replay_key_len + payload.len;
+            self.records += 1;
+        }
+    };
+    var collector = Collector{};
+    _ = try forEachReplayLane(store, "", internal_keys.replay_all_kind, 0, 0, &collector, Collector.collect);
+    for (replay_hints) |hint|
+        _ = try forEachReplayLane(store, "", replayHintOrdinal(hint), 0, 0, &collector, Collector.collect);
+
+    var read = try Txn.openReadWithPrefix(store, "");
+    defer read.abort();
+    const ledger = blk: {
+        const raw = read.get(internal_keys.journal_credit_ledger_key[0..]) catch |err| switch (err) {
+            error.NotFound => break :blk internal_keys.JournalCreditLedger{},
+            else => return err,
+        };
+        break :blk internal_keys.JournalCreditLedger.decode(raw) orelse return error.TestUnexpectedResult;
+    };
+    try std.testing.expectEqual(collector.bytes, ledger.bytes);
+    try std.testing.expectEqual(collector.records, ledger.records);
+}
+
+test "WS5 serviceRetirement retires every lane in exactly one native commit" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "ws5-one-commit.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+
+    const payload = try change_journal_mod.encodeRecord(a, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc"},
+        .target_hints = &.{ .dense_vector, .full_text },
+    });
+    defer a.free(payload);
+    try store.appendReplayOpaque(a, 1, payload);
+    try expectLedgerMatchesScanForTest(&store);
+
+    const commit_before = store.file.activeCheckpoint().commit_sequence;
+    store.requestRetirement(2);
+    const stats = try store.serviceRetirement(true, .{});
+    try std.testing.expect(!stats.no_op);
+    try std.testing.expect(stats.done);
+    try std.testing.expectEqual(@as(u64, 1), stats.retired_through);
+    // Every lane (all-kind plus every hinted lane) retired in one commit.
+    try std.testing.expectEqual(commit_before + 1, store.file.activeCheckpoint().commit_sequence);
+    try expectLedgerMatchesScanForTest(&store);
+
+    var read = try Txn.openReadWithPrefix(&store, "");
+    defer read.abort();
+    const all_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    const dense_key = internal_keys.replayEntryKey(replayHintOrdinal(.dense_vector), 1);
+    const full_text_key = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), 1);
+    try std.testing.expectError(error.NotFound, read.get(&all_key));
+    try std.testing.expectError(error.NotFound, read.get(&dense_key));
+    try std.testing.expectError(error.NotFound, read.get(&full_text_key));
+}
+
+test "WS5 serviceRetirement refuses a non-owner caller without changing any state" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "ws5-non-owner.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+
+    const payload = try change_journal_mod.encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{"doc"} });
+    defer a.free(payload);
+    try store.appendReplayOpaque(a, 1, payload);
+    store.requestRetirement(2);
+
+    const commit_before = store.file.activeCheckpoint().commit_sequence;
+    try std.testing.expectError(error.RetirementRequiresOwner, store.serviceRetirement(false, .{}));
+    try std.testing.expectEqual(commit_before, store.file.activeCheckpoint().commit_sequence);
+
+    var read = try Txn.openReadWithPrefix(&store, "");
+    defer read.abort();
+    const all_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    const raw = try read.get(&all_key);
+    try std.testing.expectEqualStrings(payload, raw);
+}
+
+test "WS5 retirement keeps deletes and credit release atomic across a mid-turn failure" {
+    const a = std.testing.allocator;
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "ws5-atomic-crash.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
+    store.maintenance_start_suppressed = true;
+    defer store.close();
+    store.file.page_cache_enabled.store(false, .monotonic);
+
+    const payload = try a.dupe(u8, "unretired-payload");
+    defer a.free(payload);
+    try store.appendReplayOpaque(a, 1, payload);
+    store.requestRetirement(2);
+
+    const commit_before = store.file.activeCheckpoint().commit_sequence;
+    budget.limit = budget.live;
+    try std.testing.expectError(error.OutOfMemory, store.serviceRetirement(true, .{}));
+    budget.limit = std.math.maxInt(usize);
+
+    // Nothing committed: the entry and its credit are both still there.
+    try std.testing.expectEqual(commit_before, store.file.activeCheckpoint().commit_sequence);
+    try expectLedgerMatchesScanForTest(&store);
+    const all_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    {
+        var read = try Txn.openReadWithPrefix(&store, "");
+        defer read.abort();
+        const raw = try read.get(&all_key);
+        try std.testing.expectEqualStrings(payload, raw);
+    }
+
+    // Retrying with headroom retires the entry and releases its credit in
+    // the same commit.
+    const stats = try store.serviceRetirement(true, .{});
+    try std.testing.expect(!stats.no_op);
+    try std.testing.expectEqual(commit_before + 1, store.file.activeCheckpoint().commit_sequence);
+    try expectLedgerMatchesScanForTest(&store);
+    var read_after = try Txn.openReadWithPrefix(&store, "");
+    defer read_after.abort();
+    try std.testing.expectError(error.NotFound, read_after.get(&all_key));
+}
+
+test "WS5 credit ledger matches a scan and an explicit drain restores admission at capacity" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "ws5-ledger-capacity.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+
+    const payload1 = try change_journal_mod.encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{"doc-1"} });
+    defer a.free(payload1);
+    try store.appendReplayOpaque(a, 1, payload1);
+    try expectLedgerMatchesScanForTest(&store);
+
+    // Pin capacity to exactly what is outstanding: a same-shaped second
+    // append no longer fits.
+    const ledger_bytes = blk: {
+        var read = try Txn.openReadWithPrefix(&store, "");
+        defer read.abort();
+        const raw = try read.get(internal_keys.journal_credit_ledger_key[0..]);
+        break :blk (internal_keys.JournalCreditLedger.decode(raw) orelse return error.TestUnexpectedResult).bytes;
+    };
+    store.setJournalCreditPolicy(ledger_bytes, 0);
+
+    const payload2 = try change_journal_mod.encodeRecord(a, .{ .sequence = 2, .changed_doc_keys = &.{"doc-2"} });
+    defer a.free(payload2);
+    try std.testing.expectError(error.JournalCreditCapacityExceeded, store.appendReplayOpaque(a, 2, payload2));
+    try expectLedgerMatchesScanForTest(&store);
+
+    // An explicit drain (serviceRetirement, asserting ownership) releases the
+    // credit; the next append at the same capacity now completes.
+    store.requestRetirement(2);
+    const stats = try store.serviceRetirement(true, .{});
+    try std.testing.expect(stats.done);
+    try expectLedgerMatchesScanForTest(&store);
+
+    try store.appendReplayOpaque(a, 2, payload2);
+    try expectLedgerMatchesScanForTest(&store);
 }
 
 test "lite replay readers propagate allocation errors before and after callbacks" {
