@@ -1371,6 +1371,24 @@ fn compareLakeTextIndexSpec(_: void, lhs: LakeTextIndexSpec, rhs: LakeTextIndexS
     return std.mem.lessThan(u8, lhs.name, rhs.name);
 }
 
+/// Recent dense/sparse preparation is determined by the authoritative index
+/// definition, independently of inline versus directory-backed publication.
+pub fn hasEmbeddingIndexesFromDefinition(alloc: Allocator, indexes_json: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, if (indexes_json.len == 0) "{}" else indexes_json, .{});
+    defer parsed.deinit();
+    const indexes = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidTableIndexMetadata,
+    };
+    for (indexes.values()) |value| if (isEmbeddingIndex(value)) return true;
+    return false;
+}
+fn isEmbeddingIndex(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const kind = value.object.get("type") orelse return false;
+    return kind == .string and std.mem.eql(u8, kind.string, "embeddings");
+}
+
 fn listEmbeddingIndexesAlloc(alloc: Allocator, index_root: std.json.ObjectMap) ![]EmbeddingIndexSpec {
     var specs = std.ArrayListUnmanaged(EmbeddingIndexSpec).empty;
     errdefer {
@@ -1379,9 +1397,7 @@ fn listEmbeddingIndexesAlloc(alloc: Allocator, index_root: std.json.ObjectMap) !
     }
     var it = index_root.iterator();
     while (it.next()) |entry| {
-        if (entry.value_ptr.* != .object) continue;
-        const type_value = entry.value_ptr.object.get("type") orelse continue;
-        if (type_value != .string or !std.mem.eql(u8, type_value.string, "embeddings")) continue;
+        if (!isEmbeddingIndex(entry.value_ptr.*)) continue;
         const sparse = if (entry.value_ptr.object.get("sparse")) |value| switch (value) {
             .bool => |flag| flag,
             else => return error.InvalidTableIndexMetadata,
@@ -3499,4 +3515,11 @@ test "external lake global frontier declared text policy fences only affected bi
     }
     try std.testing.expectEqual(@as(u8, 0), try declaredTextProjectionRevision(a, unaffected));
     try std.testing.expectEqual(@as(u8, 2), try declaredTextProjectionRevision(a, affected));
+}
+
+test "serverless lake recent segment work follows canonical dense and sparse index kinds" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "", "{}", "{\"text\":{\"type\":\"full_text\"},\"metric\":{\"type\":\"algebraic\"}}", "{\"graph\":{\"type\":\"graph\"}}" }) |definition| try std.testing.expect(!try hasEmbeddingIndexesFromDefinition(a, definition));
+    for ([_][]const u8{ "{\"dense\":{\"type\":\"embeddings\"}}", "{\"sparse\":{\"type\":\"embeddings\",\"sparse\":true}}" }) |definition| try std.testing.expect(try hasEmbeddingIndexesFromDefinition(a, definition));
+    try std.testing.expectError(error.InvalidTableIndexMetadata, hasEmbeddingIndexesFromDefinition(a, "[]"));
 }

@@ -35,9 +35,8 @@ pub const default_max_expired: usize = 256;
 pub const Result = struct { planning: bool = false, expired_snapshots: usize = 0, remaining_snapshots: usize = 0, eligible_objects: usize = 0, deleted_objects: usize = 0, retained_objects: usize = 0, complete: bool = false, conflicted: bool = false, delegated: bool = false, provider: ?catalog.maintenance.Provider = null, provider_state: ?catalog.maintenance.State = null };
 const plan = @import("lake_vacuum_plan.zig");
 const Retired = plan.Retired;
-// Versions one and two keep their existing serialization and replay hashes.
-// Version three records a no-op that must finish cleanup without a catalog commit.
-const Job = struct { version: u8 = 1, id: []const u8, expected: []const u8, body: []const u8, timestamp_ms: i64, retired: []const Retired, nodes: []const plan.Inline = &.{} };
+// One immutable job format covers snapshot removal and cleanup-only work.
+const Job = struct { version: u8 = 4, no_op: bool = false, id: []const u8, expected: []const u8, body: []const u8, timestamp_ms: i64, retired: []const Retired, nodes: []const plan.Inline = &.{} };
 // Mutable planning progress is separate from the immutable catalog intent.
 // Each turn reads a bounded number of immutable inputs. Spill nodes are durable
 // before the conditional checkpoint publication; inline nodes need no PUT.
@@ -134,7 +133,7 @@ fn planningTurn(a: A, client_value: @import("objectstore").Client, bucket: []con
             progress.partial = null;
             continue;
         }
-        var sources: usize = 1;
+        var sources: catalog.manifest_inventory.BootstrapBudget = .{ .remaining_sources = 1 };
         const list = (try inventories.load(a, candidate.uri, true, &sources)) orelse return error.InvalidLakeVacuumPlan;
         const source_bytes = inventories.source_bytes_read;
         inventories.source_bytes_read = 0;
@@ -173,7 +172,7 @@ fn planningTurn(a: A, client_value: @import("objectstore").Client, bucket: []con
         }
         progress.partial = try plans.children(children.items);
         if (progress.manifest == list.count) {
-            try retired.append(a, .{ .snapshot = text, .object_plan = progress.partial });
+            try retired.append(a, .{ .snapshot = text, .object_plan = progress.partial.? });
             progress.candidate += 1;
             progress.manifest = 0;
             progress.partial = null;
@@ -186,7 +185,7 @@ fn planningTurn(a: A, client_value: @import("objectstore").Client, bucket: []con
     while (cache_bytes > 2 * 1024 * 1024 and start < manifest_roots.items.len) : (start += 1) cache_bytes -= manifest_roots.items[start].uri.len + 160;
     progress.manifests = manifest_roots.items[start..];
     var dependencies: std.ArrayList([]const u8) = .empty;
-    for (progress.retired) |entry| try dependencies.append(a, entry.object_plan.?);
+    for (progress.retired) |entry| try dependencies.append(a, entry.object_plan);
     if (progress.partial) |hash| try dependencies.append(a, hash);
     for (progress.manifests) |entry| try dependencies.append(a, entry.root);
     progress.nodes = try plans.inlineFor(dependencies.items);
@@ -208,21 +207,24 @@ fn planningTurn(a: A, client_value: @import("objectstore").Client, bucket: []con
     return if (!progress.spilling and (progress.candidate == progress.candidates.len or progress.retired.len == progress.max_expired)) progress else null;
 }
 const Execution = struct {
-    version: u8 = 2,
+    version: u8 = 4,
     job: []const u8,
     pinned: usize = 0,
-    // Legacy numeric positions are retained only to decode version-one jobs.
-    scan: usize = 0,
     cursor: plan.Cursor = .{},
+    // A traversal window can outlive its smaller catalog retirement batch.
+    // These unfenced candidates must be checked against current authority on
+    // every resume; the cursor's durable closure owns their inventory.
+    pending: []const []const u8 = &.{},
     approved: []const []const u8 = &.{},
     approved_index: usize = 0,
-    next_scan: usize = 0,
     exhausted: bool = false,
     complete: bool = false,
 };
 fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Binding, options: configured.BindingObjectStoreOpenOptions, request: Options, protected: []const []const u8, pin_store: pins.Store, destination: catalog.row_commit.Files, plans: *plan.Store, job: Job) !Result {
     var client = plans.client;
     const context = plans.context;
+    var visits: ?catalog.retirement_index.Index = null;
+    defer if (visits) |*index| index.deinit();
     const key = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-execution/{s}.json", .{ plans.prefix, catalog.types.digestHex(request.operation_id) });
     const job_hash = try a.dupe(u8, &catalog.types.digestHex(try std.json.Stringify.valueAlloc(a, job, .{})));
     var saved = client.getObject(plans.bucket, key, .{ .max_response_bytes = catalog.types.max_commit_bytes, .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
@@ -230,18 +232,13 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
         else => return err,
     };
     defer if (saved) |*value| value.deinit(client.allocator);
+    var queued: ?@import("objectstore").PutResult = null;
+    defer if (queued) |*value| value.deinit(client.allocator);
+    var queued_bytes: ?[]u8 = null;
+    defer if (queued_bytes) |bytes| a.free(bytes);
     var progress: Execution = if (saved) |value| try std.json.parseFromSliceLeaky(Execution, a, value.body, .{ .allocate = .alloc_always }) else .{ .job = job_hash };
-    if ((progress.version != 1 and progress.version != 2) or !std.mem.eql(u8, progress.job, job_hash) or progress.pinned > job.retired.len or progress.approved_index > progress.approved.len) return error.InvalidLakeVacuumPlan;
-    if (progress.version == 1) {
-        // Restart traversal once for legacy numeric cursors, then checkpoint
-        // bounded frontier progress. Already deleted objects stay harmless;
-        // preserve any pending batch's existing catalog retirement proof.
-        progress.version = 2;
-        progress.scan = 0;
-        progress.next_scan = 0;
-        progress.cursor = .{};
-        if (!progress.complete) progress.exhausted = false;
-    }
+    if (progress.version != 4 or !std.mem.eql(u8, progress.job, job_hash) or progress.pinned > job.retired.len or progress.approved_index > progress.approved.len or progress.pending.len > catalog.types.max_reference_steps) return error.InvalidLakeVacuumPlan;
+    if (progress.complete and progress.pending.len != 0) return error.InvalidLakeVacuumPlan;
     const input_store = try inputs.Store.init(a, client, plans.bucket, plans.prefix, request.operation_id, context);
     var result: Result = .{ .expired_snapshots = job.retired.len };
     var latest = try configured.executeLakeCatalogAlloc(a, binding, options, context, .load);
@@ -271,28 +268,52 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
                 var ready = try configured.executeLakeCatalogAlloc(a, binding, options, context, .{ .references = .{ .objects = &.{} } });
                 defer ready.deinit(a);
                 if (!ready.references.ready) break :selection;
-                var candidates: std.ArrayList([]const u8) = .empty;
                 var selected: std.ArrayList([]const u8) = .empty;
-                var seen = catalog.retirement_index.Index.init(a, client, plans.bucket, try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-traversal", .{plans.prefix}), context);
-                defer seen.deinit();
-                var walker = try plan.Walker.init(plans, job.retired, &seen, progress.cursor);
-                var steps = catalog.types.max_reference_steps - ready.references.steps;
-                if (steps == 0) break :selection;
-                var exhausted = false;
-                while (candidates.items.len < @min(16, request.max_deleted)) {
-                    const uri = (walker.next(&steps) catch |err| switch (err) {
-                        error.LakeVacuumPlanYield => break,
-                        else => return err,
-                    }) orelse {
-                        exhausted = true;
-                        break;
-                    };
-                    if (!has(candidates.items, uri)) try candidates.append(a, uri);
+                var candidates = progress.pending;
+                var exhausted = progress.exhausted;
+                if (candidates.len == 0) {
+                    var collected: std.ArrayList([]const u8) = .empty;
+                    visits = catalog.retirement_index.Index.init(a, client, plans.bucket, try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-traversal", .{plans.prefix}), context);
+                    const seen = &visits.?;
+                    if (progress.cursor.visited != null) seen.loadHints() catch {};
+                    try context.ensureActive();
+                    var walker = try plan.Walker.init(plans, job.retired, seen, progress.cursor);
+                    var steps = catalog.types.max_reference_steps - ready.references.steps;
+                    if (steps == 0) break :selection;
+                    exhausted = false;
+                    // Retained objects consume traversal work, not deletion
+                    // slots. Keep the existing 64-step bound and buffer any
+                    // candidates beyond the smaller fenced retirement batch.
+                    while (collected.items.len < catalog.types.max_reference_steps) {
+                        const uri = (walker.next(&steps) catch |err| switch (err) {
+                            error.LakeVacuumPlanYield => break,
+                            else => return err,
+                        }) orelse {
+                            exhausted = true;
+                            break;
+                        };
+                        if (!has(collected.items, uri)) try collected.append(a, uri);
+                    }
+                    candidates = collected.items;
+                    // Discovery is independent of commit authority. Persist
+                    // the durable frontier and unfenced queue before any
+                    // reference lookup or retirement can yield/conflict.
+                    progress.cursor = try walker.checkpoint();
+                    progress.pending = candidates;
+                    progress.exhausted = exhausted;
+                    queued_bytes = try std.json.Stringify.valueAlloc(a, progress, .{});
+                    queued = try storeExecution(&client, plans.bucket, key, queued_bytes.?, if (saved) |value| value.metadata.writeRevision() orelse return error.MissingObjectRevision else null, context);
+                    _ = queued.?.writeRevision() orelse return error.MissingObjectRevision;
                 }
-                var references = try configured.executeLakeCatalogAlloc(a, binding, options, context, .{ .references = .{ .objects = candidates.items, .max_steps = 0 } });
+                var references = try configured.executeLakeCatalogAlloc(a, binding, options, context, .{ .references = .{ .objects = candidates, .max_steps = 0 } });
                 defer references.deinit(a);
                 if (!references.references.ready) break :selection;
-                for (candidates.items, references.references.referenced) |uri, referenced| {
+                var consumed: usize = 0;
+                for (candidates, references.references.referenced) |uri, referenced| {
+                    if (selected.items.len == 16) break;
+                    try context.ensureActive();
+                    if (context.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s >= deadline) break;
+                    consumed += 1;
                     if (referenced) {
                         result.retained_objects += 1;
                         continue;
@@ -315,7 +336,7 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
                 }
                 progress.approved = selected.items;
                 progress.approved_index = 0;
-                progress.cursor = walker.checkpoint();
+                progress.pending = candidates[consumed..];
                 progress.exhausted = exhausted;
             }
             // Save the fenced deletion batch before any physical deletion.
@@ -335,17 +356,30 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
         if (progress.approved_index == progress.approved.len) {
             progress.approved = &.{};
             progress.approved_index = 0;
-            progress.complete = progress.exhausted;
+            progress.complete = progress.exhausted and progress.pending.len == 0;
         }
     }
     const bytes = try std.json.Stringify.valueAlloc(a, progress, .{});
-    var stored = if (saved) |value|
-        try client.compareAndPut(plans.bucket, key, bytes, value.metadata.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = catalog.types.contextCancellation(&context) })
-    else
-        try client.putObject(plans.bucket, key, bytes, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&context) });
-    stored.deinit(client.allocator);
+    defer a.free(bytes);
+    // A proof miss leaves the newly checkpointed queue unchanged. Avoid a
+    // second CAS in that case; approval/deletion updates use its new revision.
+    if (queued_bytes == null or !std.mem.eql(u8, queued_bytes.?, bytes)) {
+        const previous = if (queued) |value| value.writeRevision() orelse return error.MissingObjectRevision else if (saved) |value| value.metadata.writeRevision() orelse return error.MissingObjectRevision else null;
+        var stored = try storeExecution(&client, plans.bucket, key, bytes, previous, context);
+        stored.deinit(client.allocator);
+    }
+    // Only the saved cursor admits traversal. Reuse authenticated visited nodes
+    // across cold turns, publishing this optional cache after the progress CAS.
+    if (visits) |*index| {
+        index.saveHints(&.{progress.cursor.visited}) catch {};
+        try context.ensureActive();
+    }
     result.complete = progress.complete and try input_store.finish(a);
     return result;
+}
+fn storeExecution(client: *@import("objectstore").Client, bucket: []const u8, key: []const u8, bytes: []const u8, previous: ?@import("objectstore").ObjectRevision, context: catalog.types.Context) !@import("objectstore").PutResult {
+    if (previous) |revision| return client.compareAndPut(bucket, key, bytes, revision, .{ .cancellation = catalog.types.contextCancellation(&context) });
+    return client.putObject(bucket, key, bytes, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&context) });
 }
 const Marker = struct { uri: []const u8, sha256: []const u8, revision: @import("objectstore").ObjectRevision, owner: []const u8 };
 fn has(values: []const []const u8, value: []const u8) bool {
@@ -415,6 +449,73 @@ fn planSnapshot(a: A, files: catalog.row_commit.Files, snapshot: V, budget: *u64
     return plans.children(children.items);
 }
 const IdSet = std.StringHashMapUnmanaged(void);
+/// Accepted overlays certify every commit between their publication base and
+/// the current head. Keeping the base alone can leave that proof with a hole.
+/// Unknown/broken ancestry retains conservatively; it never manufactures a
+/// native-commit certificate or changes query validation.
+/// All allocations, including the result, belong to the operation arena.
+pub fn protectOverlayAncestry(a: A, root: V, bases: []const []const u8) ![]const []const u8 {
+    if (bases.len == 0) return bases;
+    const m = catalog.metadata;
+    const snapshots_value = try m.get(root, "snapshots");
+    if (snapshots_value != .array or snapshots_value.array.items.len > 100_000) return error.InvalidLakeMetadata;
+    const snapshots = snapshots_value.array.items;
+    const Entry = struct { text: []const u8, parent: ?i64 };
+    var nodes: std.AutoHashMapUnmanaged(i64, Entry) = .empty;
+    for (snapshots) |snapshot| {
+        const id = try m.int(try m.get(snapshot, "snapshot-id"));
+        const parent = snapshot.object.get("parent-snapshot-id") orelse .null;
+        const entry = try nodes.getOrPut(a, id);
+        if (entry.found_existing) return error.InvalidLakeMetadata;
+        entry.value_ptr.* = .{ .text = try std.fmt.allocPrint(a, "{d}", .{id}), .parent = if (parent == .null) null else try m.int(parent) };
+    }
+    var protected: IdSet = .empty;
+    var wanted: std.AutoHashMapUnmanaged(i64, void) = .empty;
+    var unknown = false;
+    for (bases) |base| {
+        try protected.put(a, base, {});
+        const id = std.fmt.parseInt(i64, base, 10) catch {
+            unknown = true;
+            continue;
+        };
+        try wanted.put(a, id, {});
+    }
+    var complete = false;
+    const head = root.object.get("current-snapshot-id") orelse .null;
+    if (!unknown and head != .null) {
+        var current = try m.int(head);
+        // A linear bound also terminates corrupt cycles without allocating an
+        // additional per-publication graph or rescanning the snapshot array.
+        for (0..snapshots.len + 1) |_| {
+            const node = nodes.get(current) orelse {
+                // A previously planned job must not retire a missing middle
+                // snapshot while a live base still depends on that edge.
+                try protected.put(a, try std.fmt.allocPrint(a, "{d}", .{current}), {});
+                break;
+            };
+            try protected.put(a, node.text, {});
+            _ = wanted.remove(current);
+            if (wanted.count() == 0) {
+                complete = true;
+                break;
+            }
+            current = node.parent orelse break;
+        }
+    }
+    if (!complete) {
+        var all = nodes.valueIterator();
+        while (all.next()) |node| try protected.put(a, node.text, {});
+    }
+    const result = try a.alloc([]const u8, protected.count());
+    var keys = protected.keyIterator();
+    for (result) |*id| id.* = (keys.next() orelse unreachable).*;
+    std.mem.sort([]const u8, result, {}, struct {
+        fn less(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.lessThan(u8, left, right);
+        }
+    }.less);
+    return result;
+}
 fn retainedIds(a: A, root: V, extra: []const []const u8, keep_latest: usize, before: i64) !IdSet {
     var retained: IdSet = .empty;
     for (extra) |id| try retained.put(a, id, {});
@@ -431,7 +532,15 @@ fn retainedIds(a: A, root: V, extra: []const []const u8, keep_latest: usize, bef
     }
     return retained;
 }
-pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Binding, options: configured.BindingObjectStoreOpenOptions, context: catalog.types.Context, request: Options, protected: []const []const u8) !Result {
+pub fn run(backing: A, binding: local.serverless_external_source_catalog_binding.Binding, options: configured.BindingObjectStoreOpenOptions, parent_context: catalog.types.Context, request: Options, protected: []const []const u8) !Result {
+    // Provider transports allocate internally as well as through per-call
+    // result allocators. One shared wrapper protects all providers opened in
+    // this request, including when the caller supplied an unsynchronized arena.
+    // All clients/workers drain before this scope and its allocator can end.
+    var allocations: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = backing };
+    const a = allocations.allocator();
+    var context = parent_context;
+    context.parallel_object_io = true;
     if (request.max_plan_steps < 3 or request.max_plan_steps > 128 or request.operation_id.len == 0 or request.operation_id.len > 256 or request.retain_ms > std.math.maxInt(i64) or request.retain_ms < 10 * 60 * 1000 or request.keep_latest == 0 or request.keep_latest > 1024 or request.max_deleted == 0 or request.max_deleted > 4096 or request.max_expired == 0 or request.max_expired > 4096) return error.InvalidLakeMaintenanceLimits;
     // A local object-store retirement marker cannot fence commits or readers
     // admitted by an external catalog. An ownership assertion is insufficient:
@@ -482,9 +591,8 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
     if (saved) |value| {
         if (request.dry_run) return error.LakeMaintenanceAlreadyStarted;
         job = try std.json.parseFromSliceLeaky(Job, scratch, value.body, .{ .allocate = .alloc_always });
-        if (job.version != 1 and job.version != 2 and job.version != 3) return error.InvalidLakeVacuumPlan;
-        if (job.version == 3 and (job.retired.len != 0 or job.nodes.len != 0)) return error.InvalidLakeVacuumPlan;
-        for (job.retired) |retired| if ((job.version == 2) != (retired.object_plan != null)) return error.InvalidLakeVacuumPlan;
+        if (job.version != 4 or job.no_op != (job.retired.len == 0)) return error.InvalidLakeVacuumPlan;
+        if (job.no_op and job.nodes.len != 0) return error.InvalidLakeVacuumPlan;
         try plans.seed(job.nodes);
     } else {
         var retired: std.ArrayList(Retired) = .empty;
@@ -538,10 +646,10 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
         }
         const parent = try catalog.metadata.get(authority_root, "current-snapshot-id");
         const body = try std.json.Stringify.valueAlloc(scratch, .{ .requirements = .{.{ .type = "assert-ref-snapshot-id", .ref = "main", .@"snapshot-id" = parent }}, .updates = .{.{ .action = "remove-snapshots", .@"snapshot-ids" = ids.items }} }, .{});
-        job = .{ .version = if (ids.items.len == 0) 3 else 2, .id = try std.fmt.allocPrint(scratch, "vacuum-{s}", .{catalog.types.digestHex(request.operation_id)}), .expected = current.table.metadata_location, .body = body, .timestamp_ms = now_ms, .retired = retired.items, .nodes = try plans.inlineNodes() };
+        job = .{ .no_op = ids.items.len == 0, .id = try std.fmt.allocPrint(scratch, "vacuum-{s}", .{catalog.types.digestHex(request.operation_id)}), .expected = current.table.metadata_location, .body = body, .timestamp_ms = now_ms, .retired = retired.items, .nodes = try plans.inlineNodes() };
         if (!request.dry_run) {
             const roots = try scratch.alloc([]const u8, job.retired.len);
-            for (job.retired, roots) |entry, *hash| hash.* = entry.object_plan.?;
+            for (job.retired, roots) |entry, *hash| hash.* = entry.object_plan;
             job.nodes = try plans.inlineFor(roots);
             // Filtering to final roots can only expand their inline allowance;
             // external closures were already flushed by the bounded planner.
@@ -557,7 +665,7 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
         // The immutable job owns all replay dependencies before closing input
         // admission. Existing registered planners are drained before cleanup.
         try input_store.close(scratch);
-        if (job.version == 3) return .{ .complete = try input_store.finish(scratch) };
+        if (job.no_op) return .{ .complete = try input_store.finish(scratch) };
     }
     // Snapshot removal precedes retirement. Concurrent refs/commits must win a
     // catalog CAS; a failed job never deletes files or blindly rebases its intent.
@@ -632,6 +740,42 @@ test "external lake vacuum retains refs newest snapshots recent commits and read
     try std.testing.expect(retained.contains("3"));
     try std.testing.expect(retained.contains("4"));
     try std.testing.expect(retained.contains("5"));
+}
+
+test "external lake vacuum ancestry protection unions live bases without retaining older history" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.json.parseFromSliceLeaky(V, a,
+        \\{"current-snapshot-id":4,"snapshots":[{"snapshot-id":1},{"snapshot-id":9},{"snapshot-id":2,"parent-snapshot-id":1},{"snapshot-id":3,"parent-snapshot-id":2},{"snapshot-id":4,"parent-snapshot-id":3}]}
+    , .{});
+    const protected = try protectOverlayAncestry(a, root, &.{ "3", "2", "3" });
+    try std.testing.expectEqual(@as(usize, 3), protected.len);
+    for (protected, [_][]const u8{ "2", "3", "4" }) |id, expected| try std.testing.expectEqualStrings(expected, id);
+    const current = try protectOverlayAncestry(a, root, &.{"4"});
+    try std.testing.expectEqual(@as(usize, 1), current.len);
+    try std.testing.expectEqualStrings("4", current[0]);
+    try std.testing.expectEqual(@as(usize, 0), (try protectOverlayAncestry(a, root, &.{})).len);
+}
+
+test "external lake vacuum ancestry protection fails closed for gaps cycles and unknown bases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        \\{"current-snapshot-id":3,"snapshots":[{"snapshot-id":1},{"snapshot-id":9},{"snapshot-id":3,"parent-snapshot-id":2}]}
+        ,
+        \\{"current-snapshot-id":3,"snapshots":[{"snapshot-id":1},{"snapshot-id":9},{"snapshot-id":2,"parent-snapshot-id":3},{"snapshot-id":3,"parent-snapshot-id":2}]}
+        ,
+    }) |bytes| {
+        const root = try std.json.parseFromSliceLeaky(V, a, bytes, .{});
+        const protected = try protectOverlayAncestry(a, root, &.{"1"});
+        // Include a missing middle ID as a guard against an already-planned
+        // retirement, and terminate cycles without granting new read authority.
+        for ([_][]const u8{ "1", "2", "3", "9" }) |id| try std.testing.expect(has(protected, id));
+        const unknown = try protectOverlayAncestry(a, root, &.{"empty:initial"});
+        try std.testing.expect(has(unknown, "1") and has(unknown, "3") and has(unknown, "9"));
+    }
 }
 
 const Collection = enum { retained, eligible, deleted };
@@ -735,7 +879,8 @@ test "external lake vacuum definitive commit conflict completes its saved operat
     defer queue.deinit();
     const base = try ingestion.prefix(a, queue.prefix, binding, options);
     const key = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum/{s}.json", .{ base, catalog.types.digestHex("scheduled-0-vacuum") });
-    const saved: Job = .{ .id = "saved-vacuum", .expected = initial.table.metadata_location, .body = "{\"requirements\":[],\"updates\":[]}", .timestamp_ms = 2, .retired = &.{} };
+    var writer: plan.Store = .{ .a = a, .client = queue.client, .bucket = queue.bucket, .prefix = base, .context = .{}, .dry_run = false };
+    const saved: Job = .{ .id = "saved-vacuum", .expected = initial.table.metadata_location, .body = "{\"requirements\":[],\"updates\":[]}", .timestamp_ms = 2, .retired = &.{.{ .snapshot = "expired", .object_plan = try writer.objects(&.{}) }} };
     var client = queue.client;
     var stored = try client.putObject(queue.bucket, key, try std.json.Stringify.valueAlloc(a, saved, .{}), .{});
     stored.deinit(client.allocator);
@@ -777,35 +922,7 @@ test "external lake vacuum expires a large backlog in bounded oldest-first jobs"
     for (expected, 0..) |counts, pass| {
         const request: Options = .{ .operation_id = try std.fmt.allocPrint(a, "vacuum-{d}", .{pass}), .dry_run = false, .exclusive_ownership = true, .retain_ms = 10 * 60 * 1000, .keep_latest = 1, .max_expired = 2, .max_deleted = 1 };
         var result = try run(alloc, binding, options, .{}, request, &.{});
-        if (pass == 0) {
-            try std.testing.expect(!result.complete);
-            // Resume a pre-frontier execution journal with a fenced batch.
-            // Migration must preserve that batch and restart only traversal.
-            var queue = try ingestion.openQueue(alloc, binding, options);
-            defer queue.deinit();
-            const execution_key = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-execution/{s}.json", .{ try ingestion.prefix(a, queue.prefix, binding, options), catalog.types.digestHex(request.operation_id) });
-            var previous = try queue.client.getObject(queue.bucket, execution_key, .{});
-            defer previous.deinit(queue.client.allocator);
-            var legacy = try std.json.parseFromSliceLeaky(Execution, a, previous.body, .{ .allocate = .alloc_always });
-            // Reachability bootstrap may yield before selecting the first
-            // fenced batch. Migrate only once that batch is durable.
-            var bootstrap_turns: usize = 0;
-            while (legacy.approved.len == 0 and bootstrap_turns < 64) : (bootstrap_turns += 1) {
-                result = try run(alloc, binding, options, .{}, request, &.{});
-                previous.deinit(queue.client.allocator);
-                previous = try queue.client.getObject(queue.bucket, execution_key, .{});
-                legacy = try std.json.parseFromSliceLeaky(Execution, a, previous.body, .{ .allocate = .alloc_always });
-            }
-            try std.testing.expect(legacy.approved.len != 0);
-            legacy.version = 1;
-            legacy.scan = 0;
-            legacy.next_scan = 1;
-            legacy.cursor = .{};
-            var wire = try std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(a, legacy, .{}), .{});
-            _ = wire.object.swapRemove("cursor");
-            var replaced = try queue.client.compareAndPut(queue.bucket, execution_key, try std.json.Stringify.valueAlloc(a, wire, .{}), previous.metadata.writeRevision() orelse return error.MissingObjectRevision, .{});
-            replaced.deinit(queue.client.allocator);
-        }
+        if (pass == 0) try std.testing.expect(!result.complete);
         var deleted = result.deleted_objects;
         // A deletion-limited job spans turns; every turn must retain backlog.
         var turns: usize = 0;
@@ -818,7 +935,7 @@ test "external lake vacuum expires a large backlog in bounded oldest-first jobs"
         try std.testing.expectEqual(counts[0], result.expired_snapshots);
         try std.testing.expectEqual(counts[1], result.remaining_snapshots);
         // Reopen the saved immutable job, as after a lost response/restart.
-        // Older jobs have no persisted backlog field; derive it from authority.
+        // Derive the remaining backlog from current catalog authority.
         const replay = try run(alloc, binding, options, .{}, request, &.{});
         try std.testing.expect(replay.complete and !replay.conflicted);
         try std.testing.expectEqual(counts[1], replay.remaining_snapshots);
@@ -925,11 +1042,17 @@ test "external lake vacuum resumes 200 snapshots within remote budgets and reval
     defer saved.deinit(queue.client.allocator);
     try std.testing.expect(saved.body.len < plan.inline_budget + 64 * 1024);
     const job = try std.json.parseFromSliceLeaky(Job, a, saved.body, .{});
-    try std.testing.expectEqual(@as(u8, 2), job.version);
+    try std.testing.expectEqual(@as(u8, 4), job.version);
     try std.testing.expect(job.nodes.len > 0);
     for (job.retired) |retired| {
-        try std.testing.expect(retired.objects.len == 0 and retired.object_plan != null);
+        try std.testing.expectEqual(@as(usize, 64), retired.object_plan.len);
     }
+    // Cold turns must reuse bounded visited-node metadata, not fetch the same
+    // immutable trie on every resume. The saved cursor remains the authority.
+    const hint_key = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-traversal/warm-v1.json", .{try ingestion.prefix(a, queue.prefix, binding, options)});
+    var hint = try queue.client.getObject(queue.bucket, hint_key, .{});
+    defer hint.deinit(queue.client.allocator);
+    try std.testing.expect(hint.body.len <= catalog.retirement_index.hint_bytes);
     // Expired source lists are gone. A fresh process must finish from journal
     // inventories, without relying on their cached source bytes.
     const replay = try run(alloc, binding, options, .{}, request, &.{});
@@ -1148,4 +1271,192 @@ test "external lake vacuum no-op jobs reclaim inputs and replay without catalog 
     defer registration.deinit(client.allocator);
     const admission = try std.json.parseFromSliceLeaky(V, a, registration.body, .{});
     try std.testing.expectEqual(@as(usize, 1), (try catalog.metadata.get(admission, "leases")).array.items.len);
+}
+
+test "external lake vacuum selection crosses retained objects without spending the delete allowance" {
+    try verifyBufferedSelection(4);
+}
+
+test "external lake vacuum selection retains excess candidates across cold deletion limited turns" {
+    try verifyBufferedSelection(22);
+}
+
+fn verifyBufferedSelection(owned_count: usize) !void {
+    const alloc = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-vacuum-selection");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = try std.json.Stringify.valueAlloc(a, .{ .deployment_mode = "standalone", .storage = .{ .engine = "local", .local = .{ .base_dir = directory.path() } } }, .{});
+    var config = try local.common_config.Config.parseFromSlice(alloc, json);
+    defer config.deinit();
+    const binding: local.serverless_external_source_catalog_binding.Binding = .{ .table_id = "events", .format = .iceberg, .source_uri = try std.fmt.allocPrint(a, "file://{s}/warehouse", .{directory.path()}), .schema_fingerprint = "schema", .write_policy = .iceberg_writer, .catalog = .{ .type = .managed } };
+    const options: configured.BindingObjectStoreOpenOptions = .{ .node_config = &config, .catalog_table_id = 11 };
+    var opened = try configured.openBindingObjectStoreAlloc(alloc, binding, options);
+    defer opened.deinit();
+    const authority: catalog.managed.Managed = .{ .client = opened.client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = binding.source_uri };
+    const table = try authority.create(a, "create", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+    const files = try ingestion.destinationFiles(a, opened, binding.source_uri, .{});
+    const base = try ingestion.prefix(a, opened.prefix, binding, options);
+    const request: Options = .{ .operation_id = "selection", .dry_run = false, .exclusive_ownership = true, .retain_ms = 600000, .keep_latest = 1, .max_deleted = 1 };
+    const input_store = try inputs.Store.init(a, opened.client, opened.bucket, base, request.operation_id, .{});
+    try input_store.close(a);
+    var objects: std.ArrayList([]const u8) = .empty;
+    // Retained, externally owned files precede the expired native files in an
+    // already committed job. Finding them must consume traversal work, rather
+    // than the physical-deletion allowance or an entire maintenance turn.
+    for (0..24) |i| {
+        const name = try std.fmt.allocPrint(a, "data/external-{d}.parquet", .{i});
+        var stored = try opened.client.putObject(opened.bucket, try std.fmt.allocPrint(a, "{s}{s}{s}", .{ files.prefix, if (files.prefix.len == 0) "" else "/", name }), "external", .{});
+        stored.deinit(opened.client.allocator);
+        try objects.append(a, try std.fmt.allocPrint(a, "{s}/{s}", .{ files.uri, name }));
+    }
+    for (0..owned_count) |i| try objects.append(a, try catalog.row_commit.upload(a, files, try std.fmt.allocPrint(a, "data/expired-{d}.parquet", .{i}), "expired"));
+    var writer: plan.Store = .{ .a = a, .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = .{}, .dry_run = false };
+    const job: Job = .{ .id = "retired-job", .expected = table.metadata_location, .body = "{}", .timestamp_ms = 2, .retired = &.{.{ .snapshot = "2", .object_plan = try writer.objects(objects.items) }} };
+    const pin_store: pins.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = try std.fmt.allocPrint(a, "{s}/selection-pins", .{base}) };
+    const execution_key = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-execution/{s}.json", .{ base, catalog.types.digestHex(request.operation_id) });
+    var deleted: usize = 0;
+    const turns = owned_count + try std.math.divCeil(usize, owned_count, 16);
+    for (0..turns) |turn| {
+        // Reopen every turn, including the deletion-limited approved batch.
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        var plans: plan.Store = .{ .a = scratch.allocator(), .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = .{}, .dry_run = false };
+        const result = try executeJob(scratch.allocator(), binding, options, request, &.{}, pin_store, files, &plans, job);
+        try std.testing.expect(result.deleted_objects <= request.max_deleted);
+        deleted += result.deleted_objects;
+        if (turn == 0) {
+            try std.testing.expectEqual(@as(usize, 0), result.deleted_objects);
+            try std.testing.expectEqual(@as(usize, 24), result.retained_objects);
+            var saved = try opened.client.getObject(opened.bucket, execution_key, .{});
+            defer saved.deinit(opened.client.allocator);
+            const progress = try std.json.parseFromSliceLeaky(Execution, scratch.allocator(), saved.body, .{});
+            try std.testing.expectEqual(@min(16, owned_count), progress.approved.len);
+            try std.testing.expectEqual(owned_count - @min(16, owned_count), progress.pending.len);
+            try std.testing.expectEqual(@as(u8, 4), progress.version);
+            try std.testing.expectEqual(@as(usize, 0), progress.approved_index);
+        }
+        try std.testing.expectEqual(turn + 1 == turns, result.complete);
+    }
+    try std.testing.expectEqual(owned_count, deleted);
+    for (0..24) |i| {
+        var preserved = try opened.client.getObject(opened.bucket, try std.fmt.allocPrint(a, "{s}{s}data/external-{d}.parquet", .{ files.prefix, if (files.prefix.len == 0) "" else "/", i }), .{});
+        defer preserved.deinit(opened.client.allocator);
+        try std.testing.expectEqualStrings("external", preserved.body);
+    }
+}
+
+test "external lake vacuum checkpoints unfenced traversal when HEAD advances during the walk" {
+    try verifyUnfencedTraversal(.walk);
+}
+test "external lake vacuum checkpoints unfenced traversal before a retirement conflict" {
+    try verifyUnfencedTraversal(.retirement);
+}
+test "external lake vacuum unfenced checkpoint survives a lost acknowledgment" {
+    try verifyUnfencedTraversal(.checkpoint_ack);
+}
+const TraversalInterleave = enum { walk, retirement, checkpoint_ack };
+fn verifyUnfencedTraversal(interleave: TraversalInterleave) !void {
+    const alloc = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("vacuum-walk-advance");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = try std.json.Stringify.valueAlloc(a, .{ .deployment_mode = "standalone", .storage = .{ .engine = "local", .local = .{ .base_dir = directory.path() } } }, .{});
+    var config = try local.common_config.Config.parseFromSlice(alloc, json);
+    defer config.deinit();
+    const binding: local.serverless_external_source_catalog_binding.Binding = .{ .table_id = "events", .format = .iceberg, .source_uri = try std.fmt.allocPrint(a, "file://{s}/warehouse", .{directory.path()}), .schema_fingerprint = "schema", .write_policy = .iceberg_writer, .catalog = .{ .type = .managed } };
+    const options: configured.BindingObjectStoreOpenOptions = .{ .node_config = &config, .catalog_table_id = 11 };
+    var opened = try configured.openBindingObjectStoreAlloc(alloc, binding, options);
+    defer opened.deinit();
+    var managed: catalog.managed.Managed = .{ .client = opened.client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = binding.source_uri };
+    const table = try managed.create(a, "create", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+    const files = try ingestion.destinationFiles(a, opened, binding.source_uri, .{});
+    const base = try ingestion.prefix(a, opened.prefix, binding, options);
+    const obsolete = try catalog.row_commit.upload(a, files, "data/obsolete.parquet", "obsolete");
+    const row = try std.json.parseFromSliceLeaky(V, a, "{\"id\":1}", .{});
+    const prepared = try catalog.row_commit.prepare(a, table, files, .{ .batch_id = "new-head", .source = "s", .epoch = "1", .checkpoint = "1", .key_fields = &.{"id"}, .changes = &.{.{ .op = .upsert, .row = row }} }, 1, 2);
+    const commit = try std.json.parseFromSliceLeaky(V, a, prepared.body, .{});
+    const live_list = for ((try catalog.metadata.get(commit, "updates")).array.items) |update| {
+        if (update.object.get("snapshot")) |snapshot| break try catalog.metadata.str(try catalog.metadata.get(snapshot, "manifest-list"));
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(prepared.snapshot_id != 2);
+    const request: Options = .{ .operation_id = "walk-advance", .dry_run = false, .exclusive_ownership = true, .retain_ms = 600000, .keep_latest = 1, .max_deleted = 1 };
+    const input_store = try inputs.Store.init(a, opened.client, opened.bucket, base, request.operation_id, .{});
+    try input_store.close(a);
+    var writer: plan.Store = .{ .a = a, .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = .{}, .dry_run = false };
+    const root = try writer.objects(&.{ obsolete, live_list });
+    const job: Job = .{ .id = "retired", .expected = table.metadata_location, .body = "{}", .timestamp_ms = 3, .retired = &.{.{ .snapshot = "2", .object_plan = root }} };
+    const Advance = struct {
+        a: A,
+        managed: *catalog.managed.Managed,
+        table: catalog.types.Table,
+        prepared: catalog.row_commit.Prepared,
+        interleave: TraversalInterleave,
+        fired: bool = false,
+        failure: ?anyerror = null,
+        fn matches(raw: *anyopaque, _: []const u8, key: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return std.mem.indexOf(u8, key, if (self.interleave == .retirement) ".antfly-owned/" else "/maintenance/vacuum-plans/") != null;
+        }
+        fn run(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.fired = true;
+            var next = self.managed.commit(self.a, .{ .id = "new-head", .expected_metadata_location = self.table.metadata_location, .body = self.prepared.body, .timestamp_ms = 2 }) catch |err| {
+                self.failure = err;
+                return;
+            };
+            next.deinit(self.a);
+        }
+    };
+    var advance: Advance = .{ .a = a, .managed = &managed, .table = table, .prepared = prepared, .interleave = interleave };
+    var faults = @import("objectstore").ScriptedFaultClient.init(alloc, opened.client);
+    defer faults.deinit();
+    faults.get_filter = .{ .ptr = &advance, .matches = Advance.matches };
+    faults.next_get = .{ .complete_then_callback = .{ .ptr = &advance, .run = Advance.run } };
+    if (interleave == .checkpoint_ack) {
+        faults.put_filter = .{ .ptr = &advance, .matches = struct {
+            fn matches(_: *anyopaque, _: []const u8, key_: []const u8, _: []const u8) bool {
+                return std.mem.indexOf(u8, key_, "/maintenance/vacuum-execution/") != null;
+            }
+        }.matches };
+        faults.commitNextPutThenFail(error.InjectedCheckpointAckLoss);
+    }
+    const pin_store: pins.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = try std.fmt.allocPrint(a, "{s}/selection-pins", .{base}) };
+    var cold: plan.Store = .{ .a = a, .client = faults.client(), .bucket = opened.bucket, .prefix = base, .context = .{}, .dry_run = false };
+    var checked_files = files;
+    if (interleave == .retirement) checked_files.client = faults.client();
+    const first = executeJob(a, binding, options, request, &.{}, pin_store, checked_files, &cold, job) catch |err| interrupted: {
+        try std.testing.expectEqual(@as(anyerror, if (interleave == .retirement) error.LakeCommitConflict else if (interleave == .checkpoint_ack) error.InjectedCheckpointAckLoss else error.TestUnexpectedResult), err);
+        break :interrupted Result{};
+    };
+    try std.testing.expect(advance.fired);
+    if (advance.failure) |err| return err;
+    try std.testing.expect(!first.complete and first.deleted_objects == 0);
+    const key = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-execution/{s}.json", .{ base, catalog.types.digestHex(request.operation_id) });
+    var saved = try opened.client.getObject(opened.bucket, key, .{});
+    defer saved.deinit(opened.client.allocator);
+    const progress = try std.json.parseFromSliceLeaky(Execution, a, saved.body, .{});
+    try std.testing.expectEqual(@as(usize, 2), progress.pending.len);
+    try std.testing.expectEqual(@as(usize, 1), progress.cursor.snapshot);
+    try std.testing.expect(progress.exhausted and progress.approved.len == 0);
+    // Reopen without warm process state. The new HEAD now references one of
+    // the queued candidates, which must be revalidated rather than deleted.
+    var result = first;
+    var deleted: usize = 0;
+    for (0..16) |_| {
+        if (result.complete) break;
+        var next: plan.Store = .{ .a = a, .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = .{}, .dry_run = false };
+        result = try executeJob(a, binding, options, request, &.{}, pin_store, files, &next, job);
+        deleted += result.deleted_objects;
+    }
+    try std.testing.expect(result.complete);
+    try std.testing.expectEqual(@as(usize, 1), deleted);
+    try std.testing.expectError(error.FileNotFound, catalog.row_commit.read(a, files, obsolete));
+    var list = try iceberg.parseManifestListAlloc(alloc, try catalog.row_commit.read(a, files, live_list));
+    defer list.deinit(alloc);
+    try std.testing.expect(list.entries.len != 0);
 }

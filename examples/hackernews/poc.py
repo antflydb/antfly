@@ -66,6 +66,19 @@ class RequestFailure(RuntimeError):
             "resource_exhausted",
             "too_many_requests",
             "temporarily_unavailable",
+            "metadata_leader_unavailable",
+            # Stable QueryTemporarilyUnavailableReason values from the public
+            # query contract. Preserve the reason, never the provider message.
+            "decision_provider_unavailable",
+            "doc_identity_unavailable",
+            "read_requires_primary",
+            "standby_read_unavailable",
+            "distributed_query_unavailable",
+            "storage_read_temporarily_unavailable",
+            "metric_not_ready",
+            "metric_stale",
+            "query_embedding_temporarily_unavailable",
+            "reranker_temporarily_unavailable",
             "invalid_request",
             "unsupported_exact_sort",
             "unsupported_query",
@@ -87,7 +100,9 @@ class RequestFailure(RuntimeError):
         return cls(record)
 
     @classmethod
-    def transport(cls, method, path, error, elapsed_ms):
+    def transport(
+        cls, method, path, error, elapsed_ms, *, phase=None, response_status=None
+    ):
         reason = error.reason if isinstance(error, urllib.error.URLError) else error
         record = {
             "method": method,
@@ -98,6 +113,12 @@ class RequestFailure(RuntimeError):
         }
         if type(getattr(reason, "errno", None)) is int:
             record["errno"] = reason.errno
+        if phase in {"connect_or_headers", "response_body"}:
+            record["transport_phase"] = phase
+        # Separate from http_status: a broken body is still a transport failure,
+        # even after 200 headers, and must retain the existing resume policy.
+        if type(response_status) is int and 100 <= response_status <= 599:
+            record["response_status"] = response_status
         return cls(record)
 
 
@@ -118,6 +139,7 @@ def gcs_bearer(project, minimum_seconds=1800):
             check=True,
             capture_output=True,
             text=True,
+            timeout=60,
         )
         credential = json.loads(result.stdout)["credential"]
         expiry = datetime.datetime.fromisoformat(credential["token_expiry"])

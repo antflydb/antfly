@@ -25,6 +25,33 @@ const Digest = [32]u8;
 const ChunkRef = struct { hash: Digest, start: usize, count: usize, offset: usize, bytes: usize };
 pub const Inventory = struct { version: u8 = 1, uri: []const u8, manifest_list: bool, pack: Digest, chunks: []const ChunkRef, count: usize };
 const Chunk = struct { paths: []const []const u8 };
+pub const max_source_bytes = 16 * 1024 * 1024;
+pub const BootstrapBudget = struct {
+    pub const credit_bytes = 4 * max_source_bytes;
+    pub const max_sources = 64;
+    pub const plain_min_credit = 1024 * 1024;
+    remaining_sources: usize = max_sources,
+    remaining_credit: usize = credit_bytes,
+
+    pub fn exhausted(self: BootstrapBudget) bool {
+        return self.remaining_sources == 0 or self.remaining_credit == 0;
+    }
+    fn validate(self: BootstrapBudget) !void {
+        if (self.remaining_sources > max_sources or self.remaining_credit > credit_bytes) return error.InvalidLakeReachability;
+    }
+    fn charge(self: *BootstrapBudget, bytes: []const u8) !bool {
+        // Compressed containers keep the former four-object allowance: small
+        // encoded bodies do not imply small decoded blocks. Plain containers
+        // share the same 64 MiB credit, with a minimum charge for per-file work.
+        const cost = if (try avro.isUncompressedContainer(bytes)) @max(bytes.len, plain_min_credit) else max_source_bytes;
+        if (cost > self.remaining_credit) {
+            self.remaining_credit = 0;
+            return false;
+        }
+        self.remaining_credit -= cost;
+        return true;
+    }
+};
 
 pub const Store = struct {
     files: rows.Files,
@@ -59,7 +86,8 @@ pub const Store = struct {
         };
         stored.deinit(a);
     }
-    pub fn load(self: *Store, a: A, uri: []const u8, manifest_list: bool, sources: *usize) !?Inventory {
+    pub fn load(self: *Store, a: A, uri: []const u8, manifest_list: bool, sources: *BootstrapBudget) !?Inventory {
+        try sources.validate();
         const path = try self.key(a, try std.fmt.allocPrint(a, "inventories/{s}-{s}.json", .{ types.digestHex(uri), if (manifest_list) "list" else "manifest" }));
         if (try self.get(a, path, types.max_metadata_bytes)) |value| {
             var object = value;
@@ -80,11 +108,23 @@ pub const Store = struct {
         // One bounded Avro object is the indivisible bootstrap unit. The caller
         // bounds source reads; a durable receipt avoids reparsing that source
         // on cold resumes.
-        if (sources.* == 0) return null;
-        sources.* -= 1;
-        const bytes = try rows.readLimited(a, self.files, uri, 16 * 1024 * 1024);
+        if (sources.exhausted()) return null;
+        sources.remaining_sources -= 1;
+        const limit = @min(max_source_bytes, sources.remaining_credit);
+        const bytes = rows.readLimited(a, self.files, uri, limit) catch |err| {
+            if (err == error.ResponseTooLarge and limit < max_source_bytes) {
+                // This valid object may only be too large for the remainder
+                // of this turn. Leave its cursor untouched for a fresh budget.
+                sources.remaining_credit = 0;
+                return null;
+            }
+            return err;
+        };
         self.source_bytes_read += bytes.len;
         self.bytes_read += bytes.len;
+        const admitted = try sources.charge(bytes);
+        try self.files.context.ensureActive();
+        if (!admitted) return null;
         var paths: std.ArrayList([]const u8) = .empty;
         if (manifest_list) {
             const list = try avro.parseManifestListAlloc(a, bytes);
@@ -166,3 +206,87 @@ pub const Store = struct {
         }
     };
 };
+
+fn emptyListFixture(a: A, codec: []const u8) ![]u8 {
+    const writer = @import("avro_writer.zig");
+    const plain = try writer.ocf(a, writer.list_schema, &.{}, &.{});
+    defer a.free(plain);
+    const tag = "\x14avro.codec";
+    const old = tag ++ "\x08null";
+    const offset = std.mem.indexOf(u8, plain, old) orelse return error.TestUnexpectedResult;
+    var bytes: std.ArrayList(u8) = .empty;
+    try bytes.appendSlice(a, plain[0 .. offset + tag.len]);
+    try bytes.append(a, @intCast(codec.len * 2));
+    try bytes.appendSlice(a, codec);
+    try bytes.appendSlice(a, plain[offset + old.len ..]);
+    return bytes.toOwnedSlice(a);
+}
+
+test "external lake bootstrap budget admits small plain cohorts and retains compressed allowance" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    for ([_][]const u8{ "null", "deflate", "snappy", "zstandard" }) |codec| {
+        const body = try emptyListFixture(scratch, codec);
+        var parsed = try avro.parseManifestListAlloc(a, body);
+        parsed.deinit(a);
+        var store: Store = .{ .files = .{ .client = client, .bucket = "archive", .prefix = "events", .uri = "gs://archive/events" }, .client = client, .bucket = "archive", .prefix = try std.fmt.allocPrint(scratch, "proof-{s}", .{codec}) };
+        var budget: BootstrapBudget = .{};
+        var loaded: usize = 0;
+        for (0..10) |i| {
+            const key_ = try std.fmt.allocPrint(scratch, "events/metadata/{s}-{d}.avro", .{ codec, i });
+            var result = try client.putObject("archive", key_, body, .{});
+            result.deinit(a);
+            if (try store.load(scratch, try std.fmt.allocPrint(scratch, "gs://archive/{s}", .{key_}), true, &budget)) |_| loaded += 1;
+        }
+        try std.testing.expectEqual(@as(usize, if (std.mem.eql(u8, codec, "null")) 10 else 4), loaded);
+        try std.testing.expect(store.source_bytes_read <= BootstrapBudget.credit_bytes);
+        if (!std.mem.eql(u8, codec, "null")) try std.testing.expect(budget.exhausted());
+    }
+}
+
+test "external lake bootstrap budget defers without publishing a partial inventory" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    const body = try emptyListFixture(scratch, "null");
+    var put = try client.putObject("archive", "events/metadata/list.avro", body, .{});
+    put.deinit(a);
+    const uri = "gs://archive/events/metadata/list.avro";
+    for ([_]usize{ 1, BootstrapBudget.plain_min_credit / 2 }) |remaining| {
+        const prefix = try std.fmt.allocPrint(scratch, "proof-{d}", .{remaining});
+        var store: Store = .{ .files = .{ .client = client, .bucket = "archive", .prefix = "events", .uri = "gs://archive/events" }, .client = client, .bucket = "archive", .prefix = prefix };
+        var budget: BootstrapBudget = .{ .remaining_credit = remaining };
+        try std.testing.expectEqual(@as(?Inventory, null), try store.load(scratch, uri, true, &budget));
+        try std.testing.expect(budget.exhausted());
+        var objects = try client.listObjects("archive", .{ .prefix = prefix, .max_keys = 100 });
+        defer objects.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), objects.entries.len);
+        var fresh: BootstrapBudget = .{};
+        const recovered = (try store.load(scratch, uri, true, &fresh)).?;
+        try std.testing.expectEqual(@as(usize, 0), recovered.count);
+    }
+}
+
+test "external lake bootstrap budget rejects expanded envelopes before IO" {
+    const a = std.testing.allocator;
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var store: Store = .{ .files = .{ .client = memory.client(), .bucket = "archive", .prefix = "events", .uri = "gs://archive/events" }, .client = memory.client(), .bucket = "archive", .prefix = "proof" };
+    for ([_]BootstrapBudget{
+        .{ .remaining_sources = BootstrapBudget.max_sources + 1 },
+        .{ .remaining_credit = BootstrapBudget.credit_bytes + 1 },
+    }) |invalid| {
+        var budget = invalid;
+        try std.testing.expectError(error.InvalidLakeReachability, store.load(a, "gs://archive/events/list.avro", true, &budget));
+    }
+    try std.testing.expectEqual(@as(u64, 0), memory.operationCount());
+}

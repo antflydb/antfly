@@ -43,7 +43,6 @@ pub const Index = struct {
     seed_arena: std.heap.ArenaAllocator = undefined,
     covered_files: std.AutoHashMapUnmanaged(catalog.Digest, void) = .empty,
     has_file_coverage: bool = false,
-    migrating: bool = false,
     prior_roots: []const catalog.Digest = &.{},
     predecessor: ?Predecessor = null,
     /// Immutable per-declaration proofs, populated before parallel workers start.
@@ -91,7 +90,7 @@ pub const Index = struct {
     fn accepts(self: *const Index, predecessor: ?Predecessor, delta: @import("lake_source_navigation.zig").Delta) bool {
         const prior = predecessor orelse return false;
         if (prior.cut) |cut| if (delta.prior_cut == null or !std.mem.eql(u8, &cut, &delta.prior_cut.?)) return false;
-        return self.counted and !self.migrating and delta.prior_snapshot != null and
+        return self.counted and delta.prior_snapshot != null and
             delta.prior_count == prior.count and std.mem.eql(u8, delta.prior_snapshot.?, prior.snapshot) and
             std.mem.eql(u8, delta.source, prior.source) and std.mem.eql(u8, delta.schema, prior.schema);
     }
@@ -245,17 +244,6 @@ pub const Index = struct {
         while (roots.next()) |key| if (!prior.contains(key.*)) try delta.adjust(key.*, true, 0);
         for (self.prior_roots) |key| if (!self.roots.contains(key)) try delta.adjust(key, false, 0);
         var changes: std.ArrayList(tree.Mutation) = .empty;
-        if (self.migrating) {
-            // One-time protocol-27 upgrade also removes obsolete records. No
-            // counted refresh repeats this old-generation census.
-            var cursor = try tree.Cursor.init(std.heap.page_allocator, self.cache.store(), self.root, "", null);
-            defer cursor.deinit();
-            while (try cursor.next()) |entry| {
-                if (entry.key.len != 32) return error.InvalidLakeIndexCatalog;
-                const key = entry.key[0..32].*;
-                if (!delta.entries.contains(key)) try changes.append(a, .{ .key = try a.dupe(u8, entry.key), .value = null });
-            }
-        }
         var iterator = delta.entries.iterator();
         while (iterator.next()) |entry| {
             const value = entry.value_ptr.value;
@@ -284,10 +272,10 @@ const CountedUpdate = struct {
         if (self.entries.contains(key)) return;
         if (self.entries.count() >= catalog.max_contributions) return error.InvalidLakeIndexCatalog;
         const old = try self.index.lookup(self.a, key);
-        if (old) |value| if (!self.index.migrating and value.references == 0) return error.InvalidLakeIndexCatalog;
+        if (old) |value| if (value.references == 0) return error.InvalidLakeIndexCatalog;
         const proposed = self.pending.get(key);
         var value = old orelse proposed orelse return error.InvalidLakeIndexCatalog;
-        value.references = if (old) |previous| if (self.index.migrating) 0 else previous.references else 0;
+        value.references = if (old) |previous| previous.references else 0;
         try self.entries.put(self.a, key, .{ .value = value, .original = if (old) |previous| try std.json.Stringify.valueAlloc(self.a, previous, .{}) else null });
     }
     fn replace(self: *@This(), key: catalog.Digest) !void {
@@ -423,7 +411,7 @@ const PageCache = struct {
     }
 };
 
-test "external lake counted ownership preserves shared aliases retires dead branches and upgrades legacy counts" {
+test "external lake counted ownership preserves shared aliases retires dead branches and rejects invalid counts" {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("native-counted-contributions");
     defer directory.cleanup();
@@ -523,16 +511,6 @@ test "external lake counted ownership preserves shared aliases retires dead bran
     alias_replace.root = (try alias_replace.update(&.{ alias_parent, fresh_alias })).?;
     try std.testing.expectEqual(@as(u32, 1), (try alias_replace.lookup(arena.allocator(), identity(values[2]))).?.references);
     try std.testing.expectEqual(@as(u32, 1), (try alias_replace.lookup(arena.allocator(), identity(fresh_alias))).?.references);
-    var migration: Index = undefined;
-    try migration.init(a, store, next_root, .none);
-    defer migration.deinit();
-    migration.counted = true;
-    migration.migrating = true;
-    try migration.includeRoot(identity(values[3]));
-    const migrated_root = (try migration.update(&.{})).?;
-    try std.testing.expectEqual(@as(u64, 3), migrated_root.records);
-    migration.root = migrated_root;
-    try std.testing.expectEqual(@as(u32, 1), (try migration.lookup(arena.allocator(), identity(values[2]))).?.references);
     var cycle: Index = undefined;
     try cycle.init(a, store, null, .none);
     defer cycle.deinit();

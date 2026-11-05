@@ -99,11 +99,10 @@ func (c *CollaborationConnector) nativeAttachment(ctx context.Context, r Request
 	if err != nil {
 		return collaborationFile{}, err
 	}
-	if len(material.Files) > 1000 || len(material.Text) > maxImportSourceObjectBytes {
-		return collaborationFile{}, ErrInvalidInput
+	parent, err := c.parentInput(r, ref, material)
+	if err != nil {
+		return collaborationFile{}, err
 	}
-	metadata := collaborationMetadata(ref, material)
-	parent := c.collaborationInput(r, ref, material, material.Text, metadata)
 	if parent.Revision != configString(item.Metadata, "parent_revision") || parent.ID != configString(item.Metadata, "parent_identity") {
 		return collaborationFile{}, &RevisionChangedError{Expected: configString(item.Metadata, "parent_revision"), Actual: parent.Revision}
 	}
@@ -155,7 +154,10 @@ func (c *CollaborationConnector) nativeMediaBytes(ctx context.Context, r Request
 		if err != nil {
 			return nil, err
 		}
-		parent := c.collaborationInput(r, ref, material, material.Text, collaborationMetadata(ref, material))
+		parent, err := c.parentInput(r, ref, material)
+		if err != nil {
+			return nil, err
+		}
 		if parent.Revision != configString(item.Metadata, "parent_revision") {
 			return nil, &RevisionChangedError{Expected: configString(item.Metadata, "parent_revision"), Actual: parent.Revision}
 		}

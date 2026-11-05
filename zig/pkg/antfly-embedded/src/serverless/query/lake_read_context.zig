@@ -21,6 +21,9 @@ const Allocator = std.mem.Allocator;
 
 pub const Context = struct {
     io: ?std.Io = null,
+    /// The owner has synchronized the construction allocator of every client
+    /// used in this scope. Providers must separately advertise concurrency.
+    parallel_object_io: bool = false,
     deadline_ns: ?u64 = null,
     cancellation: ?storage.CancellationToken = null,
     checkpoint: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
