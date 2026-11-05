@@ -1567,10 +1567,34 @@ components:
         s3_credentials:
           $ref: "../shared/s3.yaml#/components/schemas/Credentials"
           description: "S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail."
+        cooperative_execution:
+          type: object
+          additionalProperties: false
+          description: Opt-in interleaving of independently owned requests on backends declaring safe step sharing. Independent of row batching; graph, prefix-cache, speculative and multimodal routes remain exclusive. Currently qualified for at most two active E4B CUDA requests with one row per step.
+          properties:
+            mode:
+              type: string
+              enum: ["off", "on"]
+              default: "off"
+            max_active_requests:
+              type: integer
+              minimum: 1
+              maximum: 2
+              default: 2
+            short_context_burst:
+              type: integer
+              minimum: 1
+              maximum: 8
+              default: 8
+            decode_handoff_wait_us:
+              type: integer
+              minimum: 0
+              maximum: 10000
+              default: 5000
         generation_batching:
           type: object
           additionalProperties: false
-          description: Experimental execution batching; mode on explicitly enables qualified CUDA scheduling. Resource and request ceilings still apply.
+          description: Experimental row batching; independent from cooperative_execution. Mode on explicitly enables qualified CUDA row scheduling. Resource and request ceilings still apply.
           properties:
             mode:
               type: string

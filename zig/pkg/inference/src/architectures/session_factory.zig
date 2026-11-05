@@ -2179,6 +2179,14 @@ fn createCudaSessionWithRequiredProfile(
         .boundary_identity = native_impl.boundary_identity,
         .budget_floor = gliner_budget,
     };
+    if (resolved_arch_config == .gpt and resolved_arch_config.gpt.family == .gemma) {
+        const declared = archExecutionCapabilities(impl);
+        std.log.info("cuda_execution_capabilities cooperative={any} max_active={d} max_rows={d} measured_weight_bytes={d} lazy={any} training={any} bert_bf16_mirrors={d} profile={s}", .{
+            declared.cooperative_steps,                  declared.max_active_requests,         declared.max_batch_rows,
+            declared.measured_resident_weights orelse 0, cuda_compute.lazy_host_store != null, cuda_compute.resident_training_cache,
+            cuda_compute.stats.bf16_mirror_weight_count, @tagName(cuda_profile),
+        });
+    }
     if (debug_cuda_session) std.log.info("cuda-session: return session path={s}", .{model_path});
     return .{ .ptr = impl, .vtable = &arch_vtable };
 }
@@ -8002,6 +8010,8 @@ fn gpuBackendData(self: *ArchSession) *GpuHostedData {
 }
 
 const arch_vtable = Session.VTable{
+    .executionOwnerStats = &archExecutionOwnerStats,
+    .executionCapabilities = &archExecutionCapabilities,
     .hasLayaDecisions = archHasLayaDecisions,
     .runLayaDecisions = archRunLayaDecisions,
     .run = &archRun,
@@ -8567,6 +8577,54 @@ pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {
         .cuda => self.backend_data.cuda.compute.snapshotStats(),
         else => null,
     };
+}
+
+/// Dense Gemma 4 mirrors are created during eager upload, before the native
+/// source session is destroyed. This inventory excludes scratch/KV caches.
+/// Leave all lazy, expert, training and non-mirrored policies conservative.
+fn archExecutionOwnerStats(raw: *anyopaque) @import("../ops/execution_scope.zig").OwnerSnapshot {
+    if (comptime !build_options.enable_cuda) return .{};
+    const self: *ArchSession = @ptrCast(@alignCast(raw));
+    if (self.backend_type != .cuda) return .{};
+    return self.backend_data.cuda.compute.cooperative_owner.snapshot();
+}
+
+fn archExecutionCapabilities(raw: *anyopaque) @import("../backends/session.zig").ExecutionCapabilities {
+    if (comptime !build_options.enable_cuda) return .{};
+    const self: *ArchSession = @ptrCast(@alignCast(raw));
+    if (self.backend_type != .cuda) return .{};
+    if (self.arch_config == .embedding_gemma2) {
+        const eligible = self.arch_config.embedding_gemma2.resident != null and
+            self.backend_data.cuda.compute.capability_profile == .embedding_gemma2 and
+            self.backend_data.cuda.compute.embedding_gemma2_policy.arithmeticBits() == 0;
+        return .{ .text_batch_rows = if (eligible) 4 else 1, .text_batch_tokens = if (eligible) 8192 else 0, .text_batch_padded_tokens = if (eligible) 8192 else 0 };
+    }
+    if (self.arch_config != .gpt) return .{};
+    const cfg = self.arch_config.gpt;
+    const compute = &self.backend_data.cuda.compute;
+    const eager = cfg.family == .gemma and cfg.usesGemma4Channels() and !cfg.usesMoe() and !cfg.gemma4_mtp_assistant and
+        compute.capability_profile == .gemma4 and compute.lazy_host_store == null and
+        compute.a4b_inference == null and !compute.resident_training_cache and compute.stats.resident_weight_bytes > 0;
+    // Qualification fence belongs to the backend, alongside the state contract.
+    // Widening this declaration requires independent output/fairness evidence.
+    const cooperative = eager and cfg.hidden_size == 2560 and cfg.num_attention_heads == 8 and
+        cfg.effectiveKVHeads() == 2 and cfg.headDim() == 256 and cfg.global_head_dim == 512;
+    return .{
+        .cooperative_steps = cooperative,
+        .max_active_requests = if (cooperative) 2 else 1,
+        .max_batch_rows = if (cooperative) compute.cooperativeDecodeBatchRows(cfg.weight_tying) else 1,
+        .decode_only_batching = true,
+        .measured_resident_weights = if (eager) compute.stats.resident_weight_bytes else null,
+    };
+}
+
+/// Compatibility accessor; scheduling and residency consume the same backend contract.
+pub fn getEagerCudaMirrorWeightBytes(session: Session) ?usize {
+    return session.executionCapabilities().measured_resident_weights;
+}
+
+pub fn retainedCudaMirrorWeightBytes(construction_bytes: usize, weight_bytes: usize) !usize {
+    return cuda_load_plan.retainedEagerMirrorBytes(construction_bytes, weight_bytes);
 }
 
 pub const CudaAllocationStats = struct {
@@ -9483,6 +9541,20 @@ pub fn getComputeBackendWithBudget(
     try bindCudaVideoAdmission(session, &cb);
     try cb.beginRequest();
     return cb;
+}
+
+/// Qualified cooperative CUDA generation calls this under its model mutex.
+/// The returned handle keeps the run budget in request-owned metadata and
+/// rebinds it at step boundaries instead of borrowing it for the whole run.
+pub fn getCoordinatedCudaComputeBackend(session: Session, budget: *runtime.tier.memory.RunBudget, owner: u64) !ops.ComputeBackend {
+    if (comptime build_options.enable_cuda) {
+        if (session.vtable != &arch_vtable) return error.NotArchSession;
+        const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+        if (self.backend_type != .cuda) return error.CudaNotEnabled;
+        var cb = self.backend_data.cuda.compute.computeBackendWithStepRunBudget(budget, owner);
+        try bindCudaVideoAdmission(session, &cb);
+        return cb;
+    } else return error.CudaNotEnabled;
 }
 
 pub fn getGenericEncoderArchConfig(session: Session) !GenericEncoderArchConfig {
@@ -12814,4 +12886,49 @@ test "LightOnOCR3 CUDA loader profile requires the reader role and supported rec
     try std.testing.expect(cudaProfileForArch(.{ .gpt = unsupported }, .generic, &manifest) == null);
     manifest.capabilities = &.{};
     try std.testing.expect(cudaProfileForArch(.{ .gpt = cfg }, .generic, &manifest) == null);
+}
+
+test "cooperative backend declaration uses eager weight inventory independently of BERT mirror counters" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    var compute: cuda_compute_mod.CudaCompute = undefined;
+    compute.capability_profile = .gemma4;
+    compute.resident_weights = .{};
+    compute.lazy_host_store = null;
+    compute.a4b_inference = null;
+    compute.resident_training_cache = false;
+    compute.stats = .{};
+    compute.stats.resident_weight_bytes = 4096;
+    var arch = ArchSession{
+        .allocator = std.testing.allocator,
+        .arch_config = .{ .gpt = .{
+            .family = .gemma,
+            .gemma4_channel_protocol = true,
+            .hidden_size = 2560,
+            .num_attention_heads = 8,
+            .num_key_value_heads = 2,
+            .attention_head_dim = 256,
+            .global_head_dim = 512,
+        } },
+        .backend_type = .cuda,
+        .backend_data = .{ .cuda = .{ .compute = compute } },
+    };
+    const session = Session{ .ptr = &arch, .vtable = &arch_vtable };
+    var caps = session.executionCapabilities();
+    try std.testing.expect(caps.cooperative_steps);
+    try std.testing.expectEqual(@as(?usize, 4096), caps.measured_resident_weights);
+    try std.testing.expectEqual(@as(usize, 2), caps.max_active_requests);
+    try std.testing.expectEqual(@as(usize, 1), caps.max_batch_rows);
+    // BERT-specific projection mirrors do not describe E4B eager residency.
+    try std.testing.expectEqual(@as(usize, 0), arch.backend_data.cuda.compute.stats.bf16_mirror_weight_count);
+    arch.backend_data.cuda.compute.resident_training_cache = true;
+    caps = session.executionCapabilities();
+    try std.testing.expect(!caps.cooperative_steps and caps.measured_resident_weights == null);
+    arch.backend_data.cuda.compute.resident_training_cache = false;
+    arch.backend_data.cuda.compute.lazy_host_store = @ptrFromInt(16);
+    caps = session.executionCapabilities();
+    try std.testing.expect(!caps.cooperative_steps and caps.measured_resident_weights == null);
+    arch.backend_data.cuda.compute.lazy_host_store = null;
+    arch.arch_config.gpt.num_key_value_heads = 1;
+    try std.testing.expect(!session.executionCapabilities().cooperative_steps);
+    try std.testing.expectEqual(@as(?usize, 4096), session.executionCapabilities().measured_resident_weights);
 }
