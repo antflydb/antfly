@@ -31,10 +31,21 @@ const portable_pool_bytes: u64 = 512 * 1024 * 1024;
 /// Prepared model-sized frames, plus one displayed frame at the source pixel limit.
 const portable_frame_bytes: usize = 96 * 1024 * 1024 + 48 * 1024 * 1024;
 /// Reserved through generation admission before any portable video work starts.
+/// CUDA holds it too, because NVDEC can hand a clip to the portable route late.
 pub const portable_host_bytes: usize = portable_pool_bytes + portable_frame_bytes;
 
 pub fn encode(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *projector_mod.ProjectorStore, bytes: []const u8) !projector_mod.ProjectedVideo {
-    if (cb.kind() == .cuda) return projector_mod.encodeProjectedVideoResident(cb, a, projector, bytes);
+    if (cb.kind() == .cuda) {
+        // NVDEC takes a narrower set of clips than the catalog advertises, and
+        // some rejections only surface mid-bitstream. Portable decoding decides
+        // what's really invalid; either route projects on the device.
+        if (projector_mod.encodeProjectedVideoResident(cb, a, projector, bytes)) |projected| {
+            return projected;
+        } else |err| {
+            if (err != error.NvdecUnavailable and inputError(err) != error.InvalidVideoInput) return err;
+            std.log.info("gemma4 video falling back to portable decoding: {s}", .{@errorName(err)});
+        }
+    }
     return encodePortable(cb, a, projector, bytes);
 }
 
@@ -169,7 +180,7 @@ test "gemma4 video reserves portable memory through generation admission" {
     try std.testing.expectEqual(portable_host_bytes, portable.host_scratch_bytes);
     try std.testing.expect(portable.token_allowance >= 60 * 80);
     const cuda = try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &messages, .{ .family = .gemma }, .cuda);
-    try std.testing.expectEqual(@as(usize, 0), cuda.host_scratch_bytes);
+    try std.testing.expectEqual(portable_host_bytes, cuda.host_scratch_bytes);
     const text = [_]generation.Message{.{ .role = "user", .content = "describe" }};
     try std.testing.expectEqual(@as(usize, 0), (try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &text, .{ .family = .gemma }, .generic)).host_scratch_bytes);
 }

@@ -248,8 +248,8 @@ pub fn nativeGenerationMediaAdmissionForBackend(
         return .{ .token_allowance = image_count *| (max_image_tokens +| 1) };
     }
     var admission: NativeGenerationMediaAdmission = .{ .token_allowance = nativeGenerationMediaTokenAllowance(messages, config) };
-    // CUDA decodes on the device. Portable decoding runs in host memory.
-    if (backend != .cuda) for (messages) |message| if (message.video_bytes != null) {
+    // Portable decoding runs in host memory, and it's CUDA's fallback as well.
+    for (messages) |message| if (message.video_bytes != null) {
         admission.host_scratch_bytes = gemma4_video.portable_host_bytes;
     };
     return admission;
