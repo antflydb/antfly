@@ -251,7 +251,7 @@ fn getBodyWithBearerAlloc(alloc: std.mem.Allocator, http: *httpx.Client, url: []
 }
 
 fn getBodyAlloc(alloc: std.mem.Allocator, http: *httpx.Client, url: []const u8, headers: ?[]const [2][]const u8, timeout_ms: u64) ![]u8 {
-    var resp = try http.request(.GET, url, .{ .headers = headers, .timeout_ms = timeout_ms });
+    var resp = try http.request(.GET, url, .{ .follow_redirects = false, .headers = headers, .timeout_ms = timeout_ms });
     defer resp.deinit();
     if (!resp.ok()) return mapListStatus(resp.status.code);
     const body = resp.body orelse return error.EmptyResponse;

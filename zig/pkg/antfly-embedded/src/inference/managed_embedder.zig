@@ -7730,6 +7730,7 @@ fn embedBatchWithCohereRequest(
     defer if (fallback_http) |*client| client.deinit();
     const client = try entry.httpClient(alloc, &fallback_http);
     var response = try client.post(url, .{
+        .follow_redirects = false,
         .attempt_observer = embeddingAttemptObserver(entry),
         .json = body,
         .headers = &headers,
@@ -7889,6 +7890,7 @@ fn embedBatchWithOpenAiCompatible(
     const client = try entry.httpClient(alloc, &fallback_http);
 
     var response = try client.post(url, .{
+        .follow_redirects = false,
         .attempt_observer = embeddingAttemptObserver(entry),
         .json = json_body,
         .headers = headers_buf[0..header_count],
@@ -11758,6 +11760,71 @@ test "managed embedder endpoint access denial survives HTTP probing and runtime 
     }
     const abi = @import("antfly_runtime_abi").error_abi;
     try std.testing.expectEqual(error.InferenceEndpointAccessDenied, abi.errorFromStatus(abi.statusFromError(error.InferenceEndpointAccessDenied)));
+}
+
+test "managed embedder rejects provider redirects without forwarding credentials or input" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer dummy-managed-provider-key", req.header("Authorization") orelse return error.MissingProviderCredential);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "private-managed-embedding-input") != null);
+        }
+
+        fn serve(server: *httpx.TestServer, failure: *?anyerror) std.Io.Cancelable!void {
+            server.handleOne() catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => failure.* = err,
+            };
+        }
+    };
+
+    for ([_][]const u8{ "openai", "cohere" }) |provider| {
+        for ([_]u16{ 307, 308 }) |status| {
+            errdefer std.debug.print("managed embedding redirect: provider={s}, status={d}\n", .{ provider, status });
+            var destination = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/capture", .respond = .{ .status = 400 } }});
+            defer destination.deinit();
+            const location = try destination.url("/capture");
+            defer a.free(location);
+            const response_headers: []const httpx.testing_mod.HeaderPair = &.{.{ .name = "Location", .value = location }};
+            var origin = try httpx.TestServer.start(a, io, &.{.{
+                .method = .POST,
+                .path = if (std.mem.eql(u8, provider, "openai")) "/v1/embeddings" else "/v2/embed",
+                .assert_request = Check.request,
+                .respond = .{ .status = status, .headers = response_headers },
+            }});
+            defer origin.deinit();
+            const config = try std.fmt.allocPrint(a,
+                \\{{"semantic":{{"type":"embeddings","field":"body","dimension":2,"embedder":{{"provider":"{s}","model":"model","url":"{s}","api_key":"dummy-managed-provider-key"}}}}}}
+            , .{ provider, origin.baseUrl() });
+            defer a.free(config);
+            var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(a, config, .{ .io = io, .bounded_http_request = true });
+            defer managed.deinit();
+            // Exercise the production managed path with its own permissive
+            // client, independently of the direct OpenAI provider adapter.
+            managed.owned_http_client.?.config.redirect_policy.follow_redirects = true;
+            var origin_failure: ?anyerror = null;
+            var destination_failure: ?anyerror = null;
+            var group: std.Io.Group = .init;
+            defer group.cancel(io);
+            try group.concurrent(io, Check.serve, .{ &origin, &origin_failure });
+            try group.concurrent(io, Check.serve, .{ &destination, &destination_failure });
+            try std.testing.expectError(error.EmbedRequestFailed, managed.denseInterface().embedDenseBatchWithContext(
+                a,
+                "semantic",
+                &.{"private-managed-embedding-input"},
+                2,
+                .{ .io = io, .deadline_ns = monotonicNowNs() + 5 * std.time.ns_per_s },
+            ));
+            group.cancel(io);
+            if (origin_failure) |err| return err;
+            if (destination_failure) |err| return err;
+            try std.testing.expectEqual(@as(usize, 1), origin.route_hits[0]);
+            try std.testing.expectEqual(@as(usize, 0), destination.route_hits[0]);
+        }
+    }
 }
 
 test "managed embedder Cloudflare compatibility preserves indexed results without resizing" {

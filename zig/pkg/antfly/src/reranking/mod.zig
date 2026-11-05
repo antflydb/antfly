@@ -756,6 +756,7 @@ fn rerankCohere(
     defer alloc.free(authorization);
     const headers = [_][2][]const u8{.{ "Authorization", authorization }};
     var response = try http.post(url, .{
+        .follow_redirects = false,
         .attempt_observer = observer,
         .json = body,
         .headers = &headers,
