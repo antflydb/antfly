@@ -273,7 +273,11 @@ pub const Collector = struct {
             }
         }
         const hints = hint_buffer[0..hint_count];
-        return journal.encodeRecord(a, .{ .version = manifest.version, .sequence = manifest.sequence, .target_hints = hints, .changed_doc_keys = self.lists[0].items, .deleted_doc_keys = self.lists[1].items, .overwritten_doc_keys = self.lists[2].items, .changed_artifact_keys = self.lists[3].items });
+        return journal.encodeRecord(a, self.record(manifest, hints));
+    }
+    /// Borrow the selected families for one final encoding/projection.
+    pub fn record(self: *const Collector, manifest: Manifest, hints: []const journal.TargetHint) journal.Record {
+        return .{ .version = manifest.version, .sequence = manifest.sequence, .target_hints = hints, .changed_doc_keys = self.lists[0].items, .deleted_doc_keys = self.lists[1].items, .overwritten_doc_keys = self.lists[2].items, .changed_artifact_keys = self.lists[3].items };
     }
 };
 

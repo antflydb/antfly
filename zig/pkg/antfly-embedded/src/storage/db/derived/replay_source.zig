@@ -87,12 +87,18 @@ pub const MatchingCursor = struct {
         self.* = undefined;
     }
 
-    pub const FamilySlice = struct { payload: []u8, position: replay_fragment.Position };
+    pub const FamilySlice = struct { payload: []u8, position: replay_fragment.Position, families: usize };
 
-    /// Native family continuations read one authenticated chunk rather than
-    /// reconstructing and sorting the entire canonical record on every turn.
-    /// Null retains the portable/legacy record iterator unchanged.
     pub fn readFamilySlice(self: *MatchingCursor, a: Allocator, index_name: []const u8, saved: ?replay_fragment.Position, max_families: usize, target_sequence: u64) !?FamilySlice {
+        return self.readFamilySliceWithBudget(a, index_name, saved, max_families, 0, target_sequence);
+    }
+
+    /// Read only the authenticated chunks touched by this service budget.
+    /// Physical chunk boundaries do not force extra publication/admission turns.
+    /// One oversized family may progress alone; every family's effects stay together.
+    /// Null preserves the portable/legacy record iterator.
+    pub fn readFamilySliceWithBudget(self: *MatchingCursor, a: Allocator, index_name: []const u8, saved: ?replay_fragment.Position, max_families: usize, max_payload_bytes: u64, target_sequence: u64) !?FamilySlice {
+        if (max_families == 0) return error.InvalidArgument;
         const cursor = switch (self.state) {
             .journal => return null,
             .primary_store => |*value| value,
@@ -125,23 +131,46 @@ pub const MatchingCursor = struct {
                 applied = position.applied;
             } else if (position.sequence > sequence or position.next_item != position.total_items) return error.InvalidDerivedApplyState;
         }
-        const ordinal: u32 = @intCast(start / replay_chunks.families_per_chunk);
-        if (ordinal < manifest.retired_chunks) return error.ReplayHistoryUnavailable;
-        const key = replay_chunks.chunkKey(sequence, ordinal);
-        const raw = try cursor.scan_txn.?.get(&key);
-        const slice = try replay_chunks.sliceFamilies(a, manifest, ordinal, raw, @intCast(start % replay_chunks.families_per_chunk), max_families);
-        defer a.free(slice.payload);
-        var decoded = try change_journal_mod.decodeRecord(a, slice.payload);
-        defer decoded.deinit();
-        const payload = try replay_reference.encodeForHint(a, decoded.record, cursor.hint);
+        var collected = replay_chunks.Collector.init(a);
+        defer collected.deinit();
+        var next = start;
+        var families: usize = 0;
+        var bytes: u64 = 0;
+        while (next < manifest.families and families < max_families) {
+            const ordinal: u32 = @intCast(next / replay_chunks.families_per_chunk);
+            if (ordinal < manifest.retired_chunks) return error.ReplayHistoryUnavailable;
+            const key = replay_chunks.chunkKey(sequence, ordinal);
+            const raw = try cursor.scan_txn.?.get(&key);
+            var limit = max_families - families;
+            var slice = try replay_chunks.sliceFamilies(a, manifest, ordinal, raw, @intCast(next % replay_chunks.families_per_chunk), limit);
+            defer a.free(slice.payload);
+            if (max_payload_bytes != 0) {
+                if (families != 0 and slice.payload.len > max_payload_bytes -| bytes) break;
+                // A single large physical chunk must still obey a smaller
+                // requested window without splitting one document family.
+                while (families == 0 and slice.payload.len > max_payload_bytes and slice.families > 1) {
+                    limit = @max(1, slice.families / 2);
+                    const smaller = try replay_chunks.sliceFamilies(a, manifest, ordinal, raw, @intCast(next % replay_chunks.families_per_chunk), limit);
+                    a.free(slice.payload);
+                    slice = smaller;
+                }
+            }
+            if (slice.families == 0) return error.InvalidReplayChunk;
+            try collected.append(slice.payload);
+            families += slice.families;
+            bytes +|= slice.payload.len;
+            next += slice.families;
+            if (next > manifest.families) return error.InvalidReplayChunk;
+            if (max_payload_bytes != 0 and bytes >= max_payload_bytes) break;
+        }
+        const hints = [_]TargetHint{cursor.hint};
+        const payload = try replay_reference.encodeForHint(a, collected.record(manifest, &hints), cursor.hint);
         errdefer a.free(payload);
-        const next = start + slice.families;
-        if (next > manifest.families) return error.InvalidReplayChunk;
         if (next == manifest.families) {
             cursor.next_sequence = sequence;
             cursor.entry = try filterLaneEntry(try cursor.cursor.?.next(), cursor.scan_lane_ordinal);
         }
-        return .{ .payload = payload, .position = .{ .sequence = sequence, .next_item = next, .total_items = manifest.families, .fingerprint = fingerprint, .applied = applied } };
+        return .{ .payload = payload, .position = .{ .sequence = sequence, .next_item = next, .total_items = manifest.families, .fingerprint = fingerprint, .applied = applied }, .families = families };
     }
 
     pub fn forEachNext(

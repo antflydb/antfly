@@ -84,8 +84,15 @@ pub const Controller = struct {
         if (failed or elapsed_ns > quantum_ns) {
             self.overruns +|= @intFromBool(!failed);
             self.lanes[lane] = .{ .records = @max(8, used.records / 2), .bytes = @max(128 * 1024, used.bytes / 2) };
-        } else if (!self.pressure and elapsed_ns < quantum_ns / 2 and scanned >= used.records) {
-            self.lanes[lane] = .{ .records = @min(self.max_records, used.records * 2), .bytes = @min(self.max_bytes, used.bytes * 2) };
+        } else if (!self.pressure and scanned >= used.records) {
+            if (elapsed_ns < quantum_ns / 2) {
+                self.lanes[lane] = .{ .records = @min(self.max_records, used.records * 2), .bytes = @min(self.max_bytes, used.bytes * 2) };
+            } else if (elapsed_ns < quantum_ns * 3 / 4) {
+                // Recover gradually after a cold overrun. Requiring enough
+                // slack to double can otherwise strand a healthy small window
+                // forever, paying extra fixed publication costs on every turn.
+                self.lanes[lane] = .{ .records = @min(self.max_records, used.records + @max(1, used.records / 4)), .bytes = @min(self.max_bytes, used.bytes + @max(1, used.bytes / 4)) };
+            }
         }
     }
 
@@ -181,4 +188,23 @@ test "replay budget respects a producer specific discovery ceiling" {
     const full = producer.budget(0);
     producer.observe(0, full, Controller.quantum_ns + 1, full.records, false);
     try std.testing.expectEqual(@as(usize, 64), producer.budget(0).records);
+}
+
+test "replay budget recovers gradual capacity after a cold overrun without exceeding its quantum" {
+    var state: Controller = .{};
+    state.observe(0, state.budget(0), Controller.quantum_ns + 1, 64, false);
+    const reduced = state.budget(0);
+    try std.testing.expectEqual(@as(usize, 32), reduced.records);
+    state.observe(0, reduced, Controller.quantum_ns * 3 / 5, reduced.records, false);
+    const recovered = state.budget(0);
+    try std.testing.expectEqual(@as(usize, 40), recovered.records);
+    try std.testing.expectEqual(reduced.bytes + reduced.bytes / 4, recovered.bytes);
+    state.observe(0, recovered, Controller.quantum_ns * 4 / 5, recovered.records, false);
+    try std.testing.expectEqualDeep(recovered, state.budget(0));
+    state.observe(0, recovered, 1, recovered.records - 1, false);
+    try std.testing.expectEqualDeep(recovered, state.budget(0));
+    state.updatePressure(256, 0, 1);
+    const pressured = state.budget(0);
+    state.observe(0, pressured, 1, pressured.records, false);
+    try std.testing.expectEqualDeep(pressured, state.budget(0));
 }

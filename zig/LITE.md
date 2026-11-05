@@ -1186,8 +1186,13 @@ shared-library boundary. Benchmark profiles report consumed and fallback documen
 counts so an unused preparation plan cannot masquerade as a performance gain.
 
 Revision 11 adds seekable canonical family chunks with a fixed-size Merkle-root
-manifest. A replay turn decodes at most 64 families before selecting its bounded
-application slice. All effects of one document family remain together. Chunk
+manifest. Each physical chunk decodes at most 64 families. A replay turn reads
+only the chunks needed by its current family and byte budget; physical chunk
+boundaries do not force additional publication turns. One oversized family can
+progress alone. All effects of one document family remain together. Adaptive
+sizing counts document families, charges journal decoding and text preparation,
+and excludes publication admission/hold costs. Gradual recovery after a cold
+overrun avoids permanently shrinking healthy windows. Chunk
 bytes retain their physical replay charge until safe deletion; chunk rows do
 not multiply logical record credits. A checked retirement turn takes the minimum
 of every index instance's durable progress and the producer, resolver, replacement

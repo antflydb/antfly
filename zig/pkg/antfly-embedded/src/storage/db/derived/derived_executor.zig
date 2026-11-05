@@ -450,7 +450,7 @@ const ManualRuntime = struct {
             return err;
         };
         completed = true;
-        if (wait.replay_budget) |controller| controller.observe(lane, budget, replayWorkElapsedNs(wait, worker.kind.kind, started, waited_before, preparation_before), @max(stats.scanned_entries, stats.collected_items), false);
+        if (wait.replay_budget) |controller| controller.observe(lane, budget, replayWorkElapsedNs(wait, worker.kind.kind, started, waited_before, preparation_before) +| (if (fragments != null) stats.window_collect_ns else 0), stats.budgetWorkItems(fragments != null), false);
         catch_up_open = false;
         return .{ .stats = stats, .token = token };
     }

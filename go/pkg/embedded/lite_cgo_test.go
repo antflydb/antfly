@@ -40,7 +40,7 @@ func TestBundledCABIHeaderMatchesSourceTree(t *testing.T) {
 		t.Fatalf("read bundled C ABI header: %v", err)
 	}
 
-	sourcePath := filepath.Join("..", "..", "..", "zig", "pkg", "antfly", "include", "antfly.h")
+	sourcePath := filepath.Join("..", "..", "..", "zig", "pkg", "antfly-embedded", "include", "antfly.h")
 	source, err := os.ReadFile(sourcePath)
 	if os.IsNotExist(err) {
 		t.Skip("source-tree C ABI header is not present in this module checkout")

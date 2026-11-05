@@ -81,6 +81,7 @@ fn ownerKey(a: std.mem.Allocator, key: []const u8, kind: Kind) ![]const u8 {
 pub const Piece = struct {
     batch: types.DerivedBatch,
     next_item: usize,
+    families: usize,
 
     pub fn deinit(self: *Piece, a: std.mem.Allocator) void {
         a.free(self.batch.documents);
@@ -168,6 +169,14 @@ pub const Plan = struct {
         return .{ .start = start, .applied = saved.applied };
     }
 
+    pub fn familyCount(self: *const Plan) usize {
+        var count: usize = 0;
+        for (self.items, 0..) |item, i| {
+            if (i == 0 or !std.mem.eql(u8, self.items[i - 1].owner, item.owner)) count += 1;
+        }
+        return count;
+    }
+
     pub fn piece(self: *const Plan, a: std.mem.Allocator, start: usize, max_families: usize) !Piece {
         std.debug.assert(max_families != 0 and start <= self.items.len);
         var end = start;
@@ -200,7 +209,7 @@ pub const Plan = struct {
                 .artifact => artifacts[slot] = item.key,
             }
         }
-        return .{ .next_item = end, .batch = .{ .sequence = self.batch.sequence, .documents = documents, .deleted_keys = deleted, .overwritten_doc_keys = overwritten, .changed_artifact_keys = artifacts } };
+        return .{ .next_item = end, .families = families, .batch = .{ .sequence = self.batch.sequence, .documents = documents, .deleted_keys = deleted, .overwritten_doc_keys = overwritten, .changed_artifact_keys = artifacts } };
     }
 };
 
@@ -213,6 +222,8 @@ test "replay fragments keep document deletion overwrite and asset effects togeth
     defer plan.deinit(a);
     var first = try plan.piece(a, 0, 1);
     defer first.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), first.families);
+    try std.testing.expectEqual(@as(usize, 2), plan.familyCount());
     try std.testing.expectEqual(@as(usize, 1), first.batch.documents.len);
     try std.testing.expectEqual(@as(usize, 1), first.batch.overwritten_doc_keys.len);
     try std.testing.expectEqual(@as(usize, 1), first.batch.deleted_keys.len);

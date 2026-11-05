@@ -5343,6 +5343,34 @@ test "lite seekable replay resumes bounded families and retires charged chunks a
         seen.deinit(a);
     }
     const source = @import("../db/derived/replay_source.zig").Source.fromPrimaryStore(&store, null, null);
+    // The application budget may span physical encoding chunks. A larger
+    // service window must not silently publish only the first 64 families.
+    {
+        var cursor = try source.openMatchingCursor(a, 0, .full_text);
+        defer cursor.deinit(a);
+        const slice = (try cursor.readFamilySliceWithBudget(a, "text", null, 96, 1024 * 1024, 0)).?;
+        defer a.free(slice.payload);
+        try std.testing.expectEqual(@as(usize, 96), slice.families);
+        try std.testing.expectEqual(@as(u64, 96), slice.position.next_item);
+        var decoded = try change_journal_mod.decodeRecord(a, slice.payload);
+        defer decoded.deinit();
+        try std.testing.expectEqual(@as(usize, 96), decoded.record.changed_doc_keys.len);
+        try std.testing.expectEqual(@as(usize, 1), decoded.record.deleted_doc_keys.len);
+        try std.testing.expectEqual(@as(usize, 1), decoded.record.overwritten_doc_keys.len);
+    }
+    {
+        var cursor = try source.openMatchingCursor(a, 0, .full_text);
+        defer cursor.deinit(a);
+        const slice = (try cursor.readFamilySliceWithBudget(a, "text", null, 130, 1, 0)).?;
+        defer a.free(slice.payload);
+        try std.testing.expectEqual(@as(usize, 1), slice.families);
+        try std.testing.expectEqual(@as(u64, 1), slice.position.next_item);
+        var decoded = try change_journal_mod.decodeRecord(a, slice.payload);
+        defer decoded.deinit();
+        try std.testing.expectEqual(@as(usize, 1), decoded.record.changed_doc_keys.len);
+        try std.testing.expectEqual(@as(usize, 1), decoded.record.deleted_doc_keys.len);
+        try std.testing.expectEqual(@as(usize, 1), decoded.record.overwritten_doc_keys.len);
+    }
     var position: ?@import("../db/derived/replay_fragment.zig").Position = null;
     var slices: usize = 0;
     var deletion_families: usize = 0;

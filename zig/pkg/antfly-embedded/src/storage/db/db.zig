@@ -56031,8 +56031,13 @@ fn applyReplayFragmentAsync(ptr: *anyopaque, batch: derived_types.DerivedBatch, 
     if (index_ref.kind != .full_text) return error.Unsupported;
     if (!try batchAffectsManagedIndexForReplay(ctx.index_manager, batch, index_ref)) return false;
     var profile: BatchProfile = .{};
+    const started = monotonicTimeNs();
     defer _ = ctx.full_text_preparation_ns.fetchAdd(profile.full_text_collect_ns + profile.full_text_plan_ns + profile.full_text_prepare_ns, .monotonic);
     try local_mutation.applyDerivedBatchToIndexContextProfiledWithFragment(ctx, batch, index_ref, &profile, true, null, position);
+    if (benchMetricsEnabled()) {
+        profile.total_ns = monotonicTimeNs() -| started;
+        logDerivedWorkerProfile(index_ref, batch, profile);
+    }
     return true;
 }
 
@@ -56634,9 +56639,9 @@ fn replayPendingDerivedBatches(
         } else try abortReplayCapture(&replay_ctx, index_ref);
         if (options.bounded_replay)
             replay_state.replay_budget.observe(replay_lane, adaptive_budget, if (fragment_replay)
-                self.async_context.full_text_preparation_ns.load(.monotonic) -| preparation_before
+                (self.async_context.full_text_preparation_ns.load(.monotonic) -| preparation_before) +| stats.window_collect_ns
             else
-                (monotonicTimeNs() -| replay_started) -| (replay_state.publication_overhead_ns.load(.monotonic) -| publication_before), @max(stats.scanned_entries, stats.collected_items), false);
+                (monotonicTimeNs() -| replay_started) -| (replay_state.publication_overhead_ns.load(.monotonic) -| publication_before), stats.budgetWorkItems(fragment_replay), false);
         replay_completed = true;
     }
     if (options.truncate_replay) try truncateReplayJournalIfSafe(self);

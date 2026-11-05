@@ -44,6 +44,7 @@ pub const FinishCatchUpFn = *const fn (ctx: *anyopaque, index_ref: index_manager
 pub const CatchUpStats = struct {
     scanned_entries: usize = 0,
     collected_items: usize = 0,
+    collected_families: usize = 0,
     applied_entries: usize = 0,
     replay_scan_batches: usize = 0,
     replay_hint_filter_skips: usize = 0,
@@ -52,6 +53,10 @@ pub const CatchUpStats = struct {
     partial_sequence: u64 = 0,
     window_collect_ns: u64 = 0,
     apply_ns: u64 = 0,
+
+    pub fn budgetWorkItems(self: @This(), fragmented: bool) usize {
+        return if (fragmented) @max(self.scanned_entries, self.collected_families) else @max(self.scanned_entries, self.collected_items);
+    }
 
     pub fn appliedSequenceAdvance(self: @This(), from_sequence: u64) ?u64 {
         if (self.last_applied_sequence <= from_sequence) return null;
@@ -349,7 +354,7 @@ pub fn catchUpIndexFromMatchingCursor(
         var retried_fresh = false;
         var collection_limit = if (fragments) @as(usize, 1) else options.max_records_per_window;
         var retry_stats = replay_source_mod.MatchingRecordStats{};
-        const seekable_slice = if (fragments) try replay_cursor.readFamilySlice(scratch_alloc, index_ref.name, try options.load_fragment_fn.?(options.fragment_ctx.?, index_ref.name), options.max_fragment_families, options.target_sequence) else null;
+        const seekable_slice = if (fragments) try replay_cursor.readFamilySliceWithBudget(scratch_alloc, index_ref.name, try options.load_fragment_fn.?(options.fragment_ctx.?, index_ref.name), options.max_fragment_families, options.max_chunk_bytes, options.target_sequence) else null;
         defer if (seekable_slice) |slice| scratch_alloc.free(slice.payload);
         const chunk_stats = if (seekable_slice) |slice| bounded: {
             try replayChunkConsumeRecord(&builder, slice.position.sequence, slice.payload);
@@ -418,6 +423,7 @@ pub fn catchUpIndexFromMatchingCursor(
             fragment_position = slice.position;
             fragment_complete = slice.position.next_item == slice.position.total_items;
             stats.collected_items += builder.item_count;
+            stats.collected_families += slice.families;
         } else if (fragments) {
             var saved = try options.load_fragment_fn.?(options.fragment_ctx.?, index_ref.name);
             if (saved) |previous| if (previous.sequence < batch.sequence and previous.next_item == previous.total_items) {
@@ -433,7 +439,11 @@ pub fn catchUpIndexFromMatchingCursor(
                 fragment_complete = fragment_piece.?.next_item == total;
                 fragment_position = .{ .sequence = batch.sequence, .next_item = fragment_piece.?.next_item, .total_items = total, .fingerprint = fragment_plan.?.fingerprint, .applied = previously_applied };
                 stats.collected_items += fragment_piece.?.next_item - continuation.start;
-            } else stats.collected_items += builder.item_count;
+                stats.collected_families += fragment_piece.?.families;
+            } else {
+                stats.collected_items += builder.item_count;
+                stats.collected_families += fragment_plan.?.familyCount();
+            }
         } else stats.collected_items += builder.item_count;
         if (options.release_read_snapshot_after_collect) {
             std.debug.assert(options.max_windows_per_call == 1);
