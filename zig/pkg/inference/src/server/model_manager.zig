@@ -4808,6 +4808,13 @@ pub const ModelManager = struct {
     serving_policy: ?model_compatibility.Policy = null,
     admission_diagnostics: admission_diagnostics.Recorder = .{},
     admission_enabled: bool = false,
+    /// Optional caller policy for full-model loads. Borrowed until deinit;
+    /// checked per resolved backend before construction, with normal fallback
+    /// and CUDA A4B fail-closed rules. No device probing belongs in this hook.
+    model_load_preflight: ?struct {
+        context: *anyopaque,
+        check: *const fn (*anyopaque, []const u8, *const manifest_mod.ModelManifest, backends.BackendType, ?backend_contracts.A4bInferenceRequest) anyerror!void,
+    } = null,
     admission_limit_overrides: runtime.tier.memory.Limits = .{},
     process_memory_limit_bytes: usize = 0,
     process_memory_limit_provenance: runtime.tier.memory.ProcessMemoryLimitProvenance = .automatic,
@@ -10893,7 +10900,7 @@ fn loadSessionForPreferredBackends(
             );
             return first_err orelse error.A4bCudaAutoFallbackForbidden;
         }
-        if (!backend.supportsDirectSessionLoad()) continue;
+        if (!backend.available() or !backend.supportsDirectSessionLoad()) continue;
         if (source_session_manager.a4b_inference_request != null and
             backend != .metal and backend != .cuda)
         {
@@ -10912,6 +10919,12 @@ fn loadSessionForPreferredBackends(
         );
         if (source_session_manager.kernel_jit.mode.failClosed() and
             std.mem.endsWith(u8, candidate_path, ".onnx")) continue;
+        if (manager.model_load_preflight) |preflight| {
+            preflight.check(preflight.context, model_dir, &man, backend, source_session_manager.a4b_inference_request) catch |err| {
+                rememberPreferredLoadError(&first_err, err);
+                continue;
+            };
+        }
         var single_backend = [_]backends.BackendType{backend};
         var backend_session_manager = sessionManagerForPreferredBackends(manager.allocator, single_backend[0..], source_session_manager);
         const backend_runtime = backend_session_manager.resolveBackendRuntime(backend) catch |err| {
@@ -11035,9 +11048,9 @@ fn loadSessionForPreferredBackends(
     }
 
     if (laya_resident_attempted) return first_err orelse error.UnsupportedLayaArtifact;
-    // A missing process boundary is an expected fail-closed policy decision,
-    // not an artifact/import failure.
-    if (first_err) |err| if (err == error.ProcessIsolationRequired) return err;
+    // Missing isolation and caller budget caps are expected policy decisions,
+    // rather than corrupt artifacts or session import failures.
+    if (first_err) |err| if (err == error.ProcessIsolationRequired or err == error.MemoryBudgetExceeded) return err;
     std.log.err("loadModel({s}) failed: no backend accepted model", .{model_dir});
     std.log.err("manifest paths onnx={?s} visual={?s} audio={?s} text_projection={?s} visual_projection={?s} audio_projection={?s}", .{
         man.onnx_path,
@@ -11209,6 +11222,42 @@ test "ColQwen query forward observes managed backend cancellation after tokeniza
         null,
     ));
     try std.testing.expectEqual(trace.fail_at.?, trace.checks);
+}
+
+test "model load preflight checks resolved backends before construction and preserves fallback" {
+    const a = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, a);
+    const root = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer a.free(root);
+    const Probe = struct {
+        attempts: [2]backends.BackendType = undefined,
+        count: usize = 0,
+        deny_all: bool = false,
+        fn check(raw: *anyopaque, _: []const u8, _: *const manifest_mod.ModelManifest, backend: backends.BackendType, _: ?backend_contracts.A4bInferenceRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.attempts[self.count] = backend;
+            self.count += 1;
+            if (self.deny_all or backend == .metal) return error.MemoryBudgetExceeded;
+        }
+    };
+    var probe: Probe = .{};
+    var manager = ModelManager.init(a, .{ .allocator = a, .preferred_backends = &.{ .cuda, .metal, .native }, .process_termination_available = false });
+    defer manager.deinit();
+    manager.model_load_preflight = .{ .context = &probe, .check = Probe.check };
+    var manifest = try manifest_mod.loadFromDir(a, root);
+    defer manifest.deinit();
+    // Reject Metal before driver/session construction, then load the same real
+    // fixture on the permitted native candidate. No accelerator is required.
+    var loaded = try loadSessionForPreferredBackends(&manager, manager.session_manager.preferred_backends, root, manifest, &manager.session_manager, null);
+    loaded.deinit();
+    const expected: []const backends.BackendType = if (build_options.enable_metal) &.{ .metal, .native } else &.{.native};
+    try std.testing.expectEqualSlices(backends.BackendType, expected, probe.attempts[0..probe.count]);
+    probe.count = 0;
+    probe.deny_all = true;
+    try std.testing.expectError(error.MemoryBudgetExceeded, loadSessionForPreferredBackends(&manager, manager.session_manager.preferred_backends, root, manifest, &manager.session_manager, null));
+    try std.testing.expectEqualSlices(backends.BackendType, expected, probe.attempts[0..probe.count]);
 }
 
 test "cold load rollback owns manifest and constructed session before cancellation checkpoints" {

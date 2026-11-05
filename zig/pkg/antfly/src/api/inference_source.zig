@@ -245,12 +245,12 @@ fn resolveChatResources(a: A, request: V, found: ChatSources, port: ?Port, attac
         const bytes = try fetch(port.?.ptr, a, resource);
         if (bytes.len != resource.length) return error.InferenceSourceMismatch;
         if (isImageMime(resource.mime_type)) {
-            const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
-            _ = std.base64.standard.Encoder.encode(encoded, bytes);
             const mime = images.inferenceMimeEssenceForFormat(images.detectFormat(bytes)) orelse return error.InferenceSourceMismatch;
             if (!std.mem.eql(u8, mime, resource.mime_type)) return error.InferenceSourceMismatch;
-            const info = try images.inspectEncoded(bytes);
+            const info = images.inspectEncoded(bytes) catch return error.InvalidInferenceMedia;
             if (try info.pixels() > 64 * 1024 * 1024) return error.InferenceRequestTooLarge;
+            const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+            _ = std.base64.standard.Encoder.encode(encoded, bytes);
             try setChatImage(a, item.part, try std.fmt.allocPrint(a, "data:{s};base64,{s}", .{ resource.mime_type, encoded }));
             continue;
         }
@@ -428,7 +428,7 @@ fn verifyInfo(a: A, reference: Reference, url: []const u8) !Verified {
     if (!std.mem.eql(u8, &std.fmt.bytesToHex(digest, .lower), reference.sha256)) return error.InferenceSourceMismatch;
     const mime = images.inferenceMimeEssenceForFormat(images.detectFormat(bytes)) orelse return error.InferenceSourceMismatch;
     if (!std.mem.eql(u8, mime, reference.mime_type)) return error.InferenceSourceMismatch;
-    const info = try images.inspectEncoded(bytes);
+    const info = images.inspectEncoded(bytes) catch return error.InvalidInferenceMedia;
     const pixels = try info.pixels();
     if (pixels > reference.max_pixels) return error.InferenceRequestTooLarge;
     return .{ .bytes = length, .digest = std.fmt.bytesToHex(digest, .lower), .mime = mime, .pixels = pixels };
@@ -679,6 +679,25 @@ fn chatRequest(a: A, mime: []const u8, length: u64) !V {
         \\{{"model":"m","messages":[{{"role":"user","content":[{{"type":"text","text":"hi"}},{{"type":"source","source":{{"type":"source","uri":"https://sources.example/v1/media/a/b","mime_type":"{s}","version":"\"abc\"","version_kind":"strong_etag","length":{d}}}}}]}}]}}
     , .{ mime, length });
     return std.json.parseFromSliceLeaky(V, a, body, .{});
+}
+
+test "httpx inference gateway malformed fetched images are invalid client media" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "\x89PNG\r\n\x1a\n", "\x89PNG\r\n\x1a\nnot actually a png file" }) |bytes| {
+        var fake = ChatFake{ .bytes = bytes };
+        var attachments: ?[]const Attachment = null;
+        try std.testing.expectError(error.InvalidInferenceMedia, resolve(a, try chatRequest(a, "image/png", bytes.len), fake.port(), &attachments));
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+        _ = std.base64.standard.Encoder.encode(encoded, bytes);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        const reference: Reference = .{ .table = "docs", .document_id = "a", .field = "assets.preview", .revision_field = "revision", .revision = "r1", .sha256 = &hex, .mime_type = "image/png", .byte_length = bytes.len, .max_pixels = 16 };
+        try std.testing.expectError(error.InvalidInferenceMedia, verifyInfo(a, reference, try std.fmt.allocPrint(a, "data:image/png;base64,{s}", .{encoded})));
+    }
 }
 
 test "httpx inference gateway chat source parts attach audio and video without their URL" {

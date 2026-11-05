@@ -179,6 +179,9 @@ It accepts PNG, JPEG, WebP and GIF images, and `audio/*` and `video/*` types. On
   64 MiB budget. Each batch item releases its media before the next item runs.
   A server at the shared media limit
   returns 429 and the request can be retried.
+  Malformed image headers in pinned resources or table source references return
+  400 `InvalidInferenceMedia` before provider dispatch. Generation batches report
+  the failure on the affected item.
 
 Declare `video: supported` under `inference_capabilities` for a named target that
 accepts video. Without a declaration, video requests to that target are rejected.

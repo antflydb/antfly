@@ -920,6 +920,10 @@ load. Preference construction and proxy-side discovery never initialize a device
 probing happens at model load, after checking the host's native-call isolation policy.
 Without a usable device, `auto` keeps the ordinary fallback order. Set
 `ANTFLY_INFERENCE_PREFERRED_BACKEND=native` to opt out.
+The native generation CLI checks load budgets for each resolved backend before
+constructing its session, including draft models. `auto` uses CUDA's weight tier
+and residency estimate when CUDA is selected; CPU fallback uses the host tier.
+Budget rejection follows the model loader's fallback and CUDA A4B safety policy.
 
 ### Capability probe
 

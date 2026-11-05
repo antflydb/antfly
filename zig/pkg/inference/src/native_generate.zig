@@ -326,10 +326,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     } else opts.draft_model;
     const started_at = std.Io.Timestamp.now(io, .awake);
 
-    var preflight_manifest = try manifest_mod.loadFromDir(allocator, opts.model_dir);
-    defer preflight_manifest.deinit();
-    try preflightModelLoadBudget(allocator, &preflight_manifest, opts);
-
     const loaded_video = if (opts.video_path) |path| try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(256 * 1024 * 1024)) else null;
     defer if (loaded_video) |bytes| allocator.free(bytes);
     var loaded_images = std.ArrayListUnmanaged([]u8).empty;
@@ -438,6 +434,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
+    var load_budget = ModelLoadBudget{ .allocator = allocator, .options = opts };
+    model_manager.model_load_preflight = .{ .context = &load_budget, .check = ModelLoadBudget.check };
 
     var draft_session_manager = backends.SessionManager.initWithIo(allocator, io);
     configureBackendPreference(&draft_session_manager, opts.backend);
@@ -450,6 +448,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     draft_session_manager.kernel_jit_load_context = .startup_preload;
     var draft_model_manager = model_manager_mod.ModelManager.init(allocator, draft_session_manager);
     defer draft_model_manager.deinit();
+    draft_model_manager.model_load_preflight = .{ .context = &load_budget, .check = ModelLoadBudget.check };
 
     if (artifact_backend != null and effective_draft_model == null and opts.max_tokens == 1 and opts.video_path == null and opts.image_count == 0 and opts.audio_count == 0) {
         var artifact_arena = std.heap.ArenaAllocator.init(allocator);
@@ -8093,27 +8092,44 @@ fn a4bInferenceRequest(opts: Options) ?ops.A4bInferenceRequest {
     };
 }
 
+const ModelLoadBudget = struct {
+    allocator: std.mem.Allocator,
+    options: Options,
+
+    fn check(raw: *anyopaque, model_dir: []const u8, manifest: *const manifest_mod.ModelManifest, backend: backends.BackendType, a4b_request: ?ops.A4bInferenceRequest) !void {
+        const self: *const ModelLoadBudget = @ptrCast(@alignCast(raw));
+        var opts = self.options;
+        opts.model_dir = model_dir;
+        try preflightModelLoadBudget(self.allocator, manifest, opts, backend, a4b_request);
+    }
+};
+
+fn loadWeightTier(backend: backends.BackendType) runtime.tier.memory.ResidencyTier {
+    return if (backend.usesGpuHostedSession()) .backend else .host;
+}
+
 fn preflightModelLoadBudget(
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
     opts: Options,
+    backend: backends.BackendType,
+    a4b_request: ?ops.A4bInferenceRequest,
 ) !void {
-    const reservation_tier = predictedWeightTier(allocator, manifest, opts.backend) orelse return;
-    const predicted_backend_type = predictedBackendType(opts.backend, reservation_tier);
-    if (predicted_backend_type == .metal or predicted_backend_type == .cuda) {
-        const a4b_config = if (predicted_backend_type == .cuda)
+    const reservation_tier = loadWeightTier(backend);
+    if (backend == .metal or backend == .cuda) {
+        const a4b_config = if (backend == .cuda)
             try session_factory.resolveCudaA4bInferenceConfigForModelListing(
                 allocator,
                 opts.model_dir,
                 manifest.*,
-                a4bInferenceRequest(opts),
+                a4b_request,
             )
         else
             try session_factory.resolveA4bInferenceConfigForModelListing(
                 allocator,
                 opts.model_dir,
                 manifest.*,
-                a4bInferenceRequest(opts),
+                a4b_request,
             );
         if (a4b_config != null) {
             // Exact A4B loads are leased as one bounded weights+KV+scratch
@@ -8122,7 +8138,7 @@ fn preflightModelLoadBudget(
             return;
         }
     }
-    const weight_bytes = estimatePreflightWeightBytes(allocator, manifest, opts) catch 0;
+    const weight_bytes = estimatePreflightWeightBytes(allocator, manifest, backend) catch 0;
     if (weight_bytes == 0) return;
 
     var limits = runtime.tier.memory.defaultLimitsForBackend(switch (reservation_tier) {
@@ -8134,7 +8150,7 @@ fn preflightModelLoadBudget(
         allocator,
         opts.model_dir,
         limits,
-        predicted_backend_type,
+        backend,
     );
     limits = try applyBudgetOverrides(limits, opts);
     var run_budget = runtime.tier.memory.RunBudget.init(limits);
@@ -8142,54 +8158,14 @@ fn preflightModelLoadBudget(
         if (err == error.MemoryBudgetExceeded) {
             var buf: [512]u8 = undefined;
             const msg = run_budget.lastDenialString(&buf) catch "memory budget exceeded before model load";
-            print("{s}; model artifact requires ~{d} MB before prompt/KV/scratch\n", .{
+            print("model load preflight ({s}): {s}; model artifact requires ~{d} MB before prompt/KV/scratch\n", .{
+                @tagName(backend),
                 msg,
                 weight_bytes / (1024 * 1024),
             });
         }
         return err;
     };
-}
-
-fn predictedWeightTier(
-    allocator: std.mem.Allocator,
-    manifest: *const manifest_mod.ModelManifest,
-    choice: BackendChoice,
-) ?runtime.tier.memory.ResidencyTier {
-    switch (choice) {
-        .native => return .host,
-        .metal => {
-            if (!build_options.enable_metal) return .host;
-            return .backend;
-        },
-        .cuda => {
-            if (!build_options.enable_cuda) return .host;
-            return .backend;
-        },
-        .auto => {
-            if (build_options.enable_metal and !shouldPreferNativeAheadOfMetal(allocator, manifest)) return .backend;
-            return .host;
-        },
-        .xla, .webgpu => return .host,
-    }
-}
-
-fn predictedBackendType(choice: BackendChoice, tier: runtime.tier.memory.ResidencyTier) backends.BackendType {
-    if (tier != .backend) return .native;
-    return switch (choice) {
-        .metal => .metal,
-        .cuda => .cuda,
-        .auto => .metal,
-        .native, .xla, .webgpu => .native,
-    };
-}
-
-fn shouldPreferNativeAheadOfMetal(
-    allocator: std.mem.Allocator,
-    manifest: *const manifest_mod.ModelManifest,
-) bool {
-    const total_bytes = estimateModelArtifactBytes(allocator, manifest) catch return true;
-    return total_bytes == 0 or total_bytes > metalEagerDenseMaxBytes();
 }
 
 fn estimateModelArtifactBytes(
@@ -8205,10 +8181,10 @@ fn estimateModelArtifactBytes(
 fn estimatePreflightWeightBytes(
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
-    opts: Options,
+    backend: backends.BackendType,
 ) !usize {
     const artifact_bytes = try estimateModelArtifactBytes(allocator, manifest);
-    if (opts.backend != .cuda or manifest.safetensors_path == null or manifest.config_path == null) return artifact_bytes;
+    if (backend != .cuda or manifest.safetensors_path == null or manifest.config_path == null) return artifact_bytes;
 
     const config_bytes = try c_file.readFile(allocator, manifest.config_path.?);
     defer allocator.free(config_bytes);
@@ -8221,15 +8197,34 @@ fn estimatePreflightWeightBytes(
     return @min(artifact_bytes, embed_bytes + overhead_bytes);
 }
 
-fn metalEagerDenseMaxBytes() u64 {
-    const mb = platform.env.getenvUsize("TERMITE_METAL_EAGER_DENSE_MAX_MB") orelse return 1024 * 1024 * 1024;
-    return mb * 1024 * 1024;
-}
-
 fn validateVideoOptions(opts: Options) !void {
     if (opts.video_path == null) return;
     if (opts.image_count > 0 or opts.audio_count > 0) return error.UnsupportedMixedVideoInput;
     if (opts.raw_prompt or opts.draft_model != null) return error.UnsupportedVideoGenerationOption;
+}
+
+test "native generate load budget uses the resolved backend when options are automatic" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const weights = try a.alloc(u8, 2 * 1024 * 1024);
+    defer a.free(weights);
+    @memset(weights, 0);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = weights });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"bert\",\"hidden_size\":4,\"num_hidden_layers\":1,\"num_attention_heads\":2,\"intermediate_size\":8,\"vocab_size\":16}" });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "model.safetensors" });
+    defer a.free(path);
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .safetensors_path = path };
+    const options = Options{ .model_dir = root, .prompt = "hello", .backend = .auto, .host_budget_mb = 1, .backend_budget_mb = 8, .combined_budget_mb = 16 };
+    // No device is loaded: preflight must charge the actual candidate's tier,
+    // rather than rejecting the CUDA candidate against the CPU host cap.
+    try preflightModelLoadBudget(a, &manifest, options, .cuda, null);
+    try std.testing.expectError(error.MemoryBudgetExceeded, preflightModelLoadBudget(a, &manifest, options, .native, null));
+    var capped = options;
+    capped.backend_budget_mb = 1;
+    try std.testing.expectError(error.MemoryBudgetExceeded, preflightModelLoadBudget(a, &manifest, capped, .cuda, null));
 }
 
 test "video CLI accepts one clip and rejects conflicting inputs" {
