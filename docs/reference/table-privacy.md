@@ -188,7 +188,9 @@ Policy replacement preserves the live resolver and curation control state,
 including proposals created after protection was enabled. Switching to monitor
 restores the logical consumer declarations while retaining current control
 state. Re-enabling protection does not resurrect deleted resolver metadata or
-interpret curation evidence as index or producer configuration.
+interpret curation evidence as index or producer configuration. Scan and coverage
+progress do not invalidate resolver admission or query proofs; authored policy
+and consumer changes still fence them.
 
 Findings enumerate document IDs and inspect one source and manifest at a time.
 Pages stop between documents after an 8 MiB inspection budget, or within a

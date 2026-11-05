@@ -357,8 +357,8 @@ pub fn progressOnly(a: A, before: []const u8, after: []const u8) !bool {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    const lhs = try std.json.parseFromSliceLeaky(std.json.Value, scratch, before, .{});
-    const rhs = try std.json.parseFromSliceLeaky(std.json.Value, scratch, after, .{});
+    var lhs = try std.json.parseFromSliceLeaky(std.json.Value, scratch, before, .{});
+    var rhs = try std.json.parseFromSliceLeaky(std.json.Value, scratch, after, .{});
     if (lhs != .object or rhs != .object) return false;
     const old = lhs.object.get(key) orelse return false;
     const next_value = rhs.object.get(key) orelse return false;
@@ -368,12 +368,22 @@ pub fn progressOnly(a: A, before: []const u8, after: []const u8) !bool {
     defer prior.deinit();
     var next_resource = (try current(scratch, rhs)) orelse return false;
     defer next_resource.deinit();
-    for ([_]*std.json.Value{ lhs.object.getPtr(key).?, rhs.object.getPtr(key).? }) |value| {
-        inline for (.{ "coverage", "scans", "scan_id", "scan_sequence", "checkpoint_encoding" }) |name| {
-            _ = value.object.swapRemove(name);
-        }
-    }
+    removeProgress(&lhs);
+    removeProgress(&rhs);
     return std.mem.eql(u8, try std.json.Stringify.valueAlloc(scratch, lhs, .{}), try std.json.Stringify.valueAlloc(scratch, rhs, .{}));
+}
+
+/// Normalize request-owned catalog JSON for semantic fingerprints. Runtime
+/// progress cannot invalidate resolver admission/query proofs: progress commits
+/// deliberately do not rebuild those derived indexes. Authored policy fields,
+/// resource version, consumer declarations and generation remain live fences.
+pub fn removeProgress(root: *std.json.Value) void {
+    if (root.* != .object) return;
+    const value = root.object.getPtr(key) orelse return;
+    if (value.* != .object) return;
+    inline for (.{ "coverage", "scans", "scan_id", "scan_sequence", "checkpoint_encoding" }) |name| {
+        _ = value.object.swapRemove(name);
+    }
 }
 
 /// Reconciliation is not an owner of privacy configuration or progress. Retain

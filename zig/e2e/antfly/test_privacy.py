@@ -2065,6 +2065,10 @@ def test_privacy_accepts_native_secret_references_without_resolving_on_empty_sam
     api = stateful_api
     table = "privacy_secret_ref_" + uuid4().hex[:8]
     api.create_table(table)
+    # A completed write/delete waits for the Raft data owner, while keeping
+    # the preview sample empty and its credential reference unresolved.
+    api.batch_write(table, inserts={"warm": {"other": "hello"}})
+    api.batch_write(table, deletes=["warm"])
     path = f"/tables/{table}/privacy"
     reference = "${secret:privacy.fixture-api_key}"
     policy = {
