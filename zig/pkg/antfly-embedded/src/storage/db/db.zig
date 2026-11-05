@@ -32875,7 +32875,33 @@ pub const DB = struct {
                 _ = try self.runRelationalIndexMaintenancePass();
                 return false;
             },
+            .replay_retirement => return try self.advanceReplayJournalRetirement(),
         }
+    }
+
+    /// WS5: owner-only journal retirement, run from the same independent
+    /// maintenance cycle as the other background slices above. The gate is
+    /// the same `ReplicationWriteGate` every other slice here already uses:
+    /// `null` (standalone/Lite) always allows it; a hosted DB's configured
+    /// gate allows it only while this node is the Raft leader for this
+    /// group. One bounded, single-transaction retirement chunk per call;
+    /// `error.NotLeader` tells the caller it correctly skipped its turn.
+    fn advanceReplayJournalRetirement(self: *DB) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (!replicationWriteGateAllowsBackgroundWork(self.local_execution.replication_write_gate)) return error.NotLeader;
+        const retirement_stats = try self.core.store.serviceRetirement(self.alloc, true, .{});
+        return !retirement_stats.done;
+    }
+
+    /// One bounded retirement turn; a non-owner (hosted non-leader,
+    /// read-only) is a quiet no-op rather than an error, for callers that
+    /// are not themselves draining anything (they only want to make
+    /// opportunistic progress alongside their own bounded work).
+    fn advanceReplayJournalRetirementBestEffort(self: *DB) !void {
+        _ = self.advanceReplayJournalRetirement() catch |err| switch (err) {
+            error.NotLeader, error.ReadOnly => return,
+            else => return err,
+        };
     }
     fn independentSourceRecoveryCancelled(ptr: *anyopaque) bool {
         const self: *DB = @ptrCast(@alignCast(ptr));
@@ -34246,6 +34272,31 @@ pub const DB = struct {
             });
             return err;
         };
+        try self.drainReplayJournalRetirementToCompletion();
+    }
+
+    /// WS5: an explicit drain must not return with avoidable retirement debt
+    /// outstanding -- a producer's very next append could otherwise be
+    /// refused for want of credit this call could have released. Consumers
+    /// already caught up and raised the watermark in the drain above; loop
+    /// bounded retirement turns (consume -> progress already done -> retire
+    /// -> release, each its own commit) to completion. A non-owner (hosted:
+    /// not the Raft leader for this group; standalone: a read-only backend)
+    /// has nothing to drain here and simply stops -- it never held the
+    /// reserve to begin with. Called by every explicit full-drain entry
+    /// point (`runUntilIdle*`, reached in turn by the C API drain and
+    /// `cmd/lite.zig run-until-idle`), not by the bounded background-quantum
+    /// helpers (`runBackgroundMaintenanceWithCancellation` and friends),
+    /// which stay bounded and rely on the independent-maintenance worker's
+    /// own `.replay_retirement` slice instead.
+    fn drainReplayJournalRetirementToCompletion(self: *DB) !void {
+        while (true) {
+            const more = self.advanceReplayJournalRetirement() catch |err| switch (err) {
+                error.NotLeader, error.ReadOnly => return,
+                else => return err,
+            };
+            if (!more) return;
+        }
     }
 
     const EnrichmentThroughputSnapshot = struct {
@@ -34298,6 +34349,11 @@ pub const DB = struct {
     pub fn runUntilIdleWithoutWaitingForEnrichmentRetries(self: *DB) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("runUntilIdleWithoutWaitingForEnrichmentRetries", .{self});
         try self.runUntilIdleWithReplayDrainOptions(.{});
+        // WS5: one bounded retirement turn, not a loop to completion --
+        // this call must stay a bounded quantum for a borrowed maintenance
+        // caller. A repeat caller's hosted `catchUpManagedDb`-style "call
+        // until debt clears" loop converges it the rest of the way.
+        try self.advanceReplayJournalRetirementBestEffort();
     }
 
     /// Borrowed maintenance owners must release their group quantum when a
@@ -34310,6 +34366,7 @@ pub const DB = struct {
     ) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation", .{ self, cancellation });
         try self.runUntilIdleWithReplayDrainOptions(.{ .cancellation = cancellation });
+        try self.advanceReplayJournalRetirementBestEffort();
     }
 
     /// A Lite background turn borrows the file's writer lease. Return pending
@@ -100126,6 +100183,128 @@ test "db batch truncates replay logs after managed indexes catch up" {
         sleepPollInterval();
     }
     try std.testing.expectEqual(@as(usize, 0), remaining_journal_entries);
+}
+
+test "WS5 hosted replay retirement is leader-gated: the leader bounds the journal, a non-leader never retires" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |is_leader| {
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
+        defer cleanupTempDir(path);
+
+        // The hosted (LSM-backed) primary storage path: the same DB and
+        // DocStore machinery WS5 wires for Lite, now exercised with the
+        // backend the server actually uses.
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{} },
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        // The same `ReplicationWriteGate.allows_background_work` every other
+        // independent-maintenance slice (artifact upload, baseline, producer,
+        // footprint) already keys off -- for a hosted deployment the server
+        // wires this to "is this node currently the Raft leader for this
+        // group". A standalone DB's gate is `null` (always allows); this
+        // test stands in for the hosted wiring directly.
+        const Gate = struct {
+            fn allow(_: *const anyopaque) anyerror!void {}
+        };
+        var gate_ctx: u8 = 0;
+        db.local_execution.replication_write_gate = .{ .borrowed = .{
+            .ptr = &gate_ctx,
+            .check_fn = Gate.allow,
+            .allows_background_work = is_leader,
+        } };
+
+        try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }} });
+        _ = try waitForAppliedSequenceAdvance(alloc, &db, "ft_v1", 0);
+
+        const entries_before = try db.core.store.iterateReplayFrom(alloc, 1);
+        defer {
+            for (entries_before) |*entry| entry.deinit(alloc);
+            alloc.free(entries_before);
+        }
+        try std.testing.expect(entries_before.len > 0);
+
+        if (is_leader) {
+            // One owner-only maintenance turn (what the independent
+            // maintenance worker's `.replay_retirement` slice calls) bounds
+            // the whole journal in this small fixture.
+            var attempts: usize = 0;
+            while (attempts < default_test_wait_attempts) : (attempts += 1) {
+                if (!try db.advanceReplayJournalRetirement()) break;
+            }
+            const entries_after = try db.core.store.iterateReplayFrom(alloc, 1);
+            defer {
+                for (entries_after) |*entry| entry.deinit(alloc);
+                alloc.free(entries_after);
+            }
+            try std.testing.expectEqual(@as(usize, 0), entries_after.len);
+        } else {
+            try std.testing.expectError(error.NotLeader, db.advanceReplayJournalRetirement());
+            const entries_after = try db.core.store.iterateReplayFrom(alloc, 1);
+            defer {
+                for (entries_after) |*entry| entry.deinit(alloc);
+                alloc.free(entries_after);
+            }
+            try std.testing.expectEqual(entries_before.len, entries_after.len);
+        }
+    }
+}
+
+test "WS5 runUntilIdle drains journal retirement to completion at credit capacity" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }} });
+    _ = try waitForAppliedSequenceAdvance(alloc, &db, "ft_v1", 0);
+
+    // Every write-triggered path only enqueues a watermark now (WS5): the
+    // first document's replay entries are still here.
+    {
+        const entries = try db.core.store.iterateReplayFrom(alloc, 1);
+        defer {
+            for (entries) |*entry| entry.deinit(alloc);
+            alloc.free(entries);
+        }
+        try std.testing.expect(entries.len > 0);
+    }
+
+    // Pin capacity to exactly what is outstanding: a same-shaped second
+    // write's replay append no longer fits, so it is refused -- this is the
+    // reserve an explicit drain must not be able to exhaust.
+    const ledger_bytes = blk: {
+        const raw = try db.core.store.get(alloc, internal_keys.journal_credit_ledger_key[0..]);
+        defer alloc.free(raw);
+        break :blk (internal_keys.JournalCreditLedger.decode(raw) orelse return error.TestUnexpectedResult).bytes;
+    };
+    db.core.store.setJournalCreditPolicy(ledger_bytes, 0);
+
+    // The real explicit-drain entry point (also reached by the C API drain
+    // and `cmd/lite.zig run-until-idle`): it must retire the journal to
+    // completion, releasing the credit, not merely raise the watermark.
+    try db.runUntilIdle();
+
+    const ledger_after = blk: {
+        const raw = try db.core.store.get(alloc, internal_keys.journal_credit_ledger_key[0..]);
+        defer alloc.free(raw);
+        break :blk (internal_keys.JournalCreditLedger.decode(raw) orelse return error.TestUnexpectedResult).bytes;
+    };
+    try std.testing.expectEqual(@as(u64, 0), ledger_after);
+
+    // The capacity that refused a second write a moment ago now admits one:
+    // the drain actually released the reserve, not just advanced a cursor.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }} });
 }
 
 test "db async replay truncation retains durable enrichment debt" {

@@ -650,6 +650,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db dense index consuming a chunk-then-embed source via plural sources config converges its target counter",
         "runUntilIdle no-progress guard fails fast with a named stuck-index diagnostic",
         "target advance stuck tracking records first-seen time and clears on success",
+        "WS5 hosted replay retirement is leader-gated: the leader bounds the journal, a non-leader never retires",
+        "WS5 runUntilIdle drains journal retirement to completion at credit capacity",
     });
     const lib_db_enrichment_tests = b.addTest(.{
         .root_module = antfly_test_mod,
