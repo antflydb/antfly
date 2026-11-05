@@ -148,6 +148,13 @@ live-seek paging. On expiry or a catalog/incarnation conflict, discard the old
 cursor and start again. Minimum freshness in `read_requirements` is independent
 of retained snapshot identity. See the [request pair](../docs/guides/document-engine.mdx#exact-sort-and-cursor-pagination).
 
+Lite storage cannot publish the directory snapshot behind a retained cut. Its
+ordered queries read live state and answer with `live_read: true` instead of a
+token, so they return one exact page: cursors stay rejected, and composed
+queries, which need a cut across leaves, remain unsupported.
+A live read sees what the writer's `sync_level` has made visible; it doesn't wait
+for indexes. Write at `full_index` to read your own writes immediately.
+
 ### Elasticsearch And Lucene Alignment
 
 Antfly should follow Elasticsearch's public model and Lucene's physical lessons

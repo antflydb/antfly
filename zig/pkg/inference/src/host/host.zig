@@ -2904,6 +2904,7 @@ fn validateEncodedReadCapabilities(
 test "encoded reader ABI enforces resolved model capabilities" {
     var bytes = @as([24]u8, @splat(0));
     @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(bytes[12..16], "IHDR");
     std.mem.writeInt(u32, bytes[16..20], 2, .big);
     std.mem.writeInt(u32, bytes[20..24], 3, .big);
     const image = readers.EncodedImage{ .bytes = &bytes, .mime_type = "image/png" };
@@ -3853,7 +3854,7 @@ pub fn decodeLocalGenerateDataUri(
 }
 
 test "linked generator validates concrete MIME and decoded pixels" {
-    const uri = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
+    const uri = "data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD";
     const messages = [_]inference_types.ChatMessage{.{
         .role = .user,
         .content = .{ .parts = &.{.{ .image_url = .{ .url = uri } }} },

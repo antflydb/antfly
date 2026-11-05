@@ -3370,6 +3370,7 @@ pub fn encodeQueryRequestWithGraphWireMode(
         try out.appendSlice(alloc, encoded);
     }
     if (req.remote_snapshot) |snapshot| try appendJsonFieldString(alloc, &out, &first, "remote_snapshot", snapshot);
+    if (req.response_live_read) try appendJsonFieldBool(alloc, &out, &first, "_response_live_read", true);
     if (req.count_only) {
         try appendJsonFieldBool(alloc, &out, &first, "count", true);
     }
