@@ -34,6 +34,7 @@ pub const Scope = struct {
     namespace: u64,
     creator: local.system_catalog_privileges.Principal,
     target_digest: [32]u8 = @splat(0),
+    parent: ?@import("scope_retirement_ledger.zig").Child = null,
     pub fn targetDigest(database: []const u8, namespace: []const u8, name: []const u8) [32]u8 {
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update("antfly/table-retirement-label/v1");
@@ -48,11 +49,16 @@ pub const Scope = struct {
         return out;
     }
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        if (self.parent) |parent| return writer.write(.{ .database = self.database, .namespace = self.namespace, .creator = self.creator, .target_digest = self.target_digest, .parent = parent });
         if (std.mem.allEqual(u8, &self.target_digest, 0)) return writer.write(.{ .database = self.database, .namespace = self.namespace, .creator = self.creator });
         return writer.write(.{ .database = self.database, .namespace = self.namespace, .creator = self.creator, .target_digest = self.target_digest });
     }
     pub fn validate(self: @This()) !void {
         try self.creator.validate();
+        if (self.parent) |parent| {
+            try parent.validate();
+            if (parent.lookup.reference.database != self.database or !std.mem.allEqual(u8, &self.target_digest, 0)) return error.InvalidCatalogRecord;
+        }
         if (self.database == 0 or self.namespace == 0 or self.creator.kind == .public) return error.InvalidCatalogRecord;
     }
 };
@@ -92,6 +98,9 @@ pub const Head = struct {
         try self.lookup.validate();
         try self.effects.validate();
         try self.scope.validate();
+        if (self.scope.parent) |parent| {
+            if (parent.table != self.lookup.table or parent.lookup.group != self.lookup.group or !std.mem.eql(u8, &parent.id, &self.lookup.id) or self.phase == .canceled or self.schema_attempts != 0 or self.survivor != null) return error.InvalidCatalogRecord;
+        }
         if (!local.metadata_incarnation.isValid(self.incarnation) or self.effects.root_table != self.lookup.table or
             self.range_count > manifests.max_ranges or self.participant_count == 0 or self.participant_count > max_tables or std.mem.allEqual(u8, &self.participants_digest, 0) or
             (self.phase == .reserved and self.revision != 1) or (self.phase == .canceled and self.revision != 2) or
@@ -207,6 +216,7 @@ pub fn prepare(backing: A, id: Id, scope: Scope, bytes: []const u8) !Prepared {
 }
 fn prepareOwned(decoded: *manifests.Owned, id: Id, scope: Scope) !Prepared {
     const a = decoded.arena.allocator();
+    if (!std.meta.eql(scope.parent, decoded.value.scope_child)) return error.InvalidCatalogRecord;
     const tables = try participantTables(a, decoded.value);
     const value: Head = .{ .lookup = .{ .group = decoded.value.metadata_group_id, .table = decoded.value.root.table_id, .id = id }, .incarnation = decoded.value.metadata_incarnation, .effects = try decoded.value.reference(), .scope = scope, .participant_count = @intCast(tables.len), .range_count = @intCast(rangeCount(decoded.value)), .participants_digest = tableDigest(tables) };
     try value.validate();
@@ -219,6 +229,7 @@ fn prepareOwned(decoded: *manifests.Owned, id: Id, scope: Scope) !Prepared {
 pub const max_command_bytes = manifests.max_bytes + 4096;
 pub const Command = union(enum) {
     begin: struct { id: Id, scope: Scope, manifest: manifests.Manifest },
+    scope_begin: @import("scope_retirement_ledger.zig").Child,
     cancel: struct { lookup: Lookup, expected_revision: u64 },
     publish: struct { lookup: Lookup, expected_revision: u64 },
     seal: struct { lookup: Lookup, expected_revision: u64, plan: @import("fk_generation_publication.zig").Plan },
@@ -253,6 +264,10 @@ pub const Input = struct {
                 owned.value = request.manifest;
                 const prepared = try prepareOwned(&owned, request.id, request.scope);
                 return .{ .command = command, .prepared = prepared, .digest = digest };
+            },
+            .scope_begin => |child| {
+                try child.validate();
+                return .{ .arena = owned.arena, .command = command, .digest = digest };
             },
             .seal => |request| {
                 try request.lookup.validate();
@@ -384,6 +399,7 @@ pub fn existing(reader: anytype, prepared: *const Prepared) !bool {
     return true;
 }
 pub fn requireVacant(txn: anytype, prepared: *const Prepared) !void {
+    if (prepared.head.scope.parent != null) return @import("scope_retirement_children.zig").requireVacant(txn, prepared);
     var buffer: [256]u8 = undefined;
     if (try optional(txn, try key(&buffer, prepared.head.lookup, .active)) != null or try optional(txn, try key(&buffer, prepared.head.lookup, .effects)) != null) return error.GenerationPublicationChanged;
     for (prepared.tables) |table| {
@@ -397,6 +413,7 @@ pub fn stageBegin(txn: anytype, prepared: *const Prepared) !void {
     const value = prepared.head;
     var buffer: [256]u8 = undefined;
     // All expected rejection checks must have completed before staging.
+    if (value.scope.parent != null) return @import("scope_retirement_children.zig").stageBegin(txn, prepared);
     for (prepared.tables, 0..) |table, ordinal| {
         try lifecycle.acquire(txn, value.lookup.group, table, .{ .kind = .table_retirement, .id = value.lookup.id });
         const encoded_member = try MemberRecord.init(.{ .root = value.lookup, .table = table, .ordinal = @intCast(ordinal) });
@@ -427,6 +444,7 @@ pub fn stageBegin(txn: anytype, prepared: *const Prepared) !void {
 pub fn requireReservations(reader: anytype, value: Head, manifest: manifests.Manifest, tables: []const u64) !void {
     if (!value.active() or value.participant_count != tables.len or !std.mem.eql(u8, &value.participants_digest, &tableDigest(tables)) or
         !std.meta.eql(value.effects, try manifest.reference())) return error.InvalidCatalogRecord;
+    if (value.scope.parent != null) return @import("scope_retirement_children.zig").requireReservations(reader, value, manifest, tables);
     var buffer: [256]u8 = undefined;
     const active = try ActiveRecord.decode((try optional(reader, try key(&buffer, value.lookup, .active))) orelse return error.InvalidCatalogRecord);
     if (!std.meta.eql(active, value.lookup)) return error.InvalidCatalogRecord;
@@ -455,6 +473,7 @@ pub fn requireReservations(reader: anytype, value: Head, manifest: manifests.Man
 }
 pub fn cancel(a: A, txn: anytype, lookup: Lookup, expected_revision: u64) !void {
     const before = (try head(txn, lookup)) orelse return error.GenerationPublicationChanged;
+    if (before.scope.parent != null) return error.GenerationPublicationChanged;
     if (before.phase == .canceled) return;
     if (before.revision != expected_revision or before.phase != .reserved) return error.GenerationPublicationChanged;
     var buffer: [256]u8 = undefined;
@@ -650,8 +669,12 @@ pub fn preparePhysicalAck(reader: anytype, before: Head, ordinal: u16, step: phy
     const state = before.physical orelse return error.InvalidCatalogRecord;
     if (ordinal >= state.summary.owner_count) return error.InvalidGenerationPublication;
     const owner = try readPhysicalOwner(reader, before, ordinal);
-    const participant = (try member(reader, before.lookup.group, owner.table)) orelse return error.InvalidCatalogRecord;
-    if (!std.meta.eql(participant.root, before.lookup)) return error.InvalidCatalogRecord;
+    if (before.scope.parent != null) {
+        try @import("scope_retirement_children.zig").requireOwner(reader, before, owner.table);
+    } else {
+        const participant = (try member(reader, before.lookup.group, owner.table)) orelse return error.InvalidCatalogRecord;
+        if (!std.meta.eql(participant.root, before.lookup)) return error.InvalidCatalogRecord;
+    }
     const commitment = try physical.verifyEvidence(before.lookup, state, owner, step, evidence);
     var buffer: [256]u8 = undefined;
     if (try optional(reader, try physical.key(&buffer, before.lookup, .receipt, ordinal, step))) |bytes| {
@@ -700,7 +723,7 @@ pub fn nextPhysical(reader: anytype, value: Head) !?physical.Owner {
     return owner;
 }
 
-fn verifyPhysical(backing: A, reader: anytype, value: Head, manifest: manifests.Manifest) !u64 {
+pub fn verifyPhysical(backing: A, reader: anytype, value: Head, manifest: manifests.Manifest) !u64 {
     const state = value.physical orelse return 0;
     var region = std.heap.ArenaAllocator.init(backing);
     defer region.deinit();
@@ -741,6 +764,7 @@ pub fn verifyDirectory(backing: A, reader: anytype, group: u64, rows: anytype, c
     var expected_physical: u64 = 0;
     var expected_active: u64 = 0;
     var expected_members: u64 = 0;
+    var expected_locks: u64 = 0;
     var expected_ranges: u64 = 0;
     var expected_views: u64 = 0;
     var buffer: [256]u8 = undefined;
@@ -778,8 +802,9 @@ pub fn verifyDirectory(backing: A, reader: anytype, group: u64, rows: anytype, c
         try context.verify(reader, value, owned.value);
         try requireReservations(reader, value, owned.value, tables);
         expected_active += 1;
-        expected_members += value.participant_count;
-        expected_ranges += value.range_count;
+        expected_members += if (value.scope.parent != null) @as(u64, 1) else value.participant_count;
+        expected_locks += if (value.scope.parent != null) @as(u64, 0) else value.participant_count;
+        expected_ranges += if (value.scope.parent != null) owned.value.root_ranges.len else value.range_count;
         expected_views += value.effects.views;
     }
     var member_buffer: [192]u8 = undefined;
@@ -834,7 +859,7 @@ pub fn verifyDirectory(backing: A, reader: anytype, group: u64, rows: anytype, c
         if (expected_active != 0) try context.inspectRow(reader, group, row);
     }
     if (physical_count != expected_physical) return error.InvalidCatalogRecord;
-    if (active_count != expected_active or members_count != expected_members or locks_count != expected_members or ranges_count != expected_ranges or views_count != expected_views or aliases_count != expected_views) return error.InvalidCatalogRecord;
+    if (active_count != expected_active or members_count != expected_members or locks_count != expected_locks or ranges_count != expected_ranges or views_count != expected_views or aliases_count != expected_views) return error.InvalidCatalogRecord;
 }
 
 test "table retirement manifest input owns grown arenas and is atomic at every allocation failure" {

@@ -58,7 +58,7 @@ backings assigns stable ordinals, root-derived child IDs and exact definition/ra
 commitments. Held and rewritten tables never receive deletion children. The
 cyclic work read returns the next compact registration using point reads; it does
 not decode the immutable membership body on every idle/coordinator poll. This
-requires metadata capability 168. Registrations identify proposed child work;
+requires metadata capability 170. Registrations identify proposed child work;
 they grant no physical execution or completion authority.
 
 Terminal progress releases leases, body, work and child registrations atomically
@@ -114,8 +114,10 @@ transaction as its outcome and custody release. Each canceled head must resolve
 its own exact receipt; aggregate counts cannot substitute for this proof.
 Allocation high-water cannot survive a missing retained head. Only one bounded
 manifest is decoded at a time; member rows do not repeatedly decode that body.
-Since native physical progress commands are not admitted yet, recovery rejects
-fabricated drained/published progress rather than treating it as an owner ACK.
+Drain and child-ready advances retain independent exact outcomes. Recovery
+rejoins every completed child to its sealed native plan and signed owner
+receipts; a phase or registration is insufficient. Final catalog publication
+remains guarded until the common survivor cohort owns that atomic cut.
 
 The captured FK/default/view footprint now has three explicit participant
 intents: retire, rewrite and hold. Reverse FK/default directories supply complete
@@ -147,7 +149,7 @@ Callable-directory reads admit retained bytes before decoding and keep scratch
 for only one resource at a time. Snapshot and standby-checkpoint recovery prove
 reverse closure from authoritative callable records, independently of rebuilt
 derived indexes. Table-only scope jobs do not parse every unrelated callable.
-These semantics require metadata capability 168. They supply dependency custody,
+These semantics require metadata capability 170. They supply dependency custody,
 not permission to execute or acknowledge physical retirement.
 
 Named-type capture now closes the whole selected domain/enum set through the
@@ -167,7 +169,7 @@ reverse pass proves every type borrower and every removed-column view has the
 same root custody. Its column cache retains only one bounded scope at a time,
 with independent per-table decoding scratch. Capture also fences new uses of
 selected types before reservation can lose its admitted footprint. This is
-metadata capability 168; it does not replace the required physical row rewrite.
+metadata capability 170; it does not replace the required physical row rewrite.
 
 The authenticated materialized-view campaign also qualifies the shared query
 population lane. Preparation uses an exact-body administrative read grant on
@@ -177,9 +179,15 @@ Asynchronous population is observed through its durable job ID and idempotency
 key; a materialized view's logical object ID is not its hidden backing table ID.
 No admitted DDL is replayed to wait for publication.
 
-Reservation does not verify connection drainage, physical child ACKs or final
-catalog withdrawal. Its progress state cannot stand for those proofs. Native
-workers and final publication must verify each independently before advancing.
+Reservation does not certify connection drainage, physical child ACKs or final
+catalog withdrawal. A separate accepting-writer drain checks durable native
+source and prepared-transaction counts. Fenced sources remain counted until
+existing decision/lock cleanup acknowledges their retirement. Native source
+registration and new commands honor the database fence; exact completion and
+cleanup replays remain admissible. FORCE carries the retained root creator,
+not the privileged worker identity, into its native termination check. Its
+indexed source cursor commits with the fence and exact outcome. Snapshot and
+standby verification prove both directions of the source directory.
 
 Query-produced tables and materialized views use the existing metadata-owned
 replicated restore job lane. The requesting data node owns one producer
@@ -207,32 +215,53 @@ that administrative admission does not borrow replica authorization. The scope
 campaign separately checks mixed type/FK/default/view capture and complete
 survivor postimages, without claiming physical scope completion.
 
+## Native physical preparation
+
+Registered children enter the existing table-retirement worker through compact
+root-bound admission. Indexed source/range reads and registered definition
+fingerprints avoid decoding the full ancestor body for each child. Each child
+owns its source aliases, sealed plan and signed receipts; source and outgoing
+parent definitions remain under the ancestor's exact leases. Shared parents
+therefore do not acquire competing child lifecycle locks.
+
+A parent that is also a registered deletion child uses its own mandatory source
+barrier at the root boundary. The immutable physical plan binds that parent's
+registration, definition and range cut. It neither fetches unused parent
+fences nor issues another parent's transition into a namespace already being
+retired. Metadata refuses such a
+transition grant. Surviving parents retain the complete stage, activation,
+acknowledgement and reference-coverage protocol. This avoids internal-FK RPCs
+and conflicting source/parent fences without reopening any source or weakening
+surviving-parent coverage.
+
+A child stops at `physical_ready`. It cannot publish its own catalog deletion,
+release root custody or run an independent survivor rewrite. Root progress
+requires the exact sealed plan and complete signed receipt set, with one durable
+completion link per ordinal. Native snapshot and standby validation rejoin these
+proofs and reject missing, substituted or orphaned custody. The mounted campaign
+covers a lost source-fence reply, cold recovery, a shared surviving FK parent,
+self/cyclic FKs and a hidden materialized backing, followed by snapshot installation
+and standby export of the completed physical-preparation cut. This establishes
+physical preparation, not successful public DROP or physical namespace deletion.
+
 ## Remaining activation
 
-1. Publish captured named-type column evolution through the native staged row
-   rewrite and constraint machinery; metadata-only removal is insufficient for
-   physical typed rows. Complete other stored-definition dependency classes as
-   their public execution is activated. Finish connection/data admission and physical-owner barriers without
-   a global query lock. The current metadata footprint and fences do not supply
-   deletion authority for those still-unimplemented effects.
-2. Drive proposals from the child identities already registered atomically at
-   admission, and join each physical child to its root custody. A
-   constant-size cyclic native work feed and verified immutable manifest read
-   already cross the storage-owner and private metadata boundaries. Reservation
-   and cancellation retain exact outcomes under the decoder capability and
-   optional originating SQL command fence; that does not authorize child work.
-3. Drive existing native retirement workers under that root custody. Validate
-   the predicted subtract-only schema evolution between children; a reusable
-   display name cannot replace a captured member. Physical and catalog changes
-   must remain unobservable as a partially dropped scope.
-4. Drain eligible FORCE owners through the existing connection/transaction/lock
-   protocols. Retain prepared decisions, role/credential limits and cancellation
-   semantics. Do not infer successful cleanup from a missing connection cache.
-5. Publish the complete ancestor withdrawal and surviving dependency changes
-   under one verified native completion boundary. Integrate transactional schema
-   intent, public receipts, retention/GC, snapshots, backup/restore and mixed
-   decoder barriers. Qualify lost replies, cancellation, owner churn and complete
-   cold recovery before changing the three original dispositions.
+1. Publish the root's combined survivor postimages through the common staged
+   schema machinery, including physical typed-row evolution for withdrawn named
+   types. Preserve surviving rows and unrelated constraints; metadata-only
+   removal is insufficient.
+2. Add the leader-fenced ancestor supervisor. Explicitly admitted physical
+   children already use the existing worker; automatic root drainage, FORCE
+   traversal and final publication remain to be connected. Finish native
+   enrollment of idle HTTP connections and connection-termination delivery.
+3. Publish all ancestor withdrawals, surviving dependency changes and child
+   terminal receipts in one verified native transaction. Preserve every child
+   source fence until that decision, and retain enough exact proof for cold
+   recovery and bounded cleanup.
+4. Integrate transactional schema intent/rollback, public SQL receipts,
+   cancellation, mixed storage capabilities and backup/restore. Complete the
+   data/read admission barriers and fault campaigns before changing the three
+   original dispositions. These cases remain unresolved.
 
 Raced committed definition/topology mutations are deterministic no-ops while
 scope custody holds their owners. The refusal precedes definition journal and

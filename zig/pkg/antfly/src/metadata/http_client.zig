@@ -1573,7 +1573,7 @@ pub const MetadataHttpClient = struct {
         defer self.alloc.free(command);
         const group = switch (request.operation) {
             .reserve => |manifest| manifest.metadata_group_id,
-            .cancel => |cancel| cancel.lookup.group,
+            inline .cancel, .drain, .child_ready => |progress| progress.lookup.group,
         };
         var input = try wire.Input.parse(self.alloc, group, command);
         defer input.deinit();

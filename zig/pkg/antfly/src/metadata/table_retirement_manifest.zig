@@ -57,6 +57,9 @@ pub const Reference = struct {
 };
 pub const Manifest = struct {
     version: u8 = 1,
+    /// Physical-only child of an admitted ancestor. Logical effects remain at the root.
+    scope_child: ?@import("scope_retirement_ledger.zig").Child = null,
+    retiring_parents: []const @import("scope_retirement_ledger.zig").Child = &.{},
     metadata_group_id: u64,
     metadata_incarnation: local.metadata_incarnation.MetadataClusterIncarnation,
     guard: domain.RelationMutationGuard,
@@ -75,12 +78,33 @@ pub const Manifest = struct {
     external_parents: []const Backing,
     view_edges: []const ViewEdge,
 
+    pub fn jsonStringify(self: Manifest, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Manifest).@"struct".field_names) |field| {
+            if (!((comptime std.mem.eql(u8, field, "scope_child")) and self.scope_child == null or
+                (comptime std.mem.eql(u8, field, "retiring_parents")) and self.retiring_parents.len == 0))
+            {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+
     pub fn validate(self: Manifest, backing: A) !void {
         if (self.version != 1 or self.metadata_group_id == 0 or !local.metadata_incarnation.isValid(self.metadata_incarnation) or
             self.root.table_id == 0 or self.guard.owner.kind != .table or self.guard.owner.table_id != self.root.table_id or
-            self.guard.constraint_name_admission != null or self.guard.object_renames.len != 0 or self.root.sql_materialized_view_id != null or
+            self.guard.constraint_name_admission != null or self.guard.object_renames.len != 0 or (self.root.sql_materialized_view_id != null and self.scope_child == null) or
             self.counters.len > max_counters or self.survivors.len > max_survivors or self.dependent_views.len > max_views or
             self.view_backings.len > self.dependent_views.len or self.view_edges.len > max_edges or self.root.read_schema_json.len != 0 or self.root.storage_migration != null) return error.InvalidTableRetirementManifest;
+        if ((self.scope_child == null and self.retiring_parents.len != 0) or self.retiring_parents.len > self.outgoing_parents.len) return error.InvalidTableRetirementManifest;
+        var previous_retiring: u64 = 0;
+        for (self.retiring_parents) |parent| {
+            try parent.validate();
+            if (parent.table <= previous_retiring or !std.meta.eql(parent.lookup, self.scope_child.?.lookup) or
+                std.mem.indexOfScalar(u64, self.outgoing_parents, parent.table) == null) return error.InvalidTableRetirementManifest;
+            previous_retiring = parent.table;
+        }
         try self.guard.validate();
         if (!std.mem.eql(u8, &std.fmt.bytesToHex(self.guard.incarnation, .lower), &self.metadata_incarnation)) return error.MetadataIncarnationMismatch;
         var digest: [32]u8 = undefined;
@@ -121,6 +145,16 @@ pub const Manifest = struct {
             previous = pair.before.table_id;
         }
         try self.validateParentsAndRanges(backing);
+        if (self.scope_child) |child| {
+            try child.validate();
+            if (child.lookup.group != self.metadata_group_id or child.table != self.root.table_id or
+                self.counters.len != 0 or self.survivors.len != 0 or self.dependent_views.len != 0 or
+                self.view_backings.len != 0 or self.view_edges.len != 0 or self.selection.types.len != 0) return error.InvalidTableRetirementManifest;
+            // This document owns only the source/outgoing-parent barriers.
+            // Incoming FK, default, type and view withdrawals belong to the
+            // ancestor's combined logical cohort, never a child publication.
+            return;
+        }
         // Count the actual logical withdrawals, not only listed table IDs.
         // Together with native indexed stamps this rejects an omitted borrower
         // or active-FK survivor without trusting a producer's claimed closure.

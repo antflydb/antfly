@@ -703,3 +703,9 @@ Malformed public table recovery identities now consistently use the existing
 invalid-token diagnostic (`22023`). A regression covers empty names, zero table
 or namespace IDs, substituted logical targets, old versions and non-admission
 effects before native observation. All five catalog recovery Debug tests pass.
+
+Ancestor-owned children reuse this physical lane with the exact custody in
+[schema and database retirement](scope-retirement.md). They borrow root leases
+and stop at physical readiness. A registered parent in the same deletion set
+is covered by its own source barrier; surviving parents retain all transition
+and coverage ACKs. No child receives independent catalog-publication authority.

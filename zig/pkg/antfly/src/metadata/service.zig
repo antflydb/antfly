@@ -3761,7 +3761,7 @@ fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.Transitio
 }
 
 fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
-    if (command == .apply_scope_retirement) return metadata_topology_protocol.sql_scope_retirement_version;
+    if (command == .apply_scope_retirement or (command == .apply_sql_lock_scope and @import("schema_reader_wire.zig").requiresScopeRetirementAuthority(command.apply_sql_lock_scope)) or (command == .apply_table_retirement and @import("schema_reader_wire.zig").requiresScopeRetirementAuthority(command.apply_table_retirement))) return metadata_topology_protocol.sql_scope_retirement_version;
     const notifications = switch (command) {
         .apply_sql_lock_scope, .apply_sql_prepared_transaction => |bytes| @import("schema_reader_wire.zig").requiresSqlNotifications(bytes),
         else => false,

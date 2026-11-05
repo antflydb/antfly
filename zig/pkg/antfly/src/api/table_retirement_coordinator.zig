@@ -46,6 +46,7 @@ fn stepInternal(server: *Server, after: u64, context: operation.RequestContext, 
     const work = try std.json.parseFromSliceLeaky(root.Work, a, work_bytes, .{});
     try work.head.validate();
     if (!std.meta.eql(work.head.lookup, lookup)) return error.InvalidCatalogRecord;
+    if (work.head.scope.parent != null and work.head.phase == .physical_ready) return page.next;
     var command: root.Command = undefined;
     switch (work.head.phase) {
         .reserved, .physical_ready => {

@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Native transaction and cold-recovery tests of scope reservation custody.
-//! These exercise the journal only, not physical child completion authority.
+//! Native admission, connection drainage, physical-child custody and cold recovery.
+//! Real source/parent execution is qualified by the mounted owner campaign.
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const domain = local.system_catalog_domain;
@@ -948,6 +948,326 @@ test "SQL scope retirement callable closure fences retired sources preserves hel
             try std.testing.expect((try H.apply(&store, scratch, fresh)) == .success);
             const snapshot = try store.snapshotBuilder().buildSnapshot(scratch, group);
             try std.testing.expect(snapshot.len != 0);
+        }
+    }
+}
+
+const ConnectionHarness = struct {
+    const L = @import("../system_catalog/lock_authority.zig");
+    fn replace(store: *native.RaftApplyStore, address: []const u8, value: ?[]const u8) !void {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        if (value) |bytes| try txn.put(address, bytes) else try txn.delete(address);
+        try txn.commit();
+    }
+    fn databaseSource(store: *native.RaftApplyStore, a: std.mem.Allocator, registration: L.scopes.Registration, after: ?L.locks.Backend, wrap: bool, context: local.api_operation.RequestContext) !L.Snapshot {
+        return std.json.parseFromSliceLeaky(L.Snapshot, a, try store.sqlLockRead(a, group, .{
+            .incarnation = registration.lease.backend.incarnation,
+            .standalone = registration.standalone,
+            .database = registration.lease.database,
+            .actor = .{ .session_user = .bootstrap, .credential = "" },
+            .database_work = .{ .after = after, .wrap = wrap },
+        }, context), .{});
+    }
+    fn submit(store: *native.RaftApplyStore, a: std.mem.Allocator, registration: L.scopes.Registration, nonce: u8, operation: @FieldType(L.Request, "operation")) !void {
+        return submitScoped(store, a, registration, nonce, operation, null);
+    }
+    fn submitScoped(store: *native.RaftApplyStore, a: std.mem.Allocator, registration: L.scopes.Registration, nonce: u8, operation: @FieldType(L.Request, "operation"), scope: ?ledger.SourceControl) !void {
+        const lease = registration.lease;
+        const before = try std.json.parseFromSliceLeaky(L.Snapshot, a, try store.sqlLockRead(a, group, .{
+            .incarnation = lease.backend.incarnation,
+            .standalone = registration.standalone,
+            .database = lease.database,
+            .actor = .{ .session_user = .bootstrap, .credential = "" },
+            .backend = lease.backend,
+        }, .{ .setting_admin = true }), .{});
+        const request: L.Request = .{
+            .scope_retirement = scope,
+            .admission = .{ .head = before.head, .nonce = @splat(nonce) },
+            .incarnation = lease.backend.incarnation,
+            .standalone = registration.standalone,
+            .database = lease.database,
+            .actor = .{ .session_user = .bootstrap, .credential = "" },
+            .backend = lease.backend,
+            .operation = operation,
+        };
+        try store.applyStandaloneCommand(group, .{ .apply_sql_lock_scope = try std.json.Stringify.valueAlloc(a, request, .{}) });
+        const result = (try std.json.parseFromSliceLeaky(?L.outcomes.Outcome, a, try store.sqlLockOutcome(a, group, request), .{})).?;
+        _ = try result.result();
+    }
+};
+
+test "SQL scope retirement native drainage fences new commands preserves completion and retains exact cold proof" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const L = ConnectionHarness.L;
+    for ([_]bool{ false, true }) |replicated| {
+        const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/native-drain-{any}", .{ tmp.sub_path, replicated });
+        var admitted: wire.Outcome = undefined;
+        var drained: wire.Outcome = undefined;
+        var drain_request: wire.Request = undefined;
+        var outside: L.scopes.Registration = undefined;
+        for (0..2) |pass| {
+            var store = try native.RaftApplyStore.init(a, .{ .root_dir = path });
+            defer store.deinit();
+            if (pass == 0) {
+                try seed(&store, scratch);
+                const ordinary = try AdmissionHarness.request(&store, scratch, 101);
+                const registration: L.scopes.Registration = .{
+                    .group = group,
+                    .lease = .{ .backend = .{ .incarnation = ordinary.operation.reserve.metadata_incarnation, .id = @splat(2), .fence = 1 }, .database = ordinary.operation.reserve.scope.database.id, .node = 7, .principal = try L.principalDigest(scratch, .bootstrap), .expires_at_ms = 1000 },
+                    .connection = @splat('a'),
+                    .nonce = @splat(3),
+                    .standalone = false,
+                };
+                const command: L.scopes.Command = .{ .sequence = 1, .nonce = @splat(4), .executor = @splat(5) };
+                try ConnectionHarness.submit(&store, scratch, registration, 11, .{ .register = registration });
+                try ConnectionHarness.submit(&store, scratch, registration, 12, .{ .begin = command });
+                // An unrelated database has a lexically earlier backend. The
+                // selected database feed must seek past none of its sources.
+                outside = registration;
+                outside.lease.backend.id = @splat(1);
+                outside.lease.database = domain.default_database_id;
+                outside.connection = @splat('c');
+                try ConnectionHarness.submit(&store, scratch, outside, 60, .{ .register = outside });
+                const control: local.api_operation.RequestContext = .{ .setting_admin = true, .schema_validation_authority = true };
+                const selected = try ConnectionHarness.databaseSource(&store, scratch, registration, null, false, control);
+                try std.testing.expectEqualDeep(registration, selected.scope.?.registration);
+                try std.testing.expectEqualDeep(registration.lease.backend, selected.database_after.?);
+                try std.testing.expect((try ConnectionHarness.databaseSource(&store, scratch, registration, selected.database_after, false, control)).scope == null);
+                try std.testing.expectEqualDeep(registration, (try ConnectionHarness.databaseSource(&store, scratch, registration, selected.database_after, true, control)).scope.?.registration);
+                try std.testing.expectError(error.Forbidden, ConnectionHarness.databaseSource(&store, scratch, registration, null, false, .{ .setting_admin = true }));
+                try std.testing.expectError(error.Forbidden, ConnectionHarness.databaseSource(&store, scratch, registration, null, false, .{ .schema_validation_authority = true }));
+                // Ordinary DROP loses to an authoritative source, not merely
+                // a locally visible connection cache entry.
+                try std.testing.expectError(error.SqlDatabaseInUse, store.scopeRetirementPreflightJson(scratch, group, try ordinary.encodeAlloc(scratch)));
+                const refused = (try AdmissionHarness.apply(&store, scratch, ordinary, 1, replicated)).outcome.?;
+                try std.testing.expectEqual(wire.Rejection.SqlDatabaseInUse, refused.result.rejected);
+                var force = ordinary;
+                force.admission.nonce = @splat(102);
+                force.operation.reserve.force = true;
+                admitted = (try AdmissionHarness.apply(&store, scratch, force, 2, replicated)).outcome.?;
+                const lookup = admitted.query.lookup;
+                // The original source may observe exact admissions and finish.
+                try ConnectionHarness.submit(&store, scratch, registration, 13, .{ .register = registration });
+                try ConnectionHarness.submit(&store, scratch, registration, 14, .{ .begin = command });
+                try ConnectionHarness.submit(&store, scratch, registration, 15, .{ .finish = command });
+                try ConnectionHarness.submit(&store, scratch, registration, 16, .{ .begin = command });
+                var next = command;
+                next.sequence = 2;
+                next.nonce = @splat(6);
+                try std.testing.expectError(error.SqlDatabaseInUse, ConnectionHarness.submit(&store, scratch, registration, 17, .{ .begin = next }));
+                var newcomer = registration;
+                newcomer.lease.backend.id = @splat(7);
+                newcomer.connection = @splat('b');
+                try std.testing.expectError(error.SqlDatabaseInUse, ConnectionHarness.submit(&store, scratch, newcomer, 18, .{ .register = newcomer }));
+                // Fencing alone cannot acknowledge drainage: native source
+                // custody remains counted until its real close job completes.
+                try std.testing.expectError(error.InvalidCatalogMutation, ConnectionHarness.submitScoped(&store, scratch, outside, 61, .{ .fence = .close }, .{ .root = lookup }));
+                try ConnectionHarness.submitScoped(&store, scratch, registration, 19, .{ .fence = .close }, .{ .root = lookup });
+                try std.testing.expectError(error.CatalogGenerationChanged, ConnectionHarness.submitScoped(&store, scratch, registration, 62, .{ .fence = .close }, .{ .root = lookup }));
+                {
+                    var read = try store.store.beginReadTxn();
+                    try std.testing.expectEqualDeep(registration.lease.backend, (try ledger.sourceCursor(&read, lookup)).?.backend);
+                    read.abort();
+                    _ = try store.snapshotBuilder().buildSnapshot(scratch, group);
+                    var buffer: [320]u8 = undefined;
+                    const address = try ledger.key(&buffer, lookup, .source_cursor);
+                    read = try store.store.beginReadTxn();
+                    const saved = try scratch.dupe(u8, try read.get(address));
+                    read.abort();
+                    const forged = try ledger.SourceCursorRecord.init(.{ .lookup = lookup, .backend = outside.lease.backend });
+                    try ConnectionHarness.replace(&store, address, forged.slice());
+                    try std.testing.expectError(error.InvalidMetadataSnapshot, store.snapshotBuilder().buildSnapshot(scratch, group));
+                    try ConnectionHarness.replace(&store, address, saved);
+                }
+                drain_request = .{ .admission = .{ .nonce = @splat(103), .head = 0 }, .operation = .{ .drain = .{ .lookup = lookup, .expected_revision = 1 } } };
+                const busy = (try AdmissionHarness.apply(&store, scratch, drain_request, 3, replicated)).outcome.?;
+                try std.testing.expectEqual(wire.Rejection.SqlDatabaseInUse, busy.result.rejected);
+                for (0..8) |step| try ConnectionHarness.submit(&store, scratch, registration, @intCast(30 + step), .close_step);
+                // The retained refusal cannot become a later acceptance.
+                try std.testing.expectEqualDeep(busy, (try AdmissionHarness.apply(&store, scratch, drain_request, 4, replicated)).outcome.?);
+                drain_request.admission.nonce = @splat(104);
+                drained = (try AdmissionHarness.apply(&store, scratch, drain_request, 5, replicated)).outcome.?;
+                try std.testing.expectEqualDeep(try admitted.result.accepted.progress.drained(), drained.result.accepted.progress);
+                // Repeating the accepted admission cannot reacquire a source.
+                try std.testing.expectError(error.SqlDatabaseInUse, ConnectionHarness.submit(&store, scratch, newcomer, 50, .{ .register = newcomer }));
+            } else {
+                try std.testing.expectEqualDeep(drained, (try AdmissionHarness.apply(&store, scratch, drain_request, 6, replicated)).outcome.?);
+                // A native checkpoint must join this root's exact drain receipt,
+                // then recover that same state in an independent storage owner.
+                const snapshot = try store.snapshotBuilder().buildSnapshot(scratch, group);
+                const clone_path = try std.fmt.allocPrint(scratch, "{s}-clone", .{path});
+                var clone = try native.RaftApplyStore.init(a, .{ .root_dir = clone_path });
+                defer clone.deinit();
+                try std.testing.expect(try clone.snapshotBuilder().installSnapshot(scratch, group, 100, snapshot));
+                const restored = try std.json.parseFromSliceLeaky(wire.Observation, scratch, try clone.scopeRetirementObservationJson(scratch, group, drained.query), .{});
+                try std.testing.expectEqualDeep(drained, restored.outcome.?);
+                // A false zero/corrupt source directory in another database
+                // must not survive checkpoint validation either. Native source
+                // records independently prove both counts and membership.
+                const ns: L.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = outside.lease.backend.incarnation };
+                for (0..2) |corruption| {
+                    var source_key: [256]u8 = undefined;
+                    const selected_key = if (corruption == 0)
+                        try L.scopes.Testing.sourceAddress(&source_key, ns, outside.lease.database, outside.lease.backend)
+                    else
+                        try L.scopes.Testing.countAddress(&source_key, ns, outside.lease.database);
+                    var read = try clone.store.beginReadTxn();
+                    const saved = try scratch.dupe(u8, try read.get(selected_key));
+                    read.abort();
+                    try ConnectionHarness.replace(&clone, selected_key, null);
+                    try std.testing.expectError(error.InvalidMetadataSnapshot, clone.snapshotBuilder().buildSnapshot(scratch, group));
+                    const checkpoint = try std.fmt.allocPrint(scratch, "{s}/bad-source-{d}.bin", .{ clone_path, corruption });
+                    try std.testing.expectError(error.InvalidMetadataHACheckpoint, clone.exportHotStandbyCheckpoint(clone.io_impl.io(), checkpoint));
+                    try ConnectionHarness.replace(&clone, selected_key, saved);
+                }
+                _ = try clone.snapshotBuilder().buildSnapshot(scratch, group);
+                var buffer: [320]u8 = undefined;
+                const address = try ledger.key(&buffer, drained.query.lookup, .drain_outcome);
+                try ConnectionHarness.replace(&clone, address, null);
+                try std.testing.expectError(error.InvalidMetadataSnapshot, clone.snapshotBuilder().buildSnapshot(scratch, group));
+            }
+        }
+    }
+}
+
+test "SQL scope retirement FORCE authority cannot turn database administration into termination of a privileged owner" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try native.RaftApplyStore.init(a, .{ .root_dir = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/force-authority", .{tmp.sub_path}) });
+    defer store.deinit();
+    try seed(&store, scratch);
+    var request = try AdmissionHarness.request(&store, scratch, 120);
+    request.operation.reserve.creator = .{ .kind = .user, .instance = @splat(9) };
+    request.operation.reserve.force = true;
+    const manifest = request.operation.reserve;
+    const L = ConnectionHarness.L;
+    const registration: L.scopes.Registration = .{
+        .group = group,
+        .lease = .{ .backend = .{ .incarnation = manifest.metadata_incarnation, .id = @splat(2), .fence = 1 }, .database = manifest.scope.database.id, .node = 7, .principal = try L.principalDigest(scratch, .bootstrap), .expires_at_ms = 1000 },
+        .connection = @splat('a'),
+        .nonce = @splat(3),
+        .standalone = false,
+    };
+    try ConnectionHarness.submit(&store, scratch, registration, 10, .{ .register = registration });
+    const admitted = (try AdmissionHarness.apply(&store, scratch, request, 1, false)).outcome.?;
+    // The request worker runs as a trusted service principal; the retained SQL
+    // issuer, rather than that service privilege, bounds FORCE authority.
+    try std.testing.expectError(error.Forbidden, ConnectionHarness.submitScoped(&store, scratch, registration, 11, .{ .fence = .close }, .{ .root = admitted.query.lookup }));
+    var read = try store.store.beginReadTxn();
+    const ns: L.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = manifest.metadata_incarnation };
+    try std.testing.expectEqual(.active, (try L.scopes.read(a, &read, ns, registration.lease.backend)).?.state);
+    try std.testing.expectEqual(@as(u32, 1), try L.scopes.databaseCount(&read, ns, registration.lease.database));
+    read.abort();
+    _ = try AdmissionHarness.apply(&store, scratch, AdmissionHarness.cancel(admitted.query.lookup, 121), 2, false);
+    // A canceled root cannot authorize a new termination command either.
+    try std.testing.expectError(error.Forbidden, ConnectionHarness.submitScoped(&store, scratch, registration, 12, .{ .fence = .close }, .{ .root = admitted.query.lookup }));
+}
+
+test "SQL scope retirement physical children borrow exact root custody without independent catalog publication" {
+    const children = @import("scope_retirement_children.zig");
+    const tables = @import("table_retirement_ledger.zig");
+    const receipts = @import("table_retirement_receipt.zig");
+    const work = @import("table_retirement_work.zig");
+    const a = std.testing.allocator;
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/scope-child-custody", .{tmp.sub_path});
+    var child: ledger.Child = undefined;
+    var receipt: receipts.Request = undefined;
+    for (0..3) |pass| {
+        var store = try native.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer store.deinit();
+        if (pass == 0) {
+            try seed(&store, scratch);
+            const admitted = (try AdmissionHarness.apply(&store, scratch, try AdmissionHarness.request(&store, scratch, 151), 1, false)).outcome.?.result.accepted;
+            {
+                var read = try store.store.beginReadTxn();
+                defer read.abort();
+                child = (try ledger.child(&read, admitted.lookup, 0)).?;
+                try std.testing.expectError(error.GenerationPublicationChanged, children.requireParent(&read, child));
+            }
+            const bytes = try (tables.Command{ .scope_begin = child }).encodeAlloc(scratch);
+            try std.testing.expectError(error.GenerationPublicationChanged, store.tableRetirementPreflightJson(scratch, group, bytes));
+            _ = try AdmissionHarness.apply(&store, scratch, .{ .admission = .{ .nonce = @splat(152), .head = 0 }, .operation = .{ .drain = .{ .lookup = admitted.lookup, .expected_revision = 1 } } }, 2, false);
+            const before_child = try store.snapshotBuilder().buildSnapshot(scratch, group);
+            var substituted = child;
+            substituted.definition[0] ^= 1;
+            try std.testing.expectError(error.GenerationPublicationChanged, store.tableRetirementPreflightJson(scratch, group, try (tables.Command{ .scope_begin = substituted }).encodeAlloc(scratch)));
+            receipt = try std.json.parseFromSliceLeaky(receipts.Request, scratch, try store.tableRetirementPreflightJson(scratch, group, bytes), .{});
+            try std.testing.expectEqualDeep(child, receipt.effect.scope_admission);
+            try store.applyStandaloneCommand(group, .{ .apply_table_retirement = bytes });
+            const accepted = try std.json.parseFromSliceLeaky(receipts.Observation, scratch, try store.tableRetirementReceiptJson(scratch, group, receipt), .{});
+            try std.testing.expect(accepted.accepted);
+            try std.testing.expectEqualDeep(child, accepted.head.?.scope.parent.?);
+            const effect_bytes = try store.tableRetirementEffectsJson(scratch, group, receipt.lookup);
+            var prepared_child = try tables.prepare(a, child.id, accepted.head.?.scope, effect_bytes);
+            defer prepared_child.deinit();
+            var fault_store = try native.RaftApplyStore.init(a, .{ .root_dir = try std.fmt.allocPrint(scratch, "{s}-faults", .{path}) });
+            defer fault_store.deinit();
+            try std.testing.expect(try fault_store.snapshotBuilder().installSnapshot(scratch, group, 1, before_child));
+            for (0..4 + prepared_child.value.root_ranges.len) |fail_at| {
+                {
+                    var txn = try fault_store.store.beginWriteTxn();
+                    defer txn.abort();
+                    try tables.requireVacant(&txn, &prepared_child);
+                    var fault: Fault = .{ .txn = &txn, .remaining = fail_at };
+                    try std.testing.expectError(error.InjectedFailure, tables.stageBegin(&fault, &prepared_child));
+                }
+                {
+                    var read = try fault_store.store.beginReadTxn();
+                    defer read.abort();
+                    try std.testing.expect(try tables.head(&read, receipt.lookup) == null);
+                    try std.testing.expect(try tables.member(&read, group, child.table) == null);
+                }
+                // Reverse validation rejects orphan aliases, bodies or work;
+                // an aborted child admission leaves the full root cut intact.
+                _ = try fault_store.snapshotBuilder().buildSnapshot(scratch, group);
+            }
+            const complete: wire.Request = .{ .admission = .{ .nonce = @splat(153), .head = 0 }, .operation = .{ .child_ready = .{ .lookup = child.lookup, .expected_revision = 2, .ordinal = 0 } } };
+            const refused = (try AdmissionHarness.apply(&store, scratch, complete, 3, false)).outcome.?;
+            try std.testing.expectEqual(wire.Rejection.ScopeRetirementChanged, refused.result.rejected);
+        }
+        const bytes = try (tables.Command{ .scope_begin = child }).encodeAlloc(scratch);
+        const checked = try store.tableRetirementPreflightJson(scratch, group, bytes);
+        try std.testing.expectEqualDeep(receipt, try std.json.parseFromSliceLeaky(receipts.Request, scratch, checked, .{}));
+        try store.applyStandaloneCommand(group, .{ .apply_table_retirement = bytes });
+        const snapshot = try store.snapshotBuilder().buildSnapshot(scratch, group);
+        _ = try store.exportHotStandbyCheckpoint(store.io_impl.io(), try std.fmt.allocPrint(scratch, "{s}/child-{d}.bin", .{ path, pass }));
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        const head = (try tables.head(&read, receipt.lookup)).?;
+        try std.testing.expectEqual(tables.Phase.reserved, head.phase);
+        try std.testing.expect(try @import("table_lifecycle_lock.zig").read(&read, group, child.table) == null);
+        const page = try work.read(&read, group, 0);
+        try std.testing.expectEqualDeep(receipt.lookup, page.lookup.?);
+        const body = try store.tableRetirementEffectsJson(scratch, group, receipt.lookup);
+        var effects = try @import("table_retirement_manifest.zig").Owned.parse(a, body);
+        defer effects.deinit();
+        try std.testing.expectEqualDeep(child, effects.value.scope_child.?);
+        try std.testing.expectEqual(@as(usize, 0), effects.value.survivors.len);
+        try std.testing.expectEqual(@as(usize, 0), effects.value.counters.len);
+        try std.testing.expectError(error.GenerationPublicationChanged, store.tableRetirementPreflightJson(scratch, group, try (tables.Command{ .cancel = .{ .lookup = receipt.lookup, .expected_revision = 1 } }).encodeAlloc(scratch)));
+        try std.testing.expectError(error.GenerationPublicationChanged, store.tableRetirementPreflightJson(scratch, group, try (tables.Command{ .publish = .{ .lookup = receipt.lookup, .expected_revision = 1 } }).encodeAlloc(scratch)));
+        if (pass == 1) {
+            var clone = try native.RaftApplyStore.init(a, .{ .root_dir = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/scope-child-clone", .{tmp.sub_path}) });
+            defer clone.deinit();
+            try std.testing.expect(try clone.snapshotBuilder().installSnapshot(scratch, group, 1, snapshot));
+            const cloned = try std.json.parseFromSliceLeaky(receipts.Observation, scratch, try clone.tableRetirementReceiptJson(scratch, group, receipt), .{});
+            try std.testing.expect(cloned.accepted);
+            try std.testing.expectEqualDeep(head, cloned.head.?);
         }
     }
 }

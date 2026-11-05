@@ -130,7 +130,15 @@ fn buildControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
     return buildFromCut(server, alloc, context, identity, .{ .tables = snapshot.tables, .ranges = snapshot.ranges }, before, proposed_schema_json, guard, sql_drop, null);
 }
 
-const RetirementRoot = struct { id: publication.Id, effects: @import("../metadata/table_retirement_manifest.zig").Reference };
+const RetirementRoot = struct {
+    id: publication.Id,
+    effects: @import("../metadata/table_retirement_manifest.zig").Reference,
+    retiring_parents: []const @import("../metadata/scope_retirement_ledger.zig").Child = &.{},
+    fn parent(self: @This(), id: u64) ?@import("../metadata/scope_retirement_ledger.zig").Child {
+        for (self.retiring_parents) |retiring| if (retiring.table == id) return retiring;
+        return null;
+    }
+};
 
 /// Plan only the accepted root's immutable source and outgoing parents. No
 /// whole-catalog snapshot is needed; seal rechecks this cut in the root txn.
@@ -149,12 +157,12 @@ pub fn buildTableRetirement(server: *server_mod.ApiHttpServer, alloc: std.mem.Al
         try selected.append(alloc, parent.table);
         try ranges.appendSlice(alloc, parent.ranges);
     }
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest.root.schema_json, .{ .parse_numbers = false });
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, if (manifest.root.schema_json.len == 0) "{}" else manifest.root.schema_json, .{ .parse_numbers = false });
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidGenerationPublication;
     _ = parsed.value.object.swapRemove("foreign_keys");
     const target = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
-    const plan = try buildFromCut(server, alloc, context, null, .{ .tables = selected.items, .ranges = ranges.items }, manifest.root, target, null, manifest.guard, .{ .id = id, .effects = try manifest.reference() });
+    const plan = try buildFromCut(server, alloc, context, null, .{ .tables = selected.items, .ranges = ranges.items }, manifest.root, target, null, manifest.guard, .{ .id = id, .effects = try manifest.reference(), .retiring_parents = manifest.retiring_parents });
     const physical = @import("../metadata/table_retirement_physical.zig");
     const prepared = try physical.prepare(alloc, alloc, plan);
     try physical.requireManifest(alloc, .{ .group = manifest.metadata_group_id, .table = manifest.root.table_id, .id = id }, prepared, manifest);
@@ -184,8 +192,9 @@ fn buildFromCut(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, con
         }
     }
     const child_ranges = try rangesForCut(alloc, snapshot, current.table_id);
+    const retiring_self = if (root) |accepted| accepted.parent(current.table_id) != null else false;
     const self_parent = for (derived) |item| {
-        if (std.mem.eql(u8, item.parent_table_name, current.name)) break true;
+        if (!retiring_self and std.mem.eql(u8, item.parent_table_name, current.name)) break true;
     } else false;
     const child_fences = try ownerFencesWithCoverage(server, alloc, context, id, current, child_ranges, if (self_parent) .child_generation_dual else .child_generation_source, .checks_v1);
     var parents: std.ArrayList(publication.Parent) = .empty;
@@ -212,10 +221,12 @@ fn buildFromCut(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, con
             }
             const dual = parent_table.table_id == current.table_id;
             const parent_ranges = if (dual) child_ranges else try rangesForCut(alloc, snapshot, parent_table.table_id);
+            const retirement = if (root) |accepted| accepted.parent(parent_table.table_id) else null;
             try parents.append(alloc, .{
+                .scope_retirement = retirement,
                 .table = try ownedTableForPlan(alloc, parent_table),
                 .ranges = parent_ranges,
-                .fences = if (dual) child_fences else try ownerFencesWithCoverage(server, alloc, context, id, parent_table, parent_ranges, .child_generation_parent, .checks_v1),
+                .fences = if (retirement != null) &.{} else if (dual) child_fences else try ownerFencesWithCoverage(server, alloc, context, id, parent_table, parent_ranges, .child_generation_parent, .checks_v1),
                 .transitions = &.{},
             });
             found = &parents.items[parents.items.len - 1];

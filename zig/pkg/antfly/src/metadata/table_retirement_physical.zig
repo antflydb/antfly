@@ -129,6 +129,10 @@ pub fn prepare(a: A, scratch: A, plan: fk.Plan) !Prepared {
     }
     const digest = try plan.digest(scratch);
     for (plan.parents) |parent| {
+        // The ancestor owns this complete physical namespace. Its registered
+        // source fence replaces internal parent RPCs; the root cannot publish
+        // until that independent child has completed its own source barrier.
+        if (parent.scope_retirement != null) continue;
         const admission = local.storage_db_relational_integrity_generation_admission;
         const transitions = try scratch.alloc(admission.Transition, parent.transitions.len);
         defer scratch.free(transitions);
@@ -190,6 +194,10 @@ pub fn requireManifest(a: A, lookup: Lookup, plan: Prepared, manifest: manifests
     try requireRanges(plan.plan.child_ranges, manifest.root_ranges);
     for (plan.plan.parents, manifest.outgoing_parents) |parent, id| {
         if (parent.table.table_id != id) return error.InvalidGenerationPublication;
+        const retired = for (manifest.retiring_parents) |registered| {
+            if (registered.table == id) break @as(?@import("scope_retirement_ledger.zig").Child, registered);
+        } else null;
+        if (!std.meta.eql(parent.scope_retirement, retired)) return error.InvalidGenerationPublication;
         const expected = if (id == manifest.root.table_id) manifest.root else blk: {
             for (manifest.survivors) |pair| if (pair.before.table_id == id) break :blk pair.before;
             for (manifest.external_parents) |item| if (item.table.table_id == id) break :blk item.table;

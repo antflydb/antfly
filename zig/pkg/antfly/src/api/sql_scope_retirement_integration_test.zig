@@ -616,3 +616,224 @@ const PopulationCampaign = struct {
 test "mounted SQL scope retirement population jobs preserve source evaluation admission cancellation refresh and cold publication" {
     try fixture.run(PopulationCampaign);
 }
+
+test "mounted SQL scope retirement capture drives registered physical children with lost replies and cold owners" {
+    const scopes = @import("../metadata/scope_retirement_ledger.zig");
+    const root = @import("../metadata/table_retirement_ledger.zig");
+    const receipts = @import("../metadata/table_retirement_receipt.zig");
+    const scope_wire = @import("../metadata/scope_retirement_wire.zig");
+    const coordinator = @import("table_retirement_coordinator.zig");
+    const PhysicalCampaign = struct {
+        pub const native_auth = true;
+        pub const native_sessions = true;
+        pub const cold_catalog = true;
+        pub const configureAuth = Campaign.configureAuth;
+        credentials: client.ApiKeyHeaders = .{},
+        lookup: scopes.Lookup = undefined,
+        first: root.Lookup = undefined,
+        fn context() local.api_operation.RequestContext {
+            return .{ .setting_admin = true, .schema_validation_authority = true, .fk_generation_publication_authority = true, .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 20 * std.time.ns_per_s };
+        }
+        fn source(ctx: *fixture.Context) http.StatusSource {
+            return http.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+        }
+        fn deferred(err: anyerror) bool {
+            return @import("../metadata/schema_validation_coordinator.zig").isDeferred(err) or switch (err) {
+                error.GenerationAdmissionPending, error.ReadIndexTimeout, error.CatalogRoutingSnapshotTimeout, error.StorageReadTemporarilyUnavailable, error.IndexBuildPending => true,
+                else => false,
+            };
+        }
+        fn pause(ctx: *fixture.Context) !void {
+            const driver = http.ApiHttpServer.FkGenerationPublicationTestDriver;
+            try driver.pauseBackground(ctx.metadata.server.owned_public_http_server orelse return error.MissingMetadataPublicApi, ctx.io);
+            if (ctx.data.http_server) |*api| try driver.pauseBackground(api, ctx.io);
+        }
+        fn ownerWork(ctx: *fixture.Context, a: std.mem.Allocator, lookup: root.Lookup) !root.Work {
+            return std.json.parseFromSliceLeaky(root.Work, a, try source(ctx).systemCatalog(a, context(), .{ .table_retirement_owner_work = lookup }), .{});
+        }
+        fn start(ctx: *fixture.Context, child: scopes.Child) !void {
+            const a = ctx.alloc;
+            const bytes = try (root.Command{ .scope_begin = child }).encodeAlloc(a);
+            defer a.free(bytes);
+            const reply = try source(ctx).systemCatalog(a, context(), .{ .table_retirement_submit = bytes });
+            defer a.free(reply);
+            var result = try std.json.parseFromSlice(receipts.Observation, a, reply, .{});
+            defer result.deinit();
+            try std.testing.expect(result.value.accepted);
+            try std.testing.expectEqualDeep(child, result.value.head.?.scope.parent.?);
+        }
+        fn awaitForeignPublication(ctx: *fixture.Context, table: u64) !u32 {
+            const publication = @import("../metadata/fk_generation_publication.zig");
+            const driver = http.ApiHttpServer.FkGenerationPublicationTestDriver;
+            const api = ctx.metadata.server.owned_public_http_server orelse return error.MissingMetadataPublicApi;
+            try pause(ctx);
+            defer driver.resumeBackground(api);
+            defer if (ctx.data.http_server) |*data_api| driver.resumeBackground(data_api);
+            const deadline = @import("antfly_platform").time.monotonicNs() +| 60 * std.time.ns_per_s;
+            var last: ?publication.Phase = null;
+            var retry: ?anyerror = null;
+            while (@import("antfly_platform").time.monotonicNs() < deadline) {
+                try ctx.checkDrivers();
+                var arena: std.heap.ArenaAllocator = .init(ctx.alloc);
+                defer arena.deinit();
+                const a = arena.allocator();
+                const bytes = try source(ctx).systemCatalog(a, context(), .{ .fk_generation_publication_status = table });
+                const value = try std.json.parseFromSliceLeaky(publication.Publication, a, bytes, .{});
+                if (last == null or last.? != value.phase) {
+                    std.debug.print("scope cycle preparation phase={s} revision={d} fenced={d} staged={d} activated={d} acknowledged={d} installed={d}\n", .{ @tagName(value.phase), value.revision, value.child_fenced.len, value.parent_staged.len, value.parent_activated.len, value.parent_acknowledged.len, value.child_installed.len });
+                    last = value.phase;
+                }
+                if (value.phase == .published) return @import("tables.zig").schemaVersion(value.plan.child_after.schema_json);
+                if (value.phase == .canceled or value.phase == .canceling) return error.CycleConstraintCanceled;
+                driver.step(api, .none) catch |err| {
+                    if (!deferred(err)) return err;
+                    retry = err;
+                };
+                try ctx.io.sleep(.fromMilliseconds(20), .awake);
+            }
+            std.debug.print("scope cycle preparation stalled phase={?} retry={?}\n", .{ last, retry });
+            return error.CycleConstraintPublicationTimeout;
+        }
+        pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.credentials.activateWithCatalog(ctx, true);
+            ctx.headers = ctx.admin_headers;
+            try Campaign.execute(ctx, "CREATE TABLE scope_parent(id BIGINT PRIMARY KEY)");
+            try Campaign.execute(ctx, "INSERT INTO scope_parent VALUES(9)");
+            try Campaign.execute(ctx, "CREATE SCHEMA scope_children");
+            try Campaign.execute(ctx, "CREATE TABLE scope_children.first(id BIGINT PRIMARY KEY, parent BIGINT REFERENCES public.scope_parent(id), self_id BIGINT REFERENCES scope_children.first(id), second_id BIGINT)");
+            const first = try fixture.waitServingSchemaInScope(ctx, "default", "scope_children", "first", 0);
+            try Campaign.execute(ctx, "INSERT INTO scope_children.first(id,parent,self_id) VALUES(1,9,1)");
+            try Campaign.execute(ctx, "CREATE TABLE scope_children.second(id BIGINT PRIMARY KEY, first_id BIGINT REFERENCES scope_children.first(id), parent BIGINT REFERENCES public.scope_parent(id))");
+            _ = try fixture.waitServingSchemaInScope(ctx, "default", "scope_children", "second", 0);
+            try Campaign.execute(ctx, "INSERT INTO scope_children.second VALUES(2,1,9)");
+            try Campaign.execute(ctx, "ALTER TABLE scope_children.first ADD CONSTRAINT first_second_fk FOREIGN KEY(second_id) REFERENCES scope_children.second(id)");
+            const successor = try awaitForeignPublication(ctx, first.table_id);
+            try std.testing.expectEqual(first.version + 1, successor);
+            _ = try fixture.waitServingSchemaInScope(ctx, "default", "scope_children", "first", successor);
+            try Campaign.execute(ctx, "UPDATE scope_children.first SET second_id=2 WHERE id=1");
+            try Campaign.execute(ctx, "CREATE MATERIALIZED VIEW scope_children.display AS SELECT id FROM scope_children.first WITH NO DATA");
+            try pause(ctx);
+            var arena: std.heap.ArenaAllocator = .init(ctx.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const bytes = try source(ctx).systemCatalog(a, context(), .{ .scope_retirement_prepare = .{ .kind = .namespace, .name = "scope_children", .creator = .bootstrap, .cascade = true } });
+            const manifest = try std.json.parseFromSliceLeaky(contract.Manifest, a, bytes, .{});
+            const admitted = try std.json.parseFromSliceLeaky(scope_wire.Observation, a, try source(ctx).systemCatalog(a, context(), .{ .scope_retirement_submit = .{ .admission = .{ .nonce = @splat(181), .head = manifest.catalog_revision }, .operation = .{ .reserve = manifest } } }), .{});
+            self.lookup = admitted.current.?.lookup;
+            try std.testing.expectEqual(@as(u16, 3), self.lookup.reference.tables);
+            const drained = try std.json.parseFromSliceLeaky(scope_wire.Observation, a, try source(ctx).systemCatalog(a, context(), .{ .scope_retirement_submit = .{ .admission = .{ .nonce = @splat(182), .head = 0 }, .operation = .{ .drain = .{ .lookup = self.lookup, .expected_revision = 1 } } } }), .{});
+            try std.testing.expectEqual(.retiring_tables, drained.current.?.progress.phase);
+            const work = try std.json.parseFromSliceLeaky(scopes.Work, a, try source(ctx).systemCatalog(a, context(), .{ .scope_retirement_work = 0 }), .{});
+            const child = work.child.?;
+            self.first = .{ .group = child.lookup.group, .table = child.table, .id = child.id };
+            try start(ctx, child);
+            const api = ctx.metadata.server.owned_public_http_server orelse return error.MissingMetadataPublicApi;
+            const deadline = @import("antfly_platform").time.monotonicNs() +| 60 * std.time.ns_per_s;
+            while (@import("antfly_platform").time.monotonicNs() < deadline) {
+                try ctx.checkDrivers();
+                var scratch: std.heap.ArenaAllocator = .init(ctx.alloc);
+                defer scratch.deinit();
+                const before = try ownerWork(ctx, scratch.allocator(), self.first);
+                if (before.head.phase == .retiring and before.head.physical.?.phase == .fencing_sources) {
+                    if (coordinator.TestDriver.loseOwnerReply(api, 0, context())) |_| return error.ScopeFaultNotObserved else |err| {
+                        if (err == error.InjectedRetirementOwnerReplyLoss) {
+                            const after = try ownerWork(ctx, scratch.allocator(), self.first);
+                            try std.testing.expectEqualDeep(before.head, after.head);
+                            return;
+                        }
+                        if (!deferred(err)) return err;
+                    }
+                } else _ = coordinator.step(api, 0, context()) catch |err| blk: {
+                    if (!deferred(err)) return err;
+                    break :blk @as(u64, 0);
+                };
+                try ctx.io.sleep(.fromMilliseconds(20), .awake);
+            }
+            return error.ScopePhysicalFenceTimeout;
+        }
+        pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.credentials.activateWithCatalog(ctx, true);
+            ctx.headers = ctx.admin_headers;
+            try pause(ctx);
+            const api = ctx.metadata.server.owned_public_http_server orelse return error.MissingMetadataPublicApi;
+            const deadline = @import("antfly_platform").time.monotonicNs() +| 90 * std.time.ns_per_s;
+            var cursor: u64 = 0;
+            var last: ?struct { child: u16, phase: root.Phase, barrier: ?root.physical.Phase } = null;
+            var retry: ?anyerror = null;
+            var checked_internal_parent = false;
+            while (@import("antfly_platform").time.monotonicNs() < deadline) {
+                try ctx.checkDrivers();
+                var arena: std.heap.ArenaAllocator = .init(ctx.alloc);
+                defer arena.deinit();
+                const a = arena.allocator();
+                const scope = try std.json.parseFromSliceLeaky(scopes.Work, a, try source(ctx).systemCatalog(a, context(), .{ .scope_retirement_work = 0 }), .{});
+                try std.testing.expectEqualDeep(self.lookup, scope.head.lookup);
+                if (scope.head.progress.phase == .publishing_catalog) {
+                    try std.testing.expectEqual(@as(u16, 3), scope.head.progress.completed_tables);
+                    try std.testing.expect(checked_internal_parent);
+                    var surviving = try client.execute(ctx, "SELECT id FROM public.scope_parent", .read);
+                    defer surviving.deinit(ctx.alloc);
+                    try std.testing.expectEqual(@as(u16, 200), surviving.status);
+                    const rows = try std.json.parseFromSliceLeaky(@import("antfly_metadata_openapi").types.SQLResponse, a, surviving.body, .{});
+                    try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+                    try std.testing.expect(try @import("sql_parity_reference.zig").rowMatchesWithNulls(ctx.alloc, rows.columns, rows.rows[0], rows.sql_nulls.?[0], &.{.{ .integer = 9 }}, &.{false}));
+                    // No child has independent catalog-publication authority.
+                    // The shared survivor and ancestor cut is still retained.
+                    try Campaign.execute(ctx, "CREATE TABLE public.scope_disjoint(id BIGINT PRIMARY KEY)");
+                    const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
+                    const snapshot = try store.snapshotBuilder().buildSnapshot(a, self.lookup.group);
+                    var tmp = std.testing.tmpDir(.{});
+                    defer tmp.cleanup();
+                    const clone_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/scope-completed", .{tmp.sub_path});
+                    var clone = try @import("../storage/metadata_raft_apply_client.zig").RaftApplyStore.init(ctx.alloc, .{ .root_dir = clone_path });
+                    defer clone.deinit();
+                    try std.testing.expect(try clone.snapshotBuilder().installSnapshot(a, self.lookup.group, 1, snapshot));
+                    const recovered = try std.json.parseFromSliceLeaky(scopes.Work, a, try clone.scopeRetirementWorkJson(a, self.lookup.group, 0), .{});
+                    try std.testing.expectEqualDeep(scope.head, recovered.head);
+                    try std.testing.expect(recovered.child == null);
+                    _ = try clone.exportHotStandbyCheckpoint(ctx.io, try std.fmt.allocPrint(a, "{s}/ready.bin", .{clone_path}));
+                    return;
+                }
+                const child = scope.child.?;
+                const lookup: root.Lookup = .{ .group = child.lookup.group, .table = child.table, .id = child.id };
+                try start(ctx, child);
+                const work = try ownerWork(ctx, a, lookup);
+                const state: @typeInfo(@TypeOf(last)).optional.child = .{ .child = child.ordinal, .phase = work.head.phase, .barrier = if (work.head.physical) |physical| physical.phase else null };
+                if (!std.meta.eql(last, @as(@TypeOf(last), state))) {
+                    std.debug.print("scope physical child={d} phase={s} barrier={s}\n", .{ child.ordinal, @tagName(state.phase), if (state.barrier) |barrier| @tagName(barrier) else "unsealed" });
+                    last = state;
+                }
+                if (!checked_internal_parent and work.head.phase == .retiring and work.head.physical.?.phase == .staging_parents) {
+                    const bytes = try source(ctx).systemCatalog(a, context(), .{ .table_retirement_effects = lookup });
+                    var effects = try @import("../metadata/table_retirement_manifest.zig").Owned.parse(ctx.alloc, bytes);
+                    defer effects.deinit();
+                    for (effects.value.retiring_parents) |retiring| {
+                        const ranges = if (retiring.table == lookup.table) effects.value.root_ranges else blk: {
+                            for (effects.value.external_parents) |parent| if (parent.table.table_id == retiring.table) break :blk parent.ranges;
+                            return error.MissingRetiringParentCut;
+                        };
+                        try std.testing.expect(ranges.len != 0);
+                        try std.testing.expectError(error.GenerationPublicationChanged, source(ctx).systemCatalog(a, context(), .{ .fk_generation_publication_decision = .{ .plan_id = child.id, .parent_table_id = retiring.table, .parent_group_id = ranges[0].group_id, .child_table_id = lookup.table, .child_table_name = effects.value.root.name, .action = .stage } }));
+                        checked_internal_parent = true;
+                    }
+                }
+                if (work.head.phase == .physical_ready) {
+                    const reply = try source(ctx).systemCatalog(a, context(), .{ .scope_retirement_submit = .{ .admission = .{ .nonce = @splat(@as(u8, 183) + @as(u8, @intCast(child.ordinal))), .head = 0 }, .operation = .{ .child_ready = .{ .lookup = self.lookup, .expected_revision = scope.head.progress.revision, .ordinal = child.ordinal } } } });
+                    const observed = try std.json.parseFromSliceLeaky(scope_wire.Observation, a, reply, .{});
+                    try std.testing.expect(observed.outcome.?.result == .accepted);
+                } else cursor = coordinator.step(api, cursor, context()) catch |err| blk: {
+                    if (!deferred(err)) {
+                        std.debug.print("scope child ordinal={d} table={d} phase={s} barrier={s} failed={s}\n", .{ child.ordinal, child.table, @tagName(work.head.phase), if (work.head.physical) |physical| @tagName(physical.phase) else "unsealed", @errorName(err) });
+                        return err;
+                    }
+                    retry = err;
+                    break :blk @as(u64, 0);
+                };
+                try ctx.io.sleep(.fromMilliseconds(20), .awake);
+            }
+            std.debug.print("scope physical timed out state={any} retry={?}\n", .{ last, retry });
+            return error.ScopePhysicalCompletionTimeout;
+        }
+    };
+    try fixture.run(PhysicalCampaign);
+}

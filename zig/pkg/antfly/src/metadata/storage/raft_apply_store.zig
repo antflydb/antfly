@@ -21278,6 +21278,25 @@ pub const RaftApplyStore = struct {
     }
 
     fn validateFkGenerationCutTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, plan: fk_generation_publication.Plan, published: bool) !void {
+        if (plan.table_retirement != null) {
+            const lookup: table_retirement.Lookup = .{ .group = group_id, .table = plan.child_before.table_id, .id = plan.id };
+            const head = (try table_retirement.head(txn, lookup)) orelse return error.GenerationPublicationChanged;
+            if (head.scope.parent != null) {
+                if (published) return error.GenerationPublicationChanged;
+                var buffer: [256]u8 = undefined;
+                var body = try @import("../table_retirement_manifest.zig").Owned.parse(self.alloc, try txn.get(try table_retirement.key(&buffer, lookup, .effects)));
+                defer body.deinit();
+                const participants = try table_retirement.participantTables(self.alloc, body.value);
+                defer self.alloc.free(participants);
+                try table_retirement.requireReservations(txn, head, body.value, participants);
+                try (TableRetirementCheckpoint{ .alloc = self.alloc, .group = group_id }).verify(txn, head, body.value);
+                // fkOwnerPublicationTxn rejoined this exact persisted plan to
+                // the sealed digest. Do not rebuild/sort/encode the full owner
+                // directory again for each individual receiver request.
+                if (!std.meta.eql(head.effects, plan.table_retirement.?) or head.physical == null) return error.InvalidCatalogRecord;
+                return;
+            }
+        }
         try self.validateFkGenerationTableTxn(txn, group_id, if (published) plan.child_after else plan.child_before, plan.child_ranges);
         for (plan.parents) |parent| {
             // A self-parent is the child descriptor, not a second table. Its
@@ -22799,6 +22818,10 @@ pub const RaftApplyStore = struct {
         const parent = for (publication.plan.parents) |candidate| {
             if (candidate.table.table_id == request.parent_table_id) break candidate;
         } else return error.GenerationPublicationChanged;
+        // A retiring namespace is covered by its own root child. It has no
+        // parent work item and must never receive an independent transition
+        // grant that could conflict with its retained source fence.
+        if (parent.scope_retirement != null) return error.GenerationPublicationChanged;
         if (publication.phase == .acknowledging_reference_coverage and !publication.plan.needsParentCoverage(parent)) return error.GenerationPublicationChanged;
         const index = for (parent.ranges, 0..) |range, i| {
             if (range.group_id == request.parent_group_id) break i;
@@ -22891,13 +22914,18 @@ pub const RaftApplyStore = struct {
         _ = try self.standbyRelationActivationTxn(&read, group, topology_protocol.table_retirement_direct_version);
         if ((try @import("../table_retirement_receipt.zig").observe(&read, expected)).accepted)
             return std.json.Stringify.valueAlloc(a, expected, .{});
-        if (input.command == .begin) {
+        if (input.command == .scope_begin) {
+            if (input.command.scope_begin.lookup.group != group) return error.InvalidCatalogRecord;
+            var prepared = try self.prepareScopeChildTxn(&read, input.command.scope_begin);
+            defer prepared.deinit();
+            _ = try self.checkTableRetirementBeginTxn(&read, &prepared);
+        } else if (input.command == .begin) {
             _ = try self.checkTableRetirementBeginTxn(&read, &input.prepared.?);
         } else {
             const current = (try table_retirement.head(&read, expected.lookup)) orelse return error.GenerationPublicationNotFound;
             switch (input.command) {
-                .begin => unreachable,
-                .cancel => |request| if (current.phase != .reserved or current.revision != request.expected_revision) return error.GenerationPublicationChanged,
+                .begin, .scope_begin => unreachable,
+                .cancel => |request| if (current.scope.parent != null or current.phase != .reserved or current.revision != request.expected_revision) return error.GenerationPublicationChanged,
                 .ack => |request| {
                     if (current.phase != .retiring or current.revision != request.expected_revision) return error.GenerationPublicationChanged;
                     _ = try table_retirement.preparePhysicalAck(&read, current, request.ordinal, request.step, request.evidence);
@@ -22905,7 +22933,7 @@ pub const RaftApplyStore = struct {
                 .seal, .publish => {
                     const revision = if (input.command == .seal) input.command.seal.expected_revision else input.command.publish.expected_revision;
                     if (current.revision != revision or (input.command == .seal and current.phase != .reserved) or
-                        (input.command == .publish and (current.phase != .physical_ready or current.effects.survivors != 0))) return error.GenerationPublicationChanged;
+                        (input.command == .publish and (current.scope.parent != null or current.phase != .physical_ready or current.effects.survivors != 0))) return error.GenerationPublicationChanged;
                     var buffer: [256]u8 = undefined;
                     var body = try @import("../table_retirement_manifest.zig").Owned.parse(a, try read.get(try table_retirement.key(&buffer, expected.lookup, .effects)));
                     defer body.deinit();
@@ -23019,7 +23047,7 @@ pub const RaftApplyStore = struct {
                 const arena: std.heap.ArenaAllocator = .init(self.alloc);
                 return .{ .arena = arena, .manifest = manifest, .lookup = input.query.lookup, .encoded = input.manifest_json orelse return error.InvalidScopeRetirement };
             },
-            .cancel => |cancel| {
+            inline .cancel, .drain, .child_ready => |cancel| {
                 var buffer: [256]u8 = undefined;
                 const bytes = txn.get(try scope_retirement.key(&buffer, cancel.lookup, .manifest)) catch |err| return if (err == error.NotFound) error.ScopeRetirementChanged else err;
                 return scope_retirement.prepare(self.alloc, cancel.lookup.group, cancel.lookup.reference.id, bytes);
@@ -23034,6 +23062,10 @@ pub const RaftApplyStore = struct {
         if (input.request.admission.command_fence) |fence| try @import("../../system_catalog/command_fence.zig").check(self.alloc, txn, group, incarnation, fence);
         switch (input.request.operation) {
             .reserve => |manifest| {
+                if (input.request.admission.command_fence) |fence| {
+                    const issuer = try @import("../../system_catalog/lock_authority.zig").principalDigest(self.alloc, manifest.creator);
+                    if (!std.mem.eql(u8, &issuer, &fence.principal)) return error.Forbidden;
+                }
                 // A head without its atomically written admission outcome is
                 // corrupt; it cannot authorize a new command or reacquisition.
                 if (try scope_retirement.head(txn, input.query.lookup) != null) return error.InvalidScopeRetirement;
@@ -23052,6 +23084,24 @@ pub const RaftApplyStore = struct {
                 const reference = try current.reference(a, input.query.lookup.reference.id);
                 if (!std.meta.eql(reference, input.query.lookup.reference)) return error.CatalogGenerationChanged;
                 try scope_retirement.requireVacant(txn, prepared);
+                try @import("../scope_retirement_admission.zig").requireReservation(self.alloc, txn, manifest);
+            },
+            .drain => |drain| {
+                const before = (try scope_retirement.existing(txn, prepared)) orelse return error.ScopeRetirementChanged;
+                if (before.progress.revision != drain.expected_revision) return error.ScopeRetirementChanged;
+                _ = try before.progress.drained();
+                if (prepared.manifest.scope.kind == .database) {
+                    const database = prepared.manifest.scope.database.id;
+                    try @import("../scope_retirement_admission.zig").requireConnectionsDrained(self.alloc, txn, group, incarnation, database);
+                    if (try @import("../../system_catalog/lock_authority.zig").scopes.readDatabaseSource(self.alloc, txn, .{ .home = .metadata, .group = group, .incarnation = incarnation }, database, null) != null) return error.SqlDatabaseInUse;
+                }
+            },
+            .child_ready => |request| {
+                const before = (try scope_retirement.existing(txn, prepared)) orelse return error.ScopeRetirementChanged;
+                if (before.progress.revision != request.expected_revision) return error.ScopeRetirementChanged;
+                _ = try before.progress.tablePublished(request.ordinal);
+                const child = (try scope_retirement.child(txn, before.lookup, request.ordinal)) orelse return error.InvalidScopeRetirement;
+                _ = try @import("../scope_retirement_children.zig").requireReady(self.alloc, txn, child);
             },
             .cancel => |cancel| {
                 const before = (try scope_retirement.existing(txn, prepared)) orelse return error.ScopeRetirementChanged;
@@ -23092,6 +23142,14 @@ pub const RaftApplyStore = struct {
             .cancel => blk: {
                 const before = (try scope_retirement.existing(txn, &prepared)) orelse return error.InvalidScopeRetirement;
                 break :blk try scope_retirement.stageAdvance(txn, &prepared, before, try before.progress.cancelBeforeEffects());
+            },
+            .child_ready => |request| blk: {
+                const before = (try scope_retirement.existing(txn, &prepared)) orelse return error.InvalidScopeRetirement;
+                break :blk try scope_retirement.stageAdvance(txn, &prepared, before, try before.progress.tablePublished(request.ordinal));
+            },
+            .drain => blk: {
+                const before = (try scope_retirement.existing(txn, &prepared)) orelse return error.InvalidScopeRetirement;
+                break :blk try scope_retirement.stageAdvance(txn, &prepared, before, try before.progress.drained());
             },
         };
         try scope_retirement_wire.stageOutcome(txn, .{ .query = input.query, .result = .{ .accepted = after } });
@@ -23780,9 +23838,97 @@ pub const RaftApplyStore = struct {
         if (!std.mem.eql(u8, before_json, after_json)) return error.CatalogGenerationChanged;
     }
 
+    /// Construct a physical child from the root's admitted identities, never
+    /// from names supplied by a worker. Shared dependency postimages stay at
+    /// the root and are not repeated in every child's physical journal.
+    fn prepareScopeChildTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, child: scope_retirement.Child) !table_retirement.Prepared {
+        const children = @import("../scope_retirement_children.zig");
+        const manifests = @import("../table_retirement_manifest.zig");
+        const parent = try children.requireParent(txn, child);
+        if (parent.progress.phase != .retiring_tables or parent.progress.completed_tables != child.ordinal) return error.GenerationPublicationChanged;
+        var arena: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const root = (try self.getTableTxn(a, txn, child.lookup.group, child.table)) orelse return error.CatalogGenerationChanged;
+        const binding = try system_catalog_storage.getById(a, txn, child.lookup.group, .table, child.table);
+        const namespace_id = if (binding) |value| value.value.parent_id else blk: {
+            const view_id = root.sql_materialized_view_id orelse return error.InvalidScopeRetirement;
+            const view = (try system_catalog_storage.getById(a, txn, child.lookup.group, .view, view_id)) orelse return error.InvalidScopeRetirement;
+            break :blk view.value.parent_id;
+        };
+        const namespace = (try system_catalog_storage.getById(a, txn, child.lookup.group, .namespace, namespace_id)) orelse return error.InvalidScopeRetirement;
+        if (namespace.value.parent_id != parent.lookup.reference.database) return error.InvalidScopeRetirement;
+        var budget: RetirementCaptureBudget = .{};
+        const root_ranges = try self.tableRetirementRangesTxn(a, txn, child.lookup.group, root.table_id, &budget);
+        const declarations = try std.json.parseFromSliceLeaky(struct { version: u32 = 0, foreign_keys: ?[]const struct { parent_table: []const u8 } = null }, a, if (root.schema_json.len == 0) "{}" else root.schema_json, .{ .ignore_unknown_fields = true });
+        var parent_ids: std.ArrayList(u64) = .empty;
+        var retiring_parents: std.ArrayList(scope_retirement.Child) = .empty;
+        var registered: std.AutoHashMapUnmanaged(u64, scope_retirement.Child) = .empty;
+        for (0..parent.lookup.reference.tables) |ordinal| {
+            const member = (try scope_retirement.child(txn, parent.lookup, @intCast(ordinal))) orelse return error.InvalidScopeRetirement;
+            try registered.put(a, member.table, member);
+        }
+        var parents: std.ArrayList(manifests.Backing) = .empty;
+        var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        for (declarations.foreign_keys orelse &.{}) |fk| {
+            const record = (try self.getTableByNameTxn(a, txn, child.lookup.group, fk.parent_table)) orelse return error.ForeignKeyParentTableNotFound;
+            const table_id = record.table_id;
+            if ((try seen.getOrPut(a, table_id)).found_existing) continue;
+            if (parent_ids.items.len == manifests.max_parents) return error.SqlProgramLimitExceeded;
+            try parent_ids.append(a, table_id);
+            if (registered.get(table_id)) |retiring| try retiring_parents.append(a, retiring);
+            if (table_id == root.table_id) continue;
+            try parents.append(a, .{ .table = record, .ranges = try self.tableRetirementRangesTxn(a, txn, child.lookup.group, table_id, &budget) });
+        }
+        std.mem.sort(u64, parent_ids.items, {}, std.sort.asc(u64));
+        std.mem.sort(scope_retirement.Child, retiring_parents.items, {}, struct {
+            fn less(_: void, left: scope_retirement.Child, right: scope_retirement.Child) bool {
+                return left.table < right.table;
+            }
+        }.less);
+        std.mem.sort(manifests.Backing, parents.items, {}, struct {
+            fn less(_: void, left: manifests.Backing, right: manifests.Backing) bool {
+                return left.table.table_id < right.table.table_id;
+            }
+        }.less);
+        const database = (try system_catalog_storage.getById(a, txn, child.lookup.group, .database, parent.lookup.reference.database)) orelse return error.InvalidScopeRetirement;
+        const logical = if (binding) |value| value.value.name else root.name;
+        var schema_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(root.schema_json, &schema_digest, .{});
+        const physical: manifests.Manifest = .{
+            .scope_child = child,
+            .retiring_parents = retiring_parents.items,
+            .metadata_group_id = child.lookup.group,
+            .metadata_incarnation = std.fmt.bytesToHex(parent.metadata_incarnation, .lower),
+            // For an unbound materialization this is a physical descriptor,
+            // authorized exclusively by scope_child, not a catalog binding.
+            .guard = .{ .target = .{ .database = database.value.name, .namespace = namespace.value.name, .name = logical }, .logical_table = logical, .owner = .{ .table_id = root.table_id, .schema_version = declarations.version, .schema_digest = schema_digest, .kind = .table }, .incarnation = parent.metadata_incarnation },
+            .root = root,
+            .root_ranges = root_ranges,
+            .incoming = try sql_fk_uses.stamp(txn, child.lookup.group, root.name),
+            .selection = .{ .relations = &.{.{ .table_id = root.table_id, .physical_name = root.name }}, .sequences = &.{} },
+            .counters = &.{},
+            .survivors = &.{},
+            .dependent_views = &.{},
+            .view_backings = &.{},
+            .survivor_ranges = &.{},
+            .outgoing_parents = parent_ids.items,
+            .external_parents = parents.items,
+            .view_edges = &.{},
+        };
+        return table_retirement.prepare(self.alloc, child.id, .{ .database = parent.lookup.reference.database, .namespace = namespace_id, .creator = parent.creator, .parent = child }, try physical.encodeAlloc(a));
+    }
+
     fn checkTableRetirementBeginTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, prepared: *const table_retirement.Prepared) !bool {
         const group = prepared.head.lookup.group;
         const label = prepared.head.scope.target_digest;
+        if (prepared.head.scope.parent != null) {
+            _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_scope_retirement_version);
+            if (try table_retirement.existing(txn, prepared)) return false;
+            try table_retirement.requireVacant(txn, prepared);
+            try (TableRetirementCheckpoint{ .alloc = self.alloc, .group = group }).verify(txn, prepared.head, prepared.value);
+            return true;
+        }
         _ = try self.standbyRelationActivationTxn(txn, group, if (std.mem.allEqual(u8, &label, 0)) topology_protocol.table_retirement_version else topology_protocol.table_retirement_public_version);
         if (!std.mem.allEqual(u8, &label, 0) and !std.mem.eql(u8, &label, &table_retirement.Scope.targetDigest(prepared.value.guard.target.database, prepared.value.guard.target.namespace, prepared.value.guard.logical_table))) return error.InvalidCatalogRecord;
         if (try table_retirement.existing(txn, prepared)) return false;
@@ -23822,6 +23968,18 @@ pub const RaftApplyStore = struct {
             break :blk &fallback.?;
         };
         switch (input.command) {
+            .scope_begin => |child| {
+                if (child.lookup.group != group) return error.InvalidCatalogRecord;
+                _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_scope_retirement_version);
+                const expected = try @import("../table_retirement_receipt.zig").Request.fromInput(input);
+                if ((try @import("../table_retirement_receipt.zig").observe(txn, expected)).accepted) return;
+                var prepared = self.prepareScopeChildTxn(txn, child) catch |err| switch (err) {
+                    error.GenerationPublicationChanged, error.CatalogGenerationChanged, error.TableTransitionActive, error.ScopeRetirementChanged => return,
+                    else => return err,
+                };
+                defer prepared.deinit();
+                if (try self.checkTableRetirementBeginTxn(txn, &prepared)) try table_retirement.stageBegin(txn, &prepared);
+            },
             .begin => {
                 if (input.prepared.?.head.lookup.group != group) return error.InvalidCatalogRecord;
                 const pending = self.checkTableRetirementBeginTxn(txn, &input.prepared.?) catch |err| switch (err) {
@@ -23863,7 +24021,7 @@ pub const RaftApplyStore = struct {
                 if (request.lookup.group != group) return error.InvalidCatalogRecord;
                 _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.table_retirement_direct_version);
                 const before = (try table_retirement.head(txn, request.lookup)) orelse return;
-                if (before.phase != .physical_ready or before.revision != request.expected_revision) return;
+                if (before.scope.parent != null or before.phase != .physical_ready or before.revision != request.expected_revision) return;
                 if (before.effects.survivors != 0 or before.survivor != null or before.schema_attempts != 0) return;
                 var key_buffer: [256]u8 = undefined;
                 var body = try @import("../table_retirement_manifest.zig").Owned.parse(self.alloc, try txn.get(try table_retirement.key(&key_buffer, request.lookup, .effects)));
@@ -23882,7 +24040,7 @@ pub const RaftApplyStore = struct {
                 // cancel performs its complete preflight before staging any
                 // release. Storage failures and corrupt reservations abort.
                 const before = (try table_retirement.head(txn, request.lookup)) orelse return;
-                if (before.phase != .reserved or before.revision != request.expected_revision) return;
+                if (before.scope.parent != null or before.phase != .reserved or before.revision != request.expected_revision) return;
                 try table_retirement.cancel(self.alloc, txn, request.lookup, request.expected_revision);
             },
         }
@@ -41376,7 +41534,7 @@ pub const RaftApplyStore = struct {
         if (!std.mem.eql(u8, &try catalogIncarnationTxn(txn, group), &request.incarnation)) return error.CatalogGenerationChanged;
         const standalone = group == group_ids.main_metadata_group_id and try stagingGet(txn, standalone_catalog_key) != null;
         if (request.standalone != standalone) return error.CatalogGenerationChanged;
-        _ = try self.standbyRelationActivationTxn(txn, group, if (request.notification_generation != null or request.operation == .notification_gc or request.operation == .notification_bind or request.operation == .notification_offer or request.operation == .notification_ack) topology_protocol.sql_notifications_version else SqlLocks.decoder_version);
+        _ = try self.standbyRelationActivationTxn(txn, group, request.requiredDecoderVersion());
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch.deinit();
         const a = scratch.allocator();
@@ -41425,8 +41583,17 @@ pub const RaftApplyStore = struct {
             break :blk if (next == null and work.wrap and after != null) try SqlLocks.scopes.readWork(a, &txn, ns, work.observed_at_ms, null) else next;
         } else null;
         const work = if (item) |value| value.work else null;
-        const backend: ?SqlLocks.locks.Backend = if (query.backend) |id| id else if (work) |next| next.backend else null;
-        const scope = if (item) |value| value.scope else if (backend) |owner| try SqlLocks.scopes.read(a, &txn, ns, owner) else null;
+        const database_source = if (query.database_work) |selection| blk: {
+            if (!context.setting_admin or !context.schema_validation_authority) return error.Forbidden;
+            _ = try self.standbyRelationActivationTxn(&txn, group, topology_protocol.sql_scope_retirement_version);
+            const selected = try SqlLocks.scopes.readDatabaseSource(a, &txn, ns, query.database, selection.after);
+            break :blk if (selected == null and selection.wrap and selection.after != null)
+                try SqlLocks.scopes.readDatabaseSource(a, &txn, ns, query.database, null)
+            else
+                selected;
+        } else null;
+        const backend: ?SqlLocks.locks.Backend = if (query.backend) |id| id else if (work) |next| next.backend else if (database_source) |source| source.registration.lease.backend else null;
+        const scope = if (item) |value| value.scope else if (database_source) |source| source else if (backend) |owner| try SqlLocks.scopes.read(a, &txn, ns, owner) else null;
         if (scope) |value| if (query.backend != null) {
             const authority: SqlLocks.Context = .{ .a = a, .actor = query.actor, .database = query.database, .standalone = query.standalone, .maintenance = query.actor.session_user.kind == .bootstrap };
             try authority.requireRead(value);
@@ -41453,7 +41620,7 @@ pub const RaftApplyStore = struct {
             if (!try SqlLocks.requireNotificationConnection(a, &txn, root, selection.generation, notification_context, false)) break :page .{};
             break :page try @import("../../system_catalog/sql_notifications.zig").readPage(a, &txn, group, root.registration.connection, selection.generation, selection.maximum);
         } else null;
-        return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .notification_binding = if (backend) |source_backend| try @import("../../system_catalog/sql_notifications.zig").readBinding(a, &txn, group, source_backend) else null, .notifications = notification_page, .notification_capable = activation.version >= topology_protocol.sql_notifications_version, .group = group, .incarnation = incarnation, .standalone = standalone, .head = try outcomes.head(a), .scope = scope, .owner = owner, .next_work = work, .receipt = receipt, .wait_resource = wait_resource, .participant = participant }, .{});
+        return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .database_after = if (database_source) |source| source.registration.lease.backend else null, .notification_binding = if (backend) |source_backend| try @import("../../system_catalog/sql_notifications.zig").readBinding(a, &txn, group, source_backend) else null, .notifications = notification_page, .notification_capable = activation.version >= topology_protocol.sql_notifications_version, .group = group, .incarnation = incarnation, .standalone = standalone, .head = try outcomes.head(a), .scope = scope, .owner = owner, .next_work = work, .receipt = receipt, .wait_resource = wait_resource, .participant = participant }, .{});
     }
     /// Every route/schema check shares the enrollment's native metadata
     /// writer. A resolved table name or a frontend routing cache is no proof.
@@ -51461,6 +51628,19 @@ const ScopeRetirementCheckpoint = struct {
         const incarnation = try decodeMetadataIncarnationRecord(try reader.get(try metadataIncarnationKeyForGroup(&buffer, self.group)));
         if (!std.meta.eql(activation.value.incarnation, incarnation.incarnation)) return error.InvalidScopeRetirement;
     }
+    pub fn verifySourceCursor(self: @This(), reader: anytype, head: scope_retirement.Head, cursor: scope_retirement.SourceCursor) !void {
+        if (head.lookup.reference.kind != .database or !std.meta.eql(cursor.lookup, head.lookup) or !std.mem.eql(u8, &cursor.backend.incarnation, &head.metadata_incarnation)) return error.InvalidScopeRetirement;
+        const source = (try RaftApplyStore.SqlLocks.scopes.read(self.alloc, reader, .{ .home = .metadata, .group = self.group, .incarnation = head.metadata_incarnation }, cursor.backend)) orelse return error.InvalidScopeRetirement;
+        if (source.state == .active or source.registration.lease.database != head.lookup.reference.database) return error.InvalidScopeRetirement;
+    }
+    pub fn verifyChildReady(self: @This(), reader: anytype, head: scope_retirement.Head, ordinal: u16) !void {
+        const child = (try scope_retirement.child(reader, head.lookup, ordinal)) orelse return error.InvalidScopeRetirement;
+        _ = @import("../scope_retirement_children.zig").requireReady(self.alloc, reader, child) catch |err| return if (err == error.OutOfMemory) err else error.InvalidScopeRetirement;
+    }
+    pub fn verifyDrained(self: @This(), reader: anytype, head: scope_retirement.Head) !void {
+        if (head.lookup.reference.kind == .database)
+            @import("../scope_retirement_admission.zig").requireConnectionsDrained(self.alloc, reader, self.group, head.metadata_incarnation, head.lookup.reference.database) catch return error.InvalidScopeRetirement;
+    }
     fn requireResource(self: @This(), reader: anytype, resource: system_catalog.Resource) !void {
         var region: std.heap.ArenaAllocator = .init(self.alloc);
         defer region.deinit();
@@ -51517,6 +51697,19 @@ const ScopeRetirementCheckpoint = struct {
 
 fn verifySqlSequenceCut(backing: std.mem.Allocator, group: u64, reader: anytype, rows: anytype, cancelled: ?*const std.atomic.Value(bool)) !void {
     const Reader = @TypeOf(reader.*);
+    // SQL source membership and counts are authority for database drainage.
+    // Prove them once per stream, not once per retirement job or database.
+    var scope_buffer: [160]u8 = undefined;
+    const source_prefix = try RaftApplyStore.SqlLocks.scopePrefixForGroup(&scope_buffer, group);
+    try rows.reset();
+    while (try rows.next()) |row| {
+        if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+        if (std.mem.startsWith(u8, row.key, source_prefix)) {
+            const ns: RaftApplyStore.SqlLocks.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = try RaftApplyStore.catalogIncarnationTxn(reader, group) };
+            try RaftApplyStore.SqlLocks.scopes.verifyDatabaseDirectory(backing, reader, ns, rows, cancelled);
+            break;
+        }
+    }
     try @import("../scope_retirement_checkpoint.zig").verifyDirectory(backing, reader, group, rows, ScopeRetirementCheckpoint{ .alloc = backing, .group = group }, cancelled);
     try table_retirement.verifyDirectory(backing, reader, group, rows, TableRetirementCheckpoint{ .alloc = backing, .group = group }, cancelled);
     try verifyInitialCounterLeaseCut(backing, group, reader, rows, cancelled);
@@ -51669,7 +51862,7 @@ const TableRetirementCheckpoint = struct {
         var buffer: [256]u8 = undefined;
         const activation = try std.json.parseFromSliceLeaky(topology_protocol.Activation, a, try reader.get(try RaftApplyStore.topologyActivationKeyForGroup(&buffer, self.group)), .{});
         const incarnation = try decodeMetadataIncarnationRecord(try reader.get(try metadataIncarnationKeyForGroup(&buffer, self.group)));
-        if (activation.version < (if (!std.mem.allEqual(u8, &head.scope.target_digest, 0)) topology_protocol.table_retirement_public_version else if (head.direct_catalog_revision != 0) topology_protocol.table_retirement_direct_version else if (head.schema_attempts != 0) topology_protocol.table_retirement_survivors_version else if (head.physical != null) topology_protocol.table_retirement_physical_version else topology_protocol.table_retirement_version) or activation.version > topology_protocol.current_version or activation.member_count == 0 or
+        if (activation.version < (if (head.scope.parent != null) topology_protocol.sql_scope_retirement_version else if (!std.mem.allEqual(u8, &head.scope.target_digest, 0)) topology_protocol.table_retirement_public_version else if (head.direct_catalog_revision != 0) topology_protocol.table_retirement_direct_version else if (head.schema_attempts != 0) topology_protocol.table_retirement_survivors_version else if (head.physical != null) topology_protocol.table_retirement_physical_version else topology_protocol.table_retirement_version) or activation.version > topology_protocol.current_version or activation.member_count == 0 or
             !std.mem.eql(u8, &head.incarnation, &incarnation.incarnation) or !std.mem.eql(u8, &activation.incarnation, &head.incarnation)) return error.InvalidCatalogRecord;
         if (head.direct_catalog_revision != 0) {
             const meta = try system_catalog_storage.readMeta(a, reader, self.group);
@@ -51713,6 +51906,11 @@ const TableRetirementCheckpoint = struct {
         }
         for (manifest.dependent_views) |view| try RaftApplyStore.requireTableRetirementResourceTxn(a, reader, self.group, view);
         for (manifest.view_edges) |edge| if (!std.mem.eql(u8, try reader.get(try sql_views.dependencyKey(&buffer, self.group, edge.dependency, edge.view)), &.{1})) return error.InvalidCatalogRecord;
+        if (head.scope.parent != null) {
+            const participants = try table_retirement.participantTables(a, manifest);
+            try @import("../scope_retirement_children.zig").requireCut(reader, head, manifest, participants);
+            return;
+        }
         const binding = try system_catalog_storage.getById(a, reader, self.group, .table, head.lookup.table);
         if (binding) |value| {
             if (value.value.parent_id != head.scope.namespace or !std.mem.eql(u8, value.value.name, manifest.guard.logical_table) or !std.mem.eql(u8, value.value.storage_name, manifest.root.name)) return error.InvalidCatalogRecord;
@@ -51750,6 +51948,7 @@ const TableRetirementCheckpoint = struct {
             if (try table_retirement.member(reader, group, table)) |selected| if (table == selected.root.table) {
                 const counter = std.mem.readInt(u64, row.key[ownership_prefix.len + 16 ..][0..8], .big);
                 const root = (try table_retirement.head(reader, selected.root)) orelse return error.InvalidCatalogRecord;
+                if (root.scope.parent != null) return;
                 try sequence_leases.require(reader, group, counter, root.lease());
             };
         }
@@ -51762,6 +51961,8 @@ const TableRetirementCheckpoint = struct {
                 .view => try table_retirement.viewRoot(reader, group, edge.dependency.id),
             };
             if (source) |root| {
+                const source_head = (try table_retirement.head(reader, root)) orelse return error.InvalidCatalogRecord;
+                if (source_head.scope.parent != null) return;
                 const target = (try table_retirement.viewRoot(reader, group, edge.view)) orelse return error.InvalidCatalogRecord;
                 if (!std.meta.eql(target, root)) return error.InvalidCatalogRecord;
             }
@@ -51778,7 +51979,7 @@ const TableRetirementCheckpoint = struct {
 const SequenceCheckpointRows = struct {
     cursor: docstore.DocStore.Txn.CursorAdapter,
     group: u64,
-    lane: u3 = 0,
+    lane: u4 = 0,
     started: bool = false,
 
     pub fn reset(self: *@This()) !void {
@@ -51786,7 +51987,7 @@ const SequenceCheckpointRows = struct {
         self.started = false;
     }
     pub fn next(self: *@This()) !?docstore.KVPair {
-        while (self.lane < 7) {
+        while (self.lane < 8) {
             var buffer: [256]u8 = undefined;
             const prefix = switch (self.lane) {
                 0 => try system_catalog_storage.prefixForGroup(&buffer, self.group),
@@ -51795,7 +51996,8 @@ const SequenceCheckpointRows = struct {
                 3 => try tablePrefixForGroup(&buffer, self.group),
                 4 => try rangePrefixForGroup(&buffer, self.group),
                 5 => try @import("../table_lifecycle_lock.zig").prefix(&buffer, self.group),
-                else => try @import("../schema_validation_dependencies.zig").prefixForGroup(&buffer, self.group),
+                6 => try @import("../schema_validation_dependencies.zig").prefixForGroup(&buffer, self.group),
+                else => try RaftApplyStore.SqlLocks.scopePrefixForGroup(&buffer, self.group),
             };
             const row = if (self.started) try self.cursor.next() else try self.cursor.seekAtOrAfter(prefix);
             self.started = true;
@@ -51838,6 +52040,17 @@ fn verifySqlSequenceCheckpointTxn(alloc: std.mem.Allocator, txn: *docstore.DocSt
         if (!std.mem.startsWith(u8, item.key, lifecycle.allGroupsPrefix())) break;
         const lock = try lifecycle.Lock.decode(item.value);
         if (lock.kind == .table_retirement) try groups.put(alloc, (try lifecycle.groupFromKey(item.key)).?, {});
+    }
+    const sources = RaftApplyStore.SqlLocks.scopeAllGroupsPrefix();
+    row = try cursor.seekAtOrAfter(sources);
+    while (row) |item| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, item.key, sources)) break;
+        const suffix = item.key[sources.len..];
+        if (suffix.len < 18 or suffix[16] != ':') return error.InvalidLockRecord;
+        const group = std.fmt.parseInt(u64, suffix[0..16], 16) catch return error.InvalidLockRecord;
+        var canonical: [160]u8 = undefined;
+        if (group == 0 or !std.mem.startsWith(u8, item.key, try RaftApplyStore.SqlLocks.scopePrefixForGroup(&canonical, group))) return error.InvalidLockRecord;
+        try groups.put(alloc, group, {});
     }
     var iterator = groups.keyIterator();
     while (iterator.next()) |group| {

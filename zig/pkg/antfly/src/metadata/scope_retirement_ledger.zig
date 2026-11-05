@@ -33,6 +33,7 @@ pub const Head = struct {
     lookup: Lookup,
     metadata_incarnation: [16]u8,
     creator: local.system_catalog_privileges.Principal,
+    force: bool = false,
     sequence: u64,
     progress: contract.Progress,
     pub fn validate(self: Head) !void {
@@ -80,7 +81,7 @@ pub fn prepare(backing: A, group: u64, id: contract.Id, bytes: []const u8) !Prep
     const encoded = try std.json.Stringify.valueAlloc(a, manifest, .{});
     return .{ .arena = arena, .manifest = manifest, .lookup = lookup, .encoded = encoded };
 }
-const Kind = enum { head, manifest, terminal_outcome };
+const Kind = enum { head, manifest, terminal_outcome, drain_outcome, source_cursor };
 pub fn prefix(buffer: []u8, group: u64) ![]const u8 {
     if (group == 0) return error.InvalidScopeRetirement;
     return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:system_catalog:{d}:scope-retirement:", .{group});
@@ -133,14 +134,34 @@ pub fn child(reader: anytype, lookup: Lookup, ordinal: u16) !?Child {
 }
 /// One compact feed response. A live job with remaining children always carries
 /// its exact next registered identity; reading it does not load the manifest.
-pub const Work = struct { head: Head, child: ?Child };
+pub const SourceControl = struct { root: Lookup, expected_after: ?local.storage_pessimistic_lock_contract.Backend = null };
+pub const SourceCursor = struct { lookup: Lookup, backend: local.storage_pessimistic_lock_contract.Backend };
+pub const SourceCursorRecord = records.Record(SourceCursor, "SRSC", 1024);
+pub fn sourceCursor(reader: anytype, lookup: Lookup) !?SourceCursor {
+    var buffer: [320]u8 = undefined;
+    const bytes = (try optional(reader, try key(&buffer, lookup, .source_cursor))) orelse return null;
+    const value = try SourceCursorRecord.decode(bytes);
+    try value.lookup.validate();
+    try value.backend.validate();
+    if (!std.meta.eql(value.lookup, lookup)) return error.InvalidScopeRetirement;
+    return value;
+}
+pub fn stageSourceCursor(txn: anytype, control: SourceControl, backend: local.storage_pessimistic_lock_contract.Backend) !void {
+    const current = try sourceCursor(txn, control.root);
+    if (!std.meta.eql(if (current) |value| @as(?local.storage_pessimistic_lock_contract.Backend, value.backend) else null, control.expected_after)) return error.ScopeRetirementChanged;
+    const value = try SourceCursorRecord.init(.{ .lookup = control.root, .backend = backend });
+    var buffer: [320]u8 = undefined;
+    try txn.put(try key(&buffer, control.root, .source_cursor), value.slice());
+}
+pub const Work = struct { head: Head, child: ?Child, source_after: ?local.storage_pessimistic_lock_contract.Backend = null };
 pub fn nextOwnerWork(reader: anytype, group: u64, after: u64) !?Work {
     const value = (try nextWork(reader, group, after)) orelse return null;
     const selected = if (value.progress.completed_tables < value.lookup.reference.tables)
         (try child(reader, value.lookup, value.progress.completed_tables)) orelse return error.InvalidScopeRetirement
     else
         null;
-    return .{ .head = value, .child = selected };
+    const source = try sourceCursor(reader, value.lookup);
+    return .{ .head = value, .child = selected, .source_after = if (source) |cursor| cursor.backend else null };
 }
 
 pub fn queuePrefix(buffer: []u8, group: u64) ![]const u8 {
@@ -248,7 +269,7 @@ pub fn requireVacant(reader: anytype, prepared: *const Prepared) !void {
 /// canceled operation cannot reacquire reservations or replace its manifest.
 pub fn existing(reader: anytype, prepared: *const Prepared) !?Head {
     const previous = (try head(reader, prepared.lookup)) orelse return null;
-    if (!std.mem.eql(u8, &previous.metadata_incarnation, &prepared.manifest.metadata_incarnation) or !previous.creator.eql(prepared.manifest.creator)) return error.CatalogGenerationChanged;
+    if (!std.mem.eql(u8, &previous.metadata_incarnation, &prepared.manifest.metadata_incarnation) or !previous.creator.eql(prepared.manifest.creator) or previous.force != prepared.manifest.force) return error.CatalogGenerationChanged;
     var buffer: [256]u8 = undefined;
     const body = try optional(reader, try key(&buffer, prepared.lookup, .manifest));
     if (previous.active()) {
@@ -264,14 +285,16 @@ pub fn stageBegin(txn: anytype, prepared: *const Prepared) !Head {
     try requireVacant(txn, prepared);
     var buffer: [256]u8 = undefined;
     if (try optional(txn, try key(&buffer, prepared.lookup, .manifest)) != null or
-        try optional(txn, try key(&buffer, prepared.lookup, .terminal_outcome)) != null) return error.InvalidScopeRetirement;
+        try optional(txn, try key(&buffer, prepared.lookup, .terminal_outcome)) != null or
+        try optional(txn, try key(&buffer, prepared.lookup, .drain_outcome)) != null or
+        try optional(txn, try key(&buffer, prepared.lookup, .source_cursor)) != null) return error.InvalidScopeRetirement;
     const previous = if (try optional(txn, try counterKey(&buffer, prepared.lookup.group))) |bytes| blk: {
         if (bytes.len != 8) return error.InvalidScopeRetirement;
         break :blk std.mem.readInt(u64, bytes[0..8], .little);
     } else 0;
     const sequence = std.math.add(u64, previous, 1) catch return error.SqlProgramLimitExceeded;
     if (try optional(txn, try queueKey(&buffer, prepared.lookup.group, sequence)) != null) return error.InvalidScopeRetirement;
-    const value: Head = .{ .lookup = prepared.lookup, .metadata_incarnation = prepared.manifest.metadata_incarnation, .creator = prepared.manifest.creator, .sequence = sequence, .progress = .{ .reference = prepared.lookup.reference } };
+    const value: Head = .{ .lookup = prepared.lookup, .metadata_incarnation = prepared.manifest.metadata_incarnation, .creator = prepared.manifest.creator, .force = prepared.manifest.force, .sequence = sequence, .progress = .{ .reference = prepared.lookup.reference } };
     try value.validate();
     for (0..prepared.lookup.reference.tables) |ordinal| {
         if (try child(txn, prepared.lookup, @intCast(ordinal)) != null) return error.InvalidScopeRetirement;
@@ -346,6 +369,7 @@ pub fn stageAdvance(txn: anytype, prepared: *const Prepared, before: Head, next:
     try result.validate();
     const encoded = try HeadRecord.init(result);
     var buffer: [256]u8 = undefined;
+    if (try sourceCursor(txn, result.lookup) != null) try txn.delete(try key(&buffer, result.lookup, .source_cursor));
     if (!result.active()) {
         try txn.delete(try memberKey(&buffer, result.lookup.group, rootKind(prepared.manifest), prepared.manifest.scope.root().id));
         for (prepared.manifest.resources) |resource| try txn.delete(try memberKey(&buffer, result.lookup.group, resource.kind, resource.id));

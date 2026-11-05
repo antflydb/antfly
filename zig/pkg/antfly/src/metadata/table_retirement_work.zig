@@ -23,8 +23,8 @@ pub const Page = struct { next: u64 = 0, lookup: ?root.Lookup = null };
 pub fn read(txn: anytype, group: u64, after: u64) !Page {
     var prefix_buffer: [192]u8 = undefined;
     var key_buffer: [192]u8 = undefined;
-    const prefix = try locks.prefix(&prefix_buffer, group);
-    const start = if (after == 0) prefix else try locks.key(&key_buffer, group, after);
+    const prefix = try root.memberPrefix(&prefix_buffer, group);
+    const start = if (after == 0) prefix else try root.memberKey(&key_buffer, group, after);
     var cursor = try txn.openCursor();
     defer cursor.close();
     var row = try cursor.seekAtOrAfter(start);
@@ -37,14 +37,17 @@ pub fn read(txn: anytype, group: u64, after: u64) !Page {
         if (!std.mem.startsWith(u8, value.key, prefix)) break;
         if (visited == max_locks) return .{ .next = last };
         visited += 1;
-        const table = (try locks.tableFromKey(value.key)) orelse return error.InvalidCatalogRecord;
-        const lock = try locks.Lock.decode(value.value);
+        const member = try root.MemberRecord.decode(value.value);
+        const table = member.table;
+        if (member.root.group != group or !std.mem.eql(u8, value.key, try root.memberKey(&key_buffer, group, table))) return error.InvalidCatalogRecord;
         last = table;
-        if (lock.kind != .table_retirement) continue;
-        const member = (try root.member(txn, group, table)) orelse return error.InvalidCatalogRecord;
         if (member.root.table != table) continue;
         const head = (try root.head(txn, member.root)) orelse return error.InvalidCatalogRecord;
-        if (!head.active() or !std.mem.eql(u8, &lock.id, &head.lookup.id)) return error.InvalidCatalogRecord;
+        if (!head.active()) return error.InvalidCatalogRecord;
+        if (head.scope.parent == null) {
+            const lock = (try locks.read(txn, group, table)) orelse return error.InvalidCatalogRecord;
+            if (lock.kind != .table_retirement or !std.mem.eql(u8, &lock.id, &head.lookup.id)) return error.InvalidCatalogRecord;
+        } else if (head.phase == .physical_ready) continue;
         // Common schema recovery owns all work after survivor admission.
         if (head.phase == .validating_survivors) continue;
         return .{ .next = table, .lookup = head.lookup };

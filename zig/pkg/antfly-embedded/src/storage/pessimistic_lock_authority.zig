@@ -498,6 +498,114 @@ fn writeDatabaseCount(txn: anytype, ns: ledger.Namespace, database: u64, value: 
     std.mem.writeInt(u32, &raw, value, .little);
     try txn.put(address, &raw);
 }
+fn databaseSourcePrefix(buffer: []u8, ns: ledger.Namespace, database: u64) ![]const u8 {
+    var base: [192]u8 = undefined;
+    return std.fmt.bufPrint(buffer, "{s}:source:", .{try databaseCountKey(&base, ns, database)});
+}
+fn databaseSourceKey(buffer: []u8, ns: ledger.Namespace, database: u64, backend: locks.Backend) ![]const u8 {
+    try backend.validate();
+    if (!std.mem.eql(u8, &ns.incarnation, &backend.incarnation)) return error.InvalidLockRecord;
+    var base: [192]u8 = undefined;
+    return std.fmt.bufPrint(buffer, "{s}{s}:{x:0>16}", .{ try databaseSourcePrefix(&base, ns, database), std.fmt.bytesToHex(backend.id, .lower), backend.fence });
+}
+
+/// One indexed seek and one authoritative source read. Database retirement
+/// never scans unrelated databases or waits for a live owner's expiry. The
+/// caller keeps its cursor through refused/busy work and wraps explicitly.
+pub fn readDatabaseSource(backing: A, txn: anytype, ns: ledger.Namespace, database: u64, after: ?locks.Backend) !?Record {
+    var prefix_buffer: [192]u8 = undefined;
+    const prefix = try databaseSourcePrefix(&prefix_buffer, ns, database);
+    var key_buffer: [256]u8 = undefined;
+    const start = if (after) |backend| try databaseSourceKey(&key_buffer, ns, database, backend) else prefix;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var entry = try cursor.seekAtOrAfter(start);
+    if (after != null) if (entry) |row| if (std.mem.eql(u8, row.key, start)) {
+        entry = try cursor.next();
+    };
+    const row = entry orelse return null;
+    if (!std.mem.startsWith(u8, row.key, prefix)) return null;
+    const suffix = row.key[prefix.len..];
+    if (suffix.len != 49 or suffix[32] != ':' or row.value.len != 16) return error.InvalidLockRecord;
+    var backend: locks.Backend = .{ .incarnation = ns.incarnation, .id = undefined, .fence = std.fmt.parseInt(u64, suffix[33..], 16) catch return error.InvalidLockRecord };
+    _ = std.fmt.hexToBytes(&backend.id, suffix[0..32]) catch return error.InvalidLockRecord;
+    if (!std.mem.eql(u8, row.key, try databaseSourceKey(&key_buffer, ns, database, backend))) return error.InvalidLockRecord;
+    const nonce = row.value[0..16].*;
+    const value = try read(backing, txn, ns, backend) orelse return error.InvalidLockRecord;
+    if (value.state == .retired or value.registration.lease.database != database or !std.mem.eql(u8, &value.registration.nonce, &nonce)) return error.InvalidLockRecord;
+    return value;
+}
+
+/// Rebuild counts from canonical source records, and prove the membership
+/// directory in both directions. Two streaming passes retain at most the
+/// bounded active-database counters, never a copy of all source tombstones.
+pub fn verifyDatabaseDirectory(backing: A, reader: anytype, ns: ledger.Namespace, rows: anytype, canceled: ?*const std.atomic.Value(bool)) !void {
+    try ns.validate();
+    var root_buffer: [192]u8 = undefined;
+    const count_key = try key(&root_buffer, ns, null);
+    const prefix = count_key[0 .. count_key.len - "count".len];
+    var databases: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+    defer databases.deinit(backing);
+    var expected: u32 = 0;
+    try rows.reset();
+    while (try rows.next()) |row| {
+        if (canceled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+        if (!std.mem.startsWith(u8, row.key, prefix)) continue;
+        const suffix = row.key[prefix.len..];
+        if (suffix.len != 49 or suffix[32] != ':') continue;
+        var backend: locks.Backend = .{ .incarnation = ns.incarnation, .id = undefined, .fence = std.fmt.parseInt(u64, suffix[33..], 16) catch return error.InvalidLockRecord };
+        _ = std.fmt.hexToBytes(&backend.id, suffix[0..32]) catch return error.InvalidLockRecord;
+        var canonical: [256]u8 = undefined;
+        if (!std.mem.eql(u8, row.key, try key(&canonical, ns, backend))) return error.InvalidLockRecord;
+        const value = try read(backing, reader, ns, backend) orelse return error.InvalidLockRecord;
+        if (value.state == .retired) continue;
+        if (expected == max_active) return error.InvalidLockRecord;
+        expected += 1;
+        const database = value.registration.lease.database;
+        const count_slot = try databases.getOrPut(backing, database);
+        if (!count_slot.found_existing) count_slot.value_ptr.* = 0;
+        count_slot.value_ptr.* += 1;
+        const member = try reader.get(try databaseSourceKey(&canonical, ns, database, backend));
+        if (!std.mem.eql(u8, member, &value.registration.nonce)) return error.InvalidLockRecord;
+    }
+    if (try count(reader, ns) != expected) return error.InvalidLockRecord;
+    var counters = databases.iterator();
+    while (counters.next()) |entry| if (try databaseCount(reader, ns, entry.key_ptr.*) != entry.value_ptr.*) return error.InvalidLockRecord;
+    var actual: u32 = 0;
+    try rows.reset();
+    while (try rows.next()) |row| {
+        if (canceled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+        if (!std.mem.startsWith(u8, row.key, prefix)) continue;
+        const suffix = row.key[prefix.len..];
+        if (!std.mem.startsWith(u8, suffix, "database:")) continue;
+        if (suffix.len < 25) return error.InvalidLockRecord;
+        const database = std.fmt.parseInt(u64, suffix[9..25], 16) catch return error.InvalidLockRecord;
+        var canonical: [256]u8 = undefined;
+        if (suffix.len == 25) {
+            if (!std.mem.eql(u8, row.key, try databaseCountKey(&canonical, ns, database)) or
+                databases.get(database) == null or try databaseCount(reader, ns, database) != databases.get(database).?) return error.InvalidLockRecord;
+        } else {
+            if (suffix.len != 82 or !std.mem.eql(u8, suffix[25..33], ":source:") or suffix[65] != ':') return error.InvalidLockRecord;
+            var backend: locks.Backend = .{ .incarnation = ns.incarnation, .id = undefined, .fence = std.fmt.parseInt(u64, suffix[66..82], 16) catch return error.InvalidLockRecord };
+            _ = std.fmt.hexToBytes(&backend.id, suffix[33..65]) catch return error.InvalidLockRecord;
+            if (!std.mem.eql(u8, row.key, try databaseSourceKey(&canonical, ns, database, backend))) return error.InvalidLockRecord;
+            const value = try read(backing, reader, ns, backend) orelse return error.InvalidLockRecord;
+            if (value.state == .retired or value.registration.lease.database != database or !std.mem.eql(u8, row.value, &value.registration.nonce) or actual == max_active) return error.InvalidLockRecord;
+            actual += 1;
+        }
+    }
+    if (actual != expected) return error.InvalidLockRecord;
+}
+
+pub const Testing = if (@import("builtin").is_test) struct {
+    pub fn sourceAddress(buffer: []u8, ns: ledger.Namespace, database: u64, backend: locks.Backend) ![]const u8 {
+        return databaseSourceKey(buffer, ns, database, backend);
+    }
+    pub fn countAddress(buffer: []u8, ns: ledger.Namespace, database: u64) ![]const u8 {
+        return databaseCountKey(buffer, ns, database);
+    }
+} else struct {};
+
 fn connectionKey(buffer: []u8, ns: ledger.Namespace, node: u64, connection_id: [32]u8) ![]const u8 {
     try ns.validate();
     return std.fmt.bufPrint(buffer, "{s}{x:0>16}:{s}:{x:0>16}:{s}", .{ homePrefix(ns, .connection), ns.group, std.fmt.bytesToHex(ns.incarnation, .lower), node, connection_id });
@@ -535,6 +643,8 @@ pub fn register(backing: A, txn: anytype, ns: ledger.Namespace, registration: Re
     try writeWork(txn, ns, value);
     try writeCount(txn, ns, active + 1);
     try writeDatabaseCount(txn, ns, registration.lease.database, database_active + 1);
+    var source_buffer: [256]u8 = undefined;
+    try txn.put(try databaseSourceKey(&source_buffer, ns, registration.lease.database, registration.lease.backend), &registration.nonce);
     var buffer: [192]u8 = undefined;
     var binding: [24]u8 = undefined;
     @memcpy(binding[0..16], &registration.lease.backend.id);
@@ -1020,6 +1130,8 @@ pub fn closeStep(backing: A, txn: anytype, ns: ledger.Namespace, backend: locks.
     try write(a, txn, ns, value);
     try writeCount(txn, ns, active - 1);
     try writeDatabaseCount(txn, ns, value.registration.lease.database, database_active - 1);
+    var source_buffer: [256]u8 = undefined;
+    try txn.delete(try databaseSourceKey(&source_buffer, ns, value.registration.lease.database, value.registration.lease.backend));
     return true;
 }
 fn CloseContext(comptime Authority: type) type {

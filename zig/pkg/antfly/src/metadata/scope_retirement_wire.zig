@@ -22,11 +22,14 @@ const ledger = @import("scope_retirement_ledger.zig");
 const records = @import("schema_validation_publication.zig");
 const A = std.mem.Allocator;
 pub const max_command_bytes = contract.max_manifest_bytes + 8192;
+pub const ProgressRequest = struct { lookup: ledger.Lookup, expected_revision: u64 };
 pub const Request = struct {
     admission: @import("../system_catalog/sequence_outcomes.zig").Admission,
     operation: union(enum) {
         reserve: contract.Manifest,
-        cancel: struct { lookup: ledger.Lookup, expected_revision: u64 },
+        cancel: ProgressRequest,
+        drain: ProgressRequest,
+        child_ready: struct { lookup: ledger.Lookup, expected_revision: u64, ordinal: u16 },
     },
     pub fn validate(self: Request, a: A) !void {
         try self.admission.validate();
@@ -35,7 +38,7 @@ pub const Request = struct {
                 try manifest.validate(a);
                 if (self.admission.head != manifest.catalog_revision) return error.CatalogGenerationChanged;
             },
-            .cancel => |value| {
+            inline .cancel, .drain, .child_ready => |value| {
                 try value.lookup.validate();
                 if (value.expected_revision == 0) return error.InvalidScopeRetirement;
             },
@@ -75,7 +78,7 @@ pub const Input = struct {
                 if (manifest.metadata_group_id != group) return error.CatalogGenerationChanged;
                 break :blk .{ .group = group, .reference = try manifest.reference(a, request.admission.nonce) };
             },
-            .cancel => |value| value.lookup,
+            inline .cancel, .drain, .child_ready => |value| value.lookup,
         };
         if (lookup.group != group) return error.CatalogGenerationChanged;
         var digest: [32]u8 = undefined;
@@ -101,6 +104,8 @@ pub const Rejection = enum {
     DatabaseNotFound,
     NamespaceNotFound,
     ScopeRetirementChanged,
+    SqlDatabaseInUse,
+    Forbidden,
     pub fn fromError(err: anyerror) ?Rejection {
         inline for (comptime std.meta.tags(Rejection).*) |tag| {
             if (std.mem.eql(u8, @errorName(err), @tagName(tag))) return tag;
@@ -142,7 +147,7 @@ pub const Observation = struct {
             const current = self.current orelse return error.InvalidScopeRetirement;
             const accepted = outcome.result.accepted;
             if (current.sequence != accepted.sequence or !std.mem.eql(u8, &current.metadata_incarnation, &accepted.metadata_incarnation) or
-                !current.creator.eql(accepted.creator) or current.progress.revision < accepted.progress.revision) return error.InvalidScopeRetirement;
+                !current.creator.eql(accepted.creator) or current.force != accepted.force or current.progress.revision < accepted.progress.revision) return error.InvalidScopeRetirement;
             if (!accepted.active() and !std.meta.eql(current, accepted)) return error.InvalidScopeRetirement;
         };
     }
@@ -175,6 +180,19 @@ pub fn stageOutcome(txn: anytype, value: Outcome) !void {
     try value.validate();
     const encoded = try OutcomeRecord.init(value);
     var buffer: [320]u8 = undefined;
+    if (value.result == .accepted and value.result.accepted.progress.revision == 2 and
+        (value.result.accepted.progress.phase == .retiring_tables or value.result.accepted.progress.phase == .publishing_catalog))
+    {
+        if (std.mem.eql(u8, &value.query.nonce, &value.query.lookup.reference.id)) return error.InvalidScopeRetirement;
+        const link = try QueryRecord.init(value.query);
+        try txn.put(try ledger.key(&buffer, value.query.lookup, .drain_outcome), link.slice());
+    }
+    if (value.result == .accepted and value.result.accepted.progress.completed_tables != 0 and
+        (value.result.accepted.progress.phase == .retiring_tables or value.result.accepted.progress.phase == .publishing_catalog))
+    {
+        const link = try QueryRecord.init(value.query);
+        try txn.put(try childOutcomeKey(&buffer, value.query.lookup, value.result.accepted.progress.completed_tables - 1), link.slice());
+    }
     if (value.result == .accepted and value.result.accepted.progress.phase == .canceled) {
         if (std.mem.eql(u8, &value.query.nonce, &value.query.lookup.reference.id)) return error.InvalidScopeRetirement;
         const link = try QueryRecord.init(value.query);
@@ -183,11 +201,35 @@ pub fn stageOutcome(txn: anytype, value: Outcome) !void {
     try txn.put(try outcomeKey(&buffer, value.query), encoded.slice());
 }
 
+pub fn childOutcomeKey(buffer: []u8, lookup: ledger.Lookup, ordinal: u16) ![]const u8 {
+    try lookup.validate();
+    if (ordinal >= lookup.reference.tables) return error.InvalidScopeRetirement;
+    var base: [128]u8 = undefined;
+    return std.fmt.bufPrint(buffer, "{s}{s}:{x:0>16}:{s}:child_outcome:{x:0>4}", .{ try ledger.prefix(&base, lookup.group), @tagName(lookup.reference.kind), lookup.reference.root, std.fmt.bytesToHex(lookup.reference.id, .lower), ordinal });
+}
+pub fn childQuery(reader: anytype, lookup: ledger.Lookup, ordinal: u16) !Query {
+    var buffer: [320]u8 = undefined;
+    const query = try QueryRecord.decode(try reader.get(try childOutcomeKey(&buffer, lookup, ordinal)));
+    try query.validate();
+    if (!std.meta.eql(query.lookup, lookup) or std.mem.eql(u8, &query.nonce, &lookup.reference.id)) return error.InvalidScopeRetirement;
+    return query;
+}
+
 /// A terminal head names exactly one retained command, independent of how many
 /// other canceled jobs exist. Counts alone cannot prove per-job receipt custody.
 pub fn terminalQuery(reader: anytype, lookup: ledger.Lookup) !Query {
     var buffer: [320]u8 = undefined;
     const result = try QueryRecord.decode(try reader.get(try ledger.key(&buffer, lookup, .terminal_outcome)));
+    try result.validate();
+    if (!std.meta.eql(result.lookup, lookup) or std.mem.eql(u8, &result.nonce, &lookup.reference.id)) return error.InvalidScopeRetirement;
+    return result;
+}
+
+/// Root-bound accepting-writer receipt, distinct from admission/cancellation.
+/// Its exact accepted postimage proves drainage; a phase alone grants nothing.
+pub fn drainQuery(reader: anytype, lookup: ledger.Lookup) !Query {
+    var buffer: [320]u8 = undefined;
+    const result = try QueryRecord.decode(try reader.get(try ledger.key(&buffer, lookup, .drain_outcome)));
     try result.validate();
     if (!std.meta.eql(result.lookup, lookup) or std.mem.eql(u8, &result.nonce, &lookup.reference.id)) return error.InvalidScopeRetirement;
     return result;

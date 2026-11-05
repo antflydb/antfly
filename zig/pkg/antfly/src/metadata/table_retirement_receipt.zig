@@ -22,6 +22,7 @@ pub const Request = struct {
     lookup: root.Lookup,
     effect: union(enum) {
         admission: struct { incarnation: [32]u8, effects: @import("table_retirement_manifest.zig").Reference, scope: root.Scope },
+        scope_admission: @import("scope_retirement_ledger.zig").Child,
         cancellation: u64,
         physical_plan: [32]u8,
         owner: struct { ordinal: u16, step: root.physical.Step, evidence: [32]u8 },
@@ -30,6 +31,7 @@ pub const Request = struct {
     pub fn fromInput(input: *const root.Input) !@This() {
         const value: @This() = switch (input.command) {
             .begin => .{ .lookup = input.prepared.?.head.lookup, .effect = .{ .admission = .{ .incarnation = input.prepared.?.head.incarnation, .effects = input.prepared.?.head.effects, .scope = input.prepared.?.head.scope } } },
+            .scope_begin => |child| .{ .lookup = .{ .group = child.lookup.group, .table = child.table, .id = child.id }, .effect = .{ .scope_admission = child } },
             .cancel => |r| .{ .lookup = r.lookup, .effect = .{ .cancellation = r.expected_revision } },
             .seal => |r| .{ .lookup = r.lookup, .effect = .{ .physical_plan = input.prepared_physical.?.summary.plan_digest } },
             .ack => |r| .{ .lookup = r.lookup, .effect = .{ .owner = .{ .ordinal = r.ordinal, .step = r.step, .evidence = r.evidence.digest() } } },
@@ -45,6 +47,10 @@ pub const Request = struct {
                 try value.effects.validate();
                 try value.scope.validate();
                 if (value.effects.root_table != self.lookup.table or std.mem.allEqual(u8, &value.incarnation, 0)) return error.InvalidCatalogRecord;
+            },
+            .scope_admission => |child| {
+                try child.validate();
+                if (child.lookup.group != self.lookup.group or child.table != self.lookup.table or !std.mem.eql(u8, &child.id, &self.lookup.id)) return error.InvalidCatalogRecord;
             },
             .cancellation, .publication => |revision| if (revision == 0 or revision == std.math.maxInt(u64)) return error.InvalidCatalogRecord,
             .physical_plan => |digest| if (std.mem.allEqual(u8, &digest, 0)) return error.InvalidCatalogRecord,
@@ -77,6 +83,7 @@ pub fn observe(reader: anytype, request: Request) !Observation {
     const head = current orelse return value;
     value.accepted = switch (request.effect) {
         .admission => |expected| std.mem.eql(u8, &head.incarnation, &expected.incarnation) and std.meta.eql(head.effects, expected.effects) and std.meta.eql(head.scope, expected.scope),
+        .scope_admission => |child| std.meta.eql(head.scope.parent, @as(?@import("scope_retirement_ledger.zig").Child, child)),
         .cancellation => |revision| head.phase == .canceled and head.revision == revision + 1,
         .physical_plan => |digest| if (head.physical) |physical| std.mem.eql(u8, &physical.summary.plan_digest, &digest) else false,
         .publication => |revision| head.phase == .published and head.direct_catalog_revision != 0 and head.revision == revision + 1,

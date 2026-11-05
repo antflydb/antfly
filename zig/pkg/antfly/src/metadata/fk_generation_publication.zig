@@ -270,6 +270,10 @@ fn initialTransitionsEqual(left: Transition, right: Transition) bool {
 }
 
 pub const Parent = struct {
+    /// No parent generation is published into a namespace that the same
+    /// ancestor is deleting. Its own registered source fence is mandatory at
+    /// the root publication boundary instead; ordinary plans cannot use this.
+    scope_retirement: ?@import("scope_retirement_ledger.zig").Child = null,
     table: records.TableRecord,
     ranges: []const records.RangeRecord,
     fences: []const topology.Fence,
@@ -280,6 +284,16 @@ pub const Parent = struct {
     /// descriptor until the post-migration owner cut is sealed.
     support_after: ?records.TableRecord = null,
 
+    pub fn jsonStringify(self: Parent, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Parent).@"struct".field_names) |field| {
+            if (!(comptime std.mem.eql(u8, field, "scope_retirement")) or self.scope_retirement != null) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
     fn readerPublicationRequired(self: Parent) bool {
         return self.table.schema_reader_requirements != null or
             (if (self.support_before) |table| table.schema_reader_requirements != null else false) or
@@ -448,25 +462,34 @@ pub const Plan = struct {
         defer if (after_foreign.len > 0) alloc.free(after_foreign);
         try table_manager.validateCompleteKeyspaceRanges(self.child_ranges);
         const self_parent = for (self.parents) |parent| {
-            if (parent.table.table_id == self.child_before.table_id) break true;
+            if (parent.scope_retirement == null and parent.table.table_id == self.child_before.table_id) break true;
         } else false;
         try validateOwnerFences(self.id, self.child_before, self.child_ranges, self.child_fences, if (self_parent) .child_generation_dual else .child_generation_source);
         var owner_count = self.child_ranges.len;
         var constraint_count: usize = 0;
         for (self.parents, 0..) |parent, index| {
+            if (parent.scope_retirement) |retirement| {
+                try retirement.validate();
+                if (self.sql_drop == null or self.table_retirement == null or retirement.table != parent.table.table_id or
+                    !std.mem.eql(u8, &try retirement.lookup.reference.childId(self.child_before.table_id), &self.id)) return error.InvalidGenerationPublication;
+                for (parent.transitions) |transition| if (transition.next_generation != null) return error.InvalidGenerationPublication;
+            }
             if (parent.support_before != null or parent.support_after != null or parent.table.table_id == 0 or
-                parent.ranges.len == 0 or parent.ranges.len > max_owners or parent.fences.len != parent.ranges.len or
+                parent.ranges.len == 0 or parent.ranges.len > max_owners or parent.fences.len != (if (parent.scope_retirement != null) @as(usize, 0) else parent.ranges.len) or
                 parent.transitions.len == 0 or parent.transitions.len > max_constraints) return error.InvalidGenerationPublication;
             for (self.parents[0..index]) |prior| if (prior.table.table_id == parent.table.table_id) return error.InvalidGenerationPublication;
             try table_manager.validateCompleteKeyspaceRanges(parent.ranges);
             const dual = parent.table.table_id == self.child_before.table_id;
-            try validateOwnerFences(self.id, parent.table, parent.ranges, parent.fences, if (dual) .child_generation_dual else .child_generation_parent);
+            if (parent.scope_retirement == null) try validateOwnerFences(self.id, parent.table, parent.ranges, parent.fences, if (dual) .child_generation_dual else .child_generation_parent);
             if (dual) {
                 if (!table_manager.tableDefinitionsEqual(parent.table, self.child_before) or parent.ranges.len != self.child_ranges.len) return error.InvalidGenerationPublication;
-                for (parent.ranges, self.child_ranges, parent.fences, self.child_fences) |parent_range, child_range, parent_fence, child_fence| {
-                    if (!table_manager.rangeRecordsEqual(parent_range, child_range) or !parent_fence.eql(child_fence)) return error.InvalidGenerationPublication;
+                for (parent.ranges, self.child_ranges) |parent_range, child_range| {
+                    if (!table_manager.rangeRecordsEqual(parent_range, child_range)) return error.InvalidGenerationPublication;
                 }
-            } else owner_count = std.math.add(usize, owner_count, parent.ranges.len) catch return error.InvalidGenerationPublication;
+                if (parent.scope_retirement == null) for (parent.fences, self.child_fences) |parent_fence, child_fence| {
+                    if (!parent_fence.eql(child_fence)) return error.InvalidGenerationPublication;
+                };
+            } else if (parent.scope_retirement == null) owner_count = std.math.add(usize, owner_count, parent.ranges.len) catch return error.InvalidGenerationPublication;
             constraint_count = std.math.add(usize, constraint_count, parent.transitions.len) catch return error.InvalidGenerationPublication;
             if (owner_count > max_owners or constraint_count > max_constraints) return error.InvalidGenerationPublication;
             for (parent.transitions, 0..) |transition, ti| {
@@ -540,6 +563,7 @@ pub const Plan = struct {
     /// Its local reference barrier disappears with that namespace. Surviving
     /// parents still require independent durable coverage-completion ACKs.
     pub fn needsParentCoverage(self: Plan, parent: Parent) bool {
+        if (parent.scope_retirement != null) return false;
         return self.sql_drop == null or parent.table.table_id != self.child_before.table_id;
     }
 

@@ -28,6 +28,7 @@ pub const Ref = struct { backend: locks.Backend, command: scopes.Command };
 pub const EffectInput = struct { command: scopes.Command, effect: scopes.ledger.Effect };
 const DataRetirement = struct { generation: u64, native: local.storage_pessimistic_lock_control.Snapshot };
 pub const Request = struct {
+    scope_retirement: ?@import("../metadata/scope_retirement_ledger.zig").SourceControl = null,
     notification_generation: ?u64 = null,
     admission: outcomes.Admission,
     incarnation: [16]u8,
@@ -62,14 +63,28 @@ pub const Request = struct {
     pub fn jsonStringify(self: Request, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Request).@"struct".field_names) |field| {
-            if (!(comptime std.mem.eql(u8, field, "notification_generation")) or self.notification_generation != null) {
+            const omit = (comptime std.mem.eql(u8, field, "notification_generation")) and self.notification_generation == null or
+                (comptime std.mem.eql(u8, field, "scope_retirement")) and self.scope_retirement == null;
+            if (!omit) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
             }
         }
         try writer.endObject();
     }
+    pub fn requiredDecoderVersion(self: Request) u16 {
+        if (self.scope_retirement != null) return @import("../metadata/topology_protocol.zig").sql_scope_retirement_version;
+        if (self.notification_generation != null or self.operation == .notification_gc or self.operation == .notification_bind or self.operation == .notification_offer or self.operation == .notification_ack) return @import("../metadata/topology_protocol.zig").sql_notifications_version;
+        return decoder_version;
+    }
     pub fn validate(self: Request) !void {
+        if (self.scope_retirement) |root| {
+            try root.root.validate();
+            if (root.expected_after) |backend| try backend.validate();
+            if (root.root.reference.kind != .database or root.root.reference.database != self.database or
+                self.operation != .fence or self.operation.fence != .close or
+                self.actor.session_user.kind != .bootstrap or self.actor.current_role != null) return error.InvalidCatalogMutation;
+        }
         if (self.notification_generation) |generation| if (generation < 2 or self.operation != .finish) return error.InvalidCatalogMutation;
         try self.admission.validate();
         try self.actor.validate();
@@ -147,6 +162,7 @@ pub const Context = struct {
     database: u64,
     standalone: bool,
     maintenance: bool = false,
+    starting_command: bool = false,
     unadmitted: ?prepared.Mutation = null,
     prepared_operation: ?[16]u8 = null,
     /// Populated only after the accepting metadata writer checks the current
@@ -207,15 +223,23 @@ pub const Context = struct {
         if (self.maintenance and self.actor.session_user.kind == .bootstrap and self.actor.current_role == null) return;
         if (!std.mem.eql(u8, &try principalDigest(self.a, self.actor.session_user), &value.registration.lease.principal)) return error.Forbidden;
     }
-    pub fn requireRegistration(self: Context, _: anytype, ns: scopes.ledger.Namespace, value: scopes.Registration) !void {
+    pub fn requireRegistration(self: Context, txn: anytype, ns: scopes.ledger.Namespace, value: scopes.Registration) !void {
         try value.validate(ns);
         try self.requireOwner(.{ .registration = value });
+        // Exact registration replay observes its existing native owner. A new
+        // backend cannot enter a database after retirement has reserved it.
+        if (try scopes.read(self.a, txn, ns, value.lease.backend) == null)
+            try @import("../metadata/scope_retirement_admission.zig").requireConnectionAdmission(txn, ns.group, value.lease.database);
     }
     pub fn requireRead(self: Context, value: scopes.Record) !void {
         try self.requireOwner(value);
     }
-    pub fn requireCommand(self: Context, _: anytype, _: scopes.ledger.Namespace, value: scopes.Record, _: scopes.Command) !void {
+    pub fn requireCommand(self: Context, txn: anytype, ns: scopes.ledger.Namespace, value: scopes.Record, command: scopes.Command) !void {
         try self.requireOwner(value);
+        // Retirement cannot strand an already admitted body's FINISH, abort,
+        // delivery ACK or exact replay. Only admission of a new body is fenced.
+        if (self.starting_command and value.command == null and command.sequence >= value.next_command)
+            try @import("../metadata/scope_retirement_admission.zig").requireConnectionAdmission(txn, ns.group, value.registration.lease.database);
     }
     pub fn requireTransaction(self: Context, _: anytype, _: scopes.ledger.Namespace, value: scopes.Record, id: [16]u8) !void {
         try self.requireOwner(value);
@@ -314,7 +338,25 @@ pub fn apply(a: A, txn: anytype, group: u64, request: Request) !?outcomes.LockEf
 pub fn applyWithEnrollment(a: A, txn: anytype, group: u64, request: Request, checked: ?scopes.Data.Spec) !?outcomes.LockEffect {
     try request.validate();
     const ns: scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = request.incarnation };
+    if (request.scope_retirement) |root| {
+        const retirement = @import("../metadata/scope_retirement_ledger.zig");
+        if (root.root.group != group) return error.Forbidden;
+        const head = (try retirement.head(txn, root.root)) orelse return error.CatalogGenerationChanged;
+        if (!head.force or head.progress.phase != .draining_connections or
+            !std.mem.eql(u8, &head.metadata_incarnation, &request.incarnation)) return error.Forbidden;
+        const lease = (try retirement.member(txn, group, .database, request.database)) orelse return error.CatalogGenerationChanged;
+        if (!std.meta.eql(lease.lookup, root.root) or lease.intent != .retire or !std.mem.eql(u8, &lease.metadata_incarnation, &head.metadata_incarnation)) return error.CatalogGenerationChanged;
+        const source = try scopes.read(a, txn, ns, request.backend) orelse return error.LockOwnerNotRegistered;
+        if (source.registration.lease.database != root.root.reference.database) return error.Forbidden;
+        // The worker's service principal is not the SQL issuer. Database
+        // ownership alone cannot terminate somebody else's privileged backend.
+        if (head.creator.kind != .bootstrap and !std.mem.eql(u8, &try principalDigest(a, head.creator), &source.registration.lease.principal)) return error.Forbidden;
+        const current = try retirement.sourceCursor(txn, root.root);
+        if (!std.meta.eql(if (current) |value| @as(?locks.Backend, value.backend) else null, root.expected_after)) return error.CatalogGenerationChanged;
+    }
     const context: Context = .{ .a = a, .actor = request.actor, .database = request.database, .standalone = request.standalone, .maintenance = request.operation == .close_step or request.operation == .release or request.operation == .release_unadmitted or request.operation == .fence or request.operation == .data_ack or request.operation == .data_retire or request.operation == .data_handoff, .unadmitted = if (request.operation == .release_unadmitted) request.operation.release_unadmitted else null, .enrollment = checked };
+    var command_context = context;
+    command_context.starting_command = request.operation == .begin;
     var checked_context = context;
     checked_context.handoff = request.operation == .data_handoff;
     checked_context.data_proof = switch (request.operation) {
@@ -347,7 +389,7 @@ pub fn applyWithEnrollment(a: A, txn: anytype, group: u64, request: Request, che
             try @import("sql_notifications.zig").acknowledge(a, txn, group, value.connection, value.generation, value.cursor);
         },
         .register => |value| try scopes.register(a, txn, ns, value, context),
-        .begin => |command| _ = try scopes.begin(a, txn, ns, request.backend, command, context),
+        .begin => |command| _ = try scopes.begin(a, txn, ns, request.backend, command, command_context),
         .finish => |command| {
             try scopes.finish(a, txn, ns, request.backend, command, context);
             if (request.notification_generation) |generation| try @import("sql_notifications.zig").resetBinding(a, txn, group, request.backend, generation);
@@ -367,6 +409,8 @@ pub fn applyWithEnrollment(a: A, txn: anytype, group: u64, request: Request, che
             if (try scopes.closeStep(a, txn, ns, request.backend, context)) try @import("sql_notifications.zig").retireBinding(a, txn, group, request.backend);
         },
     }
+    if (request.scope_retirement) |control|
+        try @import("../metadata/scope_retirement_ledger.zig").stageSourceCursor(txn, control, request.backend);
     const result = receipt orelse return null;
     const effect = switch (request.operation) {
         .effect, .cancel, .step => |value| value.effect,
@@ -388,8 +432,11 @@ pub fn requireNotificationConnection(a: A, txn: anytype, root: scopes.Record, ge
     return true;
 }
 
+pub fn scopeAllGroupsPrefix() []const u8 {
+    return "\x00\x00__metadata__:sql_lock_scope:";
+}
 pub fn scopePrefixForGroup(buffer: []u8, group: u64) ![]const u8 {
-    return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:sql_lock_scope:{x:0>16}:", .{group});
+    return std.fmt.bufPrint(buffer, "{s}{x:0>16}:", .{ scopeAllGroupsPrefix(), group });
 }
 pub fn workPrefixForGroup(buffer: []u8, group: u64) ![]const u8 {
     return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:sql_lock_work:{x:0>16}:", .{group});
@@ -412,15 +459,26 @@ pub const Query = struct {
     /// Bounded ingress anchor: one database lookup, no backend/work scan.
     discovery: ?[]const u8 = null,
     notification_work: ?struct { after: ?[32]u8 = null } = null,
+    database_work: ?struct { after: ?locks.Backend = null, wrap: bool = false } = null,
     notifications: ?struct { generation: u64, maximum: u16 = 128 } = null,
     participant: ?union(enum) {
         generation: u64,
         route: struct { spec: scopes.Data.Spec, transaction: [16]u8 },
     } = null,
+    pub fn requiredDecoderVersion(self: Query) u16 {
+        return if (self.database_work != null) @import("../metadata/topology_protocol.zig").sql_scope_retirement_version else decoder_version;
+    }
     pub fn validate(self: Query) !void {
         try self.actor.validate();
-        const selectors = @as(u8, @intFromBool(self.backend != null)) + @as(u8, @intFromBool(self.work != null)) + @as(u8, @intFromBool(self.discovery != null)) + @as(u8, @intFromBool(self.notification_work != null));
+        const selectors = @as(u8, @intFromBool(self.backend != null)) + @as(u8, @intFromBool(self.work != null)) + @as(u8, @intFromBool(self.discovery != null)) + @as(u8, @intFromBool(self.notification_work != null)) + @as(u8, @intFromBool(self.database_work != null));
         if (selectors != 1 or (self.backend != null and std.mem.allEqual(u8, &self.incarnation, 0))) return error.InvalidCatalogMutation;
+        if (self.database_work) |selection| {
+            if (self.database == 0 or self.actor.session_user.kind != .bootstrap or self.actor.current_role != null) return error.Forbidden;
+            if (selection.after) |backend| {
+                try backend.validate();
+                if (!std.mem.eql(u8, &backend.incarnation, &self.incarnation)) return error.InvalidCatalogMutation;
+            }
+        }
         if (self.notification_work != null and (self.database != 0 or self.actor.session_user.kind != .bootstrap or self.actor.current_role != null)) return error.Forbidden;
         if (self.discovery) |name| {
             if (self.database != 0 or name.len == 0 or name.len > 256 or !std.unicode.utf8ValidateSlice(name) or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidCatalogMutation;
@@ -446,6 +504,7 @@ pub const Query = struct {
     }
 };
 pub const Snapshot = struct {
+    database_after: ?locks.Backend = null,
     notification_binding: ?@import("sql_notifications.zig").Binding = null,
     notification_work: ?@import("sql_notifications.zig").Work = null,
     notifications: ?@import("sql_notifications.zig").Page = null,
@@ -465,7 +524,7 @@ pub const Snapshot = struct {
     pub fn jsonStringify(self: Snapshot, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Snapshot).@"struct".field_names) |field| {
-            if (comptime std.mem.eql(u8, field, "notifications") or std.mem.eql(u8, field, "notification_work") or std.mem.eql(u8, field, "notification_binding")) {
+            if (comptime std.mem.eql(u8, field, "database_after") or std.mem.eql(u8, field, "notifications") or std.mem.eql(u8, field, "notification_work") or std.mem.eql(u8, field, "notification_binding")) {
                 if (@field(self, field)) |page| {
                     try writer.objectField(field);
                     try writer.write(page);

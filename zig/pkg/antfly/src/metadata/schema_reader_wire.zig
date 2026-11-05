@@ -83,6 +83,10 @@ pub fn requiresSqlCast(bytes: []const u8) bool {
     return requiresMarker(bytes, "sql_cast");
 }
 
+pub fn requiresScopeRetirementAuthority(bytes: []const u8) bool {
+    return requiresMarker(bytes, "scope_retirement") or requiresMarker(bytes, "scope_begin") or requiresMarker(bytes, "scope_child");
+}
+
 pub fn requiresSqlNotifications(bytes: []const u8) bool {
     return requiresMarker(bytes, "@sql-notifications");
 }
@@ -544,4 +548,11 @@ test "SQL notification decoder admission follows frozen intents and exact contro
 test "SQL database defaults decoder gates scoped baseline mutations without matching string payloads" {
     for ([_][]const u8{ "{}", "{\"description\":\"database_defaults_only\"}", "{\"role_defaults_only\":true}" }) |bytes| try std.testing.expect(!requiresDatabaseDefaults(bytes));
     for ([_][]const u8{ "{\"database_defaults_only\":true}", "{\"database_defaults_\\u006fnly\":true}", "{" }) |bytes| try std.testing.expect(requiresDatabaseDefaults(bytes));
+}
+
+test "SQL scope retirement termination decoder projection ignores payloads and recognizes escaped authority fields" {
+    for ([_][]const u8{ "{}", "{\"scope_retirement\":null}", "{\"payload\":\"scope_retirement\"}", "{\"scope_child\":null}", "{\"payload\":\"scope_begin\"}" }) |bytes|
+        try std.testing.expect(!requiresScopeRetirementAuthority(bytes));
+    for ([_][]const u8{ "{", "{\"scope_retirement\":{}}", "{\"scope_retire\\u006dent\":{}}", "{\"scope_begin\":{}}", "{\"begin\":{\"manifest\":{\"scope_child\":{}}}}" }) |bytes|
+        try std.testing.expect(requiresScopeRetirementAuthority(bytes));
 }

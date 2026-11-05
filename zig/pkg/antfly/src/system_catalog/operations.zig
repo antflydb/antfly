@@ -300,7 +300,7 @@ pub fn mutateSqlLocks(svc: anytype, alloc: std.mem.Allocator, context: operation
     try context.ensureActive();
     try request.validate();
     if (request.standalone) return error.InvalidCatalogMutation;
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, types.decoder_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, request.requiredDecoderVersion());
     try svc.ensureLinearizableReadWithContext(context);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     const previous = try store.sqlLockOutcome(alloc, svc.metadata_group_id, request);
@@ -1528,7 +1528,7 @@ pub fn submitScopeRetirement(svc: anytype, alloc: std.mem.Allocator, context: op
 pub fn submitTableRetirement(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: []const u8) ![]u8 {
     if (!context.schema_validation_authority or !context.setting_admin) return error.Forbidden;
     try context.ensureActive();
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.table_retirement_public_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, if (@import("../metadata/schema_reader_wire.zig").requiresScopeRetirementAuthority(command)) protocol.sql_scope_retirement_version else protocol.table_retirement_public_version);
     try svc.ensureLinearizableReadWithContext(context);
     svc.lockCatalogMutation();
     var gate_held = true;
@@ -2906,7 +2906,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .sql_lock_read => |request| blk: {
             if (!context.setting_admin) return error.Forbidden;
             try context.ensureActive();
-            const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, @import("lock_authority.zig").decoder_version);
+            const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, request.requiredDecoderVersion());
             try svc.ensureLinearizableReadWithContext(context);
             try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
