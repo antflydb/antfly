@@ -7292,10 +7292,11 @@ pub const ContainsQuery = struct {
     }
 };
 
-/// A content part for multimodal input (text, image URL, or inline media).
+/// A content part for multimodal input (text, image URL, inline media, or a pinned source reference).
 pub const ContentPart = union(enum) {
     media_content_part: *MediaContentPart,
     image_url_content_part: *ImageURLContentPart,
+    source_content_part: *SourceContentPart,
     text_content_part: *TextContentPart,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
@@ -7338,6 +7339,7 @@ pub const ContentPart = union(enum) {
             .value => |disc_str| {
                 if (std.mem.eql(u8, disc_str, "media")) return .{ .media_content_part = try parseStructuralVariantFromSlice(MediaContentPart, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "image_url")) return .{ .image_url_content_part = try parseStructuralVariantFromSlice(ImageURLContentPart, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "source")) return .{ .source_content_part = try parseStructuralVariantFromSlice(SourceContentPart, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "text")) return .{ .text_content_part = try parseStructuralVariantFromSlice(TextContentPart, allocator, input, options) };
                 return error.UnexpectedToken;
             },
@@ -7369,6 +7371,10 @@ pub const ContentPart = union(enum) {
             const parsed = try parseStructuralVariant(ImageURLContentPart, allocator, source, options) orelse return error.UnexpectedToken;
             return .{ .image_url_content_part = parsed };
         }
+        if (std.mem.eql(u8, disc_str, "source")) {
+            const parsed = try parseStructuralVariant(SourceContentPart, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .source_content_part = parsed };
+        }
         if (std.mem.eql(u8, disc_str, "text")) {
             const parsed = try parseStructuralVariant(TextContentPart, allocator, source, options) orelse return error.UnexpectedToken;
             return .{ .text_content_part = parsed };
@@ -7380,6 +7386,7 @@ pub const ContentPart = union(enum) {
         switch (self) {
             .media_content_part => |v| try jw.write(v.*),
             .image_url_content_part => |v| try jw.write(v.*),
+            .source_content_part => |v| try jw.write(v.*),
             .text_content_part => |v| try jw.write(v.*),
         }
     }
@@ -7401,6 +7408,8 @@ pub const ContentSecurityConfig = struct {
     max_image_dimension: ?i64 = null,
     /// Whitelist of allowed path prefixes for file:// and s3:// URLs. File downloads require an explicit nonempty path allowlist; omission and an empty list deny local file access. For S3 the generic scraper treats omission as unrestricted and an empty list as deny-all; Antfly inference requires explicit path allowlists. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
     allowed_paths: ?[]const []const u8 = null,
+    /// Exact source companion base URLs that a chat `source` part may fetch, matched on scheme, host, port and path. This is how a loopback or private companion is allowed; such URLs need no `allowed_hosts` entry. Every other `source` URL needs `allowed_hosts` and always keeps private-IP blocking, whatever `block_private_ips` says. Template fetches ignore this setting.
+    source_media_base_urls: ?[]const []const u8 = null,
     /// User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
     user_agent: ?[]const u8 = null,
 
@@ -7413,6 +7422,7 @@ pub const ContentSecurityConfig = struct {
         .{ "download_timeout_seconds", "download_timeout_seconds", true },
         .{ "max_image_dimension", "max_image_dimension", true },
         .{ "allowed_paths", "allowed_paths", true },
+        .{ "source_media_base_urls", "source_media_base_urls", true },
         .{ "user_agent", "user_agent", true },
     };
 
@@ -7452,6 +7462,10 @@ pub const ContentSecurityConfig = struct {
         }
         if (self.allowed_paths) |value| {
             try jw.objectField("allowed_paths");
+            try jw.write(value);
+        }
+        if (self.source_media_base_urls) |value| {
+            try jw.objectField("source_media_base_urls");
             try jw.write(value);
         }
         if (self.user_agent) |value| {
@@ -54272,6 +54286,12 @@ pub const SortProfile = struct {
         }
         try jw.endObject();
     }
+};
+
+/// Image, audio, or video named by a source record's `content.resource`. Accepted only on the Antfly gateway's generate and chat routes, which fetch the pinned version under `remote_content.security` and replace this part with inline media, so the source URL never reaches a model vendor. Fetching requires a nonempty `allowed_hosts`. The expanded request is limited to 16 MiB. Models that do not support the media type reject the request.
+pub const SourceContentPart = struct {
+    type: []const u8,
+    source: std.json.Value,
 };
 
 pub const SqlSettingDatabaseDefault = struct {

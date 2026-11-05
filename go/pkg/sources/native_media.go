@@ -215,6 +215,12 @@ type AcquiredMediaConnector interface {
 	AcquireMedia(context.Context, Request, Item) ([]byte, bool, error)
 }
 
+// VerifiedAcquisitionConnector names the digest its acquired bytes were already
+// checked against. ServeMedia skips rehashing only when it equals the pinned digest.
+type VerifiedAcquisitionConnector interface {
+	AcquiredMediaDigest(Item) string
+}
+
 func (c *GoogleConnector) AcquireMedia(ctx context.Context, r Request, item Item) ([]byte, bool, error) {
 	if configString(item.Metadata, "export_mime_type") == "" {
 		return nil, false, nil

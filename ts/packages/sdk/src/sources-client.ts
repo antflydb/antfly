@@ -1,6 +1,6 @@
 /** Client for the optional antfly-source companion, at its own base URL. */
 export interface SourceConnection {
-  provider: "github" | "google_workspace" | "gcs" | "s3" | "slack" | "discord";
+  provider: "github" | "google_workspace" | "gcs" | "s3" | "local" | "slack" | "discord";
   secret_refs?: Partial<
     Record<
       "token" | "credentials" | "access_key_id" | "secret_access_key" | "session_token",
@@ -15,6 +15,7 @@ export interface SourceConnection {
   session_token_env?: string;
   s3_endpoint?: string;
   s3_insecure?: boolean;
+  local_root?: string;
 }
 
 export interface SourceDefinition {
