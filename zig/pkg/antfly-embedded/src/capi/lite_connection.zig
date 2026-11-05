@@ -7046,7 +7046,12 @@ test "issue1015 issue1431 warm SQL retains the incremental allocator digest" {
     api.antfly_buffer_free_zero(&output);
     const owner = fixture.connection.owner;
     const root = owner.current.?;
-    const ledger = root.owned_lite_backend.?.native_docstore.?.file.ledger.?;
+    // Quiescent SQL returns its mutable ledger to the path cache. The
+    // serving wrapper keeps checked authority without retaining that loan.
+    const cache = &owner.gate.writer_allocator_cache;
+    const ledger = cache.holder.?.ledger.?;
+    const file = &root.owned_lite_backend.?.native_docstore.?.file;
+    const initial_work = file.allocatorWorkSnapshot();
     for (0..8) |i| {
         const before = ledger.digestWork();
         var request: [160]u8 = undefined;
@@ -7054,7 +7059,10 @@ test "issue1015 issue1431 warm SQL retains the incremental allocator digest" {
         try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_sql_json(fixture.id, .fromSlice(bytes), &output));
         api.antfly_buffer_free_zero(&output);
         try std.testing.expect(owner.current == root);
-        try std.testing.expect(root.owned_lite_backend.?.native_docstore.?.file.ledger == ledger);
+        try std.testing.expect(cache.holder.?.ledger == ledger);
+        const work = file.allocatorWorkSnapshot();
+        try std.testing.expectEqual(initial_work.full_loads, work.full_loads);
+        try std.testing.expectEqual(initial_work.digest_rebuilds, work.digest_rebuilds);
         try std.testing.expect(ledger.digestWork() - before < 1000);
     }
 }
