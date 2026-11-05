@@ -191,7 +191,7 @@ func (s CatalogStore) Read(ctx context.Context, ids []string) (map[string]Catalo
 		if err := json.Unmarshal(data, &result); err != nil {
 			return nil, err
 		}
-		if len(result.Responses) != 1 || result.Responses[0].Status != 200 || !result.Responses[0].fresh() || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
+		if len(result.Responses) != 1 || result.Responses[0].Status != 200 || !result.Responses[0].readable() || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
 			return nil, fmt.Errorf("catalog query requires a successful snapshot")
 		}
 		allowed := map[string]bool{}

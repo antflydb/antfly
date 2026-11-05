@@ -173,8 +173,11 @@ It accepts PNG, JPEG, WebP and GIF images, and `audio/*` and `video/*` types. On
 - Images are inlined, so an expanded request is limited to 16 MiB, or about 12 MiB of
   images (413). Audio and video travel to local and Antfly models as binary attachments,
   up to 256 MiB per request and `max_download_size_bytes`, which defaults to 100 MiB.
-  Hosted providers receive them inline, within the 64 MiB request budget (413).
-- Concurrent fetched media is bounded across the server. A server at that limit
+  Hosted providers receive them inline and may impose smaller request limits.
+- Fetched media, native framing, and hosted base64/JSON copies share a 2 GiB
+  allocation budget across the server. Metadata parsing retains its separate
+  64 MiB budget. Each batch item releases its media before the next item runs.
+  A server at the shared media limit
   returns 429 and the request can be retried.
 
 Declare `video: supported` under `inference_capabilities` for a named target that

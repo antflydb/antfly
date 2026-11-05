@@ -21,6 +21,7 @@ const std = @import("std");
 const images = @import("antfly_image");
 const scraping = @import("antfly_scraping");
 const Attachment = @import("httpx").attachment_envelope.Attachment;
+const MemoryBudget = @import("antfly_local_sources").sql_memory_budget;
 const A = std.mem.Allocator;
 const V = std.json.Value;
 pub const Reference = @import("antfly_decisions").evidence.TableSourceReference;
@@ -32,6 +33,8 @@ pub const Port = struct {
     lookup_many: ?*const fn (*anyopaque, A, []const Reference) anyerror![]const []const u8 = null,
     /// Returns exactly resource.length bytes of the pinned version.
     fetch: ?*const fn (*anyopaque, A, Resource) anyerror![]const u8 = null,
+    /// Releases fetched bytes after one invocation, including a failed batch item.
+    reset: ?*const fn (*anyopaque) void = null,
 };
 /// The `content.resource` object of a source record. Unknown fields are rejected.
 pub const Resource = struct {
@@ -53,14 +56,13 @@ const max_expanded_request_bytes = 16 * 1024 * 1024;
 /// Audio and video travel as binary attachments, not base64 in the request. The
 /// configured download limit still applies when each one is fetched.
 pub const max_resource_attachment_bytes: u64 = 256 * 1024 * 1024;
-/// Fetched media held across all requests. Forwarding also copies it into the
-/// framed request, so each byte reserves two.
+/// Actual live fetch, framing and hosted-adapter allocations across requests.
 const max_reserved_fetch_bytes: usize = 2 * 1024 * 1024 * 1024;
 var reserved_fetch_bytes: std.atomic.Value(usize) = .init(0);
 
 /// Fails rather than queues: the gateway reports capacity and the caller retries.
 pub fn reserveFetch(bytes: usize) !usize {
-    const cost = std.math.mul(usize, bytes, 2) catch return error.InferenceRequestTooLarge;
+    const cost = bytes;
     var current = reserved_fetch_bytes.load(.monotonic);
     while (true) {
         const next = std.math.add(usize, current, cost) catch return error.InferenceCapacityUnavailable;
@@ -71,6 +73,50 @@ pub fn reserveFetch(bytes: usize) !usize {
 pub fn releaseFetch(cost: usize) void {
     _ = reserved_fetch_bytes.fetchSub(cost, .acq_rel);
 }
+
+/// Compose shared admission with the caller's allocator. Account for actual
+/// capacity, including arena growth and base64/JSON copies, rather than guessing
+/// how many copies a provider will need. Metadata parsing keeps its own 64 MiB cap.
+pub fn allocationBudget(backing: A) MemoryBudget {
+    return .{ .backing = backing, .limit = max_reserved_fetch_bytes, .admission = .{
+        .ptr = &reserved_fetch_bytes,
+        .reserve = struct {
+            fn reserve(_: *anyopaque, bytes: usize) bool {
+                _ = reserveFetch(bytes) catch return false;
+                return true;
+            }
+        }.reserve,
+        .release = struct {
+            fn release(_: *anyopaque, bytes: usize) void {
+                releaseFetch(bytes);
+            }
+        }.release,
+    } };
+}
+
+/// Stable, invocation-owned storage. Both buffers and their admission are
+/// released on every exit, even when a fetch fails after allocating its output.
+pub const FetchScope = struct {
+    budget: MemoryBudget = undefined,
+    arena: std.heap.ArenaAllocator = undefined,
+    initialized: bool = false,
+
+    pub fn allocator(self: *@This(), backing: A) A {
+        if (!self.initialized) {
+            self.budget = allocationBudget(backing);
+            self.arena = std.heap.ArenaAllocator.init(self.budget.allocator());
+            self.initialized = true;
+        }
+        return self.arena.allocator();
+    }
+
+    pub fn deinit(self: *@This()) void {
+        if (!self.initialized) return;
+        self.arena.deinit();
+        self.budget.finishAdmission();
+        self.initialized = false;
+    }
+};
 const image_mime_types = [_][]const u8{ "image/png", "image/jpeg", "image/webp", "image/gif" };
 fn isImageMime(mime: []const u8) bool {
     for (image_mime_types) |candidate| if (std.mem.eql(u8, mime, candidate)) return true;
@@ -171,7 +217,12 @@ fn resolveChatResources(a: A, request: V, found: ChatSources, port: ?Port, attac
     var counter: std.Io.Writer.Discarding = .init(&.{});
     try std.json.Stringify.value(request, .{}, &counter.writer);
     var expanded = std.math.cast(usize, counter.fullCount()) orelse return error.InferenceRequestTooLarge;
+    const existing = attachments.* orelse &.{};
     var attached_bytes: u64 = 0;
+    for (existing) |attachment| {
+        attached_bytes = std.math.add(u64, attached_bytes, attachment.data.len) catch return error.InferenceRequestTooLarge;
+    }
+    if (attached_bytes > max_resource_attachment_bytes) return error.InferenceRequestTooLarge;
     var attached_count: usize = 0;
     for (found.resources.items) |item| {
         const length = std.math.cast(usize, item.resource.length) orelse return error.InferenceRequestTooLarge;
@@ -185,7 +236,7 @@ fn resolveChatResources(a: A, request: V, found: ChatSources, port: ?Port, attac
             attached_count += 1;
         }
     }
-    const existing = attachments.* orelse &.{};
+    if (existing.len + attached_count > 1024) return error.InferenceRequestTooLarge;
     const merged = try a.alloc(Attachment, existing.len + attached_count);
     @memcpy(merged[0..existing.len], existing);
     var next = existing.len;
@@ -220,11 +271,16 @@ pub fn fetchResource(a: A, io: std.Io, remote_content: ?*const scraping.RemoteCo
     var snapshot = try config.acquire();
     defer snapshot.deinit();
     const configured = if (snapshot.config.security) |*value| value else return error.Forbidden;
-    var security = try resourceSecurity(a, configured.*, resource.uri);
+    var scratch = std.heap.ArenaAllocator.init(MemoryBudget.reclaimingAllocator(a));
+    defer scratch.deinit();
+    const work = scratch.allocator();
+    var security = try resourceSecurity(work, configured.*, resource.uri);
+    if (security.max_download_size_bytes) |limit| if (resource.length > limit) return error.InferenceRequestTooLarge;
     const context: scraping.DownloadContext = .{ .io = io, .timeout_ms = timeout_ms, .cancellation = cancellation };
-    const out = try a.alloc(u8, @intCast(resource.length));
-    const range = scraping.PinnedRange.create(a, context, resource.uri, resource.version, resource.version_kind, resource.length, &security, null, &.{}) catch |err| return fetchFailure(err);
+    const range = scraping.PinnedRange.create(work, context, resource.uri, resource.version, resource.version_kind, resource.length, &security, null, &.{}) catch |err| return fetchFailure(err);
     defer range.destroy();
+    const out = try a.alloc(u8, @intCast(resource.length));
+    errdefer a.free(out);
     const read = range.readAt(0, out) catch |err| return fetchFailure(err);
     if (read != out.len) return error.InferenceSourceMismatch;
     return out;
@@ -653,10 +709,45 @@ test "httpx inference gateway chat source parts attach audio and video without t
 }
 
 test "httpx inference gateway chat source fetches reserve bounded memory" {
-    const first = try reserveFetch(max_reserved_fetch_bytes / 2);
+    const first = try reserveFetch(max_reserved_fetch_bytes);
     defer releaseFetch(first);
     try std.testing.expectError(error.InferenceCapacityUnavailable, reserveFetch(1));
     releaseFetch(try reserveFetch(0));
+}
+
+test "httpx inference gateway fetch scope releases actual allocation capacity on every exit" {
+    const before = reserved_fetch_bytes.load(.acquire);
+    var scope: FetchScope = .{};
+    const a = scope.allocator(std.testing.allocator);
+    _ = try a.alloc(u8, 4096);
+    try std.testing.expect(reserved_fetch_bytes.load(.acquire) > before);
+    scope.deinit();
+    try std.testing.expectEqual(before, reserved_fetch_bytes.load(.acquire));
+    // A batch reuses the source port but starts with new ownership per item.
+    _ = try scope.allocator(std.testing.allocator).alloc(u8, 8192);
+    scope.deinit();
+    scope.deinit();
+    try std.testing.expectEqual(before, reserved_fetch_bytes.load(.acquire));
+}
+
+test "httpx inference gateway denied source fetch frees temporary allocations" {
+    var hosts = [_][]u8{@constCast("sources.example")};
+    const remote: scraping.RemoteContentConfig = .{ .security = .{ .allowed_hosts = &hosts } };
+    const resource: Resource = .{ .type = "source", .uri = "https://denied.example/clip", .mime_type = "video/mp4", .version = "\"v\"", .length = 4096 };
+    // A real reclaiming allocator catches leaks that arena-backed fakes hide.
+    try std.testing.expectError(error.Forbidden, fetchResource(std.testing.allocator, std.testing.io, &remote, resource, null, 100));
+}
+
+test "httpx inference gateway shared media admission refunds failed allocations" {
+    const before = reserved_fetch_bytes.load(.acquire);
+    const held = try reserveFetch(max_reserved_fetch_bytes - before);
+    var budget = allocationBudget(std.testing.allocator);
+    try std.testing.expectError(error.OutOfMemory, budget.allocator().alloc(u8, 1));
+    try std.testing.expect(budget.admission_exhausted);
+    releaseFetch(held);
+    const bytes = try budget.allocator().alloc(u8, 4096);
+    budget.allocator().free(bytes);
+    try std.testing.expectEqual(before, reserved_fetch_bytes.load(.acquire));
 }
 
 test "httpx inference gateway chat source parts verify images and return chat shape" {

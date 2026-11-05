@@ -4621,13 +4621,16 @@ pub const AntflyApiHandler = struct {
         server: *ApiHttpServer,
         ctx: *httpx.Context,
         identity: ?AuthenticatedIdentity,
-        reserved_fetch_bytes: usize = 0,
+        fetch_memory: inference_gateway.source_media.FetchScope = .{},
         fn release(self: *@This()) void {
-            inference_gateway.source_media.releaseFetch(self.reserved_fetch_bytes);
-            self.reserved_fetch_bytes = 0;
+            self.fetch_memory.deinit();
+        }
+        fn reset(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.release();
         }
         fn port(self: *@This()) inference_gateway.source_media.Port {
-            return .{ .ptr = self, .lookup = lookup, .lookup_many = lookupMany, .fetch = fetch };
+            return .{ .ptr = self, .lookup = lookup, .lookup_many = lookupMany, .fetch = fetch, .reset = reset };
         }
         fn fetch(raw: *anyopaque, a: std.mem.Allocator, resource: inference_gateway.source_media.Resource) ![]const u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -4642,8 +4645,11 @@ pub const AntflyApiHandler = struct {
             }.call;
             // Large bodies live for the request, outside the bounded parsing arena.
             _ = a;
-            self.reserved_fetch_bytes += try inference_gateway.source_media.reserveFetch(std.math.cast(usize, resource.length) orelse return error.InferenceRequestTooLarge);
-            return inference_gateway.source_media.fetchResource(self.ctx.allocator, self.server.inferenceIo(), self.server.cfg.remote_content, resource, .{ .ptr = self.ctx, .is_cancelled_fn = cancelled }, (deadline - now) / std.time.ns_per_ms);
+            const media_allocator = self.fetch_memory.allocator(self.ctx.allocator);
+            return inference_gateway.source_media.fetchResource(media_allocator, self.server.inferenceIo(), self.server.cfg.remote_content, resource, .{ .ptr = self.ctx, .is_cancelled_fn = cancelled }, (deadline - now) / std.time.ns_per_ms) catch |err| {
+                if (err == error.OutOfMemory and self.fetch_memory.budget.isLocallyExhausted()) return error.InferenceCapacityUnavailable;
+                return err;
+            };
         }
         fn at(value: std.json.Value, path: []const u8) ?std.json.Value {
             var current = value;
@@ -19373,6 +19379,75 @@ test "httpx inference gateway authorization covers inventory execution and sessi
     try Cases.request(alloc, &handler, authorization, "/ai/v1/transcription/sessions", 403);
     try Cases.request(alloc, &handler, authorization, "/ai/v1/models", 200);
     try std.testing.expectEqual(@as(usize, 1), target.calls);
+}
+
+test "httpx inference gateway large source batch items bypass metadata limits and release between items" {
+    const Media = struct {
+        scope: inference_gateway.source_media.FetchScope = .{},
+        resets: usize = 0,
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: inference_gateway.source_media.Reference) ![]const u8 {
+            return error.UnexpectedLookup;
+        }
+        fn fetch(raw: *anyopaque, _: std.mem.Allocator, resource: inference_gateway.source_media.Resource) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = try self.scope.allocator(std.testing.allocator).alloc(u8, @intCast(resource.length));
+            @memset(bytes, 42);
+            return bytes;
+        }
+        fn reset(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.scope.deinit();
+            self.resets += 1;
+        }
+    };
+    const Target = struct {
+        calls: usize = 0,
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            check(context) catch |err| return inference_connection_abi.statusFromError(err);
+            return .ok;
+        }
+        fn check(context: *const inference_connection_abi.InvokeContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            const a = context.allocator.asStd();
+            var envelope = try httpx.attachment_envelope.parseAlloc(a, context.body.slice(), .{});
+            defer envelope.deinit();
+            try std.testing.expectEqual(@as(usize, 1), envelope.attachments.len);
+            const bytes = envelope.attachments[0].data;
+            try std.testing.expectEqual(@as(usize, 65 * 1024 * 1024), bytes.len);
+            try std.testing.expectEqual(@as(u8, 42), bytes[0]);
+            try std.testing.expectEqual(@as(u8, 42), bytes[bytes.len - 1]);
+            self.calls += 1;
+            const response = try a.dupe(u8,
+                \\{"id":"test","object":"chat.completion","created":1,"model":"backend","usage":null,"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}
+            );
+            context.out_response.* = .{ .status = 200, .body = .{ .ptr = response.ptr, .len = response.len } };
+        }
+    };
+    const a = std.testing.allocator;
+    var config = try common_config.Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":true}}");
+    defer config.deinit();
+    var source = AuthStatusSource{};
+    var target: Target = .{};
+    var server = ApiHttpServer.init(a, .{ .node_config = &config, .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } }, source.iface(), null, null);
+    defer server.deinit();
+    var media: Media = .{};
+    defer media.scope.deinit();
+    const body =
+        \\{"requests":[{"custom_id":"a","body":{"model":"local/backend","messages":[{"role":"user","content":[{"type":"source","source":{"type":"source","uri":"https://sources.example/clip","mime_type":"video/mp4","version":"\"v\"","length":68157440}}]}]}},{"custom_id":"b","body":{"model":"local/backend","messages":[{"role":"user","content":[{"type":"source","source":{"type":"source","uri":"https://sources.example/clip","mime_type":"video/mp4","version":"\"v\"","length":68157440}}]}]}}]}
+    ;
+    var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/generate/batch");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try inference_gateway.batchWithSources(&server, &ctx, .{ .ptr = &media, .lookup = Media.lookup, .fetch = Media.fetch, .reset = Media.reset });
+    defer response.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("summary").?.object.get("succeeded").?.integer);
+    try std.testing.expectEqual(@as(usize, 2), target.calls);
+    try std.testing.expectEqual(@as(usize, 2), media.resets);
+    try std.testing.expect(!media.scope.initialized);
 }
 
 test "httpx inference gateway batches buffer in-process targets without a socket" {

@@ -43,6 +43,7 @@ pub const Payload = struct {
 
     pub fn encode(self: Payload, a: std.mem.Allocator) ![]const u8 {
         const metadata = try std.json.Stringify.valueAlloc(a, self.value, .{});
+        defer if (self.attachments != null) a.free(metadata);
         return encodeMetadata(a, metadata, self.attachments);
     }
 

@@ -122,7 +122,9 @@ func (p *Publisher) EnsureTable(ctx context.Context, table string) error {
 	return err
 }
 func (p *Publisher) Batch(ctx context.Context, table string, inserts map[string]any, deletes []string) error {
-	body, err := p.call(ctx, "POST", tablePath(table)+"/batch", map[string]any{"inserts": inserts, "deletes": deletes, "sync_level": "write"})
+	// Catalog publication and retirement use live queries on Lite. An index
+	// barrier makes their subsequent presence/absence checks authoritative.
+	body, err := p.call(ctx, "POST", tablePath(table)+"/batch", map[string]any{"inserts": inserts, "deletes": deletes, "sync_level": "full_index"})
 	if err != nil {
 		return err
 	}
@@ -149,7 +151,8 @@ func (p *Publisher) ReadyAbsent(ctx context.Context, table string, ids []string)
 	return WaitForAbsent(ctx, p.Query, table, ids)
 }
 
-// WaitForAbsent verifies retirement through fresh ordinary table-query snapshots.
+// WaitForAbsent verifies retirement through ordinary table queries. Callers must
+// commit deletions at full_index before accepting an empty live result on Lite.
 func WaitForAbsent(ctx context.Context, query func(context.Context, string, []byte) ([]byte, error), table string, ids []string) error {
 	if len(ids) == 0 {
 		return nil
@@ -179,7 +182,7 @@ func WaitForAbsent(ctx context.Context, query func(context.Context, string, []by
 		if err := json.Unmarshal(data, &result); err != nil {
 			return err
 		}
-		if len(result.Responses) != 1 || result.Responses[0].Status != 200 || !result.Responses[0].fresh() || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
+		if len(result.Responses) != 1 || result.Responses[0].Status != 200 || !result.Responses[0].readable() || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
 			return fmt.Errorf("Antfly did not provide successful deletion snapshot readiness")
 		}
 		if len(result.Responses[0].Hits.Hits) == 0 {

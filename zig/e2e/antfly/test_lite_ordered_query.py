@@ -101,6 +101,37 @@ def test_ordered_first_page_on_every_engine(storage_engine):
                 {"order_by": ORDER, "limit": 1, "search_after": hits[0]["_sort"]},
             )
             assert cursor.status_code == 409, cursor.text
+
+            # A committed insert can still be absent from Lite's live index.
+            # Source cleanup must reconcile primary rows and wait for indexing,
+            # rather than treating an empty live query as proof of absence.
+            pending = post(
+                "/tables/docs/batch",
+                {"inserts": {"doc/pending": {"title": "pending"}}, "sync_level": "write"},
+            )
+            assert pending.ok, pending.text
+            cleanup = session.post(
+                server.api_url + "/tables/docs/merge",
+                json={
+                    "scoped_merge": {
+                        "key_range": {"from": "doc/", "to": "doc0"},
+                        "records": {},
+                        "retain_ids": ["doc/a"],
+                        "last_merged_id": "doc/",
+                        "delete_missing": True,
+                        "sync_level": "full_index",
+                    }
+                },
+                headers={"Content-Type": "application/vnd.antfly.scoped-merge.v1+json"},
+                timeout=30,
+            )
+            assert cleanup.ok, cleanup.text
+            assert cleanup.json()["deleted"] == 3
+            remaining = query({"order_by": ORDER, "limit": 10})
+            assert [hit["_id"] for hit in remaining["hits"]["hits"]] == [
+                "doc/a",
+                "other/d",
+            ]
         failed = False
     finally:
         server.stop(test_failed=failed)

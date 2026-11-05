@@ -16,12 +16,14 @@
 package sources
 
 import (
+	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
 
-func TestSyncGateAcceptsOnlyAnExplicitFreshnessProof(t *testing.T) {
+func TestSyncGateAcceptsOnlyAnExplicitReadSource(t *testing.T) {
 	hits := `"hits":{"hits":[{"_id":"a"}]}`
 	for name, tc := range map[string]struct {
 		body string
@@ -43,4 +45,47 @@ func TestSyncGateAcceptsOnlyAnExplicitFreshnessProof(t *testing.T) {
 			require.Len(t, got, 1)
 		})
 	}
+}
+
+// Model an acknowledged primary row whose insertion is still missing from Lite's
+// index. An empty complete inventory must delete it, even when the live query
+// returns no hits. No concurrent writers are needed to expose the failure.
+type laggingLiteCleanupClient struct {
+	t               *testing.T
+	primaryHasRow   bool
+	merges, queries int
+}
+
+func (c *laggingLiteCleanupClient) Query(context.Context, string, []byte) ([]byte, error) {
+	c.queries++
+	return []byte(`{"responses":[{"status":200,"live_read":true,"hits":{"hits":[]}}]}`), nil
+}
+
+func (c *laggingLiteCleanupClient) Merge(_ context.Context, _ string, body []byte) ([]byte, error) {
+	var request ScopedMergeRequest
+	require.NoError(c.t, json.Unmarshal(body, &request))
+	page := request.ScopedMerge
+	require.True(c.t, page.DeleteMissing)
+	require.Equal(c.t, "full_index", page.SyncLevel)
+	c.merges++
+	c.primaryHasRow = false
+	return json.Marshal(MergeResult{Status: "success", Deleted: 1, NextCursor: page.LastMergedID, KeyRange: KeyRange{From: page.LastMergedID, To: page.KeyRange.To}})
+}
+
+func (c *laggingLiteCleanupClient) Batch(context.Context, string, map[string]any, []string) error {
+	c.t.Fatal("cleanup must use bounded scoped merge")
+	return nil
+}
+
+func TestLiteEmptyInventoryReconcilesRowsPendingIndexing(t *testing.T) {
+	client := &laggingLiteCleanupClient{t: t, primaryHasRow: true}
+	writer, err := NewSyncWriter(client, "docs", testSourceID, nil, true)
+	require.NoError(t, err)
+	result, err := writer.Finish(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "success", result.Status)
+	require.Equal(t, 1, result.Deleted)
+	require.Equal(t, 1, client.merges)
+	require.Equal(t, 2, client.queries)
+	require.False(t, client.primaryHasRow)
 }

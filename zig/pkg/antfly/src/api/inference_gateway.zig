@@ -383,16 +383,28 @@ pub fn executeOperationWithSources(server: anytype, ctx: *httpx.Context, task: g
 }
 
 fn executeBounded(server: anytype, ctx: *httpx.Context, task: gateway.Task, backing: std.mem.Allocator, options: ExecutionOptions) !httpx.Response {
-    // All parsing and adapter allocations share request lifetime and a bounded
-    // transport body. No executor retains these values after the call.
+    defer if (options.source_port) |port| if (port.reset) |reset| reset(port.ptr);
+    // Parsing and source metadata stay bounded independently of binary media.
     var arena = std.heap.ArenaAllocator.init(backing);
     defer arena.deinit();
-    const a = arena.allocator();
-    const payload = try payloads.Payload.parse(a, ctx);
+    const metadata_allocator = arena.allocator();
+    const payload = try payloads.Payload.parse(metadata_allocator, ctx);
     var execution = options;
     execution.attachments = payload.attachments;
     const request = payload.value;
-    try source_media.resolve(a, request, execution.source_port, &execution.attachments);
+    try source_media.resolve(metadata_allocator, request, execution.source_port, &execution.attachments);
+    // Hosted adapters may produce multiple base64 and JSON copies. Their actual
+    // allocation capacity shares admission with fetches and native framing.
+    var media_budget = source_media.allocationBudget(ctx.allocator);
+    var execution_arena = std.heap.ArenaAllocator.init(if (execution.attachments != null) media_budget.allocator() else backing);
+    defer execution_arena.deinit();
+    return executePrepared(server, ctx, task, execution_arena.allocator(), request, execution) catch |err| {
+        if (err == error.OutOfMemory and media_budget.isLocallyExhausted()) return error.InferenceCapacityUnavailable;
+        return err;
+    };
+}
+
+fn executePrepared(server: anytype, ctx: *httpx.Context, task: gateway.Task, a: std.mem.Allocator, request: Json, execution: ExecutionOptions) !httpx.Response {
     if (request != .object) return error.InvalidInferenceRequest;
     if (try generatedSelector(task, request)) |model| return executeGenerated(server, ctx, task, a, request, model, execution);
     var effective = request;
@@ -1296,9 +1308,16 @@ pub fn batchWithSources(server: anytype, ctx: *httpx.Context, port: ?source_medi
         if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
         var item_request = try httpx.Request.init(a, .POST, "http://gateway/ai/v1/generate");
         defer item_request.deinit();
-        item_request.body = try item_payloads[index].encode(a);
+        var media_budget = source_media.allocationBudget(ctx.allocator);
+        const item_allocator = if (item_payloads[index].attachments != null) media_budget.allocator() else a;
+        const item_body = item_payloads[index].encode(item_allocator) catch |err| {
+            if (err == error.OutOfMemory and media_budget.isLocallyExhausted()) return error.InferenceCapacityUnavailable;
+            return err;
+        };
+        defer if (item_payloads[index].attachments != null) item_allocator.free(item_body);
+        item_request.body = item_body;
         try item_request.headers.set("content-type", item_payloads[index].contentType());
-        var item_context = httpx.Context.init(a, ctx.io, &item_request);
+        var item_context = httpx.Context.init(ctx.allocator, ctx.io, &item_request);
         defer item_context.deinit();
         item_context.application_deadline_ns = deadline;
         if (invocationState(ctx)) |state| try item_context.setData(invocation_state_key, state, null);
@@ -1643,8 +1662,12 @@ fn forward(server: anytype, ctx: *httpx.Context, connection: []const u8, operati
     var transport = bridge.Outbound{ .context = ctx };
     const observed = observation.stream(transport.stream());
     var guard = tasks.FallbackSink{ .downstream = observed };
-    const encoded = try payloads.encodeMetadata(ctx.allocator, body, options.attachments);
-    defer if (options.attachments != null) ctx.allocator.free(encoded);
+    var media_budget = source_media.allocationBudget(ctx.allocator);
+    const encoded = payloads.encodeMetadata(media_budget.allocator(), body, options.attachments) catch |err| {
+        if (err == error.OutOfMemory and media_budget.isLocallyExhausted()) return error.InferenceCapacityUnavailable;
+        return err;
+    };
+    defer if (options.attachments != null) media_budget.allocator().free(encoded);
     var owned_client: ?httpx.Client = null;
     defer if (owned_client) |*client| client.deinit();
     const client: ?*httpx.Client = if (owner == .target) null else if (std.mem.eql(u8, operation, "read"))
@@ -1698,8 +1721,12 @@ fn forwardEndpoint(server: anytype, ctx: *httpx.Context, endpoint: []const u8, a
     try headers.append(a, .{ "X-Antfly-Inference-Attempts-Remaining", "1" });
     try headers.append(a, .{ "X-Antfly-Inference-Timeout-Ms", timeout_header });
     if (authorization) |value| try headers.append(a, .{ "Authorization", value });
-    const encoded = try payloads.encodeMetadata(a, body, execution_options.attachments);
-    defer if (execution_options.attachments != null) a.free(encoded);
+    var media_budget = source_media.allocationBudget(a);
+    const encoded = payloads.encodeMetadata(media_budget.allocator(), body, execution_options.attachments) catch |err| {
+        if (err == error.OutOfMemory and media_budget.isLocallyExhausted()) return error.InferenceCapacityUnavailable;
+        return err;
+    };
+    defer if (execution_options.attachments != null) media_budget.allocator().free(encoded);
     try headers.append(a, .{ "Content-Type", if (execution_options.attachments != null) httpx.attachment_envelope.content_type else "application/json" });
     const options = httpx.RequestOptions{
         .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
@@ -2028,6 +2055,27 @@ test "httpx inference gateway framed typed adapters inline only media references
     try std.testing.expectError(error.InvalidInferenceRequest, inlineTaskAttachments(a, .read, invalid, attachments));
     const unused = try std.json.parseFromSliceLeaky(Json, a, "{\"images\":[{\"url\":\"https://example.com/image\"}]}", .{});
     try std.testing.expectError(error.InvalidInferenceRequest, inlineTaskAttachments(a, .read, unused, attachments));
+}
+
+test "httpx inference gateway hosted media expansion uses shared admission beyond metadata size" {
+    const a = std.testing.allocator;
+    const bytes = try a.alloc(u8, 49 * 1024 * 1024);
+    defer a.free(bytes);
+    @memset(bytes, 1);
+    // The source metadata itself is tiny. Its valid hosted representation is
+    // larger than the metadata parser's 64 MiB allocator, even before JSON.
+    var metadata = std.heap.ArenaAllocator.init(a);
+    defer metadata.deinit();
+    const request = try std.json.parseFromSliceLeaky(Json, metadata.allocator(),
+        \\{"model":"generators/audio","messages":[{"role":"user","content":[{"type":"media","mime_type":"audio/wav","data":"attachment:0"}]}]}
+    , .{});
+    var budget = source_media.allocationBudget(a);
+    var arena = std.heap.ArenaAllocator.init(budget.allocator());
+    defer arena.deinit();
+    const adapted = try inlineTaskAttachments(arena.allocator(), .generate, request, &.{.{ .mime_type = "audio/wav", .data = bytes }});
+    const encoded = try std.json.Stringify.valueAlloc(arena.allocator(), adapted, .{});
+    try std.testing.expect(encoded.len > 64 * 1024 * 1024);
+    try std.testing.expect(!budget.isLocallyExhausted());
 }
 
 test "httpx inference gateway physical decision catalogs apply connection image budgets by task" {

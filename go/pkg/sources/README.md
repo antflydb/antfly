@@ -96,6 +96,10 @@ The runner creates a missing destination through the normal table API, writes
 canonical rows with a write barrier, and checks revision, content digest and
 permissions through a snapshot-capable query before declaring them searchable. On Lite, which
 cannot retain a snapshot, the same query reads live state and says so with `live_read`.
+An empty live result does not prove absence while inserts are awaiting indexing.
+Lite therefore checks authoritative cleanup against primary storage through scoped
+merge, with `full_index` visibility before completion. Catalog publication and
+retirement also use `full_index`. Retained snapshots keep the no-op cleanup shortcut.
 Multiple sources may share an ingestion destination. The runner never imports
 arbitrary application rows into its ownership ledger. All queries use existing Antfly table endpoints;
 self-hosted grep never invokes `antfly-cloud`.
