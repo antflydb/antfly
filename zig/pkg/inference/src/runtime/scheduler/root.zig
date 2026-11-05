@@ -14,7 +14,9 @@
 // limitations under the License.
 
 pub const native_generate = @import("native_generate.zig");
+pub const generation_admission = @import("generation_admission.zig");
 
 test {
     _ = native_generate;
+    _ = generation_admission;
 }

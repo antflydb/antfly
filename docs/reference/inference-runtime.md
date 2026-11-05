@@ -185,6 +185,87 @@ across independent callers. Model loading, prompt caching, and generation batchi
 remain under `inference`. The DB and standalone inference use the same policy;
 the previous resource config locations are rejected.
 
+The standalone inference worker also applies an explicit
+`resources.inference.memory.max_device_bytes` (or `--backend-budget-mb` override)
+to the sum of its managed CUDA `DeviceBuffer` allocations across model contexts.
+Cached scratch and deferred frees remain charged; allocation failure restores
+the reservation, and a failed free cannot authorize additional allocations.
+This physical allocation guard supplements the shared logical admission ledger.
+It excludes driver/module storage, NVDEC surfaces and vendor-library-private
+allocations, so leave device headroom for those users. An omitted device override
+keeps the existing automatic admission policy and an unlimited physical guard.
+
+`/ml/v1/metrics` reports `antfly_inference_cuda_managed_live_bytes`,
+`antfly_inference_cuda_managed_peak_bytes`, and
+`antfly_inference_cuda_managed_limit_bytes`. These cover managed allocations,
+including cached buffers; the peak includes pending allocation reservations.
+The existing `antfly_inference_admission_{host,backend}_{weight,kv,scratch}_bytes`
+gauges describe conservative admission reservations. Prompt-prefix cache logical
+bytes and OS/NVML process memory are separate measurements; adding these counters
+would double-count overlapping storage.
+
+Scheduled generation polls the request execution control while waiting for
+prefill/decode work, including dedicated-executor event waits. A caller deadline
+returns HTTP 504 `INFERENCE_TIMEOUT`; explicit cancellation returns HTTP 408
+`INFERENCE_CANCELLED`. Cancellation removes idle queued work immediately, but a
+claimed GPU step must drain before its borrowed work pointer and KV owner can be
+retired. These are cooperative boundaries, not GPU-instruction preemption.
+
+Default CUDA and Metal generation holds the model gate for the whole request.
+Prefill admission therefore uses the bounded idle chunk ceiling even when other
+callers already hold scheduler leases while waiting for that gate. Isolated
+pipelines retain the scheduler's shared-execution ceiling. In both cases,
+explicit request limits and scratch/KV admission constrain the final immutable
+plan before execution; queued callers do not force a serialized GPU request to
+retain a tiny shared-execution plan.
+
+With `inference.cooperative_execution.mode: on`, eligible dense Gemma 4 E4B
+CUDA text requests share two active slots and interleave scheduler steps.
+Enabling `inference.generation_batching.mode: on` additionally combines two
+ready decode requests into one forward when the backend declares support.
+Each step binds its owners' memory budget while holding the model mutex.
+Graph, draft, prefix-cache, selected-KV and multimodal routes retain exclusive
+ownership. The shipped `configs/inference-read-pool-40g.json` enables both
+controls, with `max_step_items: 2` and `max_decode_wait_us: 0`: it batches ready
+requests without waiting to fill a batch. No request flag is needed. Setting
+`generation_batching.mode: off` restores one-row cooperative execution;
+disabling cooperative execution restores exclusive generation. Other runtime
+configurations retain their existing defaults. See the
+[measurements and tradeoffs](../design/inference/cuda-generation-batching.md).
+Compatible EmbeddingGemma 2 CUDA text requests also combine automatically under
+the default arithmetic policy, with at most four rows and 8,192 bucket-padded
+tokens per cohort. Nearby lengths share attention masks with at most 25%
+grouping padding. Individual inputs retain the full 8,192-token model limit;
+inputs above 4,096 tokens naturally occupy singleton cohorts.
+Authenticated CUDA GLiNER 2.5-Decide classification calls combine up to eight
+compatible rows through `/extract` and `/decisions`. These use the Node-owned
+executor broker independently of the generation controls. Other execution profiles retain their existing paths. See the
+[HTTP batching contract](../design/inference/read-pool-http-batching.md).
+
+The cooperative policy prefers shorter contexts for up to eight consecutive turns, then grants
+the next round-robin owner. Manual final-prefill turns participate in that
+selection, so queued long chunks cannot hide a short request's final chunk.
+Other scheduling policies retain strict round robin.
+
+Generation waits in a bounded model queue before scheduler/KV/scratch admission.
+Queue saturation returns retryable HTTP 503 `MODEL_RESOURCE_BUSY`; a waiting
+deadline returns retryable HTTP 504. Queued cancellation removes its waiter
+without reserving device state. `/ml/v1/metrics` exposes generation active/queued
+gauges, queue rejection/cancellation counters and `queue_wait_seconds`,
+`first_content_seconds`, `prefill_seconds` and `decode_seconds` histograms under
+the `antfly_inference_generation_` prefix. Pipeline phase times include scheduler
+waits. First-content time is server-observed availability, includes queueing and
+excludes network transit; default reasoning-capable requests may defer public
+content until completion. These are not synchronized GPU-kernel timers.
+
+For eagerly uploaded dense CUDA Gemma 4 with BF16 weight mirrors, construction
+keeps its conservative format-based load reservation. After upload, the retained
+weight lease uses the measured immutable weight inventory plus bounded headroom.
+Scratch and KV remain separate owners; lazy, expert, training and non-mirrored
+models retain their existing estimate. OCR temporary/deferred-free cache leases
+remain scratch-classified even while idle. Recovery should compare those leases
+with the warmed baseline rather than requiring every scratch gauge to be zero.
+
 Grouped embedding requests share one aggregate pixel ceiling across all groups,
 including when execution splits them into separate microbatches. Transcription
 shares one output-token budget across the audio item's windows and temperature

@@ -5521,6 +5521,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         lib_standalone_runtime_test_step.dependOn(&run.step);
         inference_host_test_step.dependOn(&run.step);
     }
+    const device_budget_host_root = b.createModule(.{ .root_source_file = b.path("pkg/inference/src/test_device_budget_host.zig"), .target = target, .optimize = optimize });
+    device_budget_host_root.addImport("antfly_inference_engine", test_imports.runtime.inference_engine);
+    device_budget_host_root.addImport("inference_server", test_imports.runtime.inference_server);
+    device_budget_host_root.link_libc = true;
+    const device_budget_host_tests = b.addTest(.{ .root_module = device_budget_host_root, .max_rss = 24 * 1024 * 1024 * 1024 });
+    const run_device_budget_host_tests = b.addRunArtifact(device_budget_host_tests);
+    b.step("inference-device-budget-host-test", "Verify CUDA device ownership through the production engine host").dependOn(&run_device_budget_host_tests.step);
+    inference_host_test_step.dependOn(&run_device_budget_host_tests.step);
+    lib_standalone_runtime_test_step.dependOn(&run_device_budget_host_tests.step);
+    b.step("install-inference-device-budget-host-tests", "Install the production CUDA budget tests for hardware qualification").dependOn(&b.addInstallArtifact(device_budget_host_tests, .{ .dest_sub_path = "inference-device-budget-host-tests" }).step);
     const inference_host_tests = b.addTest(.{
         .root_module = test_imports.runtime.inference_host,
         .filters = &.{

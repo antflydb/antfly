@@ -118,6 +118,7 @@ const InferenceRuntimeConfig = struct {
     worker_environment: []const worker_runtime.EnvironmentEntry = &.{},
     resources: inference.platform.resource_policy.Resources = .{},
     generation_batching: inference.platform.inference_settings.GenerationBatching = .{},
+    cooperative_execution: inference.platform.inference_settings.CooperativeExecution = .{},
     kernel_jit: inference.graph.kernel_jit.Config = .{},
     prompt_cache: inference.server.PromptCacheConfig = .{},
 };
@@ -869,6 +870,7 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
     node_config.max_concurrent_requests = policy.admission.max_concurrent_requests;
     node_config.max_work_units = policy.admission.workCapacity();
     node_config.request_limits = policy.request_limits;
+    node_config.cooperative_execution = inference.server.CooperativeExecutionConfig.fromSettings(runtime_config.value.cooperative_execution);
     node_config.generation_batching = inference.server.GenerationBatchingConfig.fromSettings(runtime_config.value.generation_batching);
     const configured_limits = policy.memory.limits(inference.runtime.tier.memory.Limits);
     // CLI/bridge overrides take precedence field by field, while physical caps
