@@ -392,7 +392,7 @@ fn executeBounded(server: anytype, ctx: *httpx.Context, task: gateway.Task, back
     var execution = options;
     execution.attachments = payload.attachments;
     const request = payload.value;
-    try source_media.resolve(a, request, execution.source_port);
+    try source_media.resolve(a, request, execution.source_port, &execution.attachments);
     if (request != .object) return error.InvalidInferenceRequest;
     if (try generatedSelector(task, request)) |model| return executeGenerated(server, ctx, task, a, request, model, execution);
     var effective = request;
@@ -1065,9 +1065,10 @@ fn inlineTaskAttachments(a: std.mem.Allocator, task: gateway.Task, request: Json
                             if (mime != .string or !std.ascii.eqlIgnoreCase(mime.string, attachment.mime_type)) return error.InvalidInferenceRequest;
                             data.* = .{ .string = try payloads.base64(self.a, attachment.data) };
                         }
-                        if (self.chat) {
-                            const mime = object.get("mime_type") orelse return error.InvalidInferenceRequest;
-                            if (mime != .string or data.* != .string or !std.mem.startsWith(u8, mime.string, "image/")) return error.UnsupportedInferenceFeature;
+                        // Hosted chat adapters read audio and video as inline media parts.
+                        const mime = object.get("mime_type") orelse return error.InvalidInferenceRequest;
+                        if (mime != .string or data.* != .string) return error.InvalidInferenceRequest;
+                        if (self.chat and std.mem.startsWith(u8, mime.string, "image/")) {
                             var image: Json = .{ .object = .empty };
                             try image.object.put(self.a, "url", .{ .string = try std.fmt.allocPrint(self.a, "data:{s};base64,{s}", .{ mime.string, data.string }) });
                             value.* = .{ .object = .empty };

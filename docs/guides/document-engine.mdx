@@ -363,6 +363,10 @@ All graph expansion work is budgeted across the whole request, including every n
 
 `order_by` produces exact sorted pages over `_id` or mapped scalar fields whose capability is `queryable` or `accelerated`. Antfly appends `_id` ascending as a deterministic tie-breaker when it is omitted.
 
+On [Lite](/docs/guides/lite), an ordered query returns one exact page from live
+state, marked `live_read: true`. Lite can't retain a snapshot, so that page has
+no `remote_snapshot` and can't be continued with a cursor.
+
 First issue an ordered query without a cursor. The response returns a retained
 `remote_snapshot` token and each hit's `_sort` tuple:
 

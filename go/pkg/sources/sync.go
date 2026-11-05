@@ -328,10 +328,10 @@ func decodeSyncJSON(raw []byte, target any) error {
 func decodeSyncHits(raw []byte) ([]syncHit, error) {
 	var result struct {
 		Responses []struct {
-			Status   int             `json:"status"`
-			Error    json.RawMessage `json:"error"`
-			Snapshot string          `json:"remote_snapshot"`
-			Hits     struct {
+			Status int             `json:"status"`
+			Error  json.RawMessage `json:"error"`
+			queryFreshness
+			Hits struct {
 				Hits []syncHit `json:"hits"`
 			} `json:"hits"`
 		} `json:"responses"`
@@ -339,7 +339,7 @@ func decodeSyncHits(raw []byte) ([]syncHit, error) {
 	if err := decodeSyncJSON(raw, &result); err != nil {
 		return nil, err
 	}
-	if len(result.Responses) != 1 || result.Responses[0].Status != 200 || result.Responses[0].Snapshot == "" || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
+	if len(result.Responses) != 1 || result.Responses[0].Status != 200 || !result.Responses[0].fresh() || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
 		return nil, fmt.Errorf("source sync requires a successful fresh snapshot")
 	}
 	return result.Responses[0].Hits.Hits, nil

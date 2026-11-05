@@ -170,8 +170,12 @@ It accepts PNG, JPEG, WebP and GIF images, and `audio/*` and `video/*` types. On
   `false`, because host-level policy would also expose that host's other ports.
 - A source whose current version differs fails with 409 rather than serving other
   bytes.
-- The expanded request is limited to 16 MiB, including base64 expansion, so media
-  is limited to about 12 MiB (413).
+- Images are inlined, so an expanded request is limited to 16 MiB, or about 12 MiB of
+  images (413). Audio and video travel to local and Antfly models as binary attachments,
+  up to 256 MiB per request and `max_download_size_bytes`, which defaults to 100 MiB.
+  Hosted providers receive them inline, within the 64 MiB request budget (413).
+- Concurrent fetched media is bounded across the server. A server at that limit
+  returns 429 and the request can be retried.
 
 Declare `video: supported` under `inference_capabilities` for a named target that
 accepts video. Without a declaration, video requests to that target are rejected.

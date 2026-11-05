@@ -94,7 +94,8 @@ antfly-grep --source-catalog ./catalog.json --source manuals 'retry budget'
 
 The runner creates a missing destination through the normal table API, writes
 canonical rows with a write barrier, and checks revision, content digest and
-permissions through a snapshot-capable query before declaring them searchable.
+permissions through a snapshot-capable query before declaring them searchable. On Lite, which
+cannot retain a snapshot, the same query reads live state and says so with `live_read`.
 Multiple sources may share an ingestion destination. The runner never imports
 arbitrary application rows into its ownership ledger. All queries use existing Antfly table endpoints;
 self-hosted grep never invokes `antfly-cloud`.

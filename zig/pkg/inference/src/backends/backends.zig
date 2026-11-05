@@ -616,7 +616,35 @@ fn configuredPreferredBackends() []const BackendType {
     if (preferredBackendOverride()) |backend| {
         return preferredBackendsForOverride(backend);
     }
+    return automaticBackends();
+}
+
+/// The `auto` order. CUDA leads when this machine has a usable device; a build
+/// with CUDA on a machine without one keeps the ordinary order.
+pub fn automaticBackends() []const BackendType {
+    if (cudaDeviceAvailable()) return &.{ .cuda, .metal, .native };
     return &.{ .metal, .native };
+}
+
+var cuda_probe_once = std.once(probeCudaDevice);
+var cuda_device_available = false;
+
+fn probeCudaDevice() void {
+    if (comptime !build_options.enable_cuda) return;
+    const context = @import("../ops/cuda/context.zig");
+    const info = context.probeDefault() catch |err| {
+        std.log.info("CUDA is not in the automatic backend order: {s}", .{@errorName(err)});
+        return;
+    };
+    _ = info;
+    cuda_device_available = true;
+}
+
+/// Initializes a device once per process, not on every backend selection.
+pub fn cudaDeviceAvailable() bool {
+    if (comptime !build_options.enable_cuda) return false;
+    cuda_probe_once.call();
+    return cuda_device_available;
 }
 
 fn preferredBackendsForOverride(backend: BackendType) []const BackendType {
@@ -754,8 +782,20 @@ test "session manager preferred-backend clone preserves runtime kernel JIT" {
     try std.testing.expectEqualSlices(BackendType, &preferred, cloned.preferred_backends);
 }
 
+test "automatic backend order leads with CUDA only when a device is available" {
+    const order = automaticBackends();
+    if (cudaDeviceAvailable()) {
+        try std.testing.expectEqual(BackendType.cuda, order[0]);
+        try std.testing.expect(backendOrderSelectsCudaBeforeCpu(order));
+    } else {
+        try std.testing.expectEqualSlices(BackendType, &.{ .metal, .native }, order);
+    }
+    // Falling back to the CPU stays possible for models CUDA cannot load.
+    try std.testing.expectEqual(BackendType.native, order[order.len - 1]);
+}
+
 test "auto backend order prefers Metal then native" {
-    if (!build_options.enable_wasm) {
+    if (!build_options.enable_wasm and !cudaDeviceAvailable()) {
         try std.testing.expectEqualSlices(BackendType, &.{ .metal, .native }, configuredPreferredBackends());
     }
 }

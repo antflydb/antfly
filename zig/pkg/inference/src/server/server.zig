@@ -32255,6 +32255,12 @@ test "direct generate preflight counts video without treating it as audio" {
     try std.testing.expectEqual(@as(usize, 4), preflight.decoded_media_bytes);
 }
 
+test "generation maps undecodable images to a client error" {
+    try std.testing.expectEqual(@as(u16, 400), generationRequestFailure(error.ImageDecodeFailed).?.status);
+    try std.testing.expectEqual(@as(u16, 413), generationRequestFailure(error.ImageTooLarge).?.status);
+    try std.testing.expectEqual(@as(u16, 413), generationRequestFailure(error.ImageBatchTooLarge).?.status);
+}
+
 test "generation maps invalid video to a client error and keeps other failures" {
     for ([_]anyerror{ error.InvalidVideoInput, error.UnsupportedVideoCodec, error.MissingTransportTables }) |err| {
         try std.testing.expectEqual(@as(u16, 400), generationRequestFailure(err).?.status);
@@ -42149,6 +42155,9 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
             .message = "the inference request was cancelled",
             .retryable = false,
         },
+        error.ImageDecodeFailed => .{ .status = 400, .code = "INVALID_IMAGE", .message = "image input is unsupported, corrupt, or has a malformed header", .retryable = false },
+        error.ImageTooLarge => .{ .status = 413, .code = "IMAGE_TOO_LARGE", .message = "image dimensions exceed the configured inference limit", .retryable = false },
+        error.ImageBatchTooLarge => .{ .status = 413, .code = "IMAGE_BATCH_TOO_LARGE", .message = "aggregate decoded image pixels exceed server capacity", .retryable = false },
         error.InvalidToolArguments => .{
             .status = 502,
             .code = "TOOL_ARGUMENTS_INVALID",

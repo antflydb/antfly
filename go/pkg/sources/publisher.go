@@ -168,10 +168,10 @@ func WaitForAbsent(ctx context.Context, query func(context.Context, string, []by
 		}
 		var result struct {
 			Responses []struct {
-				Status   int             `json:"status"`
-				Error    json.RawMessage `json:"error"`
-				Snapshot string          `json:"remote_snapshot"`
-				Hits     struct {
+				Status int             `json:"status"`
+				Error  json.RawMessage `json:"error"`
+				queryFreshness
+				Hits struct {
 					Hits []json.RawMessage `json:"hits"`
 				} `json:"hits"`
 			} `json:"responses"`
@@ -179,7 +179,7 @@ func WaitForAbsent(ctx context.Context, query func(context.Context, string, []by
 		if err := json.Unmarshal(data, &result); err != nil {
 			return err
 		}
-		if len(result.Responses) != 1 || result.Responses[0].Status != 200 || result.Responses[0].Snapshot == "" || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
+		if len(result.Responses) != 1 || result.Responses[0].Status != 200 || !result.Responses[0].fresh() || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
 			return fmt.Errorf("Antfly did not provide successful deletion snapshot readiness")
 		}
 		if len(result.Responses[0].Hits.Hits) == 0 {

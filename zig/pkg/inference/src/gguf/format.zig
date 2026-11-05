@@ -369,6 +369,25 @@ pub fn readSupportMetadata(bytes: []const u8) !SupportMetadata {
     return result;
 }
 
+/// Reads `general.architecture` from a prefix of a GGUF file. Writers place it first,
+/// so listing does not need the tokenizer tables that follow. Returns null when the
+/// prefix ends first, which callers treat as an unknown architecture.
+pub fn readArchitectureFromPrefix(prefix: []const u8) ?[]const u8 {
+    var cursor = Cursor{ .bytes = prefix };
+    const header = parseHeader(&cursor) catch return null;
+    const count = countToUsize(header.metadata_count) catch return null;
+    for (0..count) |_| {
+        const key = cursor.readBorrowedString() catch return null;
+        const raw_type = cursor.readInt(u32) catch return null;
+        const value_type = metadataValueTypeFromRaw(raw_type) orelse return null;
+        if (value_type == .string and std.mem.eql(u8, key, "general.architecture")) {
+            return cursor.readBorrowedString() catch null;
+        }
+        cursor.skipMetadataValue(value_type) catch return null;
+    }
+    return null;
+}
+
 pub fn readArchitecture(bytes: []const u8) !?[]const u8 {
     return (try readSupportMetadata(bytes)).architecture;
 }

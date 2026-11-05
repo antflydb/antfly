@@ -65,6 +65,8 @@ pub fn configureSessionPreference(session_manager: *backends.SessionManager, cho
     session_manager.preferred_backends = switch (choice) {
         .auto => if (build_options.enable_wasm)
             &.{backends.BackendType.wasm}
+        else if (backends.cudaDeviceAvailable())
+            backends.automaticBackends()
         else if (build_options.enable_metal)
             &.{ backends.BackendType.metal, backends.BackendType.native }
         else

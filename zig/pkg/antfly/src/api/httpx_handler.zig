@@ -4611,6 +4611,7 @@ pub const AntflyApiHandler = struct {
         const response = blk: {
             inference_gateway.prepare(self.api_server, ctx) catch |err| break :blk @as(anyerror!httpx.Response, err);
             var sources: GatewaySources = .{ .server = self.api_server, .ctx = ctx, .identity = identity };
+            defer sources.release();
             break :blk inference_gateway.batchWithSources(self.api_server, ctx, sources.port());
         };
         return response catch |err| gatewayFailure(ctx, err);
@@ -4620,6 +4621,11 @@ pub const AntflyApiHandler = struct {
         server: *ApiHttpServer,
         ctx: *httpx.Context,
         identity: ?AuthenticatedIdentity,
+        reserved_fetch_bytes: usize = 0,
+        fn release(self: *@This()) void {
+            inference_gateway.source_media.releaseFetch(self.reserved_fetch_bytes);
+            self.reserved_fetch_bytes = 0;
+        }
         fn port(self: *@This()) inference_gateway.source_media.Port {
             return .{ .ptr = self, .lookup = lookup, .lookup_many = lookupMany, .fetch = fetch };
         }
@@ -4634,7 +4640,10 @@ pub const AntflyApiHandler = struct {
                     return context.isCancellationRequested();
                 }
             }.call;
-            return inference_gateway.source_media.fetchResource(a, self.server.inferenceIo(), self.server.cfg.remote_content, resource, .{ .ptr = self.ctx, .is_cancelled_fn = cancelled }, (deadline - now) / std.time.ns_per_ms);
+            // Large bodies live for the request, outside the bounded parsing arena.
+            _ = a;
+            self.reserved_fetch_bytes += try inference_gateway.source_media.reserveFetch(std.math.cast(usize, resource.length) orelse return error.InferenceRequestTooLarge);
+            return inference_gateway.source_media.fetchResource(self.ctx.allocator, self.server.inferenceIo(), self.server.cfg.remote_content, resource, .{ .ptr = self.ctx, .is_cancelled_fn = cancelled }, (deadline - now) / std.time.ns_per_ms);
         }
         fn at(value: std.json.Value, path: []const u8) ?std.json.Value {
             var current = value;
@@ -5012,6 +5021,7 @@ pub const AntflyApiHandler = struct {
         const response = blk: {
             inference_gateway.prepare(self.api_server, ctx) catch |err| break :blk @as(anyerror!httpx.Response, err);
             var sources: GatewaySources = .{ .server = self.api_server, .ctx = ctx, .identity = identity };
+            defer sources.release();
             break :blk if (task) |selected| inference_gateway.executeOperationWithSources(self.api_server, ctx, selected, operation, sources.port()) else if (inference_gateway.isPredictorDiscoveryPath(ctx.request.uri.path)) inference_gateway.predictors(self.api_server, ctx) else inference_gateway.models(self.api_server, ctx);
         };
         return response catch |err| gatewayFailure(ctx, err);
