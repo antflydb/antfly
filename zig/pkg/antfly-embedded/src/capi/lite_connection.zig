@@ -9713,14 +9713,12 @@ test "capi native mixed index turns retain bounded immutable sources after catch
         const text_applied = try root.db.core.loadAppliedSequence(std.testing.allocator, "text");
         const graph_applied = try root.db.core.loadAppliedSequence(std.testing.allocator, "graph");
         if (text_applied < target or graph_applied < target) continue;
-        const actor = owner.maintenance_snapshot orelse continue;
-        if (!actor.db_live) continue;
         try std.testing.expect(owner.text_source_runtime_cache == null);
-        // LSM housekeeping can legitimately retain this actor after catch-up.
-        // Exercise the real quiescent retirement path rather than depending on
-        // its idle timer. Only independently leased immutable sources survive.
-        owner.discardMaintenanceRuntime();
-        try std.testing.expect(owner.maintenance_snapshot == null);
+        // An empty control sweep can already have retired the actor on this
+        // completion turn. Otherwise exercise the same retirement explicitly.
+        // Both paths must retain independently leased immutable sources.
+        if (owner.maintenance_snapshot) |actor| if (actor.db_live) owner.discardMaintenanceRuntime();
+        if (owner.maintenance_snapshot) |actor| try std.testing.expect(!actor.db_live);
         try std.testing.expect(owner.immutable_sources.count > 0);
         try std.testing.expect(owner.immutable_sources.range_bytes <= artifact_source.WorkingSet.max_range_bytes);
         complete = true;
@@ -9897,6 +9895,52 @@ test "capi native maintenance text source reuse refreshes primary observations a
     try std.testing.expect(try cache.matches(file));
     try file.putDocument(@import("../storage/db/resolver_projection.zig").epoch_key, "changed");
     try std.testing.expect(!try owner.text_source_runtime_cache.?.matches(file));
+}
+
+test "capi native retirement coalesces consumer lanes in one physical publication" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("retirement-one-publication", 1000, .batch);
+    defer fixture.deinit();
+    var lease = try fixture.connection.acquire();
+    defer {
+        lease.close();
+        fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    }
+    const root = try fixture.connection.owner.refresh();
+    const store = root.db.core.store;
+    const file = &root.owned_lite_backend.?.native_docstore.?.file;
+    const refs = @import("../storage/db/derived/replay_reference.zig");
+    const journal = @import("../storage/db/derived/change_journal.zig");
+    try store.ensureReplayIndexInitialized();
+    {
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.put(&keys.replay_meta_init_key, "1");
+        for ([_]u64{ 41, 42 }) |sequence| {
+            try batch.put(&keys.replayEntryKey(keys.replay_all_kind, sequence), "canonical");
+            inline for (@typeInfo(journal.TargetHint).@"enum".field_values) |ordinal| {
+                try batch.put(&keys.replayEntryKey(@intCast(ordinal), sequence), &refs.encodeReference(sequence, @fromBackingInt(@intCast(ordinal))));
+            }
+        }
+        try batch.commit();
+    }
+    const before = file.activeCheckpoint().commit_sequence;
+    try store.truncateReplayUpTo(std.testing.allocator, 41);
+    try std.testing.expectEqual(before + 1, file.activeCheckpoint().commit_sequence);
+    try std.testing.expectError(error.NotFound, store.get(std.testing.allocator, &keys.replayEntryKey(keys.replay_all_kind, 41)));
+    inline for (@typeInfo(journal.TargetHint).@"enum".field_values) |ordinal| {
+        try std.testing.expectError(error.NotFound, store.get(std.testing.allocator, &keys.replayEntryKey(@intCast(ordinal), 41)));
+        const retained = try store.get(std.testing.allocator, &keys.replayEntryKey(@intCast(ordinal), 42));
+        defer std.testing.allocator.free(retained);
+        try std.testing.expect(refs.isReference(retained));
+    }
+    const retained = try store.get(std.testing.allocator, &keys.replayEntryKey(keys.replay_all_kind, 42));
+    defer std.testing.allocator.free(retained);
+    try std.testing.expectEqualStrings("canonical", retained);
+    const debt = (try file.replayAdmission()).?;
+    const scanned = try file.scanReplayAdmission();
+    try std.testing.expectEqual(debt.bytes, scanned.bytes);
+    try std.testing.expectEqual(debt.records, scanned.records);
 }
 
 test "capi native retirement selection never materializes primary payload pages" {

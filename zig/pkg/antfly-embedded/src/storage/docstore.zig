@@ -3015,6 +3015,16 @@ pub const DocStore = struct {
         if (up_to_sequence == 0) return;
         if (!(try self.hasReplayEntries())) return;
 
+        if (self.runtime_store.capabilities().bounded_replay_admission) {
+            // A synchronous drain still returns only after physical deletion.
+            // Share the bounded retirement service's atomic lane selection so
+            // one acknowledged record does not require a commit per consumer.
+            // Credits remain charged until each deletion batch commits.
+            var state: ReplayRetirement = .{ .watermark = up_to_sequence, .runnable = true };
+            while (state.runnable) try self.truncateReplaySlice(alloc, up_to_sequence, &state);
+            return;
+        }
+
         var deletes = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (deletes.items) |key| alloc.free(key);

@@ -284,30 +284,40 @@ fn saveProjectionMetadataUpdates(alloc: Allocator, store: anytype, updates: []co
     defer runtime.deinit();
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
+    try saveProjectionMetadataUpdatesTxn(&txn, updates, mode);
+    try txn.commit();
+}
+
+/// Advance authoritative progress inside a caller-owned metadata publication.
+/// The caller commits or aborts all accompanying status/evidence mutations.
+pub fn advanceProjectionMetadataTxn(txn: anytype, updates: []const AppliedSequenceUpdate) !void {
+    try saveProjectionMetadataUpdatesTxn(txn, updates, .advance);
+}
+
+fn saveProjectionMetadataUpdatesTxn(txn: anytype, updates: []const AppliedSequenceUpdate, mode: MetadataUpdateMode) !void {
     for (updates) |update| {
         // Replacement is an explicit recovery boundary. Neither malformed
         // metadata record may prevent an authoritative replacement/reset.
-        const previous = if (mode == .replace) null else try loadProjectionMetadataTxn(&txn, update.index_name);
+        const previous = if (mode == .replace) null else try loadProjectionMetadataTxn(txn, update.index_name);
         var checkpoint = previous orelse ProjectionCheckpoint{
-            .applied_sequence = if (mode == .replace) 0 else (try loadScalarAppliedSequenceTxn(&txn, update.index_name)) orelse 0,
+            .applied_sequence = if (mode == .replace) 0 else (try loadScalarAppliedSequenceTxn(txn, update.index_name)) orelse 0,
         };
         if (mode == .replace) {
-            try clearReplayFragmentTxn(&txn, update.index_name);
+            try clearReplayFragmentTxn(txn, update.index_name);
             checkpoint = update.checkpoint();
         } else {
             const previous_sequence = checkpoint.applied_sequence;
             checkpoint.applied_sequence = if (mode == .advance) @max(previous_sequence, update.sequence) else update.sequence;
             mergeSequenceMetadata(&checkpoint, update, previous_sequence, mode == .set);
         }
-        if (mode == .replace or invalidatesCompletion(previous, checkpoint)) try @import("../artifact_projection_epoch.zig").revoke(&txn);
+        if (mode == .replace or invalidatesCompletion(previous, checkpoint)) try @import("../artifact_projection_epoch.zig").revoke(txn);
         if (mode == .replace) {
-            try putScalarAppliedSequenceTxn(&txn, update.index_name, checkpoint.applied_sequence);
+            try putScalarAppliedSequenceTxn(txn, update.index_name, checkpoint.applied_sequence);
         } else {
-            try saveScalarAppliedSequenceTxn(&txn, update.index_name, checkpoint.applied_sequence);
+            try saveScalarAppliedSequenceTxn(txn, update.index_name, checkpoint.applied_sequence);
         }
-        try saveProjectionMetadataTxn(&txn, update.index_name, checkpoint);
+        try saveProjectionMetadataTxn(txn, update.index_name, checkpoint);
     }
-    try txn.commit();
 }
 
 /// A coherent receiver-local projection checkpoint cut. The file lock remains

@@ -102,6 +102,7 @@ class ContentionReportTests(unittest.TestCase):
     def test_unequal_worker_windows_and_busy_calls_are_not_successful_throughput(self):
         workers = [
             {
+                "index": 1,
                 "started": 1,
                 "ended": 3,
                 "proof_observed_from": 0,
@@ -119,6 +120,7 @@ class ContentionReportTests(unittest.TestCase):
                 "involuntary_context_switches": 2,
             },
             {
+                "index": 0,
                 "started": 2,
                 "ended": 4,
                 "proof_observed_from": 1,
@@ -137,6 +139,8 @@ class ContentionReportTests(unittest.TestCase):
             },
         ]
         result = bench.aggregate(workers)
+        self.assertEqual(result["per_worker_indices"], [1, 0])
+        self.assertEqual(result["per_worker_successful_calls"], [2, 1])
         self.assertEqual(result["elapsed_seconds"], 3)
         self.assertEqual(result["successful_calls_per_second"], 1)
         self.assertEqual(result["busy_fraction"], 0.4)

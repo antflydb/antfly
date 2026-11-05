@@ -819,6 +819,10 @@ def aggregate(workers: list[dict]) -> dict:
             row["proofs"]["allocator_proof_walks"] for row in workers
         ],
     }
+    # Workers arrive in completion order. Preserve identity alongside every
+    # parallel per-worker array; array position is never a worker ID.
+    if all("index" in row for row in workers):
+        result["per_worker_indices"] = [row["index"] for row in workers]
     for name, values in (("success", successful), ("busy", busy)):
         for percent in (50, 95, 99):
             result[f"{name}_p{percent}_ns"] = percentile(values, percent)

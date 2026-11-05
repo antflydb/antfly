@@ -524,6 +524,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
 
     const capi_model_filters = [_][]const u8{"capi local model "};
     const capi_default_filters = [_][]const u8{
+        "index manager forced native compaction uses bounded task admission",
         "capi native",
         "background enrichment turn",
         "inline resolver replacement background replay yields",
@@ -604,6 +605,9 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "lsm backend wal retention generation",
         "lsm obsolete retry starts",
         "docstore replay retirement defers",
+        "docstore replay retirement atomically",
+        "capi native retirement coalesces",
+        "native projection progress and status",
         "capi native recovery agenda",
         "capi native logical generations",
         "capi native close bounds proof work",

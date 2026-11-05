@@ -26254,6 +26254,13 @@ pub const IndexManager = struct {
         defer self.alloc.free(planned);
         if (planned.len < 2) return null;
 
+        return try self.beginPlannedTextMergeTaskForEntry(entry, snap, planned);
+    }
+
+    // Both policy maintenance and explicit compaction use the same enforced
+    // allocator, adaptive source width, deletion tracking and publication.
+    // Caller holds the per-index apply mutex while capturing these inputs.
+    fn beginPlannedTextMergeTaskForEntry(self: *IndexManager, entry: *TextIndex, snap: *index_mod.IndexSnapshot, planned: []const usize) !TextMergeTask {
         // The tier policy optimizes write amplification by selecting a wider
         // group, but that group may exceed the merge-buffer slice even though
         // a smaller merge can make forward progress. Adapt admission down to
@@ -26731,29 +26738,42 @@ pub const IndexManager = struct {
         self.text_merge_scheduler.supersedeInFlightForIndex(self.alloc, entry.config.name);
         entry.detachAllMergeDeletionStates();
         while (true) {
-            const snap = entry.persistent.snapshot();
-            if (snap.segments.len < 2) return true;
             if (options.mode == .best_effort and self.shouldDeferTextMergeForResourcePressure()) return false;
-
-            const planned = try text_index_maintenance.planForceCompactAlloc(self.alloc, snap, force_merge_max_segments_at_once);
-            defer self.alloc.free(planned);
-            var reservation = self.reserveTextMergeBuffers(&entry.persistent, snap, planned, .strict) catch |err| switch (err) {
-                error.ResourceBudgetExceeded => if (options.mode == .best_effort) return false else return err,
+            var task = blk: {
+                self.lockAtomicWithBackoff(entry.apply_mutex);
+                defer entry.apply_mutex.unlock();
+                if (entry.backfill_active.load(.acquire) != 0) return error.IndexApplyBusy;
+                const snap = entry.persistent.acquireSnapshot();
+                defer snap.release();
+                if (snap.segments.len < 2) return true;
+                const planned = try text_index_maintenance.planForceCompactAlloc(self.alloc, snap, force_merge_max_segments_at_once);
+                defer self.alloc.free(planned);
+                break :blk self.beginPlannedTextMergeTaskForEntry(entry, snap, planned) catch |err| switch (err) {
+                    error.ResourceBudgetExceeded => if (options.mode == .best_effort) return false else return err,
+                    else => return err,
+                };
+            };
+            defer task.deinit(self.alloc);
+            errdefer self.cancelTextMergeTask(&task);
+            var result = executeTextMergeTask(self.alloc, &task) catch |err| switch (err) {
+                error.ResourceBudgetExceeded => {
+                    self.text_merge_scheduler.deferred_for_pressure += 1;
+                    self.noteTextMergeResourceBudgetExceeded(&task);
+                    if (options.mode == .best_effort) return false;
+                    // Actual scratch/deletion use can exceed the estimate.
+                    // Retry a narrower task, but never spin on a failing pair.
+                    if (task.merge_indices.len > 2) continue;
+                    return err;
+                },
                 else => return err,
             };
-            defer if (reservation) |*active| active.release();
-
-            const applied = text_index_maintenance.applyPlannedMerge(
-                self.alloc,
-                &entry.persistent,
-                snap,
-                planned,
-                activeTextMergePolicy().max_segment_size,
-                "force compact text index merge failed",
-                "force compact text index apply merge failed",
-            ) catch |err| switch (err) {
-                error.ResourceBudgetExceeded => if (options.mode == .best_effort) return false else return err,
-                else => return err,
+            defer result.deinit(self.alloc);
+            const applied = while (true) {
+                break self.finishTextMergeTask(&task, &result) catch |err| {
+                    if (err != error.TextMergePublicationLookupRequired) return err;
+                    try prepareTextMergeTaskPublicationLookup(&task, &result);
+                    continue;
+                };
             };
             if (!applied) return false;
         }
@@ -49253,6 +49273,51 @@ test "best effort force compact defers under text merge pressure" {
     const entry_after = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
     try std.testing.expect(entry_after.persistent.snapshot().segments.len >= 2);
     try std.testing.expect(entry_after.compaction_pending.load(.acquire));
+}
+
+test "index manager forced native compaction uses bounded task admission" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try a.dupeSentinel(u8, path, 0);
+    defer a.free(path_z);
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
+        .soft_limit_bytes = 10 * 1024 * 1024,
+        .hard_limit_bytes = 10 * 1024 * 1024,
+    };
+    var resources = resource_manager_mod.ResourceManager.init(.{
+        .budgets = budgets,
+        .disk_safety_floor_bytes = 1024 * 1024,
+        .disk_safety_floor_divisor = 0,
+    });
+    defer resources.deinit(a);
+    var store = try docstore_mod.DocStore.open(a, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.initWithOptions(a, path, .{ .resource_manager = &resources });
+    defer manager.deinit();
+    manager.setIo(std.testing.io);
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{ .name = "text", .kind = .full_text, .config_json = "{}" }});
+    const options: IndexBatchOptions = .{ .compact_text = false, .compact_text_segment_threshold = 2, .defer_text_compaction = true };
+    for (0..16) |i| {
+        const key = try std.fmt.allocPrint(a, "doc-{d}", .{i});
+        defer a.free(key);
+        const value = try std.fmt.allocPrint(a, "{{\"title\":\"bounded forced compact canary {d}\"}}", .{i});
+        defer a.free(value);
+        try store.putBatch(&.{.{ .key = key, .value = value }}, &.{});
+        try manager.indexTextBatchByNameWithOptions(&store, "text", &.{.{ .key = key, .value = value }}, options);
+    }
+    const entry = manager.textIndexEntry("text").?;
+    try std.testing.expect(entry.persistent.supportsFileBackedSegmentArtifacts());
+    try std.testing.expectEqual(@as(usize, 16), entry.persistent.snapshot().segments.len);
+    try manager.forceCompactAllTextIndexes();
+    try std.testing.expectEqual(@as(usize, 1), entry.persistent.snapshot().segments.len);
+    try std.testing.expectEqual(@as(u64, 16), entry.persistent.snapshot().liveDocCount());
+    try std.testing.expectEqual(@as(u64, 0), resources.sliceStats(.text_merge_buffers).used_bytes);
+    try std.testing.expectEqual(@as(u64, 10 * 1024 * 1024), resources.sliceStats(.text_merge_buffers).hard_limit_bytes);
 }
 
 test "best effort force compact stops on resource budget rejection" {

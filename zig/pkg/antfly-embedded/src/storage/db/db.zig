@@ -37656,6 +37656,38 @@ pub const DB = struct {
         return terms;
     }
 
+    // Native progress has no external checkpoint file. Publish its checked
+    // metadata and diagnostic status in the same transaction, after durable
+    // index output, rather than paying a second native commit per fragment.
+    fn saveNativeAppliedSequencesWithStatus(
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        index_manager: *index_manager_mod.IndexManager,
+        updates: []const apply_state.AppliedSequenceUpdate,
+    ) !void {
+        const Status = struct { key: []u8, value: [index_status_encoded_len]u8 };
+        var statuses = std.ArrayListUnmanaged(Status).empty;
+        defer {
+            for (statuses.items) |status| alloc.free(status.key);
+            statuses.deinit(alloc);
+        }
+        // Capture immutable index state before opening the primary writer;
+        // never acquire index snapshot locks underneath its transaction lock.
+        for (updates) |update| {
+            const status_snapshot = collectLiveIndexStatusSnapshot(index_manager, update.index_name) orelse continue;
+            const key = try indexStatusKeyAlloc(alloc, update.index_name);
+            errdefer alloc.free(key);
+            var encoded: [index_status_encoded_len]u8 = undefined;
+            encodeIndexStatusSnapshot(status_snapshot, &encoded);
+            try statuses.append(alloc, .{ .key = key, .value = encoded });
+        }
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try apply_state.advanceProjectionMetadataTxn(&txn, updates);
+        for (statuses.items) |status| try txn.put(status.key, &status.value);
+        try txn.commit();
+    }
+
     fn saveIndexStatusSnapshots(
         alloc: Allocator,
         store: *docstore_mod.DocStore,
@@ -62457,6 +62489,7 @@ fn flushPendingAppliedSequencesLocked(
     var projection_metadata_ns: u64 = 0;
     var checkpoint_file_ns: u64 = 0;
     var status_snapshot_ns: u64 = 0;
+    var status_in_checkpoint = false;
 
     const save_start_ns = monotonicTimeNs();
     // Keep the complete metadata/checkpoint/status transaction on one stable
@@ -62497,14 +62530,19 @@ fn flushPendingAppliedSequencesLocked(
             try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
             projection_metadata_ns +|= elapsedSince(metadata_started);
             const checkpoint_started = monotonicTimeNs();
-            try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
-                ctx.index_manager.generation_storage,
-                ctx.alloc,
-                ctx.index_manager.checkpointIo(),
-                ctx.store,
-                ctx.applied_sequence_checkpoint_path,
-                generic_updates.items,
-            );
+            if (ctx.store.runtime_store.capabilities().bounded_replay_admission and ctx.applied_sequence_checkpoint_path == null) {
+                try DB.saveNativeAppliedSequencesWithStatus(ctx.alloc, ctx.store, ctx.index_manager, generic_updates.items);
+                status_in_checkpoint = true;
+            } else {
+                try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
+                    ctx.index_manager.generation_storage,
+                    ctx.alloc,
+                    ctx.index_manager.checkpointIo(),
+                    ctx.store,
+                    ctx.applied_sequence_checkpoint_path,
+                    generic_updates.items,
+                );
+            }
             checkpoint_file_ns +|= elapsedSince(checkpoint_started);
         }
         var authoritative_lifecycle_completed = false;
@@ -62514,7 +62552,7 @@ fn flushPendingAppliedSequencesLocked(
             authoritative_lifecycle_completed = authoritative_lifecycle_completed or
                 (completed_now and ctx.index_manager.densePostingWalAuthoritativeByName(update.index_name));
         }
-        if (generic_updates.items.len > 0) {
+        if (generic_updates.items.len > 0 and !status_in_checkpoint) {
             const status_started = monotonicTimeNs();
             try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, generic_updates.items);
             status_snapshot_ns +|= elapsedSince(status_started);
@@ -147392,6 +147430,131 @@ test "db manual text producers merge capacity without optional workers visibilit
     var completed = try std.json.parseFromSlice(std.json.Value, alloc, visible, .{});
     defer completed.deinit();
     try std.testing.expectEqual(@as(i64, 1), completed.value.object.get("count").?.integer);
+}
+
+test "native projection progress and status share a failure atomic publication" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite = @import("../lite/backend.zig");
+    var directory = try TestDirectory.init("native-progress-status-publication");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrint(a, "{s}/drain.aflite", .{directory.path()});
+    defer a.free(path);
+    var host = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer host.deinit();
+    var backend = try lite.Handle.createWithOptions(a, path, .{ .exclusive = true, .externally_locked = true, .no_sync = true, .io = std.testing.io });
+    defer backend.deinit();
+    backend.native_docstore.?.maintenance_start_suppressed = true;
+    var options: OpenOptions = .{
+        .backend_runtime = host.ptr(),
+        .executor = .{ .backend = .manual },
+        .start_index_workers = false,
+        .start_optional_runtimes = true,
+        .start_optional_runtime_workers = false,
+        .start_independent_maintenance = false,
+        .enrichment = .{ .enable_without_producers = true },
+        .text_merge = .{ .enabled = false },
+    };
+    try backend.configureDbOpenOptions(&options);
+    var db = try DB.open(a, path, options);
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    try std.testing.expect(db.core.applied_sequence_checkpoint_path == null);
+    const file = &backend.native_docstore.?.file;
+    const updates = [_]apply_state.AppliedSequenceUpdate{.{ .index_name = "text", .sequence = 7, .generation = 2, .config_hash = 42 }};
+    const key = try DB.indexStatusKeyAlloc(a, "text");
+    defer a.free(key);
+    const prior = db.core.store.get(a, key) catch |err| if (err == error.NotFound) null else return err;
+    defer if (prior) |raw| a.free(raw);
+    file.test_page_write_fail_after = 0;
+    const failed = DB.saveNativeAppliedSequencesWithStatus(a, db.core.store, db.core.index_manager, &updates);
+    file.test_page_write_fail_after = null;
+    try std.testing.expectError(error.TestPageWriteFailure, failed);
+    try std.testing.expectEqual(@as(u64, 0), try db.core.loadAppliedSequence(a, "text"));
+    const after_failure = db.core.store.get(a, key) catch |err| if (err == error.NotFound) null else return err;
+    defer if (after_failure) |raw| a.free(raw);
+    if (prior) |raw| try std.testing.expectEqualSlices(u8, raw, after_failure.?) else try std.testing.expect(after_failure == null);
+    const before = file.activeCheckpoint().commit_sequence;
+    try DB.saveNativeAppliedSequencesWithStatus(a, db.core.store, db.core.index_manager, &updates);
+    try std.testing.expectEqual(before + 1, file.activeCheckpoint().commit_sequence);
+    const progress = try apply_state.loadProjectionCheckpointWithSidecar(a, std.testing.io, db.core.store, null, "text");
+    try std.testing.expectEqual(@as(u64, 7), progress.applied_sequence);
+    try std.testing.expectEqual(@as(u64, 2), progress.generation);
+    try std.testing.expectEqual(@as(u64, 42), progress.config_hash);
+    const raw = try db.core.store.get(a, key);
+    defer a.free(raw);
+    _ = try DB.decodeIndexStatusSnapshot(raw);
+    try std.testing.expect((try backend.check()).valid);
+}
+
+test "background enrichment turn explicit native drain services consumers before its progress reserve fills" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const QueuedOutput = struct {
+        fn commit(ptr: *anyopaque, batch: enrichment_runtime_mod.GeneratedRecordBatch, promotions: []const enrichment_runtime_mod.GeneratedArtifactPromotion, deletes: []const []const u8, guards: []const enrichment_runtime_mod.GeneratedSourceGuard, fence: ?enrichment_runtime_mod.GeneratedWriteFence) anyerror!enrichment_runtime_mod.GeneratedRecordCommit {
+            const database: *DB = @ptrCast(@alignCast(ptr));
+            return database.enqueuePreparedGeneratedBatch(batch, promotions, deletes, guards, fence);
+        }
+    };
+    const a = std.testing.allocator;
+    const lite = @import("../lite/backend.zig");
+    var directory = try TestDirectory.init("native-cooperative-full-drain");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrint(a, "{s}/drain.aflite", .{directory.path()});
+    defer a.free(path);
+    var host = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer host.deinit();
+    var backend = try lite.Handle.createWithOptions(a, path, .{ .exclusive = true, .externally_locked = true, .no_sync = true, .io = std.testing.io });
+    defer backend.deinit();
+    backend.native_docstore.?.maintenance_start_suppressed = true;
+    var options: OpenOptions = .{
+        .backend_runtime = host.ptr(),
+        .executor = .{ .backend = .manual },
+        .start_index_workers = false,
+        .start_optional_runtimes = true,
+        .start_optional_runtime_workers = false,
+        .start_independent_maintenance = false,
+        .enrichment = .{ .enable_without_producers = true },
+        .text_merge = .{ .enabled = false },
+    };
+    try backend.configureDbOpenOptions(&options);
+    var db = try DB.open(a, path, options);
+    defer db.close();
+    try db.addEnrichment(.{ .name = "copy", .kind = .asset, .field = "text", .producer_json = "{\"type\":\"copy\"}" });
+    try db.addIndex(.{ .name = "raw", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{ .name = "generated", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"copy\"}]}" });
+    db.enrichment_runtime.?.write_ctx = &db;
+    db.enrichment_runtime.?.write_fn = QueuedOutput.commit;
+    const padding: [2304]u8 = @splat('a');
+    const value = try std.fmt.allocPrint(a, "{{\"text\":\"cooperative canary {s}\"}}", .{padding});
+    defer a.free(value);
+    for (0..32) |i| {
+        var key: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&key, "source-{d}", .{i});
+        try db.batch(.{ .writes = &.{.{ .key = name, .value = value }}, .sync_level = .write });
+    }
+    const file = &backend.native_docstore.?.file;
+    var debt = (try file.replayAdmission()).?;
+    try std.testing.expect(debt.bytes != 0);
+    debt.limits.bytes = debt.bytes + 1024;
+    debt.limits.records = debt.records;
+    const limits = debt.limits;
+    try file.putDocument(lite.native.replay_admission.key, &debt.encode());
+    // Match the C API explicit-drain consumer scope. This adds the existing
+    // finite progress reserve, but does not make producer admission unbounded.
+    file.replay_consumer_admission = true;
+    defer file.replay_consumer_admission = false;
+    try db.runUntilIdle();
+    const target = db.core.nextDerivedSequence();
+    try std.testing.expect(db.enrichment_runtime.?.stats().applied_sequence >= target);
+    try std.testing.expectEqual(@as(u32, 32), db.core.index_manager.textIndex("raw").?.snapshot().liveDocCount());
+    try std.testing.expectEqual(@as(u32, 32), db.core.index_manager.textIndex("generated").?.snapshot().liveDocCount());
+    const after = (try file.replayAdmission()).?;
+    try std.testing.expectEqual(limits.bytes, after.limits.bytes);
+    try std.testing.expectEqual(limits.records, after.limits.records);
+    try std.testing.expect(after.bytes < limits.bytes);
+    try std.testing.expect((try backend.check()).valid);
 }
 
 test "background enrichment turn fences artifact consumers at the producer prefix" {
