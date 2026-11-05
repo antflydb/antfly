@@ -1,0 +1,62 @@
+{
+  "qualified": false,
+  "production_source_commit": "df9fad81a2dd5e600028821f33de41a5c54cb870",
+  "integrated_main": "a60aa92028ee5a9a336ba5c4ac95f506b9f83e7e",
+  "prior_local_diagnostic": {
+    "source": "5aac14c0dce3d3fcb461fd8e9911b7486219f704",
+    "mode": "Debug",
+    "metrics_enabled": true,
+    "original_importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+    "frozen_input_tree_sha256": "1a54a15e5b957c39807adb41b321bafa74ca2177124238a42c9247b70953f276",
+    "successful_inputs": 7,
+    "planned_inputs": 15,
+    "failed_input": 7,
+    "failure": "Pre-commit raw document batch Busy: LiteReplayBacklogExceeded",
+    "seconds": 1204.734,
+    "compiler_overlap": false,
+    "file_bytes": 2848870400,
+    "history_replay": {
+      "target_sequence": 260,
+      "producer_applied": 18,
+      "producer_scanned_record": 19,
+      "producer_retry_tickets": 0,
+      "full_text_applied": 9,
+      "retained_canonical_records": 251,
+      "records_with_1024_families": 245
+    },
+    "allocator_full_loads": 2,
+    "allocator_full_load_ns": 320240000,
+    "pending_retirements": 92,
+    "interpretation": "Diagnostic evidence only. Producer discovery repeatedly rebuilt large records and scheduled catalog-inapplicable primary rows; no failed inference tickets blocked this source. This does not quantify a final speedup."
+  },
+  "implemented": [
+    "Filter catalog-inapplicable rows before durable retry-window sizing; retain documents with artifact-unit outbox jobs.",
+    "Resume authenticated canonical family chunks using a persisted fingerprint and next-family position.",
+    "Persist incomplete discovery separately from complete-record progress, without releasing journal credits.",
+    "Read ESQ2 retry headers and write ESQ3 headers with bounded continuation metadata.",
+    "Bound zero-output discovery by bytes, records and 4096 families per turn.",
+    "Merge current origin/main and preserve artifact identity and revision handling."
+  ],
+  "integrated_debug_regressions": {
+    "unique_tests_passed": 13,
+    "failed": 0,
+    "leaked": 0,
+    "coverage": [
+      "Bounded producer continuation with a damaged distant chunk",
+      "Manifest fingerprint rejection",
+      "Durable cursor serialization and legacy header compatibility",
+      "Complete-record bound across restart",
+      "Group configuration routing and deleted group units",
+      "Discovery filtering, bounds and failure retry",
+      "Retry-workset clocks, allocation failures and maximum metadata",
+      "Both artifact identity/revision regressions affected by main integration"
+    ]
+  },
+  "remaining": [
+    "Validate the integrated shared library, native/C API/ABI and all database SDKs.",
+    "Complete a fresh full unchanged-importer local run.",
+    "Run candidate-only final optimized qualification on wolfspider, including original-importer contention, field parity, storage accounting, large graph writes and both ten-minute active-write soaks.",
+    "Human-approved aggregate CI; full factory remains assigned to Beads."
+  ],
+  "reference_policy": "Reuse retained references only; no baseline build or execution."
+}

@@ -12732,5 +12732,20 @@ test "lite seekable producer discovery persists authenticated bounded continuati
         state.deinit(a);
         state = restored;
     }
+    const Filter = struct {
+        visits: usize = 0,
+        fn accepts(ptr: *anyopaque, _: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.visits += 1;
+            return false;
+        }
+    };
+    var filter = Filter{};
+    const filtered = try source.collectEnrichmentDocumentGroupsWindow(a, 0, .{ .seekable = true, .max_records = 1, .max_document_groups = 9, .document_filter = .{ .ptr = &filter, .accepts = Filter.accepts } });
+    defer source_mod.freePendingDocumentGroups(a, filtered.groups);
+    try std.testing.expectEqual(@as(usize, 1024), filter.visits);
+    try std.testing.expectEqual(@as(usize, 0), filtered.groups.len);
+    try std.testing.expectEqual(@as(u64, 1), filtered.last_sequence);
+    try std.testing.expect(filtered.fragment == null);
     try std.testing.expectEqualDeep(charged, (try native_store.file.replayAdmission()).?);
 }
