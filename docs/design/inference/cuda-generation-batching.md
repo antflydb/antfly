@@ -273,8 +273,8 @@ executor broker automatically, through both `/extract` and `/decisions`.
 The typed `/decisions` API accepts either one `input` or an `inputs` array;
 results retain caller order and each caller's schema and presentation options.
 The read-pool model directory selects the authenticated Q8 split bundle.
-EmbeddingGemma 2 short CUDA text calls use the same broker with a separate
-four-row capability. See [HTTP batching ownership and qualification](read-pool-http-batching.md)
+EmbeddingGemma 2 CUDA text calls use the same broker with a separate
+four-row, 8,192-padded-token capability and bounded length buckets. See [HTTP batching ownership and qualification](read-pool-http-batching.md)
 for the exact eligibility limits and numerical contract. Other GLiNER
 architectures, artifacts and backends retain their own batching contracts;
 the boundary extractor's discovery does not declare Decide's classification contract.

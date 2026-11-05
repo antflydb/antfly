@@ -22,6 +22,9 @@ const processor = @import("pipelines/gliner_boundary_processor.zig");
 test {
     _ = @import("server/executor_microbatch.zig");
     _ = @import("server/read_pool_microbatch.zig");
+    _ = @import("pipelines/text_batch_admission.zig");
+    _ = @import("pipelines/batch_execution.zig");
+    _ = @import("pipelines/embedding.zig");
 }
 
 test "read pool microbatch presents independent schemas without reentering the backend" {
@@ -59,4 +62,62 @@ test "read pool microbatch presents independent schemas without reentering the b
     try std.testing.expectError(error.InvalidExtractionInput, span.executePlanned(null, a, .{ .deberta = .{} }, &request, &plan, .{ .classification_results = logits[0..1] }));
     items[0].ranges = &.{};
     try std.testing.expect(!span.canBatchClassifications(&request, &plan));
+}
+
+const MaskedEncoder = struct {
+    pub fn inputInfo(_: @This()) []const @import("backends/tensor.zig").TensorInfo {
+        return &.{
+            .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, -1 } },
+            .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ -1, -1 } },
+        };
+    }
+};
+
+test "read pool microbatch document buckets bound input padding and backend tile rounding" {
+    const bucket = @import("pipelines/batch_execution.zig").maskedSequenceBucket;
+    for (1..8193) |tokens| {
+        const width = bucket(MaskedEncoder{}, tokens, 8192);
+        try std.testing.expect(width >= tokens and width * 4 <= tokens * 5);
+        const rows = @min(@as(usize, 4), 8192 / width);
+        const physical_width = if (width >= 128) std.mem.alignForward(usize, width, 64) else width;
+        try std.testing.expect(rows >= 1 and rows * physical_width <= 8192);
+    }
+    try std.testing.expectEqual(@as(usize, 2048), bucket(MaskedEncoder{}, 2041, 8192));
+    try std.testing.expectEqual(@as(usize, 4096), bucket(MaskedEncoder{}, 4091, 8192));
+    try std.testing.expectEqual(@as(usize, 8192), bucket(MaskedEncoder{}, 8191, 8192));
+}
+
+test "read pool microbatch document rows share bounded forwards across heterogeneous arrays" {
+    const broker_mod = @import("server/executor_microbatch.zig");
+    const bucket = @import("pipelines/batch_execution.zig").maskedSequenceBucket;
+    var broker = broker_mod.Broker.init(std.testing.allocator);
+    defer broker.deinit();
+    const Executor = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fn execute(raw: *anyopaque, items: []const broker_mod.ExecuteItem) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            var padded: usize = 0;
+            for (items) |item| padded += bucket(MaskedEncoder{}, item.payloadAs(usize).*, 8192);
+            std.debug.assert(items.len <= 4 and padded <= 8192);
+            for (items) |item| item.slot.setValue(usize, item.payloadAs(usize).*, if (items.len > 1) .native_batch else .serial);
+        }
+    };
+    var executor = Executor{};
+    const tokens = [_]usize{ 2040, 4090, 8190, 2041, 4091, 2042, 2043 };
+    var shapes: [tokens.len]broker_mod.Shape = undefined;
+    for (tokens, &shapes) |count, *shape| {
+        const width = bucket(MaskedEncoder{}, count, 8192);
+        shape.* = .{ .geometry_key = width, .tokens = width };
+    }
+    const ids = @as([tokens.len]broker_mod.Identity, @splat(.{}));
+    const results = try broker.submitBatchControlled(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "document-encoder", .task = .embed, .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 4, .max_items = 4, .max_tokens = 8192 }, &shapes, &ids, null, .{}, &tokens, &executor, Executor.execute);
+    defer std.testing.allocator.free(results);
+    try std.testing.expectEqual(@as(usize, 5), executor.calls.load(.monotonic));
+    for (tokens, results) |expected, actual| try std.testing.expectEqual(expected, actual.result.value);
+    try std.testing.expectEqual(results[0].execution_id, results[3].execution_id);
+    // The generic broker retains four-ticket waves for bounded host ownership.
+    try std.testing.expectEqual(results[5].execution_id, results[6].execution_id);
+    try std.testing.expect(results[0].execution_id != results[5].execution_id);
+    try std.testing.expect(results[1].execution_id != results[4].execution_id);
 }

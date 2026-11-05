@@ -8597,7 +8597,7 @@ fn archExecutionCapabilities(raw: *anyopaque) @import("../backends/session.zig")
         const eligible = self.arch_config.embedding_gemma2.resident != null and
             self.backend_data.cuda.compute.capability_profile == .embedding_gemma2 and
             self.backend_data.cuda.compute.embedding_gemma2_policy.arithmeticBits() == 0;
-        return .{ .text_batch_rows = if (eligible) 4 else 1, .text_batch_tokens = if (eligible) 64 else 0 };
+        return .{ .text_batch_rows = if (eligible) 4 else 1, .text_batch_tokens = if (eligible) 8192 else 0, .text_batch_padded_tokens = if (eligible) 8192 else 0 };
     }
     if (self.arch_config != .gpt) return .{};
     const cfg = self.arch_config.gpt;

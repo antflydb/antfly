@@ -7474,11 +7474,13 @@ pub const Node = struct {
             const token_text = if (prefix.prefix.len > 0) try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix.prefix, text }) else text;
             defer if (prefix.prefix.len > 0) allocator.free(token_text);
             const tokens = if (read_text) try strictEmbeddingTextTokens(allocator, model, token_text) else try countTokenizerTokens(allocator, io, model.getTokenizer(), token_text);
-            // The qualified arithmetic regime covers four <=64-token rows.
-            // Longer items retain the ordinary independently owned path.
+            // Charge the bucket width, including padding, to the cohort's
+            // aggregate token ceiling. Nearby lengths may share a masked run;
+            // the model maximum still applies independently to every row.
+            const width = if (read_text) @import("../pipelines/batch_execution.zig").maskedSequenceBucket(model.session, tokens, model.session.executionCapabilities().text_batch_tokens) else tokens;
             if (read_text and tokens > model.session.executionCapabilities().text_batch_tokens) return null;
-            shape.* = .{ .bytes = token_text.len, .tokens = tokens, .geometry_key = if (read_text) tokens else 0 };
-            try validateTextExecutorInvocation(contract, 1, &.{text}, prefix.prefix.len, shape.tokens, 0, 0);
+            shape.* = .{ .bytes = token_text.len, .tokens = width, .geometry_key = if (read_text) width else 0 };
+            try validateTextExecutorInvocation(contract, 1, &.{text}, prefix.prefix.len, tokens, 0, 0);
             identity.* = .{};
         }
         const Probe = struct {
@@ -7503,7 +7505,7 @@ pub const Node = struct {
             .preferred_items = if (read_text) rows else @min(contract.batch.preferred_items, rows),
             .max_items = rows,
             .max_bytes = requestMediaMaxBytes(self),
-            .max_tokens = if (contract.batch.max_input_tokens_per_item) |limit| limit *| rows else std.math.maxInt(usize),
+            .max_tokens = if (read_text) @min(model.session.executionCapabilities().text_batch_padded_tokens, if (contract.batch.max_input_tokens_per_item) |limit| limit *| rows else std.math.maxInt(usize)) else if (contract.batch.max_input_tokens_per_item) |limit| limit *| rows else std.math.maxInt(usize),
             .max_wait_us = self.config.executor_microbatch_max_wait_us,
         }, shapes, identities, try directExecutorDeadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, self, if (sparse) executeSparseTextEmbedMicrobatch else executeTextEmbedMicrobatch);
         return try executor_microbatch.collectOwned(Output, allocator, shared, results, if (sparse) cloneSparseRow else cloneDenseRow, if (sparse) freeSparseRow else freeDenseRow);

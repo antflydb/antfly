@@ -267,14 +267,15 @@ def run(args):
             for future in [pool.submit(call, kind, body) for kind, body in extras for _ in range(2)]:
                 future.result()
         if 'embed' in bodies:
-            c.set_phase('long-embedding-fallback')
+            c.set_phase('long-embedding-broker')
             body = copy.deepcopy(bodies['embed'][0])
             body['input'] = ['An account password needs resetting. ' * 24]
             before = metrics(args.url)
             reference = call('embed', body)['response']
             equivalent(reference, call('embed', body)['response'], .002)
             after = metrics(args.url)
-            assert after.get('antfly_inference_executor_microbatch_groups_total', 0) == before.get('antfly_inference_executor_microbatch_groups_total', 0), 'long embedding unexpectedly entered short-query broker'
+            delta = after.get('antfly_inference_executor_microbatch_groups_total', 0)-before.get('antfly_inference_executor_microbatch_groups_total', 0)
+            assert delta == 0 if args.baseline else delta >= 2, ('long embedding broker eligibility differs', delta)
         c.set_phase('request-limits')
         for kind in bodies:
             body = copy.deepcopy(bodies[kind][0])

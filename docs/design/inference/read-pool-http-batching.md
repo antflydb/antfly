@@ -8,17 +8,36 @@ allocation guard; batching does not change the 38 GiB read-profile ceiling.
 
 ## Compatibility and ownership
 
-Embedding text groups have at most four rows, each at most 64 tokens including
-the task prefix and model special tokens. The resident CUDA backend declares
-this capability only for its default arithmetic policy. Longer text retains the
-existing per-request route. Groups require the same loaded model
-generation, task prefix/instruction, backend and exact token length. Output
+Embedding text groups have at most four rows and 8,192 bucket-padded tokens in
+aggregate. Each input may use the full 8,192-token model context, including task
+prefixes and special tokens. The resident CUDA backend declares this capability
+only for its default arithmetic policy. Nearby lengths share explicit attention
+masks in quarter-step length classes; input padding introduced by grouping is at
+most 25%. Kernel tile rounding is covered by existing workspace admission.
+
+| Bucket width | Maximum rows in one cohort |
+| --- | ---: |
+| Up to 2,048 tokens | 4 |
+| 2,560 tokens | 3 |
+| 4,096 tokens | 2 |
+| Above 4,096 through 8,192 tokens | 1 |
+
+The aggregate token ceiling bounds a model turn alongside the other read models;
+actual scratch admission can reduce the physical cohort further. Only a resource
+refusal before GPU dispatch authorizes subdivision. Kernel, physical allocation,
+cancellation and deadline failures are propagated without replay. The encoder
+arithmetic is unchanged.
+
+Groups require the same loaded model generation, task prefix/instruction and
+backend. Per-request limits are checked against actual token counts; bucket
+padding is charged to the cohort rather than reported as input usage. Output
 vectors retain the full model dimension until each caller applies its requested
 MRL dimension and normalization. Strict token counting includes model special
 tokens; usage cannot silently fall back to an estimate. Mixed media, ordered
 content groups, tracing and per-item-error routes retain their existing paths.
 The generic multimodal capability remains conservative; this does not advertise
-native batching for every content group.
+native batching for every content group. Arrays retain bounded four-ticket
+submission waves and restore the caller's original output order.
 
 GLiNER classification groups have at most eight prepared rows and compatible
 length buckets, authenticated model generation, encoder configuration and budget
@@ -133,7 +152,7 @@ Spark hardware, not a production throughput or universal tail-latency guarantee.
 
 Every candidate burst observed native groups of at least two rows. The campaign
 also passed multi-input ordering, task and dimension options, long embedding
-fallback, request ceilings, mixed Gemma traffic, deadlines, disconnected clients,
+broker admission, request ceilings, mixed Gemma traffic, deadlines, disconnected clients,
 recovery to zero active requests/KV reservations, and unchanged model identities.
 Every workload phase had managed and service-specific NVML samples, with no
 sampling failures. Service NVML peaked around 9.85 GiB; this campaign does not
@@ -203,3 +222,91 @@ promotion is claimed. Eleven artifact-identity tests and eight memory-evidence
 tests pass, including rejection of changed weights at the same path/size/mtime,
 changed manifests/tokenizers, missing hashes, linked-shard cycles, files changing
 during hashing, and model reloads during capture.
+
+## Document-sized CUDA cohorts
+
+The widened path removes the earlier short-query eligibility fence and exact-length
+requirement. It was compared with the previous serving executable
+`24fc2e85d16ff98ee707c89811648401cbe3fee150569f0034ea1bfeb9bb11aa` on the same
+GB10, configuration, environment and immutable 27-file model inventory. The
+candidate executable is
+`808cf602544d619ad3b5723f3c962e441f95c9eca6ed007d32623c03c83cf42d`.
+The control predates the latest-main merge; this is a shared-machine serving
+comparison, not an isolated kernel benchmark.
+
+Each length class has eight distinct documents of slightly unequal lengths,
+repeated across three concurrent bursts. Values below are median burst p95
+latencies, including queueing for all eight requests. They are not single-request
+service times or peak GPU rates.
+
+| Input class | Control p95 | Candidate p95 | Aggregate throughput ratio |
+| --- | ---: | ---: | ---: |
+| 128 tokens | 77.36 ms | 50.09 ms | 1.43x |
+| 512 tokens | 252.37 ms | 202.16 ms | 1.25x |
+| 1,024 tokens | 556.27 ms | 495.26 ms | 1.12x |
+| 2,048 tokens | 1,463.71 ms | 1,478.59 ms | 0.99x |
+| 4,096 tokens | 4,713.30 ms | 4,778.86 ms | 0.99x |
+| 8,192 tokens | 17,539.34 ms | 17,960.60 ms | 0.98x |
+
+Every 128–4,096-token burst observed native batches. The 8,192-token class stayed
+singleton under the aggregate token ceiling. A separate three-row document case
+also passed. All predefined document gates pass: median p95 at most 1.25 times
+the control plus a 10 ms noise allowance, and throughput at least 0.90 times the
+control. Longer cohorts are supported without claiming a throughput gain where
+none was observed.
+
+The campaign validates 256 embedding comparisons, with minimum cosine 0.999964
+and maximum coordinate difference 0.001855. MRL dimensions, multi-input ordering,
+usage, exactly-at-limit inputs and over-limit rejection pass. Four-topic retrieval
+uses the actual vectors recorded from concurrent document bursts, not singleton
+document replays: top results remain unchanged at all lengths, with maximum
+score drift 0.001345. This synthetic fixture is a regression check rather than a
+broad retrieval-quality benchmark.
+
+With two Gemma generations and GLiNER traffic active, document p95 was 3.34 s
+versus 3.56 s in the control, typed-decision p95 was 1.70 s versus 0.95 s, and
+Gemma completion p95 was 7.83 s versus 7.47 s. These pass the predefined mixed
+limits (2x plus 50 ms for smaller models, 1.25x plus 50 ms for generation).
+They do not establish a universal sub-second decision SLO. In a separate
+interactive-query turnover fixture, eight short queries completed before the
+2K-document backlog drained, at 744 ms p95 against a 1,500 ms fixture gate.
+
+Deadlines, disconnected clients, healthy-peer recovery, zero remaining active
+requests/KV reservations and unchanged loaded-model identities pass. All workload
+phases have valid managed and service NVML evidence: 537 samples, no sampling
+errors. Managed CUDA peaks at 10.25 GiB and service NVML at 10.60 GiB; these
+measurements overlap and must not be added. The 38 GiB managed ceiling is unchanged,
+and this campaign does not exercise physical exhaustion near that ceiling.
+
+The complete short read-pool regression passes with the widened path, including
+both GLiNER APIs and native embedding controls. The same candidate passes the
+102-request write-pool regression, with valid evidence in all eight phases.
+
+Raw receipts are under `.benchmark-results/embedding-document-batching/` in the
+qualification worktree: `control/`, `final/`, `short-read-regression/`, and
+`write-regression/`. `final-batched-retrieval.json` derives the retrieval check
+from the preserved `final/requests.jsonl` vectors and records that file's hash.
+The updated harness performs this burst-vector check directly in subsequent runs.
+The initial `candidate-v1/` campaign also passed; its performance numbers are
+separate observations and are not substituted for the final table above.
+
+```sh
+# Run against the previous executable first, then restart with the candidate.
+python3 zig/pkg/inference/scripts/qualify_embedding_document_batching.py \
+  --binary CONTROL_BINARY --config LOCAL_READ_CONFIG --cgroup SERVICE_CGROUP \
+  --output .benchmark-results/embedding-document-batching/control
+python3 zig/pkg/inference/scripts/qualify_embedding_document_batching.py \
+  --binary SERVING_BINARY --config LOCAL_READ_CONFIG --cgroup SERVICE_CGROUP \
+  --control .benchmark-results/embedding-document-batching/control \
+  --output .benchmark-results/embedding-document-batching/final
+```
+
+The focused read-model suite passes 42 tests in CPU and CUDA builds, including
+real admission refusal with an in-memory controller, safe cohort subdivision,
+non-replay of backend failures, padding bounds, legacy fallback compatibility,
+and heterogeneous-array ordering. Its cold build peaks around 1 GiB. The
+82-test generation batching suite and seven allocation-lifetime tests also pass
+in both configurations. Nineteen shared artifact/telemetry tests and four
+recorded-retrieval tests pass, together with formatting, license headers and the
+Apache boundary check. Runtime changes preserve existing CUDA arithmetic; later
+qualification edits only added tests and evidence handling.

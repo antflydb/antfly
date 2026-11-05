@@ -284,7 +284,7 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     var read_batch_imports = suite.tests.root_module.import_table.iterator();
     while (read_batch_imports.next()) |entry| read_batch_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
     read_batch_root.link_libc = true;
-    const read_batch_tests = b.addTest(.{ .max_rss = 4 * 1024 * 1024 * 1024, .root_module = read_batch_root, .filters = &.{ "read pool microbatch", "microbatch", "gliner span v2 batch admission", "test_0" } });
+    const read_batch_tests = b.addTest(.{ .max_rss = 4 * 1024 * 1024 * 1024, .root_module = read_batch_root, .filters = &.{ "read pool microbatch", "executor_microbatch.test.", "embedding text batch", "gliner span v2 batch admission", "test_0" } });
     const run_read_batch_tests = ctx.addRunArtifact(read_batch_tests);
     test_step.dependOn(&run_read_batch_tests.step);
     ctx.step("test-read-pool-microbatch", "Verify read-model row ownership, capacity and cancellation").dependOn(&run_read_batch_tests.step);

@@ -232,12 +232,14 @@ requests without waiting to fill a batch. No request flag is needed. Setting
 disabling cooperative execution restores exclusive generation. Other runtime
 configurations retain their existing defaults. See the
 [measurements and tradeoffs](../design/inference/cuda-generation-batching.md).
-Compatible EmbeddingGemma 2 CUDA text requests also combine automatically, up to
-four equal-length rows of at most 64 tokens under the default arithmetic policy.
+Compatible EmbeddingGemma 2 CUDA text requests also combine automatically under
+the default arithmetic policy, with at most four rows and 8,192 bucket-padded
+tokens per cohort. Nearby lengths share attention masks with at most 25%
+grouping padding. Individual inputs retain the full 8,192-token model limit;
+inputs above 4,096 tokens naturally occupy singleton cohorts.
 Authenticated CUDA GLiNER 2.5-Decide classification calls combine up to eight
 compatible rows through `/extract` and `/decisions`. These use the Node-owned
-executor broker independently of the generation controls. Longer embedding text
-and other execution profiles retain their existing paths. See the
+executor broker independently of the generation controls. Other execution profiles retain their existing paths. See the
 [HTTP batching contract](../design/inference/read-pool-http-batching.md).
 
 The cooperative policy prefers shorter contexts for up to eight consecutive turns, then grants
